@@ -174,3 +174,72 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
                 arr = arr.reshape(node.op.source_shape)
             input_data[nid] = apply_load_ops(arr, node.op.load_ops)
     return input_data
+
+
+def drain_tune(pipeline, graph, *, on=None, **kwargs):
+    """Synchronously collect :meth:`Pipeline.tune_async` terminals for tests.
+
+    ``Pipeline.tune`` (the sync generator) is gone — the autotuner is async-only —
+    so tests drive ``tune_async`` through one ``asyncio.run``. Returns the list of
+    terminal candidates. ``on(candidate)`` is invoked per terminal as it arrives;
+    return truthy from it to stop early (the async mirror of a ``for ... break``).
+    A real ``CudaBackend``'s device-pinned worker is bound to this loop, so it is
+    awaited-closed before the loop ends (no orphaned subprocess transport)."""
+    import asyncio
+
+    async def _collect():
+        out = []
+        try:
+            async for cand in pipeline.tune_async(graph, **kwargs):
+                out.append(cand)
+                if on is not None and on(cand):
+                    break
+        finally:
+            backend = kwargs.get("backend")
+            if backend is not None and hasattr(backend, "aclose_async_worker"):
+                await backend.aclose_async_worker()
+        return out
+
+    return asyncio.run(_collect())
+
+
+def run_inner_reward(
+    fused_graph, *, ctx, db, backend=None, backends=None, patience, ucb_c=None, explore_eps=0.0, seed=0, progress=None, prior=None
+):
+    """Synchronously run the async per-op inner reward for tests.
+
+    ``two_level.inner_reward`` (the sync ``asyncio.run`` bridge) is gone — the tuner
+    is async-only — so tests drive ``_inner_reward_async`` through one ``asyncio.run``,
+    building the device-pinned ``pool`` from ``backend`` / ``backends`` exactly as the
+    production outer loop does. Mirrors the old signature so call sites only rename."""
+    import asyncio
+
+    from deplodock.compiler.pipeline import TuningSearch
+    from deplodock.compiler.pipeline.search.two_level import _inner_reward_async
+
+    if ucb_c is None:
+        ucb_c = TuningSearch.DEFAULT_UCB_C
+    pool = list(backends) if backends else [backend]
+    return asyncio.run(
+        _inner_reward_async(
+            fused_graph,
+            ctx=ctx,
+            db=db,
+            pool=pool,
+            patience=patience,
+            ucb_c=ucb_c,
+            explore_eps=explore_eps,
+            seed=seed,
+            progress=progress,
+            prior=prior,
+        )
+    )
+
+
+def run_two_level(graph, **kwargs):
+    """Synchronously run the async :func:`two_level.run_two_level_tune` for tests."""
+    import asyncio
+
+    from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
+
+    return asyncio.run(run_two_level_tune(graph, **kwargs))

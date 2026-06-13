@@ -25,6 +25,7 @@ from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
 from deplodock.compiler.pipeline.pipeline import _is_structural_option
 from deplodock.compiler.pipeline.search.db import SearchDB
+from tests.compiler.conftest import drain_tune
 
 _S, _H, _I = 32, 1024, 3072
 
@@ -80,8 +81,7 @@ def _f32_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
 def _drive_one_terminal(graph: Graph, cc: tuple[int, int]) -> _RecordingSearch:
     """Drive ``TILE_PASSES`` to the first terminal with the recording search."""
     search = _RecordingSearch(patience=10**6)
-    for _ in Pipeline.build(TILE_PASSES).tune(graph, search=search, ctx=Context.from_target(cc), db=SearchDB()):
-        break
+    drain_tune(Pipeline.build(TILE_PASSES), graph, search=search, ctx=Context.from_target(cc), db=SearchDB(), on=lambda c: True)
     return search
 
 

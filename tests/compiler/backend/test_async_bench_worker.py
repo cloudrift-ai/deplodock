@@ -53,7 +53,7 @@ def test_child_env_no_lock_suffix_when_base_unset(monkeypatch) -> None:
 
 @requires_cuda
 def test_async_worker_real_roundtrip_single_gpu() -> None:
-    """Smoke the real transport: ``inner_reward``'s async pool benches a tiny matmul
+    """Smoke the real transport: the async inner-reward pool benches a tiny matmul
     end-to-end on GPU 0 through a real ``_AsyncBenchWorker`` (``create_subprocess_exec``
     + framed-pickle protocol + ``asyncio.wait_for`` wall cap), producing a measured
     per-op best. The transport mirrors the proven sync worker; this confirms the
@@ -65,7 +65,7 @@ def test_async_worker_real_roundtrip_single_gpu() -> None:
     from deplodock.compiler.ir.frontend.ir import MatmulOp
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
     from deplodock.compiler.pipeline.search.db import SearchDB
-    from deplodock.compiler.pipeline.search.two_level import inner_reward
+    from tests.compiler.conftest import run_inner_reward
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (64, 128)), node_id="a")
@@ -76,7 +76,7 @@ def test_async_worker_real_roundtrip_single_gpu() -> None:
 
     backend = CudaBackend(bench_compile_timeout_s=15.0, bench_run_timeout_s=15.0, bench_wall_timeout_s=40.0, device_id=0)
     try:
-        reward = inner_reward(fused, ctx=Context.probe(), db=SearchDB(), backends=[backend], patience=2, prior=None)
+        reward = run_inner_reward(fused, ctx=Context.probe(), db=SearchDB(), backends=[backend], patience=2, prior=None)
     finally:
         backend.close_async_worker()
     assert reward.ok

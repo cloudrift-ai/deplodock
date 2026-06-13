@@ -8,6 +8,7 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -292,8 +293,10 @@ def handle_run(args):
     # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
     # the whole bench block here. Print/dump are pure CPU work.
     try:
-        results, bench, captured = _bench_interleaved_captured(
-            cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+        results, bench, captured = asyncio.run(
+            _bench_interleaved_captured(
+                cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+            )
         )
     except RuntimeError as exc:
         # Bench watchdog fired (slow kernel, hung launch). The kernel
@@ -315,7 +318,7 @@ def handle_run(args):
     golden_benches = None
     pinned = list(getattr(args, "golden_configs", None) or []) + (_ab_samples(args.ab, dynamic=args.dynamic) if args.ab else [])
     if pinned:
-        golden_benches = _bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters)
+        golden_benches = asyncio.run(_bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters))
 
     capture_note = None if captured else "(graph-capture fallback: timings include host launch overhead)"
     notes = [n for n in (_symbolic_bench_note(bench_sym_env), capture_note) if n]
@@ -432,7 +435,7 @@ def _ab_samples(specs, dynamic=None):
     return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None, dynamic=dyn) for raw in specs]
 
 
-def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
+async def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
     measured row beside the greedy pick. ``golden_configs`` are
@@ -458,7 +461,7 @@ def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
                 # Fresh graph; knobs baked into the kernel source here.
                 graph, _, _ = graph_from_code(code, dynamic_shapes=dynamic_shapes)
                 g_compiled = backend.compile(graph)
-            g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
+            g_bench = await backend.benchmark_async(g_compiled, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
             logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
             continue
@@ -970,7 +973,7 @@ def _passes_after_stage(stage: str) -> list[str]:
     return [p for p in CUDA_PASSES if p not in completed]
 
 
-def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends, capture_graphs=True):
+async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends, capture_graphs=True):
     """Run + (optionally) benchmark a lowered graph against its torch reference on
     shared random inputs. The common bench primitive behind ``run --ir`` and
     ``tune --bench``.
@@ -1079,22 +1082,22 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
         backends = _resolve_backends(bench_backends)
         torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, warmup, backends=backends)
         if capture_graphs:
-            results, bench, captured = _bench_interleaved_captured(
+            results, bench, captured = await _bench_interleaved_captured(
                 torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns
             )
         else:
-            results, bench = _bench_interleaved(
+            results, bench = await _bench_interleaved(
                 torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
             )
             captured = False
         return results, bench, True, captured
     # Deplodock-only: a capture failure falls back inside ``benchmark_program``
     # (warned + reported via ``bench.captured``) — nothing to de-mix.
-    bench = backend.benchmark(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
+    bench = await backend.benchmark_async(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
     return {"Deplodock": bench.time_ms * 1000}, bench, False, bench.captured
 
 
-def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
+async def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
     """End-to-end full-model bench against the **real torch module** — eager /
     ``torch.compile`` / Deplodock — using the all-or-nothing CUDA-graph-captured
     interleaved bench (real modules occasionally resist capture; those fall back
@@ -1113,7 +1116,7 @@ def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, i
     cuda_args, cuda_kwargs, _ = _hint_sized_inputs(lowered, cuda_args, cuda_kwargs)
     backends = _resolve_backends(bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
-    return _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
+    return await _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
 
 
 def _handle_run_ir(args, CudaBackend, CompilerDump):
@@ -1160,15 +1163,17 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         # warm-started prior into single-shot compile is a deferred follow-up.
         graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
-    results, bench, torch_available, captured = bench_lowered_vs_torch(
-        frontend,
-        graph,
-        backend,
-        seed=args.seed,
-        do_bench=args.bench,
-        warmup=args.warmup,
-        iters=args.iters,
-        bench_backends=args.bench_backends,
+    results, bench, torch_available, captured = asyncio.run(
+        bench_lowered_vs_torch(
+            frontend,
+            graph,
+            backend,
+            seed=args.seed,
+            do_bench=args.bench,
+            warmup=args.warmup,
+            iters=args.iters,
+            bench_backends=args.bench_backends,
+        )
     )
 
     if args.bench:
@@ -1187,7 +1192,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         ab_benches = None
         if args.ab:
             if tail:
-                ab_benches = _bench_ab_variants_ir(backend, path, tail, args.ab, warmup=args.warmup, iters=args.iters, db=db)
+                ab_benches = asyncio.run(_bench_ab_variants_ir(backend, path, tail, args.ab, warmup=args.warmup, iters=args.iters, db=db))
             else:
                 logger.warning("--ab ignored: %s IR is fully lowered (no forks left to pin)", stage)
         _print_kernel_stats(graph, bench, golden_benches=ab_benches)
@@ -1195,7 +1200,7 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
 
 
-def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters, db=None):
+async def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters, db=None):
     """The ``--ab`` counterpart of :func:`_bench_golden_variants` for the ``--ir``
     path: each config reloads the IR file fresh (the tail lowering mutates the graph
     in place) and re-lowers it with the knobs pinned, so the pin collapses every
@@ -1213,7 +1218,7 @@ def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters, db=No
                 g = Graph.from_dict(_json.loads(Path(ir_path).read_text()))
                 if tail:
                     g = Pipeline.build(tail).run(g, db=db)
-            g_bench = backend.benchmark(g, warmup=warmup, num_iters=iters)
+            g_bench = await backend.benchmark_async(g, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own table
             logger.warning("[ab] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
             continue
@@ -1616,7 +1621,7 @@ def _capture_torch_fns(torch_fns: dict) -> dict | None:
     return captured
 
 
-def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, iters, *, torch_fns):
+async def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, iters, *, torch_fns):
     """All-or-nothing CUDA-graph-captured interleaved bench.
 
     Captures every torch closure (``_capture_torch_fns``) and runs the
@@ -1627,7 +1632,7 @@ def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, 
     ``(results, bench, captured)``."""
     captured_fns = _capture_torch_fns(torch_fns)
     if captured_fns is not None:
-        results, bench = _bench_interleaved(
+        results, bench = await _bench_interleaved(
             module, args, kwargs, backend, lowered, warmup, iters, torch_fns=captured_fns, capture_graphs=True
         )
         if bench.captured:
@@ -1636,18 +1641,20 @@ def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, 
             return results, bench, False  # deplodock-only: nothing to de-mix
         # benchmark_program already logged the capture failure; re-run only to de-mix the table.
         logger.warning("deplodock side fell back to uncaptured timing — re-benching all backends uncaptured")
-    results, bench = _bench_interleaved(module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False)
+    results, bench = await _bench_interleaved(
+        module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
+    )
     return results, bench, False
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns, capture_graphs=False):
+async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns, capture_graphs=False):
     """Time the selected backends by alternating one iter of each per
     loop step. All backends see the same warm GPU state across the
     measurement window — same clocks, same caches, same thermal drift
     — instead of running in sequential phases that each get a
     different steady state.
 
-    Driven by ``backend.benchmark(on_iter=...)``: deplodock is the
+    Driven by ``backend.benchmark_async(on_iter=...)``: deplodock is the
     backbone, ``on_iter`` runs each torch closure and records its
     cuda events, and the same call returns per-launch deplodock
     timings — so the kernel-stats breakdown shares the same warm
@@ -1687,7 +1694,7 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
                 stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
+    bench = await backend.benchmark_async(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}

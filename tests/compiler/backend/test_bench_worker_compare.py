@@ -13,6 +13,7 @@ freeing the device and leaving the parent clean, instead of the ~109-minute in-p
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import textwrap
 import time
@@ -24,7 +25,7 @@ from ..conftest import requires_cuda
 def test_compare_in_worker_returns_torch_and_deplodock() -> None:
     from deplodock.commands.run import _detect_stage, _passes_after_stage
     from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
     from deplodock.compiler.pipeline import Pipeline
 
     # A small torch_ref-runnable op; lowered in-parent (as the per-kernel sweep does), then the
@@ -34,15 +35,17 @@ def test_compare_in_worker_returns_torch_and_deplodock() -> None:
     tail = _passes_after_stage(_detect_stage(g))
     lowered = Pipeline.build(tail).run(g) if tail else g
 
-    results, bench, torch_available, _captured = benchmark_compare_isolated(
-        lowered=lowered,
-        torch_spec=("frontend_graph", fe),
-        bench_backends="eager,deplodock",
-        wall_timeout_s=180.0,
-        warmup=2,
-        iters=5,
-        seed=0,
-        nvcc_flags="",
+    results, bench, torch_available, _captured = asyncio.run(
+        benchmark_compare_isolated_async(
+            lowered=lowered,
+            torch_spec=("frontend_graph", fe),
+            bench_backends="eager,deplodock",
+            wall_timeout_s=180.0,
+            warmup=2,
+            iters=5,
+            seed=0,
+            nvcc_flags="",
+        )
     )
     assert torch_available, "the worker should have rebuilt the torch reference from the frontend graph"
     assert results.get("Deplodock", 0) > 0, f"missing deplodock number: {results}"

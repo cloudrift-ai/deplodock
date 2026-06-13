@@ -506,7 +506,6 @@ class Pipeline:
         its node un-lowered into a loud :class:`LoweringError` instead
         of a downstream ``CudaBackend`` mystery."""
         from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
         from deplodock.compiler.pipeline.search.policy.greedy import greedy_decide  # noqa: PLC0415
 
@@ -537,68 +536,12 @@ class Pipeline:
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)
         _raise_on_unlowered(terminal, rejections, ctx)
-        if backend is not None:
-            _bench_terminal(Candidate(run=run, graph=terminal, cursor=Cursor(run=run)), backend=backend, db=db)
         logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
         return terminal
 
-    def tune(
-        self,
-        graph: Graph,
-        *,
-        search: Search,
-        ctx: Context | None = None,
-        backend=None,
-        db: SearchDB | None = None,
-        dump: CompilerDump | None = None,
-        rejections: list[tuple[str, str, str]] | None = None,
-    ) -> Iterator[Candidate]:
-        """Drive the autotune search. Yields one terminal ``Candidate``
-        per fully-explored branch.
-
-        ``search`` chooses both the order and the stopping condition —
-        :class:`TuningSearch` for ``deplodock tune`` (runs the queue dry,
-        exploring every fork). Single-shot compiles don't come through
-        here: :meth:`run` is a deterministic resolution
-        (:meth:`Run.resolve`), not a search.
-
-        When ``search`` exposes a ``tree: SearchTree``
-        (:class:`TuningSearch` does), each yielded terminal candidate
-        has its ``CudaOp`` nodes recorded to ``db`` and the tree via
-        :func:`record_terminal` before being yielded — so subsequent
-        candidates see the updated priority signal. Pass a ``Backend``
-        (typically :class:`CudaBackend`) via ``backend=`` to record
-        real GPU-event latencies; omit it to skip persistence entirely
-        (terminals yield a stub ``latency_us=1.0`` but nothing is
-        written to ``db``).
-
-        ``ctx`` is built once (probing the live device if not provided)
-        and shared by every candidate. ``dump`` / ``rejections`` are
-        run-scoped sinks — see :class:`Run`."""
-        run = self._new_run(graph, search=search, ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
-        t_start = time.monotonic()
-        n_terminals = 0
-        for token, cand in run.drive(graph):
-            n_terminals += 1
-            if backend is not None:
-                logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
-            stats, status = _bench_terminal(cand, backend=backend, db=run.db)
-            search.observe(token, stats, status, candidate=cand)
-            # Re-bench at -O3 for a deployable prior sample any config the search
-            # flags as -O3-worthy — every config within the -O1 tolerance band of
-            # the best (see ``TuningSearch.observe`` / ``O3_REBENCH_TOL``), not
-            # just a strict new best, so configs that tie at -O1 but differ at -O3
-            # (the warp WARPSPEC / occupancy split) each get an -O3 truth sample.
-            # Best-effort + deduped, so the cost stays bounded.
-            if backend is not None and getattr(search, "last_o3_worthy", False):
-                o3_us = _rebench_o3(cand, backend)
-                if o3_us is not None:
-                    search.observe_o3(token, o3_us)
-            yield cand
-        logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
-
     def _new_run(self, graph: Graph, *, search, ctx, backend, db, dump, rejections) -> Run:
-        """Build the :class:`Run` shared by :meth:`tune` and :meth:`tune_async`:
+        """Build the :class:`Run` shared by :meth:`tune_async` (and the deterministic
+        :meth:`run`):
         seed provenance, probe / align ``ctx``, and wire the run-scoped sinks."""
         from deplodock.compiler import provenance  # noqa: PLC0415
         from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
@@ -1095,30 +1038,16 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 
 
 # ---------------------------------------------------------------------------
-# Bench + DB persistence for autotune terminals (used by Pipeline.tune)
+# Bench + DB persistence for autotune terminals (used by Pipeline.tune_async)
 # ---------------------------------------------------------------------------
 
 
-def _rebench_o3(cand, backend):
-    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable
-    codegen) for a clean prior sample. Returns the -O3 median latency in µs, or
-    ``None`` when the sweep is already at -O3 or the bench errors (best-effort —
-    a re-bench hiccup must never abort the sweep). The winner already benched OK
-    at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
-    from deplodock import config  # noqa: PLC0415
-
-    if "-O3" in config.nvcc_flags():
-        return None  # already deployable codegen — nothing to re-bench
-    try:
-        result = backend.benchmark(cand.graph, nvcc_flags="-Xcicc -O3")
-    except Exception:  # noqa: BLE001 — a re-bench failure is non-fatal to tuning
-        return None
-    return result.time_ms * 1000.0 if result.time_ms else None
-
-
 async def _rebench_o3_async(cand, backend):
-    """Async mirror of :func:`_rebench_o3` for the multi-GPU tune driver — awaits
-    the device-pinned worker's -O3 re-bench. Best-effort: a hiccup returns ``None``."""
+    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable codegen)
+    for a clean prior sample, awaiting the device-pinned worker. Returns the -O3
+    median latency in µs, or ``None`` when the sweep is already at -O3 or the bench
+    errors (best-effort — a re-bench hiccup must never abort the sweep). The winner
+    already benched OK at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
     from deplodock import config  # noqa: PLC0415
 
     if "-O3" in config.nvcc_flags():
@@ -1134,10 +1063,9 @@ class _TerminalBench:
     """Shared machinery for benching one terminal candidate's ``CudaOp``s and
     persisting per-kernel ``perf`` / inventory / lowering rows.
 
-    The sync (:func:`_bench_terminal`) and async (:func:`_bench_terminal_async`)
-    entry points differ *only* in how they obtain the ``BenchmarkResult`` — the
-    no-cuda / cache-hit / stub short-circuits and every DB write live here, so
-    the multi-GPU async path reuses the exact persistence semantics."""
+    :func:`_bench_terminal_async` drives it: the no-cuda / cache-hit / stub
+    short-circuits (:meth:`prelude`) and every DB write (:meth:`finalize_result` /
+    :meth:`finalize_exc`) live here, so the only awaited step is the device bench."""
 
     def __init__(self, cand, *, backend, db) -> None:
         from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
@@ -1372,27 +1300,12 @@ class _TerminalBench:
         return agg or self._point_stats(0.0), "ok"
 
 
-def _bench_terminal(cand, *, backend, db):
-    """Bench every ``CudaOp`` in ``cand.graph``, persist per-kernel
-    ``perf`` / inventory / lowering rows, and return ``(stats, status)``
-    where ``stats`` is the per-kernel ``PerfStats`` summed across the
-    graph (total terminal latency)."""
-    b = _TerminalBench(cand, backend=backend, db=db)
-    kind, payload = b.prelude()
-    if kind == "done":
-        return payload
-    try:
-        result = backend.benchmark(b.graph, num_iters="auto")
-    except Exception as exc:  # noqa: BLE001
-        return b.finalize_exc(exc)
-    return b.finalize_result(result)
-
-
 async def _bench_terminal_async(cand, *, backend, db):
-    """Async mirror of :func:`_bench_terminal` for the multi-GPU tune driver: the
-    only ``await`` is the device-pinned bench, so N kernels' benches overlap on
-    one event loop. Cache-hit / stub / persistence semantics are identical
-    (shared :class:`_TerminalBench`)."""
+    """Bench every ``CudaOp`` in ``cand.graph``, persist per-kernel ``perf`` /
+    inventory / lowering rows, and return ``(stats, status)`` where ``stats`` is the
+    per-kernel ``PerfStats`` summed across the graph (total terminal latency). The
+    only ``await`` is the device-pinned bench, so N kernels' benches overlap on one
+    event loop; cache-hit / stub / persistence semantics live in :class:`_TerminalBench`."""
     b = _TerminalBench(cand, backend=backend, db=db)
     kind, payload = b.prelude()
     if kind == "done":

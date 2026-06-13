@@ -398,14 +398,13 @@ loops (`drive` for exploration, `resolve` for deterministic resolution):
   Decision with chosen_kind == "graph"`), the retry retires structural picks wholesale
   (`price_structural=False`) and re-resolves down the keep-fused branch before falling back to tile
   blocklisting (`blocked=`).
-  `tune` explores structural forks regardless; an env pin makes the
-  Graph the rule's only option, which applies inline and never reaches a decide. With a `backend`,
-  `Pipeline.run` benches the settled terminal once via `_bench_terminal` (per-kernel `perf` / lowering /
-  inventory rows); with `backend=None` nothing is benched or persisted.
-- `Pipeline.tune(graph, *, search, backend=None, db=None) -> Iterator[Candidate]` —
-  autotune sweep. Pass a `TuningSearch(patience=, ucb_c=)`; the iterator
+  `tune_async` explores structural forks regardless; an env pin makes the
+  Graph the rule's only option, which applies inline and never reaches a decide. `Pipeline.run` is the
+  deterministic greedy compile only — it does not bench (the benching tune path is `tune_async`).
+- `async Pipeline.tune_async(graph, *, search, backend=None, db=None)` — the (async-only) autotune
+  sweep; the sync `Pipeline.tune` is gone. Pass a `TuningSearch(patience=, ucb_c=)`; the async generator
   yields one terminal `Candidate` per fully-explored rollout.
-  `Pipeline.tune` benches each terminal via `_bench_terminal` (writes
+  `tune_async` benches each terminal via `await _bench_terminal_async` (writes
   per-kernel `perf` / `lowering` / inventory rows, returns the aggregate
   `PerfStats`), then calls `search.observe(stats, status)`. With
   `backend=None` the bench is stubbed to `latency_us=1.0` and nothing
@@ -488,12 +487,12 @@ The autotune state is split across two cooperating modules:
   ensure no re-bench on warm starts. Greedy compiles build no tree at
   all — they don't go through a `Search` (see `Run.resolve`).
 
-`Pipeline._bench_terminal` is the only function that knows about all
+`_bench_terminal_async` (over the shared `_TerminalBench`) is the only path that knows about all
 four parts (graph, DB, tree-through-`search.observe`, backend). It
 short-circuits when every `CudaOp` in the graph already has a `perf`
 row for the current `(context_key, backend)` — no GPU bench, stats
 reconstructed from the DB. Otherwise it does one
-`backend.benchmark(...)` call, walks `Op.source` once to record op
+`await backend.benchmark_async(...)` call, walks `Op.source` once to record op
 inventory + lowering edges + the `perf` row per kernel, and returns
 the aggregate `PerfStats` (summed across kernels) for the search to
 score.
@@ -527,7 +526,7 @@ fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — 
   side-table state threaded through resolves; a terminal whose ops are all known is a pure DB read. **Fusion
   itself is still deterministic** (no rule emits a multi-option *fusion* fork — see `autotune_no_graph_forks`); a graph
   with no structural offers yields one terminal and this reduces to "tune each op once, sum, assemble". The outer uses
-  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal`. The global
+  a `Run` directly (manual `observe`) since its reward comes from the inner tuning, not `_bench_terminal_async`. The global
   prior also drives the outer PUCT (the outer `TuningSearch` carries `prior_model` + ctx `base_knobs`): each terminal
   emits one **composed Σ row** per structural decision it realized — features `{ctx, pre-decision op knobs, decision
   delta}`, label = the Σ of that side's per-kernel bests (`_decomposition_rows`) — attributed through the `Op.source`
@@ -539,7 +538,7 @@ fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — 
   generic row against its fully-knobed unresolved sibling), so a warm re-tune descends the predicted-cheaper kernel
   set first instead of emission order. Composed rows are derived value-of-position estimates that *order
   exploration*; greedy's deploy decision keeps the sharper compositional probe (complete-row predictions per kernel).
-- **Inner search** (`inner_reward`) tunes each finalized kernel **independently** in its own single-node slice
+- **Inner search** (`_inner_reward_async`) tunes each finalized kernel **independently** in its own single-node slice
   (`single_node_graph`, `search/slice.py`) with a plain `TuningSearch` over `LOWERING_PASSES` only (`tile → kernel →
   cuda`). The slice keeps the root kernel + its leaf-op closure and turns every other kernel-input into a synthetic
   `InputOp`; the root op is shared **by reference**, so its body — and thus `op_cache_key` — is byte-for-byte the
@@ -561,7 +560,7 @@ it to the `Σ` estimate is the **separability check** — a gap exposes L2 / clo
 can't see (in practice <2% for the small graphs above).
 
 **Always re-run, replay from the cache.** The inner search runs for **every** op on every pass — it is never skipped on
-prior effort. Replay is cheap, not gated: each benched terminal hits the per-variant `perf` cache (`_bench_terminal`),
+prior effort. Replay is cheap, not gated: each benched terminal hits the per-variant `perf` cache (`_TerminalBench`),
 so an already-measured variant is served from the DB with no GPU bench. An identical re-run (same prior) re-walks the
 same deterministic trajectory → every terminal is a cache hit → zero benches and the same total — idempotent without a
 gate. But the global learned prior keeps changing (it refits across ops and runs), so the **same patience** can steer the
@@ -572,11 +571,11 @@ which suppressed exactly that prior-driven re-exploration.) The inner search rec
 `best_per_op_time` prefers that direct row and otherwise walks the `lowering` chain down to the `cuda` terminal.
 
 **Per-kernel GPU parallelism (`--gpus N` / `--devices 0,1,2`).** Because the inner search tunes each unique kernel
-independently, the per-op loop fans out across GPUs. `inner_reward` is a thin sync wrapper around
-`_inner_reward_async`, which runs one coroutine per unique kernel over an `asyncio.Queue` of `len(pool)`
-device-pinned `CudaBackend`s — each pops a backend, drives its op's whole inner search via `Pipeline.tune_async`
-(an async-generator mirror of `tune` whose only `await` is the per-terminal bench, `_bench_terminal_async`), then
-returns the backend. So `len(pool)` benches run at once, one per GPU. **True single-thread asyncio**: every Python
+independently, the per-op loop fans out across GPUs. The whole tuner is async-only: `run_two_level_tune` (async; the
+sync CLI bridges with `asyncio.run` in `handle_tune`) `await`s `_inner_reward_async` per outer terminal, which runs
+one coroutine per unique kernel over an `asyncio.Queue` of `len(pool)` device-pinned `CudaBackend`s — each pops a
+backend, drives its op's whole inner search via `Pipeline.tune_async` (whose only `await` is the per-terminal bench,
+`_bench_terminal_async`), then returns the backend. So `len(pool)` benches run at once, one per GPU. **True single-thread asyncio**: every Python
 statement (lowering, DB writes, prior `add_rows` / `maybe_refit` / `checkpoint`) runs on the one event-loop thread
 and yields only at the bench `await`, so the shared `db` / `prior` need no locks — the in-flight refit is atomic
 between awaits. Each op seeds its `TuningSearch` by `seed + op_idx` (execution-order-independent) and the reward is
@@ -598,7 +597,7 @@ On completion it prints one `done: N fused terminal(s) in Xs` line — the deplo
 On default verbosity (and a tty) a `commands/tune_progress.TuneProgress` draws a live single-line bar — completed/total
 tuned op leaves plus a `<kernel> <current us> (best <best us>) <knobs>` tail. The current latency is fixed-width and the
 variable-length `pipeline.variant_label` knob string sits last, so the prefix up to the knobs stays put as the
-per-variant latency changes (only a new best, which is rare, shifts the trailing part — no flicker). It is threaded as an optional `progress=` through `run_two_level_tune` → `inner_reward`
+per-variant latency changes (only a new best, which is rare, shifts the trailing part — no flicker). It is threaded as an optional `progress=` through `run_two_level_tune` → `_inner_reward_async`
 (duck-typed, so the search package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated
 per benched variant (read off `TuningSearch.last_stats`). Under `--gpus N` the tail keys by a per-op `slot` and joins
 every in-flight kernel with ` | ` (one per device); single-GPU shows the one active kernel as before. `-v` disables the bar (the per-`[tune]` INFO lines show
@@ -630,12 +629,12 @@ over one op's forks — with max-Q normalized UCB1:
   `TileOp.score` tiebreak, and the `+∞`-unvisited UCB rule are all gone (see the learned-prior section).
 - **Expansion** is implicit: `Run.drive` pops a node and runs one rule batch; every fork pushes one new child per
   alternative. The tree mirrors the graph's fork lineage.
-- **Simulation** is the actual `backend.benchmark(...)` call on the terminal — for the inner search that is one real GPU
-  run of a single-kernel slice per leaf.
+- **Simulation** is the actual `await backend.benchmark_async(...)` call on the terminal — for the inner search that is
+  one real GPU run of a single-kernel slice per leaf.
 - **Backprop** walks the popped candidate's `parent` chain up to the root, updating `visits` and `best_reward` so future
   UCB1 calls see the new max-Q.
 - **Patience** counts terminals visited *since the last new global best*; when it exceeds `patience` (`--patience N`,
-  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune` / `Run.drive` exits. The inner
+  default 50), `TuningSearch.stop_reason` is set and that level's `Pipeline.tune_async` / `Run.drive` exits. The inner
   search records `∞` effort when it instead drains its tree (no patience stop).
 
 **Learned prior (`search/prior/`).** ONE global `CatBoostPrior` across every kernel, GPU and nvcc setting — not per-op,
@@ -721,7 +720,7 @@ flattened set and picks the next-best (the valid runner-up is usually ranked rig
 `_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
 `tile_identity` never matches a different tile, so no other candidate is pruned.
 
-**Reading the result.** `_bench_terminal` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
+**Reading the result.** `_bench_terminal_async` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
 adds the whole-slice total under the LoopOp key) — the bench record / training data. A subsequent `deplodock compile` /
 `deplodock run` does NOT replay these DB forks (the greedy DB→fork replay was removed with the learned prior); instead
@@ -729,7 +728,7 @@ adds the whole-slice total under the LoopOp key) — the bench record / training
 `AnalyticPrior`'s `mean_score` argmin — lowest predicted latency) — see "Greedy uses the prior too" above.
 `run_two_level_tune` assembles its final graph the same way.
 
-**Stub backend.** With `backend=None`, `Pipeline.tune`'s `_bench_terminal` short-circuits to `latency_us=1.0` and
+**Stub backend.** With `backend=None`, `Pipeline.tune_async`'s `_bench_terminal_async` short-circuits to `latency_us=1.0` and
 persists nothing (`Pipeline.run` skips benching entirely without a backend) — so a GPU-less compile or sweep never
 clobbers tuned rows with a stub.
 

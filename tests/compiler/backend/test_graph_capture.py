@@ -14,6 +14,8 @@ event windows measure dense GPU work instead of per-launch dispatch gaps. These 
   program-graph capture fails — which is never fatal.
 """
 
+import asyncio
+
 from deplodock.compiler.backend.cuda.program import GraphCaptureError, benchmark_program
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
@@ -159,8 +161,8 @@ def test_bench_lowered_vs_torch_captures():
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     fe, lowered = _lowered_rmsnorm()
-    results, bench, torch_available, captured = bench_lowered_vs_torch(
-        fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock"
+    results, bench, torch_available, captured = asyncio.run(
+        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock")
     )
     assert torch_available
     assert captured is True
@@ -180,8 +182,8 @@ def test_deplodock_capture_failure_falls_back_uncaptured(monkeypatch):
 
     monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", _boom)
     fe, lowered = _lowered_rmsnorm()
-    results, _, torch_available, captured = bench_lowered_vs_torch(
-        fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock"
+    results, _, torch_available, captured = asyncio.run(
+        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock")
     )
     assert torch_available
     assert captured is False, "deplodock-side capture failure must fall the whole bench back to uncaptured"
@@ -204,8 +206,10 @@ def test_torch_capture_failure_disables_deplodock_capture(monkeypatch):
     monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", lambda self, bs: deplodock_captures.append(bs) or orig(self, bs))
 
     fe, lowered = _lowered_rmsnorm()
-    results, _, torch_available, captured = run_mod.bench_lowered_vs_torch(
-        fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock"
+    results, _, torch_available, captured = asyncio.run(
+        run_mod.bench_lowered_vs_torch(
+            fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock"
+        )
     )
     assert torch_available
     assert captured is False

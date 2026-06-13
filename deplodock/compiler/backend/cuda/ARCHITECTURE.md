@@ -138,12 +138,14 @@ printed table carries a `benched at seq_len=… (symbolic hint)` note);
 `("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. Rebuilding the torch side **in the
 child** (not pickling a live module) is what lets the interleaved comparison — which couldn't cross a
 subprocess boundary before — run isolated. So `tune --bench` (`commands/tune.py` `_run_bench` /
-`_bench_per_kernel`) and any deployable bench go through `benchmark_compare_isolated`: a hung kernel
+`_bench_per_kernel`) and any deployable bench go through `benchmark_compare_isolated_async`: a hung kernel
 hangs the child, the parent SIGKILLs it at `wall_timeout_s`, the device is freed, and the per-kernel
-sweep **continues** to the next reproducer (no device-poisoning wedge, no skip). The parent transport
-is the single **`_AsyncBenchWorker.run_job`** (the old sync `_BenchWorker` is gone); `benchmark_program_isolated` /
-`benchmark_compare_isolated` are synchronous `asyncio.run` bridges over a one-shot instance, and the autotune sweep
-awaits a persistent per-GPU instance directly via `benchmark_program_isolated_async`. See
+sweep **continues** to the next reproducer (no device-poisoning wedge, no skip). The whole bench surface
+is **async-only** — the parent transport is the single **`_AsyncBenchWorker.run_job`** (the old sync
+`_BenchWorker` and the sync `benchmark_program_isolated` / `benchmark_compare_isolated` bridges are gone).
+`benchmark_compare_isolated_async` awaits a one-shot instance (`_run_job_oneshot`); the autotune sweep
+awaits a persistent per-GPU instance directly via `benchmark_program_isolated_async`. Synchronous CLI
+entry points (`handle_run`, `_handle_run_ir`, `_run_bench`) bridge with `asyncio.run`. See
 `tests/compiler/backend/test_bench_worker_compare.py` (compare-in-worker + SIGKILL recovery),
 `test_hung_kernel_watchdog.py` (watchdog raises promptly), and
 `tests/compiler/cli/test_tune_bench_hung_kernel.py` (the `_run_bench` control flow).
@@ -153,15 +155,16 @@ length><pickle>`, both directions) over `asyncio` streams, so one event loop can
 concurrently (`tune --gpus`, see `pipeline/ARCHITECTURE.md` → *Per-kernel GPU parallelism*). Two entry shapes:
 
 - **Autotune sweep** awaits `benchmark_program_isolated_async(graph, worker=…)`. `CudaBackend(device_id=i)` lazily owns
-  one **persistent** worker (reused across configs — pay the ~0.2 s Python spawn once) and exposes `benchmark_async`
-  (always isolated, requires `bench_wall_timeout_s`). The device pin is a **per-worker spawn-env overlay** —
+  one **persistent** worker (reused across configs — pay the ~0.2 s Python spawn once) and exposes `benchmark_async`,
+  the single benchmarking entry point: the isolated-worker path when `bench_wall_timeout_s` is set and no `on_iter`,
+  else the in-process `benchmark_program` path (interactive `run --bench` interleaving). The device pin is a **per-worker spawn-env overlay** —
   `CUDA_VISIBLE_DEVICES=<id>` (so the child's logical device 0 *is* that GPU; every argumentless `cp.cuda.Device()`
   resolves correctly) plus, when a base `DEPLODOCK_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on
   different GPUs take distinct `FileLock`s instead of serialising. The overlay rides the child only — the parent's
   `os.environ` is never mutated (all slots share one event-loop thread).
-- **Deployable `--bench`** (`benchmark_program_isolated` / `benchmark_compare_isolated`) are synchronous bridges:
-  each wraps `_run_job_oneshot` (spawn → run → `aclose`) in `asyncio.run`. The worker's streams bind to the loop, so
-  it can't persist across `asyncio.run` calls — a per-call spawn, negligible against a minutes-long deployable bench.
+- **Deployable `--bench`** awaits `benchmark_compare_isolated_async`, which uses `_run_job_oneshot` (spawn → run →
+  `aclose`). The worker's streams bind to the loop, so it can't persist across `asyncio.run` calls — a per-call spawn,
+  negligible against a minutes-long deployable bench. Sync callers (`_run_bench` / `_bench_per_kernel`) `asyncio.run` it.
 
 The wall-clock cap is `asyncio.wait_for`; on overrun the child is SIGKILLed and the next bench respawns it on a clean
 device. Because the persistent worker is reused across configs, an illegal / misaligned access is a hazard: that error

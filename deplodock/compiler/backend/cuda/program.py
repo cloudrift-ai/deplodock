@@ -1157,10 +1157,10 @@ class _AsyncBenchWorker:
     Drives the ``_bench_worker`` protocol (``<8-byte LE length><pickle>``, both
     directions) over asyncio streams, so one event loop can keep N device-pinned
     workers benching concurrently — the per-kernel multi-GPU autotune path
-    (``two_level.inner_reward``). The sync ``benchmark_program_isolated`` /
-    ``benchmark_compare_isolated`` entry points are thin ``asyncio.run`` bridges over
-    a one-shot instance (deployable ``--bench``); the autotune sweep awaits a
-    persistent instance per GPU directly via ``benchmark_program_isolated_async``.
+    (``two_level._inner_reward_async``). The deployable ``--bench`` comparison awaits
+    ``benchmark_compare_isolated_async`` over a one-shot instance (via
+    ``_run_job_oneshot``); the autotune sweep awaits a persistent instance per GPU
+    directly via ``benchmark_program_isolated_async``.
 
     Pin a worker to a physical GPU with ``device_id``: the spawn env gets
     ``CUDA_VISIBLE_DEVICES=<id>`` (so the child's logical device 0 *is* that
@@ -1309,9 +1309,12 @@ async def benchmark_program_isolated_async(
     nvcc_flags: str | None = None,
     capture_graphs: bool = True,
 ) -> BenchmarkResult:
-    """Async mirror of :func:`benchmark_program_isolated`, benching through a
+    """Wall-time-bounded ``benchmark_program`` in a subprocess, benching through a
     caller-supplied device-pinned ``worker`` so one event loop can drive N GPUs
-    concurrently. Same in-worker budgets + ``wall_timeout_s`` SIGKILL backstop."""
+    concurrently — the autotune sweep's transport. The in-worker
+    ``compile_timeout_s`` / ``run_timeout_s`` budgets apply, and ``wall_timeout_s`` is
+    the SIGKILL backstop for a kernel that keeps the GPU busy past them. No ``on_iter``
+    (interleaved ``run --bench`` benches in-process via ``benchmark_program``)."""
     resp = await worker.run_job(
         {
             "graph": graph,
@@ -1343,49 +1346,7 @@ async def _run_job_oneshot(request_obj: dict, *, wall_timeout_s: float) -> dict:
         await worker.aclose()
 
 
-def benchmark_program_isolated(
-    graph: Graph,
-    *,
-    wall_timeout_s: float,
-    warmup: int = 5,
-    num_iters: int | str = 20,
-    compile_timeout_s: float | None = None,
-    run_timeout_s: float | None = None,
-    nvcc_flags: str | None = None,
-    capture_graphs: bool = True,
-) -> BenchmarkResult:
-    """Synchronous wall-time-bounded ``benchmark_program`` — a thin ``asyncio.run``
-    bridge over :class:`_AsyncBenchWorker` (the one transport). Runs the bench in a
-    SIGKILL-able subprocess; the in-worker ``compile_timeout_s`` / ``run_timeout_s``
-    budgets still apply, and ``wall_timeout_s`` is the backstop for a kernel that
-    keeps the GPU busy past them (cupy's next ``deviceSynchronize`` would block).
-
-    ``on_iter`` isn't supported here — interleaved benchmarking (``deplodock run
-    --bench``) shares a Python process with torch and uses ``benchmark_program``
-    directly. The autotune sweep awaits ``benchmark_program_isolated_async`` instead
-    (a persistent per-GPU worker); this sync entry serves ``CudaBackend.benchmark``'s
-    isolated path."""
-    resp = asyncio.run(
-        _run_job_oneshot(
-            {
-                "graph": graph,
-                "nvcc_flags": nvcc_flags,
-                "torch_spec": None,  # no torch comparison — pure deplodock bench
-                "kwargs": {
-                    "warmup": warmup,
-                    "num_iters": num_iters,
-                    "compile_timeout_s": compile_timeout_s,
-                    "run_timeout_s": run_timeout_s,
-                    "capture_graphs": capture_graphs,
-                },
-            },
-            wall_timeout_s=wall_timeout_s,
-        )
-    )
-    return resp["result"]
-
-
-def benchmark_compare_isolated(
+async def benchmark_compare_isolated_async(
     *,
     lowered: Graph,
     torch_spec: tuple,
@@ -1397,8 +1358,8 @@ def benchmark_compare_isolated(
     nvcc_flags: str | None = None,
 ) -> tuple:
     """Run the deployable eager / torch.compile / deplodock comparison in the
-    SIGKILL-able worker — a synchronous ``asyncio.run`` bridge over
-    :class:`_AsyncBenchWorker` (the one transport).
+    SIGKILL-able worker, awaiting a fresh one-shot :class:`_AsyncBenchWorker`
+    (the one transport).
 
     Unlike the deplodock-only autotune bench, the deployable comparison interleaves deplodock with
     real torch in one process and so couldn't be isolated before — a hung generated kernel wedged
@@ -1416,18 +1377,16 @@ def benchmark_compare_isolated(
     Returns ``(results, bench, torch_available, captured)`` — the shape ``bench_lowered_vs_torch``
     returns (``captured``: all backends were timed under CUDA graph capture; False means the
     all-or-nothing fallback ran and the timings include host dispatch)."""
-    resp = asyncio.run(
-        _run_job_oneshot(
-            {
-                "graph": lowered,
-                "nvcc_flags": nvcc_flags,
-                "torch_spec": torch_spec,
-                "bench_backends": bench_backends,
-                "warmup": warmup,
-                "iters": iters,
-                "seed": seed,
-            },
-            wall_timeout_s=wall_timeout_s,
-        )
+    resp = await _run_job_oneshot(
+        {
+            "graph": lowered,
+            "nvcc_flags": nvcc_flags,
+            "torch_spec": torch_spec,
+            "bench_backends": bench_backends,
+            "warmup": warmup,
+            "iters": iters,
+            "seed": seed,
+        },
+        wall_timeout_s=wall_timeout_s,
     )
     return resp["results"], resp["result"], resp["torch_available"], resp.get("captured", False)
