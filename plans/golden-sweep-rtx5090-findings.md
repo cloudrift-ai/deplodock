@@ -16,6 +16,9 @@
   pasted into `search/prior/analytic.py`): the pre-refit `_W_A_DYN` ranked the *new* dynM goldens at median 355 (it
   was fit to the seeds this sweep replaced); post-refit five of eight dynM rows rank ≤1, dynM median ~6, static
   median 12.
+- **Finding 1 fixed in this branch** (`FallbackPrior.score` analytic-tilt blend — see the rewritten finding below): the
+  two fp16-square shapes the sweep deployed at 2.0–2.25× golden now deploy `BK=2` at golden parity (square.2048.fp16
+  235→105 µs, square.4096.fp16 1490→761 µs). The per-shape table below still shows the pre-fix sweep numbers.
 
 ## Headline: the evidence-pick fix worked
 
@@ -34,37 +37,37 @@ shallow. See findings 2–3.
 
 ## Per-shape outcome (live -O3 A/B; pass-1 µs, pass-2 ratio in parens where it mattered)
 
-| shape                            | greedy µs | best golden µs | greedy/golden | category |
-|----------------------------------|----------:|---------------:|--------------:|----------|
-| square.512                       |      10.6 |           10.5 |   1.01 (0.98) | same knobs — exact reproduction |
-| square.1024                      |      53.4 |           49.2 |   1.09 (1.10) | worse (finding 3) |
-| square.2048                      |     305.7 |          294.3 |   1.04 (1.03) | worse-marginal (≤4%, left) |
-| square.4096                      |    2525.8 |         2282.4 |   1.11 (1.10) | worse (finding 3) |
-| square.512.fp16                  |       4.4 |            3.9 |          1.13 | worse (finding 1) |
-| square.1024.fp16                 |      17.3 |           17.1 |          1.01 | **added** (parity, WM4 BK8 vs WM1 BK2) |
-| square.2048.fp16                 |     235.4 |          104.8 |   2.25 (2.24) | worse (finding 1) |
-| square.4096.fp16                 |    1490.1 |          741.6 |   2.01 (2.01) | worse (finding 1) |
-| qwen3_06b.q_proj.s32             |       7.5 |            8.3 |   0.90 (0.89) | **replaced** (3 entries → 1, FM4 FN2) |
-| qwen3_06b.kv_proj.s32            |       5.7 |            5.7 |          1.00 | same knobs — exact reproduction |
-| qwen3_06b.o_proj.s32             |       9.2 |            9.2 |          1.00 | same knobs — exact reproduction |
-| qwen3_06b.gate_up_proj.s32       |      10.9 |           11.0 |          0.99 | **added** (parity, RING 3 vs 4) |
-| qwen3_06b.down_proj.s32          |      14.0 |           13.9 |          1.01 | same knobs (prev sweep's finding 5: fixed) |
-| qwen3_06b.q_proj.s128            |      19.4 |           18.5 |   1.05 (1.04) | worse-marginal (4–5%, left) |
-| qwen3_06b.kv_proj.s128           |      11.4 |           11.3 |          1.01 | **added** (parity, BN16 SPLITK1 RING2) |
-| qwen3_06b.o_proj.s128            |      19.9 |           19.9 |          1.00 | same knobs — exact reproduction |
-| qwen3_06b.gate_up_proj.s128      |      23.8 |           28.1 |          0.85 | **replaced** (WARPSPEC pin dropped, finding 4) |
-| qwen3_06b.down_proj.s128         |      28.2 |           28.2 |          1.00 | **added** (parity, BM8 RING2) |
-| qwen3_06b.q_proj.s512            |      54.3 |           49.1 |   1.11 (1.10) | worse (finding 2) — prev sweep's win not re-found |
-| qwen3_06b.kv_proj.s512           |      29.8 |           27.1 |   1.10 (1.09) | worse (finding 2, repeat) |
-| qwen3_06b.o_proj.s512            |      49.5 |           49.8 | 0.99 (1.06, 1.06) | worse-marginal (left; bimodal greedy bench) |
-| qwen3_06b.gate_up_proj.s512      |      68.4 |           56.0 |   1.22 (1.19) | worse (finding 2) — prev sweep's −37% win not re-found |
-| qwen3_06b.down_proj.s512         |      75.7 |           81.8 |          0.93 | **replaced** (3 entries → 1, FM14 BK64 OVERHANG) |
-| square.512.dynM                  |      12.8 |           18.0 |          0.71 | **replaced** (BN16 FM4 FN2 RING4; sweep's big win) |
-| qwen3_06b.q_proj.s512.dynM       |      54.4 |           56.0 | 0.97 (0.99, 0.98) | **added** (parity, BM8 FM14 SPLITK2) |
-| qwen3_06b.kv_proj.s512.dynM      |      30.7 |           35.0 |          0.88 | **replaced** (2 entries → 1, BM8 FM8) |
-| qwen3_06b.o_proj.s512.dynM       |      52.7 |           62.0 |   0.85 (0.86) | **replaced** (2 entries → 1, BM16 FM8 BK64) |
-| qwen3_06b.gate_up_proj.s512.dynM |      72.8 |           77.0 | 0.95 (0.95, 0.94) | **replaced** (2 entries → 1, BM8 FM8 SPLITK2) |
-| qwen3_06b.down_proj.s512.dynM    |      74.8 |           81.9 |   0.91 (0.92) | **replaced** (BM16 FM8 BK64; prev finding 6 fixed) |
+| shape                            | greedy µs | best golden µs |     greedy/golden | category                                                |
+|----------------------------------|----------:|---------------:|------------------:|---------------------------------------------------------|
+| square.512                       |      10.6 |           10.5 |       1.01 (0.98) | same knobs — exact reproduction                         |
+| square.1024                      |      53.4 |           49.2 |       1.09 (1.10) | worse (finding 3)                                       |
+| square.2048                      |     305.7 |          294.3 |       1.04 (1.03) | worse-marginal (≤4%, left)                              |
+| square.4096                      |    2525.8 |         2282.4 |       1.11 (1.10) | worse (finding 3)                                       |
+| square.512.fp16                  |       4.4 |            3.9 |              1.13 | worse (finding 1)                                       |
+| square.1024.fp16                 |      17.3 |           17.1 |              1.01 | **added** (parity, WM4 BK8 vs WM1 BK2)                  |
+| square.2048.fp16                 |     235.4 |          104.8 |       2.25 (2.24) | worse (finding 1)                                       |
+| square.4096.fp16                 |    1490.1 |          741.6 |       2.01 (2.01) | worse (finding 1)                                       |
+| qwen3_06b.q_proj.s32             |       7.5 |            8.3 |       0.90 (0.89) | **replaced** (3 entries → 1, FM4 FN2)                   |
+| qwen3_06b.kv_proj.s32            |       5.7 |            5.7 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.o_proj.s32             |       9.2 |            9.2 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.gate_up_proj.s32       |      10.9 |           11.0 |              0.99 | **added** (parity, RING 3 vs 4)                         |
+| qwen3_06b.down_proj.s32          |      14.0 |           13.9 |              1.01 | same knobs (prev sweep's finding 5: fixed)              |
+| qwen3_06b.q_proj.s128            |      19.4 |           18.5 |       1.05 (1.04) | worse-marginal (4–5%, left)                             |
+| qwen3_06b.kv_proj.s128           |      11.4 |           11.3 |              1.01 | **added** (parity, BN16 SPLITK1 RING2)                  |
+| qwen3_06b.o_proj.s128            |      19.9 |           19.9 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.gate_up_proj.s128      |      23.8 |           28.1 |              0.85 | **replaced** (WARPSPEC pin dropped, finding 4)          |
+| qwen3_06b.down_proj.s128         |      28.2 |           28.2 |              1.00 | **added** (parity, BM8 RING2)                           |
+| qwen3_06b.q_proj.s512            |      54.3 |           49.1 |       1.11 (1.10) | worse (finding 2) — prev sweep's win not re-found       |
+| qwen3_06b.kv_proj.s512           |      29.8 |           27.1 |       1.10 (1.09) | worse (finding 2, repeat)                               |
+| qwen3_06b.o_proj.s512            |      49.5 |           49.8 | 0.99 (1.06, 1.06) | worse-marginal (left; bimodal greedy bench)             |
+| qwen3_06b.gate_up_proj.s512      |      68.4 |           56.0 |       1.22 (1.19) | worse (finding 2) — prev sweep's −37% win not re-found  |
+| qwen3_06b.down_proj.s512         |      75.7 |           81.8 |              0.93 | **replaced** (3 entries → 1, FM14 BK64 OVERHANG)        |
+| square.512.dynM                  |      12.8 |           18.0 |              0.71 | **replaced** (BN16 FM4 FN2 RING4; sweep's big win)      |
+| qwen3_06b.q_proj.s512.dynM       |      54.4 |           56.0 | 0.97 (0.99, 0.98) | **added** (parity, BM8 FM14 SPLITK2)                    |
+| qwen3_06b.kv_proj.s512.dynM      |      30.7 |           35.0 |              0.88 | **replaced** (2 entries → 1, BM8 FM8)                   |
+| qwen3_06b.o_proj.s512.dynM       |      52.7 |           62.0 |       0.85 (0.86) | **replaced** (2 entries → 1, BM16 FM8 BK64)             |
+| qwen3_06b.gate_up_proj.s512.dynM |      72.8 |           77.0 | 0.95 (0.95, 0.94) | **replaced** (2 entries → 1, BM8 FM8 SPLITK2)           |
+| qwen3_06b.down_proj.s512.dynM    |      74.8 |           81.9 |       0.91 (0.92) | **replaced** (BM16 FM8 BK64; prev finding 6 fixed)      |
 
 All replaces verified post-edit: `run --bench --golden` on the edited shapes re-benches the new entries at parity
 with the greedy pick (gate_up_proj.s128's unpinned entry re-derives the warp-specialized form at 24.0 µs ≈ the
@@ -74,27 +77,65 @@ The dynM family converged onto one knob family this sweep — `FM8 FN4 SPLITK2 R
 it beats the seed-era `BM16 FM4 FN4` family by 5–15% everywhere; square.512.dynM (a `BN16 FM4 FN2 RING4` masked tile)
 closed from 1.29× over its static twin to ~1.21× of the static 10.6 µs.
 
-## Finding 1 — fp16 large squares: the warp tier's BK floor scales with shape, locking out the BK=2 golden class (P0)
+## Finding 1 — fp16 large squares: the learned prior buries the small-`BK` warp region; patience-bounded search never benches it (P0 — FIXED)
 
-square.2048.fp16 deploys at **2.25×** the golden and square.4096.fp16 at **2.01×** — much worse than the previous
-sweep's 1.19×/1.30×. New mechanism (the old launch-crash class is fixed and benches fine):
+square.2048.fp16 deployed at **2.25×** the golden and square.4096.fp16 at **2.01×**. The sweep-time hypothesis ("the
+warp-tier enumeration floors `BK` by shape size, so `BK=2` is never offered at 2048/4096") was **wrong** — disproven by
+directly enumerating the warp variants (`_enumerate_warp_matmul_impl`, `lowering/tile/_enumeration.py`):
 
-- The goldens for 1024/2048/4096.fp16 all record `BK: 2`. Grepping the tune log's MMA variants per target: at 512
-  the enumeration offered BK∈{1,2,4}; at 1024 BK∈{4,8}; at 2048 BK∈{8,32,64}; at 4096 BK∈{16,32,64}. The offered BK
-  floor grows with the square size, so at 2048/4096 the golden class was **never benched** — 65 MMA variants tried at
-  2048, none below BK=8. The class compiles and runs fine there: the golden A/B rows benched 104.8 µs / 741.6 µs live.
-- `eval analytic`: the cold prior ranks those goldens **0**/2632 and 0/2723 — the heuristic is right and would walk
-  straight to them. `eval prior`: the learned prior ranks them 335–592 deep (trained this sweep on a variant space
-  that never contained the class at those sizes, garbage-in). So the gate is in the enumeration the search tree
-  offers, not in either prior.
-- square.1024.fp16 reached parity through a different door (a `WM4 WN4 BK8` warp-specialized config, added as a
-  twin), and square.512.fp16's 1.13× is a within-tier misorder (WM 1/4 swap; learned rank 16, analytic 53) — the
-  same BK story at its mildest (BK=4 offered, golden has it).
+- The candidate set is `(64,32,16,8,4,2,1)` gated only by `k_cells_total % bk == 0`, and `k_cells_total = E_K/16` is
+  32/64/128/256 at 512/1024/2048/4096 — **all divisible by 2**. A direct probe confirms `BK=2` (and the exact golden
+  row `WM1 WN4 FM4 FN2 BK2`) is enumerated at every size: **316 / 373 / 404 / 417** `BK=2` rows for 512/1024/2048/4096.
+  The BK histogram in the original finding was what the **search benched**, not what was enumerated.
 
-**Recommendation (P0):** find and widen the BK gate in the warp-tier enumeration (the tile-size-dependent floor —
-likely a smem-budget or K-chunk heuristic in the warp-tier variant builder under `lowering/tile`) so BK=2 stays
-offered at every square size, then re-tune the two shapes. This is cheap to verify: `run --bench --ab` with the
-golden knobs already proves the config wins at 2048/4096; only the search can't see it.
+The real gate is the **search/prior**, and the chain is:
+
+1. The learned `CatBoostPrior` regresses `log(µs)` on `knob_features`. It measured `BK=2` warp tiles only at small fp16
+   squares (512), so at 2048/4096 it **extrapolates** the fp32-thread-tier pattern (large shape → large `BK`) and
+   predicts `BK=2` is slow there — `eval prior` ranks the golden 335–592 deep. The cold `AnalyticPrior` prices it
+   correctly (`D_w_near_bk`, rank 0/2632), but `FallbackPrior` used the learned half once fitted.
+2. PUCT selection weights an unvisited child by `1/score`, so the buried `BK=2` region gets a tiny weight and patience
+   (50) expires before reaching it — a **self-reinforcing blind spot** (never benched → never measured → never learned
+   fast). Reproduced in isolation with a 6-shape "polluter" prior (sweep targets 1–6): tuning 2048.fp16 benched `BK=2`
+   **0 times**.
+3. `evidence_pick` then faithfully deploys the best **measured** `-O3` config — `BK=64` @ 235 µs — because the reservoir
+   has no `BK=2` row to deploy. Not an enumeration gate, not an evidence-pick bug: the search simply never produced the
+   evidence.
+
+**Fix (this branch): an analytic-tilt blend in `FallbackPrior.score` — the MCTS *selection* signal only.** The two
+priors are on different scales (CatBoost = calibrated µs; analytic = an ordinal learning-to-rank proxy, neutral value
+1.0), so a naive `min`/blend collapses to "always analytic" (the reverted 2× regression). Instead `score` keeps the
+learned µs as the per-shape scale and folds the analytic in as a dimensionless multiplier centered at its neutral 1.0:
+
+```
+score = learned_µs · analytic(knobs) ** W            # W = config.analytic_tilt(), default 0.3
+```
+
+A config the heuristic favors (`analytic < 1`) gets its predicted µs pulled down → larger PUCT exploration weight → it
+is explored; a no-opinion config (`analytic = 1`) is untouched. So the heuristic *perturbs* the learned order without
+replacing it, and the learned half still owns the scale. `mean_score` / `mean_scores` / `pick` (deploy, eval,
+diagnostics) stay **pure-learned + evidence** — only exploration changed. No MCTS machinery: the blend lives entirely
+in the prior, behind the regular `score` interface PUCT already calls.
+
+**Validation** (polluter prior, fresh DB, isolated; `W` swept via `DEPLODOCK_ANALYTIC_TILT`):
+
+| `W` | `BK=2` benched | tuned best µs |
+|----:|---------------:|--------------:|
+| 0 (baseline) | **0** | 99.0 (`BK=4`) |
+| 0.2 | 40 | 92.5 |
+| 0.3 (default) | 41 | 92.3 |
+| 0.5 | 45 | 92.4 |
+
+End-to-end, re-tuning the two shapes on the real cache with the fix and re-deploying: square.2048.fp16 **235 → 105 µs**
+(`BK=2`, golden parity) and square.4096.fp16 **1490 → 761 µs** (`BK=2`, golden parity). No regression where the learned
+prior is already right: square.1024 fp32 46.5 → 44.9 µs (improved), q_proj.s512 40.3 → 40.7 µs (within bench noise). The
+existing fp16 goldens already record the `BK=2` region, so no YAML change is needed — the fix makes them *reachable*.
+square.512.fp16's residual 1.13× is the same story at its mildest (a within-tier `WM 1/4` misorder, `BK=4` already
+benched) and is not load-bearing.
+
+**Follow-up:** the fix only refreshes a shape's deploy once that shape is re-tuned (it changes selection, not the
+stored reservoir). A full `tune --dataset golden` re-run on this branch would re-record every shape under the fixed
+exploration; only the two fp16 squares were re-tuned here.
 
 ## Finding 2 — fp32 s512 family: clean-DB search variance unsamples the goldens; evidence-pick then deploys a worse measured best (q_proj +10%, kv_proj +10%, gate_up +20%)
 

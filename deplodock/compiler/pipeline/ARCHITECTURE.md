@@ -81,7 +81,12 @@ has evidence. There is ONE ranking path — the `Prior` is the hand-coded `Analy
 *score* over `knob.knob_features`, not emission order; a separate `_W_A_DYN` weight set ranks symbolic-axis
 masked-tile kernels, selected on the stamped `S_ext_n_symbolic_axis`) and the learned `CatBoostPrior` once
 trained, composed behind `FallbackPrior` (`load_prior`). A single-shot compile picks the analytic argmin cold;
-a `tune` sweep explores every fork. (DB-best replay `_best_fork` and the static `score_of` prior were removed;
+a `tune` sweep explores every fork. `FallbackPrior` splits its two surfaces once the learned half is fitted:
+`mean_score` / `mean_scores` / `pick` (deploy + eval) are pure-learned + evidence, but `score` — the MCTS
+*selection* signal — tilts the learned µs by the analytic's dimensionless ranking multiplier
+(`learned · analytic**W`, `W = config.analytic_tilt`, neutral 1.0), so PUCT still explores a region the cold
+heuristic prices well but the data-poor learned model buries (the fp16 small-`BK` warp tiles — golden-sweep
+finding 1). (DB-best replay `_best_fork` and the static `score_of` prior were removed;
 the old `_priority_*` enumeration sort that ranked the cold path by emission order is gone — the
 `AnalyticPrior` ranks it now. Greedy stays prior-only: the -O3 evidence ships inside the prior's checkpointed
 reservoir, not the DB.)

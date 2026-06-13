@@ -41,6 +41,7 @@ KNOBS = "DEPLODOCK_KNOBS"
 TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
 TUNE_EPS = "DEPLODOCK_TUNE_EPS"
 O3_TOL = "DEPLODOCK_O3_TOL"
+ANALYTIC_TILT = "DEPLODOCK_ANALYTIC_TILT"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
@@ -206,6 +207,15 @@ def o3_tol(default: float = 0.10) -> float:
     within which a tuned config is also re-benched at -O3 for a deployable prior
     sample. ``0.10`` = re-bench everything within 10% of the best -O1."""
     return float_env(O3_TOL, default)
+
+
+def analytic_tilt(default: float = 0.3) -> float:
+    """``DEPLODOCK_ANALYTIC_TILT`` — exponent ``W`` of the cold ``AnalyticPrior``
+    multiplier in :meth:`FallbackPrior.score` (selection only): the learned µs are
+    tilted by ``analytic**W`` so the heuristic's ranking nudges PUCT exploration
+    toward configs it favors without overriding the learned scale (``W=0`` =
+    pure learned, large ``W`` = analytic dominates). See the method docstring."""
+    return float_env(ANALYTIC_TILT, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:
