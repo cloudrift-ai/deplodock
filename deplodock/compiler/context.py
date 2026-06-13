@@ -15,7 +15,7 @@ the signature alone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock import config, gpu
 
@@ -104,6 +104,15 @@ class Context:
     # in ``structural_key`` (device-physical, like ``max_dynamic_smem``: it steers
     # the option-0 pick, but the resulting knobs already key the perf cache).
     sm_count: int = DEFAULT_SM_COUNT
+    # Physical device feature dict (``sm_count`` / ``smem_per_sm`` / … keys, as
+    # ``gpu.GpuSpec.device_features``) for the GPU this context is *for*. Empty ⇒
+    # use the live-device probe in :meth:`features` (the live-compile default).
+    # Non-empty is the **memorized** set of a specific card, set by
+    # ``from_target(gpu_name=…)`` so a reconstructed *golden* context featurizes
+    # with its own card's regime (H_sm_count / smem / …) — not the live device's,
+    # which would mis-model an RTX PRO 6000 golden ranked on an RTX 5090 (both
+    # cc 12.0 but 188 vs 170 SMs). NOT in ``structural_key`` (device-physical).
+    device_props: dict = field(default_factory=dict)
     # Identifies which backend's perf rows this compile reads/writes — the
     # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
     # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
@@ -119,11 +128,20 @@ class Context:
     compile_flags: str = ""
 
     @classmethod
-    def from_target(cls, cap: tuple[int, int]) -> Context:
+    def from_target(cls, cap: tuple[int, int], *, gpu_name: str | None = None) -> Context:
+        """A target-derived context. ``gpu_name`` (a PCIe product name) pins the
+        device-physical features to that card's **memorized** specs from the
+        :mod:`deplodock.gpu` registry — used to reconstruct a *golden* config's
+        context so it featurizes with its own card's SM count / smem (not the live
+        device's). Default ``None`` → the live device (the live-compile path)."""
+        spec = gpu.by_name(gpu_name) if gpu_name else None
+        props = spec.device_features() if spec else {}
+        sm = int(props.get("sm_count") or _live_sm_count())
         return cls(
             compute_capability=cap,
             max_dynamic_smem=_max_dynamic_smem_for(cap),
-            sm_count=_live_sm_count(),
+            sm_count=sm,
+            device_props=props,
             compile_flags=_env_compile_flags(),
         )
 
@@ -172,7 +190,9 @@ class Context:
             "H_smem_optin": float(self.max_dynamic_smem),
             "H_opt": float(m.group(1)) if m else 3.0,
         }
-        for k, v in live_device_features().items():
+        # The memorized props of this context's card (golden reconstruction) when
+        # set, else the live device's — so a golden featurizes with its own card.
+        for k, v in (self.device_props or live_device_features()).items():
             feats[f"H_{k}"] = v
         return feats
 

@@ -147,7 +147,10 @@ def test_golden_compile_s_feats_matches_inline(monkeypatch) -> None:
     s_feats: dict = {}
     for n in compiled.nodes.values():
         s_feats.update({k: v for k, v in (getattr(n.op, "knobs", {}) or {}).items() if k.startswith(STRUCT_PREFIX)})
-    inline = knob.knob_features({**Context.from_target(g.compute_cap).features(), **s_feats, **g.knobs})
+    # gpu_name pins the device-physical H_* features to the golden's own card's
+    # memorized specs (so a 4090 golden gets 128 SMs, not the live device's count) —
+    # Sample.from_golden does the same, so the two must still agree.
+    inline = knob.knob_features({**Context.from_target(g.compute_cap, gpu_name=g.gpu_name).features(), **s_feats, **g.knobs})
 
     assert Sample.from_golden(g, compile_s_feats=True).features() == inline
 
@@ -155,6 +158,18 @@ def test_golden_compile_s_feats_matches_inline(monkeypatch) -> None:
     full = Sample.from_golden(g, compile_s_feats=True).s_features()
     assert set(arith) <= set(full)
     assert all(arith[k] == full[k] for k in arith)
+
+
+def test_golden_features_use_own_cards_sm_count() -> None:
+    """A golden featurizes with its OWN card's SM count (from the gpu registry via
+    gpu_name), not the live device's — the fix that makes same-compute_cap cards
+    (RTX 5090 = 170 vs RTX PRO 6000 = 188 SMs) distinguishable in the model."""
+    from deplodock.compiler.pipeline.search.golden import goldens_by_name
+
+    by_gpu = {g.gpu_name: Sample.from_golden(g).context["H_sm_count"] for g in goldens_by_name("square.512")}
+    assert by_gpu["NVIDIA GeForce RTX 4090"] == 128.0
+    assert by_gpu["NVIDIA GeForce RTX 5090"] == 170.0
+    assert by_gpu["NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"] == 188.0
 
 
 # --- Dataset adapters + grouping --------------------------------------------

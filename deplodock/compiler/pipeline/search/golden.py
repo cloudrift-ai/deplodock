@@ -103,6 +103,19 @@ class GoldenConfig:
         """Within 95% of cuBLAS or better."""
         return self.ratio >= 0.95
 
+    @property
+    def sm_count(self) -> int | None:
+        """The recording card's SM count, from the common GPU registry (by
+        :attr:`gpu_name`) — ``None`` if the GPU isn't registered. This is what makes
+        a same-``compute_cap`` pair distinguishable (RTX 5090 = 170 vs RTX PRO 6000
+        = 188 SMs); :meth:`~...data.sample.Sample.from_golden` threads it into the
+        reconstructed context so the golden featurizes with its own card's regime,
+        not the live device's."""
+        from deplodock import gpu  # noqa: PLC0415
+
+        spec = gpu.by_name(self.gpu_name)
+        return spec.sm_count if spec else None
+
 
 @dataclass(frozen=True, kw_only=True)
 class MatmulGoldenConfig(GoldenConfig):

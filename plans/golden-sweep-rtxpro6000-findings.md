@@ -77,6 +77,15 @@ data on the dev box. Docstrings in `search/golden.py` were corrected to state th
 cross-card comparison. Touches `Dataset.from_golden` + the `eval` command paths + tests; deferred from this task as a
 focused follow-up rather than risk the eval tooling mid-sweep.
 
+**Update (implemented):** done across two follow-ups. (1) `goldens_for_live_gpu()` scopes the `eval` / diagnostics
+golden views + the `run --golden` A/B to the live card (`Dataset.from_golden(live_gpu=True)`); cards with no recorded
+golden fall back to the full set (seed / transfer flow). (2) The deeper fix the same-cap case needed: GPUs are now
+distinguished by **SM count** (the common `deplodock.gpu` registry — RTX 5090 = 170 vs RTX PRO 6000 = 188), and
+`Sample.from_golden` reconstructs each golden's context with its OWN card's memorized device features
+(`Context.from_target(gpu_name=…)`) instead of the live device's — so a PRO 6000 golden ranked on a 5090 now
+featurizes with 188 SMs, not 170. `ShapeKey` stays deliberately structural-only (the op side carries no `H_*`
+features); the per-card distinction lives where it belongs — in the features + the live-GPU scoping.
+
 ## Workflow notes
 
 - **sm_120 seeds cleanly; sm_89 does not** (cf. the 4090 report). The deciding factor is whether the live capability
