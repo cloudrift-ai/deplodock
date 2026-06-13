@@ -144,7 +144,7 @@ It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `
 fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
 piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
 in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
-`Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys. Boundary sentinels
+`Pipeline.tune_async` / `Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys. Boundary sentinels
 (`InputOp`/`ConstantOp`) never carry prov: `put` refuses to stamp them and `propagate` scrubs splice outputs that land
 on one (the generic hint merge would otherwise copy prov onto e.g. the ConstantOp produced by the sm_90+
 weight-transpose fold, inflating `totals` so every kernel of that origin read partial coverage).

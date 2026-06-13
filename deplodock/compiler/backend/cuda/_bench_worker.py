@@ -32,6 +32,7 @@ worker alive, so they don't pay the respawn cost.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import pickle
 import sys
@@ -58,7 +59,7 @@ def _hung(exc: BaseException) -> bool:
     return isinstance(exc, HungKernelError)
 
 
-def _run_job(req: dict) -> dict:
+async def _run_job(req: dict) -> dict:
     """Run one bench job; return ``{"result": BenchmarkResult, "results": dict|None,
     "torch_available": bool, "captured": bool}`` (``captured``: timings came from
     CUDA-graph-captured windows; False = the all-or-nothing uncaptured fallback ran).
@@ -92,7 +93,7 @@ def _run_job(req: dict) -> dict:
         if kind == "frontend_graph":
             from deplodock.commands.run import bench_lowered_vs_torch
 
-            results, bench, avail, captured = bench_lowered_vs_torch(
+            results, bench, avail, captured = await bench_lowered_vs_torch(
                 payload,
                 req["graph"],
                 backend,
@@ -112,7 +113,7 @@ def _run_job(req: dict) -> dict:
             if bundle is None:
                 raise RuntimeError("trace_args produced no runnable module (--ir JSON path has none)")
             module, args_t, kwargs = bundle
-            results, bench, captured = bench_full_model_real(
+            results, bench, captured = await bench_full_model_real(
                 module,
                 args_t,
                 kwargs,
@@ -160,7 +161,7 @@ def main() -> None:
             return
         dirty = False
         try:
-            resp = {"ok": True, **_run_job(pickle.loads(body))}
+            resp = {"ok": True, **asyncio.run(_run_job(pickle.loads(body)))}
         except BaseException as exc:  # noqa: BLE001 — surface every failure mode to the parent
             resp = {"ok": False, "error": repr(exc), "traceback": traceback.format_exc()}
             dirty = _hung(exc) or _context_dirty()
@@ -170,7 +171,7 @@ def main() -> None:
         if dirty:
             # Corrupted context — don't serve more requests from it. Exit so the
             # parent respawns a fresh context on its next bench (program.py
-            # ``_BenchWorker.bench`` re-spawns when ``poll()`` shows us dead).
+            # ``_AsyncBenchWorker.run_job`` re-spawns when the proc is dead).
             return
 
 

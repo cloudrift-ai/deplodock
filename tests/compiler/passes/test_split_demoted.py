@@ -36,6 +36,7 @@ from deplodock.compiler.pipeline.fork import OptionFork
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile._split_demoted import try_split_demoted
 from deplodock.compiler.pipeline.search.db import SearchDB
+from tests.compiler.conftest import drain_tune
 
 from ..conftest import requires_cuda
 
@@ -670,15 +671,19 @@ def test_tune_explores_fused_and_split_terminals(monkeypatch) -> None:
     for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     seen: set[int] = set()
-    for t in Pipeline.build(TILE_PASSES).tune(
+
+    def _saw(t) -> bool:
+        seen.add(sum(1 for n in t.graph.nodes.values() if isinstance(n.op, TileOp)))
+        return {1, 2} <= seen  # early-exit once both kinds are seen
+
+    drain_tune(
+        Pipeline.build(TILE_PASSES),
         _norm_linear_graph(),
         search=TuningSearch(patience=10**6),
         ctx=Context.from_target((12, 0)),
         db=SearchDB(),
-    ):
-        seen.add(sum(1 for n in t.graph.nodes.values() if isinstance(n.op, TileOp)))
-        if {1, 2} <= seen:
-            break
+        on=_saw,
+    )
     assert {1, 2} <= seen, f"both fused (1-kernel) and split (2-kernel) terminals must appear, saw {seen}"
 
 

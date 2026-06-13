@@ -10,7 +10,7 @@ to ``CudaBackend``, which raised a cryptic ``non-CudaOp`` ``TypeError``.
 ``Pipeline.run`` now installs a rejection sink and, after the single
 terminal settles, raises a loud :class:`LoweringError` naming the node,
 the pass that declined it, and the validate reason. The tuning path
-(``Pipeline.tune`` / ``TuningSearch``) installs no sink, so the
+(``Pipeline.tune_async`` / ``TuningSearch``) installs no sink, so the
 fork-pruning drop stays silent and a dropped branch is a graceful dead
 end — sibling branches carry other tile shapes.
 
@@ -33,6 +33,7 @@ from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import LoweringError
 from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
+from tests.compiler.conftest import drain_tune
 
 
 def _small_smem_ctx() -> Context:
@@ -130,7 +131,7 @@ def test_tuning_does_not_raise_and_prunes_branch():
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     pipeline = _build_pipeline()
-    terminals = list(pipeline.tune(_graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB()))
+    terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
     # Tuning yields the (dead) terminal without raising; the node stays a
     # TileOp because its only lowering option was validate-filtered.
     assert terminals, "tuning should still yield the dead terminal"

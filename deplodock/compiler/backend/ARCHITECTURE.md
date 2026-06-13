@@ -7,7 +7,7 @@ same two-step API (`backend/base.py`):
 compiled = backend.compile(graph)
 result   = backend.run(compiled, input_data={"x": np.ndarray(...)})
 # RunResult(outputs: dict[name, ndarray], time_ms: float | None)
-bench    = backend.benchmark(compiled, input_data=…, warmup=, num_iters=)
+bench    = await backend.benchmark_async(compiled, warmup=, num_iters=)  # async-only; callers asyncio.run at the CLI boundary
 # BenchmarkResult(time_ms, min_ms, max_ms, num_launches, per_launch)
 ```
 

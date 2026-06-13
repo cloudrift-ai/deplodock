@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -90,6 +91,24 @@ def register_tune_command(subparsers):
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --bench random inputs (default: 0).")
     parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help=(
+            "Tune the post-fusion kernels concurrently across this many GPUs (devices 0..N-1): one in-flight "
+            "bench per GPU on a single event loop. Default: single-GPU (serial, behaviorally identical). "
+            "Bounded by the number of unique kernels; devices must be homogeneous. ``--devices`` overrides."
+        ),
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help=(
+            "Comma-separated GPU ids to tune across (e.g. ``0,1,3``), the explicit form of ``--gpus``. "
+            "Devices must be homogeneous (one perf key per tune). Default: single-GPU."
+        ),
+    )
+    parser.add_argument(
         "--bench-backends",
         default="eager,tcompile,deplodock",
         help=(
@@ -122,26 +141,71 @@ def _tune_offline(args):
     sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
 
 
-def _tune_backend():
+def _tune_backend(device_id: int | None = None):
     """The autotune-sweep ``CudaBackend``: benches each variant in a SIGKILL-able
     ``_bench_worker`` **subprocess** (``bench_wall_timeout_s`` set → the isolated
-    path in ``backend.benchmark``), so a wedged kernel dies with the worker and the
-    **parent** CUDA stream stays clean. Tight per-variant budgets: tune benches
-    isolated single kernels at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample
-    and the 6 s wall SIGKILLs any runaway."""
+    path in ``benchmark_async``), so a wedged kernel dies
+    with the worker and the **parent** CUDA stream stays clean. Tight per-variant
+    budgets: tune benches isolated single kernels at -Xcicc -O1 (fast), so 2 s
+    compile / 2 s run is ample and the 6 s wall SIGKILLs any runaway. ``device_id``
+    pins the async bench worker to a physical GPU (multi-GPU tune)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0)
+    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0, device_id=device_id)
 
 
-def _tune_one(args, *, backend, db, ctx, dump):
+def _resolve_devices(args) -> list[int | None]:
+    """Resolve ``--gpus`` / ``--devices`` into a device-id list (``--devices`` wins).
+    Default ``[None]`` → a single unpinned slot = today's serial behavior. Two or
+    more devices must be homogeneous — the tune keys every perf row on one probed
+    ``ctx``, so mixed compute capabilities would corrupt the per-op cache."""
+    if args.devices:
+        try:
+            devices: list[int | None] = [int(x) for x in args.devices.split(",") if x.strip() != ""]
+        except ValueError:
+            logger.error("--devices must be comma-separated GPU ids, e.g. 0,1,3")
+            sys.exit(2)
+    elif args.gpus is not None:
+        if args.gpus < 1:
+            logger.error("--gpus must be >= 1")
+            sys.exit(2)
+        devices = list(range(args.gpus))
+    else:
+        return [None]
+    if len(devices) <= 1:
+        return devices or [None]
+    _require_homogeneous_devices(devices)
+    return devices
+
+
+def _require_homogeneous_devices(devices: list[int | None]) -> None:
+    try:
+        import cupy as cp
+    except Exception:  # noqa: BLE001 — no cupy → can't probe; let the bench surface any mismatch
+        return
+    caps = {}
+    for d in devices:
+        try:
+            props = cp.cuda.runtime.getDeviceProperties(d)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("--devices: GPU %s not available (%s)", d, exc)
+            sys.exit(2)
+        caps[d] = (props["major"], props["minor"])
+    if len(set(caps.values())) > 1:
+        logger.error("--devices must be homogeneous (one perf key per tune); got compute capabilities %s", caps)
+        sys.exit(2)
+
+
+def _tune_one(args, *, backends, db, ctx, dump):
     """Trace ``args.code`` / ``args.input`` and run the two-level tune on that one
     graph; return ``(result, bench_bundle)``. Manages the live progress bar (closed
     in ``finally``) and prints the per-op ``done`` summary. Lets ``KeyboardInterrupt``
     and the saturated-queue ``RuntimeError`` (dirty parent stream) **propagate** so
     the caller decides how to exit — called once per target by ``handle_tune``'s
     loop (one shape or the whole golden set). Benching itself is subprocess-isolated
-    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape."""
+    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape.
+    ``backends`` is the device-pinned pool (one per GPU; single-element by default)
+    fanning the inner per-kernel search across GPUs."""
     import time
 
     from deplodock.commands.tune_progress import TuneProgress
@@ -160,17 +224,22 @@ def _tune_one(args, *, backend, db, ctx, dump):
     explore_eps = args.explore_eps if args.explore_eps is not None else config.tune_eps(0.0)
     t0 = time.monotonic()
     try:
-        result = run_two_level_tune(
-            graph,
-            ctx=ctx,
-            db=db,
-            backend=backend,
-            patience=patience,
-            ucb_c=args.ucb_c,
-            explore_eps=explore_eps,
-            dump=dump,
-            progress=progress,
-            prior_seed=args.seed,
+        # The two-level tune is async (per-kernel benches fan across device-pinned
+        # workers on one event loop); ``handle_tune`` is the sync CLI boundary, so the
+        # whole outer drive runs under one ``asyncio.run`` here.
+        result = asyncio.run(
+            run_two_level_tune(
+                graph,
+                ctx=ctx,
+                db=db,
+                backends=backends,
+                patience=patience,
+                ucb_c=args.ucb_c,
+                explore_eps=explore_eps,
+                dump=dump,
+                progress=progress,
+                prior_seed=args.seed,
+            )
         )
     finally:
         progress.close()
@@ -271,9 +340,13 @@ def handle_tune(args):
         _clean_caches(db_path)
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
-    # One bench worker (subprocess-isolated) + one prior shared across every target —
-    # benching can't dirty the parent, so a single long-lived process loops cleanly.
-    backend = _tune_backend()
+    # One device-pinned bench worker per GPU (subprocess-isolated) + one prior shared
+    # across every target — benching can't dirty the parent, so a single long-lived
+    # process loops cleanly. ``[None]`` (default) = one unpinned worker = serial.
+    devices = _resolve_devices(args)
+    backends = [_tune_backend(device_id=d) for d in devices]
+    if len(backends) > 1:
+        sys.stderr.write(f"[tune] per-kernel parallel across {len(backends)} GPUs: {[d for d in devices]}\n")
     ctx = Context.probe()
 
     multi = len(targets) > 1
@@ -286,7 +359,7 @@ def handle_tune(args):
             sys.stderr.write(f"\n[tune] === {i + 1}/{len(targets)}: {label} → {code} ===\n")
         dump, tmp_dump = _bench_dump(args)
         try:
-            result, bench_bundle = _tune_one(args, backend=backend, db=db, ctx=ctx, dump=dump)
+            result, bench_bundle = _tune_one(args, backends=backends, db=db, ctx=ctx, dump=dump)
         except KeyboardInterrupt:
             # Per-op bests already landed in the DB as they were measured, so a re-run resumes.
             sys.stderr.write(f"\n[tune] interrupted{f' at {label}' if multi else ''} — partial per-op results are in the DB\n")
@@ -377,7 +450,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     per-kernel table runs."""
     from deplodock.commands.run import _collect_sym_env, _print_table, _symbolic_bench_note
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     # Re-bench at -O3 (deployable) unless the user explicitly pinned --nvcc-flags;
@@ -395,7 +468,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     # noise during benching. (No-op when tuning used a temp dump — the env wasn't set.)
     saved_dump_env = os.environ.pop(config.DUMP_DIR, None)
     # ``backend`` here is only the handle to resolve the tune DB (for the per-kernel re-lowering);
-    # the benches themselves run in the SIGKILL-able worker (``benchmark_compare_isolated``), which
+    # the benches themselves run in the SIGKILL-able worker (``benchmark_compare_isolated_async``), which
     # builds its own backend. DUMP_DIR is cleared so CudaBackend's default CompilerDump doesn't
     # rmtree the reproducer dir the per-kernel bench reads.
     backend = CudaBackend(tune_db="auto")
@@ -416,15 +489,17 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
             "dynamic": getattr(args, "dynamic", None),
         }
         try:
-            full, _, _, full_captured = benchmark_compare_isolated(
-                lowered=assembled,
-                torch_spec=("trace_args", trace_args),
-                bench_backends=args.bench_backends,
-                wall_timeout_s=_FULL_MODEL_BENCH_WALL_S,
-                warmup=args.warmup,
-                iters=args.iters,
-                seed=args.seed,
-                nvcc_flags=bench_flags,
+            full, _, _, full_captured = asyncio.run(
+                benchmark_compare_isolated_async(
+                    lowered=assembled,
+                    torch_spec=("trace_args", trace_args),
+                    bench_backends=args.bench_backends,
+                    wall_timeout_s=_FULL_MODEL_BENCH_WALL_S,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    seed=args.seed,
+                    nvcc_flags=bench_flags,
+                )
             )
             # The worker tiled the torch inputs to the hint for a symbolic graph
             # (``_hint_sized_inputs`` inside ``bench_full_model_real``); label the
@@ -452,7 +527,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
 def _bench_per_kernel(args, dump_dir, db):
     """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily so the tuned
     DB-best forks are picked) vs eager / torch.compile / deplodock at -O3 — each in the SIGKILL-able
-    worker (``benchmark_compare_isolated``). Re-lowering runs in the parent (CPU; greedy forks read
+    worker (``benchmark_compare_isolated_async``). Re-lowering runs in the parent (CPU; greedy forks read
     the DB); only the GPU bench is isolated, so a hung / failed kernel skips just that reproducer and
     the sweep continues. Returns ``(rows, fallback)`` — ``rows`` is ``[(label, {backend: us})]``,
     ``fallback`` the labels that benched without CUDA graph capture (dispatch-inclusive timings)."""
@@ -460,7 +535,7 @@ def _bench_per_kernel(args, dump_dir, db):
 
     from deplodock.commands.run import _detect_stage, _passes_after_stage
     from deplodock.compiler.backend import torch_ref
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated
+    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
     from deplodock.compiler.graph import Graph
     from deplodock.compiler.pipeline import Pipeline
 
@@ -481,15 +556,17 @@ def _bench_per_kernel(args, dump_dir, db):
             tail = _passes_after_stage(_detect_stage(g))
             # No dump here — re-creating a CompilerDump on the repro dir would rmtree it.
             lowered = Pipeline.build(tail).run(g, db=db) if tail else g
-            results, _, _, captured = benchmark_compare_isolated(
-                lowered=lowered,
-                torch_spec=("frontend_graph", fe),
-                bench_backends=args.bench_backends,
-                wall_timeout_s=_PER_KERNEL_BENCH_WALL_S,
-                warmup=args.warmup,
-                iters=args.iters,
-                seed=args.seed,
-                nvcc_flags=bench_flags,
+            results, _, _, captured = asyncio.run(
+                benchmark_compare_isolated_async(
+                    lowered=lowered,
+                    torch_spec=("frontend_graph", fe),
+                    bench_backends=args.bench_backends,
+                    wall_timeout_s=_PER_KERNEL_BENCH_WALL_S,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    seed=args.seed,
+                    nvcc_flags=bench_flags,
+                )
             )
         except Exception as exc:  # noqa: BLE001 — isolated, so a hung / failed kernel skips just this one
             sys.stderr.write(f"[tune]   {label}: skipped ({exc})\n")

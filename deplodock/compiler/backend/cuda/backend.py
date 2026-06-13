@@ -16,7 +16,7 @@ from deplodock import config
 from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import (
     benchmark_program,
-    benchmark_program_isolated,
+    benchmark_program_isolated_async,
     run_program,
     run_program_debug,
 )
@@ -76,6 +76,7 @@ class CudaBackend(Backend):
         bench_compile_timeout_s: float = 30.0,
         bench_run_timeout_s: float = 10.0,
         tune_db: Path | str | None = None,
+        device_id: int | None = None,
     ) -> None:
         if debug is None:
             debug = config.debug_enabled()
@@ -103,6 +104,33 @@ class CudaBackend(Backend):
         # open if the file exists. Explicit ``Path`` → use that file
         # (open if it exists; silently skip otherwise).
         self.tune_db = _resolve_tune_db(tune_db)
+        # Physical GPU this backend's async bench worker is pinned to (multi-GPU
+        # tune). ``None`` → unpinned (default device). The pinned worker is the
+        # device-selection seam: ``benchmark_async`` drives it so one event loop
+        # can keep N GPUs benching concurrently.
+        self.device_id = device_id
+        self._async_worker_obj = None  # lazily spawned on first benchmark_async
+
+    def _async_worker(self):
+        from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker  # noqa: PLC0415
+
+        if self._async_worker_obj is None:
+            self._async_worker_obj = _AsyncBenchWorker(device_id=self.device_id)
+        return self._async_worker_obj
+
+    def close_async_worker(self) -> None:
+        """SIGKILL this backend's async bench worker, if any (driver teardown)."""
+        if self._async_worker_obj is not None:
+            self._async_worker_obj.close()
+            self._async_worker_obj = None
+
+    async def aclose_async_worker(self) -> None:
+        """SIGKILL + await-reap this backend's async bench worker (driver teardown
+        from inside the event loop — cleans the subprocess transport before the loop
+        closes, so no 'Event loop is closed' GC warning)."""
+        if self._async_worker_obj is not None:
+            await self._async_worker_obj.aclose()
+            self._async_worker_obj = None
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
@@ -158,38 +186,37 @@ class CudaBackend(Backend):
             outputs[name] = np.asarray(vals, dtype=compiled.nodes[name].output.dtype.np).reshape(shape)
         return RunResult(outputs=outputs, time_ms=time_ms), pre_result
 
-    def benchmark(
+    async def benchmark_async(
         self,
         compiled: Graph,
         *,
-        input_data: dict[str, np.ndarray] | None = None,
         warmup: int = 5,
         num_iters: int | str = 20,
         on_iter=None,
         nvcc_flags: str | None = None,
         capture_graphs: bool = True,
     ) -> BenchmarkResult:
-        del input_data
-        # ``nvcc_flags`` re-points this one bench's compile at a different opt
-        # level (e.g. an -O3 re-bench of a tune winner) without disturbing the
-        # ambient flags — the worker applies it per-request; in-process we wrap.
-        # ``bench_wall_timeout_s`` selects between two paths:
-        # - Set (autotune sweep): run in a subprocess-isolated worker so
-        #   a wedged kernel can be SIGKILLed without leaving the
-        #   parent's CUDA stream dirty. Wall-clock backstop on top of the
-        #   in-worker ``bench_compile_timeout_s`` / ``bench_run_timeout_s``.
-        # - ``None`` (interactive ``deplodock run --bench``): run in-process.
-        #   Required when ``on_iter`` callbacks are supplied — they can't
-        #   cross the subprocess boundary.
-        # ``on_iter`` forces the in-process path even when
-        # ``bench_wall_timeout_s`` is set — interleaved benches need to
-        # share torch state with the parent and can't cross the
-        # subprocess boundary. The autotune sweep never passes
-        # ``on_iter``, so this fallback only fires for ``--tune --bench``
-        # where the post-tune interleaved bench reuses the same backend.
+        """The single benchmarking entry point for ``CudaBackend`` — async, two paths.
+
+        ``nvcc_flags`` re-points this one bench's compile at a different opt level (e.g.
+        an -O3 re-bench of a tune winner) without disturbing the ambient flags — the
+        worker applies it per-request; in-process we wrap. ``bench_wall_timeout_s``
+        (plus the absence of ``on_iter``) selects the path:
+
+        - **Set, no ``on_iter`` (autotune sweep)**: bench in a device-pinned,
+          SIGKILL-able subprocess worker (:func:`benchmark_program_isolated_async`), so
+          one event loop keeps N GPUs benching concurrently and a wedged kernel never
+          dirties the parent's CUDA stream. ``wall_timeout_s`` is the backstop on top of
+          the in-worker ``bench_compile_timeout_s`` / ``bench_run_timeout_s`` budgets.
+        - **Otherwise (interactive ``deplodock run --bench``)**: bench in-process via
+          :func:`benchmark_program`. Required when ``on_iter`` interleaves peer torch
+          closures — they share torch state with this process and can't cross the
+          subprocess boundary. The blocking bench runs directly on the event loop (it is
+          the only work in flight), so ``async`` here is just the uniform call shape."""
         if self.bench_wall_timeout_s is not None and on_iter is None:
-            result = benchmark_program_isolated(
+            result = await benchmark_program_isolated_async(
                 compiled,
+                worker=self._async_worker(),
                 wall_timeout_s=self.bench_wall_timeout_s,
                 warmup=warmup,
                 num_iters=num_iters,

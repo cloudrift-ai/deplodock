@@ -33,10 +33,9 @@ from deplodock.compiler.pipeline.search.two_level import (
     LOWERING_PASSES,
     OpResult,
     _decomposition_rows,
-    inner_reward,
     outer_pipeline,
-    run_two_level_tune,
 )
+from tests.compiler.conftest import drain_tune, run_inner_reward, run_two_level
 
 # Moderate patience: each kernel explores several variants then stops on
 # stagnation (the fake backend gives a stable but arbitrary per-variant
@@ -81,6 +80,13 @@ class _CountingBackend:
             per.append(LaunchTime(idx=i, kernel_name=getattr(n.op, "kernel_name", "k"), time_ms=us / 1000.0, samples=(us / 1000.0,)))
         return BenchmarkResult(time_ms=sum(p.time_ms for p in per), num_launches=len(per), per_launch=per)
 
+    async def benchmark_async(self, graph, num_iters="auto") -> BenchmarkResult:
+        # The two-level driver benches through the async path (``Pipeline.tune_async``);
+        # the fake has no real I/O, so delegate to the deterministic sync bench. The
+        # signature mirrors ``benchmark`` exactly (no ``nvcc_flags``) so the -O3
+        # re-bench rejects the same way → identical bench counts to the sync path.
+        return self.benchmark(graph, num_iters=num_iters)
+
 
 def _matmul(g: Graph, prefix: str, M: int, K: int, N: int) -> str:
     a, b, c = f"{prefix}a", f"{prefix}b", f"{prefix}c"
@@ -122,7 +128,7 @@ def _tune_one_slice(fused: Graph, nid: str, patience: int) -> int:
     sub = single_node_graph(fused, nid)
     pipeline = Pipeline.build(LOWERING_PASSES)
     search = TuningSearch(patience=patience)
-    list(pipeline.tune(sub, search=search, ctx=Context.from_target((8, 0)), backend=backend, db=SearchDB()))
+    drain_tune(pipeline, sub, search=search, ctx=Context.from_target((8, 0)), backend=backend, db=SearchDB())
     return backend.calls
 
 
@@ -138,7 +144,7 @@ def test_inner_reward_is_separable_not_a_product() -> None:
 
     backend = _CountingBackend()
     db = SearchDB()
-    reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=db, backend=backend, patience=_PATIENCE)
+    reward = run_inner_reward(fused, ctx=Context.from_target((8, 0)), db=db, backend=backend, patience=_PATIENCE)
 
     # Separability: the shared run must not blow up to the cross-product
     # (n1 * n2 — the old whole-graph SP-MCTS bug this test guards against).
@@ -187,9 +193,9 @@ def test_inner_reward_rerun_is_replay_dominated() -> None:
     ctx = Context.from_target((8, 0))
 
     cold_backend = _CountingBackend()
-    first = inner_reward(fused, ctx=ctx, db=db, backend=cold_backend, patience=_PATIENCE)
+    first = run_inner_reward(fused, ctx=ctx, db=db, backend=cold_backend, patience=_PATIENCE)
     rerun_backend = _CountingBackend()
-    second = inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
+    second = run_inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
 
     # The DB's per-op best is monotone non-increasing — more benches never worsen it.
     assert second.total_us <= first.total_us + 1e-6, "rerun must not regress the per-op best total"
@@ -207,10 +213,10 @@ def test_inner_reward_deeper_patience_benches_new_variants() -> None:
     db = SearchDB()
     ctx = Context.from_target((8, 0))
 
-    inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
+    run_inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
 
     deep_backend = _CountingBackend()
-    inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
+    run_inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
     assert deep_backend.calls > 0, "a deeper pass must bench the new variants it reaches"
 
 
@@ -229,13 +235,33 @@ def test_inner_reward_shares_identical_kernel() -> None:
 
     single = _tune_one_slice(fused, loops[0], _PATIENCE)
     backend = _CountingBackend()
-    reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=SearchDB(), backend=backend, patience=_PATIENCE)
+    reward = run_inner_reward(fused, ctx=Context.from_target((8, 0)), db=SearchDB(), backend=backend, patience=_PATIENCE)
 
     assert backend.calls == single, "shared kernel must bench once, not twice"
     assert len(reward.per_op) == 1, "identical kernels collapse to one per_op entry"
     assert reward.per_op[0].multiplicity == 2, "both node positions are counted"
     # Total weights the shared best by its multiplicity — both kernels still cost time.
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
+
+
+def test_inner_reward_parallel_matches_serial() -> None:
+    """The core multi-GPU invariant: tuning the unique kernels concurrently across
+    a pool of N device-pinned backends yields the SAME per-op bests and summed
+    reward as the one-slot serial path. Each op's search is seeded by ``op_idx``
+    (execution-order-independent) and the fake backend's latency keys off
+    ``op_cache_key`` (slot-independent), so completion order can't change the
+    result. ``prior=None`` keeps this off the learned-prior (catboost) path."""
+    fused = _fuse(_two_distinct_matmuls())
+    ctx = Context.from_target((8, 0))
+
+    serial = run_inner_reward(fused, ctx=ctx, db=SearchDB(), backend=_CountingBackend(), patience=_PATIENCE)
+    parallel = run_inner_reward(fused, ctx=ctx, db=SearchDB(), backends=[_CountingBackend(), _CountingBackend()], patience=_PATIENCE)
+
+    assert parallel.total_us == pytest.approx(serial.total_us)
+    assert parallel.ok == serial.ok
+    s_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in serial.per_op}
+    p_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in parallel.per_op}
+    assert p_by_key == s_by_key, "per-op bests must be identical regardless of slot count"
 
 
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
@@ -265,13 +291,13 @@ class _RecordingProgress:
     def start_terminal(self, n_ops: int) -> None:
         self.terminal_sizes.append(n_ops)
 
-    def op_start(self, name: str) -> None:
+    def op_start(self, name: str, *, slot: int = 0) -> None:  # noqa: ARG002
         self.ops.append(name)
 
     def variant(self, *a, **kw) -> None:  # noqa: ANN002
         pass
 
-    def op_done(self, name: str) -> None:
+    def op_done(self, name: str, *, slot: int = 0) -> None:
         pass
 
 
@@ -333,7 +359,7 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: rec)
     progress = _RecordingProgress()
     db = SearchDB()
-    result = run_two_level_tune(
+    result = run_two_level(
         _norm_linear("a"),
         ctx=Context.from_target((12, 0)),
         db=db,
@@ -359,10 +385,9 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
 
 
 def _outer_terminals(graph: Graph) -> list[Graph]:
-    return [
-        cand.graph
-        for cand in outer_pipeline().tune(graph, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
-    ]
+    search = TuningSearch(patience=10**6)
+    drained = drain_tune(outer_pipeline(), graph, search=search, ctx=Context.from_target((12, 0)), db=SearchDB())
+    return [cand.graph for cand in drained]
 
 
 def _loops(graph: Graph) -> list:
@@ -408,8 +433,10 @@ def test_outer_descends_prior_preferred_branch_first() -> None:
                 return 1.0
             return 2.0 if "SPLIT_CONE" in knobs else 3.0
 
-    search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=Context.from_target((12, 0)).features())
-    first = next(outer_pipeline().tune(_norm_linear("a"), search=search, ctx=Context.from_target((12, 0)), db=SearchDB()))
+    ctx = Context.from_target((12, 0))
+    search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
+    drained = drain_tune(outer_pipeline(), _norm_linear("a"), search=search, ctx=ctx, db=SearchDB(), on=lambda c: True)
+    first = drained[0]
     assert len(_loops(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
 
 
@@ -450,7 +477,7 @@ def test_identical_offer_sites_take_the_same_side() -> None:
     g = _norm_linear("b", _norm_linear("a"))
     terminals = [
         cand.graph
-        for cand in outer_pipeline().tune(g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
+        for cand in drain_tune(outer_pipeline(), g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
     ]
     sizes = sorted(sum(1 for n in t.nodes.values() if isinstance(n.op, LoopOp)) for t in terminals)
     assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
@@ -459,7 +486,7 @@ def test_identical_offer_sites_take_the_same_side() -> None:
 def test_run_two_level_tune_single_terminal_assembles_bests() -> None:
     """With no fusion forks today the outer yields one terminal; the assembled
     graph greedy-replays the per-op bests."""
-    result = run_two_level_tune(
+    result = run_two_level(
         _two_distinct_matmuls(),
         ctx=Context.from_target((8, 0)),
         db=SearchDB(),

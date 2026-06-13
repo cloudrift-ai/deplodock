@@ -20,6 +20,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
 from deplodock.compiler.pipeline.fork import ThunkFork
 from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
+from tests.compiler.conftest import drain_tune
 
 
 # A tiny stub Op for testing. Carries an arbitrary ``knobs`` dict that the
@@ -134,7 +135,7 @@ def test_tuning_enumerates_thunk_leaves() -> None:
     pipeline = _build_pipeline(rewrite)
     search = TuningSearch(patience=10**6)
     leaves: set[tuple[int, int]] = set()
-    for cand in pipeline.tune(_make_graph(), search=search, db=SearchDB()):
+    for cand in drain_tune(pipeline, _make_graph(), search=search, db=SearchDB()):
         op = _final_op(cand.graph)
         leaves.add((op.knobs["A"], op.knobs["B"]))
     # 2 outer × 2 inner = 4 leaves; expect all to materialize.
@@ -166,7 +167,7 @@ def test_mixed_fork_and_concrete_op_siblings() -> None:
     # Tuning: both K=1 (via-fork) and K=99 (direct) materialize.
     search = TuningSearch(patience=10**6)
     leaves: set[int] = set()
-    for cand in pipeline.tune(_make_graph(), search=search, db=SearchDB()):
+    for cand in drain_tune(pipeline, _make_graph(), search=search, db=SearchDB()):
         leaves.add(_final_op(cand.graph).knobs["K"])
     assert leaves == {1, 99}
 

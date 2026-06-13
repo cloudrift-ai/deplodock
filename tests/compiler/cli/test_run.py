@@ -4,6 +4,7 @@ Accuracy failures (``max_diff >= 1.0``) make ``deplodock run`` exit
 non-zero, so ``rc == 0`` is the accuracy assertion.
 """
 
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -242,10 +243,16 @@ def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
         return object(), "slug", (None, (), {})
 
     monkeypatch.setattr(tmod, "graph_from_code", fake_graph_from_code)
-    backend = SimpleNamespace(compile=lambda g: g, benchmark=lambda g, *, warmup, num_iters: SimpleNamespace())
+
+    async def fake_benchmark_async(g, *, warmup, num_iters):
+        return SimpleNamespace()
+
+    backend = SimpleNamespace(compile=lambda g: g, benchmark_async=fake_benchmark_async)
     dyn = SimpleNamespace(name="g.dynM", knobs={"BM": 8}, shape=None, dynamic=("seq_len@x0:0",))
     static = SimpleNamespace(name="g", knobs={"BM": 8}, shape=None, dynamic=None)
-    benches = _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
+    benches = asyncio.run(
+        _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
+    )
     assert len(benches) == 2
     assert seen[0] is not None and 0 in seen[0]["x0"]  # {x0: {0: Dim(seq_len)}}
     assert seen[1] is None

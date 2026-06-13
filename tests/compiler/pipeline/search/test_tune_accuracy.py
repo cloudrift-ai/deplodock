@@ -2,11 +2,11 @@
 
 For a handful of small fused-launch patterns (matmul, rmsnorm, gated_mlp,
 sdpa — same shapes as the perf suite at smaller dimensions), populate a
-tmp :class:`SearchDB` via :func:`Pipeline.tune`, then re-execute the same
-graph through :class:`CudaBackend` with the tuned DB and check the
+tmp :class:`SearchDB` via :func:`Pipeline.tune_async`, then re-execute the
+same graph through :class:`CudaBackend` with the tuned DB and check the
 output matches the rule-default reference within fp32 tolerance.
 
-The tuner's own ``_bench_terminal`` only measures latency, so any
+The tuner's own ``_bench_terminal_async`` only measures latency, so any
 variant in the search space that produces wrong output gets cached as
 "fast" and later loaded by ``deplodock run``. Each case below
 exercises a code path that previously had a quietly-broken variant:
@@ -34,7 +34,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ...conftest import requires_cuda
+from ...conftest import drain_tune, requires_cuda
 
 # Small-shape variants of the perf suite. Dimensions are picked so each
 # planner branch (matmul, cooperative-K, multi-Accum matmul, multi-stmt
@@ -148,13 +148,12 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     # whenever a scoring change adds new high-prior siblings (TMA-
     # eligibility bonus, SPLITK penalty) and patience alone would let
     # MCTS keep finding new "best"s deeper into the variant tree.
-    candidates = list(
-        Pipeline.build(CUDA_PASSES).tune(
-            graph,
-            search=TuningSearch(patience=3, max_visits=4),
-            backend=tune_backend,
-            db=db,
-        )
+    candidates = drain_tune(
+        Pipeline.build(CUDA_PASSES),
+        graph,
+        search=TuningSearch(patience=3, max_visits=4),
+        backend=tune_backend,
+        db=db,
     )
     assert candidates, "tune produced no terminal candidates"
 
