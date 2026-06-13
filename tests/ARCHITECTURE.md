@@ -61,7 +61,7 @@ tests/
 │   │   ├── test_loop_op.py                     # LoopOp SSA body (Loop/Assign/Accum/…)
 │   │   ├── test_shape_inference.py             # infer_output_shape (static + Dim symbolic)
 │   │   ├── test_provenance.py                  # provenance data model + propagation
-│   │   ├── test_dynamic_shapes.py              # Dim round-trips through trace/lift/LoopOp
+│   │   ├── test_dynamic_shapes.py              # Dim round-trips trace/lift/LoopOp + per-seq_len captured-graph replay
 │   │   ├── test_real_trace.py                  # TinyLlama fixture sanity (op-type counts)
 │   │   ├── test_body_deps.py / test_op_shape_invariants.py / …
 │   │   ├── stmt/   — SSA-body unit tests (hoist / merge / rename / structural_key)

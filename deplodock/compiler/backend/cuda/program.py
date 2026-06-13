@@ -588,6 +588,14 @@ class CompiledProgram:
     _e2e_graph: Any | None = field(default=None, repr=False)
     _e2e_start: Any | None = field(default=None, repr=False)
     _e2e_stop: Any | None = field(default=None, repr=False)
+    # Whole-program graphs keyed by the resolved symbolic tuple — the serving
+    # captured-replay path holds one captured graph PER seq_len over a single
+    # capacity-sized buffer set (a graph baked at seq_len S only replays at S,
+    # since each kernel's grid + by-value seq_len are frozen by capture). LRU,
+    # bounded by ``_graph_cache_max``. The static-shape bench path uses the one
+    # ``()`` key, so it's unaffected.
+    _graph_cache: dict = field(default_factory=dict, repr=False)
+    _graph_cache_max: int = 64
 
     @classmethod
     def build(
@@ -655,6 +663,25 @@ class CompiledProgram:
             self._graphs = None
             self._graph_batch_sizes = None
             self._e2e_graph = None
+            self._graph_cache.clear()
+
+    def set_sym_values(self, values: dict[str, int]) -> None:
+        """Set the host symbolic values that resolve launch grids + by-value
+        kernel args, WITHOUT re-allocating buffers — they stay at the build
+        (capacity) shape. The serving capture path: buffers sized once at
+        capacity, grids + frozen seq_len baked per request via
+        :meth:`capture_program_graph`, results sliced to the real shape by
+        ``outputs(sym_values=…)``. Errors if any value exceeds the allocated
+        buffer capacity (the caller falls back to ``rebind`` above capacity)."""
+        merged = {**self.sym_values, **values}
+        for buf in self.compiled.bufs:
+            want = buf.resolve_shape(merged) or (1,)
+            if math.prod(want) > self.arrays[buf.name].size:
+                raise ValueError(
+                    f"set_sym_values {values}: buffer {buf.name!r} resolves to {want} "
+                    f"({math.prod(want)} elems) > capacity {self.arrays[buf.name].size}"
+                )
+        self.sym_values = merged
 
     def run_once(self) -> None:
         """Launch every kernel once in program order with no per-launch event
@@ -712,22 +739,31 @@ class CompiledProgram:
         self._graph_batch_sizes = list(batch_sizes)
 
     def capture_program_graph(self) -> None:
-        """Capture every launch (batch 1, program order) into ONE CUDA graph.
+        """Capture every launch (batch 1, program order) into ONE CUDA graph at
+        the CURRENT ``self.sym_values``, caching it by the resolved symbolic
+        tuple and pointing ``self._e2e_graph`` at it.
 
-        The whole-program graph backs :meth:`time_program_window` — an event
-        window around N replays of the full program, which is the same
-        semantics the captured torch closures get in the interleaved bench
-        (one graph per forward, replayed back-to-back inside one window).
-        Per-launch capture (:meth:`capture_launch_graphs`) can't provide this:
-        summing isolated single-kernel windows drops cross-kernel cache
-        effects and inter-kernel gaps, so the sum is not an end-to-end time.
+        Two callers:
+        - The bench's :meth:`time_program_window` (static graph → the single
+          ``()`` cache key): one event window around N back-to-back replays, the
+          same semantics the captured torch closures get.
+        - The serving path: one captured graph PER seq_len over a SHARED
+          capacity-sized buffer set. A graph baked at seq_len S only replays at S
+          (its grids + by-value seq_len are frozen by capture), so the cache is
+          keyed by ``self.sym_values`` and bounded LRU (``_graph_cache_max``).
+          Set ``self.sym_values`` (via :meth:`set_sym_values`) and upload the
+          request's input prefix (via :meth:`upload_prefix`) before calling.
 
-        No-op when already captured. Same error contract as
+        Cache hit ⇒ no re-capture. Same error contract as
         :meth:`capture_launch_graphs`: raises :class:`GraphCaptureError` after
         draining any partial capture state."""
         import cupy as cp
 
-        if self._e2e_graph is not None:
+        key = self._sym_key()
+        cached = self._graph_cache.get(key)
+        if cached is not None:
+            self._graph_cache[key] = self._graph_cache.pop(key)  # LRU bump
+            self._e2e_graph = cached
             return
         side = cp.cuda.Stream(non_blocking=True)
         try:
@@ -747,7 +783,41 @@ class CompiledProgram:
         # Throwaway replay absorbs graphExec instantiation/upload cost.
         graph.launch()
         cp.cuda.runtime.deviceSynchronize()
+        self._graph_cache[key] = graph
+        while len(self._graph_cache) > self._graph_cache_max:
+            self._graph_cache.pop(next(iter(self._graph_cache)))  # evict LRU
         self._e2e_graph = graph
+
+    def _sym_key(self) -> tuple:
+        """Hashable cache key for the current resolved symbolic values (``()`` for
+        a fully-static graph)."""
+        return tuple(sorted(self.sym_values.items()))
+
+    def replay_program_graph(self) -> None:
+        """Launch the whole-program graph for the current ``self.sym_values`` once
+        on the default stream — the serving hot path. The caller sets the request's
+        seq_len (:meth:`set_sym_values`), uploads its input prefix
+        (:meth:`upload_prefix`), and captures-or-reuses the graph
+        (:meth:`capture_program_graph`) first; results come from
+        ``outputs(sym_values=…)``. Caller must hold ``gpu_lock()``."""
+        if self._e2e_graph is None:
+            raise RuntimeError("replay_program_graph called before capture_program_graph")
+        self._e2e_graph.launch()
+
+    def upload_prefix(self, input_data: dict[str, np.ndarray]) -> None:
+        """H2D each host array into the contiguous PREFIX of its capacity-sized
+        device buffer — no re-allocation, so the captured graphs' baked pointers
+        stay valid (a logically ``(1, S, …)`` tensor occupies the first ``S*…``
+        elements of the ``(1, S_cap, …)`` allocation; the kernels, launched at
+        grids for the real S, only touch that prefix). Errors if a host array
+        exceeds its buffer's capacity. Caller must hold ``gpu_lock()``."""
+        for name, host in input_data.items():
+            buf = self.compiled.buf_by_name[name]
+            arr = self.arrays[name]
+            flat = np.ascontiguousarray(host, dtype=buf.dtype.np).ravel()
+            if flat.size > arr.size:
+                raise ValueError(f"upload_prefix: {name!r} has {flat.size} elems > capacity {arr.size}")
+            arr.ravel()[: flat.size].set(flat)
 
     def time_program_window(self, replays: int) -> float:
         """One event window around ``replays`` back-to-back whole-program
@@ -842,12 +912,30 @@ class CompiledProgram:
                 per_launch_hook(i, launch)
         return dts
 
-    def outputs(self) -> dict[str, np.ndarray]:
+    def outputs(self, sym_values: dict[str, int] | None = None) -> dict[str, np.ndarray]:
         """Copy every output buffer back to host. Caller must hold the
         GPU lock — ``.get()`` is an async D2H copy on the default
         stream, so peer workers' kernels would otherwise interleave
-        with our D2H on the shared device."""
-        return {b.name: self.arrays[b.name].get() for b in self.compiled.bufs if b.role == "output"}
+        with our D2H on the shared device.
+
+        ``sym_values`` (serving's capture path) slices each output to its real-S
+        shape — the buffer is allocated at capacity but only the
+        ``resolve_shape(sym_values)`` prefix holds the request's result; the rest
+        is unmasked garbage from the oversized allocation. Without it (the
+        default) the whole buffer is returned (the uncaptured rebind path already
+        sizes buffers to the request)."""
+        out: dict[str, np.ndarray] = {}
+        for b in self.compiled.bufs:
+            if b.role != "output":
+                continue
+            arr = self.arrays[b.name]
+            if sym_values is not None:
+                shape = b.resolve_shape({**self.sym_values, **sym_values})
+                n = math.prod(shape) if shape else 1
+                out[b.name] = arr.ravel()[:n].get().reshape(shape)
+            else:
+                out[b.name] = arr.get()
+        return out
 
     def snapshot(self) -> dict[str, np.ndarray]:
         """Copy every non-input buffer (scratch + constants + outputs)

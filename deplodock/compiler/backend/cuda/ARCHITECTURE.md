@@ -78,6 +78,21 @@ every kernel in program order with none of `iter_once`'s per-launch event record
 in `iter_once`; the caller's `outputs()` `.get()` synchronizes. Both expect the caller to hold `gpu_lock()`. See
 `tests/compiler/test_program_rebind.py`.
 
+**Captured-graph replay over a capacity buffer set (`set_sym_values` / `upload_prefix` / `capture_program_graph` /
+`replay_program_graph` / `outputs(sym_values)`).** The serving fast path: instead of `rebind` re-sizing buffers and
+`run_once` issuing ~hundreds of host launches per request, build the program once at a **capacity** seq_len, then per
+request (1) `set_sym_values({"seq_len": S})` sizes the launch grids + by-value seq_len to the real S without
+re-allocating (errors if S exceeds capacity), (2) `upload_prefix(input_data)` H2D's each input into the contiguous
+prefix of its capacity buffer (a logically `(1, S, …)` tensor occupies the first `S·…` elements), (3)
+`capture_program_graph()` captures the whole program at the current S into ONE CUDA graph — **cached per seq_len**
+(bounded LRU `_graph_cache`), so a repeated length replays with no re-capture — and (4) `replay_program_graph()` is one
+host launch; `outputs({"seq_len": S})` slices each capacity buffer to its real-S prefix. Each graph is captured at its
+EXACT S, so every kernel runs at its exact grid: no oversized-grid masking is needed (and a single capacity-baked graph
+for ALL S is not viable — several symbolic-M kernels read OOB at an oversized grid: the CTA-swizzle decode reconstructs
+`num_m` from the runtime seq_len, and ceil-div staged loads over-read; see
+`plans/serving-dynamic-shape-cuda-graphs.md`). `rebind` clears `_graph_cache` on re-allocation. Validate multi-S
+correctness under `compute-sanitizer` (`tests/compiler/ir/test_dynamic_shapes.py`).
+
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a
 warmup loop + timed loop wrapped in `cupy.cuda.Event` pairs — one
 global pair for `BenchmarkResult.time_ms`, one pair per launch index
