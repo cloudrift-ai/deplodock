@@ -1,166 +1,221 @@
-# Golden sweep findings — RTX 5090 (sm_120), 2026-06-12 (second sweep; first with .dynM shapes in the dataset)
+# Golden sweep findings — RTX 5090 (sm_120), 2026-06-12 evening (third sweep; first after the evidence-pick prior fix)
 
-- Sweep: `deplodock tune --dataset golden --clean` — 29 matmul targets (23 static + 6 dynamic `.dynM`), 52 min wall.
-  The 6 dynM additions cost ~12 min over the previous 23-shape sweep on this box (40 min).
-- A/B: `deplodock run --bench --golden NAME` per shape (29 names), then a second confirmation pass over the 16 shapes
-  whose category depended on the margin. Absolute µs swung ~10% between the two passes (GPU thermal state — pass 2 ran
-  hot), but the within-run greedy/golden **ratios** were stable to ≤3%, so categorization is ratio-based and the
-  recorded µs are the cool-state pass-1 numbers.
-- Branch under test: `feature/dynamic-golden` (post dynM-seeding, same masked-MMA codegen as the previous sweep).
-- Tally: **4 replaced / 9 added / 2 exact reproductions / 14 worse / 0 re-records** (the 5 reduce/pointwise goldens
-  remain unsweepable, as last time).
+- Sweep: `deplodock tune --dataset golden --clean` — 29 matmul targets (23 static + 6 dynamic `.dynM`), 52 min wall
+  (15:40–16:32). 24 bench_fail rows total, all in fp32 `MMA=0, FK-split` classes on the big squares (slow compile /
+  slow run) — the fp16 `TMA+WARPSPEC` launch-crash class from the previous two sweeps is **gone** (its goldens bench
+  fine live now).
+- A/B: `deplodock run --bench --golden NAME` per shape — and this time the full 29-shape pass took **~3.5 min**, not
+  ~45: every kernel hit the cubin cache the tune had just filled (~7 s per cold process launch). Two full passes plus
+  a 5-shape tie-breaker pass; greedy/golden ratios were stable to ≤2% across passes, and absolute µs barely drifted
+  (back-to-back runs, no thermal swing).
+- Branch under test: `main` @ `ad08f813` (the dynM end-to-end PR, which includes the `FallbackPrior.evidence_pick`
+  measured-evidence fix the previous sweep's findings 2/4/5/6 asked for). Edits on `feature/golden-sweep-rtx5090-3`.
+- Tally: **8 replaced / 5 added / 5 exact reproductions / 11 worse** (the 5 reduce/pointwise goldens remain
+  unsweepable, as in both previous sweeps).
+- The analytic weights were refit after the YAML edits (`scripts/golden_knob_heuristics.py` → `_W_A` + `_W_A_DYN`
+  pasted into `search/prior/analytic.py`): the pre-refit `_W_A_DYN` ranked the *new* dynM goldens at median 355 (it
+  was fit to the seeds this sweep replaced); post-refit five of eight dynM rows rank ≤1, dynM median ~6, static
+  median 12.
+- **Finding 1 fixed in this branch** (`FallbackPrior.score` analytic-tilt blend — see the rewritten finding below): the
+  two fp16-square shapes the sweep deployed at 2.0–2.25× golden now deploy `BK=2` at golden parity (square.2048.fp16
+  235→105 µs, square.4096.fp16 1490→761 µs). The per-shape table below still shows the pre-fix sweep numbers.
 
-## Per-shape outcome (all numbers -O3 live A/B pass 1; pass-2 ratio in parens where it decided the category)
+## Headline: the evidence-pick fix worked
 
-| shape                            | greedy µs | best golden µs | greedy/golden | category |
-|----------------------------------|----------:|---------------:|--------------:|----------|
-| square.512                       |       9.8 |            9.0 |  1.09 (1.06)  | worse (finding 3) |
-| square.1024                      |      44.1 |           45.8 |  0.96 (0.98)  | **added** (parity, diff knobs) |
-| square.2048                      |     296.8 |          272.3 |          1.09 | worse (finding 2) |
-| square.4096                      |    2475.9 |         2218.1 |          1.12 | worse (finding 2) |
-| square.512.fp16                  |       5.1 |            3.5 |          1.46 | worse (finding 1) |
-| square.1024.fp16                 |      16.8 |           14.9 |          1.13 | worse (finding 1) |
-| square.2048.fp16                 |     109.6 |           92.0 |          1.19 | worse (finding 1) |
-| square.4096.fp16                 |     838.8 |          644.4 |          1.30 | worse (finding 1) |
-| qwen3_06b.q_proj.s32             |       7.2 |            7.5 |  0.96 (0.97)  | **added** (parity, diff knobs) |
-| qwen3_06b.kv_proj.s32            |       4.9 |            5.3 |  0.92 (0.95)  | **replaced** |
-| qwen3_06b.o_proj.s32             |       8.0 |            8.7 |  0.92 (0.93)  | **replaced** (duplicate pair collapsed) |
-| qwen3_06b.gate_up_proj.s32       |       9.6 |            9.6 |          1.00 | same knobs — exact reproduction |
-| qwen3_06b.down_proj.s32          |      13.4 |           12.2 |          1.10 | worse (finding 5) |
-| qwen3_06b.q_proj.s128            |      20.3 |           16.3 |          1.25 | worse (finding 4) |
-| qwen3_06b.kv_proj.s128           |      10.3 |            9.8 |  1.05 (1.03)  | worse-marginal (within noise; left) |
-| qwen3_06b.o_proj.s128            |      17.4 |           17.7 |  0.98 (0.98)  | **added** (parity, diff knobs) |
-| qwen3_06b.gate_up_proj.s128      |      29.8 |           24.5 |          1.22 | worse (finding 4) |
-| qwen3_06b.down_proj.s128         |      25.1 |           24.7 |  1.02 (1.00)  | **added** (parity, diff knobs) |
-| qwen3_06b.q_proj.s512            |      44.2 |           48.1 |  0.92 (0.89)  | **replaced** |
-| qwen3_06b.kv_proj.s512           |      26.6 |           24.9 |          1.07 | worse (finding 2) |
-| qwen3_06b.o_proj.s512            |      50.6 |           46.5 |          1.09 | worse (finding 2) |
-| qwen3_06b.gate_up_proj.s512      |      52.4 |           82.9 |  0.63 (0.59)  | **replaced** (−37%, the sweep's big win) |
-| qwen3_06b.down_proj.s512         |      72.4 |           72.3 |  1.00 (0.99)  | **added** (parity, diff knobs) |
-| square.512.dynM                  |      15.9 |           16.0 |          0.99 | same knobs — exact reproduction |
-| qwen3_06b.q_proj.s512.dynM       |      50.4 |           50.8 |  0.99 (0.97)  | **added** (parity, RING 3 vs 2) |
-| qwen3_06b.kv_proj.s512.dynM      |      30.7 |           31.2 |  0.98 (0.97)  | **added** (parity, RING 3 vs 2) |
-| qwen3_06b.o_proj.s512.dynM       |      55.0 |           55.6 |  0.99 (0.98)  | **added** (parity, RING 3 vs 2) |
-| qwen3_06b.gate_up_proj.s512.dynM |      70.0 |           70.0 |  1.00 (1.00)  | **added** (parity, RING 3 vs 2) |
-| qwen3_06b.down_proj.s512.dynM    |      80.5 |           72.7 |          1.11 | worse (finding 6, first dynM shortfall) |
+The previous sweep's core finding — "the deploy argmin prefers unmeasured extrapolations over configs with winning
+-O3 reservoir rows" (its findings 2, 4, 5, 6) — does not reproduce. Everywhere the search measured the good region,
+the deploy pick *is* the measured -O3 best: down_proj.s512 and square.512.dynM deploy measured rank-1 configs with
+-O3 rows; every dynM kernel's pick is exactly the config with the minimum -O3 reservoir latency (e.g.
+`k_matmul_701d6c` deploys -O1 rank 3 because it holds the best -O3 row, 56.2 µs, over the -O1 rank-1's 59.1). The
+previous sweep's finding-5 (down_proj.s32 FM1-over-FM2) and finding-3 (square.512 drift) are both exact
+reproductions now. The dynM shapes — five of six of which the previous sweep could only record at parity or worse —
+all came back better or equal, including a −29% on square.512.dynM.
 
-The wins continue the previous sweep's `BM16 + RING4` and `RING2`-at-s32 directions: kv/o_proj.s32 win on a single RING
-4→2 flip, q_proj.s512 moves to `BM16 BK32 RING4`, and gate_up_proj.s512 jumps −37% onto the `FM10 FN4 SPLITK1
-OVERHANG` family (its old `SPLITK2 FN2` golden also live-benched 23% over its recorded number, so the old entry was both
-beaten and stale). All four wins reproduced on the confirmation pass with margins well above the ≤3% ratio spread. The
-five dynM seeds from this morning survive a clean-DB retune: four reproduce at parity modulo a RING 3-vs-2 flip (added
-as twins), square.512.dynM reproduces exactly, and only down_proj.s512.dynM regressed (finding 6).
+What's left over is a different failure mode: when the clean-DB search never measures the golden's region at all,
+evidence-pick (correctly) deploys its measured best, which can sit 5–20% above a golden the model itself ranks
+shallow. See findings 2–3.
 
-## Finding 1 — fp16 warp tier: the TMA+WARPSPEC launch crash persists; all four fp16 squares still locked out (P0 repeat)
+## Per-shape outcome (live -O3 A/B; pass-1 µs, pass-2 ratio in parens where it mattered)
 
-All four fp16 squares remain worse: +13% (1024) to +46% (512). Same signature as the previous sweep's Finding 1:
+| shape                            | greedy µs | best golden µs |     greedy/golden | category                                                |
+|----------------------------------|----------:|---------------:|------------------:|---------------------------------------------------------|
+| square.512                       |      10.6 |           10.5 |       1.01 (0.98) | same knobs — exact reproduction                         |
+| square.1024                      |      53.4 |           49.2 |       1.09 (1.10) | worse (finding 3)                                       |
+| square.2048                      |     305.7 |          294.3 |       1.04 (1.03) | worse-marginal (≤4%, left)                              |
+| square.4096                      |    2525.8 |         2282.4 |       1.11 (1.10) | worse (finding 3)                                       |
+| square.512.fp16                  |       4.4 |            3.9 |              1.13 | worse (finding 1)                                       |
+| square.1024.fp16                 |      17.3 |           17.1 |              1.01 | **added** (parity, WM4 BK8 vs WM1 BK2)                  |
+| square.2048.fp16                 |     235.4 |          104.8 |       2.25 (2.24) | worse (finding 1)                                       |
+| square.4096.fp16                 |    1490.1 |          741.6 |       2.01 (2.01) | worse (finding 1)                                       |
+| qwen3_06b.q_proj.s32             |       7.5 |            8.3 |       0.90 (0.89) | **replaced** (3 entries → 1, FM4 FN2)                   |
+| qwen3_06b.kv_proj.s32            |       5.7 |            5.7 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.o_proj.s32             |       9.2 |            9.2 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.gate_up_proj.s32       |      10.9 |           11.0 |              0.99 | **added** (parity, RING 3 vs 4)                         |
+| qwen3_06b.down_proj.s32          |      14.0 |           13.9 |              1.01 | same knobs (prev sweep's finding 5: fixed)              |
+| qwen3_06b.q_proj.s128            |      19.4 |           18.5 |       1.05 (1.04) | worse-marginal (4–5%, left)                             |
+| qwen3_06b.kv_proj.s128           |      11.4 |           11.3 |              1.01 | **added** (parity, BN16 SPLITK1 RING2)                  |
+| qwen3_06b.o_proj.s128            |      19.9 |           19.9 |              1.00 | same knobs — exact reproduction                         |
+| qwen3_06b.gate_up_proj.s128      |      23.8 |           28.1 |              0.85 | **replaced** (WARPSPEC pin dropped, finding 4)          |
+| qwen3_06b.down_proj.s128         |      28.2 |           28.2 |              1.00 | **added** (parity, BM8 RING2)                           |
+| qwen3_06b.q_proj.s512            |      54.3 |           49.1 |       1.11 (1.10) | worse (finding 2) — prev sweep's win not re-found       |
+| qwen3_06b.kv_proj.s512           |      29.8 |           27.1 |       1.10 (1.09) | worse (finding 2, repeat)                               |
+| qwen3_06b.o_proj.s512            |      49.5 |           49.8 | 0.99 (1.06, 1.06) | worse-marginal (left; bimodal greedy bench)             |
+| qwen3_06b.gate_up_proj.s512      |      68.4 |           56.0 |       1.22 (1.19) | worse (finding 2) — prev sweep's −37% win not re-found  |
+| qwen3_06b.down_proj.s512         |      75.7 |           81.8 |              0.93 | **replaced** (3 entries → 1, FM14 BK64 OVERHANG)        |
+| square.512.dynM                  |      12.8 |           18.0 |              0.71 | **replaced** (BN16 FM4 FN2 RING4; sweep's big win)      |
+| qwen3_06b.q_proj.s512.dynM       |      54.4 |           56.0 | 0.97 (0.99, 0.98) | **added** (parity, BM8 FM14 SPLITK2)                    |
+| qwen3_06b.kv_proj.s512.dynM      |      30.7 |           35.0 |              0.88 | **replaced** (2 entries → 1, BM8 FM8)                   |
+| qwen3_06b.o_proj.s512.dynM       |      52.7 |           62.0 |       0.85 (0.86) | **replaced** (2 entries → 1, BM16 FM8 BK64)             |
+| qwen3_06b.gate_up_proj.s512.dynM |      72.8 |           77.0 | 0.95 (0.95, 0.94) | **replaced** (2 entries → 1, BM8 FM8 SPLITK2)           |
+| qwen3_06b.down_proj.s512.dynM    |      74.8 |           81.9 |       0.91 (0.92) | **replaced** (BM16 FM8 BK64; prev finding 6 fixed)      |
 
-- `eval failures`: 6 of the sweep's 9 bench_fail rows are `CUDA_ERROR_INVALID_VALUE` with shared knobs
-  `TMA=True, WARPSPEC=True, MMA=mma_m16n8k16_f16` (k_matmul_262948 ×4, 207791 ×2, 180e20 ×1).
-- With the WARPSPEC class dead at tune time, the greedy locks onto the surviving `WM8 WN2 FM1` class on every fp16
-  square; the goldens rank 58–288 under the learned prior (no healthy data near them) while the cold analytic ranks
-  them 0–20 — the heuristic is fine, the data is poisoned.
-- One improvement over last sweep, and it's data-driven: square.4096.fp16 narrowed from 8.4× to 1.30× because the
-  greedy no longer falls into the `MMA=0 FK-split` timeout class — the prior learned from that class's bench_fail rows.
-  The crash class itself is unchanged.
+All replaces verified post-edit: `run --bench --golden` on the edited shapes re-benches the new entries at parity
+with the greedy pick (gate_up_proj.s128's unpinned entry re-derives the warp-specialized form at 24.0 µs ≈ the
+23.8 µs pick).
 
-**Recommendation (P0, unchanged from last sweep — not yet actioned):** debug the `TMA+WARPSPEC+mma_f16` launch failure
-(CUDA_ERROR_INVALID_VALUE at launch; introduced by the masked warp-tier MMA work). Add a compile+launch regression test
-pinning the golden `square.1024.fp16` knobs with the planner-derived TMA transport. Until fixed, every fp16 golden is
-unreachable by construction and re-sweeping fp16 is wasted GPU time — consider `--kernel`-excluding fp16 from routine
-sweeps.
+The dynM family converged onto one knob family this sweep — `FM8 FN4 SPLITK2 RING2` with per-shape BM/BN/BK — and
+it beats the seed-era `BM16 FM4 FN4` family by 5–15% everywhere; square.512.dynM (a `BN16 FM4 FN2 RING4` masked tile)
+closed from 1.29× over its static twin to ~1.21× of the static 10.6 µs.
 
-## Finding 2 — the prior deploys FN4 over the measured-faster FN2 + tall-FM family (kv/o_proj.s512, square.2048/4096)
+## Finding 1 — fp16 large squares: the learned prior buries the small-`BK` warp region; patience-bounded search never benches it (P0 — FIXED)
 
-kv_proj.s512 (+7%), o_proj.s512 (+9%), square.2048 (+9%), square.4096 (+12%). Two distinct mechanisms:
+square.2048.fp16 deployed at **2.25×** the golden and square.4096.fp16 at **2.01×**. The sweep-time hypothesis ("the
+warp-tier enumeration floors `BK` by shape size, so `BK=2` is never offered at 2048/4096") was **wrong** — disproven by
+directly enumerating the warp variants (`_enumerate_warp_matmul_impl`, `lowering/tile/_enumeration.py`):
 
-- **kv/o_proj.s512 — calibration miss on measured data.** `eval variants` (k_matmul_1262e3 / 8781f5): the golden
-  `FM10–14, FN2` family holds measured ranks 1–3 **with -O3 re-bench rows** (kv: 29.6–30.7 µs; o: 54.8–55.5 µs), while
-  the prior's pick is an `FN4` config at rank 5/43 (1.25x, flagged `misses best`) and 4/43 (1.20x) — both with no -O3
-  row of their own. The prior had deployable-truth evidence for the golden family and deployed an unmeasured
-  extrapolation instead. Not an -O1/-O3 inversion and not reachability.
-- **square.2048 — reachability.** The `FM26` golden is absent from the kernel's 69 measured variants; learned rank 394,
-  analytic rank 121. Patience cannot reach rank 394. square.4096 sits between: its golden family was measured (rank 1
-  in the DB view) but the live deploy chose a `SPLITK2 BM8 BN16 FM6` config (grid 11008) that isn't even the DB view's
-  pick — see finding 4's deploy-vs-eval-pick discrepancy.
+- The candidate set is `(64,32,16,8,4,2,1)` gated only by `k_cells_total % bk == 0`, and `k_cells_total = E_K/16` is
+  32/64/128/256 at 512/1024/2048/4096 — **all divisible by 2**. A direct probe confirms `BK=2` (and the exact golden
+  row `WM1 WN4 FM4 FN2 BK2`) is enumerated at every size: **316 / 373 / 404 / 417** `BK=2` rows for 512/1024/2048/4096.
+  The BK histogram in the original finding was what the **search benched**, not what was enumerated.
 
-**Recommendation:** two halves. (a) The cheap, high-leverage fix: make the deploy-time argmin respect measured -O3
-reservoir rows — e.g. restrict the argmin to measured configs when any exist within the prior's top-K predicted, or
-add a measured-evidence bonus. Findings 2, 4, 5 and 6 are all this one bug wearing different knobs. (b) The repeat
-fix from last sweep (still unactioned): refit the analytic weights with the big-FM regime represented and add a `D_*`
-register-tile-intensity feature so FM26-class configs stop ranking 100+ deep cold.
+The real gate is the **search/prior**, and the chain is:
 
-## Finding 3 — square.512: greedy drifts to BM16/BK32/RING4 (+6–9%)
+1. The learned `CatBoostPrior` regresses `log(µs)` on `knob_features`. It measured `BK=2` warp tiles only at small fp16
+   squares (512), so at 2048/4096 it **extrapolates** the fp32-thread-tier pattern (large shape → large `BK`) and
+   predicts `BK=2` is slow there — `eval prior` ranks the golden 335–592 deep. The cold `AnalyticPrior` prices it
+   correctly (`D_w_near_bk`, rank 0/2632), but `FallbackPrior` used the learned half once fitted.
+2. PUCT selection weights an unvisited child by `1/score`, so the buried `BK=2` region gets a tiny weight and patience
+   (50) expires before reaching it — a **self-reinforcing blind spot** (never benched → never measured → never learned
+   fast). Reproduced in isolation with a 6-shape "polluter" prior (sweep targets 1–6): tuning 2048.fp16 benched `BK=2`
+   **0 times**.
+3. `evidence_pick` then faithfully deploys the best **measured** `-O3` config — `BK=64` @ 235 µs — because the reservoir
+   has no `BK=2` row to deploy. Not an enumeration gate, not an evidence-pick bug: the search simply never produced the
+   evidence.
 
-`eval golden`: misses are `BM 16/8, BK 32/64, RING 4/3`. Learned rank 4/1008, analytic rank 2 — both shallow; the
-argmin misorders within its own top-5. The same `BM16 + RING4` family that genuinely wins on q_proj.s512 and the s128
-parity adds loses here, so the prior is over-generalizing the family across free-dim sizes. Same class as finding 5
-(shallow-rank misorder); covered by recommendation 2(a)'s measured-evidence weighting — the golden family has DB rows.
+**Fix (this branch): an analytic-tilt blend in `FallbackPrior.score` — the MCTS *selection* signal only.** The two
+priors are on different scales (CatBoost = calibrated µs; analytic = an ordinal learning-to-rank proxy, neutral value
+1.0), so a naive `min`/blend collapses to "always analytic" (the reverted 2× regression). Instead `score` keeps the
+learned µs as the per-shape scale and folds the analytic in as a dimensionless multiplier centered at its neutral 1.0:
 
-## Finding 4 — gate_up_proj.s128 / q_proj.s128: the DB-view pick IS the golden, but greedy deploys something else (+22% / +25%)
+```
+score = learned_µs · analytic(knobs) ** W            # W = config.analytic_tilt(), default 0.3
+```
 
-The strangest result this sweep. For gate_up_proj.s128, `eval variants` (k_matmul_2f6858) shows the golden
-`BN16 FM6 FN4 OVERHANG` config as measured rank 1/16 **with the best -O3 row (24.1 µs)** and marks it as the prior's
-own pick (`◄ pick: rank 1/16, 1.00x`). Yet the live greedy deploys `FM8`, no OVERHANG, at 29.8 µs live. `eval prior`
-agrees with the deploy side: golden rank 6/1008 over the full gated enumeration — so the prior prefers six other
-(unmeasured) configs when ranking the full enumeration, but prefers the golden when restricted to measured rows. The
-previous sweep blamed the OVERHANG offer gate; this sweep disproves that — the config was offered and measured. The
-gap between "argmin over full enumeration" (deploy) and "argmin over measured variants" (eval variants) is the bug
-surface. q_proj.s128 is the same shape of failure (golden learned ranks 5 and 28; greedy lands `BK32 FM8 RING2`
-at +25%).
+A config the heuristic favors (`analytic < 1`) gets its predicted µs pulled down → larger PUCT exploration weight → it
+is explored; a no-opinion config (`analytic = 1`) is untouched. So the heuristic *perturbs* the learned order without
+replacing it, and the learned half still owns the scale. `mean_score` / `mean_scores` / `pick` (deploy, eval,
+diagnostics) stay **pure-learned + evidence** — only exploration changed. No MCTS machinery: the blend lives entirely
+in the prior, behind the regular `score` interface PUCT already calls.
 
-**Recommendation:** same as 2(a) — the deploy argmin must not prefer an unmeasured extrapolation over a config with a
-winning -O3 reservoir row. This finding is the cleanest reproducer for that work: one shape, 16 measured variants, the
-golden is measured-rank-1 with -O3 truth and still loses the deploy. Start here.
+**Validation** (polluter prior, fresh DB, isolated; `W` swept via `DEPLODOCK_ANALYTIC_TILT`):
 
-## Finding 5 — down_proj.s32: FM1 over FM2 again (+10%, exact repeat of last sweep's finding 3)
+| `W` | `BK=2` benched | tuned best µs |
+|----:|---------------:|--------------:|
+| 0 (baseline) | **0** | 99.0 (`BK=4`) |
+| 0.2 | 40 | 92.5 |
+| 0.3 (default) | 41 | 92.3 |
+| 0.5 | 45 | 92.4 |
 
-`eval golden`: misses `FM 1/2, FN 4/2`. Learned rank 1/1008 — the argmin misorders its own top-2. The `vs gold` column
-reads 0.85x but that's the stale-denominator artifact (recorded 16.4 µs is a pre-capture number; the golden lives at
-12.2 µs today — fixed by this sweep's YAML edits for the replaced shapes, but this entry was left). The previous
-sweep's recommendation (a `D_*` term separating per-thread work at degenerate M) stands, unactioned.
+End-to-end, re-tuning the two shapes on the real cache with the fix and re-deploying: square.2048.fp16 **235 → 105 µs**
+(`BK=2`, golden parity) and square.4096.fp16 **1490 → 761 µs** (`BK=2`, golden parity). No regression where the learned
+prior is already right: square.1024 fp32 46.5 → 44.9 µs (improved), q_proj.s512 40.3 → 40.7 µs (within bench noise). The
+existing fp16 goldens already record the `BK=2` region, so no YAML change is needed — the fix makes them *reachable*.
+square.512.fp16's residual 1.13× is the same story at its mildest (a within-tier `WM 1/4` misorder, `BK=4` already
+benched) and is not load-bearing.
 
-## Finding 6 — down_proj.s512.dynM: first dynamic-golden shortfall (+11%); prior had better -O3 evidence and ignored it
+**Follow-up:** the fix only refreshes a shape's deploy once that shape is re-tuned (it changes selection, not the
+stored reservoir). A full `tune --dataset golden` re-run on this branch would re-record every shape under the fixed
+exploration; only the two fp16 squares were re-tuned here.
 
-The only one of six dynM seeds that regressed under a clean-DB retune. Greedy deploys `BM16 FM4 RING3`; golden is
-`BM8 FM8 RING2`. `eval variants` (k_matmul_2189d8, 49 measured configs): the golden's `BM8 FM8 SPLITK2` family is
-measured rank 1 with **-O3 75.7 µs vs the pick's -O3 80.9 µs** — again, measured deployable truth beaten by the
-argmin's preference. Meanwhile `eval prior` ranks this golden 0/1008, i.e. the enumeration scoring agrees with the
-golden, and still the live deploy lands elsewhere — the deploy-side pick and the eval-side rank disagree (the same
-discrepancy as finding 4, seen from the other side). The masked-tier analytic ranks are improving but still cold-deep
-(20–125 across dynM shapes, median ~28 vs the seed report's 55) — `scripts/golden_knob_heuristics.py` still hasn't
-been refit with the dynM goldens (seed report's finding 4 recommendation, unactioned).
+## Finding 2 — fp32 s512 family: clean-DB search variance unsamples the goldens; evidence-pick then deploys a worse measured best (q_proj +10%, kv_proj +10%, gate_up +20%)
 
-**Recommendation:** fold into 2(a)'s measured-evidence work, and refit the analytic weights now that the dynM goldens
-are recorded. Also worth a 30-minute look: why `eval prior`'s rank-0 and the live deploy disagree on this shape —
-if the deploy path stamps different `S_*`/`D_*` features than `Sample.from_golden`, every eval rank this report cites
-is an approximation of the thing that actually picks kernels.
+q_proj.s512, kv_proj.s512 and gate_up_proj.s512 are all worse with the same signature: `eval variants` shows the
+deploy pick at measured rank 1 (or the only -O3-evidenced config) — evidence-pick did its job — but the golden's
+config is **absent from the measured set** (21–39 measured configs per kernel; grepping `--top 0` for the golden's
+knob row finds nothing). Two of these goldens are the *previous sweep's own wins* (q_proj.s512's `BM16 BK32 RING4`,
+gate_up.s512's −37% `FM10 FN4 SPLITK1 RING3`): the accumulated DB that contained them was wiped by `--clean`, and
+this sweep's patience-bounded re-search took different trajectories (the learned prior ranks the q_proj.s512 golden
+3/1008 — shallow — yet the inner search still never benched it before patience ran out; kv_proj.s512's ranks 140
+learned / 331 analytic, a genuine mispricing on top).
+
+**Recommendation:** seed the inner search with the recorded golden configs. `tune --dataset golden` knows exactly
+which shape it is tuning and what the golden knobs are — force-bench each recorded golden as the first variant(s) of
+its op's inner search. Cost is one bench per golden entry (~30 s across the whole sweep); benefit is that
+evidence-pick can never deploy worse than the recorded golden after a clean tune, and "worse" findings would then
+*only* mean real regressions. This also stops wins from silently un-happening across sweeps (gate_up.s512's −37%
+existed this morning, was recorded, and is now unreachable again purely by sampling luck).
+
+## Finding 3 — big fp32 squares: FM misorder within shallow ranks persists (square.1024 +9%, square.4096 +11%)
+
+square.1024 deploys `FM10 RING3` vs golden `FM14/FM8 RING2/4` (learned ranks 3 and 47 for its two entries);
+square.4096 deploys `FM28` vs golden `FM10` (learned rank 50, `vs gold` 1.00x — the -O3 reservoir number says
+parity, the live A/B says +11%). The previous sweep's recommendation to represent the big-FM regime in the analytic
+fit was applied (FM26-class analytic ranks improved 121→147 vs 394 learned previously), but the searched-and-measured
+sets again don't contain the goldens (same mechanism as finding 2 at lower stakes). Covered by finding 2's
+golden-seeding recommendation; no separate action.
+
+## Finding 4 — the A/B knob columns hide planner-derived knobs that differ (WARPSPEC), and gate_up_proj.s128's golden was pinning the slow choice
+
+gate_up_proj.s128's greedy pick benched **−15%** vs a golden row showing *identical* knob columns — only `block`
+(160 vs 128) and `regs` betrayed the difference. `eval golden` resolved it: `WARPSPEC True/False`. The pick's variant
+space (`eval variants`) has no WARPSPEC column at all — in the fp32 thread tier it is planner-derived, not searched —
+while the YAML entry recorded `WARPSPEC: false` from an earlier era, actively pinning the kernel away from the
+warp-specialized form the planner now prefers. The fix was to drop the pin (the replacement entry records only the
+search knobs), verified at 24.0 µs.
+
+**Recommendation:** two small ones. (a) The `run --golden`/`--ab` knob table should add a column for any knob that
+*differs* between the greedy pick's resolved config and a golden row even when it isn't in the searched space —
+block-size archaeology shouldn't be needed to see a WARPSPEC diff. (b) Audit the remaining `WARPSPEC: false` pins
+(square.2048, square.4096 static) — they may be pinning those shapes away from better planner-derived forms too.
+
+## Finding 5 — `eval variants`' ◄ pick marker disagrees with the actual deploy when no -O3 evidence exists
+
+For the small s32/s128 kernels (no -O3 reservoir rows at all — e.g. `k_matmul_60e20f`, `2f6d1b`, `39c474`,
+`aaa3b2`), the ◄ marker lands on `FM6 FN4` rows while the live deploy (and `eval golden`'s found column) picks
+`FM4 FN2`. With no evidence, deploy argmins the model over the **full enumeration** while the variants view argmins
+over the **measured rows only** — both labeled "the prior's pick". Harmless this sweep (the live picks beat the
+goldens anyway) but it makes the view's `pick: rank N` line untrustworthy exactly when it's needed. Also from the
+same neighborhood: kernels this small never get -O3 re-bench rows despite the 10%-of-best tolerance band — worth a
+look at whether the re-bench is failing or the reservoir is dropping them.
+
+**Recommendation:** make the ◄ marker call the same `Prior.pick` path the deploy uses (full enumeration, evidence
+first), and flag when the resulting config is unmeasured instead of silently marking the nearest measured row.
 
 ## Workflow notes
 
-- **Tune wall time**: 52 min for 29 targets (previous: 40 min for 23). The dynM shapes are mid-cost. The fp16 squares
-  remain pure waste until finding 1 is fixed (their goldens are unreachable by construction) — a
-  `--kernel`-exclusion would save ~10 min per sweep.
-- **Thermal drift dominates absolute µs; ratios are solid.** Pass 1 vs pass 2 absolute numbers differ ~10% uniformly
-  (pass 2 hot), while within-run greedy/golden ratios agree to ≤3% on all 16 re-run shapes. Two consequences: (a) the
-  recorded `deplodock_us` of any entry is a ±10% thermal lottery — this morning's dynM seeds turned out to be hot-state
-  numbers (their pass-2 live re-bench matches the YAML to 0.2 µs); (b) the previous sweep's "≤1.5% spread" claim
-  held within a thermal state, not across invocations. Proposal: categorize on ratios only (this sweep did), and have
-  the A/B table print the same-run eager µs beside each row so a recorded ratio-to-reference survives thermal drift.
-- **`eval variants` kernel-name collisions persist** (repeat note, unfixed): the k_matmul_207791 group shows fp32
-  OVERHANG rows at 14–20 µs that belong to neither square.512 (9.8 µs live) nor square.512.fp16 (5.1 µs); 1cd565's
-  group doesn't match q_proj.s128's live numbers either. Findings 2/4/6 leaned on the groups that were verifiably
-  clean (latencies match the live A/B). The view still needs a ShapeKey subgrouping or `--shape` filter.
-- **`eval prior`'s `vs gold` stale denominators persist** (repeat note): entries not touched this sweep keep
-  pre-capture / hot-state numbers (down_proj.s32's 0.85x, q_proj.s512.dynM's 1.66x are artifacts). The thermal note
-  above makes a one-shot re-record pass less attractive than switching the column to a same-run ratio.
-- **reduce/pointwise goldens still unsweepable** (repeat note, unfixed): `tune --dataset golden` and `run --golden`
-  cover only matmul shapes; the 5 reduce/pointwise entries are silently outside the loop.
-- **A/B remains 29 + 16 cold process launches** (~45 min total). The previous note proposing an in-process
-  `run --bench --dataset golden` loop with machine-readable per-shape output stands — this sweep again assembled the
-  outcome table by awk-parsing 45 logs.
-- **Fixed since the previous reports and held**: (a) the dynM eval-view fixes from the seed report (static-trace
-  mismatch + OVERHANG list/tuple false-flags) — all six dynM rows now show exact or single-knob diffs in
-  `eval golden`, matching the live A/Bs; (b) fp16 shapes now appear in `eval prior --dataset golden`'s rank list
-  instead of being silently dropped (they rank 58–288, which is finding 1's knock-on made visible — exactly what the
-  previous sweep's note asked for).
+- **The A/B pass collapsed from ~45 min to ~3.5 min** because it ran right after the tune with a hot cubin cache
+  (~7 s per shape, 29 shapes). The previous report's "in-process `run --bench --dataset golden` loop" proposal is
+  much less urgent now; sequencing A/B directly after tune is the cheap fix. Three full passes cost ~10 min total,
+  which made the noise-floor confirmation (step 4) painless for the first time.
+- **Ratios were rock-solid across passes** (≤2% drift on 28/29 shapes; absolute µs steady too — back-to-back runs,
+  one thermal state). The exception: o_proj.s512's greedy bench was bimodal (49.5 / 53.2 / 53.3 µs across passes,
+  same kernel) — categorized worse-marginal on the 2-of-3 majority.
+- **`eval golden` is now the WARPSPEC oracle** (finding 4): the live A/B table hid the only differing knob, and
+  `eval golden` exposed it. Until finding 4(a) is fixed, run `eval golden` before recording any "same-knobs but
+  faster" result — a hidden planner-derived diff may be the real story.
+- **Kernel-name collisions persist** (third report in a row): square.NNNN and square.NNNN.fp16 share kernel names
+  (`bed174`, `180e20`, `262948`, `207791`), so their `eval variants` groups interleave fp32 FK-split rows with
+  fp16 warp-tier rows. This sweep's finding-1 evidence had to come from the tune log (grepping per-target BK
+  histograms) because the variants view couldn't separate the tiers. The ShapeKey-subgrouping / `--shape` filter
+  proposal stands, now with a concrete victim.
+- **The tune log was the only source for "which knob values were ever offered"** (finding 1's BK histograms). A
+  per-op enumeration summary — even just min/max per knob in `eval variants`' header — would have answered it in
+  one command.
+- **Fixed since the previous report and held**: (a) the evidence-pick work (its findings 2/4/5/6) — verified across
+  every kernel with -O3 reservoir rows; (b) the fp16 TMA+WARPSPEC launch crash (its finding 1) — zero
+  CUDA_ERROR_INVALID_VALUE rows this sweep, the fp16 golden rows bench fine; (c) fp16 shapes still appear in
+  `eval prior` rank lists (held). **Not fixed**: kernel-name collisions (above); reduce/pointwise goldens still
+  outside the tune/A-B loop (third report in a row).
+- The `--clean` sweep cost finding 2's regressions: two recorded wins became unreachable again because the DB that
+  knew about them was wiped and the re-search didn't re-find them. Until golden-seeding lands, consider running
+  routine sweeps *without* `--clean` (accumulate) and reserving `--clean` for prior-hygiene checks.

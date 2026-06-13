@@ -136,7 +136,8 @@ Everything in steps 1–7 applies unchanged — the spec is **part of the config
   the join failed.
 - The cold `AnalyticPrior` ranks `.dynM` shapes under a dedicated masked-tier weight set (`_W_A_DYN`, selected
   on the stamped `S_ext_n_symbolic_axis`), fit by `scripts/golden_knob_heuristics.py` over the recorded dynamic
-  goldens (2026-06-12 refit: median cold rank 0). Re-run the script after recording new `.dynM` goldens — it
+  goldens (2026-06-12 evening refit: five of eight dynM rows rank ≤1, median ~6). Re-run the script after
+  recording new `.dynM` goldens — it
   prints both `_W_A` and `_W_A_DYN` to paste into `search/prior/analytic.py`.
 
 ## Step 6 — Validate
