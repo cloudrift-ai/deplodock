@@ -20,6 +20,8 @@ from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 from deplodock.compiler.pipeline import Pipeline
 
+from ..conftest import from_pretrained_or_skip
+
 
 def _seq_len_dim(*, min: int = 5, max: int = 4096):
     """``torch.export.Dim('seq_len')`` instance for tests below.
@@ -345,7 +347,7 @@ def test_qwen_whole_model_dynamic_compiles_and_matches_eager():
     from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
     config.num_hidden_layers = 1
     model = AutoModel.from_config(config).float().eval()
 
@@ -415,7 +417,7 @@ def test_qwen_layer_dynamic_compiles_and_matches_eager():
     from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
     config.num_hidden_layers = 1
     model = AutoModel.from_config(config).float().eval()
 
@@ -471,7 +473,7 @@ def test_qwen_whole_model_dynamic_traces():
     from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(0)
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
     config.num_hidden_layers = 1
     model = AutoModelForCausalLM.from_config(config).float().eval()
 

@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-from ..conftest import requires_cuda
+from ..conftest import from_pretrained_or_skip, requires_cuda
 
 
 def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str = "cuda"):
@@ -35,7 +35,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     from deplodock.compiler.trace.torch import trace_module
 
     torch.manual_seed(42)
-    config = AutoConfig.from_pretrained(model_id)
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, model_id)
     config.num_hidden_layers = 1
     model = AutoModelForCausalLM.from_config(config).float()
     block = model.model.layers[0].eval()

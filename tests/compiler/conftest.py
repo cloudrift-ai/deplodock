@@ -243,3 +243,19 @@ def run_two_level(graph, **kwargs):
     from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
 
     return asyncio.run(run_two_level_tune(graph, **kwargs))
+
+
+def from_pretrained_or_skip(loader, *args, **kwargs):
+    """Run a HuggingFace ``from_pretrained`` download, skipping the test on a Hub
+    connection / rate-limit failure.
+
+    CI runners regularly hit HTTP 429 (Too Many Requests) from huggingface.co —
+    transformers retries then wraps it as ``OSError("We couldn't connect …")``.
+    That's an environment issue, not a code regression, so the network-dependent
+    e2e / trace tests skip rather than hard-fail. ``loader`` is e.g.
+    ``AutoConfig.from_pretrained``; ``args[0]`` is the model id (for the message)."""
+    try:
+        return loader(*args, **kwargs)
+    except OSError as exc:  # transformers wraps 429 / connection errors as OSError here
+        model = args[0] if args else kwargs.get("pretrained_model_name_or_path", "?")
+        pytest.skip(f"HuggingFace Hub unavailable for {model} (likely rate-limited): {exc}")
