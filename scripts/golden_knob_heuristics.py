@@ -80,13 +80,23 @@ def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dic
     return base
 
 
-def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]]]]:
+def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
     """Reconstruct each matmul golden's candidate enumeration (both tiers), pin the
     golden's index, and featurize every row. Returns ``(name, tier, golden_idx,
     feats)`` where ``tier`` is ``"thread"``/``"warp"`` and ``feats`` is the per-row
-    ``D_*`` (+ ``MMA_tier``) feature dict."""
+    ``D_*`` (+ ``MMA_tier``) feature dict.
+
+    Each golden is reconstructed under its OWN card's context
+    (``Context.from_target(cap, gpu_name=…)``, mirroring ``Sample.from_golden``):
+    the multi-GPU golden set spans cards that differ in compute capability AND in
+    SM count at the same cap (RTX 5090 = 170 vs RTX PRO 6000 = 188 vs RTX 4090 =
+    128 SMs, the latter at sm_89), so both the candidate enumeration (cp.async /
+    TMA tiers gate on cap) and the ``H_*`` / ``D_*`` occupancy features must use the
+    recording card's regime — not one global cap — for the rank objective to match
+    the deployed per-card featurization."""
     cases = []
     for g in GOLDEN_CONFIGS:
+        ctx = Context.from_target(tuple(g.compute_cap), gpu_name=g.gpu_name)
         if isinstance(g, ReduceGoldenConfig):
             # The reduce's free axis (the ``M`` rows) maps to the planner's N axis
             # (the tuned ``FN`` register tile sweeps it), so enumerate E_M=1, E_N=M.
@@ -232,14 +242,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--samples", type=int, default=20000, help="random weight vectors to try")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--cap", type=int, default=12, help="compute capability major (12 == sm_120 / RTX 5090)")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    ctx = Context.from_target((args.cap, 0))
 
-    print(f"Building golden dataset (sm_{args.cap}0) ...")
-    cases = build_cases(ctx)
+    print("Building golden dataset (each golden under its own card's context) ...")
+    cases = build_cases()
     names = sorted({k for _, _, _, feats in cases for f in feats for k in f})
     static_cases = [c for c in cases if c[1] != "dyn"]
     dyn_cases = [c for c in cases if c[1] == "dyn"]
