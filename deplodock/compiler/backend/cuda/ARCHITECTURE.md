@@ -167,6 +167,18 @@ a respawn + one resend before surfacing as `bench worker died during request
 send`. Phase A of the tune-stabilization work; see
 `tests/compiler/backend/test_bench_worker_recovery.py`.
 
+**Async sibling for multi-GPU tune.** `_AsyncBenchWorker` / `benchmark_program_isolated_async(...)` drive the *same*
+`_bench_worker.py` subprocess protocol (`<8-byte LE length><pickle>`) over `asyncio` streams instead of blocking
+`select` — so one event loop can keep N device-pinned workers benching concurrently (`tune --gpus`, see
+`pipeline/ARCHITECTURE.md` → *Per-kernel GPU parallelism*). The wall-clock cap is `asyncio.wait_for` (same SIGKILL +
+respawn recovery contract); a stale-worker send race respawns and retries once, exactly as the sync worker.
+`CudaBackend(device_id=i)` lazily owns one such worker and exposes `benchmark_async` (always isolated, requires
+`bench_wall_timeout_s`). The device pin is a **per-worker spawn-env overlay** — `CUDA_VISIBLE_DEVICES=<id>` (so the
+child's logical device 0 *is* that GPU; every argumentless `cp.cuda.Device()` resolves correctly) plus, when a base
+`DEPLODOCK_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on different GPUs take distinct `FileLock`s
+instead of serialising on one. The overlay never mutates the parent `os.environ` (all slots share one event-loop
+thread). See `tests/compiler/backend/test_async_bench_worker.py`.
+
 `iter_once` (the per-iter sample loop) rejects a `cp.cuda.get_elapsed_time`
 reading of `<= 0.0` as `bench_fail` instead of accepting it as a 0µs sample.
 CUDA event timing has sub-µs resolution and any real launch consumes at least

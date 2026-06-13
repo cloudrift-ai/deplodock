@@ -17,6 +17,7 @@ from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
 from deplodock.compiler.backend.cuda.program import (
     benchmark_program,
     benchmark_program_isolated,
+    benchmark_program_isolated_async,
     run_program,
     run_program_debug,
 )
@@ -76,6 +77,7 @@ class CudaBackend(Backend):
         bench_compile_timeout_s: float = 30.0,
         bench_run_timeout_s: float = 10.0,
         tune_db: Path | str | None = None,
+        device_id: int | None = None,
     ) -> None:
         if debug is None:
             debug = config.debug_enabled()
@@ -103,6 +105,25 @@ class CudaBackend(Backend):
         # open if the file exists. Explicit ``Path`` → use that file
         # (open if it exists; silently skip otherwise).
         self.tune_db = _resolve_tune_db(tune_db)
+        # Physical GPU this backend's async bench worker is pinned to (multi-GPU
+        # tune). ``None`` → unpinned (default device). The pinned worker is the
+        # device-selection seam: ``benchmark_async`` drives it so one event loop
+        # can keep N GPUs benching concurrently.
+        self.device_id = device_id
+        self._async_worker_obj = None  # lazily spawned on first benchmark_async
+
+    def _async_worker(self):
+        from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker  # noqa: PLC0415
+
+        if self._async_worker_obj is None:
+            self._async_worker_obj = _AsyncBenchWorker(device_id=self.device_id)
+        return self._async_worker_obj
+
+    def close_async_worker(self) -> None:
+        """SIGKILL this backend's async bench worker, if any (driver teardown)."""
+        if self._async_worker_obj is not None:
+            self._async_worker_obj.close()
+            self._async_worker_obj = None
 
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
@@ -209,6 +230,44 @@ class CudaBackend(Backend):
                     run_timeout_s=self.bench_run_timeout_s,
                     capture_graphs=capture_graphs,
                 )
+        return BenchmarkResult(
+            time_ms=result.time_ms,
+            min_ms=result.min_ms,
+            num_launches=result.num_launches,
+            per_launch=result.per_launch,
+            captured=result.captured,
+            e2e_ms=result.e2e_ms,
+            e2e_min_ms=result.e2e_min_ms,
+        )
+
+    async def benchmark_async(
+        self,
+        compiled: Graph,
+        *,
+        warmup: int = 5,
+        num_iters: int | str = 20,
+        nvcc_flags: str | None = None,
+        capture_graphs: bool = True,
+    ) -> BenchmarkResult:
+        """Async, always-isolated bench for the parallel tune driver
+        (``two_level.inner_reward``). Drives this backend's device-pinned async
+        worker so one event loop keeps N GPUs benching concurrently. Requires
+        ``bench_wall_timeout_s`` (the tune backend always sets it) — there is no
+        in-process async path (``on_iter`` interleaving stays on the sync
+        :meth:`benchmark`)."""
+        if self.bench_wall_timeout_s is None:
+            raise RuntimeError("benchmark_async requires bench_wall_timeout_s (the autotune backend sets it)")
+        result = await benchmark_program_isolated_async(
+            compiled,
+            worker=self._async_worker(),
+            wall_timeout_s=self.bench_wall_timeout_s,
+            warmup=warmup,
+            num_iters=num_iters,
+            compile_timeout_s=self.bench_compile_timeout_s,
+            run_timeout_s=self.bench_run_timeout_s,
+            nvcc_flags=nvcc_flags,
+            capture_graphs=capture_graphs,
+        )
         return BenchmarkResult(
             time_ms=result.time_ms,
             min_ms=result.min_ms,

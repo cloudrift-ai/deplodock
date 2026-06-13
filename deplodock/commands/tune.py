@@ -90,6 +90,24 @@ def register_tune_command(subparsers):
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --bench random inputs (default: 0).")
     parser.add_argument(
+        "--gpus",
+        type=int,
+        default=None,
+        help=(
+            "Tune the post-fusion kernels concurrently across this many GPUs (devices 0..N-1): one in-flight "
+            "bench per GPU on a single event loop. Default: single-GPU (serial, behaviorally identical). "
+            "Bounded by the number of unique kernels; devices must be homogeneous. ``--devices`` overrides."
+        ),
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help=(
+            "Comma-separated GPU ids to tune across (e.g. ``0,1,3``), the explicit form of ``--gpus``. "
+            "Devices must be homogeneous (one perf key per tune). Default: single-GPU."
+        ),
+    )
+    parser.add_argument(
         "--bench-backends",
         default="eager,tcompile,deplodock",
         help=(
@@ -122,26 +140,71 @@ def _tune_offline(args):
     sys.stderr.write(diagnostics.golden_prior_eval(prior) + "\n")
 
 
-def _tune_backend():
+def _tune_backend(device_id: int | None = None):
     """The autotune-sweep ``CudaBackend``: benches each variant in a SIGKILL-able
     ``_bench_worker`` **subprocess** (``bench_wall_timeout_s`` set → the isolated
-    path in ``backend.benchmark``), so a wedged kernel dies with the worker and the
-    **parent** CUDA stream stays clean. Tight per-variant budgets: tune benches
-    isolated single kernels at -Xcicc -O1 (fast), so 2 s compile / 2 s run is ample
-    and the 6 s wall SIGKILLs any runaway."""
+    path in ``backend.benchmark`` / ``benchmark_async``), so a wedged kernel dies
+    with the worker and the **parent** CUDA stream stays clean. Tight per-variant
+    budgets: tune benches isolated single kernels at -Xcicc -O1 (fast), so 2 s
+    compile / 2 s run is ample and the 6 s wall SIGKILLs any runaway. ``device_id``
+    pins the async bench worker to a physical GPU (multi-GPU tune)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0)
+    return CudaBackend(bench_compile_timeout_s=2.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=6.0, device_id=device_id)
 
 
-def _tune_one(args, *, backend, db, ctx, dump):
+def _resolve_devices(args) -> list[int | None]:
+    """Resolve ``--gpus`` / ``--devices`` into a device-id list (``--devices`` wins).
+    Default ``[None]`` → a single unpinned slot = today's serial behavior. Two or
+    more devices must be homogeneous — the tune keys every perf row on one probed
+    ``ctx``, so mixed compute capabilities would corrupt the per-op cache."""
+    if args.devices:
+        try:
+            devices: list[int | None] = [int(x) for x in args.devices.split(",") if x.strip() != ""]
+        except ValueError:
+            logger.error("--devices must be comma-separated GPU ids, e.g. 0,1,3")
+            sys.exit(2)
+    elif args.gpus is not None:
+        if args.gpus < 1:
+            logger.error("--gpus must be >= 1")
+            sys.exit(2)
+        devices = list(range(args.gpus))
+    else:
+        return [None]
+    if len(devices) <= 1:
+        return devices or [None]
+    _require_homogeneous_devices(devices)
+    return devices
+
+
+def _require_homogeneous_devices(devices: list[int | None]) -> None:
+    try:
+        import cupy as cp
+    except Exception:  # noqa: BLE001 — no cupy → can't probe; let the bench surface any mismatch
+        return
+    caps = {}
+    for d in devices:
+        try:
+            props = cp.cuda.runtime.getDeviceProperties(d)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("--devices: GPU %s not available (%s)", d, exc)
+            sys.exit(2)
+        caps[d] = (props["major"], props["minor"])
+    if len(set(caps.values())) > 1:
+        logger.error("--devices must be homogeneous (one perf key per tune); got compute capabilities %s", caps)
+        sys.exit(2)
+
+
+def _tune_one(args, *, backends, db, ctx, dump):
     """Trace ``args.code`` / ``args.input`` and run the two-level tune on that one
     graph; return ``(result, bench_bundle)``. Manages the live progress bar (closed
     in ``finally``) and prints the per-op ``done`` summary. Lets ``KeyboardInterrupt``
     and the saturated-queue ``RuntimeError`` (dirty parent stream) **propagate** so
     the caller decides how to exit — called once per target by ``handle_tune``'s
     loop (one shape or the whole golden set). Benching itself is subprocess-isolated
-    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape."""
+    (see ``_tune_backend``), so the parent process is safe to reuse shape-to-shape.
+    ``backends`` is the device-pinned pool (one per GPU; single-element by default)
+    fanning the inner per-kernel search across GPUs."""
     import time
 
     from deplodock.commands.tune_progress import TuneProgress
@@ -164,7 +227,7 @@ def _tune_one(args, *, backend, db, ctx, dump):
             graph,
             ctx=ctx,
             db=db,
-            backend=backend,
+            backends=backends,
             patience=patience,
             ucb_c=args.ucb_c,
             explore_eps=explore_eps,
@@ -271,9 +334,13 @@ def handle_tune(args):
         _clean_caches(db_path)
     db = SearchDB(path=db_path)
     logger.info("Tuning DB: %s", db_path)
-    # One bench worker (subprocess-isolated) + one prior shared across every target —
-    # benching can't dirty the parent, so a single long-lived process loops cleanly.
-    backend = _tune_backend()
+    # One device-pinned bench worker per GPU (subprocess-isolated) + one prior shared
+    # across every target — benching can't dirty the parent, so a single long-lived
+    # process loops cleanly. ``[None]`` (default) = one unpinned worker = serial.
+    devices = _resolve_devices(args)
+    backends = [_tune_backend(device_id=d) for d in devices]
+    if len(backends) > 1:
+        sys.stderr.write(f"[tune] per-kernel parallel across {len(backends)} GPUs: {[d for d in devices]}\n")
     ctx = Context.probe()
 
     multi = len(targets) > 1
@@ -286,7 +353,7 @@ def handle_tune(args):
             sys.stderr.write(f"\n[tune] === {i + 1}/{len(targets)}: {label} → {code} ===\n")
         dump, tmp_dump = _bench_dump(args)
         try:
-            result, bench_bundle = _tune_one(args, backend=backend, db=db, ctx=ctx, dump=dump)
+            result, bench_bundle = _tune_one(args, backends=backends, db=db, ctx=ctx, dump=dump)
         except KeyboardInterrupt:
             # Per-op bests already landed in the DB as they were measured, so a re-run resumes.
             sys.stderr.write(f"\n[tune] interrupted{f' at {label}' if multi else ''} — partial per-op results are in the DB\n")

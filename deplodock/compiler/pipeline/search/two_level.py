@@ -56,6 +56,7 @@ whole op, which would suppress exactly that prior-driven re-exploration.)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -226,7 +227,8 @@ def inner_reward(
     *,
     ctx: Context,
     db: SearchDB,
-    backend,
+    backend=None,
+    backends=None,
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     explore_eps: float = 0.0,
@@ -236,6 +238,15 @@ def inner_reward(
 ) -> InnerReward:
     """Tune every post-fusion kernel of ``fused_graph`` in its own single-node
     slice and return ``Σ best-per-op time`` — the outer terminal reward.
+
+    With ``backends`` (a list of device-pinned :class:`CudaBackend`s, one per
+    GPU) the unique kernels are tuned **concurrently** — each op's inner search
+    runs on its own slot via :meth:`Pipeline.tune_async` on a single event loop
+    (one in-flight bench per GPU). Single-thread asyncio: the shared ``db`` /
+    ``prior`` are touched only between bench ``await``s, so no locks. The default
+    single ``backend`` is a one-slot pool whose coroutines acquire the lone
+    worker in ``op_idx`` order → strictly sequential, byte-identical to the old
+    serial loop (in-flight prior refit in op order included).
 
     ``prior`` (a single shared
     :class:`~deplodock.compiler.pipeline.search.prior.Prior`, or ``None``) drives
@@ -266,16 +277,34 @@ def inner_reward(
     Multiplicity is preserved: ``total_us`` weights each unique kernel's best
     by its node count, so the outer MCTS reward is bit-for-bit identical to
     the per-node-iterated total."""
+    pool = list(backends) if backends else [backend]
+    return asyncio.run(
+        _inner_reward_async(
+            fused_graph,
+            ctx=ctx,
+            db=db,
+            pool=pool,
+            patience=patience,
+            ucb_c=ucb_c,
+            explore_eps=explore_eps,
+            seed=seed,
+            progress=progress,
+            prior=prior,
+        )
+    )
+
+
+async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, explore_eps, seed, progress, prior) -> InnerReward:
+    """Async core of :func:`inner_reward`: one coroutine per unique kernel over a
+    slot queue of ``len(pool)`` device-pinned backends (one in-flight bench per
+    slot). Single event loop, single thread — ``db`` / ``prior`` mutations sit
+    between bench ``await``s, so they're atomic with no locks."""
     from collections import OrderedDict  # noqa: PLC0415
 
     from deplodock.compiler.pipeline.pipeline import variant_label  # noqa: PLC0415
 
     ctx_key = ctx.structural_key()
-    backend_name = getattr(backend, "name", "cuda")
-    total = 0.0
-    ok = True
-    per_op: list[OpResult] = []
-    prior_summaries: list[str] = []
+    backend_name = getattr(pool[0], "name", "cuda")
     # Group structurally-identical LoopOps under one ``op_cache_key`` —
     # insertion order = first occurrence (drives the progress tail name).
     # Ops with no cache key are unreachable through the bench path so they
@@ -292,67 +321,103 @@ def inner_reward(
             unique[key] = (nid, op, 1)
     if progress is not None:
         progress.start_terminal(len(unique))
-    for op_idx, (key, (nid, op, count)) in enumerate(unique.items()):
+
+    # Slot queue: each coroutine pops a device-pinned backend, benches its op's
+    # whole inner search on it, returns it. ``len(pool)`` benches run at once.
+    slots: asyncio.Queue = asyncio.Queue()
+    for b in pool:
+        slots.put_nowait(b)
+    results: dict[int, OpResult] = {}
+
+    async def tune_op(op_idx: int, key: str, nid: str, op, count: int) -> None:
         name = getattr(op, "name", None) or nid
-        if progress is not None:
-            progress.op_start(name)
-        sub = single_node_graph(fused_graph, nid)
-        # Base knobs the prior sees on every row: the LoopOp's ``S_*``
-        # structural identity (op-aware rows) + the ``H_*`` host/hardware
-        # regime (GPU + nvcc opt level), so one global prior spans ops and
-        # regimes from the feature vector alone.
-        base_knobs = {**ctx.features(), **op.knobs}
-        # Per-op RNG seed so each kernel's ε-greedy stream differs yet the whole
-        # run is reproducible (no wall-clock seeding).
-        inner = TuningSearch(
-            patience=patience,
-            ucb_c=ucb_c,
-            explore_eps=explore_eps,
-            seed=seed + op_idx,
-            prior_model=prior,
-            base_knobs=base_knobs,
-        )
-        for cand in Pipeline.build(LOWERING_PASSES).tune(sub, search=inner, ctx=ctx, backend=backend, db=db):
+        backend = await slots.get()
+        try:
             if progress is not None:
-                st = inner.last_stats
-                best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
-                progress.variant(
-                    name,
-                    variant_label(cand.graph),
-                    median_us=st.median if st is not None else None,
-                    status=inner.last_status or "",
-                    best_us=best_us,
-                )
-        # The inner MCTS's best reward is ``1 / min whole-slice total``
-        # (``_bench_terminal`` sums every CudaOp in the slice, so a split-K
-        # main + combine both count). Record that total under the LoopOp
-        # key so ``best_per_op_time`` reads the true per-op cost.
-        best_total = 1.0 / inner.tree.best_reward if inner.tree.best_reward > 0 else None
-        if best_total is not None:
-            # captured=True: the sweep benches under graph capture by default, so
-            # this Σ-best bookkeeping row derives from captured measurements (a
-            # rare per-variant capture fallback can contaminate the min — accepted;
-            # the capture-wins overwrite then lets a re-tune upgrade it).
-            db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total), captured=True)
-        if prior is not None:
-            # Stream this op's value-of-position rows (-O1) plus any -O3 winner
-            # samples into the global (reservoir-bounded) dataset; refit +
-            # checkpoint once enough new rows accumulate (batched — see ``Prior``).
-            prior.add_rows(inner._collect_rows() + inner.o3_rows)
-            if prior.maybe_refit():
-                prior.checkpoint()
-        best = db.best_per_op_time(ctx_key, key, backend=backend_name)
-        per_op.append(OpResult(name=name, op_key=key, best_us=best, multiplicity=count))
-        # Multiplicity-weighted accumulation — a 24-layer RMSNorm contributes
-        # 24 × best, matching the per-node total before dedup.
-        if best is None:
+                progress.op_start(name, slot=op_idx)
+            sub = single_node_graph(fused_graph, nid)
+            # Base knobs the prior sees on every row: the LoopOp's ``S_*``
+            # structural identity (op-aware rows) + the ``H_*`` host/hardware
+            # regime (GPU + nvcc opt level), so one global prior spans ops and
+            # regimes from the feature vector alone.
+            base_knobs = {**ctx.features(), **op.knobs}
+            # Per-op RNG seed so each kernel's ε-greedy stream differs yet the run
+            # is reproducible AND execution-order-independent (no wall-clock seed):
+            # op ``op_idx`` always seeds ``seed + op_idx`` regardless of which slot
+            # or completion order it ran in.
+            inner = TuningSearch(
+                patience=patience,
+                ucb_c=ucb_c,
+                explore_eps=explore_eps,
+                seed=seed + op_idx,
+                prior_model=prior,
+                base_knobs=base_knobs,
+            )
+            async for cand in Pipeline.build(LOWERING_PASSES).tune_async(sub, search=inner, ctx=ctx, backend=backend, db=db):
+                if progress is not None:
+                    st = inner.last_stats
+                    best_us = (1.0 / inner.tree.best_reward) if inner.tree.best_reward > 0 else None
+                    progress.variant(
+                        name,
+                        variant_label(cand.graph),
+                        median_us=st.median if st is not None else None,
+                        status=inner.last_status or "",
+                        best_us=best_us,
+                        slot=op_idx,
+                    )
+            # The inner MCTS's best reward is ``1 / min whole-slice total``
+            # (``_bench_terminal`` sums every CudaOp in the slice, so a split-K
+            # main + combine both count). Record that total under the LoopOp
+            # key so ``best_per_op_time`` reads the true per-op cost.
+            best_total = 1.0 / inner.tree.best_reward if inner.tree.best_reward > 0 else None
+            if best_total is not None:
+                # captured=True: the sweep benches under graph capture by default, so
+                # this Σ-best bookkeeping row derives from captured measurements (a
+                # rare per-variant capture fallback can contaminate the min — accepted;
+                # the capture-wins overwrite then lets a re-tune upgrade it).
+                db.record_perf(ctx_key, key, backend=backend_name, status="ok", stats=_point_stats(best_total), captured=True)
+            if prior is not None:
+                # In-flight refit (single-threaded → no lock): stream this op's
+                # value-of-position rows (-O1) plus any -O3 winner samples into the
+                # global reservoir; refit + checkpoint once enough new rows
+                # accumulate (batched — see ``Prior``). Rows arrive in completion
+                # order, so the trained ``prior.json`` varies run-to-run; the per-op
+                # DB best below does not (distinct ``key`` per op).
+                prior.add_rows(inner._collect_rows() + inner.o3_rows)
+                if prior.maybe_refit():
+                    prior.checkpoint()
+            best = db.best_per_op_time(ctx_key, key, backend=backend_name)
+            results[op_idx] = OpResult(name=name, op_key=key, best_us=best, multiplicity=count)
+            if progress is not None:
+                progress.op_done(name, slot=op_idx)
+        finally:
+            slots.put_nowait(backend)
+
+    try:
+        await asyncio.gather(*[tune_op(i, key, nid, op, count) for i, (key, (nid, op, count)) in enumerate(unique.items())])
+    finally:
+        # SIGKILL each slot's async bench worker (the subprocess transports are
+        # bound to this event loop). Backend objects persist — their workers
+        # respawn on the next terminal's ``asyncio.run``.
+        for b in pool:
+            close = getattr(b, "close_async_worker", None)
+            if close is not None:
+                close()
+
+    # Accumulate in ``op_idx`` order so the reward / ``per_op`` order is
+    # execution-order-independent (the float sum is order-stable, matching serial).
+    total = 0.0
+    ok = True
+    per_op: list[OpResult] = []
+    for op_idx in range(len(unique)):
+        r = results[op_idx]
+        per_op.append(r)
+        if r.best_us is None:
             ok = False
-            total += _FAIL_US * count
+            total += _FAIL_US * r.multiplicity
         else:
-            total += best * count
-        if progress is not None:
-            progress.op_done(name)
-    return InnerReward(total_us=total, ok=ok, per_op=per_op, prior_summaries=prior_summaries)
+            total += r.best_us * r.multiplicity
+    return InnerReward(total_us=total, ok=ok, per_op=per_op, prior_summaries=[])
 
 
 def run_two_level_tune(
@@ -360,7 +425,8 @@ def run_two_level_tune(
     *,
     ctx: Context,
     db: SearchDB,
-    backend,
+    backend=None,
+    backends=None,
     patience: int,
     ucb_c: float = TuningSearch.DEFAULT_UCB_C,
     explore_eps: float = 0.0,
@@ -371,6 +437,10 @@ def run_two_level_tune(
     """Drive the outer structural search, scoring each terminal by
     :func:`inner_reward`, then greedy-assemble the DB-best kernels and bench
     the whole graph once for the separability check.
+
+    ``backends`` (a list of device-pinned :class:`CudaBackend`s) fans the inner
+    per-kernel search out across GPUs; the default single ``backend`` is the
+    one-slot serial pool.
 
     The outer drives a :class:`Run` directly (manual ``observe``)
     because its terminal reward comes from the inner tuning, not
@@ -418,6 +488,7 @@ def run_two_level_tune(
             ctx=ctx,
             db=db,
             backend=backend,
+            backends=backends,
             patience=patience,
             ucb_c=ucb_c,
             explore_eps=explore_eps,

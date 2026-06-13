@@ -81,6 +81,13 @@ class _CountingBackend:
             per.append(LaunchTime(idx=i, kernel_name=getattr(n.op, "kernel_name", "k"), time_ms=us / 1000.0, samples=(us / 1000.0,)))
         return BenchmarkResult(time_ms=sum(p.time_ms for p in per), num_launches=len(per), per_launch=per)
 
+    async def benchmark_async(self, graph, num_iters="auto") -> BenchmarkResult:
+        # The two-level driver benches through the async path (``Pipeline.tune_async``);
+        # the fake has no real I/O, so delegate to the deterministic sync bench. The
+        # signature mirrors ``benchmark`` exactly (no ``nvcc_flags``) so the -O3
+        # re-bench rejects the same way → identical bench counts to the sync path.
+        return self.benchmark(graph, num_iters=num_iters)
+
 
 def _matmul(g: Graph, prefix: str, M: int, K: int, N: int) -> str:
     a, b, c = f"{prefix}a", f"{prefix}b", f"{prefix}c"
@@ -238,6 +245,26 @@ def test_inner_reward_shares_identical_kernel() -> None:
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
 
 
+def test_inner_reward_parallel_matches_serial() -> None:
+    """The core multi-GPU invariant: tuning the unique kernels concurrently across
+    a pool of N device-pinned backends yields the SAME per-op bests and summed
+    reward as the one-slot serial path. Each op's search is seeded by ``op_idx``
+    (execution-order-independent) and the fake backend's latency keys off
+    ``op_cache_key`` (slot-independent), so completion order can't change the
+    result. ``prior=None`` keeps this off the learned-prior (catboost) path."""
+    fused = _fuse(_two_distinct_matmuls())
+    ctx = Context.from_target((8, 0))
+
+    serial = inner_reward(fused, ctx=ctx, db=SearchDB(), backend=_CountingBackend(), patience=_PATIENCE)
+    parallel = inner_reward(fused, ctx=ctx, db=SearchDB(), backends=[_CountingBackend(), _CountingBackend()], patience=_PATIENCE)
+
+    assert parallel.total_us == pytest.approx(serial.total_us)
+    assert parallel.ok == serial.ok
+    s_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in serial.per_op}
+    p_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in parallel.per_op}
+    assert p_by_key == s_by_key, "per-op bests must be identical regardless of slot count"
+
+
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
     """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
     keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
@@ -265,13 +292,13 @@ class _RecordingProgress:
     def start_terminal(self, n_ops: int) -> None:
         self.terminal_sizes.append(n_ops)
 
-    def op_start(self, name: str) -> None:
+    def op_start(self, name: str, *, slot: int = 0) -> None:  # noqa: ARG002
         self.ops.append(name)
 
     def variant(self, *a, **kw) -> None:  # noqa: ANN002
         pass
 
-    def op_done(self, name: str) -> None:
+    def op_done(self, name: str, *, slot: int = 0) -> None:
         pass
 
 

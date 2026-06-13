@@ -13,12 +13,14 @@ scratch. Launch order is ``graph.topological_order()``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os as _os
 import pickle
 import select
 import subprocess
+import sys as _sys
 import time as _time_module
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -1166,8 +1168,6 @@ class _BenchWorker:
         self._proc: subprocess.Popen | None = None  # noqa: UP007 — lazy-init sentinel
 
     def _spawn(self) -> None:
-        import sys as _sys  # noqa: PLC0415
-
         self._proc = subprocess.Popen(  # noqa: S603
             [_sys.executable, "-m", self._WORKER_MODULE],
             stdin=subprocess.PIPE,
@@ -1353,6 +1353,169 @@ def benchmark_program_isolated(
     and must use ``benchmark_program`` directly instead.
     """
     resp = _bench_worker().run_job(
+        {
+            "graph": graph,
+            "nvcc_flags": nvcc_flags,
+            "torch_spec": None,  # no torch comparison — pure deplodock bench
+            "kwargs": {
+                "warmup": warmup,
+                "num_iters": num_iters,
+                "compile_timeout_s": compile_timeout_s,
+                "run_timeout_s": run_timeout_s,
+                "capture_graphs": capture_graphs,
+            },
+        },
+        wall_timeout_s=wall_timeout_s,
+    )
+    return resp["result"]
+
+
+class _AsyncBenchWorker:
+    """Async sibling of :class:`_BenchWorker` for the parallel tune driver.
+
+    Drives the same ``_bench_worker`` subprocess protocol (``<8-byte LE
+    length><pickle>``, both directions) over asyncio streams, so one event
+    loop can keep N device-pinned workers benching concurrently — the
+    per-kernel multi-GPU autotune path (``two_level.inner_reward``).
+
+    Pin a worker to a physical GPU with ``device_id``: the spawn env gets
+    ``CUDA_VISIBLE_DEVICES=<id>`` (so the child's logical device 0 *is* that
+    GPU — every argumentless ``cp.cuda.Device()`` in the child resolves
+    correctly with no other call-site change) and, when a base
+    ``DEPLODOCK_GPU_LOCK`` is set, a per-device lock path so workers on
+    different GPUs take distinct ``FileLock``s instead of serialising. The
+    env overlay rides the child only — the parent's ``os.environ`` is never
+    mutated (it's shared by every slot on the one event-loop thread).
+
+    The wall-clock cap is :func:`asyncio.wait_for`; on overrun the child is
+    SIGKILLed and respawned on the next bench (same recovery contract as the
+    sync worker)."""
+
+    _WORKER_MODULE = "deplodock.compiler.backend.cuda._bench_worker"
+
+    def __init__(self, *, device_id: int | None = None) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._device_id = device_id
+
+    def _child_env(self) -> dict:
+        env = dict(_os.environ)
+        if self._device_id is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self._device_id)
+            from deplodock import config  # noqa: PLC0415
+
+            base = config.gpu_lock_path()
+            if base:
+                # Per-device lock so concurrent device-pinned workers don't
+                # serialise on one FileLock (the lock is taken inside the child).
+                env["DEPLODOCK_GPU_LOCK"] = f"{base}-{self._device_id}"
+        return env
+
+    async def _spawn(self) -> None:
+        self._proc = await asyncio.create_subprocess_exec(
+            _sys.executable,
+            "-m",
+            self._WORKER_MODULE,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self._child_env(),
+        )
+        logger.info("[bench-worker] spawned (async) pid=%s device=%s", self._proc.pid, self._device_id)
+
+    def _kill(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+    def close(self) -> None:
+        """Terminate the worker (driver teardown). The subprocess transport is
+        reaped when the event loop closes."""
+        self._kill()
+
+    async def _read_stderr_tail(self, proc: asyncio.subprocess.Process) -> str:
+        try:
+            data = await asyncio.wait_for(proc.stderr.read(), timeout=2.0)
+        except (TimeoutError, Exception):  # noqa: BLE001 — stderr drain is best-effort
+            return ""
+        return data.decode(errors="replace")[-500:]
+
+    async def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
+        """Send one request, read the response within ``wall_timeout_s`` (else SIGKILL
+        + raise ``RuntimeError``), and return the unpickled response. Mirrors
+        :meth:`_BenchWorker.run_job`: a stale-worker race on send respawns and retries
+        once; a response-side timeout / EOF is a hard error."""
+        request = pickle.dumps(request_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        frame = len(request).to_bytes(8, "little") + request
+        deadline = _time_module.perf_counter() + wall_timeout_s
+        for attempt in (0, 1):
+            if self._proc is None or self._proc.returncode is not None:
+                await self._spawn()
+            assert self._proc is not None  # for type narrowing
+            proc = self._proc
+            try:
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                proc.stdin.write(frame)
+                await asyncio.wait_for(proc.stdin.drain(), timeout=remaining)
+            except TimeoutError as exc:
+                self._kill()
+                raise RuntimeError(
+                    f"bench worker did not accept the request within {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned"
+                ) from exc
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                self._kill()
+                if attempt == 1:
+                    raise RuntimeError(f"bench worker died during request send: {exc}") from exc
+                logger.info("[bench-worker] stale async worker on send (%s) — respawning", exc)
+                continue
+
+            try:
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                header = await asyncio.wait_for(proc.stdout.readexactly(8), timeout=remaining)
+                n = int.from_bytes(header, "little")
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                body = await asyncio.wait_for(proc.stdout.readexactly(n), timeout=remaining)
+            except TimeoutError as exc:
+                self._kill()
+                raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned") from exc
+            except asyncio.IncompleteReadError as exc:
+                stderr_tail = await self._read_stderr_tail(proc)
+                self._kill()
+                raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail}") from exc
+
+            resp = pickle.loads(body)
+            if not resp.get("ok"):
+                raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
+            return resp
+        raise RuntimeError("bench worker unreachable")  # both attempts exhausted (defensive)
+
+
+async def benchmark_program_isolated_async(
+    graph: Graph,
+    *,
+    worker: _AsyncBenchWorker,
+    wall_timeout_s: float,
+    warmup: int = 5,
+    num_iters: int | str = 20,
+    compile_timeout_s: float | None = None,
+    run_timeout_s: float | None = None,
+    nvcc_flags: str | None = None,
+    capture_graphs: bool = True,
+) -> BenchmarkResult:
+    """Async mirror of :func:`benchmark_program_isolated`, benching through a
+    caller-supplied device-pinned ``worker`` so one event loop can drive N GPUs
+    concurrently. Same in-worker budgets + ``wall_timeout_s`` SIGKILL backstop."""
+    resp = await worker.run_job(
         {
             "graph": graph,
             "nvcc_flags": nvcc_flags,

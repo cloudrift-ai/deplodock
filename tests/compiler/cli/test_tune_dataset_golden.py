@@ -37,6 +37,8 @@ def _args(**over):
         bench_backends="eager,deplodock",
         warmup=10,
         iters=100,
+        gpus=None,
+        devices=None,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -136,7 +138,7 @@ def _stub_runtime(monkeypatch):
         return SimpleNamespace(best_reward=None, assembled=None), None
 
     monkeypatch.setattr(tune, "_tune_one", fake_tune_one)
-    monkeypatch.setattr(tune, "_tune_backend", lambda: object())
+    monkeypatch.setattr(tune, "_tune_backend", lambda device_id=None: object())
     monkeypatch.setattr(tune, "_bench_dump", lambda a: (None, None))
     monkeypatch.setattr(tune, "_clean_caches", lambda p: cleaned.append(p))
     monkeypatch.setattr(tune, "setup_pipeline_runtime", lambda a: None)

@@ -571,6 +571,25 @@ which suppressed exactly that prior-driven re-exploration.) The inner search rec
 (`Σ` over the slice's CudaOps, so a split-K main + combine both count) under the LoopOp key via `record_perf`;
 `best_per_op_time` prefers that direct row and otherwise walks the `lowering` chain down to the `cuda` terminal.
 
+**Per-kernel GPU parallelism (`--gpus N` / `--devices 0,1,2`).** Because the inner search tunes each unique kernel
+independently, the per-op loop fans out across GPUs. `inner_reward` is a thin sync wrapper around
+`_inner_reward_async`, which runs one coroutine per unique kernel over an `asyncio.Queue` of `len(pool)`
+device-pinned `CudaBackend`s — each pops a backend, drives its op's whole inner search via `Pipeline.tune_async`
+(an async-generator mirror of `tune` whose only `await` is the per-terminal bench, `_bench_terminal_async`), then
+returns the backend. So `len(pool)` benches run at once, one per GPU. **True single-thread asyncio**: every Python
+statement (lowering, DB writes, prior `add_rows` / `maybe_refit` / `checkpoint`) runs on the one event-loop thread
+and yields only at the bench `await`, so the shared `db` / `prior` need no locks — the in-flight refit is atomic
+between awaits. Each op seeds its `TuningSearch` by `seed + op_idx` (execution-order-independent) and the reward is
+a commutative `Σ`, so the per-op DB bests and `total_us` are byte-identical regardless of slot count; only the
+learned `prior.json` varies run-to-run (rows arrive in completion order). The **default single-GPU** path is a
+one-slot pool whose coroutines acquire the lone worker in `op_idx` order → strictly sequential, identical to the
+old serial loop. A backend pins its async worker to a physical GPU via the child spawn env
+(`CUDA_VISIBLE_DEVICES`, plus a per-device `DEPLODOCK_GPU_LOCK` suffix so workers don't serialise on one lock) —
+never mutating the parent `os.environ`. Parallelism is bounded by the unique-kernel count; devices must be
+homogeneous (the tune keys every perf row on one probed `ctx`). Each terminal's `asyncio.run` SIGKILLs its workers
+on exit (their subprocess transports bind to that loop); the backend objects persist and respawn on the next
+terminal. See `plans/let-s-make-a-plan-glimmering-mist.md`.
+
 **Driving the loop.** `deplodock tune <model_or_ir | --code EXPR>` probes a `Context`, opens the tuning database
 (default `~/.cache/deplodock/autotune.db`, overridable via `DEPLODOCK_TUNE_DB`), and calls `run_two_level_tune(...)`.
 On completion it prints one `done: N fused terminal(s) in Xs` line — the deployable numbers come from the optional
@@ -581,7 +600,8 @@ tuned op leaves plus a `<kernel> <current us> (best <best us>) <knobs>` tail. Th
 variable-length `pipeline.variant_label` knob string sits last, so the prefix up to the knobs stays put as the
 per-variant latency changes (only a new best, which is rare, shifts the trailing part — no flicker). It is threaded as an optional `progress=` through `run_two_level_tune` → `inner_reward`
 (duck-typed, so the search package keeps no dependency on `commands/`): one op leaf ticked per kernel, the tail updated
-per benched variant (read off `TuningSearch.last_stats`). `-v` disables the bar (the per-`[tune]` INFO lines show
+per benched variant (read off `TuningSearch.last_stats`). Under `--gpus N` the tail keys by a per-op `slot` and joins
+every in-flight kernel with ` | ` (one per device); single-GPU shows the one active kernel as before. `-v` disables the bar (the per-`[tune]` INFO lines show
 progress instead); `-q` is quiet (errors only). `--bench` re-benches the tuned winner at **-O3** (deployable, not the -O1 ranking pass) after tuning —
 the assembled full model **against the real torch module** (eager / `torch.compile` / Deplodock, via the bundle
 plumbed from `load_or_trace` → `commands/run.bench_full_model_real`; a symbolic graph benches the torch side on

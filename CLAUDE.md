@@ -91,7 +91,7 @@ same worker.
   dataset (no GPU, no benching) and print diagnostics — per-op **pick reachability** (does the prior's predicted-fastest
   config recover each op's measured-best config?), median ranking calibration (Spearman), and golden-matmul coverage. Use it to see
   whether the prior can actually reach the best configs it's been tuned on (`compiler/pipeline/search/prior/diagnostics.py`).
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--bench] [-q]` — **two-level** autotune (see
+- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--gpus N | --devices 0,1,2] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over structural forks (the graph-changing
   `frontend`+`loop` passes plus the pre-partition head of `lowering/tile`, where `005_split_demoted`'s keep-vs-split
   offer branches the outer tree — one terminal per kernel set; identical offer sites replay the trajectory's
@@ -101,7 +101,11 @@ same worker.
   single-node slice (post-partition `lowering` forks only, so `Σ_k n_k` benches not the product). Greedy `compile` /
   `run` deploy a structural option when the *trained* prior prices its kernel-set Σ cheaper (cold compiles never
   change kernel sets) — see `plans/structural-forks-in-two-level.md`. Per-op results key structurally
-  (`op_cache_key`) so they transfer/share. The inner search runs for
+  (`op_cache_key`) so they transfer/share. `--gpus N` / `--devices 0,1,2` fan the inner per-kernel search out
+  across GPUs — one in-flight bench per device-pinned `_AsyncBenchWorker` on a single asyncio event loop
+  (`two_level._inner_reward_async`); single-thread asyncio touches the shared DB / prior only between bench
+  `await`s, so no locks, and the default single-GPU path is the byte-identical one-slot serial case. Parallelism
+  is bounded by the unique-kernel count; devices must be homogeneous (one perf key per tune). The inner search runs for
   **every** op on every pass — never skipped on prior effort; replay is cheap, not gated: each benched terminal hits the
   per-variant `perf` cache, so an identical re-run (same prior) replays every variant with no GPU bench, while the
   ever-changing global prior can steer the same-patience search down a new trajectory and bench only the genuinely-new
