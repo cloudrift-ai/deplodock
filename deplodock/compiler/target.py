@@ -97,27 +97,19 @@ def compute_capability() -> tuple[int, int]:
 
 @functools.cache
 def live_device_features() -> dict[str, float]:
-    """Best-effort physical properties of the live CUDA device — SM count,
-    shared memory per SM / per block, register file, warp size — for the learned
-    prior's hardware-regime features (see :meth:`Context.features`). These are
-    SKU facts CUDA reports but compute-capability alone doesn't fix (an sm_120
-    laptop and an sm_120 RTX 5090 differ in SM count). Empty dict when cupy is
-    unavailable (GPU-less CI → the prior simply gets fewer regime features).
-    Cached — physical, target-independent, so :func:`set_target` need not clear it."""
-    try:
-        import cupy as cp
+    """Physical properties of the live CUDA device — SM count, shared memory per
+    SM / per block, register file, warp size — for the learned prior's
+    hardware-regime features (see :meth:`Context.features`). These are SKU facts
+    CUDA reports but compute-capability alone doesn't fix (an sm_120 laptop and an
+    sm_120 RTX 5090 differ in SM count). Delegates to
+    :func:`deplodock.gpu.probe_live_features`, which probes the live device via
+    cupy and, when none is visible (GPU-less CI / offline eval), falls back to the
+    **memorized** specs of :data:`deplodock.gpu.DEFAULT_GPU` — so offline hosts get
+    faithful per-SKU features instead of none. Cached — physical and
+    target-independent, so :func:`set_target` need not clear it."""
+    from deplodock import gpu  # noqa: PLC0415
 
-        props = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
-        return {
-            "sm_count": float(props["multiProcessorCount"]),
-            "smem_per_sm": float(props["sharedMemPerMultiprocessor"]),
-            "smem_per_block": float(props["sharedMemPerBlock"]),
-            "regs_per_block": float(props["regsPerBlock"]),
-            "warp_size": float(props["warpSize"]),
-        }
-    except Exception as e:  # pragma: no cover
-        _logger.debug("live_device_features query failed (%s)", e)
-        return {}
+    return gpu.probe_live_features()
 
 
 @functools.cache

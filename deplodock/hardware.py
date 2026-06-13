@@ -1,4 +1,11 @@
-"""Hardware lookup tables: GPU brand -> provider instance types."""
+"""Hardware lookup tables: GPU brand -> provider instance types.
+
+Physical GPU facts (PCI ids, compute capability, SM count, VRAM) live in the
+common :mod:`deplodock.gpu` registry; this module owns only the cloud-provisioning
+tables (instance types, zones, provisioning models) keyed by the same GPU name.
+"""
+
+from deplodock import gpu
 
 # GPU brand -> list of (provider, base_instance_type) in preference order.
 #
@@ -60,22 +67,9 @@ GPU_INSTANCE_TYPES = {
 }
 
 
-# Full GPU name -> short name for result filenames.
-GPU_SHORT_NAMES = {
-    "NVIDIA GeForce RTX 4090": "rtx4090",
-    "NVIDIA GeForce RTX 5090": "rtx5090",
-    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": "pro6000",
-    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": "pro6000",
-    "NVIDIA RTX PRO 6000 Blackwell Server Edition": "pro6000",
-    "NVIDIA L40S": "l40s",
-    "NVIDIA H100 80GB": "h100",
-    "NVIDIA H200 141GB": "h200",
-    "NVIDIA B200": "b200",
-    "NVIDIA A100 40GB": "a100",
-    "NVIDIA A100 80GB": "a100",
-    "AMD Instinct MI350X": "mi350x",
-    "NVIDIA Tesla V100 SXM3 32GB": "v100",
-}
+# Full GPU name -> short name for result filenames. Derived from the common GPU
+# registry (:mod:`deplodock.gpu`), the single source of truth for GPU identity.
+GPU_SHORT_NAMES = gpu.short_names()
 
 
 # GCP zones per GPU, tried in order. Falls back to config default.

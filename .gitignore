@@ -40,3 +40,6 @@ recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
 .claude/settings.local.json
 *-dump/
 .claude/scheduled_tasks.lock
+
+# Local-only analysis artifacts (priors / tune DBs / harvest dumps) — never commit
+_data/

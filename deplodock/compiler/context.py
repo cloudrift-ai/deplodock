@@ -17,51 +17,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock import config
+from deplodock import config, gpu
 
-# Per-block static-smem cap. Hard hardware limit since Maxwell (sm_50);
-# anything declared as ``__shared__`` at compile time must fit.
-# Universal across every arch we target.
-STATIC_SMEM_CAP = 48 * 1024
+# GPU hardware facts live in the common :mod:`deplodock.gpu` registry; these are
+# aliases so the long-standing context-local names keep working.
+#
+# ``STATIC_SMEM_CAP`` — per-block static-smem cap (hard hardware limit since
+# Maxwell; anything declared ``__shared__`` at compile time must fit; universal).
+# ``_MAX_DYNAMIC_SMEM_BY_CC`` — per-block dynamic-smem opt-in cap by cc
+# (``cudaDevAttrMaxSharedMemoryPerBlockOptin``). ``_TENSOR_CORE_GEN`` — coarse
+# tensor-core generation by cc for the learned prior's regime features.
+STATIC_SMEM_CAP = gpu.STATIC_SMEM_CAP
+_MAX_DYNAMIC_SMEM_BY_CC = gpu.MAX_DYNAMIC_SMEM_BY_CC
+_TENSOR_CORE_GEN = gpu.TENSOR_CORE_GEN
 
-# Fallback SM (streaming-multiprocessor) count when no live CUDA device is
-# present (GPU-less CI / offline eval). RTX 5090 / sm_120 = 170 — the device the
-# golden configs were measured on, so offline golden ranking matches. The live
-# count (``target.live_device_features``) overrides this in ``from_target`` /
-# ``probe``. Consumed by the occupancy-aware analytic prior (the ``D_*`` CTA /
-# waves features in ``knob.knob_features``, ranked by ``search/prior/AnalyticPrior``)
-# to size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
-DEFAULT_SM_COUNT = 170
-
-# Per-block dynamic-smem opt-in cap by compute capability. NVIDIA assigns
-# different sm_XX numbers to datacenter vs consumer SKUs within the same
-# arch family (sm_80 A100 vs sm_86 RTX 30xx; sm_90 H100 vs sm_120 RTX
-# 50xx), so this is keyed on cc, not "arch generation". Values from
-# ``cudaDevAttrMaxSharedMemoryPerBlockOptin``.
-_MAX_DYNAMIC_SMEM_BY_CC: dict[tuple[int, int], int] = {
-    (7, 5): 64 * 1024,
-    (8, 0): 163 * 1024,
-    (8, 6): 99 * 1024,
-    (8, 9): 99 * 1024,
-    (9, 0): 227 * 1024,
-    (10, 0): 227 * 1024,
-    (12, 0): 99 * 1024,
-}
-
-# Tensor-core generation by compute capability — Volta(1)/Turing(2)/Ampere+Ada(3)
-# /Hopper(4)/Blackwell(5). A coarse arch-capability axis for the learned prior's
-# regime features (e.g. which mma shapes / dtypes the SM can issue); unknown ccs
-# fall back to the major version.
-_TENSOR_CORE_GEN: dict[tuple[int, int], int] = {
-    (7, 0): 1,
-    (7, 5): 2,
-    (8, 0): 3,
-    (8, 6): 3,
-    (8, 9): 3,
-    (9, 0): 4,
-    (10, 0): 5,
-    (12, 0): 5,
-}
+# Fallback SM count when no live CUDA device is present (GPU-less CI / offline
+# eval) — the memorized count of the default card (RTX 5090 / sm_120 = 170, the
+# device the golden configs were measured on, so offline golden ranking matches).
+# The live count (``target.live_device_features`` → ``gpu.probe_live_features``)
+# overrides this in ``from_target`` / ``probe``. Consumed by the occupancy-aware
+# analytic prior (the ``D_*`` CTA / waves features in ``knob.knob_features``) to
+# size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
+DEFAULT_SM_COUNT = gpu.DEFAULT_GPU.sm_count
 
 
 def _env_compile_flags() -> str:

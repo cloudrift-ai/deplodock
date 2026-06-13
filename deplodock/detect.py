@@ -3,6 +3,7 @@
 import asyncio
 import logging
 
+from deplodock import gpu
 from deplodock.provisioning.ssh_transport import ssh_base_args
 
 logger = logging.getLogger(__name__)
@@ -10,43 +11,9 @@ logger = logging.getLogger(__name__)
 NVIDIA_VENDOR = "0x10de"
 AMD_VENDOR = "0x1002"
 
-# PCI device ID (hex, no prefix) -> GPU name
-# Source: PCI ID database (vendor 10de for NVIDIA, 1002 for AMD)
-GPU_PCI_DEVICE_IDS: dict[str, str] = {
-    # NVIDIA GeForce RTX 4090
-    "2684": "NVIDIA GeForce RTX 4090",
-    # NVIDIA GeForce RTX 5090
-    "2b85": "NVIDIA GeForce RTX 5090",
-    # NVIDIA RTX PRO 6000 Blackwell Workstation Edition
-    "2ba0": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-    # NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition
-    # NVIDIA ships multiple PCI device IDs under the same product name —
-    # 2ba2 is the desktop variant, 2bb4 is the variant CloudRift attaches
-    # to its Pro 6000 Max-Q VMs (confirmed via nvidia-smi vs sysfs).
-    "2ba2": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
-    "2bb4": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
-    # NVIDIA RTX PRO 6000 Blackwell Server Edition
-    "2ba4": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-    # NVIDIA L40S
-    "26b9": "NVIDIA L40S",
-    # NVIDIA H100 80GB (SXM/PCIe)
-    "2330": "NVIDIA H100 80GB",
-    "2331": "NVIDIA H100 80GB",
-    # NVIDIA H200 141GB
-    "2335": "NVIDIA H200 141GB",
-    # NVIDIA B200
-    "2900": "NVIDIA B200",
-    "2901": "NVIDIA B200",
-    # NVIDIA A100 40GB (PCIe)
-    "20f1": "NVIDIA A100 40GB",
-    # NVIDIA A100 80GB (SXM/PCIe)
-    "20b2": "NVIDIA A100 80GB",
-    "20b5": "NVIDIA A100 80GB",
-    # AMD Instinct MI350X
-    "75b0": "AMD Instinct MI350X",
-    # NVIDIA Tesla V100 SXM3 32GB (DGX-2 / HGX-2 baseboard)
-    "1db8": "NVIDIA Tesla V100 SXM3 32GB",
-}
+# PCI device ID (hex, no prefix) -> GPU name, from the common GPU registry
+# (:mod:`deplodock.gpu`) — the single source of truth for PCI ids + names.
+GPU_PCI_DEVICE_IDS: dict[str, str] = gpu.pci_device_id_to_name()
 
 _SYSFS_SCAN_CMD = (
     "for d in /sys/bus/pci/devices/*/; do "
