@@ -12,8 +12,20 @@ from __future__ import annotations
 
 import pytest
 
+from deplodock.compiler.pipeline.search import golden as golden_mod
 from deplodock.compiler.pipeline.search.golden import goldens_by_name
 from deplodock.compiler.pipeline.search.prior import diagnostics
+
+
+@pytest.fixture(autouse=True)
+def _single_gpu_goldens(monkeypatch):
+    """Pin the golden set to one card (RTX 5090). With multiple per-GPU files a name
+    recurs once per card and the GPU-blind ``ShapeKey`` join would mix their
+    latencies (5090 / PRO 6000 even share ``compute_cap (12, 0)``), making these
+    shape-keyed assertions depend on which goldens dir is checked in. Off-GPU here,
+    so ``goldens_for_live_gpu`` can't auto-scope — inject the single-card set."""
+    one = [g for g in golden_mod.GOLDEN_CONFIGS if g.gpu_name == "NVIDIA GeForce RTX 5090"]
+    monkeypatch.setattr(golden_mod, "GOLDEN_CONFIGS", one)
 
 
 class _FakePrior:

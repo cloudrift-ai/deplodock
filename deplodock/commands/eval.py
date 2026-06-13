@@ -438,9 +438,9 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
     from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
 
@@ -473,10 +473,14 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
 
 def _golden_configs(kernel_filter: str | None):
-    """The matmul golden configs, optionally filtered by name substring."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    """The matmul golden configs for the **live** card, optionally filtered by name
+    substring. Scoping to the live GPU (:func:`goldens_for_live_gpu`) keeps the eval
+    views about the card in hand when a multi-GPU goldens dir is checked in — a name
+    recurs once per card and the GPU-blind ``ShapeKey`` join would otherwise mix
+    cards (5090 / PRO 6000 even share ``compute_cap``)."""
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
     return configs

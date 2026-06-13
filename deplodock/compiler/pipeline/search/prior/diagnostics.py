@@ -81,9 +81,12 @@ def _calibration(prior, groups: dict) -> float | None:
 
 
 def _golden_coverage(groups: dict) -> tuple[int, int]:
-    """How many golden matmul shapes have measured data in the dataset, matched by
+    """How many golden matmul **shapes** have measured data in the dataset, matched by
     :class:`ShapeKey` (free-dim product, reduce extent, dtype flag — so an fp32
-    square and its ``.fp16`` twin are counted separately)."""
+    square and its ``.fp16`` twin are counted separately). Counts *distinct shape
+    keys*, not per-config rows, so multiple knob sets for one shape — and the same
+    shape recurring across per-GPU golden files (``ShapeKey`` is GPU-blind) — count
+    once."""
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     have = set()
@@ -91,9 +94,9 @@ def _golden_coverage(groups: dict) -> tuple[int, int]:
         d = dict(sig)
         if _matmul_sig(d):
             have.add(ShapeKey.from_s_features(d))
-    matmuls = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
-    covered = sum(1 for g in matmuls if g.shape_key() in have)
-    return covered, len(matmuls)
+    golden_keys = {g.shape_key() for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}
+    covered = sum(1 for k in golden_keys if k in have)
+    return covered, len(golden_keys)
 
 
 def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
@@ -116,7 +119,9 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     first); the faithful deploy check is ``eval golden``'s real greedy compile."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+
+    GOLDEN_CONFIGS = goldens_for_live_gpu()  # live card only — see golden_deploy_perf
 
     # Index the matmul op groups by ShapeKey (free-dim product, reduce extent,
     # dtype flag — both sides built by the ShapeKey constructors, so the fp32/fp16
@@ -183,8 +188,14 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
     deployable speed comparison; <1.0 = the prior's pick is faster than golden). Shapes
     with no -O3 reservoir row are omitted (the caller renders ``—``). The reservoir is
     used rather than the raw ``perf`` table because only it carries the ``H_*`` regime
-    columns needed to isolate the deployable measurements."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    columns needed to isolate the deployable measurements.
+
+    Goldens are scoped to the live card (:func:`goldens_for_live_gpu`) so a multi-GPU
+    goldens dir doesn't make a name's per-card entries collide on the GPU-blind
+    ``ShapeKey`` (e.g. RTX 5090 / RTX PRO 6000 both ``(12, 0)``)."""
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+
+    GOLDEN_CONFIGS = goldens_for_live_gpu()
 
     # Deployable (-O3) measured rows per matmul op group, indexed by ShapeKey.
     # An fp32 square and its ``.fp16`` twin share (free_prod, reduce), so the key's

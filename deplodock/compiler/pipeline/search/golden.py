@@ -226,8 +226,16 @@ def _load_goldens() -> list[GoldenConfig]:
     One file per GPU: a ``gpu_name`` / ``compute_cap`` header (stamped onto every
     config so it isn't repeated per entry) plus a ``configs`` list, each tagged with
     a ``kernel`` discriminator (``matmul`` / ``reduce`` / ``pointwise``) selecting the
-    dataclass. All files are concatenated — a ``name`` may recur across GPUs, told
-    apart by ``compute_cap`` (see :func:`goldens_by_name`)."""
+    dataclass. All files are concatenated — a ``name`` may recur across GPUs.
+
+    NOTE: ``compute_cap`` does **not** uniquely identify a GPU — two different cards
+    can share a capability (e.g. ``rtx5090_sm120.yaml`` and
+    ``rtxpro6000_sm120.yaml`` are both ``(12, 0)``). The full ``(gpu_name,
+    compute_cap)`` pair is the GPU identity. The ``eval`` / ``tune --dataset golden``
+    paths currently iterate this flat list without filtering to the live GPU, so a
+    multi-GPU goldens dir intermixes cards in those views and ``ShapeKey`` joins
+    (which key on shape, not GPU) merge same-shape entries across cards — filtering
+    the consumers to the live ``(gpu_name, compute_cap)`` is a known TODO."""
     out: list[GoldenConfig] = []
     for path in sorted(_GOLDENS_DIR.glob("*.yaml")):
         doc = yaml.safe_load(path.read_text())
@@ -246,5 +254,34 @@ def goldens_by_name(name: str) -> list[MatmulGoldenConfig]:
     found faster variant alongside the old one), so callers must not assume a name
     is unique. Empty when ``name`` is unknown. All entries share the shape (so any
     one's :meth:`~MatmulGoldenConfig.snippet` is interchangeable); they differ only
-    in ``knobs`` / measured latency."""
+    in ``knobs`` / measured latency — **including across GPUs**: with multiple
+    per-GPU files the same ``name`` recurs once per card, so the returned list can
+    mix GPUs (use ``compute_cap`` **and** ``gpu_name`` to pick a specific card; cap
+    alone is ambiguous for same-capability cards like RTX 5090 / RTX PRO 6000)."""
     return [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig) and g.name == name]
+
+
+def goldens_for_live_gpu() -> list[GoldenConfig]:
+    """:data:`GOLDEN_CONFIGS` narrowed to the **live** card's ``(gpu_name,
+    compute_cap)`` when a CUDA device is visible, else the full flat list.
+
+    The shape-keyed diagnostics / ``eval`` golden views (coverage, deploy-perf,
+    prior rank) join on :class:`ShapeKey`, which is GPU-blind — so with multiple
+    per-GPU files a name recurs once per card and same-shape entries collide.
+    Two cards can even share ``compute_cap`` (RTX 5090 / RTX PRO 6000 are both
+    ``(12, 0)``), so the live ``gpu_name`` is what disambiguates them. Filtering to
+    the live card keeps those views about the card actually being tuned. Off-GPU
+    (CI, pure-logic tests) there is no live card, so the unfiltered list is
+    returned — callers that need determinism there should inject a single-GPU set.
+    """
+    try:
+        import torch  # noqa: PLC0415
+
+        if not torch.cuda.is_available():
+            return list(GOLDEN_CONFIGS)
+        name = torch.cuda.get_device_name(0)
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception:  # noqa: BLE001 — any probe failure ⇒ no live filter
+        return list(GOLDEN_CONFIGS)
+    live = [g for g in GOLDEN_CONFIGS if g.gpu_name == name and tuple(g.compute_cap) == (major, minor)]
+    return live or list(GOLDEN_CONFIGS)
