@@ -23,12 +23,33 @@ def test_default_is_single_unpinned_slot() -> None:
     assert tune._resolve_devices(_args()) == [None]
 
 
+def _device_count() -> int:
+    """Physical GPU count, or 0 if cupy can't probe (absent / no driver)."""
+    try:
+        import cupy as cp
+
+        return cp.cuda.runtime.getDeviceCount()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _gate_multi_gpu(max_ordinal: int) -> None:
+    """Multi-device resolution runs the homogeneity probe, which queries each
+    GPU. With cupy present but too few GPUs the probe ``sys.exit(2)``s, so skip
+    unless the box has the ordinals (cupy absent → probe is a no-op, test runs)."""
+    count = _device_count()
+    if 0 < count <= max_ordinal:
+        pytest.skip(f"needs GPU ordinal {max_ordinal} (homogeneity probe), have {count}")
+
+
 def test_gpus_n_expands_to_range() -> None:
-    # cupy is absent in CI → the homogeneity probe is a no-op, so >1 resolves.
+    # cupy absent → probe is a no-op; present → needs ordinals 0,1,2.
+    _gate_multi_gpu(2)
     assert tune._resolve_devices(_args(gpus=3)) == [0, 1, 2]
 
 
 def test_devices_list_wins_over_gpus() -> None:
+    _gate_multi_gpu(5)
     assert tune._resolve_devices(_args(gpus=8, devices="0,2,5")) == [0, 2, 5]
 
 
