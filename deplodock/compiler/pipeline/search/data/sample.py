@@ -139,7 +139,10 @@ class Sample:
             name=cfg.name,
             dtype=cfg.dtype,
             ref_us=cfg.cublas_us,
-            context=Context.from_target(cfg.compute_cap).features(),
+            # gpu_name pins the device-physical features (H_sm_count / smem / …) to
+            # the golden's OWN card's memorized specs, not the live device's — so a
+            # PRO 6000 golden ranked on a 5090 (both cc 12.0) gets 188 SMs, not 170.
+            context=Context.from_target(cfg.compute_cap, gpu_name=cfg.gpu_name).features(),
             snippet=cfg.snippet(),
             source="golden",
             s_full=s_full,

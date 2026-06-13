@@ -149,7 +149,11 @@ def resolve_golden_arg(args) -> None:
     if getattr(args, "dynamic", None):
         logger.error("--dynamic is incompatible with --golden (a dynamic golden's spec is part of its config)")
         sys.exit(2)
-    matches = Dataset.from_golden(name=name).samples
+    # Scope to the live card's golden(s): on a multi-GPU goldens dir, A/B-ing the
+    # deployed pick against another card's recorded config (e.g. a PRO 6000 golden
+    # on a 5090 — both cc 12.0) is meaningless. Cards with no recorded golden of
+    # their own fall back to the full set (the seed / transfer flow).
+    matches = Dataset.from_golden(name=name, live_gpu=True).samples
     if not matches:
         from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 

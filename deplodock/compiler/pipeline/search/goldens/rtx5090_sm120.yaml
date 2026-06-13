@@ -289,8 +289,8 @@ configs:
     N: 512
     K: 512
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 4}
-    deplodock_us: 12.8
+    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    deplodock_us: 11.0
     cublas_us: 14.0
   - kernel: matmul
     name: qwen3_06b.q_proj.s512.dynM

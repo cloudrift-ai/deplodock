@@ -16,10 +16,12 @@ from collections.abc import Callable
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
+from deplodock.gpu import DEFAULT_GPU
 
-# Occupancy reference fallback when a context carries no SM count (GPU-less hosts).
-# RTX 5090 / sm_120 has 170 SMs; the golden set was measured there.
-DEFAULT_SM_COUNT = 170
+# Occupancy reference fallback when a context carries no SM count (GPU-less hosts) —
+# the default card's memorized SM count (RTX 5090 / sm_120 = 170; the golden set was
+# measured there). Single source: the common GPU registry (:mod:`deplodock.gpu`).
+DEFAULT_SM_COUNT = DEFAULT_GPU.sm_count
 
 # Knobs the thread-tier / warp-tier enumeration decides — the projection a golden
 # is matched on (STAGE / RING / WARPSPEC / NOATOMIC are stamped by later passes,
