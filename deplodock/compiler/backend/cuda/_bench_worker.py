@@ -170,7 +170,7 @@ def main() -> None:
         if dirty:
             # Corrupted context — don't serve more requests from it. Exit so the
             # parent respawns a fresh context on its next bench (program.py
-            # ``_BenchWorker.bench`` re-spawns when ``poll()`` shows us dead).
+            # ``_AsyncBenchWorker.run_job`` re-spawns when the proc is dead).
             return
 
 

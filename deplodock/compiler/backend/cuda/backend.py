@@ -125,6 +125,14 @@ class CudaBackend(Backend):
             self._async_worker_obj.close()
             self._async_worker_obj = None
 
+    async def aclose_async_worker(self) -> None:
+        """SIGKILL + await-reap this backend's async bench worker (driver teardown
+        from inside the event loop — cleans the subprocess transport before the loop
+        closes, so no 'Event loop is closed' GC warning)."""
+        if self._async_worker_obj is not None:
+            await self._async_worker_obj.aclose()
+            self._async_worker_obj = None
+
     def compile(self, graph: Graph) -> Graph:
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
         db = None

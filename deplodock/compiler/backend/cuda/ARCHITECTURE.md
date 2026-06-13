@@ -141,43 +141,39 @@ subprocess boundary before — run isolated. So `tune --bench` (`commands/tune.p
 `_bench_per_kernel`) and any deployable bench go through `benchmark_compare_isolated`: a hung kernel
 hangs the child, the parent SIGKILLs it at `wall_timeout_s`, the device is freed, and the per-kernel
 sweep **continues** to the next reproducer (no device-poisoning wedge, no skip). The parent transport
-is the single `_BenchWorker.run_job`; `benchmark_program_isolated` / `benchmark_compare_isolated` are
-its two thin adapters. See `tests/compiler/backend/test_bench_worker_compare.py` (compare-in-worker +
-SIGKILL recovery), `test_hung_kernel_watchdog.py` (watchdog raises promptly), and
+is the single **`_AsyncBenchWorker.run_job`** (the old sync `_BenchWorker` is gone); `benchmark_program_isolated` /
+`benchmark_compare_isolated` are synchronous `asyncio.run` bridges over a one-shot instance, and the autotune sweep
+awaits a persistent per-GPU instance directly via `benchmark_program_isolated_async`. See
+`tests/compiler/backend/test_bench_worker_compare.py` (compare-in-worker + SIGKILL recovery),
+`test_hung_kernel_watchdog.py` (watchdog raises promptly), and
 `tests/compiler/cli/test_tune_bench_hung_kernel.py` (the `_run_bench` control flow).
 
-`benchmark_program_isolated(...)` (the autotune path, gated on
-`bench_wall_timeout_s`) runs the bench in a **persistent** subprocess
-(`_bench_worker.py`, one per `CudaBackend`) so a wedged kernel can be
-SIGKILLed without dirtying the parent's stream. Because the worker is reused
-across configs, a kernel that does an illegal / misaligned access is a hazard:
-that error is **sticky** — it corrupts the CUDA context so every later call
-returns the same status until the process dies, which would cascade identical
-false `bench_fail`s across all subsequent configs. So after any failure the
-worker probes its context (`_context_dirty` — a cheap `deviceSynchronize`) and
-*exits* if it's poisoned; the parent respawns a clean context on the next
-request. Benign failures (NVRTC compile errors, cleaned-up OOM) leave the
-context healthy and keep the worker alive, so they pay no respawn cost.
+**One async transport — `_AsyncBenchWorker`.** It drives the `_bench_worker.py` subprocess protocol (`<8-byte LE
+length><pickle>`, both directions) over `asyncio` streams, so one event loop can keep N device-pinned workers benching
+concurrently (`tune --gpus`, see `pipeline/ARCHITECTURE.md` → *Per-kernel GPU parallelism*). Two entry shapes:
 
-The dirty-exit path can race the parent's `poll()` check: by the time the
-parent writes the next request, the worker's stdin has been closed but
-`poll()` may not yet show the exit. `_BenchWorker.bench` therefore wraps the
-send in a single-retry loop — a `BrokenPipeError` on the first write triggers
-a respawn + one resend before surfacing as `bench worker died during request
-send`. Phase A of the tune-stabilization work; see
-`tests/compiler/backend/test_bench_worker_recovery.py`.
+- **Autotune sweep** awaits `benchmark_program_isolated_async(graph, worker=…)`. `CudaBackend(device_id=i)` lazily owns
+  one **persistent** worker (reused across configs — pay the ~0.2 s Python spawn once) and exposes `benchmark_async`
+  (always isolated, requires `bench_wall_timeout_s`). The device pin is a **per-worker spawn-env overlay** —
+  `CUDA_VISIBLE_DEVICES=<id>` (so the child's logical device 0 *is* that GPU; every argumentless `cp.cuda.Device()`
+  resolves correctly) plus, when a base `DEPLODOCK_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on
+  different GPUs take distinct `FileLock`s instead of serialising. The overlay rides the child only — the parent's
+  `os.environ` is never mutated (all slots share one event-loop thread).
+- **Deployable `--bench`** (`benchmark_program_isolated` / `benchmark_compare_isolated`) are synchronous bridges:
+  each wraps `_run_job_oneshot` (spawn → run → `aclose`) in `asyncio.run`. The worker's streams bind to the loop, so
+  it can't persist across `asyncio.run` calls — a per-call spawn, negligible against a minutes-long deployable bench.
 
-**Async sibling for multi-GPU tune.** `_AsyncBenchWorker` / `benchmark_program_isolated_async(...)` drive the *same*
-`_bench_worker.py` subprocess protocol (`<8-byte LE length><pickle>`) over `asyncio` streams instead of blocking
-`select` — so one event loop can keep N device-pinned workers benching concurrently (`tune --gpus`, see
-`pipeline/ARCHITECTURE.md` → *Per-kernel GPU parallelism*). The wall-clock cap is `asyncio.wait_for` (same SIGKILL +
-respawn recovery contract); a stale-worker send race respawns and retries once, exactly as the sync worker.
-`CudaBackend(device_id=i)` lazily owns one such worker and exposes `benchmark_async` (always isolated, requires
-`bench_wall_timeout_s`). The device pin is a **per-worker spawn-env overlay** — `CUDA_VISIBLE_DEVICES=<id>` (so the
-child's logical device 0 *is* that GPU; every argumentless `cp.cuda.Device()` resolves correctly) plus, when a base
-`DEPLODOCK_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on different GPUs take distinct `FileLock`s
-instead of serialising on one. The overlay never mutates the parent `os.environ` (all slots share one event-loop
-thread). See `tests/compiler/backend/test_async_bench_worker.py`.
+The wall-clock cap is `asyncio.wait_for`; on overrun the child is SIGKILLed and the next bench respawns it on a clean
+device. Because the persistent worker is reused across configs, an illegal / misaligned access is a hazard: that error
+is **sticky** — it corrupts the CUDA context so every later call returns the same status until the process dies, which
+would cascade identical false `bench_fail`s across all subsequent configs. So after any failure the worker probes its
+context (`_context_dirty` — a cheap `deviceSynchronize`) and *exits* if it's poisoned; `run_job` respawns a clean
+context on the next request (the dead-proc check before `await self._spawn()`). Benign failures (NVRTC compile errors,
+cleaned-up OOM) leave the context healthy and keep the worker alive, so they pay no respawn cost. A stale-worker race
+on the send (a `BrokenPipeError`/`ConnectionResetError` from `stdin.drain` after the worker's dirty-context exit)
+triggers one respawn + resend before surfacing as `bench worker died during request send`. Error paths `await aclose()`
+(SIGKILL + reap) so the subprocess transport is cleaned before the loop closes. See
+`tests/compiler/backend/test_bench_worker_recovery.py` and `test_async_bench_worker.py`.
 
 `iter_once` (the per-iter sample loop) rejects a `cp.cuda.get_elapsed_time`
 reading of `<= 0.0` as `bench_fail` instead of accepting it as a 0µs sample.

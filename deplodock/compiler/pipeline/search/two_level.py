@@ -396,13 +396,14 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
     try:
         await asyncio.gather(*[tune_op(i, key, nid, op, count) for i, (key, (nid, op, count)) in enumerate(unique.items())])
     finally:
-        # SIGKILL each slot's async bench worker (the subprocess transports are
-        # bound to this event loop). Backend objects persist — their workers
-        # respawn on the next terminal's ``asyncio.run``.
+        # SIGKILL + await-reap each slot's async bench worker (the subprocess
+        # transports are bound to this event loop; awaiting the reap cleans them
+        # before the loop closes). Backend objects persist — their workers respawn
+        # on the next terminal's ``asyncio.run``.
         for b in pool:
-            close = getattr(b, "close_async_worker", None)
-            if close is not None:
-                close()
+            aclose = getattr(b, "aclose_async_worker", None)
+            if aclose is not None:
+                await aclose()
 
     # Accumulate in ``op_idx`` order so the reward / ``per_op`` order is
     # execution-order-independent (the float sum is order-stable, matching serial).

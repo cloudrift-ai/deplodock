@@ -13,7 +13,6 @@ freeing the device and leaving the parent clean, instead of the ~109-minute in-p
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import textwrap
 import time
@@ -52,8 +51,8 @@ def test_compare_in_worker_returns_torch_and_deplodock() -> None:
 
 
 class _HangWorker:
-    """A ``_BenchWorker`` whose child's ``_run_job`` launches a non-terminating GPU kernel and blocks
-    on it forever — to exercise the parent's wall-timeout SIGKILL on a genuinely hung worker."""
+    """An ``_AsyncBenchWorker`` whose child's ``_run_job`` launches a non-terminating GPU kernel and
+    blocks on it forever — to exercise the parent's wall-timeout SIGKILL on a genuinely hung worker."""
 
     _CHILD = textwrap.dedent(
         """
@@ -71,19 +70,22 @@ class _HangWorker:
     )
 
     def __init__(self) -> None:
-        from deplodock.compiler.backend.cuda.program import _BenchWorker
+        from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
 
-        self._impl = _BenchWorker()
+        self._impl = _AsyncBenchWorker()
         # Override _spawn to launch our hanging child instead of ``-m _bench_worker``.
         self._impl._spawn = self._spawn_hang  # type: ignore[method-assign]
 
-    def _spawn_hang(self) -> None:
-        self._impl._proc = subprocess.Popen(  # noqa: S603
-            [sys.executable, "-c", self._CHILD],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
+    async def _spawn_hang(self) -> None:
+        import asyncio
+
+        self._impl._proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            self._CHILD,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
     def run_job(self, *a, **k):
@@ -97,34 +99,38 @@ class _HangWorker:
 def test_run_job_send_times_out_on_unresponsive_worker() -> None:
     """A worker that is alive but never reads stdin — e.g. wedged in CUDA-context
     teardown behind a hung kernel after a dirty exit — must trip the wall budget
-    during the request SEND. Previously the parent blocked forever in the pipe
-    write once the request exceeded the ~64 KB pipe buffer (the wall budget only
-    bounded the response read). No CUDA needed: the deaf child is plain Python."""
+    during the request SEND (``stdin.drain`` blocks once the request exceeds the
+    ~64 KB pipe buffer). No CUDA needed: the deaf child is plain Python."""
+    import asyncio
+
     import pytest
 
-    from deplodock.compiler.backend.cuda.program import _BenchWorker
+    from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
 
-    worker = _BenchWorker()
+    worker = _AsyncBenchWorker()
 
-    def _spawn_deaf() -> None:
-        worker._proc = subprocess.Popen(  # noqa: S603
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
+    async def _spawn_deaf() -> None:
+        worker._proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
     worker._spawn = _spawn_deaf  # type: ignore[method-assign]
     t0 = time.time()
     with pytest.raises(RuntimeError, match="did not accept the request"):
-        worker.run_job({"blob": b"x" * (1 << 20)}, wall_timeout_s=2.0)  # 1 MB >> pipe buffer
+        asyncio.run(worker.run_job({"blob": b"x" * (1 << 20)}, wall_timeout_s=2.0))  # 1 MB >> pipe buffer
     assert time.time() - t0 < 20.0, "send must respect the wall budget, not block on the pipe"
     assert worker._proc is None, "the unresponsive worker must be killed and its handle released"
 
 
 @requires_cuda
 def test_worker_hang_is_sigkilled_not_wedged() -> None:
+    import asyncio
+
     import pytest
 
     worker = _HangWorker()
@@ -132,7 +138,7 @@ def test_worker_hang_is_sigkilled_not_wedged() -> None:
     # The child launches an infinite kernel and never responds; the parent must SIGKILL it at the
     # 3 s wall budget and raise — not block forever (the pre-isolation in-process failure mode).
     with pytest.raises(RuntimeError, match="wall budget"):
-        worker.run_job({"graph": None, "torch_spec": None, "kwargs": {}}, wall_timeout_s=3.0)
+        asyncio.run(worker.run_job({"graph": None, "torch_spec": None, "kwargs": {}}, wall_timeout_s=3.0))
     elapsed = time.time() - t0
     assert elapsed < 30.0, f"run_job took {elapsed:.1f}s — the wall-timeout SIGKILL did not fire promptly"
     assert worker.proc is None, "the hung worker must be killed and its handle released"
