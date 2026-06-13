@@ -1,7 +1,7 @@
 ---
 name: tune-model
-description: Use this skill when the user asks to "tune model X", "analyze tune findings for <model>", "tune and analyze model X", "why is deplodock slower than eager / torch.compile on X", "do a per-kernel performance analysis", "drill into kernel performance", "profile the compiled kernels with NCU", or otherwise wants a clean autotune of a model (or one layer), an end-to-end + per-kernel bench against PyTorch eager and torch.compile, a root-cause analysis of every underperforming kernel (search shortfall, tier/optimization lockout, codegen quality, bench failures), and a findings report saved to plans/. Modeled on plans/qwen3-embedding-layer0-tune-findings.md. For the golden matmul shapes use the tune-golden skill instead — there the target config is known, so the analysis evaluates the prior's expectation against it.
-version: 0.4.0
+description: Use this skill when the user asks to "tune model X", "analyze tune findings for <model>", "tune and analyze model X", "why is deplodock slower than eager / torch.compile on X", "do a per-kernel performance analysis", "drill into kernel performance", "profile the compiled kernels with NCU", or otherwise wants a clean autotune of a model (or one layer), an end-to-end + per-kernel bench against PyTorch eager and torch.compile, a root-cause analysis of every underperforming kernel (search shortfall, tier/optimization lockout, codegen quality, bench failures), and a findings report saved to plans/. For a whole-model tune it also validates the full model end-to-end (eager / torch.compile / deplodock) and, when the model is servable via `deplodock serve` (an embedding model), benches the served model via `vllm bench serve` against vanilla vLLM. Modeled on plans/qwen3-embedding-layer0-tune-findings.md. For the golden matmul shapes use the tune-golden skill instead — there the target config is known, so the analysis evaluates the prior's expectation against it.
+version: 0.5.0
 ---
 
 # Tune a model and produce a per-kernel findings report
@@ -73,6 +73,32 @@ legitimate finding, not noise.
   `k_sdpa_reduce`, …; same-named kernels disambiguate by hash suffix).
 - Name the dominating kernels: cumulative µs until ~80% of the deplodock total. Those get the deep dives;
   kernels already beating eager and tcompile get at most one line.
+
+## Step 2b — whole-model end-to-end & serving validation (full-model scope only)
+
+Run this **only when the user asked for a whole-model tune** (no `--layer`); skip it for the default single-layer
+scope, which has no servable artifact — say so in the report. The per-kernel table proves which kernels got faster,
+but a full-model tune's deployable question is the whole model's standing.
+
+- **End-to-end vs eager / torch.compile** — already produced by Step 1's `--bench` full-model table (whole-model
+  scope drops `--layer`). For a full-model tune, lead the report's bench section with that table's eager /
+  torch.compile / deplodock rows as the headline e2e result. (A single-layer table is the layer's e2e, not the
+  model's — never present it as the model result.)
+- **Serving A/B vs vanilla vLLM** — if the model is servable via `deplodock serve` (an embedding model; vLLM
+  `--runner pooling`, e.g. `Qwen/Qwen3-Embedding-0.6B`), bench the served model both ways and compare:
+
+  ```bash
+  deplodock serve <model> --bench               # deplodock kernels (tuned plugin)
+  deplodock serve <model> --bench --stock       # vanilla vLLM baseline
+  ```
+
+  Run these in the **same environment as the tune** so the plugin's greedy pick reads the prior this run trained
+  (`DEPLODOCK_PRIOR_FILE` — `--clean` reset it, then the tune retrained it; the served kernels then reflect the
+  tune). Both invocations run `vllm bench serve --backend openai-embeddings` at the same `--max-model-len`, so it's
+  apples-to-apples. **Match the bench params across the two runs** (`--num-prompts`, `--random-input-len`,
+  `--max-concurrency`, `--bench-seed`) so request-throughput / TTFT / per-request latency compare directly. Needs the
+  `serving` extra. Record both result tables in the report and state whether the per-kernel wins translated into
+  served throughput/latency. A generative (non-pooling) model isn't servable this way — skip and note it.
 
 ## Step 3 — triage every underperforming kernel
 
@@ -159,7 +185,9 @@ doc's structure:
   quoted for ranking context are -O1"), and whether the run was dynamic (symbolic `seq_len`, benched at the
   512 hint — the default) or static (shape-specialised).
 - **Bench results**: both tables (full model + per-kernel with the Layer-op column), then one sentence naming
-  the dominating kernels and their combined µs.
+  the dominating kernels and their combined µs. **For a whole-model tune** (Step 2b), also include the serving A/B
+  table (deplodock plugin vs `--stock` vanilla vLLM) when the model is servable, and state whether the per-kernel
+  wins moved the served numbers; note when the model isn't servable or the scope was single-layer.
 - **One `## Finding N — <title>` per root cause**, ordered by µs at stake. Each finding carries: symptom (the
   numbers), evidence (NCU compare rows, `eval variants` rank lines, `eval failures` clusters, emitted-CUDA
   observations), root cause or the best hypothesis with the distinguishing diagnostic (cite the gate as
