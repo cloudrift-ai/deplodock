@@ -48,6 +48,8 @@ NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
 SERVING_DTYPE = "DEPLODOCK_SERVING_DTYPE"
+SERVING_CAPTURE_CAP = "DEPLODOCK_SERVING_CAPTURE_CAP"
+SERVING_NO_GRAPHS = "DEPLODOCK_SERVING_NO_GRAPHS"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -253,6 +255,23 @@ def serving_dtype(default: str = "float16") -> str:
     by default; ``float32`` is the accuracy escape hatch (doubles weight
     memory — an 8B model no longer fits a 24 GB card)."""
     return _str(SERVING_DTYPE) or default
+
+
+def serving_capture_cap(default: int) -> int:
+    """``DEPLODOCK_SERVING_CAPTURE_CAP`` — capacity seq_len the serving runner
+    allocates its (shared, capacity-sized) buffer set at. Captured CUDA graphs
+    are keyed per request seq_len ≤ this cap; requests above it fall back to the
+    uncaptured rebind path. Defaults to the server's ``max_seq_len``; lower it
+    for big models / small cards where the S² attention scratch at full capacity
+    would not fit."""
+    return int_env(SERVING_CAPTURE_CAP, default)
+
+
+def serving_no_graphs() -> bool:
+    """``DEPLODOCK_SERVING_NO_GRAPHS`` — kill switch: keep the serving runner on
+    the uncaptured rebind+run_once path (per-request shape rebind) instead of
+    captured-graph replay. Debug escape hatch + fallback-test lever."""
+    return _bool(SERVING_NO_GRAPHS)
 
 
 # Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) used to live here as

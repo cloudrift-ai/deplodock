@@ -502,3 +502,116 @@ def test_qwen_whole_model_dynamic_traces():
         node = inputs_by_name.get(name)
         assert node is not None, f"missing graph input {name!r}; got {list(inputs_by_name)}"
         assert Dim("seq_len") in node.output.shape, f"{name} shape {node.output.shape} missing Dim('seq_len')"
+
+
+# ---------------------------------------------------------------------------
+# Captured-CUDA-graph serving path: one captured whole-program graph per
+# seq_len over a shared capacity-sized buffer set (CompiledProgram
+# set_sym_values + upload_prefix + capture_program_graph[cached] +
+# replay_program_graph + outputs(sym_values)). Each graph is captured at its
+# EXACT seq_len, so every kernel runs at its exact grid — no oversized-grid
+# guard story needed. Plan: plans/serving-dynamic-shape-cuda-graphs.md.
+# ---------------------------------------------------------------------------
+
+
+def test_capture_replay_cache_rmsnorm_over_capacity_buffers():
+    """RMSNorm built once at capacity 64; serve S ∈ {5,12,33,64,12} through the
+    per-seq_len graph cache — capture lazily, replay at each S, slice the output
+    to the real shape, match torch eager. Repeats hit the cache (no re-capture)."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from deplodock.compiler.trace.torch import trace_module
+
+    cap = 64
+    m = torch.nn.RMSNorm(2048)
+    compiled = CudaBackend().compile(trace_module(m, (torch.randn(1, 32, 2048),), dynamic_shapes={"x": {1: _seq_len_dim()}}))
+    weight = m.weight.detach().numpy().astype(np.float32)
+    out_name = compiled.outputs[0]
+
+    def x_at(s: int) -> np.ndarray:
+        return np.random.RandomState(s).standard_normal((1, s, 2048)).astype(np.float32)
+
+    with gpu_lock():
+        prog = CompiledProgram.build(compiled, {"x": x_at(cap), "p_weight": weight})
+        for s in (5, 12, 33, 64, 12):
+            x = x_at(s)
+            prog.set_sym_values({"seq_len": s})
+            prog.upload_prefix({"x": x})
+            prog.capture_program_graph()
+            prog.replay_program_graph()
+            out = prog.outputs({"seq_len": s})[out_name]
+            with torch.no_grad():
+                ref = torch.nn.functional.rms_norm(torch.from_numpy(x), (2048,), m.weight, eps=m.eps).numpy()
+            assert out.shape == (1, s, 2048)
+            np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+        assert set(k[0][1] for k in prog._graph_cache) == {5, 12, 33, 64}, "expected one cached graph per distinct seq_len"
+
+
+def test_qwen_whole_model_capture_replay_cache_matches_eager():
+    """1-layer random-weight Qwen3 trunk through the captured-graph serving path:
+    build once at capacity, serve several seq_lens via the per-S graph cache
+    (capture at exact S, replay, slice), compare against torch eager with NON-ZERO
+    ids. End-to-end gate for the attention / mask / shared-capacity-buffer story.
+    Run under compute-sanitizer in dev to confirm zero illegal accesses."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import torch
+    from transformers import AutoConfig, AutoModel
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from deplodock.compiler.loader.binder import bind_constants
+    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from deplodock.compiler.trace.torch import trace_module
+
+    torch.manual_seed(0)
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, "Qwen/Qwen3-Embedding-0.6B")
+    config.num_hidden_layers = 1
+    model = AutoModel.from_config(config).float().eval()
+
+    hint, cap, dtype = 32, 64, torch.float32
+    wrapper = build_full_model_wrapper(model, hint, dtype, dynamic=True)
+    seq_dim = _seq_len_dim(min=1)
+    graph = trace_module(
+        wrapper,
+        (torch.zeros((1, hint), dtype=torch.long), build_causal_mask(hint, dtype), torch.arange(hint).unsqueeze(0)),
+        dynamic_shapes={"input_ids": {1: seq_dim}, "attention_mask": {2: seq_dim, 3: seq_dim}, "position_ids": {1: seq_dim}},
+    )
+    compiled = CudaBackend().compile(graph)
+
+    sources: dict[str, np.ndarray] = {}
+    for path, t in wrapper.named_parameters(remove_duplicate=False):
+        sources[path] = t.detach().cpu().numpy().astype(np.float32, copy=False)
+    for path, t in wrapper.named_buffers(remove_duplicate=False):
+        sources[path] = t.detach().cpu().numpy().astype(np.float32, copy=False)
+    const_feed = bind_constants(compiled, sources)
+    ids_name, mask_name, pos_name = compiled.inputs
+    out_name = compiled.outputs[0]
+
+    def feed(s: int) -> dict[str, np.ndarray]:
+        ids = (np.arange(s, dtype=np.int64).reshape(1, s) * 97) % config.vocab_size
+        return {
+            ids_name: ids,
+            mask_name: build_causal_mask(s, dtype).numpy(),
+            pos_name: np.arange(s, dtype=np.int64).reshape(1, s),
+        }
+
+    with gpu_lock():
+        prog = CompiledProgram.build(compiled, {**const_feed, **feed(cap)})
+        for s in (5, 17, 64, 17):
+            fd = feed(s)
+            prog.set_sym_values({"seq_len": s})
+            prog.upload_prefix(fd)
+            prog.capture_program_graph()
+            prog.replay_program_graph()
+            out = prog.outputs({"seq_len": s})[out_name]
+            with torch.no_grad():
+                ref = wrapper(torch.from_numpy(fd[ids_name]), build_causal_mask(s, dtype), torch.arange(s).unsqueeze(0)).numpy()
+            assert out.shape == ref.shape
+            np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-3)

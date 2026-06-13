@@ -8,6 +8,15 @@ no lm_head) with a dynamic seq_len, compiles it through the CUDA backend
 launches (``run_once``) — one compiled program serves every request at any
 seq_len ≤ ``DYNAMIC_DIM_MAX``.
 
+Per request it captures (once per distinct seq_len, then replays) a whole-program
+CUDA graph over a single capacity-sized buffer set — one host-side launch instead
+of the ~hundreds the uncaptured ``rebind`` + ``run_once`` loop issues. Each graph
+is captured at its EXACT seq_len, so every kernel runs at its exact grid (no
+oversized-grid masking); the buffers are allocated once at capacity and each
+request's inputs upload into their contiguous prefix. ``DEPLODOCK_SERVING_NO_GRAPHS``
+keeps the uncaptured path; requests above ``DEPLODOCK_SERVING_CAPTURE_CAP`` fall
+back to it too.
+
 No vllm imports here — the class is driven by ``vllm_model.DeplodockEmbedModel``
 but is independently testable with torch + cupy alone.
 """
@@ -42,12 +51,23 @@ def _causal_mask_np(s: int, np_dtype) -> np.ndarray:
 class DeplodockForwardRunner:
     """One compiled dynamic-seq_len trunk + its per-sequence execution."""
 
-    def __init__(self, program: CompiledProgram, input_names: tuple[str, str, str], output_name: str, np_dtype, max_seq_len: int):
+    def __init__(
+        self,
+        program: CompiledProgram,
+        input_names: tuple[str, str, str],
+        output_name: str,
+        np_dtype,
+        max_seq_len: int,
+        capacity: int,
+    ):
         self._program = program
         self._ids_name, self._mask_name, self._pos_name = input_names
         self._output_name = output_name
         self._np_dtype = np_dtype
         self.max_seq_len = max_seq_len
+        # Shared buffer set is sized for this seq_len; requests ≤ capacity use the
+        # captured-graph path, larger ones fall back to uncaptured rebind.
+        self.capacity = capacity
         self._mask_cache: dict[int, np.ndarray] = {}
 
     @classmethod
@@ -55,6 +75,7 @@ class DeplodockForwardRunner:
         import torch
         from transformers import AutoModel
 
+        from deplodock import config
         from deplodock.compiler.backend.cuda.backend import CudaBackend
         from deplodock.compiler.backend.cuda.program import CompiledProgram
         from deplodock.compiler.backend.gpu_lock import gpu_lock
@@ -114,22 +135,34 @@ class DeplodockForwardRunner:
             sources[path] = t.detach().cpu().to(torch.float32).numpy().astype(np_dtype, copy=False)
         const_feed = bind_constants(compiled, sources)
 
+        # Allocate the shared buffer set at capacity so each captured graph
+        # (one per seq_len) replays over the same prefix-occupied buffers. The
+        # S²-scratch at capacity dominates memory; lower the cap for big models /
+        # small cards (requests above it fall back to the uncaptured path).
+        capacity = min(max_seq_len, config.serving_capture_cap(max_seq_len))
         ids_name, mask_name, pos_name = compiled.inputs
         feed = {
-            ids_name: np.zeros((1, _TRACE_SEQ), dtype=np.int64),
-            mask_name: _causal_mask_np(_TRACE_SEQ, np_dtype),
-            pos_name: np.arange(_TRACE_SEQ, dtype=np.int64).reshape(1, _TRACE_SEQ),
+            ids_name: np.zeros((1, capacity), dtype=np.int64),
+            mask_name: _causal_mask_np(capacity, np_dtype),
+            pos_name: np.arange(capacity, dtype=np.int64).reshape(1, capacity),
         }
         with gpu_lock():
             program = CompiledProgram.build(compiled, {**const_feed, **feed})
         del model, wrapper, sources, const_feed
-        logger.info("[serving] ready: %d launches, max_seq_len=%d", len(program.compiled.launches), max_seq_len)
+        logger.info(
+            "[serving] ready: %d launches, max_seq_len=%d, capture capacity=%d%s",
+            len(program.compiled.launches),
+            max_seq_len,
+            capacity,
+            " (graphs off)" if config.serving_no_graphs() else "",
+        )
         return cls(
             program=program,
             input_names=(ids_name, mask_name, pos_name),
             output_name=compiled.outputs[0],
             np_dtype=np_dtype,
             max_seq_len=max_seq_len,
+            capacity=capacity,
         )
 
     @property
@@ -149,7 +182,15 @@ class DeplodockForwardRunner:
 
     def forward_hidden_states(self, token_ids: np.ndarray) -> np.ndarray:
         """Run one sequence: ``token_ids`` shape ``(S,)`` int64, ``S <=
-        max_seq_len``. Returns ``(S, hidden)`` numpy in the traced dtype."""
+        max_seq_len``. Returns ``(S, hidden)`` numpy in the traced dtype.
+
+        Captured-graph path (default, ``S <= capacity``): size the launch grids to
+        S, upload the request's ids / causal mask / position_ids into the shared
+        buffers' prefix, capture-or-reuse the whole-program graph for this S, and
+        replay it — one host launch. Falls back to the uncaptured rebind +
+        run_once loop when ``DEPLODOCK_SERVING_NO_GRAPHS`` is set or ``S`` exceeds
+        the capture capacity (the buffer set was sized for capacity)."""
+        from deplodock import config
         from deplodock.compiler.backend.gpu_lock import gpu_lock
 
         s = int(token_ids.shape[0])
@@ -159,6 +200,12 @@ class DeplodockForwardRunner:
             self._pos_name: np.arange(s, dtype=np.int64).reshape(1, s),
         }
         with gpu_lock():
-            self._program.rebind(feed)
-            self._program.run_once()
-            return self._program.outputs()[self._output_name][0]
+            if config.serving_no_graphs() or s > self.capacity:
+                self._program.rebind(feed)
+                self._program.run_once()
+                return self._program.outputs()[self._output_name][0]
+            self._program.set_sym_values({"seq_len": s})
+            self._program.upload_prefix(feed)
+            self._program.capture_program_graph()
+            self._program.replay_program_graph()
+            return self._program.outputs({"seq_len": s})[self._output_name][0]
