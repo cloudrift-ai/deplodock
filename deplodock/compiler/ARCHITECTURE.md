@@ -107,7 +107,14 @@ autotuning cache doesn't bust on cosmetic edits.
   with `FM = FN = 1` (`mask_f1`); static-K prologue kernels (fused gated-MLP) and cooperative-reduce
   kernels keep symbolic axes degenerate (one element per thread) — their staged pipelines can't coexist
   with the per-row guard (`021`'s hoist would break the prologue's SSA ordering; it now refuses such
-  lifts), and their deployment path is the structural split, which offers on symbolic rows.
+  lifts), and their deployment path is the structural split (`005_split_demoted`), which offers on
+  symbolic ROW **and** symbolic N axes (the rotary QK^T's symbolic-N key cone materializes canonically,
+  reaching the masked warp tier) — so e.g. the dynamic o_proj's collapsed attn-out splits into a
+  contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The cut keeps a
+  symbolic ROW/N buffer's runtime dim var (`seq_len` in a collapsed-reshape stride) as a legitimate read,
+  not an unmodeled-scope bail (`_split_demoted.dim_names`). Symbolic K stays bailed: the warp tier needs a
+  static reduce, so a symbolic-K matmul (P@V) is scalar fused or split — the split would only add a
+  materialization with no tier upgrade.
   Cooperative-reduce kernels still regain CTA-level parallelism on symbolic-row graphs via
   **strided-cooperative rows**: their STATIC free axes thread-bind alongside the `BR` cooperative lanes
   (the symbolic axis keeps its exact whole-to-grid bind, no mask), so e.g. a per-head q/k-norm with

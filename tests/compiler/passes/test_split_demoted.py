@@ -949,9 +949,44 @@ def test_gated_mlp_split_offered_for_symbolic_rows() -> None:
         assert any(not d.is_static for d in n.output.shape), f"mm buffer must carry the symbolic leading dim, got {n.output.shape}"
 
 
+def test_collapsed_attn_out_split_offered_for_symbolic_rows() -> None:
+    """The o_proj collapsed attn-out cut admits symbolic rows even though its
+    K-folded operand index references the symbolic dim in its strides (the head
+    stride is ``seq_len * D``). That ``seq_len`` read is a legitimate runtime
+    quantity, not an unmodeled scope — the regression that kept the dynamic
+    o_proj fused-scalar at seq_len=512 (~461 us) instead of warp-tier."""
+    from deplodock.compiler.dim import Dim
+
+    f16 = _dt.get("f16")
+    HD, S, D, N = 4, Dim("seq_len"), 64, 64
+    K = HD * D
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("attn", (1, HD, S, D), f16), node_id="attn")
+    g.add_node(InputOp(), [], Tensor("w", (K, N), f16), node_id="w")
+    g.add_node(InputOp(), [], Tensor("res", (1, S, N), f16), node_id="res")
+    g.add_node(TransposeOp(axes=(1, 2)), ["attn"], Tensor("at", (1, S, HD, D), f16), node_id="at")
+    g.add_node(ReshapeOp(shape=(1, S, K)), ["at"], Tensor("ar", (1, S, K), f16), node_id="ar")
+    g.add_node(MatmulOp(), ["ar", "w"], Tensor("mm", (1, S, N), f16), node_id="mm")
+    g.add_node(ElementwiseOp("add"), ["mm", "res"], Tensor("o", (1, S, N), f16), node_id="o")
+    g.inputs = ["attn", "w", "res"]
+    g.outputs = ["o"]
+
+    frag = _split(_fuse(g))
+    assert frag is not None, "the collapsed attn-out cut must offer on symbolic-row graphs"
+    xn_nodes = [n for nid, n in frag.nodes.items() if "__xn" in nid]
+    assert xn_nodes, "expected a contiguizing xn producer in the fragment"
+    assert any(not d.is_static for d in xn_nodes[0].output.shape), (
+        f"xn buffer must carry the symbolic row dim, got {xn_nodes[0].output.shape}"
+    )
+
+
 def test_no_split_for_symbolic_k() -> None:
     """The static-K bail is pinned: a symbolic reduce extent keeps the fused
-    path the only outcome (the gemm extraction reasons about K's volume)."""
+    path the only outcome. The split exists to hand the cell tagger a clean
+    gemm that reaches the WARP tier, but the warp tier needs a static reduce
+    (``mma.sync`` / ``ldmatrix``), so a symbolic-K matmul is scalar fused or
+    split — splitting it would only add a materialization with no tier upgrade.
+    (Symbolic N and symbolic ROW axes ARE admitted — see the tests above.)"""
     from deplodock.compiler.dim import Dim
 
     f16 = _dt.get("f16")
