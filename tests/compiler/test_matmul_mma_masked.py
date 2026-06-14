@@ -274,3 +274,53 @@ def test_symbolic_k_masked_mma_accuracy(monkeypatch, seq):
         assert got.shape == (64, 128)
         diff = np.abs(got - want).max()
         assert diff < 5e-2, f"seq={run_seq}: masked-K MMA mismatch (max abs err {diff})"
+
+
+def _batched_symbolic_mk_graph(*, H: int = 16, N: int = 128) -> Graph:
+    """The SDPA P@V split-consumer in full: a BATCHED matmul (``H`` heads) whose
+    M (query) AND K (key) axes are both symbolic ``seq_len`` —
+    ``xna[H, seq, seq] @ xnb[H, seq, N]``. The batch axis sits before K in the B
+    operand's index (``xnb[head, k, n]``), the case ``classify_matmul_operands``
+    must recognize so the cell reaches the warp tier (not scalar)."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("xna", (H, Dim("seq_len"), Dim("seq_len")), dtype=F16), node_id="xna")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("xnb", (H, Dim("seq_len"), N), dtype=F16), node_id="xnb")
+    g.add_node(op=MatmulOp(), inputs=["xna", "xnb"], output=Tensor("o", (H, Dim("seq_len"), N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["xna", "xnb"], ["o"]
+    return g
+
+
+def test_batched_symbolic_mk_reaches_warp(monkeypatch):
+    """The batched masked-M + masked-K P@V consumer must reach the mma.sync tier
+    (the ``classify_matmul_operands`` batch-aware B test), not fall to scalar."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    lowered = Pipeline.build(CUDA_PASSES).run(_batched_symbolic_mk_graph(), ctx=Context(compute_capability=(12, 0)))
+    kop = lowered.nodes["o"].op
+    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "batched symbolic M+K matmul must reach the warp tier"
+    src = kop.kernel_source
+    assert "mma.sync.aligned.m16n8k16" in src and "ldmatrix" in src
+    assert "int seq_len" in src, "runtime extent must be a kernel arg"
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
+def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):
+    """One compiled batched symbolic-M+K kernel (the deployable P@V consumer) is
+    accurate at runtime sizes around the 512 hint, including the straddling
+    cases where both the M tile and the partial K slab are masked."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_batched_symbolic_mk_graph())
+    rng = np.random.default_rng(0)
+    xna = (rng.standard_normal((16, seq, seq)) * 0.1).astype(np.float16)
+    xnb = (rng.standard_normal((16, seq, 128)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"xna": xna, "xnb": xnb})
+    got = result.outputs["o"].astype(np.float32)
+    want = np.matmul(xna.astype(np.float32), xnb.astype(np.float32))
+    assert got.shape == (16, seq, 128)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: batched masked-M+K MMA mismatch (max abs err {diff})"

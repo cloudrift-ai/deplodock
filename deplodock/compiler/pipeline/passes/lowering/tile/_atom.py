@@ -76,9 +76,17 @@ def classify_matmul_operands(loads, k_name: str):
         var_dims = [d for d, e in enumerate(ld.index) if d not in k_dims and e.free_vars()]
         if len(k_dims) != 1 or not var_dims:
             continue
-        if all(k_dims[0] > d for d in var_dims):
+        after_k = [d for d in var_dims if d > k_dims[0]]
+        if not after_k:
+            # K is the innermost var-carrying dim (every other var dim precedes
+            # it) ⇒ A.
             a_load = ld
-        elif all(k_dims[0] < d for d in var_dims):
+        elif len(after_k) == 1:
+            # Exactly ONE var dim follows K (the N output); any var dims BEFORE K
+            # are leading BATCH axes (shared by both operands — the batched SDPA
+            # P@V split-consumer ``xnb[head, k, n]``), so K immediately precedes N
+            # ⇒ B. The old ``all(k < d)`` test mis-rejected this whenever a batch
+            # dim sat before K, leaving the consumer scalar.
             b_load = ld
     return a_load, b_load
 
