@@ -537,6 +537,16 @@ class Source:
     addressing: AffineAddressing | TemplateAddressing | None = None
     dtype: DataType | None = None
     gmem_extents: tuple[int | Expr, ...] | None = None
+    # ``kmask`` — ``(source_index dim, bound Expr)`` when this operand is staged
+    # for a masked-K (symbolic reduce — SDPA P@V's seq_len) warp matmul. The
+    # final K_o tile overruns the runtime extent, and unlike a masked OUTPUT
+    # axis (M/N — the overhang feeds a never-written cell, so an edge-clamp is
+    # harmless) the reduce overhang feeds the mma ACCUMULATION, so it must be
+    # ZERO, not a clamped duplicate. ``_stage_expand.emit_stage`` forces the
+    # SYNC transport for a ``kmask`` source (cp.async can't ternary a value) and
+    # zero-fills the loaded value where the K coord ``>= bound``. ``None`` (the
+    # default) is every static-K / output-only-masked source — no change.
+    kmask: tuple[int, object] | None = None
     swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
@@ -1171,8 +1181,15 @@ class SerialTile(SerialTileBase):
         var = self.axis.name
         # ``Dim.__str__`` returns the bare value (literal for static, symbolic
         # name for ``Dim('seq_len')``) so both static and symbolic SerialTile
-        # extents render correctly.
-        extent = str(self.axis.extent)
+        # extents render correctly. A COMPOSITE extent (the ceil-div K_o bound
+        # of a masked-K warp tile, ``(seq_len+31)//32``) must go through the C
+        # expr renderer so ``//`` becomes ``/`` — ``str`` would leak the Python
+        # spelling and nvcc would read it as a line comment.
+        ext = self.axis.extent
+        if ext.is_static or isinstance(ext.expr, Var):
+            extent = str(ext)
+        else:
+            extent = f"({ext.expr.render(ctx)})"
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")

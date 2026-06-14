@@ -593,6 +593,14 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # but correct; perf follow-up uses strided cooperative threads.
         k_symbolic = not k_loop.axis.extent.is_static
         E_K = 1 if k_symbolic else k_loop.axis.extent.as_static()
+        # Warp-tier masked K (SDPA P@V's symbolic seq_len): the warp enumeration
+        # below tiles K at its hint and zero-fills the final partial K slab, so
+        # it needs the hint extent (the scalar path keeps E_K=1 — a single
+        # serial reduce over the runtime extent). A masked-K warp tile only
+        # deploys for a clean matmul (no fused prologue): the softmax stats of
+        # an SDPA prologue can't share the zero-filled slab, so a fused-prologue
+        # symbolic-K matmul stays scalar and its deployment path is the split.
+        E_K_warp = k_loop.axis.extent.hint if k_symbolic else E_K
         # target_names unions over outer_n.body (the matmul K reduces) and
         # the prologue (softmax max/sum reduces sharing the matmul K extent,
         # axis-name-unified by unify_sibling_reduce_axes upstream). For
@@ -682,7 +690,15 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible  # noqa: PLC0415
 
         mma_on, pinned_atom = mma_mode()
-        if mma_on and graph is not None and not prologue and not k_symbolic:
+        # Warp tier admits a symbolic (masked) K, but only for a CLEAN matmul
+        # (the ``not prologue`` gate below): the K reduce is tiled at the hint
+        # and the partial final slab is zero-filled in smem (``_stage_expand``),
+        # so the mma accumulates zero past the runtime seq_len. A fused-prologue
+        # matmul (SDPA P@V before the demoted-matmul split) keeps K scalar — its
+        # softmax stats can't co-exist with the zero-filled slab; its warp-tier
+        # path is the structural split, which hands the consumer a clean
+        # symbolic-K matmul that reaches here.
+        if mma_on and graph is not None and not prologue:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
             # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats
@@ -708,7 +724,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                 warp_combos = enumerate_cartesian(
                     E_M=E_M,
                     E_N=E_N,
-                    E_K=E_K,
+                    E_K=E_K_warp,
                     ctx=ctx,
                     priority_mode=("matmul", "warp"),
                     force_splitk_one=force_splitk_one,
@@ -717,6 +733,8 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     n_axis_name=outer_n.axis.name,
                     m_forced_mask=m_symbolic,
                     n_forced_mask=n_symbolic,
+                    k_axis_name=k_loop.axis.name,
+                    k_forced_mask=k_symbolic,
                 )
                 # Drop single-warp (WM·WN == 1) variants: ldmatrix is
                 # smem→register only, so the atom REQUIRES staged operands, but
@@ -1240,8 +1258,18 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     assert shape.k_loop is not None, "warp-tier matmul requires a K reduce"
     K_axis = shape.k_loop.axis
     K_src = K_axis.source_axis or K_axis
-    E_K = K_axis.extent.as_static()
-    K_o_ext = E_K // (params["SPLITK"] * params["BK"] * atom_k)
+    k_masked = not K_axis.extent.is_static
+    k_per_block = params["SPLITK"] * params["BK"] * atom_k
+    if k_masked:
+        # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
+        # runtime extent for the K_o serial bound. The final partial K slab is
+        # zero-filled in smem (``_stage_expand``), so the mma accumulates zero
+        # past the runtime seq_len. The warp enumerator forces SPLITK=1 for a
+        # masked K, so this ceil-div ``Dim`` never feeds the (SPLITK>1) K_s σ
+        # term — only the K_o serial-loop bound, which renders the ceil-div Expr.
+        K_o_ext: object = (K_axis.extent + (k_per_block - 1)) // k_per_block
+    else:
+        K_o_ext = K_axis.extent.as_static() // k_per_block
     K_s = Axis(f"{K_axis.name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
 
     # σ-rewrite the matmul body's outer axes (M/N), then expand the K reduce

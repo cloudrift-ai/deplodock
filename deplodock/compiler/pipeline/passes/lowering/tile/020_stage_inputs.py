@@ -136,6 +136,11 @@ class _Slab(NamedTuple):
     slab_dims: tuple[int, ...]
     template: tuple[Expr, ...] | None
     n_bytes: int
+    # The gmem dim the matmul REDUCE axis indexes into (``var_to_dim`` of the
+    # reduce candidate), or ``None`` when the reduce axis isn't a slab cache
+    # axis (no staged K — pointwise / output-only slabs). ``_build_sources``
+    # reads it to detect a symbolic-K operand and stamp ``Source.kmask``.
+    reduce_dim: int | None = None
     # Per-cache-axis structural block multiplier extracted from σ literal
     # coefficients. ``()`` = all-1s (the scalar / pre-M3 case); a non-
     # trivial tuple aligns with ``cache_axes`` and records the per-axis
@@ -164,6 +169,10 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # admissable staged variant (the block-scaled slab gets over-counted
     # 2× and trips ``slab_cap``).
     bytes_per_elem = {buf: int(t.dtype.nbytes) for buf, t in root.op.inputs.items() if t.dtype is not None}
+    # Per-input gmem dim shapes (Dim per dim) — ``_build_sources`` reads the
+    # operand's reduce-dim extent to detect a symbolic K and stamp
+    # ``Source.kmask`` (the masked-K zero-fill, ``_stage_expand``).
+    input_shapes = {buf: tuple(t.shape) for buf, t in root.op.inputs.items() if getattr(t, "shape", None) is not None}
     variants = _enumerate_variants(
         root.op.body,
         slab_cap=budget,
@@ -171,6 +180,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         parent_op=root.op,
         warp_size=ctx.warp_size,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
         bytes_per_elem=bytes_per_elem,
     )
     if not variants:
@@ -197,6 +207,7 @@ def _enumerate_variants(
     warp_size: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
 ) -> list[TileOp]:
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
@@ -227,6 +238,7 @@ def _enumerate_variants(
             allowed_bufs=allow,
             warp_size=warp_size,
             atom_kind=atom_kind,
+            input_shapes=input_shapes,
             bytes_per_elem=bytes_per_elem,
         )
         if new_body is None:
@@ -394,6 +406,7 @@ def _maybe_rewrite(
     warp_size: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
 ) -> Body | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
@@ -431,6 +444,7 @@ def _maybe_rewrite(
         allowed_bufs=allowed_bufs,
         is_cooperative=is_cooperative,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
         bytes_per_elem=bytes_per_elem,
     )
     if new_tile_body == tt.body:
@@ -468,6 +482,7 @@ def _process_scope(
     register_axes: tuple[Axis, ...] = (),
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
 ) -> Body:
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
@@ -511,6 +526,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -531,6 +547,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -548,6 +565,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -573,6 +591,7 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(Cond(cond=s.cond, body=Body(new_body), else_body=s.else_body))
@@ -600,6 +619,7 @@ def _process_scope(
         slab_cap=slab_cap,
         scope_budget=scope_budget,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
         bytes_per_elem=bytes_per_elem,
     )
     if not sources:
@@ -639,6 +659,7 @@ def _build_sources(
     scope_budget: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
 ) -> tuple[list[Source], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by index equality; per partition, derive
     slab geometry; admit Sources under budget. Returns (sources,
@@ -696,6 +717,18 @@ def _build_sources(
                     dims=tuple(slab.slab_dims),
                     block=slab.block,
                 )
+            # Masked-K (symbolic reduce): when this operand's REDUCE gmem dim is
+            # symbolic (SDPA P@V's seq_len), the final K_o tile overruns the
+            # runtime extent and the overhang must read ZERO into the mma
+            # accumulation. Stamp ``kmask=(reduce_dim, bound)`` so
+            # ``_stage_expand`` forces the sync transport and zero-fills the
+            # loaded value where the K coord ``>= bound``. A static-K operand
+            # (every output-only-masked / dense matmul) leaves ``kmask=None``.
+            kmask: tuple[int, object] | None = None
+            shape = (input_shapes or {}).get(buf)
+            rd = slab.reduce_dim
+            if shape is not None and rd is not None and rd < len(shape) and not shape[rd].is_static:
+                kmask = (rd, shape[rd].expr)
             src = Source(
                 name=smem_name,
                 buf=buf,
@@ -703,6 +736,7 @@ def _build_sources(
                 origin=slab.origin,
                 pad=(),
                 addressing=addressing,
+                kmask=kmask,
             )
             sources.append(src)
             used_bytes += slab.n_bytes
@@ -928,6 +962,7 @@ def _classify(
         template=template,
         n_bytes=n_bytes,
         block=block_tuple,
+        reduce_dim=var_to_dim.get(reduce_axis.name),
     )
 
 

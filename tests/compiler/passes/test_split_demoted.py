@@ -980,13 +980,13 @@ def test_collapsed_attn_out_split_offered_for_symbolic_rows() -> None:
     )
 
 
-def test_no_split_for_symbolic_k() -> None:
-    """The static-K bail is pinned: a symbolic reduce extent keeps the fused
-    path the only outcome. The split exists to hand the cell tagger a clean
-    gemm that reaches the WARP tier, but the warp tier needs a static reduce
-    (``mma.sync`` / ``ldmatrix``), so a symbolic-K matmul is scalar fused or
-    split — splitting it would only add a materialization with no tier upgrade.
-    (Symbolic N and symbolic ROW axes ARE admitted — see the tests above.)"""
+def test_split_offered_for_symbolic_k() -> None:
+    """A symbolic reduce extent IS admitted now that the warp tier accepts a
+    MASKED K (hint-tiled, the partial final slab zero-filled in smem — see
+    ``010_partition_loops`` / ``_stage_expand``). The split hands the cell tagger
+    a clean symbolic-K gemm that reaches the tensor-core tier, exactly the
+    static-K case; before masked-K MMA this was bailed (no tier upgrade).
+    (Symbolic N and symbolic ROW axes were already admitted — tests above.)"""
     from deplodock.compiler.dim import Dim
 
     f16 = _dt.get("f16")
@@ -999,7 +999,10 @@ def test_no_split_for_symbolic_k() -> None:
     g.add_node(MatmulOp(), ["xs", "w"], Tensor("o", (32, 64), f16), node_id="o")
     g.inputs = ["x", "s", "w"]
     g.outputs = ["o"]
-    assert _split(_fuse(g)) is None
+    frag = _split(_fuse(g))
+    assert frag is not None, "symbolic-K demoted matmul should now split (masked-K warp tier)"
+    loops = {n.id for n in frag.nodes.values() if isinstance(n.op, LoopOp)}
+    assert loops == {"o__xn", "o__mm"}
 
 
 def test_symbolic_split_matches_fused_on_numpy() -> None:

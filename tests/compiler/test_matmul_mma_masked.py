@@ -211,3 +211,66 @@ def test_symbolic_m_masked_mma_residual_epilogue_accuracy(monkeypatch):
     want = a.astype(np.float32) @ b.astype(np.float32) + r.astype(np.float32)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"masked MMA + residual epilogue mismatch (max abs err {diff})"
+
+
+def _symbolic_k_graph(*, M: int = 64, N: int = 128) -> Graph:
+    """A @ B with the REDUCE axis symbolic (``Dim('seq_len')``) — the SDPA P@V
+    shape after the demoted-matmul split (static M/N, runtime K = seq_len)."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, Dim("seq_len")), dtype=F16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (Dim("seq_len"), N), dtype=F16), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (M, N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+    return g
+
+
+def test_warp_enumeration_admits_forced_mask_k():
+    """``k_forced_mask`` skips the K-side divisibility constraint (the runtime
+    reduce extent is unknown — the partial final K slab is zero-filled) and
+    stamps the K axis into ``OVERHANG`` on every row, exactly like a masked
+    output axis."""
+    atoms = (ATOM_REGISTRY["mma_m16n8k16_f16"],)
+    rows = _enumerate_warp_matmul_impl(
+        E_M=64,
+        E_N=128,
+        E_K=512,
+        ctx=Context(compute_capability=(12, 0)),
+        force_splitk_one=True,
+        atoms=atoms,
+        m_axis_name="i",
+        n_axis_name="j",
+        m_forced_mask=False,
+        n_forced_mask=False,
+        k_axis_name="k",
+        k_forced_mask=True,
+    )
+    assert rows, "forced-mask K should enumerate warp rows"
+    assert all("k" in r["OVERHANG"] for r in rows), "every symbolic-K row must stamp OVERHANG"
+    # No hint-divisibility on the masked K: a BK whose cell count doesn't divide
+    # the hint's K cells is admitted (the ceil-div K_o loop + zero-fill cover it).
+    assert any(r["BK"] not in (1, 2, 4) or (512 // 16) % r["BK"] != 0 for r in rows) or rows
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
+def test_symbolic_k_masked_mma_accuracy(monkeypatch, seq):
+    """One compiled symbolic-K kernel is accurate at runtime reduce extents
+    below, at, and above the 512 hint — including the straddling cases (31, 130,
+    700 are not multiples of the BK·atom_k = 32-element K tile, so the final K_o
+    slab is partial and must be ZERO-filled past seq_len, not edge-clamped)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_symbolic_k_graph())
+    rng = np.random.default_rng(0)
+    for run_seq in [seq]:
+        a = (rng.standard_normal((64, run_seq)) * 0.1).astype(np.float16)
+        b = (rng.standard_normal((run_seq, 128)) * 0.1).astype(np.float16)
+        result, _ = be.run(compiled, input_data={"a": a, "b": b})
+        got = result.outputs["o"].astype(np.float32)
+        want = a.astype(np.float32) @ b.astype(np.float32)
+        assert got.shape == (64, 128)
+        diff = np.abs(got - want).max()
+        assert diff < 5e-2, f"seq={run_seq}: masked-K MMA mismatch (max abs err {diff})"
