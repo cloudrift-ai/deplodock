@@ -57,12 +57,18 @@ cold), and a lowering failure on either side must surface as a rejection.
 Conservative bails (return ``None``, never raise) keep the fused path the only
 outcome for any shape the cut doesn't fully understand: multiple K loops, no computed
 or K-folded operand, a K-invariant Load operand, distinct-class cones sharing stmts,
-cone values escaping past the multiply, mixed-dtype cell leaves, symbolic K or N extents
-(symbolic ROW axes are admitted — the cut re-emits rows verbatim and the ``xn`` / ``mm_i``
-buffers carry the symbolic Dim), more
+cone values escaping past the multiply, mixed-dtype cell leaves, more
 than one cone reading the output N axis (two ``(…, K, N)`` buffers would re-do the
 matmul's own volume — the materialization that defeats the split), or — multi-accum only —
-a cell stmt claimed by no gemm / an operand Load doubling as a cone member.
+a cell stmt claimed by no gemm / an operand Load doubling as a cone member, or a symbolic K
+extent. Symbolic N / ROW extents ARE admitted: the cut tiles neither, so the ``xn`` /
+``mm_i`` buffers just carry the symbolic Dim (allocated from the runtime extent) and the
+clean gemm reaches the warp tier on a symbolic N as a masked tile (M9) — un-fusing the
+rotary QK^T (symbolic N). Symbolic K stays bailed because the warp tier needs a static
+reduce, so a symbolic-K matmul (SDPA P@V) is scalar fused or split — splitting only adds a
+materialization with no tier upgrade. A symbolic dimension VARIABLE in a cone's index
+arithmetic (the o_proj collapsed attn-out, whose head stride is ``seq_len * 128``) is a
+legitimate runtime read, not an unmodeled scope — see ``dim_names`` below.
 """
 
 from __future__ import annotations
@@ -180,6 +186,15 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     # check and the consumer rebuild need each duplicate chain's stmts); only
     # the class representatives materialize producers.
     axis_names = {a.name for a in loop_op.axes}
+    # Symbolic dimension vars (e.g. ``seq_len``) are legitimate external reads,
+    # not an unmodeled scope: a symbolic-extent buffer's index arithmetic
+    # references the Dim in its strides (the collapsed-reshape o_proj attn-out
+    # read, whose head stride is ``seq_len * 128``), and the backend resolves it
+    # from the input shapes at launch like any runtime kernel arg. They are NOT
+    # added to ``axis_names`` — they're scalar runtime quantities, not loop axes
+    # to tile/materialize over; the producers re-emit the symbolic row loops and
+    # the index arithmetic flows through unchanged.
+    dim_names = {v for a in loop_op.axes for v in a.extent.expr.free_vars()}
     cone_of: dict[str, _RootCone] = {}
     for root in roots:
         cell_cone = k_loop.body.backward_cone((root,))
@@ -189,8 +204,8 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
             return None  # cone reads the matmul's own running accumulator — not cuttable
         pro_cone = Body(prologue_level).backward_cone(cell_cone.external_reads)
         lead_cone = Body(leading).backward_cone(pro_cone.external_reads)
-        if lead_cone.external_reads - axis_names:
-            return None  # name from an unmodeled scope — bail conservatively
+        if lead_cone.external_reads - axis_names - dim_names:
+            return None  # name from an unmodeled scope (axis vars + symbolic Dims allowed)
         # Axes the materialization must cover: everything the moved stmts read
         # (prologue deps included — their row loops rebuild around the xn Write).
         axes = lead_cone.external_reads & axis_names
@@ -266,8 +281,8 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
             level = (Loop(axis=lp.axis, body=Body(level)),)
         producer = LoopOp(body=Body((*c.lead.members, *level)))
         producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
-        # Row extents pass through as Dims (symbolic rows allocate from the
-        # runtime extent); K / N are static-gated by ``_classify_cut``.
+        # Every extent passes through as a Dim — rows, K, and N alike allocate
+        # from the runtime extent when symbolic (``_classify_cut`` admits all).
         shape = tuple(lp.axis.extent for lp in rows_used) + (k_loop.axis.extent,)
         if reads_n:
             shape += (outer_n.axis.extent,)
@@ -283,8 +298,7 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     acc_loads: list[Load] = []
     if len(accums) > 1:
         mm_index = (*(Var(lp.axis.name) for lp in rows), Var(n_name))
-        # Row Dims pass through (symbolic rows allocate at runtime); N is
-        # static-gated by ``_classify_cut``.
+        # Every Dim passes through (symbolic rows / N allocate at runtime).
         mm_shape = tuple(lp.axis.extent for lp in rows) + (outer_n.axis.extent,)
         for i, (acc, mul, _) in enumerate(per_acc):
             mm_id = f"{node_id}__mm{i}"
@@ -412,13 +426,20 @@ def _classify_cut(loop_op: LoopOp):
     if len(k_loops) != 1:
         return None
     k_loop = k_loops[0]
-    if not k_loop.axis.extent.is_static or not outer_n.axis.extent.is_static:
+    # Symbolic N / ROW extents are admitted; symbolic K is not. The cut tiles
+    # none of these axes — the producers and consumer re-emit them verbatim and
+    # every ``xn`` / ``mm_i`` buffer dim carries the symbolic Dim (allocated
+    # from the runtime extent; nothing here reasons about the numeric volume) —
+    # so a symbolic N is offered: the clean gemm reaches the WARP tier as a
+    # masked tile (M9), and the search prices the split. A symbolic K stays
+    # bailed: the warp tier needs a static reduce (``mma.sync`` / ``ldmatrix``
+    # over a static K), so a symbolic-K matmul is scalar whether fused or split
+    # — splitting it only adds a materialization producer with no tier upgrade
+    # (strictly slower), which is the split's whole reason to exist. This
+    # un-fuses the symbolic-N rotary QK^T demotion (P@V's symbolic K stays
+    # fused-scalar — its deployment path is finding-3's flash work, not this).
+    if not k_loop.axis.extent.is_static:
         return None
-    # Symbolic ROW extents are fine: the cut never tiles the row axes — the
-    # producers and the consumer re-emit them verbatim, and the ``xn`` /
-    # ``mm_i`` buffers carry the symbolic Dim (the backend allocates them
-    # from the runtime extent like any other symbolic intermediate). Only K
-    # and N must be static (the gemm extraction reasons about their volume).
     return tuple(leading), rows, prologue_level, outer_n, k_loop
 
 

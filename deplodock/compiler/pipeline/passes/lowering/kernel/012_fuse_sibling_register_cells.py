@@ -122,15 +122,15 @@ def _try_fuse_runs(body: Body) -> Body:
 
 def _has_matching_lead_loop(a: Body, b: Body) -> bool:
     """Two bodies are run-compatible iff their leading statement is a
-    loop-like stmt over the same axis name + static extent. The tail stmts
-    are not required to match — they're handled per-cell in the fused
-    output."""
+    loop-like stmt over the same axis name + extent (``Dim`` equality, so a
+    symbolic ``seq_len`` matches a symbolic ``seq_len``). The tail stmts are
+    not required to match — they're handled per-cell in the fused output."""
     if not a or not b:
         return False
     la, lb = a[0], b[0]
     if not isinstance(la, _LOOP_LIKE) or not isinstance(lb, _LOOP_LIKE) or type(la) is not type(lb):
         return False
-    if la.axis.name != lb.axis.name or la.axis.extent.as_static() != lb.axis.extent.as_static():
+    if la.axis.name != lb.axis.name or la.axis.extent != lb.axis.extent:
         return False
     return True
 
@@ -195,11 +195,8 @@ def _fuse_loop_run(loops: list, preds: list):
 def _all_single_matched_loop(bodies: list[list[Stmt]]) -> bool:
     """Lockstep drill predicate: every body is exactly one loop-like stmt of
     the same flavor (``Loop`` / ``SerialTile`` / ``StridedTile``) over the
-    same axis name + static extent."""
+    same axis name + extent (``Dim`` equality — symbolic extents included)."""
     if not all(len(b) == 1 and isinstance(b[0], _LOOP_LIKE) for b in bodies):
         return False
     first = bodies[0][0]
-    return all(
-        type(b[0]) is type(first) and b[0].axis.name == first.axis.name and b[0].axis.extent.as_static() == first.axis.extent.as_static()
-        for b in bodies
-    )
+    return all(type(b[0]) is type(first) and b[0].axis.name == first.axis.name and b[0].axis.extent == first.axis.extent for b in bodies)
