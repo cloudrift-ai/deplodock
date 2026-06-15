@@ -63,10 +63,12 @@ matmul's own volume — the materialization that defeats the split), or — mult
 a cell stmt claimed by no gemm / an operand Load doubling as a cone member, or a symbolic K
 extent. Symbolic N / ROW extents ARE admitted: the cut tiles neither, so the ``xn`` /
 ``mm_i`` buffers just carry the symbolic Dim (allocated from the runtime extent) and the
-clean gemm reaches the warp tier on a symbolic N as a masked tile (M9) — un-fusing the
-rotary QK^T (symbolic N). Symbolic K stays bailed because the warp tier needs a static
-reduce, so a symbolic-K matmul (SDPA P@V) is scalar fused or split — splitting only adds a
-materialization with no tier upgrade. A symbolic dimension VARIABLE in a cone's index
+clean gemm reaches the warp tier on a symbolic N as a masked tile — un-fusing the
+rotary QK^T (symbolic N). Symbolic K is ALSO admitted now that the warp tier accepts a
+masked reduce (the K is hint-tiled and the partial final slab is zero-filled in smem):
+the SDPA P@V demotion un-fuses into a softmax-normalizing ``xn`` producer + a clean
+symbolic-K consumer that reaches the tensor-core tier (matching its static twin), instead
+of staying fused-scalar. A symbolic dimension VARIABLE in a cone's index
 arithmetic (the o_proj collapsed attn-out, whose head stride is ``seq_len * 128``) is a
 legitimate runtime read, not an unmodeled scope — see ``dim_names`` below.
 """
@@ -426,20 +428,18 @@ def _classify_cut(loop_op: LoopOp):
     if len(k_loops) != 1:
         return None
     k_loop = k_loops[0]
-    # Symbolic N / ROW extents are admitted; symbolic K is not. The cut tiles
-    # none of these axes — the producers and consumer re-emit them verbatim and
-    # every ``xn`` / ``mm_i`` buffer dim carries the symbolic Dim (allocated
-    # from the runtime extent; nothing here reasons about the numeric volume) —
-    # so a symbolic N is offered: the clean gemm reaches the WARP tier as a
-    # masked tile (M9), and the search prices the split. A symbolic K stays
-    # bailed: the warp tier needs a static reduce (``mma.sync`` / ``ldmatrix``
-    # over a static K), so a symbolic-K matmul is scalar whether fused or split
-    # — splitting it only adds a materialization producer with no tier upgrade
-    # (strictly slower), which is the split's whole reason to exist. This
-    # un-fuses the symbolic-N rotary QK^T demotion (P@V's symbolic K stays
-    # fused-scalar — its deployment path is finding-3's flash work, not this).
-    if not k_loop.axis.extent.is_static:
-        return None
+    # Symbolic N / ROW / K extents are all admitted. The cut tiles none of these
+    # axes — the producers and consumer re-emit them verbatim and every ``xn`` /
+    # ``mm_i`` buffer dim carries the symbolic Dim (allocated from the runtime
+    # extent; nothing here reasons about the numeric volume). A symbolic N is
+    # offered because the clean gemm reaches the WARP tier as a masked tile; a
+    # symbolic K is offered for the same reason now that the warp tier admits a
+    # MASKED reduce (``mma.sync`` over a hint-tiled K with the partial final slab
+    # zero-filled in smem — see ``010_partition_loops`` + ``_stage_expand``). So
+    # the SDPA P@V demotion (softmax prologue + a symbolic-K matmul) un-fuses
+    # into a softmax-normalizing ``xn`` producer + a clean symbolic-K consumer
+    # that reaches the tensor-core tier, matching its static twin — the search
+    # prices the split against the fused-scalar form.
     return tuple(leading), rows, prologue_level, outer_n, k_loop
 
 

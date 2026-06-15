@@ -264,6 +264,8 @@ def enumerate_cartesian(
     n_axis_name: str | None = None,
     m_forced_mask: bool = False,
     n_forced_mask: bool = False,
+    k_axis_name: str | None = None,
+    k_forced_mask: bool = False,
     mask_f1: bool = False,
     atoms: tuple[Atom, ...] = (),
     fp16_window: bool = False,
@@ -341,6 +343,8 @@ def enumerate_cartesian(
             n_axis_name=n_axis_name,
             m_forced_mask=m_forced_mask,
             n_forced_mask=n_forced_mask,
+            k_axis_name=k_axis_name,
+            k_forced_mask=k_forced_mask,
         )
         return _prior_order(warp_rows, E_M=E_M, E_N=E_N, E_K=E_K, ctx=ctx)
     # ``sweep_fk`` enables the reduce-axis multiple-accumulator (FK) sweep —
@@ -720,6 +724,8 @@ def _enumerate_warp_matmul_impl(
     n_axis_name: str | None,
     m_forced_mask: bool,
     n_forced_mask: bool,
+    k_axis_name: str | None = None,
+    k_forced_mask: bool = False,
 ) -> list[dict]:
     """Pure cartesian enumeration for the warp tier — produces
     warp-tier knob rows. Parallel in spirit to
@@ -742,11 +748,20 @@ def _enumerate_warp_matmul_impl(
         return []
     m_masked = m_forced_mask and m_axis_name is not None and E_M > 1
     n_masked = n_forced_mask and n_axis_name is not None and E_N > 1
+    # Masked K (symbolic reduce — SDPA P@V's seq_len): the K axis is tiled at
+    # its hint and the final partial K tile is ZERO-FILLED in smem (the slab
+    # value, not the index — K feeds the mma accumulation, so an edge-clamp
+    # would add garbage; ``_stage_expand`` emits the ``(k < seq_len) ? v : 0``
+    # guard). Unlike M/N, the K axis carries no output cell, so it stamps into
+    # OVERHANG but never reaches the per-element store guard.
+    k_masked = k_forced_mask and k_axis_name is not None and E_K > 1
     overhang_axes: tuple[str, ...] = ()
     if n_masked:
         overhang_axes = (*overhang_axes, n_axis_name)
     if m_masked:
         overhang_axes = (*overhang_axes, m_axis_name)
+    if k_masked:
+        overhang_axes = (*overhang_axes, k_axis_name)
 
     out: list[dict] = []
     seen: set[tuple] = set()
@@ -775,13 +790,12 @@ def _enumerate_warp_matmul_impl(
     splitk_choices: tuple[int, ...] = (1,)
     for atom in atoms:
         atom_m, atom_n, atom_k = atom.shape
-        if (not m_masked and E_M % atom_m != 0) or (not n_masked and E_N % atom_n != 0) or E_K % atom_k != 0:
+        if (not m_masked and E_M % atom_m != 0) or (not n_masked and E_N % atom_n != 0) or (not k_masked and E_K % atom_k != 0):
             # Outer divisibility — the eligibility predicate already enforced
             # this for the kind it gated, but a different kind in the same
             # registry could disagree, so double-check structurally here.
-            # A masked axis ceil-divs instead (boundary guard covers the
-            # partial tile); K stays static-divisor (symbolic-K warp tier is
-            # out of scope).
+            # A masked axis ceil-divs instead (boundary guard / K zero-fill
+            # covers the partial tile).
             continue
         # Per-axis cell counts available after the atom cell is fixed. For a
         # masked axis the hint's ceil-div cell count only CAPS the sweep (the
@@ -790,8 +804,9 @@ def _enumerate_warp_matmul_impl(
         cells_N = -(-E_N // atom_n) if n_masked else E_N // atom_n
         # K iterations consumed by one mma_sync. Total K cells = E_K / atom_k;
         # BK below is the inner stage_inner trip count (number of mma_syncs
-        # per K_o iteration).
-        k_cells_total = E_K // atom_k
+        # per K_o iteration). A masked K ceil-divs at the hint (the partial
+        # final cell is zero-filled), so its cell count only caps the BK sweep.
+        k_cells_total = -(-E_K // atom_k) if k_masked else E_K // atom_k
         for wm in wm_choices:
             if not m_masked and cells_M % wm != 0:
                 continue
@@ -824,11 +839,14 @@ def _enumerate_warp_matmul_impl(
                         for bk in bk_choices:
                             # ``bk`` is the inner stage_inner trip count
                             # (mma_syncs per K_o iter); each iter consumes
-                            # ``atom_k`` K-elements. ``k_cells_total`` must
-                            # divide cleanly by ``bk``.
-                            if bk < 1 or k_cells_total % bk != 0:
+                            # ``atom_k`` K-elements. A clean K must divide
+                            # evenly by ``bk``; a masked K ceil-divs (the final
+                            # K_o iteration's partial slab is zero-filled).
+                            if bk < 1:
                                 continue
-                            k_o_total = k_cells_total // bk
+                            if not k_masked and k_cells_total % bk != 0:
+                                continue
+                            k_o_total = -(-k_cells_total // bk) if k_masked else k_cells_total // bk
                             for splitk in splitk_choices:
                                 if splitk < 1 or k_o_total % splitk != 0:
                                     continue

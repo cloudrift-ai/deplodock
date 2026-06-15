@@ -59,6 +59,13 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         raise RuleSkipped("ring buffers already applied (idempotence via knob)")
     if any(isinstance(s, StageBundle) and s.policy != StagePolicy.SYNC for s in body.iter()):
         raise RuleSkipped("double-buffer already applied (non-SYNC bundle present)")
+    # Masked-K (symbolic reduce) bundles are pinned to the SYNC transport: the
+    # partial-K-slab zero-fill needs a per-value ternary that cp.async / a ring
+    # buffer can't express (``_stage_expand``). Decline the ring (BUFFER_COUNT=1)
+    # so 050/060/080 also see SYNC and the consumer reads the un-phased slab the
+    # sync writer fills — never a phase-indexed slot the sync path never wrote.
+    if any(isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in body.iter()):
+        return [TileOp(body=body, name=root.op.name, knobs={**root.op.knobs, BUFFER_COUNT.name: 1})]
 
     candidates = BUFFER_COUNT.narrow(BUFFER_COUNT.hints)
     # Pin detection: if the user pinned ``DEPLODOCK_BUFFER_COUNT=N`` (or
