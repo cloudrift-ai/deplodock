@@ -20,10 +20,14 @@ knobs the greedy pick misses, and whether the search ever measured it. Use the `
 Requires a CUDA GPU. The whole sweep is ~30 min (23 shapes). Goldens are **hand-maintained YAML** — never dump them with
 PyYAML (it destroys the flow-style `{BN: 16, ...}` knob dicts and key order); edit the YAML text directly.
 
+Work dir: keep all temp data **inside the repo** under the untracked `_tune/` folder (e.g.
+`_tune/golden-sweep-<gpu>/`) — `_tune/` is gitignored, so the tee'd logs and any `--dump-dir` dumps persist across
+reboots (unlike `/tmp`) and the sweep stays reproducible later.
+
 ## Step 1 — Tune the whole golden dataset
 
 ```
-deplodock tune --dataset golden --clean
+deplodock tune --dataset golden --clean 2>&1 | tee _tune/golden-sweep-<gpu>/tune.log
 ```
 
 This tunes every golden shape in one in-process loop (`handle_tune` over `_tune_targets` — the same codepath as a

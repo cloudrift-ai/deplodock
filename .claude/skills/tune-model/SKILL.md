@@ -30,8 +30,10 @@ write ad-hoc bench scripts or hand-written SQL.
   `Qwen/Qwen3-Embedding-0.6B`.
 - Static (no `--dynamic`) only if the user explicitly wants shape-specialised kernels; say so in the report
   (specialised kernels, no masked-tile guards — not the deployable configuration).
-- Work dir: pick a fresh dir (e.g. `/tmp/tune-model-<slug>/`) holding the dump dir and tee'd logs — the
-  report quotes both, and `deplodock compare` diffs dump dirs across runs.
+- Work dir: pick a fresh dir **inside the repo** under the untracked `_tune/` folder (e.g.
+  `_tune/tune-model-<slug>/`) holding the dump dir and tee'd logs — `_tune/` is gitignored, so the dumps,
+  reproducers, and logs persist across reboots (unlike `/tmp`) and the run stays reproducible later. The report
+  quotes the dump + logs, and `deplodock compare` diffs dump dirs across runs.
 
 ## Step 1 — clean tune + -O3 bench
 

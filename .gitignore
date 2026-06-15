@@ -43,3 +43,7 @@ recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
 
 # Local-only analysis artifacts (priors / tune DBs / harvest dumps) — never commit
 _data/
+
+# Tune-skill work dirs (per-run dump dirs + tee'd logs) — kept in-repo so runs are
+# reproducible later, but never committed
+_tune/
