@@ -42,6 +42,20 @@ def test_int_dim_arithmetic_ergonomic():
     assert Dim("s") + 0 == Dim("s")
 
 
+def test_ceil_div_static_folds_to_int_ceil():
+    # Matches the ``-(-E // b)`` idiom (positive extents) the masked-tile sites used.
+    for ext, div in [(65, 16), (64, 16), (151669, 128), (1, 1), (512, 128), (100, 32)]:
+        got = Dim(ext).ceil_div(div)
+        assert got.is_static and got.as_static() == -(-ext // div), (ext, div)
+
+
+def test_ceil_div_symbolic_builds_composite_expr():
+    # ``(seq + (b - 1)) // b`` — the launch resolver evals it from sym_values.
+    assert Dim("seq").ceil_div(16).expr == BinaryExpr("//", BinaryExpr("+", Var("seq"), Literal(15, "int")), Literal(16, "int"))
+    # Degenerate divisor 1 collapses to the bare axis (matches the symbolic-serial passthrough).
+    assert Dim("seq").ceil_div(1).expr == Var("seq")
+
+
 def test_equality_with_bare_int_and_str():
     assert Dim(32) == 32
     assert Dim("s") == "s"

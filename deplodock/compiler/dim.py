@@ -168,6 +168,18 @@ class Dim:
     def __rmod__(self, other: int | Dim) -> Dim:
         return Dim(_simplify(BinaryExpr("%", _coerce_expr(other), self.expr)))
 
+    def ceil_div(self, other: int | Dim) -> Dim:
+        """Ceiling division ``ceil(self / other)``, as ``(self + (other - 1)) // other``.
+
+        One masked-tile grid-extent formula for static and symbolic dims alike:
+        eager ``Expr.simplify`` folds a static (``Literal``) dim to the integer
+        ceil (``Dim(65).ceil_div(16) → Dim(5)``, matching the ``-(-E // b)``
+        idiom for positive extents), while a symbolic dim builds the composite
+        ceil-div ``Expr`` the launch resolver evals from ``sym_values``. Replaces
+        the hand-written static-int / symbolic-``Expr`` ceil-div pair at masked
+        block-axis and masked-K sites (``tile/010_partition_loops.py``)."""
+        return (self + (other - 1)) // other
+
     # ---- equality + hashing ---------------------------------------------
 
     def __eq__(self, other: object) -> bool:
