@@ -86,4 +86,10 @@ retained only to record the rejected approach and why; see "Status" above for wh
   nothing.)*
 - **Prefix-occupancy** for shared capacity buffers, with the 2-D causal mask generated on-device. *(Prefix occupancy
   kept; on-device mask-gen deferred to follow-up #1 — the host upload is correct and simpler for the first cut.)*
-- TMA is rejected on symbolic-dim graphs (`lowering/tile/050_use_tma.py:152-157`), so it was never a concern.
+- TMA was originally rejected on symbolic-dim graphs, so it was never a concern. **Update:** TMA now fires on
+  symbolic-dim graphs for M-masked matmuls with a static innermost dim (`lowering/tile/050_use_tma.py`) — the
+  descriptor's `globalDim` is encoded per launch from the runtime input shape (`program._prebuild_descriptors`) and TMA
+  zero-fills the masked overhang. For serving this is handled by the **capture-per-`seq_len`** model: each captured
+  graph bakes a descriptor for its exact `seq_len`, so no per-replay descriptor refresh is needed. A future
+  single-graph-across-`seq_len` mode would need the descriptor re-encoded + refreshed before each replay (stable
+  pointer, updated contents) — out of scope for the per-S capture path.

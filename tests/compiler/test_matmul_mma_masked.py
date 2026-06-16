@@ -29,7 +29,12 @@ from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _enumerate_warp_matmul_impl
 
-_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2"}
+# ``TMA=0`` pins the cp.async masked path: these tests assert cp.async-specific
+# codegen (the clamped A-slab fill, the "shape D" double-buffered pipeline).
+# Symbolic-M with a static innermost dim is now ALSO TMA-eligible
+# (``050_use_tma`` builds the descriptor's globalDim per launch from the runtime
+# shape; TMA zero-fills the masked overhang) — that path has its own test below.
+_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2", "TMA": "0"}
 
 
 def _has_cuda() -> bool:
@@ -147,6 +152,52 @@ def test_symbolic_m_masked_mma_accuracy(monkeypatch, seq):
     assert got.shape == (seq, 1024)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"seq={seq}: masked MMA mismatch (max abs err {diff})"
+
+
+_TMA_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2", "TMA": "1"}
+
+
+def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
+    """Symbolic-M (static innermost) reaches the warp tier staged via **TMA**:
+    the kernel carries the runtime ``seq_len`` arg + a ``CUtensorMap`` descriptor
+    param and stages the A operand with ``cp.async.bulk.tensor`` (no cp.async
+    clamp — the descriptor's globalDim is the runtime extent and TMA zero-fills
+    the masked overhang). The descriptor is encoded per launch from the input
+    array shape (``program._prebuild_descriptors``)."""
+    for k, v in _TMA_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
+    kop = lowered.nodes["o"].op
+    assert kop.knobs.get("TMA") is True, "symbolic-M with static innermost dim must be TMA-eligible"
+    src = kop.kernel_source
+    assert "int seq_len" in src, "runtime extent must still be a kernel arg"
+    assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"
+    assert "CUtensorMap" in src, "kernel must take the TMA descriptor param"
+    assert "mma.sync.aligned.m16n8k16" in src
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("seq", [1, 31, 512, 700])
+def test_symbolic_m_masked_mma_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged symbolic-M kernel is accurate at runtime sizes below, at,
+    and above the 512 hint — the cases that exercise the per-launch descriptor
+    build (``_collapse_inert_dims`` must keep the masked dim even when its
+    runtime extent is 1/31, and TMA zero-fills the box overhang past ``seq_len``)."""
+    for k, v in _TMA_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_symbolic_m_graph())
+    rng = np.random.default_rng(0)
+    b = (rng.standard_normal((512, 1024)) * 0.1).astype(np.float16)
+    a = (rng.standard_normal((seq, 512)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"a": a, "b": b})
+    got = result.outputs["o"].astype(np.float32)
+    want = a.astype(np.float32) @ b.astype(np.float32)
+    assert got.shape == (seq, 1024)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: TMA masked MMA mismatch (max abs err {diff})"
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")

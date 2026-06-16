@@ -245,6 +245,33 @@ def run_two_level(graph, **kwargs):
     return asyncio.run(run_two_level_tune(graph, **kwargs))
 
 
+@pytest.fixture(params=["static", "dynamic"])
+def shape_mode(request) -> str:
+    """Parametrize a test over a static vs dynamic (symbolic-M) shape. Any test
+    that names this fixture runs once per mode — the static/dynamic parity
+    automation. Pair with :func:`dyn_M` to flip a graph's leading/M axis:
+
+        def test_x(shape_mode):
+            g = build_graph(M=dyn_M(shape_mode, 256), ...)   # int 256 or Dim('seq_len')
+
+    The dynamic mode compiles ONE symbolic kernel (``Dim('seq_len')``, runtime
+    ``int seq_len`` arg) tiled at the 512 hint and run at the concrete M fed in
+    the input arrays; the static mode bakes M. Use tile-divisor M for strict
+    static-vs-dynamic parity (off-hint masked sizes live in
+    ``test_matmul_mma_masked.py``)."""
+    return request.param
+
+
+def dyn_M(mode: str, M: int):
+    """``Dim('seq_len')`` for ``mode == 'dynamic'``, else the int ``M``. The
+    one-liner that turns a static graph builder into a static/dynamic one."""
+    if mode == "dynamic":
+        from deplodock.compiler.dim import Dim
+
+        return Dim("seq_len")
+    return M
+
+
 def from_pretrained_or_skip(loader, *args, **kwargs):
     """Run a HuggingFace ``from_pretrained`` download, skipping the test on a Hub
     connection / rate-limit failure.
