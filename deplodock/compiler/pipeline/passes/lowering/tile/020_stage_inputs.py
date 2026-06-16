@@ -649,6 +649,38 @@ def _process_scope(
     return tuple([*rewritten[:lo], bundle, *rewritten[hi + 1 :]])
 
 
+def _masked_k_mma_pad(
+    kmask: tuple[int, object] | None,
+    cache_axes: tuple[Axis, ...],
+    block: tuple[int, ...],
+    elem_bytes: int,
+) -> tuple[int, ...]:
+    """Inner-dim pad that breaks the masked-K MMA slab's ldmatrix bank conflict.
+
+    A masked-K (symbolic reduce) operand staged for a warp matmul is read with
+    ``ldmatrix.x4`` from a flat ``[…, M, K]`` smem slab (K innermost). When the
+    M-row stride (the block-scaled innermost alloc-extent) is a multiple of 128
+    bytes, the M-row lanes of one ldmatrix all alias one 4-byte bank — a
+    catastrophic load conflict (the 3.67M-conflict storm in the Qwen3-Embedding
+    dynamic SDPA P@V). Pad the innermost cache dim by one 16-byte ldmatrix chunk
+    (``16 // elem_bytes`` elements) so that stride — and every outer stride,
+    which all carry it as a factor — steps off the 128-byte alias, while every
+    row stays 16-byte aligned (the pad bytes are a multiple of 16, so ldmatrix
+    stays legal). Returns ``()`` (no pad) unless this is a kmask + block-stamped
+    (MMA) slab whose innermost stride actually hits the 128-byte alias — every
+    other slab keeps its dense layout. Reaching the static path's 0-conflict
+    floor needs its swizzle-atom-wide K-subtile relayout; this is the flat-slab
+    fix."""
+    if kmask is None or not block or len(cache_axes) < 2:
+        return ()
+    inner = cache_axes[-1].extent.as_static() * (block[-1] if block else 1)
+    if inner == 0 or (inner * elem_bytes) % 128 != 0:
+        return ()
+    pad = [0] * len(cache_axes)
+    pad[-1] = max(1, 16 // elem_bytes)
+    return tuple(pad)
+
+
 def _build_sources(
     loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]],
     thread_axes: tuple[Axis, ...],
@@ -729,12 +761,25 @@ def _build_sources(
             rd = slab.reduce_dim
             if shape is not None and rd is not None and rd < len(shape) and not shape[rd].is_static:
                 kmask = (rd, shape[rd].expr)
+            # Masked-K MMA slab: the consumer reads this ``[M][K]`` slab with
+            # ``ldmatrix.x4``, whose M-row lanes all hit one 4-byte bank when the
+            # M-row stride (inner alloc-extent) is a multiple of 128 B — the
+            # 3.67M-conflict storm in the Qwen3-Embedding dynamic SDPA P@V. An
+            # alignment-preserving inner pad (one 16-byte ldmatrix chunk) shifts
+            # the stride off the bank alias (~16-way → conflict-free for the 8
+            # row-lanes of one ldmatrix phase) while keeping every row 16-byte
+            # aligned so ldmatrix stays legal. Stamped here (not via the
+            # ``070_pad_smem`` autotune fork) because it is a near-strict win
+            # with no misalignment penalty — intrinsic to the slab so greedy
+            # deploys it, and ``070`` then self-skips the already-padded source.
+            ebytes = (bytes_per_elem or {}).get(buf, BYTES_PER_ELEM) if bytes_per_elem else BYTES_PER_ELEM
+            pad = _masked_k_mma_pad(kmask, slab.cache_axes, slab.block, ebytes)
             src = Source(
                 name=smem_name,
                 buf=buf,
                 cache_axes=slab.cache_axes,
                 origin=slab.origin,
-                pad=(),
+                pad=pad,
                 addressing=addressing,
                 kmask=kmask,
             )
