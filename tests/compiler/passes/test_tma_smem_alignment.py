@@ -29,6 +29,7 @@ import re
 
 import pytest
 
+from deplodock.compiler import target as target_mod
 from deplodock.compiler.backend.cuda.backend import CudaBackend
 from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Tensor
@@ -64,12 +65,18 @@ def _norm_linear_graph(dtype, s: int = 32, h: int = 128, i: int = 512) -> Graph:
 
 
 @pytest.fixture
-def _tma_eligible_context(monkeypatch):
+def _tma_eligible_context():
     # Force Hopper+ so ``050_use_tma`` admits TMA promotion regardless of the
-    # live device. The materializer's smem-prologue logic is the surface
-    # under test; the live device's compute capability is irrelevant.
-    monkeypatch.setenv("DEPLODOCK_COMPUTE_CAPABILITY", "9.0")
-    yield
+    # live device — the gate reads ``ctx.compute_capability``, which honors the
+    # ``set_target`` override (NOT an env var), so on a GPU-less CI runner
+    # ``compute_capability()`` would otherwise fall back to ``(0, 0)`` and
+    # decline TMA. The materializer's smem-prologue logic is the surface under
+    # test; the live device's compute capability is irrelevant.
+    target_mod.set_target((9, 0))
+    try:
+        yield
+    finally:
+        target_mod.set_target(None)
 
 
 def _smem_decl_align(cuda_src: str, buf_name: str) -> int | None:
