@@ -154,6 +154,14 @@ class _Compiled:
     # fallback concrete value when no ``input_data`` is supplied (the autotuner
     # benches a symbolic graph at the hint size).
     symbolic_hints: dict[str, int] = field(default_factory=dict)
+    # Symbolic axis name → its capacity CAP. A capacity-capped kernel (the
+    # smem-staged fused symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)
+    # bakes its smem slab at the ``Dim`` hint and is only correct for runtime
+    # extents ≤ that cap, so the launch resolver hard-errors when the supplied
+    # input shape exceeds it (rather than reading/writing past the baked slab).
+    # Empty for every kernel set that tiles the symbolic extent with a ceil-div
+    # grid (those handle any runtime size); populated only by the capped cut.
+    symbolic_caps: dict[str, int] = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -318,6 +326,13 @@ def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) ->
         arr = input_data.get(buf)
         if arr is not None:
             env[name] = int(arr.shape[dim_idx])
+            cap = compiled.symbolic_caps.get(name)
+            if cap is not None and env[name] > cap:
+                raise ValueError(
+                    f"symbolic dim {name!r} = {env[name]} exceeds the capacity-capped kernel's hint ({cap}); "
+                    f"this build bakes its smem slab at {cap} and cannot run a larger extent — "
+                    f"re-trace with a larger --seq-len hint or use the ceil-div (uncapped) lowering"
+                )
         elif name in compiled.symbolic_hints:
             env[name] = compiled.symbolic_hints[name]
         else:

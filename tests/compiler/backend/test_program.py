@@ -1,13 +1,48 @@
 """Tests for cupy dispatch of a lowered ``Graph[CudaOp]``."""
 
+import numpy as np
 import pytest
 
-from deplodock.compiler.backend.cuda.program import _collapse_inert_dims, benchmark_program, run_program
+from deplodock.compiler.backend.cuda.program import _collapse_inert_dims, _Compiled, _resolve_symbolic, benchmark_program, run_program
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
+
+
+def _minimal_compiled(**kw) -> _Compiled:
+    """A ``_Compiled`` with no kernels — enough to exercise ``_resolve_symbolic``
+    (which only reads the symbolic_* maps). No CUDA needed."""
+    return _Compiled(bufs=[], buf_by_name={}, constants={}, kernels={}, launches=[], **kw)
+
+
+class TestSymbolicCapacityGuard:
+    """``symbolic_caps`` makes the launch resolver hard-error when a runtime
+    extent exceeds a capacity-capped kernel's baked hint (the smem-staged fused
+    symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)."""
+
+    def test_extent_over_cap_raises(self):
+        compiled = _minimal_compiled(
+            symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512}, symbolic_caps={"seq_len": 512}
+        )
+        big = np.zeros((1, 700, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="exceeds the capacity-capped"):
+            _resolve_symbolic(compiled, {"x": big})
+
+    @pytest.mark.parametrize("seq", [31, 512])
+    def test_extent_at_or_under_cap_ok(self, seq):
+        compiled = _minimal_compiled(
+            symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512}, symbolic_caps={"seq_len": 512}
+        )
+        arr = np.zeros((1, seq, 8), dtype=np.float32)
+        assert _resolve_symbolic(compiled, {"x": arr}) == {"seq_len": seq}
+
+    def test_no_cap_allows_any_extent(self):
+        # Uncapped (ceil-div) kernels carry no cap, so a large extent resolves fine.
+        compiled = _minimal_compiled(symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512})
+        big = np.zeros((1, 4096, 8), dtype=np.float32)
+        assert _resolve_symbolic(compiled, {"x": big}) == {"seq_len": 4096}
 
 
 class TestCollapseInertDims:

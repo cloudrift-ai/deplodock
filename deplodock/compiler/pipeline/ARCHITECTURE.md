@@ -810,6 +810,20 @@ order (inline-fuse first as the greedy default — smaller smem, works on every 
 fire whenever any source has a fixable conflict; the greedy run picks pad-on first. Honors `DEPLODOCK_PAD_SMEM` for
 one-off pinning.
 
+One smem pad is **not** an autotune fork: the **masked-K MMA slab** alignment pad, stamped intrinsically on the
+`Source` at creation by `020_stage_inputs._masked_k_mma_pad`. A symbolic-reduce (`kmask`) operand staged for a warp
+matmul — the SDPA P@V softmaxed `P` — lands in a flat `[…, M, K]` smem slab read by `ldmatrix.x4`; when the M-row
+stride (the innermost block-scaled alloc-extent) is a 128 B multiple, the ldmatrix M-row lanes all alias one bank
+(the 3.67M-load-conflict storm in the Qwen3-Embedding dynamic P@V — NCU 38 µs @ 26 % occ). `070_pad_smem` can't fix
+it: `kmask` pins masked-K to the SYNC transport (which `070` skips) and the source is block-stamped (which `070` also
+skips, since its `+1` pad breaks ldmatrix's 16 B alignment). So `020` pads the innermost cache dim by one 16 B
+ldmatrix chunk (`16 // elem_bytes` elements) — stepping the stride off the alias while keeping every row 16 B aligned.
+It's intrinsic (not a fork) because it's a near-strict win with no misalignment penalty, so greedy deploys it without a
+re-tune (`070` then self-skips the already-padded source); the result is numerically transparent and drops the P@V
+consumer's conflicts ~3.67M → ~1000 (NCU 38 → 27 µs). A flat `[M][K]` slab can't reach the static path's 0-conflict
+floor — that needs its swizzle-atom-wide K-subtile relayout — so this is the deployable flat-slab fix. See
+`plans/fused-symbolic-pv-smem-staged.md`.
+
 ## Pass directories
 
 Pass files are numerically prefixed so `sorted()` pickup is
