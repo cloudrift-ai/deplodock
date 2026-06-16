@@ -381,14 +381,24 @@ def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...
     box_rev = list(reversed(box_extents))
     if len(box_rev) == len(arr_rev) + 1 and arr_rev and box_rev[0] != 0 and arr_rev[0] % box_rev[0] == 0:
         arr_rev = [box_rev[0], arr_rev[0] // box_rev[0], *arr_rev[1:]]
+    # Drop exactly ``arr_rank - box_rank`` inert gap singletons — no more. A
+    # *box-carrying* dim can be a runtime-extent-1 (or any extent < its box):
+    # a masked dynamic axis (e.g. ``seq_len`` = 1, 31) is legitimately small,
+    # and TMA zero-fills the overhang where the box exceeds globalDim. The old
+    # "drop every extent-1 aligned with box>1" rule mis-dropped that masked dim
+    # whenever its runtime extent hit 1, then failed the rank match (seq_len=1
+    # → ``arr=(1, 512)`` vs ``box=(64, 32)``). Shedding only the surplus dims
+    # keeps the genuine inner gap-singleton drop (arr_rank > box_rank) intact.
+    n_drop = len(arr_rev) - len(box_rev)
     kept: list[int] = []
     bi = 0
     for a in arr_rev:
-        if bi < len(box_rev) and a == 1 and box_rev[bi] != 1:
+        if n_drop > 0 and a == 1 and bi < len(box_rev) and box_rev[bi] != 1:
+            n_drop -= 1
             continue  # dropped gap singleton
         kept.append(a)
         bi += 1
-    if bi != len(box_rev) or len(kept) != len(box_rev):
+    if n_drop != 0 or len(kept) != len(box_rev):
         raise ValueError(f"TMA descriptor rank mismatch: arr_shape={arr_shape!r} cannot be collapsed to match box_extents={box_extents!r}")
     return tuple(reversed(kept))
 

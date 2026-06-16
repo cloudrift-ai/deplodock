@@ -1,11 +1,40 @@
 """Tests for cupy dispatch of a lowered ``Graph[CudaOp]``."""
 
-from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
+import pytest
+
+from deplodock.compiler.backend.cuda.program import _collapse_inert_dims, benchmark_program, run_program
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
+
+
+class TestCollapseInertDims:
+    """``_collapse_inert_dims`` maps a runtime array shape onto a TMA descriptor's
+    box rank. It must keep a *box-carrying* dim even when its runtime extent is
+    small (a masked dynamic ``seq_len`` = 1, 31 — TMA zero-fills the box overhang
+    past the runtime extent), while still shedding genuine inert gap singletons
+    (arr_rank > box_rank). The old extent==1 heuristic mis-dropped the masked dim
+    at small ``seq_len`` (regression: ``arr=(1, 512)`` vs ``box=(64, 32)``)."""
+
+    def test_masked_m_runtime_extent_one(self):
+        # seq_len=1: the M dim (1) is box-carrying, not an inert singleton — keep it.
+        assert _collapse_inert_dims((1, 512), (64, 32)) == (1, 512)
+
+    @pytest.mark.parametrize("seq", [31, 512, 700])
+    def test_masked_m_runtime_extents(self, seq):
+        # Same-rank direct map at, below, and above the hint — drop nothing.
+        assert _collapse_inert_dims((seq, 512), (64, 32)) == (seq, 512)
+
+    def test_drops_inner_gap_singleton(self):
+        # arr_rank (3) > box_rank (2): the genuine inner gap singleton is dropped.
+        assert _collapse_inert_dims((512, 1, 1024), (64, 128)) == (512, 1024)
+
+    def test_rank_mismatch_raises(self):
+        with pytest.raises(ValueError, match="rank mismatch"):
+            _collapse_inert_dims((512, 768, 1024), (64, 128))
+
 
 EW_ADD_SOURCE = """
 extern "C" __global__ void ew_add(const float* A, const float* B, float* C) {

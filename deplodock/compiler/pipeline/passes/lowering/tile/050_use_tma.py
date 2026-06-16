@@ -28,6 +28,15 @@ Eligibility (per ``Source``):
 - Source rank ≤ 5 (TMA descriptor limit).
 - Every collapsed per-dim box extent ≤ 256 (``cuTensorMapEncodeTiled``'s
   ``boxDim`` limit — violations only surface at launch, as CUresult=1).
+- The source's innermost (fastest-varying) gmem dim is **static**. A
+  symbolic OUTER/middle dim (dynamic ``seq_len``, the M-masked case) IS
+  allowed: the descriptor's ``globalDim`` is encoded per launch from the
+  runtime input shape (``program._prebuild_descriptors``) and TMA's hardware
+  OOB handling zero-fills the masked overhang past the runtime extent. A
+  symbolic *innermost* dim is rejected — its runtime value (31, 700) gives a
+  global stride that isn't 16 B-aligned (CUresult=1 at encode), so N-masked
+  inner axes stay on cp.async. Masked-K (symbolic-reduce) sources also stay
+  on cp.async (the SYNC-pinned manual zero-fill) for now.
 
 Additionally (per tile): the ``serial_outer`` K loop holding the bundles
 must not be nested inside a serial loop with trip count > 1 — the
@@ -149,15 +158,55 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
             raise ValueError(f"DEPLODOCK_TMA=1 but TMA cannot fire: {msg}")
         return _off()
 
-    # TMA descriptors bake the source shape statically into the cuTensorMap; bail
-    # out cleanly if any input shape carries a symbolic dim.
-    for nid, node in match.graph.nodes.items():
+    # The TMA descriptor's globalDim is encoded per launch from the *runtime*
+    # input array shape (``program._prebuild_descriptors`` reads ``arr.shape``),
+    # not baked at compile time — so a symbolic source dim (dynamic ``seq_len``)
+    # is fine for the descriptor. The box extents stay the static hint tile, so
+    # the compile-time eligibility checks (box<=256, alignment, gap-dim) run
+    # against the Dim *hint*; the launch uses the real extent and TMA's hardware
+    # OOB handling zero-fills the masked overhang. A symbolic dim with no hint
+    # can't size the box — decline.
+    def _shape_for_tma(node) -> tuple[int, ...] | None:  # noqa: ANN001
+        dims: list[int] = []
         for d in node.output.shape:
-            if not d.is_static:
-                return _decline(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
-    src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
+            if d.is_static:
+                dims.append(d.as_static())
+            elif d.hint is not None:
+                dims.append(int(d.hint))
+            else:
+                return None
+        return tuple(dims)
+
+    src_shapes: dict[str, tuple[int, ...]] = {}
+    for nid, node in match.graph.nodes.items():
+        shp = _shape_for_tma(node)
+        if shp is None:
+            return _decline(f"node {nid!r} has a symbolic dim with no hint — cannot size the TMA box")
+        src_shapes[nid] = shp
+    # Buffers whose innermost (fastest-varying) dim is symbolic can't be TMA
+    # *sources*: every outer dim's global stride is ``∏(inner extents)·elem_size``,
+    # which ``cuTensorMapEncodeTiled`` requires 16-byte-aligned, and a symbolic
+    # innermost dim takes runtime values (31, 700) whose stride isn't 16-aligned
+    # → ``CUresult=1`` at encode. A symbolic OUTER/middle dim (the common dynamic
+    # ``seq_len``, M-masked) is safe: its stride is a product of static inner
+    # extents and globalDim along it is unconstrained (TMA zero-fills the box
+    # overhang past the runtime extent). Only the actually-staged sources are
+    # checked (``_source_eligible``) — an in-kernel intermediate with a symbolic
+    # inner dim (e.g. the SDPA scores in the o_proj kernel) is never staged, so
+    # it must not veto the matmul operands' TMA path. N-masked inner sources stay
+    # on cp.async.
+    inner_symbolic_bufs = {nid for nid, node in match.graph.nodes.items() if node.output.shape and not node.output.shape[-1].is_static}
 
     body = root.op.body
+    # Masked-K (symbolic-reduce) sources keep their SYNC-pinned manual zero-fill
+    # for now: the masked-K overhang must be ZERO for the mma accumulation
+    # (``_stage_expand`` hand-rolls a ``(k < seq_len) ? v : 0`` ternary on the
+    # SYNC transport). TMA's hardware OOB zero-fill could replace that AND
+    # re-enable the async pipeline, but it needs the 4-D leading-batch box
+    # derivation fixed first (the P@V ``box can't collapse arr`` bench-fail), so
+    # that is follow-up — keep masked-K on cp.async.
+    if any(isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in body.iter()):
+        return _decline("masked-K (symbolic reduce) source — TMA OOB-zero-fill path is follow-up work; staying on cp.async")
     # A TMA ring pipeline must start from freshly-initialized mbarriers: the
     # materializer emits ``MbarrierInit`` once at kernel entry, and the
     # pipeline's parity schedule (steady-state wait at ``(k / RING) % 2``,
@@ -188,7 +237,7 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
             continue
         if s.policy == StagePolicy.TMA:
             continue
-        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes):
+        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes, inner_symbolic_bufs):
             return _decline(
                 f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
                 "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
@@ -344,13 +393,17 @@ def _stamp_source_swizzle(src: Source, dtype_bytes: dict[str, int]) -> Source:
     return replace(src, swizzle=mode)
 
 
-def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]], inner_symbolic_bufs: set[str] = frozenset()) -> bool:
     """A bundle is TMA-eligible iff every Source is."""
-    return all(_source_eligible(src, src_shapes) for src in bundle.sources)
+    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs) for src in bundle.sources)
 
 
-def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]], inner_symbolic_bufs: set[str] = frozenset()) -> bool:
     if not isinstance(src.addressing, AffineAddressing):
+        return False
+    # A symbolic innermost gmem dim breaks the 16-byte global-stride alignment
+    # ``cuTensorMapEncodeTiled`` requires at runtime (see the gate). Stay on cp.async.
+    if src.buf in inner_symbolic_bufs:
         return False
     cache_axes = src.cache_axes
     if not cache_axes or len(cache_axes) > _MAX_RANK:
