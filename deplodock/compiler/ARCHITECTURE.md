@@ -79,7 +79,11 @@ autotuning cache doesn't bust on cosmetic edits.
   (`compiler/dim.py`) that wraps an `Expr` from `ir/expr.py`: static (`Dim(32)` → `Literal(32)`), atomic
   symbolic (`Dim("seq_len")` → `Var("seq_len")`), or composite from arithmetic (`Dim("S") * Dim(2)` →
   `BinaryExpr("*", Var("S"), Literal(2))`). `Dim` overloads `+`/`-`/`*`/`//`/`%` and eager-folds via
-  `Expr.simplify` — static math matches plain int math byte-for-byte; symbolic stays as `BinaryExpr`.
+  `Expr.simplify` — static math matches plain int math byte-for-byte; symbolic stays as `BinaryExpr`. It
+  also exposes `ceil_div` (`(self + (b-1))//b`): the single masked-tile grid-extent formula for both
+  regimes — it folds to the integer ceil (`-(-E//b)`) for a static dim and builds the composite ceil-div
+  `Expr` for a symbolic one, so the partition planner's masked block-axis / masked-K sites need no
+  static-vs-symbolic branch.
   Read sites use `d.expr` (always works), `d.as_static()` (raises on symbolic), `d.as_atom_name()` (raises
   unless `Var`-backed), or `d.value` (back-compat shim: int for `Literal`, str for `Var`, raises on
   composite). There is deliberately no `__int__` / `__index__`, so `int(d)` and `range(d)` fail loudly

@@ -125,6 +125,7 @@ import enum
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
@@ -939,27 +940,24 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     # a static overhang axis, the symbolic ``Var`` for a hint-driven one, None
     # when N isn't masked.
     n_bound: object | None = None
-    if N_axis.extent.is_static:
-        E_N = N_axis.extent.as_static()
-        # Masked tiles (N in overhang): use ceil_div so the boundary CTA covers
-        # the partial tile. ``real_extent`` on N_b tells the materializer how
-        # to gate boundary lanes (``if decoded < real_extent``).
-        if N_name in overhang:
-            N_b = Axis(f"{N_name}_b", -(-E_N // n_bnfn), source_axis=N_src, real_extent=E_N)
-            n_bound = Literal(E_N, "int")
-        else:
-            N_b = Axis(f"{N_name}_b", E_N // n_bnfn, source_axis=N_src)
-    elif N_name in overhang:
-        # Symbolic + hint-driven masked: ceil-div the SYMBOLIC extent so the grid
-        # covers the partial last tile at any runtime size; the boundary Cond
-        # gates lanes past the runtime value. ``Dim`` arithmetic builds the
-        # composite ceil-div Expr; the launch resolver evals it from sym_values.
-        N_b = Axis(f"{N_name}_b", (N_axis.extent + (n_bnfn - 1)) // n_bnfn, source_axis=N_src)
+    # Masked tiles (N in overhang): ceil-div so the boundary CTA covers the
+    # partial last tile, and ``n_bound`` carries the Cond RHS so the materializer
+    # gates boundary lanes (``if decoded < n_bound``). ``Dim.ceil_div`` is one
+    # formula for both regimes — it folds to the integer ceil for a static extent
+    # and builds the composite ceil-div Expr (launch-resolver-evaluated) for a
+    # symbolic one. A clean (non-masked) tile floor-divides; the degenerate
+    # symbolic case (bn=fn=1) leaves the whole axis on the GridTile (``ext // 1``).
+    # ``real_extent`` (the static pre-ceil bound) only applies when the extent is
+    # statically known; a symbolic masked tile relies solely on ``n_bound``.
+    n_masked = N_name in overhang
+    N_b = Axis(
+        f"{N_name}_b",
+        N_axis.extent.ceil_div(n_bnfn) if n_masked else N_axis.extent // n_bnfn,
+        source_axis=N_src,
+        real_extent=N_axis.extent.as_static() if n_masked and N_axis.extent.is_static else None,
+    )
+    if n_masked:
         n_bound = N_axis.extent.expr
-    else:
-        # Symbolic, no hint (degenerate): bn=fn=1 by construction, bind the
-        # whole axis to GridTile; the size-1 normalizer drops N_t / N_r.
-        N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
     N_t = Axis(f"{N_name}_t", params["BN"], source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     # N register-tile decode — two layouts:
@@ -994,18 +992,18 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
         M_name = M_axis.name
         M_src = M_axis.source_axis or M_axis
         m_bnfm = params["BM"] * params["FM"]
-        if M_axis.extent.is_static:
-            E_M = M_axis.extent.as_static()
-            if M_name in overhang:
-                M_b = Axis(f"{M_name}_b", -(-E_M // m_bnfm), source_axis=M_src, real_extent=E_M)
-                m_bound = Literal(E_M, "int")
-            else:
-                M_b = Axis(f"{M_name}_b", E_M // m_bnfm, source_axis=M_src)
-        elif M_name in overhang:
-            M_b = Axis(f"{M_name}_b", (M_axis.extent + (m_bnfm - 1)) // m_bnfm, source_axis=M_src)
+        # Mirror of the N-axis split above: ``Dim.ceil_div`` unifies the static
+        # and symbolic masked ceil-div, a clean tile floor-divides, ``real_extent``
+        # is the static pre-ceil bound (None when symbolic).
+        m_masked = M_name in overhang
+        M_b = Axis(
+            f"{M_name}_b",
+            M_axis.extent.ceil_div(m_bnfm) if m_masked else M_axis.extent // m_bnfm,
+            source_axis=M_src,
+            real_extent=M_axis.extent.as_static() if m_masked and M_axis.extent.is_static else None,
+        )
+        if m_masked:
             m_bound = M_axis.extent.expr
-        else:
-            M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
         M_t = Axis(f"{M_name}_t", params["BM"], source_axis=M_src)
         M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
         sigma_map[M_name] = (
@@ -1034,26 +1032,19 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
         K_name = K_axis.name
         K_src = K_axis.source_axis or K_axis
         k_div = params["SPLITK"] * params["BR"] * params["BK"] * fk
-        if K_axis.extent.is_static:
-            E_K = K_axis.extent.as_static()
-            K_o_ext = E_K // k_div
-        elif k_div > 1:
-            # Masked cooperative reduce over a SYMBOLIC K: tile at the hint and
-            # ceil-div the symbolic extent so ``K_o`` covers the partial last
-            # tile at any runtime size. The final tile overruns the runtime
-            # extent, so the reduce body is wrapped in ``Cond(decoded_K <
-            # seq_len)`` (in ``_replace_k_loops``) — an overhang K step just
-            # skips (no spurious fold, no OOB read/write). ``Dim`` arithmetic
-            # builds the composite ceil-div Expr; the launch resolver evals it
-            # from sym_values (mirrors the masked block-axis ceil-div).
-            K_o_ext = (K_axis.extent + (k_div - 1)) // k_div
-            k_masked = True
+        # K_o serial bound. A masked cooperative reduce over a SYMBOLIC K (k_div >
+        # 1) ceil-divs the symbolic extent so ``K_o`` covers the partial last tile
+        # at any runtime size; the final overhang step is wrapped in
+        # ``Cond(decoded_K < seq_len)`` (in ``_replace_k_loops``) so it skips (no
+        # spurious fold, no OOB read/write). ``Dim.ceil_div`` is one formula for
+        # both regimes — folds to the int ceil for a static extent, builds the
+        # launch-resolver-evaluated Expr for a symbolic one. Static K and the
+        # degenerate symbolic-serial case (BR=BK=SPLITK=fk=1, ``ext // 1``)
+        # floor-divide and stay unmasked.
+        k_masked = not K_axis.extent.is_static and k_div > 1
+        K_o_ext = K_axis.extent.ceil_div(k_div) if k_masked else K_axis.extent // k_div
+        if k_masked:
             k_bound = K_axis.extent.expr
-        else:
-            # Symbolic K, serial (BR=BK=SPLITK=fk=1): whole axis stays as one
-            # serial K_o iteration. ``Axis.__post_init__`` coerces the ``Dim``
-            # straight back into the K_o axis.
-            K_o_ext = K_axis.extent
         K_s = Axis(f"{K_name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
         K_c = Axis(f"{K_name}_c", params["BR"], source_axis=K_src) if params["BR"] > 1 else None
         K_f = Axis(f"{K_name}_f", fk, source_axis=K_src) if fk > 1 else None
@@ -1304,16 +1295,15 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     K_src = K_axis.source_axis or K_axis
     k_masked = not K_axis.extent.is_static
     k_per_block = params["SPLITK"] * params["BK"] * atom_k
-    if k_masked:
-        # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
-        # runtime extent for the K_o serial bound. The final partial K slab is
-        # zero-filled in smem (``_stage_expand``), so the mma accumulates zero
-        # past the runtime seq_len. The warp enumerator forces SPLITK=1 for a
-        # masked K, so this ceil-div ``Dim`` never feeds the (SPLITK>1) K_s σ
-        # term — only the K_o serial-loop bound, which renders the ceil-div Expr.
-        K_o_ext: object = (K_axis.extent + (k_per_block - 1)) // k_per_block
-    else:
-        K_o_ext = K_axis.extent.as_static() // k_per_block
+    # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
+    # runtime extent for the K_o serial bound. The final partial K slab is
+    # zero-filled in smem (``_stage_expand``), so the mma accumulates zero past
+    # the runtime seq_len. The warp enumerator forces SPLITK=1 for a masked K, so
+    # this ceil-div ``Dim`` never feeds the (SPLITK>1) K_s σ term — only the K_o
+    # serial-loop bound, which renders the ceil-div Expr. A static K floor-divides
+    # (``Dim.ceil_div`` would fold identically when divisible, but the static warp
+    # tile is always a clean divisor). ``Dim.ceil_div`` keeps the one formula.
+    K_o_ext: object = K_axis.extent.ceil_div(k_per_block) if k_masked else K_axis.extent // k_per_block
     K_s = Axis(f"{K_axis.name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
 
     # σ-rewrite the matmul body's outer axes (M/N), then expand the K reduce
@@ -1554,7 +1544,7 @@ def _build_k_sigma(
     K_c: Axis | None,
     K_i: Axis,
     K_f: Axis | None,
-    K_o_ext: int,
+    K_o_ext: int | Dim,
     br: int,
     bk: int,
     fk: int = 1,
@@ -1585,5 +1575,9 @@ def _build_k_sigma(
     else:
         inner_expr = inner_expr + Var(K_i.name)
     if K_s is not None:
-        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk * fk * atom_k, "int") + inner_expr
+        # The K_s (SPLITK) stride needs a concrete int K_o_ext. SPLITK > 1 only
+        # pairs with a static K (symbolic-K paths force SPLITK=1), so the now-
+        # unified ``Dim`` K_o_ext is always a static-folded literal here.
+        k_o_ext = K_o_ext.as_static() if isinstance(K_o_ext, Dim) else K_o_ext
+        inner_expr = Var(K_s.name) * Literal(k_o_ext * br * bk * fk * atom_k, "int") + inner_expr
     return Sigma({K_name: inner_expr})
