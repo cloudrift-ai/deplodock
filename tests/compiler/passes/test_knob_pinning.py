@@ -107,6 +107,29 @@ def _build_gated_graph(dims: dict, mode: str = "static"):
     return g, {"x": (1, S, H), "wg": (H, Inter), "wu": (H, Inter)}, ("y", (1, S, Inter))
 
 
+def _build_norm_linear_graph(dims: dict, mode: str = "static"):
+    """``RmsNorm(x) @ W.T`` in fp16 — the fused norm+matmul shape of
+    Qwen3-Embedding's ``k_linear_mean_reduce``. ``mode='dynamic'`` makes the
+    seq axis symbolic (``Dim('seq_len')``, the deployable masked-tile path).
+    The norm reduction stages ``x`` in ``BK``-element inner slabs; at fp16 +
+    ``BK=32`` that slab is 64 B (not 128 B-aligned), the TMA-misalignment hazard."""
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+    from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+
+    S, H, Inter = dims["S"], dims["H"], dims["I"]
+    Sg = dyn_M(mode, S)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, Sg, H), dtype=F16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("wn", (H,), dtype=F16), node_id="wn")
+    g.add_node(InputOp(), [], Tensor("w", (Inter, H), dtype=F16), node_id="w")
+    g.add_node(RmsNormOp(), ["x", "wn"], Tensor("xn", (1, Sg, H), dtype=F16), node_id="xn")
+    g.add_node(LinearOp(), ["xn", "w"], Tensor("y", (1, Sg, Inter), dtype=F16), node_id="y")
+    g.inputs, g.outputs = ["x", "wn", "w"], ["y"]
+    return g, {"x": (1, S, H), "wn": (H,), "w": (Inter, H)}, ("y", (1, S, Inter))
+
+
 def _run_with_knobs(graph, inputs: dict[str, np.ndarray], out_name: str, knobs: dict, monkeypatch) -> np.ndarray:
     """Set the per-knob ``DEPLODOCK_<K>`` env vars (the same pinning
     mechanism ``DEPLODOCK_KNOBS=...`` uses after ``apply_knobs_env``
@@ -175,6 +198,42 @@ def test_gated_mlp_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch)
     ref = _reference(static_graph, inputs, out_name)
     forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
     _assert_match(forced, ref)
+
+
+# The #244 dynamic-tune wedge: a scalar (``MMA=0``) cooperative norm-reduce whose
+# fp16 per-slot box is a single ``BK=32`` axis = 64 B — not a 128 B multiple, so
+# under ``RING=2`` the second TMA ring slot lands at a 64 B offset. The 128 B slot
+# check sized off the fp32 ``BYTES_PER_ELEM`` constant let the fp16 64 B slab
+# through, the materializer left it unpadded, and ``cp.async.bulk.tensor`` faulted
+# with ``CUDA_ERROR_MISALIGNED_ADDRESS`` → 1 s watchdog hang → bench_fail. The
+# dtype-aware gate now declines TMA for this slab (→ cp.async). ``MMA=0`` forces
+# the scalar tier; ``RING=2`` double-buffers so the slot offset matters.
+_NORM_REDUCE_WEDGE_KNOBS = {"BM": 1, "BN": 128, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "MMA": 0, "RING": 2}
+_NORM_DIMS = {"S": 32, "H": 128, "I": 512}
+
+
+@requires_cuda
+def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
+    """fp16 ``RmsNorm(x) @ W.T`` forced through the scalar cooperative-reduce tile
+    that wedged the #244 dynamic tune. The pinned config must produce correct
+    output whether the seq axis is baked (static) or symbolic (dynamic
+    ``seq_len``) — STATIC/DYNAMIC PARITY: both paths must make the same TMA
+    decision (decline, since the fp16 64 B ring slot isn't 128 B-aligned) and fall
+    back to cp.async. Pre-fix the dynamic path emitted a misaligned
+    ``cp.async.bulk.tensor`` store and hung (``HungKernelError``); this test would
+    time out. The numpy reference is the static graph; the forced CUDA run uses
+    the mode's graph."""
+    static_graph, input_shapes, (out_name, _) = _build_norm_linear_graph(_NORM_DIMS)
+    forced_graph, _, _ = _build_norm_linear_graph(_NORM_DIMS, mode=shape_mode)
+    rng = np.random.default_rng(0)
+    # fp16 inputs scaled down so the H=128 sum-of-squares stays well inside fp16 range.
+    inputs = {name: (rng.standard_normal(shape, dtype=np.float32) * 0.1).astype(np.float16) for name, shape in input_shapes.items()}
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, _NORM_REDUCE_WEDGE_KNOBS, monkeypatch)
+    # fp16 reduction drift over H=128 — same looser bound the other fp16 tests use.
+    peak = float(np.max(np.abs(ref.astype(np.float32))))
+    atol = max(5e-1, 0.1 * peak)
+    np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
 # Staged MMA regression for ``plans/mma-smem-staging.md`` M5. These
