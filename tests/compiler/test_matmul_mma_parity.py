@@ -24,12 +24,13 @@ import numpy as np
 import pytest
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
+
+from .conftest import dyn_M
 
 # Static matmul N / K (only M flips static<->dynamic). K static so the source
 # innermost dim stays static — TMA-eligible (a symbolic innermost dim would
@@ -69,20 +70,13 @@ def _supports_tma() -> bool:
 def _mma_graph(mode: str, *, M: int):
     """``a @ b`` with the M axis static (``mode='static'``) or symbolic
     (``mode='dynamic'`` → ``Dim('seq_len')``, one kernel for every runtime M)."""
-    m_dim = Dim("seq_len") if mode == "dynamic" else M
+    m_dim = dyn_M(mode, M)
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m_dim, _K), dtype=F16), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (_K, _N), dtype=F16), node_id="b")
     g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (m_dim, _N), dtype=F16), node_id="o")
     g.inputs, g.outputs = ["a", "b"], ["o"]
     return g
-
-
-@pytest.fixture(params=["static", "dynamic"])
-def shape_mode(request) -> str:
-    """Flip the matmul's M axis static <-> symbolic. Any test that names this
-    fixture runs once per shape — the static/dynamic automation."""
-    return request.param
 
 
 @pytest.fixture(params=["cp.async", "tma"])

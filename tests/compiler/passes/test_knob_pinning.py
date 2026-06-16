@@ -38,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ..conftest import requires_cuda
+from ..conftest import dyn_M, requires_cuda
 
 # Shapes match the user's offline scan.
 _MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}
@@ -69,35 +69,40 @@ def _format_knobs(knobs: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in knobs.items())
 
 
-def _build_matmul_graph(dims: dict):
+def _build_matmul_graph(dims: dict, mode: str = "static"):
+    """``(1, M, K) @ (K, N)``. ``mode='dynamic'`` makes the M axis symbolic
+    (``Dim('seq_len')``); the returned ``input_shapes`` stay concrete so the run
+    feeds a real (1, M, K) array the symbolic kernel resolves ``seq_len`` from."""
     from deplodock.compiler.graph import Graph, Tensor
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     M, K, N = dims["M"], dims["K"], dims["N"]
+    Mg = dyn_M(mode, M)
     g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (1, M, K)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("a", (1, Mg, K)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
-    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (1, M, N)), node_id="c")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (1, Mg, N)), node_id="c")
     g.inputs, g.outputs = ["a", "b"], ["c"]
     return g, {"a": (1, M, K), "b": (K, N)}, ("c", (1, M, N))
 
 
-def _build_gated_graph(dims: dict):
+def _build_gated_graph(dims: dict, mode: str = "static"):
     from deplodock.compiler.graph import Graph, Tensor
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
     from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
     S, H, Inter = dims["S"], dims["H"], dims["I"]
+    Sg = dyn_M(mode, S)
     g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (1, S, H)), node_id="x")
+    g.add_node(InputOp(), [], Tensor("x", (1, Sg, H)), node_id="x")
     g.add_node(InputOp(), [], Tensor("wg", (H, Inter)), node_id="wg")
     g.add_node(InputOp(), [], Tensor("wu", (H, Inter)), node_id="wu")
-    g.add_node(MatmulOp(), ["x", "wg"], Tensor("mg", (1, S, Inter)), node_id="mg")
-    g.add_node(MatmulOp(), ["x", "wu"], Tensor("mu", (1, S, Inter)), node_id="mu")
-    g.add_node(ElementwiseOp("silu"), ["mg"], Tensor("sg", (1, S, Inter)), node_id="sg")
-    g.add_node(ElementwiseOp("multiply"), ["sg", "mu"], Tensor("y", (1, S, Inter)), node_id="y")
+    g.add_node(MatmulOp(), ["x", "wg"], Tensor("mg", (1, Sg, Inter)), node_id="mg")
+    g.add_node(MatmulOp(), ["x", "wu"], Tensor("mu", (1, Sg, Inter)), node_id="mu")
+    g.add_node(ElementwiseOp("silu"), ["mg"], Tensor("sg", (1, Sg, Inter)), node_id="sg")
+    g.add_node(ElementwiseOp("multiply"), ["sg", "mu"], Tensor("y", (1, Sg, Inter)), node_id="y")
     g.inputs, g.outputs = ["x", "wg", "wu"], ["y"]
     return g, {"x": (1, S, H), "wg": (H, Inter), "wu": (H, Inter)}, ("y", (1, S, Inter))
 
@@ -146,23 +151,29 @@ def _assert_match(forced: np.ndarray, ref: np.ndarray) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("knobs", _BROKEN_MATMUL, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_matmul_single_cta_f_replicated(knobs: dict, monkeypatch):
-    """matmul (1, 32, 128) @ (128, 64) — single-CTA + F-replicated tile."""
-    graph, input_shapes, (out_name, _) = _build_matmul_graph(_MATMUL_DIMS)
+def test_matmul_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
+    """matmul (1, 32, 128) @ (128, 64) — single-CTA + F-replicated tile. The
+    pinned config must produce the same correct output whether M is baked
+    (static) or symbolic (dynamic ``seq_len``, masked path) — the numpy
+    reference is the static graph; the forced CUDA run uses the mode's graph."""
+    static_graph, input_shapes, (out_name, _) = _build_matmul_graph(_MATMUL_DIMS)
+    forced_graph, _, _ = _build_matmul_graph(_MATMUL_DIMS, mode=shape_mode)
     inputs = _random_inputs(input_shapes)
-    ref = _reference(graph, inputs, out_name)
-    forced = _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
     _assert_match(forced, ref)
 
 
 @requires_cuda
 @pytest.mark.parametrize("knobs", _BROKEN_GATED, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_gated_mlp_single_cta_f_replicated(knobs: dict, monkeypatch):
-    """gated_mlp (1, 32, 128) → (1, 32, 256) — single-CTA + F-replicated tile."""
-    graph, input_shapes, (out_name, _) = _build_gated_graph(_GATED_DIMS)
+def test_gated_mlp_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
+    """gated_mlp (1, 32, 128) → (1, 32, 256) — single-CTA + F-replicated tile,
+    static and dynamic (symbolic ``seq_len``). Reference is the static graph."""
+    static_graph, input_shapes, (out_name, _) = _build_gated_graph(_GATED_DIMS)
+    forced_graph, _, _ = _build_gated_graph(_GATED_DIMS, mode=shape_mode)
     inputs = _random_inputs(input_shapes)
-    ref = _reference(graph, inputs, out_name)
-    forced = _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
     _assert_match(forced, ref)
 
 
