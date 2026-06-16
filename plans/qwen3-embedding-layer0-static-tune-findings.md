@@ -14,6 +14,13 @@ structural — it is the per-kernel masked-tile tax the symbolic path pays: a st
 pin on the P@V mma. Every one of these is gated on `*_symbolic` in `010_partition_loops.py` — they fire only under
 `--dynamic`.**
 
+> **Update (#245).** One transport item above has since been fixed: the masked-tile tax included routing the dynamic
+> matmuls onto cp.async (TMA was wholesale-declined for symbolic graphs). #245 enables **TMA for dynamic M-masked
+> matmuls with a static innermost dim** (o_proj, q/v_proj, MLP-down), closing the o_proj NCU gap (47.0 → 29.2 µs, ≈
+> static 28.6 µs; 6.8M → 0 bank conflicts) and moving whole-layer dynamic e2e **361 → 337 µs (0.62 → 0.65x eager)**.
+> The attention path (softmax materialisation, QK^T, masked-K P@V) is unchanged and remains the gap. Tables below carry
+> the post-#245 numbers inline (marked); see the finding-2 and finding-4 notes.
+
 - Command: `deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --seq-len 512 --clean --bench --dump-dir <dir>/dump`
   (note: **`--seq-len 512`** — static kernels are shape-specialised, so they are tuned/benched at the SAME 512 the
   dynamic report's symbolic hint uses; tuning at the default seq 32 would shrink attention ~256x and make the
@@ -60,7 +67,7 @@ attention attribution is the NCU table in finding 2.
 
 | Kernel                 | Layer op                                                 | eager | tcompile | **static** | dynamic |  static vs dyn |
 |------------------------|----------------------------------------------------------|------:|---------:|-----------:|--------:|---------------:|
-| `k_linear_sdpa_reduce` | attn-out reshape + o_proj (linear_3) + residual          |    39 |       37 |     **78** |     213 |    2.7x faster |
+| `k_linear_sdpa_reduce` † | attn-out reshape + o_proj (linear_3) + residual        |    39 |       37 |     **78** |     213 |    2.7x faster |
 | `k_sdpa_linear_reduce` | SDPA P@V split (v_proj + softmax-normalise + P@V mma)    |    29 |       29 |     **70** |     203 |    2.9x faster |
 | `k_sdpa_reduce`        | RoPE(q,k) + QK^T scores + softmax-stats                  |   148 |       25 |     **45** |     162 |    3.6x faster |
 | `k_linear_mean_reduce` | post-attn RMSNorm + MLP gate+up (linear_4/5) + SiLU·up   |   119 |       57 |     **47** |      58 |    1.2x faster |
@@ -76,6 +83,15 @@ fires for static-K too. The dominators by static deplodock µs are the three att
 (`k_linear_sdpa_reduce` 78 + `k_sdpa_linear_reduce` 70 + `k_sdpa_reduce` 45 ≈ 193 µs of slice-set total, ~80% once
 de-duplicated against the deployed total) — and every one is 2.7–3.6x faster than its dynamic twin. The linears are
 1.5–1.9x faster; the RMSNorms are at parity (already memory-bound, no masked-tile content).
+
+> **† Updated post-#245 (TMA for dynamic M-masked matmuls).** This dynamic column is the *original* cp.async
+> reproducer totals (re-fused slice-set, so the row is dominated by the unchanged upstream softmax — that is why the
+> total stays ~2.7x even though the o_proj kernel itself was fixed). The o_proj *kernel* now stages via TMA on the
+> dynamic path: its solo reproducer window is **34.4 µs (cp.async) → 19.6 µs (TMA)** and its clean NCU is **47.0 →
+> 29.2 µs, ≈ the static 28.6 µs** (finding 2 note). The other two attention rows (`k_sdpa_linear_reduce` P@V,
+> `k_sdpa_reduce` QK^T) are unchanged — still cp.async (P@V is masked-K; QK^T has a symbolic-N inner axis), so their
+> 2.9x / 3.6x gaps stand. The matmul-only kernels below (`k_linear` MLP-down, `k_linear_reduce` q/v_proj) also moved to
+> TMA on the dynamic path (per-kernel ~1.6–1.8x), shrinking their dynamic numbers toward the static ones.
 
 ## Finding 1 — a sibling-cell-fused hoisted-compute slab aborted the whole static tune; fixed with a descriptive `LoweringError` + per-variant `Run.drive` containment (fixed on this branch)
 
@@ -152,7 +168,7 @@ attention kernel (NCU, locked clock)                         static      dynamic
 QK^T scores (+ softmax max/sum stats; scalar)                 68.1 us     71.6 us  (QK^T only — softmax split out)
 standalone softmax producer (…_xn)                            14.3 us    148.5 us  ← 10.4x
 P@V (mma_m16n8k16_f16)                                         15.4 us     42.4 us
-o_proj (mma_m16n8k16_f16)                                      28.6 us     47.0 us
+o_proj (mma_m16n8k16_f16)                                      28.6 us     47.0 → 29.2 us  (dynamic TMA, #245 — see note)
 attn-out contiguify (…_xn)                                      4.4 us      4.3 us
 -----------------------------------------------------------------------------------
 torch ref: flash_fwd_splitkv + combine                        ~36 us      ~37 us
@@ -163,6 +179,16 @@ Static raw NCU rows (this run): `k_sdpa_reduce_c0c97e` (QK^T+softmax-stats, scal
 `k_sdpa_reduce_ba65cb` (P@V mma) **15,360 ns**; `k_sdpa_reduce_ba65cb_xn` (softmax-normalise producer, 67% dram —
 memory-bound but small) **14,336 ns**; `k_linear_sdpa_reduce_94ab75` (o_proj mma) **28,608 ns**;
 `k_linear_sdpa_reduce_94ab75_xn` (contiguify) **4,416 ns**.
+
+> **Update (#245 — TMA for dynamic M-masked matmuls).** The o_proj `47.0 µs` dynamic number above was the *original*
+> cp.async dynamic path. #245 enables TMA staging on the dynamic path for M-masked matmuls with a static innermost dim
+> (the descriptor's globalDim is encoded per launch from the runtime shape; TMA zero-fills the masked overhang), so the
+> deployed dynamic o_proj `k_linear_sdpa_reduce_43208b` now NCU-clocks **29,216 ns (29.2 µs), 0 smem bank conflicts**
+> (vs the cp.async 47.0 µs / 6.8M conflicts) — essentially **at parity with the static o_proj (28.6 µs)**. The o_proj
+> transport gap is closed; the other dynamic attention rows (softmax 148 µs, QK^T 71 µs, P@V 42 µs) are unchanged — they
+> stay on cp.async (QK^T's symbolic-N inner axis breaks TMA's 16 B stride alignment; P@V is masked-K). Whole-layer
+> dynamic e2e moved **361 → 337 µs (0.62 → 0.65x eager)**. Repro: `deplodock run --ir
+> dynamic.k_linear_sdpa_reduce.repro.torch.json --bench --profile` (TMA default) vs `--ab "TMA=0"`.
 
 **Root cause.** In the **dynamic** path, the masked-K demotion split (`005_split_demoted` on symbolic K) un-fuses the
 SDPA into a **standalone softmax-normalising producer** that must MATERIALISE the full normalised seq×seq P matrix to
@@ -223,9 +249,12 @@ linears (v_proj/q_proj), worth ~10–15 µs.
 
 **Symptom.** The P@V consumer reaches `mma_m16n8k16_f16` in BOTH paths (static `k_sdpa_reduce_ba65cb` mma=11; dynamic
 masked-K mma), but the dynamic one runs **42.4 µs** (dynamic finding 2, 26% occ, 3.67M smem bank conflicts) vs static
-**15.4 µs** (50% occ). Same for o_proj: dynamic 47 µs vs static 28.6 µs. The static prior recovers its measured best
-cleanly (`eval prior --dataset db`: static mean **1.25x** / median 1.09x / worst 1.97x, all -O1 inversions — vs the
-dynamic DB's mean 2.52x / worst 17.64x), so this is NOT a search shortfall or a tier lockout.
+**15.4 µs** (50% occ). (o_proj used to belong here too — dynamic 47 µs vs static 28.6 µs — but **#245 closed it**: the
+o_proj matmul is M-masked with a static innermost dim, so it now stages via TMA on the dynamic path → 29.2 µs / 0 bank
+conflicts, ≈ static. **P@V is the remaining gap**, because it's masked-K (symbolic reduce) and stays on cp.async.) The
+static prior recovers its measured best cleanly (`eval prior --dataset db`: static mean **1.25x** / median 1.09x /
+worst 1.97x, all -O1 inversions — vs the dynamic DB's mean 2.52x / worst 17.64x), so this is NOT a search shortfall or
+a tier lockout.
 
 **Root cause.** The dynamic masked-K P@V pays three symbolic-only taxes the static-K mma skips, all from the masked-K
 staging: (1) the K reduce is tiled at the hint with a partial final slab **zero-filled in smem** (`_stage_expand.py:256`
@@ -239,10 +268,12 @@ the levers the tuner has don't reach it. Static K → none of this: clean stagin
 `_stage_expand.py:179` (SYNC pin), `:256` (zero-fill), `010_partition_loops.py:737` (`k_forced_mask`). The dynamic A/B
 proving PAD_SMEM/PERMUTE_LANES are no-ops: dynamic report finding 2.
 
-**Suggested fix (medium — ~50 µs at stake across P@V + o_proj on the dynamic path, generalises to every masked warp
-tile).** A conflict-free masked-K smem layout (swizzle inside the zero-filled slab) and a cp.async-compatible masked-K
-copy (stage then mask in smem, so the ring buffer is usable) would close most of the 42→15 µs P@V gap. Folds into the
-flash work (finding 2) since that owns the symbolic-K schedule.
+**Suggested fix (medium — ~27 µs at stake on P@V; the o_proj half was already landed in #245).** The cleanest path is
+**TMA for masked-K**: TMA's hardware OOB zero-fill replaces the manual `(k < seq_len) ? v : 0` ternary AND removes the
+SYNC pin (so the async pipeline is usable again), exactly as #245 did for the M-masked matmuls — but P@V first needs
+the 4-D leading-batch box derivation fixed (finding 5's `_collapse_inert_dims` / `box can't collapse arr` bench-fail).
+Failing that, a conflict-free masked-K smem layout (swizzle inside the zero-filled slab) would close most of the
+42→15 µs P@V gap. Folds into the flash work (finding 2) since that owns the symbolic-K schedule.
 
 ## Finding 5 — TMA descriptor rank mismatch: 20 `bench_fail`s on the P@V mma + the tune's full-model `--bench` capture (static-512 codegen bug)
 
