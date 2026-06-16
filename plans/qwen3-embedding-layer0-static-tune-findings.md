@@ -65,18 +65,18 @@ layer-op labels read off each kernel's `.torch.json` provenance). The attention 
 upstream cone, so their `deplodock` µs is a slice-set total, not the deployed kernel alone — the clean per-kernel
 attention attribution is the NCU table in finding 2.
 
-| Kernel                 | Layer op                                                 | eager | tcompile | **static** | dynamic |  static vs dyn |
-|------------------------|----------------------------------------------------------|------:|---------:|-----------:|--------:|---------------:|
-| `k_linear_sdpa_reduce` † | attn-out reshape + o_proj (linear_3) + residual        |    39 |       37 |     **78** |     213 |    2.7x faster |
-| `k_sdpa_linear_reduce` | SDPA P@V split (v_proj + softmax-normalise + P@V mma)    |    29 |       29 |     **70** |     203 |    2.9x faster |
-| `k_sdpa_reduce`        | RoPE(q,k) + QK^T scores + softmax-stats                  |   148 |       25 |     **45** |     162 |    3.6x faster |
-| `k_linear_mean_reduce` | post-attn RMSNorm + MLP gate+up (linear_4/5) + SiLU·up   |   119 |       57 |     **47** |      58 |    1.2x faster |
-| `k_linear`             | MLP down (linear_6) + residual                           |    26 |       26 |     **26** |      44 |    1.7x faster |
-| `k_mean_linear_reduce` | q_norm RMSNorm + rotated-q producer (xna)                |   105 |       20 |     **18** |      27 |    1.5x faster |
-| `k_linear_reduce`      | v_proj matmul (linear_1)                                 |    14 |       14 |     **15** |      27 |    1.8x faster |
-| `k_mean_linear_reduce` | k_norm RMSNorm + rotated-k producer (xnb)                |    76 |       14 |     **12** |      18 |    1.5x faster |
-| `k_linear_reduce`      | q_proj matmul (linear)                                   |    10 |       10 |      **9** |      17 |    1.9x faster |
-| `k_mean`               | input RMSNorm                                            |    64 |        4 |      **2** |       2 |           same |
+| Kernel                 | Layer op                                                  | eager | tcompile | **static** | dynamic |  static vs dyn |
+|------------------------|-----------------------------------------------------------|------:|---------:|-----------:|--------:|---------------:|
+| `k_linear_sdpa_reduce` | attn-out reshape + o_proj (linear_3) + residual           |    39 |       37 |     **78** |     213 |    2.7x faster |
+| `k_sdpa_linear_reduce` | SDPA P@V split (v_proj + softmax-normalise + P@V mma)     |    29 |       29 |     **70** |     203 |    2.9x faster |
+| `k_sdpa_reduce`        | RoPE(q,k) + QK^T scores + softmax-stats                   |   148 |       25 |     **45** |     162 |    3.6x faster |
+| `k_linear_mean_reduce` | post-attn RMSNorm + MLP gate+up (linear_4/5) + SiLU·up    |   119 |       57 |     **47** |      58 |    1.2x faster |
+| `k_linear`             | MLP down (linear_6) + residual                            |    26 |       26 |     **26** |      44 |    1.7x faster |
+| `k_mean_linear_reduce` | q_norm RMSNorm + rotated-q producer (xna)                 |   105 |       20 |     **18** |      27 |    1.5x faster |
+| `k_linear_reduce`      | v_proj matmul (linear_1)                                  |    14 |       14 |     **15** |      27 |    1.8x faster |
+| `k_mean_linear_reduce` | k_norm RMSNorm + rotated-k producer (xnb)                 |    76 |       14 |     **12** |      18 |    1.5x faster |
+| `k_linear_reduce`      | q_proj matmul (linear)                                    |    10 |       10 |      **9** |      17 |    1.9x faster |
+| `k_mean`               | input RMSNorm                                             |    64 |        4 |      **2** |       2 |           same |
 
 Same 10 kernels in the same fusion/split structure as the dynamic report — the SDPA P@V split (`005_split_demoted`)
 fires for static-K too. The dominators by static deplodock µs are the three attention reproducers
@@ -84,7 +84,8 @@ fires for static-K too. The dominators by static deplodock µs are the three att
 de-duplicated against the deployed total) — and every one is 2.7–3.6x faster than its dynamic twin. The linears are
 1.5–1.9x faster; the RMSNorms are at parity (already memory-bound, no masked-tile content).
 
-> **† Updated post-#245 (TMA for dynamic M-masked matmuls).** This dynamic column is the *original* cp.async
+> **`k_linear_sdpa_reduce` — updated post-#245 (TMA for dynamic M-masked matmuls).** This dynamic column is the
+> *original* cp.async
 > reproducer totals (re-fused slice-set, so the row is dominated by the unchanged upstream softmax — that is why the
 > total stays ~2.7x even though the o_proj kernel itself was fixed). The o_proj *kernel* now stages via TMA on the
 > dynamic path: its solo reproducer window is **34.4 µs (cp.async) → 19.6 µs (TMA)** and its clean NCU is **47.0 →
