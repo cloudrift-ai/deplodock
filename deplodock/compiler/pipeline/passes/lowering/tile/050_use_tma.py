@@ -226,23 +226,6 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
             "serial_outer pipeline is nested inside a serial loop with trip count > 1; "
             "the once-initialized mbarrier ring would be re-entered at stale phase parity (device hang)"
         )
-    # All-or-nothing per tile (see module docstring): if any
-    # promotable-policy bundle is not TMA-eligible, leave the whole
-    # tile on cp.async — 060_use_async_copy promotes the BUFFERED
-    # leftovers to ASYNC. Mixed TMA + cp.async inside one pipelined
-    # K-loop deadlocks the mbarrier scheme, so we'd rather skip TMA
-    # for the whole tile than partially promote.
-    for s in body.iter():
-        if not isinstance(s, StageBundle):
-            continue
-        if s.policy == StagePolicy.TMA:
-            continue
-        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes, inner_symbolic_bufs):
-            return _decline(
-                f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
-                "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
-            )
-
     # Per-source swizzle is stamped only on mma.sync kernels — their
     # explicit-ldmatrix consumer reads the swizzled slab with a matching
     # per-lane XOR; scalar kernels don't stage for ldmatrix, so their sources
@@ -258,6 +241,33 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # 4 B/elem = 128 B → wrongly B128, whose box the descriptor can't satisfy →
     # TMA deadlock). Read the true element size off the gmem node here.
     dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in match.graph.nodes.items()}
+
+    # All-or-nothing per tile (see module docstring): if any
+    # promotable-policy bundle is not TMA-eligible, leave the whole
+    # tile on cp.async — 060_use_async_copy promotes the BUFFERED
+    # leftovers to ASYNC. Mixed TMA + cp.async inside one pipelined
+    # K-loop deadlocks the mbarrier scheme, so we'd rather skip TMA
+    # for the whole tile than partially promote.
+    for s in body.iter():
+        if not isinstance(s, StageBundle):
+            continue
+        if s.policy == StagePolicy.TMA:
+            continue
+        # A double-buffered (``buffer_count > 1``) NONE-swizzle bundle must keep
+        # every ring slot 128 B-aligned; size that smem-slot check off the TRUE
+        # element width (``strict_slot_align``) so a sub-128 B fp16 slab declines
+        # to cp.async instead of emitting a misaligned ``cp.async.bulk.tensor``
+        # (the #244 ``k_linear_mean_reduce`` wedge — the materializer's slot pad
+        # uses the fp32 constant and under-pads fp16). Swizzled (mma) slabs align
+        # via their swizzle atom and single-slot bundles sit at the aligned base,
+        # so both keep the lenient fp32-constant check.
+        strict_slot_align = not swizzle and s.buffer_count > 1
+        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align):
+            return _decline(
+                f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
+                "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
+            )
+
     new_body, changed = _walk(body, swizzle=swizzle, dtype_bytes=dtype_bytes)
     already_tma = any(isinstance(s, StageBundle) and s.policy == StagePolicy.TMA for s in body.iter())
     if not changed and not already_tma:
@@ -393,12 +403,24 @@ def _stamp_source_swizzle(src: Source, dtype_bytes: dict[str, int]) -> Source:
     return replace(src, swizzle=mode)
 
 
-def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]], inner_symbolic_bufs: set[str] = frozenset()) -> bool:
+def _bundle_eligible(
+    bundle: StageBundle,
+    src_shapes: dict[str, tuple[int, ...]],
+    inner_symbolic_bufs: set[str] = frozenset(),
+    dtype_bytes: dict[str, int] | None = None,
+    strict_slot_align: bool = False,
+) -> bool:
     """A bundle is TMA-eligible iff every Source is."""
-    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs) for src in bundle.sources)
+    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align) for src in bundle.sources)
 
 
-def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]], inner_symbolic_bufs: set[str] = frozenset()) -> bool:
+def _source_eligible(
+    src: Source,
+    src_shapes: dict[str, tuple[int, ...]],
+    inner_symbolic_bufs: set[str] = frozenset(),
+    dtype_bytes: dict[str, int] | None = None,
+    strict_slot_align: bool = False,
+) -> bool:
     if not isinstance(src.addressing, AffineAddressing):
         return False
     # A symbolic innermost gmem dim breaks the 16-byte global-stride alignment
@@ -470,6 +492,27 @@ def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]], inner_
     src_inner = src_shape[-1]
     if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
+    # Ring-slot 128 B alignment, at the TRUE element width. A double-buffered
+    # NONE-swizzle bundle (``strict_slot_align`` — set in the rewrite loop) keeps
+    # ``buffer_count`` rotating slots at ``slot * inner_box`` byte offsets from a
+    # 128 B-aligned base; every slot stays aligned only if the whole per-slot box
+    # footprint is a 128 B multiple. The materializer's slot pad sizes that
+    # threshold off the fp32 ``BYTES_PER_ELEM``, so a pure-reduction fp16 slab
+    # whose box is a single 32-elem axis (64 B) reads as already-aligned, stays
+    # UNPADDED, and the second ring slot lands at a 64 B offset →
+    # ``cp.async.bulk.tensor`` faults with ``CUDA_ERROR_MISALIGNED_ADDRESS`` (the
+    # #244 ``k_linear_mean_reduce`` wedge). Decline to cp.async (no 128 B rule)
+    # for that case. A matmul slab whose box collapses several axes (e.g.
+    # ``BK·BN·FN``) is already a 128 B multiple and stays on TMA; swizzled (mma)
+    # slabs align via their swizzle atom and single-slot bundles sit at the
+    # aligned base, so neither sets ``strict_slot_align``.
+    if strict_slot_align:
+        slot_elems = 1
+        for ext in box_per_dim.values():
+            slot_elems *= ext
+        elem_bytes = (dtype_bytes or {}).get(src.buf, BYTES_PER_ELEM)
+        if (slot_elems * elem_bytes) % _TMA_ALIGN_BYTES != 0:
+            return False
     if src_inner < inner_extent * 2:
         return False
     return True

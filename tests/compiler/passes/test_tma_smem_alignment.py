@@ -29,11 +29,13 @@ import re
 
 import pytest
 
+from deplodock.compiler import target as target_mod
 from deplodock.compiler.backend.cuda.backend import CudaBackend
+from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 
 
 def _matmul_graph(m: int = 32, k: int = 1024, n: int = 1024) -> Graph:
@@ -46,13 +48,35 @@ def _matmul_graph(m: int = 32, k: int = 1024, n: int = 1024) -> Graph:
     return g
 
 
+def _norm_linear_graph(dtype, s: int = 32, h: int = 128, i: int = 512) -> Graph:
+    """``RmsNorm(x) @ W.T`` — the fused norm+matmul shape of Qwen3-Embedding's
+    ``k_linear_mean_reduce``. The norm reduction stages ``x`` in ``BK``-element
+    inner slabs; at ``BK=32`` that slab is 32 elems = 128 B in fp32 but only
+    64 B in fp16 — the dtype the TMA-alignment eligibility gate must respect."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, s, h), dtype=dtype), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("wn", (h,), dtype=dtype), node_id="wn")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (i, h), dtype=dtype), node_id="w")
+    g.add_node(op=RmsNormOp(), inputs=["x", "wn"], output=Tensor("xn", (1, s, h), dtype=dtype), node_id="xn")
+    g.add_node(op=LinearOp(), inputs=["xn", "w"], output=Tensor("y", (1, s, i), dtype=dtype), node_id="y")
+    g.inputs = ["x", "wn", "w"]
+    g.outputs = ["y"]
+    return g
+
+
 @pytest.fixture
-def _tma_eligible_context(monkeypatch):
+def _tma_eligible_context():
     # Force Hopper+ so ``050_use_tma`` admits TMA promotion regardless of the
-    # live device. The materializer's smem-prologue logic is the surface
-    # under test; the live device's compute capability is irrelevant.
-    monkeypatch.setenv("DEPLODOCK_COMPUTE_CAPABILITY", "9.0")
-    yield
+    # live device — the gate reads ``ctx.compute_capability``, which honors the
+    # ``set_target`` override (NOT an env var), so on a GPU-less CI runner
+    # ``compute_capability()`` would otherwise fall back to ``(0, 0)`` and
+    # decline TMA. The materializer's smem-prologue logic is the surface under
+    # test; the live device's compute capability is irrelevant.
+    target_mod.set_target((9, 0))
+    try:
+        yield
+    finally:
+        target_mod.set_target(None)
 
 
 def _smem_decl_align(cuda_src: str, buf_name: str) -> int | None:
@@ -123,3 +147,42 @@ def test_tma_smem_slot_stride_is_128_byte_multiple(monkeypatch, _tma_eligible_co
             f"{name!r}: total_elems={total} is not a 32-element (128 B) multiple — "
             "ring slot 1 lands at a non-128 B-aligned offset, misaligning TMA"
         )
+
+
+def _compile_norm_linear(monkeypatch, dtype, knobs: dict[str, str]) -> str:
+    for k, v in knobs.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    compiled = CudaBackend().compile(_norm_linear_graph(dtype))
+    cuda_ops = [n.op for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
+    assert cuda_ops, "expected at least one CudaOp"
+    return "\n".join(op.kernel_source for op in cuda_ops)
+
+
+# Knobs reproducing the #244 dynamic-tune wedge: a scalar (``MMA=0``)
+# cooperative norm-reduce whose ``BK=32`` inner slab is double-buffered
+# (``RING=2``). Its per-slot box is a single 32-elem axis — 64 B in fp16, NOT a
+# 128 B multiple — so the second ring slot would land at a 64 B offset and
+# ``cp.async.bulk.tensor`` faults (``CUDA_ERROR_MISALIGNED_ADDRESS`` → 1 s
+# watchdog hang → bench_fail). The eligibility gate must decline TMA here.
+_WEDGE_KNOBS = {"BK": "32", "BM": "1", "BN": "128", "BR": "1", "FM": "1", "FN": "1", "SPLITK": "1", "STAGE": "1", "MMA": "0", "RING": "2"}
+
+
+def test_fp16_subaligned_ring_slot_declines_tma_fp32_keeps_it(monkeypatch, _tma_eligible_context):
+    """Dtype-aware ring-slot eligibility: the same scalar norm+matmul, same knobs,
+    must DECLINE TMA in fp16 (per-slot box = 32 elems = 64 B, not a 128 B multiple
+    at ``RING=2``) but still PROMOTE in fp32 (32 elems = 128 B). The 128 B slot
+    check sized off the fp32 ``BYTES_PER_ELEM`` constant let the fp16 64 B slab
+    through as 128 B, the materializer's slot pad (same constant) left it
+    unpadded, and the second ring slot landed at a 64 B offset →
+    ``cp.async.bulk.tensor`` device hang (``CUDA_ERROR_MISALIGNED_ADDRESS``, the
+    #244 ``k_linear_mean_reduce`` wedge). Declining routes the fp16 slab to
+    cp.async (no 128 B rule). Compile-only — no CUDA device needed."""
+    fp32_src = _compile_norm_linear(monkeypatch, F32, _WEDGE_KNOBS)
+    assert "cp.async.bulk.tensor" in fp32_src, (
+        "fp32 32-elem slot is 128 B and must still promote to TMA — the dtype-aware guard must not over-decline the correctly-aligned case"
+    )
+    fp16_src = _compile_norm_linear(monkeypatch, F16, _WEDGE_KNOBS)
+    assert "cp.async.bulk.tensor" not in fp16_src, (
+        "fp16 32-elem ring slot is 64 B (not a 128 B multiple) — TMA must be declined "
+        "(fall back to cp.async), else cp.async.bulk.tensor stores misalign and hang"
+    )
