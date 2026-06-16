@@ -597,7 +597,13 @@ class Pipeline:
                 if o3_us is not None:
                     search.observe_o3(token, o3_us)
             yield cand
-        logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
+        dropped = run._dropped_candidates
+        logger.info(
+            "compile: total %.2fs (%d terminal(s)%s)",
+            time.monotonic() - t_start,
+            n_terminals,
+            f", {dropped} un-lowerable candidate(s) dropped" if dropped else "",
+        )
 
 
 @dataclass
@@ -692,6 +698,10 @@ class Run:
     backend: object | None = None
     dump: CompilerDump | None = None
     rejections: list[tuple[str, str, str]] | None = None
+    # Count of search candidates dropped by :meth:`drive`'s per-variant
+    # containment (un-lowerable forks that raised during lowering). Tune-only;
+    # stays 0 on the deterministic greedy path.
+    _dropped_candidates: int = 0
 
     def _step(self, cand: Candidate) -> tuple[Match, list, bool] | None:
         """Run one rule batch against ``cand`` — the per-candidate engine
@@ -844,7 +854,28 @@ class Run:
             if cand.cursor.is_done:
                 yield token, cand
                 continue
-            step = self._step(cand)
+            # Per-variant containment: a search-explored candidate can reach an
+            # un-lowerable shape that a *deterministic* lowering pass raises on
+            # (e.g. a sibling-cell-fused slab fill the single-Write hoisted-compute
+            # materializer can't represent, or an orphan AtomTile at render). The
+            # deployable greedy pick (``Run.resolve``) never reaches these forks, so
+            # under tune they are legitimate dead ends — exactly like a branch whose
+            # every option fails ``validate(ctx)``. Drop the candidate's subtree and
+            # keep driving the rest of the search instead of aborting the whole tune.
+            # (``RuleSkipped`` is handled inside ``try_rewrite``; control-flow
+            # exceptions propagate.)
+            try:
+                step = self._step(cand)
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except Exception as exc:  # noqa: BLE001 — broad by design; this is the tune dead-end sink
+                self._dropped_candidates += 1
+                logger.warning(
+                    "[tune] dropped un-lowerable candidate (%s: %s) — pruning branch, continuing search",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
             if step is None:
                 search.push(cand.lazy(), parent=token)
                 continue

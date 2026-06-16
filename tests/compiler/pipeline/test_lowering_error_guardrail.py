@@ -147,3 +147,82 @@ def test_run_leaves_no_state_on_pipeline():
     with pytest.raises(LoweringError):
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
     assert not hasattr(pipeline, "_lowering_rejections")
+
+
+# ---------------------------------------------------------------------------
+# Per-variant containment: a lowering pass that *raises* (not a validate
+# filter) aborts a greedy compile loudly, but under tune is a dropped dead
+# end so one un-lowerable search fork can't abort the whole tune. This is the
+# stacked defect the static tune-findings report flagged: an un-handled
+# fused-cell slab shape (compute_phase_info LoweringError) / an orphan AtomTile
+# at render would crash mid-tune with no per-variant containment.
+# ---------------------------------------------------------------------------
+
+
+def _build_raising_pipeline() -> Pipeline:
+    """One pass, one rule matching the ``TileOp`` at ``y`` whose rewrite
+    *raises* a ``LoweringError`` (an un-lowerable shape a deterministic pass
+    chokes on), rather than returning a validate-filtered option."""
+
+    def rewrite(root):  # noqa: ARG001
+        raise LoweringError("synthetic un-lowerable shape")
+
+    rule = Rule(
+        name="__raising_lower__",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=rewrite,
+        param_names=tuple(inspect.signature(rewrite).parameters.keys()),
+    )
+    pass_ = Pass(name="__test_raise__", rules=[rule], index=0)
+    rule.pass_ = pass_
+    return Pipeline(passes=[pass_])
+
+
+def test_greedy_run_propagates_lowering_exception():
+    # Greedy uses ``Run.resolve`` (no containment) — a raising lowering pass
+    # propagates loudly, exactly as before.
+    pipeline = _build_raising_pipeline()
+    with pytest.raises(LoweringError, match="synthetic un-lowerable shape"):
+        pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
+
+
+def test_compute_phase_info_raises_on_collapsed_index():
+    # A hoisted-compute Write whose index has a non-cache-axis entry (a
+    # ``Literal`` left by a sibling-cell fusion) is un-lowerable by the
+    # single-Write materializer — ``compute_phase_info`` flags it as a
+    # ``LoweringError`` (caught + pruned under tune by the containment above)
+    # instead of an opaque ``AttributeError`` mid-tune.
+    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.expr import Literal, Var
+    from deplodock.compiler.ir.stmt import Write
+    from deplodock.compiler.ir.tile.ir import Source
+    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
+
+    sources = (Source(name="slab", buf="x", cache_axes=(Axis("a2", 4), Axis("a4", 8)), origin=(Literal(0, "int"), Literal(0, "int"))),)
+    # Clean all-Var index → recovers the two cache axes.
+    good = [Write(output="slab", index=(Var("a2"), Var("a4")), value="v")]
+    name, axes, _ = compute_phase_info(good, sources)
+    assert name == "slab"
+    assert tuple(a.name for a in axes) == ("a2", "a4")
+    # Collapsed index (a sibling-cell-fused constant) → LoweringError.
+    bad = [Write(output="slab", index=(Var("a2"), Literal(1, "int")), value="v")]
+    with pytest.raises(LoweringError, match="sibling-cell-fused"):
+        compute_phase_info(bad, sources)
+
+
+def test_tuning_contains_raising_lowering_pass(caplog):
+    # Under tune, ``Run.drive`` catches the lowering exception, drops the
+    # candidate's subtree, logs a warning, and finishes without raising —
+    # so a single un-lowerable fork can't abort the whole tune.
+    import logging
+
+    from deplodock.compiler.pipeline import TuningSearch
+    from deplodock.compiler.pipeline.search.db import SearchDB
+
+    pipeline = _build_raising_pipeline()
+    with caplog.at_level(logging.WARNING, logger="deplodock.compiler.pipeline"):
+        terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
+    # The only lowering option raised, so no terminal is benchable — the search
+    # ends cleanly with zero terminals instead of crashing.
+    assert terminals == []
+    assert any("dropped un-lowerable candidate" in r.message for r in caplog.records)

@@ -366,6 +366,15 @@ of letting it leak to `CudaBackend` as a cryptic `non-CudaOp` `TypeError`. The
 sink is absent under `tune`, so the fork-pruning path stays silent and a
 validate-dropped branch is a graceful dead end.
 
+A rewrite that *raises* mid-lowering (a deterministic lowering pass hitting an un-lowerable shape it can't
+represent — e.g. `100_materialize_tile`'s single-Write hoisted-compute materializer on a sibling-cell-fused slab,
+which raises `LoweringError` from `_stage_expand.compute_phase_info`) is the same kind of dead end, but for an
+*exception* rather than a validate-filter. Greedy `resolve` lets it propagate loudly; under `tune`, `Run.drive`
+catches it per-candidate, drops that candidate's subtree (the `pop()` already decremented its `live` count, so this
+is bookkeeping-identical to a dead-end terminal), logs `[tune] dropped un-lowerable candidate (…)`, and bumps
+`Run._dropped_candidates` (reported in the terminal-count line). Without this, one search-only un-lowerable fork
+aborted the whole tune.
+
 Files starting with `_` (e.g. `_broadcast.py`) are **not** loaded as
 rules — they're shared helpers for the pass's rule modules.
 
