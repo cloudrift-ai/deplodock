@@ -39,8 +39,7 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `outputs({"seq_len": S})` slices each output to its real shape. Captured graphs are cached per seq_len (bounded LRU);
   each is captured at its EXACT S so every kernel runs at its exact grid — no oversized-grid masking (a single
   capacity-baked graph for all S is **not** viable: several symbolic-M kernels do illegal reads at an oversized grid,
-  the swizzle decode + staged loads among them). `DEPLODOCK_SERVING_NO_GRAPHS=1` keeps the uncaptured `rebind` →
-  `run_once` path. See `compiler/backend/cuda/ARCHITECTURE.md`
+  the swizzle decode + staged loads among them). See `compiler/backend/cuda/ARCHITECTURE.md`
   → repeated execution + captured replay. Trace dtype: `DEPLODOCK_SERVING_DTYPE` (default `float16`; `float32` is the
   accuracy escape hatch — 2× weight memory).
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
@@ -81,8 +80,7 @@ Recorded follow-ups, in impact order:
   persistence across container restarts is what keeps reboots fast.
 - The shared buffer set is allocated at `max_seq_len` (`--max-model-len`); every accepted request (S ≤ `max_seq_len`)
   uses the captured-graph path. The S²-attention scratch dominates that allocation (0.6B at 4096 ≈ 15 GB), so lower
-  `--max-model-len` for bigger models / smaller cards. `DEPLODOCK_SERVING_NO_GRAPHS=1` forces the uncaptured rebind
-  path for every request (debug / A-B).
+  `--max-model-len` for bigger models / smaller cards.
 - vLLM's memory profiler only sees torch allocations; the runner's cupy-held weights/activations are invisible to it.
   Leave `--gpu-memory-utilization` headroom accordingly (the attention-free model needs no KV cache, so vLLM's own
   budget is tiny).

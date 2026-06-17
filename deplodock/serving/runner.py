@@ -4,17 +4,14 @@
 server start it traces the HuggingFace ``AutoModel`` trunk (hidden states out,
 no lm_head) with a dynamic seq_len, compiles it through the CUDA backend
 (greedy fork picks from the global prior — no GPU tuning), and builds ONE
-``CompiledProgram``. Per sequence it re-binds fresh inputs (``rebind``) and
-launches (``run_once``) — one compiled program serves every request at any
-seq_len ≤ ``DYNAMIC_DIM_MAX``.
+``CompiledProgram`` over a single ``max_seq_len``-sized buffer set — one program
+serves every request at any seq_len ≤ ``max_seq_len``.
 
 Per request it captures (once per distinct seq_len, then replays) a whole-program
-CUDA graph over a single ``max_seq_len``-sized buffer set — one host-side launch
-instead of the ~hundreds the uncaptured ``rebind`` + ``run_once`` loop issues. Each
+CUDA graph over that buffer set — one host-side launch instead of ~hundreds. Each
 graph is captured at its EXACT seq_len, so every kernel runs at its exact grid (no
 oversized-grid masking); the buffers are allocated once at ``max_seq_len`` and each
-request's inputs upload into their contiguous prefix. ``DEPLODOCK_SERVING_NO_GRAPHS``
-keeps the uncaptured path.
+request's inputs upload into their contiguous prefix.
 
 No vllm imports here — the class is driven by ``vllm_model.DeplodockEmbedModel``
 but is independently testable with torch + cupy alone.
@@ -72,7 +69,6 @@ class DeplodockForwardRunner:
         import torch
         from transformers import AutoModel
 
-        from deplodock import config
         from deplodock.compiler.backend.cuda.backend import CudaBackend
         from deplodock.compiler.backend.cuda.program import CompiledProgram
         from deplodock.compiler.backend.gpu_lock import gpu_lock
@@ -145,10 +141,9 @@ class DeplodockForwardRunner:
             program = CompiledProgram.build(compiled, {**const_feed, **feed})
         del model, wrapper, sources, const_feed
         logger.info(
-            "[serving] ready: %d launches, max_seq_len=%d%s",
+            "[serving] ready: %d launches, max_seq_len=%d",
             len(program.compiled.launches),
             max_seq_len,
-            " (graphs off)" if config.serving_no_graphs() else "",
         )
         return cls(
             program=program,
@@ -177,26 +172,21 @@ class DeplodockForwardRunner:
         """Run one sequence: ``token_ids`` shape ``(S,)`` int64, ``S <=
         max_seq_len``. Returns ``(S, hidden)`` numpy in the traced dtype.
 
-        Captured-graph path (default): size the launch grids to S, upload the
-        request's ids / causal mask / position_ids into the shared buffers'
-        prefix, capture-or-reuse the whole-program graph for this S, and replay
-        it — one host launch. Falls back to the uncaptured rebind + run_once loop
-        when ``DEPLODOCK_SERVING_NO_GRAPHS`` is set or ``S`` exceeds
-        ``max_seq_len`` (the buffer set was sized for max_seq_len)."""
-        from deplodock import config
+        Captured-graph path: size the launch grids to S, upload the request's
+        ids / causal mask / position_ids into the shared buffers' prefix,
+        capture-or-reuse the whole-program graph for this S, and replay it — one
+        host launch."""
         from deplodock.compiler.backend.gpu_lock import gpu_lock
 
         s = int(token_ids.shape[0])
+        if s > self.max_seq_len:
+            raise ValueError(f"seq_len {s} exceeds max_seq_len {self.max_seq_len}")
         feed = {
             self._ids_name: token_ids.reshape(1, s),
             self._mask_name: self._mask(s),
             self._pos_name: np.arange(s, dtype=np.int64).reshape(1, s),
         }
         with gpu_lock():
-            if config.serving_no_graphs() or s > self.max_seq_len:
-                self._program.rebind(feed)
-                self._program.run_once()
-                return self._program.outputs()[self._output_name][0]
             self._program.set_sym_values({"seq_len": s})
             self._program.upload_prefix(feed)
             self._program.capture_program_graph()
