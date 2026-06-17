@@ -939,6 +939,26 @@ class CompiledProgram:
                 raise ValueError(f"upload_prefix: {name!r} has {flat.size} elems > capacity {arr.size}")
             arr.ravel()[: flat.size].set(flat)
 
+    def upload_prefix_device(self, input_data: dict[str, cp.ndarray]) -> None:
+        """Device-to-device twin of :meth:`upload_prefix`: copy each cupy source
+        into the contiguous PREFIX of its capacity-sized device buffer with NO
+        host round-trip — the serving zero-copy path, where the sources are cupy
+        views of the caller's torch GPU tensors (``cp.from_dlpack``). Same
+        prefix-packing contract and capacity check as :meth:`upload_prefix` (the
+        kernels launched at the real-S grid read only the prefix). Caller must
+        hold ``gpu_lock()`` and order the copy on the replay stream — the serving
+        runner enters a cupy external stream bound to torch's current stream so
+        the copy, the graph replay, and the output read all enqueue in order."""
+        import cupy as cp  # noqa: PLC0415
+
+        for name, src in input_data.items():
+            buf = self.compiled.buf_by_name[name]
+            arr = self.arrays[name]
+            flat = cp.ascontiguousarray(src, dtype=buf.dtype.np).ravel()
+            if flat.size > arr.size:
+                raise ValueError(f"upload_prefix_device: {name!r} has {flat.size} elems > capacity {arr.size}")
+            arr.ravel()[: flat.size] = flat
+
     def time_program_window(self, replays: int) -> float:
         """One event window around ``replays`` back-to-back whole-program
         replays of the captured e2e graph; returns per-replay ms. Caller
@@ -1055,6 +1075,28 @@ class CompiledProgram:
                 out[b.name] = arr.ravel()[:n].get().reshape(shape)
             else:
                 out[b.name] = arr.get()
+        return out
+
+    def output_prefix_device(self, sym_values: dict[str, int] | None = None) -> dict[str, cp.ndarray]:
+        """Device twin of :meth:`outputs`: return each output buffer's real-S
+        PREFIX as a cupy view (reshaped to the resolved shape) with NO ``.get()``
+        host copy — the serving zero-copy path, where the caller wraps the view as
+        a torch tensor (``torch.from_dlpack``) and clones it (the shared buffer is
+        overwritten by the next request's replay). ``sym_values`` slices to the
+        real shape exactly like :meth:`outputs`; without it the whole buffer view
+        is returned. Caller must hold ``gpu_lock()`` (and read on the replay
+        stream — see :meth:`upload_prefix_device`)."""
+        out: dict[str, cp.ndarray] = {}
+        for b in self.compiled.bufs:
+            if b.role != "output":
+                continue
+            arr = self.arrays[b.name]
+            if sym_values is not None:
+                shape = b.resolve_shape({**self.sym_values, **sym_values})
+                n = math.prod(shape) if shape else 1
+                out[b.name] = arr.ravel()[:n].reshape(shape)
+            else:
+                out[b.name] = arr
         return out
 
     def snapshot(self) -> dict[str, np.ndarray]:

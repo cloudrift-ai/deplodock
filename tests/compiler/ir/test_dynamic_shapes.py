@@ -552,6 +552,45 @@ def test_capture_replay_cache_rmsnorm_over_capacity_buffers():
         assert set(k[0][1] for k in prog._graph_cache) == {5, 12, 33, 64}, "expected one cached graph per distinct seq_len"
 
 
+def test_capture_replay_device_io_matches_eager():
+    """Serving zero-copy device I/O: feed cupy inputs through ``upload_prefix_device``
+    and read the output buffer's prefix back as a torch tensor via ``output_prefix_device``
+    + ``torch.from_dlpack`` — NO host round-trip — and confirm it matches torch eager
+    across seq_lens. The dlpack bridge (cupy ↔ torch) is what lets the runner accept
+    torch tensors straight from vLLM. Repeats hit the per-S graph cache."""
+    pytest = __import__("pytest")
+    pytest.importorskip("cupy")
+    import cupy as cp
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from deplodock.compiler.trace.torch import trace_module
+
+    cap = 48
+    m = torch.nn.RMSNorm(1024)
+    compiled = CudaBackend().compile(trace_module(m, (torch.randn(1, 32, 1024),), dynamic_shapes={"x": {1: _seq_len_dim()}}))
+    weight = m.weight.detach().numpy().astype(np.float32)
+    out_name = compiled.outputs[0]
+
+    with gpu_lock():
+        prog = CompiledProgram.build(compiled, {"x": np.zeros((1, cap, 1024), np.float32), "p_weight": weight})
+        for s in (7, 32, 48, 7):
+            x = np.random.RandomState(s).standard_normal((1, s, 1024)).astype(np.float32)
+            prog.set_sym_values({"seq_len": s})
+            prog.upload_prefix_device({"x": cp.asarray(x)})  # cupy in — no host upload
+            prog.capture_program_graph()
+            prog.replay_program_graph()
+            out_view = prog.output_prefix_device({"seq_len": s})[out_name]  # cupy view, no .get()
+            cp.cuda.runtime.deviceSynchronize()
+            out = torch.from_dlpack(out_view).clone().cpu().numpy()  # torch view of cupy mem
+            with torch.no_grad():
+                ref = torch.nn.functional.rms_norm(torch.from_numpy(x), (1024,), m.weight, eps=m.eps).numpy()
+            assert out.shape == (1, s, 1024)
+            np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+
 def test_qwen_whole_model_capture_replay_cache_matches_eager():
     """1-layer random-weight Qwen3 trunk through the captured-graph serving path:
     build once at capacity, serve several seq_lens via the per-S graph cache

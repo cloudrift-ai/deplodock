@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.pooler import DispatchPooler
@@ -64,14 +63,19 @@ class DeplodockEmbedModel(nn.Module, IsAttentionFree):
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         # Packed (num_tokens_padded,) tensors: sequences flattened back-to-back,
-        # positions 0-based per request. Garbage dummy-run batches must survive
-        # too — hence the vocab clamp and split_spans' chunking hardening.
+        # positions 0-based per request. Everything stays on-device — each span's
+        # ids slice straight into the runner (torch→cupy zero-copy) and hidden
+        # states come back as torch CUDA tensors. Only the span boundaries need a
+        # host read of positions (a tiny (num_tokens,) int vector); garbage
+        # dummy-run batches survive via the vocab clamp + split_spans' chunking.
         n = int(input_ids.shape[0])
-        ids = input_ids.clamp(0, self.vocab_size - 1).cpu().numpy().astype(np.int64).reshape(-1)
-        pos = positions.cpu().numpy().reshape(-1)
-        chunks = [self.runner.forward_hidden_states(ids[a:b]) for a, b in split_spans(pos, self.runner.max_seq_len)]
-        hidden = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, self.runner.hidden_size), dtype=np.float32)
-        out = torch.from_numpy(np.ascontiguousarray(hidden)).to(device=input_ids.device, dtype=self.out_dtype)
+        ids = input_ids.clamp(0, self.vocab_size - 1).to(torch.int64)
+        spans = split_spans(positions.cpu().numpy().reshape(-1), self.runner.max_seq_len)
+        chunks = [self.runner.forward_hidden_states(ids[a:b]) for a, b in spans]
+        if chunks:
+            out = torch.cat(chunks, dim=0).to(device=input_ids.device, dtype=self.out_dtype)
+        else:
+            out = torch.zeros((0, self.runner.hidden_size), device=input_ids.device, dtype=self.out_dtype)
         if out.shape[0] < n:  # pad back to num_tokens_padded
             out = torch.nn.functional.pad(out, (0, 0, 0, n - out.shape[0]))
         return out

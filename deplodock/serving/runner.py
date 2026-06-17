@@ -62,7 +62,9 @@ class DeplodockForwardRunner:
         # Shared buffer set is sized for max_seq_len; every accepted request
         # (S ≤ max_seq_len) uses the captured-graph path.
         self.max_seq_len = max_seq_len
-        self._mask_cache: dict[int, np.ndarray] = {}
+        # int seq_len -> device-built (1,1,S,S) cupy causal mask (built on first
+        # sight of each S, reused across same-S requests via a D2D prefix copy).
+        self._mask_cache: dict = {}
 
     @classmethod
     def create(cls, model_id: str, max_seq_len: int, dtype_str: str = "float16") -> DeplodockForwardRunner:
@@ -158,37 +160,51 @@ class DeplodockForwardRunner:
         out = self._program.compiled.buf_by_name[self._output_name]
         return int(out.shape[-1].as_static())
 
-    def _mask(self, s: int) -> np.ndarray:
+    def _mask(self, s: int):
+        """``(1, 1, s, s)`` additive causal mask as a cached cupy device array —
+        the device twin of :func:`_causal_mask_np`, built once per S on the GPU so
+        the hot path never builds/uploads it from host."""
+        import cupy as cp  # noqa: PLC0415
+
         cached = self._mask_cache.get(s)
         if cached is not None:
             return cached
-        mask = _causal_mask_np(s, self._np_dtype)
+        mask = cp.triu(cp.full((s, s), float("-inf"), dtype=cp.float32), k=1).astype(self._np_dtype)[None, None, :, :]
         if len(self._mask_cache) >= _MASK_CACHE_MAX:
             self._mask_cache.pop(next(iter(self._mask_cache)))
         self._mask_cache[s] = mask
         return mask
 
-    def forward_hidden_states(self, token_ids: np.ndarray) -> np.ndarray:
-        """Run one sequence: ``token_ids`` shape ``(S,)`` int64, ``S <=
-        max_seq_len``. Returns ``(S, hidden)`` numpy in the traced dtype.
+    def forward_hidden_states(self, token_ids):
+        """Run one sequence: ``token_ids`` a 1-D int torch CUDA tensor of length
+        ``S <= max_seq_len``. Returns an ``(S, hidden)`` torch CUDA tensor in the
+        trunk dtype.
 
-        Captured-graph path: size the launch grids to S, upload the request's
-        ids / causal mask / position_ids into the shared buffers' prefix,
-        capture-or-reuse the whole-program graph for this S, and replay it — one
-        host launch."""
+        Zero-copy device path: bridge the torch input to cupy (``cp.from_dlpack``,
+        no host copy), size the launch grids to S, copy ids / device-built causal
+        mask / position_ids into the shared buffers' prefix (device-to-device),
+        capture-or-reuse the whole-program graph for this S, replay it, and wrap
+        the output buffer's prefix back as a torch tensor (``torch.from_dlpack``)
+        — no GPU↔host round-trip. All cupy work runs on torch's current stream so
+        the prefix copy, the graph replay, and the output read stay ordered; the
+        result is cloned because the shared buffer is reused by the next request."""
+        import cupy as cp  # noqa: PLC0415
+        import torch
+
         from deplodock.compiler.backend.gpu_lock import gpu_lock
 
         s = int(token_ids.shape[0])
         if s > self.max_seq_len:
             raise ValueError(f"seq_len {s} exceeds max_seq_len {self.max_seq_len}")
-        feed = {
-            self._ids_name: token_ids.reshape(1, s),
-            self._mask_name: self._mask(s),
-            self._pos_name: np.arange(s, dtype=np.int64).reshape(1, s),
-        }
-        with gpu_lock():
+        with gpu_lock(), cp.cuda.Stream.from_external(torch.cuda.current_stream()):
+            feed = {
+                self._ids_name: cp.from_dlpack(token_ids.detach().reshape(1, s)),
+                self._mask_name: self._mask(s),
+                self._pos_name: cp.arange(s, dtype=cp.int64).reshape(1, s),
+            }
             self._program.set_sym_values({"seq_len": s})
-            self._program.upload_prefix(feed)
+            self._program.upload_prefix_device(feed)
             self._program.capture_program_graph()
             self._program.replay_program_graph()
-            return self._program.outputs({"seq_len": s})[self._output_name][0]
+            out = self._program.output_prefix_device({"seq_len": s})[self._output_name][0]
+            return torch.from_dlpack(out).clone()

@@ -26,17 +26,26 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `attn_type = "encoder_only"` (vLLM disables chunked prefill → every request reaches `forward` whole),
   `pooler = DispatchPooler.for_embedding(...)` (last-token pooling + L2 normalize + matryoshka — identical to stock
   Qwen3-Embedding serving), stub `embed_input_ids`, no-op `load_weights` (the runner loads the checkpoint itself; not
-  consuming the iterator skips reading the safetensors).
+  consuming the iterator skips reading the safetensors). `forward` keeps everything **on-device**: it clamps + casts
+  the packed ids to int64 on the GPU, slices each span straight into the runner (torch tensors, no `.cpu()`/numpy), and
+  `torch.cat`s the torch results back. The only host touch is a small `positions.cpu()` to find span boundaries for
+  `split_spans` (a `(num_tokens,)` int vector).
 - `runner.py` — `DeplodockForwardRunner`. At engine start: load the `AutoModel` **trunk** (hidden states out — no
   lm_head), `build_full_model_wrapper(dynamic=True)`, trace with the canonical 4-spec dynamic seq_len
   (`seq_len@input_ids:1`, `@attention_mask:2`, `@attention_mask:3`, `@position_ids:1`), compile through `CudaBackend`
   (greedy fork picks from the global prior — benefits from any prior `deplodock tune`), bind weights as graph
   constants (`named_parameters` + `named_buffers`, `remove_duplicate=False`, in the traced dtype), and build ONE
   `CompiledProgram` over a buffer set sized at **`max_seq_len`** (`--max-model-len`). Per
-  sequence (`forward_hidden_states`): size the launch grids to S (`set_sym_values`), upload the request's ids / causal
-  mask / position_ids into the buffers' contiguous **prefix** (`upload_prefix`), **capture-or-reuse** the whole-program
-  CUDA graph for this S, and **replay** it — one host launch instead of the ~hundreds the uncaptured loop issues; then
-  `outputs({"seq_len": S})` slices each output to its real shape. Captured graphs are cached per seq_len (bounded LRU);
+  sequence (`forward_hidden_states`) it takes a **1-D int torch CUDA tensor** and returns an `(S, hidden)` **torch CUDA
+  tensor** — no host round-trip. It enters a cupy external stream bound to torch's current stream
+  (`cp.cuda.Stream.from_external`), then: bridge the
+  torch ids to cupy (`cp.from_dlpack`, zero-copy), size the launch grids to S (`set_sym_values`), copy ids /
+  **device-built** causal mask / position_ids into the buffers' contiguous **prefix** device-to-device
+  (`upload_prefix_device`), **capture-or-reuse** the whole-program CUDA graph for this S, **replay** it — one host launch
+  instead of the ~hundreds the uncaptured loop issues — and wrap the output buffer's real-S prefix back as a torch
+  tensor (`output_prefix_device` + `torch.from_dlpack`, cloned because the shared buffer is reused next request). The
+  causal mask is built once per S as a cupy array (the device twin of `_causal_mask_np`) and reused. Captured graphs are
+  cached per seq_len (bounded LRU);
   each is captured at its EXACT S so every kernel runs at its exact grid — no oversized-grid masking (a single
   capacity-baked graph for all S is **not** viable: several symbolic-M kernels do illegal reads at an oversized grid,
   the swizzle decode + staged loads among them). See `compiler/backend/cuda/ARCHITECTURE.md`
@@ -51,7 +60,8 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
 
 Each sequence runs **individually** through the compiled dynamic-seq_len program (batch axis is compile-time fixed at
 1), as a captured whole-program CUDA graph (one host launch) replayed over a single capacity-sized buffer set, with the
-request's inputs uploaded into the buffers' prefix and the output sliced back out. One captured graph is cached per
+request's torch inputs bridged to the buffers' prefix device-to-device (dlpack, no host hop) and the output handed back
+as a torch view of the output buffer. One captured graph is cached per
 distinct seq_len (bounded LRU); a new length pays one capture (~one forward) on first sight, then replays. The captured
 graph removes the per-launch dispatch overhead and the ~hundreds of host calls the uncaptured loop made — the
 precondition for fast low-concurrency serving. (Measured A/B is ~flat today: the uncaptured `run_once` loop already
@@ -62,10 +72,15 @@ structurally trails stock vLLM's packed-batch prefill — that gap measures the 
 Recorded follow-ups, in impact order:
 
 1. **Packed-varlen attention** (cu_seqlens-aware SDPA tiles) — run vLLM's whole packed batch in one launch; the only
-   item that makes the throughput regime apples-to-apples. Matmuls/norms/pointwise are already token-wise.
-2. **dlpack zero-copy I/O** — cupy ↔ torch without the host round-trip (`cp.from_dlpack` / `torch.from_dlpack`).
-3. **Device-side causal mask** — the `(1,1,S,S)` host mask upload (~32 MB fp16 at S=4096) per request; a tiny kernel
-   (or in-kernel `j <= i` predicate) removes the mask input + its upload entirely.
+   item that makes the throughput regime apples-to-apples. Matmuls/norms/pointwise are already token-wise. This is now
+   the dominant remaining gap: at concurrency 1 (no batching) deplodock is ~1.5× stock; the rest of the
+   concurrency-32 gap is this.
+2. **dlpack zero-copy I/O** — **done**: `forward_hidden_states` takes/returns torch CUDA tensors, bridged to the cupy
+   buffers via `cp.from_dlpack` / `torch.from_dlpack` on torch's stream — no GPU↔host round-trip (`upload_prefix_device`
+   / `output_prefix_device`). The only residual host touch is `positions.cpu()` for span boundaries.
+3. **Device-side causal mask** — host build + upload **removed**: the `(1,1,S,S)` mask is now built once per S as a cupy
+   array on the GPU (`runner._mask`) and copied into the prefix device-to-device. Still open: an in-kernel `j <= i`
+   predicate would drop the mask input + its per-request D2D copy entirely.
 4. **Single capacity-baked graph** — would collapse the per-S cache to one graph, but needs every symbolic-M kernel to
    be correct at an oversized (capacity) grid; today several aren't (swizzle decode + staged loads read OOB). Tracked
    in `plans/serving-dynamic-shape-cuda-graphs.md`.
@@ -94,6 +109,8 @@ Recorded follow-ups, in impact order:
   The three texts have different token counts, so it exercises the per-seq_len captured-graph cache end to end.
 - `tests/compiler/ir/test_dynamic_shapes.py` — the captured-replay primitives directly (RMSNorm + a 1-layer Qwen3
   trunk through `set_sym_values` + `upload_prefix` + `capture_program_graph` + `replay_program_graph` +
-  `outputs(sym_values)`); run under `compute-sanitizer` in dev to confirm zero illegal accesses.
+  `outputs(sym_values)`); run under `compute-sanitizer` in dev to confirm zero illegal accesses. Plus
+  `test_capture_replay_device_io_matches_eager` — the zero-copy device path (`upload_prefix_device` + cupy-in,
+  `output_prefix_device` + `torch.from_dlpack`-out) matches eager, the primitive behind the runner's torch I/O.
 - `scripts/compare_embeddings.py` — the accuracy gate against a *server*: embeds a fixed text set through two
   OpenAI-compatible endpoints (deplodock-backed and stock) and asserts pairwise cosine > 0.99.
