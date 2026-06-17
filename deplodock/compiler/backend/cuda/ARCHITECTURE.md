@@ -58,7 +58,7 @@ arg_order).
 
 `run_program(graph, input_data) → RunResult`:
 
-1. Allocate a `cupy.ndarray` for every buffer. Inputs + optional
+1. Allocate device memory for every buffer. Inputs + optional
    constant overrides come from `input_data`; scalar `ConstantOp`s
    materialize as single-element arrays; scratch buffers zero-init.
    Inputs without supplied data get a deterministic pseudo-random fill
@@ -66,6 +66,26 @@ arg_order).
 2. Launch each kernel in topological order; `zero_outputs` fills run
    before the launch.
 3. Copy `graph.outputs` buffers back to numpy.
+
+**Scratch-buffer reuse (`_planner.py`).** Step 1 does *not* give every node its
+own permanently-live buffer — that holds all 28 layers' `[heads, S, S]` attention scratch resident at once (~29 GB for
+Qwen3-Embedding at S=4096 → cupy OOM). A scratch buffer is live only from the launch that writes it to the last launch
+that reads it, so `_allocate` packs all `role=="scratch"` buffers into **one persistent slab**: `compute_live_intervals`
+derives each buffer's half-open `[first_write, last_read+1)` interval over the topo launch order (a launch reads a buffer
+named in its `arg_names` *or* the `src_buf` of one of its TMA descriptors — TMA loads name the descriptor, not the
+buffer), then `plan_offsets` greedily assigns byte offsets so buffers with non-overlapping intervals share memory
+(largest-first, deterministic). Each scratch `arrays[name]` becomes a typed `cupy` *view* into the slab at its offset; the
+view's device pointer (`slab.data + offset`) is stable for the program lifetime, so captured graphs / TMA descriptors that
+bake `int(arr.data.ptr)` stay valid. Input/constant/output buffers stay standalone (persistent across the call). The
+half-open `+1` convention is load-bearing: a launch's output (born at `i`) overlaps its inputs (live through `i`), so an
+output never aliases its own input. **Correctness rests on the lowering contract** (`lowering/cuda/010_lower_kernelop.py`):
+only atomic-reduction (split-K) outputs need zeroing and are in `zero_outputs` (re-zeroed per launch); every other kernel
+fully overwrites its output, so a reused slot's stale contents are never read. `build` logs the slab vs naive-sum
+reduction. `rebind` re-plans + reallocates the slab when symbolic dims change (then rebuilds descs / drops graphs, as for
+any re-alloc). `set_sym_values` keeps the slab fixed (capacity slots, pointer-stable capture path). Reuse is unconditional; the only
+nuance is `run_program_debug`'s per-launch snapshots — a buffer read *after its last use* reflects the slot's new tenant
+(each kernel's own output is still valid at its launch, the usual debug read). Planner unit tests:
+`tests/compiler/backend/test_planner.py`.
 
 **Repeated execution (`CompiledProgram.rebind` / `run_once`).** One built program can serve request after request —
 the serving path (the vLLM plugin runs one compiled dynamic-seq_len program per sequence). `rebind(input_data)`
