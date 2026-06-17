@@ -47,7 +47,6 @@ CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
-SERVING_DTYPE = "DEPLODOCK_SERVING_DTYPE"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -245,14 +244,6 @@ def ncu_child() -> bool:
     """``DEPLODOCK_NCU_CHILD`` — set in the ncu-profiled child to prevent
     recursive re-spawning of ncu."""
     return _bool(NCU_CHILD)
-
-
-def serving_dtype(default: str = "float16") -> str:
-    """``DEPLODOCK_SERVING_DTYPE`` — torch dtype name the vLLM-plugin serving
-    runner traces/compiles the model at (``deplodock/serving``). ``float16``
-    by default; ``float32`` is the accuracy escape hatch (doubles weight
-    memory — an 8B model no longer fits a 24 GB card)."""
-    return _str(SERVING_DTYPE) or default
 
 
 # Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) used to live here as

@@ -26,11 +26,23 @@ import torch.nn as nn
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.models.interfaces import IsAttentionFree
 
-from deplodock import config as dd_config
 from deplodock.serving.packed import split_spans
 from deplodock.serving.runner import DeplodockForwardRunner
 
 logger = logging.getLogger(__name__)
+
+# vLLM's --dtype (mc.dtype, already resolved from `auto`) → the dtype the
+# deplodock trunk computes at. Only fp16/fp32 are representable through the
+# runner's numpy weight carrier, so anything else (e.g. bf16) downcasts to fp16.
+_TRUNK_DTYPE = {torch.float16: "float16", torch.float32: "float32"}
+
+
+def _trunk_dtype_str(torch_dtype) -> str:
+    dtype_str = _TRUNK_DTYPE.get(torch_dtype)
+    if dtype_str is None:
+        logger.warning("[serving] --dtype %s unsupported by the deplodock trunk; computing in float16", torch_dtype)
+        return "float16"
+    return dtype_str
 
 
 class DeplodockEmbedModel(nn.Module, IsAttentionFree):
@@ -47,7 +59,7 @@ class DeplodockEmbedModel(nn.Module, IsAttentionFree):
         self.runner = DeplodockForwardRunner.create(
             model_id=mc.model,
             max_seq_len=mc.max_model_len,
-            dtype_str=dd_config.serving_dtype(),
+            dtype_str=_trunk_dtype_str(mc.dtype),
         )
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):

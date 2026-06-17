@@ -40,8 +40,9 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   each is captured at its EXACT S so every kernel runs at its exact grid — no oversized-grid masking (a single
   capacity-baked graph for all S is **not** viable: several symbolic-M kernels do illegal reads at an oversized grid,
   the swizzle decode + staged loads among them). See `compiler/backend/cuda/ARCHITECTURE.md`
-  → repeated execution + captured replay. Trace dtype: `DEPLODOCK_SERVING_DTYPE` (default `float16`; `float32` is the
-  accuracy escape hatch — 2× weight memory).
+  → repeated execution + captured replay. Trunk compute dtype follows vLLM's `--dtype` (`mc.dtype`, mapped in
+  `vllm_model._trunk_dtype_str`): `float32`→fp32, `float16`→fp16, anything else (e.g. `bfloat16`/`auto`) downcasts to
+  fp16 with a warn — the runner's numpy weight carrier can't represent bf16, and only fp16/fp32 trunks are supported.
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
   with per-request 0-based positions; spans split at `positions == 0`. Hardened for `_dummy_run`'s garbage profiling
   batches (index 0 always opens a span; overlong spans are chopped).
