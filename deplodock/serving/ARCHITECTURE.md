@@ -32,17 +32,17 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   (`seq_len@input_ids:1`, `@attention_mask:2`, `@attention_mask:3`, `@position_ids:1`), compile through `CudaBackend`
   (greedy fork picks from the global prior — benefits from any prior `deplodock tune`), bind weights as graph
   constants (`named_parameters` + `named_buffers`, `remove_duplicate=False`, in the traced dtype), and build ONE
-  `CompiledProgram` over a **capacity-sized** buffer set (`min(max_seq_len, DEPLODOCK_SERVING_CAPTURE_CAP)`). Per
+  `CompiledProgram` over a buffer set sized at **`max_seq_len`** (`--max-model-len`). Per
   sequence (`forward_hidden_states`): size the launch grids to S (`set_sym_values`), upload the request's ids / causal
   mask / position_ids into the buffers' contiguous **prefix** (`upload_prefix`), **capture-or-reuse** the whole-program
   CUDA graph for this S, and **replay** it — one host launch instead of the ~hundreds the uncaptured loop issues; then
   `outputs({"seq_len": S})` slices each output to its real shape. Captured graphs are cached per seq_len (bounded LRU);
   each is captured at its EXACT S so every kernel runs at its exact grid — no oversized-grid masking (a single
   capacity-baked graph for all S is **not** viable: several symbolic-M kernels do illegal reads at an oversized grid,
-  the swizzle decode + staged loads among them). `DEPLODOCK_SERVING_NO_GRAPHS=1` keeps the uncaptured `rebind` →
-  `run_once` path; requests above the capture capacity fall back to it too. See `compiler/backend/cuda/ARCHITECTURE.md`
-  → repeated execution + captured replay. Trace dtype: `DEPLODOCK_SERVING_DTYPE` (default `float16`; `float32` is the
-  accuracy escape hatch — 2× weight memory).
+  the swizzle decode + staged loads among them). See `compiler/backend/cuda/ARCHITECTURE.md`
+  → repeated execution + captured replay. Trunk compute dtype follows vLLM's `--dtype` (`mc.dtype`, mapped in
+  `vllm_model._trunk_dtype_str`): `float32`→fp32, `float16`→fp16, anything else (e.g. `bfloat16`/`auto`) downcasts to
+  fp16 with a warn — the runner's numpy weight carrier can't represent bf16, and only fp16/fp32 trunks are supported.
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
   with per-request 0-based positions; spans split at `positions == 0`. Hardened for `_dummy_run`'s garbage profiling
   batches (index 0 always opens a span; overlong spans are chopped).
@@ -79,10 +79,9 @@ Recorded follow-ups, in impact order:
   the whole engine eager so the runner's own kernel launches can't race a capture.
 - Startup compiles the whole model (~1–2 min for 0.6B warm-cubin-cache; first boot pays nvcc). `DEPLODOCK_CUBIN_CACHE`
   persistence across container restarts is what keeps reboots fast.
-- `DEPLODOCK_SERVING_CAPTURE_CAP` caps the seq_len the shared buffer set is allocated at (default `max_seq_len`). The
-  S²-attention scratch dominates that allocation (0.6B at 4096 ≈ 15 GB), so lower the cap for bigger models / smaller
-  cards — requests above it fall back to the uncaptured rebind path (correct, just slower).
-  `DEPLODOCK_SERVING_NO_GRAPHS=1` forces that uncaptured path for every request (debug / A-B).
+- The shared buffer set is allocated at `max_seq_len` (`--max-model-len`); every accepted request (S ≤ `max_seq_len`)
+  uses the captured-graph path. The S²-attention scratch dominates that allocation (0.6B at 4096 ≈ 15 GB), so lower
+  `--max-model-len` for bigger models / smaller cards.
 - vLLM's memory profiler only sees torch allocations; the runner's cupy-held weights/activations are invisible to it.
   Leave `--gpu-memory-utilization` headroom accordingly (the attention-free model needs no KV cache, so vLLM's own
   budget is tiny).
