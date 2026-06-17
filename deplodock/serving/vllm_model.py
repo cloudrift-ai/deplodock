@@ -25,6 +25,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.pooler import DispatchPooler
 from vllm.model_executor.models.interfaces import IsAttentionFree
 
+from deplodock import config
 from deplodock.serving.packed import split_spans
 from deplodock.serving.runner import DeplodockForwardRunner
 
@@ -55,10 +56,15 @@ class DeplodockEmbedModel(nn.Module, IsAttentionFree):
         self.out_dtype = mc.dtype
         self.vocab_size = mc.get_vocab_size()
         self.pooler = DispatchPooler.for_embedding(mc.pooler_config)
+        # Static mode (opt-in): static extents for both batch and seq_len. Batch cap
+        # = vLLM's own max_num_seqs, so it's sized by --max-num-seqs (seq by
+        # --max-model-len), not a deplodock-specific knob.
+        batch = vllm_config.scheduler_config.max_num_seqs if config.serving_static() else 1
         self.runner = DeplodockForwardRunner.create(
             model_id=mc.model,
             max_seq_len=mc.max_model_len,
             dtype_str=_trunk_dtype_str(mc.dtype),
+            batch=batch,
         )
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
@@ -68,10 +74,14 @@ class DeplodockEmbedModel(nn.Module, IsAttentionFree):
         # states come back as torch CUDA tensors. Only the span boundaries need a
         # host read of positions (a tiny (num_tokens,) int vector); garbage
         # dummy-run batches survive via the vocab clamp + split_spans' chunking.
+        # With batch_cap > 1 the whole step runs as one padded batched forward.
         n = int(input_ids.shape[0])
         ids = input_ids.clamp(0, self.vocab_size - 1).to(torch.int64)
-        spans = split_spans(positions.cpu().numpy().reshape(-1), self.runner.max_seq_len)
-        chunks = [self.runner.forward_hidden_states(ids[a:b]) for a, b in spans]
+        spans = [ids[a:b] for a, b in split_spans(positions.cpu().numpy().reshape(-1), self.runner.max_seq_len)]
+        if self.runner.batch_cap > 1:
+            chunks = self.runner.forward_hidden_states_batched(spans)
+        else:
+            chunks = [self.runner.forward_hidden_states(t) for t in spans]
         if chunks:
             out = torch.cat(chunks, dim=0).to(device=input_ids.device, dtype=self.out_dtype)
         else:
