@@ -47,6 +47,7 @@ CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
+SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -215,6 +216,18 @@ def analytic_tilt(default: float = 0.3) -> float:
     toward configs it favors without overriding the learned scale (``W=0`` =
     pure learned, large ``W`` = analytic dominates). See the method docstring."""
     return float_env(ANALYTIC_TILT, default)
+
+
+def serving_static(default: bool = False) -> bool:
+    """``DEPLODOCK_SERVING_STATIC`` — opt into the serving plugin's fully-static
+    program: **static extents for both batch and seq_len**. Off (default) keeps the
+    symbolic-seq, batch-1 path; on builds ONE static ``(max_num_seqs, max_seq_len)``
+    program (batch from vLLM's ``--max-num-seqs``, seq from ``--max-model-len``) and
+    runs each scheduler step as a padded batched forward. Only correct/efficient for
+    fixed-length workloads — it pads every sequence to ``max_seq_len`` and the
+    dynamic-seq kernels miscompute batch>1, so it is a deliberate opt-in, not a
+    default. See `serving/ARCHITECTURE.md`."""
+    return _bool(SERVING_STATIC, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:
