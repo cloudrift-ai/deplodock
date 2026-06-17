@@ -109,6 +109,52 @@ def test_run_program_elementwise_add():
     assert all(v == v for v in result.outputs["C"].tolist())  # NaN check
 
 
+def _make_chain_graph(n: int = 8) -> Graph:
+    """Two-stage chain with a real scratch buffer: T = A + B (scratch), C = T + T."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (n,)), node_id="A")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (n,)), node_id="B")
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE, kernel_name="ew_add", arg_order=("A", "B", "T"), grid=((n + 255) // 256, 1, 1), block=(256, 1, 1)
+        ),
+        inputs=["A", "B"],
+        output=Tensor("T", (n,)),
+        node_id="T",
+    )
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE, kernel_name="ew_add", arg_order=("T", "T", "C"), grid=((n + 255) // 256, 1, 1), block=(256, 1, 1)
+        ),
+        inputs=["T"],
+        output=Tensor("C", (n,)),
+        node_id="C",
+    )
+    g.inputs = ["A", "B"]
+    g.outputs = ["C"]
+    return g
+
+
+@requires_cuda
+def test_buffer_reuse_correct_and_slab_managed():
+    """A graph with a scratch buffer runs correctly through the reused slab, and
+    the intermediate ``T`` is slab-managed while inputs/outputs stay standalone."""
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+
+    graph = _make_chain_graph(8)
+    a = np.arange(8, dtype=np.float32)
+    b = np.arange(8, dtype=np.float32) * 10
+    with gpu_lock():
+        prog = CompiledProgram.build(graph, {"A": a, "B": b})
+        prog.iter_once()
+        out = prog.outputs()["C"]
+        plan = prog.slab_plan
+    np.testing.assert_array_equal(out, 2 * (a + b))  # C = T + T = 2(A+B)
+    assert plan is not None and "T" in plan.offsets  # scratch T is slab-managed
+    assert "A" not in plan.offsets and "C" not in plan.offsets  # input/output stay standalone
+
+
 @requires_cuda
 def test_benchmark_program_returns_timing():
     result = benchmark_program(_make_add_graph(1024), warmup=2, num_iters=5)

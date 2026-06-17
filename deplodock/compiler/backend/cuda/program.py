@@ -27,6 +27,7 @@ import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
 from deplodock.compiler.backend.cuda import _tma, nvcc
+from deplodock.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
 from deplodock.compiler.backend.cuda.dtype import cupy_dtype
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import DataType
@@ -301,7 +302,70 @@ def _materialize(buf: _Buffer, shape: tuple[int, ...], src: np.ndarray | None, c
     return cp.zeros(shape, dtype=cp_dtype)
 
 
-def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> dict[str, cp.ndarray]:
+@dataclass
+class _SlabPlan:
+    """A liveness-planned layout of the program's scratch buffers into one
+    persistent device slab. ``offsets`` is the byte offset of each scratch
+    buffer's view into ``slab``; ``total_bytes`` is the slab size; ``sym_values``
+    are the (capacity) dims the layout was planned at — a re-plan is needed when
+    they change (``rebind``). ``naive_bytes`` is the sum of the per-scratch sizes
+    this layout replaces (for the reduction-factor log). ``slab`` is held for the
+    program lifetime so cupy never reclaims it under the views' baked pointers."""
+
+    offsets: dict[str, int]
+    total_bytes: int
+    sym_values: dict[str, int]
+    naive_bytes: int
+    slab: cp.ndarray | None = None
+
+
+def _scratch_sizes(compiled: _Compiled, sym_values: dict[str, int]) -> tuple[dict[str, int], dict[str, int]]:
+    """Byte size + alignment per ``scratch`` buffer at the resolved ``sym_values``."""
+    sizes: dict[str, int] = {}
+    aligns: dict[str, int] = {}
+    for buf in compiled.bufs:
+        if buf.role != "scratch":
+            continue
+        shape = buf.resolve_shape(sym_values) or (1,)
+        n = 1
+        for d in shape:
+            n *= int(d)
+        sizes[buf.name] = max(1, n) * buf.dtype.nbytes
+        aligns[buf.name] = buf.dtype.nbytes
+    return sizes, aligns
+
+
+def _plan_slab(compiled: _Compiled, sym_values: dict[str, int]) -> _SlabPlan:
+    """Liveness-plan the scratch buffers into one slab layout (no allocation)."""
+    sizes, aligns = _scratch_sizes(compiled, sym_values)
+    intervals = compute_live_intervals(list(sizes), compiled.launches)
+    offsets, total = plan_offsets(intervals, sizes, aligns)
+    return _SlabPlan(offsets=offsets, total_bytes=total, sym_values=dict(sym_values), naive_bytes=sum(sizes.values()))
+
+
+def _alloc_slab(compiled: _Compiled, sym_values: dict[str, int]) -> tuple[dict[str, cp.ndarray], _SlabPlan]:
+    """Plan + allocate the scratch slab and return each scratch buffer as a typed
+    view into it. One zero-init ``uint8`` allocation; each view's device pointer
+    (``slab.data + offset``) is stable for the program lifetime (the slab is pinned
+    on the returned plan), so captured graphs / TMA descriptors that bake the
+    pointer stay valid across replays."""
+    import cupy as cp  # noqa: PLC0415
+
+    plan = _plan_slab(compiled, sym_values)
+    plan.slab = cp.zeros(plan.total_bytes or 1, dtype=cp.uint8)
+    views: dict[str, cp.ndarray] = {}
+    for buf in compiled.bufs:
+        if buf.role != "scratch":
+            continue
+        shape = buf.resolve_shape(sym_values) or (1,)
+        views[buf.name] = cp.ndarray(shape, dtype=cupy_dtype(buf.dtype), memptr=plan.slab.data + plan.offsets[buf.name])
+    return views, plan
+
+
+def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> tuple[dict[str, cp.ndarray], _SlabPlan]:
+    """Materialize every buffer. ``scratch`` buffers become typed views into one
+    liveness-planned persistent slab (dead intervals share memory);
+    input/constant/output buffers stay standalone (persistent across the call)."""
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
     arrays: dict[str, cp.ndarray] = {}
@@ -310,9 +374,18 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     # softmax). Ignore the over/invalid warnings so genuine output stays clean.
     with np.errstate(over="ignore", invalid="ignore"):
         for buf in compiled.bufs:
+            if buf.role == "scratch":
+                continue  # placed into the slab below
             shape = buf.resolve_shape(sym_values) or (1,)
             arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), compiled.constants)
-    return arrays
+    # ``scratch`` buffers become views into one zero-init slab. The build-time
+    # zero preserves the contract scratch had under ``cp.zeros``; per-launch
+    # ``zero_outputs`` re-zeros atomic-reduction outputs, and every other kernel
+    # fully overwrites its output (lowering contract), so a reused slot's stale
+    # contents are never read.
+    scratch_views, plan = _alloc_slab(compiled, sym_values)
+    arrays.update(scratch_views)
+    return arrays, plan
 
 
 def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) -> dict[str, int]:
@@ -588,6 +661,10 @@ class CompiledProgram:
     # block resolution and the runtime-arg tail. Empty for fully-static
     # graphs.
     sym_values: dict[str, int] = field(default_factory=dict)
+    # Liveness-planned scratch slab: scratch ``arrays`` are views into
+    # ``slab_plan.slab``, pinned here for the program lifetime (``build`` always
+    # populates it; the default is only for dataclass construction).
+    slab_plan: _SlabPlan | None = None
     # Per-launch timing events, lazily created on first ``iter_once``
     # and reused across every subsequent call so multi-iter bench loops
     # don't churn the cupy ``Event`` pool (the pre-unification
@@ -641,7 +718,7 @@ class CompiledProgram:
         t0 = _time_module.monotonic()
         compiled = _compile(graph)
         sym_values = _resolve_symbolic(compiled, input_data or {})
-        arrays = _allocate(compiled, input_data)
+        arrays, slab_plan = _allocate(compiled, input_data)
         descs = _prebuild_descriptors(compiled, arrays)
         elapsed = _time_module.monotonic() - t0
         if compile_timeout_s is not None and elapsed > compile_timeout_s:
@@ -652,7 +729,15 @@ class CompiledProgram:
             elapsed,
             ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
         )
-        return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values)
+        if slab_plan.naive_bytes > 0:
+            logger.info(
+                "[cuda] buffer-reuse: scratch slab=%.2f GB (%.2f GB naive, %.1fx) over %d scratch buf(s)",
+                slab_plan.total_bytes / 1e9,
+                slab_plan.naive_bytes / 1e9,
+                slab_plan.naive_bytes / max(1, slab_plan.total_bytes),
+                len(slab_plan.offsets),
+            )
+        return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values, slab_plan=slab_plan)
 
     def rebind(self, input_data: dict[str, np.ndarray]) -> None:
         """Re-bind ``input_data`` on an already-built program, re-sizing
@@ -670,8 +755,11 @@ class CompiledProgram:
         pointers). Caller must hold ``gpu_lock()``."""
         new_sym = _resolve_symbolic(self.compiled, input_data)
         realloc = False
+        reuse = self.slab_plan is not None
         with np.errstate(over="ignore", invalid="ignore"):
             for buf in self.compiled.bufs:
+                if reuse and buf.role == "scratch":
+                    continue  # slab-managed; re-planned below when dims change
                 src = input_data.get(buf.name)
                 if src is None and not buf.is_symbolic:
                     continue
@@ -682,6 +770,13 @@ class CompiledProgram:
                     realloc = True
                 elif src is not None:
                     arr.set(np.ascontiguousarray(src, dtype=buf.dtype.np).reshape(shape))
+        # Scratch slab: re-plan + reallocate at the new dims (sizes scale with the
+        # symbolic extent). The fresh slab has new pointers, so descs/graphs must
+        # be rebuilt/dropped — handled by the shared ``if realloc:`` block below.
+        if reuse and new_sym != self.slab_plan.sym_values:
+            scratch_views, self.slab_plan = _alloc_slab(self.compiled, new_sym)
+            self.arrays.update(scratch_views)
+            realloc = True
         self.sym_values = new_sym
         if realloc:
             self.descs = _prebuild_descriptors(self.compiled, self.arrays)
@@ -1020,6 +1115,10 @@ def run_program_debug(
     per_launch: dict[int, dict[str, np.ndarray]] = {}
     with gpu_lock():
         pre_result = pre_run() if pre_run is not None else None
+        # Note: scratch buffers share one reused slab, so a per-launch snapshot of
+        # a buffer *after its last use* reflects whatever now occupies that slot.
+        # Each kernel's own output is valid at its launch (just written, still
+        # live) — the usual debug read.
         prog = CompiledProgram.build(graph, input_data)
         prog.iter_once(per_launch_hook=lambda li, _lc: per_launch.__setitem__(li, prog.snapshot()))
         outputs = prog.outputs()
