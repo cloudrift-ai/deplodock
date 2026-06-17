@@ -1,0 +1,122 @@
+[
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc44_np80_mcr44",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc44_np80_mcr44",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc44_np80_mcr44_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc44_np80_mcr44_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc48_np80_mcr48",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc48_np80_mcr48",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc48_np80_mcr48_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc48_np80_mcr48_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc52_np80_mcr52",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc52_np80_mcr52",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc52_np80_mcr52_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc52_np80_mcr52_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc56_np80_mcr56",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc56_np80_mcr56",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc56_np80_mcr56_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc56_np80_mcr56_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc60_np80_mcr60",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc60_np80_mcr60",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc60_np80_mcr60_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc60_np80_mcr60_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc64_np80_mcr64",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc64_np80_mcr64",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc64_np80_mcr64_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc64_np80_mcr64_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc68_np80_mcr68",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc68_np80_mcr68",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc68_np80_mcr68_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc68_np80_mcr68_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc72_np80_mcr72",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc72_np80_mcr72",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc72_np80_mcr72_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc72_np80_mcr72_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc76_np80_mcr76",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc76_np80_mcr76",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc76_np80_mcr76_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc76_np80_mcr76_vllm_benchmark.json"
+  },
+  {
+    "task_id": "optimal_mcr_vllm_b200/b200x8_mc80_np80_mcr80",
+    "recipe_dir": "experiments/Kimi-K2.5/optimal_mcr_vllm_b200",
+    "variant": "b200x8_mc80_np80_mcr80",
+    "recipe_name": "optimal_mcr_vllm_b200",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8,
+    "model_name": "nvidia/Kimi-K2.5-NVFP4",
+    "result_file": "b200x8_mc80_np80_mcr80_vllm_benchmark.txt",
+    "json_result_file": "b200x8_mc80_np80_mcr80_vllm_benchmark.json"
+  }
+]

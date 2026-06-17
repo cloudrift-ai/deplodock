@@ -8,7 +8,7 @@ from deplodock.provisioning.ssh_transport import ssh_base_args
 logger = logging.getLogger(__name__)
 
 
-async def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=120, interval=5):
+async def wait_for_ssh(host, username, ssh_port, ssh_key_path, timeout=300, interval=5):
     """Poll SSH connectivity until success or timeout.
 
     Uses plain ssh (not gcloud) for provider-agnostic SSH readiness check.

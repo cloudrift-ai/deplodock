@@ -1,0 +1,26 @@
+[
+  {
+    "task_id": "baseline_mi350x/mi350xx8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_dir": "experiments/Kimi-K2.5/baseline_mi350x",
+    "variant": "mi350xx8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_name": "baseline_mi350x",
+    "gpu_name": "AMD Instinct MI350X",
+    "gpu_short": "mi350x",
+    "gpu_count": 8,
+    "model_name": "moonshotai/Kimi-K2.5",
+    "result_file": "mi350xx8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2_vllm_benchmark.txt",
+    "json_result_file": "mi350xx8_vi-vllm-vllm-oai-v0.17.0-e-a-t-c-p-k-k2-reas-p-k-k2_vllm_benchmark.json"
+  },
+  {
+    "task_id": "baseline_mi350x/mi350xx8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_dir": "experiments/Kimi-K2.5/baseline_mi350x",
+    "variant": "mi350xx8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2",
+    "recipe_name": "baseline_mi350x",
+    "gpu_name": "AMD Instinct MI350X",
+    "gpu_short": "mi350x",
+    "gpu_count": 8,
+    "model_name": "moonshotai/Kimi-K2.5",
+    "result_file": "mi350xx8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.txt",
+    "json_result_file": "mi350xx8_si-lms-sglang-v0.5.9-e-a-t-c-p-k-k2-reas-p-k-k2_sglang_benchmark.json"
+  }
+]
