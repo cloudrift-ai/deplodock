@@ -132,6 +132,15 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         vram_mib=24564,
     ),  # measured
     GpuSpec(
+        name="NVIDIA GeForce RTX 4070 Ti",
+        pci_device_ids=("2782",),
+        short_name="rtx4070ti",
+        compute_capability=(8, 9),
+        sm_count=60,
+        smem_per_sm=102400,
+        vram_mib=12282,
+    ),  # measured
+    GpuSpec(
         name="NVIDIA GeForce RTX 5090",
         pci_device_ids=("2b85",),
         short_name="rtx5090",

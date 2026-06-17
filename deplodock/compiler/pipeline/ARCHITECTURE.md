@@ -727,7 +727,14 @@ leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.r
 `tile_identity` (its planner knobs) and **re-resolves**: `greedy_decide(blocked=…)` drops the matching leaf from the
 flattened set and picks the next-best (the valid runner-up is usually ranked right below). Bounded by
 `_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
-`tile_identity` never matches a different tile, so no other candidate is pruned.
+`tile_identity` never matches a different tile, so no other candidate is pruned. The cap is `64` (not the original `8`):
+when the prior is **mis-calibrated for the live arch** it can rank *many* invalid tiles ahead of the first valid one —
+e.g. deploying on Ada (sm_89, 99 KB smem) with a prior trained on the Blackwell golden cards (much larger dynamic-smem
+cap) ranks dozens of >99 KB tiles first, exhausting the old cap of 8 and hard-crashing every rectangular projection
+(`plans/golden-sweep-rtx4070ti-findings.md`, Finding 1). The cap is free on well-matched hardware (the loop exits on
+attempt 1 when nothing fails `validate`). The durable fix — recommended in that report — is an smem-budget **pre-filter**
+in `greedy_decide` (exclude over-budget leaves from a cheap closed-form smem estimate *before* the argmin), after which
+the cap can shrink back.
 
 **Reading the result.** `_bench_terminal_async` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search

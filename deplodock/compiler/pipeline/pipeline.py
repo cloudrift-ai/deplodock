@@ -50,7 +50,7 @@ logger = logging.getLogger("deplodock.compiler.pipeline")
 # re-resolves blocklisting a tile that failed ``validate(ctx)``. Each retry
 # blocks ≥1 fresh tile or stops, so this only bounds pathological cases (every
 # sibling unviable).
-_MAX_GREEDY_RETRIES = 8
+_MAX_GREEDY_RETRIES = 64
 
 
 _PASSES_DIR = Path(__file__).resolve().parent / "passes"
