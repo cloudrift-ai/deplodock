@@ -168,6 +168,41 @@ def is_matmul_reduce(loop) -> bool:
     return any(isinstance(s, (Accum, Mma)) for s in loop.body)
 
 
+def segmentable_k_extent(load: Load, k_name: str) -> int | None:
+    """For a folded-K matmul operand (the reduce axis spread across >1 index dim
+    — the collapsed-reshape / transpose ``o_proj`` attn-out read), return the
+    inner contiguous extent ``C`` when the read is **segmentable**; else ``None``.
+
+    Segmentable signature: the innermost (stride-1) index dim is ``expr % C`` with
+    a literal ``C`` carrying ``k_name`` — i.e. K's contiguous run has extent ``C``
+    and the remaining K-dims are higher-order delinearization of the same flat
+    offset. A C-aligned K split (``k_per_block == C`` ⇒ ``K_o`` = strided-outer
+    segment, ``K_i·atom_k`` = the contiguous inner run) folds the delinearization
+    to a clean ``[outer, …, inner]`` read (the range-aware ``Expr.simplify``), so
+    the matmul reaches the mma tier reading gmem directly — no transpose producer.
+
+    Returns ``None`` for a single-K-dim load (already stageable) or a fold whose
+    inner dim isn't a literal-modulus contiguous run (not safely C-alignable)."""
+    from deplodock.compiler.ir.expr import BinaryExpr, Literal  # noqa: PLC0415
+
+    if not load.index:
+        return None
+    k_dims = [d for d, e in enumerate(load.index) if k_name in e.free_vars()]
+    if len(k_dims) <= 1:
+        return None
+    inner = load.index[-1]
+    if (
+        isinstance(inner, BinaryExpr)
+        and inner.op == "%"
+        and isinstance(inner.right, Literal)
+        and inner.right.dtype == "int"
+        and isinstance(inner.right.value, int)
+        and k_name in inner.left.free_vars()
+    ):
+        return inner.right.value
+    return None
+
+
 def collect_invariant_names(stmt: Stmt) -> set[str]:
     """SSA names that ``stmt`` defines and exposes to its enclosing scope.
 
