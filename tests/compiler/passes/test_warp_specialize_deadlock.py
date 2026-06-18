@@ -31,7 +31,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
-from ..conftest import requires_cuda
+from ..conftest import requires_cuda, requires_sm90
 
 # The hanging op's tile family (the greedy pick deployed for Qwen3-Embedding-0.6B layer 0's
 # k_linear_mean_reduce), plus the transport pins that force the TMA depth-2 pipelined path
@@ -115,6 +115,7 @@ def test_mlp_slice_never_offers_ws1(monkeypatch, _sm120_target):
 
 
 @requires_cuda
+@requires_sm90
 def test_mlp_slice_completes_and_matches(monkeypatch):
     """The pinned knob family compiles and runs to completion (a regression would
     trip the per-launch watchdog's HungKernelError) and matches the numpy reference."""

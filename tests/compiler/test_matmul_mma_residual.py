@@ -38,7 +38,7 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign, Stmt
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-from .conftest import requires_cuda
+from .conftest import requires_cuda, requires_sm90
 
 
 def _has_cuda() -> bool:
@@ -302,6 +302,7 @@ def test_escaping_epilogue_value_blocks_fold(monkeypatch, _sm120_target):
 # ``requires_cuda`` routes the device tests onto the single ``cuda`` xdist group
 # (one GPU — see ``test_matmul_mma.py``); the skipif adds the sm_80+ arch gate.
 @requires_cuda
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize(
     ("M", "N", "K", "FM", "out_dtype"),
@@ -334,6 +335,7 @@ def test_residual_mma_matches_reference(M: int, N: int, K: int, FM: int, out_dty
 
 
 @requires_cuda
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("FM", [1, 4])
 def test_chain_epilogue_mma_matches_reference(FM: int, monkeypatch):
@@ -372,6 +374,7 @@ def test_chain_epilogue_mma_matches_reference(FM: int, monkeypatch):
 
 
 @requires_cuda
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_transposed_residual_mma_matches_reference(monkeypatch):
     """``c = acc + r[j, i]`` — the swapped dim roles apply the row / col motion

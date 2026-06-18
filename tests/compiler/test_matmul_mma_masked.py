@@ -29,6 +29,8 @@ from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _enumerate_warp_matmul_impl
 
+from .conftest import requires_sm90
+
 # ``TMA=0`` pins the cp.async masked path: these tests assert cp.async-specific
 # codegen (the clamped A-slab fill, the "shape D" double-buffered pipeline).
 # Symbolic-M with a static innermost dim is now ALSO TMA-eligible
@@ -138,6 +140,7 @@ def test_symbolic_m_masked_mma_kernel_structure(monkeypatch):
     assert "+ _g < (seq_len)" in src and "+ _g + 8 < (seq_len)" in src, "fragment store must row-guard against seq_len"
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("seq", [1, 31, 512, 700])
 def test_symbolic_m_masked_mma_accuracy(monkeypatch, seq):
@@ -185,6 +188,7 @@ def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
     assert "mma.sync.aligned.m16n8k16" in src
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("seq", [1, 31, 512, 700])
 def test_symbolic_m_masked_mma_tma_accuracy(monkeypatch, seq):
@@ -209,6 +213,7 @@ def test_symbolic_m_masked_mma_tma_accuracy(monkeypatch, seq):
     assert diff < 5e-2, f"seq={seq}: TMA masked MMA mismatch (max abs err {diff})"
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("seq", [31, 512, 700])
 def test_symbolic_mn_masked_mma_accuracy(monkeypatch, seq):
@@ -240,6 +245,7 @@ def test_symbolic_mn_masked_mma_accuracy(monkeypatch, seq):
     assert diff < 5e-2, f"seq={seq}: both-symbolic masked MMA mismatch (max abs err {diff})"
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_symbolic_m_masked_mma_residual_epilogue_accuracy(monkeypatch):
     """A fused residual epilogue (``o = a@b + r`` with ``r`` sharing the
@@ -311,6 +317,7 @@ def test_warp_enumeration_admits_forced_mask_k():
     assert any(r["BK"] not in (1, 2, 4) or (512 // 16) % r["BK"] != 0 for r in rows) or rows
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
 def test_symbolic_k_masked_mma_accuracy(monkeypatch, seq):
@@ -363,6 +370,7 @@ def test_batched_symbolic_mk_reaches_warp(monkeypatch):
     assert "int seq_len" in src, "runtime extent must be a kernel arg"
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
 def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):

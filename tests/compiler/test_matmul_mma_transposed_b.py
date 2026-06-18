@@ -26,9 +26,12 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-from .conftest import dyn_M, requires_cuda
+from .conftest import dyn_M, requires_cuda, requires_sm90
 
-pytestmark = [requires_cuda]
+# ``requires_sm90`` skips below sm_90: this suite forces the mma.sync warp tier
+# (ldmatrix), which is non-functional on sm_80-89 (host ldmatrix fault). It
+# deploys / is validated on sm_90+.
+pytestmark = [requires_cuda, requires_sm90]
 
 
 def _has_cuda() -> bool:

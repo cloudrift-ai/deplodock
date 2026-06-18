@@ -24,15 +24,16 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import is_warp
 
-from .conftest import dyn_M, requires_cuda
+from .conftest import dyn_M, requires_cuda, requires_sm90
 
 # Route every test in this module to the single ``cuda`` xdist_group
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — the host has one
 # GPU and scattering CUDA tests across workers exhausts the device context.
-# The per-test ``_supports_mma_sync`` skipif still gates the sm_80+ arch
-# requirement on top of this.
-pytestmark = [requires_cuda]
+# ``requires_sm90`` skips the whole module below sm_90: this suite forces the
+# mma.sync warp tier, which is pin-only and non-functional on sm_80-89 (ldmatrix
+# host fault + ``sm_NNa`` TMA compile). It deploys / is validated on sm_90+.
+pytestmark = [requires_cuda, requires_sm90]
 
 
 def _has_cuda() -> bool:

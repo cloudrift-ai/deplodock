@@ -30,7 +30,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 
-from .conftest import dyn_M
+from .conftest import dyn_M, requires_sm90
 
 # Static matmul N / K (only M flips static<->dynamic). K static so the source
 # innermost dim stays static — TMA-eligible (a symbolic innermost dim would
@@ -107,6 +107,7 @@ def test_pinned_transport_and_shape_fire(shape_mode, transport):
         assert "int seq_len" not in src, "static kernel bakes M — no runtime extent arg"
 
 
+@requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 @pytest.mark.parametrize("M", [256, 512])
 def test_static_dynamic_mma_parity(shape_mode, transport, M):
