@@ -90,6 +90,35 @@ def test_symbolic_axis_gets_nonneg_range():
     assert ctx.bounds["a0"] == Var("seq_len")
 
 
+def test_segmented_k_collapses_oproj_delinearized_read():
+    """The segmented-K mechanism: a C-aligned split of the flat matmul K plus
+    range-aware simplify collapses the o_proj attn-out delinearized read to a
+    clean ``[head, seq, within]`` access — no div/mod, no producer needed.
+
+    Real o_proj A-operand index (flat K = a2, over physical [16, seq, 128]):
+        head = (a0*2048 + a2)/128 % 16 ,  seq = (a0*2048 + a2)/2048 % seq_len ,
+        dim  = (a0*2048 + a2) % 128
+    Split a2 = a2_o*128 + a2_i (a2_o = head 0..15, a2_i = within 0..127); with
+    axis ranges/bounds the three coords fold to a2_o / a0 / a2_i."""
+    from deplodock.compiler.ir.sigma import Sigma
+
+    a0, a2 = Var("a0"), Var("a2")
+    flat = BinaryExpr("+", BinaryExpr("*", a0, Literal(2048, "int")), a2)
+    head = BinaryExpr("%", BinaryExpr("//", flat, Literal(128, "int")), Literal(16, "int"))
+    seq = BinaryExpr("%", BinaryExpr("//", flat, Literal(2048, "int")), Var("seq_len"))
+    dim = BinaryExpr("%", flat, Literal(128, "int"))
+
+    seg = Sigma({"a2": BinaryExpr("+", BinaryExpr("*", Var("a2_o"), Literal(128, "int")), Var("a2_i"))})
+    ctx = SimplifyCtx.empty()
+    ctx = extend_simplify_ctx(ctx, Axis("a0", "seq_len"))
+    ctx = extend_simplify_ctx(ctx, Axis("a2_o", 16))
+    ctx = extend_simplify_ctx(ctx, Axis("a2_i", 128))
+
+    assert seg.apply(head).simplify(ctx) == Var("a2_o")   # head, no div/mod
+    assert seg.apply(seq).simplify(ctx) == Var("a0")       # seq, no % seq_len
+    assert seg.apply(dim).simplify(ctx) == Var("a2_i")     # contiguous inner K
+
+
 def test_static_axis_unchanged_behavior():
     """Static axis still gets a precise interval; a literal divisor folds via the
     existing ``_div_mod_decompose`` path (unaffected by the symbolic addition)."""
