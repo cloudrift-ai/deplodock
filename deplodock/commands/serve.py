@@ -2,8 +2,9 @@
 
 Wraps ``vllm serve`` with the ``deplodock/serving`` plugin boilerplate
 (``--runner pooling --enforce-eager --hf-overrides …DeplodockEmbedModel…``,
-plus ``--max-model-len 4096`` — the dynamic-dim cap — unless overridden), and
-passes any unrecognized flags through to vLLM verbatim. ``--stock`` drops the
+plus ``--max-model-len 4096`` — the dynamic-dim cap — and
+``--gpu-memory-utilization=0.9`` unless overridden), and passes any
+unrecognized flags through to vLLM verbatim. ``--stock`` drops the
 plugin flags for the raw-vLLM baseline, so an A/B is two invocations of the
 same command. ``--bench`` turns it into a one-shot benchmark: start the
 server, wait for ``/health``, run ``vllm bench serve --backend
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 # runner rejects anything larger at startup. Applied to --stock too, so the
 # A/B compares both engines at the same max-model-len.
 _DEFAULT_MAX_MODEL_LEN = "4096"
+_DEFAULT_GPU_MEMORY_UTILIZATION = "0.9"
 
 _PLUGIN_ARGS = ["--enforce-eager", "--hf-overrides", '{"architectures": ["DeplodockEmbedModel"]}']
 
@@ -123,6 +125,8 @@ def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str]) -> list[st
         cmd += _PLUGIN_ARGS
     if not _has_flag(vllm_args, "--max-model-len"):
         cmd += ["--max-model-len", _DEFAULT_MAX_MODEL_LEN]
+    if not _has_flag(vllm_args, "--gpu-memory-utilization"):
+        cmd += [f"--gpu-memory-utilization={_DEFAULT_GPU_MEMORY_UTILIZATION}"]
     return cmd + vllm_args
 
 

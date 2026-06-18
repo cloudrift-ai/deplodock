@@ -20,6 +20,7 @@ def test_serve_cmd_plugin_defaults():
     assert "--enforce-eager" in cmd
     assert '{"architectures": ["DeplodockEmbedModel"]}' in cmd
     assert cmd[cmd.index("--max-model-len") + 1] == "4096"
+    assert "--gpu-memory-utilization=0.9" in cmd
 
 
 def test_serve_cmd_stock_drops_plugin_but_keeps_parity():
@@ -28,13 +29,21 @@ def test_serve_cmd_stock_drops_plugin_but_keeps_parity():
     assert "--hf-overrides" not in cmd
     assert "pooling" in cmd
     assert cmd[cmd.index("--max-model-len") + 1] == "4096"  # same cap as the plugin → apples-to-apples
+    assert "--gpu-memory-utilization=0.9" in cmd
 
 
 def test_serve_cmd_passthrough_and_max_model_len_override():
     cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--max-model-len", "2048", "--gpu-memory-utilization", "0.8"])
     assert cmd.count("--max-model-len") == 1
     assert cmd[cmd.index("--max-model-len") + 1] == "2048"
-    assert "--gpu-memory-utilization" in cmd
+    assert "--gpu-memory-utilization=0.9" not in cmd
+    assert cmd[cmd.index("--gpu-memory-utilization") + 1] == "0.8"
+
+
+def test_serve_cmd_gpu_memory_utilization_equals_style_override():
+    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--gpu-memory-utilization=0.8"])
+    assert "--gpu-memory-utilization=0.9" not in cmd
+    assert "--gpu-memory-utilization=0.8" in cmd
 
 
 def test_serve_cmd_max_model_len_equals_style():

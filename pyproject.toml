@@ -19,7 +19,12 @@ dependencies = [
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
 compile = ["torch", "transformers>=5.10", "cppyy==3.5.0", "safetensors"]
 # vLLM out-of-tree embedding plugin (deplodock/serving); vllm pins its own torch.
-serving = ["vllm>=0.22.1,<0.23"]
+# fastapi<0.137 cap: vllm 0.22.1 pins fastapi only as `>=0.115.0` (no upper bound),
+# so a fresh install pulls fastapi>=0.137, whose new `_IncludedRouter` route objects
+# (no `.path`) crash vllm's bundled prometheus-fastapi-instrumentator 8.0.0 on every
+# request — `serve --bench` then never passes /health. Drop the cap once vllm ships
+# a prometheus-fastapi-instrumentator that handles fastapi's `_IncludedRouter`.
+serving = ["vllm>=0.22.1,<0.23", "fastapi[standard]<0.137"]
 visualize = ["playwright>=1.40"]
 # flash-attn requires torch at build time, install separately:
 #   pip install flash-attn --no-build-isolation
