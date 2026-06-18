@@ -38,7 +38,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._split_demoted import try_
 from deplodock.compiler.pipeline.search.db import SearchDB
 from tests.compiler.conftest import drain_tune
 
-from ..conftest import requires_cuda
+from ..conftest import requires_cuda, requires_sm90
 
 split_rule = importlib.import_module(
     "deplodock.compiler.pipeline.passes.lowering.tile.005_split_demoted",
@@ -767,6 +767,7 @@ def test_split_scalar_accuracy_cuda(monkeypatch) -> None:
 
 
 @requires_cuda
+@requires_sm90
 def test_split_mma_accuracy_cuda(monkeypatch) -> None:
     """Pinned split on a MatmulOp-derived demotion: the clean gemm runs on
     mma.sync and matches numpy. (Linear-derived gemms can't mma-lower — the
@@ -798,6 +799,7 @@ def test_split_mma_accuracy_cuda(monkeypatch) -> None:
 
 
 @requires_cuda
+@requires_sm90
 def test_two_sided_split_mma_accuracy_cuda(monkeypatch) -> None:
     """Pinned two-sided split: three kernels, the consumer gemm runs on
     mma.sync (the [K, N] xn_b materialization fixes the Linear-transposed
@@ -830,6 +832,7 @@ def test_two_sided_split_mma_accuracy_cuda(monkeypatch) -> None:
 
 
 @requires_cuda
+@requires_sm90
 def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
     """Pinned split on the gated-MLP dual-accum kernel: three kernels (the
     ``006_merge_split_glue`` re-fusion folds the pointwise combine into one
@@ -858,6 +861,7 @@ def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
 
 
 @requires_cuda
+@requires_sm90
 def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
     """Pinned split on the collapsed-layout matmul (finding 3's o_proj shape):
     the contiguizing copy producer + the clean gemm on mma.sync, output

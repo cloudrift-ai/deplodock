@@ -38,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ..conftest import requires_cuda
+from ..conftest import device_compute_capability, requires_cuda
 
 # Shapes match the user's offline scan.
 _MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}
@@ -570,6 +570,12 @@ def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: 
     boundary-Cond hoist (``021_hoist_staged_loads_above_mask``) + B2
     per-Load guard (``_guard_unsafe_loads``) interaction with the
     selected transport (TMA / cp.async)."""
+    # The TMA transport emits the ``sm_NNa`` arch-accelerated target, which only
+    # exists for sm_90a+; on sm_80-89 nvcc rejects it (``Unsupported gpu
+    # architecture 'sm_89a'``). Skip the TMA-pinned rows below sm_90 — the
+    # cp.async / sync rows still cover the masked-tile paths here.
+    if knobs.get("TMA") == 1 and (device_compute_capability() or (0, 0)) < (9, 0):
+        pytest.skip("TMA transport needs sm_90+ (sm_NNa unsupported on sm_80-89)")
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)

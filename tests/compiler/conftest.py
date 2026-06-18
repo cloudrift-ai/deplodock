@@ -11,6 +11,7 @@ skip marker shared by all CUDA-gated tests in this package.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import numpy as np
@@ -30,6 +31,33 @@ def has_cuda_gpu() -> bool:
 requires_cuda = pytest.mark.skipif(
     not has_cuda_gpu(),
     reason="CUDA not available (need cupy + GPU)",
+)
+
+
+@functools.cache
+def device_compute_capability() -> tuple[int, int] | None:
+    """Live CUDA device compute capability as ``(major, minor)``, or ``None`` when
+    no GPU is visible. cupy reports it as a string like ``"89"`` → ``(8, 9)``."""
+    if not has_cuda_gpu():
+        return None
+    import cupy as cp
+
+    cap = str(cp.cuda.Device().compute_capability)
+    return (int(cap[:-1]), int(cap[-1]))
+
+
+# Skip the mma.sync warp-tier tests below sm_90. The warp tier (swizzled
+# ``ldmatrix`` + ``mma.sync``, TMA transport) auto-enumerates and is validated on
+# sm_90+; on sm_80-89 it is pin-only and currently non-functional, for two
+# independent reasons: the ``sm_NNa`` arch-accelerated suffix the TMA path emits
+# is rejected by nvcc (``Unsupported gpu architecture 'sm_89a'`` — the ``a``
+# variant only exists for sm_90a+), and ``ldmatrix`` itself faults at runtime on
+# at least this Ada (sm_89) host. Tests that FORCE the warp tier via
+# ``DEPLODOCK_MMA`` pins therefore can't run below sm_90; they exercise the
+# deployed path on sm_90+ CI.
+requires_sm90 = pytest.mark.skipif(
+    (device_compute_capability() or (0, 0)) < (9, 0),
+    reason="mma.sync warp tier needs sm_90+ (pin-only / non-functional on sm_80-89: ldmatrix fault + sm_NNa TMA compile)",
 )
 
 

@@ -49,8 +49,8 @@ tests/
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
 │   └── test_fused.py              # SDPA (xfail until fusion lands)
 ├── compiler/                       # mirrors deplodock/compiler/
-│   ├── conftest.py                     # requires_cuda marker, run_graph fixture,
-│   │                                   # matmul_graph(m,k,n) shared builder
+│   ├── conftest.py                     # requires_cuda / requires_sm90 markers, run_graph fixture,
+│   │                                   # device_compute_capability(), matmul_graph(m,k,n) shared builder
 │   ├── fixtures/                       # pre-computed traces (tinyllama_layer0.json)
 │   ├── ir/                             # IR datatypes (mirrors deplodock/compiler/ir/)
 │   │   ├── test_graph.py                       # Graph / Node / Tensor primitives
@@ -191,3 +191,14 @@ fresh CUDA context; bounding their concurrency prevents GPU OOM from ~30 simulta
 `tryfirst` because xdist's worker-side hook bakes group names into nodeids before plain conftest hooks run —
 without it the markers land too late and CUDA tests silently scatter across workers. Non-CUDA tests are
 LPT-bucketed across the remaining workers using the cached duration table.
+
+`tests/compiler/conftest.py` also exposes `device_compute_capability()` and the `requires_sm90` skip marker. The
+mma.sync warp tier (swizzled `ldmatrix` + `mma.sync`, TMA transport) auto-enumerates and is validated on **sm_90+**;
+on sm_80-89 it is pin-only and currently non-functional for two independent reasons — the `sm_NNa` arch-accelerated
+target the TMA path emits is rejected by nvcc (`Unsupported gpu architecture 'sm_89a'`), and `ldmatrix` itself faults
+at runtime on at least Ada (sm_89). Tests that **force** the warp tier via `DEPLODOCK_MMA` / `TMA` pins carry
+`requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
+context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The mma suites
+(`test_matmul_mma*.py`) gate at module scope; mixed files (`test_split_demoted.py`, `test_matmul_mma_residual.py`,
+`test_warp_specialize_deadlock.py`) gate only the warp-tier tests, and `test_knob_pinning.py` skips its `TMA=1` rows
+in-body. `_supports_mma_sync()` (≥ sm_80, the instruction-availability check) still gates on top.

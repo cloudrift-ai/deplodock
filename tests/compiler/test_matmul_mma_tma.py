@@ -34,14 +34,17 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-from .conftest import requires_cuda
+from .conftest import requires_cuda, requires_sm90
 
 # Route every test in this module to the single ``cuda`` xdist_group
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — scattering CUDA
-# tests across xdist workers exhausts the single-GPU device context. The
-# per-test ``_supports_tma`` skipif still gates the sm_90+ arch requirement.
-pytestmark = [requires_cuda]
+# tests across xdist workers exhausts the single-GPU device context.
+# ``requires_sm90`` skips the whole module below sm_90: the TMA + mma.sync warp
+# tier is pin-only and non-functional on sm_80-89 — the ``sm_NNa`` arch suffix
+# the TMA path emits is rejected by nvcc (``Unsupported gpu architecture
+# 'sm_89a'``) and ldmatrix faults on the host. It deploys / is validated on sm_90+.
+pytestmark = [requires_cuda, requires_sm90]
 
 
 def _has_cuda() -> bool:
