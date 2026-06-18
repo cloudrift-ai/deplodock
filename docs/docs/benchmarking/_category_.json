@@ -1,0 +1,8 @@
+{
+  "label": "Benchmarking",
+  "position": 4,
+  "link": {
+    "type": "generated-index",
+    "description": "Run and analyze benchmarks across GPU types and model configurations."
+  }
+}
