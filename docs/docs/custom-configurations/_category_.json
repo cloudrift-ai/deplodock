@@ -1,0 +1,8 @@
+{
+  "label": "Custom Configurations",
+  "position": 3,
+  "link": {
+    "type": "generated-index",
+    "description": "Create your own deployment configurations for any model or GPU setup."
+  }
+}
