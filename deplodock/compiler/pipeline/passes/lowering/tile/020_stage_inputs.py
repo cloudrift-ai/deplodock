@@ -83,8 +83,8 @@ from typing import NamedTuple
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Mma, Stmt
 from deplodock.compiler.ir.tile.ir import (
@@ -837,7 +837,9 @@ def _classify(
     bytes_per_elem: int = BYTES_PER_ELEM,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
-    ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes if ax.extent.is_static})
+    ctx = SimplifyCtx.empty()
+    for ax in scope_axes:
+        ctx = extend_simplify_ctx(ctx, ax)
     candidate_names = tuple(ax.name for ax in candidates)
 
     zero_sigma = Sigma({n: Literal(0, "int") for n in candidate_names})

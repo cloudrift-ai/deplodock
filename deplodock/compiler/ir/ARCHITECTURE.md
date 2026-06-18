@@ -227,8 +227,17 @@ set member when deduping candidate bodies in a search.
 
 Called inside `normalize_body`. Generic bottom-up Expr rewriter:
 constant folding, algebraic identities, range-based comparison folding
-(`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `Context`/`Interval`
-track integer ranges from axis extents.
+(`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `SimplifyCtx`/`Interval`
+track integer ranges from axis extents (`axis.extend_simplify_ctx` pushes
+each loop axis into the ctx). `SimplifyCtx.bounds` additionally tracks a
+*symbolic* exclusive upper bound per var (`i < seq_len`) so a modulo by a
+non-literal divisor folds — `i % seq_len → i` when `i`'s loop extent is
+`seq_len` (`_mod_below_divisor`). This collapses the delinearized seq
+coordinate `((i*stride + feat) / stride) % seq_len` that compose-indexmaps
+emits back to `i`, the symbolic-shape counterpart of the literal-divisor
+`_div_mod_decompose` cleanup (a static `seq_len` already constant-folds it).
+Symbolic-extent axes get `[0, sentinel]` ranges (non-negativity for the inner
+`(i*c + …)//c → i` div fold) instead of being dropped.
 
 Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
 
