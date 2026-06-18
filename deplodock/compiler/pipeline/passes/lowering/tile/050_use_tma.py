@@ -33,10 +33,17 @@ Eligibility (per ``Source``):
   allowed: the descriptor's ``globalDim`` is encoded per launch from the
   runtime input shape (``program._prebuild_descriptors``) and TMA's hardware
   OOB handling zero-fills the masked overhang past the runtime extent. A
-  symbolic *innermost* dim is rejected — its runtime value (31, 700) gives a
-  global stride that isn't 16 B-aligned (CUresult=1 at encode), so N-masked
-  inner axes stay on cp.async. Masked-K (symbolic-reduce) sources also stay
-  on cp.async (the SYNC-pinned manual zero-fill) for now.
+  symbolic *innermost* dim is rejected UNLESS it is a provable 16 B-aligned
+  multiple (``_inner_stride_aligned`` — the demoted B/A cones pad their symbolic
+  inner to a 64-multiple so the stride stays aligned at any ``seq_len``); a bare
+  symbolic inner (an unpadded input) still stays on cp.async. Masked-K
+  (symbolic-reduce) sources ALSO reach TMA now: the reduce overhang must read 0,
+  which TMA's hardware OOB zero-fill delivers on the middle-K B operand (V),
+  allocated at the real ``seq_len`` so its descriptor globalDim is ``seq_len`` —
+  binding every overhang product to 0. ``040_use_ring_buffers`` rings a masked-K
+  bundle only when ``tile_reaches_tma`` confirms this whole tile is TMA-eligible,
+  so a masked-K bundle is never stranded on cp.async (it stays SYNC + ternary
+  otherwise).
 
 Additionally (per tile): the ``serial_outer`` K loop holding the bundles
 must not be nested inside a serial loop with trip count > 1 — the
@@ -71,6 +78,7 @@ from dataclasses import replace
 from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.expr import BinaryExpr, Literal
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
@@ -110,6 +118,91 @@ _TMA_ALIGN_BYTES = 128
 # are excluded — the materializer's TMA emit path assumes a buffer-count
 # >= 1 phase dim on the smem slab; promoting SYNC would break that.
 _PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
+
+# cuTensorMapEncodeTiled's hard requirement: every global stride above the
+# innermost dim must be a multiple of 16 bytes. The above-inner stride equals
+# the inner extent in elements, so a symbolic inner extent is encode-safe iff
+# it is a provable multiple of ``16 / elem_bytes`` elements.
+_TMA_STRIDE_ALIGN_BYTES = 16
+
+
+def _inner_stride_aligned(dim, elem_bytes: int) -> bool:  # noqa: ANN001
+    """True when a *symbolic* inner extent ``dim`` is a provable constant multiple
+    ``c`` whose byte width ``c * elem_bytes`` is a multiple of 16 — so the
+    above-inner gmem stride stays 16 B-aligned at every runtime value and
+    ``cuTensorMapEncodeTiled`` accepts the descriptor. Recognizes the padded
+    ``round_up(N, P)`` Dim that ``_split_demoted._pad_inner_for_tma`` emits, whose
+    top-level expr is ``X * Literal(P)`` (or the mirrored ``Literal(P) * X``). A
+    bare symbolic dim (no constant factor) is unaligned and stays on cp.async."""
+    expr = dim.expr
+    if not (isinstance(expr, BinaryExpr) and expr.op == "*"):
+        return False
+    factor = None
+    if isinstance(expr.right, Literal) and isinstance(expr.right.value, int):
+        factor = expr.right.value
+    elif isinstance(expr.left, Literal) and isinstance(expr.left.value, int):
+        factor = expr.left.value
+    return factor is not None and (factor * elem_bytes) % _TMA_STRIDE_ALIGN_BYTES == 0
+
+
+def _shape_for_tma(node) -> tuple[int, ...] | None:  # noqa: ANN001
+    """The node's output shape as static ints for the compile-time box checks:
+    static dims as-is, symbolic dims at their Dim hint, ``None`` (cannot size the
+    TMA box) for a symbolic dim with no hint."""
+    dims: list[int] = []
+    for d in node.output.shape:
+        if d.is_static:
+            dims.append(d.as_static())
+        elif d.hint is not None:
+            dims.append(int(d.hint))
+        else:
+            return None
+    return tuple(dims)
+
+
+def tile_reaches_tma(body: Body, graph_nodes: dict, ctx: Context) -> bool:
+    """Pure predicate: would ``rewrite`` promote this tile body to TMA?
+
+    Mirrors ``rewrite``'s all-or-nothing gate WITHOUT mutating — used by
+    ``040_use_ring_buffers`` to decide whether to ring a masked-K bundle. A
+    ringed masked-K is only correct if it reaches TMA (whose hardware OOB
+    zero-fill replaces the SYNC ternary that cp.async / a synchronous
+    double-buffer can't express), so 040 must not ring one this predicate
+    rejects. The bundles here are still SYNC (040 runs before the promotion),
+    but ``_source_eligible`` is policy-agnostic — it checks the Source's
+    addressing / shape / alignment, which the ring doesn't change. The
+    ``strict_slot_align`` ring-slot check keys off the post-ring
+    ``buffer_count`` (the swizzle-stamped mma slabs masked-K rides never set
+    it, so the SYNC ``buffer_count == 1`` reads identically)."""
+    if ctx.compute_capability < _MIN_CAPABILITY:
+        return False
+    src_shapes: dict[str, tuple[int, ...]] = {}
+    for nid, node in graph_nodes.items():
+        shp = _shape_for_tma(node)
+        if shp is None:
+            return False
+        src_shapes[nid] = shp
+    inner_symbolic_bufs = {
+        nid
+        for nid, node in graph_nodes.items()
+        if node.output.shape
+        and not node.output.shape[-1].is_static
+        and not _inner_stride_aligned(node.output.shape[-1], node.output.dtype.nbytes)
+    }
+    if _reenters_pipeline(body):
+        return False
+    swizzle = any(isinstance(s, AtomTile) for s in body.iter())
+    dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in graph_nodes.items()}
+    saw_bundle = False
+    for s in body.iter():
+        if not isinstance(s, StageBundle) or s.policy == StagePolicy.TMA:
+            continue
+        saw_bundle = True
+        strict_slot_align = not swizzle and s.buffer_count > 1
+        if not _bundle_eligible(s, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align):
+            return False
+    return saw_bundle
+
 
 # TMA knob — hints ``(True, False)`` so the *first* candidate is True
 # (the preferred policy on Hopper+). On sm < 9.0 the rule hands ``(False,)``
@@ -166,17 +259,6 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # against the Dim *hint*; the launch uses the real extent and TMA's hardware
     # OOB handling zero-fills the masked overhang. A symbolic dim with no hint
     # can't size the box — decline.
-    def _shape_for_tma(node) -> tuple[int, ...] | None:  # noqa: ANN001
-        dims: list[int] = []
-        for d in node.output.shape:
-            if d.is_static:
-                dims.append(d.as_static())
-            elif d.hint is not None:
-                dims.append(int(d.hint))
-            else:
-                return None
-        return tuple(dims)
-
     src_shapes: dict[str, tuple[int, ...]] = {}
     for nid, node in match.graph.nodes.items():
         shp = _shape_for_tma(node)
@@ -195,18 +277,33 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # inner dim (e.g. the SDPA scores in the o_proj kernel) is never staged, so
     # it must not veto the matmul operands' TMA path. N-masked inner sources stay
     # on cp.async.
-    inner_symbolic_bufs = {nid for nid, node in match.graph.nodes.items() if node.output.shape and not node.output.shape[-1].is_static}
+    # A symbolic inner dim is fine for TMA when its extent is provably a multiple
+    # of the 16 B alignment unit — the above-inner gmem stride is then 16 B-aligned
+    # at every runtime value, so ``cuTensorMapEncodeTiled`` accepts it. The demoted
+    # B-operand split pads its symbolic N inner up to ``_TMA_INNER_PAD`` exactly so
+    # this holds (``_split_demoted._pad_inner_for_tma``); the padded overhang columns
+    # are store-masked, so the descriptor can read them as ordinary in-bounds data.
+    inner_symbolic_bufs = {
+        nid
+        for nid, node in match.graph.nodes.items()
+        if node.output.shape
+        and not node.output.shape[-1].is_static
+        and not _inner_stride_aligned(node.output.shape[-1], node.output.dtype.nbytes)
+    }
 
     body = root.op.body
-    # Masked-K (symbolic-reduce) sources keep their SYNC-pinned manual zero-fill
-    # for now: the masked-K overhang must be ZERO for the mma accumulation
-    # (``_stage_expand`` hand-rolls a ``(k < seq_len) ? v : 0`` ternary on the
-    # SYNC transport). TMA's hardware OOB zero-fill could replace that AND
-    # re-enable the async pipeline, but it needs the 4-D leading-batch box
-    # derivation fixed first (the P@V ``box can't collapse arr`` bench-fail), so
-    # that is follow-up — keep masked-K on cp.async.
-    if any(isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in body.iter()):
-        return _decline("masked-K (symbolic reduce) source — TMA OOB-zero-fill path is follow-up work; staying on cp.async")
+    # Masked-K (symbolic-reduce) sources are no longer pinned off TMA. The reduce
+    # overhang must read ZERO for the mma accumulation; TMA's hardware OOB
+    # zero-fill provides exactly that on the *middle*-K B operand (V), whose
+    # buffer is allocated at the real ``seq_len`` so its descriptor globalDim is
+    # ``seq_len`` and coords past it zero-fill — binding the reduce overhang
+    # product to 0 regardless of the A operand's (padded) overhang (which the
+    # zero-init-reused scratch keeps finite, so ``finite × 0 = 0``). ``040`` only
+    # rings a masked-K bundle when this whole tile is TMA-eligible (shared
+    # ``tma_eligible.tile_reaches_tma``), so a ringed masked-K always reaches TMA
+    # here — never a cp.async / synchronous-double-buffer state that can't zero the
+    # overhang. An ineligible masked-K stays SYNC (``040`` declines the ring) and
+    # keeps its ``_stage_expand`` ternary zero-fill.
     # A TMA ring pipeline must start from freshly-initialized mbarriers: the
     # materializer emits ``MbarrierInit`` once at kernel entry, and the
     # pipeline's parity schedule (steady-state wait at ``(k / RING) % 2``,
