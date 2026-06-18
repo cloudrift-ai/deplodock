@@ -157,12 +157,28 @@ the QK^T reaches `mma_m16n8k16_f16` and is numerically correct (`run --ir` accur
    into the fragment store as a per-element ternary (`__M__`/`__N__` placeholders → each element's absolute row/col).
    Covered by `tests/compiler/test_matmul_mma_causal_epilogue.py`.
 
-**Still open (not in this change): greedy deployment.** Even with the capability landed, greedy keeps the kernel
-fused-scalar (the cold prior picks keep-fused; the warp QK^T variants were never enumerated when the v2 prior trained).
-Deploying it needs a **re-tune** so the prior prices the `SPLIT_CONE=1` + warp consumer cheaper. Forced
-(`DEPLODOCK_SPLIT_CONE=1 DEPLODOCK_MMA=mma_m16n8k16_f16`) the scores consumer lands at ~36 µs **untuned** (vs 34 µs
-scalar) — a tie until the warp tile knobs are tuned (cf. the P@V warp consumer at ~16 µs); the win is a tuning follow-up,
-the capability is the blocker that's now removed.
+**Greedy deployment after a re-tune (done).** Re-tuning the QK^T reproducer with the new capability (warm-started from
+the v2 dynamic prior into `qkt-prior.json`, 4 fused terminals, ~19.5 min) trains the prior to deploy the warp tier:
+greedy now picks the **split + warp QK^T** with no forcing. The scores consumer drops from **34.3 µs scalar → 28.8 µs
+warp** (`mma_m16n8k16_f16`), and the full layer-0 dynamic e2e is **accuracy PASS** (`max_diff=0.0039`):
+
+| Layer-0 dynamic e2e (seq 512) | eager | torch.compile | deplodock |
+|-------------------------------|------:|--------------:|----------:|
+| v2 (scalar QK^T)              |   219 |           147 |       217 |
+| this branch (warp QK^T)       |   219 |           147 |   **210** |
+
+So the warp QK^T deploys correctly e2e, but the **net e2e win is small (~3%)** and deplodock still loses to
+torch.compile. Reason: un-fusing the RoPE prologue to reach the warp tier materializes rotated Q/K producers (`xna` /
+`xnb`) whose cost (~20 µs for the rotary `xna` in this pick — itself a prior-reachability miss) eats most of the
+28.8-vs-34.3 warp gain. **A flash-style *fused* tensor-core QK^T (softmax/RoPE on-chip, no materialization) is the real
+win** and remains future work; this change removes the tier-lockout that blocked any tensor-core QK^T at all.
+
+**Tuner note (corrects an earlier mis-call).** The re-tune was first reported as a "wedge" (the v2 report's Finding 1).
+On re-investigation it was **not** a deadlock: the run was CPU-bound (~1800 % across ~66 parent threads, GPU mostly
+idle) but **progressing** — the newly-enabled big warp variants are compile/lower-heavy. It completes if left alone
+(~19.5 min for one reproducer). The genuine v2 0 %-CPU deadlock did **not** reproduce here; the SIGKILL-able bench-worker
+child-recovery path works (a dirty child exits, a clean one respawns). The high per-variant tuning cost on this kernel
+class is a real follow-up (tuner CPU-thrash), distinct from the deadlock.
 
 ---
 
