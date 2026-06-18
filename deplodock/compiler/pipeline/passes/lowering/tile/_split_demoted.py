@@ -81,6 +81,7 @@ from string import ascii_lowercase
 from typing import TYPE_CHECKING
 
 from deplodock.compiler import dtype as dtype_mod
+from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
@@ -91,6 +92,30 @@ from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
+
+# Element-count multiple a symbolic N (inner) extent is padded up to so the
+# materialized B operand's above-inner gmem stride stays 16 B-aligned for TMA
+# (the ``cuTensorMapEncodeTiled`` requirement ``050_use_tma`` gates on). 64
+# elements is ≥ 128 B for any ≥ 2-byte dtype (fp16 → 128 B, fp32 → 256 B),
+# clearing the descriptor's recommended box alignment too, while wasting at
+# most 63 columns of scratch. The matching aligned-stride acceptance lives in
+# ``050_use_tma._inner_stride_aligned``.
+_TMA_INNER_PAD = 64
+
+
+def _pad_inner_for_tma(extent: Dim) -> Dim:
+    """Round a *symbolic* inner (N) extent up to a multiple of ``_TMA_INNER_PAD``
+    so the materialized buffer's above-inner gmem stride is 16 B-aligned and the
+    operand becomes TMA-eligible. Static extents pass through unchanged (a fixed
+    inner extent already has a compile-checkable, aligned stride). The composite
+    ``round_up`` Dim carries an explicit hint (the base hint rounded up the same
+    way) because arithmetic-result Dims otherwise drop their hint, which
+    ``050_use_tma._shape_for_tma`` needs to size the descriptor box."""
+    if extent.is_static:
+        return extent
+    base_hint = extent.hint if extent.hint is not None else DEFAULT_SEQ_HINT
+    pad_hint = -(-base_hint // _TMA_INNER_PAD) * _TMA_INNER_PAD
+    return Dim((extent.ceil_div(_TMA_INNER_PAD) * _TMA_INNER_PAD).expr, hint=pad_hint)
 
 
 @dataclass
@@ -287,7 +312,21 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         # from the runtime extent when symbolic (``_classify_cut`` admits all).
         shape = tuple(lp.axis.extent for lp in rows_used) + (k_loop.axis.extent,)
         if reads_n:
-            shape += (outer_n.axis.extent,)
+            # An N-reading cone materializes the canonical B operand ``xnb[…, K, N]``.
+            # When N is symbolic (the rotary QK^T's ``seq_len`` key cone), the raw
+            # ``seq_len`` inner extent gives the K dim a gmem stride of ``seq_len``
+            # elements — runtime values like 31 / 700 aren't 16 B-aligned, so
+            # ``cuTensorMapEncodeTiled`` rejects the descriptor and ``050_use_tma``
+            # declines TMA (and warp-spec with it). Pad the inner N up to a multiple
+            # of ``_TMA_INNER_PAD`` so the above-inner stride is always 16 B-aligned
+            # while the buffer stays runtime-sized (correct at any seq, unlike a
+            # fixed static width that would overflow past the hint). The extra
+            # ``[seq_len, round_up)`` columns are never stored — the consumer's
+            # per-element boundary guard masks ``n >= seq_len`` — so the pad is
+            # value-neutral; it only enlarges the scratch alloc by ``< _TMA_INNER_PAD``
+            # columns. The garbage columns DO feed the mma, but only into
+            # store-masked output positions, so they can't contaminate a live score.
+            shape += (_pad_inner_for_tma(outer_n.axis.extent),)
         producers.append((producer, Tensor(xn_id, shape, c.dtype)))
         for root in roots:
             if vn[root] == vn[c.root]:

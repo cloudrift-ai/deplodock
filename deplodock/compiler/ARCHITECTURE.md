@@ -114,7 +114,14 @@ autotuning cache doesn't bust on cosmetic edits.
   lifts), and their deployment path is the structural split (`005_split_demoted`), which offers on
   symbolic ROW **and** symbolic N axes (the rotary QK^T's symbolic-N key cone materializes canonically,
   reaching the masked warp tier) — so e.g. the dynamic o_proj's collapsed attn-out splits into a
-  contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The cut keeps a
+  contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The symbolic-N B
+  operand `xnb[…, K, N]` further reaches the **TMA + warp-specialized** tier (matching its static twin,
+  not just cp.async): `_split_demoted._pad_inner_for_tma` rounds the materialized inner N up to a
+  multiple of 64 so the K dim's gmem stride stays 16 B-aligned at any runtime `seq_len`, which is the
+  `cuTensorMapEncodeTiled` requirement `050_use_tma` otherwise declines a symbolic innermost dim for
+  (`_inner_stride_aligned`). The buffer stays runtime-sized (correct above the hint, unlike a fixed
+  static width), and the padded `[seq_len, round_up)` overhang columns feed the mma only into
+  store-masked output positions, so they can't contaminate a live score. The cut keeps a
   symbolic ROW/N buffer's runtime dim var (`seq_len` in a collapsed-reshape stride) as a legitimate read,
   not an unmodeled-scope bail (`_split_demoted.dim_names`). Symbolic K stays bailed: the warp tier needs a
   static reduce, so a symbolic-K matmul (P@V) is scalar fused or split — the split would only add a

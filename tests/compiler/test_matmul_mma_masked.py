@@ -54,6 +54,15 @@ def _supports_mma_sync() -> bool:
     return int(cp.cuda.Device().compute_capability) >= 80
 
 
+def _supports_tma() -> bool:
+    """TMA (cp.async.bulk.tensor) needs sm_90+ (Hopper / Blackwell)."""
+    if not _has_cuda():
+        return False
+    import cupy as cp
+
+    return int(cp.cuda.Device().compute_capability) >= 90
+
+
 def _symbolic_m_graph(*, K: int = 512, N: int = 1024) -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (Dim("seq_len"), K), dtype=F16), node_id="a")
@@ -375,3 +384,93 @@ def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):
     assert got.shape == (16, seq, 128)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"seq={seq}: batched masked-M+K MMA mismatch (max abs err {diff})"
+
+
+# --- demoted symbolic-N B operand: TMA + warp-spec (WS1/WS2) ----------------
+# The rotary QK^T's key cone materializes the canonical B operand
+# ``xnb[…, K, N]`` with a symbolic inner N (``seq_len``). A bare symbolic inner
+# extent gives the K dim an unaligned gmem stride, so ``cuTensorMapEncodeTiled``
+# rejects it and the masked-N matmul is stuck on cp.async (no TMA → no
+# warp-spec). ``_split_demoted`` now pads the inner N up to a multiple of 64 so
+# the stride stays 16 B-aligned; ``050_use_tma`` accepts the aligned symbolic
+# inner, and warp-spec follows automatically on the resulting TMA depth-2 bundle.
+
+
+def _demoted_symbolic_n_graph(M=None, N=None, K: int = 128) -> Graph:
+    """Computed-B-cone matmul (the rotary QK^T shape): an elementwise scale on
+    BOTH operands feeds a transposed-``[N, K]`` Linear, so fusion demotes the
+    matmul and ``005_split_demoted`` materializes the canonical ``xnb[K, N]``
+    producer. With N symbolic this is the dynamic QK^T B operand WS1 unblocks.
+    M and N default to the same ``Dim('seq_len')`` (the [seq, seq] scores)."""
+    from deplodock.compiler.ir.frontend.ir import LinearOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
+
+    M = Dim("seq_len") if M is None else M
+    N = Dim("seq_len") if N is None else N
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (M, K), dtype=F16), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sx", (M, K), dtype=F16), node_id="sx")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (N, K), dtype=F16), node_id="w")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sw", (N, K), dtype=F16), node_id="sw")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["x", "sx"], output=Tensor("xs", (M, K), dtype=F16), node_id="xs")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["w", "sw"], output=Tensor("ws", (N, K), dtype=F16), node_id="ws")
+    g.add_node(op=LinearOp(), inputs=["xs", "ws"], output=Tensor("o", (M, N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["x", "sx", "w", "sw"], ["o"]
+    return g
+
+
+def test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec(monkeypatch):
+    """The demoted symbolic-N B operand stages via **TMA** and warp-spec fires:
+    ``005_split_demoted`` pads the ``xnb`` inner N to a 16 B-aligned multiple, so
+    the masked-N consumer's bundle promotes to ``cp.async.bulk.tensor`` and the
+    greedy default deploys the warp-specialized role split (no env pin — TMA +
+    WARPSPEC are the chosen-by-greedy decisions, the deployable shape)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # drop the _WARP_KNOBS TMA=0 pin — let greedy pick TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # force the demotion split
+    lowered = Pipeline.build(CUDA_PASSES).run(_demoted_symbolic_n_graph(), ctx=Context(compute_capability=(12, 0)))
+
+    xnb = lowered.nodes["o__xnb"].output
+    inner = xnb.shape[-1]
+    assert not inner.is_static, "the xnb inner N stays symbolic (runtime-sized, correct at any seq)"
+    assert "64" in inner.expr.pretty(), f"the xnb inner N must be padded to a 64-multiple, got {inner.expr.pretty()}"
+
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is True, "greedy must deploy TMA on the symbolic-N B operand"
+    assert con.knobs.get("WARPSPEC") is True, "warp-spec must fire on the TMA depth-2 bundle"
+    src = con.kernel_source
+    assert "cp.async.bulk.tensor" in src, "B operand must stage via TMA"
+    assert "mbarrier.arrive.expect_tx" in src, "TMA mbarrier handshake must be present"
+    assert "cp.async.commit_group" not in src, "must not fall back to the legacy cp.async path"
+    assert "mma.sync.aligned.m16n8k16" in src
+    assert "int seq_len" in src, "runtime extent must still be a kernel arg"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="TMA (cp.async.bulk.tensor) needs sm_90+")
+@pytest.mark.parametrize("seq", [31, 130, 512, 700])
+def test_demoted_symbolic_n_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged + warp-specialized symbolic-N kernel is accurate below, at,
+    and above the 512 hint — including straddling sizes (31, 130, 700) where the
+    last N tile reads the padded ``[seq, round_up)`` overhang columns. Those
+    garbage columns feed the mma only into store-masked output positions, so the
+    live scores stay correct."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # let greedy deploy TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_demoted_symbolic_n_graph())
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    sx = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    w = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    sw = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"x": x, "sx": sx, "w": w, "sw": sw})
+    got = result.outputs["o"].astype(np.float32)
+    want = (x * sx).astype(np.float32) @ (w * sw).astype(np.float32).T
+    assert got.shape == (seq, seq)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: demoted symbolic-N TMA MMA mismatch (max abs err {diff})"

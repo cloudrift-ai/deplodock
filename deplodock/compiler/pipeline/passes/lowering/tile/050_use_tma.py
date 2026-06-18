@@ -71,6 +71,7 @@ from dataclasses import replace
 from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.expr import BinaryExpr, Literal
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
@@ -110,6 +111,32 @@ _TMA_ALIGN_BYTES = 128
 # are excluded — the materializer's TMA emit path assumes a buffer-count
 # >= 1 phase dim on the smem slab; promoting SYNC would break that.
 _PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
+
+# cuTensorMapEncodeTiled's hard requirement: every global stride above the
+# innermost dim must be a multiple of 16 bytes. The above-inner stride equals
+# the inner extent in elements, so a symbolic inner extent is encode-safe iff
+# it is a provable multiple of ``16 / elem_bytes`` elements.
+_TMA_STRIDE_ALIGN_BYTES = 16
+
+
+def _inner_stride_aligned(dim, elem_bytes: int) -> bool:  # noqa: ANN001
+    """True when a *symbolic* inner extent ``dim`` is a provable constant multiple
+    ``c`` whose byte width ``c * elem_bytes`` is a multiple of 16 — so the
+    above-inner gmem stride stays 16 B-aligned at every runtime value and
+    ``cuTensorMapEncodeTiled`` accepts the descriptor. Recognizes the padded
+    ``round_up(N, P)`` Dim that ``_split_demoted._pad_inner_for_tma`` emits, whose
+    top-level expr is ``X * Literal(P)`` (or the mirrored ``Literal(P) * X``). A
+    bare symbolic dim (no constant factor) is unaligned and stays on cp.async."""
+    expr = dim.expr
+    if not (isinstance(expr, BinaryExpr) and expr.op == "*"):
+        return False
+    factor = None
+    if isinstance(expr.right, Literal) and isinstance(expr.right.value, int):
+        factor = expr.right.value
+    elif isinstance(expr.left, Literal) and isinstance(expr.left.value, int):
+        factor = expr.left.value
+    return factor is not None and (factor * elem_bytes) % _TMA_STRIDE_ALIGN_BYTES == 0
+
 
 # TMA knob — hints ``(True, False)`` so the *first* candidate is True
 # (the preferred policy on Hopper+). On sm < 9.0 the rule hands ``(False,)``
@@ -195,7 +222,19 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # inner dim (e.g. the SDPA scores in the o_proj kernel) is never staged, so
     # it must not veto the matmul operands' TMA path. N-masked inner sources stay
     # on cp.async.
-    inner_symbolic_bufs = {nid for nid, node in match.graph.nodes.items() if node.output.shape and not node.output.shape[-1].is_static}
+    # A symbolic inner dim is fine for TMA when its extent is provably a multiple
+    # of the 16 B alignment unit — the above-inner gmem stride is then 16 B-aligned
+    # at every runtime value, so ``cuTensorMapEncodeTiled`` accepts it. The demoted
+    # B-operand split pads its symbolic N inner up to ``_TMA_INNER_PAD`` exactly so
+    # this holds (``_split_demoted._pad_inner_for_tma``); the padded overhang columns
+    # are store-masked, so the descriptor can read them as ordinary in-bounds data.
+    inner_symbolic_bufs = {
+        nid
+        for nid, node in match.graph.nodes.items()
+        if node.output.shape
+        and not node.output.shape[-1].is_static
+        and not _inner_stride_aligned(node.output.shape[-1], node.output.dtype.nbytes)
+    }
 
     body = root.op.body
     # Masked-K (symbolic-reduce) sources keep their SYNC-pinned manual zero-fill
