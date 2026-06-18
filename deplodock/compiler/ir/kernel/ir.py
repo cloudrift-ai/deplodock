@@ -660,6 +660,7 @@ class LdmatrixLoad(Stmt):
     swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
     staged: bool = True  # False → gmem-direct fragment load (operand not in smem)
     gmem_guard: tuple[Expr, Expr] | None = None  # masked-axis (base, bound); gmem-direct only
+    b_trans: bool = False  # role "b" only: B stored N×K (Q@K^T native col-major) → gmem-direct trans helper
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -694,9 +695,15 @@ class LdmatrixLoad(Stmt):
                 # elements left from the tile base (>= 1 — the boundary Cond
                 # admitted the tile).
                 base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
-                helper = "dpl_mma_load_a_gmem_mclamp" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp"
+                if self.role == "a":
+                    helper = "dpl_mma_load_a_gmem_mclamp"
+                else:
+                    helper = "dpl_mma_load_b_gmem_trans_nclamp" if self.b_trans else "dpl_mma_load_b_gmem_nclamp"
                 return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, ({bound}) - ({base}));"]
-            helper = "dpl_mma_load_a_gmem" if self.role == "a" else "dpl_mma_load_b_gmem"
+            if self.role == "a":
+                helper = "dpl_mma_load_a_gmem"
+            else:
+                helper = "dpl_mma_load_b_gmem_trans" if self.b_trans else "dpl_mma_load_b_gmem"
             return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm});"]
         lane = "(threadIdx.x & 31)"
         if self.role == "a":
@@ -704,6 +711,15 @@ class LdmatrixLoad(Stmt):
             elem = f"{flat} + ({lane} % 16) * {ldm} + ({lane} / 16) * 8"
             addr = self._swizzled_addr(elem)
             return [f"{_pad(ctx.indent)}dpl_ldmatrix_x4({self.frag}, {addr});"]
+        # Transposed-B (Q@K^T) is the native col-major B and would need a plain
+        # x2 (no .trans) staged load whose ldmatrix lane→element map differs from
+        # the canonical x2.trans below. That staged variant isn't implemented yet
+        # — ``tile/020_stage_inputs`` excludes the transposed-B operand so it
+        # lowers gmem-direct (the ``staged=False`` branch above). Fail loud if a
+        # transposed-B operand ever reaches the staged path rather than silently
+        # emitting the wrong (canonical) lane map.
+        if self.b_trans:
+            raise NotImplementedError("staged ldmatrix for transposed-B (Q@K^T) not supported — must lower gmem-direct")
         # 16×8 B: x2.trans — lane addresses K-row (lane%16); .trans yields col-major.
         elem = f"{flat} + ({lane} % 16) * {ldm}"
         addr = self._swizzled_addr(elem)
@@ -790,6 +806,12 @@ class RegEpilogue:
     loads: tuple[EpilogueLoad, ...]
     ops: tuple[tuple[str, str, tuple[str, ...]], ...]
     result: str
+    # Coord-predicated Selects (the causal attention mask), rendered before the
+    # ``ops`` chain as per-element ternaries. Each is ``(name, branches)`` where
+    # ``branches`` is ``((cond_expr | None, value_name), ...)`` — the predicate
+    # carries ``__M__`` / ``__N__`` placeholder Vars the store substitutes with
+    # the fragment element's own (row, col); the last branch is the else.
+    selects: tuple[tuple[str, tuple[tuple[Expr | None, str], ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -882,12 +904,20 @@ class RegStore(Stmt):
         accesses coalesce regardless."""
         if self.epilogue is None:
             return [[], [], [], []], [f"{self.frag}[{i}]" for i in range(4)]
-        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+        from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var  # noqa: PLC0415
         from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
         from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
 
         epi = self.epilogue
         conv = {"f16": "__half2float({})", "bf16": "__bfloat162float({})"}
+        # Coord-predicated Selects (causal mask) need the cell-base M / N coords
+        # (the last two var-bearing output dims) — the element adds its own
+        # (row, col) to get the absolute coordinate the predicate compares.
+        sel_m_base = sel_n_base = None
+        if epi.selects:
+            dvd = [e for e in self.dst_index if e.free_vars()]
+            sel_m_base = dvd[-2] if len(dvd) >= 2 else None
+            sel_n_base = dvd[-1] if dvd else None
         per_elem: list[list[str]] = []
         vals: list[str] = []
         for i in range(4):
@@ -913,6 +943,21 @@ class RegStore(Stmt):
                 dt = ctx.buffer_dtypes.get(ld.buffer, "f32")
                 lines.append(f"const float {temp} = {conv.get(dt, '{}').format(f'{ld.buffer}[{addr}]')};")
                 env[ld.name] = temp
+            # Coord-predicated Selects (the causal mask): a per-element ternary.
+            # ``__M__`` / ``__N__`` substitute to this element's absolute (row,
+            # col); branches fold right with the last branch as the else.
+            row_off = Var("_g") if i < 2 else BinaryExpr("+", Var("_g"), Literal(8, "int"))
+            col_off = BinaryExpr("+", BinaryExpr("*", Var("_t"), Literal(2, "int")), Literal(i & 1, "int"))
+            m_abs = BinaryExpr("+", sel_m_base, row_off) if sel_m_base is not None else row_off
+            n_abs = BinaryExpr("+", sel_n_base, col_off) if sel_n_base is not None else col_off
+            coord = {"__M__": m_abs, "__N__": n_abs}
+            for sel_name, branches in epi.selects:
+                expr = env[branches[-1][1]]
+                for cond, value in reversed(branches[:-1]):
+                    rc = cond.substitute(coord).render(ctx)
+                    expr = f"(({rc}) ? {env[value]} : {expr})"
+                lines.append(f"const float {sel_name}_e{i} = {expr};")
+                env[sel_name] = f"{sel_name}_e{i}"
             for name, op_name, args in epi.ops:
                 expr = op_to_expr(op_name, [Var(env[a]) for a in args])
                 lines.append(f"const float {name}_e{i} = {expr.render(ctx)};")
@@ -1417,6 +1462,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         swizzle=s.swizzle,
         staged=s.staged,
         gmem_guard=None if s.gmem_guard is None else (sigma.apply(s.gmem_guard[0]), sigma.apply(s.gmem_guard[1])),
+        b_trans=s.b_trans,
     )
 
 
@@ -1441,6 +1487,10 @@ def _(s: RegStore, rename, sigma, axis_fn):
             ),
             ops=epilogue.ops,
             result=epilogue.result,
+            # Select predicates carry ``__M__`` / ``__N__`` placeholders (not
+            # real partition vars), so they're cell-invariant — pass through; the
+            # per-cell M/N offset reaches them via ``dst_index`` at render.
+            selects=epilogue.selects,
         )
 
     # Guard base/bound Exprs σ-substitute like ``dst_index`` (the per-cell

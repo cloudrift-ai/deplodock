@@ -549,6 +549,11 @@ class Mma(Stmt):
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
       cooperative-K info the escape analysis reads). Threaded through
       ``rewrite`` like ``Accum.axes``.
+    - ``b_trans`` — the B operand is stored N×K (K in its last dim), i.e. a
+      transposed-B ``Q @ K^T`` cell. This is the native ``mma.row.col`` B layout
+      (col-major K×N), so ``kernel/005_lower_atom_tile`` loads it via ``ldmatrix``
+      WITHOUT ``.trans`` (the default canonical B[k,n] uses ``.trans``). Set by
+      ``tile/011_lower_atom_cell`` from the classified B Load's K position.
     """
 
     c: str
@@ -556,6 +561,7 @@ class Mma(Stmt):
     b: str
     atom: Atom
     axes: tuple[str, ...] = ()
+    b_trans: bool = False
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum``: the accumulator read is implicit (loop-carried),

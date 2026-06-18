@@ -198,15 +198,14 @@ def test_split_offered_for_prologue_demotion() -> None:
     assert tuple(d.as_static() for d in xn.output.shape) == (_S, _H)
     assert xn.output.dtype == _dt.get("f16")
     assert xn.op.name.endswith("_xn")
-    # Consumer: loads xn + the weight. The Linear-derived gemm keeps its
+    # Consumer: loads xn + the weight. The Linear-derived gemm has a
     # transposed-B operand (wg is [N, K] — K in the last index dim of BOTH
-    # loads), which ``011_lower_atom_cell._classify_ab`` cannot tag — the
-    # eligibility gate mirrors that honestly, so this split lands on the
-    # scalar register-tile tier (informational here, NOT a gate the builder
-    # applies; the MatmulOp-derived split below reaches the warp tier).
+    # loads); ``011_lower_atom_cell._classify_ab`` now recovers A/B from the
+    # output coordinates, so the eligibility gate admits it for the tensor-core
+    # tier (B lowers gmem-direct via the trans helper — same Q@K^T class).
     assert xn.id in mm.inputs
     ctx = Context.from_target((12, 0))
-    assert not any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
     assert frag.outputs == [mm.id]
     # Structural features restamped per body — the split kernels must not
     # featurize as the fused kernel for the learned prior.

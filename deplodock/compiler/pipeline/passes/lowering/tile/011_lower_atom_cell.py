@@ -119,12 +119,15 @@ def _try_tag_here(body: Body, *, atom: Atom, k_name: str | None, write: Write | 
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:
         return None
+    # Transposed-B (Q @ K^T): B stored N×K (K in its last dim) is the native
+    # mma.row.col col-major B — flag it so kernel/005 loads it without ``.trans``.
+    b_trans = _is_transposed_b(b_load, k_name=k_name, write=write)
     # The Mma carries the Atom spec (taken straight off the AtomTile) + the A/B
     # operand identity (by SSA name); the operand Loads stay plain —
     # kernel/005_lower_atom_tile reads the spec off the Mma and recovers each
     # load's role from it. Emit the (plain) loads in A,B order then the Mma;
     # the multiply + Accum are dropped.
-    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes)
+    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes, b_trans=b_trans)
     rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
     return Body((*rest, a_load, b_load, mma))
 
@@ -138,7 +141,8 @@ def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) 
     a_load: Load | None = None
     b_load: Load | None = None
     if k_name is not None:
-        return classify_matmul_operands(loads, k_name)
+        out_index = write.index if (write is not None and write.index) else None
+        return classify_matmul_operands(loads, k_name, out_index=out_index)
     if write is None or not write.index:
         return None, None
     w_m_vars = set(write.index[0].free_vars())
@@ -151,3 +155,17 @@ def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) 
         elif w_n_vars & ld_inner and not (w_m_vars & ld_outer):
             b_load = ld
     return a_load, b_load
+
+
+def _is_transposed_b(b_load: Load, *, k_name: str | None, write: Write | None) -> bool:
+    """The B operand is transposed (stored N×K, K in its last dim) — a Q @ K^T
+    cell. With a reduce axis it's simply K-in-last; for the shape-C (filtered-K)
+    fallback it's B carrying the N (col) output var in its FIRST dim."""
+    if not b_load.index:
+        return False
+    if k_name is not None:
+        return k_name in b_load.index[-1].free_vars()
+    if write is None or not write.index:
+        return False
+    n_vars = set(write.index[-1].free_vars())
+    return bool(n_vars & set(b_load.index[0].free_vars()))

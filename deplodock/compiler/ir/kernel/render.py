@@ -218,6 +218,45 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp(unsigned* r, c
     }
 }
 
+// Transposed-B (Q @ K^T): B stored N×K (``g[n][k]``, K contiguous) — the native
+// ``mma.row.col`` col-major B, so no ldmatrix ``.trans`` is needed. The fragment
+// lane→element map is the same (n = groupID, k = 2·threadID_in_group + k16 half),
+// but each lane now reads a contiguous (k, k+1) pair from row ``n`` of B. ``ldm``
+// is B's gmem row stride (the K extent). Mirrors ``dpl_mma_load_b_gmem`` with the
+// (k, n) index roles swapped to (n, k).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans(unsigned* r, const T* g, int ldm) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;                                 // N: groupID (0..7)
+        int k = (tig << 1) + (i ? 8 : 0);            // K: 2*threadID_in_group, +8 for the k16 half
+        unsigned packed;
+        ((T*)&packed)[0] = g[n * ldm + k];           // .f16x2: contiguous (k, k+1) in row n
+        ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
+// Masked-tile variant of the transposed-B gmem load: the gated N axis is the
+// row (``n``) here, so clamp ``n`` to the runtime extent (cf. _b_gmem_nclamp,
+// which clamps N as the column). Clamped lanes read a duplicate in-bounds row;
+// their stores are masked by the RegStore guard.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_nclamp(unsigned* r, const T* g, int ldm, int cols_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed;
+        ((T*)&packed)[0] = g[n * ldm + k];
+        ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"
