@@ -86,7 +86,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Mma, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -212,6 +212,16 @@ def _enumerate_variants(
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
         return []
+    # Transposed-B (Q @ K^T) operands lower gmem-direct — the staged ldmatrix
+    # path for the native col-major B isn't implemented (its lane→element map
+    # differs from the canonical x2.trans; see kernel/005_lower_atom_tile +
+    # ir/kernel LdmatrixLoad). Drop those buffers so they stay gmem (the atom
+    # path's all-staged mask never tries to land them in smem).
+    excl = _transposed_b_bufs(body)
+    if excl:
+        candidates = [(b, w) for b, w in candidates if b not in excl]
+        if not candidates:
+            return []
     ranked = sorted(candidates, key=lambda kv: -kv[1])
     bufs_ranked = [b for b, _ in ranked]
     n = len(bufs_ranked)
@@ -246,6 +256,16 @@ def _enumerate_variants(
         knobs = {**parent_op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}
         variants.append(TileOp(body=new_body, name=parent_op.name, knobs=knobs))
     return variants
+
+
+def _transposed_b_bufs(body: Body) -> frozenset[str]:
+    """Gmem buffers used as a transposed-B (Q @ K^T) mma operand — excluded from
+    staging so they lower gmem-direct (no staged ldmatrix path for the native
+    col-major B yet)."""
+    b_names = {m.b for m in body.iter_of_type(Mma) if m.b_trans}
+    if not b_names:
+        return frozenset()
+    return frozenset(ld.input for ld in body.iter_of_type(Load) if ld.names and ld.names[0] in b_names)
 
 
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
