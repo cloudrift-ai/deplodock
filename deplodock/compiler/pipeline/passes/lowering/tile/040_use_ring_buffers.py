@@ -26,15 +26,24 @@ Idempotence: any K_o whose bundles are already non-SYNC is left alone.
 
 from __future__ import annotations
 
+import importlib
+
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import SerialTile, StageBundle, StagePolicy, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
 
 PATTERN = [Pattern("root", TileOp)]
+
+# ``050_use_tma.tile_reaches_tma`` — the shared TMA-eligibility predicate. A
+# masked-K bundle may only ring when it will reach TMA (whose OOB zero-fill
+# replaces the SYNC ternary), so this pass consults 050's exact gate rather than
+# re-deriving it. Imported lazily by name (the pass module's numeric prefix
+# blocks a plain ``import``); 050 doesn't import this pass, so there is no cycle.
+_use_tma = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.050_use_tma")
 
 # Ring-buffer depth fork. 2 = classic double-buffer (compute current slot while
 # the next async copy fills the other). 3-4 = multi-stage pipeline (CUTLASS-style)
@@ -53,18 +62,27 @@ BUFFER_COUNT = Knob(
 )
 
 
-def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
+def rewrite(ctx: Context, root: Node, match: Match | None = None) -> list[TileOp] | None:
+    # ``match`` is injected by name by the pipeline; it's optional only so direct
+    # unit calls (no masked-K bundle) needn't build one. A masked-K bundle with no
+    # ``match`` conservatively stays SYNC (it can't confirm TMA eligibility).
     body = root.op.body
     if BUFFER_COUNT.name in root.op.knobs:
         raise RuleSkipped("ring buffers already applied (idempotence via knob)")
     if any(isinstance(s, StageBundle) and s.policy != StagePolicy.SYNC for s in body.iter()):
         raise RuleSkipped("double-buffer already applied (non-SYNC bundle present)")
-    # Masked-K (symbolic reduce) bundles are pinned to the SYNC transport: the
-    # partial-K-slab zero-fill needs a per-value ternary that cp.async / a ring
-    # buffer can't express (``_stage_expand``). Decline the ring (BUFFER_COUNT=1)
-    # so 050/060/080 also see SYNC and the consumer reads the un-phased slab the
-    # sync writer fills — never a phase-indexed slot the sync path never wrote.
-    if any(isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in body.iter()):
+    # Masked-K (symbolic reduce) bundles need their partial-K-slab overhang to
+    # read ZERO for the mma accumulation. Two transports deliver that: the SYNC
+    # ternary (``_stage_expand``'s ``(k < seq_len) ? v : 0``) and TMA's hardware
+    # OOB zero-fill. cp.async and a synchronous double-buffer can do NEITHER (they
+    # copy raw bytes, can't ternary), so a ringed masked-K is correct ONLY if it
+    # goes on to reach TMA in ``050_use_tma``. Consult 050's exact gate: if the
+    # tile won't reach TMA (sm < 9.0, an ineligible operand box, a re-entered
+    # pipeline), keep the bundle SYNC (``BUFFER_COUNT=1``) so it stays on the
+    # ternary path — never a phase-indexed ring slot the sync writer never filled.
+    if any(isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in body.iter()) and not (
+        match is not None and _use_tma.tile_reaches_tma(body, match.graph.nodes, ctx)
+    ):
         return [TileOp(body=body, name=root.op.name, knobs={**root.op.knobs, BUFFER_COUNT.name: 1})]
 
     candidates = BUFFER_COUNT.narrow(BUFFER_COUNT.hints)
@@ -208,9 +226,16 @@ def _walk(body: Body, *, smem_budget: int, buffer_count: int, input_nbytes: dict
 
 def _maybe_promote_kouter(kouter: SerialTile, *, smem_budget: int, buffer_count: int, input_nbytes: dict[str, int]) -> SerialTile | None:
     # Ring buffers need ≥``buffer_count`` K iterations to prologue + steady-state.
-    # Symbolic K can be either — defer the promotion (no per-iter overlap) rather
-    # than speculatively allocating a multi-buffer slab.
-    if not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < buffer_count:
+    # A static K below that can't fill the ring — defer. A *masked-K* (symbolic
+    # reduce) K_o loop is exempt: its extent is the symbolic ``ceil(seq_len/BK)``
+    # whose hint (512 → 16 K_o steps) clears any depth, and the TMA pipeline drains
+    # correctly at every runtime K_o down to 1 (validated at seq ∈ {16…700}) — the
+    # masked-K P@V is the deployable symbolic-K matmul, so it must ring to reach
+    # TMA + warp-spec, not stay single-buffered.
+    _kmask_bundle = any(
+        isinstance(s, StageBundle) and any(getattr(src, "kmask", None) is not None for src in s.sources) for s in kouter.body
+    )
+    if not _kmask_bundle and (not kouter.axis.extent.is_static or kouter.axis.extent.as_static() < buffer_count):
         return None
     promote_ids: set[int] = set()
     total_bytes = 0

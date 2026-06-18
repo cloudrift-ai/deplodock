@@ -106,8 +106,9 @@ autotuning cache doesn't bust on cosmetic edits.
   are invisible to σ), staged slab fills clamp their gmem reads to the runtime extent
   (`Source.gmem_extents` with symbolic `Expr` bounds), unstaged operands take clamped gmem-direct
   fragment loads (`LdmatrixLoad.gmem_guard`), and a symbolic output inner extent resolves its `ldm` from
-  the runtime kernel arg at render. Symbolic K stays off the warp tier (flash-style attention is future
-  work). SDPA-prologue matmuls with a **symbolic K** (P@V — which never stages) get masked THREAD tiles
+  the runtime kernel arg at render. A *fused* symbolic K stays off the warp tier (flash-style attention is
+  future work); the *split* symbolic-K gemm reaches it (see below). SDPA-prologue matmuls with a **symbolic
+  K** (P@V — which never stages) get masked THREAD tiles
   with `FM = FN = 1` (`mask_f1`); static-K prologue kernels (fused gated-MLP) and cooperative-reduce
   kernels keep symbolic axes degenerate (one element per thread) — their staged pipelines can't coexist
   with the per-row guard (`021`'s hoist would break the prologue's SSA ordering; it now refuses such
@@ -123,9 +124,17 @@ autotuning cache doesn't bust on cosmetic edits.
   static width), and the padded `[seq_len, round_up)` overhang columns feed the mma only into
   store-masked output positions, so they can't contaminate a live score. The cut keeps a
   symbolic ROW/N buffer's runtime dim var (`seq_len` in a collapsed-reshape stride) as a legitimate read,
-  not an unmodeled-scope bail (`_split_demoted.dim_names`). Symbolic K stays bailed: the warp tier needs a
-  static reduce, so a symbolic-K matmul (P@V) is scalar fused or split — the split would only add a
-  materialization with no tier upgrade.
+  not an unmodeled-scope bail (`_split_demoted.dim_names`). A symbolic **K** (reduce) reaches the warp tier
+  too via the split: the demoted P@V un-fuses into a softmax-prob A cone `xn[H, m, k]` + a clean symbolic-K
+  gemm whose masked reduce is a hint-tiled `mma.sync` with the partial final K slab zero-filled. That cone's
+  reduce axis is innermost, so `_split_demoted._pad_inner_for_tma` pads it to a 64-multiple (16 B-aligned
+  stride) and the consumer reaches **TMA**: the reduce overhang must read 0, which TMA's hardware OOB
+  zero-fill delivers on the *middle-K* B operand (V, allocated at the real `seq_len`, so its descriptor
+  globalDim is `seq_len`) — binding every overhang product to 0 regardless of the padded A overhang (which
+  the zero-init-reused scratch keeps finite). `040` rings a masked-K bundle only when `050.tile_reaches_tma`
+  confirms the whole tile is TMA-eligible, so a masked-K bundle is never stranded on cp.async (it keeps the
+  SYNC ternary zero-fill otherwise). Only the **fused** prologue P@V (before the split, above) stays
+  degenerate at `FM = FN = 1`; flash-style fused symbolic-K attention remains future work.
   Cooperative-reduce kernels still regain CTA-level parallelism on symbolic-row graphs via
   **strided-cooperative rows**: their STATIC free axes thread-bind alongside the `BR` cooperative lanes
   (the symbolic axis keeps its exact whole-to-grid bind, no mask), so e.g. a per-head q/k-norm with

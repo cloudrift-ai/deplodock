@@ -310,7 +310,19 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
         # Every extent passes through as a Dim — rows, K, and N alike allocate
         # from the runtime extent when symbolic (``_classify_cut`` admits all).
-        shape = tuple(lp.axis.extent for lp in rows_used) + (k_loop.axis.extent,)
+        # A row cone (the A operand) puts the reduce K innermost; when K is
+        # symbolic (the masked-K P@V probs cone) pad it like the N cone so the
+        # above-inner stride stays 16 B-aligned and the operand is TMA-eligible.
+        # The reduce overhang here is NOT self-zeroed (this buffer's TMA globalDim
+        # is the padded extent), but it doesn't need to be: the matmul's *other*
+        # operand — the middle-K B cone (V), allocated at the real ``seq_len`` — is
+        # TMA-OOB-zero-filled past ``seq_len``, so every overhang product is
+        # ``A_overhang × 0``. The scratch slab is zero-initialised and only ever
+        # holds finite kernel outputs, so ``A_overhang`` is finite (never NaN/Inf)
+        # and the product is a true 0 — the masked-K reduction stays exact. (On the
+        # SYNC fallback the per-value ternary zeroes it directly.)
+        k_inner = _pad_inner_for_tma(k_loop.axis.extent) if not reads_n else k_loop.axis.extent
+        shape = tuple(lp.axis.extent for lp in rows_used) + (k_inner,)
         if reads_n:
             # An N-reading cone materializes the canonical B operand ``xnb[…, K, N]``.
             # When N is symbolic (the rotary QK^T's ``seq_len`` key cone), the raw

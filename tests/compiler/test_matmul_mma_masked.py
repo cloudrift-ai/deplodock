@@ -474,3 +474,100 @@ def test_demoted_symbolic_n_tma_accuracy(monkeypatch, seq):
     assert got.shape == (seq, seq)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"seq={seq}: demoted symbolic-N TMA MMA mismatch (max abs err {diff})"
+
+
+# --- demoted masked-K P@V: TMA via OOB zero-fill (WS3) -----------------------
+# The SDPA P@V's A operand is the softmax-normalized probs ``xn[head, m, k]`` with
+# the reduce K innermost and symbolic (``seq_len``). Padding its inner K to a
+# 16 B-aligned multiple makes it TMA-eligible; the masked-K reduce overhang must
+# read 0, which the *other* operand (V, middle-K, allocated at the real seq_len)
+# delivers via TMA's hardware OOB zero-fill — every overhang product is
+# ``A_overhang × 0`` (A_overhang finite, since scratch is zero-init + holds only
+# finite kernel outputs). ``040`` rings the masked-K bundle only when it will reach
+# TMA (``050.tile_reaches_tma``); otherwise it stays SYNC with the per-value
+# ternary zero-fill, so a masked-K bundle is never stranded on cp.async.
+
+
+def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
+    """Softmax(scores) @ V with the reduce K = ``seq_len`` symbolic (the SDPA P@V
+    shape). Fusion demotes the matmul; ``005_split_demoted`` materializes the
+    softmax-prob A cone ``xn[H, seq, seq]`` (inner K) + the clean symbolic-K gemm."""
+    from deplodock.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
+
+    s = Dim("seq_len")
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("scores", (H, s, s), dtype=F16), node_id="scores")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("v", (H, s, N), dtype=F16), node_id="v")
+    g.add_node(op=SoftmaxOp(axis=-1), inputs=["scores"], output=Tensor("probs", (H, s, s), dtype=F16), node_id="probs")
+    g.add_node(op=MatmulOp(), inputs=["probs", "v"], output=Tensor("o", (H, s, N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["scores", "v"], ["o"]
+    return g
+
+
+def test_demoted_masked_k_pv_reaches_tma(monkeypatch):
+    """The demoted masked-K P@V consumer stages via TMA on sm_90+: the padded
+    probs A cone + the middle-K V both clear ``050``'s gate, so greedy deploys the
+    TMA ring (``cp.async.bulk.tensor``). The probs cone's inner K is padded to a
+    64-multiple (symbolic, runtime-sized)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # let greedy pick TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # force the demotion split
+    lowered = Pipeline.build(CUDA_PASSES).run(_pv_softmax_graph(), ctx=Context(compute_capability=(12, 0)))
+
+    xn = lowered.nodes["o__xn"].output
+    inner = xn.shape[-1]
+    assert not inner.is_static, "the probs cone inner K stays symbolic (runtime-sized)"
+    assert "64" in inner.expr.pretty(), f"the probs cone inner K must be padded to a 64-multiple, got {inner.expr.pretty()}"
+
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is True, "greedy must deploy TMA on the masked-K P@V"
+    src = con.kernel_source
+    assert "cp.async.bulk.tensor" in src, "masked-K operands must stage via TMA"
+    assert "mma.sync.aligned.m16n8k16" in src
+    assert "int seq_len" in src, "runtime reduce extent must be a kernel arg"
+
+
+def test_demoted_masked_k_pv_stays_sync_below_sm90(monkeypatch):
+    """Below sm_90 (no TMA) the masked-K P@V keeps the SYNC ternary zero-fill —
+    ``040`` declines the ring (``tile_reaches_tma`` False), never leaving a
+    masked-K bundle on a cp.async / double-buffer transport that can't zero the
+    partial-K slab."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    lowered = Pipeline.build(CUDA_PASSES).run(_pv_softmax_graph(), ctx=Context(compute_capability=(8, 0)))
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is not True, "sm_80 has no TMA — masked-K must stay SYNC"
+    assert con.knobs.get("RING") == 1, "the masked-K ring must be declined below sm_90 (stays on the SYNC ternary)"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="TMA (cp.async.bulk.tensor) needs sm_90+")
+@pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
+def test_demoted_masked_k_pv_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged masked-K P@V is accurate below, at, and above the 512 hint —
+    including the straddling reduce extents (31, 130, 700) where the final K slab
+    is partial and TMA's middle-K OOB zero-fill must zero V past ``seq_len`` (a
+    clamped duplicate would corrupt the reduction). seq=16 exercises the tiny
+    K_o=1 ring (prologue-only, no steady state)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_pv_softmax_graph())
+    rng = np.random.default_rng(seq)
+    scores = (rng.standard_normal((16, seq, seq)) * 2).astype(np.float16)
+    v = (rng.standard_normal((16, seq, 128)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"scores": scores, "v": v})
+    got = result.outputs["o"].astype(np.float32)
+    sc = scores.astype(np.float32)
+    e = np.exp(sc - sc.max(-1, keepdims=True))
+    probs = e / e.sum(-1, keepdims=True)
+    want = np.matmul(probs, v.astype(np.float32))
+    assert got.shape == (16, seq, 128)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: demoted masked-K P@V TMA mismatch (max abs err {diff})"

@@ -151,23 +151,35 @@ gate already covers the CTA-overflow risk). Verified end-to-end on the synthetic
 materializer needed **no** change — the existing per-launch `globalDim`-from-`arr.shape` path handles the padded
 buffer directly.
 
-**WS3 — NOT LANDED (blocked; deeper than the plan's framing).** Investigation found compounding blockers, several
-with real device-hang risk, so it was not landed rather than shipped half-working/unverified:
-  1. The masked-K **K_o serial loop has a symbolic extent** `ceil(seq_len / (BK·atom_k))`, and
-     `040_use_ring_buffers._maybe_promote_kouter` refuses to ring-buffer a symbolic-extent K loop. There is **no
-     existing precedent** for a symbolic-count ring pipeline — M-masked TMA rings a *static* reduce; the masked M is
-     a parallel grid axis, never the serial K_o pipeline.
-  2. Force-allowing the symbolic ring exposes a second decline in `050` upstream of the eligibility gate (the
-     masked-K bundle never reaches `_bundle_eligible`).
-  3. The double-buffered K pipeline's **drain / parity schedule** (hardcoded parities, assumes ≥ `depth`
-     iterations) is unverified over a runtime `K_o ∈ {1, 2, …}` — the exact stale-parity re-entry hang the `050`
-     docstring already documents for `k_linear_mean_reduce`.
-  4. The **foundational hypothesis** — that TMA's *per-dimension* OOB zeroes a **middle** K coordinate (rather than
-     reading the next head's data via the linear address) — could **not be verified**, because TMA never fired far
-     enough to test it. This must be confirmed before any masked-K TMA work is trusted.
-All WS3 experimental edits were reverted; the masked-K SYNC pins (`040:62-68`, `050`'s masked-K decline,
-`_stage_expand`'s `has_kmask → SYNC`) remain in place. Recommend a dedicated effort that first answers (4) in
-isolation, then designs the symbolic-count ring pipeline (1)/(3) before touching the pins.
+**WS3 — DONE** (the "4-D leading-batch box" framing turned out to be a red herring; the real shape and fix were
+different). The debug trace showed the blocker is the masked-K **A operand** (the softmax-prob cone
+`xn[head, m, k]`), not the B operand: its reduce K is the *innermost* dim, so — exactly like WS1's N — its symbolic
+inner gives an unaligned above-inner stride and `050` declines it. The B operand (V) has the reduce K as a *middle*
+dim and was **already TMA-eligible** (the existing symbolic-outer/middle path).
+
+The solution reuses WS1's mechanism on the A operand plus one correctness insight:
+  - `_split_demoted._pad_inner_for_tma` is extended to the **row cone**: a symbolic inner *reduce* K is padded to a
+    64-multiple, making the probs cone TMA-eligible (same aligned-stride trick).
+  - **The reduce overhang must read 0** (a duplicate corrupts the sum). It does — not via the A operand (whose TMA
+    globalDim is the padded extent, so its overhang is read as valid), but via the **middle-K B operand (V),
+    allocated at the real `seq_len`** → its descriptor globalDim is `seq_len` → TMA's hardware OOB zero-fill zeroes
+    V past `seq_len`. Every overhang product is therefore `A_overhang × 0`. `A_overhang` is *finite* (never
+    NaN/Inf) because the scratch slab is zero-initialised and only ever holds finite kernel outputs, so the product
+    is a true 0 and the masked-K reduction stays exact. **This answers the foundational hypothesis: TMA's
+    per-dimension OOB does zero a middle-K coordinate** — verified by accuracy at `seq ∈ {16, 31, 130, 512, 700}`
+    (err ~1e-4), including the tiny `K_o = 1` ring (so the symbolic-count pipeline drains correctly — concern (3)
+    above was unfounded).
+
+The pass coupling is made robust by a shared predicate `050_use_tma.tile_reaches_tma`: `040_use_ring_buffers` rings
+a masked-K bundle **only when that predicate confirms the whole tile will reach TMA**, so a masked-K bundle is
+never stranded on cp.async / a synchronous double-buffer (neither can zero the partial-K slab) — it keeps the SYNC
+`_stage_expand` ternary otherwise. Verified: sm_120 → TMA + ring (accurate), sm_80 → SYNC ternary (accurate), and
+the masked-K input case (an *unpadded* graph input, e.g. `test_symbolic_k_masked_mma_accuracy`) correctly stays
+SYNC (an input can't be padded). Touch points: `_split_demoted.py` (row-cone padding), `050_use_tma.py`
+(`tile_reaches_tma` + masked-K decline removed), `040_use_ring_buffers.py` (gate + symbolic-K_o ring). Tests:
+`test_demoted_masked_k_pv_reaches_tma` / `_stays_sync_below_sm90` / `_tma_accuracy`. Warp-spec on masked-K is
+eligible at `RING=2` (085's existing machinery); greedy currently front-loads `RING=3` for it, so the warp-spec
+variant is the tuner's to deploy.
 
 ## References
 
