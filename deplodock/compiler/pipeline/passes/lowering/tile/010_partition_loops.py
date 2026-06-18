@@ -710,12 +710,15 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # symbolic-K matmul that reaches here.
         if mma_on and graph is not None and not prologue:
             eligible = tuple(atom for atom in ATOM_REGISTRY.values() if is_atom_eligible(atom, loop_op, ctx, graph=graph))
-            # The s16816 ``mma.sync`` + swizzled-``ldmatrix`` path is the sole
+            # The s16816 ``mma.sync`` + ``ldmatrix`` path is the sole
             # tensor-core family (WMMA was removed; the swizzled slab beats
-            # it). It auto-enumerates
-            # alongside the scalar register-tile tier on **sm_90+** (the
-            # swizzled-TMA fast path needs Hopper+; on sm_80-89 mma.sync would
-            # fall back to slower cp.async staging, so keep it pin-only there).
+            # it). It auto-enumerates alongside the scalar register-tile tier
+            # on **sm_80+** — ``is_atom_eligible`` gates ``min_cc=(8, 0)``, so
+            # pre-Ampere never sees it. sm_90+ gets the swizzled-TMA fast path;
+            # sm_80-89 stages the operands through cp.async (the ``ldmatrix``
+            # loads carry the ``.shared`` state-space qualifier so ptxas keeps
+            # the smem offset as-is instead of folding a spurious
+            # generic->shared conversion — without it ``LDSM`` faults on Ada).
             # The greedy/DB-less picker and the autotuner choose mma.sync vs
             # scalar per shape. Shapes mma.sync can't serve fall to scalar:
             # non-divisible extents (filtered by ``is_atom_eligible``) and
@@ -724,12 +727,6 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
             # unstaged AtomTile can't lower). A ``DEPLODOCK_MMA=<kind>``
             # pin forces the kind at any size / arch (bring-up + A-B
             # benching).
-            pin_is_mma_sync = pinned_atom in ATOM_REGISTRY
-            if not pin_is_mma_sync and ctx.compute_capability < (9, 0):
-                # Auto-enumerating the mma.sync (s16816) family — the only
-                # registered atom family — needs the swizzled-TMA fast path
-                # (Hopper+); on sm_80-89 it's pin-only, so drop every atom.
-                eligible = ()
             if eligible:
                 warp_combos = enumerate_cartesian(
                     E_M=E_M,
