@@ -49,6 +49,16 @@ MMA tile whose operands the staging passes declined to stage (e.g. slabs don't
 fit the smem budget) still compiles — slower than the staged path (no smem
 reuse), but correct — instead of crashing, so the search needn't avoid it.
 
+EXCEPTION — masked-K: the gmem-direct load only clamps the M/N (output) lane
+axis (``gmem_guard``); it has NO K zero-fill. So an unstaged operand whose
+REDUCE (K) dim is symbolic (SDPA P@V over ``seq_len``) would read the partial
+final K tile past the mask-padded extent — garbage (wrong result / hang) or an
+OOB illegal access (the masked-K mma bench_fails). Only the staged path
+zero-fills the partial slab (``_stage_expand``). :func:`_unstaged_masked_k`
+detects this and :func:`_emit_chain` raises ``LoweringError`` to drop the
+candidate, so the search uses the staged (zero-filling) transport or the scalar
+path instead.
+
 Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
 ``rewrite`` entry point and its lowering helpers all live in this one module.
@@ -190,7 +200,15 @@ def _lower_cell(
                 )
             if isinstance(s, SerialTile) and s.is_reduce:
                 chain = _build_chain(
-                    s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=sources, spec=spec, m_guard=m_guard, n_guard=n_guard
+                    s.body,
+                    c_frag=c_frag,
+                    a_frag=a_frag,
+                    b_frag=b_frag,
+                    smem_sources=sources,
+                    spec=spec,
+                    m_guard=m_guard,
+                    n_guard=n_guard,
+                    graph=graph,
                 )
                 return (s.with_bodies((Body(chain),)),)
             return None
@@ -217,6 +235,7 @@ def _lower_cell(
         m_guard=m_guard,
         n_guard=n_guard,
         b_trans=b_trans,
+        graph=graph,
     )
     store = _emit_store(
         spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, epilogue=epilogue, m_guard=m_guard, n_guard=n_guard
@@ -406,6 +425,7 @@ def _build_chain(
     spec: Atom,
     m_guard: tuple[Expr, Expr] | None = None,
     n_guard: tuple[Expr, Expr] | None = None,
+    graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
     """Build the ``ldmatrix a + ldmatrix b + mma.sync`` chain that replaces a
     reduce SerialTile's ``[Load a, Load b, Mma]`` body — operands matched via
@@ -424,6 +444,7 @@ def _build_chain(
         m_guard=m_guard,
         n_guard=n_guard,
         b_trans=b_trans,
+        graph=graph,
     )
 
 
@@ -440,6 +461,30 @@ def _emit_fragments(spec: Atom, *, c_frag: str, a_frag: str, b_frag: str, c_dtyp
     )
 
 
+def _unstaged_masked_k(load: Load, role: str, graph: Graph | None) -> bool:
+    """An unstaged mma operand whose REDUCE (K) gmem dim is symbolic — the
+    masked-K case (SDPA P@V over ``seq_len``).
+
+    The gmem-direct fragment load (``dpl_mma_load_{a,b}_gmem*``) iterates K to the
+    tile's ``BK·atom_k`` and only clamps the M/N (output, lane-varying) axis via
+    ``gmem_guard`` — it has **no K zero-fill**. So a symbolic, mask-padded K is
+    read past its runtime extent (``ceil(seq/64)*64`` < ``BK·atom_k``): garbage
+    into the accumulation (wrong result, or a hang on the slow path) or an OOB
+    illegal access. Only the STAGED path zero-fills the partial K slab
+    (``_stage_expand``). Detect so the caller bails — forcing the staged
+    transport, or the (correct) scalar fallback. A's K is the last index dim
+    (canonical ``[…, M, K]``); B's K is a non-last dim (N is last)."""
+    if graph is None:
+        return False
+    node = graph.nodes.get(load.input)
+    if node is None or not node.output.shape:
+        return False
+    shape = node.output.shape
+    if role == "a":
+        return not shape[-1].is_static
+    return any(not d.is_static for d in shape[:-1])
+
+
 def _emit_chain(
     spec: Atom,
     *,
@@ -452,6 +497,7 @@ def _emit_chain(
     m_guard: tuple[Expr, Expr] | None = None,
     n_guard: tuple[Expr, Expr] | None = None,
     b_trans: bool = False,
+    graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
     """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
     a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
@@ -466,6 +512,22 @@ def _emit_chain(
     # search needn't avoid unstageable MMA tiles.
     a_staged = a_load.input in smem_sources
     b_staged = b_load.input in smem_sources
+    # Masked-K (symbolic reduce) correctness gate: the gmem-direct fragment load
+    # has no K zero-fill, so an unstaged masked-K operand reads past the padded
+    # extent (wrong result / hang / OOB — only the staged ``_stage_expand`` path
+    # zero-fills). Bail so the search stages it or falls to the scalar path.
+    if (not a_staged and _unstaged_masked_k(a_load, "a", graph)) or (
+        not b_staged and not b_trans and _unstaged_masked_k(b_load, "b", graph)
+    ):
+        # LoweringError (not RuleSkipped): drop this candidate so the search
+        # falls back to a staged-mma or scalar variant. RuleSkipped would leave
+        # the AtomTile unlowered → crash at render.
+        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+        raise LoweringError(
+            "masked-K (symbolic reduce) mma operand can't lower gmem-direct — no K zero-fill "
+            "(only the staged _stage_expand path zero-fills the partial slab); needs staging"
+        )
     # Masked cells with an UNSTAGED gated-axis operand take the clamped
     # gmem-direct helper: the staged slab is in-bounds by construction (its
     # gmem fill is clamped — 021 + _stage_expand), but a plain gmem-direct

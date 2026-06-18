@@ -18,6 +18,17 @@ its producer the contiguizing copy), or a
 computed cone (becomes a producer kernel); every distinct cone materializes an ``xn``
 intermediate over exactly the axes it reads —
 
+**Segmented-K exception (no producer).** A K-folded ``Load`` whose innermost (contiguous)
+index dim is ``expr % C`` — the o_proj attn-out / P@V-V transpose layout, where K is a
+``(strided-outer × contiguous-inner extent C)`` nest — is NOT demoted (see
+``_helpers.segmentable_k_extent``). Partition C-aligns the K split (``k_per_block == C``)
+so the delinearization folds to a clean ``[K_o, …, K_i]`` read (the range-aware
+``Expr.simplify``); the matmul then reaches the mma tier reading the folded operand from
+gmem directly — the ``K_o`` outer segment's per-step base is the head stride (``seq_len *
+C``), the ``K_i`` inner run is contiguous and ``ldmatrix``-stageable. So segmented-K
+supersedes the contiguizing producer for these reads; only a *non*-segmentable fold (no
+literal-modulus inner run) still materializes the copy.
+
     ``xn[row axes read…, k]``        (a row cone — the A operand)
     ``xn[row axes read…, k, n]``     (an N-reading cone — the B operand)
 
@@ -33,8 +44,9 @@ to the old "other operand's dtype" rule on every shape seen so far. The familiar
 are instances of the one rule: norm→linear / scale→matmul = one row cone beside a Load;
 SDPA P@V = one row cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA
 ``head / 2`` shared-KV read keeps that row axis as a leading dim — duplicated across the
-sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load;
-o_proj's collapsed attn-out = one degenerate Load cone beside a Load.
+sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load.
+(o_proj's collapsed attn-out — once a degenerate Load cone — now takes the segmented-K path
+above: no producer, mma reads it directly.)
 
 Cones compare by VALUE, not SSA name: fusion inlines a shared producer chain once per
 consuming matmul (the gated-MLP norm feeds gate AND up as two structurally identical
@@ -88,7 +100,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.stmt.body import Cone
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -180,7 +192,14 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
                 # only member is itself): the producer is the contiguizing
                 # copy, materializing the operand as a plain ``xn[rows…, K]``.
                 # A single-K-dim Load is already stageable and stays put.
-                if len(k_dims) > 1:
+                #
+                # EXCEPT a *segmentable* fold (segmented-K): when K's innermost
+                # index dim is ``expr % C`` the read is a (strided-outer ×
+                # contiguous-inner) nest — a C-aligned K split in partition folds
+                # the delinearization to a clean single-K-dim read and the matmul
+                # reaches the mma tier reading gmem directly. Don't demote it;
+                # let it flow to partition (no transpose producer needed).
+                if len(k_dims) > 1 and segmentable_k_extent(d, k_name) is None:
                     cone_args[a] = None
             else:
                 return None

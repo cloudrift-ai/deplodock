@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -85,6 +85,14 @@ def classify_matmul_operands(loads, k_name: str, *, out_index=None):
             continue
         k_dims = [d for d, e in enumerate(ld.index) if k_name in e.free_vars()]
         var_dims = [d for d, e in enumerate(ld.index) if d not in k_dims and e.free_vars()]
+        if len(k_dims) > 1:
+            # Folded K across >1 dim. Segmentable (innermost ``% C``, the o_proj
+            # attn-out read) ⇒ A: a C-aligned K split in partition folds it to a
+            # clean single-K-dim read, so the consumer reads gmem directly with
+            # no transpose producer. Other folds stay unclassified (no mma).
+            if segmentable_k_extent(ld, k_name) is not None and a_load is None:
+                a_load = ld
+            continue
         if len(k_dims) != 1 or not var_dims:
             continue
         after_k = [d for d in var_dims if d > k_dims[0]]
@@ -181,13 +189,21 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                     continue
                 # The mma path needs both operands staged for ``ldmatrix``.
                 # ``020_stage_inputs._classify`` only stages a load whose cache
-                # var (the K axis here) lands in a *single* index dim; a
-                # collapsed-reshape operand (e.g. an attention output reaching
-                # the o_proj via ``[(a/128)%16, …, a%128]`` — K split across two
-                # dims) is rejected there, leaving it gmem-direct. Mirror that
-                # rejection so the atom isn't offered for an operand the stager
-                # can't serve; same for a fused intermediate produced in-kernel.
-                if len(k_dims) > 1 or load.input in produced:
+                # var (the K axis here) lands in a *single* index dim. A
+                # collapsed-reshape operand (attention output → o_proj via
+                # ``[(a/128)%16, …, a%128]`` — K split across two dims) is
+                # normally rejected — EXCEPT a *segmentable* fold (innermost
+                # ``% C``) whose contiguous extent ``C`` is a multiple of the
+                # atom's K (so partition can C-align the split: ``k_per_block ==
+                # C``). Post-split the staged read is single-K-dim (the
+                # delinearization folds away), so the stager serves it. Gating on
+                # ``C % cell_k`` keeps eligibility in lock-step with partition's
+                # C-alignment — never offer mma on a read partition leaves
+                # delinearized. A fused in-kernel intermediate still can't be
+                # staged (``ldmatrix`` is smem→reg only).
+                seg_c = segmentable_k_extent(load, K_name)
+                segmentable = seg_c is not None and seg_c % cell_k == 0
+                if (len(k_dims) > 1 and not segmentable) or load.input in produced:
                     return False
                 node = graph.nodes.get(load.input)
                 if node is None or node.output.dtype != operand_dtype:

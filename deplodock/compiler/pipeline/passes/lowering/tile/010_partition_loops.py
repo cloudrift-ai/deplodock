@@ -159,7 +159,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     enumerate_cartesian,
     mma_mode,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
 
 
@@ -1294,7 +1294,21 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     K_axis = shape.k_loop.axis
     K_src = K_axis.source_axis or K_axis
     k_masked = not K_axis.extent.is_static
-    k_per_block = params["SPLITK"] * params["BK"] * atom_k
+    # Segmented-K: if a matmul operand reads K folded as (strided-outer ×
+    # contiguous-inner ``% C``) — the o_proj attn-out / P@V transpose layout —
+    # pin the staged inner run to the contiguous extent ``C`` (``bk·atom_k ==
+    # C``) so ``K_o`` lands on the segment boundary. The σ then makes the index
+    # delinearization fold (range-aware simplify) to a clean ``[K_o, …, K_i]``
+    # read: the matmul reaches the mma tier reading gmem directly, no transpose
+    # producer. Overrides the tuned ``BK`` for that operand only.
+    bk = params["BK"]
+    seg_c = next(
+        (c for ld in shape.k_loop.body.iter_of_type(Load) if (c := segmentable_k_extent(ld, K_axis.name)) is not None),
+        None,
+    )
+    if seg_c is not None and seg_c % atom_k == 0:
+        bk = seg_c // atom_k
+    k_per_block = params["SPLITK"] * bk * atom_k
     # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
     # runtime extent for the K_o serial bound. The final partial K slab is
     # zero-filled in smem (``_stage_expand``), so the mma accumulates zero past
@@ -1316,7 +1330,7 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
         K_s=K_s,
         K_c=None,
         br=1,
-        bk=params["BK"],
+        bk=bk,
         K_o_ext=K_o_ext,
         atom_k=atom_k,
     )

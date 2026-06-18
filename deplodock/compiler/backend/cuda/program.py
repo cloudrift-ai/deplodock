@@ -221,23 +221,32 @@ def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
     value from ``input_arrays[buf].shape[dim_index]``. First-seen position
     wins on conflicts so each name resolves deterministically.
 
-    Input dims are atomic ``Var``-backed when symbolic (composite Dim exprs
-    appear only on derived tensors). We collect via ``expr.free_vars()`` so
-    each free name binds to the first input axis where it appears."""
+    A symbolic name is recovered from an **atomic** ``Var`` axis (``shape[d] ==
+    Var(name)``). A **composite** symbolic input dim — e.g. a sliced masked-K
+    producer slab's padded extent ``((seq_len + 63) // 64) * 64`` reaching a
+    standalone-benched consumer as a synthetic input — can't be inverted to its
+    free var directly, so it does NOT bind; it is fine as long as every free var
+    it carries is bound from an atomic axis somewhere (the slab's own ``seq_q``
+    axis, the sibling P operand, …). Only a name that appears *exclusively* in
+    composite dims is unrecoverable — that raises."""
     from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
 
     bindings: dict[str, tuple[str, int]] = {}
+    composite_names: set[str] = set()
     for nid in graph.inputs:
         for d, dim in enumerate(graph.nodes[nid].output.shape):
             if dim.is_static:
                 continue
-            if not isinstance(dim.expr, Var):
-                raise ValueError(
-                    f"input {nid!r} axis {d} has a composite symbolic dim {dim!r}; "
-                    "inputs must carry atomic Var-backed symbolic dims so the launch "
-                    "resolver can recover each name from a single shape axis"
-                )
-            bindings.setdefault(dim.expr.name, (nid, d))
+            if isinstance(dim.expr, Var):
+                bindings.setdefault(dim.expr.name, (nid, d))
+            else:
+                composite_names |= dim.expr.free_vars()
+    unrecoverable = composite_names - bindings.keys()
+    if unrecoverable:
+        raise ValueError(
+            f"symbolic name(s) {sorted(unrecoverable)} appear only in composite input dims; "
+            "no atomic Var-backed axis to recover them from at launch"
+        )
     return bindings
 
 

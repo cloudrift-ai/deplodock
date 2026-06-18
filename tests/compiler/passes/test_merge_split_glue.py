@@ -22,7 +22,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligi
 from deplodock.compiler.pipeline.pipeline import Run
 from deplodock.compiler.pipeline.search.two_level import outer_pipeline
 
-from .test_split_demoted import _collapsed_matmul_graph, _gated_mlp_graph, _norm_linear_graph
+from .test_split_demoted import _gated_mlp_graph, _norm_linear_graph
 
 _CTX = Context.from_target((12, 0))
 
@@ -97,17 +97,6 @@ def test_norm_linear_xn_not_reinlined(monkeypatch) -> None:
     ops = _loop_ops(terminal)
     assert len(ops) == 2, f"xn + consumer must stay separate, got {sorted(ops)}"
     assert any(nid.endswith("__xn") for nid in ops)
-    assert not _glued_ids(terminal)
-
-
-def test_collapsed_layout_pair_stays_split(monkeypatch) -> None:
-    """The o_proj relayout shape: the contiguizing copy feeds the gemm's K cell
-    (K-cell guard), and the reverse (gemm→copy) pair only exists with an
-    upstream producer — within this slice nothing merges. Splice support for
-    the deployed-graph attn@V→copy backward merge is the documented v2 gap."""
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
-    terminal = _resolve_outer(_collapsed_matmul_graph())
-    assert len(_loop_ops(terminal)) == 2, "copy producer + gemm must stay separate"
     assert not _glued_ids(terminal)
 
 
