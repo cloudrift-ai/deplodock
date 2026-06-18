@@ -49,6 +49,16 @@ MMA tile whose operands the staging passes declined to stage (e.g. slabs don't
 fit the smem budget) still compiles — slower than the staged path (no smem
 reuse), but correct — instead of crashing, so the search needn't avoid it.
 
+EXCEPTION — masked-K: the gmem-direct load only clamps the M/N (output) lane
+axis (``gmem_guard``); it has NO K zero-fill. So an unstaged operand whose
+REDUCE (K) dim is symbolic (SDPA P@V over ``seq_len``) would read the partial
+final K tile past the mask-padded extent — garbage (wrong result / hang) or an
+OOB illegal access (the masked-K mma bench_fails). Only the staged path
+zero-fills the partial slab (``_stage_expand``). :func:`_unstaged_masked_k`
+detects this and :func:`_emit_chain` raises ``LoweringError`` to drop the
+candidate, so the search uses the staged (zero-filling) transport or the scalar
+path instead.
+
 Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
 ``rewrite`` entry point and its lowering helpers all live in this one module.
@@ -190,7 +200,15 @@ def _lower_cell(
                 )
             if isinstance(s, SerialTile) and s.is_reduce:
                 chain = _build_chain(
-                    s.body, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, smem_sources=sources, spec=spec, m_guard=m_guard, n_guard=n_guard
+                    s.body,
+                    c_frag=c_frag,
+                    a_frag=a_frag,
+                    b_frag=b_frag,
+                    smem_sources=sources,
+                    spec=spec,
+                    m_guard=m_guard,
+                    n_guard=n_guard,
+                    graph=graph,
                 )
                 return (s.with_bodies((Body(chain),)),)
             return None
@@ -203,7 +221,7 @@ def _lower_cell(
     # chain + store): correctness doesn't need it — gmem-direct loads clamp
     # via ``gmem_guard``, staged loads read the in-bounds slab, and the store
     # carries the per-element guards. The Cond was only a whole-tile skip.
-    a_load, b_load = _find_role_loads(atom_body)
+    a_load, b_load, b_trans = _find_role_loads(atom_body)
     if a_load is None or b_load is None:
         raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
     chain = _emit_chain(
@@ -216,6 +234,8 @@ def _lower_cell(
         smem_sources=bundle_sources,
         m_guard=m_guard,
         n_guard=n_guard,
+        b_trans=b_trans,
+        graph=graph,
     )
     store = _emit_store(
         spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, epilogue=epilogue, m_guard=m_guard, n_guard=n_guard
@@ -301,6 +321,21 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
     return write_stmt, a_seed, b_seed, c_seed, has_reduce, spec
 
 
+def _replace_subexprs(e, pairs):
+    """Structurally replace whole sub-expressions: any node equal to a ``target``
+    becomes its ``replacement``. Recurses through ``BinaryExpr`` (leaves pass
+    through). Used to swap a Select predicate's M / N coordinate expressions for
+    the ``__M__`` / ``__N__`` placeholders without touching their internal vars."""
+    from deplodock.compiler.ir.expr import BinaryExpr  # noqa: PLC0415
+
+    for tgt, rep in pairs:
+        if e == tgt:
+            return rep
+    if isinstance(e, BinaryExpr):
+        return BinaryExpr(e.op, _replace_subexprs(e.left, pairs), _replace_subexprs(e.right, pairs))
+    return e
+
+
 def _scan_epilogue(
     body: Body, *, acc_name: str, graph: Graph | None, outer_loads: dict[str, Load] | None = None
 ) -> tuple[RegEpilogue | None, frozenset[int]]:
@@ -330,6 +365,29 @@ def _scan_epilogue(
         raise RuleSkipped(f"AtomTile epilogue consuming {acc_name!r} is not foldable ({blocker}) — gate out of sync?")
     if slice_ is None:
         return None, frozenset()
+    # Rewrite each folded Select's predicate from the cell's M / N coordinate
+    # EXPRESSIONS to the ``__M__`` / ``__N__`` placeholders the RegStore
+    # substitutes with the fragment element's own (row, col). Whole-subexpression
+    # replacement, not var-level: post-partition a coordinate is a compound expr
+    # (``a1*128 + a3*64 + …``), so replacing its vars one-by-one would corrupt
+    # the arithmetic. The predicate's coordinate operands are struct-equal to the
+    # Write's M / N index dims (same partition σ) — the last two var-bearing dims.
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+    w_var_dims = [e for e in slice_.write.index if e.free_vars()]
+    pairs = []
+    if len(w_var_dims) >= 2:
+        pairs.append((w_var_dims[-2], Var("__M__")))
+    if w_var_dims:
+        pairs.append((w_var_dims[-1], Var("__N__")))
+    selects = tuple((sel.name, tuple((_replace_subexprs(br.select, pairs), br.value) for br in sel.branches)) for sel in slice_.selects)
+    # After replacement a predicate may reference only the ``__M__`` / ``__N__``
+    # placeholders (+ constants). A leftover coordinate var means the structural
+    # match failed (gate admitted a shape the fold can't render) — fail loud.
+    for _name, branches in selects:
+        for cond, _value in branches:
+            if cond.free_vars() - {"__M__", "__N__"}:
+                raise RuleSkipped(f"Select predicate {cond.pretty()} not reducible to (__M__, __N__) — gate out of sync?")
     epilogue = RegEpilogue(
         acc=slice_.acc,
         loads=tuple(
@@ -338,22 +396,23 @@ def _scan_epilogue(
         ),
         ops=tuple((a.name, a.op.name, tuple(a.args)) for a in slice_.assigns),
         result=slice_.write.value,
+        selects=selects,
     )
-    return epilogue, frozenset(map(id, (*slice_.assigns, *slice_.loads)))
+    return epilogue, frozenset(map(id, (*slice_.assigns, *slice_.loads, *slice_.selects)))
 
 
-def _find_role_loads(body: Body) -> tuple[Load | None, Load | None]:
-    """The A / B operand Loads of the cell in ``body`` — identified via the
-    co-located ``Mma``, which names its operands by SSA value (so the operand
-    Loads need no tensor-core tag of their own). Recursive: a masked cell
-    wraps the K-filtered (shape C) body in the boundary ``Cond``, so the
-    Loads + ``Mma`` sit one level down — SSA names are unique per kernel, so
-    the deep search is unambiguous."""
+def _find_role_loads(body: Body) -> tuple[Load | None, Load | None, bool]:
+    """The A / B operand Loads of the cell in ``body`` (+ the B operand's
+    ``b_trans`` flag) — identified via the co-located ``Mma``, which names its
+    operands by SSA value (so the operand Loads need no tensor-core tag of their
+    own). Recursive: a masked cell wraps the K-filtered (shape C) body in the
+    boundary ``Cond``, so the Loads + ``Mma`` sit one level down — SSA names are
+    unique per kernel, so the deep search is unambiguous."""
     mma = next(iter(body.iter_of_type(Mma)), None)
     if mma is None:
-        return None, None
+        return None, None, False
     by_name = {ld.names[0]: ld for ld in body.iter_of_type(Load) if ld.names}
-    return by_name.get(mma.a), by_name.get(mma.b)
+    return by_name.get(mma.a), by_name.get(mma.b), mma.b_trans
 
 
 def _build_chain(
@@ -366,11 +425,12 @@ def _build_chain(
     spec: Atom,
     m_guard: tuple[Expr, Expr] | None = None,
     n_guard: tuple[Expr, Expr] | None = None,
+    graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
     """Build the ``ldmatrix a + ldmatrix b + mma.sync`` chain that replaces a
     reduce SerialTile's ``[Load a, Load b, Mma]`` body — operands matched via
     the body's ``Mma`` (which names its A/B operands by SSA value)."""
-    a_load, b_load = _find_role_loads(reduce_body)
+    a_load, b_load, b_trans = _find_role_loads(reduce_body)
     if a_load is None or b_load is None:
         raise RuleSkipped("reduce SerialTile body missing its Mma / A/B Loads")
     return _emit_chain(
@@ -383,6 +443,8 @@ def _build_chain(
         smem_sources=smem_sources,
         m_guard=m_guard,
         n_guard=n_guard,
+        b_trans=b_trans,
+        graph=graph,
     )
 
 
@@ -399,6 +461,30 @@ def _emit_fragments(spec: Atom, *, c_frag: str, a_frag: str, b_frag: str, c_dtyp
     )
 
 
+def _unstaged_masked_k(load: Load, role: str, graph: Graph | None) -> bool:
+    """An unstaged mma operand whose REDUCE (K) gmem dim is symbolic — the
+    masked-K case (SDPA P@V over ``seq_len``).
+
+    The gmem-direct fragment load (``dpl_mma_load_{a,b}_gmem*``) iterates K to the
+    tile's ``BK·atom_k`` and only clamps the M/N (output, lane-varying) axis via
+    ``gmem_guard`` — it has **no K zero-fill**. So a symbolic, mask-padded K is
+    read past its runtime extent (``ceil(seq/64)*64`` < ``BK·atom_k``): garbage
+    into the accumulation (wrong result, or a hang on the slow path) or an OOB
+    illegal access. Only the STAGED path zero-fills the partial K slab
+    (``_stage_expand``). Detect so the caller bails — forcing the staged
+    transport, or the (correct) scalar fallback. A's K is the last index dim
+    (canonical ``[…, M, K]``); B's K is a non-last dim (N is last)."""
+    if graph is None:
+        return False
+    node = graph.nodes.get(load.input)
+    if node is None or not node.output.shape:
+        return False
+    shape = node.output.shape
+    if role == "a":
+        return not shape[-1].is_static
+    return any(not d.is_static for d in shape[:-1])
+
+
 def _emit_chain(
     spec: Atom,
     *,
@@ -410,6 +496,8 @@ def _emit_chain(
     smem_sources: dict[str, Source],
     m_guard: tuple[Expr, Expr] | None = None,
     n_guard: tuple[Expr, Expr] | None = None,
+    b_trans: bool = False,
+    graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
     """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
     a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
@@ -424,6 +512,22 @@ def _emit_chain(
     # search needn't avoid unstageable MMA tiles.
     a_staged = a_load.input in smem_sources
     b_staged = b_load.input in smem_sources
+    # Masked-K (symbolic reduce) correctness gate: the gmem-direct fragment load
+    # has no K zero-fill, so an unstaged masked-K operand reads past the padded
+    # extent (wrong result / hang / OOB — only the staged ``_stage_expand`` path
+    # zero-fills). Bail so the search stages it or falls to the scalar path.
+    if (not a_staged and _unstaged_masked_k(a_load, "a", graph)) or (
+        not b_staged and not b_trans and _unstaged_masked_k(b_load, "b", graph)
+    ):
+        # LoweringError (not RuleSkipped): drop this candidate so the search
+        # falls back to a staged-mma or scalar variant. RuleSkipped would leave
+        # the AtomTile unlowered → crash at render.
+        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+        raise LoweringError(
+            "masked-K (symbolic reduce) mma operand can't lower gmem-direct — no K zero-fill "
+            "(only the staged _stage_expand path zero-fills the partial slab); needs staging"
+        )
     # Masked cells with an UNSTAGED gated-axis operand take the clamped
     # gmem-direct helper: the staged slab is in-bounds by construction (its
     # gmem fill is clamped — 021 + _stage_expand), but a plain gmem-direct
@@ -456,6 +560,7 @@ def _emit_chain(
             swizzle=b_swz,
             staged=b_staged,
             gmem_guard=b_guard,
+            b_trans=b_trans,
         ),
         MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
     )

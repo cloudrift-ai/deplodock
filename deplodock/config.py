@@ -47,9 +47,7 @@ CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
-SERVING_DTYPE = "DEPLODOCK_SERVING_DTYPE"
-SERVING_CAPTURE_CAP = "DEPLODOCK_SERVING_CAPTURE_CAP"
-SERVING_NO_GRAPHS = "DEPLODOCK_SERVING_NO_GRAPHS"
+SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -220,6 +218,18 @@ def analytic_tilt(default: float = 0.3) -> float:
     return float_env(ANALYTIC_TILT, default)
 
 
+def serving_static(default: bool = False) -> bool:
+    """``DEPLODOCK_SERVING_STATIC`` — opt into the serving plugin's fully-static
+    program: **static extents for both batch and seq_len**. Off (default) keeps the
+    symbolic-seq, batch-1 path; on builds ONE static ``(max_num_seqs, max_seq_len)``
+    program (batch from vLLM's ``--max-num-seqs``, seq from ``--max-model-len``) and
+    runs each scheduler step as a padded batched forward. Only correct/efficient for
+    fixed-length workloads — it pads every sequence to ``max_seq_len`` and the
+    dynamic-seq kernels miscompute batch>1, so it is a deliberate opt-in, not a
+    default. See `serving/ARCHITECTURE.md`."""
+    return _bool(SERVING_STATIC, default)
+
+
 def bench_backends_raw(cli_value: str | None) -> str:
     """Raw comma-separated bench-backend selection. Precedence: ``cli_value`` >
     ``DEPLODOCK_BENCH_BACKENDS`` > ``"eager,deplodock"``. Backend-key
@@ -247,31 +257,6 @@ def ncu_child() -> bool:
     """``DEPLODOCK_NCU_CHILD`` — set in the ncu-profiled child to prevent
     recursive re-spawning of ncu."""
     return _bool(NCU_CHILD)
-
-
-def serving_dtype(default: str = "float16") -> str:
-    """``DEPLODOCK_SERVING_DTYPE`` — torch dtype name the vLLM-plugin serving
-    runner traces/compiles the model at (``deplodock/serving``). ``float16``
-    by default; ``float32`` is the accuracy escape hatch (doubles weight
-    memory — an 8B model no longer fits a 24 GB card)."""
-    return _str(SERVING_DTYPE) or default
-
-
-def serving_capture_cap(default: int) -> int:
-    """``DEPLODOCK_SERVING_CAPTURE_CAP`` — capacity seq_len the serving runner
-    allocates its (shared, capacity-sized) buffer set at. Captured CUDA graphs
-    are keyed per request seq_len ≤ this cap; requests above it fall back to the
-    uncaptured rebind path. Defaults to the server's ``max_seq_len``; lower it
-    for big models / small cards where the S² attention scratch at full capacity
-    would not fit."""
-    return int_env(SERVING_CAPTURE_CAP, default)
-
-
-def serving_no_graphs() -> bool:
-    """``DEPLODOCK_SERVING_NO_GRAPHS`` — kill switch: keep the serving runner on
-    the uncaptured rebind+run_once path (per-request shape rebind) instead of
-    captured-graph replay. Debug escape hatch + fallback-test lever."""
-    return _bool(SERVING_NO_GRAPHS)
 
 
 # Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) used to live here as

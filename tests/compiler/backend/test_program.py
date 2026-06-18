@@ -1,11 +1,75 @@
 """Tests for cupy dispatch of a lowered ``Graph[CudaOp]``."""
 
-from deplodock.compiler.backend.cuda.program import benchmark_program, run_program
+import numpy as np
+import pytest
+
+from deplodock.compiler.backend.cuda.program import _collapse_inert_dims, _Compiled, _resolve_symbolic, benchmark_program, run_program
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
+
+
+def _minimal_compiled(**kw) -> _Compiled:
+    """A ``_Compiled`` with no kernels — enough to exercise ``_resolve_symbolic``
+    (which only reads the symbolic_* maps). No CUDA needed."""
+    return _Compiled(bufs=[], buf_by_name={}, constants={}, kernels={}, launches=[], **kw)
+
+
+class TestSymbolicCapacityGuard:
+    """``symbolic_caps`` makes the launch resolver hard-error when a runtime
+    extent exceeds a capacity-capped kernel's baked hint (the smem-staged fused
+    symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)."""
+
+    def test_extent_over_cap_raises(self):
+        compiled = _minimal_compiled(
+            symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512}, symbolic_caps={"seq_len": 512}
+        )
+        big = np.zeros((1, 700, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="exceeds the capacity-capped"):
+            _resolve_symbolic(compiled, {"x": big})
+
+    @pytest.mark.parametrize("seq", [31, 512])
+    def test_extent_at_or_under_cap_ok(self, seq):
+        compiled = _minimal_compiled(
+            symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512}, symbolic_caps={"seq_len": 512}
+        )
+        arr = np.zeros((1, seq, 8), dtype=np.float32)
+        assert _resolve_symbolic(compiled, {"x": arr}) == {"seq_len": seq}
+
+    def test_no_cap_allows_any_extent(self):
+        # Uncapped (ceil-div) kernels carry no cap, so a large extent resolves fine.
+        compiled = _minimal_compiled(symbolic_bindings={"seq_len": ("x", 1)}, symbolic_hints={"seq_len": 512})
+        big = np.zeros((1, 4096, 8), dtype=np.float32)
+        assert _resolve_symbolic(compiled, {"x": big}) == {"seq_len": 4096}
+
+
+class TestCollapseInertDims:
+    """``_collapse_inert_dims`` maps a runtime array shape onto a TMA descriptor's
+    box rank. It must keep a *box-carrying* dim even when its runtime extent is
+    small (a masked dynamic ``seq_len`` = 1, 31 — TMA zero-fills the box overhang
+    past the runtime extent), while still shedding genuine inert gap singletons
+    (arr_rank > box_rank). The old extent==1 heuristic mis-dropped the masked dim
+    at small ``seq_len`` (regression: ``arr=(1, 512)`` vs ``box=(64, 32)``)."""
+
+    def test_masked_m_runtime_extent_one(self):
+        # seq_len=1: the M dim (1) is box-carrying, not an inert singleton — keep it.
+        assert _collapse_inert_dims((1, 512), (64, 32)) == (1, 512)
+
+    @pytest.mark.parametrize("seq", [31, 512, 700])
+    def test_masked_m_runtime_extents(self, seq):
+        # Same-rank direct map at, below, and above the hint — drop nothing.
+        assert _collapse_inert_dims((seq, 512), (64, 32)) == (seq, 512)
+
+    def test_drops_inner_gap_singleton(self):
+        # arr_rank (3) > box_rank (2): the genuine inner gap singleton is dropped.
+        assert _collapse_inert_dims((512, 1, 1024), (64, 128)) == (512, 1024)
+
+    def test_rank_mismatch_raises(self):
+        with pytest.raises(ValueError, match="rank mismatch"):
+            _collapse_inert_dims((512, 768, 1024), (64, 128))
+
 
 EW_ADD_SOURCE = """
 extern "C" __global__ void ew_add(const float* A, const float* B, float* C) {
@@ -43,6 +107,52 @@ def test_run_program_elementwise_add():
     assert "C" in result.outputs
     assert result.outputs["C"].shape == (8,)
     assert all(v == v for v in result.outputs["C"].tolist())  # NaN check
+
+
+def _make_chain_graph(n: int = 8) -> Graph:
+    """Two-stage chain with a real scratch buffer: T = A + B (scratch), C = T + T."""
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("A", (n,)), node_id="A")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("B", (n,)), node_id="B")
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE, kernel_name="ew_add", arg_order=("A", "B", "T"), grid=((n + 255) // 256, 1, 1), block=(256, 1, 1)
+        ),
+        inputs=["A", "B"],
+        output=Tensor("T", (n,)),
+        node_id="T",
+    )
+    g.add_node(
+        op=CudaOp(
+            kernel_source=EW_ADD_SOURCE, kernel_name="ew_add", arg_order=("T", "T", "C"), grid=((n + 255) // 256, 1, 1), block=(256, 1, 1)
+        ),
+        inputs=["T"],
+        output=Tensor("C", (n,)),
+        node_id="C",
+    )
+    g.inputs = ["A", "B"]
+    g.outputs = ["C"]
+    return g
+
+
+@requires_cuda
+def test_buffer_reuse_correct_and_slab_managed():
+    """A graph with a scratch buffer runs correctly through the reused slab, and
+    the intermediate ``T`` is slab-managed while inputs/outputs stay standalone."""
+    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from deplodock.compiler.backend.gpu_lock import gpu_lock
+
+    graph = _make_chain_graph(8)
+    a = np.arange(8, dtype=np.float32)
+    b = np.arange(8, dtype=np.float32) * 10
+    with gpu_lock():
+        prog = CompiledProgram.build(graph, {"A": a, "B": b})
+        prog.iter_once()
+        out = prog.outputs()["C"]
+        plan = prog.slab_plan
+    np.testing.assert_array_equal(out, 2 * (a + b))  # C = T + T = 2(A+B)
+    assert plan is not None and "T" in plan.offsets  # scratch T is slab-managed
+    assert "A" not in plan.offsets and "C" not in plan.offsets  # input/output stay standalone
 
 
 @requires_cuda

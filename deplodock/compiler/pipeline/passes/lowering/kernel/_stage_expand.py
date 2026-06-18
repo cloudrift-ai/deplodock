@@ -395,6 +395,26 @@ def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source
     for src in sources:
         for ax in src.cache_axes:
             axis_map[ax.name] = ax
+    # Each index entry must be a bare ``Var`` naming one of the sibling cone's
+    # cache axes. A sibling-cell fusion (``012_fuse_sibling_register_cells``)
+    # can σ-collapse a cache-axis ``Var`` to a constant ``Literal`` in this
+    # self-describing Write (the compute body is exposed via
+    # ``StageBundle.nested()``, so generic index substitution reaches it) —
+    # the slab is then co-filled by N sibling bundles, each writing one pinned
+    # cell. The hoisted-compute materializer derives ONE iteration domain /
+    # slab shape from a single Write, so it can't represent that multi-bundle
+    # fill; flag it as un-lowerable. Under ``tune`` this prunes the offending
+    # search branch (``Run.drive`` containment); the deployable greedy pick
+    # never reaches this fork.
+    bad = [v for v in write.index if not (isinstance(v, Var) and v.name in axis_map)]
+    if bad:
+        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+        raise LoweringError(
+            f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
+            f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} (axes {tuple(axis_map)!r}) — a sibling-cell-fused "
+            f"slab fill the single-Write materializer can't represent"
+        )
     cache_axes = tuple(axis_map[v.name] for v in write.index)
     if not cache_axes:
         raise ValueError(f"compute phase {write.output!r}: needs at least one cache axis")

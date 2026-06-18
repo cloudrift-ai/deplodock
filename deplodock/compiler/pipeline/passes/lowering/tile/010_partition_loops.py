@@ -125,13 +125,14 @@ import enum
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F16
+from deplodock.compiler.dim import Dim
+from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     Atom,
@@ -158,7 +159,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
     enumerate_cartesian,
     mma_mode,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import has_nonlinear_post_reduce_epilogue
 
 
@@ -524,6 +525,15 @@ def _is_fp16_matmul(matmul_reduces: list, graph: Graph | None) -> bool:
     return True
 
 
+def _coop_reduce_ext(ext) -> int:
+    """Cooperative-reduce eligibility extent: the static reduce extent, or the
+    ``Dim`` hint for a SYMBOLIC reduce axis (the masked cooperative reduce —
+    tiled at the hint, ceil-div ``K_o``, with the partial last tile boundary-
+    masked to the Accum identity). ``0`` when symbolic with no hint, so the
+    ``>= warp_size`` gate falls through to the pointwise path."""
+    return ext.as_static() if ext.is_static else (ext.hint or 0)
+
+
 def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph: Graph | None = None) -> _Plan | None:
     """Unified σ-split planning for matmul, pointwise, and cooperative-reduce
     kernels. Returns a :class:`_Plan` whose ``params`` enumerates every
@@ -752,7 +762,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     param_combos = warp_combos
                 else:
                     param_combos = [*warp_combos, *param_combos]
-    elif nonmatmul_reduces and nonmatmul_reduces[0].axis.extent.is_static and nonmatmul_reduces[0].axis.extent.as_static() >= ctx.warp_size:
+    elif nonmatmul_reduces and _coop_reduce_ext(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: with BN=BM=1 the combine spans the whole CTA (any
         # BR); with free-axis threads alongside (BN·BM > 1, the strided-
         # cooperative form) the enumerator clips BR to powers of two ≤
@@ -772,13 +782,29 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # using its own (half-data) reduction. Forcing SPLITK=1 keeps the
         # search space honest.
         k_loop = nonmatmul_reduces[0]
-        E_K = k_loop.axis.extent.as_static()
+        k_red_symbolic = not k_loop.axis.extent.is_static
+        E_K = _coop_reduce_ext(k_loop.axis.extent)  # static extent, or the Dim hint for a symbolic reduce
         # ``is_static`` guards the ``as_static()`` read: a symbolic free Loop
         # in the body (e.g. a split producer's row sweep next to a static
-        # row-stat reduce) is never a K-target, not a crash.
-        target_names = frozenset(
-            lp.axis.name for lp in all_loops if lp.axis.extent.is_static and lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp)
-        )
+        # row-stat reduce) is never a K-target, not a crash. For a SYMBOLIC
+        # reduce axis (masked cooperative reduce) the K-targets are the loops
+        # sharing that symbolic extent — matched by ``Dim`` identity, not a
+        # static value.
+        if k_red_symbolic:
+            target_names = frozenset(lp.axis.name for lp in all_loops if lp.axis.extent == k_loop.axis.extent and not is_matmul_reduce(lp))
+        else:
+            target_names = frozenset(
+                lp.axis.name
+                for lp in all_loops
+                if lp.axis.extent.is_static and lp.axis.extent.as_static() == E_K and not is_matmul_reduce(lp)
+            )
+        # NOTE: this is the symbolic-*free*-axis case. A symbolic *reduce* axis
+        # (the softmax-producer key sweep) is now handled above — ``_coop_reduce_ext``
+        # gates it in at the Dim hint, the K_o ceil-divs the symbolic extent, and
+        # ``_mask_reduce_accums`` masks the partial last tile (clamp the K read,
+        # fold the Accum identity past seq_len) WITHOUT wrapping the Accum in a
+        # Cond, so ``is_reduce`` + the cross-thread combine stay intact.
+        #
         # A SYMBOLIC free axis stays degenerate (E=1, no forced mask): bound
         # whole-to-grid, correct at any seq_len. A masked register-tile
         # (FN>1) would wrap the reduce body in the boundary Cond and hide it
@@ -914,27 +940,24 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     # a static overhang axis, the symbolic ``Var`` for a hint-driven one, None
     # when N isn't masked.
     n_bound: object | None = None
-    if N_axis.extent.is_static:
-        E_N = N_axis.extent.as_static()
-        # Masked tiles (N in overhang): use ceil_div so the boundary CTA covers
-        # the partial tile. ``real_extent`` on N_b tells the materializer how
-        # to gate boundary lanes (``if decoded < real_extent``).
-        if N_name in overhang:
-            N_b = Axis(f"{N_name}_b", -(-E_N // n_bnfn), source_axis=N_src, real_extent=E_N)
-            n_bound = Literal(E_N, "int")
-        else:
-            N_b = Axis(f"{N_name}_b", E_N // n_bnfn, source_axis=N_src)
-    elif N_name in overhang:
-        # Symbolic + hint-driven masked: ceil-div the SYMBOLIC extent so the grid
-        # covers the partial last tile at any runtime size; the boundary Cond
-        # gates lanes past the runtime value. ``Dim`` arithmetic builds the
-        # composite ceil-div Expr; the launch resolver evals it from sym_values.
-        N_b = Axis(f"{N_name}_b", (N_axis.extent + (n_bnfn - 1)) // n_bnfn, source_axis=N_src)
+    # Masked tiles (N in overhang): ceil-div so the boundary CTA covers the
+    # partial last tile, and ``n_bound`` carries the Cond RHS so the materializer
+    # gates boundary lanes (``if decoded < n_bound``). ``Dim.ceil_div`` is one
+    # formula for both regimes — it folds to the integer ceil for a static extent
+    # and builds the composite ceil-div Expr (launch-resolver-evaluated) for a
+    # symbolic one. A clean (non-masked) tile floor-divides; the degenerate
+    # symbolic case (bn=fn=1) leaves the whole axis on the GridTile (``ext // 1``).
+    # ``real_extent`` (the static pre-ceil bound) only applies when the extent is
+    # statically known; a symbolic masked tile relies solely on ``n_bound``.
+    n_masked = N_name in overhang
+    N_b = Axis(
+        f"{N_name}_b",
+        N_axis.extent.ceil_div(n_bnfn) if n_masked else N_axis.extent // n_bnfn,
+        source_axis=N_src,
+        real_extent=N_axis.extent.as_static() if n_masked and N_axis.extent.is_static else None,
+    )
+    if n_masked:
         n_bound = N_axis.extent.expr
-    else:
-        # Symbolic, no hint (degenerate): bn=fn=1 by construction, bind the
-        # whole axis to GridTile; the size-1 normalizer drops N_t / N_r.
-        N_b = Axis(f"{N_name}_b", N_axis.extent, source_axis=N_src)
     N_t = Axis(f"{N_name}_t", params["BN"], source_axis=N_src)
     N_r = Axis(f"{N_name}_r", params["FN"], source_axis=N_src)
     # N register-tile decode — two layouts:
@@ -969,18 +992,18 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
         M_name = M_axis.name
         M_src = M_axis.source_axis or M_axis
         m_bnfm = params["BM"] * params["FM"]
-        if M_axis.extent.is_static:
-            E_M = M_axis.extent.as_static()
-            if M_name in overhang:
-                M_b = Axis(f"{M_name}_b", -(-E_M // m_bnfm), source_axis=M_src, real_extent=E_M)
-                m_bound = Literal(E_M, "int")
-            else:
-                M_b = Axis(f"{M_name}_b", E_M // m_bnfm, source_axis=M_src)
-        elif M_name in overhang:
-            M_b = Axis(f"{M_name}_b", (M_axis.extent + (m_bnfm - 1)) // m_bnfm, source_axis=M_src)
+        # Mirror of the N-axis split above: ``Dim.ceil_div`` unifies the static
+        # and symbolic masked ceil-div, a clean tile floor-divides, ``real_extent``
+        # is the static pre-ceil bound (None when symbolic).
+        m_masked = M_name in overhang
+        M_b = Axis(
+            f"{M_name}_b",
+            M_axis.extent.ceil_div(m_bnfm) if m_masked else M_axis.extent // m_bnfm,
+            source_axis=M_src,
+            real_extent=M_axis.extent.as_static() if m_masked and M_axis.extent.is_static else None,
+        )
+        if m_masked:
             m_bound = M_axis.extent.expr
-        else:
-            M_b = Axis(f"{M_name}_b", M_axis.extent, source_axis=M_src)
         M_t = Axis(f"{M_name}_t", params["BM"], source_axis=M_src)
         M_r = Axis(f"{M_name}_r", params["FM"], source_axis=M_src)
         sigma_map[M_name] = (
@@ -1002,18 +1025,26 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
     # ``kernel/075_pack_fk_window`` off the stamped ``FK`` knob. Only the reduce
     # strip-mine consumes ``fk`` in the factorization / K_f tile below.
     fk = 1 if "FKWIN" in params else params["FK"]
+    k_masked = False
+    k_bound: object = None
     if shape.k_loop is not None:
         K_axis = shape.k_loop.axis
         K_name = K_axis.name
         K_src = K_axis.source_axis or K_axis
-        if K_axis.extent.is_static:
-            E_K = K_axis.extent.as_static()
-            K_o_ext = E_K // (params["SPLITK"] * params["BR"] * params["BK"] * fk)
-        else:
-            # Symbolic K (params["BK"]=splitk=br=fk=1 by planner construction): whole
-            # axis stays as one serial K_o iteration. ``Axis.__post_init__``
-            # coerces the ``Dim`` straight back into the K_o axis.
-            K_o_ext = K_axis.extent
+        k_div = params["SPLITK"] * params["BR"] * params["BK"] * fk
+        # K_o serial bound. A masked cooperative reduce over a SYMBOLIC K (k_div >
+        # 1) ceil-divs the symbolic extent so ``K_o`` covers the partial last tile
+        # at any runtime size; the final overhang step is wrapped in
+        # ``Cond(decoded_K < seq_len)`` (in ``_replace_k_loops``) so it skips (no
+        # spurious fold, no OOB read/write). ``Dim.ceil_div`` is one formula for
+        # both regimes — folds to the int ceil for a static extent, builds the
+        # launch-resolver-evaluated Expr for a symbolic one. Static K and the
+        # degenerate symbolic-serial case (BR=BK=SPLITK=fk=1, ``ext // 1``)
+        # floor-divide and stay unmasked.
+        k_masked = not K_axis.extent.is_static and k_div > 1
+        K_o_ext = K_axis.extent.ceil_div(k_div) if k_masked else K_axis.extent // k_div
+        if k_masked:
+            k_bound = K_axis.extent.expr
         K_s = Axis(f"{K_name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
         K_c = Axis(f"{K_name}_c", params["BR"], source_axis=K_src) if params["BR"] > 1 else None
         K_f = Axis(f"{K_name}_f", fk, source_axis=K_src) if fk > 1 else None
@@ -1035,6 +1066,8 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
             bk=params["BK"],
             fk=fk,
             K_o_ext=K_o_ext,
+            k_masked=k_masked,
+            k_bound=k_bound,
         )
         if n_replaced == 0:
             raise RuleSkipped("K reduce not found in body")
@@ -1087,6 +1120,8 @@ def _build_split_body(shape: KernelShape, params: dict) -> tuple[Stmt, ...]:
                 bk=params["BK"],
                 fk=fk,
                 K_o_ext=K_o_ext,
+                k_masked=k_masked,
+                k_bound=k_bound,
             )
         else:
             prologue_rewritten = prologue_outer
@@ -1259,17 +1294,30 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     K_axis = shape.k_loop.axis
     K_src = K_axis.source_axis or K_axis
     k_masked = not K_axis.extent.is_static
-    k_per_block = params["SPLITK"] * params["BK"] * atom_k
-    if k_masked:
-        # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
-        # runtime extent for the K_o serial bound. The final partial K slab is
-        # zero-filled in smem (``_stage_expand``), so the mma accumulates zero
-        # past the runtime seq_len. The warp enumerator forces SPLITK=1 for a
-        # masked K, so this ceil-div ``Dim`` never feeds the (SPLITK>1) K_s σ
-        # term — only the K_o serial-loop bound, which renders the ceil-div Expr.
-        K_o_ext: object = (K_axis.extent + (k_per_block - 1)) // k_per_block
-    else:
-        K_o_ext = K_axis.extent.as_static() // k_per_block
+    # Segmented-K: if a matmul operand reads K folded as (strided-outer ×
+    # contiguous-inner ``% C``) — the o_proj attn-out / P@V transpose layout —
+    # pin the staged inner run to the contiguous extent ``C`` (``bk·atom_k ==
+    # C``) so ``K_o`` lands on the segment boundary. The σ then makes the index
+    # delinearization fold (range-aware simplify) to a clean ``[K_o, …, K_i]``
+    # read: the matmul reaches the mma tier reading gmem directly, no transpose
+    # producer. Overrides the tuned ``BK`` for that operand only.
+    bk = params["BK"]
+    seg_c = next(
+        (c for ld in shape.k_loop.body.iter_of_type(Load) if (c := segmentable_k_extent(ld, K_axis.name)) is not None),
+        None,
+    )
+    if seg_c is not None and seg_c % atom_k == 0:
+        bk = seg_c // atom_k
+    k_per_block = params["SPLITK"] * bk * atom_k
+    # Masked K (SDPA P@V's symbolic seq_len): tile at the hint, ceil-div the
+    # runtime extent for the K_o serial bound. The final partial K slab is
+    # zero-filled in smem (``_stage_expand``), so the mma accumulates zero past
+    # the runtime seq_len. The warp enumerator forces SPLITK=1 for a masked K, so
+    # this ceil-div ``Dim`` never feeds the (SPLITK>1) K_s σ term — only the K_o
+    # serial-loop bound, which renders the ceil-div Expr. A static K floor-divides
+    # (``Dim.ceil_div`` would fold identically when divisible, but the static warp
+    # tile is always a clean divisor). ``Dim.ceil_div`` keeps the one formula.
+    K_o_ext: object = K_axis.extent.ceil_div(k_per_block) if k_masked else K_axis.extent // k_per_block
     K_s = Axis(f"{K_axis.name}_s", params["SPLITK"], source_axis=K_src) if params["SPLITK"] > 1 else None
 
     # σ-rewrite the matmul body's outer axes (M/N), then expand the K reduce
@@ -1282,7 +1330,7 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
         K_s=K_s,
         K_c=None,
         br=1,
-        bk=params["BK"],
+        bk=bk,
         K_o_ext=K_o_ext,
         atom_k=atom_k,
     )
@@ -1317,6 +1365,37 @@ def _build_split_body_warp(shape: KernelShape, params: dict) -> tuple[Stmt, ...]
     return _wrap_tower(layers, new_inner, atom=atom)
 
 
+def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask each ``Accum``'s input value to the reduce identity past the
+    boundary (masked cooperative reduce over a symbolic K). For each
+    ``Accum(name, value=V, op)`` insert, just before it, ``Init(V_kid, op)``
+    (the op's neutral element) and ``Select(V_km, [V if pred, else V_kid])``,
+    then fold ``V_km`` instead of ``V``. The Accum stays a direct child of the
+    reduce loop (``is_reduce`` + the cross-thread combine intact); an overhang K
+    step folds the identity (no contribution). The Load was already index-
+    clamped by the caller so the read stays in-bounds."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Accum):
+            ident = f"{c.value}_kid"
+            masked = f"{c.value}_km"
+            # The cooperative-reduce stats (softmax max/sum, RMSNorm) accumulate in
+            # f32; the identity carrier declares f32 so downstream dtype passes
+            # (030_stamp_types / 040_demote) see a concrete type, not the Accum's
+            # None loop-IR dtype.
+            out.append(Init(name=ident, op=c.op, dtype=c.dtype or F32))
+            out.append(
+                Select(
+                    name=masked,
+                    branches=(SelectBranch(value=c.value, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+                )
+            )
+            out.append(replace(c, value=masked))
+        else:
+            out.append(c)
+    return tuple(out)
+
+
 def _replace_k_loops(
     stmts: tuple[Stmt, ...],
     *,
@@ -1330,6 +1409,8 @@ def _replace_k_loops(
     fk: int = 1,
     K_o_ext: int,
     atom_k: int = 1,
+    k_masked: bool = False,
+    k_bound: object = None,
 ) -> tuple[tuple[Stmt, ...], int]:
     """Replace every ``Loop`` whose axis name is in ``target_names`` with a
     ``Loop(K_o, SERIAL_OUTER, Loop(K_i, STAGE_INNER, σ(body)))`` tower.
@@ -1363,7 +1444,32 @@ def _replace_k_loops(
             K_o = Axis(f"{K_canonical_name}_o", K_o_ext, source_axis=K_src)
             K_i = Axis(f"{K_canonical_name}_i", bk, source_axis=K_src)
             sigma_k = _build_k_sigma(K_name, K_s, K_o, K_c, K_i, K_f, K_o_ext, br, bk, fk, atom_k=atom_k)
-            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            # Masked cooperative reduce over a SYMBOLIC K (ceil-div K_o): the final
+            # K_o tile overruns the runtime extent. Two shapes, by whether the
+            # matched loop reduces:
+            #
+            #  - REDUCE loop: keep the ``Accum`` a DIRECT child (so ``Loop.is_reduce``
+            #    stays True and the cross-thread combine engages — wrapping it in a
+            #    ``Cond`` would flip ``is_reduce`` off). Instead clamp the K index for
+            #    a safe in-bounds read (``min(decoded, seq_len-1)``, via the σ) and
+            #    mask each Accum's input VALUE to the op identity past the bound
+            #    (``Select(decoded < seq_len ? value : identity)``) so the overhang
+            #    folds a no-op. This is the scalar-reduce twin of the masked-K mma's
+            #    clamp-read + zero-fill (``_stage_expand``).
+            #  - non-reduce (post-pointwise Write) loop: no Accum to protect, so the
+            #    simple ``Cond(decoded < seq_len)`` skips the OOB store outright.
+            if k_masked and k_bound is not None:
+                decoded_k = sigma_k.apply(Var(K_name))
+                pred = BinaryExpr("<", decoded_k, k_bound)
+                if s.is_reduce:
+                    clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", k_bound, Literal(1, "int")))
+                    body_c = tuple(c.rewrite(_identity_rename, Sigma({K_name: clamp})) for c in s.body)
+                    new_body = _mask_reduce_accums(body_c, pred)
+                else:
+                    body_u = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+                    new_body = (Cond(cond=pred, body=Body(body_u)),)
+            else:
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             # FK strip-mine: the register tile sits innermost (inside K_i) so the
             # FK cells are the unrolled, ILP-exposed dimension. ``reduce=True``
             # marks it as a reduce-AXIS (K_f) tile — distinguishing it from the
@@ -1399,6 +1505,8 @@ def _replace_k_loops(
                 fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
+                k_masked=k_masked,
+                k_bound=k_bound,
             )
             if r:
                 out.append(replace(s, body=inner))
@@ -1417,6 +1525,8 @@ def _replace_k_loops(
                 fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
+                k_masked=k_masked,
+                k_bound=k_bound,
             )
             inner_e, re_ = _replace_k_loops(
                 s.else_body,
@@ -1430,6 +1540,8 @@ def _replace_k_loops(
                 fk=fk,
                 K_o_ext=K_o_ext,
                 atom_k=atom_k,
+                k_masked=k_masked,
+                k_bound=k_bound,
             )
             if rb or re_:
                 out.append(Cond(cond=s.cond, body=inner_b, else_body=inner_e))
@@ -1446,7 +1558,7 @@ def _build_k_sigma(
     K_c: Axis | None,
     K_i: Axis,
     K_f: Axis | None,
-    K_o_ext: int,
+    K_o_ext: int | Dim,
     br: int,
     bk: int,
     fk: int = 1,
@@ -1477,5 +1589,9 @@ def _build_k_sigma(
     else:
         inner_expr = inner_expr + Var(K_i.name)
     if K_s is not None:
-        inner_expr = Var(K_s.name) * Literal(K_o_ext * br * bk * fk * atom_k, "int") + inner_expr
+        # The K_s (SPLITK) stride needs a concrete int K_o_ext. SPLITK > 1 only
+        # pairs with a static K (symbolic-K paths force SPLITK=1), so the now-
+        # unified ``Dim`` K_o_ext is always a static-folded literal here.
+        k_o_ext = K_o_ext.as_static() if isinstance(K_o_ext, Dim) else K_o_ext
+        inner_expr = Var(K_s.name) * Literal(k_o_ext * br * bk * fk * atom_k, "int") + inner_expr
     return Sigma({K_name: inner_expr})

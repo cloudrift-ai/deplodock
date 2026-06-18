@@ -148,12 +148,12 @@ def test_mma_eligibility_rejects_indivisible_extents():
     assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], loop_op, _ctx(cc=(8, 0)), graph=g)
 
 
-def test_mma_eligibility_rejects_transposed_b():
-    """A transposed-B matmul (``Q @ K^T`` — both operands carry K in their
-    LAST index dim) is unclassifiable by ``011_lower_atom_cell._classify_ab``
-    in any staging order: the AtomTile would reach render unconsumed. The
-    eligibility gate mirrors the tagger so the shape falls to the scalar
-    register-tile path."""
+def test_mma_eligibility_accepts_transposed_b():
+    """A transposed-B matmul (``Q @ K^T`` — both operands carry K in their LAST
+    index dim) is the native ``mma.row.col`` col-major B layout. The classifier
+    recovers A/B from the output coordinates (``out_index``), so the gate admits
+    it for the tensor-core tier (B lowers gmem-direct via the trans helper; see
+    ``kernel/005_lower_atom_tile`` + ``ir/kernel`` LdmatrixLoad)."""
     g = Graph()
     _input(g, "a", (64, 64), dtype=F16)
     _input(g, "b", (64, 64), dtype=F16)
@@ -185,7 +185,7 @@ def test_mma_eligibility_rejects_transposed_b():
     g.add_node(op=op, inputs=["a", "b"], output=Tensor("c", (64, 64), dtype=F32), node_id="c")
     g.inputs = ["a", "b"]
     g.outputs = ["c"]
-    assert not is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
+    assert is_atom_eligible(ATOM_REGISTRY["mma_m16n8k16_f16"], op, _ctx(cc=(9, 0)), graph=g)
 
 
 def _matmul_with_epilogue_loop_op(*, M: int = 64, N: int = 64, K: int = 64, epilogue_op: str = "add") -> LoopOp:

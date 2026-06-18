@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -39,7 +39,7 @@ __all__ = [
 ]
 
 
-def classify_matmul_operands(loads, k_name: str):
+def classify_matmul_operands(loads, k_name: str, *, out_index=None):
     """Identify the A (M×K) / B (K×N) operand ``Load``s of a canonical matmul
     cell by where the reduce axis ``k_name`` sits in each load's index.
 
@@ -47,9 +47,17 @@ def classify_matmul_operands(loads, k_name: str):
     first) ⇒ A; K in the FIRST dim (and not the last) ⇒ B. Fallback for K in a
     *middle* dim — e.g. the SDPA cone-split's 4-D V slab ``(0, k, 0, n)``,
     where K is dim 1 of 4: a load whose single K dim sits AFTER every other
-    var-carrying dim ⇒ A, BEFORE every one ⇒ B. Ambiguous layouts (transposed
-    B with both operands K-in-last, K folded across dims, K-only indices)
-    classify neither side and return ``None`` for it.
+    var-carrying dim ⇒ A, BEFORE every one ⇒ B.
+
+    **Transposed-B (e.g. Q @ K^T):** when BOTH operands carry K in their last
+    dim the primary test tags both as A and leaves B empty. This is the native
+    ``mma.row.col`` layout — B stored N×K *is* the col-major K×N operand the
+    instruction wants — so with the output coordinates supplied via ``out_index``
+    we disambiguate: the operand sharing the M (row) output var is A, the one
+    sharing N (col) is B (loaded ``ldmatrix`` without ``.trans``; see
+    ``kernel/005_lower_atom_tile``). Without ``out_index`` it stays unclassified
+    (returns ``None`` for B), as before. Other ambiguous layouts (K folded
+    across dims, K-only indices) also classify neither side.
 
     This is the ONE A/B layout decision: ``011_lower_atom_cell._classify_ab``
     tags cells with it, and the ``is_atom_eligible`` mma gate calls the same
@@ -61,19 +69,30 @@ def classify_matmul_operands(loads, k_name: str):
     """
     a_load = None
     b_load = None
+    k_last: list = []  # transposed-B candidates (K in the LAST dim, like A)
     for ld in loads:
         if not ld.index:
             continue
         k_in_first = k_name in ld.index[0].free_vars()
         k_in_last = k_name in ld.index[-1].free_vars()
         if k_in_last and not k_in_first:
-            a_load = ld
+            if a_load is None:
+                a_load = ld
+            k_last.append(ld)
             continue
         if k_in_first and not k_in_last:
             b_load = ld
             continue
         k_dims = [d for d, e in enumerate(ld.index) if k_name in e.free_vars()]
         var_dims = [d for d, e in enumerate(ld.index) if d not in k_dims and e.free_vars()]
+        if len(k_dims) > 1:
+            # Folded K across >1 dim. Segmentable (innermost ``% C``, the o_proj
+            # attn-out read) ⇒ A: a C-aligned K split in partition folds it to a
+            # clean single-K-dim read, so the consumer reads gmem directly with
+            # no transpose producer. Other folds stay unclassified (no mma).
+            if segmentable_k_extent(ld, k_name) is not None and a_load is None:
+                a_load = ld
+            continue
         if len(k_dims) != 1 or not var_dims:
             continue
         after_k = [d for d in var_dims if d > k_dims[0]]
@@ -87,6 +106,38 @@ def classify_matmul_operands(loads, k_name: str):
             # P@V split-consumer ``xnb[head, k, n]``), so K immediately precedes N
             # ⇒ B. The old ``all(k < d)`` test mis-rejected this whenever a batch
             # dim sat before K, leaving the consumer scalar.
+            b_load = ld
+    # Transposed-B: two K-in-last operands and no canonical B. Recover A/B from
+    # the output coordinates (the M / N output vars are the last two var-bearing
+    # dims — the same convention as ``classify_fragment_epilogue`` / the
+    # ``_boundary_guards`` M/N split).
+    if b_load is None and len(k_last) == 2 and out_index is not None:
+        a2, b2 = _classify_transposed_b(k_last, k_name, out_index)
+        if a2 is not None and b2 is not None:
+            return a2, b2
+    return a_load, b_load
+
+
+def _classify_transposed_b(loads, k_name: str, out_index):
+    """Split two K-in-last operands into (A, B) by which output coordinate each
+    shares: A carries the M (row) output var, B carries N (col)."""
+    out_vars = [e for e in out_index if e.free_vars()]
+    if len(out_vars) < 2:
+        return None, None
+    m_vars = set(out_vars[-2].free_vars()) - {k_name}
+    n_vars = set(out_vars[-1].free_vars()) - {k_name}
+    a_load = None
+    b_load = None
+    for ld in loads:
+        non_k: set = set()
+        for d, e in enumerate(ld.index):
+            if d == len(ld.index) - 1 and k_name in e.free_vars():
+                continue  # the trailing K dim
+            non_k |= set(e.free_vars())
+        non_k.discard(k_name)
+        if (non_k & m_vars) and not (non_k & n_vars):
+            a_load = ld
+        elif (non_k & n_vars) and not (non_k & m_vars):
             b_load = ld
     return a_load, b_load
 
@@ -115,6 +166,11 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
         matmul_reduces = [lp for lp in loop_op.body.iter_of_type(Loop, StridedLoop) if lp.is_reduce and is_matmul_reduce(lp)]
         if not matmul_reduces:
             return False
+        # Output coordinates for the transposed-B (Q @ K^T) A/B disambiguation:
+        # the matmul output Write (≥2 var-bearing index dims). Threaded into the
+        # shared classifier so the gate mirrors the tagger on this layout too.
+        out_writes = [w for w in loop_op.body.iter_of_type(Write) if sum(1 for e in w.index if e.free_vars()) >= 2]
+        out_index = out_writes[0].index if out_writes else None
         # Buffers produced *inside* this fused kernel (e.g. an attention output
         # feeding the o_proj matmul). ``ldmatrix`` is smem→register only and
         # ``020_stage_inputs`` stages external gmem inputs, not register-resident
@@ -133,13 +189,21 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                     continue
                 # The mma path needs both operands staged for ``ldmatrix``.
                 # ``020_stage_inputs._classify`` only stages a load whose cache
-                # var (the K axis here) lands in a *single* index dim; a
-                # collapsed-reshape operand (e.g. an attention output reaching
-                # the o_proj via ``[(a/128)%16, …, a%128]`` — K split across two
-                # dims) is rejected there, leaving it gmem-direct. Mirror that
-                # rejection so the atom isn't offered for an operand the stager
-                # can't serve; same for a fused intermediate produced in-kernel.
-                if len(k_dims) > 1 or load.input in produced:
+                # var (the K axis here) lands in a *single* index dim. A
+                # collapsed-reshape operand (attention output → o_proj via
+                # ``[(a/128)%16, …, a%128]`` — K split across two dims) is
+                # normally rejected — EXCEPT a *segmentable* fold (innermost
+                # ``% C``) whose contiguous extent ``C`` is a multiple of the
+                # atom's K (so partition can C-align the split: ``k_per_block ==
+                # C``). Post-split the staged read is single-K-dim (the
+                # delinearization folds away), so the stager serves it. Gating on
+                # ``C % cell_k`` keeps eligibility in lock-step with partition's
+                # C-alignment — never offer mma on a read partition leaves
+                # delinearized. A fused in-kernel intermediate still can't be
+                # staged (``ldmatrix`` is smem→reg only).
+                seg_c = segmentable_k_extent(load, K_name)
+                segmentable = seg_c is not None and seg_c % cell_k == 0
+                if (len(k_dims) > 1 and not segmentable) or load.input in produced:
                     return False
                 node = graph.nodes.get(load.input)
                 if node is None or node.output.dtype != operand_dtype:
@@ -171,12 +235,13 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                 return False
             # Operand layout: the gate and the tagger share ONE classifier
             # (:func:`classify_matmul_operands`), so a cell the tagger can't
-            # recover A/B for — e.g. a transposed-B Q @ K^T, where BOTH
-            # operands carry K in their last dim — is never offered the mma
-            # tier (an untagged ``AtomTile`` would survive to render
-            # unconsumed and crash); it falls to the scalar register-tile
-            # path instead.
-            a_ld, b_ld = classify_matmul_operands(loads, K_name)
+            # recover A/B for is never offered the mma tier (an untagged
+            # ``AtomTile`` would survive to render unconsumed and crash); it
+            # falls to the scalar register-tile path instead. A transposed-B
+            # Q @ K^T (both operands K-in-last) IS recovered here via the output
+            # coordinates (``out_index``) — the native ``mma.row.col`` layout,
+            # B loaded ``ldmatrix`` without ``.trans`` in ``kernel/005``.
+            a_ld, b_ld = classify_matmul_operands(loads, K_name, out_index=out_index)
             if a_ld is None or b_ld is None:
                 return False
             accum_names.add(accum.name)
@@ -241,6 +306,11 @@ class EpilogueSlice:
     loads: tuple
     load_roles: tuple[tuple[str, ...], ...]
     write: object
+    # Coord-predicated Selects folded into the store (the causal attention mask):
+    # the raw ``Select`` stmts. ``kernel/005_lower_atom_tile`` turns each into a
+    # per-element ternary, rewriting its predicate's M/N coordinate vars to the
+    # fragment element's own (row, col).
+    selects: tuple = ()
 
 
 def classify_fragment_epilogue(
@@ -350,13 +420,39 @@ def classify_fragment_epilogue(
         return None, "the accumulator is also written directly alongside the epilogue"
 
     slice_set = set(map(id, slice_assigns))
+
+    # Per-element-addressable cell coordinates: the Write's var-bearing index
+    # dims give the M (second-to-last) / N (last) motions. Computed here (before
+    # leaf classification) because a folded Select's predicate is checked
+    # against these coordinate vars.
+    from deplodock.compiler.ir.stmt import Select  # noqa: PLC0415
+
+    w_var_dims = [d for d, e in enumerate(write.index) if e.free_vars()]
+    if not w_var_dims:
+        return None, "the Write index has no free axes (not a matmul output)"
+    n_expr = write.index[w_var_dims[-1]]
+    m_expr = write.index[w_var_dims[-2]] if len(w_var_dims) >= 2 else None
+    m_coord_vars = frozenset(m_expr.free_vars()) if m_expr is not None else frozenset()
+    n_coord_vars = frozenset(n_expr.free_vars())
+    cell_vars = n_coord_vars | m_coord_vars
+
+    # A folded Select (the causal attention mask) is itself a slice statement —
+    # collect its id so the escape check doesn't treat its consumed-by-slice use
+    # as an escape, and so it is stripped from the consumer body.
+    selects_by_name: dict[str, object] = {s.name: s for s, _ in stmts if isinstance(s, Select)}
+    folded_selects: list = []
+
     for s, _ in stmts:
-        if id(s) in slice_set or s is write:
+        if id(s) in slice_set or s is write or isinstance(s, Select):
             continue
         if set(s.deps()) & closure:
             return None, f"an epilogue value escapes the slice (consumed by {type(s).__name__})"
 
     # Leaf operands: every arg that is neither an accumulator nor a slice value.
+    # A leaf may resolve to a Select (the coord-predicated causal mask) instead
+    # of a Load — fold it: its predicate must be addressable per element (only
+    # the M/N coordinate vars) and its branch values must themselves be leaf
+    # Loads. Branch values join the leaf worklist.
     loads_by_name: dict[str, object] = {}
     loads_in_reduce: set[str] = set()
     for s, in_reduce in stmts:
@@ -370,7 +466,24 @@ def classify_fragment_epilogue(
             if arg not in accum_names and arg not in closure and arg not in leaf_names:
                 leaf_names.append(arg)
     leaf_loads = []
-    for name in leaf_names:
+    seen_selects: set[str] = set()
+    i = 0
+    while i < len(leaf_names):
+        name = leaf_names[i]
+        i += 1
+        sel = selects_by_name.get(name)
+        if sel is not None:
+            if name in seen_selects:
+                continue
+            seen_selects.add(name)
+            for br in sel.branches:
+                pred_vars = set(br.select.free_vars())
+                if not pred_vars <= cell_vars:
+                    return None, f"epilogue Select {name!r} predicate {br.select.pretty()} references non-coordinate axes"
+                if br.value not in leaf_names:
+                    leaf_names.append(br.value)
+            folded_selects.append(sel)
+            continue
         ld = loads_by_name.get(name) or (outer_loads or {}).get(name)
         if ld is None:
             return None, f"epilogue operand {name!r} is not a scalar Load or the accumulator"
@@ -382,16 +495,6 @@ def classify_fragment_epilogue(
         if dt is not None and dt not in _EPILOGUE_LEAF_DTYPES:
             return None, f"epilogue operand buffer {ld.input!r} dtype {dt!r} has no f32 conversion"
         leaf_loads.append(ld)
-
-    # Per-dim addressability: the Write's var-bearing index dims give the M
-    # (second-to-last) / N (last) cell motions; every leaf index dim must be
-    # struct-equal to one of those, or be uniform across the cell.
-    w_var_dims = [d for d, e in enumerate(write.index) if e.free_vars()]
-    if not w_var_dims:
-        return None, "the Write index has no free axes (not a matmul output)"
-    n_expr = write.index[w_var_dims[-1]]
-    m_expr = write.index[w_var_dims[-2]] if len(w_var_dims) >= 2 else None
-    cell_vars = frozenset(n_expr.free_vars()) | (frozenset(m_expr.free_vars()) if m_expr is not None else frozenset())
     load_roles: list[tuple[str, ...]] = []
     for ld in leaf_loads:
         roles: list[str] = []
@@ -418,6 +521,7 @@ def classify_fragment_epilogue(
             loads=tuple(leaf_loads),
             load_roles=tuple(load_roles),
             write=write,
+            selects=tuple(folded_selects),
         ),
         None,
     )

@@ -180,3 +180,36 @@ def test_masked_shape_c_cell_lowers_through_the_cond():
     assert store.m_guard == (m_expr, Var("seq_len"))
     a_ld = next(s for s in out if isinstance(s, LdmatrixLoad) and s.role == "a")
     assert a_ld.gmem_guard == (m_expr, Var("seq_len")), "unstaged gated A operand must clamp"
+
+
+def test_unstaged_masked_k_gate_detection():
+    """Masked-K correctness gate (``_unstaged_masked_k``): an mma operand whose
+    REDUCE (K) dim is symbolic must NOT lower gmem-direct — the gmem fragment
+    load has no K zero-fill (only the staged ``_stage_expand`` path does), so it
+    over-reads the mask-padded slab (the SDPA P@V hang / OOB bench_fails). A's K
+    is the last index dim; B's K is a non-last dim (N is last). M-symbolic-only
+    (A's non-last) and fully-static operands stay fine gmem-direct (M is clamped
+    by ``gmem_guard``)."""
+    from deplodock.compiler import dtype as _dt
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a_symK", (16, Dim("seq_len")), f16), node_id="a_symK")  # A: K (last) symbolic
+    g.add_node(InputOp(), [], Tensor("a_symM", (Dim("seq_len"), 128), f16), node_id="a_symM")  # A: M (first) symbolic, K static
+    g.add_node(InputOp(), [], Tensor("dense", (64, 128), f16), node_id="dense")  # fully static
+    g.add_node(InputOp(), [], Tensor("b_symK", (Dim("seq_len"), 64), f16), node_id="b_symK")  # B: K (non-last) symbolic
+
+    def ld(buf: str) -> Load:
+        return Load(names=("x",), input=buf, index=(), dtype=f16)
+
+    f = _mod._unstaged_masked_k
+    assert f(ld("a_symK"), "a", g) is True  # A reduce (last) symbolic → gate
+    assert f(ld("a_symM"), "a", g) is False  # A's K (last) static; symbolic M is gmem-clamped → fine
+    assert f(ld("dense"), "a", g) is False  # fully static → fine
+    assert f(ld("b_symK"), "b", g) is True  # B reduce (non-last) symbolic → gate
+    assert f(ld("dense"), "b", g) is False
+    assert f(ld("dense"), "a", None) is False  # no graph → no info, don't gate
+    assert f(ld("missing"), "a", g) is False  # buffer absent from graph → don't gate

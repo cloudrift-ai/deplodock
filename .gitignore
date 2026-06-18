@@ -47,3 +47,28 @@ _data/
 # Tune-skill work dirs (per-run dump dirs + tee'd logs) — kept in-repo so runs are
 # reproducible later, but never committed
 _tune/
+
+# For documentation
+# Vercel
+docs/.vercel
+
+# Node
+/docs/node_modules
+
+# Production
+/docs/build
+
+# Generated files
+/docs/.docusaurus
+/docs/.cache-loader
+
+# Misc
+/docs/.DS_Store
+/docs/.env.local
+/docs/.env.development.local
+/docs/.env.test.local
+/docs/.env.production.local
+
+/docs/npm-debug.log*
+/docs/yarn-debug.log*
+/docs/yarn-error.log*

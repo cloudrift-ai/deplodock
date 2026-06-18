@@ -18,6 +18,17 @@ its producer the contiguizing copy), or a
 computed cone (becomes a producer kernel); every distinct cone materializes an ``xn``
 intermediate over exactly the axes it reads —
 
+**Segmented-K exception (no producer).** A K-folded ``Load`` whose innermost (contiguous)
+index dim is ``expr % C`` — the o_proj attn-out / P@V-V transpose layout, where K is a
+``(strided-outer × contiguous-inner extent C)`` nest — is NOT demoted (see
+``_helpers.segmentable_k_extent``). Partition C-aligns the K split (``k_per_block == C``)
+so the delinearization folds to a clean ``[K_o, …, K_i]`` read (the range-aware
+``Expr.simplify``); the matmul then reaches the mma tier reading the folded operand from
+gmem directly — the ``K_o`` outer segment's per-step base is the head stride (``seq_len *
+C``), the ``K_i`` inner run is contiguous and ``ldmatrix``-stageable. So segmented-K
+supersedes the contiguizing producer for these reads; only a *non*-segmentable fold (no
+literal-modulus inner run) still materializes the copy.
+
     ``xn[row axes read…, k]``        (a row cone — the A operand)
     ``xn[row axes read…, k, n]``     (an N-reading cone — the B operand)
 
@@ -33,8 +44,9 @@ to the old "other operand's dtype" rule on every shape seen so far. The familiar
 are instances of the one rule: norm→linear / scale→matmul = one row cone beside a Load;
 SDPA P@V = one row cone with prologue deps; rotary QK^T = a row cone + an N cone (the GQA
 ``head / 2`` shared-KV read keeps that row axis as a leading dim — duplicated across the
-sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load;
-o_proj's collapsed attn-out = one degenerate Load cone beside a Load.
+sharing heads, simple over minimal); a weight-side scale = one N cone beside a Load.
+(o_proj's collapsed attn-out — once a degenerate Load cone — now takes the segmented-K path
+above: no producer, mma reads it directly.)
 
 Cones compare by VALUE, not SSA name: fusion inlines a shared producer chain once per
 consuming matmul (the gated-MLP norm feeds gate AND up as two structurally identical
@@ -81,16 +93,41 @@ from string import ascii_lowercase
 from typing import TYPE_CHECKING
 
 from deplodock.compiler import dtype as dtype_mod
+from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.stmt.body import Cone
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
+
+# Element-count multiple a symbolic N (inner) extent is padded up to so the
+# materialized B operand's above-inner gmem stride stays 16 B-aligned for TMA
+# (the ``cuTensorMapEncodeTiled`` requirement ``050_use_tma`` gates on). 64
+# elements is ≥ 128 B for any ≥ 2-byte dtype (fp16 → 128 B, fp32 → 256 B),
+# clearing the descriptor's recommended box alignment too, while wasting at
+# most 63 columns of scratch. The matching aligned-stride acceptance lives in
+# ``050_use_tma._inner_stride_aligned``.
+_TMA_INNER_PAD = 64
+
+
+def _pad_inner_for_tma(extent: Dim) -> Dim:
+    """Round a *symbolic* inner (N) extent up to a multiple of ``_TMA_INNER_PAD``
+    so the materialized buffer's above-inner gmem stride is 16 B-aligned and the
+    operand becomes TMA-eligible. Static extents pass through unchanged (a fixed
+    inner extent already has a compile-checkable, aligned stride). The composite
+    ``round_up`` Dim carries an explicit hint (the base hint rounded up the same
+    way) because arithmetic-result Dims otherwise drop their hint, which
+    ``050_use_tma._shape_for_tma`` needs to size the descriptor box."""
+    if extent.is_static:
+        return extent
+    base_hint = extent.hint if extent.hint is not None else DEFAULT_SEQ_HINT
+    pad_hint = -(-base_hint // _TMA_INNER_PAD) * _TMA_INNER_PAD
+    return Dim((extent.ceil_div(_TMA_INNER_PAD) * _TMA_INNER_PAD).expr, hint=pad_hint)
 
 
 @dataclass
@@ -155,7 +192,14 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
                 # only member is itself): the producer is the contiguizing
                 # copy, materializing the operand as a plain ``xn[rows…, K]``.
                 # A single-K-dim Load is already stageable and stays put.
-                if len(k_dims) > 1:
+                #
+                # EXCEPT a *segmentable* fold (segmented-K): when K's innermost
+                # index dim is ``expr % C`` the read is a (strided-outer ×
+                # contiguous-inner) nest — a C-aligned K split in partition folds
+                # the delinearization to a clean single-K-dim read and the matmul
+                # reaches the mma tier reading gmem directly. Don't demote it;
+                # let it flow to partition (no transpose producer needed).
+                if len(k_dims) > 1 and segmentable_k_extent(d, k_name) is None:
                     cone_args[a] = None
             else:
                 return None
@@ -285,9 +329,35 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         producer.name = f"{loop_op.name}_xn{sfx}" if loop_op.name else ""
         # Every extent passes through as a Dim — rows, K, and N alike allocate
         # from the runtime extent when symbolic (``_classify_cut`` admits all).
-        shape = tuple(lp.axis.extent for lp in rows_used) + (k_loop.axis.extent,)
+        # A row cone (the A operand) puts the reduce K innermost; when K is
+        # symbolic (the masked-K P@V probs cone) pad it like the N cone so the
+        # above-inner stride stays 16 B-aligned and the operand is TMA-eligible.
+        # The reduce overhang here is NOT self-zeroed (this buffer's TMA globalDim
+        # is the padded extent), but it doesn't need to be: the matmul's *other*
+        # operand — the middle-K B cone (V), allocated at the real ``seq_len`` — is
+        # TMA-OOB-zero-filled past ``seq_len``, so every overhang product is
+        # ``A_overhang × 0``. The scratch slab is zero-initialised and only ever
+        # holds finite kernel outputs, so ``A_overhang`` is finite (never NaN/Inf)
+        # and the product is a true 0 — the masked-K reduction stays exact. (On the
+        # SYNC fallback the per-value ternary zeroes it directly.)
+        k_inner = _pad_inner_for_tma(k_loop.axis.extent) if not reads_n else k_loop.axis.extent
+        shape = tuple(lp.axis.extent for lp in rows_used) + (k_inner,)
         if reads_n:
-            shape += (outer_n.axis.extent,)
+            # An N-reading cone materializes the canonical B operand ``xnb[…, K, N]``.
+            # When N is symbolic (the rotary QK^T's ``seq_len`` key cone), the raw
+            # ``seq_len`` inner extent gives the K dim a gmem stride of ``seq_len``
+            # elements — runtime values like 31 / 700 aren't 16 B-aligned, so
+            # ``cuTensorMapEncodeTiled`` rejects the descriptor and ``050_use_tma``
+            # declines TMA (and warp-spec with it). Pad the inner N up to a multiple
+            # of ``_TMA_INNER_PAD`` so the above-inner stride is always 16 B-aligned
+            # while the buffer stays runtime-sized (correct at any seq, unlike a
+            # fixed static width that would overflow past the hint). The extra
+            # ``[seq_len, round_up)`` columns are never stored — the consumer's
+            # per-element boundary guard masks ``n >= seq_len`` — so the pad is
+            # value-neutral; it only enlarges the scratch alloc by ``< _TMA_INNER_PAD``
+            # columns. The garbage columns DO feed the mma, but only into
+            # store-masked output positions, so they can't contaminate a live score.
+            shape += (_pad_inner_for_tma(outer_n.axis.extent),)
         producers.append((producer, Tensor(xn_id, shape, c.dtype)))
         for root in roots:
             if vn[root] == vn[c.root]:

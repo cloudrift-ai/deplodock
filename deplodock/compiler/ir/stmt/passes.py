@@ -14,8 +14,8 @@ from collections.abc import Callable
 from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx, Var
+from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
+from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
@@ -123,7 +123,7 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 @rewrite.register
 def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
-    return Mma(c=rename(s.c), a=rename(s.a), b=rename(s.b), atom=s.atom, axes=new_axes)
+    return Mma(c=rename(s.c), a=rename(s.a), b=rename(s.b), atom=s.atom, axes=new_axes, b_trans=s.b_trans)
 
 
 def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
@@ -229,13 +229,13 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
+    inner = extend_simplify_ctx(ctx, s.axis)
     return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
 
 
 @simplify.register
 def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
+    inner = extend_simplify_ctx(ctx, s.axis)
     step = s.step.simplify(ctx) if isinstance(s.step, Expr) else s.step
     return StridedLoop(
         axis=s.axis,

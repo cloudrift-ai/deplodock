@@ -198,15 +198,14 @@ def test_split_offered_for_prologue_demotion() -> None:
     assert tuple(d.as_static() for d in xn.output.shape) == (_S, _H)
     assert xn.output.dtype == _dt.get("f16")
     assert xn.op.name.endswith("_xn")
-    # Consumer: loads xn + the weight. The Linear-derived gemm keeps its
+    # Consumer: loads xn + the weight. The Linear-derived gemm has a
     # transposed-B operand (wg is [N, K] — K in the last index dim of BOTH
-    # loads), which ``011_lower_atom_cell._classify_ab`` cannot tag — the
-    # eligibility gate mirrors that honestly, so this split lands on the
-    # scalar register-tile tier (informational here, NOT a gate the builder
-    # applies; the MatmulOp-derived split below reaches the warp tier).
+    # loads); ``011_lower_atom_cell._classify_ab`` now recovers A/B from the
+    # output coordinates, so the eligibility gate admits it for the tensor-core
+    # tier (B lowers gmem-direct via the trans helper — same Q@K^T class).
     assert xn.id in mm.inputs
     ctx = Context.from_target((12, 0))
-    assert not any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
+    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
     assert frag.outputs == [mm.id]
     # Structural features restamped per body — the split kernels must not
     # featurize as the fused kernel for the learned prior.
@@ -368,31 +367,24 @@ def test_gated_mlp_split_matches_fused_on_numpy() -> None:
     _assert_close(out, ref)
 
 
-def test_layout_split_offered_for_folded_k_load() -> None:
-    """A plain-Load matmul operand whose K folds across index dims (the
-    collapsed reshape/transpose o_proj read) is a DEGENERATE cone — the split
-    materializes it through a contiguizing copy producer, and the consumer
-    gemm (canonical [rows, K] A load, residual epilogue intact) is genuinely
-    warp-tier eligible. Finding 3's fix: without the offer, no structural
-    escape existed (both operands plain Loads = 'pure cell')."""
-    HD, S, D, N = 4, 32, 64, 64
+def test_segmentable_folded_k_load_reaches_mma_no_split() -> None:
+    """A matmul operand whose K folds across index dims (the collapsed
+    reshape/transpose o_proj read) but whose innermost index dim is ``expr % C``
+    (a contiguous inner run of extent C) is SEGMENTABLE: rather than
+    materializing a contiguizing transpose producer, it stays fused and
+    partition C-aligns the K split so the delinearization folds to a clean
+    ``[K_o, …, K_i]`` read — the matmul reaches the mma tier reading the folded
+    operand from gmem directly (segmented-K supersedes the layout-split for these
+    reads). So the demoted-split is NOT offered, and the fused matmul is warp-tier
+    eligible as-is."""
+    HD, S, D, N = 4, 32, 64, 64  # K = HD*D = 256, contiguous inner run D = 64
     fused = _fuse(_collapsed_matmul_graph(HD, S, D, N))
     node = _fused_loop_node(fused)
-    frag = _split(fused)
-    assert frag is not None
-    loops = {nid: n for nid, n in frag.nodes.items() if isinstance(n.op, LoopOp)}
-    assert set(loops) == {f"{node.id}__xn", f"{node.id}__mm"}
-    xn = frag.nodes[f"{node.id}__xn"]
-    # The producer is the pure contiguizing copy: [rows, K] at the operand
-    # dtype, no compute (one load, no assigns).
-    assert tuple(d.as_static() for d in xn.output.shape) == (S, HD * D)
-    assert xn.output.dtype == _dt.get("f16")
-    assert xn.op.knobs.get("S_n_load") == 1.0 and xn.op.knobs.get("S_n_assign") == 0.0
-    mm = frag.nodes[f"{node.id}__mm"]
-    assert xn.id in mm.inputs
+    # segmentable fold ⇒ no transpose producer (the split is not offered)
+    assert _split(fused) is None
+    # the fused matmul reaches the mma tier directly (segmented-K, no producer)
     ctx = Context.from_target((12, 0))
-    assert any(is_atom_eligible(atom, mm.op, ctx, graph=frag) for atom in ATOM_REGISTRY.values())
-    assert frag.outputs == [mm.id]
+    assert any(is_atom_eligible(atom, node.op, ctx, graph=fused) for atom in ATOM_REGISTRY.values())
 
 
 def test_no_layout_split_for_single_k_dim_load() -> None:
@@ -401,25 +393,6 @@ def test_no_layout_split_for_single_k_dim_load() -> None:
     fused = _fuse(_pure_matmul_graph())
     node = _fused_loop_node(fused)
     assert try_split_demoted(node.op, Context.from_target((12, 0)), graph=fused, node_id=node.id, out_tensor=node.output) is None
-
-
-def test_layout_split_matches_fused_on_numpy() -> None:
-    from deplodock.compiler.backend.numpy import NumpyBackend
-
-    fused = _fuse(_collapsed_matmul_graph())
-    node = _fused_loop_node(fused)
-    frag = _split(fused)
-    assert frag is not None
-    split_graph = fused.copy()
-    split_graph.splice(frag, consumed={node.id}, output=node.id)
-    assert sum(1 for n in split_graph.nodes.values() if isinstance(n.op, LoopOp)) == 2
-
-    rng = np.random.default_rng(0)
-    inputs = _collapsed_matmul_inputs(rng)
-    be = NumpyBackend()
-    ref = be.run(be.compile(_collapsed_matmul_graph()), input_data=dict(inputs))[0].outputs["o"]
-    out = be.run(be.compile(split_graph), input_data=dict(inputs))[0].outputs["o"]
-    _assert_close(out, ref)
 
 
 def test_no_split_when_multi_accum_cell_has_stray_stmt() -> None:
@@ -862,17 +835,17 @@ def test_gated_mlp_split_mma_accuracy_cuda(monkeypatch) -> None:
 
 @requires_cuda
 @requires_sm90
-def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
-    """Pinned split on the collapsed-layout matmul (finding 3's o_proj shape):
-    the contiguizing copy producer + the clean gemm on mma.sync, output
-    matches numpy (the real o_proj kernel goes 25 µs scalar-fused → ~6 µs
-    split on an RTX 5090)."""
+def test_segmented_k_mma_accuracy_cuda(monkeypatch) -> None:
+    """Segmented-K on the collapsed-layout matmul (finding 3's o_proj shape): the
+    folded operand reaches the mma tier as a SINGLE kernel reading gmem directly
+    — no transpose producer — and the output matches numpy. The C-aligned K split
+    (``k_per_block == C`` = the contiguous inner run) folds the delinearization
+    away, so the staged read is single-K-dim and ``ldmatrix``-stageable."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.numpy import NumpyBackend
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     target_mod.set_target(None)
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     rng = np.random.default_rng(0)
     inputs = _collapsed_matmul_inputs(rng)
@@ -881,9 +854,9 @@ def test_layout_split_mma_accuracy_cuda(monkeypatch) -> None:
     be = CudaBackend()
     compiled = be.compile(_collapsed_matmul_graph())
     ids = _lowered_kernel_ids(compiled)
-    assert len(ids) == 2
+    assert len(ids) == 1, "segmented-K reads the folded operand directly — no producer kernel"
     mma_kernels = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp) and "mma.sync" in n.op.kernel_source]
-    assert len(mma_kernels) == 1, "the layout-split gemm must lower on the warp tier"
+    assert len(mma_kernels) == 1, "the segmented-K matmul must lower on the warp tier"
     out = be.run(compiled, input_data=dict(inputs))[0].outputs["o"]
     _assert_close(out, ref)
 
@@ -953,12 +926,13 @@ def test_gated_mlp_split_offered_for_symbolic_rows() -> None:
         assert any(not d.is_static for d in n.output.shape), f"mm buffer must carry the symbolic leading dim, got {n.output.shape}"
 
 
-def test_collapsed_attn_out_split_offered_for_symbolic_rows() -> None:
-    """The o_proj collapsed attn-out cut admits symbolic rows even though its
-    K-folded operand index references the symbolic dim in its strides (the head
-    stride is ``seq_len * D``). That ``seq_len`` read is a legitimate runtime
-    quantity, not an unmodeled scope — the regression that kept the dynamic
-    o_proj fused-scalar at seq_len=512 (~461 us) instead of warp-tier."""
+def test_collapsed_attn_out_segmented_no_split_symbolic_rows() -> None:
+    """The o_proj collapsed attn-out (symbolic rows, static folded K = HD*D) is
+    SEGMENTABLE: its K-folded operand has a contiguous inner run (``% D``), so
+    segmented-K supersedes the transpose producer — no ``xn`` is materialized and
+    the fused matmul reaches the mma tier reading the folded attn-out from gmem
+    directly (the head stride ``seq_len * D`` is the per-segment ``K_o`` base).
+    Was: materialized a contiguizing xn producer."""
     from deplodock.compiler.dim import Dim
 
     f16 = _dt.get("f16")
@@ -975,13 +949,11 @@ def test_collapsed_attn_out_split_offered_for_symbolic_rows() -> None:
     g.inputs = ["attn", "w", "res"]
     g.outputs = ["o"]
 
-    frag = _split(_fuse(g))
-    assert frag is not None, "the collapsed attn-out cut must offer on symbolic-row graphs"
-    xn_nodes = [n for nid, n in frag.nodes.items() if "__xn" in nid]
-    assert xn_nodes, "expected a contiguizing xn producer in the fragment"
-    assert any(not d.is_static for d in xn_nodes[0].output.shape), (
-        f"xn buffer must carry the symbolic row dim, got {xn_nodes[0].output.shape}"
-    )
+    fused = _fuse(g)
+    node = _fused_loop_node(fused)
+    assert _split(fused) is None, "segmentable folded-K attn-out must not materialize a producer"
+    ctx = Context.from_target((12, 0))
+    assert any(is_atom_eligible(atom, node.op, ctx, graph=fused) for atom in ATOM_REGISTRY.values())
 
 
 def test_split_offered_for_symbolic_k() -> None:

@@ -19,7 +19,7 @@ on the same AST.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -381,6 +381,10 @@ class BinaryExpr(_ExprOps):
                 decomp = _div_mod_decompose(left, right.value, ctx)
                 if decomp is not None:
                     return decomp[1]
+            else:
+                below = _mod_below_divisor(left, right, ctx)
+                if below is not None:
+                    return below
             cancelled = _cancel_common_factors(op, left, right, ctx)
             if cancelled is not None:
                 return cancelled
@@ -655,16 +659,26 @@ class Interval:
 class SimplifyCtx:
     """Range info available at a given scope. Immutable per-call; callers
     push into a nested scope by calling :meth:`extend` to get a fresh ctx
-    (so the pass stays pure)."""
+    (so the pass stays pure).
+
+    ``ranges`` carries integer ``Interval`` bounds (drives comparison folding
+    and the ``_div_mod_decompose`` non-negativity / ``r < n`` checks).
+    ``bounds`` carries a *symbolic* exclusive upper bound per name — an ``Expr``
+    ``B`` with ``var < B`` known — so a modulo by a non-literal divisor folds
+    (``i % seq_len → i`` when ``i`` is a loop axis whose extent is ``seq_len``).
+    A static integer interval can't represent ``< seq_len`` for a symbolic
+    ``seq_len``; ``bounds`` fills that gap without making ``Interval`` symbolic."""
 
     ranges: dict[str, Interval]
+    bounds: dict[str, Expr] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> SimplifyCtx:
-        return cls({})
+        return cls({}, {})
 
-    def extend(self, name: str, interval: Interval) -> SimplifyCtx:
-        return SimplifyCtx({**self.ranges, name: interval})
+    def extend(self, name: str, interval: Interval, bound: Expr | None = None) -> SimplifyCtx:
+        new_bounds = self.bounds if bound is None else {**self.bounds, name: bound}
+        return SimplifyCtx({**self.ranges, name: interval}, new_bounds)
 
 
 def _make_int_literal(v: int) -> Literal:
@@ -842,6 +856,29 @@ def _div_mod_decompose(expr: Expr, n: int, ctx: SimplifyCtx) -> tuple[Expr, Expr
     rng = expr.range(ctx)
     if rng is not None and rng.lo >= 0 and rng.hi < n:
         return (_make_int_literal(0), expr)
+    return None
+
+
+def _mod_below_divisor(left: Expr, right: Expr, ctx: SimplifyCtx) -> Expr | None:
+    """Fold ``left % D`` → ``left`` for a *non-literal* divisor ``D`` when
+    ``0 <= left < D`` is provable — the symbolic-extent counterpart of the
+    ``_div_mod_decompose`` modulo path (which only handles a literal ``n``).
+
+    Covers the collapsed-reshape seq coordinate ``i % seq_len`` left behind by
+    compose-indexmaps: after the inner ``(i*stride + feat) / stride`` folds to
+    ``i`` (a loop var whose extent is exactly ``seq_len``, so ``i ∈ [0,
+    seq_len)``), the outer ``% seq_len`` is a no-op. A static ``seq_len``
+    constant-folds it away; a symbolic one otherwise survives as a runtime
+    integer modulo (the slow delinearized gmem index). ``D``'s exclusive
+    bound is read from ``SimplifyCtx.bounds`` (registered per loop axis)."""
+    if not isinstance(left, Var):
+        return None
+    bound = ctx.bounds.get(left.name)
+    if bound is None or bound.simplify(ctx) != right:
+        return None
+    rng = left.range(ctx)
+    if rng is not None and rng.lo >= 0:
+        return left
     return None
 
 

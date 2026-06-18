@@ -118,3 +118,24 @@ def test_fan_out():
     b = g.add_node(op=ElementwiseOp(op="negative"), inputs=[x], output=Tensor("negX", (4,)), node_id="b")
     g.outputs = [a, b]
     assert sorted(g.consumers("x")) == ["a", "b"]
+
+
+def test_to_dict_serializes_composite_shape_dim():
+    """A node whose output shape carries a COMPOSITE Dim (``BinaryExpr``-backed —
+    e.g. the demoted symbolic-N B operand's TMA-padded ``round_up(seq_len, 64)``
+    inner extent, or a CatOp output) must not crash ``to_dict``: the dump path
+    serializes it to its pretty expr string. Atomic dims (int / Var name) still
+    return their scalar value for the ``run --ir`` round-trip."""
+    from deplodock.compiler.dim import Dim
+
+    g = Graph()
+    padded = Dim((Dim("seq_len").ceil_div(64) * 64).expr, hint=512)  # ((seq_len + 63) // 64) * 64
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("xnb", (128, padded)), node_id="xnb")
+    g.inputs, g.outputs = ["xnb"], ["xnb"]
+
+    d = g.to_dict()  # must not raise (pre-fix: Dim.value raised on the composite)
+    shape = d["nodes"]["xnb"]["output"]["shape"]
+    assert shape[0] == 128, "static inner-rank dim keeps its int value"
+    assert isinstance(shape[1], str) and "seq_len" in shape[1] and "64" in shape[1], (
+        f"composite dim must serialize to its pretty expr string, got {shape[1]!r}"
+    )

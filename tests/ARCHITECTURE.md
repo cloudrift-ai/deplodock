@@ -198,7 +198,10 @@ on sm_80-89 it is pin-only and currently non-functional for two independent reas
 target the TMA path emits is rejected by nvcc (`Unsupported gpu architecture 'sm_89a'`), and `ldmatrix` itself faults
 at runtime on at least Ada (sm_89). Tests that **force** the warp tier via `DEPLODOCK_MMA` / `TMA` pins carry
 `requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
-context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The mma suites
-(`test_matmul_mma*.py`) gate at module scope; mixed files (`test_split_demoted.py`, `test_matmul_mma_residual.py`,
-`test_warp_specialize_deadlock.py`) gate only the warp-tier tests, and `test_knob_pinning.py` skips its `TMA=1` rows
-in-body. `_supports_mma_sync()` (≥ sm_80, the instruction-availability check) still gates on top.
+context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The pure mma suites
+(`test_matmul_mma.py`, `test_matmul_mma_tma.py`, `test_matmul_mma_staged_pipelined.py`,
+`test_matmul_mma_causal_epilogue.py`, `test_matmul_mma_transposed_b.py`) gate at module scope; mixed files that also
+hold GPU-less structure / compile-only tests (`test_matmul_mma_masked.py`, `test_matmul_mma_parity.py`,
+`test_matmul_mma_residual.py`, `test_split_demoted.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
+tests, and `test_knob_pinning.py` skips its `TMA=1` rows in-body. `_supports_mma_sync()` (≥ sm_80, the
+instruction-availability check) and `_supports_tma()` (≥ sm_90) still gate on top.

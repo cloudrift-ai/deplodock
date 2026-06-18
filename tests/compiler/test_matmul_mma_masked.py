@@ -31,7 +31,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _enume
 
 from .conftest import requires_sm90
 
-_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2"}
+# ``TMA=0`` pins the cp.async masked path: these tests assert cp.async-specific
+# codegen (the clamped A-slab fill, the "shape D" double-buffered pipeline).
+# Symbolic-M with a static innermost dim is now ALSO TMA-eligible
+# (``050_use_tma`` builds the descriptor's globalDim per launch from the runtime
+# shape; TMA zero-fills the masked overhang) — that path has its own test below.
+_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2", "TMA": "0"}
 
 
 def _has_cuda() -> bool:
@@ -49,6 +54,15 @@ def _supports_mma_sync() -> bool:
     import cupy as cp
 
     return int(cp.cuda.Device().compute_capability) >= 80
+
+
+def _supports_tma() -> bool:
+    """TMA (cp.async.bulk.tensor) needs sm_90+ (Hopper / Blackwell)."""
+    if not _has_cuda():
+        return False
+    import cupy as cp
+
+    return int(cp.cuda.Device().compute_capability) >= 90
 
 
 def _symbolic_m_graph(*, K: int = 512, N: int = 1024) -> Graph:
@@ -150,6 +164,53 @@ def test_symbolic_m_masked_mma_accuracy(monkeypatch, seq):
     assert got.shape == (seq, 1024)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"seq={seq}: masked MMA mismatch (max abs err {diff})"
+
+
+_TMA_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2", "TMA": "1"}
+
+
+def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
+    """Symbolic-M (static innermost) reaches the warp tier staged via **TMA**:
+    the kernel carries the runtime ``seq_len`` arg + a ``CUtensorMap`` descriptor
+    param and stages the A operand with ``cp.async.bulk.tensor`` (no cp.async
+    clamp — the descriptor's globalDim is the runtime extent and TMA zero-fills
+    the masked overhang). The descriptor is encoded per launch from the input
+    array shape (``program._prebuild_descriptors``)."""
+    for k, v in _TMA_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
+    kop = lowered.nodes["o"].op
+    assert kop.knobs.get("TMA") is True, "symbolic-M with static innermost dim must be TMA-eligible"
+    src = kop.kernel_source
+    assert "int seq_len" in src, "runtime extent must still be a kernel arg"
+    assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"
+    assert "CUtensorMap" in src, "kernel must take the TMA descriptor param"
+    assert "mma.sync.aligned.m16n8k16" in src
+
+
+@requires_sm90
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("seq", [1, 31, 512, 700])
+def test_symbolic_m_masked_mma_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged symbolic-M kernel is accurate at runtime sizes below, at,
+    and above the 512 hint — the cases that exercise the per-launch descriptor
+    build (``_collapse_inert_dims`` must keep the masked dim even when its
+    runtime extent is 1/31, and TMA zero-fills the box overhang past ``seq_len``)."""
+    for k, v in _TMA_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_symbolic_m_graph())
+    rng = np.random.default_rng(0)
+    b = (rng.standard_normal((512, 1024)) * 0.1).astype(np.float16)
+    a = (rng.standard_normal((seq, 512)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"a": a, "b": b})
+    got = result.outputs["o"].astype(np.float32)
+    want = a.astype(np.float32) @ b.astype(np.float32)
+    assert got.shape == (seq, 1024)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: TMA masked MMA mismatch (max abs err {diff})"
 
 
 @requires_sm90
@@ -331,3 +392,190 @@ def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):
     assert got.shape == (16, seq, 128)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"seq={seq}: batched masked-M+K MMA mismatch (max abs err {diff})"
+
+
+# --- demoted symbolic-N B operand: TMA + warp-spec (WS1/WS2) ----------------
+# The rotary QK^T's key cone materializes the canonical B operand
+# ``xnb[…, K, N]`` with a symbolic inner N (``seq_len``). A bare symbolic inner
+# extent gives the K dim an unaligned gmem stride, so ``cuTensorMapEncodeTiled``
+# rejects it and the masked-N matmul is stuck on cp.async (no TMA → no
+# warp-spec). ``_split_demoted`` now pads the inner N up to a multiple of 64 so
+# the stride stays 16 B-aligned; ``050_use_tma`` accepts the aligned symbolic
+# inner, and warp-spec follows automatically on the resulting TMA depth-2 bundle.
+
+
+def _demoted_symbolic_n_graph(M=None, N=None, K: int = 128) -> Graph:
+    """Computed-B-cone matmul (the rotary QK^T shape): an elementwise scale on
+    BOTH operands feeds a transposed-``[N, K]`` Linear, so fusion demotes the
+    matmul and ``005_split_demoted`` materializes the canonical ``xnb[K, N]``
+    producer. With N symbolic this is the dynamic QK^T B operand WS1 unblocks.
+    M and N default to the same ``Dim('seq_len')`` (the [seq, seq] scores)."""
+    from deplodock.compiler.ir.frontend.ir import LinearOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
+
+    M = Dim("seq_len") if M is None else M
+    N = Dim("seq_len") if N is None else N
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (M, K), dtype=F16), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sx", (M, K), dtype=F16), node_id="sx")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (N, K), dtype=F16), node_id="w")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sw", (N, K), dtype=F16), node_id="sw")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["x", "sx"], output=Tensor("xs", (M, K), dtype=F16), node_id="xs")
+    g.add_node(op=ElementwiseOp("multiply"), inputs=["w", "sw"], output=Tensor("ws", (N, K), dtype=F16), node_id="ws")
+    g.add_node(op=LinearOp(), inputs=["xs", "ws"], output=Tensor("o", (M, N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["x", "sx", "w", "sw"], ["o"]
+    return g
+
+
+def test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec(monkeypatch):
+    """The demoted symbolic-N B operand stages via **TMA** and warp-spec fires:
+    ``005_split_demoted`` pads the ``xnb`` inner N to a 16 B-aligned multiple, so
+    the masked-N consumer's bundle promotes to ``cp.async.bulk.tensor`` and the
+    greedy default deploys the warp-specialized role split (no env pin — TMA +
+    WARPSPEC are the chosen-by-greedy decisions, the deployable shape)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # drop the _WARP_KNOBS TMA=0 pin — let greedy pick TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # force the demotion split
+    lowered = Pipeline.build(CUDA_PASSES).run(_demoted_symbolic_n_graph(), ctx=Context(compute_capability=(12, 0)))
+
+    xnb = lowered.nodes["o__xnb"].output
+    inner = xnb.shape[-1]
+    assert not inner.is_static, "the xnb inner N stays symbolic (runtime-sized, correct at any seq)"
+    assert "64" in inner.expr.pretty(), f"the xnb inner N must be padded to a 64-multiple, got {inner.expr.pretty()}"
+
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is True, "greedy must deploy TMA on the symbolic-N B operand"
+    assert con.knobs.get("WARPSPEC") is True, "warp-spec must fire on the TMA depth-2 bundle"
+    src = con.kernel_source
+    assert "cp.async.bulk.tensor" in src, "B operand must stage via TMA"
+    assert "mbarrier.arrive.expect_tx" in src, "TMA mbarrier handshake must be present"
+    assert "cp.async.commit_group" not in src, "must not fall back to the legacy cp.async path"
+    assert "mma.sync.aligned.m16n8k16" in src
+    assert "int seq_len" in src, "runtime extent must still be a kernel arg"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="TMA (cp.async.bulk.tensor) needs sm_90+")
+@pytest.mark.parametrize("seq", [31, 130, 512, 700])
+def test_demoted_symbolic_n_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged + warp-specialized symbolic-N kernel is accurate below, at,
+    and above the 512 hint — including straddling sizes (31, 130, 700) where the
+    last N tile reads the padded ``[seq, round_up)`` overhang columns. Those
+    garbage columns feed the mma only into store-masked output positions, so the
+    live scores stay correct."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # let greedy deploy TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_demoted_symbolic_n_graph())
+    rng = np.random.default_rng(0)
+    x = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    sx = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    w = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    sw = (rng.standard_normal((seq, 128)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"x": x, "sx": sx, "w": w, "sw": sw})
+    got = result.outputs["o"].astype(np.float32)
+    want = (x * sx).astype(np.float32) @ (w * sw).astype(np.float32).T
+    assert got.shape == (seq, seq)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: demoted symbolic-N TMA MMA mismatch (max abs err {diff})"
+
+
+# --- demoted masked-K P@V: TMA via OOB zero-fill (WS3) -----------------------
+# The SDPA P@V's A operand is the softmax-normalized probs ``xn[head, m, k]`` with
+# the reduce K innermost and symbolic (``seq_len``). Padding its inner K to a
+# 16 B-aligned multiple makes it TMA-eligible; the masked-K reduce overhang must
+# read 0, which the *other* operand (V, middle-K, allocated at the real seq_len)
+# delivers via TMA's hardware OOB zero-fill — every overhang product is
+# ``A_overhang × 0`` (A_overhang finite, since scratch is zero-init + holds only
+# finite kernel outputs). ``040`` rings the masked-K bundle only when it will reach
+# TMA (``050.tile_reaches_tma``); otherwise it stays SYNC with the per-value
+# ternary zero-fill, so a masked-K bundle is never stranded on cp.async.
+
+
+def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
+    """Softmax(scores) @ V with the reduce K = ``seq_len`` symbolic (the SDPA P@V
+    shape). Fusion demotes the matmul; ``005_split_demoted`` materializes the
+    softmax-prob A cone ``xn[H, seq, seq]`` (inner K) + the clean symbolic-K gemm."""
+    from deplodock.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
+
+    s = Dim("seq_len")
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("scores", (H, s, s), dtype=F16), node_id="scores")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("v", (H, s, N), dtype=F16), node_id="v")
+    g.add_node(op=SoftmaxOp(axis=-1), inputs=["scores"], output=Tensor("probs", (H, s, s), dtype=F16), node_id="probs")
+    g.add_node(op=MatmulOp(), inputs=["probs", "v"], output=Tensor("o", (H, s, N), dtype=F16), node_id="o")
+    g.inputs, g.outputs = ["scores", "v"], ["o"]
+    return g
+
+
+def test_demoted_masked_k_pv_reaches_tma(monkeypatch):
+    """The demoted masked-K P@V consumer stages via TMA on sm_90+: the padded
+    probs A cone + the middle-K V both clear ``050``'s gate, so greedy deploys the
+    TMA ring (``cp.async.bulk.tensor``). The probs cone's inner K is padded to a
+    64-multiple (symbolic, runtime-sized)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)  # let greedy pick TMA
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # force the demotion split
+    lowered = Pipeline.build(CUDA_PASSES).run(_pv_softmax_graph(), ctx=Context(compute_capability=(12, 0)))
+
+    xn = lowered.nodes["o__xn"].output
+    inner = xn.shape[-1]
+    assert not inner.is_static, "the probs cone inner K stays symbolic (runtime-sized)"
+    assert "64" in inner.expr.pretty(), f"the probs cone inner K must be padded to a 64-multiple, got {inner.expr.pretty()}"
+
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is True, "greedy must deploy TMA on the masked-K P@V"
+    src = con.kernel_source
+    assert "cp.async.bulk.tensor" in src, "masked-K operands must stage via TMA"
+    assert "mma.sync.aligned.m16n8k16" in src
+    assert "int seq_len" in src, "runtime reduce extent must be a kernel arg"
+
+
+def test_demoted_masked_k_pv_stays_sync_below_sm90(monkeypatch):
+    """Below sm_90 (no TMA) the masked-K P@V keeps the SYNC ternary zero-fill —
+    ``040`` declines the ring (``tile_reaches_tma`` False), never leaving a
+    masked-K bundle on a cp.async / double-buffer transport that can't zero the
+    partial-K slab."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    lowered = Pipeline.build(CUDA_PASSES).run(_pv_softmax_graph(), ctx=Context(compute_capability=(8, 0)))
+    con = lowered.nodes["o"].op
+    assert con.knobs.get("TMA") is not True, "sm_80 has no TMA — masked-K must stay SYNC"
+    assert con.knobs.get("RING") == 1, "the masked-K ring must be declined below sm_90 (stays on the SYNC ternary)"
+
+
+@pytest.mark.skipif(not _supports_tma(), reason="TMA (cp.async.bulk.tensor) needs sm_90+")
+@pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
+def test_demoted_masked_k_pv_tma_accuracy(monkeypatch, seq):
+    """The TMA-staged masked-K P@V is accurate below, at, and above the 512 hint —
+    including the straddling reduce extents (31, 130, 700) where the final K slab
+    is partial and TMA's middle-K OOB zero-fill must zero V past ``seq_len`` (a
+    clamped duplicate would corrupt the reduction). seq=16 exercises the tiny
+    K_o=1 ring (prologue-only, no steady state)."""
+    for k, v in _WARP_KNOBS.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    be = CudaBackend()
+    compiled = be.compile(_pv_softmax_graph())
+    rng = np.random.default_rng(seq)
+    scores = (rng.standard_normal((16, seq, seq)) * 2).astype(np.float16)
+    v = (rng.standard_normal((16, seq, 128)) * 0.1).astype(np.float16)
+    result, _ = be.run(compiled, input_data={"scores": scores, "v": v})
+    got = result.outputs["o"].astype(np.float32)
+    sc = scores.astype(np.float32)
+    e = np.exp(sc - sc.max(-1, keepdims=True))
+    probs = e / e.sum(-1, keepdims=True)
+    want = np.matmul(probs, v.astype(np.float32))
+    assert got.shape == (16, seq, 128)
+    diff = np.abs(got - want).max()
+    assert diff < 5e-2, f"seq={seq}: demoted masked-K P@V TMA mismatch (max abs err {diff})"

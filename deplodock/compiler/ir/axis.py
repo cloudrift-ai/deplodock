@@ -20,6 +20,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.dim import Dim, to_dim
+from deplodock.compiler.ir.expr import Interval, Literal, SimplifyCtx
+
+# Sentinel upper bound for a symbolic loop axis ``[0, hi]``. Only its ``lo = 0``
+# matters (gives the non-negativity the ``(i*c + …)//c → i`` div fold needs);
+# the finite ``hi`` never enables a wrong fold (``_div_mod_decompose``'s
+# ``rng.hi < n`` check just fails for it). Matches ``dim._simplify``'s sentinel.
+_SYMBOLIC_AXIS_HI = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -85,4 +92,23 @@ class Axis:
         )
 
 
-__all__ = ["Axis"]
+def extend_simplify_ctx(ctx: SimplifyCtx, axis: Axis) -> SimplifyCtx:
+    """Push an iteration axis ``[0, extent)`` into a ``SimplifyCtx`` so index
+    expressions over it fold.
+
+    A **static** extent gets a precise ``Interval`` (as before) plus its size as
+    a literal exclusive bound. A **symbolic** extent — previously dropped, which
+    left symbolic-seq indices unsimplified — gets ``[0, sentinel]`` (the
+    non-negativity the ``(i*c + …)//c → i`` div fold needs) plus its extent
+    ``Expr`` as an exclusive upper bound, so ``i % extent → i`` folds. Together
+    these collapse the delinearized seq coordinate (``(i*stride + feat)/stride %
+    seq_len``) back to ``i`` exactly as a static seq does, removing the runtime
+    integer div/mod from masked-tile repack kernels."""
+    ext = axis.extent
+    if ext.is_static:
+        n = ext.as_static()
+        return ctx.extend(axis.name, Interval(0, n - 1), bound=Literal(n, "int"))
+    return ctx.extend(axis.name, Interval(0, _SYMBOLIC_AXIS_HI), bound=ext.expr)
+
+
+__all__ = ["Axis", "extend_simplify_ctx"]

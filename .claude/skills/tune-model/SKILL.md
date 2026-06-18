@@ -8,9 +8,7 @@ version: 0.5.0
 
 A "tune findings" pass answers: after a clean autotune, where does deplodock stand vs eager PyTorch and
 torch.compile on this model, which kernels lose, and *why* — with each "why" pinned to a failure class, evidence
-(NCU counters, tune-DB rows, emitted CUDA), and a repro command. The deliverable is a report in `plans/`, in the
-shape of `plans/qwen3-embedding-layer0-tune-findings.md` (read it first — it is the reference for tone, structure,
-and evidence density).
+(NCU counters, tune-DB rows, emitted CUDA), and a repro command. The deliverable is a report in `plans/`.
 
 Reuse the existing CLI for everything: `tune` / `run` / `compile` / `eval` / `compare` already cover tuning,
 benching, the variant leaderboard, failure forensics, knob A/Bs, NCU comparison, and run-to-run diffing. Do not
