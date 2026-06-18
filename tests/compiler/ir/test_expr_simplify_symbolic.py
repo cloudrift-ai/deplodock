@@ -114,9 +114,9 @@ def test_segmented_k_collapses_oproj_delinearized_read():
     ctx = extend_simplify_ctx(ctx, Axis("a2_o", 16))
     ctx = extend_simplify_ctx(ctx, Axis("a2_i", 128))
 
-    assert seg.apply(head).simplify(ctx) == Var("a2_o")   # head, no div/mod
-    assert seg.apply(seq).simplify(ctx) == Var("a0")       # seq, no % seq_len
-    assert seg.apply(dim).simplify(ctx) == Var("a2_i")     # contiguous inner K
+    assert seg.apply(head).simplify(ctx) == Var("a2_o")  # head, no div/mod
+    assert seg.apply(seq).simplify(ctx) == Var("a0")  # seq, no % seq_len
+    assert seg.apply(dim).simplify(ctx) == Var("a2_i")  # contiguous inner K
 
 
 def test_static_axis_unchanged_behavior():
