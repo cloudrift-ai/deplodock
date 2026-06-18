@@ -42,12 +42,16 @@ backend change did **not** move these kernels — the v2 numbers are stable on H
 
 ### Per-reproducer (current HEAD, dynamic, -O3 captured) — as the user's table sees them
 
-| Reproducer (kernel)                       | eager | tc  | deplodock | the table's verdict        |
-|-------------------------------------------|------:|----:|----------:|----------------------------|
-| `k_sdpa_reduce_77b0f0` (RoPE + QK^T)      |   148 |  25 |        64 | beat eager, lose to tc     |
-| `k_linear_mean_reduce_05d34c` (RMSNorm+MLP)|  119 |  57 |        57 | beat eager 2×, tie tc      |
-| `k_linear_sdpa_reduce_43208b` (o_proj)    |    39 |  37 |        81 | **lose** 0.48× eager       |
-| `k_sdpa_linear_reduce_a76a28` (P@V)       |    29 |  29 |        74 | **lose** 0.39× eager       |
+The `depl (fix)` column is the re-bench **after** the transposed-B + causal-mask fix and the QK^T re-tune (the warp QK^T
+deploys via greedy); `depl (v2)` is the original scalar-QK^T number. The QK^T scores kernel itself goes
+**scalar → `mma_m16n8k16_f16`** in every reproducer.
+
+| Reproducer (kernel)                       | eager | tc  | depl (v2) | depl (fix) | note                                   |
+|-------------------------------------------|------:|----:|----------:|-----------:|----------------------------------------|
+| `k_sdpa_reduce_77b0f0` (RoPE + QK^T)      |   148 |  25 |        64 |     **73** | QK^T consumer 34→**28.8 warp**; split rotary `xna` producer regressed (20µs) |
+| `k_linear_mean_reduce_05d34c` (RMSNorm+MLP)|  119 |  57 |        57 |         57 | unchanged (QK^T not in this reproducer) |
+| `k_linear_sdpa_reduce_43208b` (o_proj)    |    39 |  37 |        81 |     **70** | embedded QK^T 39.9→**29.3 warp**        |
+| `k_sdpa_linear_reduce_a76a28` (P@V)       |    29 |  29 |        74 |     **64** | embedded QK^T 39.9→**29.3 warp**        |
 
 ### The same totals, decomposed into the *unique* kernels they actually run
 
@@ -55,13 +59,19 @@ Each attention-tail reproducer re-lowers the **whole attention dependency cone**
 reproducers (64 / 81 / 74 µs) are dominated by the **same** QK^T kernel. Summing them — as the per-kernel table in the
 v2 report does — triple-counts it. The unique kernels and their real in-context costs:
 
-| Kernel                         | tier        |  µs  | appears in reproducer(s)        | verdict                    |
-|--------------------------------|-------------|-----:|---------------------------------|----------------------------|
-| QK^T scores `k_sdpa_reduce`    | **scalar**  | ~40  | all three (40.2 / 39.8 / 39.9)  | **the only real loser**    |
-| P@V split `k_sdpa_linear_reduce`| warp (mma) | ~23  | QK^T (22.7), P@V (23.7), o_proj (21.8) | competitive         |
-| o_proj `k_linear_sdpa_reduce`  | warp (mma)  | ~16  | o_proj repro                    | fine (eager 39, tc 37)     |
-| v_proj tail `k_linear_reduce`  | scalar      |  ~9  | P@V repro                       | fine                       |
-| MLP gate/up + down `k_linear_mean_reduce` | warp (mma) | ~54 | MLP repro (26.1 + 27.5) | ties tc                |
+The `µs (v2)` column is the original scalar-QK^T cost; `µs (fix)` is after the transposed-B + causal-mask fix + re-tune.
+
+| Kernel                         | tier (fix)      | µs (v2) | µs (fix) | appears in reproducer(s)        | verdict                    |
+|--------------------------------|-----------------|--------:|---------:|---------------------------------|----------------------------|
+| QK^T scores `k_sdpa_reduce`    | **warp (mma)**  |    ~40  |  **~29** | all three (now `mma_m16n8k16_f16`) | tier-lockout removed; still > tc 25 |
+| P@V split `k_sdpa_linear_reduce`| warp (mma)     |    ~23  |     ~23  | QK^T, P@V, o_proj               | competitive                |
+| o_proj `k_linear_sdpa_reduce`  | warp (mma)      |    ~16  |     ~16  | o_proj repro                    | fine (eager 39, tc 37)     |
+| v_proj tail `k_linear_reduce`  | scalar          |     ~9  |      ~9  | P@V repro                       | fine                       |
+| MLP gate/up + down `k_linear_mean_reduce` | warp (mma) | ~54 |   ~54  | MLP repro (26.1 + 27.5)         | ties tc                    |
+
+(The dedicated QK^T reproducer un-fuses the RoPE prologue into `xna`/`xnb` producers + the warp consumer, so its *total*
+rose 64→73 despite the consumer getting faster — a producer-overhead artifact; in the o_proj/P@V reproducers the
+embedded QK^T deploys warp as a single 29.3µs kernel and the totals drop. See Finding 1's re-tune addendum.)
 
 **The real attention tail is ≈ QK^T 40 + P@V 23 + o_proj 16 + v_proj 9 ≈ 88 µs, not the ~150–195 µs the v2 report's
 summed per-kernel rows imply.** And of that 88 µs, the **QK^T scores matmul (~40 µs) is the single dominant kernel and
