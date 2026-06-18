@@ -134,13 +134,13 @@ static __device__ __forceinline__ void cp_async_bulk_tensor_5d(
 _MMA_SYNC_PRELUDE = """\
 static __device__ __forceinline__ void dpl_ldmatrix_x4(unsigned* r, const void* smem) {
     unsigned addr = __cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];\\n"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
 static __device__ __forceinline__ void dpl_ldmatrix_x2_trans(unsigned* r, const void* smem) {
     unsigned addr = __cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];\\n"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\\n"
                  : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
