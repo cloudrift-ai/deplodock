@@ -680,7 +680,7 @@ dataset, via `deplodock.storage`; `tune` writes it, `compile` / `run` read it.
 
 **-O3 deployable samples.** The sweep compiles at `-Xcicc -O1` (fast, but a *ranking* signal — it ties configs that
 differ at -O3, e.g. a reduction's `FK` or a warp tile's `WARPSPEC`). So whenever a bench lands **within
-`DEPLODOCK_O3_TOL` (default 10%, `config.o3_tol`) of the best -O1 so far** — flagged `TuningSearch.last_o3_worthy`, a
+`DEPLODOCK_O3_TOL` (default 15%, `config.o3_tol`) of the best -O1 so far** — flagged `TuningSearch.last_o3_worthy`, a
 band *wider* than a strict new best so near-tied contenders all qualify — the engine re-benches it at `-Xcicc -O3`
 (`_rebench_o3`) and `observe_o3` records an extra row with the same realized knobs tagged `H_opt=3` (the deployable
 regime). Each config is re-benched at most once (`_o3_done`, keyed on a value-stringified knob signature). The `H_*`
