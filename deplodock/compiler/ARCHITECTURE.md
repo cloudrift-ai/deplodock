@@ -155,7 +155,20 @@ autotuning cache doesn't bust on cosmetic edits.
 - **`LoopOp.forward()` executes.** The body interpreter in
   `ir/loop/interpret.py` lets the default `Backend.run` topo-walk
   (`backend/base.py`) run post-fusion graphs on CPU — fusion
-  correctness can be checked without a GPU.
+  correctness can be checked without a GPU. **Exception: mixed-int cones.** The C++ loop runner is float-only, so
+  `LoopOp.forward` raises on any integer input (a W4A16 dequant unpack) rather than reinterpreting packed int32 as
+  float; validate those against a numpy reference (`DequantLinearOp.forward`).
+- **The IR is dtype-unified except for `CastOp`.** Every op preserves its inputs' dtype; `ir/tensor/ir.py::CastOp` is
+  the single dtype-changing primitive (emitted post-decomposition by `045_dequant_linear` at the W4A16 int→fp16
+  boundary). The lone integer path is the W4A16 weight unpack: frontend `DequantLinearOp` (+ a `QuantScheme`
+  descriptor) decomposes to a fixed-shift-lane unpack (`right_shift` / `bitwise_and` over i32, assembled by a
+  multi-source `IndexMapOp` whose lift emits an i32-typed `Select`) → `(nibble − zp)` → `CastOp(f16)` → group-scale
+  multiply → transpose → matmul. The bitwise ops are integer-only (`dtype_promote` forces an i32 result — they have no
+  float form), and the CUDA `RenderTarget` carries `i32` `type_name` / `convert` (`__int2half_rn` etc.) / native ops.
+  Integer scalar-literal constants (the shift/mask immediates) are carried as int through the lowering so `packed >> 4`
+  renders (not `packed >> 4.0f`). The default fusion pipeline already merges the dequant producer cone into the matmul
+  kernel, so gmem holds only packed int32 + scales + zp. See `trace/quantized.py` and
+  `plans/w4a16-quantization-support.md`.
 
 ## Op provenance
 

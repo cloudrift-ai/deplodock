@@ -50,7 +50,14 @@ def rewrite(match: Match, root: Node) -> Graph | None:
             body.append(Load(name=name, input=src_id, index=idx))
             select_expr = src.select.substitute(mapping) if src.select is not None else Literal(1, "int")
             branches.append(SelectBranch(value=name, select=select_expr))
-        body.append(Select(name="v", branches=tuple(branches)))
+        # Carry the IndexMap's result dtype ONLY for an integer assembly so it
+        # renders as an ``int`` lane select rather than being forced to float
+        # (W4A16 8-lane unpack: ``unpacked[o,k] = lane_{k%8}[o, k//8]``). Float /
+        # half cats keep ``dtype=None`` → the legacy float-detour rendering, so
+        # this change is a strict no-op for every existing (non-quant) graph.
+        out_dt = root.output.dtype
+        sel_dtype = out_dt if out_dt.name in ("i32", "i64") else None
+        body.append(Select(name="v", branches=tuple(branches), dtype=sel_dtype))
         body.append(Write(output=out_buf, index=write_index, value="v"))
 
     # Wrap in nested free Loops.

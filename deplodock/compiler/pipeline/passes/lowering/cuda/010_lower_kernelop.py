@@ -32,9 +32,16 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
     # the ``constant`` / ``value`` flags for ConstantOp predecessors.
     tensors: dict[str, Tensor] = {**root.op.inputs, **root.op.outputs}
 
-    # Scalar ConstantOp inputs get embedded as float literals in the kernel
-    # body — no kernel parameter, no buffer load.
-    literal_constants: dict[str, float] = {n: float(t.value) for n, t in root.op.inputs.items() if t.constant and t.value is not None}
+    # Scalar ConstantOp inputs get embedded as literals in the kernel body —
+    # no kernel parameter, no buffer load. Integer-typed scalars (the W4A16
+    # unpack immediates ``4i`` / ``0xF`` / ``8``) are carried as Python ``int``
+    # so the inlining renders ``packed >> 4`` (not the invalid ``packed >> 4.0f``)
+    # and stamps the use site as i32; float scalars stay ``float``.
+    literal_constants: dict[str, float | int] = {
+        n: (int(t.value) if t.dtype.name in ("i32", "i64") else float(t.value))
+        for n, t in root.op.inputs.items()
+        if t.constant and t.value is not None
+    }
 
     runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
 

@@ -17,13 +17,15 @@ from collections.abc import Iterable
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
+from deplodock.compiler.ir.frontend.ir import TransposeOp
+from deplodock.compiler.ir.tensor.ir import CastOp, ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
 from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
 from deplodock.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
 
 __all__ = [
     "broadcast_to",
     "const_bc",
+    "dequant_decompose",
     "gqa_broadcast",
     "matmul_decompose",
     "matmul_unsqueeze",
@@ -155,3 +157,169 @@ def gqa_broadcast(
         p = placeholder(d)
         coord_map.append(BinaryExpr("/", p, Literal(group_size, "int")) if d == head_axis else p)
     return single_indexmap(frag, src, out_shape=target_shape, coord_map=coord_map, name=name, dtype=dtype)
+
+
+def _unpack_nibbles(frag: Graph, packed: Node | str, *, axis: int, pack_factor: int, num_bits: int, out_shape: tuple, name: str) -> Node:
+    """Unpack ``pack_factor`` unsigned nibbles per int32 along ``axis``.
+
+    ``pack_factor`` fixed-shift lanes ``lane_i = (packed >> num_bits*i) & mask``
+    (each an i32 tensor the shape of ``packed``), assembled into ``out_shape``
+    by a multi-source ``IndexMapOp``: output coord ``j`` along ``axis`` reads
+    ``lane_{j % pack_factor}`` at ``j // pack_factor`` (the interleaved
+    ``i::pack_factor`` layout). Stays integer end-to-end. The shift / mask
+    immediates flow as i32 scalar ``ConstantOp``s (inlined as int literals at
+    lowering); no coordinate-dependent shift, so Phase 0 needs no IR gap.
+    """
+    packed = _node(frag, packed)
+    packed_shape = tuple(packed.output.shape)
+    mask = (1 << num_bits) - 1
+
+    lanes: list[Node] = []
+    for i in range(pack_factor):
+        shift_bc = const_bc(frag, name=f"{name}_sh{i}", value=num_bits * i, target_shape=packed_shape, dtype="i32")
+        shifted = frag.add_node(
+            op=ElementwiseOp(op="right_shift"),
+            inputs=[packed, shift_bc],
+            output=Tensor(f"{name}_shifted{i}", packed_shape, "i32"),
+        )
+        mask_bc = const_bc(frag, name=f"{name}_mk{i}", value=mask, target_shape=packed_shape, dtype="i32")
+        lane = frag.add_node(
+            op=ElementwiseOp(op="bitwise_and"),
+            inputs=[shifted, mask_bc],
+            output=Tensor(f"{name}_lane{i}", packed_shape, "i32"),
+        )
+        lanes.append(frag.nodes[lane])
+
+    ndim = len(out_shape)
+    sources: list[IndexSource] = []
+    for i in range(pack_factor):
+        coord_map = tuple(
+            BinaryExpr("/", placeholder(d), Literal(pack_factor, "int")) if d == axis else placeholder(d) for d in range(ndim)
+        )
+        # Last lane is the default (else) branch — no select; earlier lanes fire
+        # on ``coord[axis] % pack_factor == i``.
+        sel = None
+        if i != pack_factor - 1:
+            sel = BinaryExpr("==", BinaryExpr("%", placeholder(axis), Literal(pack_factor, "int")), Literal(i, "int"))
+        sources.append(IndexSource(input_idx=i, coord_map=coord_map, select=sel))
+
+    nid = frag.add_node(
+        op=IndexMapOp(out_shape=tuple(out_shape), sources=tuple(sources)),
+        inputs=lanes,
+        output=Tensor(name, tuple(out_shape), "i32"),
+    )
+    return frag.nodes[nid]
+
+
+def dequant_decompose(
+    frag: Graph,
+    x: Node | str,
+    weight_packed: Node | str,
+    scale: Node | str,
+    zp: Node | str | None,
+    *,
+    scheme,
+    matmul_name: str,
+    out_dtype,
+) -> Node:
+    """Build the W4A16 unpack → dequant → transpose → matmul cone.
+
+    Mirrors ``matmul_decompose``'s role for ``045_dequant_linear``: returns the
+    matmul output node named ``matmul_name`` (the rule adds bias after).
+
+    Asymmetric (``symmetric=False``, the verified format): two independent
+    unsigned-nibble unpacks — the weight along the in/K axis, the zero-point
+    along OUT — then ``(nibble − zp)`` with zp group-broadcast on K, an
+    int→fp16 ``CastOp``, the group-broadcast ``· scale``, a transpose to
+    ``[in, out]``, and the matmul. Symmetric subtracts the constant midpoint
+    ``2**(num_bits-1)`` instead of the unpacked zp (never both).
+    """
+    x = _node(frag, x)
+    wp = _node(frag, weight_packed)
+    sc = _node(frag, scale)
+    per = scheme.pack_factor
+    num_bits = scheme.num_bits
+    g = scheme.group_size
+    weight_dtype = sc.output.dtype
+
+    wp_shape = tuple(wp.output.shape)
+    out_features = wp_shape[0]
+    in_features = wp_shape[1] * per
+    weight_int_shape = (out_features, in_features)
+
+    # Per-group quant (the only granularity real compressed-tensors AWQ models
+    # use, e.g. G=32 / G=128) is supported. A *single* group (group_size >=
+    # in_features → per-channel / per-tensor-along-K) collapses ``k // G`` to a
+    # constant 0, and the resulting broadcast trips a splicer def-use scope check
+    # when it merges with the multi-lane unpack — a fusion-hardening follow-up.
+    if in_features.is_static and in_features.as_static() <= g:
+        raise NotImplementedError(
+            f"W4A16 single-group quant (group_size={g} >= in_features={in_features.as_static()}, "
+            "i.e. per-channel / per-tensor-along-K) is not yet supported; per-group (G < in_features) works. "
+            "See plans/w4a16-quantization-support.md (Phase 2)."
+        )
+
+    # 1. Unpack the weight nibbles along the in/K axis (packed_dim == 1).
+    nibble = _unpack_nibbles(frag, wp, axis=1, pack_factor=per, num_bits=num_bits, out_shape=weight_int_shape, name=f"{matmul_name}_wq")
+
+    # 2. (nibble − zp) [asymmetric]  /  (nibble − 8) [symmetric].
+    if scheme.symmetric:
+        offset_bc = const_bc(frag, name=f"{matmul_name}_off", value=1 << (num_bits - 1), target_shape=weight_int_shape, dtype="i32")
+        diff_b = offset_bc
+    else:
+        zp_node = _node(frag, zp)
+        zp_shape = tuple(zp_node.output.shape)
+        zp_groups = zp_shape[1]
+        # Zero-point is int4-packed along OUT (axis 0) — a distinct axis from the
+        # weight's in-axis pack.
+        zp_unpacked = _unpack_nibbles(
+            frag, zp_node, axis=0, pack_factor=per, num_bits=num_bits, out_shape=(out_features, zp_groups), name=f"{matmul_name}_zq"
+        )
+        # Broadcast zp on K (group-indexed): zp_bc[o, k] = zp_unpacked[o, k // g].
+        diff_b = single_indexmap(
+            frag,
+            zp_unpacked,
+            out_shape=weight_int_shape,
+            coord_map=(placeholder(0), BinaryExpr("/", placeholder(1), Literal(g, "int"))),
+            name=f"{matmul_name}_zpbc",
+            dtype="i32",
+        )
+    diff = frag.add_node(
+        op=ElementwiseOp(op="subtract"),
+        inputs=[nibble, diff_b],
+        output=Tensor(f"{matmul_name}_diff", weight_int_shape, "i32"),
+    )
+
+    # 3. int → fp16 cast (the dequant boundary).
+    cast = frag.add_node(
+        op=CastOp(target_dtype=weight_dtype.name),
+        inputs=[diff],
+        output=Tensor(f"{matmul_name}_wf", weight_int_shape, weight_dtype),
+    )
+
+    # 4. Group-broadcast scale on K: scale_bc[o, k] = scale[o, k // g].
+    scale_bc = single_indexmap(
+        frag,
+        sc,
+        out_shape=weight_int_shape,
+        coord_map=(placeholder(0), BinaryExpr("/", placeholder(1), Literal(g, "int"))),
+        name=f"{matmul_name}_scbc",
+        dtype=weight_dtype,
+    )
+
+    # 5. w = cast · scale_bc (fp16).
+    w = frag.add_node(
+        op=ElementwiseOp(op="multiply"),
+        inputs=[cast, scale_bc],
+        output=Tensor(f"{matmul_name}_w", weight_int_shape, weight_dtype),
+    )
+
+    # 6. Transpose [out, in] → [in, out] (matmul wants A[…,K] @ B[K,N]).
+    wt = frag.add_node(
+        op=TransposeOp(axes=(-2, -1)),
+        inputs=[w],
+        output=Tensor(f"{matmul_name}_wt", (in_features, out_features), weight_dtype),
+    )
+
+    # 7. x @ wt.
+    return matmul_decompose(frag, x, wt, name=matmul_name, dtype=out_dtype)

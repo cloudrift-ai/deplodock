@@ -75,6 +75,31 @@ def bind_constants(graph: Graph, sources: dict[str, np.ndarray]) -> dict[str, np
     return out
 
 
+def declared_const_dtypes(graph: Graph) -> dict[str, np.dtype]:
+    """Map each ``ConstantOp.source_path`` to its graph-declared numpy dtype.
+
+    Lets the source loaders bind a constant at the dtype the graph expects —
+    crucial for W4A16, whose packed-int32 weight / zero-point must NOT be cast
+    through float32 (which would corrupt the bit-packed values)."""
+    out: dict[str, np.dtype] = {}
+    for node in graph.nodes.values():
+        if isinstance(node.op, ConstantOp) and node.op.source_path is not None:
+            out[node.op.source_path] = node.output.dtype.np
+    return out
+
+
+def source_array_at_dtype(tensor, np_dtype) -> np.ndarray:  # noqa: ANN001 — torch.Tensor, duck-typed
+    """Convert a torch tensor to numpy at ``np_dtype``.
+
+    Integer-declared dtypes go straight to numpy (no float round-trip — a
+    ``.float()`` detour would corrupt a packed int32 weight). Everything else
+    routes through ``.float()`` (also sidesteps reading bf16 through numpy) and
+    keeps the legacy float32 binding so non-quant graphs are byte-identical."""
+    if np_dtype is not None and np.issubdtype(np_dtype, np.integer):
+        return tensor.detach().cpu().numpy().astype(np_dtype, copy=False)
+    return tensor.detach().cpu().float().numpy().astype(np.float32, copy=False)
+
+
 def bind_constants_from_module(graph: Graph, module) -> dict[str, np.ndarray]:  # noqa: ANN001 — torch.nn.Module, duck-typed
     """Bind every parameter/buffer ``ConstantOp`` from a *live* ``nn.Module``.
 
@@ -92,7 +117,8 @@ def bind_constants_from_module(graph: Graph, module) -> dict[str, np.ndarray]:  
     only, leaving the final projection unbound (→ zero logits). Tensors are cast
     to float32 numpy (the backend dtype; also sidesteps reading bf16 checkpoints
     through numpy)."""
+    declared = declared_const_dtypes(graph)
     sources: dict[str, np.ndarray] = {}
     for name, t in module.state_dict().items():
-        sources[name] = t.detach().cpu().float().numpy()
+        sources[name] = source_array_at_dtype(t, declared.get(name))
     return bind_constants(graph, sources)

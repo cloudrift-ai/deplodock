@@ -64,6 +64,24 @@ args): the legacy constant-input convention can't represent a `None` start (`x[:
 `_resolve_inputs` drops both, leaving the surviving constants positionally ambiguous. Pre-field IR dumps still
 decompose via the constant-input fallback.
 
+### `quantized.py` — W4A16 (compressed-tensors AWQ-INT4) pre-trace substitution
+
+A compressed-tensors checkpoint registers a forward *decompress pre-hook* that unpacks the int4 weights on first
+forward; under `torch.export` that hook fires mid-trace and injects a data-dependent slice (`unpack_from_int32 →
+int(shape[1])`) export can't specialize. `apply_quant_substitution(model)` walks the loaded model **before** export
+(the established `huggingface.py` submodule-swap pattern) and replaces each targeted quantized linear with a
+`DequantLinear` whose `forward` is a single opaque custom op `deplodock::dequant_linear` (registered via
+`torch.library.custom_op` + `register_fake`). This keeps the packed int32 / fp16-scale / int32-zp tensors as graph
+**constants** (passed as explicit tensor args, never closed over), prevents the decompress hook from firing, and emits
+one `DequantLinearOp` node the `045_dequant_linear` decomposition expands. The tracer maps the custom op by name in
+`_op_name` / `_handle_dequant_linear` (a dedicated arg branch peels the tensor inputs from the scalar `QuantScheme`,
+which becomes op metadata — never graph `ConstantOp`s). `parse_quant_config` handles the transformers wrapper
+(`CompressedTensorsConfig → .quantization_config.config_groups`) and skips `ignore` modules (`lm_head`). The module is
+deliberately written **without** `from __future__ import annotations` so `torch.library` can infer the op schema from
+real annotations. No-op for non-quantized models. Wired into `commands/compile.py::_trace_model` (so `run` / `tune`
+reach it). All format-specific logic (config parse + the torch dequant the eager impl runs) lives here; everything
+below `DequantLinearOp` is format-agnostic. See `plans/w4a16-quantization-support.md`.
+
 ## Entry points
 
 - Whole-model trace: `trace_module(build_full_model_wrapper(model, …), (input_ids,))`.

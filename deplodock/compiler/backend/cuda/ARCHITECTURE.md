@@ -9,10 +9,17 @@ CUDA-specific dispatch. Shared backend contract lives in
 
 ```
 cuda/
-├── backend.py   # CudaBackend(Backend) — drives lowering + delegates dispatch
-├── nvcc.py      # offline `nvcc --cubin` compile (+ content-addressed cubin cache) → RawModule load
-└── program.py   # Graph[CudaOp] → kernel dispatch (via nvcc.py) + per-kernel event timing
+├── backend.py        # CudaBackend(Backend) — drives lowering + delegates dispatch
+├── nvcc.py           # offline `nvcc --cubin` compile (+ content-addressed cubin cache) → RawModule load
+├── program.py        # Graph[CudaOp] → kernel dispatch (via nvcc.py) + per-kernel event timing
+└── render_target.py  # CudaRenderTarget — every CUDA C spelling the Stmt renderer makes
 ```
+
+`render_target.py` owns `type_name` (`f32`→`float`, `f16`→`__half`, **`i32`→`int`**), `convert` (f16↔f32 plus the W4A16
+int boundary: `__int2half_rn` / `__int2float_rn` / `__half2int_rn` / `__float2int_rn`), per-dtype `intrinsic`
+spellings, and `has_native_op` (the `_NATIVE_FP16_OPS` set plus `_NATIVE_I32_OPS` = `+ - * >> &` for the dequant
+unpack). `i32` exists so the W4A16 weight-unpack cone (packed int32 → nibbles) renders natively; without `i32` in
+`type_name` an integer local silently defaulted to `float`.
 
 ## Compile
 

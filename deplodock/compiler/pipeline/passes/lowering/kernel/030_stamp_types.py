@@ -48,6 +48,7 @@ from deplodock.compiler.ir.stmt import (
     Load,
     Loop,
     Pack,
+    Select,
     Stmt,
     StridedLoop,
     Unpack,
@@ -93,6 +94,8 @@ def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
         return _stamp_assign(s, ctx)
     if isinstance(s, Write):
         return _stamp_write(s, ctx)
+    if isinstance(s, Select):
+        return _stamp_select(s, ctx)
     if isinstance(s, (Accum, Init)):
         ctx.ssa_dtypes[s.name] = s.dtype or F32
         return s
@@ -201,6 +204,17 @@ def _is_overflow_prone(s: Assign) -> bool:
     if s.op.name == "pow":
         return True
     return s.op.name == "multiply" and len(s.args) == 2 and s.args[0] == s.args[1]
+
+
+def _stamp_select(s: Select, ctx: _StampCtx) -> Select:
+    """Register the Select's result dtype in the running ssa map so a
+    downstream Assign (e.g. the W4A16 ``nibble - zp`` subtract) sees the
+    assembled lane as i32. The integer assembly stamps ``dtype`` at lift
+    time; a legacy float cat leaves it ``None`` and is left untouched
+    (its render keeps the float-detour path)."""
+    if s.dtype is not None:
+        ctx.ssa_dtypes[s.name] = s.dtype
+    return s
 
 
 def _stamp_write(s: Write, ctx: _StampCtx) -> Write:
