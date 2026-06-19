@@ -17,6 +17,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr,
 from deplodock.compiler.ir.sigma import Sigma
 
 if TYPE_CHECKING:
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.stmt.leaves import Select
     from deplodock.compiler.render_target import RenderTarget
@@ -493,6 +494,45 @@ class Stmt:
         for index flattening. Subclasses override.
         """
         raise NotImplementedError(f"{type(self).__name__}.render not implemented")
+
+
+class ReduceCarrier(Stmt):
+    """A loop-carried reduce accumulator — the shared structural role behind
+    ``Accum`` (scalar monoid fold), ``Mma`` (tensor-core ``c += a @ b``), and
+    the future flash/LSE combine.
+
+    A ``Loop`` / ``StridedLoop`` / serial tile is a *reduce* loop iff its
+    immediate body holds a ``ReduceCarrier`` — that is the one predicate the
+    trait-agnostic machinery (``is_reduce``, axis threading, topo-sort)
+    keys off, so a new carrier kind is recognized everywhere by subclassing
+    this rather than being threaded through an ``isinstance(s, (Accum, Mma))``
+    ladder at every site.
+
+    Rules that *do* care about the combine's algebra don't switch on the
+    carrier type either — they read :meth:`combine_op` and query its traits
+    (``associative`` / ``commutative`` / ``has_identity``) to decide whether a
+    reduction may be split / reordered (split-K, cooperative tree-combine).
+
+    Three methods name the carrier's reduce surface, distinct from the generic
+    SSA def-use surface (:meth:`deps` / :meth:`defines`):
+
+    - :meth:`carried_names` — the accumulator name(s) read-and-written across
+      the reduce axis (the carried read is *implicit*, so it is absent from
+      :meth:`deps`).
+    - :meth:`partial_deps` — the SSA names read to form this iteration's
+      contribution, excluding the carried accumulator. Defaults to
+      :meth:`deps`, which ``Accum`` / ``Mma`` already define to exclude it.
+    - :meth:`combine_op` — the accumulation's combine op, for its traits.
+    """
+
+    def carried_names(self) -> tuple[str, ...]:
+        raise NotImplementedError(f"{type(self).__name__}.carried_names")
+
+    def partial_deps(self) -> tuple[str, ...]:
+        return self.deps()
+
+    def combine_op(self) -> ElementwiseImpl:
+        raise NotImplementedError(f"{type(self).__name__}.combine_op")
 
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:

@@ -41,6 +41,7 @@ and produce Loop-IR's canonical form.
 
 from deplodock.compiler.ir.stmt.base import (
     INDENT,
+    ReduceCarrier,
     RenderCtx,
     Stmt,
     op_to_expr,
@@ -83,6 +84,7 @@ __all__ = [
     "Loop",
     "Mma",
     "Pack",
+    "ReduceCarrier",
     "RenderCtx",
     "Select",
     "SelectBranch",

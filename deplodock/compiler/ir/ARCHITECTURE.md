@@ -113,15 +113,21 @@ it replaces the frontend layout ops via `coord_map` expressions.
 | `GatherOp`, `ScatterOp`              | Data-dependent reads / writes.                                 |
 | `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
 
-Op metadata (arity / commutative / reduce identity) lives on
-`ElementwiseImpl` in `ir/elementwise.py` — the single source of truth
-shared across elementwise, reduce, scan, and accumulator use sites.
+Op metadata (arity / `commutative` / `associative` / `identity` /
+`has_identity`) lives on `ElementwiseImpl` in `ir/elementwise.py` — the single
+source of truth shared across elementwise, reduce, scan, and accumulator use
+sites. The algebraic traits are what reassociation gates (split-K, cooperative
+tree-combine) query instead of matching op names.
 
 ## `loop/`
 
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
-`Loop` is a reduce Loop iff its body contains an `Accum`.
+`Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
+base of `Accum` and its tensor-core form `Mma`; `is_reduce`, axis threading,
+and the other carrier-agnostic checks key off the base, not an
+`isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's algebra
+read `carrier.combine_op()` and query its traits.
 
 ### `loop/ir.py` — LoopOp types
 
@@ -307,8 +313,10 @@ itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.
 Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
-(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its loop
-`is_reduce`) that carries that `Atom` and names its A/B operand `Load`s by SSA
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
+`ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,
+and its `combine_op()` reports `add`) that carries that `Atom` and names its A/B
+operand `Load`s by SSA
 value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
 marker downstream. Both are ordinary IR the staging passes carry through (the
 loads stage like any `Load`); `kernel/005_lower_atom_tile` recovers each
