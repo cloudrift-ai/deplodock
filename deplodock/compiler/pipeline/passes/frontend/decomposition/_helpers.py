@@ -247,6 +247,18 @@ def dequant_decompose(
     in_features = wp_shape[1] * per
     weight_int_shape = (out_features, in_features)
 
+    # Per-group quant (the only granularity real compressed-tensors AWQ models
+    # use, e.g. G=32 / G=128) is supported. A *single* group (group_size >=
+    # in_features → per-channel / per-tensor-along-K) collapses ``k // G`` to a
+    # constant 0, and the resulting broadcast trips a splicer def-use scope check
+    # when it merges with the multi-lane unpack — a fusion-hardening follow-up.
+    if in_features.is_static and in_features.as_static() <= g:
+        raise NotImplementedError(
+            f"W4A16 single-group quant (group_size={g} >= in_features={in_features.as_static()}, "
+            "i.e. per-channel / per-tensor-along-K) is not yet supported; per-group (G < in_features) works. "
+            "See plans/w4a16-quantization-support.md (Phase 2)."
+        )
+
     # 1. Unpack the weight nibbles along the in/K axis (packed_dim == 1).
     nibble = _unpack_nibbles(frag, wp, axis=1, pack_factor=per, num_bits=num_bits, out_shape=weight_int_shape, name=f"{matmul_name}_wq")
 

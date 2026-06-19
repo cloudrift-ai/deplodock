@@ -277,38 +277,30 @@ def test_substitution_noop_for_unquantized_model():
 # ---------------------------------------------------------------------------
 
 
-@requires_cuda
-@pytest.mark.parametrize("symmetric", [False, True])
-def test_dequant_linear_e2e_cuda(symmetric):
+def _build_quant_module(fx, out_f):
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.loader.binder import bind_constants, declared_const_dtypes, source_array_at_dtype
     from deplodock.compiler.trace.quantized import _build_dequant_linear
-    from deplodock.compiler.trace.torch import trace_module_with_constants
 
-    fx = make_fixture(out_f=32, in_f=128, group=32, symmetric=symmetric, seed=8)
     holder = nn.Module()
     holder.register_buffer("weight_packed", torch.from_numpy(fx["weight_packed"]))
     holder.register_buffer("weight_scale", torch.from_numpy(fx["weight_scale"]))
     zp = fx["weight_zero_point"]
-    holder.register_buffer("weight_zero_point", torch.from_numpy(zp if zp is not None else fx["weight_packed"][:4]))
+    holder.register_buffer("weight_zero_point", torch.from_numpy(zp if zp is not None else fx["weight_packed"][: max(out_f // 8, 1)]))
     holder.bias = None
-    mod = _build_dequant_linear(holder, fx["scheme"])
+    return _build_dequant_linear(holder, fx["scheme"])
 
-    x = torch.randn(1, 8, 128, dtype=torch.float16)
+
+def _compile_and_run(mod, x):
+    """Trace → compile → bind → run a DequantLinear; return (compiled, out, ref)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.loader.binder import bind_constants, declared_const_dtypes, source_array_at_dtype
+    from deplodock.compiler.trace.torch import trace_module_with_constants
+
     ref = mod(x).detach().numpy().astype(np.float32)
-
     graph, _ = trace_module_with_constants(mod, (x,))
     compiled = CudaBackend().compile(graph)
-
-    # The compiled kernel must dequantize in integer math — no float-shift bug.
-    sources_cu = "\n".join(getattr(n.op, "kernel_source", "") or "" for n in compiled.nodes.values())
-    assert ">> " in sources_cu and "& 15" in sources_cu
-    import re
-
-    assert not re.search(r">> [0-9]+\.[0-9]+f", sources_cu)
 
     in_id = list(compiled.inputs)[0]
     input_data = {in_id: x.detach().cpu().numpy().astype(compiled.nodes[in_id].output.dtype.np, copy=False)}
@@ -317,7 +309,90 @@ def test_dequant_linear_e2e_cuda(symmetric):
     input_data.update(bind_constants(compiled, src))
 
     out = list(CudaBackend().run(compiled, input_data=input_data)[0].outputs.values())[-1]
-    out = np.asarray(out).reshape(ref.shape).astype(np.float32)
+    return compiled, np.asarray(out).reshape(ref.shape).astype(np.float32), ref
+
+
+@requires_cuda
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("group", [32, 128])  # per-group — the granularities real AWQ models use
+def test_dequant_linear_e2e_cuda(group, symmetric):
+    import torch
+
+    fx = make_fixture(out_f=64, in_f=256, group=group, symmetric=symmetric, seed=8)
+    mod = _build_quant_module(fx, out_f=64)
+    x = torch.randn(1, 8, 256, dtype=torch.float16)
+    compiled, out, ref = _compile_and_run(mod, x)
+
+    # The compiled kernel dequantizes in integer math — no float-shift bug.
+    import re
+
+    sources_cu = "\n".join(getattr(n.op, "kernel_source", "") or "" for n in compiled.nodes.values())
+    assert ">> " in sources_cu and "& 15" in sources_cu
+    assert not re.search(r">> [0-9]+\.[0-9]+f", sources_cu)
+
     # fp16-eps tolerance — the int round-trip is exact, error is only fp16
     # accumulation (the same bound a plain fp16 linear gets).
     np.testing.assert_allclose(out, ref, rtol=6e-3, atol=6e-3)
+
+
+def _gmem_buffers(compiled):
+    """``{node_id: (bytes, shape, dtype_name)}`` over a compiled graph's buffers."""
+    out = {}
+    for nid, node in compiled.nodes.items():
+        t = node.output
+        n = 1
+        for d in t.shape:
+            n *= d.as_static() if hasattr(d, "as_static") else int(d)
+        shape = tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in t.shape)
+        out[nid] = (n * t.dtype.nbytes, shape, t.dtype.name)
+    return out
+
+
+@requires_cuda
+def test_dequant_fuses_no_materialized_weight_vram():
+    """Phase 3: the dequant cone fuses into the matmul — gmem holds only packed
+    int32 + scale + zp, never a materialized [out, in] fp16 weight slab."""
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module_with_constants
+
+    out_f, in_f = 512, 512
+    fx = make_fixture(out_f=out_f, in_f=in_f, group=32, symmetric=False, seed=9)
+    qmod = _build_quant_module(fx, out_f=out_f)
+    x = torch.randn(1, 16, in_f, dtype=torch.float16)
+    qcompiled, qout, qref = _compile_and_run(qmod, x)
+    np.testing.assert_allclose(qout, qref, rtol=6e-3, atol=6e-3)
+
+    bufs = _gmem_buffers(qcompiled)
+    # No materialized dense fp16 weight (the unpack intermediates never hit gmem).
+    dense_shape = tuple(sorted((out_f, in_f)))
+    materialized = [(nid, shape) for nid, (_, shape, dt) in bufs.items() if dt == "f16" and tuple(sorted(shape)) == dense_shape]
+    assert materialized == [], f"unexpected materialized fp16 weight buffer(s): {materialized}"
+    # The largest buffer is the packed int32 weight, 4x smaller than dense fp16.
+    biggest = max(bufs.values())
+    assert biggest[2] == "i32" and biggest[1] == (out_f, in_f // 8)
+
+    # Total deplodock gmem footprint is far below a same-shape dense fp16 linear.
+    import torch.nn as nn
+
+    dcompiled = CudaBackend().compile(trace_module_with_constants(nn.Linear(in_f, out_f, bias=False).half(), (x,))[0])
+    q_bytes = sum(b for b, _, _ in bufs.values())
+    d_bytes = sum(b for b, _, _ in _gmem_buffers(dcompiled).values())
+    assert q_bytes < d_bytes / 2.5, f"expected >2.5x gmem reduction, got {d_bytes / q_bytes:.2f}x ({q_bytes} vs {d_bytes})"
+
+
+def test_per_channel_single_group_raises_clear_error():
+    """Single-group quant (per-channel / per-tensor-along-K) is a documented
+    Phase-2 gap; it must fail with a clear message, not a cryptic IR error."""
+    pytest.importorskip("torch")
+    import torch
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module_with_constants
+
+    fx = make_fixture(out_f=16, in_f=32, group=32, symmetric=False, seed=3)  # group == in_features → 1 group
+    mod = _build_quant_module(fx, out_f=16)
+    graph, _ = trace_module_with_constants(mod, (torch.randn(1, 4, 32, dtype=torch.float16),))
+    with pytest.raises(NotImplementedError, match="single-group"):
+        CudaBackend().compile(graph)

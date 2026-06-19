@@ -228,6 +228,14 @@ The `DequantLinearOp` + its decomposition already exist (Phase 0); here the unpa
   `k // G` on the K/in axis. **zp is packed along OUT** → a *second, distinct* IndexMap (different axis-divide) — easy
   to transpose-confuse, unit-test each independently. Don't hardcode G=32 (test G=128 and per-tensor/per-channel too).
 - (The int→fp16 cast op moved to Phase 0 — it's foundational, not a granularity concern.)
+- **Verified (per-group works; per-channel is a fusion gap).** `group_size` is read from the `QuantScheme` (never
+  hardcoded). Per-group GPU e2e PASSES at **G=32 and G=128** (sym + asym) and the numerics oracle covers per-tensor
+  group too. The remaining gap is the **single-group** case (`group_size >= in_features`, i.e. per-channel /
+  per-tensor-along-K, which no compressed-tensors AWQ model uses — they're all per-group): `k // G` folds to `0`, the
+  broadcast collapses, and the resulting access trips a splicer def-use scope check when it merges with the multi-lane
+  unpack (`Assign … arg not defined`). `dequant_decompose` now raises a **clear `NotImplementedError`** for that case
+  instead of the cryptic IR error (`tests/compiler/test_dequant.py::test_per_channel_single_group_raises_clear_error`);
+  fixing the splicer to support it is the open Phase-2 follow-up.
 
 ### Phase 3 — Dequant→matmul fusion (the VRAM requirement: no full fp16 weight in gmem)
 The dequant producer chain is a strict-producer cone feeding the matmul's B Load — the same shape as
@@ -240,6 +248,16 @@ per-tile.
 - **Fallback gate** `DEPLODOCK_W4A16_FUSE` (default off until this lands): if fusion bails, keep Phase 0's separate
   dequant kernel — correct but no VRAM win — so a correctness build always exists.
 - **Verify**: `compile --ir loop|cuda` shows no `[out,in]` fp16 scratch slab; measure peak VRAM vs Phase 0.
+
+> **Status: achieved by default fusion — no gate needed.** The default pipeline already fuses the dequant producer cone
+> into the matmul kernel. Verified at a realistic 4096×4096 (q_proj-sized) linear: **no materialized `[out,in]` fp16
+> weight buffer exists** (the `nibble`/`diff`/`cast`/`w` intermediates never hit gmem); the only weight buffer is the
+> packed int32 `[out, in/8]`. Measured deplodock gmem footprint **9.96 MB vs 33.82 MB** for a same-shape dense fp16
+> linear (**3.39× total reduction; 4.0× on the weight itself**); rel_err 0.00045 vs eager. So the `DEPLODOCK_W4A16_FUSE`
+> fallback gate was unnecessary for Phase 0. `tests/compiler/test_dequant.py::test_dequant_fuses_no_materialized_weight_vram`
+> guards this. (One staging fix was needed: `right_shift`/`bitwise_and` force an i32 result in `dtype_promote` so the
+> unpack stays integer when a staged-smem Load's dtype is unresolved at stamp time.) What's left here is **performance**,
+> not VRAM — the current matmul is the scalar path, not tensor-core (Phases 4–5).
 
 ### Phase 4 — In-smem dequant via `StageBundle.compute` (scalar tier first)
 Stage packed int32 (+ scales + zp) into smem, then a hoisted **`StageBundle.compute`** phase
