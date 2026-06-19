@@ -18,7 +18,9 @@ correct, if redundant, scalar form; the tensor-core P@V tier is future work)::
         FlashCombine((m_i,l_i,O_i), (s, V[…,kv,d]))  # the LSE rescale
       out[…,m,d] = O_i / l_i
 
-Scope (first increment): static shapes, non-causal, no explicit mask, no GQA.
+Scope (so far): static shapes, causal or non-causal, no explicit additive mask,
+no GQA. Causal masks the score per element (``kv ≤ m`` keeps it, else −inf); the
+tile-skip-above-the-diagonal optimization belongs to the future tensor-core tier.
 Anything else raises ``RuleSkipped`` so ``010_sdpa`` handles it. The ``FLASH``
 knob is read from the env pin (``DEPLODOCK_FLASH=1`` / ``DEPLODOCK_KNOBS=FLASH=1``)
 — the structural-fork offer + analytic cold-start wiring is a follow-up.
@@ -33,10 +35,10 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.frontend.ir import SdpaOp
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, FlashCombine, Init, Load, Loop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, FlashCombine, Init, Load, Loop, Select, SelectBranch, Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
@@ -69,8 +71,9 @@ def _static_dims(shape: tuple) -> list[int] | None:
 def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp_mask: Node | None, out: Tensor) -> Graph | None:
     if not _flash_enabled():
         raise RuleSkipped("FLASH knob off — generic 010_sdpa handles this SDPA")
-    if inp_mask is not None or root.op.is_causal:
-        raise RuleSkipped("flash: masked / causal SDPA not yet supported (Step 5) — fall through to 010_sdpa")
+    if inp_mask is not None:
+        raise RuleSkipped("flash: explicit additive mask not yet supported — fall through to 010_sdpa")
+    causal = bool(root.op.is_causal)
 
     q = _static_dims(inp_q.output.shape)
     k = _static_dims(inp_k.output.shape)
@@ -92,16 +95,24 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp
         raise RuleSkipped(f"flash: V seq {v[-2]} != K seq {s_k}")
 
     scale = 1.0 / math.sqrt(head_dim)
-    body = _flash_loop_body(inp_q.id, inp_k.id, inp_v.id, "_flash_scale", batch, s_q, s_k, head_dim, d_v, out.name)
+    body = _flash_loop_body(inp_q.id, inp_k.id, inp_v.id, "_flash_scale", batch, s_q, s_k, head_dim, d_v, out.name, causal=causal)
     nest = _wrap_free_axes(body, batch, s_q, d_v)
 
     frag = open_fragment(match.graph, [inp_q, inp_k, inp_v])
+    inputs = [inp_q.id, inp_k.id, inp_v.id, "_flash_scale"]
     frag.add_node(
         op=ConstantOp(name="_flash_scale", value=scale), inputs=[], output=Tensor("_flash_scale", (1,), out.dtype), node_id="_flash_scale"
     )
+    if causal:
+        # -inf bias for masked (key-after-query) positions: exp(-inf)=0, so a
+        # masked score contributes nothing to the streaming softmax / output.
+        frag.add_node(
+            op=ConstantOp(name="_flash_ninf", value=-1e30), inputs=[], output=Tensor("_flash_ninf", (1,), out.dtype), node_id="_flash_ninf"
+        )
+        inputs.append("_flash_ninf")
     frag.add_node(
         op=LoopOp(body=nest),
-        inputs=[inp_q.id, inp_k.id, inp_v.id, "_flash_scale"],
+        inputs=inputs,
         output=Tensor(out.name, out.shape, out.dtype),
         node_id=out.name,
     )
@@ -114,7 +125,18 @@ def _batch_vars(n: int) -> tuple[Var, ...]:
 
 
 def _flash_loop_body(
-    q_buf: str, k_buf: str, v_buf: str, scale_buf: str, batch: list[int], s_q: int, s_k: int, head_dim: int, d_v: int, out_buf: str
+    q_buf: str,
+    k_buf: str,
+    v_buf: str,
+    scale_buf: str,
+    batch: list[int],
+    s_q: int,
+    s_k: int,
+    head_dim: int,
+    d_v: int,
+    out_buf: str,
+    *,
+    causal: bool = False,
 ) -> tuple:
     """The per-output-element ``(…, m, d)`` body: streaming KV reduce + finalize."""
     bvars = _batch_vars(len(batch))
@@ -132,15 +154,32 @@ def _flash_loop_body(
             Accum(name="sacc", value="qk", op=ElementwiseImpl("add")),
         ),
     )
+    score: tuple = (Assign(name="s", op="multiply", args=("sacc", "scale_c")),)
+    score_name = "s"
+    prologue: tuple = ()
+    if causal:
+        # Causal mask: keep the score where key ≤ query (kv ≤ m), else −inf.
+        prologue = (Load(name="ninf_c", input="_flash_ninf", index=()),)
+        score += (
+            Select(
+                name="s_masked",
+                branches=(
+                    SelectBranch(value="s", select=BinaryExpr("<=", Var("kv"), Var("m"))),
+                    SelectBranch(value="ninf_c", select=Literal(1, "int")),
+                ),
+            ),
+        )
+        score_name = "s_masked"
     kv_body = (
         Init(name="sacc", op=ElementwiseImpl("add"), dtype="f32"),
         score_reduce,
-        Assign(name="s", op="multiply", args=("sacc", "scale_c")),
+        *score,
         Load(name="v_e", input=v_buf, index=v_idx),
-        FlashCombine(state=("m_i", "l_i", "O_i"), partial=("s", "v_e"), axes=("kv",)),
+        FlashCombine(state=("m_i", "l_i", "O_i"), partial=(score_name, "v_e"), axes=("kv",)),
     )
     return (
         Load(name="scale_c", input=scale_buf, index=()),
+        *prologue,
         Init(name="m_i", op=ElementwiseImpl("maximum"), dtype="f32"),
         Init(name="l_i", op=ElementwiseImpl("add"), dtype="f32"),
         Init(name="O_i", op=ElementwiseImpl("add"), dtype="f32"),
