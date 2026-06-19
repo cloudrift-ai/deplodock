@@ -48,8 +48,8 @@ if TYPE_CHECKING:
 # occupancy split where the -O1 latencies are within ~1% but -O3 differs ~15%.
 # Widening the deployable-sample net to this band feeds the prior -O3 truth for
 # every near-best contender, so it can rank by -O3 cost. Env-overridable via
-# ``DEPLODOCK_O3_TOL`` (a fraction, e.g. ``0.10`` for 10%).
-O3_REBENCH_TOL = 0.10
+# ``DEPLODOCK_O3_TOL`` (a fraction, e.g. ``0.15`` for 15%).
+O3_REBENCH_TOL = 0.15
 
 
 @dataclass

@@ -117,7 +117,7 @@ same worker.
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
   `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches at
-  `-Xcicc -O3`** every config **within `DEPLODOCK_O3_TOL` (default 10%) of the best -O1 so far** — not just a strict new
+  `-Xcicc -O3`** every config **within `DEPLODOCK_O3_TOL` (default 15%) of the best -O1 so far** — not just a strict new
   global-best — and feeds each as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run at -O3, rank by
   the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK` or a warp tile's
   `WARPSPEC`). The tolerance band gives the prior an -O3 truth sample for every near-best contender, not only the winner;

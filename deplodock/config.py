@@ -202,10 +202,10 @@ def tune_eps(default: float = 0.0) -> float:
     return float_env(TUNE_EPS, default)
 
 
-def o3_tol(default: float = 0.10) -> float:
+def o3_tol(default: float = 0.15) -> float:
     """``DEPLODOCK_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
     within which a tuned config is also re-benched at -O3 for a deployable prior
-    sample. ``0.10`` = re-bench everything within 10% of the best -O1."""
+    sample. ``0.15`` = re-bench everything within 15% of the best -O1."""
     return float_env(O3_TOL, default)
 
 
