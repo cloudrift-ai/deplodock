@@ -2,8 +2,9 @@
 
 The trait-agnostic machinery keys off ``isinstance(s, ReduceCarrier)`` instead
 of an ``isinstance(s, (Accum, Mma))`` ladder, and rules that care about the
-combine query ``combine_op()``'s traits rather than matching op names. These
-tests pin both halves of that contract.
+combine read the carrier's ``associative`` / ``commutative`` / ``has_identity``
+traits rather than matching op names. These tests pin both halves of that
+contract.
 """
 
 from __future__ import annotations
@@ -52,8 +53,14 @@ def test_accum_is_reduce_carrier():
     assert isinstance(a, ReduceCarrier)
     assert a.carried_names() == ("acc",)
     assert a.partial_deps() == ("v",)  # excludes the implicit carried read
-    assert a.combine_op().name == "maximum"
-    assert a.combine_op().associative
+    # Traits forward to the scalar op — a `maximum` Accum is associative.
+    assert a.associative and a.commutative and a.has_identity
+
+
+def test_accum_traits_forward_to_op():
+    # A non-reassociable op flips the carrier's traits — they are not hardcoded.
+    a = Accum(name="acc", value="v", op=ElementwiseImpl("subtract"))
+    assert not a.associative and not a.has_identity
 
 
 # --------------------------------------------------------------------------- #
@@ -70,11 +77,9 @@ def test_mma_is_reduce_carrier():
     assert isinstance(m, ReduceCarrier)
     assert m.carried_names() == ("acc",)
     assert m.partial_deps() == ("a0", "b0")  # operands, not the carried c
-    # The tensor-core accumulation is an additive fold — reported so split-K
-    # reassociation gates see the same algebra as a scalar sum Accum.
-    op = m.combine_op()
-    assert op.name == "add"
-    assert op.associative and op.commutative and op.has_identity
+    # The tensor-core accumulation is an additive fold — its traits match a
+    # scalar sum Accum so split-K reassociation gates see the same algebra.
+    assert m.associative and m.commutative and m.has_identity
 
 
 # --------------------------------------------------------------------------- #

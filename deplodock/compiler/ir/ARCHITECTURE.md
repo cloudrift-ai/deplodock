@@ -127,7 +127,9 @@ iteration axes. Free vs reduce is inferred from body structure — a
 base of `Accum` and its tensor-core form `Mma`; `is_reduce`, axis threading,
 and the other carrier-agnostic checks key off the base, not an
 `isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's algebra
-read `carrier.combine_op()` and query its traits.
+read the carrier's `associative` / `commutative` / `has_identity` traits
+directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
+constants).
 
 ### `loop/ir.py` — LoopOp types
 
@@ -315,7 +317,8 @@ Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
 (`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
 `ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,
-and its `combine_op()` reports `add`) that carries that `Atom` and names its A/B
+and reports the additive-fold traits `associative` / `commutative` /
+`has_identity` directly) that carries that `Atom` and names its A/B
 operand `Load`s by SSA
 value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
 marker downstream. Both are ordinary IR the staging passes carry through (the

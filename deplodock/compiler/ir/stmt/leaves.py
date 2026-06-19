@@ -514,8 +514,19 @@ class Accum(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.name,)
 
-    def combine_op(self) -> ElementwiseImpl:
-        return self.op
+    # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
+    # ``sum`` Accum differ, and ``self.op`` is the source of truth.
+    @property
+    def associative(self) -> bool:
+        return self.op.associative
+
+    @property
+    def commutative(self) -> bool:
+        return self.op.commutative
+
+    @property
+    def has_identity(self) -> bool:
+        return self.op.has_identity
 
     def pretty(self, indent: str = "") -> list[str]:
         prefix = f"{self.dtype.name} " if self.dtype is not None else ""
@@ -590,12 +601,22 @@ class Mma(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.c,)
 
-    def combine_op(self) -> ElementwiseImpl:
-        # The tensor-core accumulation is ``c += a @ b`` — an additive fold.
-        # Reporting ``add`` (associative + commutative + identity 0) is what
-        # tells reassociation gates that split-K over the matmul's K axis is
-        # legal, exactly as for a scalar sum Accum.
-        return ElementwiseImpl("add")
+    # The tensor-core accumulation ``c += a @ b`` is an additive fold —
+    # associative + commutative with identity 0. That is what tells
+    # reassociation gates split-K over the matmul's K axis is legal, exactly as
+    # for a scalar ``sum`` Accum (there is no scalar op to point at, so the
+    # traits are reported as constants).
+    @property
+    def associative(self) -> bool:
+        return True
+
+    @property
+    def commutative(self) -> bool:
+        return True
+
+    @property
+    def has_identity(self) -> bool:
+        return True
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.c} <- mma[{self.atom.name}]({self.a} @ {self.b})"]
