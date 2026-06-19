@@ -1480,6 +1480,7 @@ def _(s: LdmatrixLoad, rename, sigma, axis_fn):
         swizzle=s.swizzle,
         staged=s.staged,
         gmem_guard=None if s.gmem_guard is None else (sigma.apply(s.gmem_guard[0]), sigma.apply(s.gmem_guard[1])),
+        k_zero=None if s.k_zero is None else (sigma.apply(s.k_zero[0]), sigma.apply(s.k_zero[1])),
         b_trans=s.b_trans,
     )
 
