@@ -250,6 +250,35 @@ static and dynamic suites:
   ranks the static under `_W_A` and the dynamic under `_W_A_DYN` — the FLASH term's symbolic clause is exercised by the
   twin, not a bespoke case.
 
+## Implementation status (2026-06-19)
+
+A **scalar-tier** flash path is implemented and GPU-verified end-to-end (RTX 5090, sm_120); the tensor-core P@V tier
+remains future work. What landed, and how it diverged from the original framing:
+
+- **Step 1 (done)** — `FlashCombine` carrier (`ir/stmt/leaves.py`): the `(m, l, O)` tuple monoid, traits, `is_reduce`,
+  `rewrite` threading. Unit-tested.
+- **Step 2 (done)** — `FlashCombine.render` lowers the LSE rescale **directly** (not via a separate pass) into fp32
+  assignments against `Init`-declared carried scalars; `LoopOp` validation learned `Init` + `FlashCombine`. Verified via
+  `LoopOp.forward` (cppyy CPU JIT) vs numpy — `tests/compiler/ir/test_flash_combine_forward.py`.
+- **Steps 3 + 4 are coupled — realized together at the scalar tier.** Step 3 (loop-carried *scaled* MMA fragment) cannot
+  be built or verified in isolation: there is no frontend op for a scaled-accumulator matmul, the scale is **per-query-
+  row** (the `m16n8k16` `c[4]` fragment maps regs→rows), and the `alpha` only exists once the softmax half of the tile is
+  built. So the scalar nest was implemented first: `frontend/decomposition/008_sdpa_flash.py` recognizes `SdpaOp` (before
+  `010_sdpa`) and, gated by the `FLASH` knob, emits a single fused `LoopOp` that runs **one independent streaming softmax
+  per output element `(…, m, d)`** — correct (the score `s = Σ_dd Q·K` is an inner reduce nested in the KV streaming
+  reduce; the nest pre-places `Init(sacc)` at the KV-body scope so it resets per step), but redundant (recomputes scores
+  per `d`). The tensor-core P@V tier (Step 3's `RegScale` fragment, the real perf win) is **still future work**.
+- **Steps 4–6 (done, scalar tier)** — non-causal, causal (per-element `kv ≤ m` mask), and dynamic (symbolic `seq_len`
+  threaded through both the masked-row M and the symbolic reduce — one cached kernel serves every size) all GPU-verified
+  vs torch SDPA at ~1–3e-7. `tests/compiler/e2e/test_flash_attention.py` (9 tests). `FLASH` is read from the
+  `DEPLODOCK_FLASH=1` env pin today; the two-level `OptionFork` offer + `AnalyticPrior` cold-start term (and the
+  `_extents` symbolic-hint change) are **not yet wired** — a follow-up. With `FLASH` off the default `010_sdpa` path is
+  unchanged.
+
+**Remaining:** the tensor-core P@V tier (loop-carried per-row-scaled `Mma` fragment — the real Step 3); the `FLASH`
+structural-fork offer + analytic cold-start; causal tile-skip (only the per-element mask exists); GQA + explicit-mask
+flash (both fall through to `010_sdpa`).
+
 ## Incremental steps (each independently verifiable)
 
 Every step's accuracy test is written under the `shape_mode` fixture (see "Test strategy"), so static and dynamic are
