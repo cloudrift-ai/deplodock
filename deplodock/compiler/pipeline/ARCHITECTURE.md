@@ -727,7 +727,13 @@ leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.r
 `tile_identity` (its planner knobs) and **re-resolves**: `greedy_decide(blocked=…)` drops the matching leaf from the
 flattened set and picks the next-best (the valid runner-up is usually ranked right below). Bounded by
 `_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
-`tile_identity` never matches a different tile, so no other candidate is pruned.
+`tile_identity` never matches a different tile, so no other candidate is pruned. When the retry budget exhausts with the
+node still un-lowered (a *learned* prior can rank many over-budget tiles above the first in-budget one — e.g. a prior
+trained on big square matmuls extrapolating a >smem-cap tile onto a tiny projection, which crashed the golden sweep at
+`qwen3_06b.q_proj.s32`), `Pipeline.run` takes one last **option-0 (emission-order) resolve** (`greedy_decide(prior=None)`):
+it ignores the prior, and the planner emits a budget-safe tile first, so it lowers whenever any in-budget tile exists.
+Only when even option-0 overflows (the rule genuinely has no in-budget option) does `_raise_on_unlowered` fire the loud
+`LoweringError` — the single-option guardrail is preserved.
 
 **Reading the result.** `_bench_terminal_async` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search
