@@ -42,37 +42,46 @@ two tiny s32 shapes — the shapes where the analytic geometry terms extrapolate
 
 ## Per-shape outcomes (-O3 `run --bench` A/B)
 
-| shape                            | greedy µs | golden µs | ratio | category                         |
-|----------------------------------|----------:|----------:|------:|----------------------------------|
-| square.512                       |      13.6 |      13.5 | 1.007 | unchanged (same knobs)           |
-| square.1024                      |      74.2 |      71.0 | 1.04  | unchanged (same knobs; clean rerun) |
-| square.2048                      |     383.3 |     467.5 | 0.82  | **replaced** (golden un-rebenchable) |
-| square.4096                      |    4216.1 |    3192.8 | 1.32  | worse → leave (Finding 1)        |
-| square.512.fp16                  |       5.9 |      17.7 | 0.33  | **replaced** (scalar→warp/MMA)   |
-| square.1024.fp16                 |      29.3 |      90.7 | 0.32  | **replaced** (scalar→warp/MMA)   |
-| square.2048.fp16                 |     177.8 |     512.5 | 0.35  | **replaced** (scalar→warp/MMA)   |
-| square.4096.fp16                 |     889.9 |    2125.8 | 0.42  | **replaced** (scalar→warp/MMA)   |
-| qwen3_06b.q_proj.s32             |       7.8 |       7.8 | 1.00  | unchanged (same knobs)           |
-| qwen3_06b.kv_proj.s32            |       6.3 |       6.9 | 0.91  | unchanged (noise, ~0.4 µs)       |
-| qwen3_06b.o_proj.s32             |      11.3 |      11.9 | 0.95  | unchanged (noise)                |
-| qwen3_06b.gate_up_proj.s32       |      14.3 |      12.9 | 1.11  | worse → leave (Finding 4)        |
-| qwen3_06b.down_proj.s32          |      19.9 |      16.6 | 1.20  | worse → leave (Finding 2)        |
-| qwen3_06b.q_proj.s128            |      20.9 |      23.5 | 0.89  | **replaced** (12% under recorded)|
-| qwen3_06b.kv_proj.s128           |      14.2 |      13.5 | 1.05  | unchanged (noise)                |
-| qwen3_06b.o_proj.s128            |      23.2 |      24.4 | 0.95  | unchanged (noise)                |
-| qwen3_06b.gate_up_proj.s128      |      33.0 |      49.5 | 0.67  | **replaced**                     |
-| qwen3_06b.down_proj.s128         |      35.4 |      33.4 | 1.06  | unchanged (noise)                |
-| qwen3_06b.q_proj.s512            |      55.6 |      95.8 | 0.58  | **replaced**                     |
-| qwen3_06b.kv_proj.s512           |      34.3 |      44.5 | 0.77  | **replaced**                     |
-| qwen3_06b.o_proj.s512            |      55.6 |      87.9 | 0.63  | **replaced**                     |
-| qwen3_06b.gate_up_proj.s512      |     103.7 |     132.2 | 0.78  | **replaced**                     |
-| qwen3_06b.down_proj.s512         |      79.7 |     143.1 | 0.56  | **replaced**                     |
-| square.512.dynM                  |      13.9 |      12.9 | 1.08  | worse → leave (Finding 3)        |
-| qwen3_06b.q_proj.s512.dynM       |      67.7 |      67.1 | 1.01  | unchanged                        |
-| qwen3_06b.kv_proj.s512.dynM      |      38.8 |      35.3 | 1.10  | worse → leave (Finding 3)        |
-| qwen3_06b.o_proj.s512.dynM       |      69.9 |      61.7 | 1.13  | worse → leave (Finding 3)        |
-| qwen3_06b.gate_up_proj.s512.dynM |      91.5 |      96.0 | 0.95  | unchanged (noise, same knobs)    |
-| qwen3_06b.down_proj.s512.dynM    |      95.3 |      91.8 | 1.04  | unchanged (noise)                |
+| shape                            | greedy µs | golden µs | ratio | cuBLAS µs | vs cuBLAS | category                         |
+|----------------------------------|----------:|----------:|------:|----------:|----------:|----------------------------------|
+| square.512                       |      13.6 |      13.5 |  1.01 |      10.8 |      1.26 | unchanged (same knobs)           |
+| square.1024                      |      74.2 |      71.0 |  1.05 |      45.4 |      1.63 | unchanged (same knobs; clean rerun) |
+| square.2048                      |     383.3 |     467.5 |  0.82 |     320.0 |      1.20 | **replaced** (golden un-rebenchable) |
+| square.4096                      |    4216.1 |    3192.8 |  1.32 |    2458.6 |      1.71 | worse → leave (Finding 1)        |
+| square.512.fp16                  |       5.9 |      17.7 |  0.33 |       5.8 |      1.02 | **replaced** (scalar→warp/MMA)   |
+| square.1024.fp16                 |      29.3 |      90.7 |  0.32 |      18.1 |      1.62 | **replaced** (scalar→warp/MMA)   |
+| square.2048.fp16                 |     177.8 |     512.5 |  0.35 |     115.2 |      1.54 | **replaced** (scalar→warp/MMA)   |
+| square.4096.fp16                 |     889.9 |    2125.8 |  0.42 |     822.3 |      1.08 | **replaced** (scalar→warp/MMA)   |
+| qwen3_06b.q_proj.s32             |       7.8 |       7.8 |  1.00 |       9.9 |      0.79 | unchanged (same knobs)           |
+| qwen3_06b.kv_proj.s32            |       6.3 |       6.9 |  0.91 |       6.9 |      0.91 | unchanged (noise, ~0.4 µs)       |
+| qwen3_06b.o_proj.s32             |      11.3 |      11.9 |  0.95 |       9.9 |      1.14 | unchanged (noise)                |
+| qwen3_06b.gate_up_proj.s32       |      14.3 |      12.9 |  1.11 |      11.3 |      1.27 | worse → leave (Finding 4)        |
+| qwen3_06b.down_proj.s32          |      19.9 |      16.6 |  1.20 |      13.0 |      1.53 | worse → leave (Finding 2)        |
+| qwen3_06b.q_proj.s128            |      20.9 |      23.5 |  0.89 |      20.2 |      1.03 | **replaced** (12% under recorded) |
+| qwen3_06b.kv_proj.s128           |      14.2 |      13.5 |  1.05 |      12.4 |      1.15 | unchanged (noise)                |
+| qwen3_06b.o_proj.s128            |      23.2 |      24.4 |  0.95 |      19.0 |      1.22 | unchanged (noise)                |
+| qwen3_06b.gate_up_proj.s128      |      33.0 |      49.5 |  0.67 |      25.5 |      1.29 | **replaced**                     |
+| qwen3_06b.down_proj.s128         |      35.4 |      33.4 |  1.06 |      24.5 |      1.44 | unchanged (noise)                |
+| qwen3_06b.q_proj.s512            |      55.6 |      95.8 |  0.58 |      53.3 |      1.04 | **replaced**                     |
+| qwen3_06b.kv_proj.s512           |      34.3 |      44.5 |  0.77 |      38.9 |      0.88 | **replaced**                     |
+| qwen3_06b.o_proj.s512            |      55.6 |      87.9 |  0.63 |      67.8 |      0.82 | **replaced**                     |
+| qwen3_06b.gate_up_proj.s512      |     103.7 |     132.2 |  0.78 |      85.5 |      1.21 | **replaced**                     |
+| qwen3_06b.down_proj.s512         |      79.7 |     143.1 |  0.56 |     113.2 |      0.70 | **replaced**                     |
+| square.512.dynM                  |      13.9 |      12.9 |  1.08 |      10.8 |      1.29 | worse → leave (Finding 3)        |
+| qwen3_06b.q_proj.s512.dynM       |      67.7 |      67.1 |  1.01 |      53.0 |      1.28 | unchanged                        |
+| qwen3_06b.kv_proj.s512.dynM      |      38.8 |      35.3 |  1.10 |      37.0 |      1.05 | worse → leave (Finding 3)        |
+| qwen3_06b.o_proj.s512.dynM       |      69.9 |      61.7 |  1.13 |      67.1 |      1.04 | worse → leave (Finding 3)        |
+| qwen3_06b.gate_up_proj.s512.dynM |      91.5 |      96.0 |  0.95 |      85.6 |      1.07 | unchanged (noise, same knobs)    |
+| qwen3_06b.down_proj.s512.dynM    |      95.3 |      91.8 |  1.04 |     119.4 |      0.80 | unchanged (noise)                |
+
+`vs cuBLAS` = greedy µs / recorded `cublas_us` (torch eager: true-fp32 SGEMM with `allow_tf32=False`, or HGEMM for
+`*.fp16`), so **>1.0 = deplodock is slower than PyTorch** — the absolute gap the relative greedy-vs-golden ratio hides.
+The worst cuBLAS losers are the large/regular GEMMs: `square.4096` 1.71×, `square.1024` 1.63×, `square.1024.fp16`
+1.62×, `square.2048.fp16` 1.54×, `down_proj.s32` 1.53×. Note the fp16 squares win their golden A/B 3× yet still trail
+cuBLAS HGEMM 1.5–1.6× (the win was vs the stale scalar golden, not vs PyTorch). deplodock only *beats* cuBLAS on six
+rectangular projections (`down_proj.s512` 0.70×, `down_proj.s512.dynM` 0.80×, `o_proj.s512` 0.82×, `kv_proj.s512`
+0.88×, `q_proj.s32` 0.79×, `kv_proj.s32` 0.91×). The cuBLAS-loser shapes that are *also* golden-unchanged/worse are the
+real headroom; the `_W_A` refit (Findings 1/4) targets the worst of them.
 
 Both win families reproduced on a second independent `run --bench` (fp16 squares: 5.9 / 27.7 / 177.4 / 891.9; s512:
 q 53.7, kv 34.3, o 55.5, gate_up 98.0, down 79.6) — all well outside the ~10–13% small-shape noise band. The two flaky

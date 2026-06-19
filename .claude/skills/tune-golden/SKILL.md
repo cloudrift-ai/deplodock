@@ -47,6 +47,12 @@ The kernel table shows the **greedy pick** row (what `run`/`compile` deploy) and
 config, **all benched live this run** — a real A/B. Knob columns are in the header; rows carry positional values.
 Compare the greedy `us` against the *best* (min) golden row's `us`.
 
+The same `run --bench` also prints a `Backend … vs Eager` latency table above the kernel table: the **`Eager
+PyTorch`** row is the live cuBLAS reference (SGEMM for fp32 — `allow_tf32=False`, HGEMM for `*.fp16`), and `vs Eager`
+is `eager_us / deplodock_us` (>1 = deplodock faster than PyTorch, <1 = slower). Note that eager number — it is the
+deplodock-vs-PyTorch/cuBLAS comparison the report surfaces (Step 7), and it is also the live cross-check on the
+shape's recorded `cublas_us` (which is config-independent, so the two should agree within noise).
+
 ## Step 3 — Categorize each shape
 
 Using the live A/B (greedy vs best golden row, same run):
@@ -166,8 +172,14 @@ density of the `tune-model` reports (`plans/*-tune-findings.md`; executed ones a
 
 - **Header**: date, GPU, the exact sweep command, wall time, and the category tally (N replaced / N added / N
   unchanged / N worse).
-- **Per-shape outcome table**: shape name, greedy µs, best-golden µs, ratio, category. All numbers from the -O3
-  `run --bench` A/B, never the -O1 tune DB.
+- **Per-shape outcome table**: shape name, greedy µs, best-golden µs, ratio (greedy/best-golden), category, **and a
+  cuBLAS comparison when an estimate is available** — a `cuBLAS µs` column (the shape's recorded `cublas_us`, or the
+  live `Eager PyTorch` row from the same `run --bench`) and a `vs cuBLAS` column (`greedy_us / cublas_us`, so >1.0 =
+  deplodock slower than PyTorch/cuBLAS — the "loser" view). Leave the two cuBLAS cells blank for any shape with no
+  estimate (e.g. a kernel kind that has no cuBLAS analogue). This makes the absolute deplodock-vs-PyTorch gap visible
+  per shape, not just the relative greedy-vs-golden delta — a shape can win the golden A/B yet still trail cuBLAS
+  (e.g. the fp16 squares: greedy beats a stale scalar golden 3× but is still ~0.6× cuBLAS HGEMM). All deplodock /
+  golden numbers from the -O3 `run --bench` A/B, never the -O1 tune DB.
 - **One `## Finding N — <title>` per prior shortfall**, ordered by how far the pick lands from the golden. The
   "worse" shapes (greedy >3% slower) are the findings: the search/prior failed to reach a config it was literally
   shown. For each, gather the evidence:
