@@ -49,10 +49,45 @@ consuming vLLM's attention output; vLLM's `Attention` layer does paged-KV attent
   runtime-arbitrary-positions trace work from the critical path. **deplodock owning RoPE with runtime positions (A1) is
   a later optimization**, not a prerequisite.
 
-Rejected alternatives are *forced, not chosen*: Mamba-state (KV grows ≠ constant state), full-recompute-in-vLLM (runner
-never re-feeds), one monolithic deplodock kernel that calls vLLM attention mid-graph (deplodock compiles static
-dataflow — it cannot yield to a Python `self.attn` call mid-kernel; the interleave must happen at the Python `forward`
-level, per layer).
+## Alternatives considered
+
+The end-state the user asked for is *vLLM first, deplodock-standalone later* — so the two genuinely-viable options (A
+and B) are not competitors but **phases of one trajectory**; the other three are forced out by the constraints above.
+
+- **Option A — carve SDPA out, vLLM owns paged attention (CHOSEN; this whole doc).** deplodock compiles each layer's
+  per-token everything-but-attention; vLLM's `Attention` layer owns the KV cache and attention math. *Why first:* it
+  reuses vLLM's entire serving stack for free — OpenAI API, sampler, scheduler, paged KV cache, continuous batching,
+  chat template, streaming — and needs **no new deplodock cache or incremental-attention kernel**, so a working chat
+  model lands soonest and the per-layer kernels (where deplodock's value is) get de-risked and tuned under real load.
+  *Cost:* the per-layer host-sync interleave (Top risk #1) — N deplodock↔vLLM round-trips per step, and the interleave
+  itself can't collapse into one captured graph.
+
+- **Option B — deplodock standalone: own KV cache + incremental-attention kernel (the eventual goal; Phase 7).** No
+  vLLM: deplodock manages its own KV cache and a new **incremental-attention kernel** (new q `[1,Hq]` vs cached K/V
+  `[S,Hkv]` — the inverse of today's full-sequence SDPA, the one deep new compiler capability), with Phase 0's loop +
+  `sampling.py` behind a minimal OpenAI server. *Why it wins long-term:* no Python interleave — a whole decode step can
+  be **one captured graph**, the low-latency story deplodock is built for — and no vLLM coupling. *Why deferred:*
+  it reimplements everything vLLM gives free (cache, scheduler, continuous batching, API, sampler) AND needs the hardest
+  new kernel; doing it first would gate the first chat output on the largest pile of new code. A proves the kernels
+  correct so B becomes "swap the host loop", not "build it all at once".
+
+- **Option C — full-sequence recompute each step (O(S²)).** Re-run the whole growing prefix every token. *Adopted only
+  as the Phase 0 standalone oracle* — zero new compiler work, an exact token-for-token reference for every later phase.
+  Rejected as a product: quadratic, and structurally **impossible inside vLLM** (the V1 runner never re-feeds prior
+  context).
+
+- **Option D — Mamba-style self-managed state (`IsAttentionFree` / `MambaSpec`).** Forced out: `MambaSpec` assumes a
+  *constant-size* recurrent state, but a KV cache grows with sequence length — deplodock cannot present its cache as
+  Mamba "state". (This is the embedding plugin's path; it does not generalize to generation.)
+
+- **Option E — one monolithic deplodock kernel that calls vLLM attention mid-graph.** Forced out: deplodock compiles a
+  static dataflow graph; it cannot yield to a Python `self.attn(q,k,v)` call partway through a kernel. The deplodock↔
+  attention interleave must live at the Python `forward` level, per layer — which is exactly what Option A does.
+
+**Sub-options inside A** (each resolved in the phases below, not re-litigated here): *who applies RoPE* — vLLM (**A2**,
+chosen for the first cut) vs deplodock with runtime positions (**A1**, Phase 6); *how to carve SDPA* — submodule
+substitution (chosen) vs post-trace frontend-IR graph surgery (fallback); *program granularity* — one program per layer
+(chosen) vs one all-layers program with attention boundaries (Phase 2).
 
 ## Phases (correctness-first; detail front-loaded on 0–4)
 
