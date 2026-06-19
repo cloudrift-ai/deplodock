@@ -50,7 +50,7 @@ two tiny s32 shapes — the shapes where the analytic geometry terms extrapolate
 | square.4096                      |    4216.1 |    3192.8 |  1.32 |    2458.6 |      1.71 | worse → leave (Finding 1)        |
 | square.512.fp16                  |       5.9 |      17.7 |  0.33 |       5.8 |      1.02 | **replaced** (scalar→warp/MMA)   |
 | square.1024.fp16                 |      29.3 |      90.7 |  0.32 |      18.1 |      1.62 | **replaced** (scalar→warp/MMA)   |
-| square.2048.fp16                 |     177.8 |     512.5 |  0.35 |     115.2 |      1.54 | **replaced** (scalar→warp/MMA)   |
+| square.2048.fp16                 |     119.3 |     512.5 |  0.23 |     115.2 |      1.04 | **replaced** (warp/MMA + 128×128 tile, Finding 5) |
 | square.4096.fp16                 |     889.9 |    2125.8 |  0.42 |     822.3 |      1.08 | **replaced** (scalar→warp/MMA)   |
 | qwen3_06b.q_proj.s32             |       7.8 |       7.8 |  1.00 |       9.9 |      0.79 | unchanged (same knobs)           |
 | qwen3_06b.kv_proj.s32            |       6.3 |       6.9 |  0.91 |       6.9 |      0.91 | unchanged (noise, ~0.4 µs)       |
@@ -142,6 +142,42 @@ these three goldens carrying more weight — the masked-tile occupancy term need
 `gate_up_proj.s32` greedy 14.3 vs golden 12.9 µs (1.11×); golden ranks 19 (analytic) / 25 (learned). Greedy diverges
 on `BN` (16 vs 32), `BK` (32 vs 64) and `SPLITK` (1 vs 2). Same root cause family as Finding 1 (analytic mis-pricing on
 sm_89), at a tiny absolute (~1.4 µs). Folded into the Finding 1 `_W_A` refit; no separate action.
+
+## Finding 5 — fp16 squares: we *do* use tensor cores, but the prior undersizes the warp tile (P1)
+
+Follow-up investigation into the deplodock-vs-cuBLAS fp16 gap ("are we not able to use MMA there?"). Two structural
+facts first: (a) the atom registry holds only `mma_m16n8k16_f16` / `_bf16` — **there is no TF32 atom**, so fp32 matmuls
+have no tensor-core path at all (the fp32 squares run scalar CUDA-core FMA against true-SGEMM, by design); (b)
+**warp-specialization requires a TMA `StageBundle`** (`085_warp_specialize._eligible` → "no TMA StageBundle"), and TMA
+is sm_90+ — the RTX 4090 (sm_89) has no TMA, so `WARPSPEC` is structurally unavailable here (this is why the 5090 fp16
+goldens carry `WARPSPEC: true` and the 4090 ones cannot). So on the 4090 every fp16 square already rides the
+plain-`mma.sync` + cp.async tensor-core path — MMA *is* used.
+
+The gap is **tile size**, not tier. The recorded fp16 squares used small warp tiles (≤64×128); cuBLAS HGEMM uses
+128×128–128×256. A manual tile sweep (10 warp-tile geometries × 4 shapes, all on the same mma.sync path — no
+warpspec — accuracy-checked, in `_tune/golden-sweep-rtx4090/fp16/`) found the best reachable config per shape:
+
+| shape            | recorded tile | was µs | best tile (`WM WN FM FN`)        | µs    | vs cuBLAS    | action          |
+|------------------|---------------|-------:|----------------------------------|------:|-------------:|-----------------|
+| square.512.fp16  | 32×32         |    5.9 | 32×32 (recorded is best)         |   5.9 | 1.02× (par)  | keep            |
+| square.1024.fp16 | 64×32         |   27.8 | 64×32 (no tile beats it)         |  27.8 | 1.7× ceiling | keep            |
+| square.2048.fp16 | 64×64         |  177.8 | **128×128 (`2 2 4 8`, BK2 RING2)**| 119.3 | 1.54×→**1.04×** | **replaced**  |
+| square.4096.fp16 | 64×128        |  889.9 | 64×128 (recorded is best)        | 889.9 | 1.08× (par)  | keep            |
+
+Only `square.2048.fp16` had headroom: the 128×128 tile (`WM2 WN2 FM4 FN8`) lands **119.3 µs / 1.04× cuBLAS** — a
+**33% win** over the 178 µs the prior deploys, accuracy-checked and reproduced (119.3/119.7). The win is purely a
+larger output tile; `RING=3` on it drops occupancy to 17% and erases the gain. Note the deployed **greedy still picks
+the 64×64 (178 µs)** — the golden records the known-best, but the prior's warp-tier geometry terms **under-reward the
+larger tile's data reuse** on sm_89, so `compile`/`run` won't deploy it until the prior is refit. The other three are
+genuinely at their ceiling: `512`/`4096` are already ≤1.08× cuBLAS, and `1024.fp16`'s ~1.7× gap survives every tile
+(no warp-specialization to overlap the mma.sync K-loop the way HGEMM does at M=1024).
+
+**Recommendation (P1):** refit the warp-tier analytic weights / add a `D_*` tile-reuse feature so the prior prefers the
+128×64 fp16 tile (the `eval analytic` warp-tier ranking under-prices it on sm_89) — this is the same `_W_A` refit
+Findings 1/4 ask for, extended to cover the warp/MMA regime, not just scalar. The remaining fp16 ceiling
+(`square.1024.fp16`, and the residual on 2048) needs warp-specialization on sm_89, which is blocked on TMA hardware
+the 4090 lacks — a deeper codegen item (a cp.async-pipelined producer/consumer split without TMA), out of scope for a
+golden refresh.
 
 ## Workflow notes
 

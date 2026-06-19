@@ -57,8 +57,8 @@ configs:
     N: 2048
     K: 2048
     dtype: fp16
-    knobs: {WN: 4, WM: 1, FM: 4, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, STAGE: '11'}
-    deplodock_us: 177.8
+    knobs: {WM: 2, WN: 2, FM: 4, FN: 8, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, STAGE: '11'}
+    deplodock_us: 119.3
     cublas_us: 115.2
   - kernel: matmul
     name: square.4096.fp16
