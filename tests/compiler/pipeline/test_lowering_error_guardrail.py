@@ -138,6 +138,107 @@ def test_tuning_does_not_raise_and_prunes_branch():
     assert isinstance(terminals[0].graph.nodes["y"].op, TileOp)
 
 
+# ---------------------------------------------------------------------------
+# Option-0 fallback: a prior that over-extrapolates large (over-budget) tiles
+# onto a small shape must not abort the greedy compile. The retry blocklist
+# exhausts on the prior-ranked over-budget tiles, then the conservative
+# emission-order pick (option-0) recovers the in-budget tile. This is the
+# tune-time golden-sweep crash: a prior trained on big square matmuls picked a
+# >smem-cap tile for the tiny ``qwen3_06b.q_proj`` projection and the assemble
+# raised instead of falling back.
+# ---------------------------------------------------------------------------
+
+
+class _BiggestBNFirstPrior:
+    """Stub global prior that ranks leaves by ``BN`` descending — i.e. always
+    prefers the largest (over-budget) tile, the way a prior trained on big
+    square matmuls extrapolates onto a tiny shape. ``pick`` returns the
+    argmax-BN row, so greedy keeps choosing over-budget tiles until the
+    blocklist retry budget is exhausted."""
+
+    fitted = True
+
+    def pick(self, rows: list[dict]) -> tuple[int, float]:
+        best_i = max(range(len(rows)), key=lambda i: rows[i].get("BN", 0))
+        return best_i, 0.0
+
+
+def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
+    """Mirror the real lowering shape: pass 0 (partition → tile ``Fork``) emits
+    an in-budget option-0 (``BN=8``, emitted first) followed by
+    ``n_over_budget`` over-budget tile leaves (``BN=16, 24, …``); pass 1
+    (``100_materialize_tile``) materializes the chosen tile into a ``KernelOp``
+    and lets ``validate(ctx)`` filter it. Over-budget tiles only fail at the
+    materialize pass (like the real planner emitting tile leaves that pass
+    through ``Candidate.try_rewrite``'s validate filter unchecked), so the
+    prior can rank them top and the blocklist retry engages per tile identity
+    (``BN``). Pass 0 ``RuleSkipped``-guards on the BN marker so it never
+    re-fires on its own (already-tiled) output."""
+    from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
+    from deplodock.compiler.pipeline.pipeline import RuleSkipped
+
+    def _tile_leaf(bn: int) -> TileOp:
+        return TileOp(body=Body(()), name="k_test", knobs={"BN": bn})
+
+    def emit_tiles(root):
+        if "BN" in root.op.knobs:  # already tiled (our own output) → don't re-fork
+            raise RuleSkipped("already tiled")
+        leaves = [OptionFork(option=_tile_leaf(8), knobs={"BN": 8})]
+        leaves += [OptionFork(option=_tile_leaf(16 + 8 * i), knobs={"BN": 16 + 8 * i}) for i in range(n_over_budget)]
+        return ThunkFork(knobs={}, expand_fn=lambda _k: leaves)
+
+    def materialize(root):
+        bn = root.op.knobs.get("BN", 0)
+        extents = (64,) if bn <= 8 else (4096,)  # 256 B fits the 2 KiB cap; 16 KiB overflows
+        return KernelOp(body=[Smem(name="buf", extents=extents, dtype="float")], name="k_test", knobs={"BN": bn})
+
+    emit_rule = Rule(
+        name="__emit_tiles__",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=emit_tiles,
+        param_names=tuple(inspect.signature(emit_tiles).parameters.keys()),
+    )
+    mat_rule = Rule(
+        name="100_materialize_tile",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=materialize,
+        param_names=tuple(inspect.signature(materialize).parameters.keys()),
+    )
+    p0 = Pass(name="__partition__", rules=[emit_rule], index=0)
+    p1 = Pass(name="__materialize__", rules=[mat_rule], index=1)
+    emit_rule.pass_ = p0
+    mat_rule.pass_ = p1
+    return Pipeline(passes=[p0, p1])
+
+
+def test_greedy_run_falls_back_to_option0_when_prior_overflows(monkeypatch):
+    # The prior ranks 12 over-budget tiles above the lone in-budget tile, so
+    # the blocklist retry can never reach it within its budget. Before the
+    # option-0 fallback this raised LoweringError; now ``Pipeline.run`` takes
+    # the conservative emission-order pick (option-0 = the in-budget tile).
+    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    terminal = _two_pass_tile_pipeline(n_over_budget=12).run(_graph_with_tile(), ctx=_small_smem_ctx())
+    op = terminal.nodes["y"].op
+    assert isinstance(op, KernelOp), "the in-budget option-0 tile must lower (no LoweringError)"
+    assert op.knobs.get("BN") == 8, "the recovered tile is the budget-safe emission-order leaf"
+
+
+def test_greedy_run_still_raises_when_no_in_budget_option(monkeypatch):
+    # The fallback must not paper over a genuinely un-lowerable shape: when
+    # EVERY tile is over-budget, option-0 overflows too and the loud
+    # LoweringError still fires (no in-budget leaf exists to recover).
+    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    # Drop the in-budget option-0: shift all leaves over budget by tuning the
+    # materializer to overflow for every BN (handled by the all-over-budget
+    # single-option pipeline already covered by ``_build_pipeline``).
+    with pytest.raises(LoweringError):
+        _build_pipeline().run(_graph_with_tile(), ctx=_small_smem_ctx())
+
+
 def test_run_leaves_no_state_on_pipeline():
     # The rejection sink is Run-scoped (``Run.rejections``), never stashed on
     # the shared frozen Pipeline — a subsequent tune on the same Pipeline sees

@@ -535,6 +535,21 @@ class Pipeline:
                 break
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)
+        # The prior-ranked tiles all overflowed ``validate(ctx)`` within the
+        # retry budget — a *learned* prior can extrapolate a large tile onto a
+        # small shape (e.g. one trained on big square matmuls picking an
+        # over-smem-cap tile for a tiny projection), and the blocklist retry
+        # exhausts before reaching an in-budget leaf. Before giving up, take the
+        # conservative emission-order pick (``greedy_decide(prior=None)`` =
+        # option-0): it ignores the prior, and the planner emits a budget-safe
+        # tile first, so it lowers whenever any in-budget tile exists. When even
+        # option-0 overflows (the over-budget rule genuinely has no in-budget
+        # option — e.g. the single-option guardrail) the re-resolve stays
+        # un-lowered and ``_raise_on_unlowered`` fires below, exactly as before.
+        if _unlowered_tiles(terminal, rejections):
+            rejections = []
+            run = Run(pipeline=self, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
+            terminal, _ = run.resolve(graph.copy(), greedy_decide(prior=None, price_structural=False))
         _raise_on_unlowered(terminal, rejections, ctx)
         logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
         return terminal
