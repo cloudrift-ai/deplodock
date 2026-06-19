@@ -435,6 +435,15 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
     model.eval()
 
+    # W4A16: swap compressed-tensors quantized linears for DequantLinear (the
+    # opaque ``deplodock::dequant_linear`` custom op) BEFORE export, so the
+    # decompress pre-hook never fires and the packed buffers stay graph
+    # constants. No-op for non-quantized models. Reached by run / tune too
+    # (both trace through here).
+    from deplodock.compiler.trace.quantized import apply_quant_substitution
+
+    apply_quant_substitution(model)
+
     if layer is None:
         from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
 

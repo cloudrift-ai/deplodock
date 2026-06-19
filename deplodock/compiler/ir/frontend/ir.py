@@ -217,6 +217,125 @@ class LinearOp(Op):
         return result
 
 
+@dataclass(frozen=True)
+class QuantScheme:
+    """Format descriptor for a weight-only quantized linear.
+
+    The single seam that carries format-specific numbers into the
+    otherwise format-agnostic dequant pipeline. Phase 0 (compressed-
+    tensors AWQ-INT4) needs four fields; richer formats (other bit
+    widths, GPTQ packing, codebook lookups) extend this descriptor and
+    the decomposition rule, leaving the bitwise IR / fusion / kernel
+    tiers untouched.
+
+    - ``num_bits`` — bits per packed weight element (4 here). ``32 //
+      num_bits`` elements pack into each int32 lane.
+    - ``group_size`` — the K/in-axis group the scale (and zero-point)
+      index by: ``scale[o, k // group_size]``.
+    - ``packed_dim`` — the weight axis the nibbles interleave along
+      (``1`` = the in/K axis: ``nibble[:, i::8] = (packed >> 4i) & 0xF``).
+    - ``symmetric`` — ``False`` (asymmetric) subtracts the unpacked
+      per-group zero-point; ``True`` subtracts the implicit midpoint
+      ``2**(num_bits-1)`` (``8``) instead. Never both — applying −8 *and*
+      an unsigned-zp subtract double-shifts.
+    """
+
+    num_bits: int = 4
+    group_size: int = 32
+    packed_dim: int = 1
+    symmetric: bool = False
+
+    @property
+    def pack_factor(self) -> int:
+        """Number of weight elements packed into one int32 lane (8 for 4-bit)."""
+        return 32 // self.num_bits
+
+
+def dequant_weight_numpy(weight_packed, weight_scale, weight_zero_point, scheme: QuantScheme):
+    """Reference int4 → fp16 weight dequant (the numerics oracle).
+
+    Mirrors ``compressed_tensors.dequantize`` for the verified pack-quantized
+    AWQ-INT4 format: the packed weight carries ``pack_factor`` unsigned
+    nibbles per int32 interleaved along ``packed_dim`` (the K/in axis); the
+    zero-point is itself int4-packed along OUT. Returns the ``[out, in]`` fp16
+    weight ``(nibble − zp) · scale`` (asymmetric) or ``(nibble − 8) · scale``
+    (symmetric). Integer-exact on the unpack; the only rounding is the fp16
+    scale multiply.
+    """
+    nbits = scheme.num_bits
+    per = scheme.pack_factor
+    mask = (1 << nbits) - 1
+    g = scheme.group_size
+
+    packed = np.asarray(weight_packed).astype(np.int64)
+    out_f, in_packed = packed.shape
+    in_f = in_packed * per
+    # Unpack weight nibbles along the in/K axis (packed_dim == 1): output
+    # column k reads lane k // per, nibble k % per.
+    nib = np.empty((out_f, in_f), dtype=np.int64)
+    for i in range(per):
+        nib[:, i::per] = (packed >> (nbits * i)) & mask
+
+    if scheme.symmetric:
+        deq_int = nib - (1 << (nbits - 1))
+    else:
+        # Zero-point is int4-packed along OUT (a different axis than the
+        # weight): output row o reads lane o // per, nibble o % per.
+        zpp = np.asarray(weight_zero_point).astype(np.int64)
+        out_packed, zp_groups = zpp.shape
+        zp = np.empty((out_packed * per, zp_groups), dtype=np.int64)
+        for i in range(per):
+            zp[i::per, :] = (zpp >> (nbits * i)) & mask
+        zp = zp[:out_f, :]
+        zp_bc = np.repeat(zp, g, axis=1)[:, :in_f]
+        deq_int = nib - zp_bc
+
+    scale_bc = np.repeat(np.asarray(weight_scale).astype(np.float32), g, axis=1)[:, :in_f]
+    return (deq_int.astype(np.float32) * scale_bc).astype(np.float16)
+
+
+@dataclass
+class DequantLinearOp(Op):
+    """Weight-only quantized linear: ``x @ dequant(W).T [+ bias]``.
+
+    The frontend surface of W4A16. Surfaces as a single opaque
+    ``call_function`` node from the ``deplodock::dequant_linear`` custom
+    op (tracing never sees the unpack/dequant cone — that's authored in
+    the ``045_dequant_linear`` decomposition). Inputs, in order:
+    ``x``, ``weight_packed`` (int32), ``weight_scale`` (fp16),
+    ``weight_zero_point`` (int32), and — when ``has_bias`` — ``bias``.
+
+    The non-tensor format numbers ride as op metadata (a
+    :class:`QuantScheme`, built from the scalar fields) rather than graph
+    constants. ``has_bias`` distinguishes a real bias from a ``None``
+    bias (the tracer's generic resolver drops a ``None`` arg, so the two
+    are otherwise indistinguishable).
+    """
+
+    has_bias: bool = False
+    num_bits: int = 4
+    group_size: int = 32
+    packed_dim: int = 1
+    symmetric: bool = False
+
+    @property
+    def scheme(self) -> QuantScheme:
+        return QuantScheme(self.num_bits, self.group_size, self.packed_dim, self.symmetric)
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        x_shape = input_shapes[0]
+        wp_shape = input_shapes[1]  # (out_features, in_features // pack_factor)
+        return tuple(x_shape[:-1]) + (wp_shape[0],)
+
+    def forward(self, *inputs):
+        x = inputs[0]
+        weight = dequant_weight_numpy(inputs[1], inputs[2], inputs[3], self.scheme)
+        result = np.asarray(x).astype(np.float32) @ weight.astype(np.float32).T
+        if self.has_bias:
+            result = result + np.asarray(inputs[4]).astype(np.float32)
+        return result.astype(np.asarray(x).dtype)
+
+
 @dataclass
 class MatmulOp(Op):
     """PyTorch aten.mm/matmul/addmm: output = A @ B [+ bias]."""

@@ -12,6 +12,8 @@ remain in the graph:
 - ``IndexMapOp`` — unified layout-only op (subsumes slice / cat / transpose
   / reshape / unsqueeze) described by affine coord arithmetic over
   placeholder vars from ``ir.expr``.
+- ``CastOp`` — the lone dtype-changing primitive (the otherwise dtype-unified
+  IR's int→fp boundary for W4A16 dequant). Emitted post-decomposition.
 
 Plus the boundary sentinels ``InputOp`` and ``ConstantOp`` from ``ir.base``.
 The ``lifting/`` pass wraps each tensor op in a trivial ``ir.loop.LoopOp``
@@ -174,6 +176,39 @@ class ScanOp(Op):
         if name in ("prod", "multiply"):
             return np.cumprod(a, axis=self.axis)
         raise NotImplementedError(f"ScanOp.forward: unknown fn {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Cast — the only dtype-changing primitive
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CastOp(Op):
+    """Cast a tensor to ``target_dtype`` element-wise.
+
+    The IR is otherwise "dtype-unified" (every op preserves its inputs'
+    dtype); ``CastOp`` is the single exception. It's emitted by the
+    ``045_dequant_linear`` decomposition at the W4A16 int→fp16 boundary:
+    the unpacked, zero-point-subtracted integer nibble is cast to fp16
+    before the group-scale multiply. Rank-preserving — the output
+    ``Tensor`` carries ``target_dtype`` while the input keeps its own
+    (typically i32) dtype.
+
+    ``target_dtype`` is a canonical dtype token (``"f16"`` / ``"f32"`` /
+    ...) kept as a string so it serializes plainly through
+    ``Graph.to_dict`` (no special-casing in ``_serialize_field``).
+    """
+
+    target_dtype: str = "f16"
+
+    def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
+        return tuple(input_shapes[0])
+
+    def forward(self, *inputs):
+        from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
+
+        return inputs[0].astype(_get(self.target_dtype).np)
 
 
 # ---------------------------------------------------------------------------

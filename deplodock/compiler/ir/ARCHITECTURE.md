@@ -99,6 +99,7 @@ remain.
 |---------------|-------------------------------------------------------------------------------------------|
 | Layout-only   | `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp`, `UnsqueezeOp` — rewrite to `IndexMapOp`.  |
 | Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `RmsNormOp`, `LayerNormOp`, `SoftmaxOp` — rewrite to elementwise + reduce chains. |
+| Quantized     | `DequantLinearOp` (+ `QuantScheme` metadata, `dequant_weight_numpy` oracle) — the W4A16 weight-only quantized linear; rewrites (`045_dequant_linear`) to int4 unpack → dequant → transpose → matmul. |
 
 ## `tensor/ir.py`
 

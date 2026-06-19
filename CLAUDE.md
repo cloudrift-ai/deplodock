@@ -12,6 +12,11 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Serving** (vLLM out-of-tree embedding plugin — deplodock-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md)
 - **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
 - **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
+  - **W4A16 quantization** (compressed-tensors AWQ-INT4): `compile` / `run` / `tune` handle quantized models via a
+    pre-trace substitution to an opaque `deplodock::dequant_linear` custom op, decomposed to an in-kernel int4 unpack +
+    dequant + matmul (the compiler's one integer codegen path). Entry seam:
+    [`deplodock/compiler/trace/quantized.py`](deplodock/compiler/trace/quantized.py); design + status in
+    [`plans/w4a16-quantization-support.md`](plans/w4a16-quantization-support.md).
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before answering — they hold details that are no longer in the README.
 

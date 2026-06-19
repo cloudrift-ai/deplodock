@@ -235,8 +235,15 @@ class Load(Stmt):
         # literal-const buffers.)
         lit = ctx.literal_constants.get(self.input) if ctx.literal_constants else None
         if lit is not None and self.is_scalar:
-            ctx.ssa_dtypes[self.names[0]] = "f32"
-            return [f"{pad}{ctx.type_name('f32')} {self.names[0]} = {_float_lit(lit)};"]
+            # Integer-typed inlined constants (the W4A16 unpack ``4i`` / ``0xF`` /
+            # ``8``) keep an ``int`` decl + literal; float constants stay f32.
+            # ``010_lower_kernelop`` carries the int-ness via the value's Python
+            # type, so a plain ``isinstance`` check recovers the dtype here.
+            is_int = isinstance(lit, int) and not isinstance(lit, bool)
+            dt = "i32" if is_int else "f32"
+            ctx.ssa_dtypes[self.names[0]] = dt
+            lit_txt = str(int(lit)) if is_int else _float_lit(lit)
+            return [f"{pad}{ctx.type_name(dt)} {self.names[0]} = {lit_txt};"]
         # Prefer the stamped ``self.dtype`` (set by ``030_stamp_types``);
         # fall back to ``ctx.buffer_dtypes`` so handwritten test fixtures
         # without a stamped dtype still render correctly.
@@ -410,6 +417,16 @@ class Assign(Stmt):
             result_dt = self.dtype.name
         else:
             result_dt = dtype_promote(op_name, arg_dtypes)
+
+        # Copy/cast fast path: a single-arg ``copy`` whose result dtype differs
+        # from its source is a pure dtype cast (the W4A16 int→fp16 boundary,
+        # emitted by ``015_lift_cast``). Convert directly via the target so
+        # i32→f16 emits one ``__int2half_rn`` instead of the f32-promote detour
+        # (``__float2half(__int2float_rn(x))``).
+        if op_name == "copy" and len(self.args) == 1 and arg_dtypes and arg_dtypes[0] != result_dt:
+            rhs = ctx.target.convert(_resolve_value(self.args[0], ctx), arg_dtypes[0], result_dt)
+            ctx.ssa_dtypes[self.name] = result_dt
+            return [f"{pad}{ctx.type_name(result_dt)} {self.name} = {rhs};"]
 
         all_args_at_result = bool(arg_dtypes) and all(d == result_dt for d in arg_dtypes)
         if result_dt != "f32" and ctx.target.has_native_op(op_name, result_dt) and all_args_at_result:
@@ -844,10 +861,18 @@ class Select(Stmt):
     should be True; its ``value`` is bound to ``name`` in the SSA scope.
     Branches are expected to be disjoint; later branches act as
     catch-alls when no earlier predicate matches.
+
+    ``dtype`` is the result dtype (the branch values' common dtype). It
+    drives the declared local type + the per-branch ternary casts.
+    ``None`` keeps the legacy ``float`` rendering — the multi-source
+    layout (cat / W4A16 8-lane unpack assembly) stamps it (``F16`` /
+    ``I32``) so an integer lane select stays integer rather than being
+    forced to float before a downstream ``- zp`` subtract.
     """
 
     name: str
     branches: tuple[SelectBranch, ...]
+    dtype: DataType | None = None
 
     def __post_init__(self) -> None:
         if not self.branches:
@@ -870,5 +895,8 @@ class Select(Stmt):
         return lines
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        expr = select_to_ternary(self)
-        return [f"{_pad(ctx.indent)}float {self.name} = {expr.render(ctx)};"]
+        result_dt = self.dtype.name if self.dtype is not None else "f32"
+        c_type = ctx.type_name(result_dt)
+        expr = select_to_ternary(self, c_type)
+        ctx.ssa_dtypes[self.name] = result_dt
+        return [f"{_pad(ctx.indent)}{c_type} {self.name} = {expr.render(ctx)};"]

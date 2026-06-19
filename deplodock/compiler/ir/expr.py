@@ -170,6 +170,10 @@ def apply_binop(op: str, lv: object, rv: object) -> object:
             import numpy as np
 
             return np.logical_or(lv, rv)
+    if op == ">>":
+        return int(lv) >> int(rv)
+    if op == "&":
+        return int(lv) & int(rv)
     raise ValueError(f"Unknown BinOp: {op}")
 
 
@@ -203,7 +207,13 @@ class Var(_ExprOps):
         # corresponding ``Load`` decl.
         lit_map = getattr(ctx, "literal_ssa", None)
         if lit_map and self.name in lit_map:
-            return _float_lit(lit_map[self.name])
+            v = lit_map[self.name]
+            # Integer-typed inlined constants (the W4A16 unpack ``4i`` / ``0xF``)
+            # render as bare int literals so ``packed >> 4`` compiles; float
+            # constants keep the ``4.0f`` form.
+            if isinstance(v, int) and not isinstance(v, bool):
+                return str(v)
+            return _float_lit(v)
         return self.name
 
     def simplify(self, ctx: SimplifyCtx) -> Expr:
@@ -271,7 +281,7 @@ class BinaryExpr(_ExprOps):
     coercion would raise).
     """
 
-    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||", "^"
+    op: str  # "+", "-", "*", "/", "//", "%", "<", "<=", ">", ">=", "==", "&&", "||", "^", ">>", "&"
     left: Expr
     right: Expr
 
@@ -316,6 +326,10 @@ class BinaryExpr(_ExprOps):
                 return np.logical_or(lv, rv)
         if op == "^":
             return int(lv) ^ int(rv)
+        if op == ">>":
+            return int(lv) >> int(rv)
+        if op == "&":
+            return int(lv) & int(rv)
         raise ValueError(f"Unknown BinaryExpr: {op}")
 
     def pretty(self) -> str:
@@ -622,6 +636,9 @@ _PRECEDENCE: dict[str, int] = {
     "^": 4,  # bitwise XOR — match relational so ``a ^ b + c`` always parens
     "&": 4,  # bitwise AND — same intent: ``a & b * c`` must paren as ``(a & b) * c``
     "|": 4,  # bitwise OR — symmetric with ``&`` / ``^``
+    ">>": 4,  # right shift — same level as ``&`` (W4A16 unpack ``(packed >> 4i) & 0xF``
+    #         emits the shift + mask as separate SSA Assigns, so cross-op precedence
+    #         never actually composes them in one rendered expr)
     "+": 5,
     "-": 5,
     "*": 6,

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from deplodock.compiler import dtype as _dtype
 
-_TYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half", "f16x2": "__half2"}
+_TYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half", "f16x2": "__half2", "i32": "int", "i64": "long long"}
 
 # Intrinsic spellings — per dtype.  Keys are abstract op names emitted
 # by ``op_to_expr`` (``"exp"``, ``"fmax"``, ``"fabs"``, ...).
@@ -86,6 +86,12 @@ _NATIVE_FP16_OPS: frozenset[str] = frozenset(
     }
 )
 
+# Integer ops with a native C form (plain ``int`` operators). The W4A16
+# weight unpack lowers to these; ``has_native_op`` returns True for them on
+# ``i32`` so ``Assign.render`` takes the native-int path (``packed >> 4``)
+# instead of the f32-promote detour (which would shift a float).
+_NATIVE_I32_OPS: frozenset[str] = frozenset({"add", "subtract", "multiply", "right_shift", "bitwise_and", "copy"})
+
 
 class CudaRenderTarget:
     """CUDA C / cuda_fp16.h spellings for :class:`RenderTarget`.
@@ -122,6 +128,19 @@ class CudaRenderTarget:
             return f"__half2half2({value})"
         if dst_dt == "f16x2" and src_dt == "f32":
             return f"__float2half2_rn({value})"
+        # Integer <-> float boundary (W4A16 dequant: the unpacked int nibble
+        # casts to fp16 before the scale multiply). Every form is a single
+        # CUDA intrinsic call ``name(value)`` so ``Assign``'s arg-promotion
+        # helpers (which parse ``convert``'s output back into a FuncCallExpr)
+        # can re-thread it through the Expr renderer.
+        if dst_dt == "f16" and src_dt == "i32":
+            return f"__int2half_rn({value})"
+        if dst_dt == "i32" and src_dt == "f16":
+            return f"__half2int_rn({value})"
+        if dst_dt == "f32" and src_dt == "i32":
+            return f"__int2float_rn({value})"
+        if dst_dt == "i32" and src_dt == "f32":
+            return f"__float2int_rn({value})"
         return value
 
     def intrinsic(self, op_name: str, result_dt: str) -> str:
@@ -137,6 +156,8 @@ class CudaRenderTarget:
             return True
         if dtype in ("f16", "f16x2"):
             return op_name in _NATIVE_FP16_OPS
+        if dtype == "i32":
+            return op_name in _NATIVE_I32_OPS
         return False
 
     def vector_type(self, dtype: str, n: int) -> tuple[str, str] | None:

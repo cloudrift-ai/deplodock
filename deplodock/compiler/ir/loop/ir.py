@@ -212,6 +212,18 @@ class LoopOp(BodyOp):
         bufs = tuple(self.inputs)
         if len(inputs) != len(bufs):
             raise ValueError(f"LoopOp.forward: expected {len(bufs)} inputs (matching input_bufs={list(bufs)}), got {len(inputs)}")
+        # The C++ loop runner is float-only (``render_loopop_cpp`` emits
+        # ``const float*`` params + coerces inputs to float32). A mixed-int cone
+        # — the W4A16 dequant unpack — can't ride that path: reinterpreting a
+        # packed int32 as float would corrupt the bit math. Skip CPU interpret
+        # loudly so callers validate against a numpy reference instead; the GPU
+        # path stays covered by the accuracy check. (Phase 0 option b — see
+        # plans/w4a16-quantization-support.md.)
+        if any(np.issubdtype(np.asarray(x).dtype, np.integer) for x in inputs):
+            raise NotImplementedError(
+                "LoopOp.forward: the C++ loop runner is float-only; validate a mixed-int "
+                "(W4A16 dequant) cone against a numpy reference (DequantLinearOp.forward) instead."
+            )
         input_arrays = {name: np.asarray(x, dtype=np.float32) for name, x in zip(bufs, inputs, strict=True)}
         loop = _specialize_symbolic_axes(self, input_arrays)
         out_shape = loop._infer_write_shape()

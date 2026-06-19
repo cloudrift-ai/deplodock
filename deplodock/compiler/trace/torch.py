@@ -18,6 +18,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
+    DequantLinearOp,
     LayerNormOp,
     LinearOp,
     MatmulOp,
@@ -396,12 +397,20 @@ def _handle_output(g: Graph, fx_node: Any, node_map: dict[str, str]) -> None:
 
 
 def _op_name(target: Any) -> str | None:
-    """Extract a short op name from an ATen target."""
+    """Extract a short op name from an ATen (or deplodock custom-op) target."""
     s = str(target)
     if "aten." in s:
         parts = s.split(".")
         for i, p in enumerate(parts):
             if p == "aten" and i + 1 < len(parts):
+                return parts[i + 1]
+    # Deplodock custom ops surface as ``deplodock.<name>.default`` — recognize
+    # them here so they don't fall through to the ``op_name is None`` first-input
+    # alias (which would silently drop the op). Currently: ``dequant_linear``.
+    if "deplodock." in s:
+        parts = s.split(".")
+        for i, p in enumerate(parts):
+            if p == "deplodock" and i + 1 < len(parts):
                 return parts[i + 1]
     return None
 
@@ -449,6 +458,44 @@ def _squeeze_indexmap(in_shape: tuple, out_shape: tuple, axis: int | str) -> Ind
     return IndexMapOp(out_shape=tuple(out_shape), sources=(IndexSource(input_idx=0, coord_map=tuple(coord_map)),))
 
 
+def _handle_dequant_linear(g: Graph, fx_node: Any, node_map: dict[str, str], name: str, shape: tuple, dtype: str) -> None:
+    """Map a ``deplodock::dequant_linear`` custom-op node to ``DequantLinearOp``.
+
+    Custom-op call: ``dequant_linear(x, weight_packed, weight_scale,
+    weight_zero_point, bias, num_bits, group_size, packed_dim, symmetric)``. The
+    five leading tensor args become the op's graph inputs (peeled by name from
+    ``node_map``; a ``None`` bias is dropped and recorded via ``has_bias``); the
+    four trailing scalars become op metadata (read from both ``args`` and
+    ``kwargs``), never graph constants.
+    """
+    args = fx_node.args
+    kwargs = fx_node.kwargs or {}
+
+    def _tensor(a) -> str | None:
+        return node_map.get(a.name) if (a is not None and hasattr(a, "name") and a.name in node_map) else None
+
+    inputs = [_tensor(args[0]), _tensor(args[1]), _tensor(args[2]), _tensor(args[3])]
+    bias_id = _tensor(args[4]) if len(args) > 4 else None
+    has_bias = bias_id is not None
+    if has_bias:
+        inputs.append(bias_id)
+
+    def _scalar(pos: int, key: str, default):
+        if key in kwargs:
+            return kwargs[key]
+        return args[pos] if len(args) > pos else default
+
+    op = DequantLinearOp(
+        has_bias=has_bias,
+        num_bits=int(_scalar(5, "num_bits", 4)),
+        group_size=int(_scalar(6, "group_size", 32)),
+        packed_dim=int(_scalar(7, "packed_dim", 1)),
+        symmetric=bool(_scalar(8, "symmetric", False)),
+    )
+    nid = g.add_node(op=op, inputs=inputs, output=Tensor(name, shape, dtype), node_id=name)
+    node_map[name] = nid
+
+
 def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, sym_rename: dict[str, str] | None = None) -> None:
     """Handle call_function nodes — faithful 1:1 capture of FX ops."""
     # ``aten.sym_size.int`` and similar shape-metadata ops return a
@@ -462,6 +509,17 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
     shape = _get_shape(fx_node, sym_rename)
     dtype = _get_dtype(fx_node)
     op_name = _op_name(fx_node.target)
+
+    # --- W4A16 dequant-linear custom op ---
+    # A dedicated resolver: the generic ``_resolve_inputs`` walks only
+    # positional ``args`` and turns the scalar scheme (num_bits / group_size /
+    # …) into bogus ``ConstantOp`` graph inputs. Here we peel the tensor inputs
+    # (x, weight_packed, weight_scale, weight_zero_point, optional bias) and
+    # record the scheme as ``DequantLinearOp`` metadata instead.
+    if op_name == "dequant_linear":
+        _handle_dequant_linear(g, fx_node, node_map, name, shape, dtype)
+        return
+
     input_ids = _resolve_inputs(fx_node, node_map, g)
 
     if op_name is None:

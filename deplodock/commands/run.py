@@ -1240,7 +1240,7 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
     import torch
 
     from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.loader.binder import bind_constants
+    from deplodock.compiler.loader.binder import bind_constants, declared_const_dtypes, source_array_at_dtype
 
     flat_inputs: list[torch.Tensor] = []
     for v in example_args:
@@ -1262,11 +1262,15 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
     # shares the embedding matrix) are surfaced under *every* name, including
     # the ``source_path`` the tracer recorded — otherwise the alias the trace
     # picked may be the one torch dedups away and the constant won't bind.
+    # Bind params/buffers at their graph-declared dtype (not blanket float32):
+    # integer-declared constants — the W4A16 packed int32 weight / zero-point —
+    # must skip the float round-trip that would corrupt the bit-packed values.
+    declared = declared_const_dtypes(compiled)
     sources: dict[str, np.ndarray] = {}
     for path, tensor in module.named_parameters(remove_duplicate=False):
-        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+        sources[path] = source_array_at_dtype(tensor, declared.get(path))
     for path, tensor in module.named_buffers(remove_duplicate=False):
-        sources[path] = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+        sources[path] = source_array_at_dtype(tensor, declared.get(path))
 
     input_data.update(bind_constants(compiled, sources))
 

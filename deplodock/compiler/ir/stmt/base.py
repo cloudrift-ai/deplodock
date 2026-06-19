@@ -67,7 +67,10 @@ class RenderCtx:
     intrinsics: dict[str, str] = field(default_factory=dict)
     builtins: dict[str, str] = field(default_factory=dict)
     explicit_inits: set[str] = field(default_factory=set)
-    literal_constants: dict[str, float] = field(default_factory=dict)
+    # Values are ``int`` for integer-typed scalar constants (W4A16 unpack
+    # immediates) and ``float`` otherwise — the type drives int-vs-float
+    # literal rendering at the use site.
+    literal_constants: dict[str, float | int] = field(default_factory=dict)
     # SSA names whose defining Load came from a ``literal_constants``
     # input — populated by ``render_body`` after scanning the body, and
     # consumed by ``Var.render`` to inline the float at use sites instead
@@ -173,9 +176,26 @@ def dtype_promote(op_name: str, arg_dtypes: list[str]) -> str:
 
     Lifted out of ``Assign.render`` so the ``030_stamp_types`` pass can
     reuse the same rule when stamping ``Assign.dtype`` on the IR.
+
+    Integer ops (the W4A16 unpack ``>>`` / ``&`` and the zero-point
+    ``subtract``) stay integer: all-i32 args → i32. Promoting them to
+    f32 — the old behavior — would render ``packed >> 4.0f`` and fail to
+    compile, so the integer rule is checked before the f32 fallback.
+
+    ``right_shift`` / ``bitwise_and`` are **integer-only** — they have no
+    float form at all (``float >> float`` doesn't compile). Their result
+    is forced i32 regardless of the arg dtypes the stamp pass resolved,
+    because a Load from a staged smem slab can stay unresolved (→ a
+    spurious f32 default) at stamp time even though the slab is declared
+    ``int``; without this, the shift/mask would freeze to f32 and render
+    the invalid ``>>`` / ``&`` on a promoted float.
     """
+    if op_name in ("right_shift", "bitwise_and"):
+        return "i32"
     if arg_dtypes and all(d == "f16" for d in arg_dtypes):
         return "f16"
+    if arg_dtypes and all(d == "i32" for d in arg_dtypes):
+        return "i32"
     return "f32"
 
 
@@ -200,6 +220,9 @@ _BINARY_OP: dict[str, str] = {
     "multiply": "*",
     "divide": "/",
     "mod": "%",
+    # Integer bitwise ops — the W4A16 weight unpack ``(packed >> 4i) & 0xF``.
+    "right_shift": ">>",
+    "bitwise_and": "&",
 }
 
 
@@ -237,20 +260,24 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
 
 
-def select_to_ternary(s: Select) -> Expr:
+def select_to_ternary(s: Select, c_type: str = "float") -> Expr:
     """Build a chained ternary from a ``Select``'s branch list.
 
-    Each branch value is cast to ``float`` to match the ``float`` result
-    ``Select.render`` declares. Without it, a branch list mixing ``__half``
-    SSA values (a raw smem/gmem load) with ``float`` ones (a computed value)
-    makes the C++ conditional operator's common type ambiguous
-    (``cond ? float : __half`` — each converts to the other), which nvcc
-    rejects. The casts are no-ops when a value is already ``float``.
+    Each branch value is cast to ``c_type`` (the C spelling of the
+    Select's result dtype — ``"float"`` by default, ``"int"`` for an
+    i32 lane select) to match the type ``Select.render`` declares.
+    Without it, a branch list mixing ``__half`` SSA values (a raw
+    smem/gmem load) with ``float`` ones (a computed value) makes the C++
+    conditional operator's common type ambiguous (``cond ? float :
+    __half`` — each converts to the other), which nvcc rejects. The
+    casts are no-ops when a value is already at ``c_type``. The i32 form
+    keeps the W4A16 lane select (``(packed >> 4i) & 0xF``) integer
+    instead of forcing the nibbles to float before the ``- zp`` subtract.
     """
     branches = list(s.branches)
-    result: Expr = CastExpr("float", Var(branches[-1].value))
+    result: Expr = CastExpr(c_type, Var(branches[-1].value))
     for b in reversed(branches[:-1]):
-        result = TernaryExpr(cond=b.select, if_true=CastExpr("float", Var(b.value)), if_false=result)
+        result = TernaryExpr(cond=b.select, if_true=CastExpr(c_type, Var(b.value)), if_false=result)
     return result
 
 
@@ -528,7 +555,13 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
             # Literal-const Loads are always scalar (the vectorize pass
             # excludes literal-const buffers from its widening logic).
             if isinstance(s, Load) and s.is_scalar and s.is_literal(ctx.literal_constants):
-                new_map[s.name] = ctx.literal_constants[s.input]
+                val = ctx.literal_constants[s.input]
+                new_map[s.name] = val
+                # Pre-register the use-site dtype so a downstream ``Assign``
+                # whose Load was skipped still sees an integer arg (the W4A16
+                # ``packed >> 4`` shift amount). ``ssa_dtypes`` is shared across
+                # the ``replace`` below, so mutating it here is visible at render.
+                ctx.ssa_dtypes[s.name] = "i32" if isinstance(val, int) and not isinstance(val, bool) else "f32"
                 changed = True
         if changed:
             ctx = replace(ctx, literal_ssa=new_map)

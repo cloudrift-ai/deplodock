@@ -39,6 +39,11 @@ _NAME_TO_FN: dict[str, object] = {
     "gelu": lambda x: 0.5 * x * (1.0 + _erf(x / np.sqrt(2.0))),
     "gelu_tanh": lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * x**3))),
     "copy": lambda x: x,
+    # Integer bitwise ops (W4A16 weight unpack: ``(packed >> 4i) & 0xF``).
+    # Registered as the numpy *ufuncs* (not lambdas) so ``__init__`` reads
+    # ``nin == 2`` for the binary arity — a lambda would default to unary.
+    "right_shift": np.right_shift,
+    "bitwise_and": np.bitwise_and,
 }
 
 
@@ -173,6 +178,10 @@ _OP_CLUSTERS: dict[str, str] = {
     "gelu_tanh": "exp",
     "pow": "exp",
     "relu": "exp",
+    # bitwise (integer unpack) — own cluster so a W4A16 dequant kernel keys
+    # distinctly from the float arithmetic around it.
+    "right_shift": "right_shift",
+    "bitwise_and": "right_shift",
     # passthrough
     "copy": "copy",
 }
