@@ -5,9 +5,10 @@ fuses scaled-dot-product attention into a single streaming online-softmax kernel
 (the ``FlashCombine`` carrier) instead of the score-materializing ``010_sdpa``
 path. These tests pin: (1) with ``FLASH`` on, one fused kernel is emitted and it
 matches torch SDPA on the GPU; (2) with ``FLASH`` off, the fork falls through to
-the multi-kernel decomposition (default unchanged).
-
-Step 4 of ``plans/online-softmax-flash-attention.md`` — non-causal, static.
+the multi-kernel decomposition (default unchanged). Covers static + dynamic
+(symbolic ``seq_len``) and causal / non-causal — the scalar-tier flash from
+``plans/online-softmax-flash-attention.md`` (Steps 4–6; the tensor-core P@V tier
+is future work).
 """
 
 from __future__ import annotations
@@ -65,6 +66,46 @@ def test_flash_sdpa_matches_torch(monkeypatch, B, H, S, D, causal):
     assert not np.any(np.isnan(got))
     max_diff = float(np.max(np.abs(got - eager)))
     assert max_diff < 1e-4, f"flash vs torch SDPA (causal={causal}) max_diff={max_diff:.6e}"
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_sdpa_dynamic_matches_torch(monkeypatch, causal):
+    """Symbolic ``seq_len`` (Q/K/V dim -2): ONE cached kernel carrying ``int
+    seq_len`` serves every runtime size — flash's single dynamic axis lands on
+    BOTH the query (masked-row M) and KV (reduce) positions, so this exercises
+    the masked-row and symbolic-reduce paths together."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    torch.manual_seed(0)
+    B, H, D = 1, 2, 8
+    seq = torch.export.Dim("seq_len", min=4, max=4096)
+    graph = trace_module(
+        _Sdpa(causal).cpu(),
+        (torch.randn(B, H, 16, D), torch.randn(B, H, 16, D), torch.randn(B, H, 16, D)),
+        dynamic_shapes={"q": {2: seq}, "k": {2: seq}, "v": {2: seq}},
+    )
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    kernels = [nid for nid in compiled.nodes if getattr(compiled.nodes[nid].op, "kernel_source", None)]
+    assert len(kernels) == 1, f"dynamic flash should emit one fused kernel, got {len(kernels)}"
+    assert "int seq_len" in compiled.nodes[kernels[0]].op.kernel_source, "dynamic kernel must carry the runtime seq_len arg"
+
+    for s in (8, 16, 37):
+        q, k, v = (torch.randn(B, H, s, D) for _ in range(3))
+
+        def eager_pre_run(q=q, k=k, v=v) -> np.ndarray:
+            with torch.no_grad():
+                return (
+                    torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda(), is_causal=causal).cpu().flatten().numpy()
+                )
+
+        run_result, eager = backend.run(compiled, input_data={"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, pre_run=eager_pre_run)
+        got = list(run_result.outputs.values())[0].flatten()
+        max_diff = float(np.max(np.abs(got - eager)))
+        assert max_diff < 1e-4, f"dynamic flash (causal={causal}) seq={s} max_diff={max_diff:.6e}"
 
 
 @requires_cuda

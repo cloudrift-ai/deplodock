@@ -18,10 +18,14 @@ correct, if redundant, scalar form; the tensor-core P@V tier is future work)::
         FlashCombine((m_i,l_i,O_i), (s, V[…,kv,d]))  # the LSE rescale
       out[…,m,d] = O_i / l_i
 
-Scope (so far): static shapes, causal or non-causal, no explicit additive mask,
-no GQA. Causal masks the score per element (``kv ≤ m`` keeps it, else −inf); the
-tile-skip-above-the-diagonal optimization belongs to the future tensor-core tier.
-Anything else raises ``RuleSkipped`` so ``010_sdpa`` handles it. The ``FLASH``
+Scope (so far): static OR dynamic (symbolic ``seq_len``) shapes, causal or
+non-causal, no explicit additive mask, no GQA. The single dynamic axis (Q/K/V
+dim -2) rides through as the actual ``Dim('seq_len')`` instance, landing on BOTH
+the query (masked-row M) and KV (reduce) positions, so one cached kernel carrying
+``int seq_len`` serves every runtime size. Causal masks the score per element
+(``kv ≤ m`` keeps it, else −inf); the tile-skip-above-the-diagonal optimization
+belongs to the future tensor-core tier. Anything else raises ``RuleSkipped`` so
+``010_sdpa`` handles it. The ``FLASH``
 knob is read from the env pin (``DEPLODOCK_FLASH=1`` / ``DEPLODOCK_KNOBS=FLASH=1``)
 — the structural-fork offer + analytic cold-start wiring is a follow-up.
 """
@@ -58,14 +62,9 @@ def _flash_enabled() -> bool:
     return raw is not None and FLASH.parse(raw)
 
 
-def _static_dims(shape: tuple) -> list[int] | None:
-    """Return every dim as a static int, or ``None`` if any is symbolic."""
-    out: list[int] = []
-    for d in shape:
-        if not d.is_static:
-            return None
-        out.append(d.as_static())
-    return out
+def _static(d) -> int | None:
+    """The static extent of a ``Dim``, or ``None`` when symbolic."""
+    return d.as_static() if d.is_static else None
 
 
 def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp_mask: Node | None, out: Tensor) -> Graph | None:
@@ -75,28 +74,30 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp
         raise RuleSkipped("flash: explicit additive mask not yet supported — fall through to 010_sdpa")
     causal = bool(root.op.is_causal)
 
-    q = _static_dims(inp_q.output.shape)
-    k = _static_dims(inp_k.output.shape)
-    v = _static_dims(inp_v.output.shape)
-    if q is None or k is None or v is None:
-        raise RuleSkipped("flash: dynamic shapes not yet supported (Step 6) — fall through to 010_sdpa")
+    q, k, v = inp_q.output.shape, inp_k.output.shape, inp_v.output.shape
     if len(q) < 2 or len(k) < 2 or len(v) < 2:
         raise RuleSkipped(f"flash: need rank>=2 Q/K/V, got {len(q)}/{len(k)}/{len(v)}")
-    # batch dims (everything before the trailing [seq, dim]) must match — no GQA.
-    if q[:-2] != k[:-2] or q[:-2] != v[:-2]:
-        raise RuleSkipped(f"flash: GQA / mismatched batch dims {q[:-2]} vs {k[:-2]} vs {v[:-2]} — fall through to 010_sdpa")
-    batch = q[:-2]
-    s_q, head_dim = q[-2], q[-1]
-    s_k = k[-2]
-    d_v = v[-2:][1]
-    if k[-1] != head_dim:
-        raise RuleSkipped(f"flash: K head_dim {k[-1]} != Q head_dim {head_dim}")
-    if v[-2] != s_k:
-        raise RuleSkipped(f"flash: V seq {v[-2]} != K seq {s_k}")
+    # Batch dims + head_dim + value-dim must be static (only the seq axis may be
+    # symbolic — that is the single dynamic axis attention carries). The seq axis
+    # (Q/K/V dim -2) rides through as the actual symbolic ``Dim`` instance, so the
+    # masked-row (M) + symbolic-reduce (K) machinery threads one ``seq_len`` symbol.
+    batch = [_static(d) for d in q[:-2]]
+    if any(b is None for b in batch):
+        raise RuleSkipped("flash: symbolic batch/head dims unsupported — only the seq axis may be dynamic")
+    if [_static(d) for d in k[:-2]] != batch or [_static(d) for d in v[:-2]] != batch:
+        raise RuleSkipped("flash: GQA / mismatched batch dims — fall through to 010_sdpa")
+    head_dim, d_v = _static(q[-1]), _static(v[-1])
+    if head_dim is None or d_v is None:
+        raise RuleSkipped("flash: symbolic head_dim / value-dim unsupported")
+    if _static(k[-1]) != head_dim:
+        raise RuleSkipped(f"flash: K head_dim {_static(k[-1])} != Q head_dim {head_dim}")
+    s_q_dim, s_k_dim = q[-2], k[-2]  # Dim instances — static int or symbolic seq_len
+    if v[-2] != s_k_dim:
+        raise RuleSkipped(f"flash: V seq {v[-2]} != K seq {s_k_dim}")
 
     scale = 1.0 / math.sqrt(head_dim)
-    body = _flash_loop_body(inp_q.id, inp_k.id, inp_v.id, "_flash_scale", batch, s_q, s_k, head_dim, d_v, out.name, causal=causal)
-    nest = _wrap_free_axes(body, batch, s_q, d_v)
+    body = _flash_loop_body(inp_q.id, inp_k.id, inp_v.id, "_flash_scale", batch, s_q_dim, s_k_dim, head_dim, d_v, out.name, causal=causal)
+    nest = _wrap_free_axes(body, batch, s_q_dim, d_v)
 
     frag = open_fragment(match.graph, [inp_q, inp_k, inp_v])
     inputs = [inp_q.id, inp_k.id, inp_v.id, "_flash_scale"]
@@ -130,8 +131,8 @@ def _flash_loop_body(
     v_buf: str,
     scale_buf: str,
     batch: list[int],
-    s_q: int,
-    s_k: int,
+    s_q: Dim,
+    s_k: Dim,
     head_dim: int,
     d_v: int,
     out_buf: str,
@@ -183,15 +184,15 @@ def _flash_loop_body(
         Init(name="m_i", op=ElementwiseImpl("maximum"), dtype="f32"),
         Init(name="l_i", op=ElementwiseImpl("add"), dtype="f32"),
         Init(name="O_i", op=ElementwiseImpl("add"), dtype="f32"),
-        Loop(axis=Axis(name="kv", extent=Dim(s_k)), body=kv_body),
+        Loop(axis=Axis(name="kv", extent=s_k), body=kv_body),
         Assign(name="res", op="divide", args=("O_i", "l_i")),
         Write(output=out_buf, index=out_idx, value="res"),
     )
 
 
-def _wrap_free_axes(body: tuple, batch: list[int], s_q: int, d_v: int) -> tuple:
+def _wrap_free_axes(body: tuple, batch: list[int], s_q: Dim, d_v: int) -> tuple:
     """Wrap the per-element body in the free grid loops: batch…, query m, value d."""
-    nest: tuple = (Loop(axis=Axis(name="m", extent=Dim(s_q)), body=(Loop(axis=Axis(name="d", extent=Dim(d_v)), body=body),)),)
+    nest: tuple = (Loop(axis=Axis(name="m", extent=s_q), body=(Loop(axis=Axis(name="d", extent=Dim(d_v)), body=body),)),)
     for i in reversed(range(len(batch))):
         nest = (Loop(axis=Axis(name=f"b{i}", extent=Dim(batch[i])), body=nest),)
     return nest
