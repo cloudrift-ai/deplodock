@@ -22,8 +22,8 @@ configs:
     M: 2048
     N: 2048
     K: 2048
-    knobs: {BM: 16, BN: 64, BK: 64, BR: 1, FM: 16, FN: 2, FK: 1, SPLITK: 2, RING: 1, STAGE: '11'}
-    deplodock_us: 467.5
+    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
+    deplodock_us: 383.3
     cublas_us: 320.0
   - kernel: matmul
     name: square.4096
@@ -39,8 +39,8 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {BM: 8, BN: 32, BK: 32, BR: 1, FM: 4, FN: 1, FK: 1, SPLITK: 1, RING: 4, STAGE: '11'}
-    deplodock_us: 17.7
+    knobs: {WN: 1, WM: 2, FM: 1, FN: 4, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 4, STAGE: '11'}
+    deplodock_us: 5.9
     cublas_us: 5.8
   - kernel: matmul
     name: square.1024.fp16
@@ -48,8 +48,8 @@ configs:
     N: 1024
     K: 1024
     dtype: fp16
-    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 8, FN: 1, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
-    deplodock_us: 90.7
+    knobs: {WN: 1, WM: 4, FM: 1, FN: 4, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, STAGE: '11'}
+    deplodock_us: 29.3
     cublas_us: 18.1
   - kernel: matmul
     name: square.2048.fp16
@@ -57,8 +57,8 @@ configs:
     N: 2048
     K: 2048
     dtype: fp16
-    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 4, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
-    deplodock_us: 512.5
+    knobs: {WN: 4, WM: 1, FM: 4, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, STAGE: '11'}
+    deplodock_us: 177.8
     cublas_us: 115.2
   - kernel: matmul
     name: square.4096.fp16
@@ -66,8 +66,8 @@ configs:
     N: 4096
     K: 4096
     dtype: fp16
-    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 4, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
-    deplodock_us: 3778.6
+    knobs: {WN: 2, WM: 1, FM: 4, FN: 8, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, STAGE: '11'}
+    deplodock_us: 889.9
     cublas_us: 822.3
   - kernel: matmul
     name: qwen3_06b.q_proj.s32
@@ -114,8 +114,8 @@ configs:
     M: 128
     N: 2048
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
-    deplodock_us: 23.6
+    knobs: {BM: 16, BN: 16, BK: 64, BR: 1, FM: 4, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11'}
+    deplodock_us: 20.9
     cublas_us: 20.2
   - kernel: matmul
     name: qwen3_06b.kv_proj.s128
@@ -138,8 +138,8 @@ configs:
     M: 128
     N: 3072
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 6, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
-    deplodock_us: 45.7
+    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 4, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
+    deplodock_us: 33.0
     cublas_us: 25.5
   - kernel: matmul
     name: qwen3_06b.down_proj.s128
@@ -154,40 +154,40 @@ configs:
     M: 512
     N: 2048
     K: 1024
-    knobs: {BM: 8, BN: 64, BK: 32, BR: 1, FM: 14, FN: 2, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', OVERHANG: ['a0']}
-    deplodock_us: 90.4
+    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
+    deplodock_us: 55.6
     cublas_us: 53.3
   - kernel: matmul
     name: qwen3_06b.kv_proj.s512
     M: 512
     N: 1024
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 3, STAGE: '11'}
-    deplodock_us: 44.9
+    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11'}
+    deplodock_us: 34.3
     cublas_us: 38.9
   - kernel: matmul
     name: qwen3_06b.o_proj.s512
     M: 512
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
-    deplodock_us: 85.9
+    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11'}
+    deplodock_us: 55.6
     cublas_us: 67.8
   - kernel: matmul
     name: qwen3_06b.gate_up_proj.s512
     M: 512
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 10, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
-    deplodock_us: 123.6
+    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11'}
+    deplodock_us: 103.7
     cublas_us: 85.5
   - kernel: matmul
     name: qwen3_06b.down_proj.s512
     M: 512
     N: 1024
     K: 3072
-    knobs: {BN: 32, BM: 8, FM: 14, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
-    deplodock_us: 143.1
+    knobs: {BM: 8, BN: 32, BK: 32, BR: 1, FM: 8, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11'}
+    deplodock_us: 79.7
     cublas_us: 113.2
   - kernel: matmul
     name: square.512.dynM
