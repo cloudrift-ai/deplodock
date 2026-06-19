@@ -13,7 +13,8 @@ from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Loop, Mma, ReduceCarrier, StridedLoop
+from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt import Accum, FlashCombine, Loop, Mma, ReduceCarrier, StridedLoop
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +84,52 @@ def test_mma_is_reduce_carrier():
 
 
 # --------------------------------------------------------------------------- #
+# ReduceCarrier protocol — FlashCombine (the tuple-monoid LSE combine)
+# --------------------------------------------------------------------------- #
+
+
+def _flash() -> FlashCombine:
+    return FlashCombine(
+        state=("m_i", "l_i", "O_i"),
+        partial=("tile_max", "tile_sum", "tile_pv"),
+        axes=("kv",),
+    )
+
+
+def test_flash_combine_is_reduce_carrier():
+    f = _flash()
+    assert isinstance(f, ReduceCarrier)
+    # The carried triple is the def surface; the carried read is implicit.
+    assert f.carried_names() == ("m_i", "l_i", "O_i")
+    assert f.defines() == ("m_i", "l_i", "O_i")
+    # Only this tile's partial contribution is a same-scope read.
+    assert f.deps() == ("tile_max", "tile_sum", "tile_pv")
+    assert f.partial_deps() == ("tile_max", "tile_sum", "tile_pv")
+    # The LSE monoid: associative AND commutative with identity — the property
+    # that makes split-KV / cooperative-combine legal.
+    assert f.associative and f.commutative and f.has_identity
+
+
+def test_flash_combine_rewrite_renames_state_and_partial():
+    f = _flash()
+    renamed = f.rewrite(lambda n: f"{n}__r")
+    assert isinstance(renamed, FlashCombine)
+    assert renamed.state == ("m_i__r", "l_i__r", "O_i__r")
+    assert renamed.partial == ("tile_max__r", "tile_sum__r", "tile_pv__r")
+    assert renamed.axes == ("kv",)  # identity Sigma leaves the axis untouched
+
+
+def test_flash_combine_rewrite_threads_axis_split():
+    # A σ that splits the KV axis (kv → kv_o*BK + kv_i) re-targets the carrier's
+    # reduction axes onto the sub-axes, exactly like Accum/Mma.
+    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+
+    sigma = Sigma({"kv": BinaryExpr("+", BinaryExpr("*", Var("kv_o"), Literal(8, "int")), Var("kv_i"))})
+    renamed = _flash().rewrite(lambda n: n, sigma)
+    assert set(renamed.axes) == {"kv_o", "kv_i"}
+
+
+# --------------------------------------------------------------------------- #
 # is_reduce keys off the protocol — Accum AND Mma make a loop a reduce loop
 # --------------------------------------------------------------------------- #
 
@@ -104,6 +151,12 @@ def test_loop_is_reduce_for_mma():
 def test_strided_loop_is_reduce_for_mma():
     sl = StridedLoop(axis=Axis(name="k", extent=Dim(16)), start=Var("t"), step=Literal(32, "int"), body=(_mma(),))
     assert sl.is_reduce
+
+
+def test_loop_is_reduce_for_flash_combine():
+    # A FlashCombine-bearing loop is a reduce loop via the same protocol hook —
+    # no isinstance ladder over (Accum, Mma, FlashCombine) needed.
+    assert _kloop(_flash()).is_reduce
 
 
 def test_non_carrier_loop_is_not_reduce():

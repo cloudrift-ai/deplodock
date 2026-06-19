@@ -124,12 +124,24 @@ tree-combine) query instead of matching op names.
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
 `Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
-base of `Accum` and its tensor-core form `Mma`; `is_reduce`, axis threading,
-and the other carrier-agnostic checks key off the base, not an
-`isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's algebra
-read the carrier's `associative` / `commutative` / `has_identity` traits
-directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
-constants).
+base of `Accum`, its tensor-core form `Mma`, and the streaming online-softmax
+`FlashCombine`; `is_reduce`, axis threading, and the other carrier-agnostic
+checks key off the base, not an `isinstance(s, (Accum, Mma))` ladder). Rules
+that need the combine's algebra read the carrier's `associative` /
+`commutative` / `has_identity` traits directly (`Accum` forwards to its scalar
+`op`; `Mma` and `FlashCombine` report constants — the additive fold and the
+LSE monoid respectively, both associative + commutative with identity).
+
+`FlashCombine` is the tuple-valued monoid carrier for flash attention: it
+carries the running `(m_i, l_i, O_i)` triple (`state`) across the streaming KV
+reduce loop and merges each tile's local-softmax partial `(tile_max, tile_sum,
+tile_pv)` (`partial`) via the log-sum-exp recurrence (the `alpha = exp(m_i −
+m_new)` rescale + `l·alpha + …` / `O·alpha + …`). The rescale lives inside the
+carrier's lowering, not as loose body statements, so the online-algorithm gates
+(`accums_independent`, `classify_fragment_epilogue`) never see the cross-`Accum`
+coupling. `carried_names()` / `defines()` return `state`; `deps()` /
+`partial_deps()` return `partial` (the carried read is implicit, like `Accum` /
+`Mma`).
 
 ### `loop/ir.py` — LoopOp types
 

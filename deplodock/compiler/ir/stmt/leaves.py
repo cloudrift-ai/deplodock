@@ -628,6 +628,86 @@ class Mma(ReduceCarrier):
 
 
 @dataclass(frozen=True)
+class FlashCombine(ReduceCarrier):
+    """Streaming online-softmax (log-sum-exp) combine — a tuple-valued monoid
+    carrier, sibling of ``Accum`` / ``Mma``.
+
+    Where ``Accum`` carries one scalar accumulator and ``Mma`` one fragment,
+    ``FlashCombine`` carries the **triple** ``(m_i, l_i, O_i)`` — running row-max,
+    running denominator, running (scaled) output — across the streaming KV
+    (reduce) loop of a flash-attention nest. Each iteration merges the carried
+    state with this tile's *local* softmax partial ``(tile_max, tile_sum,
+    tile_pv)`` via the LSE recurrence::
+
+        m_new = max(m_i, tile_max)
+        alpha = exp(m_i - m_new)
+        l_i   = l_i * alpha + tile_sum
+        O_i   = O_i * alpha + tile_pv
+        m_i   = m_new
+
+    The rescale (the ``alpha`` cross-accumulator read + the mid-reduction
+    ``O_i *= alpha``) lives **inside this carrier's lowering**, not as loose body
+    statements — so the gates that reject online algorithms
+    (``accums_independent``, ``classify_fragment_epilogue``) never see the
+    coupling, and the partition planner places one carrier.
+
+    - ``state`` — the carried SSA names ``(m_i, l_i, O_i)``; read-and-written
+      across the reduce axis (the carried read is implicit, like ``Accum.name`` /
+      ``Mma.c``). These are the defs visible after the loop.
+    - ``partial`` — this tile's local-softmax SSA names ``(tile_max, tile_sum,
+      tile_pv)``; the per-iteration contribution the ``K_o`` pipeline scheduler
+      reads.
+    - ``axes`` — the reduction axes (the KV / sequence axis), mirroring
+      ``Accum.axes`` / ``Mma.axes``; threaded through ``rewrite``.
+
+    The combine is the LSE monoid: **associative and commutative with identity**
+    ``(m=-inf, l=0, O=0)`` — the same trait constants as ``Mma``'s additive fold,
+    which is exactly what makes split-KV (flash-decoding) and cooperative-combine
+    legal later.
+    """
+
+    state: tuple[str, ...]
+    partial: tuple[str, ...]
+    axes: tuple[str, ...] = ()
+
+    def deps(self) -> tuple[str, ...]:
+        # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit
+        # (loop-carried), so only this tile's partial contribution is listed —
+        # keeps sibling-def analyses from treating the state as a same-scope read.
+        return self.partial
+
+    def defines(self) -> tuple[str, ...]:
+        return self.state
+
+    def carried_names(self) -> tuple[str, ...]:
+        return self.state
+
+    # The LSE combine is associative AND commutative with identity — the monoid
+    # property the plan relies on (split-KV / cooperative-combine reachable).
+    @property
+    def associative(self) -> bool:
+        return True
+
+    @property
+    def commutative(self) -> bool:
+        return True
+
+    @property
+    def has_identity(self) -> bool:
+        return True
+
+    def pretty(self, indent: str = "") -> list[str]:
+        state = ", ".join(self.state)
+        partial = ", ".join(self.partial)
+        return [f"{indent}({state}) <- flash_combine({partial})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise NotImplementedError(
+            f"FlashCombine must be lowered by its streaming-reduce rule before render — reached render with state={self.state!r}"
+        )
+
+
+@dataclass(frozen=True)
 class Init(Stmt):
     """Explicit accumulator initialization at this scope.
 
