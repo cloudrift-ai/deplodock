@@ -485,6 +485,38 @@ def _unstaged_masked_k(load: Load, role: str, graph: Graph | None) -> bool:
     return any(not d.is_static for d in shape[:-1])
 
 
+def _masked_k_zero(load: Load, src_index: tuple, role: str, graph: Graph | None) -> tuple[Expr, Expr] | None:
+    """``(k_base, bound)`` for an unstaged masked-K operand's ``*_kzero`` helper:
+    ``k_base`` is the tile's K coordinate (the operand's reduce-dim index, to which
+    the helper adds the lane's K offset) and ``bound`` is the runtime K extent
+    (``seq_len``) — so a half whose ``k_base + offset >= seq_len`` reads +0.0.
+    Mirrors the staged ``Source.kmask`` zero-fill. K is the last index dim for
+    role ``a``; the first symbolic non-last dim for role ``b`` (N is last). The
+    bound is the sole free var of the (tile-padded) extent expr — the runtime
+    ``seq_len``. ``None`` when not masked-K or the extent isn't a single symbol
+    (caller bails)."""
+    if graph is None:
+        return None
+    node = graph.nodes.get(load.input)
+    if node is None or not node.output.shape:
+        return None
+    shape = node.output.shape
+    if role == "a":
+        kd = len(shape) - 1
+        if shape[kd].is_static:
+            return None
+    else:
+        kd = next((i for i, d in enumerate(shape[:-1]) if not d.is_static), None)
+        if kd is None:
+            return None
+    if kd >= len(src_index):
+        return None
+    fvs = shape[kd].expr.free_vars()
+    if len(fvs) != 1:
+        return None
+    return (src_index[kd], Var(next(iter(fvs))))
+
+
 def _emit_chain(
     spec: Atom,
     *,
@@ -512,21 +544,26 @@ def _emit_chain(
     # search needn't avoid unstageable MMA tiles.
     a_staged = a_load.input in smem_sources
     b_staged = b_load.input in smem_sources
-    # Masked-K (symbolic reduce) correctness gate: the gmem-direct fragment load
-    # has no K zero-fill, so an unstaged masked-K operand reads past the padded
-    # extent (wrong result / hang / OOB — only the staged ``_stage_expand`` path
-    # zero-fills). Bail so the search stages it or falls to the scalar path.
-    if (not a_staged and _unstaged_masked_k(a_load, "a", graph)) or (
-        not b_staged and not b_trans and _unstaged_masked_k(b_load, "b", graph)
+    # Masked-K (symbolic reduce): an unstaged operand whose reduce (K) gmem dim is
+    # symbolic takes the gmem-direct ``*_kzero`` helper, which ZERO-FILLS the
+    # partial final K tile past ``seq_len`` (a clamp would duplicate and corrupt
+    # the accumulation). Mirrors the staged ``_stage_expand`` zero-fill for the
+    # unstaged transport, so a masked-K mma lowers gmem-direct (slower than staged
+    # — no smem reuse — but correct) instead of bailing. A transposed-B operand
+    # keeps the clamp path (its K is the contiguous dim).
+    a_kz = _masked_k_zero(a_load, a_src_index, "a", graph) if not a_staged else None
+    b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
+    if (not a_staged and a_kz is None and _unstaged_masked_k(a_load, "a", graph)) or (
+        not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph)
     ):
-        # LoweringError (not RuleSkipped): drop this candidate so the search
-        # falls back to a staged-mma or scalar variant. RuleSkipped would leave
-        # the AtomTile unlowered → crash at render.
+        # The masked-K extent isn't a single symbol → can't build the ``*_kzero``
+        # bound. Bail (LoweringError) so greedy retries / the search picks a staged
+        # or scalar variant rather than emit an un-zero-filled gmem-direct read.
         from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
         raise LoweringError(
-            "masked-K (symbolic reduce) mma operand can't lower gmem-direct — no K zero-fill "
-            "(only the staged _stage_expand path zero-fills the partial slab); needs staging"
+            "masked-K (symbolic reduce) mma operand can't lower gmem-direct — reduce extent "
+            "is not a single symbol, so the *_kzero bound can't be built; needs staging"
         )
     # Masked cells with an UNSTAGED gated-axis operand take the clamped
     # gmem-direct helper: the staged slab is in-bounds by construction (its
@@ -550,6 +587,7 @@ def _emit_chain(
             swizzle=a_swz,
             staged=a_staged,
             gmem_guard=a_guard,
+            k_zero=a_kz,
         ),
         LdmatrixLoad(
             frag=b_frag,
@@ -561,6 +599,7 @@ def _emit_chain(
             staged=b_staged,
             gmem_guard=b_guard,
             b_trans=b_trans,
+            k_zero=b_kz,
         ),
         MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
     )
