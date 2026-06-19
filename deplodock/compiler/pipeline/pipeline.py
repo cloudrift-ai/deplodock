@@ -49,8 +49,10 @@ logger = logging.getLogger("deplodock.compiler.pipeline")
 # Greedy compile validity-fallback cap: how many times ``Pipeline.run``
 # re-resolves blocklisting a tile that failed ``validate(ctx)``. Each retry
 # blocks ≥1 fresh tile or stops, so this only bounds pathological cases (every
-# sibling unviable).
-_MAX_GREEDY_RETRIES = 64
+# sibling unviable). Smem mis-ranking is now handled in-pass by ``greedy_decide``'s
+# feasibility probe, so this absorbs only non-smem lowering failures + structural
+# retirement — back to a small cap.
+_MAX_GREEDY_RETRIES = 8
 
 
 _PASSES_DIR = Path(__file__).resolve().parent / "passes"

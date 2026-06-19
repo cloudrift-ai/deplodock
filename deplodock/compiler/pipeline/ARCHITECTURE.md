@@ -721,20 +721,30 @@ returns nothing does it take option-0 (the first leaf). (Greedy benches nothing,
 train one — and it is not a `Search` at all: a deterministic resolution has no frontier, so its process facts live on
 the returned `Decision` trace, never on policy-object state.)
 
-**Greedy validity fallback.** The prior ranks by *predicted latency*, which can rank a tile that fails `validate(ctx)`
-(smem / thread budget) first — `tune` benches-and-skips it, but greedy benches nothing. So when a deterministic compile
-leaves a node un-lowered (its only lowering rejected at `validate`), `Pipeline.run` blocklists that tile's
-`tile_identity` (its planner knobs) and **re-resolves**: `greedy_decide(blocked=…)` drops the matching leaf from the
-flattened set and picks the next-best (the valid runner-up is usually ranked right below). Bounded by
-`_MAX_GREEDY_RETRIES` (each retry blocks ≥1 fresh tile or stops). Only the offending leaf is dropped — its full-row
-`tile_identity` never matches a different tile, so no other candidate is pruned. The cap is `64` (not the original `8`):
-when the prior is **mis-calibrated for the live arch** it can rank *many* invalid tiles ahead of the first valid one —
-e.g. deploying on Ada (sm_89, 99 KB smem) with a prior trained on the Blackwell golden cards (much larger dynamic-smem
-cap) ranks dozens of >99 KB tiles first, exhausting the old cap of 8 and hard-crashing every rectangular projection
-(`plans/golden-sweep-rtx4070ti-findings.md`, Finding 1). The cap is free on well-matched hardware (the loop exits on
-attempt 1 when nothing fails `validate`). The durable fix — recommended in that report — is an smem-budget **pre-filter**
-in `greedy_decide` (exclude over-budget leaves from a cheap closed-form smem estimate *before* the argmin), after which
-the cap can shrink back.
+**Greedy feasibility filter (partition fork).** The prior ranks by *predicted latency*, which can rank a tile whose
+lowered `KernelOp` exceeds the live device's dynamic-smem cap **first** — a cross-arch mis-rank, e.g. a prior trained on
+the Blackwell golden cards deploying on Ada (sm_89, 99 KB smem) ranks dozens of >99 KB tiles ahead of the first that
+fits (`plans/golden-sweep-rtx4070ti-findings.md`, Finding 1). The footprint can't be read off the leaf at the partition
+fork: there are no `StageBundle`s yet (the `020`–`070` staging passes run later), dtype is unstamped (`030_stamp_types`
+is a `lowering/kernel` pass), and the footprint depends on staging multiplicity (buffer_count / ring depth) — itself a
+downstream greedy choice. A cheap closed-form smem estimate *before* the argmin is therefore **not** possible. So
+`greedy_decide` probes feasibility by *lowering*: at the partition fork (`010_partition_loops`, whose flattened leaves
+are complete tiles) it walks the prior-ranked leaves best-first and deploys the first whose pinned single-node slice
+lowers through `KERNEL_PASSES` to a `KernelOp` that passes `KernelOp.validate(ctx)` (`_leaf_feasible`, memoized per
+`(op_cache_key, tile_identity)`). Measured -O3 evidence (`Prior.pick`) still floats to the front of the rank order. This
+runs **in one resolve pass** — an infeasible tile is never deployed — so the cost is ≤ the prior-ranked infeasible
+prefix lowered on a single-node slice (memoized), strictly cheaper than the whole-graph re-resolutions it replaces. The
+nested probe resolves (this filter's own kernel-lowering and the structural price probes) carry `check_feasibility=False`
+so the filter never re-enters itself; the partition-fork gate + that flag make recursion structurally impossible. A cold
+prior (option-0) skips the probe entirely.
+
+**Validity fallback (non-smem).** When a deterministic compile still leaves a node un-lowered — its only lowering
+rejected at `validate` for a *non-smem* reason, or a structural-fragment failure — `Pipeline.run` blocklists that tile's
+`tile_identity` and **re-resolves**: `greedy_decide(blocked=…)` drops the matching leaf and picks the next-best. Bounded
+by `_MAX_GREEDY_RETRIES` (back to `8`, since smem mis-ranking is now handled in-pass by the feasibility filter above —
+this loop only absorbs non-smem lowering failures + structural retirement). Only the offending leaf is dropped. If the
+feasibility filter finds *nothing* feasible (every tile over-budget), it deploys the prior's #1 pick so this same
+rejection → blocklist → `LoweringError` path reports the genuinely-unsatisfiable case unchanged.
 
 **Reading the result.** `_bench_terminal_async` writes one `perf` row per CudaOp per `(context_key, backend)` keyed on
 `op_cache_key`, plus a `lowering` edge per rewrite hop carrying the knob delta the rule stamped (and the inner search

@@ -26,6 +26,20 @@ op's ``S_*`` structural knobs (read off the offer op) + the leaf's complete knob
 row. The pick equals scoring the flat candidate set, invariant to the tree's
 level order. With no trained prior the model is unfit → it falls back to the first
 emitted sibling (option-0).
+
+**Pick the first hardware-feasible leaf, not the bare argmin.** A prior trained on
+one card can rank a tile whose lowered ``KernelOp`` exceeds another device's
+dynamic-smem cap *first* (the Blackwell-trained prior on Ada sm_89, ~99 KB). The
+smem footprint can't be read off the leaf at the partition fork — there are no
+``StageBundle``s yet (the ``020``–``070`` staging passes run later) and dtype is
+unstamped (``030_stamp_types`` is a ``lowering/kernel`` pass), and the footprint
+depends on staging multiplicity (a downstream greedy choice). So greedy probes
+feasibility by *lowering*: at the partition fork it walks the prior-ranked leaves
+best-first and deploys the first whose pinned single-node slice lowers to a
+``KernelOp`` that passes ``validate(ctx)`` (:func:`_leaf_feasible`, memoized) — in
+ONE resolve pass, so an infeasible tile is never deployed and ``Pipeline.run``'s
+retry loop no longer absorbs smem mis-ranking. Measured -O3 evidence (``Prior.pick``)
+still floats to the front of the rank order.
 """
 
 from __future__ import annotations
@@ -49,6 +63,17 @@ def _tile_pipeline():
     from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
 
     return Pipeline.build(["lowering/tile"])
+
+
+@lru_cache(maxsize=1)
+def _kernel_pipeline():
+    """The tile+kernel pipeline the feasibility probe drives — lowers a pinned
+    partition leaf all the way to its ``KernelOp`` so ``validate(ctx)`` sees the
+    authoritative smem footprint (which only exists post-staging / post
+    ``030_stamp_types``, both in ``lowering/kernel``). Frozen and shareable."""
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline  # noqa: PLC0415
+
+    return Pipeline.build(KERNEL_PASSES)
 
 
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
@@ -155,7 +180,7 @@ def _price_kernel(graph: Graph, nid: str, ctx: Context, prior, memo: dict[str, f
         return memo[key]
     us: float | None = None
     try:
-        nested = greedy_decide(prior=prior, price_structural=False)
+        nested = greedy_decide(prior=prior, price_structural=False, check_feasibility=False)
         _, trace = Run(pipeline=_tile_pipeline(), ctx=ctx).resolve(single_node_graph(graph, nid), nested)
         us = next((d.score for d in trace if d.rule_name == PARTITION_RULE and d.node_id == nid), None)
     except Exception:  # noqa: BLE001 — a price-probe failure must never break compile
@@ -187,6 +212,51 @@ def _price_op_leaf(fp: ForkPoint, leaf: object, prior, memo: dict[str, float | N
     sub = single_node_graph(fp.match.graph, fp.node_id)
     sub.nodes[fp.node_id].op = option
     return _price_graph(sub, fp.ctx, prior, memo)
+
+
+def _leaf_feasible(fp: ForkPoint, leaf: object, prior, feas_memo: dict[tuple, bool]) -> bool:
+    """True if the chosen partition leaf lowers to a deployable ``KernelOp`` on
+    this device. The leaf's true smem footprint can't be read off the partition
+    fork (no ``StageBundle`` / unstamped dtype yet — staging multiplicity is a
+    downstream choice), so feasibility is evaluated by *lowering*: pin the leaf
+    onto a single-node slice and resolve the kernel passes. The idempotent
+    partition rule skips the already-tiled node, so the staging+kernel passes
+    lower exactly this geometry. The nested resolve runs with
+    ``check_feasibility=False`` so it never re-enters this probe.
+
+    The verdict is **whether lowering produced a ``KernelOp``**: ``materialize_tile``
+    only emits one when it passes :meth:`KernelOp.validate` (the smem / thread /
+    CTA gates), so a rejected (over-budget) tile leaves the node *un-lowered* (a
+    ``TileOp``) — that's the infeasible signal. Memoized per
+    ``(op_cache_key, tile_identity)``. Best-effort: a probe that **raises** is
+    treated as feasible (a probe error declines to judge, never drops a tile —
+    the real resolve's rejection sink still catches a genuinely un-lowerable
+    tile; mirrors :func:`_price_kernel`'s ``None``)."""
+    from deplodock.compiler.ir.base import Op  # noqa: PLC0415
+    from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
+
+    key = (op_cache_key(fp.root_op), tile_identity(_leaf_knobs(leaf)))
+    if key in feas_memo:
+        return feas_memo[key]
+    verdict = True
+    try:
+        op = leaf.expand()[0] if isinstance(leaf, Fork) and leaf.is_leaf else leaf
+        if isinstance(op, Op) and not isinstance(op, Graph):
+            sub = single_node_graph(fp.match.graph, fp.node_id)
+            sub.nodes[fp.node_id].op = op
+            nested = greedy_decide(prior=prior, price_structural=False, check_feasibility=False)
+            terminal, _ = Run(pipeline=_kernel_pipeline(), ctx=fp.ctx).resolve(sub, nested)
+            # A produced KernelOp already passed validate(ctx) at materialize →
+            # feasible. An un-lowered node (still Tile/Loop) means validate
+            # REJECTED the KernelOp (over budget) → infeasible.
+            verdict = isinstance(terminal.nodes[fp.node_id].op, KernelOp)
+    except Exception:  # noqa: BLE001 — a probe error must never break compile or drop a tile
+        verdict = True
+    feas_memo[key] = verdict
+    return verdict
 
 
 def _pick_structural(fp: ForkPoint, leaves: list, prior, memo: dict[str, float | None], price_structural: bool) -> object | None:
@@ -227,17 +297,25 @@ def greedy_decide(
     *,
     prior: object = _LOAD_PRIOR,
     price_structural: bool = True,
+    check_feasibility: bool = True,
 ) -> Callable[[ForkPoint], object]:
     """The greedy compile pick as a :meth:`Run.resolve` ``decide`` callback:
     flatten the fork point to its complete leaves (:func:`flatten_leaves`),
-    skip ``blocked`` tile identities, and take the prior's ``mean_scores``
-    argmin — the learned ``CatBoostPrior`` once trained, the ``AnalyticPrior``
-    cold-start heuristic otherwise (both behind ``load_prior``'s
-    ``FallbackPrior``). Falls to emission order (option-0, first leaf) only if
-    the prior fails to load entirely. Stamps the pick's predicted µs on
-    ``fp.score``, so the resolve trace carries the per-fork price (the
-    structural pricing probe reads a kernel's cost off the partition fork's
-    trace entry).
+    skip ``blocked`` tile identities, and at the partition fork return the
+    **first hardware-feasible** leaf in the prior's ``mean_scores`` rank order
+    (:func:`_leaf_feasible`); elsewhere take the prior's argmin — the learned
+    ``CatBoostPrior`` once trained, the ``AnalyticPrior`` cold-start heuristic
+    otherwise (both behind ``load_prior``'s ``FallbackPrior``). Falls to
+    emission order (option-0, first leaf) only if the prior fails to load
+    entirely. Stamps the pick's predicted µs on ``fp.score``, so the resolve
+    trace carries the per-fork price (the structural pricing probe reads a
+    kernel's cost off the partition fork's trace entry).
+
+    ``check_feasibility`` (default on) gates the in-pass feasibility probe to
+    the partition fork. It is threaded ``False`` into every nested probe resolve
+    (the feasibility probe's own kernel-lowering and the structural price
+    probes), so the filter never re-enters itself — recursion is structurally
+    impossible.
 
     ``blocked`` (``{node_id: {tile_identity, ...}}``) lists tiles that failed
     ``validate(ctx)`` on a previous compile attempt — ``Pipeline.run`` retries
@@ -258,6 +336,7 @@ def greedy_decide(
     from deplodock.compiler.pipeline.pipeline import _is_structural_option  # noqa: PLC0415
 
     memo: dict[str, float | None] = {}  # op_cache_key → predicted µs (None = unpriceable)
+    feas_memo: dict[tuple, bool] = {}  # (op_cache_key, tile_identity) → KernelOp.validate(ctx)
     loaded = prior is not _LOAD_PRIOR
     the_prior = prior if loaded else None
 
@@ -309,6 +388,34 @@ def greedy_decide(
             return leaves[0]
         rows = [{**base, **k} for _, k in live]
         picker = getattr(the_prior, "pick", None)
+        # At the partition fork the prior can rank a tile whose lowered KernelOp
+        # exceeds the device's dynamic-smem cap (a cross-arch mis-rank — the
+        # Blackwell-trained prior on Ada). The smem footprint isn't knowable off
+        # the leaf (no StageBundle / unstamped dtype here — it's a downstream
+        # staging choice), so we probe feasibility by lowering each prior-ranked
+        # candidate to its KernelOp (:func:`_leaf_feasible`) and deploy the first
+        # that fits — in ONE resolve pass, so the outer retry loop never absorbs
+        # smem mis-ranking. Gated to the partition fork (its leaves are complete
+        # tiles); ``check_feasibility=False`` on nested probe resolves blocks
+        # re-entry.
+        if check_feasibility and fp.match.rule.name == PARTITION_RULE:
+            scores = the_prior.mean_scores(rows)
+            order = sorted(range(len(live)), key=scores.__getitem__)
+            head_price = None
+            if picker is not None:
+                # ``Prior.pick``: measured -O3 evidence first, model argmin else —
+                # float that #1 deploy choice to the front of the rank order.
+                head_i, head_price = picker(rows)
+                order = [head_i, *(i for i in order if i != head_i)]
+            for i in order:
+                if _leaf_feasible(fp, live[i][0], the_prior, feas_memo):
+                    fp.score = head_price if (i == order[0] and head_price is not None) else scores[i]
+                    return live[i][0]
+            # Nothing feasible — return the #1 pick so the existing rejection →
+            # blocklist → LoweringError path reports the unsatisfiable case, unchanged.
+            fb_i = order[0]
+            fp.score = head_price if head_price is not None else scores[fb_i]
+            return live[fb_i][0]
         if picker is not None:
             # ``Prior.pick``: measured -O3 reservoir evidence first, model argmin
             # otherwise — a config the tune proved fastest at -O3 must not lose

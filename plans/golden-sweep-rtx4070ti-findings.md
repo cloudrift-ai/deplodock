@@ -86,12 +86,17 @@ squares' deploy). It blocks tuning **and** `run --bench --golden` (same greedy p
 is reachable, just deep in the prior's ranking). It is safe on well-matched hardware — the loop exits on attempt 1 when
 no tile fails `validate`, so only mis-calibrated (Ada) compiles pay the extra re-resolves.
 
-**Recommendation (priority 1).** Replace the band-aid with a **budget pre-filter in `greedy_decide`**: exclude leaves
-whose smem exceeds `ctx.max_dynamic_smem` *before* the prior argmin, using a cheap closed-form smem estimate from the
-leaf knob row (BM·BN·BK·FK·STAGE·RING already determine it — no full materialization). This makes greedy pick the best
-*in-budget* tile directly, removes the retry blow-up, and is exactly what the `LoweringError` message recommends
-("adjust tile-geometry scoring so an in-budget variant ranks first"). Cite `greedy.py:225` (`greedy_decide`),
-`candidate.py:505` (the smem gate to reuse), `pipeline.py:522` (the retry loop to shrink back to ~8 afterward).
+**Recommendation (priority 1).** Replace the band-aid with a feasibility filter in `greedy_decide` that makes greedy
+pick the best *in-budget* tile directly and removes the retry blow-up.
+
+**Resolution (implemented).** A *closed-form* smem pre-filter turned out to be impossible: at the partition fork the
+leaf has no `StageBundle` yet (the `020`–`070` staging passes run later) and unstamped dtype (`030_stamp_types` is a
+`lowering/kernel` pass), and the real footprint depends on staging multiplicity (a downstream greedy choice) — so the
+knob row alone does **not** determine smem. The shipped fix instead probes feasibility by *lowering*: at the partition
+fork `greedy_decide` walks the prior-ranked leaves best-first and deploys the first whose pinned single-node slice
+lowers through `KERNEL_PASSES` to a `KernelOp` passing `KernelOp.validate(ctx)` (`_leaf_feasible`, memoized) — one
+resolve pass, no whole-graph re-resolution. `_MAX_GREEDY_RETRIES` reverted 64 → 8. See
+`deplodock/compiler/pipeline/ARCHITECTURE.md` → "Greedy feasibility filter".
 
 ## Finding 2 — greedy pick is mis-calibrated for Ada: loses 1.1×–3.5× to the cross-arch 4090 config on 16/29 shapes
 
