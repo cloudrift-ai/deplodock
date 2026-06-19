@@ -173,6 +173,12 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # operand's reduce-dim extent to detect a symbolic K and stamp
     # ``Source.kmask`` (the masked-K zero-fill, ``_stage_expand``).
     input_shapes = {buf: tuple(t.shape) for buf, t in root.op.inputs.items() if getattr(t, "shape", None) is not None}
+    # Per-input dtype — stamped onto each ``Source`` at creation so the post-020
+    # ``TileOp.validate`` smem-budget gate sizes the slab at the real element
+    # width (``030_stamp_types`` only runs at the kernel dialect, far too late;
+    # without this an fp16 mma slab is validated at the fp32 ``BYTES_PER_ELEM``
+    # fallback — 2× — and a masked-K mma tile that fits is wrongly rejected).
+    input_dtypes = {buf: t.dtype for buf, t in root.op.inputs.items() if t.dtype is not None}
     variants = _enumerate_variants(
         root.op.body,
         slab_cap=budget,
@@ -181,6 +187,7 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         warp_size=ctx.warp_size,
         atom_kind=atom_kind,
         input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if not variants:
@@ -208,6 +215,7 @@ def _enumerate_variants(
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
     input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> list[TileOp]:
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
@@ -249,6 +257,7 @@ def _enumerate_variants(
             warp_size=warp_size,
             atom_kind=atom_kind,
             input_shapes=input_shapes,
+            input_dtypes=input_dtypes,
             bytes_per_elem=bytes_per_elem,
         )
         if new_body is None:
@@ -427,6 +436,7 @@ def _maybe_rewrite(
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
     input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> Body | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
@@ -465,6 +475,7 @@ def _maybe_rewrite(
         is_cooperative=is_cooperative,
         atom_kind=atom_kind,
         input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if new_tile_body == tt.body:
@@ -503,6 +514,7 @@ def _process_scope(
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
     input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> Body:
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
@@ -547,6 +559,7 @@ def _process_scope(
                 register_axes=new_register_axes,
                 atom_kind=atom_kind,
                 input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -568,6 +581,7 @@ def _process_scope(
                 register_axes=register_axes,
                 atom_kind=atom_kind,
                 input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -586,6 +600,7 @@ def _process_scope(
                 register_axes=register_axes,
                 atom_kind=atom_kind,
                 input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -612,6 +627,7 @@ def _process_scope(
                 register_axes=register_axes,
                 atom_kind=atom_kind,
                 input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(Cond(cond=s.cond, body=Body(new_body), else_body=s.else_body))
@@ -640,6 +656,7 @@ def _process_scope(
         scope_budget=scope_budget,
         atom_kind=atom_kind,
         input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if not sources:
@@ -712,6 +729,7 @@ def _build_sources(
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
     input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> tuple[list[Source], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by index equality; per partition, derive
     slab geometry; admit Sources under budget. Returns (sources,
@@ -802,6 +820,7 @@ def _build_sources(
                 pad=pad,
                 addressing=addressing,
                 kmask=kmask,
+                dtype=(input_dtypes or {}).get(buf),
             )
             sources.append(src)
             used_bytes += slab.n_bytes

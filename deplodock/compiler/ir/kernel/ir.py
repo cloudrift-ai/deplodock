@@ -660,6 +660,7 @@ class LdmatrixLoad(Stmt):
     swizzle: str = "NONE"  # TMA smem swizzle mode the slab was written with
     staged: bool = True  # False → gmem-direct fragment load (operand not in smem)
     gmem_guard: tuple[Expr, Expr] | None = None  # masked-axis (base, bound); gmem-direct only
+    k_zero: tuple[Expr, Expr] | None = None  # masked-K reduce axis (base, bound); gmem-direct only
     b_trans: bool = False  # role "b" only: B stored N×K (Q@K^T native col-major) → gmem-direct trans helper
 
     def deps(self) -> tuple[str, ...]:
@@ -673,7 +674,8 @@ class LdmatrixLoad(Stmt):
 
     def exprs(self) -> tuple[Expr, ...]:
         guard = () if self.gmem_guard is None else self.gmem_guard
-        return (*self.src_index, *guard)
+        kz = () if self.k_zero is None else self.k_zero
+        return (*self.src_index, *guard, *kz)
 
     def pretty(self, indent: str = "") -> list[str]:
         idx = ", ".join(e.pretty() for e in self.src_index)
@@ -690,6 +692,22 @@ class LdmatrixLoad(Stmt):
             # Operand not staged in smem — ldmatrix can't reach gmem, so read the
             # fragment straight from gmem (each lane adds its own (row,col) inside
             # the helper). No swizzle: that's a TMA-smem-layout concern only.
+            if self.k_zero is not None:
+                # Masked-K (symbolic reduce): zero-fill (not clamp) the K halves
+                # past the runtime extent so the mma reduction stays correct.
+                # ``k_left`` = in-range K elements from the tile base; may co-occur
+                # with an M/N clamp. (b_trans masked-K never reaches here — a
+                # transposed-B's K is its contiguous dim and stays gmem-direct
+                # without zero-fill via the clamp path; canonical B only.)
+                kbase, kbound = self.k_zero[0].render(ctx), self.k_zero[1].render(ctx)
+                k_left = f"({kbound}) - ({kbase})"
+                if self.gmem_guard is not None:
+                    base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
+                    mn_left = f"({bound}) - ({base})"
+                    helper = "dpl_mma_load_a_gmem_mclamp_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp_kzero"
+                    return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {mn_left}, {k_left});"]
+                helper = "dpl_mma_load_a_gmem_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_kzero"
+                return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {k_left});"]
             if self.gmem_guard is not None:
                 # Masked axis: clamp the lane coordinate to the in-range
                 # elements left from the tile base (>= 1 — the boundary Cond

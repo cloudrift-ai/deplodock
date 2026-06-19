@@ -257,11 +257,21 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
         axes = lead_cone.external_reads & axis_names
         if not axes <= set(row_names) | {k_name, n_name}:
             return None
-        # The xn element dtype is the CELL leaves' (the chain the materialized
-        # value is computed from); prologue/lead loads only feed row stats —
-        # e.g. an f32 mean-count scalar beside an f16 norm chain — and need
-        # only resolve, not match.
-        dtype = _cone_dtype(cell_cone.loads, graph)
+        # The xn materializes at the matmul's OPERAND dtype — the dtype the
+        # consuming multiply reads this operand as, i.e. the *other* multiply
+        # operand's dtype (a matmul's two operands share an element type, and the
+        # mma tier requires it). For the SDPA P@V the cone is the fp32 softmax
+        # weights but the other operand (V) is fp16, so xn downcasts to fp16 —
+        # matching eager fp16 attention AND halving the staged slab so the
+        # masked-K mma tile fits the smem budget (an fp32 xn over-allocates 2× and
+        # is misread by ``ldmatrix.b16``). Falls back to the CELL leaves' own
+        # dtype when the other operand is itself a computed cone (rotary QK^T:
+        # both operands already share the cone dtype) — prologue/lead loads only
+        # feed row stats (an f32 mean-count beside an f16 chain) and need only
+        # resolve, not match.
+        dtype = _matmul_operand_dtype(root, per_acc, cell_def, graph)
+        if dtype is None:
+            dtype = _cone_dtype(cell_cone.loads, graph)
         if dtype is None:
             return None
         if any(graph.nodes.get(ld.input) is None for ld in (*pro_cone.loads, *lead_cone.loads)):
@@ -519,11 +529,37 @@ def _contains_matmul_reduce_loop(stmt: Stmt) -> bool:
     return any(_contains_matmul_reduce_loop(c) for body in stmt.nested() for c in body)
 
 
+def _matmul_operand_dtype(root: str, per_acc, cell_def, graph: Graph):
+    """The dtype the consuming matmul reads this cone operand AS — the *other*
+    multiply operand's gmem dtype. A matmul's two operands share an element type
+    (and the warp/mma tier requires it), so the materialized ``xn`` must match
+    the operand it multiplies against, NOT the (possibly higher-precision)
+    softmax/compute dtype the cone is calculated in. For the SDPA P@V this turns
+    the fp32 softmax cone into an fp16 ``xn`` (V is fp16). ``None`` when the other
+    operand is itself a computed cone (an Assign — both sides already share the
+    cone dtype, e.g. rotary QK^T), a squared cone (``a*a`` — no distinct other
+    operand), or the source is unresolvable; the caller then falls back to the
+    cone leaf dtype."""
+    for _acc, mul, rs in per_acc:
+        if root not in rs:
+            continue
+        others = [a for a in mul.args if a != root]
+        if not others:
+            return None  # squared cone (a*a) — no distinct other operand
+        d = cell_def.get(others[0])
+        if isinstance(d, Load):
+            node = graph.nodes.get(d.input)
+            return node.output.dtype if node is not None else None
+        return None  # other operand is a computed cone — share the cone dtype
+    return None
+
+
 def _cone_dtype(loads, graph: Graph):
     """The uniform dtype of every graph-resolvable Load in the cone's CELL
-    stmts — the dtype its ``xn`` buffer materializes at (value-preserving;
-    identical to the multiply's other-operand dtype on every shape seen so
-    far). Prologue/lead loads don't vote: they feed row stats (an f32
+    stmts — the fallback dtype its ``xn`` buffer materializes at when the
+    matmul-operand dtype can't be read (``_matmul_operand_dtype``; the two
+    rules coincide on most shapes — the SDPA P@V fp32-softmax cone is the
+    exception). Prologue/lead loads don't vote: they feed row stats (an f32
     mean-count scalar must not block an f16 norm chain). ``None`` (bail) when
     a Load source is unresolvable or the leaf dtypes disagree."""
     dtypes = set()

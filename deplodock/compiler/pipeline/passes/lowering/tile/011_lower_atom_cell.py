@@ -158,13 +158,23 @@ def _classify_ab(loads: list[Load], *, k_name: str | None, write: Write | None) 
 
 
 def _is_transposed_b(b_load: Load, *, k_name: str | None, write: Write | None) -> bool:
-    """The B operand is transposed (stored N×K, K in its last dim) — a Q @ K^T
-    cell. With a reduce axis it's simply K-in-last; for the shape-C (filtered-K)
-    fallback it's B carrying the N (col) output var in its FIRST dim."""
+    """The B operand is transposed (stored N×K, K contiguous in its last dim) — a
+    Q @ K^T cell — so kernel/005 reads it gmem-direct without ``.trans``. With a
+    reduce axis: K is the contiguous (last) gmem dim AND nowhere else. The
+    ``and-nowhere-else`` guard is load-bearing for a *collapsed-reshape* B (the
+    SDPA P@V's ``V[seq, kv_head, head_dim]`` flattened to ``[seq, 1024]``): the
+    delinearized index spreads the reduce var ``a10`` across BOTH the seq (K,
+    outer) dim and the channel (N, contiguous-last) dim, so the bare ``k in
+    last`` test wrongly flags canonical V as transposed and the consumer reads
+    V with K/N swapped (garbage). K appearing in an earlier dim too ⇒ it's the
+    outer (row) axis ⇒ canonical B. For the shape-C (filtered-K) fallback it's
+    B carrying the N (col) output var in its FIRST dim."""
     if not b_load.index:
         return False
     if k_name is not None:
-        return k_name in b_load.index[-1].free_vars()
+        in_last = k_name in b_load.index[-1].free_vars()
+        in_earlier = any(k_name in e.free_vars() for e in b_load.index[:-1])
+        return in_last and not in_earlier
     if write is None or not write.index:
         return False
     n_vars = set(write.index[-1].free_vars())

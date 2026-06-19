@@ -257,6 +257,76 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_nclamp(unsigned
     }
 }
 
+// Masked-K (symbolic reduce) variants of the gmem-direct fragment loads: when the
+// operand's REDUCE (K) axis is mask-padded (SDPA P@V over ``seq_len``), the final
+// K tile straddles the runtime extent. Unlike the M/N clamp above, a K element
+// past the extent must be ZERO-FILLED, not clamped to a duplicate — K is summed
+// by the mma, so a duplicate corrupts the reduction. ``k_left`` = in-range K
+// elements from the tile base; a half past it reads as +0.0 and is never
+// dereferenced. Mirrors the staged path's slab zero-fill (``_stage_expand``).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed = 0;
+        if (col < k_left) ((T*)&packed)[0] = p[0];
+        if (col + 1 < k_left) ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+// A: masked-M (clamp rows) AND masked-K (zero-fill cols).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_mclamp_kzero(unsigned* r, const T* g, int ldm, int rows_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        if (row >= rows_left) row = rows_left - 1;
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed = 0;
+        if (col < k_left) ((T*)&packed)[0] = p[0];
+        if (col + 1 < k_left) ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+// B (row-major K×N, NOT transposed): K is the row, zero-fill past the extent.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[k * ldm + n];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
+// B: masked-N (clamp col) AND masked-K (zero-fill row).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp_kzero(unsigned* r, const T* g, int ldm, int cols_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[k * ldm + n];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"
