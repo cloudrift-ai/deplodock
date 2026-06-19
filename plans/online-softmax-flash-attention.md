@@ -279,6 +279,19 @@ remains future work. What landed, and how it diverged from the original framing:
 structural-fork offer + analytic cold-start; causal tile-skip (only the per-element mask exists); GQA + explicit-mask
 flash (both fall through to `010_sdpa`).
 
+**Perf-tier blocker found (vector-`O`).** An attempt to make the scalar nest efficient — carry a running `O[d]` *vector*
+across the KV loop so the QK score is computed ONCE per `(m, kv)` and reused for every output dim (the FlashAttention
+reuse), instead of recomputed per `(m, kv, d)` — works for `B·H > 1` but the partition planner
+(`lowering/tile/010_partition_loops::_plan_kernel`) rejects it when the grid collapses to a single free axis (`B·H = 1`,
+only `m` free). Root cause: the inner `dd` score-reduce reads as a **matmul reduce** (`qk = q·k; sacc += qk`), but its
+output `score[m, kv]` lands on the **reduce** axis `kv` (consumed by the streaming softmax, never written), so the
+matmul branch's `if outer_m is None: return None` fires — it needs two free *output* axes (M and N), and flash has only
+`m` free (the old scalar nest accidentally satisfied this by keeping `d` as a grid axis). Also drives high register
+pressure (`d_v` carried `O` accumulators). So the efficient nest needs the planner to model a matmul-reduce whose N axis
+is itself reduced away — the same gap the tensor-core P@V tier must close. The redundant scalar nest (committed) is the
+correct fallback meanwhile. `FlashCombine.render` was generalized to a vector `O` during the attempt and reverted with
+it (no consumer once the nest reverted).
+
 ## Incremental steps (each independently verifiable)
 
 Every step's accuracy test is written under the `shape_mode` fixture (see "Test strategy"), so static and dynamic are
