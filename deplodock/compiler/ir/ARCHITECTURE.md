@@ -143,6 +143,19 @@ coupling. `carried_names()` / `defines()` return `state`; `deps()` /
 `partial_deps()` return `partial` (the carried read is implicit, like `Accum` /
 `Mma`).
 
+`FlashCombine.render` lowers the rescale directly (it is the carrier's
+codegen, isinstance-keyed like `Mma`'s): it emits the LSE recurrence as plain
+fp32 assignments to the carried state (declared by an enclosing `Init`, before
+the streaming `Loop`) plus local `m_new` / `alpha` / `p` temps, with statement
+order load-bearing (`alpha` reads the OLD `m` before `m = m_new` overwrites it).
+Two scalar shapes lower here — `state=(m, l)` / `partial=(s,)` (online-softmax
+normalization) and `state=(m, l, O)` / `partial=(s, v)` (the full triple with a
+scalar value, a 1-D weighted-softmax average); the tensor-core P@V form (`O` a
+fragment, the per-tile P@V the partial) lowers through the kernel tier instead.
+`LoopOp` validation threads both `Init` (a carried-name binding site) and
+`FlashCombine` (partials must be in scope; state is loop-carried and exports),
+so a hand-written streaming nest type-checks and runs through `LoopOp.forward`.
+
 ### `loop/ir.py` — LoopOp types
 
 | Symbol                       | Role                                                                                                              |

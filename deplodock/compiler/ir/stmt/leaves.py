@@ -702,9 +702,54 @@ class FlashCombine(ReduceCarrier):
         return [f"{indent}({state}) <- flash_combine({partial})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        raise NotImplementedError(
-            f"FlashCombine must be lowered by its streaming-reduce rule before render — reached render with state={self.state!r}"
-        )
+        """Emit the per-iteration LSE rescale, in fp32, as plain assignments to
+        the carried state (declared by an enclosing ``Init``) + local temps.
+
+        Two scalar shapes are handled — the no-mma forms the streaming-reduce
+        validates against a CPU reference:
+
+        - ``state=(m, l)``, ``partial=(s,)`` — online-softmax normalization: the
+          streaming pass that produces the final ``(max, denom)`` a second loop
+          divides by.
+        - ``state=(m, l, O)``, ``partial=(s, v)`` — the full triple with a scalar
+          value (a 1-D weighted-softmax average): ``O += p·v`` rides the same
+          ``p = exp(s − m_new)`` the denom uses. The matmul form (``O`` a tensor-
+          core fragment, ``partial`` the per-tile ``P@V``) lowers through the
+          kernel tier, not here.
+
+        The recurrence reads the OLD ``m`` for ``alpha`` *before* overwriting it,
+        so statement order is load-bearing: ``m_new`` and ``alpha`` first, the
+        ``l`` / ``O`` updates next, ``m = m_new`` last.
+        """
+        from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+
+        if len(self.state) not in (2, 3) or len(self.partial) != len(self.state) - 1:
+            raise NotImplementedError(
+                f"FlashCombine.render: only the scalar (m,l)/(m,l,O) forms are lowered here; "
+                f"got state={self.state!r} partial={self.partial!r} (the tensor-core P@V form lowers in the kernel tier)"
+            )
+        pad = _pad(ctx.indent)
+        m, ll = self.state[0], self.state[1]
+        o = self.state[2] if len(self.state) == 3 else None
+        s = self.partial[0]
+        v = self.partial[1] if len(self.partial) == 2 else None
+        m_new, alpha, p = f"{m}_new", f"{m}_alpha", f"{ll}_p"
+        for nm in (m_new, alpha, p):
+            ctx.ssa_dtypes[nm] = "f32"
+        ty = ctx.type_name("f32")
+        max_e = FuncCallExpr("fmax", (Var(m), Var(s))).render(ctx)
+        alpha_e = FuncCallExpr("exp", (BinaryExpr("-", Var(m), Var(m_new)),)).render(ctx)
+        p_e = FuncCallExpr("exp", (BinaryExpr("-", Var(s), Var(m_new)),)).render(ctx)
+        out = [
+            f"{pad}{ty} {m_new} = {max_e};",  # m_new = max(m, s)
+            f"{pad}{ty} {alpha} = {alpha_e};",  # alpha = exp(m - m_new)  (reads OLD m)
+            f"{pad}{ty} {p} = {p_e};",  # p = exp(s - m_new)  (this element's prob, m_new frame)
+            f"{pad}{ll} = {ll} * {alpha} + {p};",  # l = l*alpha + p
+        ]
+        if o is not None:
+            out.append(f"{pad}{o} = {o} * {alpha} + {p} * {v};")  # O = O*alpha + p*v
+        out.append(f"{pad}{m} = {m_new};")  # m = m_new  (must come last)
+        return out
 
 
 @dataclass(frozen=True)

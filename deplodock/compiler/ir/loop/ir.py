@@ -42,6 +42,8 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Assign,
     Body,
     Cond,
+    FlashCombine,
+    Init,
     Load,
     Loop,
     Select,
@@ -420,6 +422,23 @@ def _validate(loop: LoopOp) -> None:
                 if stmt.name in defined:
                     raise ValueError(f"Select {stmt.name!r}: name already defined")
                 defined.add(stmt.name)
+            elif isinstance(stmt, Init):
+                # Explicit accumulator seed at this scope — a binding site for the
+                # carried name (FlashCombine's (m, l, O) are declared here, before
+                # the streaming Loop, so a post-loop sweep can read them).
+                defined.add(stmt.name)
+                exported_accs.add(stmt.name)
+            elif isinstance(stmt, FlashCombine):
+                # Tuple-monoid carrier: its ``partial`` (this iteration's
+                # contribution) must be in scope; its ``state`` is loop-carried
+                # (seeded by an enclosing Init, like Accum's implicit declare) and
+                # exports to the enclosing scope.
+                for pdep in stmt.partial:
+                    if pdep not in defined:
+                        raise ValueError(f"FlashCombine: partial dep {pdep!r} not defined")
+                for nm in stmt.state:
+                    defined.add(nm)
+                    exported_accs.add(nm)
             elif isinstance(stmt, Write):
                 if stmt.value not in defined:
                     raise ValueError(f"Write: value {stmt.value!r} not defined")
