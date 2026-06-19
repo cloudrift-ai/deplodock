@@ -48,12 +48,20 @@ class ElementwiseImpl:
     Construction resolves the callable from ``_NAME_TO_FN`` (non-numpy
     intrinsics) or ``getattr(np, name)`` for numpy-aligned names, and
     reads arity from the ufunc's ``nin`` (non-ufunc intrinsics are
-    unary). Unknown names raise. ``commutative`` / ``identity`` are
-    computed properties reading from class-level tables keyed by name.
+    unary). Unknown names raise. ``commutative`` / ``associative`` /
+    ``identity`` / ``has_identity`` are computed properties reading from
+    class-level tables keyed by name — the algebraic traits reassociation
+    gates (split-K, cooperative tree-combine) query instead of matching op
+    names.
     """
 
     # Commutative ops — binary combines where ``op(a, b) == op(b, a)``.
     _COMMUTATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
+    # Associative ops — binary combines where ``op(op(a, b), c) == op(a, op(b, c))``.
+    # The reassociable reduce combines: a reduction over one of these may be
+    # split / reordered (split-K, cooperative tree-combine) without changing
+    # the result. ``subtract`` / ``divide`` are deliberately absent.
+    _ASSOCIATIVE: frozenset[str] = frozenset({"add", "multiply", "maximum", "minimum", "amax", "sum", "prod"})
     # Reducer neutral elements — only meaningful when used as an Accum
     # combine or a ReduceOp.
     _IDENTITY: dict[str, float] = {
@@ -90,8 +98,19 @@ class ElementwiseImpl:
         return self.name in self._COMMUTATIVE
 
     @property
+    def associative(self) -> bool:
+        return self.name in self._ASSOCIATIVE
+
+    @property
     def identity(self) -> float | None:
         return self._IDENTITY.get(self.name)
+
+    @property
+    def has_identity(self) -> bool:
+        """True iff this op has a neutral element — i.e. it can seed an
+        accumulator. The reassociation gates pair this with ``associative``
+        / ``commutative`` to admit a reduce for split-K / tree-combine."""
+        return self.identity is not None
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, ElementwiseImpl) and self.name == other.name

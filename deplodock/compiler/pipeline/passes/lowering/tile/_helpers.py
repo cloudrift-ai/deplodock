@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Mma, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, ReduceCarrier, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -165,7 +165,7 @@ def is_matmul_reduce(loop) -> bool:
     bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}
     if len(bufs) < 2:
         return False
-    return any(isinstance(s, (Accum, Mma)) for s in loop.body)
+    return any(isinstance(s, ReduceCarrier) for s in loop.body)
 
 
 def segmentable_k_extent(load: Load, k_name: str) -> int | None:
