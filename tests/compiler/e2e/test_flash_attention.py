@@ -1,10 +1,11 @@
 """Flash-attention recognition at Loop IR — GPU parity vs torch SDPA.
 
-The ``FLASH`` knob drives a **Loop-IR** pass (``loop/fusion/001_recognize_flash``)
-that pattern-matches the decomposed online-softmax attention (``010_sdpa`` +
-lifting produce the QK^T → softmax → P@V ``LoopOp`` chain) and rewrites it into a
-single streaming online-softmax kernel (the ``FlashCombine`` carrier) — with NO
-modification to the decomposition stage. These tests pin: (1) with ``FLASH`` on,
+The ``FLASH`` knob drives a **Loop-IR** pass (``loop/fusion/025_recognize_flash``)
+that runs AFTER the generic fuser and pattern-matches the consolidated softmax-
+attention kernel (post-fusion a non-causal SDPA is two ``LoopOp``s: scaled scores
++ a softmax-then-P@V kernel), rewriting it into a single streaming online-softmax
+kernel (the ``FlashCombine`` carrier) — with NO modification to the decomposition
+stage. These tests pin: (1) with ``FLASH`` on,
 non-causal SDPA fuses to one kernel matching torch on the GPU (static + dynamic
 symbolic ``seq_len``); (2) with ``FLASH`` off, the score-materializing
 decomposition is untouched (default unchanged). Causal / explicit-mask / GQA are

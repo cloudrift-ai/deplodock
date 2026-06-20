@@ -263,13 +263,17 @@ remains future work. What landed, and how it diverged from the original framing:
 - **Steps 3 + 4 are coupled — realized together at the scalar tier.** Step 3 (loop-carried *scaled* MMA fragment) cannot
   be built or verified in isolation: there is no frontend op for a scaled-accumulator matmul, the scale is **per-query-
   row** (the `m16n8k16` `c[4]` fragment maps regs→rows), and the `alpha` only exists once the softmax half of the tile is
-  built. So the scalar nest was implemented as a **Loop-IR recognition** pass with NO decomposition-stage change:
-  `010_sdpa` decomposes SDPA into the QK^T → softmax → P@V tensor ops as always, lifting produces the canonical per-op
-  `LoopOp` chain, and `loop/fusion/001_recognize_flash.py` (before the generic fuser `010_merge_loop_ops`) structurally
-  pattern-matches that chain — a backward walk from the terminal P@V squeeze through `_as_copy` / `_as_reduce` /
-  `_as_binary` / `_as_unary` classifiers, reading Q/K/V off the two matmuls' leaf operands in `matmul_decompose`'s
-  A-then-B order — and rewrites it into the fused flash `LoopOp` (`_flash.build_flash_frag`); the old chain orphans and
-  is removed. The nest runs **one independent streaming softmax per output element `(…, m, d)`** — correct (the score
+  built. So the scalar nest was implemented as a **Loop-IR recognition** pass with NO decomposition-stage change, run
+  **after the generic fuser**: `010_sdpa` decomposes SDPA as always, and after `loop/fusion`'s `010_merge_loop_ops` a
+  non-causal SDPA is just two `LoopOp`s — the scaled scores `X = (Σ_dd Q·K)·scale` and the softmax-then-P@V kernel
+  `Σ_kv softmax(X)·V` (rowmax + rowsum-of-exp + normalized P@V in one body — the online-softmax pattern in one place).
+  `loop/fusion/025_recognize_flash.py` anchors on that softmax-P@V kernel (tell-tale `maximum` rowmax Accum + `exp` + a
+  P@V sum feeding the output), reads `X` / `V` off its body, traces `X` to its scaled-QK^T producer for Q / K
+  (disambiguated **by index** — fusion reorders the multiply operands, so the QK operand whose seq index matches the
+  score's row/M axis is Q), and rewrites the pair to the fused flash `LoopOp` (`_flash.build_flash_frag`); the scores
+  kernel orphans and is removed. (Recognizing the *fused* form — chosen over the pre-fusion 19-op chain — matches the
+  consolidated semantic kernel, not scattered primitives.) The nest runs **one independent streaming softmax per output
+  element `(…, m, d)`** — correct (the score
   `s = Σ_dd Q·K` is an inner reduce nested in the KV streaming reduce; the nest pre-places `Init(sacc)` at the KV-body
   scope so it resets per step), but redundant (recomputes scores per `d`). The tensor-core P@V tier (Step 3's `RegScale`
   fragment, the real perf win) is **still future work**.

@@ -1,12 +1,13 @@
 """Flash-attention shared helper — the ``FLASH`` knob, eligibility predicate, and
 the streaming online-softmax ``LoopOp`` nest builder.
 
-Flash recognition is a **Loop-IR** pass (``loop/fusion/001_recognize_flash``): it
-pattern-matches the decomposed online-softmax attention (the QK^T → softmax → P@V
-chain of canonical lifted ``LoopOp``s that ``010_sdpa`` + lifting produce) and
-rewrites it into one fused streaming kernel — with NO modification to the
-decomposition stage. This module is the sole owner of the ``FLASH`` knob, the
-``flash_shape_eligible`` predicate, and the nest builder ``build_flash_frag``.
+Flash recognition is a **Loop-IR** pass (``loop/fusion/025_recognize_flash``) that
+runs AFTER the generic fuser: a non-causal SDPA fuses to two ``LoopOp``s — the
+scaled scores and the softmax-then-P@V kernel — and the pass pattern-matches that
+consolidated softmax-attention kernel and rewrites it into one fused streaming
+kernel, with NO modification to the decomposition stage. This module is the sole
+owner of the ``FLASH`` knob, the ``flash_shape_eligible`` predicate, and the nest
+builder ``build_flash_frag``.
 
 The nest fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
