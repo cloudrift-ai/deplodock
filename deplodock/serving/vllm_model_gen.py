@@ -65,6 +65,18 @@ class DeplodockGenModel(nn.Module):
         self.config = config
         self.dtype = mc.dtype
 
+        # The flattened width T = num_tokens is the SUM of newly-scheduled tokens across all
+        # requests per step (continuous batching), bounded by max_num_batched_tokens — NOT
+        # max_model_len. It must stay within the compiler's dynamic-dim / RoPE-buffer cap.
+        from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+
+        max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        if max_batched and max_batched > DYNAMIC_DIM_MAX:
+            raise ValueError(
+                f"max_num_batched_tokens={max_batched} exceeds DYNAMIC_DIM_MAX ({DYNAMIC_DIM_MAX}); "
+                f"serve with --max-num-batched-tokens {DYNAMIC_DIM_MAX} or lower"
+            )
+
         self.runner = DeplodockGenRunner.create(model_id=mc.model, dtype_str=_trunk_dtype_str(mc.dtype))
         n_layers = self.runner.num_layers
         head_dim = self.runner.head_dim

@@ -70,6 +70,7 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
         enforce_eager=True,
         dtype="float16",
         max_model_len=128,
+        max_num_batched_tokens=512,  # <= DYNAMIC_DIM_MAX (the flattened-width bound)
         gpu_memory_utilization=0.4,
     )
     out = llm.generate(TokensPrompt(prompt_token_ids=prompt_ids), SamplingParams(temperature=0.0, max_tokens=max_new))
