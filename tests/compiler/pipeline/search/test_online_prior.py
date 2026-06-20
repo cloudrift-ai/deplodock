@@ -330,3 +330,89 @@ def test_cold_or_absent_prior_descends_emission_order():
     assert TuningSearch(tree=tree)._select([a, b], tree.root) is a
     cold = CatBoostPrior(seed=0)
     assert TuningSearch(tree=tree, prior_model=cold)._select([a, b], tree.root) is a
+
+
+# --- deployable-evidence pick (Prior.pick / evidence_pick) ------------------
+
+
+def _o3_row(knobs: dict, us: float) -> tuple[dict, float]:
+    """A reservoir row shaped like tune's -O3 re-bench: S_* identity + H_opt=3
+    stamp + tunable knobs."""
+    return ({"S_sig": 7.0, "H_opt": 3.0, **knobs}, us)
+
+
+def _cand(knobs: dict) -> dict:
+    """A greedy candidate row: same S_* identity, deploy regime H_opt=3."""
+    return {"S_sig": 7.0, "H_opt": 3.0, **knobs}
+
+
+def test_evidence_pick_prefers_measured_best():
+    """A candidate matching the fastest -O3 reservoir row wins the pick even when
+    the model would rank an unmeasured candidate lower (the golden-sweep
+    gate_up_proj.s128 class: measured rank-1 config lost the deploy to an
+    extrapolation)."""
+    p = CatBoostPrior(seed=0, iterations=40, min_rows=3)
+    p.add_rows([_o3_row({"FM": 6, "FN": 4}, 24.1), _o3_row({"FM": 4, "FN": 4}, 30.0)])
+    p.add_rows(_bm_rows())  # unrelated S_-less rows give the model signal
+    p.fit()
+    rows = [_cand({"FM": 8, "FN": 4}), _cand({"FM": 6, "FN": 4}), _cand({"FM": 4, "FN": 4})]
+    best_i, us = p.pick(rows)
+    assert best_i == 1, "pick must land on the measured-fastest config, not an unmeasured one"
+    assert us == 24.1
+
+
+def test_evidence_prefix_consistency():
+    """A partial candidate (knob undecided) inherits the best measured outcome
+    consistent with its prefix — value-of-position semantics; a candidate that
+    contradicts every measured row gets no evidence."""
+    p = CatBoostPrior(seed=0)
+    p.add_rows([_o3_row({"FM": 6, "RING": 2}, 24.0), _o3_row({"FM": 6, "RING": 3}, 28.0)])
+    ev = p.evidence_pick([_cand({"FM": 6}), _cand({"FM": 8})])
+    assert ev == (0, 24.0)  # FM=6 prefix → min over its two measured rows
+    assert p.evidence_pick([_cand({"FM": 8})]) is None
+
+
+def test_evidence_ignores_o1_rows_and_other_ops():
+    """-O1 ranking rows (H_opt=1) and rows from a different S_* signature are not
+    evidence; without -O3 rows the pick falls back to the model argmin."""
+    p = CatBoostPrior(seed=0, iterations=40, min_rows=3)
+    p.add_rows([({"S_sig": 7.0, "H_opt": 1.0, "FM": 6}, 5.0), ({"S_sig": 9.0, "H_opt": 3.0, "FM": 6}, 5.0)])
+    assert p.evidence_pick([_cand({"FM": 6})]) is None
+    p.add_rows(_bm_rows())
+    p.fit()
+    best_i, us = p.pick([{"H_opt": 3.0, "BM": 2}, {"H_opt": 3.0, "BM": 64}])
+    assert best_i == 1  # model argmin (bigger BM = faster in _bm_rows)
+
+
+def test_evidence_skipped_off_o3_regime():
+    """Deploying a non--O3 regime (e.g. ``--nvcc-flags -Xcicc -O1``) must not
+    consult -O3 evidence."""
+    p = CatBoostPrior(seed=0)
+    p.add_rows([_o3_row({"FM": 6}, 24.0)])
+    assert p.evidence_pick([{"S_sig": 7.0, "H_opt": 1.0, "FM": 6}]) is None
+
+
+def test_evidence_normalizes_sequence_knobs():
+    """OVERHANG recorded as a list (YAML) matches a tuple-valued candidate (the
+    seed-report ``_knob_eq`` lesson)."""
+    p = CatBoostPrior(seed=0)
+    p.add_rows([_o3_row({"OVERHANG": ["a0"], "FM": 6}, 24.0)])
+    ev = p.evidence_pick([_cand({"OVERHANG": ("a0",), "FM": 6})])
+    assert ev == (0, 24.0)
+
+
+def test_fallback_pick_uses_learned_evidence_when_cold():
+    """FallbackPrior.pick consults the learned half's reservoir even before the
+    model is fitted (a freshly-seeded reservoir holds real measurements), and
+    falls through to the analytic ranking when no evidence matches."""
+    from deplodock.compiler.pipeline.search.prior import FallbackPrior
+
+    learned = CatBoostPrior(seed=0)
+    learned.add_rows([_o3_row({"FM": 6}, 24.0)])
+    fb = FallbackPrior(learned)
+    assert not fb.fitted
+    best_i, us = fb.pick([_cand({"FM": 8}), _cand({"FM": 6})])
+    assert (best_i, us) == (1, 24.0)
+    # No evidence → analytic mean_scores argmin path (finite, in-range index).
+    best_i, score = fb.pick([_cand({"FM": 8}), _cand({"FM": 12})])
+    assert best_i in (0, 1) and math.isfinite(score)

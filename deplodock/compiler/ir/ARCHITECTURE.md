@@ -98,7 +98,7 @@ remain.
 | Group         | Ops                                                                                       |
 |---------------|-------------------------------------------------------------------------------------------|
 | Layout-only   | `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp`, `UnsqueezeOp` — rewrite to `IndexMapOp`.  |
-| Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp` — rewrite to elementwise + reduce chains.      |
+| Compound math | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `RmsNormOp`, `LayerNormOp`, `SoftmaxOp` — rewrite to elementwise + reduce chains. |
 
 ## `tensor/ir.py`
 
@@ -113,15 +113,21 @@ it replaces the frontend layout ops via `coord_map` expressions.
 | `GatherOp`, `ScatterOp`              | Data-dependent reads / writes.                                 |
 | `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
 
-Op metadata (arity / commutative / reduce identity) lives on
-`ElementwiseImpl` in `ir/elementwise.py` — the single source of truth
-shared across elementwise, reduce, scan, and accumulator use sites.
+Op metadata (arity / `commutative` / `associative` / `identity` /
+`has_identity`) lives on `ElementwiseImpl` in `ir/elementwise.py` — the single
+source of truth shared across elementwise, reduce, scan, and accumulator use
+sites. The algebraic traits are what reassociation gates (split-K, cooperative
+tree-combine) query instead of matching op names.
 
 ## `loop/`
 
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
-`Loop` is a reduce Loop iff its body contains an `Accum`.
+`Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
+base of `Accum` and its tensor-core form `Mma`; `is_reduce`, axis threading,
+and the other carrier-agnostic checks key off the base, not an
+`isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's algebra
+read `carrier.combine_op()` and query its traits.
 
 ### `loop/ir.py` — LoopOp types
 
@@ -227,8 +233,17 @@ set member when deduping candidate bodies in a search.
 
 Called inside `normalize_body`. Generic bottom-up Expr rewriter:
 constant folding, algebraic identities, range-based comparison folding
-(`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `Context`/`Interval`
-track integer ranges from axis extents.
+(`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `SimplifyCtx`/`Interval`
+track integer ranges from axis extents (`axis.extend_simplify_ctx` pushes
+each loop axis into the ctx). `SimplifyCtx.bounds` additionally tracks a
+*symbolic* exclusive upper bound per var (`i < seq_len`) so a modulo by a
+non-literal divisor folds — `i % seq_len → i` when `i`'s loop extent is
+`seq_len` (`_mod_below_divisor`). This collapses the delinearized seq
+coordinate `((i*stride + feat) / stride) % seq_len` that compose-indexmaps
+emits back to `i`, the symbolic-shape counterpart of the literal-divisor
+`_div_mod_decompose` cleanup (a static `seq_len` already constant-folds it).
+Symbolic-extent axes get `[0, sentinel]` ranges (non-negativity for the inner
+`(i*c + …)//c → i` div fold) instead of being dropped.
 
 Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
 
@@ -298,8 +313,10 @@ itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.
 Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
-(`c += a @ b`, a reduce-accumulate sibling of `Accum` — it makes its loop
-`is_reduce`) that carries that `Atom` and names its A/B operand `Load`s by SSA
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
+`ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,
+and its `combine_op()` reports `add`) that carries that `Atom` and names its A/B
+operand `Load`s by SSA
 value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
 marker downstream. Both are ordinary IR the staging passes carry through (the
 loads stage like any `Load`); `kernel/005_lower_atom_tile` recovers each
@@ -353,9 +370,9 @@ directly (no separate AST class).
 | `Sync`             | `__syncthreads()` barrier.                                        |
 | `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
 | `RegFragment`      | mma.sync (s16816) per-thread register array decl (one per operand role `"a"`/`"b"`/`"c"`): `unsigned a[4]`/`b[2]` (16-bit operands, 2 elems/reg) or `float c[4]` (f32 acc, zero-init at decl — no separate fill). Carries the cell shape `(M, N, K)` + dtype. Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). The sole tensor-core fragment family (the opaque `nvcuda::wmma` nodes were removed). |
-| `LdmatrixLoad`     | Load one operand into a `RegFragment`. `staged=True` (default): `ldmatrix.sync.aligned.m8n8.x{4,trans}.b16` from smem (`role="a"` → x4; `role="b"` → x2.trans; each lane derives its row address from `threadIdx.x & 31`; `swizzle` applies the per-lane chunk XOR for a TMA-swizzled slab). `staged=False`: operand not staged into smem (ldmatrix is smem-only) → renders a **gmem-direct fragment load** (`dpl_mma_load_{a,b}_gmem`) reading the fragment straight from gmem with the same m16n8k16 lane→element map — slower (no smem reuse) but lets an unstageable MMA tile compile instead of crashing. |
+| `LdmatrixLoad`     | Load one operand into a `RegFragment`. `staged=True` (default): `ldmatrix.sync.aligned.m8n8.x{4,trans}.b16` from smem (`role="a"` → x4; `role="b"` → x2.trans; each lane derives its row address from `threadIdx.x & 31`; `swizzle` applies the per-lane chunk XOR for a TMA-swizzled slab). `staged=False`: operand not staged into smem (ldmatrix is smem-only) → renders a **gmem-direct fragment load** (`dpl_mma_load_{a,b}_gmem`) reading the fragment straight from gmem with the same m16n8k16 lane→element map — slower (no smem reuse) but lets an unstageable MMA tile compile instead of crashing. `b_trans=True` (role "b" only) marks a transposed-B operand stored `[N, K]` (the native `mma.row.col` col-major B — a Q@K^T cell): gmem-direct via `dpl_mma_load_b_gmem_trans` (k contiguous; masked → `_trans_nclamp`). |
 | `MmaSyncPtx`       | `mma.sync.aligned.m16n8k16.row.col.f32.{f16,bf16}.{f16,bf16}.f32` — one s16816 MMA via inline PTX (`c += a @ b`). `ab_dtype` (`"f16"`/`"bf16"`) picks the `dpl_mma_…` wrapper. |
-| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by `kernel/005_lower_atom_tile._scan_epilogue` after the shared negative-form gate `tile/_atom.classify_fragment_epilogue` admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). |
+| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order, plus `selects` — coord-predicated causal-mask ternaries) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations, the causal attention mask — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by `kernel/005_lower_atom_tile._scan_epilogue` after the shared negative-form gate `tile/_atom.classify_fragment_epilogue` admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). Each `selects` entry `(name, ((cond|None, value), …))` renders as a per-element ternary, its `__M__`/`__N__` placeholder coords substituted with the element's absolute (row, col). |
 | Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`

@@ -38,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ..conftest import requires_cuda
+from ..conftest import device_compute_capability, dyn_M, requires_cuda
 
 # Shapes match the user's offline scan.
 _MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}
@@ -69,37 +69,65 @@ def _format_knobs(knobs: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in knobs.items())
 
 
-def _build_matmul_graph(dims: dict):
+def _build_matmul_graph(dims: dict, mode: str = "static"):
+    """``(1, M, K) @ (K, N)``. ``mode='dynamic'`` makes the M axis symbolic
+    (``Dim('seq_len')``); the returned ``input_shapes`` stay concrete so the run
+    feeds a real (1, M, K) array the symbolic kernel resolves ``seq_len`` from."""
     from deplodock.compiler.graph import Graph, Tensor
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
     M, K, N = dims["M"], dims["K"], dims["N"]
+    Mg = dyn_M(mode, M)
     g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (1, M, K)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("a", (1, Mg, K)), node_id="a")
     g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
-    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (1, M, N)), node_id="c")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (1, Mg, N)), node_id="c")
     g.inputs, g.outputs = ["a", "b"], ["c"]
     return g, {"a": (1, M, K), "b": (K, N)}, ("c", (1, M, N))
 
 
-def _build_gated_graph(dims: dict):
+def _build_gated_graph(dims: dict, mode: str = "static"):
     from deplodock.compiler.graph import Graph, Tensor
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
     from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 
     S, H, Inter = dims["S"], dims["H"], dims["I"]
+    Sg = dyn_M(mode, S)
     g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (1, S, H)), node_id="x")
+    g.add_node(InputOp(), [], Tensor("x", (1, Sg, H)), node_id="x")
     g.add_node(InputOp(), [], Tensor("wg", (H, Inter)), node_id="wg")
     g.add_node(InputOp(), [], Tensor("wu", (H, Inter)), node_id="wu")
-    g.add_node(MatmulOp(), ["x", "wg"], Tensor("mg", (1, S, Inter)), node_id="mg")
-    g.add_node(MatmulOp(), ["x", "wu"], Tensor("mu", (1, S, Inter)), node_id="mu")
-    g.add_node(ElementwiseOp("silu"), ["mg"], Tensor("sg", (1, S, Inter)), node_id="sg")
-    g.add_node(ElementwiseOp("multiply"), ["sg", "mu"], Tensor("y", (1, S, Inter)), node_id="y")
+    g.add_node(MatmulOp(), ["x", "wg"], Tensor("mg", (1, Sg, Inter)), node_id="mg")
+    g.add_node(MatmulOp(), ["x", "wu"], Tensor("mu", (1, Sg, Inter)), node_id="mu")
+    g.add_node(ElementwiseOp("silu"), ["mg"], Tensor("sg", (1, Sg, Inter)), node_id="sg")
+    g.add_node(ElementwiseOp("multiply"), ["sg", "mu"], Tensor("y", (1, Sg, Inter)), node_id="y")
     g.inputs, g.outputs = ["x", "wg", "wu"], ["y"]
     return g, {"x": (1, S, H), "wg": (H, Inter), "wu": (H, Inter)}, ("y", (1, S, Inter))
+
+
+def _build_norm_linear_graph(dims: dict, mode: str = "static"):
+    """``RmsNorm(x) @ W.T`` in fp16 — the fused norm+matmul shape of
+    Qwen3-Embedding's ``k_linear_mean_reduce``. ``mode='dynamic'`` makes the
+    seq axis symbolic (``Dim('seq_len')``, the deployable masked-tile path).
+    The norm reduction stages ``x`` in ``BK``-element inner slabs; at fp16 +
+    ``BK=32`` that slab is 64 B (not 128 B-aligned), the TMA-misalignment hazard."""
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+    from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+
+    S, H, Inter = dims["S"], dims["H"], dims["I"]
+    Sg = dyn_M(mode, S)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, Sg, H), dtype=F16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("wn", (H,), dtype=F16), node_id="wn")
+    g.add_node(InputOp(), [], Tensor("w", (Inter, H), dtype=F16), node_id="w")
+    g.add_node(RmsNormOp(), ["x", "wn"], Tensor("xn", (1, Sg, H), dtype=F16), node_id="xn")
+    g.add_node(LinearOp(), ["xn", "w"], Tensor("y", (1, Sg, Inter), dtype=F16), node_id="y")
+    g.inputs, g.outputs = ["x", "wn", "w"], ["y"]
+    return g, {"x": (1, S, H), "wn": (H,), "w": (Inter, H)}, ("y", (1, S, Inter))
 
 
 def _run_with_knobs(graph, inputs: dict[str, np.ndarray], out_name: str, knobs: dict, monkeypatch) -> np.ndarray:
@@ -146,24 +174,66 @@ def _assert_match(forced: np.ndarray, ref: np.ndarray) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("knobs", _BROKEN_MATMUL, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_matmul_single_cta_f_replicated(knobs: dict, monkeypatch):
-    """matmul (1, 32, 128) @ (128, 64) — single-CTA + F-replicated tile."""
-    graph, input_shapes, (out_name, _) = _build_matmul_graph(_MATMUL_DIMS)
+def test_matmul_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
+    """matmul (1, 32, 128) @ (128, 64) — single-CTA + F-replicated tile. The
+    pinned config must produce the same correct output whether M is baked
+    (static) or symbolic (dynamic ``seq_len``, masked path) — the numpy
+    reference is the static graph; the forced CUDA run uses the mode's graph."""
+    static_graph, input_shapes, (out_name, _) = _build_matmul_graph(_MATMUL_DIMS)
+    forced_graph, _, _ = _build_matmul_graph(_MATMUL_DIMS, mode=shape_mode)
     inputs = _random_inputs(input_shapes)
-    ref = _reference(graph, inputs, out_name)
-    forced = _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
     _assert_match(forced, ref)
 
 
 @requires_cuda
 @pytest.mark.parametrize("knobs", _BROKEN_GATED, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_gated_mlp_single_cta_f_replicated(knobs: dict, monkeypatch):
-    """gated_mlp (1, 32, 128) → (1, 32, 256) — single-CTA + F-replicated tile."""
-    graph, input_shapes, (out_name, _) = _build_gated_graph(_GATED_DIMS)
+def test_gated_mlp_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
+    """gated_mlp (1, 32, 128) → (1, 32, 256) — single-CTA + F-replicated tile,
+    static and dynamic (symbolic ``seq_len``). Reference is the static graph."""
+    static_graph, input_shapes, (out_name, _) = _build_gated_graph(_GATED_DIMS)
+    forced_graph, _, _ = _build_gated_graph(_GATED_DIMS, mode=shape_mode)
     inputs = _random_inputs(input_shapes)
-    ref = _reference(graph, inputs, out_name)
-    forced = _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
     _assert_match(forced, ref)
+
+
+# The #244 dynamic-tune wedge: a scalar (``MMA=0``) cooperative norm-reduce whose
+# fp16 per-slot box is a single ``BK=32`` axis = 64 B — not a 128 B multiple, so
+# under ``RING=2`` the second TMA ring slot lands at a 64 B offset. The 128 B slot
+# check sized off the fp32 ``BYTES_PER_ELEM`` constant let the fp16 64 B slab
+# through, the materializer left it unpadded, and ``cp.async.bulk.tensor`` faulted
+# with ``CUDA_ERROR_MISALIGNED_ADDRESS`` → 1 s watchdog hang → bench_fail. The
+# dtype-aware gate now declines TMA for this slab (→ cp.async). ``MMA=0`` forces
+# the scalar tier; ``RING=2`` double-buffers so the slot offset matters.
+_NORM_REDUCE_WEDGE_KNOBS = {"BM": 1, "BN": 128, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "MMA": 0, "RING": 2}
+_NORM_DIMS = {"S": 32, "H": 128, "I": 512}
+
+
+@requires_cuda
+def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
+    """fp16 ``RmsNorm(x) @ W.T`` forced through the scalar cooperative-reduce tile
+    that wedged the #244 dynamic tune. The pinned config must produce correct
+    output whether the seq axis is baked (static) or symbolic (dynamic
+    ``seq_len``) — STATIC/DYNAMIC PARITY: both paths must make the same TMA
+    decision (decline, since the fp16 64 B ring slot isn't 128 B-aligned) and fall
+    back to cp.async. Pre-fix the dynamic path emitted a misaligned
+    ``cp.async.bulk.tensor`` store and hung (``HungKernelError``); this test would
+    time out. The numpy reference is the static graph; the forced CUDA run uses
+    the mode's graph."""
+    static_graph, input_shapes, (out_name, _) = _build_norm_linear_graph(_NORM_DIMS)
+    forced_graph, _, _ = _build_norm_linear_graph(_NORM_DIMS, mode=shape_mode)
+    rng = np.random.default_rng(0)
+    # fp16 inputs scaled down so the H=128 sum-of-squares stays well inside fp16 range.
+    inputs = {name: (rng.standard_normal(shape, dtype=np.float32) * 0.1).astype(np.float16) for name, shape in input_shapes.items()}
+    ref = _reference(static_graph, inputs, out_name)
+    forced = _run_with_knobs(forced_graph, inputs, out_name, _NORM_REDUCE_WEDGE_KNOBS, monkeypatch)
+    # fp16 reduction drift over H=128 — same looser bound the other fp16 tests use.
+    peak = float(np.max(np.abs(ref.astype(np.float32))))
+    atol = max(5e-1, 0.1 * peak)
+    np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
 # Staged MMA regression for ``plans/mma-smem-staging.md`` M5. These
@@ -570,6 +640,12 @@ def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: 
     boundary-Cond hoist (``021_hoist_staged_loads_above_mask``) + B2
     per-Load guard (``_guard_unsafe_loads``) interaction with the
     selected transport (TMA / cp.async)."""
+    # The TMA transport emits the ``sm_NNa`` arch-accelerated target, which only
+    # exists for sm_90a+; on sm_80-89 nvcc rejects it (``Unsupported gpu
+    # architecture 'sm_89a'``). Skip the TMA-pinned rows below sm_90 — the
+    # cp.async / sync rows still cover the masked-tile paths here.
+    if knobs.get("TMA") == 1 and (device_compute_capability() or (0, 0)) < (9, 0):
+        pytest.skip("TMA transport needs sm_90+ (sm_NNa unsupported on sm_80-89)")
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)

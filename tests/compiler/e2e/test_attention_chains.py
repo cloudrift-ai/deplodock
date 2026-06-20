@@ -31,7 +31,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ..conftest import requires_cuda
+from ..conftest import from_pretrained_or_skip, requires_cuda
 
 
 @pytest.fixture(autouse=True)
@@ -199,7 +199,7 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     and verify deplodock matches eager within ``threshold``."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    config = AutoConfig.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    config = from_pretrained_or_skip(AutoConfig.from_pretrained, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     config.num_hidden_layers = 1
     block = AutoModelForCausalLM.from_config(config).float().model.layers[0].eval()
     attn = block.self_attn

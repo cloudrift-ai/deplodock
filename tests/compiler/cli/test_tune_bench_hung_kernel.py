@@ -4,7 +4,7 @@ to skip the per-kernel sweep (the pre-isolation behavior); it just continues.
 
 A non-terminating kernel trips the worker's per-launch watchdog (``HungKernelError``) and the parent
 SIGKILLs the child, surfacing as a ``RuntimeError`` to ``_run_bench``. These tests drive the
-``_run_bench`` control flow with the worker call (``benchmark_compare_isolated``) and the per-kernel
+``_run_bench`` control flow with the worker call (``benchmark_compare_isolated_async``) and the per-kernel
 sweep stubbed — no CUDA. The real-GPU recovery is covered in
 ``tests/compiler/backend/test_bench_worker_compare.py``.
 """
@@ -47,7 +47,7 @@ def _patch_common(monkeypatch, *, compare_raises: Exception | None) -> list[bool
     """Stub the worker compare call + the per-kernel sweep; return a flag flipped iff per-kernel ran."""
     per_kernel_ran = [False]
 
-    def _fake_compare(**_kw):
+    async def _fake_compare(**_kw):
         if compare_raises is not None:
             raise compare_raises
         return {"Deplodock": 1.0}, object(), True, False  # (results, bench, torch_available, captured)
@@ -57,7 +57,7 @@ def _patch_common(monkeypatch, *, compare_raises: Exception | None) -> list[bool
         return [], []
 
     monkeypatch.setattr(backend_mod, "CudaBackend", _DummyBackend)
-    monkeypatch.setattr(program_mod, "benchmark_compare_isolated", _fake_compare)
+    monkeypatch.setattr(program_mod, "benchmark_compare_isolated_async", _fake_compare)
     monkeypatch.setattr(tune_mod, "_bench_per_kernel", _fake_per_kernel)
     monkeypatch.setattr(run_mod, "_print_table", lambda *_a, **_k: None)
     monkeypatch.setenv(config.NVCC_FLAGS, "")  # registers cleanup of the flag _run_bench sets

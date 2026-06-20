@@ -41,11 +41,13 @@ KNOBS = "DEPLODOCK_KNOBS"
 TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
 TUNE_EPS = "DEPLODOCK_TUNE_EPS"
 O3_TOL = "DEPLODOCK_O3_TOL"
+ANALYTIC_TILT = "DEPLODOCK_ANALYTIC_TILT"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
+SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -200,11 +202,32 @@ def tune_eps(default: float = 0.0) -> float:
     return float_env(TUNE_EPS, default)
 
 
-def o3_tol(default: float = 0.10) -> float:
+def o3_tol(default: float = 0.15) -> float:
     """``DEPLODOCK_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
     within which a tuned config is also re-benched at -O3 for a deployable prior
-    sample. ``0.10`` = re-bench everything within 10% of the best -O1."""
+    sample. ``0.15`` = re-bench everything within 15% of the best -O1."""
     return float_env(O3_TOL, default)
+
+
+def analytic_tilt(default: float = 0.3) -> float:
+    """``DEPLODOCK_ANALYTIC_TILT`` — exponent ``W`` of the cold ``AnalyticPrior``
+    multiplier in :meth:`FallbackPrior.score` (selection only): the learned µs are
+    tilted by ``analytic**W`` so the heuristic's ranking nudges PUCT exploration
+    toward configs it favors without overriding the learned scale (``W=0`` =
+    pure learned, large ``W`` = analytic dominates). See the method docstring."""
+    return float_env(ANALYTIC_TILT, default)
+
+
+def serving_static(default: bool = False) -> bool:
+    """``DEPLODOCK_SERVING_STATIC`` — opt into the serving plugin's fully-static
+    program: **static extents for both batch and seq_len**. Off (default) keeps the
+    symbolic-seq, batch-1 path; on builds ONE static ``(max_num_seqs, max_seq_len)``
+    program (batch from vLLM's ``--max-num-seqs``, seq from ``--max-model-len``) and
+    runs each scheduler step as a padded batched forward. Only correct/efficient for
+    fixed-length workloads — it pads every sequence to ``max_seq_len`` and the
+    dynamic-seq kernels miscompute batch>1, so it is a deliberate opt-in, not a
+    default. See `serving/ARCHITECTURE.md`."""
+    return _bool(SERVING_STATIC, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:

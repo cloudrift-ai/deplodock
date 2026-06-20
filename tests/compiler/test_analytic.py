@@ -61,3 +61,20 @@ def test_pick_matmul_warp_dispatch_by_dtype():
     assert r16["WM"] * r16["WN"] != 1  # single-warp tiles are pruned
     r_bf = pick_matmul(256, 256, 256, "bf16", ctx)
     assert r_bf.get("MMA") == "mma_m16n8k16_bf16"
+
+
+def test_dynamic_weight_set_selected_on_symbolic_flag():
+    """A symbolic-axis row (``S_ext_n_symbolic_axis > 0``) ranks under the
+    dynamic weight set; a static row under the static one. With deliberately
+    opposed weight sets the same knobs must score differently across the flag."""
+    from deplodock.compiler.pipeline.search.prior.analytic import AnalyticPrior
+
+    p = AnalyticPrior(weights={"D_l2_bm": 1.0}, weights_dynamic={"D_l2_bm": -1.0})
+    static = {"BN": 16, "BM": 8, "FM": 4, "FN": 2, "BK": 64, "SPLITK": 1, "BR": 1, "S_ext_free_prod": 4096.0}
+    dynamic = {**static, "S_ext_n_symbolic_axis": 1.0}
+    assert p.score(static) != p.score(dynamic)
+    # Polarity: bigger BM is rewarded statically (+w → lower proxy), penalized dynamically.
+    static_big = {**static, "BM": 16}
+    dynamic_big = {**dynamic, "BM": 16}
+    assert p.score(static_big) < p.score(static)
+    assert p.score(dynamic_big) > p.score(dynamic)

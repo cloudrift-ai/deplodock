@@ -4,6 +4,7 @@ Accuracy failures (``max_diff >= 1.0``) make ``deplodock run`` exit
 non-zero, so ``rc == 0`` is the accuracy assertion.
 """
 
+import asyncio
 import subprocess
 import sys
 from pathlib import Path
@@ -67,6 +68,95 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
     assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
 
 
+def _symbolic_input_graph():
+    """Frontend-ish graph with one symbolic input (``x``, seq axis 1) and one
+    static input (``w``) — enough for ``_hint_sized_inputs``' input pairing."""
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("w", (4, 8)), node_id="w")
+    g.inputs = ["x", "w"]
+    g.outputs = ["x"]
+    return g
+
+
+def test_hint_sized_inputs_tiles_symbolic_axes():
+    """A symbolic input axis grows to its Dim hint (DEFAULT_SEQ_HINT) by tiling
+    the trace-time values; static inputs pass through untouched (finding 4 of
+    plans/qwen3-embedding-layer0-dynamic-tune-findings.md: the full-model table
+    must bench torch at the same hint shape deplodock benches at)."""
+    from deplodock.commands.run import _hint_sized_inputs
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT
+
+    x = torch.randn(1, 32, 8)
+    w = torch.randn(4, 8)
+    args, kwargs, sym_env = _hint_sized_inputs(_symbolic_input_graph(), (x, w), {})
+    assert sym_env == {"seq_len": DEFAULT_SEQ_HINT}
+    assert kwargs == {}
+    rx, rw = args
+    assert rx.shape == (1, DEFAULT_SEQ_HINT, 8)
+    assert rw is w  # static input untouched
+    # Values are tiled repeats of the trace input, not fresh randoms.
+    assert torch.equal(rx[:, :32], x)
+    assert torch.equal(rx[:, 32:64], x)
+
+
+def test_hint_sized_inputs_static_graph_is_noop():
+    from deplodock.commands.run import _hint_sized_inputs
+
+    from ..conftest import matmul_graph
+
+    a, b = torch.randn(4, 8), torch.randn(8, 4)
+    args, kwargs, sym_env = _hint_sized_inputs(matmul_graph(4, 8, 4), (a, b), {})
+    assert sym_env == {}
+    assert args[0] is a and args[1] is b
+
+
+def test_hint_sized_inputs_resizes_kwargs_in_nested_structure():
+    """Tensors inside kwargs containers (HF's ``position_embeddings`` tuple
+    style) are paired in ``_flatten_tensors`` order and rebuilt in place."""
+    from deplodock.commands.run import _hint_sized_inputs
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1, Dim("seq_len"), 8)), node_id="x")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("cos", (Dim("seq_len"), 4)), node_id="cos")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("sin", (Dim("seq_len"), 4)), node_id="sin")
+    g.inputs = ["x", "cos", "sin"]
+    g.outputs = ["x"]
+
+    x, cos, sin = torch.randn(1, 32, 8), torch.randn(32, 4), torch.randn(32, 4)
+    args, kwargs, sym_env = _hint_sized_inputs(g, (x,), {"position_embeddings": (cos, sin)})
+    assert args[0].shape == (1, 512, 8)
+    rcos, rsin = kwargs["position_embeddings"]
+    assert isinstance(kwargs["position_embeddings"], tuple)
+    assert rcos.shape == (512, 4) and rsin.shape == (512, 4)
+    assert torch.equal(rsin[:32], sin)
+
+
+def test_tile_to_non_divisible_and_dtype():
+    from deplodock.commands.run import _tile_to
+
+    t = torch.tensor([[1, 2]], dtype=torch.long)
+    out = _tile_to(t, 1, 5)
+    assert out.dtype == torch.long
+    assert out.tolist() == [[1, 2, 1, 2, 1]]
+    assert _tile_to(t, 1, 2) is t  # already sized → identity
+
+
+def test_symbolic_bench_note():
+    from deplodock.commands.run import _symbolic_bench_note
+
+    assert _symbolic_bench_note({}) is None
+    note = _symbolic_bench_note({"seq_len": 512})
+    assert "seq_len=512" in note and "symbolic" in note
+
+
 def test_build_torch_fns_resets_dynamo_before_compile(monkeypatch):
     """Persistent bench processes compile a fresh closure of the SAME torch_ref
     ``fn`` code object per row; dynamo's per-code-object recompile limit then
@@ -98,6 +188,126 @@ def test_run_golden_bench_shows_benched_golden_row(run_cli):
     rc, stdout, stderr = run_cli("run", "--golden", "square.512", "--bench")
     assert rc == 0, f"stderr: {stderr}"
     assert "golden square.512" in stdout, stdout
+
+
+def test_run_ab_requires_bench(run_cli):
+    rc, stdout, stderr = run_cli("run", "--code", "torch.zeros(4)", "--ab", "BM=8")
+    assert rc == 2
+    assert "--ab requires --bench" in (stdout + stderr)
+
+
+def test_run_ab_requires_relowerable_input(run_cli):
+    """``--ab`` on a model-ID positional has no code / IR to re-lower per config."""
+    rc, stdout, stderr = run_cli("run", "some/model", "--ab", "BM=8", "--bench")
+    assert rc == 2
+    assert "re-lowerable" in (stdout + stderr)
+
+
+def test_run_ab_rejects_malformed_spec(run_cli):
+    rc, stdout, stderr = run_cli("run", "--code", "torch.zeros(4)", "--bench", "--ab", "BM8")
+    assert rc == 2
+    assert "missing '='" in (stdout + stderr)
+
+
+def test_ab_samples_parse_label_and_shape():
+    """``_ab_samples`` parses each spec with the ``DEPLODOCK_KNOBS`` grammar, labels
+    the row with the raw spec, and marks it shapeless (the ``_print_kernel_stats``
+    cue to nest by kernel ``S_*`` signature instead of a golden matmul shape)."""
+    from deplodock.commands.run import _ab_samples
+
+    (s,) = _ab_samples(["bm=8, BN=16"])
+    assert s.knobs == {"BM": "8", "BN": "16"}  # names uppercased, whitespace tolerated
+    assert s.name == "ab bm=8, BN=16"
+    assert s.shape is None
+    assert s.dynamic is None
+    # A --dynamic run stamps its specs on the pseudo-sample so the A/B re-trace
+    # builds the same symbolic graph as the greedy run.
+    (d,) = _ab_samples(["BM=8"], dynamic=["seq_len@x0:0"])
+    assert d.dynamic == ("seq_len@x0:0",)
+
+
+def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
+    """A pinned sample carrying ``dynamic`` specs (a dynamic golden) re-traces its
+    snippet with the matching ``torch.export`` dynamic_shapes, so the pinned kernel
+    is the same masked-tile artifact as the greedy run; a static sample re-traces
+    with ``dynamic_shapes=None``."""
+    from types import SimpleNamespace
+
+    from deplodock.commands import trace as tmod
+    from deplodock.commands.run import _bench_golden_variants
+
+    seen = []
+
+    def fake_graph_from_code(code, dynamic_shapes=None):
+        seen.append(dynamic_shapes)
+        return object(), "slug", (None, (), {})
+
+    monkeypatch.setattr(tmod, "graph_from_code", fake_graph_from_code)
+
+    async def fake_benchmark_async(g, *, warmup, num_iters):
+        return SimpleNamespace()
+
+    backend = SimpleNamespace(compile=lambda g: g, benchmark_async=fake_benchmark_async)
+    dyn = SimpleNamespace(name="g.dynM", knobs={"BM": 8}, shape=None, dynamic=("seq_len@x0:0",))
+    static = SimpleNamespace(name="g", knobs={"BM": 8}, shape=None, dynamic=None)
+    benches = asyncio.run(
+        _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
+    )
+    assert len(benches) == 2
+    assert seen[0] is not None and 0 in seen[0]["x0"]  # {x0: {0: Dim(seq_len)}}
+    assert seen[1] is None
+
+
+_NCU_CSV = """"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
+"0","k_matmul_abc123","gpu__time_duration.sum","nsecond","10,000"
+"0","k_matmul_abc123","sm__warps_active.avg.pct_of_peak_sustained_active","%","41.5"
+"0","k_matmul_abc123","smsp__inst_executed_pipe_lsu.sum","inst","100"
+"1","k_matmul_abc123","gpu__time_duration.sum","nsecond","12,000"
+"1","k_matmul_abc123","sm__warps_active.avg.pct_of_peak_sustained_active","%","42.5"
+"1","k_matmul_abc123","smsp__inst_executed_pipe_lsu.sum","inst","100"
+"2","ampere_sgemm_128x64_nn","gpu__time_duration.sum","nsecond","8,000"
+"2","ampere_sgemm_128x64_nn","sm__warps_active.avg.pct_of_peak_sustained_active","%","80.0"
+"2","ampere_sgemm_128x64_nn","launch__registers_per_thread","register/thread","90"
+"""
+
+
+def test_parse_ncu_csv_keeps_both_sides_and_aggregates():
+    """The parser keeps the reference (cuBLAS / aten) rows beside the ``k_*`` rows
+    (the comparison table needs both) and aggregates multi-launch rows: ``.sum`` /
+    ``smsp__*`` counters add up, percentages average."""
+    from deplodock.commands.run import _ncu_units, _parse_ncu_csv
+
+    parsed = _parse_ncu_csv(_NCU_CSV)
+    assert set(parsed) == {"k_matmul_abc123", "ampere_sgemm_128x64_nn"}
+    dep = parsed["k_matmul_abc123"]
+    assert dep["gpu__time_duration.sum"] == 22000.0  # summed over the two launches
+    assert dep["sm__warps_active.avg.pct_of_peak_sustained_active"] == 42.0  # averaged
+    assert dep["smsp__inst_executed_pipe_lsu.sum"] == 200.0
+    assert _ncu_units(_NCU_CSV)["gpu__time_duration.sum"] == "nsecond"
+
+
+def test_print_ncu_compare_renders_dep_then_ref(capsys):
+    """The compare table puts deplodock rows above the reference rows, carries the
+    duration unit in the header, and dashes out metrics a side didn't report."""
+    from deplodock.commands.run import _ncu_units, _parse_ncu_csv, _print_ncu_compare
+
+    _print_ncu_compare(_parse_ncu_csv(_NCU_CSV), _ncu_units(_NCU_CSV))
+    out = capsys.readouterr().out
+    assert "ncu compare" in out
+    assert out.index("k_matmul_abc123") < out.index("ampere_sgemm_128x64_nn")  # dep side first
+    assert "dur (nsecond)" in out
+    lines = [ln for ln in out.splitlines() if "ampere_sgemm" in ln]
+    assert lines and lines[0].split()[-1] == "90"  # regs lands in the last column
+    assert "-" in lines[0]  # unreported metrics dash out
+
+
+@requires_cuda
+def test_run_ab_bench_shows_pinned_row(run_cli):
+    """``run --code ... --bench --ab KNOBS`` benches the pinned config and prints it
+    as an ``ab KNOBS``-labeled row in the kernel table."""
+    rc, stdout, stderr = run_cli("run", "--code", "torch.matmul(torch.randn(64, 64), torch.randn(64, 64))", "--bench", "--ab", "BM=8,BN=16")
+    assert rc == 0, f"stderr: {stderr}"
+    assert "ab BM=8,BN=16" in stdout, stdout
 
 
 @requires_cuda

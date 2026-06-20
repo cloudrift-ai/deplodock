@@ -34,14 +34,17 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
-from .conftest import requires_cuda
+from .conftest import dyn_M, requires_cuda, requires_sm90
 
 # Route every test in this module to the single ``cuda`` xdist_group
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — scattering CUDA
-# tests across xdist workers exhausts the single-GPU device context. The
-# per-test ``_supports_tma`` skipif still gates the sm_90+ arch requirement.
-pytestmark = [requires_cuda]
+# tests across xdist workers exhausts the single-GPU device context.
+# ``requires_sm90`` skips the whole module below sm_90: the TMA + mma.sync warp
+# tier is pin-only and non-functional on sm_80-89 — the ``sm_NNa`` arch suffix
+# the TMA path emits is rejected by nvcc (``Unsupported gpu architecture
+# 'sm_89a'``) and ldmatrix faults on the host. It deploys / is validated on sm_90+.
+pytestmark = [requires_cuda, requires_sm90]
 
 
 def _has_cuda() -> bool:
@@ -170,9 +173,13 @@ def test_tma_mma_path_emits_bulk_tensor_ptx(pin_tma_mma):
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
 @pytest.mark.parametrize("M,N,K", [(256, 256, 128), (512, 512, 128), (256, 256, 64)])
-def test_tma_mma_matches_f32_reference(pin_tma_mma, M: int, N: int, K: int):
+def test_tma_mma_matches_f32_reference(pin_tma_mma, shape_mode, M: int, N: int, K: int):
     """The TMA-staged mma.sync path produces output that matches the f32
-    reference within fp16 tolerance.
+    reference within fp16 tolerance — for BOTH a static M and a dynamic
+    (symbolic ``seq_len``) M run at the same runtime M (M ∈ {256, 512} are tile
+    divisors). The dynamic case is #245: TMA stages the symbolic-M operand via a
+    per-launch descriptor (globalDim from the runtime shape) and zero-fills the
+    masked overhang — it must produce the same result as the baked-M static path.
 
     The fp16 cuTensorMap encoder enum fix (``CU_TENSOR_MAP_DATA_TYPE_FLOAT16
     = 6`` mapped via ``_DTYPE_BY_ITEMSIZE``) is exercised here — pre-fix
@@ -185,27 +192,29 @@ def test_tma_mma_matches_f32_reference(pin_tma_mma, M: int, N: int, K: int):
     this TMA-staged kernel passes garbage descriptor pointers and segfaults —
     the regression that motivated routing the launch through the backend,
     which binds every ``CUtensorMap`` via ``_prebuild_descriptors``."""
-    _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=F32)
+    Mg = dyn_M(shape_mode, M)
+    _, kop, src = _compile_and_render(M=Mg, N=N, K=K, out_dtype=F32)
     assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
-    assert "cp.async.bulk.tensor" in src  # smoke-check the TMA path actually fired
+    assert "cp.async.bulk.tensor" in src  # smoke-check the TMA path actually fired (static + dynamic)
 
     # Launch through the real backend so ``_prebuild_descriptors`` binds the
     # per-operand ``CUtensorMap`` args (a hand-rolled cubin launch can't) and
     # opts into the dynamic-smem allowance. Recompile from a fresh loop graph
-    # via the full ``CUDA_PASSES`` pipeline under the same pinned env.
+    # via the full ``CUDA_PASSES`` pipeline under the same pinned env. The
+    # dynamic graph resolves ``seq_len`` from the (M, K) input array shape.
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
     b = (np.random.randn(K, N) * 0.1).astype(np.float16)
     be = CudaBackend()
-    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=F32))
+    g_run = be.compile(_matmul_graph(M=Mg, N=N, K=K, out_dtype=F32))
     run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
 
     expected = a.astype(np.float32) @ b.astype(np.float32)
     result = run_result.outputs["c"].astype(np.float32)
     diff = np.abs(result - expected).max()
-    assert diff < 1e-2, f"M={M} N={N} K={K} max-abs-err {diff}"
+    assert diff < 1e-2, f"{shape_mode} M={M} N={N} K={K} max-abs-err {diff}"
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA needs sm_90+ (Hopper / Blackwell)")
@@ -274,16 +283,18 @@ def test_mma_sync_path_emits_ldmatrix_and_mma_ptx(pin_mma_sync):
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs sm_80+ (Ampere+)")
 @pytest.mark.parametrize("M,N,K,out_dtype", [(256, 256, 128, F32), (128, 256, 128, F32), (256, 256, 128, F16)])
-def test_mma_sync_matches_reference(pin_mma_sync, M: int, N: int, K: int, out_dtype: DataType):
-    """The s16816 path matches the f32 reference within fp16 tolerance —
-    guards the ldmatrix per-lane address map, the B-operand ``.trans``, and
-    the per-lane ``RegStore`` epilogue (a wrong lane map / trans flag yields
-    a plausible-but-wrong result that this catches). f32 output exercises the
-    direct ``RegStore`` path; f16 output exercises the ``__float2half``
-    downconvert."""
+def test_mma_sync_matches_reference(pin_mma_sync, shape_mode, M: int, N: int, K: int, out_dtype: DataType):
+    """The s16816 path matches the f32 reference within fp16 tolerance — for
+    both a static and a dynamic (symbolic ``seq_len``) M (M ∈ {128, 256} are
+    tile divisors). Guards the ldmatrix per-lane address map, the B-operand
+    ``.trans``, and the per-lane ``RegStore`` epilogue (a wrong lane map / trans
+    flag yields a plausible-but-wrong result that this catches). f32 output
+    exercises the direct ``RegStore`` path; f16 output exercises the
+    ``__float2half`` downconvert."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    _, kop, src = _compile_and_render(M=M, N=N, K=K, out_dtype=out_dtype)
+    Mg = dyn_M(shape_mode, M)
+    _, kop, src = _compile_and_render(M=Mg, N=N, K=K, out_dtype=out_dtype)
     assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
     assert "mma.sync.aligned.m16n8k16" in src
 
@@ -291,7 +302,7 @@ def test_mma_sync_matches_reference(pin_mma_sync, M: int, N: int, K: int, out_dt
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
     b = (np.random.randn(K, N) * 0.1).astype(np.float16)
     be = CudaBackend()
-    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype))
+    g_run = be.compile(_matmul_graph(M=Mg, N=N, K=K, out_dtype=out_dtype))
     run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
 
     expected = a.astype(np.float32) @ b.astype(np.float32)

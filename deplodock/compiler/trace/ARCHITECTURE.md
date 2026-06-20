@@ -41,10 +41,34 @@ ops. One helper cleans this up:
   builders (`_update_causal_mask` / `_prepare_4d_causal_attention_mask`)
   to return the precomputed mask verbatim.
 
+The wrapper also **replaces the rotary embedding in both modes** — HF's in-graph rotary silently breaks under
+`torch.export`: its `inv_freq` buffer is `persistent=False` and doesn't survive export with its real value, so the
+traced cos/sin constant-fold to `cos=1, sin=0` and RoPE degenerates to identity. Static mode precomputes cos/sin at
+the trace seq_len (`_PassThroughRotary`); dynamic mode precomputes out to `DYNAMIC_DIM_MAX + 1` positions and slices
+to the runtime seq_len in-graph (`_SlicedRotary` — the slice end is a SymInt; the `+1` exists because export guards a
+symbolic slice end strictly below the sliced extent). Beware that an accuracy check with `input_ids = zeros` cannot
+catch a degenerate RoPE or wrong attention scores — identical value rows make the attention output independent of the
+attention weights; `tests/compiler/ir/test_dynamic_shapes.py::test_qwen_whole_model_dynamic_compiles_and_matches_eager`
+checks with non-zero ids for exactly that reason. The model passed in is **not** restricted to `CausalLM` — wrapping
+an `AutoModel` trunk yields hidden states instead of logits (the serving plugin's embedding path, `deplodock/serving`).
+
+- `build_layer_wrapper(block, rotary_emb, hidden_size, dtype, layer_type=None) → nn.Module` is the per-layer dynamic
+  analogue: `forward(x)` slices precomputed cos/sin buffers (out to `DYNAMIC_DIM_MAX + 1`, same `+1` guard) by
+  `x.shape[1]` in-graph and calls `block(x, position_embeddings=(cos, sin))`. The static per-layer trace instead passes
+  concrete `(cos, sin)` kwargs — those specialise rotary to the trace seq_len, which is exactly what dynamic mode must
+  avoid. Forward arg is named `x`, so the CLI spec is `--dynamic seq_len@x:1`
+  (`tests/compiler/ir/test_dynamic_shapes.py::test_qwen_layer_dynamic_compiles_and_matches_eager`).
+
+`SliceOp` nodes record `dim`/`start` as **op fields** at trace time (`torch.py`'s slice handler reads the raw FX
+args): the legacy constant-input convention can't represent a `None` start (`x[:, :s]`) or a SymInt end —
+`_resolve_inputs` drops both, leaving the surviving constants positionally ambiguous. Pre-field IR dumps still
+decompose via the constant-input fallback.
+
 ## Entry points
 
 - Whole-model trace: `trace_module(build_full_model_wrapper(model, …), (input_ids,))`.
-- Single-layer trace: `trace_module(model.model.layers[N], (x,), kwargs={…})`.
+- Single-layer trace: `trace_module(model.model.layers[N], (x,), kwargs={…})` (static); with `--dynamic`,
+  `trace_module(build_layer_wrapper(block, …), (x,), dynamic_shapes={"x": {1: Dim("seq_len")}})`.
 - Inline expression: `graph_from_code("torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))")` (used by `deplodock compile --code` and `deplodock trace --code`).
 
 ## Rule

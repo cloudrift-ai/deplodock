@@ -83,10 +83,10 @@ from typing import NamedTuple
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Mma, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -136,6 +136,11 @@ class _Slab(NamedTuple):
     slab_dims: tuple[int, ...]
     template: tuple[Expr, ...] | None
     n_bytes: int
+    # The gmem dim the matmul REDUCE axis indexes into (``var_to_dim`` of the
+    # reduce candidate), or ``None`` when the reduce axis isn't a slab cache
+    # axis (no staged K — pointwise / output-only slabs). ``_build_sources``
+    # reads it to detect a symbolic-K operand and stamp ``Source.kmask``.
+    reduce_dim: int | None = None
     # Per-cache-axis structural block multiplier extracted from σ literal
     # coefficients. ``()`` = all-1s (the scalar / pre-M3 case); a non-
     # trivial tuple aligns with ``cache_axes`` and records the per-axis
@@ -164,6 +169,16 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
     # admissable staged variant (the block-scaled slab gets over-counted
     # 2× and trips ``slab_cap``).
     bytes_per_elem = {buf: int(t.dtype.nbytes) for buf, t in root.op.inputs.items() if t.dtype is not None}
+    # Per-input gmem dim shapes (Dim per dim) — ``_build_sources`` reads the
+    # operand's reduce-dim extent to detect a symbolic K and stamp
+    # ``Source.kmask`` (the masked-K zero-fill, ``_stage_expand``).
+    input_shapes = {buf: tuple(t.shape) for buf, t in root.op.inputs.items() if getattr(t, "shape", None) is not None}
+    # Per-input dtype — stamped onto each ``Source`` at creation so the post-020
+    # ``TileOp.validate`` smem-budget gate sizes the slab at the real element
+    # width (``030_stamp_types`` only runs at the kernel dialect, far too late;
+    # without this an fp16 mma slab is validated at the fp32 ``BYTES_PER_ELEM``
+    # fallback — 2× — and a masked-K mma tile that fits is wrongly rejected).
+    input_dtypes = {buf: t.dtype for buf, t in root.op.inputs.items() if t.dtype is not None}
     variants = _enumerate_variants(
         root.op.body,
         slab_cap=budget,
@@ -171,6 +186,8 @@ def rewrite(ctx: Context, root: Node) -> list[TileOp] | None:
         parent_op=root.op,
         warp_size=ctx.warp_size,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if not variants:
@@ -197,10 +214,22 @@ def _enumerate_variants(
     warp_size: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> list[TileOp]:
     candidates = _candidate_buffers(body, warp_size=warp_size)
     if not candidates:
         return []
+    # Transposed-B (Q @ K^T) operands lower gmem-direct — the staged ldmatrix
+    # path for the native col-major B isn't implemented (its lane→element map
+    # differs from the canonical x2.trans; see kernel/005_lower_atom_tile +
+    # ir/kernel LdmatrixLoad). Drop those buffers so they stay gmem (the atom
+    # path's all-staged mask never tries to land them in smem).
+    excl = _transposed_b_bufs(body)
+    if excl:
+        candidates = [(b, w) for b, w in candidates if b not in excl]
+        if not candidates:
+            return []
     ranked = sorted(candidates, key=lambda kv: -kv[1])
     bufs_ranked = [b for b, _ in ranked]
     n = len(bufs_ranked)
@@ -227,6 +256,8 @@ def _enumerate_variants(
             allowed_bufs=allow,
             warp_size=warp_size,
             atom_kind=atom_kind,
+            input_shapes=input_shapes,
+            input_dtypes=input_dtypes,
             bytes_per_elem=bytes_per_elem,
         )
         if new_body is None:
@@ -234,6 +265,16 @@ def _enumerate_variants(
         knobs = {**parent_op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}
         variants.append(TileOp(body=new_body, name=parent_op.name, knobs=knobs))
     return variants
+
+
+def _transposed_b_bufs(body: Body) -> frozenset[str]:
+    """Gmem buffers used as a transposed-B (Q @ K^T) mma operand — excluded from
+    staging so they lower gmem-direct (no staged ldmatrix path for the native
+    col-major B yet)."""
+    b_names = {m.b for m in body.iter_of_type(Mma) if m.b_trans}
+    if not b_names:
+        return frozenset()
+    return frozenset(ld.input for ld in body.iter_of_type(Load) if ld.names and ld.names[0] in b_names)
 
 
 def _candidate_buffers(body: Body, *, warp_size: int) -> list[tuple[str, int]]:
@@ -394,6 +435,8 @@ def _maybe_rewrite(
     warp_size: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> Body | None:
     idx, outer = single_tile(body)
     tt = parallel_tile_of(outer)
@@ -431,6 +474,8 @@ def _maybe_rewrite(
         allowed_bufs=allowed_bufs,
         is_cooperative=is_cooperative,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if new_tile_body == tt.body:
@@ -468,6 +513,8 @@ def _process_scope(
     register_axes: tuple[Axis, ...] = (),
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> Body:
     """Walk scope.body; recurse into non-reduce free tiles; collect Loads
     from reduce tiles into per-buffer buckets. Per buffer, build a Source
@@ -511,6 +558,8 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=new_register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -531,6 +580,8 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -548,6 +599,8 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(s.with_bodies((new_body,)))
@@ -573,6 +626,8 @@ def _process_scope(
                 is_cooperative=is_cooperative,
                 register_axes=register_axes,
                 atom_kind=atom_kind,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
                 bytes_per_elem=bytes_per_elem,
             )
             rewritten_inner.append(Cond(cond=s.cond, body=Body(new_body), else_body=s.else_body))
@@ -600,6 +655,8 @@ def _process_scope(
         slab_cap=slab_cap,
         scope_budget=scope_budget,
         atom_kind=atom_kind,
+        input_shapes=input_shapes,
+        input_dtypes=input_dtypes,
         bytes_per_elem=bytes_per_elem,
     )
     if not sources:
@@ -629,6 +686,38 @@ def _process_scope(
     return tuple([*rewritten[:lo], bundle, *rewritten[hi + 1 :]])
 
 
+def _masked_k_mma_pad(
+    kmask: tuple[int, object] | None,
+    cache_axes: tuple[Axis, ...],
+    block: tuple[int, ...],
+    elem_bytes: int,
+) -> tuple[int, ...]:
+    """Inner-dim pad that breaks the masked-K MMA slab's ldmatrix bank conflict.
+
+    A masked-K (symbolic reduce) operand staged for a warp matmul is read with
+    ``ldmatrix.x4`` from a flat ``[…, M, K]`` smem slab (K innermost). When the
+    M-row stride (the block-scaled innermost alloc-extent) is a multiple of 128
+    bytes, the M-row lanes of one ldmatrix all alias one 4-byte bank — a
+    catastrophic load conflict (the 3.67M-conflict storm in the Qwen3-Embedding
+    dynamic SDPA P@V). Pad the innermost cache dim by one 16-byte ldmatrix chunk
+    (``16 // elem_bytes`` elements) so that stride — and every outer stride,
+    which all carry it as a factor — steps off the 128-byte alias, while every
+    row stays 16-byte aligned (the pad bytes are a multiple of 16, so ldmatrix
+    stays legal). Returns ``()`` (no pad) unless this is a kmask + block-stamped
+    (MMA) slab whose innermost stride actually hits the 128-byte alias — every
+    other slab keeps its dense layout. Reaching the static path's 0-conflict
+    floor needs its swizzle-atom-wide K-subtile relayout; this is the flat-slab
+    fix."""
+    if kmask is None or not block or len(cache_axes) < 2:
+        return ()
+    inner = cache_axes[-1].extent.as_static() * (block[-1] if block else 1)
+    if inner == 0 or (inner * elem_bytes) % 128 != 0:
+        return ()
+    pad = [0] * len(cache_axes)
+    pad[-1] = max(1, 16 // elem_bytes)
+    return tuple(pad)
+
+
 def _build_sources(
     loads_by_buf: dict[str, list[tuple[Load, Axis, tuple[Axis, ...], tuple[Axis, ...]]]],
     thread_axes: tuple[Axis, ...],
@@ -639,6 +728,8 @@ def _build_sources(
     scope_budget: int,
     atom_kind: str | None = None,
     bytes_per_elem: dict[str, int] | None = None,
+    input_shapes: dict[str, tuple] | None = None,
+    input_dtypes: dict | None = None,
 ) -> tuple[list[Source], dict[str, tuple[str, tuple[Expr, ...]]]]:
     """Per buffer, partition Loads by index equality; per partition, derive
     slab geometry; admit Sources under budget. Returns (sources,
@@ -696,13 +787,40 @@ def _build_sources(
                     dims=tuple(slab.slab_dims),
                     block=slab.block,
                 )
+            # Masked-K (symbolic reduce): when this operand's REDUCE gmem dim is
+            # symbolic (SDPA P@V's seq_len), the final K_o tile overruns the
+            # runtime extent and the overhang must read ZERO into the mma
+            # accumulation. Stamp ``kmask=(reduce_dim, bound)`` so
+            # ``_stage_expand`` forces the sync transport and zero-fills the
+            # loaded value where the K coord ``>= bound``. A static-K operand
+            # (every output-only-masked / dense matmul) leaves ``kmask=None``.
+            kmask: tuple[int, object] | None = None
+            shape = (input_shapes or {}).get(buf)
+            rd = slab.reduce_dim
+            if shape is not None and rd is not None and rd < len(shape) and not shape[rd].is_static:
+                kmask = (rd, shape[rd].expr)
+            # Masked-K MMA slab: the consumer reads this ``[M][K]`` slab with
+            # ``ldmatrix.x4``, whose M-row lanes all hit one 4-byte bank when the
+            # M-row stride (inner alloc-extent) is a multiple of 128 B — the
+            # 3.67M-conflict storm in the Qwen3-Embedding dynamic SDPA P@V. An
+            # alignment-preserving inner pad (one 16-byte ldmatrix chunk) shifts
+            # the stride off the bank alias (~16-way → conflict-free for the 8
+            # row-lanes of one ldmatrix phase) while keeping every row 16-byte
+            # aligned so ldmatrix stays legal. Stamped here (not via the
+            # ``070_pad_smem`` autotune fork) because it is a near-strict win
+            # with no misalignment penalty — intrinsic to the slab so greedy
+            # deploys it, and ``070`` then self-skips the already-padded source.
+            ebytes = (bytes_per_elem or {}).get(buf, BYTES_PER_ELEM) if bytes_per_elem else BYTES_PER_ELEM
+            pad = _masked_k_mma_pad(kmask, slab.cache_axes, slab.block, ebytes)
             src = Source(
                 name=smem_name,
                 buf=buf,
                 cache_axes=slab.cache_axes,
                 origin=slab.origin,
-                pad=(),
+                pad=pad,
                 addressing=addressing,
+                kmask=kmask,
+                dtype=(input_dtypes or {}).get(buf),
             )
             sources.append(src)
             used_bytes += slab.n_bytes
@@ -738,7 +856,9 @@ def _classify(
     bytes_per_elem: int = BYTES_PER_ELEM,
 ) -> _Slab | None:
     candidates = (*thread_axes, reduce_axis, *extra_candidates)
-    ctx = SimplifyCtx({ax.name: Interval(0, ax.extent.as_static() - 1) for ax in scope_axes if ax.extent.is_static})
+    ctx = SimplifyCtx.empty()
+    for ax in scope_axes:
+        ctx = extend_simplify_ctx(ctx, ax)
     candidate_names = tuple(ax.name for ax in candidates)
 
     zero_sigma = Sigma({n: Literal(0, "int") for n in candidate_names})
@@ -928,6 +1048,7 @@ def _classify(
         template=template,
         n_bytes=n_bytes,
         block=block_tuple,
+        reduce_dim=var_to_dim.get(reduce_axis.name),
     )
 
 

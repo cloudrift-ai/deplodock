@@ -13,20 +13,29 @@ latencies keyed off each CudaOp's structural key.
 
 from __future__ import annotations
 
+import zlib
+
 import pytest
 
+from deplodock.compiler import dtype as _dt
 from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import LOWERING_PASSES, inner_reward, run_two_level_tune
+from deplodock.compiler.pipeline.search.two_level import (
+    LOWERING_PASSES,
+    OpResult,
+    _decomposition_rows,
+    outer_pipeline,
+)
+from tests.compiler.conftest import drain_tune, run_inner_reward, run_two_level
 
 # Moderate patience: each kernel explores several variants then stops on
 # stagnation (the fake backend gives a stable but arbitrary per-variant
@@ -36,9 +45,13 @@ _PATIENCE = 8
 
 
 @pytest.fixture(autouse=True)
-def _force_target():
+def _force_target(monkeypatch, tmp_path):
     from deplodock.compiler import target as target_mod
 
+    # Isolate the learned-prior checkpoint: ``run_two_level_tune`` trains and
+    # checkpoints the global prior, and these fake-backend rows must never
+    # pollute the host's real ``~/.cache/deplodock/prior.json``.
+    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
     target_mod.set_target((8, 0))
     yield
     target_mod.set_target(None)
@@ -60,9 +73,19 @@ class _CountingBackend:
         cuda = [n for n in graph.nodes.values() if isinstance(n.op, CudaOp)]
         per: list[LaunchTime] = []
         for i, n in enumerate(cuda):
-            us = 1.0 + (abs(hash(op_cache_key(n.op))) % 100)
+            # crc32, not hash(): str hashes are salted per process (PYTHONHASHSEED),
+            # which made the MCTS path — and the bench counts the separability test
+            # bounds — vary run to run.
+            us = 1.0 + (zlib.crc32(op_cache_key(n.op).encode()) % 100)
             per.append(LaunchTime(idx=i, kernel_name=getattr(n.op, "kernel_name", "k"), time_ms=us / 1000.0, samples=(us / 1000.0,)))
         return BenchmarkResult(time_ms=sum(p.time_ms for p in per), num_launches=len(per), per_launch=per)
+
+    async def benchmark_async(self, graph, num_iters="auto") -> BenchmarkResult:
+        # The two-level driver benches through the async path (``Pipeline.tune_async``);
+        # the fake has no real I/O, so delegate to the deterministic sync bench. The
+        # signature mirrors ``benchmark`` exactly (no ``nvcc_flags``) so the -O3
+        # re-bench rejects the same way → identical bench counts to the sync path.
+        return self.benchmark(graph, num_iters=num_iters)
 
 
 def _matmul(g: Graph, prefix: str, M: int, K: int, N: int) -> str:
@@ -105,7 +128,7 @@ def _tune_one_slice(fused: Graph, nid: str, patience: int) -> int:
     sub = single_node_graph(fused, nid)
     pipeline = Pipeline.build(LOWERING_PASSES)
     search = TuningSearch(patience=patience)
-    list(pipeline.tune(sub, search=search, ctx=Context.from_target((8, 0)), backend=backend, db=SearchDB()))
+    drain_tune(pipeline, sub, search=search, ctx=Context.from_target((8, 0)), backend=backend, db=SearchDB())
     return backend.calls
 
 
@@ -121,14 +144,14 @@ def test_inner_reward_is_separable_not_a_product() -> None:
 
     backend = _CountingBackend()
     db = SearchDB()
-    reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=db, backend=backend, patience=_PATIENCE)
+    reward = run_inner_reward(fused, ctx=Context.from_target((8, 0)), db=db, backend=backend, patience=_PATIENCE)
 
     # Separability: the shared run must not blow up to the cross-product
     # (n1 * n2 — the old whole-graph SP-MCTS bug this test guards against).
     # Per-op sharing through the DB perf cache is allowed — an already-measured
     # variant replays without a bench. The exact share count is sensitive to
     # MCTS exploration order: the
-    # ``_CountingBackend`` fakes latency from ``hash(op_cache_key)``, so any
+    # ``_CountingBackend`` fakes latency from ``crc32(op_cache_key)``, so any
     # structural-digest perturbation (e.g. a Source-field rename) shifts the
     # path and the count by a few benches. The hard guarantee is the
     # cross-product upper bound; tighter ``n1+n2`` / ``max(n1,n2)`` bounds
@@ -163,22 +186,22 @@ def test_inner_reward_rerun_is_replay_dominated() -> None:
     keeps the minimum and ``best_per_op_time`` reads it — so ``second.total_us <=
     first.total_us`` always (it does not converge to the *same* total; it converges
     *downward*). The exact bench count is exploration-order-sensitive (same caveat
-    as ``test_inner_reward_separability``); the ``_CountingBackend``'s hash-derived
-    latencies make it host-dependent, so only the two robust invariants are pinned."""
+    as ``test_inner_reward_separability``), so only the two robust invariants are
+    pinned."""
     fused = _fuse(_two_distinct_matmuls())
     db = SearchDB()
     ctx = Context.from_target((8, 0))
 
     cold_backend = _CountingBackend()
-    first = inner_reward(fused, ctx=ctx, db=db, backend=cold_backend, patience=_PATIENCE)
+    first = run_inner_reward(fused, ctx=ctx, db=db, backend=cold_backend, patience=_PATIENCE)
     rerun_backend = _CountingBackend()
-    second = inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
+    second = run_inner_reward(fused, ctx=ctx, db=db, backend=rerun_backend, patience=_PATIENCE)
 
     # The DB's per-op best is monotone non-increasing — more benches never worsen it.
     assert second.total_us <= first.total_us + 1e-6, "rerun must not regress the per-op best total"
     # Warm rerun replays most terminals from the perf cache → fewer benches than cold.
-    # (Only "fewer", not a fixed ratio: the exact count is exploration-order- and
-    # host-dependent — see the docstring — so a `cold // 2`-style bound is not robust.)
+    # (Only "fewer", not a fixed ratio: the exact count is exploration-order-
+    # sensitive — see the docstring — so a `cold // 2`-style bound is not robust.)
     assert rerun_backend.calls < cold_backend.calls, "warm rerun must bench fewer variants than the cold run"
 
 
@@ -190,10 +213,10 @@ def test_inner_reward_deeper_patience_benches_new_variants() -> None:
     db = SearchDB()
     ctx = Context.from_target((8, 0))
 
-    inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
+    run_inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=1)
 
     deep_backend = _CountingBackend()
-    inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
+    run_inner_reward(fused, ctx=ctx, db=db, backend=deep_backend, patience=_PATIENCE)
     assert deep_backend.calls > 0, "a deeper pass must bench the new variants it reaches"
 
 
@@ -212,7 +235,7 @@ def test_inner_reward_shares_identical_kernel() -> None:
 
     single = _tune_one_slice(fused, loops[0], _PATIENCE)
     backend = _CountingBackend()
-    reward = inner_reward(fused, ctx=Context.from_target((8, 0)), db=SearchDB(), backend=backend, patience=_PATIENCE)
+    reward = run_inner_reward(fused, ctx=Context.from_target((8, 0)), db=SearchDB(), backend=backend, patience=_PATIENCE)
 
     assert backend.calls == single, "shared kernel must bench once, not twice"
     assert len(reward.per_op) == 1, "identical kernels collapse to one per_op entry"
@@ -221,10 +244,249 @@ def test_inner_reward_shares_identical_kernel() -> None:
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
 
 
+def test_inner_reward_parallel_matches_serial() -> None:
+    """The core multi-GPU invariant: tuning the unique kernels concurrently across
+    a pool of N device-pinned backends yields the SAME per-op bests and summed
+    reward as the one-slot serial path. Each op's search is seeded by ``op_idx``
+    (execution-order-independent) and the fake backend's latency keys off
+    ``op_cache_key`` (slot-independent), so completion order can't change the
+    result. ``prior=None`` keeps this off the learned-prior (catboost) path."""
+    fused = _fuse(_two_distinct_matmuls())
+    ctx = Context.from_target((8, 0))
+
+    serial = run_inner_reward(fused, ctx=ctx, db=SearchDB(), backend=_CountingBackend(), patience=_PATIENCE)
+    parallel = run_inner_reward(fused, ctx=ctx, db=SearchDB(), backends=[_CountingBackend(), _CountingBackend()], patience=_PATIENCE)
+
+    assert parallel.total_us == pytest.approx(serial.total_us)
+    assert parallel.ok == serial.ok
+    s_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in serial.per_op}
+    p_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in parallel.per_op}
+    assert p_by_key == s_by_key, "per-op bests must be identical regardless of slot count"
+
+
+def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
+    """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
+    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    f16 = _dt.get("f16")
+    g = g if g is not None else Graph()
+    x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
+    g.add_node(InputOp(), [], Tensor(x, (1, 32, 1024), f16), node_id=x)
+    g.add_node(InputOp(), [], Tensor(nw, (1024,), f16), node_id=nw)
+    g.add_node(InputOp(), [], Tensor(wg, (3072, 1024), f16), node_id=wg)
+    g.add_node(RmsNormOp(eps=1e-6), [x, nw], Tensor(xn, (1, 32, 1024), f16), node_id=xn)
+    g.add_node(LinearOp(), [xn, wg], Tensor(o, (1, 32, 3072), f16), node_id=o)
+    g.inputs += [x, nw, wg]
+    g.outputs += [o]
+    return g
+
+
+class _RecordingProgress:
+    """Duck-typed ``TuneProgress``: captures per-terminal op denominators and
+    the tuned op-leaf names."""
+
+    def __init__(self) -> None:
+        self.terminal_sizes: list[int] = []
+        self.ops: list[str] = []
+
+    def start_terminal(self, n_ops: int) -> None:
+        self.terminal_sizes.append(n_ops)
+
+    def op_start(self, name: str, *, slot: int = 0) -> None:  # noqa: ARG002
+        self.ops.append(name)
+
+    def variant(self, *a, **kw) -> None:  # noqa: ANN002
+        pass
+
+    def op_done(self, name: str, *, slot: int = 0) -> None:
+        pass
+
+
+class _RecordingPrior:
+    """Minimal ``Prior`` stand-in for ``load_prior`` monkeypatching: unfitted
+    (uniform PUCT, greedy keeps cold behavior), captures ``add_rows`` traffic."""
+
+    fitted = False
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[dict, float]] = []
+        self.trajectory: list = []
+
+    def add_rows(self, rows) -> None:
+        self.rows.extend(rows)
+
+    def maybe_refit(self, *, force: bool = False) -> bool:
+        return False
+
+    def checkpoint(self) -> None:
+        pass
+
+    def record_bench(self, knobs, median, status) -> None:
+        pass
+
+    def score(self, knobs) -> float:
+        return 0.0
+
+    def mean_score(self, knobs) -> float:
+        return 0.0
+
+    def mean_scores(self, rows) -> list[float]:
+        return [0.0] * len(rows)
+
+    def summary(self, label) -> str:
+        return ""
+
+
+def _is_decomposition_row(knobs: dict) -> bool:
+    """Composed Σ rows carry the decision knob but no tile-level knobs — every
+    inner per-kernel / branch row carries at least one partition-level knob."""
+    return "SPLIT_CONE" in knobs and not any(k in knobs for k in ("BM", "BN", "BR", "MMA", "WM", "FM"))
+
+
+def test_outer_branches_on_structural_fork(monkeypatch) -> None:
+    """The outer drives through the pre-partition tile head: 005's keep-vs-split
+    offer branches the OUTER tree, so both kernel sets appear as outer terminals
+    and the split producer/consumer are their own tuned op leaves (own progress
+    denominator), not sub-explorations inside the fused kernel's slice. Each
+    terminal also feeds the prior one composed Σ row per structural decision —
+    the kernel-set cost of the side it realized."""
+    from deplodock.compiler import target as target_mod
+    from deplodock.compiler.pipeline.search import prior as prior_pkg
+
+    for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+    target_mod.set_target((12, 0))
+    rec = _RecordingPrior()
+    monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: rec)
+    progress = _RecordingProgress()
+    db = SearchDB()
+    result = run_two_level(
+        _norm_linear("a"),
+        ctx=Context.from_target((12, 0)),
+        db=db,
+        backend=_CountingBackend(),
+        patience=4,
+        progress=progress,
+    )
+    assert result.n_terminals == 2, "keep-vs-split must branch the outer tree into two terminals"
+    # One terminal carries the fused kernel (1 op leaf), the other the split
+    # producer + consumer (2 op leaves) — the denominators the progress bar sees.
+    assert sorted(progress.terminal_sizes) == [1, 2]
+    assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
+    # Both sides' composed rows reached the prior: SPLIT_CONE=False labeled
+    # with the fused best, SPLIT_CONE=True with the split kernels' Σ.
+    decomp = [(k, us) for k, us in rec.rows if _is_decomposition_row(k)]
+    assert {k["SPLIT_CONE"] for k, _ in decomp} == {False, True}
+    assert all(us > 0 for _, us in decomp)
+    # The decision hop never enters the ``lowering`` table (one best child per
+    # parent — a multi-kernel decomposition's parent must not resolve through
+    # ONE fragment kernel's median): the pre-decision op has no lowering row.
+    site = next(n.op.source for n in result.best_fused.nodes.values() if isinstance(n.op, LoopOp) and n.op.source is not None)
+    assert db.lookup_lowering(op_cache_key(site)) is None
+
+
+def _outer_terminals(graph: Graph) -> list[Graph]:
+    search = TuningSearch(patience=10**6)
+    drained = drain_tune(outer_pipeline(), graph, search=search, ctx=Context.from_target((12, 0)), db=SearchDB())
+    return [cand.graph for cand in drained]
+
+
+def _loops(graph: Graph) -> list:
+    return [n.op for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+
+
+def test_split_kernels_attribute_to_pre_decision_op() -> None:
+    """Both sides of the structural fork attribute to the offer-site op via
+    ``Op.source`` — the decomposition link the composed Σ rows group by. The
+    split side is stamped at the splice; the keep side is stamped by the
+    engine's UNCONDITIONAL rebind stamp (005 builds the keep option via
+    ``dataclasses.replace``, which copies the root's own knob-less ancestor
+    into ``source`` — honoring the copy used to point the link past the offer
+    site)."""
+    terminals = _outer_terminals(_norm_linear("a"))
+    split = next(t for t in terminals if len(_loops(t)) == 2)
+    kernels = _loops(split)
+    assert all(k.knobs.get("SPLIT_CONE") is True for k in kernels)
+    assert all(k.source is not None for k in kernels)
+    assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
+    site = kernels[0].source
+    assert "SPLIT_CONE" not in site.knobs
+    assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
+
+    fused = next(t for t in terminals if len(_loops(t)) == 1)
+    keep = _loops(fused)[0]
+    assert keep.knobs.get("SPLIT_CONE") is False
+    assert keep.source is not None and op_cache_key(keep.source) == op_cache_key(site), (
+        "the keep side must attribute to the SAME offer-site op as the split side"
+    )
+
+
+def test_outer_descends_prior_preferred_branch_first() -> None:
+    """With a prior ranking the split side cheaper, the outer PUCT explores it
+    FIRST — including past the fork's resolve: the resolved branch's
+    continuation keeps its ``SPLIT_CONE`` delta (``LazyCandidate.resolved_knobs``),
+    so it isn't out-scored by the unresolved keep-fused sibling as a knob-less
+    generic row (the regression this test pins)."""
+
+    class _SplitCheapPrior(_RecordingPrior):
+        def score(self, knobs) -> float:
+            if knobs.get("SPLIT_CONE") is True:
+                return 1.0
+            return 2.0 if "SPLIT_CONE" in knobs else 3.0
+
+    ctx = Context.from_target((12, 0))
+    search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
+    drained = drain_tune(outer_pipeline(), _norm_linear("a"), search=search, ctx=ctx, db=SearchDB(), on=lambda c: True)
+    first = drained[0]
+    assert len(_loops(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
+
+
+def test_decomposition_rows_sum_kernel_set_costs() -> None:
+    """One composed row per structural decision: features = the offer site's
+    knobs + the decision delta (never the kids' restamped ``S_*``), label =
+    the Σ of the side's per-kernel bests."""
+    terminals = _outer_terminals(_norm_linear("a"))
+    by_size = {len(_loops(t)): t for t in terminals}
+    ctx = Context.from_target((12, 0))
+
+    split = by_size[2]
+    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_loops(split), (7.0, 13.0), strict=True)]
+    rows = _decomposition_rows(split, per_op, ctx)
+    assert len(rows) == 1
+    feats, label = rows[0]
+    assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
+    assert feats["SPLIT_CONE"] is True
+    site = _loops(split)[0].source
+    site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
+    assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
+
+    fused = by_size[1]
+    fop = _loops(fused)[0]
+    rows = _decomposition_rows(fused, [OpResult(name="k", op_key=op_cache_key(fop), best_us=42.0)], ctx)
+    assert len(rows) == 1
+    feats, label = rows[0]
+    assert label == pytest.approx(42.0)
+    assert feats["SPLIT_CONE"] is False
+
+
+def test_identical_offer_sites_take_the_same_side() -> None:
+    """Two structurally identical offer sites take the same side within a
+    trajectory — the engine replays the first decision read off the graph via
+    the ``Op.source`` links + stamped decision knobs
+    (``pipeline._replay_structural_decision``): the outer tree yields 2
+    terminals (all-fused, all-split), not the 2^sites cross-product."""
+    g = _norm_linear("b", _norm_linear("a"))
+    terminals = [
+        cand.graph
+        for cand in drain_tune(outer_pipeline(), g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
+    ]
+    sizes = sorted(sum(1 for n in t.nodes.values() if isinstance(n.op, LoopOp)) for t in terminals)
+    assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
+
+
 def test_run_two_level_tune_single_terminal_assembles_bests() -> None:
     """With no fusion forks today the outer yields one terminal; the assembled
     graph greedy-replays the per-op bests."""
-    result = run_two_level_tune(
+    result = run_two_level(
         _two_distinct_matmuls(),
         ctx=Context.from_target((8, 0)),
         db=SearchDB(),

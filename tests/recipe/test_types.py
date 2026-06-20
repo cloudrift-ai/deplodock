@@ -323,3 +323,15 @@ def test_from_dict_without_aggregate():
     d = {"model": {"huggingface": "org/model"}}
     recipe = Recipe.from_dict(d)
     assert recipe.aggregate is None
+
+
+def test_model_task_default_generate():
+    r = Recipe.from_dict({"model": {"huggingface": "org/m"}})
+    assert r.model.task == "generate"
+    assert not r.is_embedding
+
+
+def test_model_task_embed():
+    r = Recipe.from_dict({"model": {"huggingface": "org/m", "task": "embed"}})
+    assert r.model.task == "embed"
+    assert r.is_embedding

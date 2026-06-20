@@ -19,7 +19,11 @@ tests/
 │   ├── test_tasks_json.py   # BenchmarkTask.write_tasks_json(), read_tasks_json()
 │   ├── test_run_dir.py      # BenchmarkTask.create_run_dir()
 │   ├── test_results.py      # parse_benchmark_metrics(), parse_system_info(), compose_json_result()
+│   ├── test_embedding_workload.py # embed bench command, embeddings output parsing, smoke-response checks
 │   └── test_command_workload.py # build_substitution_map(), render_command()
+├── serving/                   # mirrors deplodock/serving/ (vLLM embedding plugin)
+│   ├── test_packed.py       # split_spans packed-batch span splitting (pure, no GPU)
+│   └── test_vllm_plugin_gpu.py # in-process vLLM engine + plugin vs HF eager (perf-marked, CUDA + vllm)
 ├── recipe/
 │   ├── test_types.py        # Recipe.from_dict(), LLMConfig properties, dataclass defaults
 │   └── test_engines.py      # build_engine_args(), banned_extra_arg_flags()
@@ -45,8 +49,8 @@ tests/
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
 │   └── test_fused.py              # SDPA (xfail until fusion lands)
 ├── compiler/                       # mirrors deplodock/compiler/
-│   ├── conftest.py                     # requires_cuda marker, run_graph fixture,
-│   │                                   # matmul_graph(m,k,n) shared builder
+│   ├── conftest.py                     # requires_cuda / requires_sm90 markers, run_graph fixture,
+│   │                                   # device_compute_capability(), matmul_graph(m,k,n) shared builder
 │   ├── fixtures/                       # pre-computed traces (tinyllama_layer0.json)
 │   ├── ir/                             # IR datatypes (mirrors deplodock/compiler/ir/)
 │   │   ├── test_graph.py                       # Graph / Node / Tensor primitives
@@ -57,7 +61,7 @@ tests/
 │   │   ├── test_loop_op.py                     # LoopOp SSA body (Loop/Assign/Accum/…)
 │   │   ├── test_shape_inference.py             # infer_output_shape (static + Dim symbolic)
 │   │   ├── test_provenance.py                  # provenance data model + propagation
-│   │   ├── test_dynamic_shapes.py              # Dim round-trips through trace/lift/LoopOp
+│   │   ├── test_dynamic_shapes.py              # Dim round-trips trace/lift/LoopOp + per-seq_len captured-graph replay
 │   │   ├── test_real_trace.py                  # TinyLlama fixture sanity (op-type counts)
 │   │   ├── test_body_deps.py / test_op_shape_invariants.py / …
 │   │   ├── stmt/   — SSA-body unit tests (hoist / merge / rename / structural_key)
@@ -187,3 +191,17 @@ fresh CUDA context; bounding their concurrency prevents GPU OOM from ~30 simulta
 `tryfirst` because xdist's worker-side hook bakes group names into nodeids before plain conftest hooks run —
 without it the markers land too late and CUDA tests silently scatter across workers. Non-CUDA tests are
 LPT-bucketed across the remaining workers using the cached duration table.
+
+`tests/compiler/conftest.py` also exposes `device_compute_capability()` and the `requires_sm90` skip marker. The
+mma.sync warp tier (swizzled `ldmatrix` + `mma.sync`, TMA transport) auto-enumerates and is validated on **sm_90+**;
+on sm_80-89 it is pin-only and currently non-functional for two independent reasons — the `sm_NNa` arch-accelerated
+target the TMA path emits is rejected by nvcc (`Unsupported gpu architecture 'sm_89a'`), and `ldmatrix` itself faults
+at runtime on at least Ada (sm_89). Tests that **force** the warp tier via `DEPLODOCK_MMA` / `TMA` pins carry
+`requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
+context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The pure mma suites
+(`test_matmul_mma.py`, `test_matmul_mma_tma.py`, `test_matmul_mma_staged_pipelined.py`,
+`test_matmul_mma_causal_epilogue.py`, `test_matmul_mma_transposed_b.py`) gate at module scope; mixed files that also
+hold GPU-less structure / compile-only tests (`test_matmul_mma_masked.py`, `test_matmul_mma_parity.py`,
+`test_matmul_mma_residual.py`, `test_split_demoted.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
+tests, and `test_knob_pinning.py` skips its `TMA=1` rows in-body. `_supports_mma_sync()` (≥ sm_80, the
+instruction-availability check) and `_supports_tma()` (≥ sm_90) still gate on top.

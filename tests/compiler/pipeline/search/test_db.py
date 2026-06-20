@@ -148,6 +148,57 @@ def test_iter_perf_samples_backend_and_min_latency() -> None:
     assert {s.latency_us for s in db.iter_perf_samples(backend=None, min_latency_us=5.0)} == {10.0}
 
 
+def test_record_perf_error_text_round_trips() -> None:
+    """A ``bench_fail`` row's failure text is whitespace-collapsed, truncated, and
+    readable back through the ``perf ⋈ cuda_op`` sample view; ``ok`` rows carry
+    ``None``."""
+    db = SearchDB()
+    _seed_cuda(db, "k1", "void k_matmul(float*)")
+    _seed_cuda(db, "k2", "void k_rms(float*)")
+    db.record_perf("ctx", "k1", backend="cuda", status="bench_fail", stats=_stats(1.0), error="HungKernelError:\n  watchdog " + "x" * 400)
+    db.record_perf("ctx", "k2", backend="cuda", status="ok", stats=_stats(5.0))
+
+    (fail,) = db.iter_perf_samples(status="bench_fail")
+    assert fail.error.startswith("HungKernelError: watchdog x")  # newline collapsed
+    assert len(fail.error) <= 300
+    (ok,) = db.iter_perf_samples()
+    assert ok.error is None
+
+
+def test_perf_error_column_added_to_pre_migration_db(tmp_path) -> None:
+    """Opening an old DB (no ``error`` column) as a writer adds the column in
+    place; a read-only open of an unmigrated DB degrades the sample ``error`` to
+    ``None`` instead of failing the select."""
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE cuda_op (key TEXT PRIMARY KEY, kernel_source TEXT NOT NULL, arg_order TEXT NOT NULL,
+            grid TEXT NOT NULL, block TEXT NOT NULL, smem_bytes INTEGER NOT NULL, pretty TEXT NOT NULL);
+        CREATE TABLE perf (context_key TEXT NOT NULL, op_key TEXT NOT NULL, backend TEXT NOT NULL,
+            status TEXT NOT NULL, latency_us_median REAL NOT NULL, latency_us_min REAL NOT NULL,
+            latency_us_max REAL NOT NULL, latency_us_mean REAL NOT NULL, latency_us_variance REAL NOT NULL,
+            n_samples INTEGER NOT NULL, measured_at TEXT NOT NULL, knobs TEXT NOT NULL DEFAULT '{}',
+            captured INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (context_key, op_key, backend));
+        INSERT INTO cuda_op VALUES ('k1', '', '[]', '[1,1,1]', '[1,1,1]', 0, 'void k(float*)');
+        INSERT INTO perf VALUES ('ctx', 'k1', 'cuda', 'bench_fail', 1.0, 1, 1, 1, 0, 1, 'now', '{}', 0);
+        """
+    )
+    con.commit()
+    con.close()
+
+    ro = SearchDB.open_readonly(path)  # unmigrated: error degrades to None
+    (s,) = ro.iter_perf_samples(status="bench_fail")
+    assert s.error is None
+    ro.close()
+
+    db = SearchDB(path)  # writer migrates in place
+    _seed_cuda(db, "k2", "void k(float*)")
+    db.record_perf("ctx", "k2", backend="cuda", status="bench_fail", stats=_stats(1.0), error="boom")
+    assert db._has_perf_error_column()
+    assert {s.error for s in db.iter_perf_samples(status="bench_fail")} == {None, "boom"}
+
+
 def test_open_readonly_reads_without_mutating(tmp_path) -> None:
     path = tmp_path / "tune.db"
     db = SearchDB(path)

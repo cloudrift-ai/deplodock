@@ -79,6 +79,16 @@ class BenchmarkResult:
     # the bench fell back to plain launches — callers that pair this result
     # with peer torch timings use the flag to keep one table single-semantics.
     captured: bool = False
+    # Whole-program time per iteration, measured as replays of ONE CUDA graph
+    # holding every launch in program order (median / min over measured iters).
+    # ``time_ms``/``min_ms`` sum per-launch windows that each replay a single
+    # kernel back-to-back — accurate per-kernel, but the sum is not an
+    # end-to-end number (no cross-kernel cache effects, no inter-kernel gaps).
+    # Populated automatically for multi-launch programs when capture held;
+    # ``None`` for single-launch programs (the solo window IS the program
+    # time) and when capture was off or fell back.
+    e2e_ms: float | None = None
+    e2e_min_ms: float | None = None
 
 
 class Backend(ABC):
@@ -149,10 +159,29 @@ class Backend(ABC):
         input_set = set(compiled.inputs)
         values: dict[str, np.ndarray] = {}
 
+        # Symbolic dims bind from the supplied input array shapes (mirrors
+        # ``CudaBackend.run``): each atomic symbolic input dim records its
+        # runtime size; downstream node shapes — possibly composite Dim
+        # exprs — resolve via ``expr.eval(sym_env)``.
+        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+
+        sym_env: dict[str, int] = {}
+        for nid in input_set:
+            node = compiled.nodes.get(nid)
+            if node is None or nid not in input_data:
+                continue
+            arr_shape = np.asarray(input_data[nid]).shape
+            for i, d in enumerate(node.output.shape):
+                if not d.is_static and isinstance(d.expr, Var) and i < len(arr_shape):
+                    sym_env.setdefault(d.expr.name, int(arr_shape[i]))
+
+        def _shape_of(node) -> tuple[int, ...]:  # noqa: ANN001
+            return tuple(d.as_static() if d.is_static else int(d.expr.eval(sym_env)) for d in node.output.shape)
+
         t0 = time.perf_counter()
         for nid in compiled.topological_order():
             node = compiled.nodes[nid]
-            shape = tuple(d.as_static() for d in node.output.shape if d.is_static)
+            shape = _shape_of(node)
 
             dtype_np = node.output.dtype.np
 
@@ -184,65 +213,6 @@ class Backend(ABC):
         elapsed = (time.perf_counter() - t0) * 1000
         outputs = {name: values[name] for name in compiled.outputs}
         return RunResult(outputs=outputs, time_ms=elapsed), pre_result
-
-    def benchmark(
-        self,
-        compiled: Any,
-        *,
-        input_data: dict[str, np.ndarray] | None = None,
-        warmup: int = 5,
-        num_iters: int | str = 20,
-    ) -> BenchmarkResult:
-        """Wall-time benchmark over repeated ``run()`` calls.
-
-        Default implementation — good enough for numpy / loop interpreters.
-        Backends with better timing (e.g. CUDA using GPU events inside an
-        nvcc-compiled subprocess) override for device-precise measurements.
-
-        Single loop covers warmup + measurement (the first ``warmup`` iters
-        are discarded). A per-call wall-time watchdog (``1000 ms``) raises
-        ``RuntimeError`` if any single ``run()`` exceeds it — autotune
-        sweeps catch this and mark the variant ``bench_fail``.
-
-        ``num_iters="auto"`` adapts the iter count to the per-call cost:
-        keep running measured iters until accumulated wall time reaches
-        100 ms, capped at ``100_000`` measured iters.
-        """
-        if isinstance(num_iters, str):
-            if num_iters != "auto":
-                raise ValueError(f"num_iters must be int or 'auto', got {num_iters!r}")
-            target_total_ms = 100.0
-            max_measured = 100_000
-            auto = True
-        else:
-            target_total_ms = float("inf")
-            max_measured = int(num_iters)
-            auto = False
-
-        kernel_timeout_ms = 1000.0
-        iters_run = 0
-        times: list[float] = []
-        cumulative_ms = 0.0
-        while True:
-            t0 = time.perf_counter()
-            self.run(compiled, input_data=input_data)  # discard tuple; only timing matters here
-            dt = (time.perf_counter() - t0) * 1000
-            if dt > kernel_timeout_ms:
-                raise RuntimeError(f"run() took {dt:.1f} ms — exceeds {kernel_timeout_ms:.0f} ms timeout")
-            iters_run += 1
-            if iters_run <= warmup:
-                continue
-            times.append(dt)
-            cumulative_ms += dt
-            if len(times) >= max_measured:
-                break
-            if auto and cumulative_ms >= target_total_ms:
-                break
-        return BenchmarkResult(
-            time_ms=sum(times) / len(times),
-            min_ms=min(times),
-            max_ms=max(times),
-        )
 
 
 def _coerce(data, shape: tuple[int, ...], dtype: np.dtype | None = None) -> np.ndarray:

@@ -71,7 +71,7 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
-    Mma,
+    ReduceCarrier,
     Select,
     SelectBranch,
     Stmt,
@@ -513,18 +513,20 @@ class Source:
       materialization can read it off the IR without reaching for the
       matcher-populated graph node. ``None`` keeps legacy fp32-assuming
       behavior for tests that construct Source by hand.
-    - ``gmem_extents`` — the gmem buffer's per-source-dim static shape,
-      stamped by ``021_hoist_staged_loads_above_mask`` ONLY when this
+    - ``gmem_extents`` — the gmem buffer's per-source-dim shape (a static
+      ``int`` per dim, or the dim's symbolic ``Expr`` — e.g. ``Var('seq_len')``,
+      resolved from the runtime kernel arg), stamped by
+      ``021_hoist_staged_loads_above_mask`` ONLY when this
       Source's cooperative load is hoisted above a masked-tile boundary
       ``Cond``. A masked output axis tiles past the real extent (e.g. N=256
-      tiled at 192 → the second tile spans [192, 384)), so the cooperative
-      gmem read overruns the buffer for the overhang columns. When set,
-      ``_stage_expand.emit_stage`` clamps each ``source_index`` dim to
-      ``[0, gmem_extents[d])`` so the producer never reads OOB (the
-      overhang slab slots get a clamped duplicate value, harmless because
-      the masked output cells they feed are never written). ``None`` (the
-      default, clean-divisor tiles) skips the clamp — no perf cost on the
-      common path.
+      tiled at 192 → the second tile spans [192, 384); a symbolic axis tiles
+      at its hint), so the cooperative gmem read overruns the buffer for the
+      overhang columns. When set, ``_stage_expand.emit_stage`` clamps each
+      ``source_index`` dim to ``[0, gmem_extents[d])`` so the producer never
+      reads OOB (the overhang slab slots get a clamped duplicate value,
+      harmless because the masked output cells they feed are never written).
+      ``None`` (the default, clean-divisor tiles) skips the clamp — no perf
+      cost on the common path.
     """
 
     name: str
@@ -534,7 +536,17 @@ class Source:
     pad: tuple[int, ...] = ()
     addressing: AffineAddressing | TemplateAddressing | None = None
     dtype: DataType | None = None
-    gmem_extents: tuple[int, ...] | None = None
+    gmem_extents: tuple[int | Expr, ...] | None = None
+    # ``kmask`` — ``(source_index dim, bound Expr)`` when this operand is staged
+    # for a masked-K (symbolic reduce — SDPA P@V's seq_len) warp matmul. The
+    # final K_o tile overruns the runtime extent, and unlike a masked OUTPUT
+    # axis (M/N — the overhang feeds a never-written cell, so an edge-clamp is
+    # harmless) the reduce overhang feeds the mma ACCUMULATION, so it must be
+    # ZERO, not a clamped duplicate. ``_stage_expand.emit_stage`` forces the
+    # SYNC transport for a ``kmask`` source (cp.async can't ternary a value) and
+    # zero-fills the loaded value where the K coord ``>= bound``. ``None`` (the
+    # default) is every static-K / output-only-masked source — no change.
+    kmask: tuple[int, object] | None = None
     swizzle: SwizzleMode = SwizzleMode.NONE
 
     def __post_init__(self) -> None:
@@ -1023,7 +1035,9 @@ class AtomTile(ParallelTile):
     def render(self, ctx: RenderCtx) -> list[str]:
         raise NotImplementedError(
             "AtomTile must be consumed by the MMA materializer "
-            "(kernel/010_split_register_axes MMA arm) before render — "
+            "(kernel/005_lower_atom_tile) before render — an AtomTile here "
+            "usually means tile/011_lower_atom_cell could not tag the cell "
+            "(operand A/B classification failed) — "
             f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
         )
 
@@ -1110,9 +1124,10 @@ class SerialTileBase(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A serial tile is a reduce iff its immediate body contains an ``Accum``
-        (or its tensor-core fused form ``Mma``, which accumulates ``c += a @ b``)."""
-        return any(isinstance(s, (Accum, Mma)) for s in self.body)
+        """A serial tile is a reduce iff its immediate body contains a
+        ``ReduceCarrier`` — an ``Accum`` or its tensor-core fused form ``Mma``
+        (which accumulates ``c += a @ b``)."""
+        return any(isinstance(s, ReduceCarrier) for s in self.body)
 
 
 @dataclass(frozen=True)
@@ -1167,8 +1182,15 @@ class SerialTile(SerialTileBase):
         var = self.axis.name
         # ``Dim.__str__`` returns the bare value (literal for static, symbolic
         # name for ``Dim('seq_len')``) so both static and symbolic SerialTile
-        # extents render correctly.
-        extent = str(self.axis.extent)
+        # extents render correctly. A COMPOSITE extent (the ceil-div K_o bound
+        # of a masked-K warp tile, ``(seq_len+31)//32``) must go through the C
+        # expr renderer so ``//`` becomes ``/`` — ``str`` would leak the Python
+        # spelling and nvcc would read it as a line comment.
+        ext = self.axis.extent
+        if ext.is_static or isinstance(ext.expr, Var):
+            extent = str(ext)
+        else:
+            extent = f"({ext.expr.render(ctx)})"
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
         out.append(f"{pad}for (int {var} = 0; {var} < {extent}; {var}++) {{")

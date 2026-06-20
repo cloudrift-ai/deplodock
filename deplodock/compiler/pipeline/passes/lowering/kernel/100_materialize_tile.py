@@ -72,7 +72,11 @@ from deplodock.compiler.ir.tile.ir import (
     pick_swizzle_atom,
 )
 from deplodock.compiler.pipeline import Pattern
-from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine, find_nested_reduce_accums, single_thread_var
+from deplodock.compiler.pipeline.passes.lowering.kernel._combine import (
+    cooperative_combine_geometry,
+    emit_combine,
+    find_nested_reduce_accums,
+)
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
     compute_phase_info,
     emit_compute_phase,
@@ -750,18 +754,20 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
             else:
                 accums_in_scope = find_nested_reduce_accums(stmt.body)
             for acc_name, acc in accums_in_scope.items():
-                if escape is not None and escape.accum_cooperative_axes.get(acc_name):
-                    tid_var = single_thread_var(thread_axes)
+                coop_names = escape.accum_cooperative_axes.get(acc_name) if escape is not None else None
+                if coop_names:
+                    tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
                     dt = acc.dtype or F32
-                    extra.extend(emit_combine(acc_name, acc.op, tid_var, n_threads, dt, warp_size=warp_size))
+                    extra.extend(emit_combine(acc_name, acc.op, tid_var, n_coop, dt, warp_size=warp_size))
                     rename[acc_name] = f"{acc_name}_b"
             return [single, *extra]
         if isinstance(stmt, Accum):
             out_local = [transform(stmt)]
-            if escape is not None and escape.accum_cooperative_axes.get(stmt.name):
-                tid_var = single_thread_var(thread_axes)
+            coop_names = escape.accum_cooperative_axes.get(stmt.name) if escape is not None else None
+            if coop_names:
+                tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
                 dt = stmt.dtype or F32
-                out_local.extend(emit_combine(stmt.name, stmt.op, tid_var, n_threads, dt, warp_size=warp_size))
+                out_local.extend(emit_combine(stmt.name, stmt.op, tid_var, n_coop, dt, warp_size=warp_size))
                 rename[stmt.name] = f"{stmt.name}_b"
             return out_local
         return [transform(stmt)]

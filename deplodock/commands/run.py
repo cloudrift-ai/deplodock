@@ -8,6 +8,7 @@ the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -71,8 +72,9 @@ def register_run_command(subparsers):
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
-        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%). Skipped if "
-        "ncu is not on PATH or the user lacks performance-counter permissions.",
+        "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%) and print a "
+        "side-by-side table of the deplodock kernels vs the torch/cuBLAS reference kernels. "
+        "Skipped if ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
     parser.add_argument("--iters", type=int, default=100, help="Measurement iterations for --bench (default: 100).")
@@ -89,6 +91,18 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for --ir random inputs (default: 0).")
+    parser.add_argument(
+        "--ab",
+        action="append",
+        default=None,
+        metavar="KNOBS",
+        help=(
+            "Compile + bench an extra variant with these knobs pinned (``K1=V1,K2=V2`` — the "
+            "``DEPLODOCK_KNOBS`` grammar) and show it as a live A/B row beneath the matching greedy "
+            "kernel in the --bench kernel table, knob diffs red. Repeatable. Requires --bench and a "
+            "re-lowerable input (--code / --golden / --ir)."
+        ),
+    )
     parser.add_argument(
         "--dynamic",
         action="append",
@@ -151,15 +165,28 @@ def handle_run(args):
         logger.error("input / --code / --ir are mutually exclusive")
         sys.exit(1)
 
-    if not torch.cuda.is_available():
-        logger.error("CUDA GPU required")
-        sys.exit(1)
-
     # A .json input (via --ir or as the positional) takes the IR path: finish
     # lowering an arbitrary-stage dump, no traced module to bench against torch.
     ir_path = args.ir
     if ir_path is None and args.input is not None and Path(args.input).suffix == ".json" and Path(args.input).exists():
         ir_path = args.input
+    if args.ab:
+        if not args.bench:
+            logger.error("--ab requires --bench (the A/B rows render in the kernel table)")
+            sys.exit(2)
+        if args.code is None and ir_path is None:
+            logger.error("--ab requires a re-lowerable input: --code, --golden, or --ir (each config re-lowers a fresh graph)")
+            sys.exit(2)
+        try:
+            _ab_samples(args.ab)  # fail fast on a malformed KNOBS spec
+        except ValueError as exc:
+            logger.error("--ab: %s", exc)
+            sys.exit(2)
+
+    if not torch.cuda.is_available():
+        logger.error("CUDA GPU required")
+        sys.exit(1)
+
     if ir_path is not None:
         args.ir = ir_path
         _handle_run_ir(args, CudaBackend, CompilerDump)
@@ -188,13 +215,11 @@ def handle_run(args):
 
     input_data = _bind_inputs(compiled, module, example_args, example_kwargs)
 
-    # Skip the accuracy check + eager forward when running as the ncu
-    # child of a ``--profile`` invocation: the parent already verified
-    # accuracy outside ncu, and re-running the eager reference under
-    # ncu (a) wastes ~5-10 s of ncu overhead per cuBLAS launch and
-    # (b) pollutes the captured CSV with cutlass / cuBLAS kernel rows
-    # the perf summary then has to filter out. The child only needs to
-    # launch the deplodock kernels so ncu can sample our metrics.
+    # The ncu child of a ``--profile`` invocation skips the accuracy *check*
+    # (the parent already verified it) but still launches both sides once —
+    # the deplodock program AND the eager reference — because the comparison
+    # table needs the cuBLAS / aten kernel rows in the captured CSV beside
+    # the ``k_*`` rows.
     skip_accuracy = config.ncu_child()
 
     try:
@@ -206,9 +231,10 @@ def handle_run(args):
             eager_out = _eager_output(module, example_args, example_kwargs)
             _check_accuracy(run_result.outputs, eager_out)
         else:
-            # ncu child needs at least one deplodock launch for metrics
-            # to populate; skip the eager comparison.
+            # ncu child: one deplodock launch (our metrics) + one eager forward
+            # (the reference rows for the comparison table); no accuracy diff.
             backend.run(compiled, input_data=input_data)
+            _eager_output(module, example_args, example_kwargs)
     except RuntimeError as exc:
         # Per-launch watchdog fired in ``run_program`` (kernel >1 s).
         # The CUDA context is dirty — bypass Python cleanup so cupy's
@@ -224,6 +250,10 @@ def handle_run(args):
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
+    # Symbolic graph: deplodock benches at the hint (synthetic hint-sized
+    # inputs), so tile the torch closures' inputs to the same hint — otherwise
+    # the table compares different shapes (trace seq vs hint).
+    cuda_args, cuda_kwargs, bench_sym_env = _hint_sized_inputs(compiled, cuda_args, cuda_kwargs)
 
     # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT when
     # ``tcompile`` is in the selected backends) *outside* the GPU lock
@@ -263,8 +293,10 @@ def handle_run(args):
     # every other GPU entry point) via ``gpu_lock()`` — no need to wrap
     # the whole bench block here. Print/dump are pure CPU work.
     try:
-        results, bench, captured = _bench_interleaved_captured(
-            cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+        results, bench, captured = asyncio.run(
+            _bench_interleaved_captured(
+                cuda_module, cuda_args, cuda_kwargs, backend, compiled, args.warmup, args.iters, torch_fns=torch_fns
+            )
         )
     except RuntimeError as exc:
         # Bench watchdog fired (slow kernel, hung launch). The kernel
@@ -281,13 +313,16 @@ def handle_run(args):
         dump.dump_benchmark(bench)
         _dump_bench_compare(dump.dir, results, args.warmup, args.iters)
 
-    # ``--golden NAME``: compile + bench each recorded golden config (knobs pinned)
-    # so the kernel table can show it as a live A/B row beside the greedy pick.
+    # ``--golden NAME`` / ``--ab KNOBS``: compile + bench each pinned config so the
+    # kernel table can show it as a live A/B row beside the greedy pick.
     golden_benches = None
-    if getattr(args, "golden_configs", None):
-        golden_benches = _bench_golden_variants(backend, args.code, args.golden_configs, warmup=args.warmup, iters=args.iters)
+    pinned = list(getattr(args, "golden_configs", None) or []) + (_ab_samples(args.ab, dynamic=args.dynamic) if args.ab else [])
+    if pinned:
+        golden_benches = asyncio.run(_bench_golden_variants(backend, args.code, pinned, warmup=args.warmup, iters=args.iters))
 
-    _print_table(results, note=None if captured else "(graph-capture fallback: timings include host launch overhead)")
+    capture_note = None if captured else "(graph-capture fallback: timings include host launch overhead)"
+    notes = [n for n in (_symbolic_bench_note(bench_sym_env), capture_note) if n]
+    _print_table(results, note="\n".join(notes) if notes else None)
     _print_kernel_stats(compiled, bench, golden_benches=golden_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
@@ -385,25 +420,48 @@ def _pinned_knobs(knobs: dict):
                 os.environ[key] = prev
 
 
-def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
+def _ab_samples(specs, dynamic=None):
+    """One shapeless pseudo-sample per ``--ab "K1=V1,K2=V2"`` spec: ``.knobs`` to pin
+    (the ``DEPLODOCK_KNOBS`` grammar), ``.name`` the table label, ``.shape None`` —
+    the marker :func:`_print_kernel_stats` uses to nest the row by the benched
+    kernel's own ``S_*`` signature instead of a golden's matmul shape. ``dynamic``
+    stamps the run's own ``--dynamic`` specs on each pseudo-sample so the A/B
+    re-trace builds the same symbolic graph as the greedy run."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    from deplodock.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
+
+    dyn = tuple(dynamic) if dynamic else None
+    return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None, dynamic=dyn) for raw in specs]
+
+
+async def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters):
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
     measured row beside the greedy pick. ``golden_configs`` are
     :class:`~deplodock.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
-    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs).
-    Each config re-traces a **fresh** graph from ``code`` — a frontend graph can't be
-    re-compiled (the first lowering mutates it in place, so a reused graph would
-    yield the first config's kernel every time). Best-effort: a golden whose pinned
+    already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs) —
+    or the shapeless ``--ab`` pseudo-samples from :func:`_ab_samples` (same duck
+    type). Each config re-traces a **fresh** graph from ``code`` — a frontend graph
+    can't be re-compiled (the first lowering mutates it in place, so a reused graph
+    would yield the first config's kernel every time). A sample carrying ``dynamic``
+    specs (a dynamic golden, or an ``--ab`` row of a ``--dynamic`` run) re-traces
+    symbolically, so the pinned kernel is the same masked-tile artifact the greedy
+    run deployed and benches at the same hint. Best-effort: a config whose pinned
     knobs fail to compile / bench for the live device is skipped with a warning."""
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     out = []
     for sample in golden_configs or []:
+        dyn = getattr(sample, "dynamic", None)
         try:
+            dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs(list(dyn))) if dyn else None
             with _pinned_knobs(sample.knobs):
-                graph, _, _ = graph_from_code(code)  # fresh graph; knobs baked into the kernel source here
+                # Fresh graph; knobs baked into the kernel source here.
+                graph, _, _ = graph_from_code(code, dynamic_shapes=dynamic_shapes)
                 g_compiled = backend.compile(graph)
-            g_bench = backend.benchmark(g_compiled, warmup=warmup, num_iters=iters)
+            g_bench = await backend.benchmark_async(g_compiled, warmup=warmup, num_iters=iters)
         except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own bench table
             logger.warning("[golden] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
             continue
@@ -429,6 +487,7 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
     from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
     from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.data import ShapeKey  # noqa: PLC0415
 
     cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
@@ -459,19 +518,48 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         occ_str = f"{occ_pct:>3.0f}%" if occ_pct is not None else "  --"
         return grid_total, block_threads, op.smem_bytes / 1024, regs, occ_str
 
+    def _op_sig(op):
+        return ShapeKey.from_s_features(getattr(op, "knobs", {}) or {})
+
+    used_ab: set[int] = set()
+
     def _matching(op):
-        """Benched golden variants whose matmul shape matches this kernel — keyed
-        on the op's ``S_*`` features (``S_ext_free_prod = M*N``, ``S_ext_reduce_max
-        = K``), the same shape signature the prior diagnostics match goldens on."""
-        free_prod = int(getattr(op, "knobs", {}).get("S_ext_free_prod", 0))
-        reduce_max = int(getattr(op, "knobs", {}).get("S_ext_reduce_max", 0))
-        return [gb for gb in (golden_benches or []) if gb.sample.shape.free_prod == free_prod and gb.sample.shape.reduce_max == reduce_max]
+        """Benched pinned variants whose shape matches this kernel — keyed via
+        ``ShapeKey.from_s_features`` over the op's stamped ``S_*`` features, the
+        same join key the prior diagnostics match goldens on (so the dtype flag
+        splits fp32/fp16 twins here too). A golden carries its matmul ``ShapeKey``
+        on ``sample.shape``; a shapeless ``--ab`` entry matches through its own
+        benched kernels' signatures and nests under the first greedy kernel it
+        matches (``used_ab`` dedups; unmatched entries are appended after the
+        greedy rows so a row is never silently dropped)."""
+        sig = _op_sig(op)
+        out = []
+        for gb in golden_benches or []:
+            if gb.sample.shape is not None:
+                if gb.sample.shape == sig:
+                    out.append(gb)
+            elif id(gb) not in used_ab and any(_op_sig(n.op) == sig for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)):
+                used_ab.add(id(gb))
+                out.append(gb)
+        return out
 
     # Build row records first (the knob columns are aligned across all rows, so we
     # can't stream): (name, t_us, pct_cell, geom, knobs, ref_knobs_or_None). A
     # golden row's ``ref`` is its matching greedy kernel's knobs — cells that differ
     # are colored red.
     records: list[tuple] = []
+
+    def _gb_rows(gb, ref):
+        """Append the rows of one benched pinned variant (golden / --ab), each
+        kernel's knobs diffed red against ``ref`` (the greedy pick's knobs)."""
+        label = f"golden {gb.sample.name}" if gb.sample.shape is not None else gb.sample.name
+        g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
+        g_attrs = _collect_kernel_attrs(gb.graph)
+        g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
+        for gidx, gnode in enumerate(g_nodes):
+            gk = dict(tuning_knob_items(gnode.op.knobs or {}))
+            records.append((label, g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, ref))
+
     for idx, node in enumerate(cuda_nodes):
         op = node.op
         t_us = times_by_idx.get(idx, 0.0)
@@ -479,12 +567,10 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
         gknobs = dict(tuning_knob_items(op.knobs or {}))
         records.append((op.kernel_name, t_us, f"{pct:.1f}%", _geom(op, attrs_by_kname), gknobs, None))
         for gb in _matching(op):
-            g_times = {lt.idx: (min(lt.samples) if lt.samples else lt.time_ms) * 1000 for lt in (gb.bench.per_launch or [])}
-            g_attrs = _collect_kernel_attrs(gb.graph)
-            g_nodes = [n for n in gb.graph.nodes.values() if isinstance(n.op, CudaOp)]
-            for gidx, gnode in enumerate(g_nodes):
-                gk = dict(tuning_knob_items(gnode.op.knobs or {}))
-                records.append((f"golden {gb.sample.name}", g_times.get(gidx, 0.0), "--", _geom(gnode.op, g_attrs), gk, gknobs))
+            _gb_rows(gb, gknobs)
+    for gb in golden_benches or []:
+        if gb.sample.shape is None and id(gb) not in used_ab:
+            _gb_rows(gb, None)
 
     kcols, kcells = knob_columns(
         [{k: (str(v), ref is not None and str(ref.get(k)) != str(v)) for k, v in knobs.items()} for *_, knobs, ref in records]
@@ -507,9 +593,14 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
             [name, f"{t_us:.1f}", pct_cell, str(grid_total), str(block_threads), f"{smem_kb:.1f}K", str(regs), occ_str.strip(), *kc]
         )
     data.append(["TOTAL", f"{total_us:.1f}", *[""] * (len(columns) - 2)])
+    # TOTAL sums per-launch solo windows (each kernel replayed back-to-back in
+    # its own event window); the whole-program row is one window around the
+    # full launch sequence — the number the backend comparison table reports.
+    if bench.e2e_min_ms is not None:
+        data.append(["whole-program (e2e)", f"{bench.e2e_min_ms * 1000:.1f}", *[""] * (len(columns) - 2)])
 
     print()
-    print("knobs (greedy pick); golden rows are red where they differ from the greedy pick:")
+    print("knobs (greedy pick); golden / ab rows are red where they differ from the greedy pick:")
     for line in render_table(columns, data):
         print(line)
 
@@ -655,6 +746,16 @@ def _run_ncu_profile(args, *, dump_dir=None):
         cmd.extend(["--code", args.code])
     elif args.ir is not None:
         cmd.extend(["--ir", args.ir])
+    else:
+        # Positional model ID / .json path (``--golden`` was already rewritten
+        # to ``--code`` by ``resolve_golden_arg``). Forward the trace shape
+        # flags so the child profiles the same graph the parent benched.
+        cmd.append(args.input)
+        if args.layer is not None:
+            cmd.extend(["--layer", str(args.layer)])
+        cmd.extend(["--seq-len", str(args.seq_len)])
+    if args.target is not None:
+        cmd.extend(["--target", args.target])
     # ncu's per-launch overhead means we want one or two launches per
     # kernel — enough for the counters to populate, not so many that
     # the run drags out. Match ``deplodock run --bench``'s minimal
@@ -695,6 +796,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
     status_text = "\n".join(lines[:csv_start])
 
     parsed = _parse_ncu_csv(csv_text)
+    _print_ncu_compare(parsed, _ncu_units(csv_text))
 
     if dump_dir is not None:
         out_dir = _Path(dump_dir)
@@ -703,17 +805,85 @@ def _run_ncu_profile(args, *, dump_dir=None):
         (out_dir / "61_ncu_metrics.json").write_text(_json.dumps(parsed, indent=2, default=str))
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.csv'}")
         print(f"ncu metrics → {out_dir / '61_ncu_metrics.json'}")
-    else:
-        # No dump dir: relay the CSV (and status lines) so ad-hoc
-        # ``deplodock run --profile`` invocations still surface the data.
-        if status_text.strip():
-            print(status_text)
-        print(csv_text)
+    elif status_text.strip():
+        # No dump dir: the comparison table above is the product; relay the
+        # ==PROF== status lines for diagnostics (the raw CSV lands in the dump
+        # dir when one is set).
+        print(status_text)
 
     if result.returncode != 0:
         logger.warning("ncu exit=%d", result.returncode)
         if result.stderr.strip():
             print(result.stderr, file=sys.stderr)
+
+
+# Display order + short labels for the per-kernel comparison table — keys are
+# entries of the curated ``_NCU_METRICS`` set.
+_NCU_COMPARE_COLS = (
+    ("gpu__time_duration.sum", "dur"),
+    ("sm__warps_active.avg.pct_of_peak_sustained_active", "occ%"),
+    ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "sm%"),
+    ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "dram%"),
+    ("sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active", "fma%"),
+    ("smsp__inst_executed_pipe_lsu.sum", "lsu.inst"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum", "ld.cnflct"),
+    ("l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum", "st.cnflct"),
+    ("launch__registers_per_thread", "regs"),
+)
+
+_NCU_REF_ROWS_MAX = 12  # eager forwards can launch dozens of tiny aten kernels
+
+
+def _print_ncu_compare(parsed: dict, units: dict[str, str] | None = None) -> None:
+    """One aligned table over the parsed ncu metrics: the deplodock ``k_*``
+    kernels first, then the reference backend's kernels (cuBLAS / cutlass /
+    aten) — so the counter deltas (occupancy, SM/DRAM/FMA utilization, smem
+    bank conflicts, register pressure) read straight down a column instead of
+    across two CSV dumps. Each side sorts by duration; reference rows truncate
+    to the :data:`_NCU_REF_ROWS_MAX` slowest with a count of the rest."""
+    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+
+    if not parsed:
+        return
+    dur_key = _NCU_COMPARE_COLS[0][0]
+    dep = sorted((k for k in parsed if k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    ref = sorted((k for k in parsed if not k.startswith("k_")), key=lambda k: -parsed[k].get(dur_key, 0.0))
+    hidden_ref = max(0, len(ref) - _NCU_REF_ROWS_MAX)
+    ref = ref[:_NCU_REF_ROWS_MAX]
+
+    def fmt(v) -> str:
+        if v is None:
+            return "-"
+        return f"{v:,.0f}" if abs(v) >= 100 or v == int(v) else f"{v:.1f}"
+
+    def row(side: str, kname: str) -> list[str]:
+        shown = kname if len(kname) <= 60 else kname[:57] + "..."
+        return [side, shown, *(fmt(parsed[kname].get(metric)) for metric, _ in _NCU_COMPARE_COLS)]
+
+    unit = (units or {}).get(dur_key, "")
+    cols = [Col("side"), Col("kernel")] + [
+        Col(f"dur ({unit})" if label == "dur" and unit else label, "r") for _, label in _NCU_COMPARE_COLS
+    ]
+    data = [row("dep", k) for k in dep] + [row("ref", k) for k in ref]
+    print()
+    print("ncu compare — deplodock kernels vs the torch/cuBLAS reference (same counters, one table):")
+    for line in render_table(cols, data, rule=True):
+        print(line)
+    if hidden_ref:
+        print(f"  … {hidden_ref} more reference kernel(s) below the duration cut")
+
+
+def _ncu_units(csv_text: str) -> dict[str, str]:
+    """``{metric: unit}`` from the CSV's ``Metric Unit`` column (first seen wins)."""
+    import csv as _csv  # noqa: PLC0415
+    import io as _io  # noqa: PLC0415
+
+    units: dict[str, str] = {}
+    for row in _csv.DictReader(_io.StringIO(csv_text)):
+        metric, unit = row.get("Metric Name", ""), row.get("Metric Unit", "")
+        if metric and unit and metric not in units:
+            units[metric] = unit
+    return units
 
 
 def _parse_ncu_csv(csv_text: str) -> dict:
@@ -726,10 +896,10 @@ def _parse_ncu_csv(csv_text: str) -> dict:
     ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
     with the bench-comparison JSON downstream.
 
-    Filters to deplodock-emitted kernels (``k_*`` naming convention) —
-    the ncu child runs in the same process as the eager-reference
-    accuracy check, which would otherwise contribute cutlass / cuBLAS
-    rows that contaminate the per-row aggregate.
+    Keeps every kernel — the deplodock ``k_*`` rows AND the reference
+    backend's (cuBLAS / cutlass / aten) rows the child's eager forward
+    contributes — so :func:`_print_ncu_compare` can put the two sides in
+    one table. Consumers split the sides on the ``k_*`` naming convention.
     """
     import csv as _csv
     import io as _io
@@ -741,8 +911,6 @@ def _parse_ncu_csv(csv_text: str) -> dict:
         metric = row.get("Metric Name", "")
         raw = row.get("Metric Value", "").replace(",", "")
         if not (kname and metric and raw):
-            continue
-        if not kname.startswith("k_"):
             continue
         try:
             val = float(raw)
@@ -805,7 +973,7 @@ def _passes_after_stage(stage: str) -> list[str]:
     return [p for p in CUDA_PASSES if p not in completed]
 
 
-def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends, capture_graphs=True):
+async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup, iters, bench_backends, capture_graphs=True):
     """Run + (optionally) benchmark a lowered graph against its torch reference on
     shared random inputs. The common bench primitive behind ``run --ir`` and
     ``tune --bench``.
@@ -842,8 +1010,17 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
 
     rng = np.random.default_rng(seed)
 
+    # Symbolic reproducers bench at each dim's hint (``DEFAULT_SEQ_HINT`` for a
+    # bare seq axis) — the same size the backend resolves a symbolic graph to
+    # when no inputs are supplied — so the random inputs built here get concrete
+    # hint-sized shapes. Atomic dims carry their own hint; composite exprs
+    # (e.g. ``S * 2``) eval over the collected env.
+    from deplodock.compiler.dim import Dim
+
+    sym_env = _collect_sym_env(([frontend] if frontend is not None else []) + [lowered])
+
     def _static(shape):
-        return tuple(d.as_static() if hasattr(d, "as_static") else int(d) for d in shape)
+        return tuple((d.as_static() if d.is_static else int(d.expr.eval(sym_env))) if isinstance(d, Dim) else int(d) for d in shape)
 
     # One random source array per distinct constant ``source_path`` — shared by
     # deplodock (lowered graph) and the torch ref (frontend graph). ``bind_constants``
@@ -862,7 +1039,9 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
     for nid, node in lowered.nodes.items():
         if isinstance(node.op, InputOp):
             arr = rng.standard_normal(_static(node.output.shape), dtype=np.float32)
-            input_data[nid] = arr.flatten().tolist()
+            # Keep the ndarray shape (no flatten) — a symbolic graph's launch
+            # reads the runtime seq_len off the input array's shape.
+            input_data[nid] = arr
             input_tensors[nid] = _to_cuda_tensor(arr, node.output.dtype)
         elif isinstance(node.op, ConstantOp) and node.op.value is not None:
             input_data[nid] = [float(node.op.value)]
@@ -903,38 +1082,41 @@ def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, warmup
         backends = _resolve_backends(bench_backends)
         torch_fns = _build_torch_fns(torch_fn, torch_inputs, {}, warmup, backends=backends)
         if capture_graphs:
-            results, bench, captured = _bench_interleaved_captured(
+            results, bench, captured = await _bench_interleaved_captured(
                 torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns
             )
         else:
-            results, bench = _bench_interleaved(
+            results, bench = await _bench_interleaved(
                 torch_fn, torch_inputs, {}, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
             )
             captured = False
         return results, bench, True, captured
     # Deplodock-only: a capture failure falls back inside ``benchmark_program``
     # (warned + reported via ``bench.captured``) — nothing to de-mix.
-    bench = backend.benchmark(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
+    bench = await backend.benchmark_async(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
     return {"Deplodock": bench.time_ms * 1000}, bench, False, bench.captured
 
 
-def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
+async def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
     """End-to-end full-model bench against the **real torch module** — eager /
     ``torch.compile`` / Deplodock — using the all-or-nothing CUDA-graph-captured
     interleaved bench (real modules occasionally resist capture; those fall back
     to uncaptured wall timing, flagged in ``captured``). The module + its
-    trace-time inputs come from ``load_or_trace``'s bundle. Skips the accuracy
-    check (deplodock's bench uses synthetic activations vs torch's bound inputs, so
-    only latency is comparable here — accuracy lives in the per-kernel path).
+    trace-time inputs come from ``load_or_trace``'s bundle; for a symbolic
+    graph the torch closures run on hint-tiled inputs (``_hint_sized_inputs``)
+    so both sides bench the hint shape. Skips the accuracy check (deplodock's
+    bench uses synthetic activations vs torch's bound inputs, so only latency
+    is comparable here — accuracy lives in the per-kernel path).
     Returns ``(results, bench, captured)``."""
     import torch
 
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in args_t)
     cuda_kwargs = _to_cuda_kwargs(kwargs)
+    cuda_args, cuda_kwargs, _ = _hint_sized_inputs(lowered, cuda_args, cuda_kwargs)
     backends = _resolve_backends(bench_backends)
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, warmup, backends=backends)
-    return _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
+    return await _bench_interleaved_captured(cuda_module, cuda_args, cuda_kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns)
 
 
 def _handle_run_ir(args, CudaBackend, CompilerDump):
@@ -981,15 +1163,17 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
         # warm-started prior into single-shot compile is a deferred follow-up.
         graph = Pipeline.build(tail).run(graph, db=db, dump=dump)
 
-    results, bench, torch_available, captured = bench_lowered_vs_torch(
-        frontend,
-        graph,
-        backend,
-        seed=args.seed,
-        do_bench=args.bench,
-        warmup=args.warmup,
-        iters=args.iters,
-        bench_backends=args.bench_backends,
+    results, bench, torch_available, captured = asyncio.run(
+        bench_lowered_vs_torch(
+            frontend,
+            graph,
+            backend,
+            seed=args.seed,
+            do_bench=args.bench,
+            warmup=args.warmup,
+            iters=args.iters,
+            bench_backends=args.bench_backends,
+        )
     )
 
     if args.bench:
@@ -1005,9 +1189,41 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             print()
             for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Deplodock", f"{bench.time_ms * 1000:.0f}"]], rule=True):
                 print(line)
-        _print_kernel_stats(graph, bench)
+        ab_benches = None
+        if args.ab:
+            if tail:
+                ab_benches = asyncio.run(_bench_ab_variants_ir(backend, path, tail, args.ab, warmup=args.warmup, iters=args.iters, db=db))
+            else:
+                logger.warning("--ab ignored: %s IR is fully lowered (no forks left to pin)", stage)
+        _print_kernel_stats(graph, bench, golden_benches=ab_benches)
     if args.profile:
         _run_ncu_profile(args, dump_dir=dump.dir if dump else None)
+
+
+async def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters, db=None):
+    """The ``--ab`` counterpart of :func:`_bench_golden_variants` for the ``--ir``
+    path: each config reloads the IR file fresh (the tail lowering mutates the graph
+    in place) and re-lowers it with the knobs pinned, so the pin collapses every
+    remaining fork. Best-effort like the golden path: a config that fails to
+    compile / bench is skipped with a warning."""
+    import json as _json  # noqa: PLC0415
+
+    from deplodock.compiler.graph import Graph  # noqa: PLC0415
+    from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
+
+    out = []
+    for sample in _ab_samples(specs):
+        try:
+            with _pinned_knobs(sample.knobs):
+                g = Graph.from_dict(_json.loads(Path(ir_path).read_text()))
+                if tail:
+                    g = Pipeline.build(tail).run(g, db=db)
+            g_bench = await backend.benchmark_async(g, warmup=warmup, num_iters=iters)
+        except Exception as exc:  # noqa: BLE001 — a bad pin must not abort the run's own table
+            logger.warning("[ab] %s: compile/bench of the pinned config failed (%s) — skipping its row", sample.name, exc)
+            continue
+        out.append(_GoldenBench(sample, g, g_bench))
+    return out
 
 
 def _bind_inputs(compiled, module, example_args, example_kwargs):
@@ -1075,6 +1291,99 @@ def _flatten_tensors(value):
             out.extend(_flatten_tensors(v))
         return out
     return []
+
+
+def _collect_sym_env(graphs) -> dict[str, int]:
+    """Map every symbolic dim var appearing in ``graphs`` to its hint
+    (``DEFAULT_SEQ_HINT`` for a bare seq axis) — the size the backend resolves
+    a symbolic graph to when benching without supplied inputs."""
+    from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+
+    sym_env: dict[str, int] = {}
+    for gph in graphs:
+        for node in gph.nodes.values():
+            for d in node.output.shape:
+                if isinstance(d, Dim) and not d.is_static:
+                    hint = d.hint or DEFAULT_SEQ_HINT
+                    for v in d.expr.free_vars():
+                        sym_env.setdefault(v, hint)
+    return sym_env
+
+
+def _tile_to(tensor, axis: int, size: int):
+    """Resize ``tensor`` along ``axis`` to ``size`` by repeating its values
+    (ceil) and slicing — keeps every element drawn from the original (token
+    ids stay in-vocab, masks keep their value range), unlike fresh randoms."""
+    old = tensor.shape[axis]
+    if old == size:
+        return tensor
+    reps = [1] * tensor.dim()
+    reps[axis] = -(-size // old)
+    return tensor.repeat(*reps).narrow(axis, 0, size)
+
+
+def _map_tensors(value, fn):
+    """Rebuild ``value``'s nested list/tuple structure with ``fn`` applied to
+    each tensor leaf, in :func:`_flatten_tensors` order."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return fn(value)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_map_tensors(v, fn) for v in value)
+    return value
+
+
+def _hint_sized_inputs(lowered, example_args, example_kwargs):
+    """Tile a symbolic graph's example inputs out to its ``Dim`` hints.
+
+    The deplodock side of the full-model bench runs a symbolic graph at each
+    dim's hint (``backend.benchmark`` builds hint-sized synthetic inputs when
+    none are supplied), while the torch closures close over the trace-time
+    example tensors — different shapes, so the table would compare e.g. a
+    seq-512 deplodock program against seq-32 eager. Grow every symbolic input
+    axis to its hint (positional ``graph.inputs`` ↔ flattened example tensors
+    pairing, same as :func:`_bind_inputs`) so both sides run the hint shape.
+    Values are tiled repeats of the trace inputs — valid for latency, which is
+    all this table compares (accuracy runs on the original trace inputs).
+
+    Returns ``(args, kwargs, sym_env)`` — the inputs unchanged and ``{}`` for
+    a static graph.
+    """
+    sym_env = _collect_sym_env([lowered])
+    if not sym_env:
+        return example_args, example_kwargs, {}
+    from deplodock.compiler.dim import Dim
+
+    flat: list = []
+    for v in example_args:
+        flat.extend(_flatten_tensors(v))
+    for v in example_kwargs.values():
+        flat.extend(_flatten_tensors(v))
+    input_ids = list(lowered.inputs)
+    if len(input_ids) != len(flat):
+        logger.warning("Input arity mismatch (graph %d vs example %d) — benching torch on trace-sized inputs", len(input_ids), len(flat))
+        return example_args, example_kwargs, sym_env
+    resized = []
+    for nid, tensor in zip(input_ids, flat, strict=True):
+        for axis, d in enumerate(lowered.nodes[nid].output.shape):
+            if isinstance(d, Dim) and not d.is_static:
+                tensor = _tile_to(tensor, axis, int(d.expr.eval(sym_env)))
+        resized.append(tensor)
+    it = iter(resized)
+    args = tuple(_map_tensors(v, lambda _: next(it)) for v in example_args)
+    kwargs = {k: _map_tensors(v, lambda _: next(it)) for k, v in example_kwargs.items()}
+    return args, kwargs, sym_env
+
+
+def _symbolic_bench_note(sym_env: dict[str, int]) -> str | None:
+    """The full-model table's shape label for a symbolic graph (``None`` for
+    static): both sides bench at the hint, and the reader should know the
+    number is hint-shaped, not trace-shaped."""
+    if not sym_env:
+        return None
+    dims = ", ".join(f"{name}={size}" for name, size in sorted(sym_env.items()))
+    return f"benched at {dims} (symbolic hint; torch inputs tiled to match)"
 
 
 def _eager_output(module, args, kwargs):
@@ -1312,7 +1621,7 @@ def _capture_torch_fns(torch_fns: dict) -> dict | None:
     return captured
 
 
-def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, iters, *, torch_fns):
+async def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, iters, *, torch_fns):
     """All-or-nothing CUDA-graph-captured interleaved bench.
 
     Captures every torch closure (``_capture_torch_fns``) and runs the
@@ -1323,7 +1632,7 @@ def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, 
     ``(results, bench, captured)``."""
     captured_fns = _capture_torch_fns(torch_fns)
     if captured_fns is not None:
-        results, bench = _bench_interleaved(
+        results, bench = await _bench_interleaved(
             module, args, kwargs, backend, lowered, warmup, iters, torch_fns=captured_fns, capture_graphs=True
         )
         if bench.captured:
@@ -1332,18 +1641,20 @@ def _bench_interleaved_captured(module, args, kwargs, backend, lowered, warmup, 
             return results, bench, False  # deplodock-only: nothing to de-mix
         # benchmark_program already logged the capture failure; re-run only to de-mix the table.
         logger.warning("deplodock side fell back to uncaptured timing — re-benching all backends uncaptured")
-    results, bench = _bench_interleaved(module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False)
+    results, bench = await _bench_interleaved(
+        module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
+    )
     return results, bench, False
 
 
-def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns, capture_graphs=False):
+async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, iters, *, torch_fns, capture_graphs=False):
     """Time the selected backends by alternating one iter of each per
     loop step. All backends see the same warm GPU state across the
     measurement window — same clocks, same caches, same thermal drift
     — instead of running in sequential phases that each get a
     different steady state.
 
-    Driven by ``backend.benchmark(on_iter=...)``: deplodock is the
+    Driven by ``backend.benchmark_async(on_iter=...)``: deplodock is the
     backbone, ``on_iter`` runs each torch closure and records its
     cuda events, and the same call returns per-launch deplodock
     timings — so the kernel-stats breakdown shares the same warm
@@ -1383,7 +1694,7 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
                 stop.record()
             torch_events[name].append((start, stop, batch_size))
 
-    bench = backend.benchmark(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
+    bench = await backend.benchmark_async(compiled_graph, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=capture_graphs)
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}
@@ -1397,7 +1708,13 @@ def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warmup, it
             # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
             results[name] = min(per_iter_us)
-    results["Deplodock"] = (bench.min_ms if bench.min_ms is not None else bench.time_ms) * 1000
+    # Whole-program (e2e) time when available — windows around replays of one
+    # all-launches CUDA graph, the same semantics the captured torch closures
+    # above get. The fallback sums per-launch solo windows, which is not an
+    # end-to-end number (no cross-kernel cache effects) — see finding 6 of
+    # plans/qwen3-embedding-layer0-tune-findings.md.
+    dep_ms = bench.e2e_min_ms if bench.e2e_min_ms is not None else (bench.min_ms if bench.min_ms is not None else bench.time_ms)
+    results["Deplodock"] = dep_ms * 1000
     return results, bench
 
 

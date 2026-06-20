@@ -316,6 +316,9 @@ class CompilerDump:
             "max_ms": result.max_ms,
             "num_launches": result.num_launches,
         }
+        if result.e2e_ms is not None:
+            data["e2e_ms"] = result.e2e_ms
+            data["e2e_min_ms"] = result.e2e_min_ms
         if result.per_launch:
             data["per_launch"] = [{"idx": lt.idx, "kernel_name": lt.kernel_name, "time_ms": lt.time_ms} for lt in result.per_launch]
         self._write_json("60_benchmark.json", data)

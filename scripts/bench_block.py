@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -229,7 +230,7 @@ def _make_compiled_fn(block, x, pos_emb, warmup):
 def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
     """Trace + compile the block, bind inputs / constants, run once for
     correctness vs eager. Returns ``(backend, compiled_graph)`` ready
-    for ``backend.benchmark(...)`` — or ``None`` on any failure (a
+    for ``backend.benchmark_async(...)`` — or ``None`` on any failure (a
     warning is logged)."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.trace.torch import trace_module
@@ -325,7 +326,7 @@ def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
 
 def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
     """Single interleaved measurement loop. Deplodock's
-    ``backend.benchmark(on_iter=...)`` drives the iteration; the
+    ``backend.benchmark_async(on_iter=...)`` drives the iteration; the
     ``on_iter`` callback runs each torch closure and records its
     cuda events. Per-launch timings come back from the same loop —
     no second non-interleaved pass needed."""
@@ -351,7 +352,8 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
 
     # capture_graphs=False: this script's torch closures run uncaptured, so the
     # deplodock side must too — one loop, one timing semantics (wall, incl. dispatch).
-    bench = backend.benchmark(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=False)
+    # ``benchmark_async`` is the only bench entry now; this sync script bridges via asyncio.run.
+    bench = asyncio.run(backend.benchmark_async(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=False))
     torch.cuda.synchronize()
 
     results: dict[str, float] = {}

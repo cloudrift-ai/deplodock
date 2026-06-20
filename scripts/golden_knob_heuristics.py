@@ -65,20 +65,38 @@ _REDUCE_KEYS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR", "FK")
 _POINTWISE_KEYS = ("BN", "BM", "FM", "FN", "SPLITK")
 
 
-def _base(ctx: Context, M: int, N: int, K: int) -> dict:
+def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dict:
     """The shape / regime features the planner stamps and the prior featurizes —
     merged into each candidate row before ``knob_features`` so the occupancy terms
-    (``#CTAs``, waves) and tier-aware BK targets fire."""
-    return {**ctx.features(), "S_ext_free_prod": float(M * N), "S_ext_reduce_prod": float(K), "S_ext_reduce_max": float(K)}
+    (``#CTAs``, waves) and tier-aware BK targets fire. A dynamic (symbolic-M)
+    golden mirrors the 992 stamp: the symbolic axis is EXCLUDED from the free-dim
+    product and counted in ``S_ext_n_symbolic_axis`` — the same features the
+    deployed featurization computes, and the flag the ``AnalyticPrior`` selects
+    its dynamic weight set on."""
+    free = float(N) if dynamic else float(M * N)
+    base = {**ctx.features(), "S_ext_free_prod": free, "S_ext_reduce_prod": float(K), "S_ext_reduce_max": float(K)}
+    if dynamic:
+        base["S_ext_n_symbolic_axis"] = 1.0
+    return base
 
 
-def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]]]]:
+def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
     """Reconstruct each matmul golden's candidate enumeration (both tiers), pin the
     golden's index, and featurize every row. Returns ``(name, tier, golden_idx,
     feats)`` where ``tier`` is ``"thread"``/``"warp"`` and ``feats`` is the per-row
-    ``D_*`` (+ ``MMA_tier``) feature dict."""
+    ``D_*`` (+ ``MMA_tier``) feature dict.
+
+    Each golden is reconstructed under its OWN card's context
+    (``Context.from_target(cap, gpu_name=…)``, mirroring ``Sample.from_golden``):
+    the multi-GPU golden set spans cards that differ in compute capability AND in
+    SM count at the same cap (RTX 5090 = 170 vs RTX PRO 6000 = 188 vs RTX 4090 =
+    128 SMs, the latter at sm_89), so both the candidate enumeration (cp.async /
+    TMA tiers gate on cap) and the ``H_*`` / ``D_*`` occupancy features must use the
+    recording card's regime — not one global cap — for the rank objective to match
+    the deployed per-card featurization."""
     cases = []
     for g in GOLDEN_CONFIGS:
+        ctx = Context.from_target(tuple(g.compute_cap), gpu_name=g.gpu_name)
         if isinstance(g, ReduceGoldenConfig):
             # The reduce's free axis (the ``M`` rows) maps to the planner's N axis
             # (the tuned ``FN`` register tile sweeps it), so enumerate E_M=1, E_N=M.
@@ -90,9 +108,9 @@ def build_cases(ctx: Context) -> list[tuple[str, str, int, list[dict[str, float]
             rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=1, ctx=ctx, priority_mode="pointwise", m_axis_name="m", n_axis_name="n")
             keys, tier = _POINTWISE_KEYS, "pointwise"
         elif isinstance(g, MatmulGoldenConfig) and g.dtype == "fp32":
-            base = _base(ctx, g.M, g.N, g.K)
+            base = _base(ctx, g.M, g.N, g.K, dynamic=bool(g.dynamic))
             rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, priority_mode="matmul", m_axis_name="m", n_axis_name="n")
-            keys, tier = _THREAD_KEYS, "thread"
+            keys, tier = _THREAD_KEYS, ("dyn" if g.dynamic else "thread")
         elif isinstance(g, MatmulGoldenConfig):
             base = _base(ctx, g.M, g.N, g.K)
             atom = ATOM_REGISTRY.get(g.knobs.get("MMA", ""))
@@ -159,43 +177,29 @@ def objective(ranks: list[int], weights: list[float]) -> float:
     return float(sum(vals) / sum(weights))
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--samples", type=int, default=20000, help="random weight vectors to try")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--cap", type=int, default=12, help="compute capability major (12 == sm_120 / RTX 5090)")
-    args = ap.parse_args()
-
-    rng = np.random.default_rng(args.seed)
-    ctx = Context.from_target((args.cap, 0))
-
-    print(f"Building golden dataset (sm_{args.cap}0) ...")
-    cases = build_cases(ctx)
-    names = sorted({k for _, _, _, feats in cases for f in feats for k in f})
+def _fit(cases, names, sd_ref, *, seed_w, rng, samples):
+    """Random-search + coordinate-descent one weight vector over ``cases``.
+    Each fit z-scores over its own candidate pool; ``seed_w`` arrives scaled by
+    ``sd_ref`` (``ones`` for a raw-weight seed, the previous fit's ``sd`` to
+    chain fits) and is re-scaled into this pool's z-space. Returns
+    ``(best_w, best_ranks, mu, sd)`` in this pool's z-space."""
     mats = [_matrix(feats, names) for _, _, _, feats in cases]
     gidx = [gi for _, _, gi, _ in cases]
-    # Tier-balanced case weights: each tier contributes equally to the objective.
     tier_n = {t: sum(1 for _, ct, _, _ in cases if ct == t) for _, t, _, _ in cases}
     cw = [1.0 / tier_n[t] for _, t, _, _ in cases]
-    print(f"  {len(cases)} matmul golden cases, {sum(len(m) for m in mats):,} candidates, {len(names)} D_* features")
 
-    # Global z-score so weights are comparable across features.
+    # Z-score over this fit's candidate pool so weights are comparable across features.
     allf = np.concatenate(mats, axis=0)
     mu, sd = allf.mean(0), allf.std(0)
     sd[sd == 0] = 1.0
     matsz = [(m - mu) / sd for m in mats]
 
-    # Seed: the current _W_A (z-scored back) so the search starts from today's
-    # weights and can only improve on the live ranking.
-    from deplodock.compiler.pipeline.search.prior.analytic import _W_A  # noqa: PLC0415
-
-    seed_w = np.array([_W_A.get(n, 0.0) * sd[i] for i, n in enumerate(names)])
-    best_w = seed_w
+    best_w = seed_w * sd / sd_ref  # re-scale the seed into this pool's z-space
     best_ranks = eval_weights(matsz, gidx, best_w)
     best_obj = objective(best_ranks, cw)
-    print("\n== seed: current _W_A ==\n  " + topk_table(best_ranks))
+    print("  seed: " + topk_table(best_ranks))
 
-    for _ in range(args.samples):
+    for _ in range(samples):
         w = rng.standard_normal(len(names))
         ranks = eval_weights(matsz, gidx, w)
         ob = objective(ranks, cw)
@@ -217,18 +221,54 @@ def main() -> None:
         if not improved:
             step /= 2
 
-    print("\n== best linear model ==\n  " + topk_table(best_ranks))
+    print("  best: " + topk_table(best_ranks))
     for (name, tier, _, _), r in sorted(zip(cases, best_ranks, strict=True), key=lambda t: -t[1]):
-        print(f"    {name:24s} [{tier:6s}] rank={r:5d}")
+        print(f"    {name:32s} [{tier:6s}] rank={r:5d}")
+    return best_w, best_ranks, mu, sd
 
+
+def _print_weights(var: str, names, best_w, sd) -> None:
     # Fold the z-score into the weights so they apply to RAW features directly:
     # score = ((raw-mu)/sd)·w = raw·(w/sd) - const; the const drops out of ranking.
     raw_w = {name: float(best_w[i] / sd[i]) for i, name in enumerate(names) if abs(best_w[i] / sd[i]) > 1e-4}
-    print("\n== _W_A (paste into search/prior/analytic.py) ==")
-    print("_W_A: dict[str, float] = {")
+    print(f"\n== {var} (paste into search/prior/analytic.py) ==")
+    print(f"{var}: dict[str, float] = {{")
     for name, wv in sorted(raw_w.items(), key=lambda t: -abs(t[1])):
         print(f"    {name!r}: {wv},")
     print("}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--samples", type=int, default=20000, help="random weight vectors to try")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    rng = np.random.default_rng(args.seed)
+
+    print("Building golden dataset (each golden under its own card's context) ...")
+    cases = build_cases()
+    names = sorted({k for _, _, _, feats in cases for f in feats for k in f})
+    static_cases = [c for c in cases if c[1] != "dyn"]
+    dyn_cases = [c for c in cases if c[1] == "dyn"]
+    print(f"  {len(static_cases)} static + {len(dyn_cases)} dynamic golden cases, {len(names)} D_* features")
+
+    # Seed: the current _W_A so each search starts from today's weights and can
+    # only improve on the live ranking (the dyn fit seeds from the STATIC result
+    # — the masked tier shares most of the geometry priors and diverges where the
+    # boundary guard / occupancy differences demand).
+    from deplodock.compiler.pipeline.search.prior.analytic import _W_A  # noqa: PLC0415
+
+    seed_raw = np.array([_W_A.get(n, 0.0) for n in names])
+
+    print("\n== static fit (thread / warp / reduce / pointwise tiers) ==")
+    static_w, _, _, static_sd = _fit(static_cases, names, np.ones(len(names)), seed_w=seed_raw, rng=rng, samples=args.samples)
+    _print_weights("_W_A", names, static_w, static_sd)
+
+    if dyn_cases:
+        print("\n== dynamic fit (symbolic-axis masked-tile goldens) ==")
+        dyn_w, _, _, dyn_sd = _fit(dyn_cases, names, static_sd, seed_w=static_w, rng=rng, samples=args.samples)
+        _print_weights("_W_A_DYN", names, dyn_w, dyn_sd)
 
 
 if __name__ == "__main__":

@@ -15,16 +15,26 @@ from __future__ import annotations
 import math
 import statistics
 
-from deplodock.compiler.pipeline.search.data import Dataset
+from deplodock.compiler.pipeline.search.data import Dataset, ShapeKey
 
 
 def _n_tunable(knobs: dict) -> int:
     return sum(1 for k in knobs if not k.startswith(("S_", "H_")))
 
 
+def _matmul_sig(d: dict) -> bool:
+    """Histogram heuristic for "this op group is a matmul": a product feeding a
+    reduce-add over ≥2 distinct inputs. ``S_n_mma`` is NOT usable as the marker:
+    the stamp pass runs at fusion end, before the tile tier emits ``Mma`` stmts,
+    so it is 0.0 on every stamped row — gating on it made golden coverage
+    permanently empty and dropped every fp16 golden from the rank/deploy joins
+    (see ``ShapeKey.from_s_features``)."""
+    return bool(d.get("S_reduce_add", 0) and d.get("S_pw_multiply", 0) and d.get("S_n_distinct_input", 0) >= 2)
+
+
 def _op_label(sig: tuple) -> str:
     d = dict(sig)
-    if d.get("S_n_mma", 0) > 0:
+    if _matmul_sig(d):
         kind = "matmul"
     elif d.get("S_reduce_add", 0) or d.get("S_reduce_max", 0):
         kind = "reduce"
@@ -71,18 +81,22 @@ def _calibration(prior, groups: dict) -> float | None:
 
 
 def _golden_coverage(groups: dict) -> tuple[int, int]:
-    """How many golden matmul shapes have measured data in the dataset (matched by
-    the op's free-dim product + reduce extent from its ``S_*`` features)."""
+    """How many golden matmul **shapes** have measured data in the dataset, matched by
+    :class:`ShapeKey` (free-dim product, reduce extent, dtype flag — so an fp32
+    square and its ``.fp16`` twin are counted separately). Counts *distinct shape
+    keys*, not per-config rows, so multiple knob sets for one shape — and the same
+    shape recurring across per-GPU golden files (``ShapeKey`` is GPU-blind) — count
+    once."""
     from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     have = set()
     for sig in groups:
         d = dict(sig)
-        if d.get("S_n_mma", 0) > 0:
-            have.add((int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0))))
-    matmuls = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
-    covered = sum(1 for g in matmuls if (g.M * g.N, g.K) in have)
-    return covered, len(matmuls)
+        if _matmul_sig(d):
+            have.add(ShapeKey.from_s_features(d))
+    golden_keys = {g.shape_key() for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}
+    covered = sum(1 for k in golden_keys if k in have)
+    return covered, len(golden_keys)
 
 
 def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
@@ -94,29 +108,46 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     come from the dataset's matching op group (so only shapes with tuned data are
     scored); ``H_*`` is the deployable compile regime (``Context.features``,
     ``H_opt=3``) the greedy ``compile`` / ``run`` actually queries with.
-    ``kernel_filter`` restricts to golden configs whose name contains it."""
+    ``kernel_filter`` restricts to golden configs whose name contains it.
+
+    The rank is a **model diagnostic, not a deploy prediction**: the enumeration
+    rows carry only the planner's tunables, while the rows the model trained on
+    (and the leaves greedy scores late in the descent) also carry decision /
+    transport stamps (``TMA``, ``PIPELINE_STAGES``, …) — absent keys are NaN
+    ("not decided") to CatBoost, so the two surfaces can disagree (the 2026-06-12
+    sweep's finding 6). Deploy reality is ``Prior.pick`` (measured -O3 evidence
+    first); the faithful deploy check is ``eval golden``'s real greedy compile."""
     from deplodock.compiler.context import Context  # noqa: PLC0415
     from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-    # Index op groups by (free-dim product, reduce extent, is-matmul) so each
-    # golden shape maps to the S_* signature it was tuned under.
-    index: dict[tuple, dict] = {}
+    GOLDEN_CONFIGS = goldens_for_live_gpu()  # live card only — see golden_deploy_perf
+
+    # Index the matmul op groups by ShapeKey (free-dim product, reduce extent,
+    # dtype flag — both sides built by the ShapeKey constructors, so the fp32/fp16
+    # twins never merge) so each golden shape maps to the S_* signature it was
+    # tuned under.
+    index: dict[ShapeKey, dict] = {}
     for sig in Dataset.from_prior(prior).group_by_op():
         d = dict(sig)
-        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_n_mma", 0) > 0)
-        index.setdefault(key, {k: v for k, v in d.items() if k.startswith("S_")})
+        if not _matmul_sig(d):
+            continue
+        index.setdefault(ShapeKey.from_s_features(d), {k: v for k, v in d.items() if k.startswith("S_")})
 
     thread = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
     warp = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
-    rows, lines = [], ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
+    rows, skipped = [], []
+    lines = ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
     for g in GOLDEN_CONFIGS:
         if not isinstance(g, MatmulGoldenConfig):
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        s_feats = index.get((g.M * g.N, g.K, g.dtype != "fp32"))
+        s_feats = index.get(g.shape_key())
         if s_feats is None:
+            # A silent skip here hid the fp16 lockout in the 2026-06-12 sweep —
+            # every unjoinable shape gets a per-shape line instead.
+            skipped.append((g.name, "no tuned rows for this shape in the prior dataset"))
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
         gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
@@ -125,16 +156,20 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
         _, rank, pool = analytic.evaluate_golden(
             g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), scorer=lambda r, b=base: -prior.mean_score({**b, **r})
         )
-        if rank is not None:
-            rows.append((g.name, rank, pool))
+        if rank is None:
+            skipped.append((g.name, f"recorded knobs not in the enumeration ({pool} rows) — pin/dtype mismatch?"))
+            continue
+        rows.append((g.name, rank, pool))
     for name, rank, pool in sorted(rows, key=lambda t: -t[1]):
         lines.append(f"    {name:26}  rank {rank:5}/{pool}")
+    for name, why in skipped:
+        lines.append(f"    {name:26}  SKIPPED: {why}")
     if rows:
         ranks = [r for _, r, _ in rows]
         n = len(ranks)
         cov = "  ".join(f"top{k}={sum(r < k for r in ranks)}/{n}" for k in (1, 10, 25, 50))
         lines.append(f"  median rank={sorted(ranks)[n // 2]}  {cov}  (over {n} golden shapes with tuned data)")
-    else:
+    elif not skipped:
         lines.append("  no golden shapes have tuned data in the dataset yet")
     return "\n".join(lines)
 
@@ -146,28 +181,35 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
 
     Tuning re-benches every winner at -O3 (``H_opt=3``) and feeds it to the prior, so
     each tuned shape's best config has a deployable row in the reservoir. For each
-    golden shape we take the op group's ``H_opt=3`` rows, pick the one the prior ranks
-    fastest (``mean_score`` argmin), and divide its measured latency by the golden's
+    golden shape we take the op group's ``H_opt=3`` rows, pick the one ``Prior.pick``
+    deploys (measured -O3 evidence first, model argmin otherwise — the same selection
+    greedy ``compile`` / ``run`` make), and divide its measured latency by the golden's
     recorded ``deplodock_us`` (also -O3 → same regime, so the ratio is a real
     deployable speed comparison; <1.0 = the prior's pick is faster than golden). Shapes
     with no -O3 reservoir row are omitted (the caller renders ``—``). The reservoir is
     used rather than the raw ``perf`` table because only it carries the ``H_*`` regime
-    columns needed to isolate the deployable measurements."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    columns needed to isolate the deployable measurements.
 
-    # Deployable (-O3) measured rows per op group, indexed by the shape signature
-    # (free-dim product, reduce extent, is-fp32). The dtype flag must use the
-    # ``S_dtype_f32`` feature, not ``S_n_mma``: an fp32 square and its ``.fp16`` twin
-    # share (free_prod, reduce) and the fp16 row may not carry an mma marker, so keying
-    # on mma would merge them and steal the fp16 latency for the fp32 row.
-    index: dict[tuple, list] = {}
+    Goldens are scoped to the live card (:func:`goldens_for_live_gpu`) so a multi-GPU
+    goldens dir doesn't make a name's per-card entries collide on the GPU-blind
+    ``ShapeKey`` (e.g. RTX 5090 / RTX PRO 6000 both ``(12, 0)``)."""
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+
+    GOLDEN_CONFIGS = goldens_for_live_gpu()
+
+    # Deployable (-O3) measured rows per matmul op group, indexed by ShapeKey.
+    # An fp32 square and its ``.fp16`` twin share (free_prod, reduce), so the key's
+    # dtype flag is what keeps them apart — ``ShapeKey.from_s_features`` derives it
+    # from ``S_dtype_f32`` (see its docstring for why ``S_n_mma`` can't be the key).
+    index: dict[ShapeKey, list] = {}
     for sig, samples in Dataset.from_prior(prior).group_by_op().items():
+        d = dict(sig)
+        if not _matmul_sig(d):
+            continue
         o3 = [s for s in samples if int(s.all_knobs().get("H_opt", 0)) == 3]
         if not o3:
             continue
-        d = dict(sig)
-        key = (int(d.get("S_ext_free_prod", 0)), int(d.get("S_ext_reduce_max", 0)), d.get("S_dtype_f32", 0) > 0)
-        index.setdefault(key, []).extend(o3)
+        index.setdefault(ShapeKey.from_s_features(d), []).extend(o3)
 
     out: dict[str, float] = {}
     for g in GOLDEN_CONFIGS:
@@ -175,11 +217,11 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
-        leaves = index.get((g.M * g.N, g.K, g.dtype == "fp32"))
+        leaves = index.get(g.shape_key())
         if not leaves:
             continue
-        pick = min(leaves, key=lambda s: prior.mean_score(s.all_knobs()))
-        out[g.name] = pick.latency_us / g.deplodock_us
+        best_i, _ = prior.pick([s.all_knobs() for s in leaves])
+        out[g.name] = leaves[best_i].latency_us / g.deplodock_us
     return out
 
 

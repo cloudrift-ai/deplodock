@@ -39,6 +39,19 @@ def test_seed_stamps_compute_skips_boundary():
     assert prov.get(g.nodes[b]) == {}
 
 
+def test_put_skips_boundary_and_clears_stale_prov():
+    """Boundary sentinels never carry prov: ``put`` onto one is a no-op, and it
+    clears a stale hint (e.g. prov copied by ``Graph.splice``'s generic hint
+    merge when a fold collapses a compute op into a constant)."""
+    g, a, _, _, _ = _graph()
+    prov.put(g.nodes[a], {"o": {"kind": "LinearOp", "pieces": ["p"]}})
+    assert prov.get(g.nodes[a]) == {}
+    # A stale hint planted behind put's back is scrubbed by the next put.
+    g.nodes[a].hints.set(prov.PROV, {"o": {"kind": "LinearOp", "pieces": ["p"]}})
+    prov.put(g.nodes[a], {"o": {"kind": "LinearOp", "pieces": ["q"]}})
+    assert prov.get(g.nodes[a]) == {}
+
+
 def test_seed_idempotent():
     g, _, _, ew, _ = _graph()
     prov.seed(g)
@@ -145,6 +158,46 @@ def test_fusion_aggregates_origins():
     assert set(merged) == {ew, c}
     assert merged[ew]["kind"] == "ElementwiseOp"
     assert merged[c]["kind"] == "ReduceOp"
+
+
+def test_constant_fold_strands_no_prov_on_boundary():
+    """``050_fold_into_constant`` (sm_90+ TMA path) collapses the weight
+    transpose minted by the Linear decomposition into a parameter ConstantOp.
+    The splice's generic hint merge used to copy the transpose's prov onto that
+    constant, inflating ``totals`` so the matmul kernel read partial coverage
+    (the spurious ``k_linear_reduce`` instead of ``k_linear``). No boundary node
+    may carry prov, and ``totals`` must equal the union over compute nodes."""
+    from deplodock.compiler import target as target_mod
+    from deplodock.compiler.ir.base import ConstantOp
+    from deplodock.compiler.ir.frontend.ir import LinearOp
+    from deplodock.compiler.pipeline import Pipeline
+
+    g = Graph()
+    x = g.add_node(InputOp(), [], Tensor("x", (8, 16)))
+    w = g.add_node(
+        ConstantOp(name="w", source_path="linear.weight", source_shape=(16, 16), source_dtype="float32"),
+        [],
+        Tensor("w", (16, 16)),
+    )
+    g.inputs = [x]
+    lin = g.add_node(LinearOp(), [x, w], Tensor("linear_0", (8, 16)))
+    g.outputs = [lin]
+
+    target_mod.set_target((9, 0))
+    try:
+        out = Pipeline.build(["frontend/decomposition"]).run(g)
+    finally:
+        target_mod.set_target(None)
+
+    folded = [n for n in out.nodes.values() if isinstance(n.op, ConstantOp) and n.op.load_ops]
+    assert folded, "the weight transpose should have been folded into the ConstantOp"
+    for node in out.nodes.values():
+        if prov.is_boundary(node.op):
+            assert prov.get(node) == {}, f"boundary node carries prov: {prov.get(node)}"
+    compute_pieces: set[str] = set()
+    for node in out.nodes.values():
+        compute_pieces.update(prov.get(node).get("linear_0", {}).get("pieces", []))
+    assert prov.totals(out)["linear_0"] == compute_pieces
 
 
 def test_rms_norm_fully_covered_after_full_pipeline():

@@ -7,7 +7,11 @@ groups rules, ``Pipeline`` is the frozen pass layout + matcher, ``Run``
 owns ONE drive of that layout (ctx / search / db / backend / dump /
 rejections + the engine loop), ``Cursor`` tracks per-candidate resume
 state inside a Run, and ``Match`` carries ``Rule`` (which backref-resolves
-to ``Pass``).
+to ``Pass``). ``Run`` exposes two entry points over one shared rule-batch
+body (``Run._step``): ``drive`` (exploration — a ``Search`` policy ranks
+the fork frontier) and ``resolve`` (deterministic resolution — a
+``decide`` callback picks at each ``ForkPoint`` and the fold returns the
+terminal graph plus a ``Decision`` trace).
 
 ``Pipeline`` also owns the compile entry points — :meth:`build`,
 :meth:`run`, :meth:`tune` (each constructs a :class:`Run` and drives it).
@@ -29,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
 from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
@@ -41,9 +46,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("deplodock.compiler.pipeline")
 
-# Greedy compile validity-fallback cap: how many times ``Pipeline.run`` re-drives
-# blocklisting a tile that failed ``validate(ctx)``. Each retry blocks ≥1 fresh
-# tile or stops, so this only bounds pathological cases (every sibling unviable).
+# Greedy compile validity-fallback cap: how many times ``Pipeline.run``
+# re-resolves blocklisting a tile that failed ``validate(ctx)``. Each retry
+# blocks ≥1 fresh tile or stops, so this only bounds pathological cases (every
+# sibling unviable).
 _MAX_GREEDY_RETRIES = 8
 
 
@@ -452,59 +458,130 @@ class Pipeline:
         db: SearchDB | None = None,
         dump: CompilerDump | None = None,
     ) -> Graph:
-        """Single-shot greedy compile — run each pass in order, picking
-        the DB-best (or, untuned, the max-prior) fork at every fork
-        point. Convenience wrapper around :meth:`tune` that yields the
-        first terminal.
+        """Single-shot greedy compile — a deterministic resolution
+        (:meth:`Run.resolve`) with the greedy pick
+        (:func:`~deplodock.compiler.pipeline.search.policy.greedy.greedy_decide`):
+        at every fork point, flatten to complete leaves and take the
+        ``Prior``'s ``mean_scores`` argmin. Not a search — no frontier,
+        no tree, no benching (it can only *use* a prior trained earlier
+        by ``tune``, never train one); exploration (PUCT) stays in
+        :meth:`tune`. The input ``graph`` is copied once per attempt and
+        resolved in place — no per-fork graph copies.
 
         ``ctx`` is built once (probing the live device if not provided)
         and passed to every rule that takes a ``ctx`` parameter.
 
         ``backend`` (typically :class:`CudaBackend`) opts the run into
-        real GPU measurement: every terminal graph's per-kernel latency
-        is recorded to ``db`` and attributed to every ancestor along
-        the ``Op.source`` chain. ``db`` defaults to a fresh in-memory
-        store; pass an explicit :class:`SearchDB` to persist
-        measurements across runs.
+        real GPU measurement: the terminal graph's per-kernel latency is
+        recorded to ``db`` (via :func:`_bench_terminal`, once after the
+        resolution settles) and attributed to every ancestor along the
+        ``Op.source`` chain. ``db`` defaults to a fresh in-memory store;
+        pass an explicit :class:`SearchDB` to persist measurements
+        across runs.
 
-        For exhaustive autotuning, call :meth:`tune` directly with
-        :class:`TuningSearch` and iterate every yielded candidate.
+        Retries are ``decide`` wrappers over a deterministic re-resolve
+        — cheap non-chronological backtracking with no graph snapshots
+        or undo log, since every other choice replays identically:
+
+        * **Validity fallback** — the prior ranks by predicted latency
+          and can rank a tile that fails ``validate(ctx)`` (smem /
+          thread budget) first; ``tune`` benches-and-skips it, but
+          greedy benches nothing, so on a left-un-lowered node we
+          blocklist its tile and re-resolve, falling back to the next
+          prior-ranked leaf. Bounded retries (each adds ≥1 block or
+          stops).
+        * **Structural retirement** — a resolution that took a
+          *structural* pick (a prior-priced kernel-set change; the trace
+          contains a ``Graph`` decision) gets one coarser fallback
+          first: any lowering failure retires structural picks wholesale
+          (``price_structural=False``) and re-resolves down the
+          keep-fused branch, since a fragment kernel's failure can't be
+          blocklisted at the fork site (the splice minted fresh node
+          ids).
 
         Installs a per-run ``rejections`` sink (on the :class:`Run`) so
         :func:`Candidate.try_rewrite` records any rewrite whose every
-        option failed ``validate(ctx)``. After the single terminal
-        settles, :func:`_raise_on_unlowered` turns a recorded rejection
-        that left its node un-lowered into a loud :class:`LoweringError`
-        instead of a downstream ``CudaBackend`` mystery."""
-        from deplodock.compiler.pipeline.search.policy import GreedySearch  # noqa: PLC0415
+        option failed ``validate(ctx)``. After the resolution settles,
+        :func:`_raise_on_unlowered` turns a recorded rejection that left
+        its node un-lowered into a loud :class:`LoweringError` instead
+        of a downstream ``CudaBackend`` mystery."""
+        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.policy.greedy import greedy_decide  # noqa: PLC0415
 
-        # Single-shot compile uses the O(1)-per-step ``GreedySearch`` driver, NOT
-        # the MCTS tree: ``TuningSearch.pop`` re-descends from the root each call,
-        # so a whole-model compile through it would be O(N²) and hang. Greedy picks
-        # each fork by the prior's ``mean_score`` argmin (no benching — it can only
-        # use a prior, never train one). Exploration (PUCT) stays in ``tune``.
-        #
-        # Validity fallback: the prior ranks by predicted latency and can rank a
-        # tile that fails ``validate(ctx)`` (smem / thread budget) first — ``tune``
-        # benches-and-skips it, but greedy benches nothing, so on a left-un-lowered
-        # node we blocklist its tile and re-drive, falling back to the next
-        # prior-ranked sibling. Bounded retries (each adds ≥1 block or stops).
+        if ctx is None:
+            ctx = _Context.probe()
+        backend_name = getattr(backend, "name", "cuda")
+        if ctx.backend_name != backend_name:
+            ctx = replace(ctx, backend_name=backend_name)
+        db = db if db is not None else _SearchDB()
+        t_start = time.monotonic()
+
         blocked: dict[str, set[frozenset]] = {}
+        allow_structural = True
         for _attempt in range(_MAX_GREEDY_RETRIES):
             rejections: list[tuple[str, str, str]] = []
-            cand = next(
-                self.tune(graph, search=GreedySearch(blocked=blocked), ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
-            )
-            failed = _unlowered_tiles(cand.graph, rejections)
+            run = Run(pipeline=self, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
+            decide = greedy_decide(blocked=blocked, price_structural=allow_structural)
+            terminal, trace = run.resolve(graph.copy(), decide)
+            failed = _unlowered_tiles(terminal, rejections)
+            if not failed:
+                break
+            if allow_structural and any(d.chosen_kind == "graph" for d in trace):
+                allow_structural = False
+                continue
             new = {nid: ident for nid, ident in failed.items() if ident not in blocked.get(nid, set())}
-            if not new:  # success, or no fresh info to retry on → report below
+            if not new:  # no fresh info to retry on → report below
                 break
             for nid, ident in new.items():
                 blocked.setdefault(nid, set()).add(ident)
-        _raise_on_unlowered(cand.graph, rejections, cand.ctx)
-        return cand.graph
+        # The prior-ranked tiles all overflowed ``validate(ctx)`` within the
+        # retry budget — a *learned* prior can extrapolate a large tile onto a
+        # small shape (e.g. one trained on big square matmuls picking an
+        # over-smem-cap tile for a tiny projection), and the blocklist retry
+        # exhausts before reaching an in-budget leaf. Before giving up, take the
+        # conservative emission-order pick (``greedy_decide(prior=None)`` =
+        # option-0): it ignores the prior, and the planner emits a budget-safe
+        # tile first, so it lowers whenever any in-budget tile exists. When even
+        # option-0 overflows (the over-budget rule genuinely has no in-budget
+        # option — e.g. the single-option guardrail) the re-resolve stays
+        # un-lowered and ``_raise_on_unlowered`` fires below, exactly as before.
+        if _unlowered_tiles(terminal, rejections):
+            rejections = []
+            run = Run(pipeline=self, ctx=ctx, db=db, backend=backend, dump=dump, rejections=rejections)
+            terminal, _ = run.resolve(graph.copy(), greedy_decide(prior=None, price_structural=False))
+        _raise_on_unlowered(terminal, rejections, ctx)
+        logger.info("compile: total %.2fs (deterministic resolve)", time.monotonic() - t_start)
+        return terminal
 
-    def tune(
+    def _new_run(self, graph: Graph, *, search, ctx, backend, db, dump, rejections) -> Run:
+        """Build the :class:`Run` shared by :meth:`tune_async` (and the deterministic
+        :meth:`run`):
+        seed provenance, probe / align ``ctx``, and wire the run-scoped sinks."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
+        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+
+        # Seed op provenance on the input graph before any pass runs — the one
+        # universal entry both ``run`` and ``tune`` funnel through. Idempotent,
+        # so a graph reloaded mid-pipeline keeps whatever prov it carried.
+        provenance.seed(graph)
+        if ctx is None:
+            ctx = _Context.probe()
+        backend_name = getattr(backend, "name", "cuda")
+        if ctx.backend_name != backend_name:
+            ctx = replace(ctx, backend_name=backend_name)
+        return Run(
+            pipeline=self,
+            ctx=ctx,
+            search=search,
+            db=db if db is not None else _SearchDB(),
+            backend=backend,
+            dump=dump,
+            rejections=rejections,
+        )
+
+    async def tune_async(
         self,
         graph: Graph,
         *,
@@ -514,74 +591,90 @@ class Pipeline:
         db: SearchDB | None = None,
         dump: CompilerDump | None = None,
         rejections: list[tuple[str, str, str]] | None = None,
-    ) -> Iterator[Candidate]:
-        """Drive the autotune search. Yields one terminal ``Candidate``
-        per fully-explored branch. With deterministic rules (no
-        list-returning rewrites) the search yields exactly one — same
-        shape as :meth:`run`.
+    ):
+        """Async-generator mirror of :meth:`tune` for the multi-GPU tune driver.
 
-        ``search`` chooses both the order and the stopping condition:
-        :class:`GreedySearch` for single-shot compiles (stops at the
-        first terminal); :class:`TuningSearch` for ``deplodock tune`` (runs the
-        queue dry, exploring every fork).
-
-        When ``search`` exposes a ``tree: SearchTree``
-        (:class:`TuningSearch` does), each yielded terminal candidate
-        has its ``CudaOp`` nodes recorded to ``db`` and the tree via
-        :func:`record_terminal` before being yielded — so subsequent
-        candidates see the updated priority signal. Pass a ``Backend``
-        (typically :class:`CudaBackend`) via ``backend=`` to record
-        real GPU-event latencies; omit it to skip persistence entirely
-        (terminals yield a stub ``latency_us=1.0`` but nothing is
-        written to ``db``).
-
-        ``ctx`` is built once (probing the live device if not provided)
-        and shared by every candidate. ``dump`` / ``rejections`` are
-        run-scoped sinks — see :class:`Run`."""
-        from deplodock.compiler import provenance  # noqa: PLC0415
-        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
-
-        # Seed op provenance on the input graph before any pass runs — the one
-        # universal entry both ``run`` and ``tune`` funnel through. Idempotent,
-        # so a graph reloaded mid-pipeline keeps whatever prov it carried.
-        provenance.seed(graph)
-
-        if ctx is None:
-            ctx = _Context.probe()
-        backend_name = getattr(backend, "name", "cuda")
-        if ctx.backend_name != backend_name:
-            ctx = replace(ctx, backend_name=backend_name)
+        The lowering (``run.drive``) stays a synchronous generator — only the
+        per-terminal bench is awaited (:func:`_bench_terminal_async`), so N
+        kernels' benches overlap across device-pinned workers on one event loop
+        while the (light) Python lowering runs cooperatively between awaits."""
+        run = self._new_run(graph, search=search, ctx=ctx, backend=backend, db=db, dump=dump, rejections=rejections)
         t_start = time.monotonic()
-
-        run = Run(
-            pipeline=self,
-            ctx=ctx,
-            search=search,
-            db=db if db is not None else _SearchDB(),
-            backend=backend,
-            dump=dump,
-            rejections=rejections,
-        )
         n_terminals = 0
         for token, cand in run.drive(graph):
             n_terminals += 1
             if backend is not None:
                 logger.info("[tune] variant #%d  [%s]", n_terminals, variant_label(cand.graph))
-            stats, status = _bench_terminal(cand, backend=backend, db=run.db)
+            stats, status = await _bench_terminal_async(cand, backend=backend, db=run.db)
             search.observe(token, stats, status, candidate=cand)
-            # Re-bench at -O3 for a deployable prior sample any config the search
-            # flags as -O3-worthy — every config within the -O1 tolerance band of
-            # the best (see ``TuningSearch.observe`` / ``O3_REBENCH_TOL``), not
-            # just a strict new best, so configs that tie at -O1 but differ at -O3
-            # (the warp WARPSPEC / occupancy split) each get an -O3 truth sample.
-            # Best-effort + deduped, so the cost stays bounded.
             if backend is not None and getattr(search, "last_o3_worthy", False):
-                o3_us = _rebench_o3(cand, backend)
+                o3_us = await _rebench_o3_async(cand, backend)
                 if o3_us is not None:
                     search.observe_o3(token, o3_us)
             yield cand
-        logger.info("compile: total %.2fs (%d terminal(s))", time.monotonic() - t_start, n_terminals)
+        dropped = run._dropped_candidates
+        logger.info(
+            "compile: total %.2fs (%d terminal(s)%s)",
+            time.monotonic() - t_start,
+            n_terminals,
+            f", {dropped} un-lowerable candidate(s) dropped" if dropped else "",
+        )
+
+
+@dataclass
+class ForkPoint:
+    """What a :meth:`Run.resolve` ``decide`` callback sees at one
+    multi-option rewrite: the live :class:`Match`, the raw ``options``
+    list exactly as ``Candidate.try_rewrite`` returned it (concrete
+    ``Op``/``Graph`` leaves and lazy ``Fork``s — branch Forks included,
+    unexpanded), the pre-decision root op, and the run's ``ctx``. No
+    ``LazyCandidate`` wrapping: ``resolve`` holds one live graph and
+    applies the chosen option in place.
+
+    ``score`` is the decide callback's one output channel besides its
+    return value: a decide that ranks options with a prior stamps the
+    chosen option's predicted µs here, and ``resolve`` copies it onto the
+    fork's :class:`Decision` trace entry (where e.g. the structural
+    pricing probe reads a kernel's price off the partition fork)."""
+
+    match: Match
+    options: list
+    root_op: Op
+    ctx: Context
+    structural: bool
+    score: float | None = None
+
+    @property
+    def node_id(self) -> str:
+        """The graph node this fork is rewriting — the blocklist / trace key."""
+        return self.match.root_node_id
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One :meth:`Run.resolve` trace entry — what a deterministic
+    resolution decided at one fork point. The trace is the resolution's
+    only output channel besides the terminal graph: process facts
+    (structural picks taken, per-fork predicted cost) are trace queries,
+    never policy-object state.
+
+    * ``rule_name`` / ``node_id`` — where the fork was offered.
+    * ``chosen_kind`` — ``"graph"`` for a structural (``Graph``-splicing)
+      pick, ``"op"`` for an in-place rebind.
+    * ``knob_delta`` — the chosen option's knob identity: a ``Fork``'s
+      pinned row, an ``Op``'s own knobs, a ``Graph``'s decision-knob delta
+      vs the offer op (:func:`_option_decision`).
+    * ``score`` — the decide callback's predicted µs for the pick
+      (``None`` when the decide didn't rank, e.g. option-0 fallback).
+    * ``n_options`` — raw option count at the fork (a lazy fork tree
+      counts as one — its leaves are the decide callback's to expand)."""
+
+    rule_name: str
+    node_id: str
+    chosen_kind: str
+    knob_delta: dict
+    score: float | None
+    n_options: int
 
 
 @dataclass
@@ -594,7 +687,9 @@ class Run:
     * ``pipeline`` — the frozen pass layout being driven.
     * ``ctx`` — the resolved hardware context, shared by every candidate
       (reached as ``cand.ctx``).
-    * ``search`` — the policy (greedy / MCTS) ordering the exploration.
+    * ``search`` — the policy ordering an exploration (:meth:`drive`);
+      ``None`` for a deterministic resolution (:meth:`resolve`), which
+      has no frontier to rank.
     * ``db`` — the autotune store ``_bench_terminal`` persists into (the
       training data for the learned prior).
     * ``backend`` — optional measurement backend (``None`` = stub bench,
@@ -613,11 +708,119 @@ class Run:
 
     pipeline: Pipeline
     ctx: Context
-    search: Search
-    db: SearchDB
+    search: Search | None = None
+    db: SearchDB | None = None
     backend: object | None = None
     dump: CompilerDump | None = None
     rejections: list[tuple[str, str, str]] | None = None
+    # Count of search candidates dropped by :meth:`drive`'s per-variant
+    # containment (un-lowerable forks that raised during lowering). Tune-only;
+    # stays 0 on the deterministic greedy path.
+    _dropped_candidates: int = 0
+
+    def _step(self, cand: Candidate) -> tuple[Match, list, bool] | None:
+        """Run one rule batch against ``cand`` — the per-candidate engine
+        body shared by :meth:`drive` and :meth:`resolve`. Single-option
+        rewrites apply inline (via ``Candidate.try_rewrite``), empty /
+        quiescent batches advance the cursor, and a structural fork whose
+        offer site was already decided on this trajectory replays that
+        side inline (:func:`_replay_structural_decision`). Returns ``None``
+        when the batch completed with nothing left to decide, or
+        ``(match, options, structural)`` at the first undecided
+        multi-option fork — selection is the caller's job (``drive``
+        spawns ``LazyCandidate`` siblings for its search; ``resolve``
+        asks its ``decide`` callback)."""
+        cur = cand.cursor
+        pass_ = cur.current_pass
+        # Empty pass (e.g. all rules filtered out) OR no live matches →
+        # no apply fires → advance the cursor directly so the caller's
+        # loop doesn't re-run the same rule batch forever. ``advance``
+        # handles both cases uniformly: with ``n_applied == 0`` it wraps
+        # to the next pass and fires the post-pass log + dump.
+        if not pass_.rules:
+            cur.advance(cand.graph)
+            return None
+        matches = self.pipeline.match(cand.graph, cur.current_rule)
+        if not matches:
+            cur.advance(cand.graph)
+            return None
+        for match in matches:
+            options = cand.try_rewrite(match)
+            if options is None:
+                continue
+            # The fork is classified here, where the raw ``options`` list
+            # is concrete (no thunk fired): any ``Graph`` option makes the
+            # fork **structural** (kernel-set-changing); pure ``Op``
+            # rebinds (and the partition planner's branch Forks) are
+            # op-variant.
+            structural = any(_is_structural_option(o) for o in options)
+            # A structurally identical offer site already decided on this
+            # trajectory takes the same side inline (no fork), so the
+            # search tree stays linear in *unique* kernels instead of
+            # ``2^sites`` (e.g. one decision for 28 identical per-layer
+            # splits). The earlier decision is read off the candidate's
+            # own graph — see :func:`_replay_structural_decision` — so no
+            # side-table state is threaded through resolves.
+            if structural and (chosen := _replay_structural_decision(cand.graph, match.root.op, options)) is not None:
+                cand.apply(match, chosen)
+                continue
+            return match, options, structural
+        return None
+
+    def resolve(self, graph: Graph, decide: Callable[[ForkPoint], object]) -> tuple[Graph, list[Decision]]:
+        """Deterministic resolution — fold the pipeline over ``graph``
+        IN PLACE, asking ``decide`` at every undecided fork point, and
+        return ``(terminal_graph, trace)``. The counterpart of
+        :meth:`drive` for callers with no frontier to rank (greedy
+        compile, structural pricing probes, assembled-graph lowering):
+        one live graph, no ``LazyCandidate`` sibling snapshots, no
+        per-fork graph copies — the returned terminal IS the seeded
+        ``graph`` object.
+
+        ``decide`` receives a :class:`ForkPoint` and returns the option
+        to apply — a concrete ``Op`` / ``Graph`` from the fork's raw
+        options, or a **leaf** ``Fork`` (a decide that wants a lazy fork
+        tree's complete rows expands branch Forks itself; returning a
+        branch Fork is an error). It may stamp ``fp.score`` with the
+        pick's predicted µs — copied onto the trace entry.
+
+        The trace (one :class:`Decision` per decided fork, in resolution
+        order) is the only output channel besides the terminal graph:
+        "did this compile take a structural pick", "what did the
+        partition fork predict for this kernel" are trace queries, not
+        accumulated policy state. Inline replays of an already-decided
+        structural offer site (see :meth:`_step`) are not decisions and
+        don't trace."""
+        from deplodock.compiler import provenance  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
+
+        provenance.seed(graph)
+        cand = Candidate(run=self, graph=graph, cursor=Cursor(run=self))
+        trace: list[Decision] = []
+        while not cand.cursor.is_done:
+            step = self._step(cand)
+            if step is None:
+                continue
+            match, options, structural = step
+            root_op = match.root.op  # read before apply rebinds it
+            fp = ForkPoint(match=match, options=options, root_op=root_op, ctx=self.ctx, structural=structural)
+            choice = decide(fp)
+            option = _concrete_option(choice)
+            if option is None:
+                raise ValueError(f"decide returned a branch Fork at {match.rule.name!r} — return a concrete option or a leaf Fork")
+            knob_delta = _choice_knobs(choice, option, root_op)
+            cand.apply(match, option)
+            trace.append(
+                Decision(
+                    rule_name=match.rule.name,
+                    node_id=fp.node_id,
+                    chosen_kind="graph" if isinstance(option, Graph) else "op",
+                    knob_delta=knob_delta,
+                    score=fp.score,
+                    n_options=len(options),
+                )
+            )
+        return cand.graph, trace
 
     def drive(self, graph: Graph) -> Iterator[tuple[object | None, Candidate]]:
         """Seed ``graph`` as the root candidate and drive the search to
@@ -629,19 +832,26 @@ class Run:
         ``search.observe`` so the measurement lands on the terminal's
         own lineage (no "most recently popped" hidden state).
 
-        Per-rule batch semantics: enumerate matches via
-        :meth:`Pipeline.match` (which stamps ``rule`` on each Match plus
-        ``is_last`` on the last live one), call
-        ``Candidate.try_rewrite`` for each. Single-option matches apply
-        inline; the first multi-option match spawns one
-        ``LazyCandidate`` per option and breaks the loop. Cursor advance
-        for the rule batch is owned by :meth:`Cursor.advance`, fired
-        from ``Candidate.apply`` on ``match.is_last`` (and directly here
-        for batches that produced no live matches) even when the rewrite
-        skipped or yielded no valid options."""
+        Per-rule batch semantics live in :meth:`_step` (shared with
+        :meth:`resolve`): single-option matches apply inline; the first
+        undecided multi-option match comes back as ``(match, options,
+        structural)`` and spawns one ``LazyCandidate`` per option, in
+        rule-emission order. Selection is the search's job (tuning
+        explores every fork and ranks the unvisited frontier with its
+        learned prior). Siblings share ``cand`` as ``inner`` so they
+        don't duplicate the snapshot; ``from_option`` lifts concrete
+        ``Op``/``Graph`` options into leaf Forks so every LazyCandidate's
+        pending carries a uniform Fork shape. Cursor advance for the rule
+        batch is owned by :meth:`Cursor.advance`, fired from
+        ``Candidate.apply`` on ``match.is_last`` (the fork's apply on
+        resolve fires it for deferred forks) or directly in ``_step`` for
+        batches that produced no live matches. The ``structural`` flag
+        rides ``Search.push`` so policies can treat kernel-set decisions
+        specially."""
         from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate  # noqa: PLC0415
 
         search = self.search
+        assert search is not None, "Run.drive needs a search policy; use Run.resolve for deterministic resolution"
         # Seed candidate: no parent token — the policy roots it itself.
         search.push(Candidate(run=self, graph=graph, cursor=Cursor(run=self)).lazy())
 
@@ -656,51 +866,131 @@ class Run:
                 search.push(*children, parent=token)
                 continue
             cand = lc.resolve()
-            cur = cand.cursor
-            if cur.is_done:
+            if cand.cursor.is_done:
                 yield token, cand
                 continue
-            pass_ = cur.current_pass
-            # Empty pass (e.g. all rules filtered out) OR no live
-            # matches → no apply fires → advance the cursor directly
-            # so the search loop doesn't re-pop the same rule batch
-            # forever. ``advance`` handles both cases uniformly: with
-            # ``n_applied == 0`` it wraps to the next pass and fires
-            # the post-pass log + dump.
-            if not pass_.rules:
-                cur.advance(cand.graph)
+            # Per-variant containment: a search-explored candidate can reach an
+            # un-lowerable shape that a *deterministic* lowering pass raises on
+            # (e.g. a sibling-cell-fused slab fill the single-Write hoisted-compute
+            # materializer can't represent, or an orphan AtomTile at render). The
+            # deployable greedy pick (``Run.resolve``) never reaches these forks, so
+            # under tune they are legitimate dead ends — exactly like a branch whose
+            # every option fails ``validate(ctx)``. Drop the candidate's subtree and
+            # keep driving the rest of the search instead of aborting the whole tune.
+            # (``RuleSkipped`` is handled inside ``try_rewrite``; control-flow
+            # exceptions propagate.)
+            try:
+                step = self._step(cand)
+            except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except Exception as exc:  # noqa: BLE001 — broad by design; this is the tune dead-end sink
+                self._dropped_candidates += 1
+                logger.warning(
+                    "[tune] dropped un-lowerable candidate (%s: %s) — pruning branch, continuing search",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if step is None:
                 search.push(cand.lazy(), parent=token)
                 continue
-            matches = self.pipeline.match(cand.graph, cur.current_rule)
-            if not matches:
-                cur.advance(cand.graph)
-                search.push(cand.lazy(), parent=token)
-                continue
+            match, options, structural = step
+            forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cand.cursor), match=match, option=opt) for opt in options]
+            search.push(*forks, parent=token, structural=structural)
 
-            forks: list[LazyCandidate] | None = None
-            for match in matches:
-                options = cand.try_rewrite(match)
-                if options is None:
-                    continue
-                # Multi-option fork point: spawn one ``LazyCandidate`` per
-                # option, in rule-emission order. Selection is the search's
-                # job (greedy keeps option-0; tuning explores every fork and
-                # ranks the unvisited frontier with its learned prior). Each
-                # shares ``cand`` as ``inner`` so siblings don't duplicate the
-                # snapshot. ``from_option`` lifts concrete ``Op``/``Graph``
-                # options into leaf Forks so every LazyCandidate's pending
-                # carries a uniform Fork shape. The fork's apply on
-                # resolve advances the cursor when ``match.is_last`` (the
-                # cursor advance the eager loop didn't do here, since we
-                # deferred to forks).
-                forks = [LazyCandidate.from_option(inner=cand, cursor=replace(cur), match=match, option=opt) for opt in options]
-                break
 
-            if forks is not None:
-                search.push(*forks, parent=token)
-                continue
+def _is_structural_option(option: object) -> bool:
+    """Classify one raw rewrite option by its effect (see
+    ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
+    changes which ops exist — **structural**; an ``Op`` rebind is in-place —
+    **op-variant**. The Op/Graph return type IS the classification; rules wrap
+    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/005_split_demoted``),
+    whose ``option`` is readable without firing any thunk. A *branch* ``Fork``
+    reads op-variant: the sole branch-Fork emitter today is the partition
+    planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —
+    the body-normalizing build the lazy tree exists to avoid."""
+    return isinstance(option, Graph) or (isinstance(option, OptionFork) and isinstance(option.option, Graph))
 
-            search.push(cand.lazy(), parent=token)
+
+def _concrete_option(option: object) -> object | None:
+    """Unwrap one raw rewrite option to the concrete ``Op`` / ``Graph`` a
+    replayed structural decision can apply inline: leaf Forks fire their
+    single-element thunk, concrete options pass through, and a *branch* Fork
+    returns ``None`` (un-applyable without a full expand — the caller falls
+    back to forking normally; no structural branch Fork exists today)."""
+    if isinstance(option, Fork):
+        return option.expand()[0] if option.is_leaf else None
+    return option
+
+
+def _option_decision(option: object, root_knobs: dict) -> dict | None:
+    """The decision-knob delta one raw structural-fork option would stamp vs
+    the offer op: new non-``S_*`` knob keys on the option's op / fork knobs (a
+    ``Graph`` option reads the union over its nodes' op knobs — fragment
+    kernels restamp their own ``S_*``, which describe the child bodies, not
+    the decision). ``None`` when the option stamps nothing new."""
+    if isinstance(option, Graph):
+        knobs: dict = {}
+        for node in option.nodes.values():
+            knobs.update(getattr(node.op, "knobs", None) or {})
+    else:
+        knobs = getattr(option, "knobs", None) or {}
+    delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
+    return delta or None
+
+
+def _choice_knobs(choice: object, option: object, root_op) -> dict:
+    """The chosen option's knob identity for a :class:`Decision` trace entry:
+    a ``Fork``'s pinned row when it carries one, a ``Graph``'s decision-knob
+    delta vs the offer op (:func:`_option_decision`), an ``Op``'s own knobs.
+    ``choice`` is what ``decide`` returned (possibly a leaf Fork); ``option``
+    is its unwrapped concrete ``Op`` / ``Graph``."""
+    if isinstance(choice, Fork) and choice.knobs:
+        return dict(choice.knobs)
+    if isinstance(option, Graph):
+        return _option_decision(option, root_op.knobs) or {}
+    return dict(getattr(option, "knobs", None) or {})
+
+
+def _replay_structural_decision(graph: Graph, root_op, options: list) -> object | None:
+    """The concrete option a structurally identical, already-decided offer
+    site on this trajectory took — or ``None`` (undecided / unmatchable →
+    fork normally).
+
+    The earlier decision is read off the candidate's own graph, not a
+    side-table: a decided site leaves its evidence in the IR by contract —
+    every structural rule stamps its decision knob onto the surviving ops
+    (the ``SPLIT_CONE`` considered-vs-declined idiom), and those ops chain to
+    the pre-decision offer op via the engine-owned ``Op.source`` (stamped
+    unconditionally on rebinds, stamped across loop-dialect splices,
+    preserved by ``_rename_buf_in_op``). So: find any op carrying every
+    decision knob whose source chain contains an op structurally identical
+    to this offer (same ``op_cache_key``), and replay the option whose delta
+    matches its stamped values. Matching by decision-knob agreement (not a
+    stored option index) survives rules reordering their emissions."""
+    from deplodock.compiler.pipeline.search.keys import op_cache_key, source_chain  # noqa: PLC0415
+
+    key = op_cache_key(root_op)
+    if key is None:
+        return None
+    deltas = [(opt, _option_decision(opt, root_op.knobs)) for opt in options]
+    decision_keys = {k for _, d in deltas if d for k in d}
+    if not decision_keys:
+        return None
+    for node in graph.nodes.values():
+        knobs = getattr(node.op, "knobs", None)
+        if not knobs or not decision_keys <= set(knobs):
+            continue  # undecided or unrelated op — the cheap pre-filter
+        chain = source_chain(node.op)
+        next(chain)  # the op itself — its key differs from the pre-decision key by the stamp
+        if not any(op_cache_key(anc) == key for anc in chain):
+            continue
+        found = {k: knobs[k] for k in decision_keys}
+        for opt, delta in deltas:
+            if delta == found:
+                return _concrete_option(opt)
+        return None  # decided, but no option matches (emission drift) — fork normally
+    return None
 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
@@ -794,48 +1084,57 @@ def _match_at(graph: Graph, start: str, rule: Rule) -> Match | None:
 
 
 # ---------------------------------------------------------------------------
-# Bench + DB persistence for autotune terminals (used by Pipeline.tune)
+# Bench + DB persistence for autotune terminals (used by Pipeline.tune_async)
 # ---------------------------------------------------------------------------
 
 
-def _rebench_o3(cand, backend):
-    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable
-    codegen) for a clean prior sample. Returns the -O3 median latency in µs, or
-    ``None`` when the sweep is already at -O3 or the bench errors (best-effort —
-    a re-bench hiccup must never abort the sweep). The winner already benched OK
-    at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
+async def _rebench_o3_async(cand, backend):
+    """Re-bench an already-lowered tune winner at ``-Xcicc -O3`` (deployable codegen)
+    for a clean prior sample, awaiting the device-pinned worker. Returns the -O3
+    median latency in µs, or ``None`` when the sweep is already at -O3 or the bench
+    errors (best-effort — a re-bench hiccup must never abort the sweep). The winner
+    already benched OK at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
     from deplodock import config  # noqa: PLC0415
 
     if "-O3" in config.nvcc_flags():
-        return None  # already deployable codegen — nothing to re-bench
+        return None
     try:
-        result = backend.benchmark(cand.graph, nvcc_flags="-Xcicc -O3")
+        result = await backend.benchmark_async(cand.graph, nvcc_flags="-Xcicc -O3")
     except Exception:  # noqa: BLE001 — a re-bench failure is non-fatal to tuning
         return None
     return result.time_ms * 1000.0 if result.time_ms else None
 
 
-def _bench_terminal(cand, *, backend, db):
-    """Bench every ``CudaOp`` in ``cand.graph``, persist per-kernel
-    ``perf`` / inventory / lowering rows, and return ``(stats, status)``
-    where ``stats`` is the per-kernel ``PerfStats`` summed across the
-    graph (total terminal latency)."""
-    import json as _json  # noqa: PLC0415
-    import statistics as _statistics  # noqa: PLC0415
+class _TerminalBench:
+    """Shared machinery for benching one terminal candidate's ``CudaOp``s and
+    persisting per-kernel ``perf`` / inventory / lowering rows.
 
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.keys import (  # noqa: PLC0415
-        _is_kernel_bearing,
-        dialect_of,
-        op_cache_key,
-        source_chain,
-    )
+    :func:`_bench_terminal_async` drives it: the no-cuda / cache-hit / stub
+    short-circuits (:meth:`prelude`) and every DB write (:meth:`finalize_result` /
+    :meth:`finalize_exc`) live here, so the only awaited step is the device bench."""
 
-    def _point_stats(us: float) -> PerfStats:
+    def __init__(self, cand, *, backend, db) -> None:
+        from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+
+        self.backend = backend
+        self.db = db
+        self.graph = cand.graph
+        self.context_key = cand.ctx.structural_key()
+        self.cuda_nodes = [self.graph.nodes[nid] for nid in self.graph.topological_order() if isinstance(self.graph.nodes[nid].op, CudaOp)]
+        self.backend_name = getattr(backend, "name", "stub")
+
+    @staticmethod
+    def _point_stats(us: float):
+        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+
         return PerfStats(median=us, min=us, max=us, mean=us, variance=0.0, n_samples=0)
 
-    def _stats_from_launch(lt) -> PerfStats:
+    @classmethod
+    def _stats_from_launch(cls, lt):
+        import statistics as _statistics  # noqa: PLC0415
+
+        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+
         if lt.samples and len(lt.samples) >= 1:
             us = [s * 1000.0 for s in lt.samples]
             return PerfStats(
@@ -846,9 +1145,12 @@ def _bench_terminal(cand, *, backend, db):
                 variance=_statistics.pvariance(us) if len(us) > 1 else 0.0,
                 n_samples=len(us),
             )
-        return _point_stats(lt.time_ms * 1000.0)
+        return cls._point_stats(lt.time_ms * 1000.0)
 
+    @staticmethod
     def _body_json(op, dialect: str) -> str:
+        import json as _json  # noqa: PLC0415
+
         return _json.dumps(
             {
                 "dialect": dialect,
@@ -858,16 +1160,18 @@ def _bench_terminal(cand, *, backend, db):
             default=str,
         )
 
-    def _record_op_inventory(op) -> None:
+    def _record_op_inventory(self, op) -> None:
+        from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
         from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
         from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
         from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
         key = op_cache_key(op)
         if key is None:
             return
         if isinstance(op, CudaOp):
-            db.record_cuda_op(
+            self.db.record_cuda_op(
                 key,
                 kernel_source=op.kernel_source,
                 arg_order=list(op.arg_order),
@@ -877,23 +1181,42 @@ def _bench_terminal(cand, *, backend, db):
                 pretty=op.kernel_source,
             )
         elif isinstance(op, KernelOp):
-            db.record_kernel_op(key, _body_json(op, "kernel"), op.pretty_body())
+            self.db.record_kernel_op(key, self._body_json(op, "kernel"), op.pretty_body())
         elif isinstance(op, TileOp):
-            db.record_tile_op(key, _body_json(op, "tile"), op.pretty_body())
+            self.db.record_tile_op(key, self._body_json(op, "tile"), op.pretty_body())
         elif isinstance(op, LoopOp):
-            db.record_loop_op(key, _body_json(op, "loop"), op.pretty_body())
+            self.db.record_loop_op(key, self._body_json(op, "loop"), op.pretty_body())
 
-    def _persist(cuda_op, *, stats: PerfStats, status: str, backend_name: str, captured: bool = False) -> None:
+    def _persist(self, cuda_op, *, stats, status: str, captured: bool = False, error: str | None = None) -> None:
+        from deplodock.compiler.pipeline.search.keys import (  # noqa: PLC0415
+            _is_kernel_bearing,
+            dialect_of,
+            op_cache_key,
+            source_chain,
+        )
+
         cuda_key = op_cache_key(cuda_op)
         if cuda_key is None:
             return
         chain = [op for op in source_chain(cuda_op) if _is_kernel_bearing(op)]
         for op in chain:
-            _record_op_inventory(op)
+            self._record_op_inventory(op)
         for parent_op, child_op in zip(chain[1:], chain[:-1], strict=False):
             p_dialect = dialect_of(parent_op)
             c_dialect = dialect_of(child_op)
             if p_dialect is None or c_dialect is None:
+                continue
+            if p_dialect == c_dialect == "loop":
+                # loop→loop source hops are structural/decision hops, not
+                # lowering rewrites: the splice attribution stamped by
+                # ``Candidate.apply`` (a decomposition's kernels → the
+                # pre-split op), 005's keep-vs-split rebind, name stamps.
+                # A ``lowering`` row holds ONE best child per parent, so
+                # recording a multi-kernel decomposition's hops would let
+                # ``best_per_op_time``'s chain walk resolve the pre-split
+                # op to a single fragment kernel's median — half the work
+                # masquerading as the whole op. The decomposition's cost
+                # is a Σ, owned by the two-level tuner, never this table.
                 continue
             p_key = op_cache_key(parent_op)
             c_key = op_cache_key(child_op)
@@ -902,7 +1225,7 @@ def _bench_terminal(cand, *, backend, db):
             p_knobs = getattr(parent_op, "knobs", None) or {}
             c_knobs = getattr(child_op, "knobs", None) or {}
             knobs_delta = {k: v for k, v in c_knobs.items() if p_knobs.get(k) != v}
-            db.record_lowering(
+            self.db.record_lowering(
                 p_key,
                 p_dialect,
                 c_key,
@@ -911,10 +1234,14 @@ def _bench_terminal(cand, *, backend, db):
                 measured_median_us=stats.median if status == "ok" else None,
             )
         knobs = getattr(cuda_op, "knobs", None) or {}
-        db.record_perf(context_key, cuda_key, backend=backend_name, status=status, stats=stats, knobs=knobs, captured=captured)
+        self.db.record_perf(
+            self.context_key, cuda_key, backend=self.backend_name, status=status, stats=stats, knobs=knobs, captured=captured, error=error
+        )
         logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
 
-    def _accumulate(acc: PerfStats | None, s: PerfStats) -> PerfStats:
+    def _accumulate(self, acc, s):
+        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+
         if acc is None:
             return s
         return PerfStats(
@@ -926,95 +1253,114 @@ def _bench_terminal(cand, *, backend, db):
             n_samples=min(acc.n_samples, s.n_samples) if acc.n_samples and s.n_samples else (acc.n_samples or s.n_samples),
         )
 
-    graph = cand.graph
-    context_key = cand.ctx.structural_key()
-    cuda_nodes = [graph.nodes[nid] for nid in graph.topological_order() if isinstance(graph.nodes[nid].op, CudaOp)]
-    if not cuda_nodes:
-        return _point_stats(0.0), "ok"
+    def prelude(self):
+        """Resolve everything that needs no live bench. Returns ``("done", (stats,
+        status))`` when no measurement is needed (no CudaOps / full cache hit /
+        stub backend), else ``("bench", None)`` — the caller obtains a
+        ``BenchmarkResult`` and calls :meth:`finalize_result` / :meth:`finalize_exc`."""
+        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
-    backend_name = getattr(backend, "name", "stub")
+        if not self.cuda_nodes:
+            return "done", (self._point_stats(0.0), "ok")
 
-    # Cache lookup: if every CudaOp already has a perf row for this
-    # (context, backend), skip the benchmark entirely and rebuild the
-    # aggregate stats from the DB. Per-kernel partial caching isn't
-    # useful here because ``backend.benchmark`` runs the whole graph.
-    cached_rows = []
-    for node in cuda_nodes:
-        key = op_cache_key(node.op)
-        row = db.lookup_perf(context_key, key, backend=backend_name) if key is not None else None
-        if row is None:
-            cached_rows = None
-            break
-        cached_rows.append(row)
-    if cached_rows is not None:
-        logger.info("[tune] cache hit for %d kernel(s) — skipping bench", len(cuda_nodes))
-        agg: PerfStats | None = None
-        status = "ok"
-        for row in cached_rows:
-            if row.status != "ok":
-                status = row.status
-            agg = _accumulate(agg, row.stats)
-            logger.info("[tune]   %s @ %.2f us  (%s, cached)", row.op_key[:12], row.stats.median, row.status)
-        return agg or _point_stats(0.0), status
+        # Cache lookup: if every CudaOp already has a perf row for this
+        # (context, backend), skip the benchmark entirely and rebuild the
+        # aggregate stats from the DB. Per-kernel partial caching isn't
+        # useful here because ``backend.benchmark`` runs the whole graph.
+        cached_rows = []
+        for node in self.cuda_nodes:
+            key = op_cache_key(node.op)
+            row = self.db.lookup_perf(self.context_key, key, backend=self.backend_name) if key is not None else None
+            if row is None:
+                cached_rows = None
+                break
+            cached_rows.append(row)
+        if cached_rows is not None:
+            logger.info("[tune] cache hit for %d kernel(s) — skipping bench", len(self.cuda_nodes))
+            agg = None
+            status = "ok"
+            for row in cached_rows:
+                if row.status != "ok":
+                    status = row.status
+                agg = self._accumulate(agg, row.stats)
+                logger.info("[tune]   %s @ %.2f us  (%s, cached)", row.op_key[:12], row.stats.median, row.status)
+            return "done", (agg or self._point_stats(0.0), status)
 
-    status = "ok"
-    agg = None
+        if self.backend is None:
+            # No real measurement → do NOT persist. Writing the 1.0us stub
+            # to a shared DB used to clobber tuned ``best_median_us`` values
+            # (record_lowering / record_perf keep the minimum), so any plain
+            # ``deplodock run`` (which routes through ``Pipeline.run`` without
+            # a backend) was overwriting real autotune rows with 1.0us stubs.
+            # Tests that need lowering edges in stub mode should pass an
+            # explicit stub backend.
+            agg = None
+            for _node in self.cuda_nodes:
+                agg = self._accumulate(agg, self._point_stats(1.0))
+            return "done", (agg or self._point_stats(0.0), "ok")
 
-    if backend is None:
-        # No real measurement → do NOT persist. Writing the 1.0us stub
-        # to a shared DB used to clobber tuned ``best_median_us`` values
-        # (record_lowering / record_perf keep the minimum), so any plain
-        # ``deplodock run`` (which routes through ``Pipeline.run`` without
-        # a backend) was overwriting real autotune rows with 1.0us stubs.
-        # Tests that need lowering edges in stub mode should pass an
-        # explicit stub backend.
-        for _node in cuda_nodes:
-            s = _point_stats(1.0)
-            agg = _accumulate(agg, s)
-    else:
-        logger.info("[tune] benching %d kernel(s) in graph", len(cuda_nodes))
-        try:
-            result = backend.benchmark(graph, num_iters="auto")
-        except Exception as exc:  # noqa: BLE001
-            fail_us = float(backend.bench_run_timeout_s) * 1_000_000.0
+        logger.info("[tune] benching %d kernel(s) in graph", len(self.cuda_nodes))
+        return "bench", None
+
+    def finalize_exc(self, exc):
+        fail_us = float(self.backend.bench_run_timeout_s) * 1_000_000.0
+        logger.warning(
+            "[tune] backend.benchmark failed (%s) — pinning bench_fail @ %.1f us for %d kernel(s)",
+            exc,
+            fail_us,
+            len(self.cuda_nodes),
+        )
+        s = self._point_stats(fail_us)
+        agg = None
+        for node in self.cuda_nodes:
+            self._persist(node.op, stats=s, status="bench_fail", error=f"{type(exc).__name__}: {exc}")
+            agg = self._accumulate(agg, s)
+        return agg or self._point_stats(0.0), "bench_fail"
+
+    def finalize_result(self, result):
+        agg = None
+        per_launch = result.per_launch or []
+        if len(per_launch) != len(self.cuda_nodes):
             logger.warning(
-                "[tune] backend.benchmark failed (%s) — pinning bench_fail @ %.1f us for %d kernel(s)",
-                exc,
-                fail_us,
-                len(cuda_nodes),
+                "[tune] per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
+                len(per_launch),
+                len(self.cuda_nodes),
             )
-            s = _point_stats(fail_us)
-            for node in cuda_nodes:
-                _persist(node.op, stats=s, status="bench_fail", backend_name=backend_name)
-                agg = _accumulate(agg, s)
-            status = "bench_fail"
+            avg_us = (result.time_ms * 1000.0) / max(len(self.cuda_nodes), 1)
+            s = self._point_stats(avg_us)
+            for node in self.cuda_nodes:
+                self._persist(node.op, stats=s, status="ok", captured=result.captured)
+                agg = self._accumulate(agg, s)
         else:
-            per_launch = result.per_launch or []
-            if len(per_launch) != len(cuda_nodes):
-                logger.warning(
-                    "[tune] per_launch count (%d) != CudaOp node count (%d); falling back to graph time_ms / N",
-                    len(per_launch),
-                    len(cuda_nodes),
-                )
-                avg_us = (result.time_ms * 1000.0) / max(len(cuda_nodes), 1)
-                s = _point_stats(avg_us)
-                for node in cuda_nodes:
-                    _persist(node.op, stats=s, status="ok", backend_name=backend_name, captured=result.captured)
-                    agg = _accumulate(agg, s)
-            else:
-                for node, lt in zip(cuda_nodes, per_launch, strict=True):
-                    s = _stats_from_launch(lt)
-                    _persist(node.op, stats=s, status="ok", backend_name=backend_name, captured=result.captured)
-                    agg = _accumulate(agg, s)
-            try:
-                import cupy as _cp  # noqa: PLC0415
+            for node, lt in zip(self.cuda_nodes, per_launch, strict=True):
+                s = self._stats_from_launch(lt)
+                self._persist(node.op, stats=s, status="ok", captured=result.captured)
+                agg = self._accumulate(agg, s)
+        try:
+            import cupy as _cp  # noqa: PLC0415
 
-                _cp.cuda.runtime.deviceSynchronize()
-                _cp.get_default_memory_pool().free_all_blocks()
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
-
-    return agg or _point_stats(0.0), status
+            _cp.cuda.runtime.deviceSynchronize()
+            _cp.get_default_memory_pool().free_all_blocks()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        return agg or self._point_stats(0.0), "ok"
 
 
-__all__ = ["LoweringError", "Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]
+async def _bench_terminal_async(cand, *, backend, db):
+    """Bench every ``CudaOp`` in ``cand.graph``, persist per-kernel ``perf`` /
+    inventory / lowering rows, and return ``(stats, status)`` where ``stats`` is the
+    per-kernel ``PerfStats`` summed across the graph (total terminal latency). The
+    only ``await`` is the device-pinned bench, so N kernels' benches overlap on one
+    event loop; cache-hit / stub / persistence semantics live in :class:`_TerminalBench`."""
+    b = _TerminalBench(cand, backend=backend, db=db)
+    kind, payload = b.prelude()
+    if kind == "done":
+        return payload
+    try:
+        result = await backend.benchmark_async(b.graph, num_iters="auto")
+    except Exception as exc:  # noqa: BLE001
+        return b.finalize_exc(exc)
+    return b.finalize_result(result)
+
+
+__all__ = ["Decision", "ForkPoint", "LoweringError", "Match", "Pass", "Pattern", "Pipeline", "Rule", "RuleSkipped"]

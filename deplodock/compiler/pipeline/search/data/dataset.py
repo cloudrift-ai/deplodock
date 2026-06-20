@@ -37,14 +37,24 @@ class Dataset:
 
     @classmethod
     def from_golden(
-        cls, *, name: str | None = None, kernel: str | None = None, dtype: str | None = None, compile_s_feats: bool = False
+        cls,
+        *,
+        name: str | None = None,
+        kernel: str | None = None,
+        dtype: str | None = None,
+        compile_s_feats: bool = False,
+        live_gpu: bool = False,
     ) -> Dataset:
         """The matmul golden configs, optionally narrowed by exact ``name``, name
         substring ``kernel``, or ``dtype``. ``compile_s_feats`` derives the full
-        ``S_*`` histogram per config (needed only for learned-prior featurization)."""
-        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+        ``S_*`` histogram per config (needed only for learned-prior featurization).
+        ``live_gpu`` scopes to the live card's goldens (:func:`goldens_for_live_gpu`)
+        — so a multi-GPU goldens dir doesn't return another card's config under the
+        same name (cards with no recorded golden fall back to the full set)."""
+        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-        configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+        source = goldens_for_live_gpu() if live_gpu else GOLDEN_CONFIGS
+        configs = [g for g in source if isinstance(g, MatmulGoldenConfig)]
         if name is not None:
             configs = [g for g in configs if g.name == name]
         if kernel:
@@ -54,16 +64,22 @@ class Dataset:
         return cls([Sample.from_golden(g, compile_s_feats=compile_s_feats) for g in configs])
 
     @classmethod
-    def from_db(cls, path: Path | str, *, kernel: str | None = None, min_latency: float = 0.0, backend: str | None = None) -> Dataset:
+    def from_db(
+        cls, path: Path | str, *, kernel: str | None = None, min_latency: float = 0.0, backend: str | None = None, status: str = "ok"
+    ) -> Dataset:
         """Every measured ``ok`` variant in the tune DB (``perf ⋈ cuda_op``), opened
         read-only so a concurrent ``tune`` writer isn't blocked. ``backend=None``
         spans every backend (matching the legacy ``eval knobs`` query); ``kernel``
-        filters on the parsed C identifier."""
+        filters on the parsed C identifier. ``status`` selects the row status
+        (``bench_fail`` rows carry the watchdog-timeout sentinel latency, so the
+        default ``min_latency`` admits them)."""
         from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
         db = SearchDB.open_readonly(path)
         try:
-            samples = [Sample.from_perf_sample(ps) for ps in db.iter_perf_samples(backend=backend, min_latency_us=min_latency)]
+            samples = [
+                Sample.from_perf_sample(ps) for ps in db.iter_perf_samples(backend=backend, status=status, min_latency_us=min_latency)
+            ]
         finally:
             db.close()
         if kernel:

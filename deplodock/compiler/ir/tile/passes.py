@@ -19,7 +19,8 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace
 
-from deplodock.compiler.ir.expr import Expr, Interval, SimplifyCtx
+from deplodock.compiler.ir.axis import extend_simplify_ctx
+from deplodock.compiler.ir.expr import Expr, SimplifyCtx
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
@@ -119,8 +120,7 @@ def _parallel_rewrite(s: ParallelTile, rename: Rename, sigma: Sigma, axis_fn: Ax
 def _parallel_simplify(s: ParallelTile, ctx: SimplifyCtx) -> Stmt:
     inner = ctx
     for ax in s.axes:
-        if ax.extent.is_static:
-            inner = inner.extend(ax.name, Interval(0, ax.extent.as_static() - 1))
+        inner = extend_simplify_ctx(inner, ax)
     new_body = tuple(simplify(c, inner) for c in s.body)
     return _replace(s, body=new_body)
 
@@ -189,7 +189,7 @@ def _(s: SerialTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: SerialTile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
+    inner = extend_simplify_ctx(ctx, s.axis)
     return SerialTile(
         axis=s.axis,
         body=tuple(simplify(c, inner) for c in s.body),
@@ -212,7 +212,7 @@ def _(s: StridedTile, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @simplify.register
 def _(s: StridedTile, ctx: SimplifyCtx) -> Stmt:
-    inner = ctx.extend(s.axis.name, Interval(0, s.axis.extent.as_static() - 1)) if s.axis.extent.is_static else ctx
+    inner = extend_simplify_ctx(ctx, s.axis)
     step = s.step.simplify(ctx) if isinstance(s.step, Expr) else s.step
     return StridedTile(
         axis=s.axis,

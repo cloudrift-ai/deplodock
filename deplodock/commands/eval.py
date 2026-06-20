@@ -1,6 +1,6 @@
-"""``deplodock eval <knobs|prior|analytic>`` — evaluate the tuning machinery.
+"""``deplodock eval <knobs|prior|analytic|golden|variants|failures>`` — evaluate the tuning machinery.
 
-Three subcommands:
+Six subcommands:
 
 - ``eval knobs``     — print the registered knob schema, then (with a tune DB)
   per-knob **regret** + a knob-interaction matrix (the analysis below).
@@ -10,6 +10,13 @@ Three subcommands:
 - ``eval prior``     — evaluate the learned ``CatBoostPrior`` on the golden
   configs: the greedy pipeline pick vs golden (per-knob ``found/golden``), the
   golden's rank under the prior, and (``--features``) the regressor input vector.
+- ``eval golden``    — the greedy pipeline pick vs recorded golden per config (the
+  reproduction check, without the rank diagnostics).
+- ``eval variants``  — per-kernel leaderboard of the tune DB's measured variants
+  (fastest first), the config the prior deploys marked + ranked, and the -O3
+  re-bench latency from the prior reservoir where one was recorded.
+- ``eval failures``  — the tune DB's ``bench_fail`` rows clustered by
+  ``(kernel, error)`` with the knob values shared by every failing row.
 
 The ``eval knobs`` regret analysis: for each kernel (grouped by the kernel C
 identifier extracted from ``cuda_op.pretty``), compute per-knob regret:
@@ -39,7 +46,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -100,6 +107,27 @@ def register_eval_command(subparsers) -> None:
     add_dataset_args(pg, default="golden")
     pg.add_argument("--features", action="store_true", help="Also print the prior's regressor feature vector per golden config.")
     pg.set_defaults(func=handle_eval_golden)
+
+    pv = sub.add_parser(
+        "variants",
+        help="Per-kernel leaderboard of the tune DB's measured variants, with the prior's deployed pick marked and ranked",
+    )
+    pv.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
+    add_dataset_args(pv, default="db")
+    pv.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        help="Variants shown per kernel, fastest first (0 = all; the pick row always shows). Default: 20.",
+    )
+    pv.set_defaults(func=handle_eval_variants)
+
+    pf = sub.add_parser(
+        "failures",
+        help="Cluster the tune DB's bench_fail rows by kernel + error, with the knob values shared by every failing row",
+    )
+    add_dataset_args(pf, default="db")
+    pf.set_defaults(func=handle_eval_failures)
 
 
 def handle_eval_knobs(args) -> None:
@@ -173,6 +201,143 @@ def handle_eval_golden(args) -> None:
     _emit_prior_golden_check(configs, title=False)
 
 
+def handle_eval_variants(args) -> None:
+    """``eval variants`` — per-kernel leaderboard of the tune DB's measured
+    variants (fastest first, knob columns aligned), the config the prior would
+    deploy marked + ranked, and the deployable -O3 re-bench latency (from the
+    prior's reservoir) where one was recorded. The per-kernel "did the
+    search/prior reach the best measured config, and which knobs distinguish
+    it?" drill-down view."""
+    require_source(args, {"db"}, "eval variants lists measured tune-DB rows — --dataset golden has no per-variant measurements.")
+    resolve_prior_arg(args)
+    from deplodock import config  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
+
+    db_path = Path(args.db) if args.db else resolve_tune_db()
+    if not db_path.exists():
+        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        return
+    groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_kernel_name()
+    if not groups:
+        logger.info("No measured variants%s in %s.", f" matching --kernel '{args.kernel}'" if args.kernel else "", db_path)
+        return
+    fails = Counter(s.name for s in Dataset.from_db(db_path, kernel=args.kernel, status="bench_fail") if s.name)
+    # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
+    prior = load_prior()
+    if not prior.fitted:
+        logger.info("No fitted prior at %s — the pick is the cold AnalyticPrior's (the ranking compile/run use).", config.prior_path())
+    o3 = _o3_reservoir_index(prior)
+    for name in sorted(groups):
+        _emit_variant_table(name, groups[name], prior, n_fail=fails.get(name, 0), o3=o3, top=args.top)
+
+
+def handle_eval_failures(args) -> None:
+    """``eval failures`` — the tune DB's ``bench_fail`` rows clustered by
+    ``(kernel, error)``, each cluster with its count and the tunable knob
+    assignments shared by EVERY failing row (the "all 28 rows have ``TMA=1``"
+    signal). Replaces grepping the tune log against hand-written SQL; rows from
+    pre-error-column DBs cluster under ``(no error recorded)``."""
+    require_source(args, {"db"}, "eval failures reads tune-DB bench_fail rows — --dataset golden records no failures.")
+    db_path = Path(args.db) if args.db else resolve_tune_db()
+    if not db_path.exists():
+        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        return
+    fails = [s for s in Dataset.from_db(db_path, kernel=args.kernel, status="bench_fail") if s.name]
+    n_ok = len(Dataset.from_db(db_path, kernel=args.kernel))
+    if not fails:
+        logger.info("No bench_fail rows%s in %s (%d ok rows).", f" matching --kernel '{args.kernel}'" if args.kernel else "", db_path, n_ok)
+        return
+    clusters: dict[tuple, list] = defaultdict(list)
+    for s in fails:
+        clusters[(s.name, s.error or "(no error recorded)")].append(s)
+    logger.info("%d bench_fail rows (beside %d ok) in %s:", len(fails), n_ok, db_path)
+    for (name, error), grp in sorted(clusters.items(), key=lambda kv: -len(kv[1])):
+        shared = dict(grp[0].knobs)
+        for s in grp[1:]:
+            shared = {k: v for k, v in shared.items() if s.knobs.get(k) == v}
+        knob_txt = ", ".join(f"{k}={v}" for k, v in sorted(shared.items())) or "(no shared knobs)"
+        logger.info("")
+        logger.info("  %s — %d row(s)", name, len(grp))
+        logger.info("    error: %s", error)
+        logger.info("    shared knobs: %s", knob_txt)
+
+
+def _variant_key(s) -> tuple:
+    """Hashable identity of one measured config: the full ``S_*`` signature plus
+    the tunable-knob dict (sorted items, lists coerced via :func:`_hashable`) —
+    the join key between a DB row and its -O3 reservoir sibling."""
+    return (
+        tuple(sorted((k, _hashable(v)) for k, v in s.s_features().items())),
+        tuple(sorted((k, _hashable(v)) for k, v in s.knobs.items())),
+    )
+
+
+def _o3_reservoir_index(prior) -> dict[tuple, float]:
+    """Deployable (-O3) latencies from the prior's reservoir, keyed by
+    :func:`_variant_key`. Tuning re-benches every config within ``DEPLODOCK_O3_TOL``
+    of the running -O1 best at ``-Xcicc -O3`` and feeds it to the prior as an
+    ``H_opt=3`` row WITHOUT writing a ``perf`` row — so the reservoir, not the DB,
+    is the only -O3 source (the same reasoning as
+    :func:`diagnostics.golden_deploy_perf`)."""
+    from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
+
+    out: dict[tuple, float] = {}
+    for knobs, us in getattr(prior, "_dataset", None) or []:
+        s = Sample.from_prior_row(knobs, us)
+        if int(s.all_knobs().get("H_opt", 0)) != 3:
+            continue
+        key = _variant_key(s)
+        if key not in out or us < out[key]:
+            out[key] = us
+    return out
+
+
+def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dict, top: int) -> None:
+    """One kernel's leaderboard: measured leaf configs sorted by tune-ranking
+    latency, the prior's pick marked, knobs in the canonical aligned columns
+    (``tuning_knob_items`` — the same filtered view the ``run --bench`` kernel
+    table renders). Non-leaf rows (partial-knob fork nodes) are dropped,
+    mirroring ``diagnostics.reachability``; the ``-O3 us`` column appears only
+    when the reservoir holds any -O3 row at all."""
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
+    kmax = max(len(s.knobs) for s in samples)
+    leaves = sorted((s for s in samples if len(s.knobs) == kmax), key=lambda s: s.latency_us)
+    # Score in the deploy regime (``H_opt=3``) through ``Prior.pick`` — measured
+    # -O3 evidence first, model argmin otherwise — so the marker shows the config
+    # greedy ``compile`` / ``run`` would actually deploy, not just the model's
+    # favourite (the DB rows themselves carry the tune's ``H_opt=1`` stamp).
+    best_i, _ = prior.pick([{**s.all_knobs(), "H_opt": 3.0} for s in leaves])
+    pick = leaves[best_i]
+    rank = best_i + 1
+
+    n_prefix = len(leaves) if not top else min(top, len(leaves))
+    shown = list(enumerate(leaves[:n_prefix], start=1))
+    if rank > n_prefix:
+        shown.append((rank, pick))
+    hidden = len(leaves) - n_prefix - (1 if rank > n_prefix else 0)
+
+    logger.info("")
+    logger.info("%s — %d measured configs%s", name, len(leaves), f", {n_fail} bench_fail" if n_fail else "")
+    kcols, kcells = knob_columns([{k: (v, False) for k, v in tuning_knob_items(s.knobs)} for _, s in shown])
+    columns = [Col("rank", "r"), Col("us", "r")] + ([Col("-O3 us", "r")] if o3 else []) + [Col("pick"), *kcols]
+    data = []
+    for (r, s), kc in zip(shown, kcells, strict=True):
+        row = [str(r), f"{s.latency_us:.1f}"]
+        if o3:
+            o3_us = o3.get(_variant_key(s))
+            row.append(f"{o3_us:.1f}" if o3_us is not None else "—")
+        data.append([*row, ("◄", _GREEN) if s is pick else "", *kc])
+    for line in render_table(columns, data, indent="  "):
+        logger.info(line)
+    if hidden > 0:
+        logger.info("  … %d more (--top 0 shows all)", hidden)
+    if len(leaves) >= 2:
+        ratio = pick.latency_us / leaves[0].latency_us
+        flag = "  <-- misses best" if ratio > 1.2 else ""
+        logger.info("  pick: rank %d/%d, %.2fx of best (tune-ranking latency)%s", rank, len(leaves), ratio, flag)
+
+
 def _emit_registry() -> None:
     """List every registered :class:`~deplodock.compiler.pipeline.knob.Knob` — the
     canonical tuning schema (name, type, candidate hints, aliases, help) collected
@@ -218,6 +383,16 @@ def _ratio_color(matched: int, total: int) -> str:
     return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
+def _knob_eq(a, b) -> bool:
+    """Knob value equality across representations: the pipeline stamps sequence
+    knobs as tuples (``OVERHANG=('a0',)``) while the golden YAML records lists
+    (``['a0']``) — a raw ``==`` false-flags every OVERHANG-carrying golden as a
+    mismatch."""
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return list(a) == list(b)
+    return a == b
+
+
 def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     """``{knob: (value_text, red?)}`` for one renderable entry (no ``NAME=`` prefix —
     :func:`~deplodock.commands.table.knob_columns` puts the name in the column header).
@@ -226,7 +401,7 @@ def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     if entry[0] == "total":
         return entry[2]
     _, _, gold, got = entry
-    return {k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold}
+    return {k: (f"{got.get(k, '-')}/{gold[k]}", not _knob_eq(got.get(k), gold[k])) for k in gold}
 
 
 def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str) -> None:
@@ -263,9 +438,9 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
     from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
     from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
 
@@ -298,10 +473,14 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
 
 def _golden_configs(kernel_filter: str | None):
-    """The matmul golden configs, optionally filtered by name substring."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    """The matmul golden configs for the **live** card, optionally filtered by name
+    substring. Scoping to the live GPU (:func:`goldens_for_live_gpu`) keeps the eval
+    views about the card in hand when a multi-GPU goldens dir is checked in — a name
+    recurs once per card and the GPU-blind ``ShapeKey`` join would otherwise mix
+    cards (5090 / PRO 6000 even share ``compute_cap``)."""
+    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
-    configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
+    configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
         configs = [g for g in configs if kernel_filter in g.name]
     return configs
@@ -324,11 +503,12 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     for g in configs:
         gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
         try:
-            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap))
+            dyn = bool(getattr(g, "dynamic", None))
+            got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), dynamic=dyn)
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
             entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue
-        matched = sum(1 for k in gold if got.get(k) == gold[k])
+        matched = sum(1 for k in gold if _knob_eq(got.get(k), gold[k]))
         lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold))), str(rank) if rank is not None else "?", str(pool)]
         entries.append(("row", lead, gold, got))
         if rank is not None:
@@ -380,12 +560,9 @@ def _emit_prior_db_reachability(args) -> None:
         return
     # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
     prior = load_prior()
-    # Group DB variants by their full S_* signature and feed diagnostics.reachability
-    # the (full-knob-dict, latency) shape it expects.
-    groups = {
-        sig: [(s.all_knobs(), s.latency_us) for s in samples]
-        for sig, samples in Dataset.from_db(db_path, kernel=args.kernel).group_by_op().items()
-    }
+    # Group DB variants by their full S_* signature — the (sig → Samples) mapping
+    # diagnostics.reachability scores.
+    groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_op()
     logger.info("")
     if not prior.fitted:
         logger.info("No fitted prior at %s — run `deplodock tune`; the cold AnalyticPrior ranks by D_* geometry only.", config.prior_path())
@@ -446,12 +623,17 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
     from deplodock import config  # noqa: PLC0415
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
     from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     def tunable(knobs: dict) -> dict:
         return {k: v for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
 
-    def picked(snippet: str) -> dict:
-        graph, _, _ = graph_from_code(snippet)
+    def picked(snippet: str, dynamic: tuple[str, ...] = ()) -> dict:
+        # A dynamic golden's greedy pick must come from the symbolic (masked-tile)
+        # trace — a static trace would compare the static twin's pick against the
+        # dynamic golden's knobs (a different artifact / variant space).
+        dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs(list(dynamic))) if dynamic else None
+        graph, _, _ = graph_from_code(snippet, dynamic_shapes=dynamic_shapes)
         compiled = Pipeline.build(TILE_PASSES).run(graph)  # tile dialect only — no codegen/nvcc
         knobs: dict = {}
         for node in compiled.nodes.values():
@@ -487,18 +669,18 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
     try:
         for name, group in groups.items():
             try:
-                got = picked(group[0].snippet())
+                got = picked(group[0].snippet(), tuple(getattr(group[0], "dynamic_specs", list)()))
             except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
                 entries.append(("err", name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
             # Closest golden: most knobs reproduced, tie-broken by match fraction.
-            scored = [(sum(1 for k in gd if got.get(k) == gd[k]), gd) for gd in (tunable(c.knobs) for c in group)]
+            scored = [(sum(1 for k in gd if _knob_eq(got.get(k), gd[k])), gd) for gd in (tunable(c.knobs) for c in group)]
             matched, gold = max(scored, key=lambda t: (t[0], t[0] / len(t[1]) if t[1] else 1.0))
             n_match += matched == len(gold)
             n_rows += 1
             for k in gold:
                 knob_total[k] = knob_total.get(k, 0) + 1
-                knob_match[k] = knob_match.get(k, 0) + (got.get(k) == gold[k])
+                knob_match[k] = knob_match.get(k, 0) + _knob_eq(got.get(k), gold[k])
             lead = [name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
             pc = _perf_cell(perf, name)
             if pc is not None:

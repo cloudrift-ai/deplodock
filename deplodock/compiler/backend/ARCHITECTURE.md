@@ -7,7 +7,7 @@ same two-step API (`backend/base.py`):
 compiled = backend.compile(graph)
 result   = backend.run(compiled, input_data={"x": np.ndarray(...)})
 # RunResult(outputs: dict[name, ndarray], time_ms: float | None)
-bench    = backend.benchmark(compiled, input_data=…, warmup=, num_iters=)
+bench    = await backend.benchmark_async(compiled, warmup=, num_iters=)  # async-only; callers asyncio.run at the CLI boundary
 # BenchmarkResult(time_ms, min_ms, max_ms, num_launches, per_launch)
 ```
 
@@ -27,11 +27,16 @@ distinction is whether the graph has been fused yet. See
 
 Not a `Backend` — a small Graph→torch evaluator that runs a frontend-dialect graph through **real PyTorch**, the eager /
 `torch.compile` baseline for `deplodock run --ir`. Each frontend / tensor op is mapped to its torch twin
-(`RmsNormOp`→`F.rms_norm`, `SdpaOp`→`F.scaled_dot_product_attention`, `LinearOp`→`F.linear`, `ElementwiseOp`/`ReduceOp`→
+(`RmsNormOp`→`F.rms_norm`, `LayerNormOp`→`F.layer_norm`, `SdpaOp`→`F.scaled_dot_product_attention`, `LinearOp`→`F.linear`, `ElementwiseOp`/`ReduceOp`→
 the torch elementwise/reduce, layout ops→view/transpose/cat). `is_runnable(graph)` is `True` only when every compute op
 has a mapping — layout/data-dependent ops that appear post-decomposition (`IndexMapOp` / `GatherOp` / `ScatterOp`) are
 unsupported, so `run --ir` falls back to deplodock-only benchmarking for non-frontend IR. `build_callable(graph,
-input_tensors)` returns a pure `fn(*tensors)` (scalar constants read inline) so `torch.compile` can trace it. Used to
+input_tensors)` returns a pure `fn(*tensors)` (scalar constants read inline) so `torch.compile` can trace it. Symbolic
+graphs work too: `build_callable` binds every symbolic axis name to its concrete extent read off the supplied tensors
+(the CUDA launch convention) and bakes the env into the per-node callables — shape-resolving sites (`ReshapeOp` target
+shape, `IndexMapOp` out-shape and coord/select exprs) eval through it, so a dynamic-trace `<kname>.torch.json`
+reproducer gets the same vs-torch comparison as a static one (benched at the `Dim` hint by
+`commands/run.py::bench_lowered_vs_torch`, which sizes its random inputs by hint-resolving symbolic dims). Used to
 turn a dumped `<kname>.torch.json` reproducer into an accuracy + latency comparison vs torch — see `../provenance.py`
 and `commands/run.py:_handle_run_ir`.
 
@@ -59,7 +64,10 @@ CUDA backend overrides it to populate per-launch CUDA-event timings.
 Result dataclasses:
 
 - `RunResult(outputs, time_ms)`
-- `BenchmarkResult(time_ms, min_ms?, max_ms?, num_launches, per_launch?)`
+- `BenchmarkResult(time_ms, min_ms?, max_ms?, num_launches, per_launch?, captured, e2e_ms?, e2e_min_ms?)` —
+  `time_ms`/`min_ms` sum per-launch solo windows; `e2e_ms`/`e2e_min_ms` (automatic for multi-launch programs
+  under capture) time the whole program as replays of one all-launches CUDA graph — the only
+  end-to-end-comparable number for multi-kernel programs.
 - `LaunchTime(idx, kernel_name, time_ms)` — one per kernel per bench run.
 
 ## Numpy backend (`numpy/`)

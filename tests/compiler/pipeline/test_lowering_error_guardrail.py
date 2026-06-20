@@ -10,7 +10,7 @@ to ``CudaBackend``, which raised a cryptic ``non-CudaOp`` ``TypeError``.
 ``Pipeline.run`` now installs a rejection sink and, after the single
 terminal settles, raises a loud :class:`LoweringError` naming the node,
 the pass that declined it, and the validate reason. The tuning path
-(``Pipeline.tune`` / ``TuningSearch``) installs no sink, so the
+(``Pipeline.tune_async`` / ``TuningSearch``) installs no sink, so the
 fork-pruning drop stays silent and a dropped branch is a graceful dead
 end — sibling branches carry other tile shapes.
 
@@ -33,6 +33,7 @@ from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import LoweringError
 from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
+from tests.compiler.conftest import drain_tune
 
 
 def _small_smem_ctx() -> Context:
@@ -130,11 +131,112 @@ def test_tuning_does_not_raise_and_prunes_branch():
     from deplodock.compiler.pipeline.search.db import SearchDB
 
     pipeline = _build_pipeline()
-    terminals = list(pipeline.tune(_graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB()))
+    terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
     # Tuning yields the (dead) terminal without raising; the node stays a
     # TileOp because its only lowering option was validate-filtered.
     assert terminals, "tuning should still yield the dead terminal"
     assert isinstance(terminals[0].graph.nodes["y"].op, TileOp)
+
+
+# ---------------------------------------------------------------------------
+# Option-0 fallback: a prior that over-extrapolates large (over-budget) tiles
+# onto a small shape must not abort the greedy compile. The retry blocklist
+# exhausts on the prior-ranked over-budget tiles, then the conservative
+# emission-order pick (option-0) recovers the in-budget tile. This is the
+# tune-time golden-sweep crash: a prior trained on big square matmuls picked a
+# >smem-cap tile for the tiny ``qwen3_06b.q_proj`` projection and the assemble
+# raised instead of falling back.
+# ---------------------------------------------------------------------------
+
+
+class _BiggestBNFirstPrior:
+    """Stub global prior that ranks leaves by ``BN`` descending — i.e. always
+    prefers the largest (over-budget) tile, the way a prior trained on big
+    square matmuls extrapolates onto a tiny shape. ``pick`` returns the
+    argmax-BN row, so greedy keeps choosing over-budget tiles until the
+    blocklist retry budget is exhausted."""
+
+    fitted = True
+
+    def pick(self, rows: list[dict]) -> tuple[int, float]:
+        best_i = max(range(len(rows)), key=lambda i: rows[i].get("BN", 0))
+        return best_i, 0.0
+
+
+def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
+    """Mirror the real lowering shape: pass 0 (partition → tile ``Fork``) emits
+    an in-budget option-0 (``BN=8``, emitted first) followed by
+    ``n_over_budget`` over-budget tile leaves (``BN=16, 24, …``); pass 1
+    (``100_materialize_tile``) materializes the chosen tile into a ``KernelOp``
+    and lets ``validate(ctx)`` filter it. Over-budget tiles only fail at the
+    materialize pass (like the real planner emitting tile leaves that pass
+    through ``Candidate.try_rewrite``'s validate filter unchecked), so the
+    prior can rank them top and the blocklist retry engages per tile identity
+    (``BN``). Pass 0 ``RuleSkipped``-guards on the BN marker so it never
+    re-fires on its own (already-tiled) output."""
+    from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
+    from deplodock.compiler.pipeline.pipeline import RuleSkipped
+
+    def _tile_leaf(bn: int) -> TileOp:
+        return TileOp(body=Body(()), name="k_test", knobs={"BN": bn})
+
+    def emit_tiles(root):
+        if "BN" in root.op.knobs:  # already tiled (our own output) → don't re-fork
+            raise RuleSkipped("already tiled")
+        leaves = [OptionFork(option=_tile_leaf(8), knobs={"BN": 8})]
+        leaves += [OptionFork(option=_tile_leaf(16 + 8 * i), knobs={"BN": 16 + 8 * i}) for i in range(n_over_budget)]
+        return ThunkFork(knobs={}, expand_fn=lambda _k: leaves)
+
+    def materialize(root):
+        bn = root.op.knobs.get("BN", 0)
+        extents = (64,) if bn <= 8 else (4096,)  # 256 B fits the 2 KiB cap; 16 KiB overflows
+        return KernelOp(body=[Smem(name="buf", extents=extents, dtype="float")], name="k_test", knobs={"BN": bn})
+
+    emit_rule = Rule(
+        name="__emit_tiles__",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=emit_tiles,
+        param_names=tuple(inspect.signature(emit_tiles).parameters.keys()),
+    )
+    mat_rule = Rule(
+        name="100_materialize_tile",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=materialize,
+        param_names=tuple(inspect.signature(materialize).parameters.keys()),
+    )
+    p0 = Pass(name="__partition__", rules=[emit_rule], index=0)
+    p1 = Pass(name="__materialize__", rules=[mat_rule], index=1)
+    emit_rule.pass_ = p0
+    mat_rule.pass_ = p1
+    return Pipeline(passes=[p0, p1])
+
+
+def test_greedy_run_falls_back_to_option0_when_prior_overflows(monkeypatch):
+    # The prior ranks 12 over-budget tiles above the lone in-budget tile, so
+    # the blocklist retry can never reach it within its budget. Before the
+    # option-0 fallback this raised LoweringError; now ``Pipeline.run`` takes
+    # the conservative emission-order pick (option-0 = the in-budget tile).
+    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    terminal = _two_pass_tile_pipeline(n_over_budget=12).run(_graph_with_tile(), ctx=_small_smem_ctx())
+    op = terminal.nodes["y"].op
+    assert isinstance(op, KernelOp), "the in-budget option-0 tile must lower (no LoweringError)"
+    assert op.knobs.get("BN") == 8, "the recovered tile is the budget-safe emission-order leaf"
+
+
+def test_greedy_run_still_raises_when_no_in_budget_option(monkeypatch):
+    # The fallback must not paper over a genuinely un-lowerable shape: when
+    # EVERY tile is over-budget, option-0 overflows too and the loud
+    # LoweringError still fires (no in-budget leaf exists to recover).
+    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+
+    monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
+    # Drop the in-budget option-0: shift all leaves over budget by tuning the
+    # materializer to overflow for every BN (handled by the all-over-budget
+    # single-option pipeline already covered by ``_build_pipeline``).
+    with pytest.raises(LoweringError):
+        _build_pipeline().run(_graph_with_tile(), ctx=_small_smem_ctx())
 
 
 def test_run_leaves_no_state_on_pipeline():
@@ -146,3 +248,82 @@ def test_run_leaves_no_state_on_pipeline():
     with pytest.raises(LoweringError):
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
     assert not hasattr(pipeline, "_lowering_rejections")
+
+
+# ---------------------------------------------------------------------------
+# Per-variant containment: a lowering pass that *raises* (not a validate
+# filter) aborts a greedy compile loudly, but under tune is a dropped dead
+# end so one un-lowerable search fork can't abort the whole tune. This is the
+# stacked defect the static tune-findings report flagged: an un-handled
+# fused-cell slab shape (compute_phase_info LoweringError) / an orphan AtomTile
+# at render would crash mid-tune with no per-variant containment.
+# ---------------------------------------------------------------------------
+
+
+def _build_raising_pipeline() -> Pipeline:
+    """One pass, one rule matching the ``TileOp`` at ``y`` whose rewrite
+    *raises* a ``LoweringError`` (an un-lowerable shape a deterministic pass
+    chokes on), rather than returning a validate-filtered option."""
+
+    def rewrite(root):  # noqa: ARG001
+        raise LoweringError("synthetic un-lowerable shape")
+
+    rule = Rule(
+        name="__raising_lower__",
+        pattern=[Pattern(name="root", op_type=TileOp)],
+        rewrite=rewrite,
+        param_names=tuple(inspect.signature(rewrite).parameters.keys()),
+    )
+    pass_ = Pass(name="__test_raise__", rules=[rule], index=0)
+    rule.pass_ = pass_
+    return Pipeline(passes=[pass_])
+
+
+def test_greedy_run_propagates_lowering_exception():
+    # Greedy uses ``Run.resolve`` (no containment) — a raising lowering pass
+    # propagates loudly, exactly as before.
+    pipeline = _build_raising_pipeline()
+    with pytest.raises(LoweringError, match="synthetic un-lowerable shape"):
+        pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
+
+
+def test_compute_phase_info_raises_on_collapsed_index():
+    # A hoisted-compute Write whose index has a non-cache-axis entry (a
+    # ``Literal`` left by a sibling-cell fusion) is un-lowerable by the
+    # single-Write materializer — ``compute_phase_info`` flags it as a
+    # ``LoweringError`` (caught + pruned under tune by the containment above)
+    # instead of an opaque ``AttributeError`` mid-tune.
+    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.expr import Literal, Var
+    from deplodock.compiler.ir.stmt import Write
+    from deplodock.compiler.ir.tile.ir import Source
+    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
+
+    sources = (Source(name="slab", buf="x", cache_axes=(Axis("a2", 4), Axis("a4", 8)), origin=(Literal(0, "int"), Literal(0, "int"))),)
+    # Clean all-Var index → recovers the two cache axes.
+    good = [Write(output="slab", index=(Var("a2"), Var("a4")), value="v")]
+    name, axes, _ = compute_phase_info(good, sources)
+    assert name == "slab"
+    assert tuple(a.name for a in axes) == ("a2", "a4")
+    # Collapsed index (a sibling-cell-fused constant) → LoweringError.
+    bad = [Write(output="slab", index=(Var("a2"), Literal(1, "int")), value="v")]
+    with pytest.raises(LoweringError, match="sibling-cell-fused"):
+        compute_phase_info(bad, sources)
+
+
+def test_tuning_contains_raising_lowering_pass(caplog):
+    # Under tune, ``Run.drive`` catches the lowering exception, drops the
+    # candidate's subtree, logs a warning, and finishes without raising —
+    # so a single un-lowerable fork can't abort the whole tune.
+    import logging
+
+    from deplodock.compiler.pipeline import TuningSearch
+    from deplodock.compiler.pipeline.search.db import SearchDB
+
+    pipeline = _build_raising_pipeline()
+    with caplog.at_level(logging.WARNING, logger="deplodock.compiler.pipeline"):
+        terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
+    # The only lowering option raised, so no terminal is benchable — the search
+    # ends cleanly with zero terminals instead of crashing.
+    assert terminals == []
+    assert any("dropped un-lowerable candidate" in r.message for r in caplog.records)

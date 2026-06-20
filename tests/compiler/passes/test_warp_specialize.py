@@ -270,6 +270,81 @@ def test_warp_tier_ws1_sets_consumer_is_warp(monkeypatch):
     assert wt.axes[0].extent.as_static() == 5
 
 
+def _tile_op_warp_tma_32_warps() -> TileOp:
+    """Warp-tier shape at the CTA launch limit: WM×WN = 8×4 = 32 consumer
+    warps = 1024 threads. Launchable on its own, but the WS=1 role split adds
+    a producer warp → 33 warps = 1056 threads > 1024 — the exact class behind
+    every fp16 TMA+WARPSPEC ``CUDA_ERROR_INVALID_VALUE`` bench_fail in the
+    2026-06-12 golden sweep (k_matmul_262948 / 207791 / 180e20)."""
+    k_outer = Axis("k_outer", 8)
+    src = Source(
+        name="a_smem",
+        buf="a",
+        cache_axes=(Axis("a_c0", 16), Axis("a_c1", 16)),
+        origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
+    )
+    tma_bundle = StageBundle(
+        sources=(src,),
+        body=Body(()),
+        policy=StagePolicy.TMA,
+        buffer_count=2,
+        phase=Var("k_outer") % Literal(2, "int"),
+        pipeline_depth=2,
+    )
+    outer_loop = SerialTile(axis=k_outer, body=Body((tma_bundle,)), kind="serial_outer")
+    body = Body((WarpTile(axes=(Axis("wm", 8), Axis("wn", 4)), body=Body((outer_loop,))),))
+    return TileOp(body=body, name="k_warp_tma_32_warps")
+
+
+def test_off_stamped_on_warp_tile_at_cta_limit():
+    """A 32-warp MMA consumer (1024 threads) must decline WS=1 — the producer
+    warp would push the CTA to 1056 threads and the launch fails with
+    ``CUDA_ERROR_INVALID_VALUE``. The decline stamps WARPSPEC=False (body
+    unchanged) so the realized config keeps a uniform knob set."""
+    op = _tile_op_warp_tma_32_warps()
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_ws.WARP_SPECIALIZE.name] is False
+    assert result.body == op.body
+
+
+def test_pinned_ws1_on_warp_tile_at_cta_limit_fails_loudly(monkeypatch):
+    """Pinned ``DEPLODOCK_WARP_SPECIALIZE=1`` on the 32-warp tile raises (the
+    pin cannot be honored without exceeding the 1024-thread launch limit)."""
+    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
+    op = _tile_op_warp_tma_32_warps()
+    with pytest.raises(ValueError, match="exceed the 1024-thread launch limit"):
+        _run_rule(op)
+
+
+def test_off_stamped_on_thread_tile_at_cta_limit():
+    """Scalar tier: a 1024-thread ThreadTile consumer (32×32 — inner extent
+    divides the 32 producer threads, total is warp-aligned, so it passed every
+    pre-existing gate) must also decline WS=1 for the same launch-limit
+    reason."""
+    k_outer = Axis("k_outer", 8)
+    src = Source(
+        name="a_smem",
+        buf="a",
+        cache_axes=(Axis("a_c0", 16), Axis("a_c1", 16)),
+        origin=(Var("k_outer") * Literal(16, "int"), Literal(0, "int")),
+    )
+    tma_bundle = StageBundle(
+        sources=(src,),
+        body=Body(()),
+        policy=StagePolicy.TMA,
+        buffer_count=2,
+        phase=Var("k_outer") % Literal(2, "int"),
+        pipeline_depth=2,
+    )
+    outer_loop = SerialTile(axis=k_outer, body=Body((tma_bundle,)), kind="serial_outer")
+    body = Body((ThreadTile(axes=(Axis("m_i", 32), Axis("n_i", 32)), body=Body((outer_loop,))),))
+    op = TileOp(body=body, name="k_thread_tma_1024")
+    result = _run_rule(op)
+    assert isinstance(result, TileOp)
+    assert result.knobs[_ws.WARP_SPECIALIZE.name] is False
+
+
 def test_warp_tier_pinned_ws1_eligible_does_not_raise(monkeypatch):
     """The loud-fail guard must NOT trip for the warp tier — it is now an
     honorable pin (regression: previously MMA kernels were ineligible)."""

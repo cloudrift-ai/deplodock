@@ -16,11 +16,11 @@ from __future__ import annotations
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
-from deplodock.compiler.ir.stmt import Load, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Assign, Load, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
-def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | None) -> int:
+def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | Expr | None) -> int:
     """Elements per ``cp.async`` for a cooperative stage load — the widest
     contiguous vector whose byte size is a legal cp.async width (4 / 8 / 16).
 
@@ -38,8 +38,13 @@ def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing,
     row, so ``PAD_SMEM``'s ``+1`` disables wide cp.async); and (c) the gmem inner
     stride is ``V``-aligned, so each row's chunk start stays ``V*elem``-byte
     aligned (cp.async faults on a misaligned 16-byte copy). Only
-    ``AffineAddressing`` is analyzed; anything else is treated non-contiguous."""
+    ``AffineAddressing`` is analyzed; anything else is treated non-contiguous.
+    A *symbolic* gmem inner stride (an ``Expr`` extent from a runtime-sized
+    buffer) can't be V-alignment-checked at compile time, so it conservatively
+    takes the scalar fallback."""
     if elem_size not in (2, 4) or not padded_extents:
+        return 1 if elem_size == 4 else 0
+    if gmem_inner is not None and not isinstance(gmem_inner, int):
         return 1 if elem_size == 4 else 0
     inner = int(padded_extents[-1])
     contiguous = isinstance(addressing, AffineAddressing) and bool(addressing.dims) and addressing.dims[-1] == n_origin_dims - 1
@@ -55,17 +60,34 @@ def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing,
     return 1 if elem_size == 4 else 0
 
 
-def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int, ...] | None) -> tuple[Expr, ...]:
+def _ext_expr(ext: int | Expr) -> Expr:
+    """An extent as an ``Expr``: static ints become ``Literal``s, symbolic
+    extents (e.g. ``Var('seq_len')``) pass through and render against the
+    runtime kernel arg."""
+    return Literal(ext, "int") if isinstance(ext, int) else ext
+
+
+def _ext_minus_one(ext: int | Expr) -> Expr:
+    return Literal(ext - 1, "int") if isinstance(ext, int) else BinaryExpr("-", ext, Literal(1, "int"))
+
+
+def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int | Expr, ...] | None) -> tuple[Expr, ...]:
     """Clamp each cooperative-load gmem index dim to ``[0, extent)``.
 
     Set only by ``021_hoist_staged_loads_above_mask`` for sources whose
     cooperative load was hoisted above a masked-tile boundary ``Cond``. A
     masked output axis tiles past the real extent (N=256 tiled at 192 → the
-    boundary tile spans [192, 384)), so the producer's gmem read overruns the
-    buffer for the overhang columns — the original cause of the
-    ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked linear-projection kernels. The
-    overhang slab slots get the clamped (duplicate) value, which is harmless:
-    they feed masked output cells that the boundary ``Cond`` never writes.
+    boundary tile spans [192, 384); a symbolic axis tiles at its hint, so the
+    boundary tile overruns whenever the runtime extent isn't tile-aligned),
+    so the producer's gmem read overruns the buffer for the overhang columns
+    — the original cause of the ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked
+    linear-projection kernels. The overhang slab slots get the clamped
+    (duplicate) value, which is harmless: they feed masked output cells that
+    the boundary ``Cond`` never writes.
+
+    Extents are ``int`` for static dims or the dim's symbolic ``Expr``
+    (``Var('seq_len')``) for runtime-sized ones — the ternary's bound then
+    renders against the runtime kernel arg.
 
     Two index shapes occur, both handled:
 
@@ -87,16 +109,28 @@ def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int,
     if len(source_index) == len(gmem_extents):
         out: list[Expr] = []
         for idx, ext in zip(source_index, gmem_extents, strict=True):
-            cond = BinaryExpr("<", idx, Literal(ext, "int"))
-            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=Literal(ext - 1, "int")))
+            cond = BinaryExpr("<", idx, _ext_expr(ext))
+            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(ext)))
         return tuple(out)
     if len(source_index) == 1:
-        total = 1
+        # ∏ extents, folding the static factors into one Literal so the common
+        # all-static case keeps its single-literal bound.
+        total_static = 1
+        total_sym: Expr | None = None
         for e in gmem_extents:
-            total *= e
+            if isinstance(e, int):
+                total_static *= e
+            else:
+                total_sym = e if total_sym is None else BinaryExpr("*", total_sym, e)
+        if total_sym is None:
+            bound: int | Expr = total_static
+        elif total_static == 1:
+            bound = total_sym
+        else:
+            bound = BinaryExpr("*", total_sym, Literal(total_static, "int"))
         idx = source_index[0]
-        cond = BinaryExpr("<", idx, Literal(total, "int"))
-        return (TernaryExpr(cond=cond, if_true=idx, if_false=Literal(total - 1, "int")),)
+        cond = BinaryExpr("<", idx, _ext_expr(bound))
+        return (TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(bound)),)
     # Unexpected rank shape (multi-dim source_index that doesn't match the
     # buffer rank) — leave untouched rather than mis-clamp.
     return source_index
@@ -134,6 +168,16 @@ def emit_stage(
 
     Bundle context (policy, buffer_count, phase, pipeline_depth) is passed in.
     """
+    # Masked-K (symbolic reduce) sources need a per-element ZERO-fill of the
+    # final partial K slab — the mma accumulates the overhang, so a clamped
+    # duplicate (the M/N edge-clamp) would corrupt the result. cp.async /
+    # buffered transports copy raw bytes and can't ternary a value, so a bundle
+    # carrying any kmask source is pinned to the SYNC transport (the promotion
+    # passes 040/050/060/080 also skip it, so the consumer reads the same
+    # un-phased slab this sync writer fills).
+    has_kmask = any(getattr(s, "kmask", None) is not None for s in sources)
+    if has_kmask:
+        policy = StagePolicy.SYNC
     is_buffered = policy != StagePolicy.SYNC
     is_async = policy == StagePolicy.ASYNC
 
@@ -209,7 +253,31 @@ def emit_stage(
         # read can overrun the buffer for the overhang columns. Clamp each
         # source dim to its gmem extent so the producer never reads OOB
         # (no-op / None on clean-divisor tiles).
+        # Masked-K zero-fill: this operand's reduce (K) gmem dim is symbolic, so
+        # the final K_o tile overruns the runtime extent. Build the in-bounds
+        # predicate from the PRE-clamp K coordinate — when masked M is also
+        # present, ``gmem_extents`` (stamped by 021) covers the K dim too, so the
+        # clamp below would otherwise fold the K index to ``bound-1`` and make
+        # the predicate vacuously true (the masked-M + masked-K bug). The clamp
+        # then makes the read in-bounds; the value is zeroed where the predicate
+        # fails so the mma accumulates zero past seq_len.
+        kmask = getattr(src, "kmask", None)
+        k_inbounds: Expr | None = None
+        k_bound_e: Expr | None = None
+        k_dim_idx = -1
+        if kmask is not None:
+            k_dim_idx, k_bound = kmask
+            if k_dim_idx < len(source_index):
+                k_bound_e = _ext_expr(k_bound)
+                k_inbounds = BinaryExpr("<", source_index[k_dim_idx], k_bound_e)
         source_index = _clamp_source_index(source_index, getattr(src, "gmem_extents", None))
+        if k_inbounds is not None and getattr(src, "gmem_extents", None) is None:
+            # masked-K only (static M/N → no 021 clamp): clamp the K dim for a
+            # safe in-bounds read ourselves (the value is zeroed below anyway).
+            source_index = tuple(
+                TernaryExpr(cond=BinaryExpr("<", e, k_bound_e), if_true=e, if_false=_ext_minus_one(kmask[1])) if d == k_dim_idx else e
+                for d, e in enumerate(source_index)
+            )
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).
         if is_buffered:
@@ -233,6 +301,8 @@ def emit_stage(
         elem_size = {"float": 4, "__half": 2, "__nv_bfloat16": 2}.get(smem_dtype, 0)
         gmem_inner = src.gmem_extents[-1] if getattr(src, "gmem_extents", None) else None
         cp_v = _cp_async_width(elem_size, padded_extents, addressing, len(src.origin), gmem_inner) if is_async else 0
+        if k_inbounds is not None:
+            cp_v = 0  # masked-K zero-fill needs the per-value sync ternary, not a raw cp.async copy
         if cp_v >= 1:
             nbytes = cp_v * elem_size
             if cp_v > 1:
@@ -251,16 +321,38 @@ def emit_stage(
             body_out.append(cooperative_load)
             continue
 
-        # Sync path: cooperative Load + Write.
+        # Sync path: cooperative Load + Write. For a masked-K source the loaded
+        # value is zeroed where the K coord is out of the runtime extent — the
+        # overhang feeds the mma accumulation, so it must be 0, not the clamped
+        # duplicate the index read returns. ``zero = v - v`` synthesizes a typed
+        # zero (no literal-cast guesswork) and ``Select`` binds the in-bounds
+        # value or that zero.
         load_name = f"{src.name}_v"
+        if k_inbounds is not None:
+            zero_name = f"{src.name}_z"
+            sel_name = f"{src.name}_kf"
+            load_body: tuple[Stmt, ...] = (
+                Load(name=load_name, input=src.buf, index=source_index),
+                Assign(name=zero_name, op="subtract", args=(load_name, load_name)),
+                Select(
+                    name=sel_name,
+                    branches=(
+                        SelectBranch(value=load_name, select=k_inbounds),
+                        SelectBranch(value=zero_name, select=Literal(1, "int")),
+                    ),
+                ),
+                Write(output=src.name, index=smem_index, value=sel_name),
+            )
+        else:
+            load_body = (
+                Load(name=load_name, input=src.buf, index=source_index),
+                Write(output=src.name, index=smem_index, value=load_name),
+            )
         cooperative_load = StridedLoop(
             axis=iter_axis,
             start=tid_expr,
             step=Literal(n_threads, "int"),
-            body=(
-                Load(name=load_name, input=src.buf, index=source_index),
-                Write(output=src.name, index=smem_index, value=load_name),
-            ),
+            body=load_body,
         )
         body_out.append(Smem(name=src.name, extents=full_extents, dtype=smem_dtype, align=smem_align))
         body_out.append(cooperative_load)
@@ -303,6 +395,26 @@ def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source
     for src in sources:
         for ax in src.cache_axes:
             axis_map[ax.name] = ax
+    # Each index entry must be a bare ``Var`` naming one of the sibling cone's
+    # cache axes. A sibling-cell fusion (``012_fuse_sibling_register_cells``)
+    # can σ-collapse a cache-axis ``Var`` to a constant ``Literal`` in this
+    # self-describing Write (the compute body is exposed via
+    # ``StageBundle.nested()``, so generic index substitution reaches it) —
+    # the slab is then co-filled by N sibling bundles, each writing one pinned
+    # cell. The hoisted-compute materializer derives ONE iteration domain /
+    # slab shape from a single Write, so it can't represent that multi-bundle
+    # fill; flag it as un-lowerable. Under ``tune`` this prunes the offending
+    # search branch (``Run.drive`` containment); the deployable greedy pick
+    # never reaches this fork.
+    bad = [v for v in write.index if not (isinstance(v, Var) and v.name in axis_map)]
+    if bad:
+        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+        raise LoweringError(
+            f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
+            f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} (axes {tuple(axis_map)!r}) — a sibling-cell-fused "
+            f"slab fill the single-Write materializer can't represent"
+        )
     cache_axes = tuple(axis_map[v.name] for v in write.index)
     if not cache_axes:
         raise ValueError(f"compute phase {write.output!r}: needs at least one cache axis")

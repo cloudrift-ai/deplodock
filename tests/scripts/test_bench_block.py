@@ -46,7 +46,7 @@ def test_bench_block_imports_compiler():
     # backend.compile returns a Graph with these same attributes.
     assert hasattr(CudaBackend, "compile")
     assert hasattr(CudaBackend, "run")
-    assert hasattr(CudaBackend, "benchmark")
+    assert hasattr(CudaBackend, "benchmark_async")
 
 
 def test_bench_dry_run_tinyllama_block(run_cli, tmp_path):

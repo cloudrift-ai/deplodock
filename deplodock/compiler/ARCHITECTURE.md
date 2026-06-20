@@ -79,7 +79,11 @@ autotuning cache doesn't bust on cosmetic edits.
   (`compiler/dim.py`) that wraps an `Expr` from `ir/expr.py`: static (`Dim(32)` → `Literal(32)`), atomic
   symbolic (`Dim("seq_len")` → `Var("seq_len")`), or composite from arithmetic (`Dim("S") * Dim(2)` →
   `BinaryExpr("*", Var("S"), Literal(2))`). `Dim` overloads `+`/`-`/`*`/`//`/`%` and eager-folds via
-  `Expr.simplify` — static math matches plain int math byte-for-byte; symbolic stays as `BinaryExpr`.
+  `Expr.simplify` — static math matches plain int math byte-for-byte; symbolic stays as `BinaryExpr`. It
+  also exposes `ceil_div` (`(self + (b-1))//b`): the single masked-tile grid-extent formula for both
+  regimes — it folds to the integer ceil (`-(-E//b)`) for a static dim and builds the composite ceil-div
+  `Expr` for a symbolic one, so the partition planner's masked block-axis / masked-K sites need no
+  static-vs-symbolic branch.
   Read sites use `d.expr` (always works), `d.as_static()` (raises on symbolic), `d.as_atom_name()` (raises
   unless `Var`-backed), or `d.value` (back-compat shim: int for `Literal`, str for `Var`, raises on
   composite). There is deliberately no `__int__` / `__index__`, so `int(d)` and `range(d)` fail loudly
@@ -96,10 +100,50 @@ autotuning cache doesn't bust on cosmetic edits.
   (`(seq_len + bf - 1)//bf`), and a boundary `Cond(decoded_coord < seq_len)` wraps the body. So one cached
   kernel runs at any runtime `seq_len` — the grid (`ir/cuda/ir.py:GridDimSpec` now accepts an `Expr`
   factor, resolved via `Expr.eval` at launch) and the guard read the runtime value; the tile shape is
-  tuned for the hint. Cooperative-reduce and SDPA-prologue matmuls keep symbolic axes degenerate (one
-  element per thread) — masking would register-tile a per-row reduction (softmax/RMS) whose accumulator
-  must not be shared across cells. The backend benches a symbolic graph at the hint when no real inputs are
-  supplied (`backend/cuda/program.py:_symbolic_hints` / `_resolve_symbolic`), so `tune` and `compile`
+  tuned for the hint. This covers the **warp/MMA tier** too: symbolic M and/or N enumerate masked
+  mma.sync rows (`OVERHANG`-stamped, no hint-divisibility) — the boundary Cond gates whole tiles, the
+  `RegStore` carries per-element row/col guards for tiles straddling the bound (the fragment lane offsets
+  are invisible to σ), staged slab fills clamp their gmem reads to the runtime extent
+  (`Source.gmem_extents` with symbolic `Expr` bounds), unstaged operands take clamped gmem-direct
+  fragment loads (`LdmatrixLoad.gmem_guard`), and a symbolic output inner extent resolves its `ldm` from
+  the runtime kernel arg at render. A *fused* symbolic K stays off the warp tier (flash-style attention is
+  future work); the *split* symbolic-K gemm reaches it (see below). SDPA-prologue matmuls with a **symbolic
+  K** (P@V — which never stages) get masked THREAD tiles
+  with `FM = FN = 1` (`mask_f1`); static-K prologue kernels (fused gated-MLP) and cooperative-reduce
+  kernels keep symbolic axes degenerate (one element per thread) — their staged pipelines can't coexist
+  with the per-row guard (`021`'s hoist would break the prologue's SSA ordering; it now refuses such
+  lifts), and their deployment path is the structural split (`005_split_demoted`), which offers on
+  symbolic ROW **and** symbolic N axes (the rotary QK^T's symbolic-N key cone materializes canonically,
+  reaching the masked warp tier) — so e.g. the dynamic o_proj's collapsed attn-out splits into a
+  contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The symbolic-N B
+  operand `xnb[…, K, N]` further reaches the **TMA + warp-specialized** tier (matching its static twin,
+  not just cp.async): `_split_demoted._pad_inner_for_tma` rounds the materialized inner N up to a
+  multiple of 64 so the K dim's gmem stride stays 16 B-aligned at any runtime `seq_len`, which is the
+  `cuTensorMapEncodeTiled` requirement `050_use_tma` otherwise declines a symbolic innermost dim for
+  (`_inner_stride_aligned`). The buffer stays runtime-sized (correct above the hint, unlike a fixed
+  static width), and the padded `[seq_len, round_up)` overhang columns feed the mma only into
+  store-masked output positions, so they can't contaminate a live score. The cut keeps a
+  symbolic ROW/N buffer's runtime dim var (`seq_len` in a collapsed-reshape stride) as a legitimate read,
+  not an unmodeled-scope bail (`_split_demoted.dim_names`). A symbolic **K** (reduce) reaches the warp tier
+  too via the split: the demoted P@V un-fuses into a softmax-prob A cone `xn[H, m, k]` + a clean symbolic-K
+  gemm whose masked reduce is a hint-tiled `mma.sync` with the partial final K slab zero-filled. That cone's
+  reduce axis is innermost, so `_split_demoted._pad_inner_for_tma` pads it to a 64-multiple (16 B-aligned
+  stride) and the consumer reaches **TMA**: the reduce overhang must read 0, which TMA's hardware OOB
+  zero-fill delivers on the *middle-K* B operand (V, allocated at the real `seq_len`, so its descriptor
+  globalDim is `seq_len`) — binding every overhang product to 0 regardless of the padded A overhang (which
+  the zero-init-reused scratch keeps finite). `040` rings a masked-K bundle only when `050.tile_reaches_tma`
+  confirms the whole tile is TMA-eligible, so a masked-K bundle is never stranded on cp.async (it keeps the
+  SYNC ternary zero-fill otherwise). Only the **fused** prologue P@V (before the split, above) stays
+  degenerate at `FM = FN = 1`; flash-style fused symbolic-K attention remains future work.
+  Cooperative-reduce kernels still regain CTA-level parallelism on symbolic-row graphs via
+  **strided-cooperative rows**: their STATIC free axes thread-bind alongside the `BR` cooperative lanes
+  (the symbolic axis keeps its exact whole-to-grid bind, no mask), so e.g. a per-head q/k-norm with
+  symbolic seq deploys a `BN×BR` CTA instead of the v1 `BR`-thread degenerate one. The combine for such
+  2D CTAs is a segmented warp shuffle over each row's BR lanes (`K_c` is the innermost THREAD axis; the
+  enumerator clips those rows' BR to powers of two ≤ warp_size —
+  `lowering/kernel/_combine.cooperative_combine_geometry`). The backend
+  benches a symbolic graph at the hint when no real inputs are supplied
+  (`backend/cuda/program.py:_symbolic_hints` / `_resolve_symbolic`), so `tune` and `compile`
   agree on a hint-sized variant.
 - **`ElementwiseOp` inputs must already share the output shape.** The
   decomposition helper
@@ -127,10 +171,17 @@ It rides on one chokepoint: `Graph.splice` calls `provenance.propagate` with a `
 fragment node as a fresh piece of the consumed origins; fusion / lifting / optimization folds *aggregate* the consumed
 piece sets onto the merged node (unioning the dissolved producers so a multi-output splice drops nothing). Lowering is
 in-place `Op` rebinds, so prov rides through `LoopOp → TileOp → KernelOp → CudaOp` untouched. Seeded once at
-`Pipeline.tune` entry (idempotent); pure metadata, excluded from structural / cache keys.
+`Pipeline.tune_async` / `Pipeline.run` entry (idempotent); pure metadata, excluded from structural / cache keys. Boundary sentinels
+(`InputOp`/`ConstantOp`) never carry prov: `put` refuses to stamp them and `propagate` scrubs splice outputs that land
+on one (the generic hint merge would otherwise copy prov onto e.g. the ConstantOp produced by the sm_90+
+weight-transpose fold, inflating `totals` so every kernel of that origin read partial coverage).
 
 Consumers: `provenance.name_for` (called from `pipeline/passes/loop/fusion/991_stamp_loop_names`, the last
 loop-dialect rule) names kernels after the ops they realize (`k_rms_norm` when full, `k_rms_norm_reduce` when partial)
 and stamps the name onto `LoopOp.name`; every subsequent dialect (`TileOp`/`KernelOp`/`CudaOp`) just copies it
-through. `pipeline/dump._dump_torch_repro` slices the pristine frontend graph by a kernel's origins into a runnable
+through. Multi-op labels sort dominant-first (descending piece count, lexical tie-break), so the name is independent
+of fusion merge order — the attention kernel is `k_sdpa_linear_reduce`, its QKV-prologue twin `k_linear_sdpa_reduce`.
+Layout/plumbing origins (`_WEAK_KINDS`: transpose / reshape / unsqueeze / cat / slice) label a kernel only when no
+strong op is present — RoPE plumbing fused into attention doesn't pollute the name, while a standalone copy kernel
+still reads `k_cat_…` instead of the node-id fallback. `pipeline/dump._dump_torch_repro` slices the pristine frontend graph by a kernel's origins into a runnable
 `<kname>.torch.json`; `backend/torch_ref` runs that slice through real torch for the `run --ir` vs-torch comparison.

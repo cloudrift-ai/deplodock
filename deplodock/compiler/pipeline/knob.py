@@ -355,24 +355,32 @@ def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
     if raw is None:
         raw = config.knobs_aggregate()
     applied: dict[str, str] = {}
-    if not raw:
-        return applied
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if "=" not in entry:
-            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} is missing '=' (expected KEY=VALUE)")
-        key, _, value = entry.partition("=")
-        key = key.strip().upper()
-        value = value.strip()
-        if not key:
-            raise ValueError(f"DEPLODOCK_KNOBS entry {entry!r} has empty KEY")
+    for key, value in parse_knob_spec(raw).items():
         # Individual per-knob env vars win — don't clobber an explicit
         # ``DEPLODOCK_BK=4`` with whatever the aggregate says.
         if config.set_knob(key, value, overwrite=False):
             applied[config.knob_var(key)] = value
     return applied
+
+
+def parse_knob_spec(raw: str) -> dict[str, str]:
+    """Parse the shared ``K1=V1,K2=V2`` knob-spec grammar (the ``DEPLODOCK_KNOBS``
+    aggregate, ``run --ab``) into an ordered ``{NAME: value}`` dict — names
+    uppercased, whitespace tolerated, empty entries skipped. A malformed entry
+    (missing ``=`` / empty KEY) raises ``ValueError``."""
+    out: dict[str, str] = {}
+    for entry in (raw or "").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(f"knob spec entry {entry!r} is missing '=' (expected KEY=VALUE)")
+        key, _, value = entry.partition("=")
+        key = key.strip().upper()
+        if not key:
+            raise ValueError(f"knob spec entry {entry!r} has empty KEY")
+        out[key] = value.strip()
+    return out
 
 
 # Splat ``DEPLODOCK_KNOBS`` once at import so every later per-knob reader
@@ -589,6 +597,12 @@ def _geom_feats(
         out["D_log2_waves"] = waves  # CTAs relative to SM count
         out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
         out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
+        # Register-tile intensity × occupancy interaction: a wide per-thread
+        # register tile (big FM·FN) is a win only while the grid still covers
+        # the SMs — the flat D_cells* terms can't express that, so the big-FM
+        # goldens (square.2048's FM=26) rank deep under any sign the fit gives
+        # them (2026-06-12 golden-sweep finding 2).
+        out["D_l2_cells_occ"] = l2(cells) if ctas >= sm else 0.0
     return out
 
 

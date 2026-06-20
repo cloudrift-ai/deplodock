@@ -18,6 +18,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import (
     CatOp,
+    LayerNormOp,
     LinearOp,
     MatmulOp,
     MeanOp,
@@ -702,8 +703,19 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
     # --- Slice ---
     if op_name == "slice":
         if input_ids:
+            # Record dim/start from the raw FX args: ``aten.slice.Tensor(self,
+            # dim, start, end)`` may carry ``start=None`` (``x[:, :s]``) or a
+            # SymInt ``end`` — ``_resolve_inputs`` drops both, leaving the
+            # surviving ConstantOp inputs positionally ambiguous. A non-int
+            # dim/start (a SymInt slice origin) stays ``None`` so the
+            # decomposition rule fails loudly instead of mis-slicing.
+            args = fx_node.args
+            dim_raw = args[1] if len(args) > 1 else 0
+            start_raw = args[2] if len(args) > 2 else None
+            dim = dim_raw if isinstance(dim_raw, int) and not isinstance(dim_raw, bool) else None
+            start = 0 if start_raw is None else (start_raw if isinstance(start_raw, int) and not isinstance(start_raw, bool) else None)
             nid = g.add_node(
-                op=SliceOp(shape=_dim_tuple_to_op_shape(shape)),
+                op=SliceOp(shape=_dim_tuple_to_op_shape(shape), dim=dim, start=start),
                 inputs=input_ids,
                 output=Tensor(name, shape, dtype),
                 node_id=name,
@@ -755,6 +767,24 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
                 eps_value = float(eps_node.op.value)
                 input_ids = input_ids[:2]
         nid = g.add_node(op=RmsNormOp(eps=eps_value), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
+        node_map[name] = nid
+        return
+
+    if op_name == "layer_norm":
+        # aten.layer_norm: (x, normalized_shape, weight?, bias?, eps, cudnn_enable).
+        # The tracer drops normalized_shape (a list literal), None affine
+        # params, and the bool flag, leaving (x [, weight [, bias]]) plus a
+        # trailing eps ConstantOp. eps is the op's own field, not a graph
+        # input, so we peel it off here. The affine params are real
+        # parameter ConstantOps (value=None, source_path set), so the
+        # scalar-value check can't mistake one for eps.
+        eps_value = 1e-5
+        if len(input_ids) >= 2:
+            eps_node = g.nodes.get(input_ids[-1])
+            if eps_node and isinstance(eps_node.op, ConstantOp) and isinstance(eps_node.op.value, (int, float)):
+                eps_value = float(eps_node.op.value)
+                input_ids = input_ids[:-1]
+        nid = g.add_node(op=LayerNormOp(eps=eps_value), inputs=input_ids, output=Tensor(name, shape, dtype), node_id=name)
         node_map[name] = nid
         return
 

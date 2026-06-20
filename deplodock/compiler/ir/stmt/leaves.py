@@ -13,7 +13,16 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
-from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, _pad, dtype_promote, op_to_expr, render_index, select_to_ternary
+from deplodock.compiler.ir.stmt.base import (
+    ReduceCarrier,
+    RenderCtx,
+    Stmt,
+    _pad,
+    dtype_promote,
+    op_to_expr,
+    render_index,
+    select_to_ternary,
+)
 
 if TYPE_CHECKING:
     # ``Mma.atom`` holds an ``Atom`` (defined in the tile-IR layer, which builds
@@ -448,7 +457,7 @@ class Assign(Stmt):
 
 
 @dataclass(frozen=True)
-class Accum(Stmt):
+class Accum(ReduceCarrier):
     """Reduce accumulator — declares-and-folds in one statement.
 
     Semantics: ``name = op(name, value)`` inside the enclosing reduce
@@ -502,6 +511,12 @@ class Accum(Stmt):
     def defines(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def carried_names(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def combine_op(self) -> ElementwiseImpl:
+        return self.op
+
     def pretty(self, indent: str = "") -> list[str]:
         prefix = f"{self.dtype.name} " if self.dtype is not None else ""
         return [f"{indent}{prefix}{self.name} <- {self.op.name}({self.name}, {self.value})"]
@@ -526,7 +541,7 @@ class Accum(Stmt):
 
 
 @dataclass(frozen=True)
-class Mma(Stmt):
+class Mma(ReduceCarrier):
     """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
@@ -549,6 +564,11 @@ class Mma(Stmt):
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
       cooperative-K info the escape analysis reads). Threaded through
       ``rewrite`` like ``Accum.axes``.
+    - ``b_trans`` — the B operand is stored N×K (K in its last dim), i.e. a
+      transposed-B ``Q @ K^T`` cell. This is the native ``mma.row.col`` B layout
+      (col-major K×N), so ``kernel/005_lower_atom_tile`` loads it via ``ldmatrix``
+      WITHOUT ``.trans`` (the default canonical B[k,n] uses ``.trans``). Set by
+      ``tile/011_lower_atom_cell`` from the classified B Load's K position.
     """
 
     c: str
@@ -556,6 +576,7 @@ class Mma(Stmt):
     b: str
     atom: Atom
     axes: tuple[str, ...] = ()
+    b_trans: bool = False
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum``: the accumulator read is implicit (loop-carried),
@@ -565,6 +586,16 @@ class Mma(Stmt):
 
     def defines(self) -> tuple[str, ...]:
         return (self.c,)
+
+    def carried_names(self) -> tuple[str, ...]:
+        return (self.c,)
+
+    def combine_op(self) -> ElementwiseImpl:
+        # The tensor-core accumulation is ``c += a @ b`` — an additive fold.
+        # Reporting ``add`` (associative + commutative + identity 0) is what
+        # tells reassociation gates that split-K over the matmul's K axis is
+        # legal, exactly as for a scalar sum Accum.
+        return ElementwiseImpl("add")
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.c} <- mma[{self.atom.name}]({self.a} @ {self.b})"]

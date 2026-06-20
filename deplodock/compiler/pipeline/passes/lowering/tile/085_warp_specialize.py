@@ -84,6 +84,11 @@ Eligibility:
   must be a multiple of 32 so the ``WarpTile`` role axis has integer
   extent. Pre-extension matmul tiles satisfy this by construction
   (``BM × BN`` is always a multiple of 32 for matmul shapes).
+- Total CTA threads (consumer + producer warps) must fit the 1024-thread
+  launch limit. The role split *adds* producer warps to an otherwise-valid
+  consumer tile, so a 32-warp MMA tile (``WM × WN = 32``, 1024 threads —
+  launchable on its own) would become 33 warps = 1056 threads under WS=1
+  and fail ``cuLaunchKernel`` with ``CUDA_ERROR_INVALID_VALUE``.
 
 ``DEPLODOCK_WARP_SPECIALIZE=0`` / ``DEPLODOCK_WARP_SPECIALIZE=1`` env pins narrow
 the fork via ``WARP_SPECIALIZE.narrow``.
@@ -129,6 +134,13 @@ WARP_SPECIALIZE = Knob(
 _PRODUCER_WARPS = 1
 _WARP_SIZE = 32
 _N_PRODUCER_THREADS = _PRODUCER_WARPS * _WARP_SIZE
+# Hard CUDA architectural limit on threads per CTA (all compute capabilities).
+# The role split ADDS producer warps on top of the consumer tile, so a tile
+# that is itself launchable (e.g. WM·WN = 32 warps = 1024 threads) can push
+# the WS=1 variant past the limit — cuLaunchKernel then fails with
+# CUDA_ERROR_INVALID_VALUE (every fp16 TMA+WARPSPEC bench_fail in the
+# 2026-06-12 golden sweep was exactly this: 33 warps × 32 = 1056 threads).
+_MAX_CTA_THREADS = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +248,12 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
         # Warp-tier MMA: producer = 1 warp, consumer = ∏(warp axes) warps. Total
         # = (n_consumer + 1) warps → always a multiple of warp_size, and warp-
         # granularity decode needs no inner-thread divisibility constraint.
+        consumer_warps = 1
+        for ax in tile.axes:
+            consumer_warps *= ax.extent.as_static()
+        total_threads = (consumer_warps + _PRODUCER_WARPS) * _WARP_SIZE
+        if total_threads > _MAX_CTA_THREADS:
+            return False, (f"CTA threads with producer warps ({total_threads}) exceed the {_MAX_CTA_THREADS}-thread launch limit")
         return True, ""
 
     # Scalar (pointwise / cooperative-reduce) ThreadTile path:
@@ -256,6 +274,8 @@ def _eligible(op: TileOp) -> tuple[bool, str]:
     total_threads = consumer_threads + _N_PRODUCER_THREADS
     if total_threads % _WARP_SIZE != 0:
         return False, f"total CTA threads ({total_threads}) not divisible by warp_size={_WARP_SIZE}"
+    if total_threads > _MAX_CTA_THREADS:
+        return False, f"CTA threads with producer warps ({total_threads}) exceed the {_MAX_CTA_THREADS}-thread launch limit"
     return True, ""
 
 

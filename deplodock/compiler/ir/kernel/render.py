@@ -134,13 +134,13 @@ static __device__ __forceinline__ void cp_async_bulk_tensor_5d(
 _MMA_SYNC_PRELUDE = """\
 static __device__ __forceinline__ void dpl_ldmatrix_x4(unsigned* r, const void* smem) {
     unsigned addr = __cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];\\n"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
 static __device__ __forceinline__ void dpl_ldmatrix_x2_trans(unsigned* r, const void* smem) {
     unsigned addr = __cvta_generic_to_shared(smem);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];\\n"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\\n"
                  : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
 }
 
@@ -176,6 +176,153 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem(unsigned* r, const T*
         unsigned packed;
         ((T*)&packed)[0] = g[k * ldm + n];           // .f16x2: low half = k, high half = k+1
         ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
+// Masked-tile (M9) variants of the gmem-direct fragment loads: a tile
+// straddling a masked axis's bound would read rows / cols past the
+// runtime-sized buffer, so the lane coordinate on the gated axis clamps to
+// ``left - 1`` (``left`` = in-range elements from the tile base; >= 1 because
+// the boundary Cond admitted the tile). Clamped lanes read a duplicate
+// in-bounds value — harmless, their stores are masked by the RegStore guard.
+// Same contract as the staged path's slab-fill clamp (_clamp_source_index).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_mclamp(unsigned* r, const T* g, int ldm, int rows_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        if (row >= rows_left) row = rows_left - 1;   // M: clamp to the runtime extent
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed;
+        ((T*)&packed)[0] = p[0];
+        ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp(unsigned* r, const T* g, int ldm, int cols_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed;
+        ((T*)&packed)[0] = g[k * ldm + n];
+        ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
+// Transposed-B (Q @ K^T): B stored N×K (``g[n][k]``, K contiguous) — the native
+// ``mma.row.col`` col-major B, so no ldmatrix ``.trans`` is needed. The fragment
+// lane→element map is the same (n = groupID, k = 2·threadID_in_group + k16 half),
+// but each lane now reads a contiguous (k, k+1) pair from row ``n`` of B. ``ldm``
+// is B's gmem row stride (the K extent). Mirrors ``dpl_mma_load_b_gmem`` with the
+// (k, n) index roles swapped to (n, k).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans(unsigned* r, const T* g, int ldm) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;                                 // N: groupID (0..7)
+        int k = (tig << 1) + (i ? 8 : 0);            // K: 2*threadID_in_group, +8 for the k16 half
+        unsigned packed;
+        ((T*)&packed)[0] = g[n * ldm + k];           // .f16x2: contiguous (k, k+1) in row n
+        ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
+// Masked-tile variant of the transposed-B gmem load: the gated N axis is the
+// row (``n``) here, so clamp ``n`` to the runtime extent (cf. _b_gmem_nclamp,
+// which clamps N as the column). Clamped lanes read a duplicate in-bounds row;
+// their stores are masked by the RegStore guard.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_nclamp(unsigned* r, const T* g, int ldm, int cols_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed;
+        ((T*)&packed)[0] = g[n * ldm + k];
+        ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
+// Masked-K (symbolic reduce) variants of the gmem-direct fragment loads: when the
+// operand's REDUCE (K) axis is mask-padded (SDPA P@V over ``seq_len``), the final
+// K tile straddles the runtime extent. Unlike the M/N clamp above, a K element
+// past the extent must be ZERO-FILLED, not clamped to a duplicate — K is summed
+// by the mma, so a duplicate corrupts the reduction. ``k_left`` = in-range K
+// elements from the tile base; a half past it reads as +0.0 and is never
+// dereferenced. Mirrors the staged path's slab zero-fill (``_stage_expand``).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed = 0;
+        if (col < k_left) ((T*)&packed)[0] = p[0];
+        if (col + 1 < k_left) ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+// A: masked-M (clamp rows) AND masked-K (zero-fill cols).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_a_gmem_mclamp_kzero(unsigned* r, const T* g, int ldm, int rows_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int row = grp + ((i & 1) ? 8 : 0);
+        if (row >= rows_left) row = rows_left - 1;
+        int col = (tig << 1) + ((i & 2) ? 8 : 0);
+        const T* p = g + row * ldm + col;
+        unsigned packed = 0;
+        if (col < k_left) ((T*)&packed)[0] = p[0];
+        if (col + 1 < k_left) ((T*)&packed)[1] = p[1];
+        r[i] = packed;
+    }
+}
+
+// B (row-major K×N, NOT transposed): K is the row, zero-fill past the extent.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[k * ldm + n];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[(k + 1) * ldm + n];
+        r[i] = packed;
+    }
+}
+
+// B: masked-N (clamp col) AND masked-K (zero-fill row).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp_kzero(unsigned* r, const T* g, int ldm, int cols_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[k * ldm + n];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[(k + 1) * ldm + n];
         r[i] = packed;
     }
 }

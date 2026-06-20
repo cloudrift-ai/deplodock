@@ -132,8 +132,11 @@ def resolve_golden_arg(args) -> None:
     """If ``--golden NAME`` is set, resolve it to ``args.code = <golden snippet>``
     and stash every config recorded under NAME on ``args.golden_configs`` (a list —
     one shape may carry several golden knob sets; ``run --bench`` echoes each under
-    its matching kernel). Exits 2 on an unknown name (listing the available names)
-    or a conflict with ``--code`` / positional input / ``--ir``."""
+    its matching kernel). A **dynamic** golden also sets ``args.dynamic`` to its own
+    recorded spec (the spec is part of the config, so a CLI ``--dynamic`` next to
+    ``--golden`` is rejected — the same way ``--ir`` rejects it). Exits 2 on an
+    unknown name (listing the available names) or a conflict with ``--code`` /
+    positional input / ``--ir`` / ``--dynamic``."""
     name = getattr(args, "golden", None)
     args.golden_configs = []
     if not name:
@@ -143,16 +146,25 @@ def resolve_golden_arg(args) -> None:
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
         sys.exit(2)
-    matches = Dataset.from_golden(name=name).samples
+    if getattr(args, "dynamic", None):
+        logger.error("--dynamic is incompatible with --golden (a dynamic golden's spec is part of its config)")
+        sys.exit(2)
+    # Scope to the live card's golden(s): on a multi-GPU goldens dir, A/B-ing the
+    # deployed pick against another card's recorded config (e.g. a PRO 6000 golden
+    # on a 5090 — both cc 12.0) is meaningless. Cards with no recorded golden of
+    # their own fall back to the full set (the seed / transfer flow).
+    matches = Dataset.from_golden(name=name, live_gpu=True).samples
     if not matches:
         from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 
         names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
         logger.error("unknown golden config %r.\nAvailable: %s", name, names)
         sys.exit(2)
-    # All configs under one name share the shape, so any snippet is interchangeable.
+    # All configs under one name share the shape (and dynamic spec), so any
+    # snippet is interchangeable.
     args.golden_configs = matches
     args.code = matches[0].snippet
+    args.dynamic = list(matches[0].dynamic) if matches[0].dynamic else None
     logger.info("[golden] %s → --code %s (%d recorded config%s)", name, args.code, len(matches), "" if len(matches) == 1 else "s")
 
 
@@ -455,10 +467,21 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
 
     hidden_size = decoder.config.hidden_size
     x = torch.randn(1, seq_len, hidden_size, dtype=dtype)
-    position_ids = torch.arange(seq_len).unsqueeze(0)
     # Some architectures (e.g. Gemma's sliding/global split) key RoPE on the
     # layer's attention type; pass it when the rotary module / layer expose it.
     layer_type = getattr(getattr(block, "self_attn", None), "layer_type", None)
+
+    if dynamic_shapes:
+        # Dynamic mode: concrete (cos, sin) kwargs would specialise rotary to
+        # the trace seq_len, so wrap the block with in-graph sliced rotary
+        # instead. The wrapper's input is ``x`` → spec ``--dynamic seq_len@x:1``.
+        from deplodock.compiler.trace.huggingface import build_layer_wrapper
+
+        wrapper = build_layer_wrapper(block, decoder.rotary_emb, hidden_size, dtype, layer_type=layer_type)
+        graph = trace_module(wrapper, (x,), dynamic_shapes=dynamic_shapes)
+        return graph, (wrapper, (x,), {})
+
+    position_ids = torch.arange(seq_len).unsqueeze(0)
     try:
         cos, sin = decoder.rotary_emb(x, position_ids, layer_type)
     except TypeError:

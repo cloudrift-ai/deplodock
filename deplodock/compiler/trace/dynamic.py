@@ -13,6 +13,11 @@ rewrite (e.g. ``--seq-len 32`` on a model whose ``num_heads == 32``).
 
 from __future__ import annotations
 
+# Upper bound on every ``--dynamic`` axis (the ``torch.export.Dim`` max below).
+# Also the length the whole-model wrapper precomputes rotary cos/sin out to
+# (``trace.huggingface._SlicedRotary``).
+DYNAMIC_DIM_MAX = 4096
+
 
 def parse_position_specs(specs: list[str] | None) -> list[tuple[str, str, int]]:
     """Parse ``--dynamic NAME@INPUT:AXIS`` CLI strings to ``(name, input,
@@ -75,9 +80,9 @@ def build_torch_dynamic_shapes(specs: list[tuple[str, str, int]]) -> dict | None
     out: dict[str, dict[int, object]] = {}
     for name, input_name, axis in specs:
         if name not in dims_by_name:
-            dims_by_name[name] = torch.export.Dim(name, min=1, max=4096)
+            dims_by_name[name] = torch.export.Dim(name, min=1, max=DYNAMIC_DIM_MAX)
         out.setdefault(input_name, {})[axis] = dims_by_name[name]
     return out
 
 
-__all__ = ["parse_position_specs", "build_torch_dynamic_shapes"]
+__all__ = ["DYNAMIC_DIM_MAX", "parse_position_specs", "build_torch_dynamic_shapes"]

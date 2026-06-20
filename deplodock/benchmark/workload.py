@@ -28,26 +28,36 @@ def extract_benchmark_results(output: str) -> str:
     return output[idx:]
 
 
+def _bench_args(recipe: Recipe) -> list[str]:
+    """The vllm bench serve argument list shared by the display string and the
+    docker invocation. Embedding recipes target /v1/embeddings via the
+    openai-embeddings backend and have no output length (nothing is generated)."""
+    bench = recipe.benchmark
+    num_instances = calculate_num_instances(recipe)
+    port = 8080 if num_instances > 1 else 8000
+    args = [
+        f"--model {recipe.model_name}",
+        "--trust-remote-code",
+    ]
+    if recipe.is_embedding:
+        args += ["--backend openai-embeddings", "--endpoint /v1/embeddings"]
+    args += [
+        f"--max-concurrency {bench.max_concurrency}",
+        f"--num-prompts {bench.num_prompts}",
+        f"--random-input-len {bench.random_input_len}",
+    ]
+    if not recipe.is_embedding:
+        args.append(f"--random-output-len {bench.random_output_len}")
+    args.append(f"--base-url http://localhost:{port}")
+    return args
+
+
 def build_bench_command(recipe: Recipe) -> str:
     """Build the vllm bench serve command string (without docker wrapper).
 
     Returns the bench command as a human-readable multi-line string.
     """
-    bench = recipe.benchmark
-    model_name = recipe.model_name
-    num_instances = calculate_num_instances(recipe)
-    port = 8080 if num_instances > 1 else 8000
-
-    return (
-        f"vllm bench serve\n"
-        f"    --model {model_name}\n"
-        f"    --trust-remote-code\n"
-        f"    --max-concurrency {bench.max_concurrency}\n"
-        f"    --num-prompts {bench.num_prompts}\n"
-        f"    --random-input-len {bench.random_input_len}\n"
-        f"    --random-output-len {bench.random_output_len}\n"
-        f"    --base-url http://localhost:{port}"
-    )
+    return "vllm bench serve\n" + "\n".join(f"    {a}" for a in _bench_args(recipe))
 
 
 def format_task_yaml(task: BenchmarkTask) -> str:
@@ -96,25 +106,18 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     """
     bench = recipe.benchmark
 
-    # Warn if input + output lengths risk exceeding context_length
+    # Warn if input + output lengths risk exceeding context_length (embedding
+    # workloads generate nothing — only the input length counts there).
     context_length = recipe.engine.llm.context_length
-    if context_length is not None and bench.random_input_len + bench.random_output_len >= context_length:
-        logging.getLogger().warning(
-            f"benchmark random_input_len ({bench.random_input_len}) + "
-            f"random_output_len ({bench.random_output_len}) = "
-            f"{bench.random_input_len + bench.random_output_len} >= "
-            f"context_length ({context_length})"
-        )
+    request_len = bench.random_input_len + (0 if recipe.is_embedding else bench.random_output_len)
+    if context_length is not None and request_len >= context_length:
+        logging.getLogger().warning(f"benchmark request length ({request_len}) >= context_length ({context_length})")
 
-    model_name = recipe.model_name
     # vllm bench serve is an HTTP client that works against any OpenAI-compatible
     # endpoint, so we always use the vLLM image for benchmarking.
     image = recipe.engine.llm.image
     if recipe.engine.llm.engine_name != "vllm":
         image = VllmConfig().image
-
-    num_instances = calculate_num_instances(recipe)
-    port = 8080 if num_instances > 1 else 8000
 
     # The ROCm vLLM image crashes on import without GPU devices, even for
     # the pure-HTTP benchmark client.  Pass device flags so it can start.
@@ -122,16 +125,7 @@ async def run_benchmark_workload(run_cmd, recipe: Recipe, dry_run=False):
     device_flags = " --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri" if is_amd else ""
 
     bench_cmd = (
-        f"docker run --rm --network host{device_flags} --entrypoint bash {image} -c '"
-        f"vllm bench serve "
-        f"--model {model_name} "
-        f"--trust-remote-code "
-        f"--base-url http://localhost:{port} "
-        f"--max-concurrency {bench.max_concurrency} "
-        f"--num-prompts {bench.num_prompts} "
-        f"--random-input-len {bench.random_input_len} "
-        f"--random-output-len {bench.random_output_len}"
-        f"'"
+        f"docker run --rm --network host{device_flags} --entrypoint bash {image} -c 'vllm bench serve {' '.join(_bench_args(recipe))}'"
     )
 
     bench_command_str = build_bench_command(recipe)

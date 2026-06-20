@@ -24,15 +24,16 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import is_warp
 
-from .conftest import requires_cuda
+from .conftest import dyn_M, requires_cuda, requires_sm90
 
 # Route every test in this module to the single ``cuda`` xdist_group
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``
 # skipif reason) so they run sequentially on one worker — the host has one
 # GPU and scattering CUDA tests across workers exhausts the device context.
-# The per-test ``_supports_mma_sync`` skipif still gates the sm_80+ arch
-# requirement on top of this.
-pytestmark = [requires_cuda]
+# ``requires_sm90`` skips the whole module below sm_90: this suite forces the
+# mma.sync warp tier, which is pin-only and non-functional on sm_80-89 (ldmatrix
+# host fault + ``sm_NNa`` TMA compile). It deploys / is validated on sm_90+.
+pytestmark = [requires_cuda, requires_sm90]
 
 
 def _has_cuda() -> bool:
@@ -123,9 +124,11 @@ def _np_dtype(dt: DataType):
         (128, 256, 128, F16),
     ],
 )
-def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: DataType, monkeypatch):
+def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: DataType, shape_mode, monkeypatch):
     """An F16×F16 matmul compiled via the mma.sync path agrees with the f32
-    reference within fp16 tolerance — for both F16 and F32 output dtypes.
+    reference within fp16 tolerance — for both F16 and F32 output dtypes, and
+    for both a STATIC M and a DYNAMIC (symbolic ``seq_len``) M run at the same
+    runtime M (the masked-tile path; ``M ∈ {128, 256}`` are tile divisors).
 
     Pins the warp-tier ``mma_m16n8k16_f16`` atom + a multi-warp 128×128
     tile (``WM=2 WN=2 FM=4 FN=8 BK=2`` — N-tile = WN·FN·atom_n = 2·8·8 = 128,
@@ -140,7 +143,8 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     monkeypatch.setenv("DEPLODOCK_FN", "8")
     monkeypatch.setenv("DEPLODOCK_BK", "2")
 
-    g = _matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype)
+    Mg = dyn_M(shape_mode, M)
+    g = _matmul_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
     assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
@@ -165,14 +169,15 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     # and segfaults. The backend's ``_prebuild_descriptors`` binds every
     # ``CUtensorMap`` and opts into dynamic smem, so any geometry — TMA or
     # gmem-direct — launches correctly. The render+source asserts above still
-    # cover the KERNEL-stage IR; this only fixes the execution path.
+    # cover the KERNEL-stage IR; this only fixes the execution path. The dynamic
+    # graph resolves ``seq_len`` from the (M, K) input array shape.
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
     b = (np.random.randn(K, N) * 0.1).astype(np.float16)
     be = CudaBackend()
-    g_run = be.compile(_matmul_graph(M=M, N=N, K=K, out_dtype=out_dtype))
+    g_run = be.compile(_matmul_graph(M=Mg, N=N, K=K, out_dtype=out_dtype))
     run_result, _ = be.run(g_run, input_data={"a": a, "b": b})
 
     expected = a.astype(np.float32) @ b.astype(np.float32)

@@ -171,6 +171,24 @@ deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --teardown
 deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --dry-run
 ```
 
+## Serve (compiled embeddings via vLLM)
+
+```bash
+# vLLM's OpenAI shell (/v1/embeddings, tokenizer, scheduler, pooler) over deplodock-compiled kernels
+pip install -e ".[compile,serving]"
+deplodock serve Qwen/Qwen3-Embedding-0.6B                  # extra flags pass through to vllm serve
+
+curl localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-Embedding-0.6B","input":"Hello"}'
+
+# One-shot benchmark (vllm bench serve against the started server), and the raw-vLLM baseline
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
+deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32 --stock
+```
+
+See [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md); embedding recipes
+(`recipes/Qwen3-Embedding-*`) A/B this against stock vLLM via `deplodock bench`.
+
 ## Recipe
 
 ```yaml
@@ -271,11 +289,13 @@ make format    # auto-fix
       - [cuda/](deplodock/compiler/backend/cuda/) — CUDA backend internals (see [ARCHITECTURE.md](deplodock/compiler/backend/cuda/ARCHITECTURE.md))
     - [tuning.py](deplodock/compiler/tuning.py) — autotuning utilities
   - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
+  - [serving/](deplodock/serving/) — vLLM out-of-tree embedding plugin (see [ARCHITECTURE.md](deplodock/serving/ARCHITECTURE.md))
   - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
   - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
   - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
   - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
+- [docker/](docker/) — Custom image builds ([vllm-deplodock](docker/vllm-deplodock/) — vLLM + the deplodock plugin)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [kernels/](kernels/) — Standalone CUDA kernel sources
 - [docs/](docs/) — Technical notes and engine-specific guides

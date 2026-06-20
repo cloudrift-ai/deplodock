@@ -13,12 +13,12 @@ scratch. Launch order is ``graph.topological_order()``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os as _os
 import pickle
-import select
-import subprocess
+import sys as _sys
 import time as _time_module
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -27,6 +27,7 @@ import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
 from deplodock.compiler.backend.cuda import _tma, nvcc
+from deplodock.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
 from deplodock.compiler.backend.cuda.dtype import cupy_dtype
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import DataType
@@ -154,6 +155,14 @@ class _Compiled:
     # fallback concrete value when no ``input_data`` is supplied (the autotuner
     # benches a symbolic graph at the hint size).
     symbolic_hints: dict[str, int] = field(default_factory=dict)
+    # Symbolic axis name → its capacity CAP. A capacity-capped kernel (the
+    # smem-staged fused symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)
+    # bakes its smem slab at the ``Dim`` hint and is only correct for runtime
+    # extents ≤ that cap, so the launch resolver hard-errors when the supplied
+    # input shape exceeds it (rather than reading/writing past the baked slab).
+    # Empty for every kernel set that tiles the symbolic extent with a ceil-div
+    # grid (those handle any runtime size); populated only by the capped cut.
+    symbolic_caps: dict[str, int] = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -212,23 +221,32 @@ def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
     value from ``input_arrays[buf].shape[dim_index]``. First-seen position
     wins on conflicts so each name resolves deterministically.
 
-    Input dims are atomic ``Var``-backed when symbolic (composite Dim exprs
-    appear only on derived tensors). We collect via ``expr.free_vars()`` so
-    each free name binds to the first input axis where it appears."""
+    A symbolic name is recovered from an **atomic** ``Var`` axis (``shape[d] ==
+    Var(name)``). A **composite** symbolic input dim — e.g. a sliced masked-K
+    producer slab's padded extent ``((seq_len + 63) // 64) * 64`` reaching a
+    standalone-benched consumer as a synthetic input — can't be inverted to its
+    free var directly, so it does NOT bind; it is fine as long as every free var
+    it carries is bound from an atomic axis somewhere (the slab's own ``seq_q``
+    axis, the sibling P operand, …). Only a name that appears *exclusively* in
+    composite dims is unrecoverable — that raises."""
     from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
 
     bindings: dict[str, tuple[str, int]] = {}
+    composite_names: set[str] = set()
     for nid in graph.inputs:
         for d, dim in enumerate(graph.nodes[nid].output.shape):
             if dim.is_static:
                 continue
-            if not isinstance(dim.expr, Var):
-                raise ValueError(
-                    f"input {nid!r} axis {d} has a composite symbolic dim {dim!r}; "
-                    "inputs must carry atomic Var-backed symbolic dims so the launch "
-                    "resolver can recover each name from a single shape axis"
-                )
-            bindings.setdefault(dim.expr.name, (nid, d))
+            if isinstance(dim.expr, Var):
+                bindings.setdefault(dim.expr.name, (nid, d))
+            else:
+                composite_names |= dim.expr.free_vars()
+    unrecoverable = composite_names - bindings.keys()
+    if unrecoverable:
+        raise ValueError(
+            f"symbolic name(s) {sorted(unrecoverable)} appear only in composite input dims; "
+            "no atomic Var-backed axis to recover them from at launch"
+        )
     return bindings
 
 
@@ -267,9 +285,96 @@ def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> dict[str, cp.ndarray]:
+def _materialize(buf: _Buffer, shape: tuple[int, ...], src: np.ndarray | None, constants: dict[str, float]) -> cp.ndarray:
+    """Build one device array for ``buf`` at ``shape`` — the single fill
+    policy shared by :func:`_allocate` and :meth:`CompiledProgram.rebind`."""
     import cupy as cp
 
+    cp_dtype = cupy_dtype(buf.dtype)
+    np_dtype = buf.dtype.np
+    if src is not None:
+        return cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
+    if buf.role == "constant" and buf.name in constants:
+        return cp.full(shape, float(constants[buf.name]), dtype=cp_dtype)
+    if buf.role == "input":
+        # Pseudo-random fill for un-supplied inputs (matches old generated program).
+        n = 1
+        for d in shape:
+            n *= int(d)
+        # Build the index ramp in int64, not ``np_dtype``: a float16 buffer
+        # past 65504 elements would overflow to ``inf`` (then ``inf % 101``
+        # → ``nan``). Compute in fp32 and cast the final values — always in
+        # ``[-0.5, 0.5]``, so fp16-safe.
+        idx = np.arange(n, dtype=np.int64)
+        vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
+        return cp.asarray(vals.reshape(shape))
+    return cp.zeros(shape, dtype=cp_dtype)
+
+
+@dataclass
+class _SlabPlan:
+    """A liveness-planned layout of the program's scratch buffers into one
+    persistent device slab. ``offsets`` is the byte offset of each scratch
+    buffer's view into ``slab``; ``total_bytes`` is the slab size; ``sym_values``
+    are the (capacity) dims the layout was planned at — a re-plan is needed when
+    they change (``rebind``). ``naive_bytes`` is the sum of the per-scratch sizes
+    this layout replaces (for the reduction-factor log). ``slab`` is held for the
+    program lifetime so cupy never reclaims it under the views' baked pointers."""
+
+    offsets: dict[str, int]
+    total_bytes: int
+    sym_values: dict[str, int]
+    naive_bytes: int
+    slab: cp.ndarray | None = None
+
+
+def _scratch_sizes(compiled: _Compiled, sym_values: dict[str, int]) -> tuple[dict[str, int], dict[str, int]]:
+    """Byte size + alignment per ``scratch`` buffer at the resolved ``sym_values``."""
+    sizes: dict[str, int] = {}
+    aligns: dict[str, int] = {}
+    for buf in compiled.bufs:
+        if buf.role != "scratch":
+            continue
+        shape = buf.resolve_shape(sym_values) or (1,)
+        n = 1
+        for d in shape:
+            n *= int(d)
+        sizes[buf.name] = max(1, n) * buf.dtype.nbytes
+        aligns[buf.name] = buf.dtype.nbytes
+    return sizes, aligns
+
+
+def _plan_slab(compiled: _Compiled, sym_values: dict[str, int]) -> _SlabPlan:
+    """Liveness-plan the scratch buffers into one slab layout (no allocation)."""
+    sizes, aligns = _scratch_sizes(compiled, sym_values)
+    intervals = compute_live_intervals(list(sizes), compiled.launches)
+    offsets, total = plan_offsets(intervals, sizes, aligns)
+    return _SlabPlan(offsets=offsets, total_bytes=total, sym_values=dict(sym_values), naive_bytes=sum(sizes.values()))
+
+
+def _alloc_slab(compiled: _Compiled, sym_values: dict[str, int]) -> tuple[dict[str, cp.ndarray], _SlabPlan]:
+    """Plan + allocate the scratch slab and return each scratch buffer as a typed
+    view into it. One zero-init ``uint8`` allocation; each view's device pointer
+    (``slab.data + offset``) is stable for the program lifetime (the slab is pinned
+    on the returned plan), so captured graphs / TMA descriptors that bake the
+    pointer stay valid across replays."""
+    import cupy as cp  # noqa: PLC0415
+
+    plan = _plan_slab(compiled, sym_values)
+    plan.slab = cp.zeros(plan.total_bytes or 1, dtype=cp.uint8)
+    views: dict[str, cp.ndarray] = {}
+    for buf in compiled.bufs:
+        if buf.role != "scratch":
+            continue
+        shape = buf.resolve_shape(sym_values) or (1,)
+        views[buf.name] = cp.ndarray(shape, dtype=cupy_dtype(buf.dtype), memptr=plan.slab.data + plan.offsets[buf.name])
+    return views, plan
+
+
+def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> tuple[dict[str, cp.ndarray], _SlabPlan]:
+    """Materialize every buffer. ``scratch`` buffers become typed views into one
+    liveness-planned persistent slab (dead intervals share memory);
+    input/constant/output buffers stay standalone (persistent across the call)."""
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
     arrays: dict[str, cp.ndarray] = {}
@@ -278,31 +383,18 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     # softmax). Ignore the over/invalid warnings so genuine output stays clean.
     with np.errstate(over="ignore", invalid="ignore"):
         for buf in compiled.bufs:
-            resolved = buf.resolve_shape(sym_values)
-            shape = resolved or (1,)
-            cp_dtype = cupy_dtype(buf.dtype)
-            np_dtype = buf.dtype.np
-            src = input_data.get(buf.name)
-            if src is not None:
-                arr = cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
-            elif buf.role == "constant" and buf.name in compiled.constants:
-                arr = cp.full(shape, float(compiled.constants[buf.name]), dtype=cp_dtype)
-            elif buf.role == "input":
-                # Pseudo-random fill for un-supplied inputs (matches old generated program).
-                n = 1
-                for d in shape:
-                    n *= int(d)
-                # Build the index ramp in int64, not ``np_dtype``: a float16 buffer
-                # past 65504 elements would overflow to ``inf`` (then ``inf % 101``
-                # → ``nan``). Compute in fp32 and cast the final values — always in
-                # ``[-0.5, 0.5]``, so fp16-safe.
-                idx = np.arange(n, dtype=np.int64)
-                vals = (0.01 * ((idx.astype(np.float32) * 7 + 13) % 101 - 50)).astype(np_dtype)
-                arr = cp.asarray(vals.reshape(shape))
-            else:
-                arr = cp.zeros(shape, dtype=cp_dtype)
-            arrays[buf.name] = arr
-    return arrays
+            if buf.role == "scratch":
+                continue  # placed into the slab below
+            shape = buf.resolve_shape(sym_values) or (1,)
+            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), compiled.constants)
+    # ``scratch`` buffers become views into one zero-init slab. The build-time
+    # zero preserves the contract scratch had under ``cp.zeros``; per-launch
+    # ``zero_outputs`` re-zeros atomic-reduction outputs, and every other kernel
+    # fully overwrites its output (lowering contract), so a reused slot's stale
+    # contents are never read.
+    scratch_views, plan = _alloc_slab(compiled, sym_values)
+    arrays.update(scratch_views)
+    return arrays, plan
 
 
 def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) -> dict[str, int]:
@@ -316,6 +408,13 @@ def _resolve_symbolic(compiled: _Compiled, input_data: dict[str, np.ndarray]) ->
         arr = input_data.get(buf)
         if arr is not None:
             env[name] = int(arr.shape[dim_idx])
+            cap = compiled.symbolic_caps.get(name)
+            if cap is not None and env[name] > cap:
+                raise ValueError(
+                    f"symbolic dim {name!r} = {env[name]} exceeds the capacity-capped kernel's hint ({cap}); "
+                    f"this build bakes its smem slab at {cap} and cannot run a larger extent — "
+                    f"re-trace with a larger --seq-len hint or use the ceil-div (uncapped) lowering"
+                )
         elif name in compiled.symbolic_hints:
             env[name] = compiled.symbolic_hints[name]
         else:
@@ -379,14 +478,24 @@ def _collapse_inert_dims(arr_shape: tuple[int, ...], box_extents: tuple[int, ...
     box_rev = list(reversed(box_extents))
     if len(box_rev) == len(arr_rev) + 1 and arr_rev and box_rev[0] != 0 and arr_rev[0] % box_rev[0] == 0:
         arr_rev = [box_rev[0], arr_rev[0] // box_rev[0], *arr_rev[1:]]
+    # Drop exactly ``arr_rank - box_rank`` inert gap singletons — no more. A
+    # *box-carrying* dim can be a runtime-extent-1 (or any extent < its box):
+    # a masked dynamic axis (e.g. ``seq_len`` = 1, 31) is legitimately small,
+    # and TMA zero-fills the overhang where the box exceeds globalDim. The old
+    # "drop every extent-1 aligned with box>1" rule mis-dropped that masked dim
+    # whenever its runtime extent hit 1, then failed the rank match (seq_len=1
+    # → ``arr=(1, 512)`` vs ``box=(64, 32)``). Shedding only the surplus dims
+    # keeps the genuine inner gap-singleton drop (arr_rank > box_rank) intact.
+    n_drop = len(arr_rev) - len(box_rev)
     kept: list[int] = []
     bi = 0
     for a in arr_rev:
-        if bi < len(box_rev) and a == 1 and box_rev[bi] != 1:
+        if n_drop > 0 and a == 1 and bi < len(box_rev) and box_rev[bi] != 1:
+            n_drop -= 1
             continue  # dropped gap singleton
         kept.append(a)
         bi += 1
-    if bi != len(box_rev) or len(kept) != len(box_rev):
+    if n_drop != 0 or len(kept) != len(box_rev):
         raise ValueError(f"TMA descriptor rank mismatch: arr_shape={arr_shape!r} cannot be collapsed to match box_extents={box_extents!r}")
     return tuple(reversed(kept))
 
@@ -561,6 +670,10 @@ class CompiledProgram:
     # block resolution and the runtime-arg tail. Empty for fully-static
     # graphs.
     sym_values: dict[str, int] = field(default_factory=dict)
+    # Liveness-planned scratch slab: scratch ``arrays`` are views into
+    # ``slab_plan.slab``, pinned here for the program lifetime (``build`` always
+    # populates it; the default is only for dataclass construction).
+    slab_plan: _SlabPlan | None = None
     # Per-launch timing events, lazily created on first ``iter_once``
     # and reused across every subsequent call so multi-iter bench loops
     # don't churn the cupy ``Event`` pool (the pre-unification
@@ -579,6 +692,21 @@ class CompiledProgram:
     # ``run_program_debug`` and the autotune sweep never capture.
     _graphs: list | None = field(default=None, repr=False)
     _graph_batch_sizes: list[int] | None = field(default=None, repr=False)
+    # One CUDA graph holding EVERY launch in program order (batch 1 each),
+    # captured by :meth:`capture_program_graph` for the whole-program (e2e)
+    # timing windows — the deplodock analogue of timing a captured torch
+    # forward, so the backend-comparison table is like-for-like.
+    _e2e_graph: Any | None = field(default=None, repr=False)
+    _e2e_start: Any | None = field(default=None, repr=False)
+    _e2e_stop: Any | None = field(default=None, repr=False)
+    # Whole-program graphs keyed by the resolved symbolic tuple — the serving
+    # captured-replay path holds one captured graph PER seq_len over a single
+    # capacity-sized buffer set (a graph baked at seq_len S only replays at S,
+    # since each kernel's grid + by-value seq_len are frozen by capture). LRU,
+    # bounded by ``_graph_cache_max``. The static-shape bench path uses the one
+    # ``()`` key, so it's unaffected.
+    _graph_cache: dict = field(default_factory=dict, repr=False)
+    _graph_cache_max: int = 64
 
     @classmethod
     def build(
@@ -599,7 +727,7 @@ class CompiledProgram:
         t0 = _time_module.monotonic()
         compiled = _compile(graph)
         sym_values = _resolve_symbolic(compiled, input_data or {})
-        arrays = _allocate(compiled, input_data)
+        arrays, slab_plan = _allocate(compiled, input_data)
         descs = _prebuild_descriptors(compiled, arrays)
         elapsed = _time_module.monotonic() - t0
         if compile_timeout_s is not None and elapsed > compile_timeout_s:
@@ -610,7 +738,87 @@ class CompiledProgram:
             elapsed,
             ", ".join(f"{li}:{lc.kernel_name}" for li, lc in enumerate(compiled.launches)),
         )
-        return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values)
+        if slab_plan.naive_bytes > 0:
+            logger.info(
+                "[cuda] buffer-reuse: scratch slab=%.2f GB (%.2f GB naive, %.1fx) over %d scratch buf(s)",
+                slab_plan.total_bytes / 1e9,
+                slab_plan.naive_bytes / 1e9,
+                slab_plan.naive_bytes / max(1, slab_plan.total_bytes),
+                len(slab_plan.offsets),
+            )
+        return cls(compiled=compiled, arrays=arrays, descs=descs, sym_values=sym_values, slab_plan=slab_plan)
+
+    def rebind(self, input_data: dict[str, np.ndarray]) -> None:
+        """Re-bind ``input_data`` on an already-built program, re-sizing
+        symbolic-shaped buffers to the new runtime dims — the serving path,
+        where one compiled dynamic-seq_len program runs request after request.
+
+        Supplied buffers are re-uploaded: in place (``arr.set``) when the
+        resolved shape is unchanged, re-allocated otherwise. Un-supplied
+        buffers whose shape carries a symbolic dim (scratch/outputs sized by
+        seq_len) re-materialize at the new shape under the same fill policy
+        as ``build``; static-shaped un-supplied buffers — the weights — keep
+        their device arrays untouched (no re-upload). When any array was
+        re-allocated, TMA descriptors are rebuilt (they embed device pointers
+        and shapes) and captured CUDA graphs are dropped (they bake old
+        pointers). Caller must hold ``gpu_lock()``."""
+        new_sym = _resolve_symbolic(self.compiled, input_data)
+        realloc = False
+        reuse = self.slab_plan is not None
+        with np.errstate(over="ignore", invalid="ignore"):
+            for buf in self.compiled.bufs:
+                if reuse and buf.role == "scratch":
+                    continue  # slab-managed; re-planned below when dims change
+                src = input_data.get(buf.name)
+                if src is None and not buf.is_symbolic:
+                    continue
+                shape = buf.resolve_shape(new_sym) or (1,)
+                arr = self.arrays[buf.name]
+                if tuple(arr.shape) != shape:
+                    self.arrays[buf.name] = _materialize(buf, shape, src, self.compiled.constants)
+                    realloc = True
+                elif src is not None:
+                    arr.set(np.ascontiguousarray(src, dtype=buf.dtype.np).reshape(shape))
+        # Scratch slab: re-plan + reallocate at the new dims (sizes scale with the
+        # symbolic extent). The fresh slab has new pointers, so descs/graphs must
+        # be rebuilt/dropped — handled by the shared ``if realloc:`` block below.
+        if reuse and new_sym != self.slab_plan.sym_values:
+            scratch_views, self.slab_plan = _alloc_slab(self.compiled, new_sym)
+            self.arrays.update(scratch_views)
+            realloc = True
+        self.sym_values = new_sym
+        if realloc:
+            self.descs = _prebuild_descriptors(self.compiled, self.arrays)
+            self._graphs = None
+            self._graph_batch_sizes = None
+            self._e2e_graph = None
+            self._graph_cache.clear()
+
+    def set_sym_values(self, values: dict[str, int]) -> None:
+        """Set the host symbolic values that resolve launch grids + by-value
+        kernel args, WITHOUT re-allocating buffers — they stay at the build
+        (capacity) shape. The serving capture path: buffers sized once at
+        capacity, grids + frozen seq_len baked per request via
+        :meth:`capture_program_graph`, results sliced to the real shape by
+        ``outputs(sym_values=…)``. Errors if any value exceeds the allocated
+        buffer capacity (the caller falls back to ``rebind`` above capacity)."""
+        merged = {**self.sym_values, **values}
+        for buf in self.compiled.bufs:
+            want = buf.resolve_shape(merged) or (1,)
+            if math.prod(want) > self.arrays[buf.name].size:
+                raise ValueError(
+                    f"set_sym_values {values}: buffer {buf.name!r} resolves to {want} "
+                    f"({math.prod(want)} elems) > capacity {self.arrays[buf.name].size}"
+                )
+        self.sym_values = merged
+
+    def run_once(self) -> None:
+        """Launch every kernel once in program order with no per-launch event
+        record/sync/watchdog — the serving hot path (timing semantics live in
+        :meth:`iter_once`). The default stream orders the launches; the
+        caller's subsequent ``outputs()`` ``.get()`` synchronizes."""
+        for i, launch in enumerate(self.compiled.launches):
+            _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
 
     def capture_launch_graphs(self, batch_sizes: list[int]) -> None:
         """Capture each launch position's batch into one CUDA graph.
@@ -658,6 +866,123 @@ class CompiledProgram:
         cp.cuda.runtime.deviceSynchronize()
         self._graphs = graphs
         self._graph_batch_sizes = list(batch_sizes)
+
+    def capture_program_graph(self) -> None:
+        """Capture every launch (batch 1, program order) into ONE CUDA graph at
+        the CURRENT ``self.sym_values``, caching it by the resolved symbolic
+        tuple and pointing ``self._e2e_graph`` at it.
+
+        Two callers:
+        - The bench's :meth:`time_program_window` (static graph → the single
+          ``()`` cache key): one event window around N back-to-back replays, the
+          same semantics the captured torch closures get.
+        - The serving path: one captured graph PER seq_len over a SHARED
+          capacity-sized buffer set. A graph baked at seq_len S only replays at S
+          (its grids + by-value seq_len are frozen by capture), so the cache is
+          keyed by ``self.sym_values`` and bounded LRU (``_graph_cache_max``).
+          Set ``self.sym_values`` (via :meth:`set_sym_values`) and upload the
+          request's input prefix (via :meth:`upload_prefix`) before calling.
+
+        Cache hit ⇒ no re-capture. Same error contract as
+        :meth:`capture_launch_graphs`: raises :class:`GraphCaptureError` after
+        draining any partial capture state."""
+        import cupy as cp
+
+        key = self._sym_key()
+        cached = self._graph_cache.get(key)
+        if cached is not None:
+            self._graph_cache[key] = self._graph_cache.pop(key)  # LRU bump
+            self._e2e_graph = cached
+            return
+        side = cp.cuda.Stream(non_blocking=True)
+        try:
+            with side:
+                side.begin_capture()
+                for i, launch in enumerate(self.compiled.launches):
+                    _launch(launch, self.compiled, self.arrays, self.descs.get(i), self.sym_values)
+                graph = side.end_capture()
+        except Exception as exc:
+            if side.is_capturing():
+                try:
+                    with side:
+                        side.end_capture()  # drain capture state; discard the partial graph
+                except Exception:  # noqa: BLE001, S110 — already raising the original failure
+                    pass
+            raise GraphCaptureError(f"whole-program capture failed: {exc}") from exc
+        # Throwaway replay absorbs graphExec instantiation/upload cost.
+        graph.launch()
+        cp.cuda.runtime.deviceSynchronize()
+        self._graph_cache[key] = graph
+        while len(self._graph_cache) > self._graph_cache_max:
+            self._graph_cache.pop(next(iter(self._graph_cache)))  # evict LRU
+        self._e2e_graph = graph
+
+    def _sym_key(self) -> tuple:
+        """Hashable cache key for the current resolved symbolic values (``()`` for
+        a fully-static graph)."""
+        return tuple(sorted(self.sym_values.items()))
+
+    def replay_program_graph(self) -> None:
+        """Launch the whole-program graph for the current ``self.sym_values`` once
+        on the default stream — the serving hot path. The caller sets the request's
+        seq_len (:meth:`set_sym_values`), uploads its input prefix
+        (:meth:`upload_prefix`), and captures-or-reuses the graph
+        (:meth:`capture_program_graph`) first; results come from
+        ``outputs(sym_values=…)``. Caller must hold ``gpu_lock()``."""
+        if self._e2e_graph is None:
+            raise RuntimeError("replay_program_graph called before capture_program_graph")
+        self._e2e_graph.launch()
+
+    def upload_prefix(self, input_data: dict[str, np.ndarray]) -> None:
+        """H2D each host array into the contiguous PREFIX of its capacity-sized
+        device buffer — no re-allocation, so the captured graphs' baked pointers
+        stay valid (a logically ``(1, S, …)`` tensor occupies the first ``S*…``
+        elements of the ``(1, S_cap, …)`` allocation; the kernels, launched at
+        grids for the real S, only touch that prefix). Errors if a host array
+        exceeds its buffer's capacity. Caller must hold ``gpu_lock()``."""
+        for name, host in input_data.items():
+            buf = self.compiled.buf_by_name[name]
+            arr = self.arrays[name]
+            flat = np.ascontiguousarray(host, dtype=buf.dtype.np).ravel()
+            if flat.size > arr.size:
+                raise ValueError(f"upload_prefix: {name!r} has {flat.size} elems > capacity {arr.size}")
+            arr.ravel()[: flat.size].set(flat)
+
+    def upload_prefix_device(self, input_data: dict[str, cp.ndarray]) -> None:
+        """Device-to-device twin of :meth:`upload_prefix`: copy each cupy source
+        into the contiguous PREFIX of its capacity-sized device buffer with NO
+        host round-trip — the serving zero-copy path, where the sources are cupy
+        views of the caller's torch GPU tensors (``cp.from_dlpack``). Same
+        prefix-packing contract and capacity check as :meth:`upload_prefix` (the
+        kernels launched at the real-S grid read only the prefix). Caller must
+        hold ``gpu_lock()`` and order the copy on the replay stream — the serving
+        runner enters a cupy external stream bound to torch's current stream so
+        the copy, the graph replay, and the output read all enqueue in order."""
+        import cupy as cp  # noqa: PLC0415
+
+        for name, src in input_data.items():
+            buf = self.compiled.buf_by_name[name]
+            arr = self.arrays[name]
+            flat = cp.ascontiguousarray(src, dtype=buf.dtype.np).ravel()
+            if flat.size > arr.size:
+                raise ValueError(f"upload_prefix_device: {name!r} has {flat.size} elems > capacity {arr.size}")
+            arr.ravel()[: flat.size] = flat
+
+    def time_program_window(self, replays: int) -> float:
+        """One event window around ``replays`` back-to-back whole-program
+        replays of the captured e2e graph; returns per-replay ms. Caller
+        must have run :meth:`capture_program_graph` first."""
+        import cupy as cp
+
+        if self._e2e_start is None:
+            self._e2e_start, self._e2e_stop = cp.cuda.Event(), cp.cuda.Event()
+        self._e2e_start.record()
+        for _ in range(replays):
+            self._e2e_graph.launch()
+        self._e2e_stop.record()
+        n = max(1, len(self.compiled.launches))
+        _wait_for_event(self._e2e_stop, _KERNEL_TIMEOUT_MS * n * replays, "<whole-program e2e window>")
+        return cp.cuda.get_elapsed_time(self._e2e_start, self._e2e_stop) / replays
 
     def iter_once(
         self,
@@ -736,12 +1061,52 @@ class CompiledProgram:
                 per_launch_hook(i, launch)
         return dts
 
-    def outputs(self) -> dict[str, np.ndarray]:
+    def outputs(self, sym_values: dict[str, int] | None = None) -> dict[str, np.ndarray]:
         """Copy every output buffer back to host. Caller must hold the
         GPU lock — ``.get()`` is an async D2H copy on the default
         stream, so peer workers' kernels would otherwise interleave
-        with our D2H on the shared device."""
-        return {b.name: self.arrays[b.name].get() for b in self.compiled.bufs if b.role == "output"}
+        with our D2H on the shared device.
+
+        ``sym_values`` (serving's capture path) slices each output to its real-S
+        shape — the buffer is allocated at capacity but only the
+        ``resolve_shape(sym_values)`` prefix holds the request's result; the rest
+        is unmasked garbage from the oversized allocation. Without it (the
+        default) the whole buffer is returned (the uncaptured rebind path already
+        sizes buffers to the request)."""
+        out: dict[str, np.ndarray] = {}
+        for b in self.compiled.bufs:
+            if b.role != "output":
+                continue
+            arr = self.arrays[b.name]
+            if sym_values is not None:
+                shape = b.resolve_shape({**self.sym_values, **sym_values})
+                n = math.prod(shape) if shape else 1
+                out[b.name] = arr.ravel()[:n].get().reshape(shape)
+            else:
+                out[b.name] = arr.get()
+        return out
+
+    def output_prefix_device(self, sym_values: dict[str, int] | None = None) -> dict[str, cp.ndarray]:
+        """Device twin of :meth:`outputs`: return each output buffer's real-S
+        PREFIX as a cupy view (reshaped to the resolved shape) with NO ``.get()``
+        host copy — the serving zero-copy path, where the caller wraps the view as
+        a torch tensor (``torch.from_dlpack``) and clones it (the shared buffer is
+        overwritten by the next request's replay). ``sym_values`` slices to the
+        real shape exactly like :meth:`outputs`; without it the whole buffer view
+        is returned. Caller must hold ``gpu_lock()`` (and read on the replay
+        stream — see :meth:`upload_prefix_device`)."""
+        out: dict[str, cp.ndarray] = {}
+        for b in self.compiled.bufs:
+            if b.role != "output":
+                continue
+            arr = self.arrays[b.name]
+            if sym_values is not None:
+                shape = b.resolve_shape({**self.sym_values, **sym_values})
+                n = math.prod(shape) if shape else 1
+                out[b.name] = arr.ravel()[:n].reshape(shape)
+            else:
+                out[b.name] = arr
+        return out
 
     def snapshot(self) -> dict[str, np.ndarray]:
         """Copy every non-input buffer (scratch + constants + outputs)
@@ -801,6 +1166,10 @@ def run_program_debug(
     per_launch: dict[int, dict[str, np.ndarray]] = {}
     with gpu_lock():
         pre_result = pre_run() if pre_run is not None else None
+        # Note: scratch buffers share one reused slab, so a per-launch snapshot of
+        # a buffer *after its last use* reflects whatever now occupies that slot.
+        # Each kernel's own output is valid at its launch (just written, still
+        # live) — the usual debug read.
         prog = CompiledProgram.build(graph, input_data)
         prog.iter_once(per_launch_hook=lambda li, _lc: per_launch.__setitem__(li, prog.snapshot()))
         outputs = prog.outputs()
@@ -867,7 +1236,20 @@ def benchmark_program(
     torch timings (``bench_lowered_vs_torch`` / the e2e comparison) use that
     flag to re-run all-or-nothing so one table never mixes semantics, and the
     tune sweep persists it on each ``perf`` row (captured measurements
-    supersede wall-semantics ones on write — see ``SearchDB.record_perf``)."""
+    supersede wall-semantics ones on write — see ``SearchDB.record_perf``).
+
+    Multi-launch programs additionally get a WHOLE-program time per measured
+    iter — one event window around back-to-back replays of a single CUDA
+    graph holding every launch in program order
+    (:meth:`CompiledProgram.time_program_window`) — reported as
+    ``BenchmarkResult.e2e_ms`` / ``e2e_min_ms``. The per-launch windows each
+    replay one kernel solo, so their sum misses cross-kernel cache effects;
+    only the whole-program window is comparable against a captured torch
+    forward. Automatic when capture holds and the program has more than one
+    launch (for a single launch the solo window IS the program time, so the
+    fields stay ``None`` and nothing is measured twice — the common case for
+    the autotune sweep's single-node slices); also ``None`` when capture is
+    off or fell back."""
     from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
@@ -882,6 +1264,9 @@ def benchmark_program(
         # one-off outliers the autotune's variant ranking previously
         # got confused by; see ``project_..._noise`` write-ups).
         samples: list[list[float]] = [[] for _ in range(n)]
+        measure_e2e = n > 1  # single launch: the solo window IS the program time
+        e2e_samples: list[float] = []
+        e2e_replays = 0  # calibrated lazily on the first measured iter
         iters_run = 0
         measured = 0
         cumulative_gpu_ms = 0.0  # measured-iter GPU time, for the "auto" stop target
@@ -941,12 +1326,30 @@ def benchmark_program(
                 samples[i].append(iter_dts[i])
             cumulative_gpu_ms += sum(iter_dts[i] * batch_sizes[i] for i in range(n))
             measured += 1
+            # Whole-program window, one per measured iter — shares the same
+            # warm GPU state as the per-launch windows and the ``on_iter``
+            # torch closures. Counted toward the run-stage GPU budget but NOT
+            # the auto-stop target, so it never starves per-launch sampling.
+            if measure_e2e and capture_graphs:
+                if e2e_replays == 0:
+                    try:
+                        prog.capture_program_graph()
+                    except GraphCaptureError as exc:
+                        logger.warning("[cuda] %s — skipping whole-program e2e timing", exc)
+                        measure_e2e = False
+                    else:
+                        iter_ms = sum(iter_dts)
+                        e2e_replays = max(1, int(round(_BATCH_TARGET_MS / iter_ms))) if 0 < iter_ms < _BATCH_TARGET_MS else 1
+                if measure_e2e:
+                    e2e_dt = prog.time_program_window(e2e_replays)
+                    e2e_samples.append(e2e_dt)
+                    total_gpu_ms += e2e_dt * e2e_replays
             if measured >= max_measured:
                 break
             if auto and cumulative_gpu_ms >= target_total_ms:
                 break
 
-    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs)
+    return _samples_to_result(samples, prog.compiled.launches, captured=capture_graphs, e2e_samples=e2e_samples)
 
 
 def _resolve_iter_budget(num_iters: int | str) -> tuple[float, int, bool]:
@@ -965,7 +1368,9 @@ def _calibrate_batch_sizes(iter_dts: list[float]) -> list[int]:
     return [max(1, int(round(_BATCH_TARGET_MS / dt))) if 0 < dt < _BATCH_TARGET_MS else 1 for dt in iter_dts]
 
 
-def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, captured: bool = False) -> BenchmarkResult:
+def _samples_to_result(
+    samples: list[list[float]], launches: list[_Launch], *, captured: bool = False, e2e_samples: list[float] | None = None
+) -> BenchmarkResult:
     """Collapse per-launch sample lists to a ``BenchmarkResult`` keyed
     on the median of each launch's measured iters."""
     import statistics as _stats  # noqa: PLC0415
@@ -986,200 +1391,179 @@ def _samples_to_result(samples: list[list[float]], launches: list[_Launch], *, c
     # is the per-launch best-case (least OS/thermal noise — what ``run --bench``
     # reports, matching tune's min-over-variants reporting).
     return BenchmarkResult(
-        time_ms=sum(medians), min_ms=sum(mins), num_launches=n, per_launch=per_launch if per_launch else None, captured=captured
+        time_ms=sum(medians),
+        min_ms=sum(mins),
+        num_launches=n,
+        per_launch=per_launch if per_launch else None,
+        captured=captured,
+        e2e_ms=_stats.median(e2e_samples) if e2e_samples else None,
+        e2e_min_ms=min(e2e_samples) if e2e_samples else None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Subprocess-isolated benchmark worker
+# Subprocess-isolated benchmark worker (single async transport)
 # ---------------------------------------------------------------------------
 
 
-class _BenchWorker:
-    """Long-lived ``deplodock.compiler.backend.cuda._bench_worker`` subprocess.
+class _AsyncBenchWorker:
+    """The parent-side transport for the SIGKILL-able ``_bench_worker`` subprocess —
+    the **single** isolated-bench transport (the old sync ``_BenchWorker`` is gone).
 
-    Lets the parent enforce a hard wall-clock cap on a bench: if the worker
-    doesn't respond within ``wall_timeout_s``, the parent SIGKILLs it. The
-    dirty CUDA stream (and any kernels still queued behind a hung launch)
-    dies with the process, so the *next* bench starts on a clean device —
-    fixes the "autotune hangs on the variant AFTER a bench_fail" pathology
-    (see ``Pipeline._bench_terminal``).
+    Lets the parent enforce a hard wall-clock cap on a bench: if the worker doesn't
+    respond within ``wall_timeout_s``, the parent SIGKILLs it. The dirty CUDA stream
+    (and any kernels still queued behind a hung launch) dies with the process, so the
+    *next* bench starts on a clean device — fixing the "autotune hangs on the variant
+    AFTER a bench_fail" pathology. The worker imports cupy lazily on its first
+    request, so spawn cost is just Python startup (~0.2 s).
 
-    Lifecycle: one worker per ``CudaBackend`` instance, lazily spawned on
-    the first ``bench`` call and respawned on timeout / EOF / error. The
-    worker imports cupy lazily on its first request — until then no CUDA
-    context is initialized in the worker, so the spawn cost is just Python
-    startup (~0.2 s).
-    """
+    Drives the ``_bench_worker`` protocol (``<8-byte LE length><pickle>``, both
+    directions) over asyncio streams, so one event loop can keep N device-pinned
+    workers benching concurrently — the per-kernel multi-GPU autotune path
+    (``two_level._inner_reward_async``). The deployable ``--bench`` comparison awaits
+    ``benchmark_compare_isolated_async`` over a one-shot instance (via
+    ``_run_job_oneshot``); the autotune sweep awaits a persistent instance per GPU
+    directly via ``benchmark_program_isolated_async``.
+
+    Pin a worker to a physical GPU with ``device_id``: the spawn env gets
+    ``CUDA_VISIBLE_DEVICES=<id>`` (so the child's logical device 0 *is* that
+    GPU — every argumentless ``cp.cuda.Device()`` in the child resolves
+    correctly with no other call-site change) and, when a base
+    ``DEPLODOCK_GPU_LOCK`` is set, a per-device lock path so workers on
+    different GPUs take distinct ``FileLock``s instead of serialising. The
+    env overlay rides the child only — the parent's ``os.environ`` is never
+    mutated (it's shared by every slot on the one event-loop thread).
+
+    The wall-clock cap is :func:`asyncio.wait_for`; on overrun the child is
+    SIGKILLed and respawned on the next bench."""
 
     _WORKER_MODULE = "deplodock.compiler.backend.cuda._bench_worker"
 
-    def __init__(self) -> None:
-        self._proc: subprocess.Popen | None = None  # noqa: UP007 — lazy-init sentinel
+    def __init__(self, *, device_id: int | None = None) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._device_id = device_id
 
-    def _spawn(self) -> None:
-        import sys as _sys  # noqa: PLC0415
+    def _child_env(self) -> dict:
+        env = dict(_os.environ)
+        if self._device_id is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self._device_id)
+            from deplodock import config  # noqa: PLC0415
 
-        self._proc = subprocess.Popen(  # noqa: S603
-            [_sys.executable, "-m", self._WORKER_MODULE],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(_os.environ),
-            bufsize=0,
+            base = config.gpu_lock_path()
+            if base:
+                # Per-device lock so concurrent device-pinned workers don't
+                # serialise on one FileLock (the lock is taken inside the child).
+                env["DEPLODOCK_GPU_LOCK"] = f"{base}-{self._device_id}"
+        return env
+
+    async def _spawn(self) -> None:
+        self._proc = await asyncio.create_subprocess_exec(
+            _sys.executable,
+            "-m",
+            self._WORKER_MODULE,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self._child_env(),
         )
-        logger.info("[bench-worker] spawned pid=%s", self._proc.pid)
+        logger.info("[bench-worker] spawned (async) pid=%s device=%s", self._proc.pid, self._device_id)
 
     def _kill(self) -> None:
-        if self._proc is None:
+        proc = self._proc
+        self._proc = None
+        if proc is None or proc.returncode is not None:
             return
         try:
-            self._proc.kill()
-            try:
-                self._proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                # Process is in uninterruptible-kernel state (rare —
-                # NVRTC stuck in a driver call). Nothing more we can do;
-                # init will reap once the syscall returns. Release the
-                # Python handle so the next bench respawns.
-                logger.warning("[bench-worker] pid=%s did not reap within 2s of SIGKILL", self._proc.pid)
+            proc.kill()
         except ProcessLookupError:
             pass
-        self._proc = None
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        """Terminate the worker (driver teardown). The subprocess transport is
+        reaped when the event loop closes."""
         self._kill()
 
-    @staticmethod
-    def _send_with_deadline(proc: subprocess.Popen, request: bytes, deadline: float) -> None:
-        """Write the length-prefixed request without blocking past ``deadline``.
+    async def aclose(self) -> None:
+        """Terminate the worker and await its reap — for one-shot bridges that
+        spawn + run + tear down within a single ``asyncio.run`` (so no orphaned
+        subprocess transport survives the loop)."""
+        proc = self._proc
+        self._proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
 
-        The worker's stdin is a pipe with a ~64 KB kernel buffer; requests carry
-        pickled graphs and routinely exceed it. A blocking write to a worker
-        that is alive but not reading wedges the parent indefinitely — so write
-        through a non-blocking fd, gated on ``select`` writability with the
-        remaining budget, and raise ``_BenchTimeout`` when it runs out."""
-        import fcntl  # noqa: PLC0415
+    async def _read_stderr_tail(self, proc: asyncio.subprocess.Process) -> str:
+        try:
+            data = await asyncio.wait_for(proc.stderr.read(), timeout=2.0)
+        except (TimeoutError, Exception):  # noqa: BLE001 — stderr drain is best-effort
+            return ""
+        return data.decode(errors="replace")[-500:]
 
-        fd = proc.stdin.fileno()
-        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | _os.O_NONBLOCK)
-        data = memoryview(len(request).to_bytes(8, "little") + request)
-        while data:
-            remaining = deadline - _time_module.perf_counter()
-            if remaining <= 0:
-                raise _BenchTimeout()
-            _, writable, _ = select.select([], [fd], [], remaining)
-            if not writable:
-                raise _BenchTimeout()
-            try:
-                n = _os.write(fd, data)
-            except BlockingIOError:  # raced a re-filled buffer between select and write
-                continue
-            data = data[n:]
-
-    def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
-        """Send one length-prefixed pickle request, read the response within ``wall_timeout_s``
-        (else SIGKILL the worker and raise ``RuntimeError``), and return the unpickled response.
-        The single transport for both the deplodock-only bench and the deployable comparison — the
-        request's ``torch_spec`` decides which (see ``_bench_worker._run_job``)."""
+    async def run_job(self, request_obj: dict, *, wall_timeout_s: float) -> dict:
+        """Send one request, read the response within ``wall_timeout_s`` (else SIGKILL
+        + raise ``RuntimeError``), and return the unpickled response. A stale-worker
+        race on send respawns and retries once; a response-side timeout / EOF is a
+        hard error."""
         request = pickle.dumps(request_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        frame = len(request).to_bytes(8, "little") + request
         deadline = _time_module.perf_counter() + wall_timeout_s
-        # A previous worker may have exited between our last interaction
-        # and this request — most commonly through the dirty-context exit
-        # path in ``_bench_worker.main``. ``poll()`` has a brief window
-        # where it still reports the worker as alive (the kernel hasn't
-        # reaped yet), so the first stdin write can hit ``BrokenPipeError``
-        # even though our state says "worker is up". Treat that as a
-        # stale-worker race: respawn and retry once. A second write
-        # failure on a fresh worker is a real bug and surfaces.
         for attempt in (0, 1):
-            if self._proc is None or self._proc.poll() is not None:
-                self._spawn()
+            if self._proc is None or self._proc.returncode is not None:
+                await self._spawn()
             assert self._proc is not None  # for type narrowing
             proc = self._proc
             try:
-                self._send_with_deadline(proc, request, deadline)
-                break
-            except _BenchTimeout as exc:
-                # The worker is alive but not reading — e.g. wedged in CUDA
-                # context teardown behind a hung kernel after a dirty exit.
-                # Before the send had its own deadline, the parent blocked
-                # forever in this pipe write (the wall budget only bounded
-                # the response read).
-                self._kill()
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                proc.stdin.write(frame)
+                await asyncio.wait_for(proc.stdin.drain(), timeout=remaining)
+            except TimeoutError as exc:
+                await self.aclose()
                 raise RuntimeError(
                     f"bench worker did not accept the request within {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned"
                 ) from exc
-            except (BrokenPipeError, OSError) as exc:
-                self._kill()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                await self.aclose()
                 if attempt == 1:
                     raise RuntimeError(f"bench worker died during request send: {exc}") from exc
-                logger.info("[bench-worker] stale worker on send (%s) — respawning", exc)
+                logger.info("[bench-worker] stale async worker on send (%s) — respawning", exc)
+                continue
 
-        out_fd = proc.stdout.fileno()
-
-        def _read_with_deadline(n: int) -> bytes:
-            buf = bytearray()
-            while len(buf) < n:
+            try:
                 remaining = deadline - _time_module.perf_counter()
                 if remaining <= 0:
-                    raise _BenchTimeout()
-                r, _, _ = select.select([out_fd], [], [], remaining)
-                if not r:
-                    raise _BenchTimeout()
-                chunk = _os.read(out_fd, n - len(buf))
-                if not chunk:
-                    raise _BenchWorkerEOF()
-                buf.extend(chunk)
-            return bytes(buf)
+                    raise TimeoutError
+                header = await asyncio.wait_for(proc.stdout.readexactly(8), timeout=remaining)
+                n = int.from_bytes(header, "little")
+                remaining = deadline - _time_module.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError
+                body = await asyncio.wait_for(proc.stdout.readexactly(n), timeout=remaining)
+            except TimeoutError as exc:
+                await self.aclose()
+                raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned") from exc
+            except asyncio.IncompleteReadError as exc:
+                stderr_tail = await self._read_stderr_tail(proc)
+                await self.aclose()
+                raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail}") from exc
 
-        try:
-            header = _read_with_deadline(8)
-            n = int.from_bytes(header, "little")
-            body = _read_with_deadline(n)
-        except _BenchTimeout as exc:
-            self._kill()
-            raise RuntimeError(f"bench worker exceeded {wall_timeout_s:.1f}s wall budget — SIGKILL'd, stream cleaned") from exc
-        except _BenchWorkerEOF as exc:
-            stderr_tail = b""
-            try:
-                stderr_tail = proc.stderr.read() or b""
-            except Exception:  # noqa: BLE001 — stderr drain is best-effort
-                pass
-            self._kill()
-            raise RuntimeError(f"bench worker EOF before response; stderr tail: {stderr_tail.decode(errors='replace')[-500:]}") from exc
-
-        resp = pickle.loads(body)
-        if not resp.get("ok"):
-            # Surface the worker-side exception verbatim. ``Pipeline._bench_terminal`` treats a
-            # failed deplodock bench as ``bench_fail``; the deployable callers report + continue.
-            raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
-        return resp
+            resp = pickle.loads(body)
+            if not resp.get("ok"):
+                raise RuntimeError(f"bench worker error: {resp.get('error', '?')}")
+            return resp
+        raise RuntimeError("bench worker unreachable")  # both attempts exhausted (defensive)
 
 
-class _BenchTimeout(Exception):
-    """Internal sentinel — converted to RuntimeError at the API boundary."""
-
-
-class _BenchWorkerEOF(Exception):
-    """Internal sentinel — worker died without writing a response."""
-
-
-# Module-level singleton. Reused across ``benchmark_program_isolated`` calls
-# in the same process so we pay the worker startup cost once.
-_bench_worker_singleton: _BenchWorker | None = None
-
-
-def _bench_worker() -> _BenchWorker:
-    global _bench_worker_singleton
-    if _bench_worker_singleton is None:
-        _bench_worker_singleton = _BenchWorker()
-    return _bench_worker_singleton
-
-
-def benchmark_program_isolated(
+async def benchmark_program_isolated_async(
     graph: Graph,
     *,
+    worker: _AsyncBenchWorker,
     wall_timeout_s: float,
     warmup: int = 5,
     num_iters: int | str = 20,
@@ -1188,23 +1572,13 @@ def benchmark_program_isolated(
     nvcc_flags: str | None = None,
     capture_graphs: bool = True,
 ) -> BenchmarkResult:
-    """Wall-time-bounded ``benchmark_program``. Runs the bench in a
-    persistent subprocess; on ``wall_timeout_s`` overrun the worker is
-    SIGKILLed and the next call respawns it on a clean device.
-
-    The in-process ``compile_timeout_s`` / ``run_timeout_s`` budgets are
-    still enforced inside the worker (they're cheaper and give better
-    error messages than a SIGKILL). ``wall_timeout_s`` is the backstop
-    for the failure mode they don't cover: a kernel that keeps the GPU
-    busy past any per-launch / per-iter budget, which on cupy makes the
-    next ``deviceSynchronize`` block indefinitely.
-
-    ``on_iter`` is not supported here — interleaved benchmarking (the
-    ``deplodock run --bench`` path that alternates torch eager / compile
-    / deplodock) needs the bench to share a Python process with torch
-    and must use ``benchmark_program`` directly instead.
-    """
-    resp = _bench_worker().run_job(
+    """Wall-time-bounded ``benchmark_program`` in a subprocess, benching through a
+    caller-supplied device-pinned ``worker`` so one event loop can drive N GPUs
+    concurrently — the autotune sweep's transport. The in-worker
+    ``compile_timeout_s`` / ``run_timeout_s`` budgets apply, and ``wall_timeout_s`` is
+    the SIGKILL backstop for a kernel that keeps the GPU busy past them. No ``on_iter``
+    (interleaved ``run --bench`` benches in-process via ``benchmark_program``)."""
+    resp = await worker.run_job(
         {
             "graph": graph,
             "nvcc_flags": nvcc_flags,
@@ -1222,7 +1596,20 @@ def benchmark_program_isolated(
     return resp["result"]
 
 
-def benchmark_compare_isolated(
+async def _run_job_oneshot(request_obj: dict, *, wall_timeout_s: float) -> dict:
+    """Spawn a fresh (unpinned) ``_AsyncBenchWorker``, run one job, tear it down.
+    The transport for the synchronous one-shot bridges below — they each wrap this
+    in ``asyncio.run`` (the worker's streams bind to the loop, so it can't persist
+    across ``asyncio.run`` calls; the per-call ~0.2 s spawn is negligible against a
+    deployable ``--bench``)."""
+    worker = _AsyncBenchWorker()
+    try:
+        return await worker.run_job(request_obj, wall_timeout_s=wall_timeout_s)
+    finally:
+        await worker.aclose()
+
+
+async def benchmark_compare_isolated_async(
     *,
     lowered: Graph,
     torch_spec: tuple,
@@ -1233,7 +1620,9 @@ def benchmark_compare_isolated(
     seed: int,
     nvcc_flags: str | None = None,
 ) -> tuple:
-    """Run the deployable eager / torch.compile / deplodock comparison in the SIGKILL-able worker.
+    """Run the deployable eager / torch.compile / deplodock comparison in the
+    SIGKILL-able worker, awaiting a fresh one-shot :class:`_AsyncBenchWorker`
+    (the one transport).
 
     Unlike the deplodock-only autotune bench, the deployable comparison interleaves deplodock with
     real torch in one process and so couldn't be isolated before — a hung generated kernel wedged
@@ -1251,7 +1640,7 @@ def benchmark_compare_isolated(
     Returns ``(results, bench, torch_available, captured)`` — the shape ``bench_lowered_vs_torch``
     returns (``captured``: all backends were timed under CUDA graph capture; False means the
     all-or-nothing fallback ran and the timings include host dispatch)."""
-    resp = _bench_worker().run_job(
+    resp = await _run_job_oneshot(
         {
             "graph": lowered,
             "nvcc_flags": nvcc_flags,

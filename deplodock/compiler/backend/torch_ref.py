@@ -37,6 +37,7 @@ SUPPORTED = frozenset(
         "SdpaOp",
         "MeanOp",
         "RmsNormOp",
+        "LayerNormOp",
         "SoftmaxOp",
         "ElementwiseOp",
         "ReduceOp",
@@ -128,10 +129,18 @@ def _elementwise(fn: str, ins: list):
     return _elementwise_callable(fn)(ins)
 
 
-def _eval(node, ins: list):
+def _shape_ints(shape, sym_env: dict[str, int]) -> tuple[int, ...]:
+    """Resolve a (possibly symbolic) ``Dim`` shape to concrete ints. Symbolic
+    dims eval over ``sym_env`` — the name → runtime-extent map read off the
+    supplied input tensors in :func:`build_callable`."""
+    return tuple(d.as_static() if d.is_static else int(d.expr.eval(sym_env)) for d in shape)
+
+
+def _eval(node, ins: list, sym_env: dict[str, int] | None = None):
     import torch  # noqa: PLC0415
     import torch.nn.functional as F  # noqa: PLC0415
 
+    sym_env = sym_env or {}
     op = node.op
     name = type(op).__name__
     if name == "ElementwiseOp":
@@ -170,6 +179,11 @@ def _eval(node, ins: list):
             return F.rms_norm(x, (x.shape[-1],), w, op.eps)
         except (AttributeError, RuntimeError):
             return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + op.eps) * w
+    if name == "LayerNormOp":
+        x = ins[0]
+        w = ins[1] if len(ins) > 1 else None
+        b = ins[2] if len(ins) > 2 else None
+        return F.layer_norm(x, (x.shape[-1],), w, b, op.eps)
     if name == "SoftmaxOp":
         return torch.softmax(ins[0], dim=op.axis)
     if name == "TransposeOp":
@@ -178,14 +192,19 @@ def _eval(node, ins: list):
             return ins[0].permute(*op.axes)
         return ins[0].transpose(op.axes[0], op.axes[1])
     if name == "ReshapeOp":
-        return ins[0].reshape(tuple(d.as_static() for d in node.output.shape))
+        return ins[0].reshape(_shape_ints(node.output.shape, sym_env))
     if name == "UnsqueezeOp":
         return ins[0].unsqueeze(op.dim)
     if name == "SliceOp":
         t = ins[0]
-        dim = int(ins[1]) if len(ins) > 1 else 0
-        start = int(ins[2]) if len(ins) > 2 else 0
-        end = int(ins[3]) if len(ins) > 3 else t.shape[dim]
+        if op.dim is not None:
+            dim, start = op.dim, op.start or 0
+            extent = op.shape[dim]
+            end = start + int(extent) if isinstance(extent, int) else t.shape[dim]
+        else:  # legacy constant-input convention (pre-field IR dumps)
+            dim = int(ins[1]) if len(ins) > 1 else 0
+            start = int(ins[2]) if len(ins) > 2 else 0
+            end = int(ins[3]) if len(ins) > 3 else t.shape[dim]
         idx = [slice(None)] * t.dim()
         idx[dim] = slice(start, end)
         return t[tuple(idx)]
@@ -194,7 +213,7 @@ def _eval(node, ins: list):
         dim = next((int(i) for i in ins if not isinstance(i, torch.Tensor)), -1)
         return torch.cat(tensors, dim=dim)
     if name == "IndexMapOp":
-        return _index_map(op, ins)
+        return _index_map(op, ins, sym_env)
     raise NotImplementedError(f"torch_ref: op {name!r} unmapped")
 
 
@@ -237,7 +256,7 @@ def _idx_expr(e, env: dict):
     return e.eval(env)
 
 
-def _index_map(op, ins: list):
+def _index_map(op, ins: list, sym_env: dict[str, int] | None = None):
     """Run an ``IndexMapOp`` as a vectorized gather over output coordinates.
 
     For every output cell, the first source whose ``select`` predicate holds
@@ -248,13 +267,15 @@ def _index_map(op, ins: list):
 
     from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX  # noqa: PLC0415
 
-    out_shape = tuple(d.as_static() for d in op.out_shape)
+    out_shape = _shape_ints(op.out_shape, sym_env or {})
     # device / dtype from the first tensor-valued source (a source can be a
     # scalar constant — stored as a python float).
     base = next((ins[s.input_idx] for s in op.sources if torch.is_tensor(ins[s.input_idx])), None)
     dev = base.device if base is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = base.dtype if base is not None else torch.float32
-    env = {}
+    # Coord / select exprs may reference symbolic extents (e.g. ``coord < seq_len``)
+    # besides the output-coordinate placeholders — resolve both from one env.
+    env: dict = dict(sym_env or {})
     for i, d in enumerate(out_shape):
         shp = [1] * len(out_shape)
         shp[i] = d
@@ -304,10 +325,21 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
     inside the traced function used to trigger a dynamo recompile per distinct
     op (``add`` vs ``multiply`` vs …), hitting the recompile limit on big
     graphs."""
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
     from deplodock.compiler.provenance import is_boundary  # noqa: PLC0415
 
     order = graph.topological_order()
     tensor_ids = [nid for nid in order if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is None]
+    # Bind every symbolic axis name to its concrete extent, read off the
+    # supplied tensors (same convention as the CUDA launch). Baked into the
+    # per-node callables — ``fn`` stays shape-specialised to these tensors,
+    # which is what the bench wants (one concrete size per timed call).
+    sym_env: dict[str, int] = {}
+    for nid in tensor_ids:
+        t = input_tensors[nid]
+        for i, d in enumerate(graph.nodes[nid].output.shape):
+            if isinstance(getattr(d, "expr", None), Var):
+                sym_env.setdefault(d.expr.name, int(t.shape[i]))
     scalars = {
         nid: float(graph.nodes[nid].op.value)
         for nid in order
@@ -330,7 +362,7 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
         if type(node.op).__name__ == "ElementwiseOp":
             op_callable = _elementwise_callable(node.op.op.name)
         else:
-            op_callable = (lambda n: lambda ins: _eval(n, ins))(node)
+            op_callable = (lambda n: lambda ins: _eval(n, ins, sym_env))(node)
         compute_steps.append((nid, op_callable, list(node.inputs), torch_dtype(node.output.dtype)))
     out_id = graph.outputs[0]
 

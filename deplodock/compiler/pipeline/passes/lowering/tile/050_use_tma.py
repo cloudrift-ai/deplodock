@@ -28,6 +28,22 @@ Eligibility (per ``Source``):
 - Source rank ≤ 5 (TMA descriptor limit).
 - Every collapsed per-dim box extent ≤ 256 (``cuTensorMapEncodeTiled``'s
   ``boxDim`` limit — violations only surface at launch, as CUresult=1).
+- The source's innermost (fastest-varying) gmem dim is **static**. A
+  symbolic OUTER/middle dim (dynamic ``seq_len``, the M-masked case) IS
+  allowed: the descriptor's ``globalDim`` is encoded per launch from the
+  runtime input shape (``program._prebuild_descriptors``) and TMA's hardware
+  OOB handling zero-fills the masked overhang past the runtime extent. A
+  symbolic *innermost* dim is rejected UNLESS it is a provable 16 B-aligned
+  multiple (``_inner_stride_aligned`` — the demoted B/A cones pad their symbolic
+  inner to a 64-multiple so the stride stays aligned at any ``seq_len``); a bare
+  symbolic inner (an unpadded input) still stays on cp.async. Masked-K
+  (symbolic-reduce) sources ALSO reach TMA now: the reduce overhang must read 0,
+  which TMA's hardware OOB zero-fill delivers on the middle-K B operand (V),
+  allocated at the real ``seq_len`` so its descriptor globalDim is ``seq_len`` —
+  binding every overhang product to 0. ``040_use_ring_buffers`` rings a masked-K
+  bundle only when ``tile_reaches_tma`` confirms this whole tile is TMA-eligible,
+  so a masked-K bundle is never stranded on cp.async (it stays SYNC + ternary
+  otherwise).
 
 Additionally (per tile): the ``serial_outer`` K loop holding the bundles
 must not be nested inside a serial loop with trip count > 1 — the
@@ -62,6 +78,7 @@ from dataclasses import replace
 from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.expr import BinaryExpr, Literal
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
@@ -101,6 +118,91 @@ _TMA_ALIGN_BYTES = 128
 # are excluded — the materializer's TMA emit path assumes a buffer-count
 # >= 1 phase dim on the smem slab; promoting SYNC would break that.
 _PROMOTABLE = frozenset({StagePolicy.BUFFERED, StagePolicy.ASYNC})
+
+# cuTensorMapEncodeTiled's hard requirement: every global stride above the
+# innermost dim must be a multiple of 16 bytes. The above-inner stride equals
+# the inner extent in elements, so a symbolic inner extent is encode-safe iff
+# it is a provable multiple of ``16 / elem_bytes`` elements.
+_TMA_STRIDE_ALIGN_BYTES = 16
+
+
+def _inner_stride_aligned(dim, elem_bytes: int) -> bool:  # noqa: ANN001
+    """True when a *symbolic* inner extent ``dim`` is a provable constant multiple
+    ``c`` whose byte width ``c * elem_bytes`` is a multiple of 16 — so the
+    above-inner gmem stride stays 16 B-aligned at every runtime value and
+    ``cuTensorMapEncodeTiled`` accepts the descriptor. Recognizes the padded
+    ``round_up(N, P)`` Dim that ``_split_demoted._pad_inner_for_tma`` emits, whose
+    top-level expr is ``X * Literal(P)`` (or the mirrored ``Literal(P) * X``). A
+    bare symbolic dim (no constant factor) is unaligned and stays on cp.async."""
+    expr = dim.expr
+    if not (isinstance(expr, BinaryExpr) and expr.op == "*"):
+        return False
+    factor = None
+    if isinstance(expr.right, Literal) and isinstance(expr.right.value, int):
+        factor = expr.right.value
+    elif isinstance(expr.left, Literal) and isinstance(expr.left.value, int):
+        factor = expr.left.value
+    return factor is not None and (factor * elem_bytes) % _TMA_STRIDE_ALIGN_BYTES == 0
+
+
+def _shape_for_tma(node) -> tuple[int, ...] | None:  # noqa: ANN001
+    """The node's output shape as static ints for the compile-time box checks:
+    static dims as-is, symbolic dims at their Dim hint, ``None`` (cannot size the
+    TMA box) for a symbolic dim with no hint."""
+    dims: list[int] = []
+    for d in node.output.shape:
+        if d.is_static:
+            dims.append(d.as_static())
+        elif d.hint is not None:
+            dims.append(int(d.hint))
+        else:
+            return None
+    return tuple(dims)
+
+
+def tile_reaches_tma(body: Body, graph_nodes: dict, ctx: Context) -> bool:
+    """Pure predicate: would ``rewrite`` promote this tile body to TMA?
+
+    Mirrors ``rewrite``'s all-or-nothing gate WITHOUT mutating — used by
+    ``040_use_ring_buffers`` to decide whether to ring a masked-K bundle. A
+    ringed masked-K is only correct if it reaches TMA (whose hardware OOB
+    zero-fill replaces the SYNC ternary that cp.async / a synchronous
+    double-buffer can't express), so 040 must not ring one this predicate
+    rejects. The bundles here are still SYNC (040 runs before the promotion),
+    but ``_source_eligible`` is policy-agnostic — it checks the Source's
+    addressing / shape / alignment, which the ring doesn't change. The
+    ``strict_slot_align`` ring-slot check keys off the post-ring
+    ``buffer_count`` (the swizzle-stamped mma slabs masked-K rides never set
+    it, so the SYNC ``buffer_count == 1`` reads identically)."""
+    if ctx.compute_capability < _MIN_CAPABILITY:
+        return False
+    src_shapes: dict[str, tuple[int, ...]] = {}
+    for nid, node in graph_nodes.items():
+        shp = _shape_for_tma(node)
+        if shp is None:
+            return False
+        src_shapes[nid] = shp
+    inner_symbolic_bufs = {
+        nid
+        for nid, node in graph_nodes.items()
+        if node.output.shape
+        and not node.output.shape[-1].is_static
+        and not _inner_stride_aligned(node.output.shape[-1], node.output.dtype.nbytes)
+    }
+    if _reenters_pipeline(body):
+        return False
+    swizzle = any(isinstance(s, AtomTile) for s in body.iter())
+    dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in graph_nodes.items()}
+    saw_bundle = False
+    for s in body.iter():
+        if not isinstance(s, StageBundle) or s.policy == StagePolicy.TMA:
+            continue
+        saw_bundle = True
+        strict_slot_align = not swizzle and s.buffer_count > 1
+        if not _bundle_eligible(s, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align):
+            return False
+    return saw_bundle
+
 
 # TMA knob — hints ``(True, False)`` so the *first* candidate is True
 # (the preferred policy on Hopper+). On sm < 9.0 the rule hands ``(False,)``
@@ -149,15 +251,59 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
             raise ValueError(f"DEPLODOCK_TMA=1 but TMA cannot fire: {msg}")
         return _off()
 
-    # TMA descriptors bake the source shape statically into the cuTensorMap; bail
-    # out cleanly if any input shape carries a symbolic dim.
+    # The TMA descriptor's globalDim is encoded per launch from the *runtime*
+    # input array shape (``program._prebuild_descriptors`` reads ``arr.shape``),
+    # not baked at compile time — so a symbolic source dim (dynamic ``seq_len``)
+    # is fine for the descriptor. The box extents stay the static hint tile, so
+    # the compile-time eligibility checks (box<=256, alignment, gap-dim) run
+    # against the Dim *hint*; the launch uses the real extent and TMA's hardware
+    # OOB handling zero-fills the masked overhang. A symbolic dim with no hint
+    # can't size the box — decline.
+    src_shapes: dict[str, tuple[int, ...]] = {}
     for nid, node in match.graph.nodes.items():
-        for d in node.output.shape:
-            if not d.is_static:
-                return _decline(f"TMA requires static shapes; node {nid!r} has symbolic dim {d!r}")
-    src_shapes = {nid: tuple(d.as_static() for d in node.output.shape) for nid, node in match.graph.nodes.items()}
+        shp = _shape_for_tma(node)
+        if shp is None:
+            return _decline(f"node {nid!r} has a symbolic dim with no hint — cannot size the TMA box")
+        src_shapes[nid] = shp
+    # Buffers whose innermost (fastest-varying) dim is symbolic can't be TMA
+    # *sources*: every outer dim's global stride is ``∏(inner extents)·elem_size``,
+    # which ``cuTensorMapEncodeTiled`` requires 16-byte-aligned, and a symbolic
+    # innermost dim takes runtime values (31, 700) whose stride isn't 16-aligned
+    # → ``CUresult=1`` at encode. A symbolic OUTER/middle dim (the common dynamic
+    # ``seq_len``, M-masked) is safe: its stride is a product of static inner
+    # extents and globalDim along it is unconstrained (TMA zero-fills the box
+    # overhang past the runtime extent). Only the actually-staged sources are
+    # checked (``_source_eligible``) — an in-kernel intermediate with a symbolic
+    # inner dim (e.g. the SDPA scores in the o_proj kernel) is never staged, so
+    # it must not veto the matmul operands' TMA path. N-masked inner sources stay
+    # on cp.async.
+    # A symbolic inner dim is fine for TMA when its extent is provably a multiple
+    # of the 16 B alignment unit — the above-inner gmem stride is then 16 B-aligned
+    # at every runtime value, so ``cuTensorMapEncodeTiled`` accepts it. The demoted
+    # B-operand split pads its symbolic N inner up to ``_TMA_INNER_PAD`` exactly so
+    # this holds (``_split_demoted._pad_inner_for_tma``); the padded overhang columns
+    # are store-masked, so the descriptor can read them as ordinary in-bounds data.
+    inner_symbolic_bufs = {
+        nid
+        for nid, node in match.graph.nodes.items()
+        if node.output.shape
+        and not node.output.shape[-1].is_static
+        and not _inner_stride_aligned(node.output.shape[-1], node.output.dtype.nbytes)
+    }
 
     body = root.op.body
+    # Masked-K (symbolic-reduce) sources are no longer pinned off TMA. The reduce
+    # overhang must read ZERO for the mma accumulation; TMA's hardware OOB
+    # zero-fill provides exactly that on the *middle*-K B operand (V), whose
+    # buffer is allocated at the real ``seq_len`` so its descriptor globalDim is
+    # ``seq_len`` and coords past it zero-fill — binding the reduce overhang
+    # product to 0 regardless of the A operand's (padded) overhang (which the
+    # zero-init-reused scratch keeps finite, so ``finite × 0 = 0``). ``040`` only
+    # rings a masked-K bundle when this whole tile is TMA-eligible (shared
+    # ``tma_eligible.tile_reaches_tma``), so a ringed masked-K always reaches TMA
+    # here — never a cp.async / synchronous-double-buffer state that can't zero the
+    # overhang. An ineligible masked-K stays SYNC (``040`` declines the ring) and
+    # keeps its ``_stage_expand`` ternary zero-fill.
     # A TMA ring pipeline must start from freshly-initialized mbarriers: the
     # materializer emits ``MbarrierInit`` once at kernel entry, and the
     # pipeline's parity schedule (steady-state wait at ``(k / RING) % 2``,
@@ -177,23 +323,6 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
             "serial_outer pipeline is nested inside a serial loop with trip count > 1; "
             "the once-initialized mbarrier ring would be re-entered at stale phase parity (device hang)"
         )
-    # All-or-nothing per tile (see module docstring): if any
-    # promotable-policy bundle is not TMA-eligible, leave the whole
-    # tile on cp.async — 060_use_async_copy promotes the BUFFERED
-    # leftovers to ASYNC. Mixed TMA + cp.async inside one pipelined
-    # K-loop deadlocks the mbarrier scheme, so we'd rather skip TMA
-    # for the whole tile than partially promote.
-    for s in body.iter():
-        if not isinstance(s, StageBundle):
-            continue
-        if s.policy == StagePolicy.TMA:
-            continue
-        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes):
-            return _decline(
-                f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
-                "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
-            )
-
     # Per-source swizzle is stamped only on mma.sync kernels — their
     # explicit-ldmatrix consumer reads the swizzled slab with a matching
     # per-lane XOR; scalar kernels don't stage for ldmatrix, so their sources
@@ -209,6 +338,33 @@ def rewrite(ctx: Context, match: Match, root: Node) -> TileOp | None:
     # 4 B/elem = 128 B → wrongly B128, whose box the descriptor can't satisfy →
     # TMA deadlock). Read the true element size off the gmem node here.
     dtype_bytes = {nid: node.output.dtype.nbytes for nid, node in match.graph.nodes.items()}
+
+    # All-or-nothing per tile (see module docstring): if any
+    # promotable-policy bundle is not TMA-eligible, leave the whole
+    # tile on cp.async — 060_use_async_copy promotes the BUFFERED
+    # leftovers to ASYNC. Mixed TMA + cp.async inside one pipelined
+    # K-loop deadlocks the mbarrier scheme, so we'd rather skip TMA
+    # for the whole tile than partially promote.
+    for s in body.iter():
+        if not isinstance(s, StageBundle):
+            continue
+        if s.policy == StagePolicy.TMA:
+            continue
+        # A double-buffered (``buffer_count > 1``) NONE-swizzle bundle must keep
+        # every ring slot 128 B-aligned; size that smem-slot check off the TRUE
+        # element width (``strict_slot_align``) so a sub-128 B fp16 slab declines
+        # to cp.async instead of emitting a misaligned ``cp.async.bulk.tensor``
+        # (the #244 ``k_linear_mean_reduce`` wedge — the materializer's slot pad
+        # uses the fp32 constant and under-pads fp16). Swizzled (mma) slabs align
+        # via their swizzle atom and single-slot bundles sit at the aligned base,
+        # so both keep the lenient fp32-constant check.
+        strict_slot_align = not swizzle and s.buffer_count > 1
+        if s.policy in _PROMOTABLE and not _bundle_eligible(s, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align):
+            return _decline(
+                f"{s.policy.name} bundle on {list(s.local_decls())!r} not TMA-eligible; "
+                "leaving the whole tile on cp.async (avoids mixed-mode pipeline deadlock)"
+            )
+
     new_body, changed = _walk(body, swizzle=swizzle, dtype_bytes=dtype_bytes)
     already_tma = any(isinstance(s, StageBundle) and s.policy == StagePolicy.TMA for s in body.iter())
     if not changed and not already_tma:
@@ -344,13 +500,29 @@ def _stamp_source_swizzle(src: Source, dtype_bytes: dict[str, int]) -> Source:
     return replace(src, swizzle=mode)
 
 
-def _bundle_eligible(bundle: StageBundle, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+def _bundle_eligible(
+    bundle: StageBundle,
+    src_shapes: dict[str, tuple[int, ...]],
+    inner_symbolic_bufs: set[str] = frozenset(),
+    dtype_bytes: dict[str, int] | None = None,
+    strict_slot_align: bool = False,
+) -> bool:
     """A bundle is TMA-eligible iff every Source is."""
-    return all(_source_eligible(src, src_shapes) for src in bundle.sources)
+    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs, dtype_bytes, strict_slot_align) for src in bundle.sources)
 
 
-def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> bool:
+def _source_eligible(
+    src: Source,
+    src_shapes: dict[str, tuple[int, ...]],
+    inner_symbolic_bufs: set[str] = frozenset(),
+    dtype_bytes: dict[str, int] | None = None,
+    strict_slot_align: bool = False,
+) -> bool:
     if not isinstance(src.addressing, AffineAddressing):
+        return False
+    # A symbolic innermost gmem dim breaks the 16-byte global-stride alignment
+    # ``cuTensorMapEncodeTiled`` requires at runtime (see the gate). Stay on cp.async.
+    if src.buf in inner_symbolic_bufs:
         return False
     cache_axes = src.cache_axes
     if not cache_axes or len(cache_axes) > _MAX_RANK:
@@ -417,6 +589,27 @@ def _source_eligible(src: Source, src_shapes: dict[str, tuple[int, ...]]) -> boo
     src_inner = src_shape[-1]
     if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
         return False
+    # Ring-slot 128 B alignment, at the TRUE element width. A double-buffered
+    # NONE-swizzle bundle (``strict_slot_align`` — set in the rewrite loop) keeps
+    # ``buffer_count`` rotating slots at ``slot * inner_box`` byte offsets from a
+    # 128 B-aligned base; every slot stays aligned only if the whole per-slot box
+    # footprint is a 128 B multiple. The materializer's slot pad sizes that
+    # threshold off the fp32 ``BYTES_PER_ELEM``, so a pure-reduction fp16 slab
+    # whose box is a single 32-elem axis (64 B) reads as already-aligned, stays
+    # UNPADDED, and the second ring slot lands at a 64 B offset →
+    # ``cp.async.bulk.tensor`` faults with ``CUDA_ERROR_MISALIGNED_ADDRESS`` (the
+    # #244 ``k_linear_mean_reduce`` wedge). Decline to cp.async (no 128 B rule)
+    # for that case. A matmul slab whose box collapses several axes (e.g.
+    # ``BK·BN·FN``) is already a 128 B multiple and stays on TMA; swizzled (mma)
+    # slabs align via their swizzle atom and single-slot bundles sit at the
+    # aligned base, so neither sets ``strict_slot_align``.
+    if strict_slot_align:
+        slot_elems = 1
+        for ext in box_per_dim.values():
+            slot_elems *= ext
+        elem_bytes = (dtype_bytes or {}).get(src.buf, BYTES_PER_ELEM)
+        if (slot_elems * elem_bytes) % _TMA_ALIGN_BYTES != 0:
+            return False
     if src_inner < inner_extent * 2:
         return False
     return True

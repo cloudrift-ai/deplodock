@@ -11,6 +11,7 @@ skip marker shared by all CUDA-gated tests in this package.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import numpy as np
@@ -30,6 +31,33 @@ def has_cuda_gpu() -> bool:
 requires_cuda = pytest.mark.skipif(
     not has_cuda_gpu(),
     reason="CUDA not available (need cupy + GPU)",
+)
+
+
+@functools.cache
+def device_compute_capability() -> tuple[int, int] | None:
+    """Live CUDA device compute capability as ``(major, minor)``, or ``None`` when
+    no GPU is visible. cupy reports it as a string like ``"89"`` → ``(8, 9)``."""
+    if not has_cuda_gpu():
+        return None
+    import cupy as cp
+
+    cap = str(cp.cuda.Device().compute_capability)
+    return (int(cap[:-1]), int(cap[-1]))
+
+
+# Skip the mma.sync warp-tier tests below sm_90. The warp tier (swizzled
+# ``ldmatrix`` + ``mma.sync``, TMA transport) auto-enumerates and is validated on
+# sm_90+; on sm_80-89 it is pin-only and currently non-functional, for two
+# independent reasons: the ``sm_NNa`` arch-accelerated suffix the TMA path emits
+# is rejected by nvcc (``Unsupported gpu architecture 'sm_89a'`` — the ``a``
+# variant only exists for sm_90a+), and ``ldmatrix`` itself faults at runtime on
+# at least this Ada (sm_89) host. Tests that FORCE the warp tier via
+# ``DEPLODOCK_MMA`` pins therefore can't run below sm_90; they exercise the
+# deployed path on sm_90+ CI.
+requires_sm90 = pytest.mark.skipif(
+    (device_compute_capability() or (0, 0)) < (9, 0),
+    reason="mma.sync warp tier needs sm_90+ (pin-only / non-functional on sm_80-89: ldmatrix fault + sm_NNa TMA compile)",
 )
 
 
@@ -174,3 +202,115 @@ def _inject_constants(input_data: dict[str, np.ndarray], graph) -> dict[str, np.
                 arr = arr.reshape(node.op.source_shape)
             input_data[nid] = apply_load_ops(arr, node.op.load_ops)
     return input_data
+
+
+def drain_tune(pipeline, graph, *, on=None, **kwargs):
+    """Synchronously collect :meth:`Pipeline.tune_async` terminals for tests.
+
+    ``Pipeline.tune`` (the sync generator) is gone — the autotuner is async-only —
+    so tests drive ``tune_async`` through one ``asyncio.run``. Returns the list of
+    terminal candidates. ``on(candidate)`` is invoked per terminal as it arrives;
+    return truthy from it to stop early (the async mirror of a ``for ... break``).
+    A real ``CudaBackend``'s device-pinned worker is bound to this loop, so it is
+    awaited-closed before the loop ends (no orphaned subprocess transport)."""
+    import asyncio
+
+    async def _collect():
+        out = []
+        try:
+            async for cand in pipeline.tune_async(graph, **kwargs):
+                out.append(cand)
+                if on is not None and on(cand):
+                    break
+        finally:
+            backend = kwargs.get("backend")
+            if backend is not None and hasattr(backend, "aclose_async_worker"):
+                await backend.aclose_async_worker()
+        return out
+
+    return asyncio.run(_collect())
+
+
+def run_inner_reward(
+    fused_graph, *, ctx, db, backend=None, backends=None, patience, ucb_c=None, explore_eps=0.0, seed=0, progress=None, prior=None
+):
+    """Synchronously run the async per-op inner reward for tests.
+
+    ``two_level.inner_reward`` (the sync ``asyncio.run`` bridge) is gone — the tuner
+    is async-only — so tests drive ``_inner_reward_async`` through one ``asyncio.run``,
+    building the device-pinned ``pool`` from ``backend`` / ``backends`` exactly as the
+    production outer loop does. Mirrors the old signature so call sites only rename."""
+    import asyncio
+
+    from deplodock.compiler.pipeline import TuningSearch
+    from deplodock.compiler.pipeline.search.two_level import _inner_reward_async
+
+    if ucb_c is None:
+        ucb_c = TuningSearch.DEFAULT_UCB_C
+    pool = list(backends) if backends else [backend]
+    return asyncio.run(
+        _inner_reward_async(
+            fused_graph,
+            ctx=ctx,
+            db=db,
+            pool=pool,
+            patience=patience,
+            ucb_c=ucb_c,
+            explore_eps=explore_eps,
+            seed=seed,
+            progress=progress,
+            prior=prior,
+        )
+    )
+
+
+def run_two_level(graph, **kwargs):
+    """Synchronously run the async :func:`two_level.run_two_level_tune` for tests."""
+    import asyncio
+
+    from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
+
+    return asyncio.run(run_two_level_tune(graph, **kwargs))
+
+
+@pytest.fixture(params=["static", "dynamic"])
+def shape_mode(request) -> str:
+    """Parametrize a test over a static vs dynamic (symbolic-M) shape. Any test
+    that names this fixture runs once per mode — the static/dynamic parity
+    automation. Pair with :func:`dyn_M` to flip a graph's leading/M axis:
+
+        def test_x(shape_mode):
+            g = build_graph(M=dyn_M(shape_mode, 256), ...)   # int 256 or Dim('seq_len')
+
+    The dynamic mode compiles ONE symbolic kernel (``Dim('seq_len')``, runtime
+    ``int seq_len`` arg) tiled at the 512 hint and run at the concrete M fed in
+    the input arrays; the static mode bakes M. Use tile-divisor M for strict
+    static-vs-dynamic parity (off-hint masked sizes live in
+    ``test_matmul_mma_masked.py``)."""
+    return request.param
+
+
+def dyn_M(mode: str, M: int):
+    """``Dim('seq_len')`` for ``mode == 'dynamic'``, else the int ``M``. The
+    one-liner that turns a static graph builder into a static/dynamic one."""
+    if mode == "dynamic":
+        from deplodock.compiler.dim import Dim
+
+        return Dim("seq_len")
+    return M
+
+
+def from_pretrained_or_skip(loader, *args, **kwargs):
+    """Run a HuggingFace ``from_pretrained`` download, skipping the test on a Hub
+    connection / rate-limit failure.
+
+    CI runners regularly hit HTTP 429 (Too Many Requests) from huggingface.co —
+    transformers retries then wraps it as ``OSError("We couldn't connect …")``.
+    That's an environment issue, not a code regression, so the network-dependent
+    e2e / trace tests skip rather than hard-fail. ``loader`` is e.g.
+    ``AutoConfig.from_pretrained``; ``args[0]`` is the model id (for the message)."""
+    try:
+        return loader(*args, **kwargs)
+    except OSError as exc:  # transformers wraps 429 / connection errors as OSError here
+        model = args[0] if args else kwargs.get("pretrained_model_name_or_path", "?")
+        pytest.skip(f"HuggingFace Hub unavailable for {model} (likely rate-limited): {exc}")

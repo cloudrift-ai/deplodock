@@ -856,10 +856,14 @@ class Graph:
                     # JSON dump preserves atomic Dims (int / Var name) so the
                     # round-trip ``deplodock run --ir <json>`` flow reconstructs
                     # them via ``Dim(value)``. Composite Dims (BinaryExpr-backed,
-                    # e.g. from a CatOp output) currently can't round-trip and
-                    # ``.value`` will raise — those graphs aren't yet a JSON
-                    # serialization target.
-                    "shape": [d.value for d in node.output.shape],
+                    # e.g. a CatOp output or the demoted symbolic-N B operand's
+                    # ``round_up(seq_len, 64)`` TMA-padded inner extent) serialize
+                    # to their pretty expr string so a ``DEPLODOCK_DUMP_DIR`` dump
+                    # of a dynamic-attention graph doesn't crash; they don't
+                    # round-trip back through ``run --ir`` (the string isn't
+                    # re-parsed) — a debug-dump artifact only, matching the prior
+                    # composite-shape limitation.
+                    "shape": [_dim_to_json(d) for d in node.output.shape],
                     "dtype": node.output.dtype.name,
                 },
             }
@@ -875,14 +879,28 @@ class Graph:
 # ---------------------------------------------------------------------------
 
 
+def _dim_to_json(d):
+    """Serialize a ``Dim`` for the JSON dump. Atomic dims (static int / symbolic
+    ``Var`` name) return their scalar ``value`` and round-trip via ``Dim(value)``;
+    a composite ``Dim`` (``BinaryExpr``-backed) has no scalar value, so it falls
+    back to the pretty expr string (a debug-dump artifact — see ``to_dict``)."""
+    try:
+        return d.value
+    except TypeError:
+        return d.expr.pretty()
+
+
 def _rename_buf_in_op(op, old: str, new: str):
     """Rewrite ``Load.source`` / ``Write.output`` references inside a
     ``LoopOp`` body from ``old`` to ``new`` (recursively into nested Loops).
     Pass-through for op types without internal buf refs. Preserves the op's
-    ``name`` / ``knobs`` identity — a rename after ``991_stamp_loop_names`` /
-    ``992_stamp_structural_features`` (e.g. the splice id-promotion of a
-    lowering-phase fragment like the demoted-matmul split) must not strip the
-    stamped kernel name or the ``S_*`` features."""
+    ``name`` / ``knobs`` / ``source`` identity — a rename after
+    ``991_stamp_loop_names`` / ``992_stamp_structural_features`` (e.g. the
+    splice id-promotion of a lowering-phase fragment like the demoted-matmul
+    split) must not strip the stamped kernel name, the ``S_*`` features, or
+    the decomposition attribution link (``Candidate.apply`` stamps the
+    pre-split op as each fragment kernel's ``source``; the two-level tuner's
+    composed Σ rows group by it)."""
     from deplodock.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
@@ -898,6 +916,7 @@ def _rename_buf_in_op(op, old: str, new: str):
     renamed = LoopOp(body=op.body.map(fn))
     renamed.name = op.name
     renamed.knobs = dict(op.knobs)
+    renamed.source = op.source
     return renamed
 
 
