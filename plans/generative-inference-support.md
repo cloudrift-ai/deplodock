@@ -111,9 +111,11 @@ First, even though the end goal is vLLM: it needs **no new SDPA-carve / attentio
 chat output now, and is the correctness reference every later phase verifies against (and is reused by the eventual
 standalone server). It uses the full-recompute strategy (re-run the whole growing prefix each step) — valid *standalone*
 (deplodock controls the loop), intentionally O(S²), an oracle not a product. Runs the **unquantized fp16 path** — the
-whole-model CLI path currently forces fp32 (`_trace_model` for `layer is None`; the runnable binder /
-`bind_constants_from_module` cast to float32), so the one fp16 change is a `dtype` param threaded through those two
-helpers (dtype plumbing, **no dependency on the W4A16 branch** — the serving runner already binds fp16). Key
+whole-model CLI path currently forces fp32 only in the **model load + trace** (`_trace_model` sets `torch.float32` for
+`layer is None`), so the one fp16 change is a `dtype` param there: the fp16 module traces an fp16 graph, and the binder
+needs **no change** — its float32 constant carriers are cast to each buffer's graph dtype at materialization
+(`program.py` `arr.set(…, dtype=buf.dtype.np)`). Dtype plumbing only, **no dependency on the W4A16 branch** (the serving
+runner already runs fp16). Key
 simplification: the recompute loop always runs at positions `0..S-1`, so the existing `_SlicedRotary` is exactly
 right — **no RoPE-runtime-positions work needed here** (that is purely a Phase-6 / incremental concern).
 
@@ -126,8 +128,8 @@ right — **no RoPE-runtime-positions work needed here** (that is purely a Phase
 - **Reuses:** `commands/compile.py::_trace_model` whole-model dynamic path, traced from `AutoModelForCausalLM` so
   `lm_head` / `logits` are in-graph — `build_full_model_wrapper(dynamic=True).forward` returns `out[0]` = logits
   `[1, S, vocab]` (Phase 0's generation wrapper slices the final position before `lm_head` → `[1, vocab]`; see Create).
-  Plus `CompiledProgram` build + `set_sym_values` + `run` + `outputs` and the constant binding (the
-  `dtype`-parameterized fp16 path).
+  Plus `CompiledProgram` build + `set_sym_values` + `run` + `outputs` and the constant binding (unchanged — float32
+  carriers cast to the graph's fp16 buffers at materialization).
 - **Create:** `deplodock/commands/generate.py` (the host generate loop: feed `input_ids[0:S]` → run dynamic program →
   read last-token `logits[1, vocab]` → sample → append id → repeat to EOS / max; the graph embeds ids internally — the
   loop never handles embeddings). A **generation wrapper** (variant of `build_full_model_wrapper`) slices the final
@@ -167,8 +169,11 @@ MLP sub-block (with its own internal second residual).
   flattened `[T, H]` layout the reshape is `.view(T, n_heads, D)` with **no batch/seq transpose**. The `[1, n_heads, T,
   D]` layout torch SDPA wants is built **only inside the oracle** (Phase 1/2 reference), never in the deplodock kernels
   or at the vLLM seam.
-- **Flattened layout:** trace the subgraph with a 2-D `[num_tokens, H]` activation, `num_tokens` symbolic (reuse
-  `parse_position_specs` / `build_torch_dynamic_shapes`, spec `seq_len@x:0`). All pre/post compute is pointwise or a
+- **Flattened layout:** trace each subgraph with 2-D `[num_tokens, H]` activations, `num_tokens` symbolic (reuse
+  `parse_position_specs` / `build_torch_dynamic_shapes`). The **pre** wrapper has one input (`num_tokens@x:0`);
+  the **post** wrapper has **two** (`attn_out`, `residual`), so both axes get the **same** `Dim` symbol —
+  `num_tokens@attn_out:0` AND `num_tokens@residual:0` (a shared NAME ties them; without the second spec `residual` stays
+  trace-sized). All pre/post compute is pointwise or a
   matmul over H, so collapsing `[1,seq,H] → [seq,H]` is layout-invariant — the property that makes Option A work; the
   q/k/v reshape-into-heads is the danger spot to test.
 - **Modify:** `commands/compile.py::_trace_model` — `--attention-split` debug branch beside the `--layer` branch.
@@ -303,15 +308,16 @@ chat template; no vLLM), `serving/gen_runner.py` (`DeplodockGenRunner`), `servin
 
 **Modify (reuse heavily):** `compiler/trace/huggingface.py` (new `build_attention_split_wrapper` + a Phase-0
 generation wrapper that slices the final position before `lm_head`; A1 rope later),
-`commands/compile.py::_trace_model` (`--attention-split` branch; thread a `dtype` param here + through the runnable
-binder so the whole-model path binds fp16), `serving/__init__.py` (register gen model), `deplodock.py` (import + call
+`commands/compile.py::_trace_model` (`--attention-split` branch; thread a `dtype` param into the whole-model load +
+trace so the graph is fp16 — binder unchanged), `serving/__init__.py` (register gen), `deplodock.py` (import + call
 `register_generate_command` in `main()`), `commands/serve.py` (generative branch).
 `passes/frontend/decomposition/010_sdpa.py` + `ir/frontend/ir.py` only if the
 Phase-1 surgery fallback is used (the explicit-wrapper path leaves them untouched).
 
 **Reuse unchanged (load-bearing machinery):** `backend/cuda/program.py` (`CompiledProgram` build / `set_sym_values` /
 capture/replay / `*_prefix_device`; unchanged **unless** the Phase-2 memory spike forces shared cross-program scratch —
-that is backend work, see Phase 2), `loader/binder.py` (`bind_constants`, fp16 constant binding),
+that is backend work, see Phase 2), `loader/binder.py` (`bind_constants` — dtype-agnostic carriers cast to each buffer's
+graph dtype at materialization),
 `trace/dynamic.py` (`parse_position_specs` / `build_torch_dynamic_shapes` / `DYNAMIC_DIM_MAX`), `trace/torch.py`
 (`trace_module`), and the entire embedding runner as the structural template (`serving/runner.py`,
 `serving/vllm_model.py`).
