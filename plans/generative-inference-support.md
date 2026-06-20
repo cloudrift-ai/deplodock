@@ -233,8 +233,10 @@ Wire Phase 2's runner into a vLLM generative model.
   `get_rope`, then calls it before `self.attn`), so `DeplodockGenModel` constructs its own RoPE via
   `get_rope(head_dim, max_position=max_position, rope_parameters=config.rope_parameters)` — the vLLM signature is
   `get_rope(head_size, max_position, …)` (no positional `rotary_dim`; rotary dim + theta + scaling derive from
-  `rope_parameters`), mirroring stock Qwen3/Llama — one
-  shared module across layers (RoPE is position-only). Test Qwen3 + Llama-3 RoPE vs stock vLLM. **Split ownership
+  `rope_parameters`). The per-architecture adapter must **apply each arch's default-theta mutation first** — Qwen3 calls
+  `set_default_rope_theta(config, 1_000_000)` before `get_rope` (else a missing `rope_theta` silently falls back to
+  10000 → wrong logits); one shared module across layers (RoPE is position-only). Test Qwen3 + Llama-3 RoPE vs stock
+  vLLM. **Split ownership
   (settled):** the **deplodock runner owns the
   embedding + the whole trunk** (bound into its constants); **vLLM owns only `lm_head`** (loaded via `load_weights`). So
   `load_weights` claims just `lm_head.*` and returns ~empty for the trunk (same trick as `DeplodockEmbedModel`) — get
