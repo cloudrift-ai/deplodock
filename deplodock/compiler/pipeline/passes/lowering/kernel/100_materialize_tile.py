@@ -52,7 +52,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TmaDescriptor,
     TmaLoad,
 )
-from deplodock.compiler.ir.stmt import Accum, Cond, Stmt
+from deplodock.compiler.ir.stmt import Accum, Combine, Cond, Stmt
 from deplodock.compiler.ir.tile.ir import (
     _SWIZZLE_BY_BYTES,
     BYTES_PER_ELEM,
@@ -75,6 +75,8 @@ from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import (
     cooperative_combine_geometry,
     emit_combine,
+    emit_combine_states,
+    find_nested_combines,
     find_nested_reduce_accums,
 )
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
@@ -751,8 +753,10 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
             extra: list[Stmt] = []
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
                 accums_in_scope = {a.name: a for a in stmt.body if isinstance(a, Accum)}
+                combines_in_scope = {c.state[0]: c for c in stmt.body if isinstance(c, Combine)}
             else:
                 accums_in_scope = find_nested_reduce_accums(stmt.body)
+                combines_in_scope = find_nested_combines(stmt.body)
             for acc_name, acc in accums_in_scope.items():
                 coop_names = escape.accum_cooperative_axes.get(acc_name) if escape is not None else None
                 if coop_names:
@@ -760,6 +764,15 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                     dt = acc.dtype or F32
                     extra.extend(emit_combine(acc_name, acc.op, tid_var, n_coop, dt, warp_size=warp_size))
                     rename[acc_name] = f"{acc_name}_b"
+            # Monoid (Combine) carriers: the tuple-valued cross-thread combine via
+            # combine_states. Keyed by the first state name; reassigns the state in
+            # place (no _b rename — the butterfly / tree leaves every thread holding
+            # the full reduction in the carried SSA names).
+            for first_state, carrier in combines_in_scope.items():
+                coop_names = escape.accum_cooperative_axes.get(first_state) if escape is not None else None
+                if coop_names:
+                    tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
+                    extra.extend(emit_combine_states(carrier, tid_var, n_coop, warp_size=warp_size))
             return [single, *extra]
         if isinstance(stmt, Accum):
             out_local = [transform(stmt)]
@@ -769,6 +782,13 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
                 dt = stmt.dtype or F32
                 out_local.extend(emit_combine(stmt.name, stmt.op, tid_var, n_coop, dt, warp_size=warp_size))
                 rename[stmt.name] = f"{stmt.name}_b"
+            return out_local
+        if isinstance(stmt, Combine):
+            out_local = [transform(stmt)]
+            coop_names = escape.accum_cooperative_axes.get(stmt.state[0]) if escape is not None else None
+            if coop_names:
+                tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
+                out_local.extend(emit_combine_states(stmt, tid_var, n_coop, warp_size=warp_size))
             return out_local
         return [transform(stmt)]
 

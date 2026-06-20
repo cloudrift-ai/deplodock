@@ -141,19 +141,38 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 @rewrite.register
 def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
+    # The merge / combine_states programs reference state / partial / state_b
+    # (all in the rename map) PLUS carrier-internal temps that are NOT surfaced via
+    # ``defines()`` — so a register-tile replicator that renames the state per cell
+    # leaves the temps shared, colliding across replicas. Uniquify the temps with a
+    # suffix derived from the renamed first state name whenever the state actually
+    # moves (identity rename / pure σ-split leaves them untouched, preserving the
+    # streaming-form SSA).
+    new_state0 = rename(s.state[0]) if s.state else None
+    carried = set(s.state) | set(s.state_b)
+    temps = {a.name for a in (*s.merge, *s.combine_states)} - carried
+    overlay: dict[str, str] = {}
+    if new_state0 is not None and new_state0 != s.state[0]:
+        overlay = {t: f"{t}__{new_state0}" for t in temps}
+
+    def rn(name: str) -> str:
+        # Prefer the caller's rename; the overlay is a fallback only for the
+        # internal temps a SELECTIVE replicator rename leaves untouched (a uniform
+        # ``f"{n}__r"`` rename already suffixes them — don't double-rename).
+        r = rename(name)
+        if r != name:
+            return r
+        return overlay.get(name, name)
+
     return Combine(
-        state=tuple(rename(n) for n in s.state),
-        partial=tuple(rename(n) for n in s.partial),
-        # The merge program references state / partial (mapped) + internal temps
-        # (not in the rename map → pass through), so rewriting each step keeps it
-        # consistent with the renamed surface. The combine_states program is the
-        # state-merges-state form — its second operand (state_b) is renamed too.
-        merge=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.merge),
+        state=tuple(rn(n) for n in s.state),
+        partial=tuple(rn(n) for n in s.partial),
+        merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
         identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,
         axes=new_axes,
-        state_b=tuple(rename(n) for n in s.state_b),
-        combine_states=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.combine_states),
+        state_b=tuple(rn(n) for n in s.state_b),
+        combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.combine_states),
     )
 
 

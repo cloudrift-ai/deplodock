@@ -21,6 +21,7 @@ from deplodock.compiler.ir.stmt.base import (
     dtype_promote,
     op_to_expr,
     render_index,
+    render_merge_program,
     select_to_ternary,
 )
 
@@ -775,18 +776,7 @@ class Combine(ReduceCarrier):
         builder orders the program so each old-state read precedes that state's
         update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
         """
-        pad = _pad(ctx.indent)
-        ty = ctx.type_name("f32")
-        state_set = set(self.state)
-        out: list[str] = []
-        for a in self.merge:
-            rhs = op_to_expr(a.op.name, [Var(x) for x in a.args]).render(ctx)
-            if a.name in state_set:
-                out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
-            else:
-                ctx.ssa_dtypes[a.name] = "f32"
-                out.append(f"{pad}{ty} {a.name} = {rhs};")  # local temp
-        return out
+        return render_merge_program(self.merge, self.state, ctx)
 
 
 @dataclass(frozen=True)

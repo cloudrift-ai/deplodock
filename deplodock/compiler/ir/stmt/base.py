@@ -237,6 +237,32 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
 
 
+def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None = None) -> list[str]:
+    """Render a monoid ``merge`` / ``combine_states`` program (a tuple of
+    ``Assign``) in fp32. An ``Assign`` whose target is in ``state_names`` is a
+    reassignment of an already-declared carried value (``name = …;``); every
+    other ``Assign`` declares a local fp32 temp (``float t = …;``). Statement
+    order is load-bearing — a state update must follow every read of that state's
+    old value (the carrier builder guarantees it).
+
+    Shared by ``Combine.render`` (the streaming step) and the kernel-IR
+    cross-thread monoid combine primitives (the state-merges-state step), so both
+    spell the carrier's algebra identically."""
+    if pad is None:
+        pad = _pad(ctx.indent)
+    ty = ctx.type_name("f32")
+    sset = set(state_names)
+    out: list[str] = []
+    for a in program:
+        rhs = op_to_expr(a.op.name, [Var(x) for x in a.args]).render(ctx)
+        if a.name in sset:
+            out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
+        else:
+            ctx.ssa_dtypes[a.name] = "f32"
+            out.append(f"{pad}{ty} {a.name} = {rhs};")  # local temp
+    return out
+
+
 def select_to_ternary(s: Select) -> Expr:
     """Build a chained ternary from a ``Select``'s branch list.
 
