@@ -329,7 +329,18 @@ CloudRift attach to a specific network with `--network <name>` (on `vm create cl
 the VM's `authorized_keys`. To grant additional people access, pass `--authorized-key PATH` (repeatable, on `vm create
 gpu` and `deploy cloud`) — each points to one public key file. The authorized set becomes `[ssh-key's .pub] + [every
 --authorized-key]` (CloudRift via the rent payload's `PublicKeys` list; GCP via newline-joined `ssh-keys` metadata).
-Missing or empty key files fail fast before any VM is provisioned.
+Missing or empty `--authorized-key` files fail fast before any VM is provisioned; a missing `--ssh-key` `.pub` warns
+(no `ssh-keys` metadata is set) instead of aborting, since OS-Login-only projects can still SSH without it.
+
+**GCP OS Login.** On GCP the `ssh-keys` metadata above is **instance-level** (temporary — it dies with the VM, no
+project-wide key needed). But a project whose common metadata sets `enable-oslogin=TRUE` makes GCP **ignore** instance
+`ssh-keys` entirely, so deplodock also pins `enable-oslogin=FALSE` in the **same** `--metadata` flag (a second
+`--metadata` would overwrite the first; `enable-oslogin` goes first so the multi-line `ssh-keys` value stays last). The
+instance value overrides the project one — *unless* an org policy **enforces** `constraints/compute.requireOsLogin`, in
+which case instance metadata can't turn OS Login off and keys must be registered through OS Login
+(`gcloud compute os-login ssh-keys add`). Check with `gcloud resource-manager org-policies describe
+compute.requireOsLogin --effective --project=PROJECT`: `booleanPolicy: {}` (or absent) = not enforced = the
+`enable-oslogin=FALSE` path works.
 
 ```bash
 deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 --provider cloudrift \

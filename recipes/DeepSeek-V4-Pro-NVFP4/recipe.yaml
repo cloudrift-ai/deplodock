@@ -1,0 +1,43 @@
+model:
+  huggingface: "nvidia/DeepSeek-V4-Pro-NVFP4"
+
+# DeepSeek-V4-Pro: 1.6T / 49B-active MoE, CSA+HCA hybrid attention, MIT, native 1M ctx.
+# Engine = vLLM (NOT SGLang): SGLang #25704 produces NaN/garbage on DeepSeek-V4-Pro NVFP4 on
+#   8xB200 single-node TP=8 unless EAGLE spec-decode is forced. vLLM has clean day-0 support.
+# Launch params from NVIDIA's model card + vLLM recipe: TP=8, kv-cache fp8, deepseek_v4 parsers.
+# Image: the day-0 `deepseekv4-cu130` (Apr 24) build is matched to the BASE deepseek-ai checkpoint
+#   and chokes loading the nvidia NVFP4 repack with `KeyError: ...experts.w13_input_scale` (the
+#   NVFP4 MoE expert-scale mapping was fixed in newer builds) — so we pin the 2026-06-10 nightly
+#   (digest below) that loads the NVFP4 repack cleanly. If the digest is pruned, use a current nightly.
+# Reasoning: serves in NON-think mode by default (3 modes: Non-think / Think-High / Think-Max).
+#   Enable per-request with `chat_template_kwargs: {"enable_thinking": true}` (optionally
+#   `"reasoning_effort": "high"|"max"`; "max" needs context_length >= 393216). NOTE: top-level
+#   `reasoning_effort` no-ops on this nightly, and the chat `reasoning_content` field is left empty
+#   by a known deepseek_v4 parser bug (vllm #41132/#41240) — the model DOES reason (verified raw),
+#   only the field separation is off. Tool-calling works. Benchmark runs in default non-think mode.
+# Verified on 8xB200 (2026-06-10): boots + serves at the FULL native 1048576 (1M) context — KV pool
+#   ~5.0M tokens => 4.77x concurrency at 1M (DeepSeek-V4's KV compression: the pool GROWS with max-len
+#   — 696K tokens @65K, 3.56M @512K, 5.0M @1M). Real 128K-input requests served clean (4/4). Tradeoff:
+#   1M prefill TTFT ~15-17s @128K (scales with input); short-request throughput is unchanged by max-len.
+#   "Think-Max" reasoning_effort needs context_length >= 393216 (fits). Drop to 524288/131072 if you want
+#   lower prefill latency / more full-context concurrency.
+engine:
+  llm:
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    context_length: 524288
+    max_concurrent_requests: 16
+    vllm:
+      image: "vllm/vllm-openai@sha256:03768d9400bf490934e5dce2e9d8ddd9e004a5054939e14641188d8a9b69db8e"
+      extra_args: "--kv-cache-dtype fp8 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4"
+
+benchmark:
+  max_concurrency: 16
+  num_prompts: 64
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA B200"
+  deploy.gpu_count: 8

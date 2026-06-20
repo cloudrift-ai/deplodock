@@ -76,8 +76,30 @@ GPU_SHORT_NAMES = gpu.short_names()
 DEFAULT_GCP_ZONE = "us-central1-b"
 GPU_GCP_ZONES = {
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": ["us-central1-b"],
-    "NVIDIA H200 141GB": ["europe-west1-b", "europe-west4-a"],
-    "NVIDIA B200": ["asia-southeast1-b", "asia-northeast1-b"],
+    "NVIDIA H200 141GB": [
+        "europe-west1-b",
+        "us-west1-c",
+        "us-east4-b",
+        "asia-south1-b",
+        "europe-west4-a",
+        "asia-south2-c",
+        "us-east5-a",
+        "us-south1-b",
+    ],
+    "NVIDIA B200": [
+        "us-central1-b",
+        "us-east1-b",
+        "asia-northeast1-b",
+        "asia-southeast1-b",
+        "us-east4-b",
+        "europe-west4-b",
+        "europe-north1-b",
+        "europe-north1-c",
+        "us-west2-c",
+        "us-west3-b",
+        "us-west3-c",
+        "us-south1-b",
+    ],
 }
 
 # GCP provisioning model per GPU. Default is FLEX_START.

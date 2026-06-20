@@ -1,0 +1,100 @@
+{
+  "task": {
+    "recipe_dir": "recipes/DeepSeek-V4-Pro-NVFP4",
+    "variant": "b200x8",
+    "gpu_name": "NVIDIA B200",
+    "gpu_short": "b200",
+    "gpu_count": 8
+  },
+  "recipe": {
+    "model": {
+      "huggingface": "nvidia/DeepSeek-V4-Pro-NVFP4"
+    },
+    "engine": {
+      "llm": {
+        "context_length": 524288,
+        "max_concurrent_requests": 16,
+        "tensor_parallel_size": 8,
+        "pipeline_parallel_size": 1,
+        "data_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "vllm": {
+          "image": "vllm/vllm-openai@sha256:03768d9400bf490934e5dce2e9d8ddd9e004a5054939e14641188d8a9b69db8e",
+          "extra_args": "--kv-cache-dtype fp8 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4",
+          "extra_env": {}
+        },
+        "sglang": null,
+        "docker_options": {}
+      }
+    },
+    "benchmark": {
+      "max_concurrency": 16,
+      "num_prompts": 64,
+      "random_input_len": 2000,
+      "random_output_len": 2000
+    },
+    "deploy": {
+      "gpu": "NVIDIA B200",
+      "gpu_count": 8,
+      "driver_version": null,
+      "cuda_version": null
+    },
+    "command": null,
+    "aggregate": null
+  },
+  "metrics": {
+    "successful_requests": 64,
+    "failed_requests": 0,
+    "max_request_concurrency": 16,
+    "benchmark_duration_s": 127.16,
+    "total_input_tokens": 128000,
+    "total_generated_tokens": 128000,
+    "request_throughput": 0.5,
+    "output_token_throughput": 1006.59,
+    "peak_output_token_throughput": 1120.0,
+    "peak_concurrent_requests": 32.0,
+    "total_token_throughput": 2013.19,
+    "mean_ttft_ms": 1508.95,
+    "median_ttft_ms": 848.84,
+    "p99_ttft_ms": 5871.12,
+    "mean_tpot_ms": 15.15,
+    "median_tpot_ms": 14.97,
+    "p99_tpot_ms": 16.13,
+    "mean_itl_ms": 15.15,
+    "median_itl_ms": 14.73,
+    "p99_itl_ms": 15.67,
+    "mean_e2el_ms": null,
+    "median_e2el_ms": null,
+    "p99_e2el_ms": null
+  },
+  "system": {
+    "hostname": "bench-vm-0610-1246-cdd8.us-east1-b.c.faircompute.internal",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.17.0-1018-gcp",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz",
+    "cpu_count": 224,
+    "cpu_arch": "x86_64",
+    "memory_total_gib": 3891.2,
+    "gpu_name": "NVIDIA B200",
+    "gpu_memory_mib": 183359,
+    "gpu_driver": "580.159.03",
+    "cuda_version": "13.0",
+    "gpu_count": 8,
+    "docker_version": "29.5.3"
+  },
+  "compose": "services:\n\n  vllm_0:\n    image: vllm/vllm-openai@sha256:03768d9400bf490934e5dce2e9d8ddd9e004a5054939e14641188d8a9b69db8e\n    container_name: vllm_0\n    deploy:\n      resources:\n        reservations:\n          devices:\n            - driver: nvidia\n              device_ids: ['0', '1', '2', '3', '4', '5', '6', '7']\n              capabilities: [gpu]\n    volumes:\n      - /hf_models:/hf_models\n    environment:\n      - HUGGING_FACE_HUB_TOKEN=***\n      - HF_HOME=/hf_models\n    ports:\n      - \"8000:8000\"\n    shm_size: '16gb'\n    ipc: host\n    restart: unless-stopped\n    command: >\n      --trust-remote-code\n      --gpu-memory-utilization=0.9\n      --host 0.0.0.0\n      --port 8000\n      --tensor-parallel-size 8\n      --pipeline-parallel-size 1\n      --data-parallel-size 1\n      --model nvidia/DeepSeek-V4-Pro-NVFP4\n      --served-model-name nvidia/DeepSeek-V4-Pro-NVFP4\n      --max-model-len 524288\n      --max-num-seqs 16\n      --kv-cache-dtype fp8 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4\n    healthcheck:\n      test: [\"CMD\", \"bash\", \"-c\", \"curl -f http://localhost:8000/health\"]\n      interval: 10s\n      timeout: 10s\n      retries: 180\n      start_period: 1200s\n",
+  "bench_command": "vllm bench serve\n    --model nvidia/DeepSeek-V4-Pro-NVFP4\n    --trust-remote-code\n    --max-concurrency 16\n    --num-prompts 64\n    --random-input-len 2000\n    --random-output-len 2000\n    --base-url http://localhost:8000",
+  "timing": {
+    "remote_provision": 4.92,
+    "image_pull": 1.69,
+    "model_download": 2.55,
+    "model_load_and_warmup": 553.88,
+    "weights_load": 66.85,
+    "cuda_graph_capture": 9.0,
+    "engine_warmup": 411.5,
+    "startup": 66.53,
+    "smoke_test": 6.01,
+    "benchmark": 143.67,
+    "total": 712.71
+  }
+}

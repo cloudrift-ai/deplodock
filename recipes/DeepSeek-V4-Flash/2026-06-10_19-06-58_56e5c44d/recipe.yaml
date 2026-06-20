@@ -1,0 +1,47 @@
+model:
+  huggingface: "deepseek-ai/DeepSeek-V4-Flash"
+
+# DeepSeek-V4-Flash: 284B / 13B-active MoE, CSA+HCA hybrid attention (MLA, 1 KV head, 256 experts / 6 active),
+#   native FP4-experts + FP8-attn (deploy-ready), MIT, text-only. Native ctx 1,048,576 (YARN x16 over 65,536 base).
+# Engine = vLLM; deepseek_v4 tokenizer/tool/reasoning parsers, kv-cache fp8, block-size 256 (vLLM recipe + HF card).
+#
+# MIN GPUs for full 1M ctx (2026-06-10 sweep on 8xH200):  >>> 2x H200 (TP2) <<<
+#   - Memory is NOT the limit: V4's compressed attention fits the 1M KV pool at TP4 14.6x / TP2 7.2x concurrency.
+#   - The real limit was the IMAGE: the day-0 deepseekv4-cu130 (Apr 24) STALLS long-context prefill at TP2
+#     (GPU 0%, workers spin) across ALL cudagraph modes (default hang = vLLM #40969; eager/PIECEWISE also stall).
+#     The 2026-06-10 nightly (pinned below) FIXES it.
+#   - Measured at TP2 on the nightly, full 1M ctx: a 200K-token prefill -> TTFT ~24s, decode TPOT ~7.7 ms, 0 fail
+#     (cf. TP4 ref: TTFT ~18.5s / TPOT ~11 ms). Good perf on 2 GPUs; TP4/8 only needed for faster long-prefill
+#     or more concurrency. Short-context throughput (2000-tok) is excellent at any TP.
+#   - TP1 (1 GPU) is INFEASIBLE: resident weights ~149 GB > 141 GB on a single H200 (OOM). 2 GPUs is the floor.
+#     (Weights are not compactly expert-sharded at low TP: ~74 GiB/GPU at TP2 vs ~21 GiB/GPU at TP4.)
+# To deploy this single TP2 instance on a multi-GPU host, pass --gpu-count 2 (else deplodock scale-out adds
+# data-parallel replicas to fill all GPUs). The 65,536-ctx short-context benchmark (2000/2000, conc 32, 8xH200
+# DP2xTP4) is recorded under 2026-06-10_15-39-22_6ed122c6/ (3,414 tok/s total, TPOT 15.2 ms).
+engine:
+  llm:
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    gpu_memory_utilization: 0.92
+    context_length: 1048576
+    max_concurrent_requests: 16
+    vllm:
+      # Switched from the day-0 deepseekv4-cu130 (Apr 24) to the 2026-06-10 nightly: the day-0 build stalls
+      # long-context prefill at TP2 (GPU idle, workers spin) across all cudagraph modes. This nightly is the
+      # one the V4-Pro recipe verified serving real 128K-input requests cleanly, so it should fix the stall
+      # and let us run default cudagraph (no PIECEWISE/enforce-eager workaround). If the digest is pruned,
+      # use a current nightly.
+      image: "vllm/vllm-openai@sha256:03768d9400bf490934e5dce2e9d8ddd9e004a5054939e14641188d8a9b69db8e"
+      extra_args: "--kv-cache-dtype fp8 --block-size 256 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4"
+
+# Single TP2 instance has --max-num-seqs 16 in-flight slots; keep max_concurrency <= 16.
+benchmark:
+  model_dir: /mnt/models   # align with deploy ssh cache path so `deplodock bench` reuses it (not /hf_models)
+  max_concurrency: 16
+  num_prompts: 64
+  random_input_len: 2000
+  random_output_len: 2000
+
+matrices:
+  deploy.gpu: "NVIDIA H200 141GB"
+  deploy.gpu_count: 2
