@@ -498,7 +498,7 @@ class Stmt:
 class ReduceCarrier(Stmt):
     """A loop-carried reduce accumulator — the shared structural role behind
     ``Accum`` (scalar monoid fold), ``Mma`` (tensor-core ``c += a @ b``), and
-    the future flash/LSE combine.
+    the general monoid ``Combine`` (e.g. flash attention's online softmax).
 
     A ``Loop`` / ``StridedLoop`` / serial tile is a *reduce* loop iff its
     immediate body holds a ``ReduceCarrier`` — that is the one predicate the
@@ -512,10 +512,11 @@ class ReduceCarrier(Stmt):
     ``commutative`` / ``has_identity``) the carrier exposes directly to decide
     whether a reduction may be split / reordered (split-K, cooperative
     tree-combine). The traits live on the carrier itself: ``Accum`` forwards to
-    its scalar ``op``; ``Mma`` and the future flash/LSE combine report them as
-    constants (both are associative, commutative monoids). No separate combine
-    object is reified — three booleans don't earn one, and an ``Mma`` has no
-    scalar op to point at (its accumulation merely *is* additive).
+    its scalar ``op``; ``Mma`` reports the additive-fold constants; ``Combine``
+    reports `associative` / `has_identity` `True` (it is a monoid) with a
+    per-instance `commutative` flag. No separate combine object is reified —
+    three booleans don't earn one, and an ``Mma`` has no scalar op to point at
+    (its accumulation merely *is* additive).
 
     Two methods name the carrier's reduce surface, distinct from the generic
     SSA def-use surface (:meth:`deps` / :meth:`defines`):

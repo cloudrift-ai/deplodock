@@ -628,51 +628,61 @@ class Mma(ReduceCarrier):
 
 
 @dataclass(frozen=True)
-class FlashCombine(ReduceCarrier):
-    """Streaming online-softmax (log-sum-exp) combine — a tuple-valued monoid
-    carrier, sibling of ``Accum`` / ``Mma``.
+class Combine(ReduceCarrier):
+    """A loop-carried **monoid** combine — a general associative reduce over
+    internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
+    ``Mma`` (tensor-core fragment fold).
 
-    Where ``Accum`` carries one scalar accumulator and ``Mma`` one fragment,
-    ``FlashCombine`` carries the **triple** ``(m_i, l_i, O_i)`` — running row-max,
-    running denominator, running (scaled) output — across the streaming KV
-    (reduce) loop of a flash-attention nest. Each iteration merges the carried
-    state with this tile's *local* softmax partial ``(tile_max, tile_sum,
-    tile_pv)`` via the LSE recurrence::
+    A monoid is *(identity element, associative binary operation, carried state)*;
+    ``Combine`` makes all three explicit so the streaming-reduce machinery isn't
+    tied to any one recurrence:
 
-        m_new = max(m_i, tile_max)
-        alpha = exp(m_i - m_new)
-        l_i   = l_i * alpha + tile_sum
-        O_i   = O_i * alpha + tile_pv
-        m_i   = m_new
-
-    The rescale (the ``alpha`` cross-accumulator read + the mid-reduction
-    ``O_i *= alpha``) lives **inside this carrier's lowering**, not as loose body
-    statements — so the gates that reject online algorithms
-    (``accums_independent``, ``classify_fragment_epilogue``) never see the
-    coupling, and the partition planner places one carrier.
-
-    - ``state`` — the carried SSA names ``(m_i, l_i, O_i)``; read-and-written
+    - ``state`` — the carried SSA names (the internal state); read-and-written
       across the reduce axis (the carried read is implicit, like ``Accum.name`` /
-      ``Mma.c``). These are the defs visible after the loop.
-    - ``partial`` — this tile's local-softmax SSA names ``(tile_max, tile_sum,
-      tile_pv)``; the per-iteration contribution the ``K_o`` pipeline scheduler
-      reads.
-    - ``axes`` — the reduction axes (the KV / sequence axis), mirroring
-      ``Accum.axes`` / ``Mma.axes``; threaded through ``rewrite``.
+      ``Mma.c``), and the defs visible after the loop.
+    - ``partial`` — this iteration's contribution SSA names (the right operand the
+      step folds into the state).
+    - ``merge`` — the associative operation, **as data**: a short program of
+      ``Assign`` steps that reads the OLD state + the partial and reassigns the new
+      state. An ``Assign`` whose target is a ``state`` name is a state update
+      (rendered ``name = …;`` — the carried name is already declared by an
+      enclosing ``Init``); every other ``Assign`` is a local fp32 temp (declared
+      ``float t = …;``). Statement ORDER is load-bearing — a state update must come
+      after every read of that state's old value.
+    - ``identity`` — the monoid's neutral element, one ``Expr`` per state
+      component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
+      cooperative-combine reductions read it to seed their partial accumulators).
+    - ``commutative`` — whether the operation also commutes (split-KV legality);
+      ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
+      monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
 
-    The combine is the LSE monoid: **associative and commutative with identity**
-    ``(m=-inf, l=0, O=0)`` — the same trait constants as ``Mma``'s additive fold,
-    which is exactly what makes split-KV (flash-decoding) and cooperative-combine
-    legal later.
+    The whole operation lives **inside this carrier**, not as loose body
+    statements, so the gates that reject online algorithms (``accums_independent``,
+    ``classify_fragment_epilogue``) never see the cross-state coupling, and the
+    partition planner places one carrier.
+
+    Example — flash attention's **online softmax** (the log-sum-exp monoid): state
+    ``(m, l, O)`` = running row-max / denominator / output, partial ``(s, v)`` =
+    this key's score + value, identity ``(−inf, 0, 0)``, and the merge::
+
+        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
+        l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
+
+    associative + commutative — which is what makes split-KV (flash-decoding) and
+    cooperative-combine legal. The flash instance is built by
+    ``loop/fusion/_flash.flash_combine``.
     """
 
     state: tuple[str, ...]
     partial: tuple[str, ...]
+    merge: tuple[Assign, ...] = ()
+    identity: tuple[Expr, ...] = ()
+    commutative: bool = True
     axes: tuple[str, ...] = ()
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit
-        # (loop-carried), so only this tile's partial contribution is listed —
+        # (loop-carried), so only this iteration's partial contribution is listed —
         # keeps sibling-def analyses from treating the state as a same-scope read.
         return self.partial
 
@@ -682,14 +692,10 @@ class FlashCombine(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return self.state
 
-    # The LSE combine is associative AND commutative with identity — the monoid
-    # property the plan relies on (split-KV / cooperative-combine reachable).
+    # A monoid is associative with identity by construction; commutativity is the
+    # extra property (the ``commutative`` field) split-KV / split reordering needs.
     @property
     def associative(self) -> bool:
-        return True
-
-    @property
-    def commutative(self) -> bool:
         return True
 
     @property
@@ -699,56 +705,26 @@ class FlashCombine(ReduceCarrier):
     def pretty(self, indent: str = "") -> list[str]:
         state = ", ".join(self.state)
         partial = ", ".join(self.partial)
-        return [f"{indent}({state}) <- flash_combine({partial})"]
+        return [f"{indent}({state}) <- combine({partial})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Emit the per-iteration LSE rescale, in fp32, as plain assignments to
-        the carried state (declared by an enclosing ``Init``) + local temps.
-
-        Two scalar shapes are handled — the no-mma forms the streaming-reduce
-        validates against a CPU reference:
-
-        - ``state=(m, l)``, ``partial=(s,)`` — online-softmax normalization: the
-          streaming pass that produces the final ``(max, denom)`` a second loop
-          divides by.
-        - ``state=(m, l, O)``, ``partial=(s, v)`` — the full triple with a scalar
-          value (a 1-D weighted-softmax average): ``O += p·v`` rides the same
-          ``p = exp(s − m_new)`` the denom uses. The matmul form (``O`` a tensor-
-          core fragment, ``partial`` the per-tile ``P@V``) lowers through the
-          kernel tier, not here.
-
-        The recurrence reads the OLD ``m`` for ``alpha`` *before* overwriting it,
-        so statement order is load-bearing: ``m_new`` and ``alpha`` first, the
-        ``l`` / ``O`` updates next, ``m = m_new`` last.
+        """Emit the merge program in fp32: each ``Assign`` targeting a ``state``
+        name is a reassignment of the carried value (already declared by an
+        enclosing ``Init``); every other ``Assign`` declares a local temp. The
+        builder orders the program so each old-state read precedes that state's
+        update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
         """
-        from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
-
-        if len(self.state) not in (2, 3) or len(self.partial) != len(self.state) - 1:
-            raise NotImplementedError(
-                f"FlashCombine.render: only the scalar (m,l)/(m,l,O) forms are lowered here; "
-                f"got state={self.state!r} partial={self.partial!r} (the tensor-core P@V form lowers in the kernel tier)"
-            )
         pad = _pad(ctx.indent)
-        m, ll = self.state[0], self.state[1]
-        o = self.state[2] if len(self.state) == 3 else None
-        s = self.partial[0]
-        v = self.partial[1] if len(self.partial) == 2 else None
-        m_new, alpha, p = f"{m}_new", f"{m}_alpha", f"{ll}_p"
-        for nm in (m_new, alpha, p):
-            ctx.ssa_dtypes[nm] = "f32"
         ty = ctx.type_name("f32")
-        max_e = FuncCallExpr("fmax", (Var(m), Var(s))).render(ctx)
-        alpha_e = FuncCallExpr("exp", (BinaryExpr("-", Var(m), Var(m_new)),)).render(ctx)
-        p_e = FuncCallExpr("exp", (BinaryExpr("-", Var(s), Var(m_new)),)).render(ctx)
-        out = [
-            f"{pad}{ty} {m_new} = {max_e};",  # m_new = max(m, s)
-            f"{pad}{ty} {alpha} = {alpha_e};",  # alpha = exp(m - m_new)  (reads OLD m)
-            f"{pad}{ty} {p} = {p_e};",  # p = exp(s - m_new)  (this element's prob, m_new frame)
-            f"{pad}{ll} = {ll} * {alpha} + {p};",  # l = l*alpha + p
-        ]
-        if o is not None:
-            out.append(f"{pad}{o} = {o} * {alpha} + {p} * {v};")  # O = O*alpha + p*v
-        out.append(f"{pad}{m} = {m_new};")  # m = m_new  (must come last)
+        state_set = set(self.state)
+        out: list[str] = []
+        for a in self.merge:
+            rhs = op_to_expr(a.op.name, [Var(x) for x in a.args]).render(ctx)
+            if a.name in state_set:
+                out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
+            else:
+                ctx.ssa_dtypes[a.name] = "f32"
+                out.append(f"{pad}{ty} {a.name} = {rhs};")  # local temp
         return out
 
 

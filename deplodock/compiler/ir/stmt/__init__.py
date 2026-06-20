@@ -61,7 +61,7 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import (
     Accum,
     Assign,
-    FlashCombine,
+    Combine,
     Init,
     Load,
     Mma,
@@ -90,8 +90,8 @@ __all__ = [
     "Accum",
     "Assign",
     "Body",
+    "Combine",
     "Cond",
-    "FlashCombine",
     "Init",
     "Load",
     "Loop",

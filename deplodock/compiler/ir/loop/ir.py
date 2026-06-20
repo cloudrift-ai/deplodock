@@ -41,8 +41,8 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Accum,
     Assign,
     Body,
+    Combine,
     Cond,
-    FlashCombine,
     Init,
     Load,
     Loop,
@@ -424,18 +424,18 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Init):
                 # Explicit accumulator seed at this scope — a binding site for the
-                # carried name (FlashCombine's (m, l, O) are declared here, before
-                # the streaming Loop, so a post-loop sweep can read them).
+                # carried name (a Combine's monoid state is declared here, before
+                # the streaming Loop, so a post-loop sweep can read it).
                 defined.add(stmt.name)
                 exported_accs.add(stmt.name)
-            elif isinstance(stmt, FlashCombine):
-                # Tuple-monoid carrier: its ``partial`` (this iteration's
-                # contribution) must be in scope; its ``state`` is loop-carried
-                # (seeded by an enclosing Init, like Accum's implicit declare) and
-                # exports to the enclosing scope.
+            elif isinstance(stmt, Combine):
+                # Monoid carrier: its ``partial`` (this iteration's contribution)
+                # must be in scope; its ``state`` is loop-carried (seeded by an
+                # enclosing Init, like Accum's implicit declare) and exports to the
+                # enclosing scope.
                 for pdep in stmt.partial:
                     if pdep not in defined:
-                        raise ValueError(f"FlashCombine: partial dep {pdep!r} not defined")
+                        raise ValueError(f"Combine: partial dep {pdep!r} not defined")
                 for nm in stmt.state:
                     defined.add(nm)
                     exported_accs.add(nm)

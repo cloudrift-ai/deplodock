@@ -22,7 +22,7 @@ from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import (
     Accum,
     Assign,
-    FlashCombine,
+    Combine,
     Init,
     Load,
     Mma,
@@ -139,11 +139,17 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: FlashCombine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
-    return FlashCombine(
+    return Combine(
         state=tuple(rename(n) for n in s.state),
         partial=tuple(rename(n) for n in s.partial),
+        # The merge program references state / partial (mapped) + internal temps
+        # (not in the rename map → pass through), so rewriting each step keeps it
+        # consistent with the renamed surface.
+        merge=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.merge),
+        identity=s.identity,  # constant Exprs — no SSA names to rename
+        commutative=s.commutative,
         axes=new_axes,
     )
 

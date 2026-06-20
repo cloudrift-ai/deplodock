@@ -21,7 +21,7 @@ redundant, scalar form; the tensor-core P@V tier is future work
         Init sacc = 0
         for dd in 0..head_dim: sacc += Q[…,m,dd]·K[…,kv,dd]   # score reduce
         s = sacc · scale
-        FlashCombine((m_i,l_i,O_i), (s, V[…,kv,d]))  # the LSE rescale
+        Combine((m_i,l_i,O_i), (s, V[…,kv,d]))       # the LSE rescale (flash_combine)
       out[…,m,d] = O_i / l_i
 
 Scope: static OR dynamic (symbolic ``seq_len`` on Q/K/V dim -2 — one cached kernel
@@ -44,8 +44,39 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, FlashCombine, Init, Load, Loop, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Combine, Init, Load, Loop, Select, SelectBranch, Write
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+
+
+def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Combine:
+    """Build the online-softmax (log-sum-exp) :class:`Combine` for one streaming
+    KV step: state ``(m, l, O)`` folds this key's ``(score, value)`` partial.
+
+        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
+        l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
+
+    Temps are namespaced by the state's first name so they stay unique per kernel
+    (they're internal to the carrier — invisible to the body's SSA renamer)."""
+
+    def t(suf: str) -> str:
+        return f"{m}__{suf}"
+
+    merge = (
+        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)
+        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new
+        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)  (reads OLD m)
+        Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
+        Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
+        Assign(t("lm"), "multiply", (ll, t("al"))),  # l·alpha
+        Assign(ll, "add", (t("lm"), t("p"))),  # l = l·alpha + p          [state]
+        Assign(t("om"), "multiply", (o, t("al"))),  # O·alpha
+        Assign(t("pv"), "multiply", (t("p"), v)),  # p·v
+        Assign(o, "add", (t("om"), t("pv"))),  # O = O·alpha + p·v        [state]
+        Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
+    )
+    identity = (Literal(-1e30), Literal(0.0), Literal(0.0))  # (−inf, 0, 0)
+    return Combine(state=(m, ll, o), partial=(s, v), merge=merge, identity=identity, commutative=True, axes=("kv",))
+
 
 # Structural fork: deploy the fused streaming nest, or fall through to the
 # score-materializing 010_sdpa path. Declared like 005_split_demoted's SPLIT_CONE;
@@ -138,7 +169,7 @@ def _flash_loop_body(
 
     The score ``s = Σ_dd Q·K`` is an inner reduce nested in the KV streaming
     reduce, so ``Init(sacc)`` is pre-placed at the KV-body scope (reset per step):
-    the streaming ``FlashCombine`` loop is a per-iteration boundary the default
+    the streaming ``Combine`` loop is a per-iteration boundary the default
     Init-placement would otherwise cross."""
     bvars = _batch_vars(len(batch))
     q_idx = (*bvars, Var("m"), Var("dd"))
@@ -176,7 +207,7 @@ def _flash_loop_body(
         score_reduce,
         *score,
         Load(name="v_e", input=v_buf, index=v_idx),
-        FlashCombine(state=("m_i", "l_i", "O_i"), partial=(score_name, "v_e"), axes=("kv",)),
+        flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
     )
     return (
         Load(name="scale_c", input=scale_buf, index=()),

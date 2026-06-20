@@ -124,37 +124,38 @@ tree-combine) query instead of matching op names.
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
 `Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
-base of `Accum`, its tensor-core form `Mma`, and the streaming online-softmax
-`FlashCombine`; `is_reduce`, axis threading, and the other carrier-agnostic
-checks key off the base, not an `isinstance(s, (Accum, Mma))` ladder). Rules
-that need the combine's algebra read the carrier's `associative` /
-`commutative` / `has_identity` traits directly (`Accum` forwards to its scalar
-`op`; `Mma` and `FlashCombine` report constants — the additive fold and the
-LSE monoid respectively, both associative + commutative with identity).
+base of `Accum`, its tensor-core form `Mma`, and the general monoid `Combine`;
+`is_reduce`, axis threading, and the other carrier-agnostic checks key off the
+base, not an `isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's
+algebra read the carrier's `associative` / `commutative` / `has_identity` traits
+directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
+constants; `Combine` reports `associative` / `has_identity` `True` by construction
+with a per-instance `commutative` field).
 
-`FlashCombine` is the tuple-valued monoid carrier for flash attention: it
-carries the running `(m_i, l_i, O_i)` triple (`state`) across the streaming KV
-reduce loop and merges each tile's local-softmax partial `(tile_max, tile_sum,
-tile_pv)` (`partial`) via the log-sum-exp recurrence (the `alpha = exp(m_i −
-m_new)` rescale + `l·alpha + …` / `O·alpha + …`). The rescale lives inside the
-carrier's lowering, not as loose body statements, so the online-algorithm gates
-(`accums_independent`, `classify_fragment_epilogue`) never see the cross-`Accum`
-coupling. `carried_names()` / `defines()` return `state`; `deps()` /
-`partial_deps()` return `partial` (the carried read is implicit, like `Accum` /
-`Mma`).
+`Combine` is the general loop-carried **monoid** carrier — *(identity element,
+associative operation, internal state)* made explicit: `state` (the carried SSA
+names), `partial` (this step's contribution), `merge` (the associative operation
+**as data** — a short `Assign` program that reads old state + partial and
+reassigns the new state; state-targeting Assigns are updates, the rest are local
+temps), `identity` (one `Expr` per state component, seeded by the enclosing
+`Init`), and a `commutative` flag. The whole operation lives inside the carrier,
+not as loose body statements, so the online-algorithm gates (`accums_independent`,
+`classify_fragment_epilogue`) never see the cross-state coupling. `carried_names()`
+/ `defines()` return `state`; `deps()` / `partial_deps()` return `partial` (the
+carried read is implicit, like `Accum` / `Mma`).
 
-`FlashCombine.render` lowers the rescale directly (it is the carrier's
-codegen, isinstance-keyed like `Mma`'s): it emits the LSE recurrence as plain
-fp32 assignments to the carried state (declared by an enclosing `Init`, before
-the streaming `Loop`) plus local `m_new` / `alpha` / `p` temps, with statement
-order load-bearing (`alpha` reads the OLD `m` before `m = m_new` overwrites it).
-Two scalar shapes lower here — `state=(m, l)` / `partial=(s,)` (online-softmax
-normalization) and `state=(m, l, O)` / `partial=(s, v)` (the full triple with a
-scalar value, a 1-D weighted-softmax average); the tensor-core P@V form (`O` a
-fragment, the per-tile P@V the partial) lowers through the kernel tier instead.
-`LoopOp` validation threads both `Init` (a carried-name binding site) and
-`FlashCombine` (partials must be in scope; state is loop-carried and exports),
-so a hand-written streaming nest type-checks and runs through `LoopOp.forward`.
+`Combine.render` emits the `merge` program in fp32: each `Assign` targeting a
+`state` name is a reassignment of the carried value (declared by an enclosing
+`Init`); every other `Assign` declares a local temp. Statement order is
+load-bearing (a state update follows every read of that state's old value).
+`rewrite` threads the merge through the SSA renamer (state / partial refs map;
+the carrier-internal temps pass through). `LoopOp` validation threads `Init` (a
+carried-name binding site) and `Combine` (partials must be in scope; state is
+loop-carried and exports), so a hand-written streaming nest type-checks and runs
+through `LoopOp.forward`. **Example** — flash attention's online softmax (the
+log-sum-exp monoid): state `(m, l, O)`, partial `(score, value)`, identity
+`(−inf, 0, 0)`, merge `m_new=max(m,s); alpha=exp(m−m_new); l=l·alpha+exp(s−m_new);
+O=O·alpha+exp(s−m_new)·v; m=m_new` (built by `loop/fusion/_flash.flash_combine`).
 
 ### `loop/ir.py` — LoopOp types
 
