@@ -47,9 +47,10 @@ consuming vLLM's attention output; vLLM's `Attention` layer does paged-KV attent
 - **Carve via explicit per-architecture pre/post wrappers** that read the block's own submodules (not post-trace graph
   surgery; substituting `self_attn` won't work — HF `self_attn.forward` returns `(attn_output, weights)`, not q/k/v).
   The **pre** wrapper runs `input_layernorm` → HF's separate `q_proj`/`k_proj`/`v_proj` (+ per-head `q_norm`/`k_norm` on
-  Qwen3) → **returns q,k,v** (no SDPA, no o_proj); the **post** wrapper runs `o_proj` + residual + MLP + post-norm from
-  an `(attn_out, residual)` input. SDPA never enters the trace by construction. (Note: the fused `qkv_proj` in vLLM's
-  `Qwen3Attention.forward` above is a vLLM detail — the HF module deplodock traces has three separate projections.)
+  Qwen3) → **returns q,k,v** (no SDPA, no o_proj); the **post** wrapper runs `o_proj` + residual + post-norm + MLP +
+  residual from an `(attn_out, residual)` input. SDPA never enters the trace by construction. (Note: the fused
+  `qkv_proj` in vLLM's `Qwen3Attention.forward` above is a vLLM detail — the HF module deplodock traces has three
+  separate projections.)
 - **vLLM applies RoPE in the first cut (A2).** deplodock emits **un-rotated** q/k; `DeplodockGenModel.forward` calls
   vLLM's `self.rotary_emb(positions, q, k)` between the pre-attention kernel and `self.attn`. This deletes the
   runtime-arbitrary-positions trace work from the critical path. **deplodock owning RoPE with runtime positions (A1) is
@@ -160,6 +161,12 @@ MLP sub-block (with its own internal second residual).
   `(attn_out, residual)` pair (residual = the layer-input `hidden`). An **architecture adapter** handles Llama next (no
   `q_norm`/`k_norm`; otherwise identical). (Fallback only if the explicit wrappers prove unworkable: post-trace cut of
   the `SdpaOp` node in frontend IR — promote its q/k/v inputs to graph outputs, its output to a graph input.)
+- **Seam q/k/v ABI (define exactly):** the pre wrapper emits **2-D** `q[T, Hq·D]`, `k[T, Hkv·D]`, `v[T, Hkv·D]` — heads
+  folded into the last dim, tokens leading — exactly what vLLM's `Attention.forward(q,k,v)` consumes (**assert** these
+  shapes at the seam). HF Qwen3's `.view(B,S,-1,D).transpose(1,2)` assumes a `[batch, seq, hidden]` input; on the
+  flattened `[T, H]` layout the reshape is `.view(T, n_heads, D)` with **no batch/seq transpose**. The `[1, n_heads, T,
+  D]` layout torch SDPA wants is built **only inside the oracle** (Phase 1/2 reference), never in the deplodock kernels
+  or at the vLLM seam.
 - **Flattened layout:** trace the subgraph with a 2-D `[num_tokens, H]` activation, `num_tokens` symbolic (reuse
   `parse_position_specs` / `build_torch_dynamic_shapes`, spec `seq_len@x:0`). All pre/post compute is pointwise or a
   matmul over H, so collapsing `[1,seq,H] → [seq,H]` is layout-invariant — the property that makes Option A work; the
@@ -186,6 +193,12 @@ runner, isolating the interleave / host-sync mechanics.
   buffer set — separate because vLLM attention runs between them, so a decode step is **two replays / layer**, not one)
   at **per-layer** granularity (simplest; layers are structurally identical so capture/replay caches well) vs one
   all-layers program with attn boundaries (heavier surgery). Start per-layer.
+- **Memory budget (spike early):** each `CompiledProgram` owns persistent input/output buffers **and** a pinned scratch
+  slab, plus its own 64-entry LRU CUDA-graph cache (`backend/cuda/program.py`). With **2 × n_layers** capacity-sized
+  programs the MLP-intermediate workspaces can add several GB, and the graph caches can reach thousands of entries
+  globally. Run an early memory-budget spike; plan **shared scratch workspaces** across the structurally-identical layer
+  programs (they run sequentially, so one slab can back all) and/or a **global graph-cache cap** instead of
+  64-per-program.
 - **Verify:** full forward of a small CausalLM — deplodock per-layer `pre` kernels → **reconstruct RoPE on q/k at
   `positions`** → reference causal GQA torch SDPA → `post` kernels, across all layers — matches eager logits. (The
   reference stitch applies the same RoPE the vLLM forward will, since `pre` emits un-rotated q/k under A2.)
@@ -221,10 +234,12 @@ Wire Phase 2's runner into a vLLM generative model.
   `--enforce-eager`), reusing the flag-split / forward plumbing.
 - **Dropped (embedding-specific):** `IsAttentionFree`, `DispatchPooler`, `packed.split_spans`, `attn_type="encoder_only"`,
   the `_mask` / `_causal_mask_np` causal-mask machinery (vLLM's paged attention owns masking now).
-- **Verify:** `vllm serve <model> --runner generate --hf-overrides …DeplodockGenModel…`, then a `/v1/chat/completions`
-  greedy request matches the **Phase 0 oracle** on **per-step logits within tolerance + top-1 agreement**
-  (token-for-token a smoke check only — the reason Phase 0 came first). GQA explicitly checked (Qwen3). GPU-gated
-  `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
+- **Verify (two tiers — HTTP can't expose full logits):** (1) **endpoint smoke** — `vllm serve <model> --runner
+  generate --hf-overrides …DeplodockGenModel…`, then a `/v1/chat/completions` greedy request matches the **Phase 0
+  oracle**'s generated **tokens** (and top-k `logprobs` where returned); (2) **in-process numerical** — a test driving
+  `DeplodockGenModel` / the runner directly (or a debug hook around `compute_logits`) gates **per-step full logits
+  within tolerance + top-1 agreement** vs the oracle (the HTTP path can't return `[vocab]` per step). GQA explicitly
+  checked (Qwen3). GPU-gated `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
 
 ### Phase 4 — Prefill + decode hardening
 
@@ -281,8 +296,10 @@ capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 
    Keep everything on one stream (`cp.cuda.Stream.from_external(torch.cuda.current_stream())`); measure decode-step
    latency early (Phase 4). Fallback: fewer / larger compiled chunks.
 2. **Flattened-token compile correctness** — layout-invariance holds only because pre/post compute is pointwise +
-   matmul-over-H; the q/k/v reshape-into-heads is the danger spot. De-risk with the Phase-1 equivalence test before any
-   vLLM work.
+   matmul-over-H; the q/k/v reshape-into-heads is the danger spot (HF's `.view(B,S,-1,D).transpose(1,2)` assumes
+   `[batch,seq,hidden]` — on `[T,H]` it must be `.view(T,n_heads,D)` with no transpose; the seam emits 2-D `q[T,Hq·D]` /
+   `k,v[T,Hkv·D]`, asserted against vLLM's `Attention` input). De-risk with the Phase-1 equivalence test before any vLLM
+   work.
 3. **Decode-shaped skinny matmuls** (`num_tokens` tiny) — far from the goldens' prefill-ish shapes; verify *correct* at
    `num_tokens=1` first, tune in Phase 5.
 4. **Captured-graph reuse across decode steps** — must be keyed on `num_tokens` and replay (not recapture) in steady
@@ -302,6 +319,9 @@ capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 
    (`test_qwen_whole_model_dynamic_traces`); whole-model CUDA execution (int64 embedding-gather, lm_head matmul) is
    uncovered. Phase 0's fp16 compile-and-run spike de-risks this before the generate loop is built; fp16 vs fp32 does
    not change the gap.
+9. **Program-count memory blow-up** — 2 × n_layers persistent `CompiledProgram`s, each with capacity-sized buffers + a
+   pinned scratch slab + a 64-entry graph cache, can cost several GB of workspace and thousands of cached graphs.
+   Memory-budget spike early (Phase 2); share scratch across layer programs and/or cap the global graph cache.
 
 ## End-to-end verification
 
