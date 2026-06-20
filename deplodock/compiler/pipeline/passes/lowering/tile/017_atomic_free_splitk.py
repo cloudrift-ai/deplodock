@@ -34,14 +34,17 @@ codegen-derived atomic rewrite (see ``plans/mma-fragment-factorization.md``).
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.context import Context
 from deplodock.compiler.dim import to_dim
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Load, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Combine, Cond, Init, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
@@ -181,6 +184,78 @@ def _build_reduce_tileop(*, workspace_name: str, out_name: str, s_extent: int, m
         ),
     )
     return TileOp(body=Body(body), name=f"{out_name}__reduce", knobs={ATOMIC_FREE_SPLITK.name: True})
+
+
+def build_monoid_reduce_tileop(
+    *,
+    carrier: Combine,
+    init_ops: tuple[ElementwiseImpl, ...],
+    workspaces: tuple[str, ...],
+    out_name: str,
+    s_extent: int,
+    m_extent: int,
+    n_extent: int,
+    dtype,
+    finalize: tuple[Assign, ...] = (),
+    out_value: str | None = None,
+    name: str = "monoid__reduce",
+) -> TileOp:
+    """Carrier-general cross-partition reduce ``TileOp`` (Step 3a of
+    ``plans/atomic-free-monoid-combine.md``) — the monoid sibling of
+    :func:`_build_reduce_tileop`.
+
+    Each of the carrier's ``state`` components has its own workspace buffer
+    ``workspaces[i]`` (shaped ``[S, M, N]``, holding that partition's state
+    component). One thread per ``(m, n)`` output cell seeds its state from
+    ``identity`` (``init_ops[i]``'s op-identity per component — ``maximum`` →
+    −inf, ``add`` → 0) and serially folds each ``S`` slice via the carrier's
+    ``combine_states`` (the state-merges-state monoid op). After the fold, an
+    optional ``finalize`` program (Assigns over the merged state — e.g. flash's
+    ``res = O / l``) produces the single output value ``out_value`` (default the
+    first state component); it is written to ``out_name``. The additive matmul
+    case stays on :func:`_build_reduce_tileop`'s ``Accum`` sum (bit-identical);
+    this is the path a non-additive carrier (flash split-KV's LSE) takes.
+    """
+    bm_red, bn_red = _BM_RED, _BN_RED
+    m_blocks = -(-m_extent // bm_red)
+    n_blocks = -(-n_extent // bn_red)
+    K_s = Axis("K_s_red", to_dim(s_extent))
+    M_b = Axis("M_b_red", to_dim(m_blocks))
+    N_b = Axis("N_b_red", to_dim(n_blocks))
+    M_t = Axis("M_t_red", to_dim(bm_red))
+    N_t = Axis("N_t_red", to_dim(bn_red))
+    m_idx = Var(M_b.name) * Literal(bm_red, "int") + Var(M_t.name)
+    n_idx = Var(N_b.name) * Literal(bn_red, "int") + Var(N_t.name)
+
+    # Load each partition's state component, then fold via combine_states. The
+    # loaded names are the "other" state operand of as_state_merge.
+    others = tuple(f"o_{i}" for i in range(len(carrier.state)))
+    loads: tuple[Stmt, ...] = tuple(
+        Load(name=others[i], input=workspaces[i], index=(Var(K_s.name), m_idx, n_idx), dtype=dtype) for i in range(len(workspaces))
+    )
+    fold = replace(carrier.as_state_merge(others), axes=(K_s.name,))
+    reduce_inner = (*loads, fold)
+
+    inits: tuple[Stmt, ...] = tuple(Init(name=st, op=init_ops[i], dtype=F32) for i, st in enumerate(carrier.state))
+    written = out_value if out_value is not None else carrier.state[0]
+    in_bounds = BinaryExpr("&&", BinaryExpr("<", m_idx, Literal(m_extent, "int")), BinaryExpr("<", n_idx, Literal(n_extent, "int")))
+    write = Write(output=out_name, index=(m_idx, n_idx), value=written, value_dtype=dtype)
+    guarded = (Cond(cond=in_bounds, body=Body((*finalize, write))),)
+
+    body = (
+        GridTile(
+            axes=(M_b, N_b),
+            body=Body(
+                (
+                    ThreadTile(
+                        axes=(M_t, N_t),
+                        body=Body((*inits, SerialTile(axis=K_s, body=Body(reduce_inner), kind="plain", unroll=True), *guarded)),
+                    ),
+                )
+            ),
+        ),
+    )
+    return TileOp(body=Body(body), name=name, knobs={ATOMIC_FREE_SPLITK.name: True})
 
 
 def _build_atomic_free_fragment(match: Match, root: Node, op: TileOp, k_s_axis: Axis, out_name: str) -> Graph:
