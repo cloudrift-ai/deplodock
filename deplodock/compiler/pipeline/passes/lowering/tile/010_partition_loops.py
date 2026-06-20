@@ -132,7 +132,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Combine, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     Atom,
@@ -588,11 +588,23 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     all_loops: tuple[Loop, ...] = outer_n.body.iter_of_type(Loop)
     matmul_reduces = [lp for lp in all_loops if lp.is_reduce and is_matmul_reduce(lp)]
     nonmatmul_reduces = [lp for lp in all_loops if lp.is_reduce and not is_matmul_reduce(lp)]
+    # Flash-style kernel (online-softmax ``Combine`` reduce): the KV reduce is the
+    # cooperative-parallelization axis (Step 4 of plans/atomic-free-monoid-combine.md),
+    # NOT the nested score dot-product (a matmul-reduce over head_dim that stays serial
+    # inside each KV step). When a Combine reduce is present, route to the
+    # cooperative-reduce path so the KV axis splits across the CTA's threads
+    # (Step 2's monoid combine) instead of the matmul-output tiling that leaves KV
+    # serial. ``commutative`` (split-KV legality) is True for the LSE monoid.
+    # Restricted to a STATIC KV extent: a SYMBOLIC (masked) KV needs the overhang
+    # keys folded to the monoid identity (score → −inf so exp → 0), which the
+    # ``Accum``-only ``_mask_reduce_accums`` doesn't do for a Combine — masked
+    # symbolic flash stays on its existing serial-KV path (a follow-up).
+    combine_reduces = [lp for lp in nonmatmul_reduces if lp.axis.extent.is_static and any(isinstance(s, Combine) for s in lp.body)]
 
     k_loop: Loop | None
     target_names: frozenset[str]
     param_combos: list[dict]
-    if matmul_reduces:
+    if matmul_reduces and not combine_reduces:
         if outer_m is None:
             return None
         k_loop = matmul_reduces[0]
@@ -759,7 +771,7 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
                     param_combos = warp_combos
                 else:
                     param_combos = [*warp_combos, *param_combos]
-    elif nonmatmul_reduces and _coop_reduce_ext(nonmatmul_reduces[0].axis.extent) >= ctx.warp_size:
+    elif (coop_reduces := combine_reduces or nonmatmul_reduces) and _coop_reduce_ext(coop_reduces[0].axis.extent) >= ctx.warp_size:
         # Cooperative-K: with BN=BM=1 the combine spans the whole CTA (any
         # BR); with free-axis threads alongside (BN·BM > 1, the strided-
         # cooperative form) the enumerator clips BR to powers of two ≤
@@ -778,7 +790,9 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
         # are still writing partial sums, and only K_s=0 writes the output
         # using its own (half-data) reduction. Forcing SPLITK=1 keeps the
         # search space honest.
-        k_loop = nonmatmul_reduces[0]
+        # Prefer the Combine (flash KV) reduce as the cooperative axis when present,
+        # else the first plain non-matmul reduce (softmax / norm).
+        k_loop = coop_reduces[0]
         k_red_symbolic = not k_loop.axis.extent.is_static
         E_K = _coop_reduce_ext(k_loop.axis.extent)  # static extent, or the Dim hint for a symbolic reduce
         # ``is_static`` guards the ``as_static()`` read: a symbolic free Loop
