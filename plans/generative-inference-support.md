@@ -217,8 +217,10 @@ runner, isolating the interleave / host-sync mechanics.
 Wire Phase 2's runner into a vLLM generative model.
 
 - **Create:** `deplodock/serving/vllm_model_gen.py` — `DeplodockGenModel(nn.Module, …text-gen interfaces)`. **NOT**
-  `IsAttentionFree`: it constructs real vLLM `Attention` layers (one per decoder layer, via `vllm.attention.Attention`
-  with the model's `num_heads` / `num_kv_heads` / `head_dim` / scale / kv-dtype) so vLLM allocates a KV-cache spec and
+  `IsAttentionFree`: it constructs real vLLM `Attention` layers (one per decoder layer, via
+  `vllm.model_executor.layers.attention.Attention` — NOT `vllm.attention.Attention`, which this pinned vLLM doesn't
+  export — with the model's `num_heads` / `num_kv_heads` / `head_dim` / scale / kv-dtype) so vLLM allocates a KV-cache
+  spec and
   runs paged attention; those layers carry no weights. **Each `Attention` needs a unique `prefix`** — vLLM keys
   `static_forward_context` / cache-spec discovery by it and rejects duplicates (the default empty prefix collides on the
   second layer), so derive `f"{prefix}.layers.{i}.self_attn.attn"` from the model's own `prefix`, and pass the
@@ -229,7 +231,9 @@ Wire Phase 2's runner into a vLLM generative model.
   KV-cache dtype, and `lm_head` all init fp16) and rejects an incompatible `--dtype` override. **RoPE is NOT in
   `Attention`:** a bare vLLM `Attention` does paged attention only (stock `Qwen3Attention` builds RoPE separately via
   `get_rope`, then calls it before `self.attn`), so `DeplodockGenModel` constructs its own RoPE via
-  `get_rope(head_dim, rotary_dim, max_position, rope_parameters=…)` from the HF config (theta + any rope-scaling) — one
+  `get_rope(head_dim, max_position=max_position, rope_parameters=config.rope_parameters)` — the vLLM signature is
+  `get_rope(head_size, max_position, …)` (no positional `rotary_dim`; rotary dim + theta + scaling derive from
+  `rope_parameters`), mirroring stock Qwen3/Llama — one
   shared module across layers (RoPE is position-only). Test Qwen3 + Llama-3 RoPE vs stock vLLM. **Split ownership
   (settled):** the **deplodock runner owns the
   embedding + the whole trunk** (bound into its constants); **vLLM owns only `lm_head`** (loaded via `load_weights`). So
