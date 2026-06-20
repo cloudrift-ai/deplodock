@@ -1,14 +1,12 @@
 """Flash-attention shared helper — the ``FLASH`` knob, eligibility predicate, and
 the streaming online-softmax ``LoopOp`` nest builder.
 
-Flash recognition is a **loop-lifting** pass (``015_lift_sdpa_flash``): the
-``LoopOp`` is constructed in the loop dialect, not at tensor-IR decomposition.
-For the intact ``SdpaOp`` to survive to the lifting stage, the generic
-``frontend/decomposition/010_sdpa`` rule **defers** (``RuleSkipped``) whenever
-flash will handle the op — both sites consult the same :func:`flash_enabled` +
-:func:`flash_shape_eligible` here so the decision can't drift. This module lives
-under ``loop/lifting`` (the LoopOp owner) and is imported by both the lifting
-pass and the decomposition deferral; it is the sole owner of the ``FLASH`` knob.
+Flash recognition is a **Loop-IR** pass (``loop/fusion/001_recognize_flash``): it
+pattern-matches the decomposed online-softmax attention (the QK^T → softmax → P@V
+chain of canonical lifted ``LoopOp``s that ``010_sdpa`` + lifting produce) and
+rewrites it into one fused streaming kernel — with NO modification to the
+decomposition stage. This module is the sole owner of the ``FLASH`` knob, the
+``flash_shape_eligible`` predicate, and the nest builder ``build_flash_frag``.
 
 The nest fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one

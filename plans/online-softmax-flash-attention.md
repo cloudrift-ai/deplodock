@@ -263,17 +263,22 @@ remains future work. What landed, and how it diverged from the original framing:
 - **Steps 3 + 4 are coupled — realized together at the scalar tier.** Step 3 (loop-carried *scaled* MMA fragment) cannot
   be built or verified in isolation: there is no frontend op for a scaled-accumulator matmul, the scale is **per-query-
   row** (the `m16n8k16` `c[4]` fragment maps regs→rows), and the `alpha` only exists once the softmax half of the tile is
-  built. So the scalar nest was implemented first as a **loop-lifting** pass: `loop/lifting/015_lift_sdpa_flash.py` lifts
-  an intact `SdpaOp` into a single fused `LoopOp` (the nest + `FLASH` knob live in the shared `loop/lifting/_flash.py`),
-  and `frontend/decomposition/010_sdpa` **defers** the `SdpaOp` (`RuleSkipped`) when FLASH is on and the shape is flash-
-  eligible — both sites share the one eligibility predicate, and the `LoopOp` is built in the loop dialect, not
-  synthesized at decomposition. The nest runs **one independent streaming softmax per output element `(…, m, d)`** —
-  correct (the score `s = Σ_dd Q·K` is an inner reduce nested in the KV streaming reduce; the nest pre-places
-  `Init(sacc)` at the KV-body scope so it resets per step), but redundant (recomputes scores per `d`). The tensor-core
-  P@V tier (Step 3's `RegScale` fragment, the real perf win) is **still future work**.
-- **Steps 4–6 (done, scalar tier)** — non-causal, causal (per-element `kv ≤ m` mask), and dynamic (symbolic `seq_len`
-  threaded through both the masked-row M and the symbolic reduce — one cached kernel serves every size) all GPU-verified
-  vs torch SDPA at ~1–3e-7. `tests/compiler/e2e/test_flash_attention.py` (9 tests). `FLASH` is read from the
+  built. So the scalar nest was implemented as a **Loop-IR recognition** pass with NO decomposition-stage change:
+  `010_sdpa` decomposes SDPA into the QK^T → softmax → P@V tensor ops as always, lifting produces the canonical per-op
+  `LoopOp` chain, and `loop/fusion/001_recognize_flash.py` (before the generic fuser `010_merge_loop_ops`) structurally
+  pattern-matches that chain — a backward walk from the terminal P@V squeeze through `_as_copy` / `_as_reduce` /
+  `_as_binary` / `_as_unary` classifiers, reading Q/K/V off the two matmuls' leaf operands in `matmul_decompose`'s
+  A-then-B order — and rewrites it into the fused flash `LoopOp` (`_flash.build_flash_frag`); the old chain orphans and
+  is removed. The nest runs **one independent streaming softmax per output element `(…, m, d)`** — correct (the score
+  `s = Σ_dd Q·K` is an inner reduce nested in the KV streaming reduce; the nest pre-places `Init(sacc)` at the KV-body
+  scope so it resets per step), but redundant (recomputes scores per `d`). The tensor-core P@V tier (Step 3's `RegScale`
+  fragment, the real perf win) is **still future work**.
+- **Steps 4 + 6 (done, scalar tier)** — non-causal SDPA, static and dynamic (symbolic `seq_len` threaded through both
+  the masked-row M and the symbolic reduce — one cached kernel serves every size), GPU-verified vs torch SDPA at
+  ~1–3e-7. `tests/compiler/e2e/test_flash_attention.py` (5 tests). **Causal (Step 5) is NOT yet recognized** at Loop IR
+  — the causal-mask `add(scaled, cmask)` between the QK scale and the softmax fails the recognizer's classifier, so a
+  causal SDPA falls through to the score-matrix decomposition (recognizing the lifted causal-mask `IndexMapOp` and
+  threading the per-element `kv ≤ m` guard into the nest is the follow-up). `FLASH` is read from the
   `DEPLODOCK_FLASH=1` env pin today; the two-level `OptionFork` offer + `AnalyticPrior` cold-start term (and the
   `_extents` symbolic-hint change) are **not yet wired** — a follow-up. With `FLASH` off the default `010_sdpa` path is
   unchanged.
