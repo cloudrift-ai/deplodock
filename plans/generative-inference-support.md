@@ -193,12 +193,16 @@ runner, isolating the interleave / host-sync mechanics.
   buffer set — separate because vLLM attention runs between them, so a decode step is **two replays / layer**, not one)
   at **per-layer** granularity (simplest; layers are structurally identical so capture/replay caches well) vs one
   all-layers program with attn boundaries (heavier surgery). Start per-layer.
-- **Memory budget (spike early):** each `CompiledProgram` owns persistent input/output buffers **and** a pinned scratch
-  slab, plus its own 64-entry LRU CUDA-graph cache (`backend/cuda/program.py`). With **2 × n_layers** capacity-sized
-  programs the MLP-intermediate workspaces can add several GB, and the graph caches can reach thousands of entries
-  globally. Run an early memory-budget spike; plan **shared scratch workspaces** across the structurally-identical layer
-  programs (they run sequentially, so one slab can back all) and/or a **global graph-cache cap** instead of
-  64-per-program.
+- **Memory budget — an early spike that GATES this design:** each `CompiledProgram` owns persistent input/output buffers
+  **and** a pinned scratch slab, plus its own 64-entry LRU CUDA-graph cache (`backend/cuda/program.py`). With **2 ×
+  n_layers** capacity-sized programs the MLP-intermediate workspaces can add several GB, and the graph caches can reach
+  thousands of entries globally. Run the spike first; if over budget, the lightest lever is a **graph-cache cap**
+  — but `_graph_cache_max` is a **per-`CompiledProgram` field** (default 64, `program.py`), so a *global* budget across
+  the 2×n_layers programs needs the **runner to set each program's cap** (e.g. budget / program-count; small allocation
+  logic, not pure config) — plus capping capacity widths. **Shared scratch across programs is NOT free** — it needs
+  backend work (externally-supplied storage, per-program slab views, pointers stable across CUDA-graph capture), which
+  moves `program.py` out of *reuse-unchanged* (add to Critical Files if pursued). If neither suffices the spike can
+  **reject two-programs-per-layer** in favor of fewer/larger chunks.
 - **Verify:** full forward of a small CausalLM — deplodock per-layer `pre` kernels → **reconstruct RoPE on q/k at
   `positions`** → reference causal GQA torch SDPA → `post` kernels, across all layers — matches eager logits. (The
   reference stitch applies the same RoPE the vLLM forward will, since `pre` emits un-rotated q/k under A2.)
@@ -210,7 +214,11 @@ Wire Phase 2's runner into a vLLM generative model.
 - **Create:** `deplodock/serving/vllm_model_gen.py` — `DeplodockGenModel(nn.Module, …text-gen interfaces)`. **NOT**
   `IsAttentionFree`: it constructs real vLLM `Attention` layers (one per decoder layer, via `vllm.attention.Attention`
   with the model's `num_heads` / `num_kv_heads` / `head_dim` / scale / kv-dtype) so vLLM allocates a KV-cache spec and
-  runs paged attention; those layers carry no weights. **Split ownership (settled):** the **deplodock runner owns the
+  runs paged attention; those layers carry no weights. **Each `Attention` needs a unique `prefix`** — vLLM keys
+  `static_forward_context` / cache-spec discovery by it and rejects duplicates (the default empty prefix collides on the
+  second layer), so derive `f"{prefix}.layers.{i}.self_attn.attn"` from the model's own `prefix`, and pass the
+  version-pinned config args (`cache_config` / `quant_config` off `vllm_config`). Test that vLLM discovers one KV-cache
+  spec per layer. **Split ownership (settled):** the **deplodock runner owns the
   embedding + the whole trunk** (bound into its constants); **vLLM owns only `lm_head`** (loaded via `load_weights`). So
   `load_weights` claims just `lm_head.*` and returns ~empty for the trunk (same trick as `DeplodockEmbedModel`) — get
   this set exactly right or vLLM rejects the model on its strict all-params-initialized check. **Tied embeddings
@@ -236,10 +244,12 @@ Wire Phase 2's runner into a vLLM generative model.
   the `_mask` / `_causal_mask_np` causal-mask machinery (vLLM's paged attention owns masking now).
 - **Verify (two tiers — HTTP can't expose full logits):** (1) **endpoint smoke** — `vllm serve <model> --runner
   generate --hf-overrides …DeplodockGenModel…`, then a `/v1/chat/completions` greedy request matches the **Phase 0
-  oracle**'s generated **tokens** (and top-k `logprobs` where returned); (2) **in-process numerical** — a test driving
-  `DeplodockGenModel` / the runner directly (or a debug hook around `compute_logits`) gates **per-step full logits
-  within tolerance + top-1 agreement** vs the oracle (the HTTP path can't return `[vocab]` per step). GQA explicitly
-  checked (Qwen3). GPU-gated `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
+  oracle**'s generated **tokens** (and top-k `logprobs` where returned); (2) **in-process numerical** — the
+  `self.attn(q,k,v)` needs initialized KV caches **and** vLLM's forward-context attention metadata — it can't just call
+  `DeplodockGenModel.forward` in a vacuum: run an **in-process V1 engine** (`vllm.LLM(...)`) with a **logits-capture
+  hook** around `compute_logits` (or build an explicit forward-context + dummy-cache harness) and gate **per-step full
+  logits within tolerance + top-1 agreement** vs the oracle (the HTTP path can't return `[vocab]` per step). GQA
+  explicitly checked (Qwen3). GPU-gated `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
 
 ### Phase 4 — Prefill + decode hardening
 
@@ -247,6 +257,11 @@ Make it robust across vLLM's two regimes: **prefill** (`num_tokens` = prompt len
 (`num_tokens` = concurrently-decoding sequences, small / 1). The same two dynamic per-layer programs (`pre` + `post`)
 serve both.
 
+- **Bound the flattened width `T` (capacity sizing):** `T` = `num_tokens` is the **sum of newly-scheduled tokens across
+  all requests** in a step (continuous batching), **not** one request's length — so `--max-model-len` does NOT bound it.
+  The cap is vLLM's `scheduler_config.max_num_batched_tokens`; assert it `≤ DYNAMIC_DIM_MAX` (4096, `trace/dynamic.py`)
+  and **size the programs' capacity buffers from `max_num_batched_tokens`**, not max-model-len. `commands/serve.py`'s
+  generative branch sets `--max-num-batched-tokens` accordingly (and rejects a larger value).
 - **Captured-graph reuse:** decode runs at small, recurring `num_tokens`; confirm capture is keyed on `num_tokens` and
   steady-state decode hits the replay path (**two replays / layer / step** — `pre` and `post`, bracketing vLLM
   attention), not recapture. **Do NOT pad q/k/v to bucket widths the way the embedding runner does** — vLLM's
@@ -272,18 +287,22 @@ serve both.
 
 ## Critical files
 
-**Create:** `commands/generate.py` (Phase 0 loop; reused by Phase 7), `serving/sampling.py` (sampler + chat template; no
-vLLM), `serving/gen_runner.py` (`DeplodockGenRunner`), `serving/vllm_model_gen.py` (`DeplodockGenModel`).
+**Create:** `commands/generate.py` (Phase 0 loop; reused by Phase 7 — exposes `register_generate_command`, wired into
+`deplodock.py`'s imports + `main()` like every other command, with CLI-parsing tests), `serving/sampling.py` (sampler +
+chat template; no vLLM), `serving/gen_runner.py` (`DeplodockGenRunner`), `serving/vllm_model_gen.py`
+(`DeplodockGenModel`).
 
 **Modify (reuse heavily):** `compiler/trace/huggingface.py` (new `build_attention_split_wrapper` + a Phase-0
 generation wrapper that slices the final position before `lm_head`; A1 rope later),
 `commands/compile.py::_trace_model` (`--attention-split` branch; thread a `dtype` param here + through the runnable
-binder so the whole-model path binds fp16), `serving/__init__.py` (register gen model),
-`commands/serve.py` (generative branch). `passes/frontend/decomposition/010_sdpa.py` + `ir/frontend/ir.py` only if the
+binder so the whole-model path binds fp16), `serving/__init__.py` (register gen model), `deplodock.py` (import + call
+`register_generate_command` in `main()`), `commands/serve.py` (generative branch).
+`passes/frontend/decomposition/010_sdpa.py` + `ir/frontend/ir.py` only if the
 Phase-1 surgery fallback is used (the explicit-wrapper path leaves them untouched).
 
 **Reuse unchanged (load-bearing machinery):** `backend/cuda/program.py` (`CompiledProgram` build / `set_sym_values` /
-capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 constant binding),
+capture/replay / `*_prefix_device`; unchanged **unless** the Phase-2 memory spike forces shared cross-program scratch —
+that is backend work, see Phase 2), `loader/binder.py` (`bind_constants`, fp16 constant binding),
 `trace/dynamic.py` (`parse_position_specs` / `build_torch_dynamic_shapes` / `DYNAMIC_DIM_MAX`), `trace/torch.py`
 (`trace_module`), and the entire embedding runner as the structural template (`serving/runner.py`,
 `serving/vllm_model.py`).
@@ -331,8 +350,9 @@ capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 
 2. Phase 1: hermetic per-layer split (pre → **rotary(q,k)** → torch GQA SDPA → post, post fed `attn_out` + residual) ==
    eager `block(x)`; flattened-vs-`[1,seq,H]` equivalence.
 3. Phase 2: whole-model host stitch (deplodock layers + **rotary(q,k)** + ref SDPA) == eager logits.
-4. Phase 3: `vllm serve … DeplodockGenModel` → `/v1/chat/completions` greedy vs Phase 0 oracle — per-step logits within
-   tolerance (token-for-token smoke); GQA ok.
+4. Phase 3: `/v1/chat/completions` greedy matches the Phase 0 oracle's **tokens** (HTTP smoke); a separate
+   **in-process** engine test with a `compute_logits` hook gates **per-step full logits within tolerance** (HTTP can't
+   return `[vocab]`); GQA ok.
 5. Phase 4: 100-token generation per-step logits within tolerance vs oracle; decode = **two replays / layer / step**
    (`pre` + `post`) under concurrency.
 6. `make test && make lint` throughout.
