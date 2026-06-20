@@ -80,6 +80,11 @@ same worker.
   a one-shot benchmark: start server → wait `/health` → `vllm bench serve --backend openai-embeddings`
   (`--max-concurrency`/`--num-prompts`/`--random-input-len`/`--bench-seed`) → print results → shut down. Needs the
   `serving` extra.
+- `deplodock serve <model> --generate [vllm flags...]` — serve a **generative (chat)** model via `DeplodockGenModel`
+  (Phase 3 of `plans/generative-inference-support.md`): `--runner generate`, forces `--dtype float16` (seam coherence;
+  rejects an incompatible `--dtype`), keeps `--enforce-eager`. vLLM owns the API / sampler / scheduler / paged KV-cache /
+  `lm_head`; deplodock-compiled per-layer kernels (`serving/gen_runner.py::DeplodockGenRunner`) own embed + the trunk,
+  with vLLM's `Attention` carved into the per-layer forward. `serving/vllm_model_gen.py`.
 - `deplodock pull <model>` — download a HuggingFace model to local cache
 - `deplodock generate <model> [--prompt T] [--max-new-tokens N] [--temperature/--top-k/--top-p/--seed] [--chat]` —
   **standalone naive generation oracle** (no vLLM; Phase 0 of `plans/generative-inference-support.md`). Re-runs the

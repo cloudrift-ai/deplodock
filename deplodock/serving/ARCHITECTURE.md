@@ -71,6 +71,15 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention` in Phase 3). Host numpy
   `rebind` I/O for now (the device zero-copy + captured-replay path is the Phase-3/4 perf step); two capacity programs
   per layer is the memory budget the plan flags (Top risk #9).
+- `vllm_model_gen.py` — `DeplodockGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
+  builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs
+  paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.
+  The trunk compute (embed + per-layer pre/post + final norm) is the `DeplodockGenRunner`; vLLM owns only `lm_head`
+  (`load_weights` claims `lm_head.weight`, or the tied embed alias). `forward` brackets each `self.attn[L](q,k,v)` with
+  two deplodock replays (pre/post), applying RoPE in between (A2). Select via `--runner generate` +
+  `--hf-overrides '{"architectures":["DeplodockGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
+  this for seam coherence). Registered in `__init__.py`. Decode-shaped tuning + the device-path interleave are
+  later-phase work.
 
 ## Static mode (`DEPLODOCK_SERVING_STATIC=1`) — static extents for both batch and seq
 

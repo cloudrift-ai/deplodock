@@ -12,3 +12,5 @@ def register() -> None:
 
     if "DeplodockEmbedModel" not in ModelRegistry.get_supported_archs():
         ModelRegistry.register_model("DeplodockEmbedModel", "deplodock.serving.vllm_model:DeplodockEmbedModel")
+    if "DeplodockGenModel" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model("DeplodockGenModel", "deplodock.serving.vllm_model_gen:DeplodockGenModel")
