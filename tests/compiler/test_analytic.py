@@ -78,3 +78,25 @@ def test_dynamic_weight_set_selected_on_symbolic_flag():
     dynamic_big = {**dynamic, "BM": 16}
     assert p.score(static_big) < p.score(static)
     assert p.score(dynamic_big) > p.score(dynamic)
+
+
+def test_atomic_free_split_preference_above_threshold():
+    """The atomic-free split-K gate (plans/atomic-free-monoid-combine.md): a wide
+    split (SPLITK >= threshold) should prefer NOATOMIC=True (workspace + reduce);
+    a narrow split should keep the atomicAdd fast-path. The two variants share
+    identical matmul geometry — the NOATOMIC term is the sole differentiator."""
+    p = AnalyticPrior(atomic_free_split_threshold=4.0, atomic_free_weight=5.0)
+    base = {"BN": 32, "BM": 8, "FM": 26, "FN": 4, "FK": 1, "BK": 32, "BR": 1, "S_ext_free_prod": 4.0e6}
+    # Wide split: atomic-free wins (lower latency proxy).
+    wide_atomic = {**base, "SPLITK": 8, "NOATOMIC": False}
+    wide_free = {**base, "SPLITK": 8, "NOATOMIC": True}
+    assert p.score(wide_free) < p.score(wide_atomic)
+    # Narrow split: the atomic fast-path wins.
+    narrow_atomic = {**base, "SPLITK": 2, "NOATOMIC": False}
+    narrow_free = {**base, "SPLITK": 2, "NOATOMIC": True}
+    assert p.score(narrow_atomic) < p.score(narrow_free)
+    # The term is gated off for NOATOMIC=False: its score matches a weight-0 prior;
+    # NOATOMIC=True diverges (the term fires).
+    p0 = AnalyticPrior(atomic_free_weight=0.0)
+    assert p.score(wide_atomic) == p0.score(wide_atomic)
+    assert p.score(wide_free) != p0.score(wide_free)

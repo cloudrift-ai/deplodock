@@ -101,7 +101,7 @@ def _(s: WarpSpecialize, ctx: SimplifyCtx) -> Stmt:
     )
 
 
-# Combine has no Expr fields — default ``simplify`` (identity) handles it.
+# Monoid has no Expr fields — default ``simplify`` (identity) handles it.
 
 
 # ---------------------------------------------------------------------------

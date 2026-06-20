@@ -21,7 +21,7 @@ redundant, scalar form; the tensor-core P@V tier is future work
         Init sacc = 0
         for dd in 0..head_dim: sacc += Q[…,m,dd]·K[…,kv,dd]   # score reduce
         s = sacc · scale
-        Combine((m_i,l_i,O_i), (s, V[…,kv,d]))       # the LSE rescale (flash_combine)
+        Monoid((m_i,l_i,O_i), (s, V[…,kv,d]))       # the LSE rescale (flash_combine)
       out[…,m,d] = O_i / l_i
 
 Scope: static OR dynamic (symbolic ``seq_len`` on Q/K/V dim -2 — one cached kernel
@@ -44,16 +44,26 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Combine, Init, Load, Loop, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Write
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 
-def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Combine:
-    """Build the online-softmax (log-sum-exp) :class:`Combine` for one streaming
+def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
+    """Build the online-softmax (log-sum-exp) :class:`Monoid` for one streaming
     KV step: state ``(m, l, O)`` folds this key's ``(score, value)`` partial.
 
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
         l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
+
+    The LSE monoid is asymmetric (partial ``(s, v)`` has different arity than
+    state ``(m, l, O)``), so the **state-merges-state** form can't be derived from
+    ``merge`` — ``combine_states`` is authored too: it merges this carrier's
+    ``(m, l, O)`` with a second partition's ``(m_o, l_o, O_o)`` (named by
+    ``state_b``), the form the cross-partition combine (cooperative-tree /
+    split-KV / split-K cross-CTA reduce) folds::
+
+        m_new = max(m, m_o);  a = exp(m − m_new);  b = exp(m_o − m_new)
+        l = l·a + l_o·b;      O = O·a + O_o·b;     m = m_new   (last)
 
     Temps are namespaced by the state's first name so they stay unique per kernel
     (they're internal to the carrier — invisible to the body's SSA renamer)."""
@@ -75,7 +85,32 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Combine:
         Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
     )
     identity = (Literal(-1e30), Literal(0.0), Literal(0.0))  # (−inf, 0, 0)
-    return Combine(state=(m, ll, o), partial=(s, v), merge=merge, identity=identity, commutative=True, axes=("kv",))
+    state_b = (f"{m}__o", f"{ll}__o", f"{o}__o")  # the second partition's (m, l, O)
+    mb, lb, ob = state_b
+    combine_states = (
+        Assign(t("cmx"), "maximum", (m, mb)),  # m_new = max(m, m_o)
+        Assign(t("cda"), "subtract", (m, t("cmx"))),  # m − m_new
+        Assign(t("ca"), "exp", (t("cda"),)),  # a = exp(m − m_new)   (reads OLD m)
+        Assign(t("cdb"), "subtract", (mb, t("cmx"))),  # m_o − m_new
+        Assign(t("cb"), "exp", (t("cdb"),)),  # b = exp(m_o − m_new)
+        Assign(t("cla"), "multiply", (ll, t("ca"))),  # l·a
+        Assign(t("clb"), "multiply", (lb, t("cb"))),  # l_o·b
+        Assign(ll, "add", (t("cla"), t("clb"))),  # l = l·a + l_o·b           [state]
+        Assign(t("coa"), "multiply", (o, t("ca"))),  # O·a
+        Assign(t("cob"), "multiply", (ob, t("cb"))),  # O_o·b
+        Assign(o, "add", (t("coa"), t("cob"))),  # O = O·a + O_o·b            [state]
+        Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
+    )
+    return Monoid(
+        state=(m, ll, o),
+        partial=(s, v),
+        merge=merge,
+        identity=identity,
+        commutative=True,
+        axes=("kv",),
+        state_b=state_b,
+        combine_states=combine_states,
+    )
 
 
 # Structural fork: deploy the fused streaming nest, or fall through to the
@@ -169,7 +204,7 @@ def _flash_loop_body(
 
     The score ``s = Σ_dd Q·K`` is an inner reduce nested in the KV streaming
     reduce, so ``Init(sacc)`` is pre-placed at the KV-body scope (reset per step):
-    the streaming ``Combine`` loop is a per-iteration boundary the default
+    the streaming ``Monoid`` loop is a per-iteration boundary the default
     Init-placement would otherwise cross."""
     bvars = _batch_vars(len(batch))
     q_idx = (*bvars, Var("m"), Var("dd"))

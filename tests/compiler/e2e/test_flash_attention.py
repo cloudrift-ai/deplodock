@@ -4,7 +4,7 @@ The ``FLASH`` knob drives a **Loop-IR** pass (``loop/fusion/025_recognize_flash`
 that runs AFTER the generic fuser and pattern-matches the consolidated softmax-
 attention kernel (post-fusion a non-causal SDPA is two ``LoopOp``s: scaled scores
 + a softmax-then-P@V kernel), rewriting it into a single streaming online-softmax
-kernel (the ``Combine`` carrier) — with NO modification to the decomposition
+kernel (the ``Monoid`` carrier) — with NO modification to the decomposition
 stage. These tests pin: (1) with ``FLASH`` on,
 non-causal SDPA fuses to one kernel matching torch on the GPU (static + dynamic
 symbolic ``seq_len``); (2) with ``FLASH`` off, the score-materializing

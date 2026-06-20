@@ -14,7 +14,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Combine, Loop, Mma, ReduceCarrier, StridedLoop
+from deplodock.compiler.ir.stmt import Accum, Assign, Loop, Mma, Monoid, ReduceCarrier, StridedLoop
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
 
 # --------------------------------------------------------------------------- #
@@ -84,16 +84,16 @@ def test_mma_is_reduce_carrier():
 
 
 # --------------------------------------------------------------------------- #
-# ReduceCarrier protocol — Combine (the general monoid carrier)
+# ReduceCarrier protocol — Monoid (the general monoid carrier)
 # --------------------------------------------------------------------------- #
 
 
-def _combine() -> Combine:
+def _combine() -> Monoid:
     # A minimal monoid: state (m, l) folding a partial (s) — the merge program is
     # the operation as data (state-targeting Assigns are the updates).
     from deplodock.compiler.ir.expr import Literal
 
-    return Combine(
+    return Monoid(
         state=("m_i", "l_i"),
         partial=("s",),
         merge=(
@@ -122,7 +122,7 @@ def test_combine_is_reduce_carrier():
 def test_combine_rewrite_renames_state_partial_and_merge():
     c = _combine()
     renamed = c.rewrite(lambda n: f"{n}__r")
-    assert isinstance(renamed, Combine)
+    assert isinstance(renamed, Monoid)
     assert renamed.state == ("m_i__r", "l_i__r")
     assert renamed.partial == ("s__r",)
     # The merge program's references thread through the same rename, so it stays
@@ -168,8 +168,8 @@ def test_strided_loop_is_reduce_for_mma():
 
 
 def test_loop_is_reduce_for_combine():
-    # A Combine-bearing loop is a reduce loop via the same protocol hook —
-    # no isinstance ladder over (Accum, Mma, Combine) needed.
+    # A Monoid-bearing loop is a reduce loop via the same protocol hook —
+    # no isinstance ladder over (Accum, Mma, Monoid) needed.
     assert _kloop(_combine()).is_reduce
 
 
