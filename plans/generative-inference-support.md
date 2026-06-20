@@ -44,10 +44,12 @@ Compile the per-layer **everything-but-attention** compute over the flattened pe
 consuming vLLM's attention output; vLLM's `Attention` layer does paged-KV attention. Validated directly by vLLM's own
 `Qwen3Attention.forward` — every line except `self.attn(q,k,v)` is per-token. Two refinements locked in:
 
-- **Carve via submodule substitution**, not post-trace graph surgery — the established pre-export pattern
-  (`_PassThroughRotary`). A thin substitute `self_attn` runs `qkv_proj` (+ q/k norm)
-  and **returns q,k,v directly** (no SDPA, no o_proj); a second subgraph runs o_proj + MLP + post-norm from an attn-out
-  input. SDPA never enters the trace by construction.
+- **Carve via explicit per-architecture pre/post wrappers** that read the block's own submodules (not post-trace graph
+  surgery; substituting `self_attn` won't work — HF `self_attn.forward` returns `(attn_output, weights)`, not q/k/v).
+  The **pre** wrapper runs `input_layernorm` → HF's separate `q_proj`/`k_proj`/`v_proj` (+ per-head `q_norm`/`k_norm` on
+  Qwen3) → **returns q,k,v** (no SDPA, no o_proj); the **post** wrapper runs `o_proj` + residual + MLP + post-norm from
+  an `(attn_out, residual)` input. SDPA never enters the trace by construction. (Note: the fused `qkv_proj` in vLLM's
+  `Qwen3Attention.forward` above is a vLLM detail — the HF module deplodock traces has three separate projections.)
 - **vLLM applies RoPE in the first cut (A2).** deplodock emits **un-rotated** q/k; `DeplodockGenModel.forward` calls
   vLLM's `self.rotary_emb(positions, q, k)` between the pre-attention kernel and `self.attn`. This deletes the
   runtime-arbitrary-positions trace work from the critical path. **deplodock owning RoPE with runtime positions (A1) is
@@ -95,9 +97,10 @@ and B) are not competitors but **phases of one trajectory**; the other three are
   attention interleave must live at the Python `forward` level, per layer — which is exactly what Option A does.
 
 **Sub-options inside A** (each resolved in the phases below, not re-litigated here): *who applies RoPE* — vLLM (**A2**,
-chosen for the first cut) vs deplodock with runtime positions (**A1**, Phase 6); *how to carve SDPA* — submodule
-substitution (chosen) vs post-trace frontend-IR graph surgery (fallback); *program granularity* — one program per layer
-(chosen) vs one all-layers program with attention boundaries (Phase 2).
+chosen for the first cut) vs deplodock with runtime positions (**A1**, Phase 6); *how to carve SDPA* — explicit
+per-architecture pre/post wrappers reading the block's submodules (chosen) vs post-trace frontend-IR graph surgery
+(fallback); *program granularity* — two programs (pre + post) per layer (chosen) vs one all-layers program with
+attention boundaries (Phase 2).
 
 ## Phases (correctness-first; detail front-loaded on 0–4)
 
@@ -120,12 +123,17 @@ right — **no RoPE-runtime-positions work needed here** (that is purely a Phase
   and fill any lowering gaps *before* the loop is built. "Reuse, no compiler change" holds only if this spike is clean —
   budget for embedding-gather / lm_head lowering work if not.
 - **Reuses:** `commands/compile.py::_trace_model` whole-model dynamic path, traced from `AutoModelForCausalLM` so
-  `lm_head` / `logits` are in-graph — confirmed: `build_full_model_wrapper(dynamic=True).forward` returns `out[0]` =
-  logits `[1, S, vocab]`. Plus `CompiledProgram` build + `set_sym_values` + `run` + `outputs` and the constant binding
-  (the `dtype`-parameterized fp16 path).
-- **Create:** `deplodock/commands/generate.py` (the host generate loop: embed → run dynamic program at S → slice
-  `logits[0,-1,:]` → sample → append → repeat to EOS / max), `deplodock/serving/sampling.py` (greedy / temperature /
-  top-k / top-p — pure numpy/torch, no vLLM), a chat-template helper (delegate to `transformers.apply_chat_template`).
+  `lm_head` / `logits` are in-graph — `build_full_model_wrapper(dynamic=True).forward` returns `out[0]` = logits
+  `[1, S, vocab]` (Phase 0's generation wrapper slices the final position before `lm_head` → `[1, vocab]`; see Create).
+  Plus `CompiledProgram` build + `set_sym_values` + `run` + `outputs` and the constant binding (the
+  `dtype`-parameterized fp16 path).
+- **Create:** `deplodock/commands/generate.py` (the host generate loop: feed `input_ids[0:S]` → run dynamic program →
+  read last-token `logits[1, vocab]` → sample → append id → repeat to EOS / max; the graph embeds ids internally — the
+  loop never handles embeddings). A **generation wrapper** (variant of `build_full_model_wrapper`) slices the final
+  hidden state and applies `lm_head` to **that position only**, returning `[1, vocab]` — not the whole-prefix
+  `[1, S, vocab]` (`CompiledProgram.outputs` copies the full buffer to host, and lm_head over every prefix position is
+  O(S·vocab) wasted/step). Plus `deplodock/serving/sampling.py` (greedy / temperature / top-k / top-p — pure
+  numpy/torch, no vLLM), a chat-template helper (delegate to `transformers.apply_chat_template`).
 - **Verify:** greedy decode vs HF `model.generate(do_sample=False)` **run in fp16** (apples-to-apples with deplodock's
   fp16 path — oracle matches the serving dtype, so the test isolates the carve/interleave, not a dtype gap) — gated
   **primarily on per-step logits within tolerance + top-1 agreement when the margin is sufficient**,
@@ -143,19 +151,24 @@ so `pre` need not return it; `post` takes it as a second input and computes `res
 MLP sub-block (with its own internal second residual).
 
 - **Create:** `build_attention_split_wrapper(block, ...)` in `trace/huggingface.py`, sibling to `build_layer_wrapper`.
-  It **substitutes `block.self_attn`** with a module that runs `qkv_proj` (+ q/k norm), returns **un-rotated** q,k,v
-  (A2), and never calls SDPA / o_proj; a second wrapper runs o_proj + residual + MLP + post-norm from an
-  `(attn_out, residual)` input pair (residual = the layer-input `hidden`). (Fallback only if substitution can't express
-  the post-half: post-trace cut of the `SdpaOp` node in frontend IR — promote its q/k/v inputs to graph outputs, its
-  output to a graph input.)
+  Two **explicit per-architecture wrappers** that read the block's own submodules (NOT a `self_attn` substitution — HF
+  `self_attn.forward` returns `(attn_output, attn_weights)`, not q/k/v, and the block adds `residual + attn_output`
+  after it, so swapping `self_attn` can't yield a clean pre-graph). For **Qwen3**: the **pre** wrapper runs
+  `input_layernorm` → separate `q_proj` / `k_proj` / `v_proj` (HF Qwen3 has three; the fused `qkv_proj` is a vLLM
+  detail) → reshape-into-heads → per-head `q_norm` / `k_norm`, returns **un-rotated** q,k,v (A2) — no SDPA, no o_proj.
+  The **post** wrapper runs `o_proj` → `residual +` → `post_attention_layernorm` → `mlp` → `residual2 +` from an
+  `(attn_out, residual)` pair (residual = the layer-input `hidden`). An **architecture adapter** handles Llama next (no
+  `q_norm`/`k_norm`; otherwise identical). (Fallback only if the explicit wrappers prove unworkable: post-trace cut of
+  the `SdpaOp` node in frontend IR — promote its q/k/v inputs to graph outputs, its output to a graph input.)
 - **Flattened layout:** trace the subgraph with a 2-D `[num_tokens, H]` activation, `num_tokens` symbolic (reuse
   `parse_position_specs` / `build_torch_dynamic_shapes`, spec `seq_len@x:0`). All pre/post compute is pointwise or a
   matmul over H, so collapsing `[1,seq,H] → [seq,H]` is layout-invariant — the property that makes Option A work; the
   q/k/v reshape-into-heads is the danger spot to test.
 - **Modify:** `commands/compile.py::_trace_model` — `--attention-split` debug branch beside the `--layer` branch.
-- **Verify (hermetic, no vLLM):** 1-layer Qwen3 (GQA), dynamic `num_tokens`. Run pre-subgraph → q/k/v → external torch
-  SDPA → post-subgraph (fed `attn_out` **and** the saved layer-input `hidden` as residual); compare layer output to
-  eager `block(x)`. Assert flattened-vs-`[1,seq,H]` equivalence.
+- **Verify (hermetic, no vLLM):** 1-layer Qwen3 (GQA), dynamic `num_tokens`. The reference path must **reconstruct
+  RoPE** (pre emits un-rotated q/k under A2): pre-subgraph → q/k/v → **apply rotary to q,k at `positions`** → external
+  causal GQA torch SDPA → post-subgraph (fed `attn_out` **and** the saved layer-input `hidden` as residual); compare
+  layer output to eager `block(x)`. Assert flattened-vs-`[1,seq,H]` equivalence.
 
 ### Phase 2 — `DeplodockGenRunner` + multi-layer host stitch (still no vLLM)
 
@@ -173,8 +186,9 @@ runner, isolating the interleave / host-sync mechanics.
   buffer set — separate because vLLM attention runs between them, so a decode step is **two replays / layer**, not one)
   at **per-layer** granularity (simplest; layers are structurally identical so capture/replay caches well) vs one
   all-layers program with attn boundaries (heavier surgery). Start per-layer.
-- **Verify:** full forward of a small CausalLM, deplodock per-layer kernels + reference torch SDPA between, matches
-  eager logits.
+- **Verify:** full forward of a small CausalLM — deplodock per-layer `pre` kernels → **reconstruct RoPE on q/k at
+  `positions`** → reference causal GQA torch SDPA → `post` kernels, across all layers — matches eager logits. (The
+  reference stitch applies the same RoPE the vLLM forward will, since `pre` emits un-rotated q/k under A2.)
 
 ### Phase 3 — `DeplodockGenModel` vLLM plugin (the integration)
 
@@ -186,10 +200,11 @@ Wire Phase 2's runner into a vLLM generative model.
   runs paged attention; those layers carry no weights. **Split ownership (settled):** the **deplodock runner owns the
   embedding + the whole trunk** (bound into its constants); **vLLM owns only `lm_head`** (loaded via `load_weights`). So
   `load_weights` claims just `lm_head.*` and returns ~empty for the trunk (same trick as `DeplodockEmbedModel`) — get
-  this set exactly right or vLLM rejects the model on its strict all-params-initialized check. **Tied embeddings:** this
-  model ties `lm_head` to the embedding matrix; with split ownership the first cut **duplicates** it (runner binds it as
-  the embedding constant, vLLM loads it again into `lm_head`) — one extra matrix copy, simplest; sharing is a later
-  optimization.
+  this set exactly right or vLLM rejects the model on its strict all-params-initialized check. **Tied embeddings
+  (config-dependent):** when `tie_word_embeddings=True` (e.g. small Qwen3) the checkpoint may store **only**
+  `embed_tokens.weight` (no `lm_head.weight`), so `load_weights` must load the head from that embedding alias; when
+  untied (e.g. Llama-3-8B) it loads `lm_head.*` normally. Either way the runner separately binds the embedding for the
+  trunk, so the tied case **duplicates** the matrix (one extra copy, simplest); sharing is a later optimization.
   - `forward(input_ids, positions, …)` over flattened `[num_tokens]`: `hidden = runner.embed(ids)`; per layer:
     `residual = hidden`; `q,k,v = runner.forward_layer_pre(L, hidden, positions)`;
     `q,k = self.rotary_emb[L](positions, q, k)` (A2); `attn_out = self.attn[L](q,k,v)` (vLLM paged attention; pulls
@@ -207,18 +222,22 @@ Wire Phase 2's runner into a vLLM generative model.
 - **Dropped (embedding-specific):** `IsAttentionFree`, `DispatchPooler`, `packed.split_spans`, `attn_type="encoder_only"`,
   the `_mask` / `_causal_mask_np` causal-mask machinery (vLLM's paged attention owns masking now).
 - **Verify:** `vllm serve <model> --runner generate --hf-overrides …DeplodockGenModel…`, then a `/v1/chat/completions`
-  greedy request matches the **Phase 0 oracle** token-for-token (the reason Phase 0 came first). GQA explicitly checked
-  (Qwen3). GPU-gated `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
+  greedy request matches the **Phase 0 oracle** on **per-step logits within tolerance + top-1 agreement**
+  (token-for-token a smoke check only — the reason Phase 0 came first). GQA explicitly checked (Qwen3). GPU-gated
+  `tests/serving/test_vllm_plugin_gen_gpu.py` mirroring `test_vllm_plugin_gpu.py`.
 
 ### Phase 4 — Prefill + decode hardening
 
 Make it robust across vLLM's two regimes: **prefill** (`num_tokens` = prompt length, large) and **decode**
-(`num_tokens` = concurrently-decoding sequences, small / 1). One dynamic per-layer program serves both.
+(`num_tokens` = concurrently-decoding sequences, small / 1). The same two dynamic per-layer programs (`pre` + `post`)
+serve both.
 
 - **Captured-graph reuse:** decode runs at small, recurring `num_tokens`; confirm capture is keyed on `num_tokens` and
   steady-state decode hits the replay path (**two replays / layer / step** — `pre` and `post`, bracketing vLLM
-  attention), not recapture. If decode width thrashes (sequences finishing), pad to a few bucket widths (mirrors the
-  embedding runner's per-S capture).
+  attention), not recapture. **Do NOT pad q/k/v to bucket widths the way the embedding runner does** — vLLM's
+  `attn_metadata` is built for *exactly* the scheduled token count, and padded rows have no paged-attention cache slots,
+  so they'd desync the seam. With `--enforce-eager` vLLM presents exact widths, so capture **per exact `num_tokens`**
+  (steady-state decode widths recur, so the cache still hits); only pad if coordinated with vLLM's own metadata/padding.
 - **GQA / head alignment** at the deplodock↔`Attention` seam (deplodock emits the right kv-head count; vLLM's
   `Attention` must be constructed to match or it misreads the layout).
 - **Verify:** long-prompt prefill + multi-step decode under concurrency; **per-step logits within tolerance** vs the
@@ -241,11 +260,12 @@ Make it robust across vLLM's two regimes: **prefill** (`num_tokens` = prompt len
 **Create:** `commands/generate.py` (Phase 0 loop; reused by Phase 7), `serving/sampling.py` (sampler + chat template; no
 vLLM), `serving/gen_runner.py` (`DeplodockGenRunner`), `serving/vllm_model_gen.py` (`DeplodockGenModel`).
 
-**Modify (reuse heavily):** `compiler/trace/huggingface.py` (new `build_attention_split_wrapper`; A1 rope later),
+**Modify (reuse heavily):** `compiler/trace/huggingface.py` (new `build_attention_split_wrapper` + a Phase-0
+generation wrapper that slices the final position before `lm_head`; A1 rope later),
 `commands/compile.py::_trace_model` (`--attention-split` branch; thread a `dtype` param here + through the runnable
 binder so the whole-model path binds fp16), `serving/__init__.py` (register gen model),
 `commands/serve.py` (generative branch). `passes/frontend/decomposition/010_sdpa.py` + `ir/frontend/ir.py` only if the
-Phase-1 surgery fallback is used (the substitution path leaves them untouched).
+Phase-1 surgery fallback is used (the explicit-wrapper path leaves them untouched).
 
 **Reuse unchanged (load-bearing machinery):** `backend/cuda/program.py` (`CompiledProgram` build / `set_sym_values` /
 capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 constant binding),
@@ -266,11 +286,13 @@ capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 
 3. **Decode-shaped skinny matmuls** (`num_tokens` tiny) — far from the goldens' prefill-ish shapes; verify *correct* at
    `num_tokens=1` first, tune in Phase 5.
 4. **Captured-graph reuse across decode steps** — must be keyed on `num_tokens` and replay (not recapture) in steady
-   state; bucket widths if thrash.
+   state. Can't pad to bucket widths like the embedding runner (vLLM's `attn_metadata` expects the exact scheduled
+   count — padded rows have no cache slots); capture per exact width (`--enforce-eager` presents exact widths).
 5. **GQA / head-count alignment** at the deplodock↔`Attention` seam — cross-check at construction; test on Qwen3.
 6. **lm_head / `load_weights` split ownership** — vLLM owns **only lm_head** (loaded via `load_weights`); the deplodock
    runner owns embed + trunk (not loaded); the returned set must satisfy vLLM's strict all-params-initialized check
-   exactly. Tied embed↔lm_head is duplicated on the first cut (runner binds embed, vLLM loads lm_head).
+   exactly. `tie_word_embeddings` is config-dependent: when tied, the checkpoint may carry only `embed_tokens.weight`,
+   so `load_weights` loads the head from that alias (trunk duplicates the matrix); when untied, load `lm_head.*`.
 7. **Oracle methodology — token-for-token is brittle.** A single fp-driven argmax flip diverges every later token, so
    greedy token equality reads as catastrophic when logits are actually within tolerance. Gate **primarily on per-step
    logits within tolerance + top-1 agreement when the margin is sufficient** (plus a KV-backed-logits vs eager-recompute
@@ -286,9 +308,9 @@ capture/replay / `*_prefix_device`), `loader/binder.py` (`bind_constants`, fp16 
 1. Phase 0: `deplodock generate <model>` (fp16 path) greedy vs HF `model.generate(do_sample=False)` **run in fp16** —
    per-step logits within tolerance + top-1 agreement (token-for-token a short-decode smoke test). Hermetic loop-wiring
    unit test. Plus the whole-model fp16 compile-and-run spike up front.
-2. Phase 1: hermetic per-layer split (pre → torch SDPA → post, post fed `attn_out` + residual) == eager `block(x)`;
-   flattened-vs-`[1,seq,H]` equivalence.
-3. Phase 2: whole-model host stitch (deplodock layers + ref SDPA) == eager logits.
+2. Phase 1: hermetic per-layer split (pre → **rotary(q,k)** → torch GQA SDPA → post, post fed `attn_out` + residual) ==
+   eager `block(x)`; flattened-vs-`[1,seq,H]` equivalence.
+3. Phase 2: whole-model host stitch (deplodock layers + **rotary(q,k)** + ref SDPA) == eager logits.
 4. Phase 3: `vllm serve … DeplodockGenModel` → `/v1/chat/completions` greedy vs Phase 0 oracle — per-step logits within
    tolerance (token-for-token smoke); GQA ok.
 5. Phase 4: 100-token generation per-step logits within tolerance vs oracle; decode = **two replays / layer / step**
