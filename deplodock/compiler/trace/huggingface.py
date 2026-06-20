@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
 
-def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = False) -> nn.Module:
+def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = False, slice_last_logits: bool = False) -> nn.Module:
     """Return an ``nn.Module`` with a trace-friendly forward.
 
     Static mode (``dynamic=False``, default): forward is
@@ -37,7 +37,18 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
 
     Dynamic mode replaces the rotary embedding too — with cos/sin
     precomputed for positions ``0..DYNAMIC_DIM_MAX-1`` and sliced to the
-    runtime seq_len in-graph (``_SlicedRotary``). Keeping HF's in-graph
+    runtime seq_len in-graph (``_SlicedRotary``).
+
+    ``slice_last_logits`` (dynamic only, the Phase-0 generation oracle): instead of
+    returning the whole-prefix logits ``[1, S, vocab]``, run the trunk to hidden states,
+    slice the **final** position (``hidden[:, -1:, :]``), and apply ``lm_head`` to that
+    one row → ``[1, 1, vocab]``. The generate loop only needs the next-token logits, so
+    this avoids the O(S·vocab) lm_head over every prefix position and the full-buffer host
+    copy each step. NOTE: the ``hidden[:, -1:, :]`` slice makes lm_head an **M=1 demoted
+    matmul** that the *cold* lowering path (no learned prior) does not turn into a CUDA
+    kernel — it lowers only once a prior/golden covers that shape. So the standalone
+    generation oracle currently traces full logits and slices the last row on the host;
+    this flag is the (correct, prior-dependent) optimized form. Keeping HF's in-graph
     rotary instead silently breaks: its ``inv_freq`` buffer is
     ``persistent=False`` and doesn't survive ``torch.export`` with its
     real value, so the traced cos/sin constant-fold to ``cos=1, sin=0``
@@ -49,6 +60,9 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
     """
     import torch
     import torch.nn as nn
+
+    if slice_last_logits and not dynamic:
+        raise ValueError("slice_last_logits requires dynamic=True (the generation oracle is dynamic-seq_len)")
 
     class _PassThroughRotary(nn.Module):
         """Replaces the model's ``rotary_emb`` and returns precomputed real
@@ -122,7 +136,28 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
                     cos, sin = rotary(sample, full_pos)
                 inner.rotary_emb = _SlicedRotary(cos, sin)
 
-        if dynamic:
+        if dynamic and slice_last_logits:
+
+            def forward(self, input_ids, attention_mask, position_ids):
+                # Generation oracle: run the trunk, then apply lm_head to ONLY the
+                # final position so the output is [1, 1, vocab] (next-token logits),
+                # not the whole-prefix [1, S, vocab].
+                trunk = getattr(self.model, "model", self.model)
+                out = trunk(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=False,
+                )
+                hidden = out[0]  # [1, S, H], final norm already applied by the trunk
+                last = hidden[:, -1:, :]  # [1, 1, H] — the next-token position
+                head = getattr(self.model, "lm_head", None)
+                if head is None:
+                    head = self.model.get_output_embeddings()
+                return head(last)  # [1, 1, vocab]
+
+        elif dynamic:
 
             def forward(self, input_ids, attention_mask, position_ids):
                 # The caller controls mask + position_ids so the seq_len axis can

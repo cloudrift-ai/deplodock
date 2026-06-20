@@ -59,6 +59,11 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
   with per-request 0-based positions; spans split at `positions == 0`. Hardened for `_dummy_run`'s garbage profiling
   batches (index 0 always opens a span; overlong spans are chopped).
+- `sampling.py` — **no vLLM, no CUDA**. Pure-numpy token sampling (`Sampler`: greedy / temperature / top-k / top-p) +
+  `apply_chat_template` (delegates to the HF tokenizer). Used by the standalone **generation oracle**
+  (`commands/generate.py`, Phase 0 of `plans/generative-inference-support.md`) — `deplodock generate`'s host loop
+  re-runs the whole fp16 prefix each step on the CUDA backend and samples with this. The generative *vLLM plugin*
+  (`DeplodockGenModel` / `gen_runner.py`) is later-phase work tracked in that plan.
 
 ## Static mode (`DEPLODOCK_SERVING_STATIC=1`) — static extents for both batch and seq
 
