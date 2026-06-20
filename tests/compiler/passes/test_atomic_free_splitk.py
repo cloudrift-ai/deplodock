@@ -181,14 +181,17 @@ def test_idempotent_skip_when_knob_present(monkeypatch):
         _rewrite(op)
 
 
-def test_mma_path_off_stamped(monkeypatch):
-    """``MMA`` set (MMA path) → records ATOMIC_FREE_SPLITK=False; MMA SPLITK
-    stays on the codegen-derived atomic rewrite."""
+def test_mma_path_forks_atomic_free(monkeypatch):
+    """MMA / warp tier (Step 3b): the ``is_warp`` early-out is gone — the C-fragment
+    Write is still a tile-level Write at this stage, so the MMA split-K forks
+    atomic-free (workspace + reduce) just like the scalar path, instead of being
+    pinned to the codegen ``atomicAdd``."""
     monkeypatch.delenv("DEPLODOCK_ATOMIC_FREE_SPLITK", raising=False)
     op = _matmul_tileop(knobs={"MMA": "mma_m16n8k16_f16"})
-    result = _rewrite(op)
-    assert isinstance(result, TileOp)
-    assert result.knobs[afree.ATOMIC_FREE_SPLITK.name] is False
+    variants = _rewrite(op)
+    assert variants is not None and len(variants) == 2
+    assert isinstance(variants[0], TileOp) and variants[0].knobs[afree.ATOMIC_FREE_SPLITK.name] is False
+    assert isinstance(variants[1], Graph)
 
 
 def test_fork_emits_two_variants(monkeypatch):

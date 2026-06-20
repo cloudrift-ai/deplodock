@@ -25,11 +25,17 @@ coordination). The schedule is bandwidth-bound at the target shape
 the generic ``100_materialize_tile.py`` handles the body unchanged.
 
 Idempotent: re-running on a TileOp whose ``knobs`` already names
-``ATOMIC_FREE_SPLITK`` skips. MMA TileOps (``MMA`` set) and non-split-K
-TileOps stamp ``ATOMIC_FREE_SPLITK=False`` (the decision is recorded for a
-uniform knob set, not skipped) — MMA accumulation flows through the C
-fragment, not scalar Init/Accum, so split-K there stays on the
-codegen-derived atomic rewrite (see ``plans/mma-fragment-factorization.md``).
+``ATOMIC_FREE_SPLITK`` skips. Non-split-K TileOps stamp
+``ATOMIC_FREE_SPLITK=False`` (the decision is recorded for a uniform knob set,
+not skipped).
+
+The **MMA / warp tier** (Step 3b of ``plans/atomic-free-monoid-combine.md``) forks
+atomic-free too: at this tile stage the C-fragment store is still a plain
+``Write(output=c)`` (the fragment ``RegStore`` is lowered later by
+``kernel/005_lower_atom_tile``, which reads its output index off that Write), so
+the same Write-retarget routes the C fragment into ``workspace[K_s, M, N]`` and the
+additive ``Accum``-sum reduce folds it — no codegen ``atomicAdd``. The legacy
+atomic arm stays available as the fork's ``False`` branch.
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Combine, Cond, Init, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._splitk_residual import find_split_k_axis_name
 from deplodock.compiler.tensor import Tensor
 
@@ -354,11 +360,13 @@ def rewrite(ctx: Context, match: Match, root: Node) -> list[TileOp | Graph] | No
         unchanged, so the realized config keeps a uniform knob set."""
         return TileOp(body=op.body, name=op.name, knobs={**op.knobs, ATOMIC_FREE_SPLITK.name: False})
 
-    if is_warp(op.knobs):
-        # MMA path: fragment-accumulation; the C-fragment Write isn't a
-        # scalar Write we can rewire here, and split-K on MMA stays on
-        # the codegen-derived atomic rewrite path.
-        return _off()
+    # MMA / warp tier (Step 3b): the C-fragment store is still a tile-level
+    # ``Write(output=c)`` at THIS stage — the MMA fragment lowering (RegStore) only
+    # happens later at ``kernel/005_lower_atom_tile``, which reads its output index
+    # off the Write. So the same Write-retarget that the scalar path uses routes
+    # the warp tier's C fragment into ``workspace[K_s, M, N]`` (K_s in the index ⇒
+    # ``atomic_axes = ∅`` ⇒ RegStore to the workspace, no atomicAdd), and the
+    # additive ``Accum``-sum reduce kernel folds it. No ``is_warp`` early-out.
     k_s_name = find_split_k_axis_name(op)
     if k_s_name is None:
         return _off()  # no split-K (SPLITK = 1) — atomic-free is moot
