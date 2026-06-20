@@ -2,6 +2,8 @@
 
 import argparse
 
+import pytest
+
 from deplodock.commands.serve import build_bench_cmd, build_serve_cmd, handle_serve, register_serve_command
 
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -101,3 +103,34 @@ def test_bench_seed_is_distinct_from_vllm_seed(capsys):
     out = capsys.readouterr().out.strip().splitlines()
     assert "--seed 1" in out[0]  # vllm serve gets --seed
     assert "--seed 9" in out[1]  # the bench client gets --bench-seed
+
+
+def test_serve_cmd_generate_branch():
+    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=[], generate=True)
+    assert cmd[cmd.index("--runner") + 1] == "generate"
+    assert '{"architectures": ["DeplodockGenModel"]}' in cmd
+    assert cmd[cmd.index("--dtype") + 1] == "float16"  # forced for seam coherence
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "4096"  # capped at the dynamic-dim limit
+    assert "--enforce-eager" in cmd
+
+
+def test_serve_cmd_generate_rejects_incompatible_dtype():
+    with pytest.raises(ValueError, match="fp16"):
+        build_serve_cmd(MODEL, stock=False, vllm_args=["--dtype", "bfloat16"], generate=True)
+
+
+def test_serve_cmd_generate_rejects_oversized_batched_tokens():
+    with pytest.raises(ValueError, match="dynamic-dim cap"):
+        build_serve_cmd(MODEL, stock=False, vllm_args=["--max-num-batched-tokens", "8192"], generate=True)
+
+
+def test_serve_cmd_generate_honors_explicit_batched_tokens():
+    cmd = build_serve_cmd(MODEL, stock=False, vllm_args=["--max-num-batched-tokens", "2048"], generate=True)
+    assert cmd.count("--max-num-batched-tokens") == 1  # the user's, no added default
+    assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "2048"
+
+
+def test_serve_generate_bench_is_rejected():
+    args = _parse(["serve", MODEL, "--generate", "--bench", "--dry-run"])
+    with pytest.raises(SystemExit):
+        handle_serve(args)

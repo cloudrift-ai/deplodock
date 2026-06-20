@@ -65,6 +65,17 @@ class DeplodockGenModel(nn.Module):
         self.config = config
         self.dtype = mc.dtype
 
+        # The carve (pre/post + a plain causal vLLM Attention) assumes FULL causal attention.
+        # Sliding-window / per-layer-sliding / dual-chunk variants would silently miscompute
+        # (neither side here is window/chunk aware) — reject rather than mislead.
+        if getattr(config, "use_sliding_window", False) and getattr(config, "sliding_window", None):
+            raise NotImplementedError("DeplodockGenModel: sliding-window attention is not supported")
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and any(lt == "sliding_attention" for lt in layer_types):
+            raise NotImplementedError("DeplodockGenModel: per-layer sliding attention is not supported")
+        if getattr(config, "dual_chunk_attention_config", None):
+            raise NotImplementedError("DeplodockGenModel: dual-chunk attention is not supported")
+
         # The flattened width T = num_tokens is the SUM of newly-scheduled tokens across all
         # requests per step (continuous batching), bounded by max_num_batched_tokens — NOT
         # max_model_len. It must stay within the compiler's dynamic-dim / RoPE-buffer cap.

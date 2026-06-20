@@ -85,4 +85,6 @@ def test_vllm_gen_plugin_matches_hf_eager(tmp_path, monkeypatch):
     with torch.no_grad():
         ref_out = ref.generate(torch.tensor([prompt_ids], device="cuda"), do_sample=False, max_new_tokens=max_new, use_cache=True)
     ref_gen = ref_out[0, len(prompt_ids) :].tolist()
-    assert gen[0] == ref_gen[0], f"first token mismatch: deplodock {gen[0]} vs HF {ref_gen[0]}"
+    # Compare the WHOLE greedy sequence: token 0 comes from prefill, tokens 1.. are KV-cache
+    # DECODE steps (num_tokens=1), so this validates the decode path, not just prefill.
+    assert gen == ref_gen, f"greedy mismatch (deplodock vs HF eager): {gen} vs {ref_gen}"
