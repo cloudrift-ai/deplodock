@@ -234,6 +234,67 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
     return LayerWrapper()
 
 
+def build_attention_split_wrapper(block):
+    """Carve SDPA out of one HF decoder layer (Phase 1 of
+    ``plans/generative-inference-support.md``). Returns ``(pre, post)`` ``nn.Module``s over
+    the flattened **``[num_tokens, H]``** per-token layout:
+
+    - ``pre(hidden[T, H]) -> (q, k, v)`` runs ``input_layernorm`` → separate
+      ``q_proj`` / ``k_proj`` / ``v_proj`` → reshape-into-heads → per-head ``q_norm`` /
+      ``k_norm`` (Qwen3 only), and returns **un-rotated** q,k,v in the 2-D seam ABI
+      ``q[T, Hq·D]``, ``k/v[T, Hkv·D]`` — exactly what vLLM's ``Attention.forward`` consumes.
+      RoPE is applied downstream (by vLLM, or by the test/oracle reference).
+    - ``post(attn_out[T, Hq·D], residual[T, H]) -> layer_out[T, H]`` runs ``o_proj`` →
+      ``residual +`` → ``post_attention_layernorm`` → ``mlp`` → second residual.
+
+    Reads the block's OWN submodules (not a ``self_attn`` substitution — HF
+    ``self_attn.forward`` returns ``(attn_output, weights)``, and the block adds the
+    residual after it, so swapping ``self_attn`` can't yield a clean pre-graph). NOTE: HF's
+    ``.view(B,S,-1,D).transpose(1,2)`` assumes a ``[batch, seq, hidden]`` input; on the
+    flattened ``[T, H]`` layout the reshape is ``.view(T, n_heads, D)`` with **no transpose**.
+    Qwen3 (q/k norm) and Llama (no q/k norm) are both handled; the architecture difference is
+    just the presence of ``q_norm`` / ``k_norm``."""
+    import torch.nn as nn
+
+    attn = block.self_attn
+    head_dim = attn.head_dim
+    num_heads = attn.q_proj.out_features // head_dim
+    num_kv_heads = attn.k_proj.out_features // head_dim
+    q_norm = getattr(attn, "q_norm", None)
+    k_norm = getattr(attn, "k_norm", None)
+
+    class Pre(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_layernorm = block.input_layernorm
+            self.q_proj, self.k_proj, self.v_proj = attn.q_proj, attn.k_proj, attn.v_proj
+            self.q_norm, self.k_norm = q_norm, k_norm
+
+        def forward(self, hidden):
+            h = self.input_layernorm(hidden)  # [T, H]
+            t = h.shape[0]
+            q = self.q_proj(h).view(t, num_heads, head_dim)  # [T, Hq, D] — NO transpose
+            k = self.k_proj(h).view(t, num_kv_heads, head_dim)
+            v = self.v_proj(h).view(t, num_kv_heads, head_dim)
+            if self.q_norm is not None:
+                q = self.q_norm(q)  # per-head RMSNorm over D
+                k = self.k_norm(k)
+            return q.reshape(t, num_heads * head_dim), k.reshape(t, num_kv_heads * head_dim), v.reshape(t, num_kv_heads * head_dim)
+
+    class Post(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.o_proj = attn.o_proj
+            self.post_attention_layernorm = block.post_attention_layernorm
+            self.mlp = block.mlp
+
+        def forward(self, attn_out, residual):
+            h = residual + self.o_proj(attn_out)  # residual1 + o_proj(SDPA)
+            return h + self.mlp(self.post_attention_layernorm(h))  # residual2 + MLP
+
+    return Pre(), Post()
+
+
 def build_causal_mask(seq_len: int, dtype) -> torch.Tensor:  # noqa: F821
     """Return the ``(1, 1, seq_len, seq_len)`` causal mask the wrapper
     uses internally — exposed so callers in dynamic mode can construct a
