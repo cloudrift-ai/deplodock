@@ -637,13 +637,13 @@ def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
 
 
 @dataclass(frozen=True)
-class Combine(ReduceCarrier):
+class Monoid(ReduceCarrier):
     """A loop-carried **monoid** combine — a general associative reduce over
     internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
     ``Mma`` (tensor-core fragment fold).
 
     A monoid is *(identity element, associative binary operation, carried state)*;
-    ``Combine`` makes all three explicit so the streaming-reduce machinery isn't
+    ``Monoid`` makes all three explicit so the streaming-reduce machinery isn't
     tied to any one recurrence:
 
     - ``state`` — the carried SSA names (the internal state); read-and-written
@@ -721,8 +721,8 @@ class Combine(ReduceCarrier):
                 tuple(_rename_assign_args(a, sub) for a in self.merge),
             )
 
-    def as_state_merge(self, other: tuple[str, ...]) -> Combine:
-        """Return a one-shot ``Combine`` that merges this carrier's ``state`` with
+    def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
+        """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
         a second fully-reduced state named ``other`` (the cross-partition
         combine's right operand). The returned carrier's ``merge`` IS
         ``combine_states`` with ``state_b`` renamed to ``other`` and its
@@ -731,7 +731,7 @@ class Combine(ReduceCarrier):
         """
         sub = dict(zip(self.state_b, other, strict=True))
         merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
-        return Combine(
+        return Monoid(
             state=self.state,
             partial=other,
             merge=merged,

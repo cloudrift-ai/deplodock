@@ -2,7 +2,7 @@
 ``plans/atomic-free-monoid-combine.md``).
 
 ``017``'s ``build_monoid_reduce_tileop`` builds an atomic-free reduce kernel
-driven by a ``Combine`` monoid carrier: per-partition state slabs in a
+driven by a ``Monoid`` carrier: per-partition state slabs in a
 ``workspace[S, M, N]``, ``identity``-seeded, folded along ``S`` via the carrier's
 ``combine_states``. The additive matmul split-K still rides the bit-identical
 ``Accum`` sum (``_build_reduce_tileop``); this test exercises the NON-additive

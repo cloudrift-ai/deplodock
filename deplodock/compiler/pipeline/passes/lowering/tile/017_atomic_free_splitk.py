@@ -50,7 +50,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Combine, Cond, Init, Load, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Monoid, Stmt, Write
 from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -194,7 +194,7 @@ def _build_reduce_tileop(*, workspace_name: str, out_name: str, s_extent: int, m
 
 def build_monoid_reduce_tileop(
     *,
-    carrier: Combine,
+    carrier: Monoid,
     init_ops: tuple[ElementwiseImpl, ...],
     workspaces: tuple[str, ...],
     out_name: str,

@@ -124,15 +124,15 @@ tree-combine) query instead of matching op names.
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
 `Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
-base of `Accum`, its tensor-core form `Mma`, and the general monoid `Combine`;
+base of `Accum`, its tensor-core form `Mma`, and the general monoid `Monoid`;
 `is_reduce`, axis threading, and the other carrier-agnostic checks key off the
 base, not an `isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's
 algebra read the carrier's `associative` / `commutative` / `has_identity` traits
 directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
-constants; `Combine` reports `associative` / `has_identity` `True` by construction
+constants; `Monoid` reports `associative` / `has_identity` `True` by construction
 with a per-instance `commutative` field).
 
-`Combine` is the general loop-carried **monoid** carrier — *(identity element,
+`Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (the carried SSA
 names), `partial` (this step's contribution), `merge` (the associative operation
 **as data** — a short `Assign` program that reads old state + partial and
@@ -154,17 +154,17 @@ For an **additive** carrier whose partial lifts to a state (`len(partial) ==
 len(state)`) the two coincide, so `__post_init__` auto-derives `combine_states`
 from `merge` (partial reads swapped for `state_b`); an asymmetric monoid (flash's
 LSE) authors both (`flash_combine`). `as_state_merge(other)` returns a one-shot
-`Combine` whose `merge` IS `combine_states` with `state_b` renamed to `other`, so a
+`Monoid` whose `merge` IS `combine_states` with `state_b` renamed to `other`, so a
 two-partition merge renders through the same machinery as a streaming step (see
 `tests/compiler/ir/test_combine_forward.py::test_combine_states_two_partition_matches_numpy`).
 
-`Combine.render` emits the `merge` program in fp32: each `Assign` targeting a
+`Monoid.render` emits the `merge` program in fp32: each `Assign` targeting a
 `state` name is a reassignment of the carried value (declared by an enclosing
 `Init`); every other `Assign` declares a local temp. Statement order is
 load-bearing (a state update follows every read of that state's old value).
 `rewrite` threads the merge through the SSA renamer (state / partial refs map;
 the carrier-internal temps pass through). `LoopOp` validation threads `Init` (a
-carried-name binding site) and `Combine` (partials must be in scope; state is
+carried-name binding site) and `Monoid` (partials must be in scope; state is
 loop-carried and exports), so a hand-written streaming nest type-checks and runs
 through `LoopOp.forward`. **Example** — flash attention's online softmax (the
 log-sum-exp monoid): state `(m, l, O)`, partial `(score, value)`, identity
@@ -327,7 +327,7 @@ cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
 atomic-write classification from enclosing ``GridTile.axes`` vs
 ``Write.index``, broadcast-write guards from cooperative thread axes vs
 ``Write.index``. The same cooperative analysis covers the general monoid
-carrier: a ``Combine``'s cooperative axes are keyed by each of its ``state``
+carrier: a ``Monoid``'s cooperative axes are keyed by each of its ``state``
 component names, and the materializer emits a **multi-component** cross-thread
 combine — ``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the
 full state tuple, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, >

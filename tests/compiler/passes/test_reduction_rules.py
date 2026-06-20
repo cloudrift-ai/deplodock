@@ -29,7 +29,7 @@ def _tile_has_combine(g: Graph) -> bool:
     """True iff some Accum reduces over an enclosing ThreadTile axis —
     the structural signal that cross-thread reduction will be emitted
     by ``100_materialize_tile``. (Pre-refactor variants: "Tile body
-    contains a ``Combine`` stmt", then "ThreadTile.cooperative_axes
+    contains a ``Monoid`` stmt", then "ThreadTile.cooperative_axes
     set"; both are gone — cooperativity now lives on ``Accum.axes``
     and the materializer / escape-analysis helper recovers it via
     ``Accum.axes ∩ ThreadTile.axes``.)"""
@@ -55,7 +55,7 @@ def _tile_has_combine(g: Graph) -> bool:
 #
 # Cooperative coordination today lives inside ``001_launch_geometry``
 # (folded from the deleted ``002_cooperative_reduce``). The structural
-# signal is "Tile body contains Combine"; assertions check via
+# signal is "Tile body contains Monoid"; assertions check via
 # :func:`_tile_has_combine` rather than rule-name firing.
 
 
@@ -192,7 +192,7 @@ def test_block_cooperative_skips_stage_inputs(recording_dump):
     """K=256 cooperative reduce: the v1 cooperative path uses a sole
     ``K_c`` THREAD axis (BR>1 ⇒ BN=BM=1), so each thread reads its
     own K_c-strided slice of the row with no cross-thread reuse —
-    ``stage_inputs`` correctly skips. The kernel still gets a Combine
+    ``stage_inputs`` correctly skips. The kernel still gets a Monoid
     (cross-thread reduce after the per-thread partial sums) and lowers
     via the planner's cooperative branch."""
     g = Graph()
@@ -213,7 +213,7 @@ def test_matmul_does_not_fire_cooperative_reduce(recording_dump):
     cooperative-reduce strategy is for single-buffer reductions and
     must not fire here.
 
-    The signal is the absence of ``Combine`` in the Tile body
+    The signal is the absence of ``Monoid`` in the Tile body
     (cooperative coordination would have emitted one)."""
     g = Graph()
     _input(g, "a", (_M, _K))

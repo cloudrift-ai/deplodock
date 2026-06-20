@@ -9,8 +9,8 @@ uses to locate the Accums and the combine's tid var + thread count
 (the whole CTA in the BN=BM=1 form, or each row's BR-lane segment when
 free-axis threads ride alongside — strided-cooperative rows).
 
-The general monoid ``Combine`` carrier (flash online-softmax) gets the
-tuple-valued counterparts: ``find_nested_combines`` locates the carriers and
+The general monoid ``Monoid`` carrier (flash online-softmax) gets the
+tuple-valued counterparts: ``find_nested_monoids`` locates the carriers and
 ``emit_combine_states`` emits a multi-component cross-thread fold —
 ``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the full
 state, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, > warp), both
@@ -29,7 +29,7 @@ from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import MonoidTreeHalve, MonoidWarpShuffle, Smem, Sync, TreeHalve, WarpShuffle
-from deplodock.compiler.ir.stmt import Accum, Combine, Cond, Load, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Cond, Load, Monoid, Stmt, Write
 from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
 
 
@@ -44,7 +44,7 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     Accums from ``010_split_register_axes``.
 
     Returns ``{}`` when no reduce-with-Accum subtree is found, preserving
-    the existing "stray Combine raises" safety net."""
+    the existing "stray Monoid raises" safety net."""
     for s in stmts:
         if isinstance(s, (SerialTile, StridedTile)) and s.is_reduce:
             accums = {a.name: a for a in s.body if isinstance(a, Accum)}
@@ -57,29 +57,29 @@ def find_nested_reduce_accums(stmts) -> dict[str, Accum]:
     return {}
 
 
-def find_nested_combines(stmts) -> dict[str, Combine]:
-    """All ``Combine`` monoid carriers at the immediate body level of the first
+def find_nested_monoids(stmts) -> dict[str, Monoid]:
+    """All ``Monoid`` carriers at the immediate body level of the first
     nested reduce ``SerialTile`` / ``StridedTile`` subtree, keyed by the carrier's
     first state name. The tuple-valued counterpart of
     :func:`find_nested_reduce_accums` — used by the materializer to locate a
     cooperative monoid reduce (flash split-KV / a hand-built scalar monoid) whose
     reduce axis is split across the CTA's threads.
 
-    Returns ``{}`` when no reduce-with-Combine subtree is found."""
+    Returns ``{}`` when no reduce-with-Monoid subtree is found."""
     for s in stmts:
         if isinstance(s, (SerialTile, StridedTile)) and s.is_reduce:
-            combines = {c.state[0]: c for c in s.body if isinstance(c, Combine)}
+            combines = {c.state[0]: c for c in s.body if isinstance(c, Monoid)}
             if combines:
                 return combines
         if isinstance(s, (SerialTile, StridedTile, RegisterTile)):
-            found = find_nested_combines(s.body)
+            found = find_nested_monoids(s.body)
             if found:
                 return found
     return {}
 
 
-def emit_combine_states(carrier: Combine, t: str, n_threads: int, *, warp_size: int) -> list[Stmt]:
-    """Emit the cross-thread monoid combine for a ``Combine`` carrier — the
+def emit_combine_states(carrier: Monoid, t: str, n_threads: int, *, warp_size: int) -> list[Stmt]:
+    """Emit the cross-thread monoid combine for a ``Monoid`` carrier — the
     tuple-valued sibling of :func:`emit_combine`. Each thread holds a full
     per-thread partial ``state`` tuple; this folds them across ``n_threads`` via
     the carrier's ``combine_states`` (the state-merges-state monoid op), leaving
@@ -143,7 +143,7 @@ def cooperative_combine_geometry(thread_axes: tuple[Axis, ...], coop_names: froz
     """
     coop = [ax for ax in thread_axes if ax.name in coop_names]
     if len(coop) != 1:
-        raise ValueError(f"Combine requires exactly one cooperative THREAD axis; got {[ax.name for ax in coop]}")
+        raise ValueError(f"Monoid requires exactly one cooperative THREAD axis; got {[ax.name for ax in coop]}")
     n_coop = coop[0].extent.as_static()
     if len(coop) == len(thread_axes):
         return coop[0].name, n_coop

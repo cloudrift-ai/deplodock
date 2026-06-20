@@ -21,7 +21,7 @@ redundant, scalar form; the tensor-core P@V tier is future work
         Init sacc = 0
         for dd in 0..head_dim: sacc += Q[…,m,dd]·K[…,kv,dd]   # score reduce
         s = sacc · scale
-        Combine((m_i,l_i,O_i), (s, V[…,kv,d]))       # the LSE rescale (flash_combine)
+        Monoid((m_i,l_i,O_i), (s, V[…,kv,d]))       # the LSE rescale (flash_combine)
       out[…,m,d] = O_i / l_i
 
 Scope: static OR dynamic (symbolic ``seq_len`` on Q/K/V dim -2 — one cached kernel
@@ -44,12 +44,12 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Combine, Init, Load, Loop, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Write
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 
-def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Combine:
-    """Build the online-softmax (log-sum-exp) :class:`Combine` for one streaming
+def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
+    """Build the online-softmax (log-sum-exp) :class:`Monoid` for one streaming
     KV step: state ``(m, l, O)`` folds this key's ``(score, value)`` partial.
 
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
@@ -101,7 +101,7 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Combine:
         Assign(o, "add", (t("coa"), t("cob"))),  # O = O·a + O_o·b            [state]
         Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
     )
-    return Combine(
+    return Monoid(
         state=(m, ll, o),
         partial=(s, v),
         merge=merge,
@@ -204,7 +204,7 @@ def _flash_loop_body(
 
     The score ``s = Σ_dd Q·K`` is an inner reduce nested in the KV streaming
     reduce, so ``Init(sacc)`` is pre-placed at the KV-body scope (reset per step):
-    the streaming ``Combine`` loop is a per-iteration boundary the default
+    the streaming ``Monoid`` loop is a per-iteration boundary the default
     Init-placement would otherwise cross."""
     bvars = _batch_vars(len(batch))
     q_idx = (*bvars, Var("m"), Var("dd"))

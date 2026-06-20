@@ -245,7 +245,7 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     order is load-bearing — a state update must follow every read of that state's
     old value (the carrier builder guarantees it).
 
-    Shared by ``Combine.render`` (the streaming step) and the kernel-IR
+    Shared by ``Monoid.render`` (the streaming step) and the kernel-IR
     cross-thread monoid combine primitives (the state-merges-state step), so both
     spell the carrier's algebra identically."""
     if pad is None:
@@ -524,7 +524,7 @@ class Stmt:
 class ReduceCarrier(Stmt):
     """A loop-carried reduce accumulator — the shared structural role behind
     ``Accum`` (scalar monoid fold), ``Mma`` (tensor-core ``c += a @ b``), and
-    the general monoid ``Combine`` (e.g. flash attention's online softmax).
+    the general monoid ``Monoid`` (e.g. flash attention's online softmax).
 
     A ``Loop`` / ``StridedLoop`` / serial tile is a *reduce* loop iff its
     immediate body holds a ``ReduceCarrier`` — that is the one predicate the
@@ -538,7 +538,7 @@ class ReduceCarrier(Stmt):
     ``commutative`` / ``has_identity``) the carrier exposes directly to decide
     whether a reduction may be split / reordered (split-K, cooperative
     tree-combine). The traits live on the carrier itself: ``Accum`` forwards to
-    its scalar ``op``; ``Mma`` reports the additive-fold constants; ``Combine``
+    its scalar ``op``; ``Mma`` reports the additive-fold constants; ``Monoid``
     reports `associative` / `has_identity` `True` (it is a monoid) with a
     per-instance `commutative` flag. No separate combine object is reified —
     three booleans don't earn one, and an ``Mma`` has no scalar op to point at

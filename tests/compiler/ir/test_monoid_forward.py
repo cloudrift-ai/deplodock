@@ -1,11 +1,11 @@
-"""``Combine`` monoid carrier — CPU forward parity (the streaming-reduce render).
+"""``Monoid`` carrier — CPU forward parity (the streaming-reduce render).
 
-A :class:`Combine` carries internal state across a reduce loop and folds each
+A :class:`Monoid` carries internal state across a reduce loop and folds each
 partial via its ``merge`` program (the associative operation as data). These tests
 build a hand-written ``LoopOp`` that streams two online-softmax monoids — the
 ``(m, l)`` normalization and the full ``(m, l, O)`` weighted average — and check
 ``LoopOp.forward`` (the cppyy-JIT'd C++ reference) against numpy, exercising the
-``Combine.render`` merge lowering with no GPU and no matmul nesting.
+``Monoid.render`` merge lowering with no GPU and no matmul nesting.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Combine, Init, Load, Loop, Write
+from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
 from deplodock.compiler.pipeline.passes.loop.fusion._flash import flash_combine
 
 
@@ -37,7 +37,7 @@ def _online_softmax_steps(m: str, ll: str, s: str) -> tuple:
 
 
 def _softmax_loopop(n: int) -> LoopOp:
-    """Online softmax of a vector ``x`` → ``out``: a ``(m, l)`` streaming Combine,
+    """Online softmax of a vector ``x`` → ``out``: a ``(m, l)`` streaming Monoid,
     then a second free sweep dividing ``exp(x − m) / l``. The reduce sweep must run
     first (a swap would read the identity m=−inf, l=0)."""
     merge = (*_online_softmax_steps("m", "l", "s"), Assign("m", "copy", ("m_mx",)))
@@ -49,7 +49,7 @@ def _softmax_loopop(n: int) -> LoopOp:
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
-                    Combine(state=("m", "l"), partial=("s",), merge=merge, identity=(Literal(-1e30), Literal(0.0)), axes=("j",)),
+                    Monoid(state=("m", "l"), partial=("s",), merge=merge, identity=(Literal(-1e30), Literal(0.0)), axes=("j",)),
                 ),
             ),
             Loop(
@@ -86,7 +86,7 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
                     Load(name="vj", input="v", index=(Var("j"),)),
-                    Combine(
+                    Monoid(
                         state=("m", "l", "acc"),
                         partial=("s", "vj"),
                         merge=merge,
@@ -103,7 +103,7 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
 
 def _streaming_half(m: str, ll: str, acc: str, x_buf: str, v_buf: str, lo: int, n: int, jname: str) -> tuple:
     """Init + streaming-reduce loop folding ``x[lo:n]`` / ``v[lo:n]`` into the
-    ``(m, l, acc)`` state via the flash ``Combine``'s ``merge`` program — one
+    ``(m, l, acc)`` state via the flash ``Monoid``'s ``merge`` program — one
     partition of a two-partition split reduce."""
     idx = Var(jname) if lo == 0 else BinaryExpr("+", Var(jname), Literal(lo, "int"))
     return (
@@ -123,7 +123,7 @@ def _streaming_half(m: str, ll: str, acc: str, x_buf: str, v_buf: str, lo: int, 
 
 def _two_partition_loopop(n: int) -> LoopOp:
     """1-D attention ``out = softmax(x) @ v`` computed as TWO independent
-    partition reduces merged by the flash ``Combine``'s ``combine_states`` — the
+    partition reduces merged by the flash ``Monoid``'s ``combine_states`` — the
     cross-partition (split-KV / split-K) form, with no atomics. Partition A folds
     the first half, partition B the second; one ``combine_states`` merges the two
     fully-reduced ``(m, l, O)`` states, then the weighted average finalizes."""
@@ -155,7 +155,7 @@ def test_combine_states_two_partition_matches_numpy(n: int) -> None:
 def test_combine_states_default_derived_for_additive() -> None:
     """An additive carrier (partial lifts to a state) auto-derives
     ``combine_states`` from ``merge`` — partial reads swapped for ``state_b``."""
-    c = Combine(
+    c = Monoid(
         state=("acc",),
         partial=("p",),
         merge=(Assign("acc", "add", ("acc", "p")),),
@@ -191,7 +191,7 @@ def test_combine_weighted_average_matches_numpy(n: int) -> None:
 
 def test_combine_reduce_loop_recognized() -> None:
     """The streaming sweep is a reduce loop via the ReduceCarrier protocol — the
-    pipeline's reduce-axis machinery keys off this with no Combine-specific
+    pipeline's reduce-axis machinery keys off this with no Monoid-specific
     isinstance ladder."""
     op = _softmax_loopop(8)
     reduce_loops = [s for s in op.body if isinstance(s, Loop) and s.is_reduce]

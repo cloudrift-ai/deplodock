@@ -536,7 +536,7 @@ class WarpShuffle(Stmt):
 
 @dataclass(frozen=True)
 class MonoidWarpShuffle(Stmt):
-    """Cross-thread combine of a multi-component **monoid** state (a ``Combine``
+    """Cross-thread combine of a multi-component **monoid** state (a ``Monoid``
     carrier) over ``length`` lanes via ``__shfl_xor_sync``.
 
     The tuple-valued generalization of :class:`WarpShuffle`: each lane holds a

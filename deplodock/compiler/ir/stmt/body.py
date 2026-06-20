@@ -659,14 +659,14 @@ class Body(tuple[Stmt, ...]):
         # imports Body from this module). Smem / StageBundle staging buffers
         # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
         # import is needed.
-        from deplodock.compiler.ir.stmt.leaves import Accum, Combine, Write  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
         from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()
         staging_buffers: set[str] = set()
         accums: list[Accum] = []
-        combines: list[Combine] = []
+        combines: list[Monoid] = []
         writes: list[Write] = []
 
         for s in self.iter():
@@ -677,7 +677,7 @@ class Body(tuple[Stmt, ...]):
                 thread_axes.update(ax.name for ax in s.axes)
             elif isinstance(s, Accum):
                 accums.append(s)
-            elif isinstance(s, Combine):
+            elif isinstance(s, Monoid):
                 combines.append(s)
             elif isinstance(s, Write):
                 writes.append(s)
@@ -688,7 +688,7 @@ class Body(tuple[Stmt, ...]):
 
         # Per-carrier cooperative axes = the carrier's reduce axes that are ALSO
         # CTA thread axes (cooperative-K). Keyed by carried name: an Accum's single
-        # accumulator, OR each of a Combine monoid's state components (the
+        # accumulator, OR each of each of a Monoid carrier's state components (the
         # materializer keys the cross-thread combine off the first state name).
         accum_cooperative = {acc.name: frozenset(acc.axes) & thread_axes_fz for acc in accums}
         for c in combines:

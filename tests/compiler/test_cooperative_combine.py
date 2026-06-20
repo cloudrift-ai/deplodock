@@ -1,7 +1,7 @@
-"""Intra-CTA cooperative combine over a general monoid (``Combine``) carrier.
+"""Intra-CTA cooperative combine over a general monoid (``Monoid``) carrier.
 
 Step 2 of ``plans/atomic-free-monoid-combine.md``: a cooperative-K reduce whose
-carrier is a tuple-valued ``Combine`` (online-softmax ``(m, l)``) — not an
+carrier is a tuple-valued ``Monoid`` (online-softmax ``(m, l)``) — not an
 ``Accum`` — splits across the CTA's threads and merges the per-thread partial
 states via the carrier's ``combine_states`` (the materializer's
 ``emit_combine_states`` → ``MonoidWarpShuffle`` / ``MonoidTreeHalve``), instead of
@@ -22,7 +22,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Combine, Init, Load, Loop, Write
+from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
 
 
 def _has_cuda() -> bool:
@@ -34,7 +34,7 @@ def _has_cuda() -> bool:
         return False
 
 
-def _ml_combine(m: str, ll: str, s: str) -> Combine:
+def _ml_combine(m: str, ll: str, s: str) -> Monoid:
     """The online-softmax ``(m, l)`` monoid: state max + denominator, folding one
     score ``s``. Authors both ``merge`` (fold a partial) and ``combine_states``
     (merge two partition states) — the asymmetric monoid can't auto-derive."""
@@ -60,7 +60,7 @@ def _ml_combine(m: str, ll: str, s: str) -> Combine:
         Assign(ll, "add", (f"{m}_cla", f"{m}_clb")),
         Assign(m, "copy", (f"{m}_cmx",)),
     )
-    return Combine(
+    return Monoid(
         state=(m, ll),
         partial=(s,),
         merge=merge,
@@ -74,7 +74,7 @@ def _ml_combine(m: str, ll: str, s: str) -> Combine:
 
 def _softmax_combine_graph(rows: int, k: int) -> Graph:
     """Row-wise softmax ``out[r, k] = exp(x[r,k] - m_r) / l_r`` where ``(m_r, l_r)``
-    is produced by a streaming ``(m, l)`` ``Combine`` reduce over the K axis — the
+    is produced by a streaming ``(m, l)`` ``Monoid`` reduce over the K axis — the
     reduce a cooperative split parallelizes across the CTA's threads."""
     body = (
         Loop(
@@ -118,7 +118,7 @@ def _ref_softmax(x: np.ndarray) -> np.ndarray:
 @pytest.mark.skipif(not _has_cuda(), reason="cooperative monoid combine runs on CUDA")
 @pytest.mark.parametrize("br", [32, 128])
 def test_cooperative_combine_softmax_matches_numpy(monkeypatch, br: int) -> None:
-    """A cooperative-K ``Combine`` reduce (BR>1) matches numpy softmax — warp-
+    """A cooperative-K ``Monoid`` reduce (BR>1) matches numpy softmax — warp-
     shuffle path at BR=32, smem-tree path at BR=128."""
     monkeypatch.setenv("DEPLODOCK_BR", str(br))
     monkeypatch.setenv("DEPLODOCK_BN", "1")

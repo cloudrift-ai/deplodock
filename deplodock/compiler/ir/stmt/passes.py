@@ -22,10 +22,10 @@ from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import (
     Accum,
     Assign,
-    Combine,
     Init,
     Load,
     Mma,
+    Monoid,
     Pack,
     Select,
     SelectBranch,
@@ -139,7 +139,7 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
     # The merge / combine_states programs reference state / partial / state_b
     # (all in the rename map) PLUS carrier-internal temps that are NOT surfaced via
@@ -164,7 +164,7 @@ def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
             return r
         return overlay.get(name, name)
 
-    return Combine(
+    return Monoid(
         state=tuple(rn(n) for n in s.state),
         partial=tuple(rn(n) for n in s.partial),
         merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
@@ -253,7 +253,7 @@ def _(s: Cond, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @singledispatch
 def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    # Default: no Expr fields to simplify (Assign / Accum / Init / Combine).
+    # Default: no Expr fields to simplify (Assign / Accum / Init / Monoid).
     return stmt
 
 
@@ -305,7 +305,7 @@ def _(s: Cond, ctx: SimplifyCtx) -> Stmt:
     )
 
 
-# Tile-IR Stmt registrations (Stage / AsyncWait / Combine) live in
+# Tile-IR Stmt registrations (Stage / AsyncWait / Monoid) live in
 # ``deplodock.compiler.ir.tile.passes`` — that module is imported from the
 # bottom of ``tile/ir.py`` so loading any Tile-IR symbol auto-registers the
 # handlers without a circular import.
