@@ -9,6 +9,7 @@ import yaml
 from deplodock.provisioning.candidates import VmCandidate
 from deplodock.provisioning.cloud import (
     _provision_cloudrift,
+    _provision_gcp,
     _ssh_keys_metadata_value,
     delete_cloud_vm,
     read_public_key_files,
@@ -307,3 +308,37 @@ async def test_provision_cloudrift_forwards_extra_keys(mock_create, tmp_path):
 
     assert conn is not None
     assert mock_create.call_args.kwargs["extra_public_keys"] == extra
+
+
+@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+async def test_provision_gcp_disables_oslogin_with_ssh_keys(mock_create, tmp_path):
+    """GCP metadata pins enable-oslogin=FALSE alongside the per-VM ssh-keys (one --metadata flag),
+    so the instance key is honored on a project that enables OS Login via metadata."""
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("private-key")
+    (tmp_path / "id_ed25519.pub").write_text("ssh-ed25519 AAAA own@host\n")
+
+    mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="", ssh_port=22)
+
+    cand = VmCandidate(provider="gcp", base_type="a3-highgpu-8g", instance_type="a3-highgpu-8g", zone="us-central1-a")
+    conn = await _provision_gcp(cand, "NVIDIA B200", str(key_file), {"gcp": {"ssh_user": "deploy"}}, "srv", False, logging.getLogger())
+
+    assert conn is not None
+    extra = mock_create.call_args.kwargs["extra_gcloud_args"]
+    assert "--metadata=enable-oslogin=FALSE,ssh-keys=deploy:ssh-ed25519 AAAA own@host" in extra
+
+
+@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+async def test_provision_gcp_warns_when_pubkey_missing(mock_create, tmp_path, caplog):
+    """A missing .pub no longer silently omits the key: it warns and adds no ssh-keys metadata."""
+    key_file = tmp_path / "id_ed25519"
+    key_file.write_text("private-key")  # no matching .pub
+    mock_create.return_value = VMConnectionInfo(host="1.2.3.4", username="", ssh_port=22)
+
+    cand = VmCandidate(provider="gcp", base_type="a3-highgpu-8g", instance_type="a3-highgpu-8g", zone="us-central1-a")
+    with caplog.at_level(logging.WARNING):
+        await _provision_gcp(cand, "NVIDIA B200", str(key_file), {}, "srv", False, logging.getLogger())
+
+    assert any("No SSH public key" in r.message for r in caplog.records)
+    extra = mock_create.call_args.kwargs["extra_gcloud_args"] or ""
+    assert "ssh-keys" not in extra

@@ -312,11 +312,22 @@ async def _provision_gcp(
         extra_parts.append(f"--tags={tags}")
 
     pub_key_path = f"{ssh_key}.pub"
-    if os.path.exists(pub_key_path) and not dry_run:
+    if not os.path.exists(pub_key_path):
+        logger.warning(
+            f"No SSH public key at {pub_key_path}; the VM will get no ssh-keys metadata and SSH may rely "
+            f"on project/OS-Login keys. Pass --ssh-key pointing at a private key whose .pub exists."
+        )
+    elif not dry_run:
         with open(pub_key_path) as f:
             pub_key = f.read().strip()
         metadata_value = _ssh_keys_metadata_value(ssh_user, pub_key, extra_authorized_keys)
-        extra_parts.append(shlex.quote(f"--metadata=ssh-keys={metadata_value}"))
+        # Pin OS Login off for this instance so the per-VM ssh-keys below is honored: a project whose
+        # metadata sets enable-oslogin=TRUE otherwise ignores instance ssh-keys entirely. The instance
+        # value overrides the project one (this does NOT work if an org policy *enforces*
+        # compute.requireOsLogin — then keys must go through OS Login). Both pairs must ride a single
+        # --metadata flag (a second --metadata overwrites the first); enable-oslogin goes first so the
+        # multi-line ssh-keys value stays last.
+        extra_parts.append(shlex.quote(f"--metadata=enable-oslogin=FALSE,ssh-keys={metadata_value}"))
 
     raw_extra = gcp_config.get("extra_gcloud_args", "")
     if raw_extra:
