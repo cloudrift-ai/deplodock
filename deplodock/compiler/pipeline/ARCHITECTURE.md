@@ -296,7 +296,12 @@ Variant ranking is a single `Prior` over `knob.knob_features` (`search/prior/`):
 frontier. The `Prior` is the hand-coded `AnalyticPrior` cold (a fixed linear model over the engineered `D_*`
 geometry / occupancy features — the cold path is ranked by a real heuristic *score*, not emission order; the
 masked tier rides its own `_W_A_DYN` weight set keyed on `S_ext_n_symbolic_axis`) and the learned
-`CatBoostPrior` once trained, composed behind `FallbackPrior` (`load_prior`). There is ONE ranking path: the old per-variant `Op.lazy_score` /
+`CatBoostPrior` once trained, composed behind `FallbackPrior` (`load_prior`). One gated term sits OUTSIDE the
+fit weights — `AnalyticPrior.score` rewards `NOATOMIC` (atomic-free split-K) once the split count `SPLITK`
+reaches `atomic_free_split_threshold` (default 4) and penalizes it below, via the `af_on · (±1)` interaction a
+plain linear weight can't express (the workspace + reduce wins on wide splits, the `atomicAdd` fast-path on
+narrow ones — see `plans/atomic-free-monoid-combine.md`). Hardcoded `__init__` params, not fit; the
+`CatBoostPrior` takes over once real atomic-vs-free `H_opt=3` rows exist. There is ONE ranking path: the old per-variant `Op.lazy_score` /
 `TileOp.score_tile_geometry` formula, the `Fork.score` / `Search.score_of` plumbing, AND the `_priority_*`
 enumeration sort that ranked the cold path were all removed — nothing materializes or scores a TileOp just to
 rank it; the prior featurizes the row knobs directly.

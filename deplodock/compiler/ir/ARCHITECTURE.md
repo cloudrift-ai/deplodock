@@ -144,6 +144,20 @@ not as loose body statements, so the online-algorithm gates (`accums_independent
 / `defines()` return `state`; `deps()` / `partial_deps()` return `partial` (the
 carried read is implicit, like `Accum` / `Mma`).
 
+Two extra fields carry the **state-merges-state** form the cross-partition combine
+needs (cooperative-tree / split-KV / split-K cross-CTA reduce, where each partition
+holds a complete state rather than a raw partial — see
+`plans/atomic-free-monoid-combine.md`): `state_b` (the second-operand state names,
+defaulting to `"<s>__o"` per component) and `combine_states` (an `Assign` program
+that reads the old `state` + the `state_b` state and reassigns the merged state).
+For an **additive** carrier whose partial lifts to a state (`len(partial) ==
+len(state)`) the two coincide, so `__post_init__` auto-derives `combine_states`
+from `merge` (partial reads swapped for `state_b`); an asymmetric monoid (flash's
+LSE) authors both (`flash_combine`). `as_state_merge(other)` returns a one-shot
+`Combine` whose `merge` IS `combine_states` with `state_b` renamed to `other`, so a
+two-partition merge renders through the same machinery as a streaming step (see
+`tests/compiler/ir/test_combine_forward.py::test_combine_states_two_partition_matches_numpy`).
+
 `Combine.render` emits the `merge` program in fp32: each `Assign` targeting a
 `state` name is a reassignment of the carried value (declared by an enclosing
 `Init`); every other `Assign` declares a local temp. Statement order is

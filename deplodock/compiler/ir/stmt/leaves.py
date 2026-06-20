@@ -627,6 +627,14 @@ class Mma(ReduceCarrier):
         )
 
 
+def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
+    """Return ``a`` with each read in ``args`` remapped through ``sub`` (the
+    target ``name`` is left alone — only the reads move). Used to retarget a
+    ``merge`` / ``combine_states`` step's right operand (partial → second
+    state, or one state-name set → another)."""
+    return Assign(name=a.name, op=a.op, args=tuple(sub.get(x, x) for x in a.args), dtype=a.dtype)
+
+
 @dataclass(frozen=True)
 class Combine(ReduceCarrier):
     """A loop-carried **monoid** combine — a general associative reduce over
@@ -652,6 +660,18 @@ class Combine(ReduceCarrier):
     - ``identity`` — the monoid's neutral element, one ``Expr`` per state
       component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
       cooperative-combine reductions read it to seed their partial accumulators).
+    - ``combine_states`` — the **state-merges-state** form of the monoid op: a
+      program (like ``merge``) that reads the OLD state + a SECOND full state
+      (named by ``state_b``) and reassigns the merged state. ``merge`` folds a
+      *partial* into the state (the streaming reduce); ``combine_states`` merges
+      two *fully-reduced* partition states — the form the cross-partition combine
+      needs (cooperative-tree / split-KV / split-K cross-CTA reduce), where each
+      partition holds a complete state, not a raw partial. For an **additive**
+      carrier whose partial lifts to a state (``len(partial) == len(state)``) the
+      two coincide, so ``combine_states`` is auto-derived from ``merge`` by
+      substituting the partial reads with ``state_b``; an asymmetric monoid
+      (flash's LSE) must author both. ``state_b`` defaults to ``"<s>__o"`` per
+      state component when not given.
     - ``commutative`` — whether the operation also commutes (split-KV legality);
       ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
       monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
@@ -679,6 +699,47 @@ class Combine(ReduceCarrier):
     identity: tuple[Expr, ...] = ()
     commutative: bool = True
     axes: tuple[str, ...] = ()
+    state_b: tuple[str, ...] = ()
+    combine_states: tuple[Assign, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Default the second-operand state names ("<s>__o") so a carrier built
+        # with only ``state`` / ``partial`` / ``merge`` still has a complete
+        # cross-partition surface. ``object.__setattr__`` — the dataclass is frozen.
+        if not self.state_b:
+            object.__setattr__(self, "state_b", tuple(f"{s}__o" for s in self.state))
+        # Auto-derive ``combine_states`` from ``merge`` for an additive carrier
+        # (the partial lifts to a state, one component each): substitute the
+        # partial reads with the second-operand state names. An asymmetric monoid
+        # (different partial / state arity, e.g. flash LSE) must author it.
+        if not self.combine_states and len(self.partial) == len(self.state):
+            sub = dict(zip(self.partial, self.state_b, strict=True))
+            object.__setattr__(
+                self,
+                "combine_states",
+                tuple(_rename_assign_args(a, sub) for a in self.merge),
+            )
+
+    def as_state_merge(self, other: tuple[str, ...]) -> Combine:
+        """Return a one-shot ``Combine`` that merges this carrier's ``state`` with
+        a second fully-reduced state named ``other`` (the cross-partition
+        combine's right operand). The returned carrier's ``merge`` IS
+        ``combine_states`` with ``state_b`` renamed to ``other`` and its
+        ``partial`` set to ``other`` — so the cooperative-tree / cross-CTA reduce
+        renders the state-merge through the same machinery as a streaming step.
+        """
+        sub = dict(zip(self.state_b, other, strict=True))
+        merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
+        return Combine(
+            state=self.state,
+            partial=other,
+            merge=merged,
+            identity=self.identity,
+            commutative=self.commutative,
+            axes=self.axes,
+            state_b=other,
+            combine_states=merged,
+        )
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit

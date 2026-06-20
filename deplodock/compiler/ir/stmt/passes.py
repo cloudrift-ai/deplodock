@@ -146,11 +146,14 @@ def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         partial=tuple(rename(n) for n in s.partial),
         # The merge program references state / partial (mapped) + internal temps
         # (not in the rename map → pass through), so rewriting each step keeps it
-        # consistent with the renamed surface.
+        # consistent with the renamed surface. The combine_states program is the
+        # state-merges-state form — its second operand (state_b) is renamed too.
         merge=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.merge),
         identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,
         axes=new_axes,
+        state_b=tuple(rename(n) for n in s.state_b),
+        combine_states=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.combine_states),
     )
 
 

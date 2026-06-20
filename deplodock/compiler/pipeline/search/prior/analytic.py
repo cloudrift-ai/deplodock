@@ -150,6 +150,8 @@ class AnalyticPrior(Prior):
         weights: dict[str, float] | None = None,
         weights_dynamic: dict[str, float] | None = None,
         scale: float = 0.1,
+        atomic_free_split_threshold: float = 4.0,
+        atomic_free_weight: float = 5.0,
     ) -> None:
         super().__init__()
         self._w = weights if weights is not None else _W_A
@@ -157,6 +159,12 @@ class AnalyticPrior(Prior):
         # exp() argument scale — keeps the proxy in a finite, sane range; does not
         # affect ranking (monotone), only the proxy's magnitude.
         self._scale = scale
+        # Atomic-free split-K preference (see plans/atomic-free-monoid-combine.md).
+        # Hardcoded — NOT fit into ``_W_A`` (a plain linear weight can't express the
+        # "good when split wide, bad when split narrow" interaction). The learned
+        # CatBoostPrior takes over once real atomic-vs-free ``H_opt=3`` rows exist.
+        self._atomic_free_split_threshold = atomic_free_split_threshold
+        self._atomic_free_weight = atomic_free_weight
 
     @property
     def fitted(self) -> bool:
@@ -182,6 +190,17 @@ class AnalyticPrior(Prior):
         feats = knob.knob_features(knobs)
         w_set = self._w_dyn if feats.get("S_ext_n_symbolic_axis", 0.0) > 0 else self._w
         quality = sum(w * feats.get(k, 0.0) for k, w in w_set.items())
+        # Atomic-free split-K gate (local term — see __init__). ``NOATOMIC`` is the
+        # canonical knob name of ``ATOMIC_FREE_SPLITK`` (1 when the workspace fork is
+        # on). The ``af_on · (±1)`` product is the interaction a plain weight can't
+        # express: above the split threshold REWARD atomic-free (higher quality →
+        # lower latency proxy), below it PENALIZE so a narrow split keeps the cheap
+        # atomicAdd fast-path. NOATOMIC=False scores zero either way (af_on = 0), so
+        # the atomic path keeps its geometry-driven rank.
+        af_on = feats.get("NOATOMIC", 0.0)
+        if af_on:
+            many_splits = feats.get("SPLITK", 1.0) >= self._atomic_free_split_threshold
+            quality += self._atomic_free_weight * af_on * (1.0 if many_splits else -1.0)
         return math.exp(-self._scale * max(min(quality, 80.0), -80.0))
 
     def mean_score(self, knobs: dict) -> float:
