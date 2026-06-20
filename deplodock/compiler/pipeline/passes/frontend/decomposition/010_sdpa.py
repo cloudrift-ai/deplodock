@@ -12,7 +12,7 @@ from deplodock.compiler.ir.base import ConstantOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
 from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
-from deplodock.compiler.pipeline import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
@@ -21,6 +21,7 @@ from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
     open_fragment,
     softmax_decompose,
 )
+from deplodock.compiler.pipeline.passes.loop.lifting._flash import flash_enabled, flash_shape_eligible
 
 PATTERN = [Pattern("root", SdpaOp)]
 
@@ -54,6 +55,14 @@ def rewrite(match: Match, root: Node, inp_q: Node, inp_k: Node, inp_v: Node, inp
     q_shape = inp_q.output.shape
     k_shape = inp_k.output.shape
     v_shape = inp_v.output.shape
+
+    # Defer to the loop/lifting flash pass (015_lift_sdpa_flash) when FLASH is on
+    # and the shape is flash-eligible: leave the SdpaOp intact so the LoopOp is
+    # built in the loop dialect, not synthesized here. Both sites share the one
+    # eligibility predicate so the decision can't drift (an ineligible SDPA —
+    # mask / GQA — is decomposed here as usual).
+    if flash_enabled() and flash_shape_eligible(q_shape, k_shape, v_shape, has_mask=inp_mask is not None):
+        raise RuleSkipped("SDPA deferred to loop/lifting flash (FLASH on)")
     dtype, name = out.dtype, out.name
 
     head_dim = q_shape[-1] if len(q_shape) >= 2 else 64

@@ -1,9 +1,10 @@
 """Flash-attention decomposition of ``SdpaOp`` — GPU parity vs torch SDPA.
 
-The ``FLASH`` structural-fork knob (``frontend/decomposition/008_sdpa_flash.py``)
-fuses scaled-dot-product attention into a single streaming online-softmax kernel
-(the ``FlashCombine`` carrier) instead of the score-materializing ``010_sdpa``
-path. These tests pin: (1) with ``FLASH`` on, one fused kernel is emitted and it
+The ``FLASH`` knob (loop-lifting pass ``loop/lifting/015_lift_sdpa_flash``, with
+``frontend/decomposition/010_sdpa`` deferring the intact ``SdpaOp`` to it) fuses
+scaled-dot-product attention into a single streaming online-softmax kernel (the
+``FlashCombine`` carrier) instead of the score-materializing ``010_sdpa`` path.
+These tests pin: (1) with ``FLASH`` on, one fused kernel is emitted and it
 matches torch SDPA on the GPU; (2) with ``FLASH`` off, the fork falls through to
 the multi-kernel decomposition (default unchanged). Covers static + dynamic
 (symbolic ``seq_len``) and causal / non-causal — the scalar-tier flash from
