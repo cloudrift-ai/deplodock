@@ -2,6 +2,7 @@
 
 import pytest
 
+from deplodock.hardware import GPU_GCP_ZONES
 from deplodock.provisioning.candidates import VmCandidate, iter_candidates
 
 
@@ -31,16 +32,16 @@ def test_iter_candidates_h200_default_picks_cloudrift_first():
     assert cands[0].provider == "cloudrift"
     assert cands[0].instance_type == "h200-8-generic.8"
     gcp_cands = [c for c in cands if c.provider == "gcp"]
-    assert len(gcp_cands) == 2
-    assert {c.zone for c in gcp_cands} == {"europe-west1-b", "europe-west4-a"}
+    h200_zones = GPU_GCP_ZONES["NVIDIA H200 141GB"]
+    assert len(gcp_cands) == len(h200_zones)  # one per zone
+    assert [c.zone for c in gcp_cands] == h200_zones
 
 
 def test_iter_candidates_provider_filter_restricts_to_gcp():
     """--provider gcp must drop CloudRift entries even when listed first."""
     cands = iter_candidates("NVIDIA H200 141GB", 8, provider="gcp")
     assert {c.provider for c in cands} == {"gcp"}
-    assert len(cands) == 2  # one per zone
-    assert [c.zone for c in cands] == ["europe-west1-b", "europe-west4-a"]
+    assert [c.zone for c in cands] == GPU_GCP_ZONES["NVIDIA H200 141GB"]  # one per zone
 
 
 def test_iter_candidates_provider_filter_unavailable_raises():
@@ -53,7 +54,7 @@ def test_iter_candidates_gcp_b200_iterates_zones_before_advancing():
     """GCP B200 has multiple zones for the same machine type; zones come first in iteration."""
     cands = iter_candidates("NVIDIA B200", 8, provider=None)
     assert {c.provider for c in cands} == {"gcp"}
-    assert [c.zone for c in cands] == ["asia-southeast1-b", "asia-northeast1-b"]
+    assert [c.zone for c in cands] == GPU_GCP_ZONES["NVIDIA B200"]
     assert all(c.instance_type == "a4-highgpu-8g" for c in cands)
 
 
