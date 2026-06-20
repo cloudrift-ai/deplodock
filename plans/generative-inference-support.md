@@ -1,6 +1,11 @@
 # Generative (chat) inference for deplodock
 
-> Status: **design / scoping doc. Not yet implemented.** Goal: serve a decoder-only chat model (Qwen3 / Llama-3)
+> Status: **Phases 0–4 implemented** on branch `feature/generative-inference` (this doc is the design spec they
+> followed). A chat model runs through deplodock-compiled kernels: `deplodock generate` is **token-for-token identical
+> to HF eager** on TinyLlama-1.1B, and `deplodock serve --generate` (the vLLM plugin) is **decode-validated** in-proc.
+> **Correctness is complete; perf hardening remains** — the device zero-copy interleave (the host-sync numpy I/O at the
+> seam is functional but slow) + decode-shaped tuning (Phase 5). See **Implementation status** below. Goal: serve a
+> decoder-only chat model (Qwen3 / Llama-3)
 > through deplodock-compiled kernels, with **vLLM owning the API / sampler / scheduler / KV-cache / chat template**
 > first; a deplodock-standalone server later. **Independent of the W4A16 quantization work on its own branch** — this
 > plan runs the **unquantized fp16 path** (fp16 is a dtype, not quantization: the embedding serving runner already binds
@@ -10,6 +15,27 @@
 >
 > Detail is front-loaded on **Phases 0–4 (to a first working vLLM chat)**; standalone serving + perf are a future-work
 > coda.
+
+## Implementation status
+
+**Phases 0–4 implemented and verified** (branch `feature/generative-inference`):
+
+- **Phase 0 ✅** — `deplodock generate <model>` standalone oracle (`commands/generate.py`, `serving/sampling.py`).
+  Token-for-token identical to HF eager greedy on **TinyLlama-1.1B-Chat** (real weights).
+- **Phase 1 ✅** — `build_attention_split_wrapper` carve (`trace/huggingface.py`). Eager-equivalent to `block(x)` for
+  Qwen3 (GQA + q/k norm) and Llama; dynamic-compiled and run at multiple token counts.
+- **Phase 2 ✅** — `DeplodockGenRunner` (`serving/gen_runner.py`), two per-layer programs. Multi-layer host stitch
+  (deplodock kernels + reference SDPA) == eager logits.
+- **Phase 3 ✅** — `DeplodockGenModel` vLLM plugin (`serving/vllm_model_gen.py`) + `serve --generate`. In-process vLLM
+  engine, greedy decode token-for-token vs HF eager on a tiny Llama.
+- **Phase 4 ◑** — flattened-width bound enforced (`serve` caps `--max-num-batched-tokens` at `DYNAMIC_DIM_MAX`);
+  prefill + decode exercised. **Remaining is perf**: the device zero-copy interleave (the numpy host I/O at the seam is
+  functional but slow) + Phase-5 decode-shaped golden tuning + bench vs stock vLLM.
+
+**Known limits:** full-causal attention only (sliding-window / per-layer-sliding / dual-chunk configs are **rejected**,
+not miscomputed), fp16, TP=1; `serve` compiles **2× n_layers** programs, so startup + memory scale with depth (small
+models for now). The in-graph `slice_last_logits` lm_head optimization stays **off** (cold M=1-matmul lowering gap,
+tracked by an xfail tripwire); `generate` uses full logits + a host slice.
 
 ## Context
 

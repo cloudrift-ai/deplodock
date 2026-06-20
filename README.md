@@ -189,6 +189,25 @@ deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32 --stock
 See [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md); embedding recipes
 (`recipes/Qwen3-Embedding-*`) A/B this against stock vLLM via `deplodock bench`.
 
+## Generate (chat) — experimental
+
+```bash
+# Standalone generation oracle (no vLLM) — re-runs the whole prefix each step, O(S²); the
+# token-for-token reference (matches HF eager greedy, e.g. on TinyLlama-1.1B-Chat).
+deplodock generate TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "The capital of France is" --max-new-tokens 10
+
+# Serve a chat model through deplodock-compiled per-layer kernels (vLLM owns the OpenAI API /
+# sampler / scheduler / paged KV-cache / lm_head; deplodock owns embed + the trunk).
+deplodock serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","messages":[{"role":"user","content":"Hi"}]}'
+```
+
+**Status:** correctness complete for decoder-only **Llama / Qwen3** (full-causal, fp16, TP=1). Perf is **not yet
+hardened** — host-sync interleave at the per-layer seam, and `serve` compiles 2× n_layers programs (startup- and
+memory-heavy → small models for now). Design + phase status:
+[`plans/generative-inference-support.md`](plans/generative-inference-support.md).
+
 ## Recipe
 
 ```yaml
