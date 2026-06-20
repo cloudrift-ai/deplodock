@@ -24,7 +24,7 @@ def test_generate_greedy_follows_logits_fn():
     def logits_fn(ids):
         return _onehot((ids[-1] + 1) % 16)
 
-    out = generate(logits_fn, [3], max_new_tokens=4, eos_id=None, sampler=Sampler())
+    out = generate(logits_fn, [3], max_new_tokens=4, eos_ids=None, sampler=Sampler())
     assert out == [4, 5, 6, 7]
 
 
@@ -32,15 +32,23 @@ def test_generate_stops_at_eos():
     def logits_fn(ids):
         return _onehot(2)  # always emit token 2
 
-    out = generate(logits_fn, [0], max_new_tokens=10, eos_id=2, sampler=Sampler())
+    out = generate(logits_fn, [0], max_new_tokens=10, eos_ids={2}, sampler=Sampler())
     assert out == [2]  # stops immediately after emitting EOS
+
+
+def test_generate_stops_at_any_eos_in_set():
+    def logits_fn(ids):
+        return _onehot(5)  # 5 is one of several terminators
+
+    out = generate(logits_fn, [0], max_new_tokens=10, eos_ids={2, 5, 7}, sampler=Sampler())
+    assert out == [5]
 
 
 def test_generate_respects_max_new_tokens():
     def logits_fn(ids):
         return _onehot(5)
 
-    out = generate(logits_fn, [0], max_new_tokens=3, eos_id=999, sampler=Sampler())
+    out = generate(logits_fn, [0], max_new_tokens=3, eos_ids={999}, sampler=Sampler())
     assert out == [5, 5, 5]
 
 
@@ -51,7 +59,7 @@ def test_generate_feeds_growing_prefix():
         seen_lengths.append(len(ids))
         return _onehot(1)
 
-    generate(logits_fn, [0, 0], max_new_tokens=3, eos_id=None, sampler=Sampler())
+    generate(logits_fn, [0, 0], max_new_tokens=3, eos_ids=None, sampler=Sampler())
     # prompt len 2, then one appended token per step: 2, 3, 4
     assert seen_lengths == [2, 3, 4]
 

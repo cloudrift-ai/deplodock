@@ -32,11 +32,12 @@ def register_generate_command(subparsers):
     parser.set_defaults(func=handle_generate)
 
 
-def generate(logits_fn, prompt_ids, *, max_new_tokens, eos_id, sampler):
+def generate(logits_fn, prompt_ids, *, max_new_tokens, eos_ids, sampler):
     """Pure host generate loop. ``logits_fn(ids: list[int]) -> np.ndarray`` returns the
     next-token logits ``[vocab]`` for the given prefix; ``sampler(logits) -> int`` picks a
-    token. Appends each sampled token and re-feeds the grown prefix, stopping at ``eos_id``
-    or after ``max_new_tokens``. Returns the generated token ids (excluding the prompt)."""
+    token. Appends each sampled token and re-feeds the grown prefix, stopping when the
+    sampled token is in ``eos_ids`` (a collection, or ``None`` to disable) or after
+    ``max_new_tokens``. Returns the generated token ids (excluding the prompt)."""
     ids = list(prompt_ids)
     generated: list[int] = []
     for _ in range(max_new_tokens):
@@ -44,9 +45,30 @@ def generate(logits_fn, prompt_ids, *, max_new_tokens, eos_id, sampler):
         token = sampler(logits)
         generated.append(token)
         ids.append(token)
-        if eos_id is not None and token == eos_id:
+        if eos_ids and token in eos_ids:
             break
     return generated
+
+
+def _resolve_eos_ids(tokenizer, model_id) -> set[int]:
+    """Collect every end-of-sequence id: the tokenizer's ``eos_token_id`` plus the model's
+    ``generation_config.eos_token_id`` (which may be a list — e.g. Llama-3's multiple
+    terminators). Stopping on any of them matches ``model.generate``."""
+    ids: set[int] = set()
+    tok_eos = getattr(tokenizer, "eos_token_id", None)
+    if tok_eos is not None:
+        ids.add(int(tok_eos))
+    try:
+        from transformers import GenerationConfig
+
+        eos = GenerationConfig.from_pretrained(model_id).eos_token_id
+        if isinstance(eos, int):
+            ids.add(eos)
+        elif eos:
+            ids.update(int(e) for e in eos)
+    except Exception:  # noqa: BLE001 — no generation_config is fine; tokenizer eos still applies
+        pass
+    return ids
 
 
 def handle_generate(args):
@@ -56,19 +78,31 @@ def handle_generate(args):
         logger.error("torch and transformers are required: pip install torch transformers")
         sys.exit(1)
 
+    from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
     from deplodock.serving.sampling import Sampler, apply_chat_template
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    lm = _CompiledLM.create(args.model, seq_len=args.seq_len)
 
     prompt_ids = apply_chat_template(tokenizer, args.prompt) if args.chat else tokenizer.encode(args.prompt)
+    if not prompt_ids:
+        logger.error("empty prompt produced no tokens")
+        sys.exit(1)
+    if len(prompt_ids) >= DYNAMIC_DIM_MAX:
+        logger.error("prompt length %d exceeds DYNAMIC_DIM_MAX (%d)", len(prompt_ids), DYNAMIC_DIM_MAX)
+        sys.exit(1)
+    # Cap so the growing prefix never exceeds the dynamic-dim / RoPE-buffer limit.
+    budget = DYNAMIC_DIM_MAX - len(prompt_ids)
+    if args.max_new_tokens > budget:
+        logger.warning("clamping --max-new-tokens %d → %d (DYNAMIC_DIM_MAX=%d)", args.max_new_tokens, budget, DYNAMIC_DIM_MAX)
+
+    lm = _CompiledLM.create(args.model, seq_len=args.seq_len)
     sampler = Sampler(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, seed=args.seed)
 
     generated = generate(
         lm.logits,
         prompt_ids,
-        max_new_tokens=args.max_new_tokens,
-        eos_id=tokenizer.eos_token_id,
+        max_new_tokens=min(args.max_new_tokens, budget),
+        eos_ids=_resolve_eos_ids(tokenizer, args.model),
         sampler=sampler,
     )
     print(tokenizer.decode(generated, skip_special_tokens=True))
@@ -173,8 +207,11 @@ class _CompiledLM:
         import numpy as np
 
         from deplodock.compiler.backend.gpu_lock import gpu_lock
+        from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 
         s = len(token_ids)
+        if not 0 < s <= DYNAMIC_DIM_MAX:
+            raise ValueError(f"prefix length {s} must be in 1..{DYNAMIC_DIM_MAX} (DYNAMIC_DIM_MAX)")
         feed = _step_feed(self._ids_name, self._mask_name, self._pos_name, np.dtype("float16"), list(token_ids))
         with gpu_lock():
             self._program.rebind(feed)  # resolves seq_len from the input shapes

@@ -43,10 +43,12 @@ def test_generate_oracle_matches_eager_fp16():
 
     from deplodock.commands.generate import _CompiledLM
 
-    model = _tiny_llama()
-    lm = _CompiledLM.from_model(model, seq_len=8)
-
-    ref = model.to("cuda").eval()
+    # IMPORTANT: build_full_model_wrapper mutates the model in place (replaces rotary_emb
+    # with _SlicedRotary, patches the causal-mask builder). Compare against an INDEPENDENT,
+    # untouched model (same seed → identical weights, but HF's real rotary) so a wrapper/RoPE
+    # bug can't hide by corrupting both sides.
+    lm = _CompiledLM.from_model(_tiny_llama(), seq_len=8)
+    ref = _tiny_llama().to("cuda").eval()
 
     prefixes = [[1, 2, 3], [1, 2, 3, 4], [5, 6, 7, 8, 9, 10]]
     for prefix in prefixes:
@@ -103,6 +105,6 @@ def test_generate_loop_runs_end_to_end():
     from deplodock.serving.sampling import Sampler
 
     lm = _CompiledLM.from_model(_tiny_llama(), seq_len=8)
-    out = generate(lm.logits, [1, 2, 3], max_new_tokens=5, eos_id=None, sampler=Sampler())
+    out = generate(lm.logits, [1, 2, 3], max_new_tokens=5, eos_ids=None, sampler=Sampler())
     assert len(out) == 5
     assert all(0 <= t < 64 for t in out)
