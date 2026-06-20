@@ -218,7 +218,15 @@ Wire Phase 2's runner into a vLLM generative model.
   `static_forward_context` / cache-spec discovery by it and rejects duplicates (the default empty prefix collides on the
   second layer), so derive `f"{prefix}.layers.{i}.self_attn.attn"` from the model's own `prefix`, and pass the
   version-pinned config args (`cache_config` / `quant_config` off `vllm_config`). Test that vLLM discovers one KV-cache
-  spec per layer. **Split ownership (settled):** the **deplodock runner owns the
+  spec per layer. **Dtype coherence (force fp16 across the seam):** vLLM owns `Attention` / the KV cache / `lm_head`
+  and defaults to `--dtype auto` → **bf16** for a bf16 checkpoint, but the deplodock trunk emits **fp16** q/k/v + hidden
+  — a mismatch at every seam. The generative `serve` branch **forces `--dtype float16`** (so vLLM's `Attention`,
+  KV-cache dtype, and `lm_head` all init fp16) and rejects an incompatible `--dtype` override. **RoPE is NOT in
+  `Attention`:** a bare vLLM `Attention` does paged attention only (stock `Qwen3Attention` builds RoPE separately via
+  `get_rope`, then calls it before `self.attn`), so `DeplodockGenModel` constructs its own RoPE via
+  `get_rope(head_dim, rotary_dim, max_position, rope_parameters=…)` from the HF config (theta + any rope-scaling) — one
+  shared module across layers (RoPE is position-only). Test Qwen3 + Llama-3 RoPE vs stock vLLM. **Split ownership
+  (settled):** the **deplodock runner owns the
   embedding + the whole trunk** (bound into its constants); **vLLM owns only `lm_head`** (loaded via `load_weights`). So
   `load_weights` claims just `lm_head.*` and returns ~empty for the trunk (same trick as `DeplodockEmbedModel`) — get
   this set exactly right or vLLM rejects the model on its strict all-params-initialized check. **Tied embeddings
@@ -228,7 +236,7 @@ Wire Phase 2's runner into a vLLM generative model.
   trunk, so the tied case **duplicates** the matrix (one extra copy, simplest); sharing is a later optimization.
   - `forward(input_ids, positions, …)` over flattened `[num_tokens]`: `hidden = runner.embed(ids)`; per layer:
     `residual = hidden`; `q,k,v = runner.forward_layer_pre(L, hidden, positions)`;
-    `q,k = self.rotary_emb[L](positions, q, k)` (A2); `attn_out = self.attn[L](q,k,v)` (vLLM paged attention; pulls
+    `q,k = self.rotary_emb(positions, q, k)` (A2, the shared RoPE module above); `attn_out = self.attn[L](q,k,v)` (pulls
     `attn_metadata` from the forward-context global); `hidden = runner.forward_layer_post(L, attn_out, residual)`. Two
     deplodock replays per layer (`pre`, `post`) bracket the vLLM attention call. Final norm in runner. Return
     `hidden[num_tokens, H]`.
@@ -238,8 +246,9 @@ Wire Phase 2's runner into a vLLM generative model.
 - **Register:** add `ModelRegistry.register_model("DeplodockGenModel", "deplodock.serving.vllm_model_gen:DeplodockGenModel")`
   in `serving/__init__.py::register` (the `vllm.general_plugins` entry point already exists). Select via
   `--hf-overrides '{"architectures":["DeplodockGenModel"]}'`.
-- **Modify:** `commands/serve.py` — generative branch (`--runner generate` not `pooling`, gen arch override, keep
-  `--enforce-eager`), reusing the flag-split / forward plumbing.
+- **Modify:** `commands/serve.py` — generative branch (`--runner generate` not `pooling`, gen arch override, **force
+  `--dtype float16`** for coherence + reject incompatible `--dtype`, keep `--enforce-eager`), reusing the flag-split
+  / forward plumbing.
 - **Dropped (embedding-specific):** `IsAttentionFree`, `DispatchPooler`, `packed.split_spans`, `attn_type="encoder_only"`,
   the `_mask` / `_causal_mask_np` causal-mask machinery (vLLM's paged attention owns masking now).
 - **Verify (two tiers — HTTP can't expose full logits):** (1) **endpoint smoke** — `vllm serve <model> --runner
@@ -341,6 +350,12 @@ that is backend work, see Phase 2), `loader/binder.py` (`bind_constants`, fp16 c
 9. **Program-count memory blow-up** — 2 × n_layers persistent `CompiledProgram`s, each with capacity-sized buffers + a
    pinned scratch slab + a 64-entry graph cache, can cost several GB of workspace and thousands of cached graphs.
    Memory-budget spike early (Phase 2); share scratch across layer programs and/or cap the global graph cache.
+10. **Seam dtype coherence** — the deplodock trunk runs **fp16** but vLLM defaults to `--dtype auto` → **bf16** for a
+    bf16 checkpoint, so vLLM's `Attention` / KV cache / `lm_head` would mismatch the fp16 q/k/v + hidden at every seam.
+    The generative `serve` branch forces `--dtype float16` and rejects incompatible overrides.
+11. **RoPE not provided by `Attention`** — a bare vLLM `Attention` is paged-attention only; `DeplodockGenModel` must
+    build its own `get_rope(...)` module (theta + rope-scaling from the HF config) and apply it before `self.attn` (A2).
+    Test Qwen3 + Llama-3 against stock vLLM.
 
 ## End-to-end verification
 
