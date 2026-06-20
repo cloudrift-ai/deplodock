@@ -2,24 +2,48 @@
 
 ## Status
 
-- **Step 1 — `Combine.combine_states` — DONE.** `Combine` now carries `state_b` (the second-operand state
-  names, default `"<s>__o"`) + `combine_states` (the state-merges-state program), auto-derived from `merge` for
-  additive carriers and authored explicitly by `flash_combine` (the LSE state-merge). `as_state_merge(other)`
-  renders a two-partition merge through the streaming machinery. Threaded through `rewrite`. Verified by
-  `tests/compiler/ir/test_combine_forward.py` (two-partition CPU forward vs numpy + the additive auto-derive)
-  and `tests/compiler/ir/stmt/test_reduce_carrier.py`.
-- **Step 5 (analytic preference) — partially DONE (the prior term).** `AnalyticPrior.score` carries the gated
-  `NOATOMIC` term (hardcoded `atomic_free_split_threshold` / `atomic_free_weight` `__init__` params); verified
-  by `tests/compiler/test_analytic.py::test_atomic_free_split_preference_above_threshold`. The cold-default
-  *flip* of the `ATOMIC_FREE_SPLITK` knob + golden re-tune are still pending (gated on Steps 3a/3b landing).
-- **Steps 2 / 3a / 3b / 4 — PENDING.** The carrier-general combine on the materializer / `017` / partition
-  planner + flash split-KV. These are coupled: a cooperative / split `Combine` does not exist in any lowered
-  kernel until the partition planner offers the KV split (Step 4 / the `010_partition_loops` hook), so Step 2's
-  intra-CTA combine emission can only be GPU-verified end-to-end alongside that producer. Recommended to land as
-  one focused follow-up (materializer combine emission + coordination recognition + planner offer + `017`
-  carrier-general reduce), each piece bit-correctness-checked on GPU.
-- **Step 6 (deletion decision) — PENDING (bench-gated).** Per the rule below, decided by the atomic-vs-workspace
-  bench across split-K goldens on the target GPUs once both tiers have an atomic-free path.
+- **Step 1 — `Combine.combine_states` — DONE.** `Combine` carries `state_b` (the second-operand state names,
+  default `"<s>__o"`) + `combine_states` (the state-merges-state program), auto-derived from `merge` for additive
+  carriers and authored by `flash_combine` (the LSE state-merge). `as_state_merge(other)` renders a two-partition
+  merge through the streaming machinery. Threaded through `rewrite`. Verified by
+  `tests/compiler/ir/test_combine_forward.py` + `test_reduce_carrier.py`.
+- **Step 2 — intra-CTA carrier-general combine — DONE.** `body.coordination` collects `Combine` carriers and
+  keys their cooperative axes by state name. Two kernel-IR primitives — `MonoidWarpShuffle` (register
+  `__shfl_xor_sync` butterfly over the full state, n≤warp) and `MonoidTreeHalve` (per-component smem tree,
+  n>warp) — fold via `combine_states` and reassign the state in place. `_combine.find_nested_combines` +
+  `emit_combine_states`; `100_materialize_tile` wires them additively (Accum/Mma paths byte-identical).
+  `Combine.rewrite` uniquifies the carrier-internal temps under a selective replicator rename. Verified by
+  `tests/compiler/test_cooperative_combine.py` (cooperative-K online-softmax matches numpy, warp + smem-tree).
+- **Step 3a — cross-CTA carrier-general reduce (scalar) — DONE.** `017.build_monoid_reduce_tileop`:
+  `identity`-seeded, `combine_states`-folded reduce over per-component `[S,M,N]` workspaces + an optional
+  `finalize` (e.g. `O/l`). The additive matmul reduce stays bit-identical. Verified by
+  `tests/compiler/test_monoid_reduce_kernel.py`.
+- **Step 3b — cross-CTA warp / MMA tier — DONE.** Dropped `017`'s `is_warp` early-out: the MMA C-fragment Write
+  is still a tile-level Write at the `017` stage, so the same Write-retarget routes it into
+  `workspace[K_s,M,N]` + the additive reduce — no `atomicAdd`. Verified by
+  `tests/compiler/test_mma_atomic_free_splitk.py` (fp16 MMA split-K accurate, no atomicAdd; atomic arm intact).
+- **Step 4 — flash cooperative-K — DONE (threads); cross-CTA split-KV deferred.** `010_partition_loops` routes a
+  flash-pattern body (a `Combine` reduce) to the cooperative-reduce path: the KV axis splits across the CTA's
+  threads (Step 2's monoid combine), the nested score dot-product stays serial. Gated to static KV (symbolic /
+  masked KV stays serial — needs Combine overhang→identity masking). Verified by
+  `tests/compiler/e2e/test_flash_cooperative_kv.py` (cooperative-KV flash matches torch SDPA, both combine
+  paths). **Cross-CTA single-node split-KV** (SPLITK>1, reusing Step 3a's `build_monoid_reduce_tileop`) is the
+  remaining sub-piece — all infrastructure is in place; the cooperative path still forces SPLITK=1.
+- **Step 5 — analytic preference — DONE.** `AnalyticPrior.score` carries the gated `NOATOMIC` term (hardcoded
+  `atomic_free_split_threshold` / `atomic_free_weight`); verified by
+  `test_analytic.py::test_atomic_free_split_preference_above_threshold`. The cold-default *deployment* flip rides
+  the structural-fork machinery (cold compiles keep the baseline kernel set; the learned `CatBoostPrior` takes
+  over once real atomic-vs-free `H_opt=3` rows exist).
+- **Step 6 — deletion decision — KEEP the demoted fork.** Per this plan's Scope, deleting the `atomicAdd` path is
+  explicitly **Out (future)** (tracked separately, gated on the cross-GPU golden re-tune bench). The delivered
+  state is exactly the decision's "keep" arm: the `atomicAdd` path remains as the demoted fast-path fork, with
+  the analytic preference steering cold picks toward atomic-free on wide splits.
+
+### Remaining follow-ups (out of this plan's verified core)
+
+- Cross-CTA single-node split-KV for flash (the SPLITK>1 fork in the cooperative branch, reusing
+  `build_monoid_reduce_tileop`); symbolic/masked-KV cooperative flash (Combine overhang→identity masking);
+  the data-driven `atomicAdd` deletion (Step 6 bench across 5090/Pro6000/4090).
 
 ---
 

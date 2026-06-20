@@ -9,6 +9,15 @@ uses to locate the Accums and the combine's tid var + thread count
 (the whole CTA in the BN=BM=1 form, or each row's BR-lane segment when
 free-axis threads ride alongside — strided-cooperative rows).
 
+The general monoid ``Combine`` carrier (flash online-softmax) gets the
+tuple-valued counterparts: ``find_nested_combines`` locates the carriers and
+``emit_combine_states`` emits a multi-component cross-thread fold —
+``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the full
+state, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, > warp), both
+folding via the carrier's ``combine_states`` and reassigning the state in place
+(no ``_b`` rename, since the butterfly / tree leaves every thread holding the
+full reduction in the carried names).
+
 Pure functions — no shared materializer state. The leading-underscore
 module name keeps the pass loader (globs ``*.py``, skips ``_``-prefixed)
 from mistaking this for a rule.

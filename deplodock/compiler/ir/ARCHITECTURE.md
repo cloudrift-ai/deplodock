@@ -326,8 +326,14 @@ the body at materialize / render time via ``ir/tile/escape_analysis.py``:
 cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
 atomic-write classification from enclosing ``GridTile.axes`` vs
 ``Write.index``, broadcast-write guards from cooperative thread axes vs
-``Write.index``. No explicit coordination stmt or per-tile tag carries
-this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
+``Write.index``. The same cooperative analysis covers the general monoid
+carrier: a ``Combine``'s cooperative axes are keyed by each of its ``state``
+component names, and the materializer emits a **multi-component** cross-thread
+combine — ``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the
+full state tuple, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, >
+warp), both folding via the carrier's ``combine_states`` and reassigning the
+state in place (no ``_b`` rename). No explicit coordination stmt or per-tile tag
+carries this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
 and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
 ``Accum.axes`` carries the names of the loops being reduced over and is
 the source of truth for cooperativity.

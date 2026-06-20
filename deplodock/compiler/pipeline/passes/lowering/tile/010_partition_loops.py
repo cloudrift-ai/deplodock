@@ -100,6 +100,16 @@ rows — free-axis threads alongside the K lanes) the combine is a SEGMENTED
 warp shuffle over each row's aligned BR-lane group, so the enumerator clips
 those rows' BR to powers of two ≤ warp_size.
 
+**Flash-style kernels** (an online-softmax ``Combine`` reduce — plans/
+atomic-free-monoid-combine.md Step 4) route here too: the KV (Combine) reduce is
+the cooperative-parallelization axis, NOT the nested score dot-product (a
+matmul-reduce over head_dim that stays serial inside each KV step). When a
+(static-extent) Combine reduce is present the matmul branch is skipped, so the KV
+axis splits across the CTA's threads and the per-thread partial ``(m, l, O)``
+states merge via the monoid combine (``MonoidWarpShuffle`` / ``MonoidTreeHalve``
+over the carrier's ``combine_states``). A symbolic (masked) KV stays serial — the
+overhang-key → identity masking for a Combine is a follow-up.
+
 For the fused-prologue matmul (SDPA P@V — softmax max/sum/reciprocal sitting
 as siblings of an inner output Loop that holds the actual matmul), the chain
 walker extends through the inner Loop (``_classify_fused_prologue``), stashes
