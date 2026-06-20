@@ -514,8 +514,19 @@ class Accum(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.name,)
 
-    def combine_op(self) -> ElementwiseImpl:
-        return self.op
+    # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
+    # ``sum`` Accum differ, and ``self.op`` is the source of truth.
+    @property
+    def associative(self) -> bool:
+        return self.op.associative
+
+    @property
+    def commutative(self) -> bool:
+        return self.op.commutative
+
+    @property
+    def has_identity(self) -> bool:
+        return self.op.has_identity
 
     def pretty(self, indent: str = "") -> list[str]:
         prefix = f"{self.dtype.name} " if self.dtype is not None else ""
@@ -590,12 +601,22 @@ class Mma(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.c,)
 
-    def combine_op(self) -> ElementwiseImpl:
-        # The tensor-core accumulation is ``c += a @ b`` — an additive fold.
-        # Reporting ``add`` (associative + commutative + identity 0) is what
-        # tells reassociation gates that split-K over the matmul's K axis is
-        # legal, exactly as for a scalar sum Accum.
-        return ElementwiseImpl("add")
+    # The tensor-core accumulation ``c += a @ b`` is an additive fold —
+    # associative + commutative with identity 0. That is what tells
+    # reassociation gates split-K over the matmul's K axis is legal, exactly as
+    # for a scalar ``sum`` Accum (there is no scalar op to point at, so the
+    # traits are reported as constants).
+    @property
+    def associative(self) -> bool:
+        return True
+
+    @property
+    def commutative(self) -> bool:
+        return True
+
+    @property
+    def has_identity(self) -> bool:
+        return True
 
     def pretty(self, indent: str = "") -> list[str]:
         return [f"{indent}{self.c} <- mma[{self.atom.name}]({self.a} @ {self.b})"]
@@ -604,6 +625,107 @@ class Mma(ReduceCarrier):
         raise NotImplementedError(
             f"Mma must be consumed by kernel/005_lower_atom_tile before render — reached render with atom={self.atom.name!r}"
         )
+
+
+@dataclass(frozen=True)
+class Combine(ReduceCarrier):
+    """A loop-carried **monoid** combine — a general associative reduce over
+    internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
+    ``Mma`` (tensor-core fragment fold).
+
+    A monoid is *(identity element, associative binary operation, carried state)*;
+    ``Combine`` makes all three explicit so the streaming-reduce machinery isn't
+    tied to any one recurrence:
+
+    - ``state`` — the carried SSA names (the internal state); read-and-written
+      across the reduce axis (the carried read is implicit, like ``Accum.name`` /
+      ``Mma.c``), and the defs visible after the loop.
+    - ``partial`` — this iteration's contribution SSA names (the right operand the
+      step folds into the state).
+    - ``merge`` — the associative operation, **as data**: a short program of
+      ``Assign`` steps that reads the OLD state + the partial and reassigns the new
+      state. An ``Assign`` whose target is a ``state`` name is a state update
+      (rendered ``name = …;`` — the carried name is already declared by an
+      enclosing ``Init``); every other ``Assign`` is a local fp32 temp (declared
+      ``float t = …;``). Statement ORDER is load-bearing — a state update must come
+      after every read of that state's old value.
+    - ``identity`` — the monoid's neutral element, one ``Expr`` per state
+      component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
+      cooperative-combine reductions read it to seed their partial accumulators).
+    - ``commutative`` — whether the operation also commutes (split-KV legality);
+      ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
+      monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
+
+    The whole operation lives **inside this carrier**, not as loose body
+    statements, so the gates that reject online algorithms (``accums_independent``,
+    ``classify_fragment_epilogue``) never see the cross-state coupling, and the
+    partition planner places one carrier.
+
+    Example — flash attention's **online softmax** (the log-sum-exp monoid): state
+    ``(m, l, O)`` = running row-max / denominator / output, partial ``(s, v)`` =
+    this key's score + value, identity ``(−inf, 0, 0)``, and the merge::
+
+        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
+        l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
+
+    associative + commutative — which is what makes split-KV (flash-decoding) and
+    cooperative-combine legal. The flash instance is built by
+    ``loop/fusion/_flash.flash_combine``.
+    """
+
+    state: tuple[str, ...]
+    partial: tuple[str, ...]
+    merge: tuple[Assign, ...] = ()
+    identity: tuple[Expr, ...] = ()
+    commutative: bool = True
+    axes: tuple[str, ...] = ()
+
+    def deps(self) -> tuple[str, ...]:
+        # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit
+        # (loop-carried), so only this iteration's partial contribution is listed —
+        # keeps sibling-def analyses from treating the state as a same-scope read.
+        return self.partial
+
+    def defines(self) -> tuple[str, ...]:
+        return self.state
+
+    def carried_names(self) -> tuple[str, ...]:
+        return self.state
+
+    # A monoid is associative with identity by construction; commutativity is the
+    # extra property (the ``commutative`` field) split-KV / split reordering needs.
+    @property
+    def associative(self) -> bool:
+        return True
+
+    @property
+    def has_identity(self) -> bool:
+        return True
+
+    def pretty(self, indent: str = "") -> list[str]:
+        state = ", ".join(self.state)
+        partial = ", ".join(self.partial)
+        return [f"{indent}({state}) <- combine({partial})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        """Emit the merge program in fp32: each ``Assign`` targeting a ``state``
+        name is a reassignment of the carried value (already declared by an
+        enclosing ``Init``); every other ``Assign`` declares a local temp. The
+        builder orders the program so each old-state read precedes that state's
+        update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
+        """
+        pad = _pad(ctx.indent)
+        ty = ctx.type_name("f32")
+        state_set = set(self.state)
+        out: list[str] = []
+        for a in self.merge:
+            rhs = op_to_expr(a.op.name, [Var(x) for x in a.args]).render(ctx)
+            if a.name in state_set:
+                out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
+            else:
+                ctx.ssa_dtypes[a.name] = "f32"
+                out.append(f"{pad}{ty} {a.name} = {rhs};")  # local temp
+        return out
 
 
 @dataclass(frozen=True)

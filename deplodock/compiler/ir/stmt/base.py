@@ -17,7 +17,6 @@ from deplodock.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr,
 from deplodock.compiler.ir.sigma import Sigma
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.stmt.body import Body
     from deplodock.compiler.ir.stmt.leaves import Select
     from deplodock.compiler.render_target import RenderTarget
@@ -499,7 +498,7 @@ class Stmt:
 class ReduceCarrier(Stmt):
     """A loop-carried reduce accumulator — the shared structural role behind
     ``Accum`` (scalar monoid fold), ``Mma`` (tensor-core ``c += a @ b``), and
-    the future flash/LSE combine.
+    the general monoid ``Combine`` (e.g. flash attention's online softmax).
 
     A ``Loop`` / ``StridedLoop`` / serial tile is a *reduce* loop iff its
     immediate body holds a ``ReduceCarrier`` — that is the one predicate the
@@ -509,11 +508,17 @@ class ReduceCarrier(Stmt):
     ladder at every site.
 
     Rules that *do* care about the combine's algebra don't switch on the
-    carrier type either — they read :meth:`combine_op` and query its traits
-    (``associative`` / ``commutative`` / ``has_identity``) to decide whether a
-    reduction may be split / reordered (split-K, cooperative tree-combine).
+    carrier type either — they read the algebraic traits (``associative`` /
+    ``commutative`` / ``has_identity``) the carrier exposes directly to decide
+    whether a reduction may be split / reordered (split-K, cooperative
+    tree-combine). The traits live on the carrier itself: ``Accum`` forwards to
+    its scalar ``op``; ``Mma`` reports the additive-fold constants; ``Combine``
+    reports `associative` / `has_identity` `True` (it is a monoid) with a
+    per-instance `commutative` flag. No separate combine object is reified —
+    three booleans don't earn one, and an ``Mma`` has no scalar op to point at
+    (its accumulation merely *is* additive).
 
-    Three methods name the carrier's reduce surface, distinct from the generic
+    Two methods name the carrier's reduce surface, distinct from the generic
     SSA def-use surface (:meth:`deps` / :meth:`defines`):
 
     - :meth:`carried_names` — the accumulator name(s) read-and-written across
@@ -522,17 +527,25 @@ class ReduceCarrier(Stmt):
     - :meth:`partial_deps` — the SSA names read to form this iteration's
       contribution, excluding the carried accumulator. Defaults to
       :meth:`deps`, which ``Accum`` / ``Mma`` already define to exclude it.
-    - :meth:`combine_op` — the accumulation's combine op, for its traits.
     """
+
+    @property
+    def associative(self) -> bool:
+        raise NotImplementedError(f"{type(self).__name__}.associative")
+
+    @property
+    def commutative(self) -> bool:
+        raise NotImplementedError(f"{type(self).__name__}.commutative")
+
+    @property
+    def has_identity(self) -> bool:
+        raise NotImplementedError(f"{type(self).__name__}.has_identity")
 
     def carried_names(self) -> tuple[str, ...]:
         raise NotImplementedError(f"{type(self).__name__}.carried_names")
 
     def partial_deps(self) -> tuple[str, ...]:
         return self.deps()
-
-    def combine_op(self) -> ElementwiseImpl:
-        raise NotImplementedError(f"{type(self).__name__}.combine_op")
 
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:

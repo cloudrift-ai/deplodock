@@ -58,7 +58,19 @@ from deplodock.compiler.ir.stmt.base import (
 )
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Mma, Pack, Select, SelectBranch, Unpack, Write
+from deplodock.compiler.ir.stmt.leaves import (
+    Accum,
+    Assign,
+    Combine,
+    Init,
+    Load,
+    Mma,
+    Pack,
+    Select,
+    SelectBranch,
+    Unpack,
+    Write,
+)
 from deplodock.compiler.ir.stmt.normalize import (
     canonicalize_buffer_names,
     canonicalize_free_axis_order,
@@ -78,6 +90,7 @@ __all__ = [
     "Accum",
     "Assign",
     "Body",
+    "Combine",
     "Cond",
     "Init",
     "Load",

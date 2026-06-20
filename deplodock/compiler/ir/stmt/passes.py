@@ -19,7 +19,19 @@ from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Mma, Pack, Select, SelectBranch, Unpack, Write
+from deplodock.compiler.ir.stmt.leaves import (
+    Accum,
+    Assign,
+    Combine,
+    Init,
+    Load,
+    Mma,
+    Pack,
+    Select,
+    SelectBranch,
+    Unpack,
+    Write,
+)
 
 Rename = Callable[[str], str]
 AxisFn = Callable[[Axis], Axis]
@@ -124,6 +136,22 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
     return Mma(c=rename(s.c), a=rename(s.a), b=rename(s.b), atom=s.atom, axes=new_axes, b_trans=s.b_trans)
+
+
+@rewrite.register
+def _(s: Combine, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
+    return Combine(
+        state=tuple(rename(n) for n in s.state),
+        partial=tuple(rename(n) for n in s.partial),
+        # The merge program references state / partial (mapped) + internal temps
+        # (not in the rename map → pass through), so rewriting each step keeps it
+        # consistent with the renamed surface.
+        merge=tuple(rewrite(m, rename, sigma, axis_fn) for m in s.merge),
+        identity=s.identity,  # constant Exprs — no SSA names to rename
+        commutative=s.commutative,
+        axes=new_axes,
+    )
 
 
 def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
