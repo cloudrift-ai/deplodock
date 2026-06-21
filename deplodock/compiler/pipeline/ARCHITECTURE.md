@@ -106,8 +106,12 @@ Implementations hold their producer's state as data: `OptionFork` (a concrete `O
 own knob delta, so siblings share one function instead of per-instance capture lambdas; used by
 `085_warp_specialize`), and the tree builder's branch / leaf node classes.
 
-The partition planner (`lowering/tile/010_partition_loops`) emits one
-hierarchical Fork tree over both tiers:
+The partition planner (`lowering/tile/010_partition_loops`) routes each reduce loop by its bottom-up **algebra
+tag** (`Loop.algebra_kind`, `ir/algebra.py`) rather than re-deriving the archetype: `SEMIRING` → matmul-output
+tiling; a static `TWISTED_MONOID` (flash's online-softmax `Monoid`) → the cooperative-reduce KV split; any other
+reduce → cooperative-K / pointwise. The tag reads the carrier already in the body, so the routing inputs come
+from the analyzer, not a fresh structural match (Part C1a of `plans/algebraic-carrier-analysis.md`). It then emits
+one hierarchical Fork tree over both tiers:
 `MMA → BR → (BM,BN) → (WM,WN) → (FM,FN) → TileOp` leaf — each leaf carrying its COMPLETE knob row
 (incl. `BK` / `SPLITK` / `FK` / `OVERHANG`, which live in no level), the DB-matchable variant identity. The root
 `MMA` level keys warp rows by atom kind; scalar rows return an empty key and skip the level (their subtree

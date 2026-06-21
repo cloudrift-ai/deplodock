@@ -138,11 +138,12 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     Atom,
@@ -596,20 +597,25 @@ def _plan_kernel(loop_op: LoopOp, ctx: Context, *, kernel_name: str = "", graph:
     # should rewrite. ``target_names`` survives σ_outer (only axis NAMES are
     # used downstream, not Loop identity — names don't change under σ).
     all_loops: tuple[Loop, ...] = outer_n.body.iter_of_type(Loop)
-    matmul_reduces = [lp for lp in all_loops if lp.is_reduce and is_matmul_reduce(lp)]
-    nonmatmul_reduces = [lp for lp in all_loops if lp.is_reduce and not is_matmul_reduce(lp)]
-    # Flash-style kernel (online-softmax ``Monoid`` reduce): the KV reduce is the
-    # cooperative-parallelization axis (Step 4 of plans/atomic-free-monoid-combine.md),
-    # NOT the nested score dot-product (a matmul-reduce over head_dim that stays serial
-    # inside each KV step). When a Monoid reduce is present, route to the
-    # cooperative-reduce path so the KV axis splits across the CTA's threads
-    # (Step 2's monoid combine) instead of the matmul-output tiling that leaves KV
-    # serial. ``commutative`` (split-KV legality) is True for the LSE monoid.
-    # Restricted to a STATIC KV extent: a SYMBOLIC (masked) KV needs the overhang
-    # keys folded to the monoid identity (score → −inf so exp → 0), which the
-    # ``Accum``-only ``_mask_reduce_accums`` doesn't do for a Monoid — masked
-    # symbolic flash stays on its existing serial-KV path (a follow-up).
-    combine_reduces = [lp for lp in nonmatmul_reduces if lp.axis.extent.is_static and any(isinstance(s, Monoid) for s in lp.body)]
+    # Route on each reduce loop's bottom-up algebra tag (Part C1a of
+    # plans/algebraic-carrier-analysis.md) instead of re-deriving the archetype:
+    # ``SEMIRING`` → matmul-output tiling; everything else → cooperative-reduce.
+    reduce_loops = [lp for lp in all_loops if lp.is_reduce]
+    matmul_reduces = [lp for lp in reduce_loops if lp.algebra_kind is AlgebraKind.SEMIRING]
+    nonmatmul_reduces = [lp for lp in reduce_loops if lp.algebra_kind is not AlgebraKind.SEMIRING]
+    # Flash-style kernel (online-softmax ``TWISTED_MONOID`` reduce): the KV reduce
+    # is the cooperative-parallelization axis (Step 4 of
+    # plans/atomic-free-monoid-combine.md), NOT the nested score dot-product (a
+    # matmul-reduce over head_dim that stays serial inside each KV step). When a
+    # twisted monoid is present, route to the cooperative-reduce path so the KV
+    # axis splits across the CTA's threads (Step 2's monoid combine) instead of
+    # the matmul-output tiling that leaves KV serial. ``commutative`` (split-KV
+    # legality) is True for the LSE monoid. Restricted to a STATIC KV extent: a
+    # SYMBOLIC (masked) KV needs the overhang keys folded to the monoid identity
+    # (score → −inf so exp → 0), which the ``Accum``-only ``_mask_reduce_accums``
+    # doesn't do for a Monoid — masked symbolic flash stays on its existing
+    # serial-KV path (a follow-up).
+    combine_reduces = [lp for lp in nonmatmul_reduces if lp.axis.extent.is_static and lp.algebra_kind is AlgebraKind.TWISTED_MONOID]
 
     k_loop: Loop | None
     target_names: frozenset[str]

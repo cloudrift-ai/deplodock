@@ -16,7 +16,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum
+from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
@@ -158,7 +158,13 @@ def test_replicator_keeps_n_invariant_loads_once():
                                 body=(
                                     Load(name="a", input="a", index=(Var("m"), Var("k"))),
                                     Load(name="b", input="b", index=(Var("k"), Var("n"))),
-                                    Accum(name="acc", value="b", op=ElementwiseImpl("add")),
+                                    # A genuine matmul cell — ``acc += a·b`` — so the planner's
+                                    # SEMIRING classification (trait-verified is_matmul_reduce ∧
+                                    # product-distributes-over) routes it to the matmul path.
+                                    # ``a[m,k]`` stays N-invariant, ``b[k,n]`` N-dependent — what
+                                    # the replicator splits.
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p", op=ElementwiseImpl("add")),
                                 ),
                             ),
                             Write(output="o", index=(Var("m"), Var("n")), value="acc"),
