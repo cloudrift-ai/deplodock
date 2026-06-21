@@ -10,16 +10,15 @@ tier without revisiting the tower mechanics. These tests poke
 
 from __future__ import annotations
 
-import importlib
-
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.stmt import Write
 from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 
-_planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
-_wrap_tower = _planner._wrap_tower
-Role = _planner.Role
+# ``Role`` / ``_wrap_tower`` / ``_layer_kind_for`` were extracted from the
+# partition planner into the shared ``partition._tower`` module (the legacy
+# planner imports them back); the move composer reuses the same mechanics.
+from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _layer_kind_for, _wrap_tower
 
 
 def _stub_inner() -> tuple:
@@ -85,4 +84,4 @@ def test_wrap_tower_thread_and_warp_dont_merge():
 
 def test_layer_kind_for_warp_returns_warp_string():
     """The kind string drives ``_wrap_tower``'s grouping switch."""
-    assert _planner._layer_kind_for(Role.WARP) == "warp"
+    assert _layer_kind_for(Role.WARP) == "warp"

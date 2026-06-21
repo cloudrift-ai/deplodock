@@ -48,6 +48,7 @@ NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
 SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
+MOVE_COMPOSER = "DEPLODOCK_MOVE_COMPOSER"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
 
@@ -228,6 +229,15 @@ def serving_static(default: bool = False) -> bool:
     dynamic-seq kernels miscompute batch>1, so it is a deliberate opt-in, not a
     default. See `serving/ARCHITECTURE.md`."""
     return _bool(SERVING_STATIC, default)
+
+
+def move_composer_enabled(default: bool = False) -> bool:
+    """``DEPLODOCK_MOVE_COMPOSER`` — opt into the hierarchical move composer
+    (``passes/lowering/tile/partition/``) for the regimes it covers, falling
+    through to the legacy partition planner otherwise. Off (default) keeps the
+    legacy planner for every kernel. Brought up regime by regime; see
+    ``plans/melodic-giggling-gem.md``."""
+    return _bool(MOVE_COMPOSER, default)
 
 
 def bench_backends_raw(cli_value: str | None) -> str:

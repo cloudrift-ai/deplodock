@@ -124,6 +124,19 @@ explicit `DEPLODOCK_MMA=<kind>` pin is authoritative (the planner drops the scal
 sidestep it). No variant is scored or materialized to rank it — the prior featurizes the row knobs directly
 (`knob.knob_features`).
 
+**Hierarchical move composer (opt-in, `DEPLODOCK_MOVE_COMPOSER`).** A from-scratch reimplementation of the
+partition stage as a stack of algebraically-justified *moves* lives under `lowering/tile/partition/`
+(`skeleton` → `moves` + `budget` → `tree` → `materialize`, sharing the extracted `_tower._wrap_tower`). Unlike
+the legacy planner — which enumerates a flat knob cartesian and groups it post-hoc via `build_fork_tree` — the
+composer **generates** the Fork tree move-by-move (`tree.py`): the root offers legal thread tiles, each branch
+offers the register tiles legal *given that thread tile* (incremental budget pruning), and each leaf
+materializes the same `TileOp` tower. It uses a **greenfield knob vocabulary** (`partition/knobs.py`:
+`MAP_N_THREAD` / `MAP_N_REG` / `MAP_M_THREAD` / `MAP_M_REG`, …), so the goldens / prior retrain on the new keys.
+`010_partition_loops.rewrite` dispatches to `partition.compose.try_compose` when the flag is set and falls
+through to the legacy planner for any regime the composer doesn't yet cover. **Phase 1 covers the pointwise
+(`MAP`) regime only**; matmul / split-K / cooperative-reduce land in later phases, flash/SDPA-prologue is out of
+scope. See `plans/melodic-giggling-gem.md`.
+
 **Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
 gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments
 from staged smem and a computed A operand has no buffer to stage, so `is_atom_eligible` never passes on the
