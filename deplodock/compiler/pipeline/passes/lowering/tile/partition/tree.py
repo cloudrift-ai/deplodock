@@ -18,11 +18,14 @@ from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK, TC_ATOM, WARP_M, WARP_N
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
+    build_coop_reduce_tile,
     build_matmul_tile,
     build_pointwise_tile,
     build_warp_matmul_tile,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
+    coop_reduce_knobs,
+    coop_reduce_offers,
     eligible_atoms,
     matmul_reduce_offers,
     matmul_reg_offers,
@@ -39,7 +42,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
     warp_reg_knobs,
     warp_reg_offers,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
+    CoopReduceSkeleton,
+    MatmulSkeleton,
+    PointwiseSkeleton,
+)
 
 
 @dataclass(frozen=True)
@@ -267,3 +274,37 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
     if not atoms:
         return scalar
     return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})
+
+
+# --- Cooperative-reduce (MONOID) tree: one reduce (bk, fk, br) decision. ---
+
+
+@dataclass(frozen=True)
+class _CoopLeaf(Fork):
+    ctx: _Ctx
+    knobs: dict
+    is_leaf = True
+
+    def expand(self) -> list:
+        return [build_coop_reduce_tile(self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs)]
+
+
+@dataclass(frozen=True)
+class _CoopChooseReduce(Fork):
+    ctx: _Ctx
+    knobs: dict
+
+    def expand(self) -> list:
+        return [_CoopLeaf(ctx=self.ctx, knobs=coop_reduce_knobs(r)) for r in coop_reduce_offers(self.ctx.skel)]
+
+
+def build_coop_reduce_tree(skel: CoopReduceSkeleton, *, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+    """Root of the cooperative-reduce tree (one ``(bk, fk, br)`` decision); a
+    bare ``TileOp`` for a single legal variant, or ``None`` if none is legal."""
+    offers = coop_reduce_offers(skel)
+    if not offers:
+        return None
+    ctx = _Ctx(skel=skel, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
+    if len(offers) == 1:
+        return build_coop_reduce_tile(skel, coop_reduce_knobs(offers[0]), kernel_name=kernel_name, base_knobs=base_knobs)
+    return _CoopChooseReduce(ctx=ctx, knobs={})

@@ -20,19 +20,21 @@ from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
 from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
+    COOP_BR,
     MAP_M_REG,
     MAP_M_THREAD,
     MAP_N_REG,
     MAP_N_THREAD,
     RED_BK,
     RED_FK,
+    RED_SPLITK,
     TC_BK,
     TC_REG_M,
     TC_REG_N,
     WARP_M,
     WARP_N,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import CoopReduceSkeleton, MatmulSkeleton, PointwiseSkeleton
 
 # One free axis to split: (axis, thread factor, register factor, interleave-when-masked).
 _FreeSpec = tuple[Axis, int, int, bool]
@@ -71,9 +73,15 @@ def _assemble(
     base_knobs: dict,
     kernel_name: str,
     k_transform: Callable[[tuple[Stmt, ...]], tuple[Stmt, ...]] | None = None,
+    coop_thread: tuple[Axis, ...] = (),
+    extra_block: tuple[Axis, ...] = (),
 ) -> TileOp:
     """Shared tower assembly: split free axes, σ-rewrite the body, apply the K
-    transform (matmul), wrap masked-axis guards, and build the tile tower."""
+    transform (matmul), wrap masked-axis guards, and build the tile tower.
+
+    ``coop_thread`` are cooperative-K THREAD axes (``K_c``) placed innermost in
+    the THREAD tier (fastest threadIdx bits); ``extra_block`` are extra GridTile
+    axes (``K_s`` split-K) placed outside the free-axis blocks."""
     sigma_map: dict = {}
     bounds: list[tuple[str, object]] = []
     layers_reg: list[tuple[Axis, Role]] = []
@@ -96,7 +104,13 @@ def _assemble(
         pred = sigma_outer.reduce(Var(name), SimplifyCtx({}))
         new_inner = (Cond(cond=BinaryExpr("<", pred, bound), body=Body(new_inner)),)
 
-    layers: list[tuple[Axis, Role | None]] = [*layers_reg, *layers_thread, *layers_block]
+    layers: list[tuple[Axis, Role | None]] = [
+        *layers_reg,
+        *[(ax, Role.THREAD) for ax in coop_thread],
+        *layers_thread,
+        *layers_block,
+        *[(ax, Role.BLOCK) for ax in extra_block],
+    ]
     layers.extend((lp.axis, Role.BLOCK) for lp in reversed(extra_outer))
     chain_body = _wrap_tower(layers, new_inner)
 
@@ -121,17 +135,20 @@ def build_pointwise_tile(skel: PointwiseSkeleton, knobs: dict, *, kernel_name: s
     )
 
 
-def _replace_k_scalar(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, fk: int) -> tuple[Stmt, ...]:
+def _replace_k_scalar(
+    stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
+) -> tuple[Stmt, ...]:
     """Replace the ``K`` reduce loop with a ``K_o`` (serial-outer) / ``K_i``
-    (stage-inner) tower, σ-mapping ``K → K_o·(bk·fk) + K_f·bk + K_i`` (the
-    ``K_f`` term only when ``fk > 1``). Scalar tier: no split-K, no
-    cooperative-K. The canonical matmul body holds the loop at top level, so a
-    flat scan suffices."""
+    (stage-inner) tower, σ-mapping
+    ``K → K_s·(K_o_ext·bk·fk) + K_o·(bk·fk) + K_f·bk + K_i`` (``K_f`` only when
+    ``fk > 1``, ``K_s`` only when ``splitk > 1``). The ``K_s`` grid axis is added
+    to the outer BLOCK layers by the caller; here it only enters the σ. The
+    canonical matmul body holds the loop at top level, so a flat scan suffices."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name == k_name:
             src = s.axis.source_axis or s.axis
-            k_o_ext = k_extent // (bk * fk)
+            k_o_ext = k_extent // (splitk * bk * fk)
             k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{k_name}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(bk * fk, "int")
@@ -140,6 +157,8 @@ def _replace_k_scalar(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: i
                 k_f = Axis(f"{k_name}_f", fk, source_axis=src)
                 expr = expr + Var(k_f.name) * Literal(bk, "int")
             expr = expr + Var(k_i.name)
+            if k_s is not None:
+                expr = Var(k_s.name) * Literal(k_o_ext * bk * fk, "int") + expr
             sigma_k = Sigma({k_name: expr})
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             if k_f is not None:
@@ -155,7 +174,9 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
         (skel.inner_n.loop.axis, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True),
         (skel.outer_m.loop.axis, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False),
     ]
-    bk, fk = knobs[RED_BK.name], knobs[RED_FK.name]
+    bk, fk, splitk = knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name]
+    src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
+    k_s = Axis(f"{skel.k_name}_s", splitk, source_axis=src_k) if splitk > 1 else None
     return _assemble(
         free_specs,
         skel.inner_body,
@@ -164,7 +185,63 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_scalar(body, skel.k_name, skel.k_extent, bk, fk),
+        k_transform=lambda body: _replace_k_scalar(body, skel.k_name, skel.k_extent, bk, fk, splitk, k_s),
+        extra_block=(k_s,) if k_s is not None else (),
+    )
+
+
+def _replace_k_coop(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, fk: int, br: int, k_c: Axis | None) -> tuple[Stmt, ...]:
+    """Replace the K reduce loop with the cooperative tower, σ-mapping
+    ``K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`` (``K_f`` only when
+    ``fk > 1``; ``K_c`` the stride-1 thread lane only when ``br > 1``). The
+    ``Accum.axes`` (originally ``(k,)``) propagate through σ to include ``K_c``,
+    which `escape_analysis` reads as cooperative → kernel/100 emits the combine.
+    The ``K_c`` THREAD axis is added to the tower by the caller."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name == k_name:
+            src = s.axis.source_axis or s.axis
+            k_o_ext = k_extent // (br * bk * fk)
+            k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
+            expr = Var(k_o.name) * Literal(br * bk * fk, "int")
+            k_f = None
+            if fk > 1:
+                k_f = Axis(f"{k_name}_f", fk, source_axis=src)
+                expr = expr + Var(k_f.name) * Literal(br * bk, "int")
+            expr = expr + Var(k_i.name) * Literal(br, "int")
+            if k_c is not None:
+                expr = expr + Var(k_c.name)
+            sigma_k = Sigma({k_name: expr})
+            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            if k_f is not None:
+                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=True),)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+    """Whole-CTA cooperative reduce: free rows → grid (thread/reg forced to 1),
+    ``BR`` threads (the ``K_c`` axis) reduce one row's K, the combine is emitted
+    downstream from ``Accum.axes ∩ ThreadTile``."""
+    free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, 1, 1, True)]
+    if skel.outer_m is not None:
+        free_specs.append((skel.outer_m.loop.axis, 1, 1, False))
+    bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
+    src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
+    k_c = Axis(f"{skel.k_name}_c", br, source_axis=src_k) if br > 1 else None
+    return _assemble(
+        free_specs,
+        skel.inner_body,
+        leading=skel.leading,
+        extra_outer=skel.extra_outer,
+        knobs=knobs,
+        base_knobs=base_knobs,
+        kernel_name=kernel_name,
+        k_transform=lambda body: _replace_k_coop(body, skel.k_name, skel.k_extent, bk, fk, br, k_c),
+        coop_thread=(k_c,) if k_c is not None else (),
     )
 
 

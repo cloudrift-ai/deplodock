@@ -119,12 +119,12 @@ def test_tree_leaves_complete_and_within_budget():
         assert _MM_KEYS <= set(kn), f"leaf missing matmul knobs: {kn}"
         assert kn["MAP_N_THREAD"] * kn["MAP_M_THREAD"] <= 1024, kn
         assert kn["RED_FK"] * kn["MAP_N_REG"] * kn["MAP_M_REG"] <= 128, kn
-        assert 128 % (kn["RED_BK"] * kn["RED_FK"]) == 0, f"bk·fk must divide K: {kn}"
+        assert 128 % (kn["RED_SPLITK"] * kn["RED_BK"] * kn["RED_FK"]) == 0, f"splitk·bk·fk must divide K: {kn}"
 
 
 def test_materialize_emits_k_serial_tower():
     skel = lift_matmul(_matmul(128, 128, 128))
-    knobs = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 32, "RED_FK": 1}
+    knobs = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 32, "RED_FK": 1, "RED_SPLITK": 1}
     tile = build_matmul_tile(skel, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)
     serials = list(tile.body.iter_of_type(SerialTile))
@@ -187,3 +187,19 @@ def test_build_warp_tile_emits_warp_atom_and_mma_knob():
     assert list(tile.body.iter_of_type(WarpTile)), "warp tower must nest a WarpTile"
     atoms = list(tile.body.iter_of_type(AtomTile))
     assert atoms and atoms[0].atom is atom, "warp tower must nest an AtomTile carrying the atom spec"
+
+
+# --- Split-K -----------------------------------------------------------------
+
+
+def test_build_matmul_tile_splitk_adds_grid_axis():
+    # M=64 (tile 16·4=64 → M_b=1), N=64 (tile 8 → N_b=8); only the K_s axis has
+    # extent 4. (Axis names canonicalize to a0/a1/… so match on extent, not name.)
+    skel = lift_matmul(_matmul(64, 64, 256))
+    base = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 1, "RED_FK": 1}
+    g1 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 1}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
+    g4 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 4}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
+    n1 = sum(len(g.axes) for g in g1)
+    extents4 = [ax.extent.as_static() for g in g4 for ax in g.axes]
+    assert sum(len(g.axes) for g in g4) == n1 + 1, "split-K must add exactly one grid axis"
+    assert 4 in extents4, "the added grid axis has extent SPLITK=4"

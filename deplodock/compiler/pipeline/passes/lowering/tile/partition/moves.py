@@ -15,11 +15,16 @@ param dicts; ``materialize.py`` realizes a complete choice into the tower.
 
 from __future__ import annotations
 
+import os
+
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
+from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     BK_CHOICES,
+    BR_CHOICES,
+    COOP_BR,
     FK_CHOICES,
     MAP_M_REG,
     MAP_M_THREAD,
@@ -27,7 +32,9 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     MAP_N_THREAD,
     RED_BK,
     RED_FK,
+    RED_SPLITK,
     REG_CHOICES,
+    SPLITK_CHOICES,
     TC_ATOM,
     TC_BK,
     TC_REG_CHOICES,
@@ -38,7 +45,19 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     WARP_M,
     WARP_N,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
+    CoopReduceSkeleton,
+    MatmulSkeleton,
+    PointwiseSkeleton,
+)
+
+
+def _pin(knob: Knob) -> int | None:
+    """Env override for one search dimension (``DEPLODOCK_<NAME>``) — lets a
+    user / test pin a greenfield knob the way the legacy enumerator does."""
+    raw = os.environ.get(knob.env)
+    return int(raw) if raw not in (None, "") else None
+
 
 # Pointwise is memory-bandwidth bound, so a conservative register-tile menu
 # keeps the generative tree small without losing the configs that matter
@@ -106,12 +125,17 @@ def reg_knobs(skel: PointwiseSkeleton, reg: tuple[int, int]) -> dict:
 _CELL_TARGET = 16  # matmul wants a register tile big enough for ILP, small enough for occupancy
 
 
-def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int]]:
-    """Legal ``(bk, fk)`` K-tilings: ``bk·fk`` divides the static K extent (so
-    ``K_o = K/(bk·fk)`` is whole). Best-first: deep chunk (large ``bk``), no
-    strip-mine (``fk=1``)."""
-    out = [(bk, fk) for bk in BK_CHOICES for fk in FK_CHOICES if bk * fk <= skel.k_extent and skel.k_extent % (bk * fk) == 0]
-    out.sort(key=lambda bf: (-bf[0], bf[1]))
+def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
+    """Legal ``(bk, fk, splitk)`` K-tilings: ``splitk·bk·fk`` divides the static
+    K extent (so ``K_o = K/(splitk·bk·fk)`` is whole). Best-first: no split-K
+    (``splitk=1``, a perf opt for small-MN/large-K), deep chunk (large ``bk``),
+    no strip-mine (``fk=1``). Each dimension is env-pinnable for tests."""
+    bk_pin, fk_pin, sk_pin = _pin(RED_BK), _pin(RED_FK), _pin(RED_SPLITK)
+    bks = (bk_pin,) if bk_pin else BK_CHOICES
+    fks = (fk_pin,) if fk_pin else FK_CHOICES
+    sks = (sk_pin,) if sk_pin else SPLITK_CHOICES
+    out = [(bk, fk, sk) for sk in sks for bk in bks for fk in fks if sk * bk * fk <= skel.k_extent and skel.k_extent % (sk * bk * fk) == 0]
+    out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out
 
 
@@ -132,10 +156,10 @@ def matmul_reg_offers(skel: MatmulSkeleton, budget: Budget, fk: int) -> list[tup
     return out
 
 
-def reduce_knobs(reduce: tuple[int, int]) -> dict:
+def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     """Knob delta a reduce-tile branch pins."""
-    bk, fk = reduce
-    return {RED_BK.name: bk, RED_FK.name: fk}
+    bk, fk, sk = reduce
+    return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
 
 
 # --- Tensorize move (warp-tier MMA): gated on atom eligibility. ---
@@ -197,3 +221,33 @@ def warp_reg_knobs(reg: tuple[int, int]) -> dict:
 
 def warp_bk_knobs(bk: int) -> dict:
     return {TC_BK.name: bk}
+
+
+# --- Cooperative-reduce (MONOID) moves: SplitParallel(K) thread-bound. ---
+
+_BR_TARGET = 128  # ~4 warps cooperating per row
+
+
+def coop_reduce_offers(skel: CoopReduceSkeleton) -> list[tuple[int, int, int]]:
+    """Legal ``(bk, fk, br)`` for a whole-CTA cooperative reduce: ``br·bk·fk``
+    divides K, ``br`` (the CTA thread count) ≤ 1024. Best-first: ≈``_BR_TARGET``
+    cooperative threads, no serial chunk / strip-mine. Env-pinnable for tests."""
+    bk_pin, fk_pin, br_pin = _pin(RED_BK), _pin(RED_FK), _pin(COOP_BR)
+    bks = (bk_pin,) if bk_pin else BK_CHOICES
+    fks = (fk_pin,) if fk_pin else FK_CHOICES
+    brs = (br_pin,) if br_pin else BR_CHOICES
+    out = [
+        (bk, fk, br)
+        for br in brs
+        for bk in bks
+        for fk in fks
+        if 1 <= br <= 1024 and br * bk * fk <= skel.k_extent and skel.k_extent % (br * bk * fk) == 0
+    ]
+    out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
+    return out
+
+
+def coop_reduce_knobs(reduce: tuple[int, int, int]) -> dict:
+    """Knob delta a cooperative-reduce leaf pins."""
+    bk, fk, br = reduce
+    return {RED_BK.name: bk, RED_FK.name: fk, COOP_BR.name: br}

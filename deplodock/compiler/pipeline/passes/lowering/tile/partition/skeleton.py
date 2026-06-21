@@ -117,6 +117,67 @@ def lift_matmul(loop_op: LoopOp) -> MatmulSkeleton | None:
     )
 
 
+@dataclass(frozen=True)
+class CoopReduceSkeleton:
+    """Plain associative reduce (`MONOID`) over a static K axis ≥ warp_size, with
+    free output rows. Phase 3b covers the whole-CTA cooperative form: each CTA
+    reduces one row's K across `BR` threads, then a warp/tree combine folds the
+    partials. The canonical body is `[Loop(k, [Load, Accum]), Write(o[rows])]`."""
+
+    inner_n: MapAxis
+    outer_m: MapAxis | None
+    extra_outer: tuple[Loop, ...]
+    k_loop: Loop
+    k_name: str
+    k_extent: int
+    inner_body: tuple[Stmt, ...]
+    leading: tuple[Stmt, ...]
+
+
+def lift_coop_reduce(loop_op: LoopOp, *, warp_size: int = 32) -> CoopReduceSkeleton | None:
+    """Lift a plain cooperative-reduce skeleton, or `None` outside the Phase-3b
+    envelope (non-`MONOID` reduce, symbolic / small K, multi-reduce, fused
+    epilogue → legacy fallthrough)."""
+    reduce_loops = [lp for lp in loop_op.body.iter_of_type(Loop) if lp.is_reduce]
+    if len(reduce_loops) != 1:
+        return None
+    k_loop = reduce_loops[0]
+    if k_loop.algebra_kind is not AlgebraKind.MONOID:
+        return None  # SEMIRING → matmul; TWISTED_MONOID → flash (out of scope)
+    if not k_loop.axis.extent.is_static or k_loop.axis.extent.as_static() < warp_size:
+        return None  # small / symbolic reduce stays on the legacy / pointwise path
+
+    leading, rest = _split_leading_non_loops(tuple(loop_op.body))
+    chain: list[Loop] = []
+    cur = rest
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
+        chain.append(cur[0])
+        cur = tuple(cur[0].body)
+    if not chain:
+        return None
+
+    inner_n_loop = chain[-1]
+    inner_body = tuple(inner_n_loop.body)
+    loops_in = [s for s in inner_body if isinstance(s, Loop)]
+    if loops_in != [k_loop]:
+        return None
+    if not any(isinstance(s, Write) for s in inner_body):
+        return None
+    if any(not isinstance(s, (Loop, Write)) for s in inner_body):
+        return None  # epilogue (e.g. RMSNorm rsqrt) — deferred
+
+    return CoopReduceSkeleton(
+        inner_n=_map_axis(inner_n_loop),
+        outer_m=_map_axis(chain[-2]) if len(chain) >= 2 else None,
+        extra_outer=tuple(chain[:-2]) if len(chain) >= 2 else tuple(chain[:-1]),
+        k_loop=k_loop,
+        k_name=k_loop.axis.name,
+        k_extent=k_loop.axis.extent.as_static(),
+        inner_body=inner_body,
+        leading=leading,
+    )
+
+
 def lift_pointwise(loop_op: LoopOp) -> PointwiseSkeleton | None:
     """Lift a pointwise skeleton, or ``None`` if the kernel has any reduce
     carrier (not pointwise → the dispatcher falls through to the legacy

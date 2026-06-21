@@ -143,8 +143,12 @@ fallback — then warp→reg→bk (or reduce→thread→register for scalar). Th
 fold the canonical cell into `Mma` (absorbing 011 fully is deferred), and **stamps the legacy `MMA` knob on the
 deployed warp tile** so the knob-driven downstream passes (`020_stage_inputs`, `005_lower_atom_tile`, `is_warp`)
 take the tensor-core path — the greenfield `TC_*` knobs are the search vocabulary, `MMA` is the downstream bridge
-until those passes are greenfielded in Phase 4. Split-K / cooperative-reduce and flash/SDPA-prologue land in later
-phases. See `plans/melodic-giggling-gem.md`.
+until those passes are greenfielded in Phase 4. **Split-K** (`RED_SPLITK` → a `K_s` grid axis, codegen-derived
+atomic-add) and **whole-CTA cooperative-reduce** (`MONOID`, K ≥ warp_size: free rows → grid, `COOP_BR` threads on
+the `K_c` THREAD axis, the warp/tree combine reused from `kernel/100` via `Accum.axes` σ-propagation) also land.
+Greenfield search dims are env-pinnable (`DEPLODOCK_<KNOB>`, `moves._pin`). Deferred to legacy fallthrough:
+strided-cooperative rows, the matmul_add residual gate (015), reduce epilogues, masked/symbolic K, and
+flash/SDPA-prologue. See `plans/melodic-giggling-gem.md`.
 
 **Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
 gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments

@@ -40,8 +40,16 @@ MAP_M_REG = Knob("MAP_M_REG", KnobType.INT, hints=REG_CHOICES, help="M (outer fr
 # chunking / no strip-mine.
 BK_CHOICES: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
 FK_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+SPLITK_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 RED_BK = Knob("RED_BK", KnobType.INT, hints=BK_CHOICES, help="K staged-chunk size (inner serial loop trip count)", off=1)
 RED_FK = Knob("RED_FK", KnobType.INT, hints=FK_CHOICES, help="K strip-mine factor (independent accumulators)", off=1)
+RED_SPLITK = Knob("RED_SPLITK", KnobType.INT, hints=SPLITK_CHOICES, help="cross-CTA split-K partitions (K_s grid axis)", off=1)
+
+# Cooperative-reduce knob (the `SplitParallel` thread binding): `COOP_BR` threads
+# cooperatively reduce one row's K, then a warp-shuffle / tree combine folds the
+# partials (emitted by kernel/100_materialize_tile from Accum.axes ∩ ThreadTile).
+BR_CHOICES: tuple[int, ...] = (256, 128, 64, 32, 16, 8, 4, 2, 1)
+COOP_BR = Knob("COOP_BR", KnobType.INT, hints=BR_CHOICES, help="cooperative-reduce threads per row (K_c thread axis)", off=1)
 
 # Tensor-core (warp-tier MMA) knobs — the ``Tensorize`` move. ``TC_ATOM`` is the
 # atom kind ("" = scalar tier, no tensorize); ``WARP_*`` are the per-CTA warp
