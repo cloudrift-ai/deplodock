@@ -17,7 +17,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import RegisterTile, TileOp
+from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     MAP_M_REG,
@@ -26,6 +26,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     MAP_N_THREAD,
     RED_BK,
     RED_FK,
+    TC_BK,
+    TC_REG_M,
+    TC_REG_N,
+    WARP_M,
+    WARP_N,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 
@@ -161,3 +166,81 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
         kernel_name=kernel_name,
         k_transform=lambda body: _replace_k_scalar(body, skel.k_name, skel.k_extent, bk, fk),
     )
+
+
+def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
+    """4-level output-axis split for the warp tier:
+    ``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom`` (the per-lane ``A_a`` offset
+    is owned by ``mma.sync``, so it is NOT in σ). Clean (divisible) only."""
+    src = axis.source_axis or axis
+    per_block = warp * reg * atom_cell
+    a_b = Axis(f"{axis.name}_b", axis.extent // per_block, source_axis=src)
+    a_w = Axis(f"{axis.name}_w", warp, source_axis=src)
+    a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
+    a_a = Axis(f"{axis.name}_a", atom_cell, source_axis=src)
+    expr = (
+        Var(a_b.name) * Literal(per_block, "int")
+        + Var(a_w.name) * Literal(reg * atom_cell, "int")
+        + Var(a_r.name) * Literal(atom_cell, "int")
+    )
+    return a_b, a_w, a_r, a_a, expr
+
+
+def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, atom_k: int) -> tuple[Stmt, ...]:
+    """Replace the K reduce loop with the ``atom_k``-strided ``K_o`` / ``K_i``
+    tower: ``σ(K) = K_o·(bk·atom_k) + K_i·atom_k`` (each ``K_i`` step is one
+    ``mma.sync`` over ``atom_k`` K-elements). No split-K / strip-mine (v1)."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name == k_name:
+            src = s.axis.source_axis or s.axis
+            k_o = Axis(f"{k_name}_o", k_extent // (bk * atom_k), source_axis=src)
+            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
+            expr = Var(k_o.name) * Literal(bk * atom_k, "int") + Var(k_i.name) * Literal(atom_k, "int")
+            new_body = tuple(c.rewrite(_identity_rename, Sigma({k_name: expr})) for c in s.body)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+    """Warp-tier (tensor-core) matmul tower. Emits the canonical AtomTile cell
+    ``[Load a, Load b, Assign(multiply), Accum]``; ``011_lower_atom_cell`` folds
+    it into an ``Mma``. Clean (divisible) tiles only in this phase."""
+    atom_m, atom_n, atom_k = atom.shape
+    wm, wn = knobs[WARP_M.name], knobs[WARP_N.name]
+    fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
+    bk = knobs[TC_BK.name]
+
+    n_b, n_w, n_r, n_a, n_expr = _warp_axis(skel.inner_n.loop.axis, wn, fn, atom_n)
+    m_b, m_w, m_r, m_a, m_expr = _warp_axis(skel.outer_m.loop.axis, wm, fm, atom_m)
+    sigma_outer = Sigma({skel.inner_n.loop.axis.name: n_expr, skel.outer_m.loop.axis.name: m_expr})
+
+    new_inner: tuple[Stmt, ...] = tuple(s.rewrite(_identity_rename, sigma_outer) for s in skel.inner_body)
+    new_inner = _replace_k_warp(new_inner, skel.k_name, skel.k_extent, bk, atom_k)
+
+    layers: list[tuple[Axis, Role | None]] = [
+        (n_a, Role.ATOM),
+        (m_a, Role.ATOM),
+        (n_r, Role.REGISTER),
+        (m_r, Role.REGISTER),
+        (n_w, Role.WARP),
+        (m_w, Role.WARP),
+        (n_b, Role.BLOCK),
+        (m_b, Role.BLOCK),
+    ]
+    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(skel.extra_outer))
+    chain_body = _wrap_tower(layers, new_inner, atom=atom)
+
+    # Bridge to the warp-tier downstream contract: ``020_stage_inputs`` /
+    # ``005_lower_atom_tile`` / ``is_warp`` discriminate the tensor-core tier via
+    # the legacy ``MMA`` knob (``mma_atom`` reads ``knobs["MMA"]``), not the
+    # AtomTile structure. Stamp it alongside the greenfield ``TC_*`` search
+    # vocabulary so 020 takes the atom staging path (force all-staged operands +
+    # block-stamped affine slab) instead of the scalar path. Dropped when those
+    # passes are greenfielded in Phase 4.
+    knobs_full = {**base_knobs, **knobs, "MMA": atom.name}
+    inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
+    kept_leading = tuple(s for s in skel.leading if not (set(s.defines()) & inner_defs))
+    return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)

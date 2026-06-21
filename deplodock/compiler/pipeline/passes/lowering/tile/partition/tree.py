@@ -13,12 +13,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.tile.ir import Atom, TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_pointwise_tile
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK, TC_ATOM, WARP_M, WARP_N
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
+    build_matmul_tile,
+    build_pointwise_tile,
+    build_warp_matmul_tile,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
+    eligible_atoms,
     matmul_reduce_offers,
     matmul_reg_offers,
     matmul_thread_offers,
@@ -27,6 +32,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
     reg_offers,
     thread_knobs,
     thread_offers,
+    warp_bk_knobs,
+    warp_bk_offers,
+    warp_knobs,
+    warp_offers,
+    warp_reg_knobs,
+    warp_reg_offers,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 
@@ -153,18 +164,106 @@ class _MmChooseReduce(Fork):
         return [_MmReduceChosen(ctx=self.ctx, knobs=reduce_knobs(r)) for r in matmul_reduce_offers(self.ctx.skel)]
 
 
-def build_matmul_tree(skel: MatmulSkeleton, *, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
-    """Root ``Fork`` of the generative matmul tree (reduce → thread → register),
-    a bare ``TileOp`` when only one variant is legal, or ``None`` when nothing
-    is legal (legacy fallthrough)."""
-    budget = Budget()
+def _scalar_subtree(ctx: _Ctx) -> Fork | TileOp | None:
+    """The scalar-tier matmul subtree (reduce → thread → register), or a bare
+    ``TileOp`` for a single variant, or ``None`` if nothing is legal."""
+    skel = ctx.skel
     reduces = matmul_reduce_offers(skel)
-    threads = matmul_thread_offers(skel, budget)
+    threads = matmul_thread_offers(skel, ctx.budget)
     if not reduces or not threads:
         return None
-    ctx = _Ctx(skel=skel, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name)
-    regs0 = matmul_reg_offers(skel, budget, reduces[0][1])
+    regs0 = matmul_reg_offers(skel, ctx.budget, reduces[0][1])
     if len(reduces) == 1 and len(threads) == 1 and len(regs0) == 1:
         full = {**reduce_knobs(reduces[0]), **thread_knobs(skel, threads[0]), **reg_knobs(skel, regs0[0])}
-        return build_matmul_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs)
+        return build_matmul_tile(skel, full, kernel_name=ctx.kernel_name, base_knobs=ctx.base_knobs)
     return _MmChooseReduce(ctx=ctx, knobs={})
+
+
+# --- Tensorize: warp-tier (tensor-core MMA) subtree, atom → warp → reg → bk. ---
+
+
+@dataclass(frozen=True)
+class _WarpLeaf(Fork):
+    ctx: _Ctx
+    atom: Atom
+    knobs: dict
+    is_leaf = True
+
+    def expand(self) -> list:
+        return [
+            build_warp_matmul_tile(self.ctx.skel, self.atom, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs)
+        ]
+
+
+@dataclass(frozen=True)
+class _WarpChooseBk(Fork):
+    ctx: _Ctx
+    atom: Atom
+    knobs: dict
+
+    def expand(self) -> list:
+        return [
+            _WarpLeaf(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_bk_knobs(bk)})
+            for bk in warp_bk_offers(self.ctx.skel, self.atom)
+        ]
+
+
+@dataclass(frozen=True)
+class _WarpChooseReg(Fork):
+    ctx: _Ctx
+    atom: Atom
+    knobs: dict
+
+    def expand(self) -> list:
+        warp = (self.knobs[WARP_M.name], self.knobs[WARP_N.name])
+        return [
+            _WarpChooseBk(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_reg_knobs(reg)})
+            for reg in warp_reg_offers(self.ctx.skel, self.atom, warp)
+        ]
+
+
+@dataclass(frozen=True)
+class _WarpChooseWarp(Fork):
+    ctx: _Ctx
+    atom: Atom
+    knobs: dict
+
+    def expand(self) -> list:
+        return [
+            _WarpChooseReg(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_knobs(self.atom, w)})
+            for w in warp_offers(self.ctx.skel, self.atom, self.ctx.budget)
+        ]
+
+
+@dataclass(frozen=True)
+class _MmTensorize(Fork):
+    """Root matmul choice: the scalar subtree + one warp subtree per eligible
+    atom (the ``Tensorize`` decision that gates whether warp knobs exist)."""
+
+    ctx: _Ctx
+    scalar: Fork | TileOp | None
+    atoms: tuple[Atom, ...]
+    knobs: dict
+
+    def expand(self) -> list:
+        # Warp subtrees first: for an eligible (fp16/bf16) matmul the tensor-core
+        # tier is the default pick (the cold prior can't yet rank the greenfield
+        # knobs, so emission order decides — Phase 4 retrain takes over). The
+        # scalar subtree stays as the fallback the search can still reach.
+        opts: list = [_WarpChooseWarp(ctx=self.ctx, atom=atom, knobs={TC_ATOM.name: atom.name}) for atom in self.atoms]
+        if self.scalar is not None:
+            opts.append(self.scalar)
+        return opts
+
+
+def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+    """Root of the generative matmul tree. The scalar subtree is always
+    available; eligible tensor-core atoms add warp subtrees under a top-level
+    ``Tensorize`` choice. Returns the scalar subtree directly when no atom is
+    eligible, or ``None`` when even the scalar tier has nothing legal."""
+    ctx = _Ctx(skel=skel, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
+    scalar = _scalar_subtree(ctx)
+    atoms = [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+    if not atoms:
+        return scalar
+    return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})

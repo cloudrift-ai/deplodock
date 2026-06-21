@@ -15,6 +15,8 @@ param dicts; ``materialize.py`` realizes a complete choice into the tower.
 
 from __future__ import annotations
 
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
+from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     BK_CHOICES,
@@ -26,7 +28,15 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     RED_BK,
     RED_FK,
     REG_CHOICES,
+    TC_ATOM,
+    TC_BK,
+    TC_REG_CHOICES,
+    TC_REG_M,
+    TC_REG_N,
     THREAD_CHOICES,
+    WARP_CHOICES,
+    WARP_M,
+    WARP_N,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 
@@ -126,3 +136,64 @@ def reduce_knobs(reduce: tuple[int, int]) -> dict:
     """Knob delta a reduce-tile branch pins."""
     bk, fk = reduce
     return {RED_BK.name: bk, RED_FK.name: fk}
+
+
+# --- Tensorize move (warp-tier MMA): gated on atom eligibility. ---
+
+_MAX_WARP_CELLS = 64  # FM·FN per warp-cell
+_WARP_TARGET = 4  # warps per CTA (~128 threads)
+
+
+def eligible_atoms(loop_op, ctx, graph) -> list[Atom]:
+    """The atoms whose tensor-core precondition holds for this matmul (compute
+    capability, operand dtypes, divisibility, foldable epilogue)."""
+    return [a for a in ATOM_REGISTRY.values() if is_atom_eligible(a, loop_op, ctx, graph=graph)]
+
+
+def warp_offers(skel: MatmulSkeleton, atom: Atom, budget: Budget) -> list[tuple[int, int]]:
+    """Legal ``(wm, wn)`` warp grids: divide the per-atom cell counts, ≥2 warps
+    (single warp can't stage ldmatrix), ``wm·wn·32 ≤`` thread budget."""
+    cells_m = skel.outer_m.extent // atom.shape[0]
+    cells_n = skel.inner_n.extent // atom.shape[1]
+    out = [
+        (wm, wn)
+        for wm in WARP_CHOICES
+        for wn in WARP_CHOICES
+        if cells_m % wm == 0 and cells_n % wn == 0 and wm * wn >= 2 and budget.threads_ok(wm * wn * 32)
+    ]
+    out.sort(key=lambda w: (abs(w[0] * w[1] - _WARP_TARGET), -w[0] * w[1]))
+    return out
+
+
+def warp_reg_offers(skel: MatmulSkeleton, atom: Atom, warp: tuple[int, int]) -> list[tuple[int, int]]:
+    """Legal ``(fm, fn)`` register cells per warp: divide the per-warp cell
+    counts, ``fm·fn ≤`` the warp-cell budget."""
+    wm, wn = warp
+    pm = (skel.outer_m.extent // atom.shape[0]) // wm
+    pn = (skel.inner_n.extent // atom.shape[1]) // wn
+    out = [(fm, fn) for fm in TC_REG_CHOICES for fn in TC_REG_CHOICES if pm % fm == 0 and pn % fn == 0 and fm * fn <= _MAX_WARP_CELLS]
+    out.sort(key=lambda r: (abs(r[0] * r[1] - 8), -r[0] * r[1]))
+    return out
+
+
+def warp_bk_offers(skel: MatmulSkeleton, atom: Atom) -> list[int]:
+    """Legal ``bk`` (K chunk in atom-K units): divides the atom-K cell count."""
+    kc = skel.k_extent // atom.shape[2]
+    out = [bk for bk in BK_CHOICES if bk <= kc and kc % bk == 0]
+    out.sort(key=lambda bk: -bk)
+    return out
+
+
+def warp_knobs(atom: Atom, warp: tuple[int, int]) -> dict:
+    """Knob delta the tensorize+warp branch pins."""
+    wm, wn = warp
+    return {TC_ATOM.name: atom.name, WARP_M.name: wm, WARP_N.name: wn}
+
+
+def warp_reg_knobs(reg: tuple[int, int]) -> dict:
+    fm, fn = reg
+    return {TC_REG_M.name: fm, TC_REG_N.name: fn}
+
+
+def warp_bk_knobs(bk: int) -> dict:
+    return {TC_BK.name: bk}

@@ -42,3 +42,16 @@ BK_CHOICES: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
 FK_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 RED_BK = Knob("RED_BK", KnobType.INT, hints=BK_CHOICES, help="K staged-chunk size (inner serial loop trip count)", off=1)
 RED_FK = Knob("RED_FK", KnobType.INT, hints=FK_CHOICES, help="K strip-mine factor (independent accumulators)", off=1)
+
+# Tensor-core (warp-tier MMA) knobs — the ``Tensorize`` move. ``TC_ATOM`` is the
+# atom kind ("" = scalar tier, no tensorize); ``WARP_*`` are the per-CTA warp
+# counts; ``TC_REG_*`` are register cells per warp; ``TC_BK`` is the K chunk in
+# atom-K units. ``off`` values mark the scalar-tier "tensorize declined".
+WARP_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+TC_REG_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+TC_ATOM = Knob("TC_ATOM", KnobType.STR, help="tensor-core atom kind ('' = scalar tier)", off="")
+WARP_M = Knob("WARP_M", KnobType.INT, hints=WARP_CHOICES, help="warps along M (WM)", off=0)
+WARP_N = Knob("WARP_N", KnobType.INT, hints=WARP_CHOICES, help="warps along N (WN)", off=0)
+TC_REG_M = Knob("TC_REG_M", KnobType.INT, hints=TC_REG_CHOICES, help="M register cells per warp (FM)", off=0)
+TC_REG_N = Knob("TC_REG_N", KnobType.INT, hints=TC_REG_CHOICES, help="N register cells per warp (FN)", off=0)
+TC_BK = Knob("TC_BK", KnobType.INT, hints=BK_CHOICES, help="K staged-chunk in atom-K units", off=0)

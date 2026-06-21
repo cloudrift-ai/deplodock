@@ -8,16 +8,19 @@ guards). A final test drives the whole tile pipeline with the composer enabled.
 
 from __future__ import annotations
 
+from deplodock.compiler.context import Context
+from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, TileOp
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, AtomTile, GridTile, SerialTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_warp_matmul_tile
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import eligible_atoms
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import lift_matmul, lift_pointwise
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree
 
@@ -92,9 +95,23 @@ def test_lift_pointwise_rejects_matmul():
     assert lift_pointwise(_matmul(64, 96, 128)) is None
 
 
+def _graph(m: int, n: int, k: int, dtype):
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k), dtype=dtype), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n), dtype=dtype), node_id="b")
+    g.add_node(op=_matmul(m, n, k), inputs=["a", "b"], output=Tensor("o", (m, n), dtype=dtype), node_id="o")
+    g.inputs = ["a", "b"]
+    g.outputs = ["o"]
+    return g
+
+
+_CTX = Context(compute_capability=(8, 0))
+
+
 def test_tree_leaves_complete_and_within_budget():
-    skel = lift_matmul(_matmul(128, 128, 128))
-    tree = build_matmul_tree(skel, base_knobs={}, kernel_name="k")
+    g = _graph(128, 128, 128, F32)  # fp32 → scalar subtree only
+    skel = lift_matmul(g.nodes["o"].op)
+    tree = build_matmul_tree(skel, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k")
     leaves = flatten_leaves([tree])
     assert len(leaves) > 1
     for leaf in leaves:
@@ -133,3 +150,40 @@ def test_pipeline_uses_composer_for_matmul(monkeypatch):
     assert tile_op.knobs.get("RED_BK", 0) >= 1, "composer should stamp the reduce-tile vocabulary"
     assert tile_op.knobs.get("BN", 0) == 0, "legacy planner must not have run for a composer-covered matmul"
     assert isinstance(tile_op.body[0], GridTile)
+
+
+# --- Tensorize (warp-tier MMA) ---------------------------------------------
+
+
+def test_eligible_atoms_fp16_yes_fp32_no():
+    g16 = _graph(64, 128, 64, F16)
+    assert eligible_atoms(g16.nodes["o"].op, _CTX, g16), "fp16 matmul should admit a tensor-core atom"
+    g32 = _graph(64, 128, 64, F32)
+    assert not eligible_atoms(g32.nodes["o"].op, _CTX, g32), "fp32 matmul admits no atom"
+
+
+def test_matmul_tree_offers_warp_for_fp16():
+    g = _graph(64, 128, 64, F16)
+    skel = lift_matmul(g.nodes["o"].op)
+    tree = build_matmul_tree(skel, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k")
+    leaves = flatten_leaves([tree])
+    warp_leaves = [leaf for leaf in leaves if leaf.knobs.get("TC_ATOM")]
+    assert warp_leaves, "fp16 matmul tree should offer warp (tensorize) leaves"
+    # The materialized TileOp carries the legacy MMA knob (the downstream tier
+    # discriminator); the Fork-leaf identity stays greenfield TC_*.
+    tile = warp_leaves[0].expand()[0]
+    assert tile.knobs["MMA"] == warp_leaves[0].knobs["TC_ATOM"]
+
+
+def test_build_warp_tile_emits_warp_atom_and_mma_knob():
+    g = _graph(64, 128, 64, F16)
+    skel = lift_matmul(g.nodes["o"].op)
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    # 64x128x64 / atom(16,8,16): cells_m=4, cells_n=16, kc=4 → wm=2,wn=2 ; pm=2,pn=8
+    knobs = {"TC_ATOM": atom.name, "WARP_M": 2, "WARP_N": 2, "TC_REG_M": 2, "TC_REG_N": 4, "TC_BK": 4}
+    tile = build_warp_matmul_tile(skel, atom, knobs, kernel_name="k", base_knobs={})
+    assert isinstance(tile, TileOp)
+    assert tile.knobs["MMA"] == atom.name, "warp tile must carry the MMA knob (020/005/is_warp tier discriminator)"
+    assert list(tile.body.iter_of_type(WarpTile)), "warp tower must nest a WarpTile"
+    atoms = list(tile.body.iter_of_type(AtomTile))
+    assert atoms and atoms[0].atom is atom, "warp tower must nest an AtomTile carrying the atom spec"

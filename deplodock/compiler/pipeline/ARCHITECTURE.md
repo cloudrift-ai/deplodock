@@ -134,11 +134,17 @@ materializes the same `TileOp` tower. It uses a **greenfield knob vocabulary** (
 `MAP_N_THREAD` / `MAP_N_REG` / `MAP_M_THREAD` / `MAP_M_REG`, …), so the goldens / prior retrain on the new keys.
 `010_partition_loops.rewrite` dispatches to `partition.compose.try_compose` when the flag is set and falls
 through to the legacy planner for any regime the composer doesn't yet cover. **Covered so far: pointwise (`MAP`)
-and scalar-tier plain matmul (`SEMIRING`, static K, no split-K / cooperative-K / fused prologue)** — the matmul
-adds a `TileSerial` move re-bracketing K into a `K_o` (serial-outer) / `K_i` (stage-inner) tower with an optional
-`RED_FK` strip-mine (`RegisterTile(reduce=True)`), via a generative reduce → thread → register Fork tree. The
-warp-tier `Tensorize` move (Mma emission, absorbing `011`), split-K / cooperative-reduce, and flash/SDPA-prologue
-land in later phases. See `plans/melodic-giggling-gem.md`.
+and plain matmul (`SEMIRING`, static K, no split-K / cooperative-K / fused prologue) — both scalar and tensor-core
+tiers.** The matmul adds a `TileSerial` move re-bracketing K into a `K_o` (serial-outer) / `K_i` (stage-inner)
+tower (scalar: optional `RED_FK` strip-mine; warp: `atom_k`-strided), and a `Tensorize` move gated on
+`_atom.is_atom_eligible` that emits the BLOCK>WARP>REGISTER>ATOM tower for an eligible (fp16/bf16) matmul. The
+generative tree's matmul root is the `Tensorize` choice — warp subtrees (one per eligible atom) plus the scalar
+fallback — then warp→reg→bk (or reduce→thread→register for scalar). The warp tier reuses `011_lower_atom_cell` to
+fold the canonical cell into `Mma` (absorbing 011 fully is deferred), and **stamps the legacy `MMA` knob on the
+deployed warp tile** so the knob-driven downstream passes (`020_stage_inputs`, `005_lower_atom_tile`, `is_warp`)
+take the tensor-core path — the greenfield `TC_*` knobs are the search vocabulary, `MMA` is the downstream bridge
+until those passes are greenfielded in Phase 4. Split-K / cooperative-reduce and flash/SDPA-prologue land in later
+phases. See `plans/melodic-giggling-gem.md`.
 
 **Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
 gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments

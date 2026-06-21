@@ -257,7 +257,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     # Hierarchical move composer (opt-in, regime by regime) — falls through to
     # the legacy planner for any regime it doesn't yet cover.
     if config.move_composer_enabled():
-        composed = try_compose(loop_op, kernel_name=kernel_name)
+        composed = try_compose(loop_op, ctx, match.graph, kernel_name=kernel_name)
         if composed is not None:
             return composed
     # Idempotence is structural: once the planner has built a TileOp, the
