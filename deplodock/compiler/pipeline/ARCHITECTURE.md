@@ -133,9 +133,12 @@ offers the register tiles legal *given that thread tile* (incremental budget pru
 materializes the same `TileOp` tower. It uses a **greenfield knob vocabulary** (`partition/knobs.py`:
 `MAP_N_THREAD` / `MAP_N_REG` / `MAP_M_THREAD` / `MAP_M_REG`, …), so the goldens / prior retrain on the new keys.
 `010_partition_loops.rewrite` dispatches to `partition.compose.try_compose` when the flag is set and falls
-through to the legacy planner for any regime the composer doesn't yet cover. **Phase 1 covers the pointwise
-(`MAP`) regime only**; matmul / split-K / cooperative-reduce land in later phases, flash/SDPA-prologue is out of
-scope. See `plans/melodic-giggling-gem.md`.
+through to the legacy planner for any regime the composer doesn't yet cover. **Covered so far: pointwise (`MAP`)
+and scalar-tier plain matmul (`SEMIRING`, static K, no split-K / cooperative-K / fused prologue)** — the matmul
+adds a `TileSerial` move re-bracketing K into a `K_o` (serial-outer) / `K_i` (stage-inner) tower with an optional
+`RED_FK` strip-mine (`RegisterTile(reduce=True)`), via a generative reduce → thread → register Fork tree. The
+warp-tier `Tensorize` move (Mma emission, absorbing `011`), split-K / cooperative-reduce, and flash/SDPA-prologue
+land in later phases. See `plans/melodic-giggling-gem.md`.
 
 **Demoted-matmul split (`SPLIT_CONE`, rule `005_split_demoted`).** A fused computed-operand cone (the
 gated-MLP norm prologue, an elementwise scale) keeps a matmul off the warp tier — `ldmatrix` feeds fragments

@@ -33,3 +33,12 @@ MAP_N_THREAD = Knob("MAP_N_THREAD", KnobType.INT, hints=THREAD_CHOICES, help="N 
 MAP_N_REG = Knob("MAP_N_REG", KnobType.INT, hints=REG_CHOICES, help="N (inner free) register-tile factor", off=1)
 MAP_M_THREAD = Knob("MAP_M_THREAD", KnobType.INT, hints=THREAD_CHOICES, help="M (outer free) thread-tile extent", off=1)
 MAP_M_REG = Knob("MAP_M_REG", KnobType.INT, hints=REG_CHOICES, help="M (outer free) register-tile factor", off=1)
+
+# Reduce-tile knobs (the ``TileSerial`` move): ``RED_BK`` is the staged K-chunk
+# (inner serial loop trip count); ``RED_FK`` strip-mines the K axis into FK
+# independent accumulators (``RegisterTile(reduce=True)``). ``off=1`` = no
+# chunking / no strip-mine.
+BK_CHOICES: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
+FK_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+RED_BK = Knob("RED_BK", KnobType.INT, hints=BK_CHOICES, help="K staged-chunk size (inner serial loop trip count)", off=1)
+RED_FK = Knob("RED_FK", KnobType.INT, hints=FK_CHOICES, help="K strip-mine factor (independent accumulators)", off=1)

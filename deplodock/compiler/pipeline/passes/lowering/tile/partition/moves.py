@@ -1,10 +1,13 @@
-"""Moves for the pointwise regime: ``TileMap`` on each free axis.
+"""Moves: ``TileMap`` on each free axis, ``TileSerial`` on a matmul's reduce axis.
 
 A ``TileMap`` on a map axis contributes a thread-tile factor and a register-tile
 factor; the block-tile count is derived from the extent at materialize time
 (``MaskMap`` is implicit — a non-divisible / symbolic axis ceil-divides and gets
 a store guard). Map axes carry no carrier, so these moves have no algebraic
-precondition; legality is purely the resource budget.
+precondition; legality is purely the resource budget. ``TileSerial`` re-brackets
+a ``SEMIRING`` reduce axis into a ``(bk, fk)`` K-chunk + strip-mine — its
+precondition (``carrier.associative``) holds for any matmul reduce, so here too
+legality reduces to ``bk·fk`` dividing the K extent plus the cell budget.
 
 This module owns the **legal offer set** (the search dimensions) and the knob
 param dicts; ``materialize.py`` realizes a complete choice into the tower.
@@ -14,13 +17,18 @@ from __future__ import annotations
 
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
+    BK_CHOICES,
+    FK_CHOICES,
     MAP_M_REG,
     MAP_M_THREAD,
     MAP_N_REG,
     MAP_N_THREAD,
+    RED_BK,
+    RED_FK,
+    REG_CHOICES,
     THREAD_CHOICES,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import PointwiseSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 
 # Pointwise is memory-bandwidth bound, so a conservative register-tile menu
 # keeps the generative tree small without losing the configs that matter
@@ -81,3 +89,40 @@ def reg_knobs(skel: PointwiseSkeleton, reg: tuple[int, int]) -> dict:
     if skel.outer_m is not None:
         knobs[MAP_M_REG.name] = r_m
     return knobs
+
+
+# --- Matmul (SEMIRING) moves: TileMap on M/N + TileSerial on K. ---
+
+_CELL_TARGET = 16  # matmul wants a register tile big enough for ILP, small enough for occupancy
+
+
+def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int]]:
+    """Legal ``(bk, fk)`` K-tilings: ``bk·fk`` divides the static K extent (so
+    ``K_o = K/(bk·fk)`` is whole). Best-first: deep chunk (large ``bk``), no
+    strip-mine (``fk=1``)."""
+    out = [(bk, fk) for bk in BK_CHOICES for fk in FK_CHOICES if bk * fk <= skel.k_extent and skel.k_extent % (bk * fk) == 0]
+    out.sort(key=lambda bf: (-bf[0], bf[1]))
+    return out
+
+
+def matmul_thread_offers(skel: MatmulSkeleton, budget: Budget) -> list[tuple[int, int]]:
+    """Legal ``(thread_n, thread_m)`` for a matmul, best-first (≈256 threads)."""
+    n_choices = _axis_thread_choices(skel.inner_n.extent)
+    m_choices = _axis_thread_choices(skel.outer_m.extent)
+    out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
+    out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
+    return out
+
+
+def matmul_reg_offers(skel: MatmulSkeleton, budget: Budget, fk: int) -> list[tuple[int, int]]:
+    """Legal ``(reg_n, reg_m)`` register tiles for a matmul under the cell budget
+    (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells)."""
+    out = [(r_n, r_m) for r_n in REG_CHOICES for r_m in REG_CHOICES if budget.cells_ok(fk * r_n * r_m)]
+    out.sort(key=lambda rm: (abs(rm[0] * rm[1] - _CELL_TARGET), -rm[0] * rm[1]))
+    return out
+
+
+def reduce_knobs(reduce: tuple[int, int]) -> dict:
+    """Knob delta a reduce-tile branch pins."""
+    bk, fk = reduce
+    return {RED_BK.name: bk, RED_FK.name: fk}

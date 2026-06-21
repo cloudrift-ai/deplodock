@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Loop, Stmt
+from deplodock.compiler.ir.stmt import Loop, Stmt, Write
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,71 @@ def _map_axis(loop: Loop) -> MapAxis:
     if ext.is_static:
         return MapAxis(loop=loop, symbolic=False, extent=ext.as_static())
     return MapAxis(loop=loop, symbolic=True, extent=ext.hint or 0)
+
+
+@dataclass(frozen=True)
+class MatmulSkeleton:
+    """Plain scalar-matmul shape: free output axes ``M`` (outer) / ``N`` (inner)
+    + one ``SEMIRING`` reduce axis ``K``, with the canonical body
+    ``[Loop(k, [Load a, Load b, Assign(multiply), Accum]), Write(o[m,n])]``.
+
+    Phase 2a covers the scalar tier with no split-K / cooperative-K / fused
+    prologue and a static ``K`` extent; everything else returns ``None`` from
+    :func:`lift_matmul` (legacy fallthrough)."""
+
+    inner_n: MapAxis
+    outer_m: MapAxis
+    extra_outer: tuple[Loop, ...]
+    k_loop: Loop
+    k_name: str
+    k_extent: int
+    inner_body: tuple[Stmt, ...]
+    leading: tuple[Stmt, ...]
+
+
+def lift_matmul(loop_op: LoopOp) -> MatmulSkeleton | None:
+    """Lift a plain scalar-matmul skeleton, or ``None`` for anything outside the
+    Phase-2a envelope (symbolic K, multi-accumulator, fused prologue, missing M
+    axis, any non-``SEMIRING`` reduce → legacy fallthrough)."""
+    reduce_loops = [lp for lp in loop_op.body.iter_of_type(Loop) if lp.is_reduce]
+    if not reduce_loops or any(lp.algebra_kind is not AlgebraKind.SEMIRING for lp in reduce_loops):
+        return None
+    if len(reduce_loops) != 1:
+        return None  # multi-accumulator matmul — defer to legacy
+    k_loop = reduce_loops[0]
+    if not k_loop.axis.extent.is_static:
+        return None  # symbolic K stays on the legacy degenerate path for now
+
+    leading, rest = _split_leading_non_loops(tuple(loop_op.body))
+    chain: list[Loop] = []
+    cur = rest
+    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
+        chain.append(cur[0])
+        cur = tuple(cur[0].body)
+    if len(chain) < 2:
+        return None  # need both M and N free axes (outer_m required)
+
+    inner_n_loop = chain[-1]
+    inner_body = tuple(inner_n_loop.body)
+    # Canonical body: exactly the K reduce loop + Write(s), no prologue siblings.
+    loops_in = [s for s in inner_body if isinstance(s, Loop)]
+    if loops_in != [k_loop]:
+        return None
+    if not any(isinstance(s, Write) for s in inner_body):
+        return None
+    if any(not isinstance(s, (Loop, Write)) for s in inner_body):
+        return None  # leading assigns / extra stmts ⇒ fused prologue, not plain matmul
+
+    return MatmulSkeleton(
+        inner_n=_map_axis(inner_n_loop),
+        outer_m=_map_axis(chain[-2]),
+        extra_outer=tuple(chain[:-2]),
+        k_loop=k_loop,
+        k_name=k_loop.axis.name,
+        k_extent=k_loop.axis.extent.as_static(),
+        inner_body=inner_body,
+        leading=leading,
+    )
 
 
 def lift_pointwise(loop_op: LoopOp) -> PointwiseSkeleton | None:
