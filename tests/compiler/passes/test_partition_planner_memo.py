@@ -28,7 +28,7 @@ from deplodock.compiler.tensor import Tensor
 _planner = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.010_partition_loops")
 BR, BM, BN, FM, FN = (_planner.BR, _planner.BM, _planner.BN, _planner.FM, _planner.FN)
 # ``structure_features`` now lives in the stamp pass (loaded under a bare stem).
-_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
 structure_features = _stamp.structure_features
 
 
@@ -152,7 +152,7 @@ def test_lazy_tree_builds_only_expanded_path(monkeypatch):
 
 
 def test_structural_features_stamped_by_last_loop_pass():
-    """``loop/fusion/992_stamp_structural_features`` runs last in the loop
+    """``loop/stamp/020_stamp_structural_features`` runs last in the loop
     dialect: every fused LoopOp leaves the loop passes carrying its ``S_*``
     structural features equal to :func:`structure_features` — identity settles
     with the final fused body, before any tune-DB keying or tile-stage scoring

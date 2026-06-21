@@ -281,7 +281,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     compile builds O(path) Forks per kernel instead of one per enumerated
     variant."""
     loop_op: LoopOp = root.op
-    # Name was stamped onto the LoopOp by ``loop/fusion/991_stamp_loop_names``
+    # Name was stamped onto the LoopOp by ``loop/stamp/010_stamp_loop_names``
     # (the last loop-dialect pass), so we just forward it onto the TileOp.
     kernel_name = loop_op.name
     # Idempotence is structural: once the planner has built a TileOp, the

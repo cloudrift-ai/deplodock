@@ -1,22 +1,37 @@
 """Recognize the (fused) online-softmax attention at Loop IR → rewrite to flash.
 
-Runs AFTER the generic fuser (``010_merge_loop_ops`` + ``020_dedup_loads``), so it
-matches the **consolidated** form, not the scattered per-op chain: a non-causal
-SDPA fuses to just two ``LoopOp``s — the scaled scores ``X = (Σ_dd Q·K)·scale``
-and the softmax-then-P@V kernel ``out = Σ_kv softmax(X)·V`` (rowmax + rowsum-of-exp
-+ the normalized P@V all in one body). That second kernel IS the online-softmax
-pattern in one place, which is the semantic layer to recognize it. NO modification
-to the decomposition stage; gated by the ``FLASH`` knob (off → untouched).
+This is a **pattern-recognition** pass (``loop/recognize``): it rewrites a generic
+fused op-cluster into a specialized fused kernel. It runs AFTER the entire
+``loop/fusion`` fixpoint has settled — not interleaved with the generic fuser. The
+placement is load-bearing: the matmul's elementwise product (``qk_ew``) and the
+score reduce start as separate ops out of decomposition, and ``010_merge_loop_ops``
+fuses them (RoPE inline) over several fixpoint iterations. Firing recognition
+*interleaved* catches the score producer mid-fusion (``qk_ew`` still a separate
+kernel) and inlines that split form, re-materializing the RoPE'd product — defeating
+flash's whole purpose. Recognizing only once fusion settles, the recovered score
+body reads the projections directly (RoPE inline in the streaming reduce). Naming +
+structural stamping then run in the shared ``loop/stamp`` pass (after both
+``loop/fusion`` and ``loop/recognize``), so the minted flash kernel is named /
+stamped like any other. NO modification to the decomposition stage; gated by the
+``FLASH`` knob (off → untouched). Future recognizers (other attention variants,
+fused-norm patterns) belong in this pass too.
+
+A non-causal SDPA fuses to two ``LoopOp``s — the scaled scores ``X = (Σ_dd
+Q·K)·scale`` and the softmax-then-P@V kernel ``out = Σ_kv softmax(X)·V`` (rowmax +
+rowsum-of-exp + the normalized P@V all in one body). That second kernel IS the
+online-softmax pattern in one place, which is the semantic layer to recognize it.
 
 The matcher anchors on the softmax-P@V kernel (its body carries the tell-tale
 ``maximum`` rowmax Accum + an ``exp`` + a P@V sum feeding the output), reads ``X``
-(the score buffer the rowmax reduces) and ``V`` (the P@V's non-``X`` operand), then
-traces ``X`` to its producer (the scaled QK^T) to read Q / K. Operand order is NOT
-preserved by fusion, so Q vs K is disambiguated by index: the QK operand whose seq
-index matches the score's row (M / query) axis is Q. On a match the whole pair is
-rewritten to the fused flash ``LoopOp`` (``_flash.build_flash_frag``); the scores
-kernel orphans and is removed. Runs before ``991``/``992`` so the new kernel is
-named + structurally stamped.
+(the score buffer the rowmax reduces) and ``V`` (the P@V's non-``X`` operand). Two
+score-recovery strategies: **synthetic** when ``X``'s producer is a clean scaled-QK
+(``_extract_qk`` reads Q / K as plain Loads, disambiguated by index — the operand
+whose seq index matches the score's row/M axis is Q), and **recovered**
+(``build_flash_recovered``) when the producer is fused (RoPE / GQA index / scale /
+mask inline, so Q/K are computed SSA values not Loads — real decoder layers): the
+producer's score body is inlined wholesale and the consumer's V-load / output
+indices are recovered. On a match the pair is rewritten to one fused flash
+``LoopOp``; the scores kernel orphans and is removed.
 
 Masking and GQA are recovered **structurally** from the fused body (no frontend
 provenance to lean on): the score feeding the rowmax ``Accum`` is either the bare
@@ -36,7 +51,13 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.fusion._flash import build_flash_frag, flash_enabled, flash_shape_eligible, gqa_group
+from deplodock.compiler.pipeline.passes.loop.recognize._flash import (
+    build_flash_frag,
+    build_flash_recovered,
+    flash_enabled,
+    flash_shape_eligible,
+    gqa_group,
+)
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -128,9 +149,11 @@ def _is_loopop(graph: Graph, buf: str) -> bool:
     return node is not None and isinstance(node.op, LoopOp)
 
 
-def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str, str | None] | None:
-    """If ``node`` is a softmax-then-P@V kernel over a scaled QK^T, return
-    ``(q_id, k_id, v_id, mask_kind, mask_buf)``; else None."""
+def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | None:
+    """If ``node`` is a softmax-then-P@V kernel, return the anchor pieces
+    ``(x_buf, v_buf, mask_kind, mask_buf)`` — the score buffer the rowmax reduces,
+    the P@V's V operand, and the softmax-side mask (if any). Q/K recovery is left
+    to the caller (``_extract_qk`` for the synthetic build, else recovery)."""
     op = node.op
     if not isinstance(op, LoopOp):
         return None
@@ -164,15 +187,7 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str, str | None
             v_buf = next(iter(others))
     if v_buf is None:
         return None
-
-    xnode = graph.nodes.get(x_buf)
-    if xnode is None:
-        return None
-    qk = _extract_qk(xnode)
-    if qk is None:
-        return None
-    q_id, k_id, _head_dim = qk
-    return q_id, k_id, v_buf, mask_kind, mask_buf
+    return x_buf, v_buf, mask_kind, mask_buf
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -181,21 +196,42 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     found = _recognize(match.graph, root)
     if found is None:
         raise RuleSkipped("not a softmax-attention kernel")
-    q_id, k_id, v_id, mask_kind, mask_buf = found
+    x_buf, v_id, mask_kind, mask_buf = found
     graph = match.graph
-    operands = (q_id, k_id, v_id, *((mask_buf,) if mask_buf is not None else ()))
+    operands = (x_buf, v_id, *((mask_buf,) if mask_buf is not None else ()))
     if any(nid not in graph.nodes for nid in operands):
-        raise RuleSkipped("flash: Q/K/V/mask operand not a graph node")
-    q_shape = graph.nodes[q_id].output.shape
-    k_shape = graph.nodes[k_id].output.shape
-    v_shape = graph.nodes[v_id].output.shape
-    group = gqa_group(q_shape, k_shape)
-    if group is None:
-        raise RuleSkipped("flash: GQA heads not statically divisible")
-    mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
-    if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
-        raise RuleSkipped("flash: SDPA shape not eligible (GQA / mask / symbolic non-seq)")
-    mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
-    return build_flash_frag(
-        q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
-    )
+        raise RuleSkipped("flash: score/V/mask operand not a graph node")
+
+    # Synthetic path: a clean scaled-QK producer (Q/K recoverable as plain Loads).
+    qk = _extract_qk(graph.nodes[x_buf])
+    if qk is not None:
+        q_id, k_id, _head_dim = qk
+        if q_id not in graph.nodes or k_id not in graph.nodes:
+            raise RuleSkipped("flash: Q/K operand not a graph node")
+        q_shape = graph.nodes[q_id].output.shape
+        k_shape = graph.nodes[k_id].output.shape
+        v_shape = graph.nodes[v_id].output.shape
+        group = gqa_group(q_shape, k_shape)
+        if group is None:
+            raise RuleSkipped("flash: GQA heads not statically divisible")
+        mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
+        if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
+            raise RuleSkipped("flash: SDPA shape not eligible (GQA / mask / symbolic non-seq)")
+        mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
+        return build_flash_frag(
+            q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
+        )
+
+    # Recovery path: a fused score producer (RoPE / GQA index / mask inline) the
+    # synthetic builder can't reconstruct. Inline the producer's score body and
+    # recover the consumer's V / output indices. The producer carries its own
+    # mask, so a softmax-side mask here would be double-counted — fall through.
+    if mask_kind != "none":
+        raise RuleSkipped("flash: softmax-side mask with a non-clean QK producer")
+    xnode = graph.nodes[x_buf]
+    if not isinstance(xnode.op, LoopOp):
+        raise RuleSkipped("flash: score producer is not a LoopOp")
+    frag = build_flash_recovered(graph, xnode.op, root.op, x_buf, v_id, root.output)
+    if frag is None:
+        raise RuleSkipped("flash: score producer not recoverable")
+    return frag

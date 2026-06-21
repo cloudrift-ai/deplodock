@@ -691,7 +691,7 @@ class Monoid(ReduceCarrier):
 
     associative + commutative — which is what makes split-KV (flash-decoding) and
     cooperative-combine legal. The flash instance is built by
-    ``loop/fusion/_flash.flash_combine``.
+    ``loop/recognize/_flash.flash_combine``.
     """
 
     state: tuple[str, ...]

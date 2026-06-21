@@ -19,18 +19,33 @@ GPU-verified vs torch (~3–8e-7) on RTX 5090. What changed and what was learned
   as **GQA + causal** (`is_causal=True`). This is the only GQA form reachable via the public torch API here, and it
   matches the real Qwen3-Embedding layer-0 trace (16 q / 8 kv heads, `is_causal=True`, no explicit mask).
 
-**Blocker found — Parts A+B do NOT yet close Finding 1 on Qwen3.** The plan's `_extract_qk` recovers Q/K by matching a
-score producer with exactly **two plain Loads** (a clean scaled-QK). On a real decoder/embedding layer the generic
-fuser **fuses RoPE into the QK score reduce**: Q/K are computed inline from `mul_*` + `position_embeddings` (rotate-half
-+ cos/sin), and the causal mask + scale also live in the producer. So `_extract_qk` returns `None` and the SDPA falls
-through to `010_sdpa` (4 kernels) — confirmed on Qwen3-Embedding-0.6B layer 0. **Next step:** recover the score
-*computation* wholesale (inline the producer's per-`(head,m,kv)` body — which already carries RoPE + the GQA `//group`
-index + the mask — into the flash nest's score reduce, via the `Sigma`/`splice_graph` axis-remap machinery), replacing
-the synthetic `score_reduce`. That generalizes Parts A+B to real layers and is the prerequisite for the integration
-validation below.
+**RoPE-fused score-body recovery — landed.** The plan's `_extract_qk` recovers Q/K only from a clean scaled-QK
+producer (two plain Loads). On a real decoder/embedding layer the generic fuser **fuses RoPE into the QK score reduce**:
+Q/K are computed inline from `mul_*` + `position_embeddings` (rotate-half + cos/sin), and the causal mask + scale also
+live in the producer, so `_extract_qk` returns `None`. Fix (`build_flash_recovered`): when the clean recovery fails,
+inline the producer's per-`(head,m,kv)` score body wholesale (RoPE + the GQA `//group` index + the mask ride along) via
+the `Sigma` + `Stmt.rewrite` axis-remap / SSA-rename machinery, and recover the consumer's V-load + output indices (the
+GQA `head // group` index + the o_proj reshape). Two interlocking pieces made it work:
 
-**Remaining (unchanged from below):** the RoPE-fused score-body recovery (above), Part C (MMA tensor-core tier), and
-Part D (FLASH structural-fork offer + analytic cold-start). Until D, flash deploys only under `DEPLODOCK_FLASH=1`.
+1. **Placement.** Flash recognition had to move to its own `loop/recognize` pass that runs AFTER the entire
+   `loop/fusion` fixpoint settles — interleaved (the old `loop/fusion/025` slot) caught the score producer mid-fusion
+   (`qk_ew` still split out) and re-materialized the RoPE'd product, defeating flash. The naming / structural stamping
+   (`991`/`992`) moved to a shared `loop/stamp` pass that runs after both fusion and recognition (no more duplicated
+   aliases). `loop/recognize` is the home for future pattern recognizers.
+2. **Codegen fix.** The monoid merge (`render_merge_program`, `ir/stmt/base.py`) rendered `p · v` with raw args, so an
+   fp16 V made `float * __half` ambiguous (nvcc reject). It now casts non-f32 args to f32 (the merge runs in fp32) — a
+   general fix for any fp16 flash.
+
+Result: flash deploys, compiles, and is **bit-correct vs eager on Qwen3-Embedding-0.6B layer 0** (`max_diff ≈ 0.004`,
+fp16) — one fused `k_sdpa…` streaming kernel, no `qk_ew` score materialization. **It is not yet faster**: the scalar
+tier recomputes the score per output dim `d`, so the whole layer is ~5× slower than the split path under
+`DEPLODOCK_FLASH=1` (the recompute the plan warned about) — exactly what **Part C (MMA tier)** fixes (score once, `O` a
+carried fragment). The per-kernel solo-window bench mis-attributes this recompute to an unrelated tiny norm kernel
+(`mul_5` benches ~810 µs solo though its body is a trivial RMSNorm — a "miss cross-kernel cache effects" artifact); the
+whole-program e2e (~987 µs) is the honest number.
+
+**Remaining:** Part C (MMA tensor-core tier — the perf win), and Part D (FLASH structural-fork offer + analytic
+cold-start). Until D, flash deploys only under `DEPLODOCK_FLASH=1`.
 
 ---
 

@@ -460,7 +460,7 @@ def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id:
     # Every new body differs from the fused one — restamp the structural
     # identity (992 ran at fusion end and never re-runs; stale S_* would make
     # the split kernels featurize as the fused kernel for the learned prior).
-    feats = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+    feats = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
     for nid in (*xn_ids, cons_id):
         op = frag.nodes[nid].op
         op.knobs = {k: v for k, v in op.knobs.items() if not k.startswith("S_")}
