@@ -145,7 +145,7 @@ def _pack_window(loop: SerialTile, counter: list[int]) -> list[Stmt]:
             pn = f"{x}__p{cid}"
             new_body.append(Pack(name=pn, low=lo, high=hi, dtype=F16x2))
             packed[x] = pn
-        elif isinstance(st, Assign) and st.op.name == "multiply":
+        elif isinstance(st, Assign) and is_semiring_product(st.op):
             args = tuple(packed.get(a, a) for a in st.args)
             pn = f"{st.name}__p{cid}"
             new_body.append(Assign(name=pn, op=st.op, args=args, dtype=F16x2))
