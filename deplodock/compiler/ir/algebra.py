@@ -28,6 +28,7 @@ from enum import Enum
 
 from deplodock.compiler.ir.elementwise import distributes_over
 from deplodock.compiler.ir.stmt.base import ReduceCarrier
+from deplodock.compiler.ir.stmt.blocks import Loop
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma, Monoid
 
 
@@ -61,6 +62,16 @@ def matmul_reduce(loop) -> bool:
     if len(bufs) < 2:
         return False
     return any(isinstance(s, ReduceCarrier) for s in loop.body)
+
+
+def contains_matmul_reduce(stmt) -> bool:
+    """True iff ``stmt`` is or transitively contains a matmul-shape reduce
+    ``Loop`` (``matmul_reduce``). Recurses through every nested body — the
+    shared core behind the planner's fused-prologue probe and the
+    demoted-split cut's K-loop search."""
+    if isinstance(stmt, Loop) and matmul_reduce(stmt):
+        return True
+    return any(contains_matmul_reduce(c) for body in stmt.nested() for c in body)
 
 
 def _is_semiring_contraction(loop) -> bool:

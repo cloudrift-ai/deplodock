@@ -95,6 +95,7 @@ from typing import TYPE_CHECKING
 from deplodock.compiler import dtype as dtype_mod
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.algebra import contains_matmul_reduce
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import distributes_over
 from deplodock.compiler.ir.expr import Var
@@ -495,7 +496,7 @@ def _classify_cut(loop_op: LoopOp):
         cur = tuple(cur[0].body)
 
     inner = [s for s in cur if isinstance(s, Loop) and not s.is_reduce]
-    if len(inner) == 1 and _contains_matmul_reduce_loop(inner[0]):
+    if len(inner) == 1 and contains_matmul_reduce(inner[0]):
         outer_n = inner[0]
         prologue_level = cur
     elif rows and not inner:
@@ -523,12 +524,6 @@ def _classify_cut(loop_op: LoopOp):
     # that reaches the tensor-core tier, matching its static twin — the search
     # prices the split against the fused-scalar form.
     return tuple(leading), rows, prologue_level, outer_n, k_loop
-
-
-def _contains_matmul_reduce_loop(stmt: Stmt) -> bool:
-    if isinstance(stmt, Loop) and stmt.is_reduce and is_matmul_reduce(stmt):
-        return True
-    return any(_contains_matmul_reduce_loop(c) for body in stmt.nested() for c in body)
 
 
 def _matmul_operand_dtype(root: str, per_acc, cell_def, graph: Graph):

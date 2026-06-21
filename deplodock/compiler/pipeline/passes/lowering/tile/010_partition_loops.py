@@ -138,7 +138,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.algebra import AlgebraKind
+from deplodock.compiler.ir.algebra import AlgebraKind, contains_matmul_reduce
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.loop import LoopOp
@@ -363,7 +363,7 @@ def _classify_fused_prologue(stmts: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...],
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce:
             prologue.append(s)
-        elif isinstance(s, Loop) and not s.is_reduce and inner is None and _contains_matmul_reduce(s):
+        elif isinstance(s, Loop) and not s.is_reduce and inner is None and contains_matmul_reduce(s):
             inner = s
         elif isinstance(s, (Loop, StridedLoop)):
             return (), None
@@ -372,19 +372,6 @@ def _classify_fused_prologue(stmts: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...],
         else:
             prologue.append(s)
     return (tuple(prologue), inner) if inner is not None else ((), None)
-
-
-def _contains_matmul_reduce(stmt: Stmt) -> bool:
-    """True if ``stmt`` is or transitively contains a matmul-shape reduce
-    Loop (``is_matmul_reduce``: reduce body has ≥ 2 K-indexed Loads + an
-    Accum)."""
-    if isinstance(stmt, Loop) and stmt.is_reduce and is_matmul_reduce(stmt):
-        return True
-    for sub in stmt.nested():
-        for c in sub:
-            if _contains_matmul_reduce(c):
-                return True
-    return False
 
 
 def _identity_rename(name: str) -> str:

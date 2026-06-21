@@ -10,7 +10,7 @@ consistent across a normalize round-trip.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra
+from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra, contains_matmul_reduce
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.loop import Accum, Load, Loop, LoopOp, Write
@@ -137,6 +137,19 @@ def test_kind_survives_loopop_normalize_roundtrip():
     op2 = LoopOp(body=op.body)
     reduce_loops2 = [s for s in op2.body.iter() if isinstance(s, Loop) and s.is_reduce]
     assert reduce_loops2[0].algebra_kind is AlgebraKind.SEMIRING
+
+
+def test_contains_matmul_reduce_recurses():
+    # The shared helper finds a matmul reduce transitively nested under a
+    # non-reduce loop (the fused-prologue / demoted-split probe shape).
+    nest = Loop(
+        axis=Axis("n", 4),
+        body=(Loop(axis=Axis("m", 4), body=(_matmul_loop(),)), Write(output="O", index=(Var("n"),), value="x")),
+    )
+    assert contains_matmul_reduce(nest)
+    # A pure pointwise / monoid nest has none.
+    monoid_nest = Loop(axis=Axis("n", 4), body=(_reduce_loop("add"),))
+    assert not contains_matmul_reduce(monoid_nest)
 
 
 def test_kind_not_in_equality_or_op_cache_key():
