@@ -28,9 +28,11 @@ Scope: static OR dynamic (symbolic ``seq_len`` on Q/K/V dim -2 — one cached ke
 carrying ``int seq_len`` serves every runtime size, the symbol landing on BOTH the
 masked-row M and the symbolic reduce), causal or non-causal (causal masks the
 score per element, ``kv ≤ m`` else −inf — tile-skip is a tensor-core-tier
-follow-up), no explicit additive mask, no GQA. Read from the ``DEPLODOCK_FLASH=1``
-env pin; the two-level ``OptionFork`` offer + ``AnalyticPrior`` cold-start are a
-follow-up.
+follow-up), an optional broadcast additive mask (the HF ``(1,1,S,S)`` float bias),
+and GQA (``q_heads == group · kv_heads``; the K/V head axis read at ``head //
+group`` directly, no materialized broadcast). The tensor-core P@V tier is future
+work. Read from the ``DEPLODOCK_FLASH=1`` env pin; the two-level ``OptionFork``
+offer + ``AnalyticPrior`` cold-start are a follow-up.
 """
 
 from __future__ import annotations
@@ -129,38 +131,100 @@ def _static(d) -> int | None:
     return d.as_static() if d.is_static else None
 
 
-def flash_shape_eligible(q_shape: tuple, k_shape: tuple, v_shape: tuple, *, has_mask: bool) -> bool:
-    """True iff the flash nest can serve this SDPA — static (only the seq axis may
-    be symbolic), no explicit additive mask, no GQA. The decomposition deferral
-    and the lifting rule MUST agree on this, so both call it."""
-    if has_mask:
-        return False
+def gqa_group(q_shape: tuple, k_shape: tuple) -> int | None:
+    """The grouped-query head ratio ``q_heads // kv_heads`` (1 when equal-head),
+    or ``None`` when the head axis isn't statically divisible. The head axis is the
+    last batch dim (``shape[-3]``); rank < 3 has no head (group 1)."""
+    qh = _static(q_shape[-3]) if len(q_shape) >= 3 else 1
+    kh = _static(k_shape[-3]) if len(k_shape) >= 3 else 1
+    if qh is None or kh is None or kh == 0 or qh % kh != 0:
+        return None
+    return qh // kh
+
+
+def flash_shape_eligible(q_shape: tuple, k_shape: tuple, v_shape: tuple, *, group: int, mask_shape: tuple | None) -> bool:
+    """True iff the flash nest can serve this SDPA — static batch/head (only the
+    seq axis may be symbolic), an optional broadcastable additive mask, and GQA
+    where ``q_heads == group · kv_heads``. The K/V head axis is read at
+    ``head // group`` directly in the nest (no materialized broadcast). The
+    recognizer and this predicate MUST agree, so both call it."""
     if len(q_shape) < 2 or len(k_shape) < 2 or len(v_shape) < 2:
         return False
-    batch = [_static(d) for d in q_shape[:-2]]
-    if any(b is None for b in batch):
+    q_batch = [_static(d) for d in q_shape[:-2]]
+    k_batch = [_static(d) for d in k_shape[:-2]]
+    v_batch = [_static(d) for d in v_shape[:-2]]
+    if any(b is None for b in (*q_batch, *k_batch, *v_batch)):
         return False  # symbolic batch / head — only the seq axis may be dynamic
-    if [_static(d) for d in k_shape[:-2]] != batch or [_static(d) for d in v_shape[:-2]] != batch:
-        return False  # GQA / mismatched batch dims
+    if len(q_batch) != len(k_batch) or len(q_batch) != len(v_batch):
+        return False
+    if q_batch:
+        # Leading (non-head) batch dims must match exactly; the head axis (last
+        # batch dim) is q = group · kv.
+        if q_batch[:-1] != k_batch[:-1] or q_batch[:-1] != v_batch[:-1]:
+            return False
+        if k_batch[-1] != v_batch[-1] or q_batch[-1] != group * k_batch[-1]:
+            return False
+    elif group != 1:
+        return False  # no head axis but a non-trivial group makes no sense
     head_dim, d_v = _static(q_shape[-1]), _static(v_shape[-1])
     if head_dim is None or d_v is None:
         return False  # symbolic head_dim / value-dim
     if _static(k_shape[-1]) != head_dim:
         return False
-    return v_shape[-2] == k_shape[-2]  # V seq must match K seq
+    if v_shape[-2] != k_shape[-2]:  # V seq must match K seq
+        return False
+    if mask_shape is not None:
+        # Per-(m, kv) additive bias: leading dims must be static 1 (indexed to 0),
+        # the trailing two address the query / key seq.
+        if len(mask_shape) < 2:
+            return False
+        if any(_static(d) != 1 for d in mask_shape[:-2]):
+            return False
+        if mask_shape[-2] != q_shape[-2] or mask_shape[-1] != k_shape[-2]:
+            return False
+    return True
 
 
 def build_flash_frag(
-    q_id: str, k_id: str, v_id: str, q_shape: tuple, k_shape: tuple, v_shape: tuple, out: Tensor, *, causal: bool
+    q_id: str,
+    k_id: str,
+    v_id: str,
+    q_shape: tuple,
+    k_shape: tuple,
+    v_shape: tuple,
+    out: Tensor,
+    *,
+    causal: bool,
+    group: int = 1,
+    mask: tuple[str, tuple] | None = None,
 ) -> Graph:
     """Build the fragment graph holding the fused flash ``LoopOp`` (+ its scale /
-    -inf constants). The caller guarantees :func:`flash_shape_eligible`."""
+    -inf constants). The caller guarantees :func:`flash_shape_eligible`.
+
+    ``group`` is the GQA head ratio (K/V indexed at ``head // group``); ``mask`` is
+    an optional ``(buffer_id, shape)`` additive bias loaded per ``(m, kv)``."""
     batch = [_static(d) for d in q_shape[:-2]]
     head_dim, d_v = _static(q_shape[-1]), _static(v_shape[-1])
     s_q_dim, s_k_dim = q_shape[-2], k_shape[-2]  # Dim instances — static int or symbolic seq_len
     scale = 1.0 / math.sqrt(head_dim)
+    mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    body = _flash_loop_body(q_id, k_id, v_id, "_flash_scale", batch, s_q_dim, s_k_dim, head_dim, d_v, out.name, causal=causal)
+    body = _flash_loop_body(
+        q_id,
+        k_id,
+        v_id,
+        "_flash_scale",
+        batch,
+        s_q_dim,
+        s_k_dim,
+        head_dim,
+        d_v,
+        out.name,
+        causal=causal,
+        group=group,
+        mask_buf=mask_buf,
+        mask_shape=mask_shape,
+    )
     nest = _wrap_free_axes(body, batch, s_q_dim, d_v)
 
     frag = Graph()
@@ -170,6 +234,9 @@ def build_flash_frag(
     frag.add_node(
         op=ConstantOp(name="_flash_scale", value=scale), inputs=[], output=Tensor("_flash_scale", (1,), out.dtype), node_id="_flash_scale"
     )
+    if mask_buf is not None:
+        frag.add_node(op=InputOp(), inputs=[], output=Tensor(mask_buf, mask_shape, out.dtype), node_id=mask_buf)
+        inputs.append(mask_buf)
     if causal:
         # -inf bias for masked (key-after-query) positions: exp(-inf)=0, so a
         # masked score contributes nothing to the streaming softmax / output.
@@ -199,17 +266,29 @@ def _flash_loop_body(
     out_buf: str,
     *,
     causal: bool = False,
+    group: int = 1,
+    mask_buf: str | None = None,
+    mask_shape: tuple | None = None,
 ) -> tuple:
     """The per-output-element ``(…, m, d)`` body: streaming KV reduce + finalize.
 
     The score ``s = Σ_dd Q·K`` is an inner reduce nested in the KV streaming
     reduce, so ``Init(sacc)`` is pre-placed at the KV-body scope (reset per step):
     the streaming ``Monoid`` loop is a per-iteration boundary the default
-    Init-placement would otherwise cross."""
+    Init-placement would otherwise cross.
+
+    GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
+    ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so
+    the kv_heads-many K/V are read without materializing the q_heads expansion.
+    An additive ``mask_buf`` (broadcast leading dims) is loaded per ``(m, kv)`` and
+    summed into the score before the streaming combine — ``-inf`` entries make
+    ``exp(s − m_new) = 0``, so masked keys contribute nothing."""
     bvars = _batch_vars(len(batch))
+    head_axis = len(batch) - 1  # last batch dim is the head (when there is one)
+    kv_bvars = tuple(BinaryExpr("/", bv, Literal(group, "int")) if (group > 1 and i == head_axis) else bv for i, bv in enumerate(bvars))
     q_idx = (*bvars, Var("m"), Var("dd"))
-    k_idx = (*bvars, Var("kv"), Var("dd"))
-    v_idx = (*bvars, Var("kv"), Var("d"))
+    k_idx = (*kv_bvars, Var("kv"), Var("dd"))
+    v_idx = (*kv_bvars, Var("kv"), Var("d"))
     out_idx = (*bvars, Var("m"), Var("d"))
 
     score_reduce = Loop(
@@ -235,6 +314,15 @@ def _flash_loop_body(
                     SelectBranch(value="ninf_c", select=Literal(1, "int")),
                 ),
             ),
+        )
+        score_name = "s_masked"
+    elif mask_buf is not None:
+        # Additive bias: leading dims broadcast (indexed to 0), trailing two are
+        # the query row m and the streaming key kv.
+        mask_idx = (*(Literal(0, "int") for _ in mask_shape[:-2]), Var("m"), Var("kv"))
+        score += (
+            Load(name="mask_e", input=mask_buf, index=mask_idx),
+            Assign(name="s_masked", op="add", args=(score_name, "mask_e")),
         )
         score_name = "s_masked"
     kv_body = (

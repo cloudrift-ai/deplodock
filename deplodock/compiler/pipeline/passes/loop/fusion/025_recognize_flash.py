@@ -16,8 +16,17 @@ preserved by fusion, so Q vs K is disambiguated by index: the QK operand whose s
 index matches the score's row (M / query) axis is Q. On a match the whole pair is
 rewritten to the fused flash ``LoopOp`` (``_flash.build_flash_frag``); the scores
 kernel orphans and is removed. Runs before ``991``/``992`` so the new kernel is
-named + structurally stamped. Scope: non-causal, static or dynamic seq, no mask,
-no GQA — anything else fails a check and the score-matrix path stands.
+named + structurally stamped.
+
+Masking and GQA are recovered **structurally** from the fused body (no frontend
+provenance to lean on): the score feeding the rowmax ``Accum`` is either the bare
+score Load (no mask), ``add(score, Select(kv ≤ m))`` (causal — the lifted
+``IndexMapOp`` bias), or ``add(score, Load(mask))`` (the HF ``(1,1,S,S)`` additive
+bias); the GQA group is the ``q_heads // kv_heads`` shape ratio, deployed as a
+``head // group`` K/V index. Detecting the mask is a correctness requirement — a
+masked SDPA that matched the anchor but built an unmasked nest would be silently
+wrong. Anything ineligible (symbolic non-seq, non-broadcastable mask, indivisible
+heads) fails a check and the score-matrix path stands.
 """
 
 from __future__ import annotations
@@ -25,9 +34,9 @@ from __future__ import annotations
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.fusion._flash import build_flash_frag, flash_enabled, flash_shape_eligible
+from deplodock.compiler.pipeline.passes.loop.fusion._flash import build_flash_frag, flash_enabled, flash_shape_eligible, gqa_group
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -78,9 +87,50 @@ def _extract_qk(xnode: Node) -> tuple[str, str, object] | None:
     return None
 
 
-def _recognize(graph: Graph, node: Node) -> tuple[str, str, str] | None:
+def _def(stmts: tuple[Stmt, ...], name: str) -> Stmt | None:
+    """The statement in ``stmts`` (one loop body, flat) that defines SSA ``name``."""
+    for s in stmts:
+        if isinstance(s, Load) and name in s.names:
+            return s
+        if isinstance(s, (Assign, Select)) and s.name == name:
+            return s
+    return None
+
+
+def _classify_rowmax(graph: Graph, lp: Loop) -> tuple[str, str, str | None] | None:
+    """For the rowmax reduce loop, return ``(score_buf, mask_kind, mask_buf)``
+    where ``mask_kind`` is ``"none"`` / ``"causal"`` / ``"additive"``; else None.
+
+    The value folded by the ``maximum`` Accum is the bare score Load (no mask) or
+    ``add(score, mask)`` — the mask being a coord ``Select`` (causal) or a buffer
+    ``Load`` (the additive bias). The score side is the operand whose buffer is a
+    ``LoopOp`` (the scaled-QK producer); the mask side is the other."""
+    max_accs = [s for s in lp.body if isinstance(s, Accum) and s.op.name in _MAX]
+    if len(max_accs) != 1:
+        return None
+    feed = _def(lp.body, max_accs[0].value)
+    if isinstance(feed, Load):
+        return feed.input, "none", None
+    if isinstance(feed, Assign) and feed.op.name == "add":
+        a, b = feed.args
+        for sc, mk in ((a, b), (b, a)):
+            sdef, mdef = _def(lp.body, sc), _def(lp.body, mk)
+            if isinstance(sdef, Load) and _is_loopop(graph, sdef.input):
+                if isinstance(mdef, Select):
+                    return sdef.input, "causal", None
+                if isinstance(mdef, Load):
+                    return sdef.input, "additive", mdef.input
+    return None
+
+
+def _is_loopop(graph: Graph, buf: str) -> bool:
+    node = graph.nodes.get(buf)
+    return node is not None and isinstance(node.op, LoopOp)
+
+
+def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str, str | None] | None:
     """If ``node`` is a softmax-then-P@V kernel over a scaled QK^T, return
-    ``(q_id, k_id, v_id)``; else None. Non-causal only."""
+    ``(q_id, k_id, v_id, mask_kind, mask_buf)``; else None."""
     op = node.op
     if not isinstance(op, LoopOp):
         return None
@@ -92,22 +142,24 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str] | None:
         return None
     out_write = writes[0]
 
-    # X = the score buffer the rowmax reduces (the softmax tell-tale).
+    # X = the score buffer the rowmax reduces; mask recovered alongside.
     x_buf: str | None = None
+    mask_kind = "none"
+    mask_buf: str | None = None
     for lp in _reduce_loops(op):
-        accs = [s for s in lp.body if isinstance(s, Accum)]
-        loads = [s for s in lp.body if isinstance(s, Load)]
-        if any(a.op.name in _MAX for a in accs) and len(loads) == 1:
-            x_buf = loads[0].input
+        cls = _classify_rowmax(graph, lp)
+        if cls is not None:
+            x_buf, mask_kind, mask_buf = cls
+            break
     if x_buf is None:
         return None
 
-    # P@V: the reduce whose sum-Accum feeds the output; V = its non-X operand.
+    # P@V: the reduce whose sum-Accum feeds the output; V = its non-X/-mask operand.
     v_buf: str | None = None
     for lp in _reduce_loops(op):
         if not any(isinstance(s, Accum) and s.name == out_write.value and s.op.name in _SUM for s in lp.body):
             continue
-        others = {s.input for s in lp.body if isinstance(s, Load)} - {x_buf}
+        others = {s.input for s in lp.body if isinstance(s, Load)} - {x_buf, mask_buf}
         if len(others) == 1:
             v_buf = next(iter(others))
     if v_buf is None:
@@ -120,7 +172,7 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str] | None:
     if qk is None:
         return None
     q_id, k_id, _head_dim = qk
-    return q_id, k_id, v_buf
+    return q_id, k_id, v_buf, mask_kind, mask_buf
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -128,14 +180,22 @@ def rewrite(match: Match, root: Node) -> Graph | None:
         raise RuleSkipped("FLASH knob off — keep the score-materializing path")
     found = _recognize(match.graph, root)
     if found is None:
-        raise RuleSkipped("not a (non-causal) softmax-attention kernel")
-    q_id, k_id, v_id = found
+        raise RuleSkipped("not a softmax-attention kernel")
+    q_id, k_id, v_id, mask_kind, mask_buf = found
     graph = match.graph
-    if any(nid not in graph.nodes for nid in (q_id, k_id, v_id)):
-        raise RuleSkipped("flash: Q/K/V operand not a graph node")
+    operands = (q_id, k_id, v_id, *((mask_buf,) if mask_buf is not None else ()))
+    if any(nid not in graph.nodes for nid in operands):
+        raise RuleSkipped("flash: Q/K/V/mask operand not a graph node")
     q_shape = graph.nodes[q_id].output.shape
     k_shape = graph.nodes[k_id].output.shape
     v_shape = graph.nodes[v_id].output.shape
-    if not flash_shape_eligible(q_shape, k_shape, v_shape, has_mask=False):
-        raise RuleSkipped("flash: SDPA shape not eligible (GQA / symbolic non-seq)")
-    return build_flash_frag(q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=False)
+    group = gqa_group(q_shape, k_shape)
+    if group is None:
+        raise RuleSkipped("flash: GQA heads not statically divisible")
+    mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
+    if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
+        raise RuleSkipped("flash: SDPA shape not eligible (GQA / mask / symbolic non-seq)")
+    mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
+    return build_flash_frag(
+        q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
+    )
