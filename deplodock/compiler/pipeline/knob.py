@@ -30,7 +30,7 @@ from deplodock import config
 _PKG_ROOT = Path(__file__).resolve().parents[2]
 
 # Reserved prefix for the structural-feature knobs stamped by
-# ``loop/fusion/992_stamp_structural_features`` — distinct from any tuning Knob
+# ``loop/stamp/020_stamp_structural_features`` — distinct from any tuning Knob
 # name, so ``format_tuning_knobs`` drops them from the tuning view and
 # ``knob_features`` passes them through as-is. Declared here (rather than with
 # the producing pass, which is loaded under a bare module stem) so every

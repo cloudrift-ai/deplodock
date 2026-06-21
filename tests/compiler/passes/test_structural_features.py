@@ -1,5 +1,5 @@
 """Unit tests for structural feature extraction
-(``loop/fusion/992_stamp_structural_features.structure_features``).
+(``loop/stamp/020_stamp_structural_features.structure_features``).
 
 Hand-built ``Body`` fixtures (same style as ``tests/compiler/ir/stmt/
 test_structural_key.py``) exercise the skeleton histogram, the extent-free
@@ -26,7 +26,7 @@ from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
 from deplodock.compiler.tensor import Tensor
 
 # ``structure_features`` lives in the stamp pass (loaded under a bare stem).
-_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
 structure_features = _stamp.structure_features
 
 

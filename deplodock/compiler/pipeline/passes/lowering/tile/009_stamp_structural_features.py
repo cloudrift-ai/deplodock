@@ -1,4 +1,4 @@
-"""Alias of ``loop/fusion/992_stamp_structural_features`` for the post-split re-fusion window.
+"""Alias of ``loop/stamp/020_stamp_structural_features`` for the post-split re-fusion window.
 
 Kernels merged by ``006_merge_split_glue`` carry no ``S_*`` features (the splicer builds a
 fresh op; 006 stamps only the decision knobs). They must be restamped before
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import importlib
 
-_m = importlib.import_module("deplodock.compiler.pipeline.passes.loop.fusion.992_stamp_structural_features")
+_m = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
 
 PATTERN = _m.PATTERN
 rewrite = _m.rewrite

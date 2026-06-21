@@ -19,7 +19,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
-from deplodock.compiler.pipeline.passes.loop.fusion._flash import flash_combine
+from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
 def _online_softmax_steps(m: str, ll: str, s: str) -> tuple:

@@ -254,7 +254,11 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     sset = set(state_names)
     out: list[str] = []
     for a in program:
-        rhs = op_to_expr(a.op.name, [Var(x) for x in a.args]).render(ctx)
+        # The merge runs in fp32 — cast any non-f32 arg (e.g. a raw ``__half``
+        # value loaded into the partial, as in fp16 flash's ``p · v``) so the
+        # operator isn't ambiguous. The cast is a no-op for f32 args.
+        arg_exprs = [Var(x) if ctx.ssa_dtypes.get(x, "f32") == "f32" else CastExpr("float", Var(x)) for x in a.args]
+        rhs = op_to_expr(a.op.name, arg_exprs).render(ctx)
         if a.name in sset:
             out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
         else:

@@ -1,9 +1,10 @@
 """Stamp ``LoopOp.name`` with a provenance-derived kernel label.
 
-Runs last in the loop dialect — after ``005_split_shared_indexmap``,
-``010_merge_loop_ops``, and ``020_dedup_loads`` have settled the body — so
-the structural hash baked into the name (see :func:`provenance.name_for`)
-reflects the final fused form. The Tile-dialect partition planner
+Runs last in the loop dialect — in the ``loop/stamp`` pass, after ``loop/fusion``
+has settled the body AND ``loop/recognize`` has minted any pattern-specialized
+kernels (e.g. the fused flash attention nest) — so the structural hash baked into
+the name (see :func:`provenance.name_for`) reflects the final form and every
+kernel, recognized or not, is labeled. The Tile-dialect partition planner
 (``lowering/tile/010_partition_loops``) reads ``loop_op.name`` directly
 and forwards it to the emitted ``TileOp``; every subsequent dialect copies
 it through. Stamping here means ``--ir loop`` dumps already render
