@@ -200,7 +200,7 @@ def _is_overflow_prone(s: Assign) -> bool:
     mean-of-squares). Distinct-arg ``multiply`` (matmul) is excluded."""
     if s.op.name == "pow":
         return True
-    return s.op.name == "multiply" and len(s.args) == 2 and s.args[0] == s.args[1]
+    return s.op.semiring_product and len(s.args) == 2 and s.args[0] == s.args[1]
 
 
 def _stamp_write(s: Write, ctx: _StampCtx) -> Write:

@@ -114,7 +114,9 @@ def _try_tag_here(body: Body, *, atom: Atom, k_name: str | None, write: Write | 
     if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
         return None
     mul, accum = assigns[0], accums[0]
-    if mul.op.name != "multiply" or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
+    # The cell is a semiring contraction: its product ``⊗`` must distribute over
+    # the accumulator's reduce ``⊕`` (today the ``(×, +)`` matmul semiring).
+    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
         return None
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:

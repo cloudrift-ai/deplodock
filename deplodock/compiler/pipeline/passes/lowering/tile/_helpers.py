@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, ReduceCarrier, Stmt, StridedLoop
+from deplodock.compiler.ir.algebra import matmul_reduce
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Stmt, StridedLoop
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, SerialTile, StridedTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -48,6 +49,17 @@ def accums_independent(body: Body) -> bool:
     body = Body.coerce(body)
     accum_names = {s.name for s in body if isinstance(s, Accum)}
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
+
+
+def reduce_body_has_coupled_accum(body: Body) -> bool:
+    """True iff a non-Accum stmt in ``body`` reads a sibling Accum's running
+    value — the online / coupled-reduction shape (online softmax, Welford)
+    whose cross-Accum dependency the ring-buffer / pipeline-stage peels can't
+    preserve. The per-reduce-scope counterpart of :func:`accums_independent`
+    (which tests Accum-value coupling over a flat body); shared by
+    ``040_use_ring_buffers`` and ``080_pipeline_stages``."""
+    body = Body.coerce(body)
+    return any(any(isinstance(d, Accum) for d in body.deps_of(c) if d is not None) for c in body if not isinstance(c, Accum))
 
 
 from deplodock.compiler.target import compute_capability  # noqa: E402,F401
@@ -158,14 +170,12 @@ def is_matmul_reduce(loop) -> bool:
     ``010_partition_loops`` to locate the matmul K reduce inside a LoopOp
     body, and by downstream tile passes to confirm a matmul-shaped reduce
     survived.
+
+    The structural core lives in ``ir/algebra.matmul_reduce`` (the single
+    source the bottom-up `AlgebraKind` classifier shares); this wrapper adds
+    the tile-layer type guard.
     """
-    if not (isinstance(loop, (Loop, StridedLoop, SerialTile, StridedTile)) and loop.is_reduce):
-        return False
-    K_name = loop.axis.name
-    bufs = {ld.input for ld in loop.body.of_type(Load) if K_name in {v for e in ld.index for v in e.free_vars()}}
-    if len(bufs) < 2:
-        return False
-    return any(isinstance(s, ReduceCarrier) for s in loop.body)
+    return isinstance(loop, (Loop, StridedLoop, SerialTile, StridedTile)) and matmul_reduce(loop)
 
 
 def segmentable_k_extent(load: Load, k_name: str) -> int | None:

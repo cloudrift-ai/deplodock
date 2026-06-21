@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_canon
 from deplodock.compiler.ir.expr import Expr, Literal, Var
 from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Body
@@ -18,11 +18,6 @@ from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ReduceOp)]
-
-# Map ReduceOp.fn ("sum"/"maximum"/"minimum"/"prod") to the combine op name that
-# ``Accum`` carries. Accum init is derived from this op by the Loop IR
-# identity table (``ACCUM_IDENTITY``), so no separate init lookup is needed.
-_COMBINE: dict[str, str] = {"sum": "add", "maximum": "maximum", "prod": "multiply", "minimum": "minimum"}
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -51,7 +46,10 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     reduce_axis_name = f"a{axis}"
     load_index = tuple(Var(a.name) for a in axes)
 
-    combine = ElementwiseImpl(_COMBINE.get(root.op.name, root.op.name))
+    # ReduceOp.fn ("sum"/"maximum"/"minimum"/"prod") canonicalizes to the combine
+    # op ``Accum`` carries (sum→add, prod→multiply). Accum init is derived from
+    # this op by the Loop IR identity table, so no separate init lookup is needed.
+    combine = ElementwiseImpl(reduce_canon(root.op.name))
     write_index = _build_write_index(axes, reduce_axis_name, tuple(root.output.shape))
 
     # Nested body: Loop(reduce_axis, [Load + Accum]) + Write wrapped in

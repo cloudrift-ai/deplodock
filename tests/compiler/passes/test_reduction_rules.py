@@ -19,6 +19,7 @@ from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.ir.tile.ir import StageBundle, ThreadTile
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import reduce_body_has_coupled_accum
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -278,3 +279,44 @@ def test_accums_dependent_via_assign_chain():
         Accum(name="acc_sum", value="e", op="add"),
     )
     assert _accums_independent(body) is False
+
+
+# --- reduce_body_has_coupled_accum: the per-reduce-scope counterpart shared by
+#     040_use_ring_buffers / 080_pipeline_stages (a NON-Accum stmt reads a
+#     sibling Accum's running value).
+
+
+def test_coupled_accum_false_when_independent():
+    body = (
+        _load("v", "x"),
+        Assign(name="vv", op="multiply", args=("v", "v")),
+        Accum(name="s", value="v", op="add"),
+        Accum(name="s2", value="vv", op="add"),
+    )
+    assert reduce_body_has_coupled_accum(body) is False
+
+
+def test_coupled_accum_true_for_online_softmax():
+    # The rescale ``d = subtract(v, acc_max)`` is a non-Accum stmt reading the
+    # running max — the coupled-reduction shape the ring/pipeline peels reject.
+    body = (
+        _load("v", "x"),
+        Accum(name="acc_max", value="v", op="max"),
+        Assign(name="d", op="subtract", args=("v", "acc_max")),
+        Assign(name="e", op="exp", args=("d",)),
+        Accum(name="acc_sum", value="e", op="add"),
+    )
+    assert reduce_body_has_coupled_accum(body) is True
+
+
+def test_coupled_accum_only_inspects_non_accum_stmts():
+    # An Accum reading another Accum directly is the *accums_independent*
+    # concern; this predicate inspects only non-Accum stmts, so the bare
+    # Accum→Accum read (no intermediate non-Accum) is not coupled here.
+    body = (
+        _load("v", "x"),
+        Accum(name="acc_max", value="v", op="max"),
+        Accum(name="acc_sum", value="acc_max", op="add"),
+    )
+    assert reduce_body_has_coupled_accum(body) is False
+    assert _accums_independent(body) is False  # the other predicate does catch it

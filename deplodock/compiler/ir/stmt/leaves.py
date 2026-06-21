@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import (
     ReduceCarrier,
@@ -535,21 +535,19 @@ class Accum(ReduceCarrier):
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        op_name = self.op.name
         # Accumulator dtype — explicit on Accum once the Init-placement pass
         # has frozen it; otherwise default to fp32 (legacy behavior).
         acc_dt = (self.dtype or F32).name
         ctx.ssa_dtypes[self.name] = acc_dt
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
         rhs = ctx.target.convert(self.value, value_dt, acc_dt)
-        if op_name in ("maximum", "amax"):
-            spelling = ctx.target.intrinsic("fmax", acc_dt)
-            return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
-        if op_name == "minimum":
-            spelling = ctx.target.intrinsic("fmin", acc_dt)
-            return [f"{pad}{self.name} = {spelling}({self.name}, {rhs});"]
-        op = {"add": "+=", "sum": "+=", "multiply": "*=", "prod": "*="}.get(op_name, "+=")
-        return [f"{pad}{self.name} {op} {rhs};"]
+        # Spelling (``+=`` / ``*=`` / ``fmax`` / ``fmin``) from the shared reduce
+        # registry; defaults to additive for non-reduce ops.
+        spelling = reduce_spelling(self.op)
+        if spelling.intrinsic is not None:
+            fn = ctx.target.intrinsic(spelling.intrinsic, acc_dt)
+            return [f"{pad}{self.name} = {fn}({self.name}, {rhs});"]
+        return [f"{pad}{self.name} {spelling.compound} {rhs};"]
 
 
 @dataclass(frozen=True)

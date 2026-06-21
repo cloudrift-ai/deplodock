@@ -85,6 +85,7 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import reduce_body_has_coupled_accum
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -173,14 +174,8 @@ def _try_pipeline(kouter: SerialTile) -> list[Stmt] | None:
     # softmax (running max / sum read mid-iter) and similar shapes
     # compound fp32 drift under the prologue/main/epilogue peel and
     # produce wrong output.
-    from deplodock.compiler.ir.stmt import Accum  # noqa: PLC0415
-
-    for k_inner in reduces:
-        for c in k_inner.body:
-            if isinstance(c, Accum):
-                continue
-            if any(isinstance(d, Accum) for d in k_inner.body.deps_of(c) if d is not None):
-                return None
+    if any(reduce_body_has_coupled_accum(k_inner.body) for k_inner in reduces):
+        return None
 
     n = kouter.axis.extent.as_static()
     k_var = kouter.axis.name

@@ -28,7 +28,7 @@ from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
@@ -1241,18 +1241,13 @@ def _binary_combine_expr(op: ElementwiseImpl, a: str, b: str, target=None, dt: s
     ``None`` keeps the legacy f32 spellings for callers that haven't
     plumbed a target through yet.
     """
-    name = op.name
-    if name in ("add", "sum"):
-        return f"{a} + {b}"
-    if name in ("multiply", "prod"):
-        return f"{a} * {b}"
-    if name in ("maximum", "amax"):
-        spelling = target.intrinsic("fmax", dt) if target is not None else "fmaxf"
-        return f"{spelling}({a}, {b})"
-    if name == "minimum":
-        spelling = target.intrinsic("fmin", dt) if target is not None else "fminf"
-        return f"{spelling}({a}, {b})"
-    raise ValueError(f"TreeHalve: unsupported op {name!r}")
+    spelling = _REDUCE_SPELLING.get(op.reduce_canon)
+    if spelling is None:
+        raise ValueError(f"TreeHalve: unsupported op {op.name!r}")
+    if spelling.infix is not None:
+        return f"{a} {spelling.infix} {b}"
+    fn = target.intrinsic(spelling.intrinsic, dt) if target is not None else f"{spelling.intrinsic}f"
+    return f"{fn}({a}, {b})"
 
 
 # ``StridedLoop`` is shared infrastructure — defined in ``ir/stmt.py``
