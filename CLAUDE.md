@@ -27,6 +27,9 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
 `DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_TUNE_EPS`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_ANALYTIC_TILT`, `DEPLODOCK_BENCH_BACKENDS`,
 `DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`, `DEPLODOCK_SERVING_STATIC` (static batched serving),
+`DEPLODOCK_MOVE_COMPOSER` (opt-in hierarchical move composer — `passes/lowering/tile/partition/`, covers pointwise /
+matmul scalar+warp-MMA / split-K / whole-CTA cooperative-reduce, falls through to the legacy planner otherwise;
+greenfield search dims env-pinnable as `DEPLODOCK_<KNOB>`; default off — see `plans/melodic-giggling-gem.md`),
 …) are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
 layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by

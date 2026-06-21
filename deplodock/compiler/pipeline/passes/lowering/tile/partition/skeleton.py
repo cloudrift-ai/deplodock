@@ -95,6 +95,11 @@ def lift_matmul(loop_op: LoopOp) -> MatmulSkeleton | None:
         return None  # need both M and N free axes (outer_m required)
 
     inner_n_loop = chain[-1]
+    # Static free axes only: the warp path is clean (no masking) and the scalar
+    # path tiles a symbolic axis at its hint, not the runtime extent — both
+    # mis-compile a symbolic M/N, so leave those to the legacy planner.
+    if not inner_n_loop.axis.extent.is_static or any(not lp.axis.extent.is_static for lp in chain[:-1]):
+        return None
     inner_body = tuple(inner_n_loop.body)
     # Canonical body: exactly the K reduce loop + Write(s), no prologue siblings.
     loops_in = [s for s in inner_body if isinstance(s, Loop)]
@@ -157,6 +162,8 @@ def lift_coop_reduce(loop_op: LoopOp, *, warp_size: int = 32) -> CoopReduceSkele
         return None
 
     inner_n_loop = chain[-1]
+    if not inner_n_loop.axis.extent.is_static or any(not lp.axis.extent.is_static for lp in chain[:-1]):
+        return None  # symbolic rows → legacy (whole-CTA build is static-row only)
     inner_body = tuple(inner_n_loop.body)
     loops_in = [s for s in inner_body if isinstance(s, Loop)]
     if loops_in != [k_loop]:
