@@ -47,7 +47,6 @@ heads) fails a check and the score-matrix path stands.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.elementwise import is_semiring_product
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
@@ -103,7 +102,7 @@ def _extract_qk(xnode: Node) -> tuple[str, str, object] | None:
     for lp in _reduce_loops(op):
         loads = [s for s in lp.body if isinstance(s, Load)]
         accs = [s for s in lp.body if isinstance(s, Accum)]
-        muls = [s for s in lp.body if isinstance(s, Assign) and is_semiring_product(s.op)]
+        muls = [s for s in lp.body if isinstance(s, Assign) and s.op.semiring_product]
         if len(loads) == 2 and len(accs) == 1 and _is_sum(accs[0]) and muls:
             q_id = k_id = None
             for ld in loads:

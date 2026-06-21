@@ -135,6 +135,19 @@ class ElementwiseImpl:
         return self.name in self._SELECTING
 
     @property
+    def semiring_product(self) -> bool:
+        """True iff this op is a ``⊗`` in some semiring (today only
+        ``multiply``) — the op-name-free 'is this a matmul / square product'
+        query. The unary counterpart of the binary ``distributes_over``."""
+        return any(self.name in prods for prods in self._SEMIRING.values())
+
+    def distributes_over(self, reduce) -> bool:
+        """True iff this op (``⊗``) distributes over the reduce combine
+        ``reduce`` (``⊕``) — i.e. ``Σ_k a⊗b`` is a contraction / matmul over
+        ``⊕``. ``reduce`` may be an op name or ``ElementwiseImpl``."""
+        return self.name in self._SEMIRING.get(reduce_canon(_op_name(reduce)), frozenset())
+
+    @property
     def reduce_canon(self) -> str:
         """This op's canonical reduce-combine identity (``sum`` → ``add``,
         ``prod`` → ``multiply``, ``amax`` → ``maximum`` …); aliasless names map
@@ -182,21 +195,6 @@ def reduce_canon(name: str) -> str:
 
 def _op_name(op) -> str:
     return op.name if isinstance(op, ElementwiseImpl) else op
-
-
-def distributes_over(product, reduce) -> bool:
-    """True iff op ``product`` (``⊗``) distributes over the reduce combine
-    ``reduce`` (``⊕``) — i.e. ``Σ_k a⊗b`` is a contraction/matmul over ``⊕``.
-    Accepts op names or ``ElementwiseImpl``."""
-    return _op_name(product) in ElementwiseImpl._SEMIRING.get(reduce_canon(_op_name(reduce)), frozenset())
-
-
-def is_semiring_product(op) -> bool:
-    """True iff ``op`` is a ``⊗`` in some semiring (today only ``multiply``) —
-    the op-name-free 'is this a matmul / square product' query. Accepts an op
-    name or ``ElementwiseImpl``."""
-    name = _op_name(op)
-    return any(name in prods for prods in ElementwiseImpl._SEMIRING.values())
 
 
 # ---------------------------------------------------------------------------

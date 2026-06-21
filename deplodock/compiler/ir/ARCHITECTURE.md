@@ -114,15 +114,17 @@ it replaces the frontend layout ops via `coord_map` expressions.
 | `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
 
 Op metadata (arity / `commutative` / `associative` / `identity` /
-`has_identity` / `selecting`) lives on `ElementwiseImpl` in `ir/elementwise.py` —
-the single source of truth shared across elementwise, reduce, scan, and
-accumulator use sites. The algebraic traits are what reassociation gates
-(split-K, cooperative tree-combine) query instead of matching op names. Beyond
-the per-op trait properties, the module exposes the op-name-free **role
-queries** the planner / atom-cell matchers / flash recognizer ask:
-`reduce_canon` (alias → base combine, `sum` → `add` …), `distributes_over(⊗, ⊕)`
-and `is_semiring_product(⊗)` (the `_SEMIRING` table — only `(+, ×)` today), and
-the `_REDUCE_SPELLING` registry (`reduce_spelling`) — the single op-keyed table
+`has_identity` / `selecting` / `semiring_product`) lives on `ElementwiseImpl` in
+`ir/elementwise.py` — the single source of truth shared across elementwise,
+reduce, scan, and accumulator use sites. The algebraic traits are what
+reassociation gates (split-K, cooperative tree-combine) query instead of matching
+op names. The per-op trait *properties* (`op.semiring_product` — is this op a `⊗`
+in some semiring) and the binary method `⊗.distributes_over(⊕)` (does this product
+distribute over that reduce — the `_SEMIRING` table, only `(+, ×)` today) live on
+`ElementwiseImpl`; the module's op-name-free **role queries** the planner /
+atom-cell matchers / flash recognizer ask round them out: `reduce_canon` (alias →
+base combine, `sum` → `add` …) and the `_REDUCE_SPELLING` registry
+(`reduce_spelling`) — the single op-keyed table
 behind the four sites that used to switch on the reduce op name (`Accum.render`'s
 `+=` / `*=` / `fmax` / `fmin`, `kernel/ir._binary_combine_expr`, and
 `ReduceOp.forward` / `ScanOp.forward`'s numpy reductions). `op.selecting` (the

@@ -42,7 +42,6 @@ from __future__ import annotations
 from deplodock.compiler.dtype import F16, F32, F16x2
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import is_semiring_product
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Pack, Stmt, Unpack
@@ -100,7 +99,7 @@ def _is_window_loop(s: SerialTile) -> bool:
     accums = [x for x in s.body if isinstance(x, Accum)]
     if not accums or not s.axis.extent.is_static or s.axis.extent.as_static() % 2 != 0:
         return False
-    muls = {x.name: x for x in s.body if isinstance(x, Assign) and is_semiring_product(x.op)}
+    muls = {x.name: x for x in s.body if isinstance(x, Assign) and x.op.semiring_product}
     loads = {x.name: x for x in s.body if isinstance(x, Load)}
     for acc in accums:
         mul = muls.get(acc.value)
@@ -145,7 +144,7 @@ def _pack_window(loop: SerialTile, counter: list[int]) -> list[Stmt]:
             pn = f"{x}__p{cid}"
             new_body.append(Pack(name=pn, low=lo, high=hi, dtype=F16x2))
             packed[x] = pn
-        elif isinstance(st, Assign) and is_semiring_product(st.op):
+        elif isinstance(st, Assign) and st.op.semiring_product:
             args = tuple(packed.get(a, a) for a in st.args)
             pn = f"{st.name}__p{cid}"
             new_body.append(Assign(name=pn, op=st.op, args=args, dtype=F16x2))

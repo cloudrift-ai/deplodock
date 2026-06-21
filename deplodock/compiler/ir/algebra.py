@@ -26,7 +26,6 @@ from __future__ import annotations
 
 from enum import Enum
 
-from deplodock.compiler.ir.elementwise import distributes_over
 from deplodock.compiler.ir.stmt.base import ReduceCarrier
 from deplodock.compiler.ir.stmt.blocks import Loop
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma, Monoid
@@ -90,7 +89,7 @@ def _is_semiring_contraction(loop) -> bool:
     for acc in body:
         if isinstance(acc, Accum):
             prod = assigns.get(acc.value)
-            if prod is not None and distributes_over(prod.op, acc.op):
+            if prod is not None and prod.op.distributes_over(acc.op):
                 return True
     return False
 

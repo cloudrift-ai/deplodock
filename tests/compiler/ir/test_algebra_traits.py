@@ -24,8 +24,6 @@ import pytest
 from deplodock.compiler.ir.elementwise import (
     _REDUCE_SPELLING,
     ElementwiseImpl,
-    distributes_over,
-    is_semiring_product,
     reduce_canon,
     reduce_spelling,
 )
@@ -72,16 +70,17 @@ def test_reduce_ops_have_identity(name: str) -> None:
 
 
 def test_semiring_product_is_multiply_only() -> None:
-    assert is_semiring_product("multiply")
+    assert ElementwiseImpl("multiply").semiring_product
     for name in ["add", "sum", "maximum", "minimum", "subtract"]:
-        assert not is_semiring_product(name)
+        assert not ElementwiseImpl(name).semiring_product
 
 
 def test_distributes_over_plus_times_only() -> None:
-    assert distributes_over("multiply", "add")
-    assert distributes_over("multiply", "sum")  # alias of add
-    assert not distributes_over("multiply", "maximum")
-    assert not distributes_over("add", "add")
+    mul, add = ElementwiseImpl("multiply"), ElementwiseImpl("add")
+    assert mul.distributes_over(add)
+    assert mul.distributes_over("sum")  # alias of add; reduce arg accepts a name
+    assert not mul.distributes_over("maximum")
+    assert not add.distributes_over(add)
 
 
 # --- reduce canonicalization (was _COMBINE / the alias tuples) ---------------
