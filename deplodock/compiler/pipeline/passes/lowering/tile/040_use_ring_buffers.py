@@ -31,10 +31,11 @@ import importlib
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import SerialTile, StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
+from deplodock.compiler.pipeline.passes.lowering.tile._helpers import reduce_body_has_coupled_accum
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -316,14 +317,9 @@ def _has_stage_inner_reduce(body: Body) -> bool:
 def _accums_independent_in(body: Body) -> bool:
     """For each reduce SerialTile inside ``body``, reject if any non-Accum
     stmt reads a sibling Accum's running value (online-softmax merge shape)."""
-    for nested in body.iter():
-        if isinstance(nested, SerialTile) and nested.is_reduce:
-            for c in nested.body:
-                if isinstance(c, Accum):
-                    continue
-                if any(isinstance(d, Accum) for d in nested.body.deps_of(c) if d is not None):
-                    return False
-    return True
+    return not any(
+        reduce_body_has_coupled_accum(nested.body) for nested in body.iter() if isinstance(nested, SerialTile) and nested.is_reduce
+    )
 
 
 def _make_phase_load_rewriter(staged_names: set[str], phase):

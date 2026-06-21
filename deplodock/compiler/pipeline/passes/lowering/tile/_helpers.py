@@ -51,6 +51,17 @@ def accums_independent(body: Body) -> bool:
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
 
 
+def reduce_body_has_coupled_accum(body: Body) -> bool:
+    """True iff a non-Accum stmt in ``body`` reads a sibling Accum's running
+    value — the online / coupled-reduction shape (online softmax, Welford)
+    whose cross-Accum dependency the ring-buffer / pipeline-stage peels can't
+    preserve. The per-reduce-scope counterpart of :func:`accums_independent`
+    (which tests Accum-value coupling over a flat body); shared by
+    ``040_use_ring_buffers`` and ``080_pipeline_stages``."""
+    body = Body.coerce(body)
+    return any(any(isinstance(d, Accum) for d in body.deps_of(c) if d is not None) for c in body if not isinstance(c, Accum))
+
+
 from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 

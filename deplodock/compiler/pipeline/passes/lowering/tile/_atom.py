@@ -233,6 +233,13 @@ def _mma_eligible_factory(atom: Atom, *, min_cc: tuple[int, int] = (8, 0)) -> Ca
                 return False
             if accum.value != multiply.name:
                 return False
+            # The cell must be a semiring contraction — the product distributes
+            # over the Accum's reduce (the matmul ``(×, +)``). This matches the
+            # check the lowering it feeds enforces (``011_lower_atom_cell`` /
+            # ``_split_demoted``: ``mul.op.distributes_over(acc.op)``), so the
+            # eligibility gate and the tagger agree on what reaches the mma tier.
+            if not multiply.op.distributes_over(accum.op):
+                return False
             # Operand layout: the gate and the tagger share ONE classifier
             # (:func:`classify_matmul_operands`), so a cell the tagger can't
             # recover A/B for is never offered the mma tier (an untagged
