@@ -47,6 +47,7 @@ heads) fails a check and the score-matrix path stands.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.elementwise import is_semiring_product
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
@@ -61,8 +62,15 @@ from deplodock.compiler.pipeline.passes.loop.recognize._flash import (
 
 PATTERN = [Pattern("root", LoopOp)]
 
-_SUM = ("add", "sum")
-_MAX = ("maximum", "amax")
+
+def _is_sum(accum: Accum) -> bool:
+    """The accum is the semiring additive reduce ``⊕`` (``add`` / ``sum``)."""
+    return accum.op.reduce_canon == "add"
+
+
+def _is_rowmax(accum: Accum) -> bool:
+    """The accum is the softmax rowmax reduce (``maximum`` / ``amax``)."""
+    return accum.op.reduce_canon == "maximum"
 
 
 def _reduce_loops(op: LoopOp) -> list[Loop]:
@@ -95,8 +103,8 @@ def _extract_qk(xnode: Node) -> tuple[str, str, object] | None:
     for lp in _reduce_loops(op):
         loads = [s for s in lp.body if isinstance(s, Load)]
         accs = [s for s in lp.body if isinstance(s, Accum)]
-        muls = [s for s in lp.body if isinstance(s, Assign) and s.op.name == "multiply"]
-        if len(loads) == 2 and len(accs) == 1 and accs[0].op.name in _SUM and muls:
+        muls = [s for s in lp.body if isinstance(s, Assign) and is_semiring_product(s.op)]
+        if len(loads) == 2 and len(accs) == 1 and _is_sum(accs[0]) and muls:
             q_id = k_id = None
             for ld in loads:
                 if _var_at(ld.index, -2) == m_var:
@@ -126,7 +134,7 @@ def _classify_rowmax(graph: Graph, lp: Loop) -> tuple[str, str, str | None] | No
     ``add(score, mask)`` — the mask being a coord ``Select`` (causal) or a buffer
     ``Load`` (the additive bias). The score side is the operand whose buffer is a
     ``LoopOp`` (the scaled-QK producer); the mask side is the other."""
-    max_accs = [s for s in lp.body if isinstance(s, Accum) and s.op.name in _MAX]
+    max_accs = [s for s in lp.body if isinstance(s, Accum) and _is_rowmax(s)]
     if len(max_accs) != 1:
         return None
     feed = _def(lp.body, max_accs[0].value)
@@ -180,7 +188,7 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
     # P@V: the reduce whose sum-Accum feeds the output; V = its non-X/-mask operand.
     v_buf: str | None = None
     for lp in _reduce_loops(op):
-        if not any(isinstance(s, Accum) and s.name == out_write.value and s.op.name in _SUM for s in lp.body):
+        if not any(isinstance(s, Accum) and s.name == out_write.value and _is_sum(s) for s in lp.body):
             continue
         others = {s.input for s in lp.body if isinstance(s, Load)} - {x_buf, mask_buf}
         if len(others) == 1:

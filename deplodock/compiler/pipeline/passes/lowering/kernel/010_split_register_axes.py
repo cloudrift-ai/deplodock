@@ -39,12 +39,6 @@ from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle,
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
-# Reduce ops the cross-accumulator fold may reorder. The FK strip-mine reorders
-# the per-thread reduction (independent partial sums folded at the end), so the
-# op must be associative + commutative — the same fp-reassociation the existing
-# BR cross-thread warp-shuffle combine already relies on (within eager tolerance).
-_ASSOCIATIVE_REDUCE_OPS = frozenset({"add", "sum", "maximum", "amax", "minimum", "amin", "multiply", "prod"})
-
 PATTERN = [Pattern("root", TileOp)]
 
 
@@ -170,9 +164,11 @@ def _build_accum_fold(tile: RegisterTile) -> list[Stmt]:
     fk = k_f.extent.as_static()
     folds: list[Stmt] = []
     for accum in _iter_accums(tile.body):
-        op_name = accum.op.name
-        if op_name not in _ASSOCIATIVE_REDUCE_OPS:
-            raise RuleSkipped(f"FK fold requires an associative reduce op; got {op_name!r} on accumulator {accum.name!r}")
+        # The FK strip-mine reorders the per-thread reduction (independent partial
+        # sums folded at the end), so the combine must be associative — the same
+        # fp-reassociation the BR cross-thread warp-shuffle combine relies on.
+        if not accum.op.associative:
+            raise RuleSkipped(f"FK fold requires an associative reduce op; got {accum.op.name!r} on accumulator {accum.name!r}")
         folds.extend(_fold_tree(accum.name, fk, accum.op))
     return folds
 

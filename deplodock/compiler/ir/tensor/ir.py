@@ -32,7 +32,7 @@ import numpy as np
 
 from deplodock.compiler.dim import Dim, to_dim
 from deplodock.compiler.ir.base import Op, _keepdim_axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -127,18 +127,10 @@ class ReduceOp(Op):
         return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
-
-        a = inputs[0]
-        name = self.op.name
-        if name in ("sum", "add"):
-            return np.sum(a, axis=self.axis, keepdims=True)
-        if name in ("prod", "multiply"):
-            return np.prod(a, axis=self.axis, keepdims=True)
-        if name in ("maximum", "amax", "fmax"):
-            return np.max(a, axis=self.axis, keepdims=True)
-        if name in ("minimum", "fmin"):
-            return np.min(a, axis=self.axis, keepdims=True)
-        raise NotImplementedError(f"ReduceOp.forward: unknown fn {name!r}")
+        spelling = _REDUCE_SPELLING.get(self.op.reduce_canon)
+        if spelling is None:
+            raise NotImplementedError(f"ReduceOp.forward: unknown fn {self.op.name!r}")
+        return spelling.np_reduce(inputs[0], axis=self.axis, keepdims=True)
 
 
 @dataclass
@@ -164,16 +156,10 @@ class ScanOp(Op):
         return tuple(input_shapes[0])  # scan preserves shape
 
     def forward(self, *inputs):
-
-        a = inputs[0]
-        name = self.op.name
-        if name in ("sum", "add"):
-            return np.cumsum(a, axis=self.axis)
-        if name in ("maximum", "fmax"):
-            return np.maximum.accumulate(a, axis=self.axis)
-        if name in ("prod", "multiply"):
-            return np.cumprod(a, axis=self.axis)
-        raise NotImplementedError(f"ScanOp.forward: unknown fn {name!r}")
+        spelling = _REDUCE_SPELLING.get(self.op.reduce_canon)
+        if spelling is None or spelling.np_scan is None:
+            raise NotImplementedError(f"ScanOp.forward: unknown fn {self.op.name!r}")
+        return spelling.np_scan(inputs[0], axis=self.axis)
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,7 @@ from __future__ import annotations
 from deplodock.compiler.dtype import F16, F32, F16x2
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import is_semiring_product
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Pack, Stmt, Unpack
@@ -99,7 +100,7 @@ def _is_window_loop(s: SerialTile) -> bool:
     accums = [x for x in s.body if isinstance(x, Accum)]
     if not accums or not s.axis.extent.is_static or s.axis.extent.as_static() % 2 != 0:
         return False
-    muls = {x.name: x for x in s.body if isinstance(x, Assign) and x.op.name == "multiply"}
+    muls = {x.name: x for x in s.body if isinstance(x, Assign) and is_semiring_product(x.op)}
     loads = {x.name: x for x in s.body if isinstance(x, Load)}
     for acc in accums:
         mul = muls.get(acc.value)

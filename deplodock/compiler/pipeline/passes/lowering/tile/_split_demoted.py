@@ -96,6 +96,7 @@ from deplodock.compiler import dtype as dtype_mod
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import distributes_over
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
@@ -172,7 +173,8 @@ def try_split_demoted(loop_op: LoopOp, ctx: Context, *, graph: Graph, node_id: s
     per_acc: list[tuple[Accum, Assign, tuple[str, ...]]] = []
     for acc in accums:
         mul = cell_def.get(acc.value)
-        if not isinstance(mul, Assign) or mul.op.name != "multiply" or len(mul.args) != 2:
+        # Matmul cell: the product must distribute over the accumulator's reduce.
+        if not isinstance(mul, Assign) or not distributes_over(mul.op, acc.op) or len(mul.args) != 2:
             return None
         cone_args: dict[str, None] = {}  # ordered de-dup (a squared cone appears twice)
         for a in mul.args:

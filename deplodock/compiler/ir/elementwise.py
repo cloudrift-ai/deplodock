@@ -18,6 +18,9 @@ indices, a separate layer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import NamedTuple
+
 import numpy as np
 
 
@@ -73,6 +76,18 @@ class ElementwiseImpl:
         "amax": -1e30,
         "minimum": 1e30,
     }
+    # Selecting ops *choose* an existing input value (max/min family) rather
+    # than accumulate magnitude — so an Accum over one may stay in the input
+    # dtype, and the flash recognizer's rowmax keys off it. The single source
+    # for the per-op ``selecting`` trait (was a ``_SELECTING_OPS`` frozenset in
+    # ``020_place_inits``).
+    _SELECTING: frozenset[str] = frozenset({"maximum", "amax", "minimum", "max", "min"})
+    # Semiring pairing — a reduce combine ``⊕`` mapped to the products ``⊗``
+    # that distribute over it (``a·(b⊕c) == a·b ⊕ a·c``), so a contraction
+    # ``Σ_k a⊗b`` is a matmul over ``⊕``. Only ``(+, ×)`` is exercised today;
+    # the table is *data* so tropical ``(min, +)`` etc. is a one-line add when a
+    # consumer exists — but DO NOT add unused semirings (simplicity-first).
+    _SEMIRING: dict[str, frozenset[str]] = {"add": frozenset({"multiply"})}
 
     def __init__(self, name: str) -> None:
         fn = _NAME_TO_FN.get(name)
@@ -112,6 +127,21 @@ class ElementwiseImpl:
         / ``commutative`` to admit a reduce for split-K / tree-combine."""
         return self.identity is not None
 
+    @property
+    def selecting(self) -> bool:
+        """True for ops that *select* an existing input value (the max/min
+        family) instead of accumulating magnitude — an Accum over one may keep
+        the input dtype rather than promote to the accumulating dtype."""
+        return self.name in self._SELECTING
+
+    @property
+    def reduce_canon(self) -> str:
+        """This op's canonical reduce-combine identity (``sum`` → ``add``,
+        ``prod`` → ``multiply``, ``amax`` → ``maximum`` …); aliasless names map
+        to themselves. The op-name-free key the reduce/scan render + numpy
+        sites share."""
+        return reduce_canon(self.name)
+
     def __eq__(self, other: object) -> bool:
         return isinstance(other, ElementwiseImpl) and self.name == other.name
 
@@ -120,6 +150,85 @@ class ElementwiseImpl:
 
     def __repr__(self) -> str:
         return f"ElementwiseImpl({self.name!r})"
+
+
+# ---------------------------------------------------------------------------
+# Algebraic-role queries — the op-name-free helpers the partition planner,
+# atom-cell matchers, and flash recognizer ask instead of string-matching
+# ``"multiply"`` / ``"add"`` / ``"maximum"``.
+# ---------------------------------------------------------------------------
+
+# Reduce/scan op aliases → their canonical combine identity. The single map
+# behind ``ElementwiseImpl.reduce_canon`` and the lift-reduce tensor→loop
+# alias; an unlisted name canonicalizes to itself.
+_REDUCE_CANON: dict[str, str] = {
+    "add": "add",
+    "sum": "add",
+    "multiply": "multiply",
+    "prod": "multiply",
+    "maximum": "maximum",
+    "amax": "maximum",
+    "fmax": "maximum",
+    "minimum": "minimum",
+    "fmin": "minimum",
+}
+
+
+def reduce_canon(name: str) -> str:
+    """Canonicalize a reduce/scan op name to its base combine identity
+    (``sum`` → ``add`` …). Names without an alias map to themselves."""
+    return _REDUCE_CANON.get(name, name)
+
+
+def _op_name(op) -> str:
+    return op.name if isinstance(op, ElementwiseImpl) else op
+
+
+def distributes_over(product, reduce) -> bool:
+    """True iff op ``product`` (``⊗``) distributes over the reduce combine
+    ``reduce`` (``⊕``) — i.e. ``Σ_k a⊗b`` is a contraction/matmul over ``⊕``.
+    Accepts op names or ``ElementwiseImpl``."""
+    return _op_name(product) in ElementwiseImpl._SEMIRING.get(reduce_canon(_op_name(reduce)), frozenset())
+
+
+def is_semiring_product(op) -> bool:
+    """True iff ``op`` is a ``⊗`` in some semiring (today only ``multiply``) —
+    the op-name-free 'is this a matmul / square product' query. Accepts an op
+    name or ``ElementwiseImpl``."""
+    name = _op_name(op)
+    return any(name in prods for prods in ElementwiseImpl._SEMIRING.values())
+
+
+# ---------------------------------------------------------------------------
+# Reduce render-spelling registry — the single op-keyed table behind the four
+# sites that used to switch on the reduce op name: ``Accum.render`` (CUDA
+# ``+=`` / ``*=`` / ``fmax`` / ``fmin``), ``kernel/ir._binary_combine_expr``
+# (the tree-combine binary expr), and ``ReduceOp.forward`` / ``ScanOp.forward``
+# (the numpy interpreter reductions). Keyed by canonical combine name.
+# ---------------------------------------------------------------------------
+
+
+class ReduceSpelling(NamedTuple):
+    infix: str | None  # binary-expr operator (``a + b``), or None for a call form
+    compound: str | None  # compound assignment (``name += rhs``), or None
+    intrinsic: str | None  # CUDA/abstract intrinsic (``fmax`` / ``fmin``), or None
+    np_reduce: Callable  # numpy axis reduction (keepdims)
+    np_scan: Callable | None  # numpy cumulative (scan), or None if scan is undefined
+
+
+_REDUCE_SPELLING: dict[str, ReduceSpelling] = {
+    "add": ReduceSpelling("+", "+=", None, np.sum, np.cumsum),
+    "multiply": ReduceSpelling("*", "*=", None, np.prod, np.cumprod),
+    "maximum": ReduceSpelling(None, None, "fmax", np.max, np.maximum.accumulate),
+    "minimum": ReduceSpelling(None, None, "fmin", np.min, np.minimum.accumulate),
+}
+
+
+def reduce_spelling(op) -> ReduceSpelling:
+    """The render data for a reduce combine, defaulting to additive (``+=``)
+    for non-reduce / unknown ops — matches ``Accum.render``'s legacy fallback.
+    Accepts an op name or ``ElementwiseImpl``."""
+    return _REDUCE_SPELLING.get(reduce_canon(_op_name(op)), _REDUCE_SPELLING["add"])
 
 
 # ---------------------------------------------------------------------------

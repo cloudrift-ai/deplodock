@@ -26,6 +26,7 @@ visit rewrites nothing and the pass skips.
 from __future__ import annotations
 
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.elementwise import distributes_over
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Atom, AtomTile, SerialTile, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -114,7 +115,9 @@ def _try_tag_here(body: Body, *, atom: Atom, k_name: str | None, write: Write | 
     if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
         return None
     mul, accum = assigns[0], accums[0]
-    if mul.op.name != "multiply" or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
+    # The cell is a semiring contraction: its product ``⊗`` must distribute over
+    # the accumulator's reduce ``⊕`` (today the ``(×, +)`` matmul semiring).
+    if not distributes_over(mul.op, accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
         return None
     a_load, b_load = _classify_ab(loads, k_name=k_name, write=write)
     if a_load is None or b_load is None:

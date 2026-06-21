@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.dtype import F16, F32, DataType
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.elementwise import is_semiring_product
 from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
@@ -200,7 +201,7 @@ def _is_overflow_prone(s: Assign) -> bool:
     mean-of-squares). Distinct-arg ``multiply`` (matmul) is excluded."""
     if s.op.name == "pow":
         return True
-    return s.op.name == "multiply" and len(s.args) == 2 and s.args[0] == s.args[1]
+    return is_semiring_product(s.op) and len(s.args) == 2 and s.args[0] == s.args[1]
 
 
 def _stamp_write(s: Write, ctx: _StampCtx) -> Write:

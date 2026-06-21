@@ -73,17 +73,15 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     return TileOp(body=new_body, name=root.op.name)
 
 
-# Reduction ops that select one input value (no magnitude accumulation)
-# and can therefore stay in the input dtype. Everything else (sum, prod)
-# uses the accumulating dtype.
-_SELECTING_OPS: frozenset[str] = frozenset({"maximum", "amax", "minimum", "max", "min"})
-
-
 def _decide_dtype(accum: Accum, accumulating_dtype: DataType, selecting_dtype: DataType) -> DataType:
-    """Per-Accum dtype choice. Already-stamped Accums keep their dtype."""
+    """Per-Accum dtype choice. Already-stamped Accums keep their dtype.
+
+    A *selecting* combine (the max/min family — ``op.selecting``) picks an
+    existing input value rather than accumulating magnitude, so it can stay in
+    the input dtype; everything else (sum, prod) uses the accumulating dtype."""
     if accum.dtype is not None:
         return accum.dtype
-    if accum.op.name in _SELECTING_OPS:
+    if accum.op.selecting:
         return selecting_dtype
     return accumulating_dtype
 
