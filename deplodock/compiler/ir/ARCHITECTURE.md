@@ -114,10 +114,19 @@ it replaces the frontend layout ops via `coord_map` expressions.
 | `IndexMapOp` + `IndexSource`         | Unified layout-only op over `Expr`.                            |
 
 Op metadata (arity / `commutative` / `associative` / `identity` /
-`has_identity`) lives on `ElementwiseImpl` in `ir/elementwise.py` — the single
-source of truth shared across elementwise, reduce, scan, and accumulator use
-sites. The algebraic traits are what reassociation gates (split-K, cooperative
-tree-combine) query instead of matching op names.
+`has_identity` / `selecting`) lives on `ElementwiseImpl` in `ir/elementwise.py` —
+the single source of truth shared across elementwise, reduce, scan, and
+accumulator use sites. The algebraic traits are what reassociation gates
+(split-K, cooperative tree-combine) query instead of matching op names. Beyond
+the per-op trait properties, the module exposes the op-name-free **role
+queries** the planner / atom-cell matchers / flash recognizer ask:
+`reduce_canon` (alias → base combine, `sum` → `add` …), `distributes_over(⊗, ⊕)`
+and `is_semiring_product(⊗)` (the `_SEMIRING` table — only `(+, ×)` today), and
+the `_REDUCE_SPELLING` registry (`reduce_spelling`) — the single op-keyed table
+behind the four sites that used to switch on the reduce op name (`Accum.render`'s
+`+=` / `*=` / `fmax` / `fmin`, `kernel/ir._binary_combine_expr`, and
+`ReduceOp.forward` / `ScanOp.forward`'s numpy reductions). `op.selecting` (the
+max/min family) drives the init-placement dtype choice.
 
 ## `loop/`
 
@@ -131,6 +140,20 @@ algebra read the carrier's `associative` / `commutative` / `has_identity` traits
 directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
 constants; `Monoid` reports `associative` / `has_identity` `True` by construction
 with a per-instance `commutative` field).
+
+**Bottom-up algebra analysis** (`ir/algebra.py`). `Loop.algebra_kind` derives
+each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (a plain
+associative `Accum`) / `SEMIRING` (a matmul-shaped reduce whose product
+distributes over its reduce — `Mma`, or an `Accum` fed by a distributing
+product) / `TWISTED_MONOID` (a recognized `Monoid`, e.g. flash's online softmax)
+— by *reading back* the carrier already in the body. It is a **derived cache,
+not a second source of truth**: computed on demand, so it can never contradict
+the carrier's traits and never enters equality / `op_cache_key`. The expensive
+match (raw coupled-accumulator → verified twisted monoid) is done once by
+`loop/recognize` (which emits the `Monoid`); this is a cheap read of that
+carrier. The structural matmul predicate `matmul_reduce` lives here too — the
+single source `lowering/tile/_helpers.is_matmul_reduce` delegates to (adding only
+its tile-layer type guard).
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (the carried SSA

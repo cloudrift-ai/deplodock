@@ -83,6 +83,17 @@ class Loop(Stmt):
         ``ReduceCarrier`` (``Accum``, or its tensor-core form ``Mma``)."""
         return any(isinstance(s, ReduceCarrier) for s in self.body)
 
+    @property
+    def algebra_kind(self):
+        """The loop's algebraic kind (``AlgebraKind``), derived bottom-up from
+        its carrier — ``MAP`` (non-reduce) / ``MONOID`` / ``SEMIRING`` /
+        ``TWISTED_MONOID``. A computed read (never stored, never in
+        ``op_cache_key``), so it can never contradict the body's algebra. See
+        ``ir/algebra.py``."""
+        from deplodock.compiler.ir.algebra import classify_algebra  # noqa: PLC0415 — break blocks↔algebra cycle
+
+        return classify_algebra(self)
+
     def pretty(self, indent: str = "") -> list[str]:
         head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
         return [head, *pretty_body(self.body, indent + INDENT)]

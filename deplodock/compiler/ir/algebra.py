@@ -1,0 +1,110 @@
+"""Bottom-up algebra analysis — derive each reduce loop's algebraic *kind*
+from its carrier and loads (Part B of ``plans/algebraic-carrier-analysis.md``).
+
+This is the inverse of the bespoke top-down recognizers (``loop/recognize``):
+rather than hand-match a known pattern, *read back* the algebra that already
+lives in the loop body and expose a uniform tag the scheduler can dispatch on.
+
+The tag is a **derived cache, not a second source of truth**: it is computed
+from the loop body on demand (`classify_algebra` / the `Loop.algebra_kind`
+property), so it can never contradict the carrier's own traits — the
+`MonoidNode(associative=False)` class of bug is unrepresentable. Because it is
+computed, not stored, it never enters equality / `op_cache_key`, and it is
+always consistent with the current body (re-derived after every rewrite). The
+*expensive* match — turning a raw coupled-accumulator cluster into a verified
+twisted monoid — is done ONCE by the recognizer (``loop/recognize``, which
+emits a `Monoid` carrier); this classification is then a cheap read of that
+carrier.
+
+The kind is well-defined where the **carrier is present** — i.e. on a `LoopOp`
+body's reduce loops, before the partition planner tiles the carrier away (a
+matmul becomes `Mma`/`ldmatrix` fragments; a `Monoid` combine becomes an
+explicit rescale + `Accum`). Post-partition nothing re-derives it.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+from deplodock.compiler.ir.elementwise import distributes_over
+from deplodock.compiler.ir.stmt.base import ReduceCarrier
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma, Monoid
+
+
+class AlgebraKind(Enum):
+    """The algebraic kind of a loop scope, derived bottom-up from its carrier.
+
+    A non-reduce scope is ``MAP`` (the default — a pointwise functor); a reduce
+    loop is one of the fold kinds below.
+    """
+
+    MAP = "map"  # pointwise / functor — a non-reduce scope (the default)
+    MONOID = "monoid"  # a plain associative reduce        (carrier: Accum)
+    SEMIRING = "semiring"  # a contraction / matmul           (carrier: Mma, or matmul-shaped Accum)
+    TWISTED_MONOID = "twisted_monoid"  # an online / coupled reduce        (carrier: Monoid — flash, Welford, …)
+    SCAN = "scan"  # prefix / causal — reserved, out of scope v1
+
+
+def matmul_reduce(loop) -> bool:
+    """True iff ``loop`` is a reduce loop whose body matches the matmul
+    signature: ≥ 2 distinct buffers with K-indexed Loads (K = ``loop.axis.name``)
+    plus at least one :class:`ReduceCarrier` (`Accum`, or its fused `Mma`).
+
+    The ir-level structural core of ``lowering/tile/_helpers.is_matmul_reduce``;
+    duck-typed on ``.is_reduce`` / ``.axis`` / ``.body`` so it serves Loop-IR
+    ``Loop`` / ``StridedLoop`` and Tile-IR ``SerialTile`` / ``StridedTile``
+    alike (the caller restricts the type)."""
+    if not getattr(loop, "is_reduce", False):
+        return False
+    k_name = loop.axis.name
+    bufs = {ld.input for ld in loop.body.of_type(Load) if k_name in {v for e in ld.index for v in e.free_vars()}}
+    if len(bufs) < 2:
+        return False
+    return any(isinstance(s, ReduceCarrier) for s in loop.body)
+
+
+def _is_semiring_contraction(loop) -> bool:
+    """A matmul-shaped reduce whose product ``⊗`` distributes over the reduce
+    combine ``⊕`` — a genuine semiring contraction, not just any 2-load reduce.
+
+    The fused `Mma` carrier *is* the ``(×, +)`` tensor-core fold (the product is
+    folded into the instruction); a scalar matmul cell is an `Accum` fed by a
+    distributing product `Assign`."""
+    if not matmul_reduce(loop):
+        return False
+    body = loop.body
+    if any(isinstance(s, Mma) for s in body):
+        return True
+    assigns = {s.name: s for s in body if isinstance(s, Assign)}
+    for acc in body:
+        if isinstance(acc, Accum):
+            prod = assigns.get(acc.value)
+            if prod is not None and distributes_over(prod.op, acc.op):
+                return True
+    return False
+
+
+def classify_algebra(loop) -> AlgebraKind:
+    """Classify a loop scope by its carrier — the cheap bottom-up read.
+
+    - ``MAP`` — a non-reduce scope (no `ReduceCarrier` in the immediate body).
+    - ``TWISTED_MONOID`` — a recognized `Monoid` carrier (flash's online softmax
+      and any future Welford / argmax catalog entry); its catalog identity is the
+      carrier's own (`FlashCombine` ⟺ ``lse``).
+    - ``SEMIRING`` — a matmul-shaped reduce whose product distributes over its
+      reduce (`Mma`, or an `Accum` fed by a distributing product).
+    - ``MONOID`` — a plain associative reduce (an `Accum` whose combine is
+      associative — `has_identity` makes it maskable).
+    - ``MAP`` (fallback) — a reduce the analysis doesn't recognize (no
+      regression: callers keep their current path)."""
+    if not getattr(loop, "is_reduce", False):
+        return AlgebraKind.MAP
+    body = loop.body
+    if any(isinstance(s, Monoid) for s in body):
+        return AlgebraKind.TWISTED_MONOID
+    if _is_semiring_contraction(loop):
+        return AlgebraKind.SEMIRING
+    carriers = [s for s in body if isinstance(s, ReduceCarrier)]
+    if carriers and all(c.associative for c in carriers):
+        return AlgebraKind.MONOID
+    return AlgebraKind.MAP
