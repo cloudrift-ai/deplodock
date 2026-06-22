@@ -197,9 +197,24 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
     return x_buf, v_buf, mask_kind, mask_buf
 
 
+def _composer_wants_flash(root: Node) -> bool:
+    """The move composer implies flash ONLY for symbolic-seq SDPA: static SDPA
+    decomposes (the composer covers the static QK^T / softmax / P@V kernels, and
+    the loop reference backend runs them), while a symbolic seq needs flash's
+    masked streaming (the composer's matmul tier requires a static K). A symbolic
+    seq shows up as a symbolic dim ANYWHERE in the attention output (the
+    whole-model o_proj collapses the attn-out, so seq isn't always ``shape[-2]``);
+    a fully-static output is a static SDPA."""
+    from deplodock import config  # noqa: PLC0415
+
+    if not config.move_composer_enabled():
+        return False
+    return any(not getattr(d, "is_static", True) for d in root.output.shape)
+
+
 def rewrite(match: Match, root: Node) -> Graph | None:
-    if not flash_enabled():
-        raise RuleSkipped("FLASH knob off — keep the score-materializing path")
+    if not flash_enabled() and not _composer_wants_flash(root):
+        raise RuleSkipped("FLASH off (composer keeps static SDPA decomposed) — score-materializing path")
     found = _recognize(match.graph, root)
     if found is None:
         raise RuleSkipped("not a softmax-attention kernel")

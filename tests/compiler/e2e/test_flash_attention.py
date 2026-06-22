@@ -109,13 +109,8 @@ def test_flash_sdpa_dynamic_matches_torch(monkeypatch):
 def test_flash_off_keeps_decomposition(monkeypatch):
     """FLASH off — the score-materializing 010_sdpa decomposition (multiple
     kernels: QK^T, softmax, P@V), proving the knob gates the Loop-IR recognition
-    and the default is unchanged. The move composer has no split-demoted P@V path,
-    so it *implies* flash (flash_enabled() is True under the composer) and the
-    knob no longer gates — skip there."""
-    from deplodock import config
-
-    if config.move_composer_enabled():
-        pytest.skip("the move composer implies flash (no split-demoted P@V); the FLASH knob does not gate")
+    and the default is unchanged. The move composer implies flash only for
+    SYMBOLIC-seq SDPA, so this static case decomposes under the composer too."""
     monkeypatch.delenv("DEPLODOCK_FLASH", raising=False)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))

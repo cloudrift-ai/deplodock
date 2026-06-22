@@ -158,8 +158,11 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
         k_dim = k_loop.axis.extent
         # Tiling extent: static size, or the Dim hint for a symbolic K (masked).
         k_extent = k_dim.as_static() if k_dim.is_static else (k_dim.hint or 0)
-        if k_extent < warp_size:
+        if k_extent < 1:
             return None
+        # A small K (< warp_size) deploys the same builder with COOP_BR=1 — a
+        # plain per-row serial reduce (no cooperative segmented shuffle); the
+        # offers (`coop_reduce_offers`) already bound `br·bk·fk ≤ k_extent`.
         # Match the reduce(s) and the second-pass map loop by K *Dim* (so static
         # and symbolic match uniformly). A body loop of any other extent is an
         # unexpected shape; leave it to legacy.

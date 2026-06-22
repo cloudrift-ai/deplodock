@@ -124,12 +124,11 @@ FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into t
 
 
 def flash_enabled() -> bool:
-    from deplodock import config  # noqa: PLC0415
-
-    # The move composer has no split-demoted P@V path, so it relies on the fused
-    # flash nest for SDPA — enabling the composer implies flash.
-    if config.move_composer_enabled():
-        return True
+    """The explicit ``FLASH`` knob. The move composer ALSO implies flash, but only
+    for symbolic-seq SDPA (static SDPA decomposes — the composer covers the static
+    QK^T / softmax / P@V kernels, and the loop reference backend can run those but
+    can't render the streaming flash carrier). That conditional implication lives
+    at the recognizer (`_composer_wants_flash`), which has the shape."""
     raw = FLASH.raw()
     return raw is not None and FLASH.parse(raw)
 
