@@ -338,7 +338,9 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
             atoms = [a for a in atoms if a.name == mma_kind]
     if not atoms:
         return scalar
-    return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})
+    # A specific pinned atom (``MMA=<kind>``) forces the warp tier — drop the
+    # scalar fallback so the prior can't rank it back to scalar.
+    return _MmTensorize(ctx=ctx, scalar=(None if mma_kind is not None else scalar), atoms=tuple(atoms), knobs={})
 
 
 # --- Cooperative-reduce (MONOID) tree: one reduce (bk, fk, br) decision. ---
