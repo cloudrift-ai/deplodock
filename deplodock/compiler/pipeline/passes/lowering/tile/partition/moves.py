@@ -21,7 +21,10 @@ from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
 from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
+from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.decompose import legal_decomps
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     BK_CHOICES,
     BR_CHOICES,
@@ -130,7 +133,11 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     """Legal ``(bk, fk, splitk)`` K-tilings: ``splitk·bk·fk`` divides the static
     K extent (so ``K_o = K/(splitk·bk·fk)`` is whole). Best-first: no split-K
     (``splitk=1``, a perf opt for small-MN/large-K), deep chunk (large ``bk``),
-    no strip-mine (``fk=1``). Each dimension is env-pinnable for tests."""
+    no strip-mine (``fk=1``). Each dimension is env-pinnable for tests.
+
+    The legality is the carrier-trait query :func:`legal_decomps` (associative →
+    split; commutative → cross-CTA combine); ranking + the split-K soundness gate
+    (cost / hardware) stay here."""
     bk_pin, fk_pin, sk_pin = _pin(RED_BK), _pin(RED_FK), _pin(RED_SPLITK)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
@@ -140,8 +147,20 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     # or a coupled multi-accum over a partial would corrupt the cross-CTA sum.
     has_epilogue = any(not isinstance(s, (Loop, Write)) for s in skel.inner_body)
     n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
-    sks = (1,) if (has_epilogue or n_reduce > 1) else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
-    out = [(bk, fk, sk) for sk in sks for bk in bks for fk in fks if sk * bk * fk <= skel.k_extent and skel.k_extent % (sk * bk * fk) == 0]
+    allow_split = not (has_epilogue or n_reduce > 1)
+    sks = (1,) if not allow_split else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
+    # Factor order [splitk (BLOCK), bk (STAGE_INNER), fk (REGISTER)] — the
+    # partition (splitk) is factor 0, where the commutative-combine gate applies.
+    decomps = legal_decomps(
+        _carrier_of(skel.k_loop),
+        skel.k_loop.axis,
+        skel.k_extent,
+        factor_menus=[sks, bks, fks],
+        placement=[Role.BLOCK, Role.STAGE_INNER, Role.REGISTER],
+        masked=False,
+        allow_split=allow_split,
+    )
+    out = [(d.factors[1], d.factors[2], d.factors[0]) for d in decomps]
     out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out
 
@@ -251,15 +270,22 @@ def coop_reduce_offers(skel: CoopReduceSkeleton) -> list[tuple[int, int, int]]:
     # WARP_SIZE gate. It still composes (the serial per-row reduce), just without
     # cooperative threads. (A symbolic/masked K tiles at the hint, which is large.)
     br_floor_serial = (not masked) and skel.k_extent < 32
+    # Same decomposition move as split-K: factor [br (cooperative THREAD), bk
+    # (STAGE_INNER), fk (REGISTER)] — the masked-K fill is licensed by the
+    # carrier's identity (has_identity), the cooperative partition by commutative.
+    decomps = legal_decomps(
+        _carrier_of(skel.k_loop),
+        skel.k_loop.axis,
+        skel.k_extent,
+        factor_menus=[brs, bks, fks],
+        placement=[Role.THREAD, Role.STAGE_INNER, Role.REGISTER],
+        masked=masked,
+        allow_split=True,
+    )
     out = [
-        (bk, fk, br)
-        for br in brs
-        for bk in bks
-        for fk in fks
-        if 1 <= br <= 1024
-        and (br == 1 or not br_floor_serial)
-        and br * bk * fk <= skel.k_extent
-        and (masked or skel.k_extent % (br * bk * fk) == 0)
+        (d.factors[1], d.factors[2], d.factors[0])
+        for d in decomps
+        if 1 <= d.factors[0] <= 1024 and (d.factors[0] == 1 or not br_floor_serial)
     ]
     out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
     return out
