@@ -209,6 +209,20 @@ def iter_dag(loop_op: LoopOp) -> IterDag:
     tagged by role and (for a reduce) carrier."""
     body = tuple(loop_op.body)
     parallel, leading, mid = _free_chain_nodes(body)
+    if not parallel:
+        leading_top, rest = _split_leading_non_loops(body)
+        if any(isinstance(s, Loop) and s.is_reduce for s in rest):
+            # Global reduce (``x[K] → s[1]``): no free output axis, so the body is
+            # one top-level reduce loop + Write. Synthesize a degenerate size-1
+            # PARALLEL row so the cooperative-reduce regime tiles it as a
+            # single-CTA tree reduce — the row var binds nothing in the body (the
+            # Write indexes a literal 0), so it costs one grid dim of extent 1.
+            from deplodock.compiler.dim import Dim  # noqa: PLC0415
+
+            row = Axis("_grow", Dim(1))
+            node = AxisNode(loop=Loop(axis=row, body=rest), role=AxisRole.PARALLEL, carrier=None, algebra=None, parent=None, body=rest)
+            reduce_nodes = tuple(_reduce_nodes(rest, node))
+            return IterDag(parallel=(node,), reduce=reduce_nodes, leading=leading_top, mid=(), inner_body=rest)
     inner_body: tuple[Stmt, ...] = ()
     if parallel:
         inner_body = tuple(mid) + parallel[-1].body
