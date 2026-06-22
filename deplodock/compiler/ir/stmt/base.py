@@ -577,6 +577,27 @@ class ReduceCarrier(Stmt):
     def partial_deps(self) -> tuple[str, ...]:
         return self.deps()
 
+    def combine_partials(self) -> tuple:
+        """The operator that folds two FULLY-reduced partial states — the ONE
+        recombine a decomposition move (split-K / split-KV / cooperative-tree)
+        reads, independent of how it is realized (atomic / warp-shuffle / smem
+        tree / mma). Returned **as data**: a tuple of :class:`Assign` steps that
+        read the carried state plus a second state operand named by
+        :meth:`combine_operands` and reassign the merged state.
+
+        ``Monoid`` returns its authored ``combine_states``; the additive carriers
+        (``Accum`` scalar fold, ``Mma`` fragment add) return a one-``Assign``
+        op-fold. This is the carrier-side half of
+        ``plans/algebra-licensed-decomposition-moves.md`` (phase 1)."""
+        raise NotImplementedError(f"{type(self).__name__}.combine_partials")
+
+    def combine_operands(self) -> tuple[str, ...]:
+        """The SSA names of the SECOND state operand :meth:`combine_partials`
+        folds in (the first is the carried state itself). ``Monoid``'s is its
+        ``state_b`` (``"<s>__o"`` by default); the additive carriers name theirs
+        ``"<carried>__o"`` to match."""
+        raise NotImplementedError(f"{type(self).__name__}.combine_operands")
+
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:
     """Flatten ``stmt.pretty(indent)`` over a body sequence."""

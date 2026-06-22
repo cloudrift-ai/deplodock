@@ -98,7 +98,11 @@ def emit_combine_states(carrier: Monoid, t: str, n_threads: int, *, warp_size: i
     if n_threads <= warp_size and (n_threads & (n_threads - 1)) == 0:
         return [
             MonoidWarpShuffle(
-                state=carrier.state, state_b=carrier.state_b, combine_states=carrier.combine_states, length=n_threads, dtype=F32
+                state=carrier.state,
+                state_b=carrier.combine_operands(),
+                combine_states=carrier.combine_partials(),
+                length=n_threads,
+                dtype=F32,
             )
         ]
     if n_threads & (n_threads - 1):
@@ -113,8 +117,8 @@ def emit_combine_states(carrier: Monoid, t: str, n_threads: int, *, warp_size: i
         MonoidTreeHalve(
             bufs=bufs,
             state=carrier.state,
-            state_b=carrier.state_b,
-            combine_states=carrier.combine_states,
+            state_b=carrier.combine_operands(),
+            combine_states=carrier.combine_partials(),
             length=n_threads,
             tid_var=t,
             dtype=F32,

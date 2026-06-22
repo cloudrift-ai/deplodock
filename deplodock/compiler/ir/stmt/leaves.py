@@ -515,6 +515,16 @@ class Accum(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def combine_operands(self) -> tuple[str, ...]:
+        return (f"{self.name}__o",)
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The scalar op-fold of two partials: ``name = op(name, name__o)`` — the
+        same combine the cooperative / split-K realizations apply, reified as a
+        one-``Assign`` program so the decomposition move reads it uniformly with
+        ``Monoid.combine_states``."""
+        return (Assign(name=self.name, op=self.op, args=(self.name, f"{self.name}__o"), dtype=self.dtype),)
+
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
     # ``sum`` Accum differ, and ``self.op`` is the source of truth.
     @property
@@ -599,6 +609,16 @@ class Mma(ReduceCarrier):
 
     def carried_names(self) -> tuple[str, ...]:
         return (self.c,)
+
+    def combine_operands(self) -> tuple[str, ...]:
+        return (f"{self.c}__o",)
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The fragment add of two partial accumulators: ``c = c + c__o`` — the
+        cross-CTA split-K combine, reified as a one-``Assign`` program (the
+        accumulation is additive, so the fold op is ``add`` regardless of the
+        original scalar cell)."""
+        return (Assign(name=self.c, op=ElementwiseImpl("add"), args=(self.c, f"{self.c}__o")),)
 
     # The tensor-core accumulation ``c += a @ b`` is an additive fold —
     # associative + commutative with identity 0. That is what tells
@@ -751,6 +771,15 @@ class Monoid(ReduceCarrier):
 
     def carried_names(self) -> tuple[str, ...]:
         return self.state
+
+    def combine_operands(self) -> tuple[str, ...]:
+        return self.state_b
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The state-merges-state monoid op (``combine_states``) — already the
+        realization-agnostic cross-partition combine the cooperative-tree /
+        split-KV / split-K reductions fold through."""
+        return self.combine_states
 
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.
