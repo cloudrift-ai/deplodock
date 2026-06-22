@@ -87,9 +87,10 @@ def test_lift_coop_reduce_detects_monoid():
     assert skel.inner_n.extent == 64
 
 
-def test_lift_coop_reduce_rejects_small_k():
-    # K=16 < warp_size → stays on the legacy / pointwise path
-    assert not isinstance(walk_nest(_sum(64, 16)), CoopReduceSkeleton)
+def test_lift_coop_reduce_accepts_small_k():
+    # K=16 < warp_size still composes — the builder deploys COOP_BR=1, a plain
+    # per-row serial reduce (offers bound br·bk·fk ≤ k_extent), no warp shuffle.
+    assert isinstance(walk_nest(_sum(64, 16)), CoopReduceSkeleton)
 
 
 def test_lift_coop_reduce_rejects_matmul():
