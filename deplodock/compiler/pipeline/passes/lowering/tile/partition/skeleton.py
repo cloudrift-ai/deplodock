@@ -69,6 +69,10 @@ class MatmulSkeleton:
     k_extent: int
     inner_body: tuple[Stmt, ...]
     leading: tuple[Stmt, ...]
+    # Every K-extent contraction loop name to split — usually just ``{k_name}``,
+    # but a multi-accumulator matmul (gated MLP / SwiGLU: gate + up matmuls
+    # sharing K with a fused epilogue between them) has several same-K reduces.
+    target_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

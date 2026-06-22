@@ -134,6 +134,66 @@ def test_matmul_with_scale_epilogue_composes_and_forces_splitk1():
     assert {sk for _, _, sk in matmul_reduce_offers(skel)} == {1}
 
 
+def _gated_matmul(m: int, n: int, k: int) -> LoopOp:
+    """Two same-K matmuls (gate, up) + a fused combine — the gated-MLP shape."""
+    return LoopOp(
+        body=(
+            Loop(
+                axis=Axis("m", m),
+                body=(
+                    Loop(
+                        axis=Axis("n", n),
+                        body=(
+                            Loop(
+                                axis=Axis("kg", k),
+                                body=(
+                                    Load(name="a", input="a", index=(Var("m"), Var("kg"))),
+                                    Load(name="g", input="g", index=(Var("kg"), Var("n"))),
+                                    Assign(name="pg", op=ElementwiseImpl("multiply"), args=("a", "g")),
+                                    Accum(name="acc_g", value="pg", op=ElementwiseImpl("add")),
+                                ),
+                            ),
+                            Loop(
+                                axis=Axis("ku", k),
+                                body=(
+                                    Load(name="a2", input="a", index=(Var("m"), Var("ku"))),
+                                    Load(name="u", input="u", index=(Var("ku"), Var("n"))),
+                                    Assign(name="pu", op=ElementwiseImpl("multiply"), args=("a2", "u")),
+                                    Accum(name="acc_u", value="pu", op=ElementwiseImpl("add")),
+                                ),
+                            ),
+                            Assign(name="o_v", op=ElementwiseImpl("multiply"), args=("acc_g", "acc_u")),
+                            Write(output="o", index=(Var("m"), Var("n")), value="o_v"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_multi_accumulator_matmul_composes():
+    # Two same-K matmuls (gate, up) sharing the `a` operand + a fused combine.
+    # unify_sibling_reduce_axes collapses the two K axes to one name and fusion
+    # merges them into a multi-accumulator reduce, which classifies MONOID and is
+    # scheduled on the cooperative path (each accumulator gets its own combine).
+    # Either classification is a valid schedule — the point is the composer
+    # RECOGNIZES it (not None → legacy fallthrough) rather than dropping it.
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (64, 256), dtype=F16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("g", (256, 96), dtype=F16), node_id="g")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("u", (256, 96), dtype=F16), node_id="u")
+    g.add_node(op=_gated_matmul(64, 96, 256), inputs=["a", "g", "u"], output=Tensor("o", (64, 96), dtype=F16), node_id="o")
+    g.inputs = ["a", "g", "u"]
+    g.outputs = ["o"]
+    skel = walk_nest(g.nodes["o"].op)
+    assert skel is not None, "gated MLP (multi-accumulator) should compose, not fall through to legacy"
+    # Fusion merges the two same-K contractions into one loop with two Accums.
+    from deplodock.compiler.ir.stmt import Body  # noqa: PLC0415
+
+    assert len(list(Body(skel.inner_body).iter_of_type(Accum))) == 2, "both gate + up accumulators present"
+
+
 def _graph(m: int, n: int, k: int, dtype):
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k), dtype=dtype), node_id="a")

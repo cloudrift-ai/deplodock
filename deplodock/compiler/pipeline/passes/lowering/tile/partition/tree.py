@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deplodock.compiler.ir.stmt import Loop
 from deplodock.compiler.ir.tile.ir import Atom, TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
@@ -270,10 +271,13 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
     eligible, or ``None`` when even the scalar tier has nothing legal."""
     ctx = _Ctx(skel=skel, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
     scalar = _scalar_subtree(ctx)
-    # The warp (tensor-core) path is clean-tile only — no masking — so a symbolic
-    # free axis (M/N tiled as a masked ceil-div) stays on the scalar tier.
-    symbolic_free = skel.inner_n.symbolic or skel.outer_m.symbolic
-    atoms = [] if symbolic_free else [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+    # The warp (tensor-core) path handles one clean-tile contraction. A symbolic
+    # free axis (masked ceil-div) or a multi-accumulator matmul (>1 same-K reduce
+    # — gated MLP) stays on the scalar tier (the warp builder takes one reduce;
+    # `is_atom_eligible` would still pass on the first, so gate explicitly).
+    n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
+    scalar_only = skel.inner_n.symbolic or skel.outer_m.symbolic or n_reduce > 1
+    atoms = [] if scalar_only else [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
     if not atoms:
         return scalar
     return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})

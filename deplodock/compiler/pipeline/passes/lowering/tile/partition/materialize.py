@@ -138,33 +138,35 @@ def build_pointwise_tile(skel: PointwiseSkeleton, knobs: dict, *, kernel_name: s
 
 
 def _replace_k_scalar(
-    stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
 ) -> tuple[Stmt, ...]:
-    """Replace the ``K`` reduce loop with a ``K_o`` (serial-outer) / ``K_i``
-    (stage-inner) tower, σ-mapping
+    """Replace every contraction loop named in ``target_names`` with a ``K_o``
+    (serial-outer) / ``K_i`` (stage-inner) tower, σ-mapping
     ``K → K_s·(K_o_ext·bk·fk) + K_o·(bk·fk) + K_f·bk + K_i`` (``K_f`` only when
-    ``fk > 1``, ``K_s`` only when ``splitk > 1``). The ``K_s`` grid axis is added
-    to the outer BLOCK layers by the caller; here it only enters the σ. The
-    canonical matmul body holds the loop at top level, so a flat scan suffices."""
+    ``fk > 1``, ``K_s`` only when ``splitk > 1``). For a plain matmul this is the
+    one K loop; a multi-accumulator matmul (gated MLP) has several same-K loops,
+    each its own ``K_o``/``K_i`` tower (sharing the ``K_s`` grid axis). The
+    ``K_s`` grid axis is added to the outer BLOCK layers by the caller."""
     out: list[Stmt] = []
     for s in stmts:
-        if isinstance(s, Loop) and s.axis.name == k_name:
+        if isinstance(s, Loop) and s.axis.name in target_names:
+            kn = s.axis.name
             src = s.axis.source_axis or s.axis
             k_o_ext = k_extent // (splitk * bk * fk)
-            k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
-            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
+            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{kn}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(bk * fk, "int")
             k_f = None
             if fk > 1:
-                k_f = Axis(f"{k_name}_f", fk, source_axis=src)
+                k_f = Axis(f"{kn}_f", fk, source_axis=src)
                 expr = expr + Var(k_f.name) * Literal(bk, "int")
             expr = expr + Var(k_i.name)
             if k_s is not None:
                 expr = Var(k_s.name) * Literal(k_o_ext * bk * fk, "int") + expr
-            sigma_k = Sigma({k_name: expr})
+            sigma_k = Sigma({kn: expr})
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             if k_f is not None:
-                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=True),)
+                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
             out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
         else:
             out.append(s)
@@ -179,6 +181,7 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
     bk, fk, splitk = knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name]
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
     k_s = Axis(f"{skel.k_name}_s", splitk, source_axis=src_k) if splitk > 1 else None
+    targets = skel.target_names or frozenset({skel.k_name})
     return _assemble(
         free_specs,
         skel.inner_body,
@@ -187,7 +190,7 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_scalar(body, skel.k_name, skel.k_extent, bk, fk, splitk, k_s),
+        k_transform=lambda body: _replace_k_scalar(body, targets, skel.k_extent, bk, fk, splitk, k_s),
         extra_block=(k_s,) if k_s is not None else (),
     )
 

@@ -78,15 +78,23 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     k_loop = reduce_loops[0]
 
     if algebras == {AlgebraKind.SEMIRING}:
-        # Matmul. One contraction (multi-accumulator is a later phase). A MAP
-        # epilogue after the reduce — the QK^T `* 1/√d` scale, a `matmul_add`
-        # residual — rides the output tile, so allow non-Loop stmts as long as
-        # the reduce is the FIRST stmt (a fused PROLOGUE, reduce-feeds-reduce,
-        # has the reduce not-first and is left to legacy).
-        if not k_loop.axis.extent.is_static or len(reduce_loops) != 1 or len(chain) < 2:
+        # Matmul. A MAP epilogue after the reduce — the QK^T `* 1/√d` scale, a
+        # `matmul_add` residual — rides the output tile, so allow non-Loop stmts.
+        # Multiple same-K contractions (a gated MLP's gate + up matmuls, with a
+        # fused epilogue between/after) also compose: each is its own reduce over
+        # the shared K, split together by extent (scalar tier — `is_atom_eligible`
+        # declines a multi-accum body, so warp gates off in build_matmul_tree).
+        # Require the FIRST stmt to be a reduce (a fused PROLOGUE — reduce-feeds-
+        # reduce — has the reduce not-first and is left to legacy), and a static K.
+        k_dim = k_loop.axis.extent
+        if not k_dim.is_static or len(chain) < 2:
             return None
-        loops_in = [s for s in inner_body if isinstance(s, Loop)]
-        if loops_in != [k_loop] or not inner_body or inner_body[0] is not k_loop:
+        if {lp.axis.extent for lp in reduce_loops} != {k_dim}:
+            return None  # reduces over different-extent K axes
+        body_loops = [s for s in inner_body if isinstance(s, Loop)]
+        if any(lp.axis.extent != k_dim for lp in body_loops):
+            return None  # a non-K loop (e.g. a second-pass map) is not a plain matmul
+        if not inner_body or inner_body[0] is not reduce_loops[0]:
             return None
         if not any(isinstance(s, Write) for s in inner_body):
             return None
@@ -96,9 +104,10 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
             extra_outer=tuple(chain[:-2]),
             k_loop=k_loop,
             k_name=k_loop.axis.name,
-            k_extent=k_loop.axis.extent.as_static(),
+            k_extent=k_dim.as_static(),
             inner_body=inner_body,
             leading=leading,
+            target_names=frozenset(lp.axis.name for lp in body_loops),
         )
 
     if algebras == {AlgebraKind.MONOID}:

@@ -134,11 +134,13 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     bk_pin, fk_pin, sk_pin = _pin(RED_BK), _pin(RED_FK), _pin(RED_SPLITK)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
-    # Split-K atomic-adds per-CTA partials, sound only for a bare reduce. A MAP
-    # epilogue (non-reduce, non-Write stmt — QK^T scale, matmul_add) forces
-    # SPLITK=1: a non-linear epilogue over a partial would corrupt the sum.
+    # Split-K atomic-adds per-CTA partials, sound only for a bare single reduce.
+    # A MAP epilogue (QK^T scale, matmul_add) or a multi-accumulator matmul
+    # (gated MLP — several same-K reduces) forces SPLITK=1: a non-linear epilogue
+    # or a coupled multi-accum over a partial would corrupt the cross-CTA sum.
     has_epilogue = any(not isinstance(s, (Loop, Write)) for s in skel.inner_body)
-    sks = (1,) if has_epilogue else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
+    n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
+    sks = (1,) if (has_epilogue or n_reduce > 1) else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
     out = [(bk, fk, sk) for sk in sks for bk in bks for fk in fks if sk * bk * fk <= skel.k_extent and skel.k_extent % (sk * bk * fk) == 0]
     out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out
