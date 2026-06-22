@@ -320,7 +320,18 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
     # `is_atom_eligible` would still pass on the first, so gate explicitly).
     n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
     scalar_only = skel.inner_n.symbolic or skel.outer_m.symbolic or n_reduce > 1
-    atoms = [] if scalar_only else [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+    # Honor the legacy ``MMA`` pin (the aliased ``TC_ATOM`` knob): ``MMA=0`` forces
+    # the scalar tier (e.g. the FK half2 window); ``MMA=<kind>`` restricts to that
+    # atom; unset / truthy auto-enumerates every eligible atom.
+    from deplodock.compiler.pipeline import knob as _knob  # noqa: PLC0415
+
+    mma_enabled, mma_kind = _knob.mma_decode(TC_ATOM.raw())
+    if scalar_only or not mma_enabled:
+        atoms: list = []
+    else:
+        atoms = [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+        if mma_kind is not None:
+            atoms = [a for a in atoms if a.name == mma_kind]
     if not atoms:
         return scalar
     return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})
