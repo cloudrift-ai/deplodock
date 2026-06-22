@@ -16,9 +16,10 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Select, SelectBranch, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Monoid, Select, SelectBranch, Stmt
 from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
@@ -143,7 +144,14 @@ def build_pointwise_tile(skel: PointwiseSkeleton, knobs: dict, *, kernel_name: s
 
 
 def _replace_k_scalar(
-    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
+    stmts: tuple[Stmt, ...],
+    target_names: frozenset[str],
+    k_extent: int,
+    bk: int,
+    fk: int,
+    splitk: int,
+    k_s: Axis | None,
+    k_bounds: dict | None = None,
 ) -> tuple[Stmt, ...]:
     """Replace every contraction loop named in ``target_names`` with a ``K_o``
     (serial-outer) / ``K_i`` (stage-inner) tower, σ-mapping
@@ -151,16 +159,26 @@ def _replace_k_scalar(
     ``fk > 1``, ``K_s`` only when ``splitk > 1``). For a plain matmul this is the
     one K loop; a multi-accumulator matmul (gated MLP) has several same-K loops,
     each its own ``K_o``/``K_i`` tower (sharing the ``K_s`` grid axis). The
-    ``K_s`` grid axis is added to the outer BLOCK layers by the caller."""
+    ``K_s`` grid axis is added to the outer BLOCK layers by the caller.
+
+    ``k_bounds`` (symbolic flash) maps a streaming-reduce axis name to its runtime
+    boundary ``Expr``: that axis' ``K_o`` ceil-divides and each step is wrapped in
+    ``Cond(decoded_k < bound)`` — the TWISTED_MONOID identity "skip the fold"
+    leaves the online-softmax state (m/l/O) unchanged for an out-of-range key."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name in target_names:
             kn = s.axis.name
             src = s.axis.source_axis or s.axis
-            # Each target loop tiles by its OWN extent (a flash nest's KV and
-            # nested QK reduces differ); a plain matmul's single K matches k_extent.
-            this_extent = s.axis.extent.as_static() if (s.axis is not None and s.axis.extent.is_static) else k_extent
-            k_o_ext = this_extent // (splitk * bk * fk)
+            bound = (k_bounds or {}).get(kn)
+            if bound is not None:
+                # Symbolic streaming axis: ceil-div over the runtime extent.
+                k_o_ext = s.axis.extent.ceil_div(splitk * bk * fk)
+            else:
+                # Each target loop tiles by its OWN extent (a flash nest's KV and
+                # nested QK reduces differ); a plain matmul's K matches k_extent.
+                this_extent = s.axis.extent.as_static() if (s.axis is not None and s.axis.extent.is_static) else k_extent
+                k_o_ext = this_extent // (splitk * bk * fk)
             k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{kn}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(bk * fk, "int")
@@ -174,8 +192,22 @@ def _replace_k_scalar(
             sigma_k = Sigma({kn: expr})
             # Recurse first so a nested target loop (flash's QK inside KV) is also
             # split, then σ-rewrite this loop's body.
-            inner = _replace_k_scalar(tuple(s.body), target_names, k_extent, bk, fk, splitk, k_s)
-            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+            inner = _replace_k_scalar(tuple(s.body), target_names, k_extent, bk, fk, splitk, k_s, k_bounds)
+            if bound is not None:
+                # Symbolic streaming step. A `Cond` around the carrier would
+                # block-scope the loop-carried online-softmax state (m/l/O), so
+                # instead CLAMP the streaming index in every load (safe read of a
+                # duplicate key) and force the masked key's SCORE to the carrier's
+                # identity (`-inf`) — `max(m, -inf) = m`, `exp(-inf) = 0`, so the
+                # Monoid folds nothing for an out-of-range key (TWISTED_MONOID
+                # identity) while the in-place state update stays unconditional.
+                decoded_k = sigma_k.apply(Var(kn))
+                pred = BinaryExpr("<", decoded_k, bound)
+                clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", bound, Literal(1, "int")))
+                body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in inner)
+                new_body = _mask_flash_monoid(body_c, pred)
+            else:
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
             if k_f is not None:
                 new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
             out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
@@ -226,6 +258,32 @@ def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...
                 )
             )
             out.append(replace(c, value=masked))
+        else:
+            out.append(c)
+    return tuple(out)
+
+
+def _mask_flash_monoid(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask the streaming flash carrier's score to ``-inf`` past a symbolic-K
+    boundary. Before each ``Monoid`` with partial ``(score, value)`` insert
+    ``Init(score_kid, op=maximum)`` (seeds ``-inf``, the score component's
+    identity) and ``Select(score_km, score if pred else score_kid)``, then fold
+    ``score_km``. The masked key contributes nothing (``max(m, -inf) = m``,
+    ``exp(-inf) = 0``); the in-place state update stays unconditional."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Monoid):
+            score = c.partial[0]
+            ident = f"{score}_kid"
+            masked = f"{score}_km"
+            out.append(Init(name=ident, op=ElementwiseImpl("maximum"), dtype=F32))
+            out.append(
+                Select(
+                    name=masked,
+                    branches=(SelectBranch(value=score, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+                )
+            )
+            out.append(replace(c, partial=(masked, *c.partial[1:])))
         else:
             out.append(c)
     return tuple(out)
@@ -303,7 +361,7 @@ def build_flash_tile(skel: FlashSkeleton, knobs: dict, *, kernel_name: str, base
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_scalar(body, skel.target_names, 1, 1, 1, 1, None),
+        k_transform=lambda body: _replace_k_scalar(body, skel.target_names, 1, 1, 1, 1, None, skel.k_bounds),
     )
 
 

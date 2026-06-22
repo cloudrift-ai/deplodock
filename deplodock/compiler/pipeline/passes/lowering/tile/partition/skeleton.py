@@ -9,7 +9,7 @@ this module holds only the dataclasses + the free-axis-chain helpers they share.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.stmt import Loop, Stmt
 
@@ -43,7 +43,15 @@ class FlashSkeleton:
     (which renders its own online-softmax rescale). The composer tiles the free
     axes and serial-transforms both reduces; the carriers lower themselves. This
     is the scalar (redundant) nest — one streaming softmax per output element;
-    the tensor-core P@V tier is future work."""
+    the tensor-core P@V tier is future work.
+
+    A symbolic ``seq_len`` lands on BOTH the free q-rows axis (masked tile, the
+    same path pointwise uses) and the streaming KV reduce. The KV reduce streams
+    masked: ``k_bounds`` maps each symbolic streaming-axis name to its runtime
+    boundary ``Expr``, and ``build_flash_tile`` ceil-divides that axis' serial
+    loop and guards each step with ``Cond(k < bound)`` — the TWISTED_MONOID
+    identity is "skip the fold" (m/l/O unchanged), so an out-of-range key
+    contributes nothing. The nested QK^T reduce (head_dim) stays static."""
 
     inner_n: MapAxis
     outer_m: MapAxis | None
@@ -51,6 +59,8 @@ class FlashSkeleton:
     target_names: frozenset[str]
     inner_body: tuple[Stmt, ...]
     leading: tuple[Stmt, ...]
+    # Symbolic streaming-axis name → runtime boundary ``Expr`` (empty = all static).
+    k_bounds: dict = field(default_factory=dict)
 
 
 def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
