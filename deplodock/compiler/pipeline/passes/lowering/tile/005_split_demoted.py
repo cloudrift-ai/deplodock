@@ -99,6 +99,22 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
         return keep_fused
     if pinned == (True,):
         return _stamp(split)
+    # The move composer has no fused-prologue regime: a demoted cone whose
+    # operand is computed by a prologue REDUCE (the gated-MLP RMSNorm) can't be
+    # kept fused, and every cut yields composable pieces (a pointwise ``xn``
+    # producer + a clean gemm). Force the split ONLY for the cones the composer
+    # would otherwise DECLINE — a plain matmul with a merely computed operand
+    # *index* (the collapsed attn-out o_proj) composes fused as a matmul, so it
+    # keeps the legacy fork. The keep-fused split branch is legacy-only.
+    from deplodock import config  # noqa: PLC0415
+
+    if config.move_composer_enabled():
+        from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest  # noqa: PLC0415
+
+        warp_size = ctx.warp_size if ctx is not None else 32
+        if walk_nest(keep_fused, warp_size=warp_size) is None:
+            return _stamp(split)
+        return keep_fused
     # The split fork's ranking knobs carry the offer site's full knob base
     # (its ``S_*`` identity) under the decision delta — mirroring the keep
     # side, whose lifted OptionFork copies the Op's knob dict — so the outer

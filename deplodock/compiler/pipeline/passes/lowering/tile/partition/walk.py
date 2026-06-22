@@ -35,16 +35,28 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import 
 Skeleton = PointwiseSkeleton | MatmulSkeleton | CoopReduceSkeleton | FlashSkeleton
 
 
-def _free_chain(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], list[Loop]]:
+def _free_chain(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], list[Loop], list[Stmt]]:
     """Split leading non-loop stmts, then walk the outer single-stmt chain of
-    free (non-reduce) loops — the `PARALLEL` axes, outermost-first."""
+    free (non-reduce) loops — the `PARALLEL` axes, outermost-first.
+
+    A free loop may be preceded at its OWN level by per-outer-axis precompute
+    stmts (the whole-model o_proj's tied-embedding gather `Load(input_ids[row])`
+    sits between the M and N loops). Those `mid` stmts don't break the chain —
+    they ride the inner tile (recomputed per inner element, σ-tiled like the
+    body), so they're returned separately to prepend to the inner body."""
     leading, rest = _split_leading_non_loops(body)
     chain: list[Loop] = []
+    mid: list[Stmt] = []
     cur = rest
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
-        chain.append(cur[0])
-        cur = tuple(cur[0].body)
-    return leading, chain
+    while True:
+        cur_lead, cur_rest = _split_leading_non_loops(cur)
+        if len(cur_rest) == 1 and isinstance(cur_rest[0], Loop) and not cur_rest[0].is_reduce:
+            mid.extend(cur_lead)
+            chain.append(cur_rest[0])
+            cur = tuple(cur_rest[0].body)
+        else:
+            break
+    return leading, chain, mid
 
 
 def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
@@ -54,11 +66,12 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     body = tuple(loop_op.body)
     reduce_loops = [lp for lp in loop_op.body.iter_of_type(Loop) if lp.is_reduce]
     algebras = {lp.algebra_kind for lp in reduce_loops}
-    leading, chain = _free_chain(body)
+    leading, chain, mid = _free_chain(body)
     if not chain:
         return None
     inner_loop = chain[-1]
-    inner_body = tuple(inner_loop.body)
+    # Per-outer-axis precompute stmts between chain levels ride the inner tile.
+    inner_body = tuple(mid) + tuple(inner_loop.body)
 
     if AlgebraKind.TWISTED_MONOID in algebras:
         # Fused flash attention (the FlashCombine streaming-softmax carrier).
