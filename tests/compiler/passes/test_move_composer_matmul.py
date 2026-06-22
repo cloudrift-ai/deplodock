@@ -19,13 +19,30 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, AtomTile, GridTile, SerialTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
+    MAP_M_REG,
+    MAP_M_THREAD,
+    MAP_N_REG,
+    MAP_N_THREAD,
+    RED_BK,
+    RED_FK,
+    RED_SPLITK,
+    TC_ATOM,
+    TC_BK,
+    TC_REG_M,
+    TC_REG_N,
+    WARP_M,
+    WARP_N,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_warp_matmul_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import eligible_atoms
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
-_MM_KEYS = {"MAP_N_THREAD", "MAP_N_REG", "MAP_M_THREAD", "MAP_M_REG", "RED_BK", "RED_FK"}
+# Move knobs are aliased to the legacy tile names (BN/BM/FN/FM/BK/FK/SPLITK/MMA/
+# WM/WN); reference via the alias ``.name`` so the assertions track the aliasing.
+_MM_KEYS = {MAP_N_THREAD.name, MAP_N_REG.name, MAP_M_THREAD.name, MAP_M_REG.name, RED_BK.name, RED_FK.name}
 
 
 def _matmul(m: int, n: int, k: int) -> LoopOp:
@@ -216,14 +233,22 @@ def test_tree_leaves_complete_and_within_budget():
     for leaf in leaves:
         kn = leaf.knobs
         assert _MM_KEYS <= set(kn), f"leaf missing matmul knobs: {kn}"
-        assert kn["MAP_N_THREAD"] * kn["MAP_M_THREAD"] <= 1024, kn
-        assert kn["RED_FK"] * kn["MAP_N_REG"] * kn["MAP_M_REG"] <= 128, kn
-        assert 128 % (kn["RED_SPLITK"] * kn["RED_BK"] * kn["RED_FK"]) == 0, f"splitk·bk·fk must divide K: {kn}"
+        assert kn[MAP_N_THREAD.name] * kn[MAP_M_THREAD.name] <= 1024, kn
+        assert kn[RED_FK.name] * kn[MAP_N_REG.name] * kn[MAP_M_REG.name] <= 128, kn
+        assert 128 % (kn[RED_SPLITK.name] * kn[RED_BK.name] * kn[RED_FK.name]) == 0, f"splitk·bk·fk must divide K: {kn}"
 
 
 def test_materialize_emits_k_serial_tower():
     skel = walk_nest(_matmul(128, 128, 128))
-    knobs = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 32, "RED_FK": 1, "RED_SPLITK": 1}
+    knobs = {
+        MAP_N_THREAD.name: 8,
+        MAP_N_REG.name: 1,
+        MAP_M_THREAD.name: 16,
+        MAP_M_REG.name: 4,
+        RED_BK.name: 32,
+        RED_FK.name: 1,
+        RED_SPLITK.name: 1,
+    }
     tile = build_matmul_tile(skel, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)
     serials = list(tile.body.iter_of_type(SerialTile))
@@ -246,8 +271,7 @@ def test_pipeline_uses_composer_for_matmul(monkeypatch):
     g.outputs = ["o"]
     out = Pipeline.build(TILE_PASSES).run(g)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert tile_op.knobs.get("RED_BK", 0) >= 1, "composer should stamp the reduce-tile vocabulary"
-    assert tile_op.knobs.get("BN", 0) == 0, "legacy planner must not have run for a composer-covered matmul"
+    assert tile_op.knobs.get(RED_BK.name, 0) >= 1, "composer should stamp the reduce-tile vocabulary (aliased to BK)"
     assert isinstance(tile_op.body[0], GridTile)
 
 
@@ -266,12 +290,12 @@ def test_matmul_tree_offers_warp_for_fp16():
     skel = walk_nest(g.nodes["o"].op)
     tree = build_matmul_tree(skel, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k")
     leaves = flatten_leaves([tree])
-    warp_leaves = [leaf for leaf in leaves if leaf.knobs.get("TC_ATOM")]
+    warp_leaves = [leaf for leaf in leaves if leaf.knobs.get(TC_ATOM.name)]
     assert warp_leaves, "fp16 matmul tree should offer warp (tensorize) leaves"
-    # The materialized TileOp carries the legacy MMA knob (the downstream tier
-    # discriminator); the Fork-leaf identity stays greenfield TC_*.
+    # The atom knob is aliased to the legacy MMA name — the Fork leaf and the
+    # materialized TileOp agree on it (the downstream tier discriminator).
     tile = warp_leaves[0].expand()[0]
-    assert tile.knobs["MMA"] == warp_leaves[0].knobs["TC_ATOM"]
+    assert tile.knobs["MMA"] == warp_leaves[0].knobs[TC_ATOM.name]
 
 
 def test_build_warp_tile_emits_warp_atom_and_mma_knob():
@@ -279,7 +303,7 @@ def test_build_warp_tile_emits_warp_atom_and_mma_knob():
     skel = walk_nest(g.nodes["o"].op)
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
     # 64x128x64 / atom(16,8,16): cells_m=4, cells_n=16, kc=4 → wm=2,wn=2 ; pm=2,pn=8
-    knobs = {"TC_ATOM": atom.name, "WARP_M": 2, "WARP_N": 2, "TC_REG_M": 2, "TC_REG_N": 4, "TC_BK": 4}
+    knobs = {TC_ATOM.name: atom.name, WARP_M.name: 2, WARP_N.name: 2, TC_REG_M.name: 2, TC_REG_N.name: 4, TC_BK.name: 4}
     tile = build_warp_matmul_tile(skel, atom, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)
     assert tile.knobs["MMA"] == atom.name, "warp tile must carry the MMA knob (020/005/is_warp tier discriminator)"
@@ -295,9 +319,9 @@ def test_build_matmul_tile_splitk_adds_grid_axis():
     # M=64 (tile 16·4=64 → M_b=1), N=64 (tile 8 → N_b=8); only the K_s axis has
     # extent 4. (Axis names canonicalize to a0/a1/… so match on extent, not name.)
     skel = walk_nest(_matmul(64, 64, 256))
-    base = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 1, "RED_FK": 1}
-    g1 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 1}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
-    g4 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 4}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
+    base = {MAP_N_THREAD.name: 8, MAP_N_REG.name: 1, MAP_M_THREAD.name: 16, MAP_M_REG.name: 4, RED_BK.name: 1, RED_FK.name: 1}
+    g1 = list(build_matmul_tile(skel, {**base, RED_SPLITK.name: 1}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
+    g4 = list(build_matmul_tile(skel, {**base, RED_SPLITK.name: 4}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
     n1 = sum(len(g.axes) for g in g1)
     extents4 = [ax.extent.as_static() for g in g4 for ax in g.axes]
     assert sum(len(g.axes) for g in g4) == n1 + 1, "split-K must add exactly one grid axis"

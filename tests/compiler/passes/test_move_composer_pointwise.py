@@ -20,12 +20,15 @@ from deplodock.compiler.ir.stmt import Accum, Cond
 from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import MAP_M_REG, MAP_M_THREAD, MAP_N_REG, MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_pointwise_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import PointwiseSkeleton
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_pointwise_tree
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
-_MAP_KEYS = {"MAP_N_THREAD", "MAP_N_REG", "MAP_M_THREAD", "MAP_M_REG"}
+# The composer's move knobs are aliased to the legacy tile names (BN/FN/BM/FM);
+# reference them via the alias ``.name`` so the tests track the aliasing.
+_MAP_KEYS = {MAP_N_THREAD.name, MAP_N_REG.name, MAP_M_THREAD.name, MAP_M_REG.name}
 
 
 def _pointwise(m: int, n: int) -> LoopOp:
@@ -89,13 +92,13 @@ def test_tree_leaves_complete_and_within_budget():
     for leaf in leaves:
         kn = leaf.knobs
         assert _MAP_KEYS <= set(kn), f"leaf missing map knobs: {kn}"
-        assert kn["MAP_N_THREAD"] * kn["MAP_M_THREAD"] <= 1024, kn
-        assert kn["MAP_N_REG"] * kn["MAP_M_REG"] <= 128, kn
+        assert kn[MAP_N_THREAD.name] * kn[MAP_M_THREAD.name] <= 1024, kn
+        assert kn[MAP_N_REG.name] * kn[MAP_M_REG.name] <= 128, kn
 
 
 def test_materialize_clean_tower_no_guard():
     skel = walk_nest(_pointwise(64, 64))
-    knobs = {"MAP_N_THREAD": 32, "MAP_N_REG": 1, "MAP_M_THREAD": 8, "MAP_M_REG": 1}
+    knobs = {MAP_N_THREAD.name: 32, MAP_N_REG.name: 1, MAP_M_THREAD.name: 8, MAP_M_REG.name: 1}
     tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)
     grid = next(s for s in tile.body if isinstance(s, GridTile))
@@ -105,7 +108,7 @@ def test_materialize_clean_tower_no_guard():
 
 def test_materialize_masked_has_store_guard():
     skel = walk_nest(_pointwise(70, 130))  # neither axis divides the tile
-    knobs = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 32, "MAP_M_REG": 1}
+    knobs = {MAP_N_THREAD.name: 8, MAP_N_REG.name: 1, MAP_M_THREAD.name: 32, MAP_M_REG.name: 1}
     tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={})
     conds = list(tile.body.iter_of_type(Cond))
     assert len(conds) == 2, f"masked N and M each get a boundary guard, got {len(conds)}"
@@ -120,9 +123,6 @@ def test_pipeline_uses_composer_when_enabled(monkeypatch):
     g.outputs = ["o"]
     out = Pipeline.build(TILE_PASSES).run(g)
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    # The composer stamped a real map tile...
-    assert tile_op.knobs.get("MAP_N_THREAD", 0) >= 1, "composer should stamp the greenfield vocabulary"
-    # ...and the legacy planner did NOT run: legacy ``BN`` stays at its OFF
-    # sentinel (0), stamped by the downstream ``apply_off_defaults`` for every
-    # still-registered knob during the transition, never a real thread size.
-    assert tile_op.knobs.get("BN", 0) == 0, "legacy planner must not have run for a composer-covered regime"
+    # The composer stamped a real map tile under the legacy ``BN`` name (the move
+    # knobs are aliased to the legacy vocabulary, so the tune DB / prior transfer).
+    assert tile_op.knobs.get(MAP_N_THREAD.name, 0) >= 1, "composer should stamp a real N thread tile"
