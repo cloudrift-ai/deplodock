@@ -94,6 +94,34 @@ def _ref_matmul(k_extent, *, allow_split, sk_choices, bk_choices, fk_choices):
     return out
 
 
+def test_one_move_expresses_splitk_coop_and_splitkv():
+    """The forcing-function proof (plan phase 5): ONE carrier-trait-gated
+    ``legal_decomps`` call expresses split-K (additive ``Accum``), cooperative
+    reduce (``max`` ``Accum``), AND flash split-KV (the online-softmax LSE
+    ``Monoid``) — same partition factorizations, differing only in the carrier
+    whose ``combine_partials`` recombines the pieces. This validates the
+    ``AxisDecomp`` abstraction across all three instances before any deletion."""
+    from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+
+    ax = Axis("kv", 256)
+    menus = [[1, 2, 4, 8], [1], [1]]
+    place = [Role.BLOCK, Role.SERIAL_OUTER, Role.REGISTER]
+
+    _max = Accum(name="m", value="v", op=ElementwiseImpl("maximum"))
+    splitk = legal_decomps(_ADD, ax, 256, factor_menus=menus, placement=place, masked=False)
+    coop = legal_decomps(_max, ax, 256, factor_menus=menus, placement=place, masked=False)
+    flash = flash_combine("m", "l", "O", "s", "V")  # the FlashCombine LSE Monoid
+    assert flash.commutative and flash.associative and flash.has_identity  # licenses the split
+    splitkv = legal_decomps(flash, ax, 256, factor_menus=menus, placement=place, masked=False)
+
+    parts = lambda decs: sorted(d.factors[0] for d in decs)  # noqa: E731
+    assert parts(splitk) == parts(coop) == parts(splitkv) == [1, 2, 4, 8]
+    # The recombine is derived from the carrier: an additive op-fold for the
+    # Accums, the 12-step state-merge for the flash LSE — one operator surface.
+    assert len(_ADD.combine_partials()) == 1
+    assert len(flash.combine_partials()) == 12  # the authored combine_states (m,l,O merge)
+
+
 def test_matmul_offers_byte_identical():
     from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.loop import Axis as LAxis
