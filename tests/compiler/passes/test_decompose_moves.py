@@ -122,6 +122,30 @@ def test_one_move_expresses_splitk_coop_and_splitkv():
     assert len(flash.combine_partials()) == 12  # the authored combine_states (m,l,O merge)
 
 
+def test_parallel_axis_is_a_no_recombine_axisdecomp():
+    """Phase 7: a free (PARALLEL) axis — no carrier — is a product decomposition of
+    independent work (block × thread × register), every factorization legal with no
+    recombine. The same ``legal_decomps`` move expresses free-axis tiling and the
+    tensorize atom-block, not just the reduce-axis split/coop/split-KV."""
+    ax = Axis("n", 256)
+    # Free-axis tile: block × thread × register, BLOCK/THREAD/REGISTER placement.
+    tiles = legal_decomps(
+        None, ax, 256, factor_menus=[[1, 2, 4], [8, 16, 32], [1, 2, 4]], placement=[Role.BLOCK, Role.THREAD, Role.REGISTER], masked=False
+    )
+    assert tiles, "a parallel axis must offer product tilings (no carrier needed)"
+    assert all(isinstance(d, AxisDecomp) for d in tiles)
+    # No associativity / commutativity gate — a partition (block > 1) is always legal.
+    assert any(d.factors[0] > 1 for d in tiles)
+    # Masking a parallel axis is a boundary store-guard, NOT an identity fill — so
+    # it is legal with no carrier (unlike a reduce, which needs has_identity).
+    masked = legal_decomps(None, ax, 256, factor_menus=[[1], [30], [1]], placement=[Role.BLOCK, Role.THREAD, Role.REGISTER], masked=True)
+    assert masked, "a non-dividing parallel tile masks via ceil-div + store guard"
+    # Tensorize atom-block: the M,N,K → atom-cell product decomposition is the same
+    # move (an ATOM-placed factor), a parallel product over the output axis.
+    atomblock = legal_decomps(None, ax, 256, factor_menus=[[2], [2], [8]], placement=[Role.WARP, Role.REGISTER, Role.ATOM], masked=False)
+    assert atomblock and atomblock[0].placement[-1] is Role.ATOM
+
+
 def test_matmul_offers_byte_identical():
     from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.loop import Axis as LAxis

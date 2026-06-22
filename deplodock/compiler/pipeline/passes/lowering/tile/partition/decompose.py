@@ -71,12 +71,20 @@ def legal_decomps(
       factorization of a non-divisible / symbolic axis; without it the product
       must divide ``extent`` exactly.
 
+    A **PARALLEL** axis (``carrier is None``) is the degenerate, no-recombine case
+    (phase 7): free-axis tiling (block × thread × register) and the tensorize
+    atom-block are product decompositions of *independent* work, so every
+    factorization is legal (no associativity needed — there is nothing to
+    recombine), masking is a plain boundary store-guard (no carrier identity), and
+    a partition factor needs no commutativity.
+
     Returns the legal :class:`AxisDecomp`s unranked — pruning / best-first
     ordering stays with the caller (cost, not algebra)."""
-    if masked and not (carrier is not None and carrier.has_identity):
-        return []  # can't mask a fill-less carrier
-    splittable = carrier is not None and carrier.associative
-    can_partition = allow_split and carrier is not None and carrier.commutative
+    parallel = carrier is None
+    if masked and not parallel and not carrier.has_identity:
+        return []  # can't identity-fill a fill-less reduce carrier (a parallel axis masks via a store guard)
+    splittable = parallel or carrier.associative
+    can_partition = parallel or (allow_split and carrier.commutative)
     placement_t = tuple(placement)
 
     out: list[AxisDecomp] = []
