@@ -383,9 +383,7 @@ def build_flash_tile(
     )
 
 
-def build_coop_reduce_tile(
-    knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag, target_names: frozenset[str]
-) -> TileOp:
+def build_coop_reduce_tile(knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag, target_names: frozenset[str]) -> TileOp:
     """Whole-CTA cooperative reduce: free rows → grid (thread/reg forced to 1),
     ``BR`` threads (the ``K_c`` axis) reduce one row's K (masked-K fill past
     ``k_bound`` when symbolic), the combine is emitted downstream from
@@ -475,12 +473,28 @@ def build_warp_matmul_tile(atom: Atom, knobs: dict, *, kernel_name: str, base_kn
     bk = knobs[TC_BK.name]
 
     inner_n, outer_m, extra_outer = _free_axes(dag)
-    n_b, n_w, n_r, n_a, n_expr, _n_bound = _warp_axis(inner_n, wn, fn, atom_n)
-    m_b, m_w, m_r, m_a, m_expr, _m_bound = _warp_axis(outer_m, wm, fm, atom_m)
+    n_b, n_w, n_r, n_a, n_expr, n_bound = _warp_axis(inner_n, wn, fn, atom_n)
+    m_b, m_w, m_r, m_a, m_expr, m_bound = _warp_axis(outer_m, wm, fm, atom_m)
     sigma_outer = Sigma({inner_n.name: n_expr, outer_m.name: m_expr})
 
     new_inner: tuple[Stmt, ...] = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
     new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_extent, bk, atom_k)
+
+    # Masked output axes (symbolic or static non-divisor): wrap the cell in a
+    # boundary ``Cond(σ(axis) < bound)`` — the same store guard the scalar
+    # ``_assemble`` emits. ``021_hoist_staged_loads_above_mask`` lifts the
+    # K-pipeline above it (and stamps ``gmem_extents`` so ``_stage_expand``
+    # clamps the cooperative slab fill); ``005_lower_atom_tile._boundary_guards``
+    # classifies the predicate against the Write's M / N coords and stamps the
+    # per-element ``RegStore`` row / col guard (a tile straddling the bound passes
+    # the Cond but its trailing rows / cols are out of range). N (inner) is
+    # wrapped first so it nests inside M, matching the scalar bound order.
+    overhang: tuple[str, ...] = ()
+    for name, bound in ((inner_n.name, n_bound), (outer_m.name, m_bound)):
+        if bound is not None:
+            overhang = (*overhang, name)
+            pred = sigma_outer.reduce(Var(name), SimplifyCtx({}))
+            new_inner = (Cond(cond=BinaryExpr("<", pred, bound), body=Body(new_inner)),)
 
     layers: list[tuple[Axis, Role | None]] = [
         (n_a, Role.ATOM),
@@ -503,6 +517,8 @@ def build_warp_matmul_tile(atom: Atom, knobs: dict, *, kernel_name: str, base_kn
     # block-stamped affine slab) instead of the scalar path. Dropped when those
     # passes are greenfielded in Phase 4.
     knobs_full = {**base_knobs, **knobs, "MMA": atom.name}
+    if overhang:
+        knobs_full["OVERHANG"] = overhang
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in dag.leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)

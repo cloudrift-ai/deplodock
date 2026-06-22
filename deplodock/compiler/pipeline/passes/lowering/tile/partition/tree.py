@@ -349,18 +349,16 @@ def build_matmul_tree(
     ctx = _Ctx(dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name, target_names=target_names)
     scalar = _scalar_subtree(ctx)
     n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
-    # A symbolic **M** (outer, row) axis reaches the warp tier as a masked mma.sync
-    # tile (`_warp_axis` ceil-divides + stamps `real_extent`; `020`/`005` clamp the
-    # A-slab load + add a per-cell store guard). This is verified-correct across
-    # runtime sizes (accuracy at 1 / 31 / 512 / 700) and its staging is NOT
-    # TMA-eligible, so the TMA box-overrun fault can't occur (a pinned `TMA=1` raises
-    # cleanly rather than firing past the runtime buffer). A symbolic **N** (inner,
-    # contiguous) axis stays SCALAR: a partial N tile misaligns the ldmatrix /
-    # cp.async (16-byte alignment on the leading dim), faulting
-    # `CUDA_ERROR_MISALIGNED_ADDRESS` — that masked-N warp path is not yet landed. A
-    # multi-accum matmul (gated MLP) also stays scalar (the warp builder takes one
-    # reduce; `is_atom_eligible` would still pass on the first, so gate explicitly).
-    scalar_only = dag.inner_n.symbolic or n_reduce > 1
+    # A symbolic **M** (outer, row) **or N** (inner, contiguous) axis reaches the
+    # warp tier as a masked mma.sync tile (`_warp_axis` ceil-divides + emits the
+    # boundary `Cond`; `020`/`021` clamp the staged slab fill, `005` stamps the
+    # per-cell `RegStore` row / col guard, and `RegStore.render` falls back to a
+    # per-element scalar store when `ldm` is symbolic-odd so the `__half2` site
+    # stays aligned). Verified-correct across runtime sizes (accuracy at off-tile
+    # 130 / 200). A multi-accum matmul (gated MLP) stays scalar (the warp builder
+    # takes one reduce; `is_atom_eligible` would still pass on the first, so gate
+    # explicitly).
+    scalar_only = n_reduce > 1
     # Honor the legacy ``MMA`` pin (the aliased ``TC_ATOM`` knob): ``MMA=0`` forces
     # the scalar tier (e.g. the FK half2 window); ``MMA=<kind>`` restricts to that
     # atom; unset / truthy auto-enumerates every eligible atom.
