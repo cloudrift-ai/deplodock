@@ -235,6 +235,11 @@ def build_matmul_tile(knobs: dict, *, kernel_name: str, base_knobs: dict, dag: I
     src_k = kax.source_axis or kax
     k_s = Axis(f"{kax.name}_s", splitk, source_axis=src_k) if splitk > 1 else None
     targets = target_names or frozenset({kax.name})
+    # Scalar tier: stamp the warp-tier knobs as explicit OFF sentinels (``MMA="0"``
+    # so ``is_warp`` reads False; ``WM=WN=0``) plus the scalar ``BR=1`` (no
+    # cooperative-K), so the leaf carries the complete, uniform knob set the tune
+    # DB / prior key on (the warp builder stamps ``MMA=<atom>`` + ``WM``/``WN``).
+    knobs = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
     return _assemble(
         free_specs,
         dag.inner_body,
