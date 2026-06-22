@@ -246,12 +246,20 @@ def coop_reduce_offers(skel: CoopReduceSkeleton) -> list[tuple[int, int, int]]:
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     brs = (br_pin,) if br_pin else BR_CHOICES
     masked = skel.k_bound is not None
+    # A short reduce (static K < warp_size) stays pure-serial (BR=1): too small to
+    # stage a meaningful cross-thread tree-halve combine — matching the legacy
+    # WARP_SIZE gate. It still composes (the serial per-row reduce), just without
+    # cooperative threads. (A symbolic/masked K tiles at the hint, which is large.)
+    br_floor_serial = (not masked) and skel.k_extent < 32
     out = [
         (bk, fk, br)
         for br in brs
         for bk in bks
         for fk in fks
-        if 1 <= br <= 1024 and br * bk * fk <= skel.k_extent and (masked or skel.k_extent % (br * bk * fk) == 0)
+        if 1 <= br <= 1024
+        and (br == 1 or not br_floor_serial)
+        and br * bk * fk <= skel.k_extent
+        and (masked or skel.k_extent % (br * bk * fk) == 0)
     ]
     out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
     return out
