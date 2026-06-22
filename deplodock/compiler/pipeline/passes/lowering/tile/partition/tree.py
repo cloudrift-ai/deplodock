@@ -319,7 +319,11 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
     # — gated MLP) stays on the scalar tier (the warp builder takes one reduce;
     # `is_atom_eligible` would still pass on the first, so gate explicitly).
     n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
-    scalar_only = skel.inner_n.symbolic or skel.outer_m.symbolic or n_reduce > 1
+    # A symbolic / non-divisible free axis reaches the warp tier as a MASKED tile
+    # (`_warp_axis` ceil-divides + stamps real_extent; 020/005 clamp+guard). A
+    # multi-accumulator matmul (gated MLP) still stays scalar (the warp builder
+    # takes one reduce).
+    scalar_only = n_reduce > 1
     # Honor the legacy ``MMA`` pin (the aliased ``TC_ATOM`` knob): ``MMA=0`` forces
     # the scalar tier (e.g. the FK half2 window); ``MMA=<kind>`` restricts to that
     # atom; unset / truthy auto-enumerates every eligible atom.

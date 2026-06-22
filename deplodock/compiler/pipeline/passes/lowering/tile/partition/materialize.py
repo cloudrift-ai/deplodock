@@ -394,10 +394,21 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
 def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
     """4-level output-axis split for the warp tier:
     ``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom`` (the per-lane ``A_a`` offset
-    is owned by ``mma.sync``, so it is NOT in σ). Clean (divisible) only."""
+    is owned by ``mma.sync``, so it is NOT in σ). A symbolic / non-divisible axis
+    is masked: ``A_b`` ceil-divides and carries ``real_extent`` (the runtime /
+    static bound) so ``020_stage_inputs`` / ``005_lower_atom_tile`` clamp the loads
+    and guard the per-cell store; the boundary ``Expr`` is returned for the
+    output-store ``Cond``."""
     src = axis.source_axis or axis
     per_block = warp * reg * atom_cell
-    a_b = Axis(f"{axis.name}_b", axis.extent // per_block, source_axis=src)
+    masked = (not axis.extent.is_static) or (axis.extent.as_static() % per_block != 0)
+    b_ext = axis.extent.ceil_div(per_block) if masked else axis.extent // per_block
+    a_b = Axis(
+        f"{axis.name}_b",
+        b_ext,
+        source_axis=src,
+        real_extent=axis.extent.as_static() if (masked and axis.extent.is_static) else None,
+    )
     a_w = Axis(f"{axis.name}_w", warp, source_axis=src)
     a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
     a_a = Axis(f"{axis.name}_a", atom_cell, source_axis=src)
@@ -406,7 +417,8 @@ def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
         + Var(a_w.name) * Literal(reg * atom_cell, "int")
         + Var(a_r.name) * Literal(atom_cell, "int")
     )
-    return a_b, a_w, a_r, a_a, expr
+    bound = axis.extent.expr if masked else None
+    return a_b, a_w, a_r, a_a, expr, bound
 
 
 def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, atom_k: int) -> tuple[Stmt, ...]:
@@ -436,8 +448,8 @@ def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, ker
     fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
     bk = knobs[TC_BK.name]
 
-    n_b, n_w, n_r, n_a, n_expr = _warp_axis(skel.inner_n.loop.axis, wn, fn, atom_n)
-    m_b, m_w, m_r, m_a, m_expr = _warp_axis(skel.outer_m.loop.axis, wm, fm, atom_m)
+    n_b, n_w, n_r, n_a, n_expr, _n_bound = _warp_axis(skel.inner_n.loop.axis, wn, fn, atom_n)
+    m_b, m_w, m_r, m_a, m_expr, _m_bound = _warp_axis(skel.outer_m.loop.axis, wm, fm, atom_m)
     sigma_outer = Sigma({skel.inner_n.loop.axis.name: n_expr, skel.outer_m.loop.axis.name: m_expr})
 
     new_inner: tuple[Stmt, ...] = tuple(s.rewrite(_identity_rename, sigma_outer) for s in skel.inner_body)
