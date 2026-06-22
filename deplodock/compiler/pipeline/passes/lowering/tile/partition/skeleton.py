@@ -35,6 +35,24 @@ class PointwiseSkeleton:
     leading: tuple[Stmt, ...]
 
 
+@dataclass(frozen=True)
+class FlashSkeleton:
+    """Fused flash-attention nest (`DEPLODOCK_FLASH=1`): free output axes
+    (q-rows / head-dim / head) + a `TWISTED_MONOID` streaming KV reduce whose
+    body holds a nested `SEMIRING` QK^T reduce and the `FlashCombine` carrier
+    (which renders its own online-softmax rescale). The composer tiles the free
+    axes and serial-transforms both reduces; the carriers lower themselves. This
+    is the scalar (redundant) nest — one streaming softmax per output element;
+    the tensor-core P@V tier is future work."""
+
+    inner_n: MapAxis
+    outer_m: MapAxis | None
+    extra_outer: tuple[Loop, ...]
+    target_names: frozenset[str]
+    inner_body: tuple[Stmt, ...]
+    leading: tuple[Stmt, ...]
+
+
 def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
     leading: list[Stmt] = []
     rest = tuple(body)

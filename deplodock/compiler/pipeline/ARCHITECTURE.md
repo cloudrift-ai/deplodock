@@ -135,8 +135,14 @@ loop composes with no new regime — that is how **RMSNorm / softmax** are cover
 different-named map loop are cooperative-split together, keyed by extent via `target_names`; the warp/tree combine
 is reused from `kernel/100` via `Accum.axes` σ-propagation). **Symbolic free axes** (dynamic seq_len as rows / M /
 N) compose too — masked as a ceil-div grid + `< extent` store guard, scalar tier only (the warp path is
-clean-tile); a symbolic **K** (reduce) still needs the masked-K zero-fill and stays on legacy. See
-`plans/move-composer-axis-walk-scheduler.md`.
+clean-tile); a symbolic **K** cooperative reduce tiles at the hint and fills the masked final tile with the
+**carrier identity** (`Init(op)`: `0` for add, `-inf` for max — the monoid-DAG mechanism). A matmul **MAP epilogue**
+(QK^T scale, matmul_add) rides the output tile (SPLITK forced to 1); a **multi-accumulator** matmul (gated MLP)
+schedules on the cooperative multi-Accum path. With `DEPLODOCK_FLASH=1` the composer also covers the **fused SDPA
+flash** nest (`TWISTED_MONOID`): `walk_nest` → `build_flash_tile` tiles the free output axes and serial-transforms
+the streaming KV + nested QK^T reduces while the `FlashCombine` carrier renders its own online-softmax rescale
+(scalar tier; the tensor-core P@V tier is future work). See `plans/move-composer-axis-walk-scheduler.md`,
+`plans/monoid-dag-carrier-annotation.md`, `plans/online-softmax-flash-attention.md`.
 Unlike
 the legacy planner — which enumerates a flat knob cartesian and groups it post-hoc via `build_fork_tree` — the
 composer **generates** the Fork tree move-by-move (`tree.py`): the root offers legal thread tiles, each branch

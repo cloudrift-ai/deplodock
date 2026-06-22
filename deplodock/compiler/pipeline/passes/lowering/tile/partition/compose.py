@@ -14,11 +14,13 @@ from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
     CoopReduceSkeleton,
+    FlashSkeleton,
     MatmulSkeleton,
     PointwiseSkeleton,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import (
     build_coop_reduce_tree,
+    build_flash_tree,
     build_matmul_tree,
     build_pointwise_tree,
 )
@@ -37,4 +39,6 @@ def try_compose(loop_op: LoopOp, ctx: Context, graph: Graph, *, kernel_name: str
         return build_matmul_tree(nest, loop_op=loop_op, context=ctx, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name)
     if isinstance(nest, CoopReduceSkeleton):
         return build_coop_reduce_tree(nest, base_knobs=base_knobs, kernel_name=kernel_name)
+    if isinstance(nest, FlashSkeleton):
+        return build_flash_tree(nest, base_knobs=base_knobs, kernel_name=kernel_name)
     return None

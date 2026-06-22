@@ -36,7 +36,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     WARP_M,
     WARP_N,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import CoopReduceSkeleton, MatmulSkeleton, PointwiseSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
+    CoopReduceSkeleton,
+    FlashSkeleton,
+    MatmulSkeleton,
+    PointwiseSkeleton,
+)
 
 # One free axis to split: (axis, thread factor, register factor, interleave-when-masked).
 _FreeSpec = tuple[Axis, int, int, bool]
@@ -152,7 +157,10 @@ def _replace_k_scalar(
         if isinstance(s, Loop) and s.axis.name in target_names:
             kn = s.axis.name
             src = s.axis.source_axis or s.axis
-            k_o_ext = k_extent // (splitk * bk * fk)
+            # Each target loop tiles by its OWN extent (a flash nest's KV and
+            # nested QK reduces differ); a plain matmul's single K matches k_extent.
+            this_extent = s.axis.extent.as_static() if (s.axis is not None and s.axis.extent.is_static) else k_extent
+            k_o_ext = this_extent // (splitk * bk * fk)
             k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{kn}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(bk * fk, "int")
@@ -164,7 +172,10 @@ def _replace_k_scalar(
             if k_s is not None:
                 expr = Var(k_s.name) * Literal(k_o_ext * bk * fk, "int") + expr
             sigma_k = Sigma({kn: expr})
-            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            # Recurse first so a nested target loop (flash's QK inside KV) is also
+            # split, then σ-rewrite this loop's body.
+            inner = _replace_k_scalar(tuple(s.body), target_names, k_extent, bk, fk, splitk, k_s)
+            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
             if k_f is not None:
                 new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
             out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
@@ -273,6 +284,27 @@ def _replace_k_coop(
         else:
             out.append(s)
     return tuple(out)
+
+
+def build_flash_tile(skel: FlashSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+    """Fused flash nest: tile the free output axes (q-rows / head-dim), and
+    serial-transform the streaming KV reduce + its nested QK^T reduce (bk=fk=1,
+    no split-K / cooperative-K — each output element streams KV itself). The
+    `FlashCombine` / `Accum` carriers render their own rescale; the Init / divide
+    finalize ride the output tile."""
+    free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
+    if skel.outer_m is not None:
+        free_specs.append((skel.outer_m.loop.axis, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
+    return _assemble(
+        free_specs,
+        skel.inner_body,
+        leading=skel.leading,
+        extra_outer=skel.extra_outer,
+        knobs=knobs,
+        base_knobs=base_knobs,
+        kernel_name=kernel_name,
+        k_transform=lambda body: _replace_k_scalar(body, skel.target_names, 1, 1, 1, 1, None),
+    )
 
 
 def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:

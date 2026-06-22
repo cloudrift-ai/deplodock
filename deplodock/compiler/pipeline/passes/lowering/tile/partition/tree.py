@@ -11,6 +11,7 @@ reusing the ``Fork`` / ``LazyCandidate`` engine unchanged.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.stmt import Loop
@@ -20,6 +21,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Bu
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK, TC_ATOM, WARP_M, WARP_N
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
     build_coop_reduce_tile,
+    build_flash_tile,
     build_matmul_tile,
     build_pointwise_tile,
     build_warp_matmul_tile,
@@ -45,6 +47,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
     CoopReduceSkeleton,
+    FlashSkeleton,
     MatmulSkeleton,
     PointwiseSkeleton,
 )
@@ -52,12 +55,15 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import 
 
 @dataclass(frozen=True)
 class _Ctx:
-    """Per-LoopOp state shared by every node of one kernel's tree."""
+    """Per-LoopOp state shared by every node of one kernel's tree. ``tile_builder``
+    materializes a leaf — `build_pointwise_tile` by default, `build_flash_tile`
+    for the flash nest (both free-axis-tiled, differing only in the K transform)."""
 
-    skel: PointwiseSkeleton | MatmulSkeleton
+    skel: PointwiseSkeleton | MatmulSkeleton | FlashSkeleton
     budget: Budget
     base_knobs: dict
     kernel_name: str
+    tile_builder: Callable = build_pointwise_tile
 
 
 @dataclass(frozen=True)
@@ -70,7 +76,7 @@ class _Leaf(Fork):
     is_leaf = True
 
     def expand(self) -> list:
-        return [build_pointwise_tile(self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs)]
+        return [self.ctx.tile_builder(self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs)]
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,23 @@ def build_pointwise_tree(skel: PointwiseSkeleton, *, base_knobs: dict, kernel_na
     if len(threads) == 1 and len(regs) == 1:
         full = {**thread_knobs(skel, threads[0]), **reg_knobs(skel, regs[0])}
         return build_pointwise_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs)
+    return _ChooseThread(ctx=ctx, knobs={})
+
+
+def build_flash_tree(skel: FlashSkeleton, *, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+    """Flash nest: the same free-axis (thread → register) generative tree as
+    pointwise, but each leaf materializes via `build_flash_tile` (which serial-
+    transforms the streaming reduces). The reduces aren't a search dimension —
+    the `FlashCombine` carrier owns the KV recurrence."""
+    budget = Budget()
+    threads = thread_offers(skel, budget)
+    regs = reg_offers(skel, budget)
+    if not threads or not regs:
+        return None
+    ctx = _Ctx(skel=skel, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name, tile_builder=build_flash_tile)
+    if len(threads) == 1 and len(regs) == 1:
+        full = {**thread_knobs(skel, threads[0]), **reg_knobs(skel, regs[0])}
+        return build_flash_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs)
     return _ChooseThread(ctx=ctx, knobs={})
 
 

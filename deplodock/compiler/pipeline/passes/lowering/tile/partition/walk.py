@@ -25,13 +25,14 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Loop, Stmt, Write
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
     CoopReduceSkeleton,
+    FlashSkeleton,
     MatmulSkeleton,
     PointwiseSkeleton,
     _map_axis,
     _split_leading_non_loops,
 )
 
-Skeleton = PointwiseSkeleton | MatmulSkeleton | CoopReduceSkeleton
+Skeleton = PointwiseSkeleton | MatmulSkeleton | CoopReduceSkeleton | FlashSkeleton
 
 
 def _free_chain(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], list[Loop]]:
@@ -53,13 +54,29 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     body = tuple(loop_op.body)
     reduce_loops = [lp for lp in loop_op.body.iter_of_type(Loop) if lp.is_reduce]
     algebras = {lp.algebra_kind for lp in reduce_loops}
-    if AlgebraKind.TWISTED_MONOID in algebras:
-        return None  # flash / coupled carry — not yet an axis transform
     leading, chain = _free_chain(body)
     if not chain:
         return None
     inner_loop = chain[-1]
     inner_body = tuple(inner_loop.body)
+
+    if AlgebraKind.TWISTED_MONOID in algebras:
+        # Fused flash attention (the FlashCombine streaming-softmax carrier).
+        # Tile the free output axes; serial-transform the streaming KV reduce +
+        # its nested QK^T reduce; the carriers render their own rescale. Static
+        # only for now (symbolic-seq flash is future work).
+        if len(chain) < 2 or any(not lp.axis.extent.is_static for lp in chain):
+            return None
+        if any(not lp.axis.extent.is_static for lp in reduce_loops):
+            return None
+        return FlashSkeleton(
+            inner_n=_map_axis(inner_loop),
+            outer_m=_map_axis(chain[-2]),
+            extra_outer=tuple(chain[:-2]),
+            target_names=frozenset(lp.axis.name for lp in reduce_loops),
+            inner_body=inner_body,
+            leading=leading,
+        )
 
     # PARALLEL-only — pointwise.
     if not reduce_loops:
