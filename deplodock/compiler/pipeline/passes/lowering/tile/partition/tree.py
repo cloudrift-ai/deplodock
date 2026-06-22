@@ -18,13 +18,12 @@ from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.ir.tile.ir import Atom, TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.build_dag import lower_matmul, lower_pointwise
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import AxisRole, IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK, TC_ATOM, WARP_M, WARP_N
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
     build_coop_reduce_tile,
     build_flash_tile,
-    build_matmul_tile,
-    build_pointwise_tile,
     build_warp_matmul_tile,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
@@ -75,7 +74,7 @@ class _Leaf(Fork):
     is_leaf = True
 
     def expand(self) -> list:
-        return [build_pointwise_tile(self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag)]
+        return [lower_pointwise(self.ctx.dag, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs)]
 
 
 @dataclass(frozen=True)
@@ -158,7 +157,7 @@ def build_pointwise_tree(*, dag: IterDag, base_knobs: dict, kernel_name: str) ->
     ctx = _Ctx(dag=dag, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name)
     if len(threads) == 1 and len(regs) == 1:
         full = {**thread_knobs(dag, threads[0]), **reg_knobs(dag, regs[0])}
-        return build_pointwise_tile(full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+        return lower_pointwise(dag, full, kernel_name=kernel_name, base_knobs=base_knobs)
     return _ChooseThread(ctx=ctx, knobs={})
 
 
@@ -194,11 +193,11 @@ class _MmLeaf(Fork):
 
     def expand(self) -> list:
         return [
-            build_matmul_tile(
+            lower_matmul(
+                self.ctx.dag,
                 self.knobs,
                 kernel_name=self.ctx.kernel_name,
                 base_knobs=self.ctx.base_knobs,
-                dag=self.ctx.dag,
                 target_names=self.ctx.target_names,
             )
         ]
@@ -256,7 +255,7 @@ def _scalar_subtree(ctx: _Ctx) -> Fork | TileOp | None:
     regs0 = matmul_reg_offers(dag, ctx.budget, reduces[0][1])
     if len(reduces) == 1 and len(threads) == 1 and len(regs0) == 1:
         full = {**reduce_knobs(reduces[0]), **thread_knobs(dag, threads[0]), **reg_knobs(dag, regs0[0])}
-        return build_matmul_tile(full, kernel_name=ctx.kernel_name, base_knobs=ctx.base_knobs, dag=dag, target_names=ctx.target_names)
+        return lower_matmul(dag, full, kernel_name=ctx.kernel_name, base_knobs=ctx.base_knobs, target_names=ctx.target_names)
     return _MmChooseReduce(ctx=ctx, knobs={})
 
 

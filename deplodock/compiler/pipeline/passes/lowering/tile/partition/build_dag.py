@@ -19,6 +19,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.blockdag import Binding, Block, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import _identity_rename
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     MAP_M_REG,
@@ -33,6 +34,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize impo
     _free_axes,
     _replace_k_scalar,
     _split_free_axis,
+    build_matmul_tile,
+    build_pointwise_tile,
 )
 
 
@@ -117,3 +120,34 @@ def build_matmul_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_name
     compute = _replace_k_scalar(inner, targets, dag.k_extent, bk, fk, splitk, k_s)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
     return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
+
+
+# ---------------------------------------------------------------------------
+# Routing helpers — build the DAG + assemble, with a legacy fallback for the
+# regimes/shapes not yet ported (masked axes). The Fork-tree leaves call these,
+# so the pipeline lowers covered shapes through the new IR while unported shapes
+# stay on the legacy materializer. assemble is byte-identical, so this is a pure
+# substitution (verified by tests/compiler/passes/test_assemble_blockdag.py).
+# ---------------------------------------------------------------------------
+
+
+def lower_pointwise(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict):
+    """Lower a pointwise leaf via the block-DAG path, falling back to the legacy
+    materializer for shapes ``build_pointwise_dag`` doesn't yet cover."""
+    try:
+        tg = build_pointwise_dag(dag, knobs, kernel_name=kernel_name)
+    except NotImplementedError:
+        return build_pointwise_tile(knobs, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+    return assemble_block(tg, knobs=knobs, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
+
+
+def lower_matmul(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str]):
+    """Lower a scalar-matmul leaf via the block-DAG path, falling back to the
+    legacy materializer for shapes ``build_matmul_dag`` doesn't yet cover."""
+    try:
+        tg = build_matmul_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
+    except NotImplementedError:
+        return build_matmul_tile(knobs, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag, target_names=target_names)
+    # Scalar tier carries the warp-tier OFF sentinels (matches build_matmul_tile).
+    stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
+    return assemble_block(tg, knobs=stamped, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
