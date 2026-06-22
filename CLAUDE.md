@@ -80,7 +80,19 @@ same worker.
   a one-shot benchmark: start server → wait `/health` → `vllm bench serve --backend openai-embeddings`
   (`--max-concurrency`/`--num-prompts`/`--random-input-len`/`--bench-seed`) → print results → shut down. Needs the
   `serving` extra.
+- `deplodock serve <model> --generate [vllm flags...]` — serve a **generative (chat)** model via `DeplodockGenModel`
+  (Phase 3 of `plans/generative-inference-support.md`): `--runner generate`, forces `--dtype float16` (seam coherence;
+  rejects an incompatible `--dtype`), keeps `--enforce-eager`. vLLM owns the API / sampler / scheduler / paged
+  KV-cache / `lm_head`; deplodock-compiled per-layer kernels (`serving/gen_runner.py::DeplodockGenRunner`) own embed +
+  trunk, with vLLM's `Attention` carved into the per-layer forward. `serving/vllm_model_gen.py`.
 - `deplodock pull <model>` — download a HuggingFace model to local cache
+- `deplodock generate <model> [--prompt T] [--max-new-tokens N] [--temperature/--top-k/--top-p/--seed] [--chat]` —
+  **standalone naive generation oracle** (no vLLM; Phase 0 of `plans/generative-inference-support.md`). Re-runs the
+  whole growing prefix each step (O(S²)) on the deplodock fp16 CUDA backend, samples
+  (`serving/sampling.py::Sampler`), and prints the decoded text. The host loop
+  (`commands/generate.py::generate`) is pure/unit-testable; `_CompiledLM` compiles the dynamic whole-model graph (full
+  logits, last row sliced on the host — the in-graph `slice_last_logits` slice makes lm_head an M=1 demoted matmul that
+  doesn't lower cold). The token-for-token reference for the later vLLM phases.
 - `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
 - `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
 - `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.

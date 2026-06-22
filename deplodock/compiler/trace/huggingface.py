@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
 
-def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = False) -> nn.Module:
+def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = False, slice_last_logits: bool = False) -> nn.Module:
     """Return an ``nn.Module`` with a trace-friendly forward.
 
     Static mode (``dynamic=False``, default): forward is
@@ -37,7 +37,18 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
 
     Dynamic mode replaces the rotary embedding too — with cos/sin
     precomputed for positions ``0..DYNAMIC_DIM_MAX-1`` and sliced to the
-    runtime seq_len in-graph (``_SlicedRotary``). Keeping HF's in-graph
+    runtime seq_len in-graph (``_SlicedRotary``).
+
+    ``slice_last_logits`` (dynamic only, the Phase-0 generation oracle): instead of
+    returning the whole-prefix logits ``[1, S, vocab]``, run the trunk to hidden states,
+    slice the **final** position (``hidden[:, -1:, :]``), and apply ``lm_head`` to that
+    one row → ``[1, 1, vocab]``. The generate loop only needs the next-token logits, so
+    this avoids the O(S·vocab) lm_head over every prefix position and the full-buffer host
+    copy each step. NOTE: the ``hidden[:, -1:, :]`` slice makes lm_head an **M=1 demoted
+    matmul** that the *cold* lowering path (no learned prior) does not turn into a CUDA
+    kernel — it lowers only once a prior/golden covers that shape. So the standalone
+    generation oracle currently traces full logits and slices the last row on the host;
+    this flag is the (correct, prior-dependent) optimized form. Keeping HF's in-graph
     rotary instead silently breaks: its ``inv_freq`` buffer is
     ``persistent=False`` and doesn't survive ``torch.export`` with its
     real value, so the traced cos/sin constant-fold to ``cos=1, sin=0``
@@ -49,6 +60,9 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
     """
     import torch
     import torch.nn as nn
+
+    if slice_last_logits and not dynamic:
+        raise ValueError("slice_last_logits requires dynamic=True (the generation oracle is dynamic-seq_len)")
 
     class _PassThroughRotary(nn.Module):
         """Replaces the model's ``rotary_emb`` and returns precomputed real
@@ -122,7 +136,28 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
                     cos, sin = rotary(sample, full_pos)
                 inner.rotary_emb = _SlicedRotary(cos, sin)
 
-        if dynamic:
+        if dynamic and slice_last_logits:
+
+            def forward(self, input_ids, attention_mask, position_ids):
+                # Generation oracle: run the trunk, then apply lm_head to ONLY the
+                # final position so the output is [1, 1, vocab] (next-token logits),
+                # not the whole-prefix [1, S, vocab].
+                trunk = getattr(self.model, "model", self.model)
+                out = trunk(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=False,
+                )
+                hidden = out[0]  # [1, S, H], final norm already applied by the trunk
+                last = hidden[:, -1:, :]  # [1, 1, H] — the next-token position
+                head = getattr(self.model, "lm_head", None)
+                if head is None:
+                    head = self.model.get_output_embeddings()
+                return head(last)  # [1, 1, vocab]
+
+        elif dynamic:
 
             def forward(self, input_ids, attention_mask, position_ids):
                 # The caller controls mask + position_ids so the seq_len axis can
@@ -197,6 +232,67 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
             return self.block(x, position_embeddings=(self.cos[:, :s], self.sin[:, :s]))
 
     return LayerWrapper()
+
+
+def build_attention_split_wrapper(block):
+    """Carve SDPA out of one HF decoder layer (Phase 1 of
+    ``plans/generative-inference-support.md``). Returns ``(pre, post)`` ``nn.Module``s over
+    the flattened **``[num_tokens, H]``** per-token layout:
+
+    - ``pre(hidden[T, H]) -> (q, k, v)`` runs ``input_layernorm`` → separate
+      ``q_proj`` / ``k_proj`` / ``v_proj`` → reshape-into-heads → per-head ``q_norm`` /
+      ``k_norm`` (Qwen3 only), and returns **un-rotated** q,k,v in the 2-D seam ABI
+      ``q[T, Hq·D]``, ``k/v[T, Hkv·D]`` — exactly what vLLM's ``Attention.forward`` consumes.
+      RoPE is applied downstream (by vLLM, or by the test/oracle reference).
+    - ``post(attn_out[T, Hq·D], residual[T, H]) -> layer_out[T, H]`` runs ``o_proj`` →
+      ``residual +`` → ``post_attention_layernorm`` → ``mlp`` → second residual.
+
+    Reads the block's OWN submodules (not a ``self_attn`` substitution — HF
+    ``self_attn.forward`` returns ``(attn_output, weights)``, and the block adds the
+    residual after it, so swapping ``self_attn`` can't yield a clean pre-graph). NOTE: HF's
+    ``.view(B,S,-1,D).transpose(1,2)`` assumes a ``[batch, seq, hidden]`` input; on the
+    flattened ``[T, H]`` layout the reshape is ``.view(T, n_heads, D)`` with **no transpose**.
+    Qwen3 (q/k norm) and Llama (no q/k norm) are both handled; the architecture difference is
+    just the presence of ``q_norm`` / ``k_norm``."""
+    import torch.nn as nn
+
+    attn = block.self_attn
+    head_dim = attn.head_dim
+    num_heads = attn.q_proj.out_features // head_dim
+    num_kv_heads = attn.k_proj.out_features // head_dim
+    q_norm = getattr(attn, "q_norm", None)
+    k_norm = getattr(attn, "k_norm", None)
+
+    class Pre(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.input_layernorm = block.input_layernorm
+            self.q_proj, self.k_proj, self.v_proj = attn.q_proj, attn.k_proj, attn.v_proj
+            self.q_norm, self.k_norm = q_norm, k_norm
+
+        def forward(self, hidden):
+            h = self.input_layernorm(hidden)  # [T, H]
+            t = h.shape[0]
+            q = self.q_proj(h).view(t, num_heads, head_dim)  # [T, Hq, D] — NO transpose
+            k = self.k_proj(h).view(t, num_kv_heads, head_dim)
+            v = self.v_proj(h).view(t, num_kv_heads, head_dim)
+            if self.q_norm is not None:
+                q = self.q_norm(q)  # per-head RMSNorm over D
+                k = self.k_norm(k)
+            return q.reshape(t, num_heads * head_dim), k.reshape(t, num_kv_heads * head_dim), v.reshape(t, num_kv_heads * head_dim)
+
+    class Post(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.o_proj = attn.o_proj
+            self.post_attention_layernorm = block.post_attention_layernorm
+            self.mlp = block.mlp
+
+        def forward(self, attn_out, residual):
+            h = residual + self.o_proj(attn_out)  # residual1 + o_proj(SDPA)
+            return h + self.mlp(self.post_attention_layernorm(h))  # residual2 + MLP
+
+    return Pre(), Post()
 
 
 def build_causal_mask(seq_len: int, dtype) -> torch.Tensor:  # noqa: F821

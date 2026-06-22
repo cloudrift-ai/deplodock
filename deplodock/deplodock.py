@@ -10,6 +10,7 @@ from deplodock.commands.deploy.cloud import register_cloud_target
 from deplodock.commands.deploy.local import register_local_target
 from deplodock.commands.deploy.ssh import register_ssh_target
 from deplodock.commands.eval import register_eval_command
+from deplodock.commands.generate import register_generate_command
 from deplodock.commands.inspect_graph import register_inspect_command
 from deplodock.commands.pull import register_pull_command
 from deplodock.commands.run import register_run_command
@@ -45,6 +46,7 @@ def main():
     register_compile_command(subparsers)
     register_tune_command(subparsers)
     register_run_command(subparsers)
+    register_generate_command(subparsers)
     register_inspect_command(subparsers)
     register_eval_command(subparsers)
     register_compare_command(subparsers)

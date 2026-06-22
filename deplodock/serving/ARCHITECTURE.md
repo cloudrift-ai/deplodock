@@ -59,6 +59,27 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
   with per-request 0-based positions; spans split at `positions == 0`. Hardened for `_dummy_run`'s garbage profiling
   batches (index 0 always opens a span; overlong spans are chopped).
+- `sampling.py` — **no vLLM, no CUDA**. Pure-numpy token sampling (`Sampler`: greedy / temperature / top-k / top-p) +
+  `apply_chat_template` (delegates to the HF tokenizer). Used by the standalone **generation oracle**
+  (`commands/generate.py`, Phase 0 of `plans/generative-inference-support.md`) — `deplodock generate`'s host loop
+  re-runs the whole fp16 prefix each step on the CUDA backend and samples with this. The generative *vLLM plugin*
+  (`DeplodockGenModel`) is later-phase work tracked in that plan.
+- `gen_runner.py` — `DeplodockGenRunner` (Phase 2; sibling to `DeplodockForwardRunner`). Carves SDPA out of every
+  decoder layer (`build_attention_split_wrapper`), compiles **two dynamic-`num_tokens` programs per layer** (`pre` +
+  `post`) over the flattened `[num_tokens, H]` layout, and exposes `embed` / `forward_layer_pre(L,…)→(q,k,v)`
+  (un-rotated 2-D seam) / `forward_layer_post(L, attn_out, residual)→hidden` / `final_norm`. The caller stitches between
+  `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention` in Phase 3). Host numpy
+  `rebind` I/O for now (the device zero-copy + captured-replay path is the Phase-3/4 perf step); two capacity programs
+  per layer is the memory budget the plan flags (Top risk #9).
+- `vllm_model_gen.py` — `DeplodockGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
+  builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs
+  paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.
+  The trunk compute (embed + per-layer pre/post + final norm) is the `DeplodockGenRunner`; vLLM owns only `lm_head`
+  (`load_weights` claims `lm_head.weight`, or the tied embed alias). `forward` brackets each `self.attn[L](q,k,v)` with
+  two deplodock replays (pre/post), applying RoPE in between (A2). Select via `--runner generate` +
+  `--hf-overrides '{"architectures":["DeplodockGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
+  this for seam coherence). Registered in `__init__.py`. Decode-shaped tuning + the device-path interleave are
+  later-phase work.
 
 ## Static mode (`DEPLODOCK_SERVING_STATIC=1`) — static extents for both batch and seq
 

@@ -57,6 +57,12 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
         "--stock", action="store_true", default=d(False), help="Serve stock vLLM kernels instead of the deplodock plugin (A/B baseline)."
     )
     parser.add_argument(
+        "--generate",
+        action="store_true",
+        default=d(False),
+        help="Serve a generative (chat) model via DeplodockGenModel (--runner generate, fp16) instead of embeddings.",
+    )
+    parser.add_argument(
         "--bench",
         action="store_true",
         default=d(False),
@@ -119,9 +125,28 @@ def _flag_value(vllm_args: list[str], flag: str, default: str) -> str:
     return default
 
 
-def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str]) -> list[str]:
-    cmd = ["vllm", "serve", model, "--runner", "pooling"]
-    if not stock:
+def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: bool = False) -> list[str]:
+    cmd = ["vllm", "serve", model, "--runner", "generate" if generate else "pooling"]
+    if not stock and generate:
+        cmd += ["--enforce-eager", "--hf-overrides", '{"architectures": ["DeplodockGenModel"]}']
+        # Force fp16 across the deplodock↔vLLM seam: vLLM defaults --dtype auto → bf16 for a
+        # bf16 checkpoint, but the deplodock trunk emits fp16. Reject an incompatible override.
+        if _has_flag(vllm_args, "--dtype"):
+            dt = _flag_value(vllm_args, "--dtype", "")
+            if dt not in ("float16", "half", "fp16"):
+                raise ValueError(f"generative serving requires fp16; --dtype {dt!r} is incompatible (use --dtype float16)")
+        else:
+            cmd += ["--dtype", "float16"]
+        # The flattened width (sum of newly-scheduled tokens per step) must stay within
+        # DYNAMIC_DIM_MAX (= _DEFAULT_MAX_MODEL_LEN). vLLM's default max_num_batched_tokens
+        # (e.g. 8192 on a big GPU) would trip the model's startup bound, so cap it here.
+        if _has_flag(vllm_args, "--max-num-batched-tokens"):
+            mnbt = _flag_value(vllm_args, "--max-num-batched-tokens", "")
+            if mnbt.isdigit() and int(mnbt) > int(_DEFAULT_MAX_MODEL_LEN):
+                raise ValueError(f"--max-num-batched-tokens {mnbt} exceeds the dynamic-dim cap ({_DEFAULT_MAX_MODEL_LEN}); use it or lower")
+        else:
+            cmd += ["--max-num-batched-tokens", _DEFAULT_MAX_MODEL_LEN]
+    elif not stock:
         cmd += _PLUGIN_ARGS
     if not _has_flag(vllm_args, "--max-model-len"):
         cmd += ["--max-model-len", _DEFAULT_MAX_MODEL_LEN]
@@ -169,8 +194,11 @@ def _vllm_bin() -> str:
 
 
 def handle_serve(args):
-    vllm_args = _split_own_flags(args)
-    serve_cmd = build_serve_cmd(args.model, stock=args.stock, vllm_args=vllm_args)
+    vllm_args = _split_own_flags(args)  # re-parses own flags placed after MODEL into args
+    if args.generate and args.bench:
+        logger.error("--bench is not supported with --generate yet (the bench client targets /v1/embeddings).")
+        sys.exit(1)
+    serve_cmd = build_serve_cmd(args.model, stock=args.stock, vllm_args=vllm_args, generate=args.generate)
     port = _flag_value(vllm_args, "--port", "8000")
     bench_cmd = build_bench_cmd(
         args.model,
