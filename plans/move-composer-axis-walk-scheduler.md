@@ -12,6 +12,30 @@ This plan replaces the three template-matchers with one **nest walk** that tags 
 the already-shared `_assemble` emitter — unlocking the fused prologue / epilogue / multi-reduce cases that were
 stranded on legacy, with no new "regime" added.
 
+## Coverage status (autonomous gap-closing)
+
+The composer now covers, opt-in behind `DEPLODOCK_MOVE_COMPOSER` (legacy is still the default + the fallthrough):
+pointwise; matmul scalar + warp-MMA, with a MAP **epilogue** (QK^T scale, `matmul_add`) and **split-K**;
+cooperative reduce + **RMSNorm / softmax / LayerNorm** (reduce → epilogue → second-pass map, multi-monoid);
+**multi-accumulator** matmul (gated MLP / SwiGLU, via the cooperative multi-Accum path); **symbolic free axes**
+(dynamic seq_len rows / M / N, masked ceil-div tiles); and **symbolic K** cooperative reduce (masked-K fill with
+the carrier identity — the monoid-DAG mechanism). Forcing the composer on across the correctness-critical suite
+now yields **31 failures (was 123)**, and *none* are composer correctness bugs — real models (`test_block`,
+`test_attention_chains`, `test_dynamic_shapes`, the `cli` accuracy tests) PASS, because the composer covers most
+kernels and cleanly declines the rest to legacy. The 31 are all legacy-structure / transport assertions:
+
+- **Transports** (`test_matmul_mma_tma`, `test_matmul_mma_staged_pipelined`, RING / half2-window) — the composer
+  stages SYNC; it does not yet emit TMA / cp.async / ring / fp16-half2-window. Perf parity, not correctness.
+- **Warp masked-MMA** (`test_symbolic_m_masked_mma_*`) — symbolic-free matmul routes scalar; warp masked-MMA is
+  declined to legacy.
+- **Strided-cooperative rows** (`test_lowering_2d_coop_*`) — the composer does whole-CTA (correct, lower
+  occupancy); the tests assert the strided multi-row structure.
+
+**Retiring the legacy planner therefore still needs:** fused SDPA **P@V** / flash (`{MONOID, SEMIRING}` over one
+K + online softmax — `TWISTED_MONOID`, blocked on the MMA-flash carrier, this plan's Phase 5 +
+`algebraic-carrier-analysis` C1b–C5); the **matmul transports** (TMA / cp.async / ring — perf); **warp
+masked-MMA** for symbolic-M; and **strided-cooperative rows**. None is a quick win; flash is the gating item.
+
 ## Framing — this is mostly inversion, not new machinery
 
 Two facts about the current `try_compose` path make the walk tractable:
