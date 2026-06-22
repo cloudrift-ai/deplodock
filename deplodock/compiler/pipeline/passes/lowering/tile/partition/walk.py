@@ -22,56 +22,37 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Loop, Write
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
     CoopReduceSkeleton,
     FlashSkeleton,
     MatmulSkeleton,
     PointwiseSkeleton,
     _map_axis,
-    _split_leading_non_loops,
 )
 
 Skeleton = PointwiseSkeleton | MatmulSkeleton | CoopReduceSkeleton | FlashSkeleton
 
 
-def _free_chain(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], list[Loop], list[Stmt]]:
-    """Split leading non-loop stmts, then walk the outer single-stmt chain of
-    free (non-reduce) loops — the `PARALLEL` axes, outermost-first.
-
-    A free loop may be preceded at its OWN level by per-outer-axis precompute
-    stmts (the whole-model o_proj's tied-embedding gather `Load(input_ids[row])`
-    sits between the M and N loops). Those `mid` stmts don't break the chain —
-    they ride the inner tile (recomputed per inner element, σ-tiled like the
-    body), so they're returned separately to prepend to the inner body."""
-    leading, rest = _split_leading_non_loops(body)
-    chain: list[Loop] = []
-    mid: list[Stmt] = []
-    cur = rest
-    while True:
-        cur_lead, cur_rest = _split_leading_non_loops(cur)
-        if len(cur_rest) == 1 and isinstance(cur_rest[0], Loop) and not cur_rest[0].is_reduce:
-            mid.extend(cur_lead)
-            chain.append(cur_rest[0])
-            cur = tuple(cur_rest[0].body)
-        else:
-            break
-    return leading, chain, mid
-
-
 def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     """Tag the nest and return the regime skeleton, or `None` for shapes the
     composer leaves to the legacy planner (symbolic axes, `TWISTED_MONOID`
-    flash, mixed/multi-different-axis reduces, chain-less bodies)."""
-    body = tuple(loop_op.body)
-    reduce_loops = [lp for lp in loop_op.body.iter_of_type(Loop) if lp.is_reduce]
-    algebras = {lp.algebra_kind for lp in reduce_loops}
-    leading, chain, mid = _free_chain(body)
+    flash, mixed/multi-different-axis reduces, chain-less bodies).
+
+    The skeletons are *projections* of the derived ``iter_dag`` view: the walk
+    builds the DAG (free-axis chain + carrier-tagged reduce axes), then reads the
+    skeleton fields off its nodes — one source of truth for the nest structure."""
+    dag = iter_dag(loop_op)
+    chain = [n.loop for n in dag.parallel]
     if not chain:
         return None
+    reduce_loops = [n.loop for n in dag.reduce]
+    algebras = dag.algebras
+    leading = dag.leading
     inner_loop = chain[-1]
     # Per-outer-axis precompute stmts between chain levels ride the inner tile.
-    inner_body = tuple(mid) + tuple(inner_loop.body)
+    inner_body = dag.inner_body
 
     if AlgebraKind.TWISTED_MONOID in algebras:
         # Fused flash attention (the FlashCombine streaming-softmax carrier).
