@@ -20,6 +20,7 @@ from deplodock.compiler.ir.stmt import Accum, Cond
 from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import MAP_M_REG, MAP_M_THREAD, MAP_N_REG, MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_pointwise_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import PointwiseSkeleton
@@ -85,8 +86,9 @@ def test_lift_rejects_reduce():
 
 
 def test_tree_leaves_complete_and_within_budget():
-    skel = walk_nest(_pointwise(64, 64))
-    tree = build_pointwise_tree(skel, base_knobs={}, kernel_name="k")
+    lo = _pointwise(64, 64)
+    skel = walk_nest(lo)
+    tree = build_pointwise_tree(skel, dag=iter_dag(lo), base_knobs={}, kernel_name="k")
     leaves = flatten_leaves([tree])
     assert len(leaves) > 1, "64x64 has many legal variants → a real fork tree"
     for leaf in leaves:
@@ -97,9 +99,10 @@ def test_tree_leaves_complete_and_within_budget():
 
 
 def test_materialize_clean_tower_no_guard():
-    skel = walk_nest(_pointwise(64, 64))
+    lo = _pointwise(64, 64)
+    skel = walk_nest(lo)
     knobs = {MAP_N_THREAD.name: 32, MAP_N_REG.name: 1, MAP_M_THREAD.name: 8, MAP_M_REG.name: 1}
-    tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={})
+    tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(lo))
     assert isinstance(tile, TileOp)
     grid = next(s for s in tile.body if isinstance(s, GridTile))
     assert list(grid.body.iter_of_type(ThreadTile)), "tower should nest a ThreadTile"
@@ -107,9 +110,10 @@ def test_materialize_clean_tower_no_guard():
 
 
 def test_materialize_masked_has_store_guard():
-    skel = walk_nest(_pointwise(70, 130))  # neither axis divides the tile
+    lo = _pointwise(70, 130)  # neither axis divides the tile
+    skel = walk_nest(lo)
     knobs = {MAP_N_THREAD.name: 8, MAP_N_REG.name: 1, MAP_M_THREAD.name: 32, MAP_M_REG.name: 1}
-    tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={})
+    tile = build_pointwise_tile(skel, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(lo))
     conds = list(tile.body.iter_of_type(Cond))
     assert len(conds) == 2, f"masked N and M each get a boundary guard, got {len(conds)}"
 

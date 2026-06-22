@@ -22,6 +22,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Monoid, Select, SelectBranch, Stmt
 from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     COOP_BR,
     MAP_M_REG,
@@ -46,6 +47,18 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import 
 
 # One free axis to split: (axis, thread factor, register factor, interleave-when-masked).
 _FreeSpec = tuple[Axis, int, int, bool]
+
+
+def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:
+    """The free (PARALLEL) axes the builders tile, read off the DAG's parallel
+    chain: ``(inner_n axis, outer_m axis | None, extra-outer loops)``. The
+    skeleton's ``inner_n`` / ``outer_m`` / ``extra_outer`` are projections of
+    exactly these nodes, so reading the DAG is byte-identical."""
+    parallel = dag.parallel
+    inner_n = parallel[-1].loop.axis
+    outer_m = parallel[-2].loop.axis if len(parallel) >= 2 else None
+    extra_outer = tuple(n.loop for n in parallel[:-2])
+    return inner_n, outer_m, extra_outer
 
 
 def _split_free_axis(axis: Axis, thread: int, reg: int, *, interleave_when_masked: bool):
@@ -128,15 +141,16 @@ def _assemble(
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
 
 
-def build_pointwise_tile(skel: PointwiseSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
-    free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
-    if skel.outer_m is not None:
-        free_specs.append((skel.outer_m.loop.axis, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
+def build_pointwise_tile(skel: PointwiseSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    free_specs: list[_FreeSpec] = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
+    if outer_m is not None:
+        free_specs.append((outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
     return _assemble(
         free_specs,
-        skel.inner_body,
-        leading=skel.leading,
-        extra_outer=skel.extra_outer,
+        dag.inner_body,
+        leading=dag.leading,
+        extra_outer=extra_outer,
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
@@ -216,10 +230,11 @@ def _replace_k_scalar(
     return tuple(out)
 
 
-def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
+    inner_n, outer_m, extra_outer = _free_axes(dag)
     free_specs: list[_FreeSpec] = [
-        (skel.inner_n.loop.axis, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True),
-        (skel.outer_m.loop.axis, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False),
+        (inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True),
+        (outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False),
     ]
     bk, fk, splitk = knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name]
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
@@ -227,9 +242,9 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
     targets = skel.target_names or frozenset({skel.k_name})
     return _assemble(
         free_specs,
-        skel.inner_body,
-        leading=skel.leading,
-        extra_outer=skel.extra_outer,
+        dag.inner_body,
+        leading=dag.leading,
+        extra_outer=extra_outer,
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
@@ -344,20 +359,21 @@ def _replace_k_coop(
     return tuple(out)
 
 
-def build_flash_tile(skel: FlashSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+def build_flash_tile(skel: FlashSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
     """Fused flash nest: tile the free output axes (q-rows / head-dim), and
     serial-transform the streaming KV reduce + its nested QK^T reduce (bk=fk=1,
     no split-K / cooperative-K — each output element streams KV itself). The
     `FlashCombine` / `Accum` carriers render their own rescale; the Init / divide
     finalize ride the output tile."""
-    free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
-    if skel.outer_m is not None:
-        free_specs.append((skel.outer_m.loop.axis, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    free_specs: list[_FreeSpec] = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
+    if outer_m is not None:
+        free_specs.append((outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
     return _assemble(
         free_specs,
-        skel.inner_body,
-        leading=skel.leading,
-        extra_outer=skel.extra_outer,
+        dag.inner_body,
+        leading=dag.leading,
+        extra_outer=extra_outer,
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
@@ -365,14 +381,15 @@ def build_flash_tile(skel: FlashSkeleton, knobs: dict, *, kernel_name: str, base
     )
 
 
-def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
     """Whole-CTA cooperative reduce: free rows → grid (thread/reg forced to 1),
     ``BR`` threads (the ``K_c`` axis) reduce one row's K (masked-K fill past
     ``k_bound`` when symbolic), the combine is emitted downstream from
     ``Accum.axes ∩ ThreadTile``."""
-    free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, 1, 1, True)]
-    if skel.outer_m is not None:
-        free_specs.append((skel.outer_m.loop.axis, 1, 1, False))
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    free_specs: list[_FreeSpec] = [(inner_n, 1, 1, True)]
+    if outer_m is not None:
+        free_specs.append((outer_m, 1, 1, False))
     bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
     k_c = Axis(f"{skel.k_name}_c", br, source_axis=src_k) if br > 1 else None
@@ -380,9 +397,9 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
     k_dim = skel.k_loop.axis.extent
     return _assemble(
         free_specs,
-        skel.inner_body,
-        leading=skel.leading,
-        extra_outer=skel.extra_outer,
+        dag.inner_body,
+        leading=dag.leading,
+        extra_outer=extra_outer,
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
@@ -439,7 +456,7 @@ def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int
     return tuple(out)
 
 
-def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
+def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
     """Warp-tier (tensor-core) matmul tower. Emits the canonical AtomTile cell
     ``[Load a, Load b, Assign(multiply), Accum]``; ``011_lower_atom_cell`` folds
     it into an ``Mma``. Clean (divisible) tiles only in this phase."""
@@ -448,11 +465,12 @@ def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, ker
     fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
     bk = knobs[TC_BK.name]
 
-    n_b, n_w, n_r, n_a, n_expr, _n_bound = _warp_axis(skel.inner_n.loop.axis, wn, fn, atom_n)
-    m_b, m_w, m_r, m_a, m_expr, _m_bound = _warp_axis(skel.outer_m.loop.axis, wm, fm, atom_m)
-    sigma_outer = Sigma({skel.inner_n.loop.axis.name: n_expr, skel.outer_m.loop.axis.name: m_expr})
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    n_b, n_w, n_r, n_a, n_expr, _n_bound = _warp_axis(inner_n, wn, fn, atom_n)
+    m_b, m_w, m_r, m_a, m_expr, _m_bound = _warp_axis(outer_m, wm, fm, atom_m)
+    sigma_outer = Sigma({inner_n.name: n_expr, outer_m.name: m_expr})
 
-    new_inner: tuple[Stmt, ...] = tuple(s.rewrite(_identity_rename, sigma_outer) for s in skel.inner_body)
+    new_inner: tuple[Stmt, ...] = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
     new_inner = _replace_k_warp(new_inner, skel.k_name, skel.k_extent, bk, atom_k)
 
     layers: list[tuple[Axis, Role | None]] = [
@@ -465,7 +483,7 @@ def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, ker
         (n_b, Role.BLOCK),
         (m_b, Role.BLOCK),
     ]
-    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(skel.extra_outer))
+    layers.extend((lp.axis, Role.BLOCK) for lp in reversed(extra_outer))
     chain_body = _wrap_tower(layers, new_inner, atom=atom)
 
     # Bridge to the warp-tier downstream contract: ``020_stage_inputs`` /
@@ -477,5 +495,5 @@ def build_warp_matmul_tile(skel: MatmulSkeleton, atom: Atom, knobs: dict, *, ker
     # passes are greenfielded in Phase 4.
     knobs_full = {**base_knobs, **knobs, "MMA": atom.name}
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
-    kept_leading = tuple(s for s in skel.leading if not (set(s.defines()) & inner_defs))
+    kept_leading = tuple(s for s in dag.leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)

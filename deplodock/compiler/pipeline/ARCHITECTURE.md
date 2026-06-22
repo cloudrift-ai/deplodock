@@ -126,10 +126,17 @@ sidestep it). No variant is scored or materialized to rank it — the prior feat
 
 **Hierarchical move composer (opt-in, `DEPLODOCK_MOVE_COMPOSER`).** A from-scratch reimplementation of the
 partition stage as a stack of algebraically-justified *moves* lives under `lowering/tile/partition/`
-(`walk` → `skeleton` → `moves` + `budget` → `tree` → `materialize`, sharing the extracted `_tower._wrap_tower`).
-The front-end is **one nest walk** (`walk.py::walk_nest`), not three template-matchers: it walks the loop nest once
-and tags it by each reduce loop's `Loop.algebra_kind` (`MAP`→pointwise, `SEMIRING`→matmul, `MONOID`→cooperative
-reduce; `TWISTED_MONOID`→legacy), producing the regime skeleton. Because non-reduce statements *ride* instead of
+(`iterdag` → `walk` → `skeleton` → `moves` + `decompose` + `budget` → `tree` → `materialize`, sharing the extracted
+`_tower._wrap_tower`). The front-end is **one nest walk** (`walk.py::walk_nest`), not three template-matchers: it
+builds the **iteration-DAG view** (`iterdag.py::iter_dag` — a derived read over the `LoopOp` body, computed on
+demand like `Loop.algebra_kind`; axis nodes tagged `PARALLEL` / `REDUCE` + carrier) and reads the regime skeleton's
+fields off its nodes — so the four skeletons are *projections* of one source of truth, and `materialize` reads its
+free axes / inner body straight off the DAG. It tags each reduce loop by `Loop.algebra_kind` (`MAP`→pointwise,
+`SEMIRING`→matmul, `MONOID`→cooperative reduce; `TWISTED_MONOID`→legacy). The reduce-axis legality (split-K /
+cooperative / strip-mine) is the carrier-trait query `decompose.py::legal_decomps` (associative→split,
+commutative→partition, has_identity→mask), with the recombine derived from `ReduceCarrier.combine_partials`; the
+`*_offers` keep the ranking + cost gates. See `plans/algebra-licensed-decomposition-moves.md`. Because non-reduce
+statements *ride* instead of
 being rejected by a rigid envelope, a `MONOID` reduce followed by a scalar **epilogue** + a second-pass **map**
 loop composes with no new regime — that is how **RMSNorm / softmax** are covered (the reduce(s) and the
 different-named map loop are cooperative-split together, keyed by extent via `target_names`; the warp/tree combine

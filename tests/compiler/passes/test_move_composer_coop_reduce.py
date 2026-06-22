@@ -13,6 +13,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import ThreadTile, TileOp
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import COOP_BR, RED_BK, RED_FK
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_coop_reduce_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import CoopReduceSkeleton
@@ -101,9 +102,10 @@ def test_lift_coop_reduce_rejects_matmul():
 
 
 def test_build_coop_tile_has_kc_thread_axis():
-    skel = walk_nest(_sum(64, 128))
+    lo = _sum(64, 128)
+    skel = walk_nest(lo)
     knobs = {RED_BK.name: 1, RED_FK.name: 1, COOP_BR.name: 128}
-    tile = build_coop_reduce_tile(skel, knobs, kernel_name="k", base_knobs={})
+    tile = build_coop_reduce_tile(skel, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(lo))
     assert isinstance(tile, TileOp)
     # Axis names canonicalize to a0/a1/… — match on structure, not name. The
     # cooperative BR threads bind to a THREAD axis of extent 128.
