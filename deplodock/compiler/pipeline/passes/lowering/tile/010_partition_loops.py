@@ -254,15 +254,14 @@ def rewrite(ctx: Context, root: Node, match) -> Graph | None | TileOp | Fork:
     # Name was stamped onto the LoopOp by ``loop/stamp/010_stamp_loop_names``
     # (the last loop-dialect pass), so we just forward it onto the TileOp.
     kernel_name = loop_op.name
-    # Hierarchical move composer. When enabled it is the SOLE path — no legacy
-    # fallback — so an unhandled kernel surfaces as a hard error (the gap to
-    # close) rather than silently routing to the legacy planner. Default off
-    # keeps the legacy planner below.
+    # Hierarchical move composer. When enabled it handles the regimes it covers
+    # and FALLS THROUGH to the legacy planner below for the rest (a kernel the
+    # composer declines — ``try_compose`` returns ``None`` — is lowered by the
+    # legacy planner rather than failing). Default off keeps the legacy planner.
     if config.move_composer_enabled():
         composed = try_compose(loop_op, ctx, match.graph, kernel_name=kernel_name)
-        if composed is None:
-            raise RuleSkipped(f"move composer cannot lower kernel {kernel_name!r} (no legacy fallback)")
-        return composed
+        if composed is not None:
+            return composed
     # Idempotence is structural: once the planner has built a TileOp, the
     # rule pattern (LoopOp) no longer matches.
     plan = _plan_kernel(loop_op, ctx, kernel_name=kernel_name, graph=match.graph)
