@@ -1,0 +1,192 @@
+"""Derived-projection tests for the block-DAG Tile IR (``ir/tile/blockdag.py``).
+
+The whole point of the new IR is that ``reads`` / ``writes`` / ``carrier`` /
+``atom`` / ``edges`` are *projections* of the body — never stored. These tests
+pin the projections against hand-built blocks so they cannot silently drift.
+"""
+
+from __future__ import annotations
+
+from deplodock.compiler.dtype import F16, F32
+from deplodock.compiler.ir.algebra import AlgebraKind
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.stmt.blocks import Loop
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from deplodock.compiler.ir.tile.blockdag import (
+    AddrKind,
+    Block,
+    Buffer,
+    Edge,
+    Schedule,
+    Space,
+    TileGraph,
+    classify_access,
+)
+
+
+def _mul(a, b):
+    return BinaryExpr("*", a, b)
+
+
+def _add(a, b):
+    return BinaryExpr("+", a, b)
+
+
+# --- classify_access ---------------------------------------------------------
+
+
+def test_classify_identity_affine():
+    acc = classify_access((Var("i"), Var("k")), frozenset({"i", "k"}))
+    assert acc.kind is AddrKind.AFFINE
+    assert acc.axes == ("i", "k")
+    assert acc.dims == (0, 1)
+    assert acc.block == (1, 1)
+    assert acc.free_axes() == frozenset({"i", "k"})
+
+
+def test_classify_blocked_stride():
+    # i*64 + i_t  along dim 0 (a tiled row coordinate)
+    idx = (_add(_mul(Var("i_b"), Literal(64, "int")), Var("i_t")), Var("k"))
+    acc = classify_access(idx, frozenset({"i_b", "i_t", "k"}))
+    assert acc.kind is AddrKind.AFFINE
+    # two axes land on dim 0 with their stride multipliers
+    by_axis = dict(zip(acc.axes, zip(acc.dims, acc.block, strict=True), strict=True))
+    assert by_axis["i_b"] == (0, 64)
+    assert by_axis["i_t"] == (0, 1)
+    assert by_axis["k"] == (1, 1)
+
+
+def test_classify_cta_uniform_offset_folds():
+    # head*stride is CTA-uniform (head ∉ domain) — it folds into the dim offset.
+    idx = (_add(_mul(Var("head"), Literal(128, "int")), Var("n")),)
+    acc = classify_access(idx, frozenset({"n"}))
+    assert acc.kind is AddrKind.AFFINE
+    assert acc.axes == ("n",)
+    assert acc.dims == (0,)
+    assert acc.offset[0].free_vars() == frozenset({"head"})
+
+
+def test_classify_template_fallback_on_modulo():
+    # collapsed-reshape view: (x // W, x % W) is not affine → TEMPLATE
+    idx = (BinaryExpr("//", Var("x"), Literal(8, "int")), BinaryExpr("%", Var("x"), Literal(8, "int")))
+    acc = classify_access(idx, frozenset({"x"}))
+    assert acc.kind is AddrKind.TEMPLATE
+    assert acc.template == idx
+    assert acc.free_axes() == frozenset({"x"})
+
+
+# --- Block projections -------------------------------------------------------
+
+
+def _matmul_block(M=64, N=64, K=64) -> Block:
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    compute = (
+        Loop(
+            axis=k,
+            body=(
+                Load(name="a_v", input="a", index=(Var("i"), Var("k"))),
+                Load(name="b_v", input="b", index=(Var("k"), Var("j"))),
+                Assign(name="p", op=ElementwiseImpl("multiply"), args=("a_v", "b_v")),
+                Accum(name="acc", value="p"),
+            ),
+        ),
+        Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+    )
+    return Block(name="mm", domain=(i, j, k), compute=compute)
+
+
+def test_block_reads_writes():
+    b = _matmul_block()
+    read_bufs = {p.buffer for p in b.reads}
+    assert read_bufs == {"a", "b"}
+    assert [p.buffer for p in b.writes] == ["c"]
+    # every read is affine over the domain
+    assert all(p.access.kind is AddrKind.AFFINE for p in b.reads)
+
+
+def test_block_carrier_semiring():
+    b = _matmul_block()
+    c = b.carrier
+    assert c is not None
+    assert c.kind is AlgebraKind.SEMIRING
+    assert c.associative and c.commutative
+    assert c.mask is None  # static K
+
+
+def test_block_atom_none_for_scalar():
+    assert _matmul_block().atom is None
+
+
+def test_pointwise_block_no_carrier():
+    n = Axis("n", 128)
+    compute = (
+        Load(name="x_v", input="x", index=(Var("n"),)),
+        Assign(name="y", op=ElementwiseImpl("relu"), args=("x_v",)),
+        Write(output="y", index=(Var("n"),), value="y"),
+    )
+    b = Block(name="pw", domain=(n,), compute=compute)
+    assert b.carrier is None
+    assert {p.buffer for p in b.reads} == {"x"}
+
+
+# --- TileGraph edge topology -------------------------------------------------
+
+
+def test_edges_input_source_and_intermediate():
+    n = Axis("n", 128)
+    # producer: xn[n] = norm(x[n]); consumer: y[n] = xn[n] + b[n]
+    producer = Block(
+        name="prod",
+        domain=(n,),
+        compute=(
+            Load(name="x_v", input="x", index=(Var("n"),)),
+            Assign(name="xn", op=ElementwiseImpl("relu"), args=("x_v",)),
+            Write(output="xn", index=(Var("n"),), value="xn"),
+        ),
+    )
+    consumer = Block(
+        name="cons",
+        domain=(n,),
+        compute=(
+            Load(name="xn_v", input="xn", index=(Var("n"),)),
+            Load(name="b_v", input="b", index=(Var("n"),)),
+            Assign(name="o", op=ElementwiseImpl("add"), args=("xn_v", "b_v")),
+            Write(output="y", index=(Var("n"),), value="o"),
+        ),
+    )
+    g = TileGraph(
+        name="g",
+        buffers={
+            "x": Buffer("x", (Literal(128, "int"),), F32),
+            "b": Buffer("b", (Literal(128, "int"),), F32),
+            "xn": Buffer("xn", (Literal(128, "int"),), F32, space=Space.GMEM),
+            "y": Buffer("y", (Literal(128, "int"),), F32),
+        },
+        blocks=(producer, consumer),
+        schedule=Schedule(),
+    )
+    edges = set(g.edges)
+    assert Edge(src="x", dst="prod", buffer="x") in edges  # input-source edge
+    assert Edge(src="prod", dst="cons", buffer="xn") in edges  # intermediate def-use
+    assert Edge(src="b", dst="cons", buffer="b") in edges  # input-source edge
+    # the producer→consumer intermediate edge names the writer block, not the buffer
+    assert {e for e in edges if e.buffer == "xn"} == {Edge(src="prod", dst="cons", buffer="xn")}
+
+
+def test_block_self_read_is_not_edge():
+    # an accumulator (block reads what it writes) must not produce a self-edge
+    b = _matmul_block()
+    g = TileGraph(
+        name="g",
+        buffers={
+            "a": Buffer("a", (Literal(64, "int"), Literal(64, "int")), F16),
+            "b": Buffer("b", (Literal(64, "int"), Literal(64, "int")), F16),
+            "c": Buffer("c", (Literal(64, "int"), Literal(64, "int")), F32),
+        },
+        blocks=(b,),
+        schedule=Schedule(),
+    )
+    assert all(e.dst != e.src for e in g.edges)
+    assert {e.buffer for e in g.edges} == {"a", "b"}
