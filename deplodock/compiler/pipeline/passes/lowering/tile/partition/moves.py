@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 
+from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
 from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
@@ -133,7 +134,11 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     bk_pin, fk_pin, sk_pin = _pin(RED_BK), _pin(RED_FK), _pin(RED_SPLITK)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
-    sks = (sk_pin,) if sk_pin else SPLITK_CHOICES
+    # Split-K atomic-adds per-CTA partials, sound only for a bare reduce. A MAP
+    # epilogue (non-reduce, non-Write stmt — QK^T scale, matmul_add) forces
+    # SPLITK=1: a non-linear epilogue over a partial would corrupt the sum.
+    has_epilogue = any(not isinstance(s, (Loop, Write)) for s in skel.inner_body)
+    sks = (1,) if has_epilogue else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
     out = [(bk, fk, sk) for sk in sks for bk in bks for fk in fks if sk * bk * fk <= skel.k_extent and skel.k_extent % (sk * bk * fk) == 0]
     out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out

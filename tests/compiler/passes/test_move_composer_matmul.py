@@ -96,6 +96,44 @@ def test_lift_pointwise_rejects_matmul():
     assert not isinstance(walk_nest(_matmul(64, 96, 128)), PointwiseSkeleton)
 
 
+def _matmul_scaled(m: int, n: int, k: int) -> LoopOp:
+    """Matmul with a `* c` MAP epilogue (the QK^T scale shape)."""
+    return LoopOp(
+        body=(
+            Loop(
+                axis=Axis("m", m),
+                body=(
+                    Loop(
+                        axis=Axis("n", n),
+                        body=(
+                            Loop(
+                                axis=Axis("k", k),
+                                body=(
+                                    Load(name="a", input="a", index=(Var("m"), Var("k"))),
+                                    Load(name="b", input="b", index=(Var("k"), Var("n"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a", "b")),
+                                    Accum(name="acc", value="p", op=ElementwiseImpl("add")),
+                                ),
+                            ),
+                            Assign(name="s", op=ElementwiseImpl("multiply"), args=("acc", "acc")),
+                            Write(output="o", index=(Var("m"), Var("n")), value="s"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_matmul_with_scale_epilogue_composes_and_forces_splitk1():
+    from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import matmul_reduce_offers  # noqa: PLC0415
+
+    skel = walk_nest(_matmul_scaled(64, 96, 256))
+    assert isinstance(skel, MatmulSkeleton), "matmul + MAP epilogue should compose (epilogue rides the output tile)"
+    # A MAP epilogue forces SPLITK=1 (cross-CTA atomic-add over a partial would be wrong).
+    assert {sk for _, _, sk in matmul_reduce_offers(skel)} == {1}
+
+
 def _graph(m: int, n: int, k: int, dtype):
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k), dtype=dtype), node_id="a")

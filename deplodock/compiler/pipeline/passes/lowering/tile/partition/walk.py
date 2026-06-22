@@ -78,15 +78,18 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     k_loop = reduce_loops[0]
 
     if algebras == {AlgebraKind.SEMIRING}:
-        # Matmul — canonical envelope (multi-accumulator + fused prologue are
-        # later phases, so keep the single-reduce, no-extra-stmts shape).
+        # Matmul. One contraction (multi-accumulator is a later phase). A MAP
+        # epilogue after the reduce — the QK^T `* 1/√d` scale, a `matmul_add`
+        # residual — rides the output tile, so allow non-Loop stmts as long as
+        # the reduce is the FIRST stmt (a fused PROLOGUE, reduce-feeds-reduce,
+        # has the reduce not-first and is left to legacy).
         if not k_loop.axis.extent.is_static or len(reduce_loops) != 1 or len(chain) < 2:
             return None
         loops_in = [s for s in inner_body if isinstance(s, Loop)]
-        if loops_in != [k_loop] or not any(isinstance(s, Write) for s in inner_body):
+        if loops_in != [k_loop] or not inner_body or inner_body[0] is not k_loop:
             return None
-        if any(not isinstance(s, (Loop, Write)) for s in inner_body):
-            return None  # fused prologue — later phase
+        if not any(isinstance(s, Write) for s in inner_body):
+            return None
         return MatmulSkeleton(
             inner_n=_map_axis(inner_loop),
             outer_m=_map_axis(chain[-2]),
