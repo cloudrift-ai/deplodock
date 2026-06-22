@@ -402,3 +402,26 @@ def build_coop_reduce_tree(skel: CoopReduceSkeleton, *, dag: IterDag, base_knobs
         full = {**free_knobs, **coop_reduce_knobs(offers[0])}
         return build_coop_reduce_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
     return _CoopChooseReduce(ctx=ctx, knobs=free_knobs)
+
+
+def build_partition(nest, *, dag: IterDag, loop_op, context, graph, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+    """The single partition entry — one ``build_partition(dag)`` over the
+    iteration-DAG view, replacing the four per-regime tree entry points
+    (``build_pointwise_tree`` / ``build_matmul_tree`` / ``build_coop_reduce_tree``
+    / ``build_flash_tree``). The regime is the algebra ``walk_nest`` tagged the
+    nest with (still carried by the projected skeleton type pending the skeleton
+    dissolution); every branch offers the same ``legal_decomps`` family filtered
+    by carrier traits. Returns a ``Fork`` / ``TileOp`` for a covered regime, or
+    ``None`` to fall through. See ``plans/algebra-licensed-decomposition-moves.md``
+    (phase 6)."""
+    if isinstance(nest, PointwiseSkeleton):
+        return build_pointwise_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
+    if isinstance(nest, MatmulSkeleton):
+        return build_matmul_tree(
+            nest, dag=dag, loop_op=loop_op, context=context, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name
+        )
+    if isinstance(nest, CoopReduceSkeleton):
+        return build_coop_reduce_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
+    if isinstance(nest, FlashSkeleton):
+        return build_flash_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
+    return None

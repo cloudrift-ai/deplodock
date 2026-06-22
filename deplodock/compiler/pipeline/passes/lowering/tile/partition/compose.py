@@ -2,7 +2,7 @@
 
 ``010_partition_loops`` calls :func:`try_compose` when the composer is enabled;
 it returns a ``Fork`` / ``TileOp`` for a regime the composer covers, or ``None``
-to fall through to the legacy planner. Phase 1 covers pointwise only.
+to fall through to the legacy planner.
 """
 
 from __future__ import annotations
@@ -13,36 +13,18 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
-    CoopReduceSkeleton,
-    FlashSkeleton,
-    MatmulSkeleton,
-    PointwiseSkeleton,
-)
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import (
-    build_coop_reduce_tree,
-    build_flash_tree,
-    build_matmul_tree,
-    build_pointwise_tree,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_partition
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
 
 def try_compose(loop_op: LoopOp, ctx: Context, graph: Graph, *, kernel_name: str) -> Fork | TileOp | None:
     """Compose ``loop_op`` if the nest walk recognizes it, else ``None``. ``ctx``
     / ``graph`` feed tensor-core atom eligibility (compute capability + operand
-    dtypes). One walk tags the nest; the skeleton type selects the builder."""
+    dtypes). One walk tags the nest; one ``build_partition`` over the derived
+    iteration-DAG view materializes it."""
     base_knobs = dict(loop_op.knobs)
     nest = walk_nest(loop_op, warp_size=ctx.warp_size)
     # The materialize builders read free axes / inner body off the DAG (a derived
     # view, byte-identical to the skeleton projections walk_nest returns).
     dag = iter_dag(loop_op)
-    if isinstance(nest, PointwiseSkeleton):
-        return build_pointwise_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
-    if isinstance(nest, MatmulSkeleton):
-        return build_matmul_tree(nest, dag=dag, loop_op=loop_op, context=ctx, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name)
-    if isinstance(nest, CoopReduceSkeleton):
-        return build_coop_reduce_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
-    if isinstance(nest, FlashSkeleton):
-        return build_flash_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
-    return None
+    return build_partition(nest, dag=dag, loop_op=loop_op, context=ctx, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name)
