@@ -124,6 +124,12 @@ FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into t
 
 
 def flash_enabled() -> bool:
+    from deplodock import config  # noqa: PLC0415
+
+    # The move composer has no split-demoted P@V path, so it relies on the fused
+    # flash nest for SDPA — enabling the composer implies flash.
+    if config.move_composer_enabled():
+        return True
     raw = FLASH.raw()
     return raw is not None and FLASH.parse(raw)
 
