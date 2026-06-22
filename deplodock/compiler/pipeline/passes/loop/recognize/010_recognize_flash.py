@@ -205,10 +205,6 @@ def _composer_wants_flash(root: Node) -> bool:
     seq shows up as a symbolic dim ANYWHERE in the attention output (the
     whole-model o_proj collapses the attn-out, so seq isn't always ``shape[-2]``);
     a fully-static output is a static SDPA."""
-    from deplodock import config  # noqa: PLC0415
-
-    if not config.move_composer_enabled():
-        return False
     return any(not getattr(d, "is_static", True) for d in root.output.shape)
 
 

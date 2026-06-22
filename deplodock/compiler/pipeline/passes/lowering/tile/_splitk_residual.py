@@ -9,12 +9,8 @@ else=[Write(out, acc)])`` so only the K_s == 0 CTA contributes the
 residual while every other CTA atomic-adds the bare Accum —
 ``sum_i acc_i + r = c · sum_k a_k + r``.
 
-Two consumers:
+Consumer:
 
-- ``010_partition_loops`` calls :func:`has_nonlinear_post_reduce_epilogue`
-  in ``_plan_kernel`` to compute ``force_splitk_one`` — non-linear /
-  multi-Write / vector-Write epilogues force SPLITK = 1 at enumeration
-  time, so the gate never sees them.
 - ``015_gate_splitk_residual`` calls :func:`gate_linear_epilogue_on_k_s_zero`
   as a post-planner pass to apply the rewrite on the wrapped TileOp body
   for the variants where SPLITK > 1 actually fires.

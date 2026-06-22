@@ -6,8 +6,9 @@ bottom-up into the existing ``TileOp`` tower, with a generative
 ``Fork`` tree the two-level MCTS branches on move-by-move. See
 ``plans/melodic-giggling-gem.md``.
 
-Brought up regime by regime behind ``config.move_composer_enabled()``
-(``DEPLODOCK_MOVE_COMPOSER``); ``010_partition_loops`` dispatches the
-regimes the composer covers and falls through to the legacy planner for
-the rest. Phase 1 covers the pointwise (``MAP``) regime only.
+It is the **sole** partitioner — ``010_partition_loops`` dispatches every
+``LoopOp`` through ``compose.try_compose``; a kernel it can't lower raises (no
+legacy planner, no fallback). Covers pointwise (``MAP``), matmul (``SEMIRING``,
+scalar + tensor-core), cooperative reduce (``MONOID``), and fused flash
+(``TWISTED_MONOID``); see ``plans/algebra-licensed-decomposition-moves.md``.
 """

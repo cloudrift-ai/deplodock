@@ -50,7 +50,6 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.fork import OptionFork
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._split_demoted import try_split_demoted
 
@@ -105,24 +104,10 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     # producer + a clean gemm). Force the split ONLY for the cones the composer
     # would otherwise DECLINE — a plain matmul with a merely computed operand
     # *index* (the collapsed attn-out o_proj) composes fused as a matmul, so it
-    # keeps the legacy fork. The keep-fused split branch is legacy-only.
-    from deplodock import config  # noqa: PLC0415
+    # keeps fused.
+    from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import classify  # noqa: PLC0415
 
-    if config.move_composer_enabled():
-        from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag  # noqa: PLC0415
-        from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import classify  # noqa: PLC0415
-
-        if classify(iter_dag(keep_fused)) is None:
-            return _stamp(split)
-        return keep_fused
-    # The split fork's ranking knobs carry the offer site's full knob base
-    # (its ``S_*`` identity) under the decision delta — mirroring the keep
-    # side, whose lifted OptionFork copies the Op's knob dict — so the outer
-    # search's ``_node_knobs`` at the two siblings is feature-identical to
-    # the composed Σ rows ``two_level._decomposition_rows`` trains the prior
-    # on. Ranking metadata only; the spliced kernels' own knobs are stamped
-    # by ``_stamp`` / the cut builder.
-    return [
-        keep_fused,
-        OptionFork(option=_stamp(split), knobs={**root.op.knobs, SPLIT_CONE.name: True}),
-    ]
+    if classify(iter_dag(keep_fused)) is None:
+        return _stamp(split)
+    return keep_fused
