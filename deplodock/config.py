@@ -232,10 +232,14 @@ def serving_static(default: bool = False) -> bool:
 
 
 def move_composer_enabled(default: bool = False) -> bool:
-    """``DEPLODOCK_MOVE_COMPOSER`` — opt into the hierarchical move composer
-    (``passes/lowering/tile/partition/``) for the regimes it covers, falling
-    through to the legacy partition planner otherwise. Off (default) keeps the
-    legacy planner for every kernel. Brought up regime by regime; see
+    """``DEPLODOCK_MOVE_COMPOSER`` — the hierarchical move composer
+    (``passes/lowering/tile/partition/``). Opt-in (``DEPLODOCK_MOVE_COMPOSER=1``);
+    strict when on (no per-kernel legacy fallthrough). The default flip is staged
+    behind the remaining cutover work — the move knobs now alias the legacy
+    vocabulary (so the learned prior ranks composer kernels), which surfaces the
+    downstream-pass integration gaps (register-tile replication / staging /
+    transports for prior-driven knobs) and the warp-tier MMA parity
+    (masked / transposed-B / TMA / causal) still to land. See
     ``plans/melodic-giggling-gem.md``."""
     return _bool(MOVE_COMPOSER, default)
 
