@@ -1,14 +1,26 @@
 # Algebra-licensed decomposition move space — moves as axis factorizations, legality + recombine from the carrier
 
 **Branch:** `feature/move-composer` (caps the axis-walk / monoid-DAG / carrier-analysis line of work)
-**Status:** in progress — phases 1–4 landed (byte-identical). Phase 1: `ReduceCarrier.combine_partials` /
-`combine_operands` (uniform recombine accessor; `kernel/_combine.py` routes through it). Phase 2: `partition/iterdag.py`
-— the `iter_dag` derived view; `walk_nest` builds it and the four skeletons are projections of its nodes. Phase 3:
-`partition/decompose.py` — `AxisDecomp` + `legal_decomps` (carrier-trait legality); `matmul_reduce_offers` /
-`coop_reduce_offers` delegate their legality to it. Phase 4: the `materialize` builders read free axes / inner body /
-leading off the DAG (threaded through `compose` → `tree._Ctx` → `build_*_tile`), not the skeleton fields. Phases 5–8
-(split-KV, skeleton dissolution, free-axis/tensorize fold-in, streaming-vs-tree) remain. Reframe the move composer's
-search space so each scheduling move is an **index-axis factorization**, with its
+**Status:** in progress — phases 1–4 landed (byte-identical); phase 5 abstraction proven; phase 6 part 1 landed.
+Phase 1: `ReduceCarrier.combine_partials` / `combine_operands` (uniform recombine accessor; `kernel/_combine.py` routes
+through it). Phase 2: `partition/iterdag.py` — the `iter_dag` derived view; `walk_nest` builds it and the four skeletons
+are projections of its nodes. Phase 3: `partition/decompose.py` — `AxisDecomp` + `legal_decomps` (carrier-trait
+legality); `matmul_reduce_offers` / `coop_reduce_offers` delegate their legality to it. Phase 4: the `materialize`
+builders read free axes / inner body / leading off the DAG (threaded through `compose` → `tree._Ctx` → `build_*_tile`),
+not the skeleton fields. **Phase 5 (abstraction proven):** `legal_decomps` is carrier-generic, so one call expresses
+split-K (additive `Accum`), coop (`max` `Accum`), AND flash split-KV (the `FlashCombine` LSE `Monoid`,
+`commutative=True`) — identical partition factorizations, recombined by each carrier's `combine_partials` (the LSE's
+authored 12-step state-merge for flash). Pinned by `test_one_move_expresses_splitk_coop_and_splitkv`. The atomic-free
+GPU **realization** of split-KV (the flash partition-producer writing the `(m,l,O)` state to per-component workspaces +
+the deferred `O/l` finalize moved into the `017` monoid-reduce combine kernel) is the remaining materialization — the
+`017::_build_monoid_reduce_tileop` combine already exists; the producer-side state-write + offer-wiring in
+`build_flash_tree` do not. **Phase 6 part 1:** the four `build_*_tree` entry points collapse into one
+`build_partition(dag)` (byte-identical dispatch). **Phase 6 part 2 (remaining):** delete the `PointwiseSkeleton` /
+`MatmulSkeleton` / `CoopReduceSkeleton` / `FlashSkeleton` types (~91 `skel.*` reads across
+`moves`/`tree`/`materialize`) by deriving the regime + K-info (`target_names` / `k_extent` / `k_bound` / `k_bounds`) in
+`build_partition` from `dag.reduce` + the inner body, and have `walk_nest` yield the `IterDag` directly. Phases 7–8
+(free-axis/tensorize fold-in, streaming-vs-tree) remain. Reframe the move composer's search space so each scheduling
+move is an **index-axis factorization**, with its
 **legality and its recombination operator read off the carrier's algebra** instead of hand-coded per regime. Split-K, split-KV,
 cooperative-reduce, strip-mine, tensorize, and streaming-vs-tree collapse into ONE carrier-parameterized "factor an axis,
 recombine via the carrier" move. The cost pick and the hardware realization of each factored piece stay OUTSIDE the algebra. The
@@ -261,14 +273,20 @@ moves (7–8).
    `tree._Ctx` → builders. The skeleton now only supplies the K-axis info (`k_loop` / `k_extent` / `k_bound` /
    `target_names`) — folding that onto `dag.reduce` nodes, and turning `_replace_k_*` into `placement`-selected
    realizations, rides phase 6's dissolution. Byte-identical on every covered kernel (full suite: 98 failed unchanged).
-5. **Flash split-KV via the move** (the forcing consumer — the third instance, a NEW carrier). `legal_decomps` offers a KV
-   partition on the `FlashCombine` carrier (`commutative=True`), recombined by `combine_partials`, realized atomic-free (cf.
-   `plans/atomic-free-streamk.md`). First genuinely new coverage; validate accuracy + `run --bench` on decode-shaped attention.
-   This proves the `AxisDecomp` abstraction expresses split-K **and** split-KV **and** coop with one move before any deletion.
-6. **Dissolve the skeletons (the target state).** With the substrate validated, delete `PointwiseSkeleton` / `MatmulSkeleton` /
-   `CoopReduceSkeleton` / `FlashSkeleton` (and the phase-2 projection shim), collapse `build_pointwise_tree` / `build_matmul_tree` /
-   `build_coop_reduce_tree` / `build_flash_tree` into one `build_partition(dag)`, and have `walk_nest` yield the `IterDag` directly.
-   Byte-identical on every covered kernel (pointwise / matmul / warp / coop / flash) — pure removal of the typed-extraction layer.
+5. **Flash split-KV via the move** (the forcing consumer — the third instance, a NEW carrier). ✅ **Abstraction proven:**
+   `legal_decomps` offers a KV partition on the `FlashCombine` carrier (`commutative=True`) identically to split-K /
+   coop, recombined by `combine_partials` (`test_one_move_expresses_splitk_coop_and_splitkv`). **Remaining — the
+   atomic-free realization:** the flash partition-producer must write the `(m,l,O)` state to per-component workspaces
+   and defer the `O/l` finalize into the `017` monoid-reduce combine (cf. `plans/atomic-free-streamk.md`;
+   `017::_build_monoid_reduce_tileop` already exists; the producer-side state-write + the `build_flash_tree`
+   offer-wiring do not), then validate accuracy + `run --bench` on decode-shaped attention.
+6. **Dissolve the skeletons (the target state).** ✅ **Part 1:** the four `build_*_tree` entry points collapse into one
+   `build_partition(dag)` (byte-identical dispatch, called from `try_compose`). **Part 2 (remaining):** delete the
+   `PointwiseSkeleton` / `MatmulSkeleton` / `CoopReduceSkeleton` / `FlashSkeleton` types (the phase-2 projection shim) —
+   derive the regime + K-info (`target_names` / `k_extent` / `k_bound` / `k_bounds`) in `build_partition` from
+   `dag.reduce` + the inner body, swap the ~91 `skel.*` reads in `moves` / `tree` / `materialize`, and have `walk_nest`
+   yield the `IterDag` directly. Byte-identical on every covered kernel (pointwise / matmul / warp / coop / flash) —
+   pure removal of the typed-extraction layer.
 7. **Fold in free-axis tiling and tensorize** — the parallel-axis (no-recombine) case and the semiring-block (atom-as-block-op)
    case become `AxisDecomp` instances over `IterDag` nodes, retiring `thread_offers` / `reg_offers` / `warp_offers` as special
    trees. Byte-identical on pointwise / matmul / warp kernels.
