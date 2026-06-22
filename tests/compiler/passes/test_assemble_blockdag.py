@@ -14,11 +14,11 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Load, Loop, Write
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_pointwise
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.build_dag import build_pointwise_dag
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Write
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block, assemble_pointwise
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.build_dag import build_matmul_dag, build_pointwise_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_pointwise_tile
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_pointwise_tile
 
 
 def _pointwise_loop_op(*, M: int, N: int) -> LoopOp:
@@ -85,3 +85,57 @@ def test_assemble_1d_pointwise():
     tg = build_pointwise_dag(dag, knobs, kernel_name="k_relu1d")
     assembled = assemble_pointwise(tg, knobs=knobs, base_knobs={}, kernel_name="k_relu1d", leading=dag.leading)
     assert assembled.body == legacy.body, f"\nASSEMBLED:\n{assembled.pretty_body()}\n\nLEGACY:\n{legacy.pretty_body()}"
+
+
+def _matmul_loop_op(*, M: int, N: int, K: int) -> LoopOp:
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", K)
+    return LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a_v", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b_v", input="b", index=(Var("k"), Var("j"))),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a_v", "b_v")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        name="k_matmul",
+    )
+
+
+@pytest.mark.parametrize(
+    "bk,fk,splitk",
+    [
+        (16, 1, 1),  # plain
+        (8, 2, 1),  # FK strip-mine
+        (16, 1, 2),  # split-K
+    ],
+)
+def test_assemble_matches_legacy_matmul_scalar(bk, fk, splitk):
+    loop_op = _matmul_loop_op(M=64, N=64, K=64)
+    dag = iter_dag(loop_op)
+    knobs = {"BN": 16, "FN": 2, "BM": 16, "FM": 2, "BK": bk, "FK": fk, "SPLITK": splitk}
+    base = dict(loop_op.knobs)
+    targets = frozenset({"k"})
+
+    legacy = build_matmul_tile(knobs, kernel_name="k_matmul", base_knobs=base, dag=dag, target_names=targets)
+
+    tg = build_matmul_dag(dag, knobs, kernel_name="k_matmul", target_names=targets)
+    stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
+    assembled = assemble_block(tg, knobs=stamped, base_knobs=base, kernel_name="k_matmul", leading=dag.leading)
+
+    assert assembled.body == legacy.body, f"\nASSEMBLED:\n{assembled.pretty_body()}\n\nLEGACY:\n{legacy.pretty_body()}"
+    assert assembled.knobs == legacy.knobs

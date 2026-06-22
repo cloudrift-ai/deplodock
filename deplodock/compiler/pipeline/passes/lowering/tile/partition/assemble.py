@@ -34,21 +34,28 @@ _ROLE_OF: dict[Binding, Role] = {
 }
 
 
-def _pointwise_layers(block: Block, sched) -> list[tuple]:
-    """The innermost-first ``(axis, Role)`` layers for a pointwise block, in the
-    exact order ``materialize._assemble`` emitted them: all REGISTER cells, then
-    all THREAD axes, then all GRID axes — each tier in ``block.domain`` order (so
-    the inner ``N`` axis precedes the outer ``M`` axis, and extra-outer GRID axes
-    trail last)."""
+def _free_layers(block: Block, sched) -> list[tuple]:
+    """The innermost-first ``(axis, Role)`` layers for one block, in the exact
+    order ``materialize._assemble`` emitted them: ATOM cells, REGISTER cells,
+    WARP, THREAD, then GRID — each tier in ``block.domain`` order (so the inner
+    ``N`` axis precedes the outer ``M`` axis, the split-K ``K_s`` and extra-outer
+    GRID axes trail last). The K serial tower (``K_o`` / ``K_i``) is NOT a layer —
+    the ``tile_axis`` reduce move embeds it directly in ``block.compute``."""
     binding = sched.binding
 
     def tier(b: Binding) -> list[tuple]:
         return [(a, _ROLE_OF[b]) for a in block.domain if binding.get(a.name) is b]
 
-    return [*tier(Binding.REGISTER), *tier(Binding.THREAD), *tier(Binding.GRID)]
+    return [
+        *tier(Binding.ATOM),
+        *tier(Binding.REGISTER),
+        *tier(Binding.WARP),
+        *tier(Binding.THREAD),
+        *tier(Binding.GRID),
+    ]
 
 
-def assemble_pointwise(
+def assemble_block(
     graph: TileGraph,
     *,
     knobs: dict,
@@ -56,19 +63,27 @@ def assemble_pointwise(
     kernel_name: str,
     leading: tuple = (),
 ) -> TileOp:
-    """Assemble a single-block pointwise ``TileGraph`` into its ``TileOp`` tower.
+    """Assemble a single-block ``TileGraph`` into its ``TileOp`` tower.
 
-    The block's ``compute`` is the σ-rewritten inner body (the ``tile_axis`` move
-    already ran); ``assemble`` only reconstructs the binding tower. ``knobs`` /
-    ``base_knobs`` / ``kernel_name`` are the deployed-variant stamp the downstream
-    passes + perf DB key on (not part of the pure algorithm)."""
+    Covers pointwise + scalar/warp matmul + cooperative reduce: the block's
+    ``compute`` is the σ-rewritten inner body with any K serial tower already
+    embedded (the ``tile_axis`` / ``partition_reduce`` body moves ran in
+    ``build_dag``); ``assemble`` only reconstructs the binding tower via the shared
+    :func:`_wrap_tower`. ``knobs`` / ``base_knobs`` / ``kernel_name`` are the
+    deployed-variant stamp the downstream passes + perf DB key on (not part of the
+    pure algorithm)."""
     if len(graph.blocks) != 1:
-        raise NotImplementedError("assemble_pointwise: expected exactly one block")
+        raise NotImplementedError("assemble_block: expected exactly one block (multi-launch DAGs not yet ported)")
     block = graph.blocks[0]
-    layers = _pointwise_layers(block, graph.schedule)
-    chain_body = _wrap_tower(layers, tuple(block.compute))
+    atom = block.atom
+    layers = _free_layers(block, graph.schedule)
+    chain_body = _wrap_tower(layers, tuple(block.compute), atom=atom)
 
     knobs_full = {**base_knobs, **knobs}
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
+
+
+# Back-compat alias (the pointwise equivalence test + early callers).
+assemble_pointwise = assemble_block
