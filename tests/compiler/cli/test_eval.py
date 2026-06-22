@@ -165,26 +165,6 @@ def test_knobs_interaction_matrix_present(run_cli, tmp_path):
     assert "K1\\K2" in stdout
 
 
-def test_knobs_tolerates_list_valued_knob(run_cli, tmp_path):
-    """Some knob dicts carry a list value (e.g. ``OVERHANG=['a0']`` for a masked
-    overhang tile). The regret + interaction analysis groups variants by knob
-    value, so a list value must not crash the dict/set keying with
-    ``TypeError: unhashable type: 'list'`` — it's coerced to a tuple."""
-    db = tmp_path / "overhang.db"
-    rows = []
-    # 8 variants: BN varies (a normal knob) alongside a list-valued OVERHANG so
-    # both code paths (regret grouping + interaction matrix) see the list.
-    for i in range(8):
-        overhang = ["a0"] if i % 2 else []
-        rows.append((f"o{i}", "k_matmul", {"BN": 16 if i < 4 else 64, "OVERHANG": overhang}, 10.0 + i))
-    _make_tune_db(db, rows)
-
-    rc, stdout, stderr = run_cli("eval", "knobs", "--db", str(db))
-    assert rc == 0, f"stderr: {stderr}"
-    assert "traceback" not in (stdout + stderr).lower()
-    assert "knob interaction" in stdout  # full report rendered, no crash
-
-
 def _add_perf_row(path: Path, op_key: str, kernel_name: str, knobs: dict, us: float, *, status: str) -> None:
     """Append one ``cuda_op`` + ``perf`` row with an explicit status (the shared
     ``_make_tune_db`` writes only ``ok`` rows)."""

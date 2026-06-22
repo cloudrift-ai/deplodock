@@ -101,7 +101,7 @@ autotuning cache doesn't bust on cosmetic edits.
   kernel runs at any runtime `seq_len` — the grid (`ir/cuda/ir.py:GridDimSpec` now accepts an `Expr`
   factor, resolved via `Expr.eval` at launch) and the guard read the runtime value; the tile shape is
   tuned for the hint. This covers the **warp/MMA tier** too: symbolic M and/or N enumerate masked
-  mma.sync rows (`OVERHANG`-stamped, no hint-divisibility) — the boundary Cond gates whole tiles, the
+  mma.sync rows (`S_masked_m`/`S_masked_n`-stamped, no hint-divisibility) — the boundary Cond gates whole tiles, the
   `RegStore` carries per-element row/col guards for tiles straddling the bound (the fragment lane offsets
   are invisible to σ), staged slab fills clamp their gmem reads to the runtime extent
   (`Source.gmem_extents` with symbolic `Expr` bounds), unstaged operands take clamped gmem-direct

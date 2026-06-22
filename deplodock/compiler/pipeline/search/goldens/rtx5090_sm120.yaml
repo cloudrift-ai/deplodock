@@ -14,7 +14,7 @@ configs:
     M: 1024
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 45.8
     cublas_us: 53.3
   - kernel: matmul
@@ -213,7 +213,7 @@ configs:
     M: 128
     N: 3072
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 6, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 6, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 23.8
     cublas_us: 39.2
   - kernel: matmul
@@ -253,7 +253,7 @@ configs:
     M: 512
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 24.6
     cublas_us: 39.6
   - kernel: matmul
@@ -261,7 +261,7 @@ configs:
     M: 512
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 50.5
     cublas_us: 58.6
   - kernel: matmul
@@ -269,7 +269,7 @@ configs:
     M: 512
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 10, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    knobs: {BN: 32, BM: 8, FM: 10, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
     deplodock_us: 52.4
     cublas_us: 82.2
   - kernel: matmul
@@ -277,7 +277,7 @@ configs:
     M: 512
     N: 1024
     K: 3072
-    knobs: {BN: 32, BM: 8, FM: 14, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 32, BM: 8, FM: 14, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 75.7
     cublas_us: 79.6
   # --- dynamic (symbolic-M) goldens: masked-tile kernels, M is the Dim hint (== DEFAULT_SEQ_HINT),
@@ -289,7 +289,7 @@ configs:
     N: 512
     K: 512
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
     deplodock_us: 11.0
     cublas_us: 14.0
   - kernel: matmul
@@ -298,7 +298,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 52.5
     cublas_us: 47.0
   - kernel: matmul
@@ -307,7 +307,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 3}
     deplodock_us: 50.4
     cublas_us: 47.0
   - kernel: matmul
@@ -316,7 +316,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 8, FM: 14, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 3}
+    knobs: {BN: 32, BM: 8, FM: 14, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 3}
     deplodock_us: 54.4
     cublas_us: 47.0
   - kernel: matmul
@@ -325,7 +325,7 @@ configs:
     N: 1024
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 30.7
     cublas_us: 39.0
   - kernel: matmul
@@ -334,7 +334,7 @@ configs:
     N: 1024
     K: 2048
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 52.7
     cublas_us: 57.0
   - kernel: matmul
@@ -343,7 +343,7 @@ configs:
     N: 3072
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 72.8
     cublas_us: 79.0
   - kernel: matmul
@@ -352,7 +352,7 @@ configs:
     N: 1024
     K: 3072
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, OVERHANG: ['a0'], STAGE: '11', RING: 2}
+    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2}
     deplodock_us: 74.8
     cublas_us: 76.0
   - kernel: reduce

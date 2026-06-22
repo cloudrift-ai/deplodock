@@ -216,9 +216,8 @@ class TuningSearch(Search):
     @staticmethod
     def _o3_sig(knobs: dict | None) -> tuple:
         """A hashable signature of a realized knob set for -O3 dedup. Values are
-        ``str()``-ified (some knobs — ``OVERHANG`` — carry list values that aren't
-        hashable), and the ``H_opt`` regime tag is excluded so the -O1 row and its
-        -O3 re-bench share one signature."""
+        ``str()``-ified for a uniform hashable key, and the ``H_opt`` regime tag is
+        excluded so the -O1 row and its -O3 re-bench share one signature."""
         if not knobs:
             return ()
         return tuple(sorted((k, str(v)) for k, v in knobs.items() if k != "H_opt"))

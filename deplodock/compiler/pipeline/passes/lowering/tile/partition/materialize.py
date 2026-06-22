@@ -21,6 +21,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Ternary
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Monoid, Select, SelectBranch, Stmt
 from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
+from deplodock.compiler.pipeline.knob import masked_axis_features
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
@@ -489,10 +490,8 @@ def build_warp_matmul_tile(atom: Atom, knobs: dict, *, kernel_name: str, base_kn
     # per-element ``RegStore`` row / col guard (a tile straddling the bound passes
     # the Cond but its trailing rows / cols are out of range). N (inner) is
     # wrapped first so it nests inside M, matching the scalar bound order.
-    overhang: tuple[str, ...] = ()
     for name, bound in ((inner_n.name, n_bound), (outer_m.name, m_bound)):
         if bound is not None:
-            overhang = (*overhang, name)
             pred = sigma_outer.reduce(Var(name), SimplifyCtx({}))
             new_inner = (Cond(cond=BinaryExpr("<", pred, bound), body=Body(new_inner)),)
 
@@ -517,8 +516,7 @@ def build_warp_matmul_tile(atom: Atom, knobs: dict, *, kernel_name: str, base_kn
     # block-stamped affine slab) instead of the scalar path. Dropped when those
     # passes are greenfielded in Phase 4.
     knobs_full = {**base_knobs, **knobs, "MMA": atom.name}
-    if overhang:
-        knobs_full["OVERHANG"] = overhang
+    knobs_full.update(masked_axis_features(m=m_bound is not None, n=n_bound is not None, k=dag.k_bound is not None))
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in dag.leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)

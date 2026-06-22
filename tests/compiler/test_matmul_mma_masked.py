@@ -2,7 +2,8 @@
 
 A matmul whose M output axis is symbolic (``Dim('seq_len')``, hint 512,
 runtime ``int seq_len`` kernel arg) reaches the mma.sync warp tier as a
-MASKED tile: the enumerator stamps ``OVERHANG`` (no hint-divisibility — the
+MASKED tile: the producer stamps the ``S_masked_*`` structural feature (no
+hint-divisibility — the
 runtime extent is unknown), the planner ceil-divs the grid and wraps the cell
 in a boundary ``Cond``, ``021`` hoists the K-pipeline above it (clamped slab
 fill — commit "stage: runtime-extent clamp"), and ``005_lower_atom_tile``
@@ -77,7 +78,7 @@ def _symbolic_m_graph(*, K: int = 512, N: int = 1024) -> Graph:
 def test_warp_enumeration_admits_forced_mask_m():
     """``m_forced_mask`` skips the M-side divisibility constraints (the
     runtime extent is unknown — the boundary guard covers the partial tile)
-    and stamps the axis into ``OVERHANG`` on every row."""
+    and stamps the ``S_masked_m`` structural feature on every row."""
     atoms = (ATOM_REGISTRY["mma_m16n8k16_f16"],)
     rows = _enumerate_warp_matmul_impl(
         E_M=512,
@@ -92,7 +93,7 @@ def test_warp_enumeration_admits_forced_mask_m():
         n_forced_mask=False,
     )
     assert rows, "forced-mask M should enumerate warp rows"
-    assert all(r["OVERHANG"] == ("i",) for r in rows), "every symbolic-M row must stamp OVERHANG"
+    assert all(r.get("S_masked_m") == 1.0 and "S_masked_n" not in r for r in rows), "every symbolic-M row must stamp S_masked_m"
     # No hint-divisibility on the masked axis: FM values that don't divide the
     # hint's per-warp cell count (512/16 cells, e.g. FM=6 with WM=2) appear.
     fms = {r["FM"] for r in rows}
@@ -128,7 +129,7 @@ def test_symbolic_m_masked_mma_kernel_structure(monkeypatch):
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
-    assert kop.knobs.get("OVERHANG"), "symbolic-M warp row must be masked"
+    assert kop.knobs.get("S_masked_m"), "symbolic-M warp row must be masked"
     src = kop.kernel_source
     assert "int seq_len" in src, "runtime extent must be a kernel arg"
     assert "mma.sync.aligned.m16n8k16" in src
@@ -293,8 +294,8 @@ def _symbolic_k_graph(*, M: int = 64, N: int = 128) -> Graph:
 def test_warp_enumeration_admits_forced_mask_k():
     """``k_forced_mask`` skips the K-side divisibility constraint (the runtime
     reduce extent is unknown — the partial final K slab is zero-filled) and
-    stamps the K axis into ``OVERHANG`` on every row, exactly like a masked
-    output axis."""
+    stamps the ``S_masked_k`` structural feature on every row, exactly like a
+    masked output axis stamps ``S_masked_m`` / ``S_masked_n``."""
     atoms = (ATOM_REGISTRY["mma_m16n8k16_f16"],)
     rows = _enumerate_warp_matmul_impl(
         E_M=64,
@@ -311,7 +312,7 @@ def test_warp_enumeration_admits_forced_mask_k():
         k_forced_mask=True,
     )
     assert rows, "forced-mask K should enumerate warp rows"
-    assert all("k" in r["OVERHANG"] for r in rows), "every symbolic-K row must stamp OVERHANG"
+    assert all(r.get("S_masked_k") == 1.0 for r in rows), "every symbolic-K row must stamp S_masked_k"
     # No hint-divisibility on the masked K: a BK whose cell count doesn't divide
     # the hint's K cells is admitted (the ceil-div K_o loop + zero-fill cover it).
     assert any(r["BK"] not in (1, 2, 4) or (512 // 16) % r["BK"] != 0 for r in rows) or rows

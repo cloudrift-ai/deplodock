@@ -45,6 +45,34 @@ STRUCT_PREFIX = "S_"
 CTX_PREFIX = "H_"
 
 
+def masked_axis_features(*, m: bool = False, n: bool = False, k: bool = False) -> dict[str, float]:
+    """The per-role boundary-masked structural features (``S_masked_m/n/k``).
+
+    A tile boundary-masks an output / reduce axis when the extent is symbolic or a
+    static non-divisor of the chosen tile — a *consequence* of the shape/tile
+    pairing, not a tunable choice — so it belongs with the ``S_`` structural
+    identity, not a tuning knob. Masking is only known once the tile geometry is
+    chosen, so the producers stamp it at materialize / enumeration time; the
+    feature definition lives here, beside ``STRUCT_PREFIX`` and the featurizer that
+    reads it (``_geom_feats`` → ``D_neg_masked_*``).
+
+    Replaces the legacy flat ``OVERHANG`` tuple knob, split per role so the prior
+    can learn that K-masking (SYNC-pinned, ring-declined) prices differently from
+    M / N output masking. Only the masked roles are emitted — an unmasked kernel
+    carries none, so its structural identity is unchanged and the featurizer
+    defaults a missing flag to ``0.0`` (matching the old ``OVERHANG`` conditional
+    stamp). ``S_masked_*`` pass through :func:`knob_features` as raw floats via the
+    ``STRUCT_PREFIX`` branch automatically."""
+    feats: dict[str, float] = {}
+    if m:
+        feats[f"{STRUCT_PREFIX}masked_m"] = 1.0
+    if n:
+        feats[f"{STRUCT_PREFIX}masked_n"] = 1.0
+    if k:
+        feats[f"{STRUCT_PREFIX}masked_k"] = 1.0
+    return feats
+
+
 class _Unset:
     """Sentinel for ``Knob.off`` meaning "no OFF value declared" — the knob is
     expected to always be stamped by its owning pass (universal knobs like
@@ -547,7 +575,9 @@ def _geom_feats(
     bn = int(knobs.get("BN", 0) or 0)
     bm = int(knobs.get("BM", 0) or 0)
     bk = int(knobs.get("BK", 1) or 1)
-    overhang = len(knobs.get("OVERHANG", ()) or ())
+    masked_m = float(knobs.get("S_masked_m", 0.0) or 0.0)
+    masked_n = float(knobs.get("S_masked_n", 0.0) or 0.0)
+    masked_k = float(knobs.get("S_masked_k", 0.0) or 0.0)
     k_ext = float(knobs.get("S_ext_reduce_prod") or 0.0)
     br = int(knobs.get("BR", 1) or 1)
     kchunks = max((k_ext / br) / bk, 1.0) if k_ext > 0 else 1.0
@@ -571,7 +601,12 @@ def _geom_feats(
         "D_l2_reuse": l2(reuse),
         "D_near_intensity": -abs(l2(reuse) - 5.0),
         "D_near_kchunks": -abs(l2(kchunks) - 5.0),
-        "D_neg_overhang": float(-overhang),
+        # Per-role masked-tile penalties (was the single ``D_neg_overhang`` count):
+        # split M / N / K so the prior can weight K-masking distinctly. Negative =
+        # penalty, preserving the old sign convention.
+        "D_neg_masked_m": -masked_m,
+        "D_neg_masked_n": -masked_n,
+        "D_neg_masked_k": -masked_k,
         # thread-tier geometry bands (raw BN/BM/BK/SPLITK; 0 on a warp row)
         "D_l2_bn": l2(bn),
         "D_l2_bm": l2(bm),

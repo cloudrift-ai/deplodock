@@ -65,7 +65,12 @@ _W_A: dict[str, float] = {
     "D_log2_area": -1.5867630330619453,
     "D_l2_reuse": 1.2797850818471639,
     "D_l2_bk": 0.9757523358723075,
-    "D_neg_overhang": -0.8646029028646691,
+    # Per-role split of the former ``D_neg_overhang`` (same weight on each role —
+    # the sum reproduces the old ``-count`` contribution exactly; a future refit
+    # can separate them). See plans/drop-overhang-knob-structural-masked-feature.md.
+    "D_neg_masked_m": -0.8646029028646691,
+    "D_neg_masked_n": -0.8646029028646691,
+    "D_neg_masked_k": -0.8646029028646691,
     "D_l2_bm": -0.8611753178680309,
     "D_aspect": -0.700694025296909,
     "D_l2_bn": -0.6882108423260582,
@@ -102,7 +107,10 @@ _W_A_DYN: dict[str, float] = {
     "D_ctas_ge_sm": -1.6368130082756995,
     "D_splitk": 1.506972617874152,
     "D_near_waves": -1.4885713149137085,
-    "D_neg_overhang": 1.4232013571064015,
+    # Per-role split of the former ``D_neg_overhang`` (see ``_W_A``).
+    "D_neg_masked_m": 1.4232013571064015,
+    "D_neg_masked_n": 1.4232013571064015,
+    "D_neg_masked_k": 1.4232013571064015,
     "D_bm_band": -1.328509340005289,
     "D_l2_threads": -1.3114718972707482,
     "MMA_tier": 1.1625757242541237,

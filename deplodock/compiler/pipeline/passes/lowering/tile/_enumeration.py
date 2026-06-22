@@ -9,9 +9,11 @@ Three layers:
 
 1. The variant row — a plain knob dict (see the block comment above the
    priority functions): scalar tier carries {BN, BM, FM, FN, FK, BK,
-   SPLITK, BR} (+ FKWIN / OVERHANG), warp tier {WN, WM, FM, FN, BK,
-   SPLITK, MMA}; ``"MMA" in row`` discriminates. De-dup keys on
-   ``frozenset(row.items())``.
+   SPLITK, BR} (+ FKWIN), warp tier {WN, WM, FM, FN, BK,
+   SPLITK, MMA}; ``"MMA" in row`` discriminates. A masked tile additionally
+   carries the ``S_masked_m/n/k`` structural features (not tuning knobs — a
+   consequence of the shape/tile pairing, see ``knob.masked_axis_features``).
+   De-dup keys on ``frozenset(row.items())``.
 2. Public ``enumerate_cartesian(...)`` — mode-dispatched wrapper that picks
    the candidate tuples + priority function for ``matmul`` / ``reduce`` /
    ``pointwise``, folds ``DEPLODOCK_<KNOB>`` env pins via ``Knob.narrow``,
@@ -179,9 +181,9 @@ def planner_pin_snapshot() -> tuple[tuple[str, str | None], ...]:
 #   scalar tier  real {BN, BM, FM, FN, FK, BK, SPLITK, BR} + OFF {WN=WM=0, MMA="0"}
 #                (+ ``FKWIN``: the fp16 half2 accumulation-window length —
 #                disambiguates window ``FK`` from the reduce strip-mine, see
-#                ``plans/fk-half2-fp16-matmul.md``; + ``OVERHANG``: tuple of
-#                masked output-axis names for non-divisor tiles — both stay
-#                conditional, no OFF)
+#                ``plans/fk-half2-fp16-matmul.md`` — conditional, no OFF; a masked
+#                tile also carries the ``S_masked_m/n/k`` structural features,
+#                stamped via ``knob.masked_axis_features`` — not tuning knobs)
 #   warp tier    real {WN, WM, FM, FN, BK, SPLITK, MMA} + OFF {BM=BN=BR=FK=0}
 #                (``knob.is_warp(row)`` discriminates the tier — value-based, since
 #                a scalar row now carries ``MMA="0"``; the ``Atom`` spec is
@@ -484,8 +486,8 @@ def _enumerate_cartesian_impl(
     No env reads, no mode dispatch.
 
     When ``allow_masked`` is set, candidates that violate the BN/BM-divides-E
-    constraint are also admitted with the offending axis name recorded in
-    the row's ``OVERHANG`` entry. ``m_forced_mask`` / ``n_forced_mask`` (set for a
+    constraint are also admitted with the offending axis role recorded in
+    the row's ``S_masked_m`` / ``S_masked_n`` structural feature. ``m_forced_mask`` / ``n_forced_mask`` (set for a
     symbolic axis tuned at its hint) admit masking regardless of ``allow_masked``
     AND record the axis in ``overhang`` even when BN/BM divides the hint — the
     runtime extent is unknown, so the masked boundary guard is always needed.
@@ -692,8 +694,9 @@ def _enumerate_cartesian_impl(
                                     }
                                     if window_fk and fk > 1:
                                         params["FKWIN"] = fk
-                                    if overhang_axes:
-                                        params["OVERHANG"] = overhang_axes
+                                    params.update(
+                                        knob.masked_axis_features(m=bool(fm_overhang and m_axis_name), n=bool(fn_overhang and n_axis_name))
+                                    )
                                     ordered.append(params)
 
     # This impl returns rows in cartesian construction order; the public
@@ -738,8 +741,8 @@ def _enumerate_warp_matmul_impl(
     ``n_forced_mask``) skips that axis's divisibility constraints entirely:
     the runtime extent is unknown, so the planner ceil-divs the grid and the
     boundary guard handles the partial tile — no hint-divisibility is
-    imposed (mirroring the scalar masked branch). Such rows stamp the axis
-    into ``OVERHANG`` unconditionally. Static non-divisor extents stay
+    imposed (mirroring the scalar masked branch). Such rows stamp the axis's
+    ``S_masked_*`` structural feature unconditionally. Static non-divisor extents stay
     rejected (static masked warp tiles are a separate follow-up — the
     eligibility predicate still gates per-kind). BR is forced to 1 (MMA +
     cooperative-K is incompatible in v1; see Failure modes).
@@ -752,8 +755,8 @@ def _enumerate_warp_matmul_impl(
     # its hint and the final partial K tile is ZERO-FILLED in smem (the slab
     # value, not the index — K feeds the mma accumulation, so an edge-clamp
     # would add garbage; ``_stage_expand`` emits the ``(k < seq_len) ? v : 0``
-    # guard). Unlike M/N, the K axis carries no output cell, so it stamps into
-    # OVERHANG but never reaches the per-element store guard.
+    # guard). Unlike M/N, the K axis carries no output cell, so it stamps
+    # ``S_masked_k`` but never reaches the per-element store guard.
     k_masked = k_forced_mask and k_axis_name is not None and E_K > 1
     overhang_axes: tuple[str, ...] = ()
     if n_masked:
@@ -863,8 +866,7 @@ def _enumerate_warp_matmul_impl(
                                     "SPLITK": splitk,
                                     "MMA": atom.name,
                                 }
-                                if overhang_axes:
-                                    row["OVERHANG"] = overhang_axes
+                                row.update(knob.masked_axis_features(m=m_masked, n=n_masked, k=k_masked))
                                 out.append(row)
 
     # Construction order — the prior ranks; no enumeration sort.
