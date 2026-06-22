@@ -112,7 +112,11 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...],
     def _real(ax: Axis) -> bool:
         return (not ax.extent.is_static) or ax.extent.as_static() > 1
 
-    register_present = any(role == Role.REGISTER and _real(axis) for axis, role in layers)
+    # A RegisterTile may also come from the K-transform already applied to the
+    # inner body (the FK reduce strip-mine ``RegisterTile(reduce=True)`` a coop
+    # reduce / matmul emits), not just from a free-axis REGISTER ``layers`` entry.
+    register_in_body = any(isinstance(s, RegisterTile) for s in Body.coerce(inner_body).iter())
+    register_present = register_in_body or any(role == Role.REGISTER and _real(axis) for axis, role in layers)
     thread_axes = [axis for axis, role in layers if role == Role.THREAD]
     keep_one_thread = register_present and bool(thread_axes) and not any(_real(ax) for ax in thread_axes)
 
