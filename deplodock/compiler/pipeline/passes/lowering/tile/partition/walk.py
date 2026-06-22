@@ -23,7 +23,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Loop, Write
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import AxisRole, iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
     CoopReduceSkeleton,
     FlashSkeleton,
@@ -54,7 +54,14 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     # Per-outer-axis precompute stmts between chain levels ride the inner tile.
     inner_body = dag.inner_body
 
-    if AlgebraKind.TWISTED_MONOID in algebras:
+    # A TWISTED_MONOID stream is **flash** only when it wraps a NESTED reduce (the
+    # QK^T `SEMIRING` inside the KV stream). A non-nested single monoid stream
+    # (e.g. a softmax `(m, l)` log-sum-exp `Monoid` over one K axis) is a plain
+    # COOPERATIVE monoid reduce — it falls through to the MONOID coop path below.
+    nested_reduce = any(n.parent is not None and n.parent.role is AxisRole.REDUCE for n in dag.reduce)
+    coop_monoid = AlgebraKind.TWISTED_MONOID in algebras and not nested_reduce
+
+    if AlgebraKind.TWISTED_MONOID in algebras and nested_reduce:
         # Fused flash attention (the FlashCombine streaming-softmax carrier).
         # Tile the free output axes; serial-transform the streaming KV reduce +
         # its nested QK^T reduce; the carriers render their own rescale. A
@@ -129,14 +136,22 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
             target_names=frozenset(lp.axis.name for lp in body_loops),
         )
 
-    if algebras == {AlgebraKind.MONOID}:
+    if algebras == {AlgebraKind.MONOID} or coop_monoid:
         # Cooperative reduce. The reduces (one for sum/max; two for softmax) and
         # any second-pass map loop all iterate the SAME K axis — `upstream
         # unify_sibling_reduce_axes` collapses the sibling reduce + map axes to
         # one canonical name, and `_replace_k_coop` rewrites every K-named loop.
         # So the epilogue MAP scalar stmts (RMSNorm rsqrt, softmax log) and the
         # normalize map loop just ride the row tile — no rigid envelope.
+        #
+        # ``coop_monoid`` is a non-nested ``Monoid`` stream (a softmax `(m, l)`
+        # log-sum-exp folded cooperatively): the tuple-state combine is emitted by
+        # `kernel/100` via `find_nested_monoids` + `emit_combine_states`. Its
+        # masked-K fill isn't wired (`_mask_reduce_accums` is Accum-only), so a
+        # symbolic-K monoid stream stays uncovered (static K only).
         k_dim = k_loop.axis.extent
+        if coop_monoid and not k_dim.is_static:
+            return None
         # Tiling extent: static size, or the Dim hint for a symbolic K (masked).
         k_extent = k_dim.as_static() if k_dim.is_static else (k_dim.hint or 0)
         if k_extent < 1:
