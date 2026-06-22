@@ -28,6 +28,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize impo
     build_warp_matmul_tile,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
+    coop_free_thread_knobs,
     coop_reduce_knobs,
     coop_reduce_offers,
     eligible_atoms,
@@ -381,16 +382,22 @@ class _CoopChooseReduce(Fork):
     knobs: dict
 
     def expand(self) -> list:
-        return [_CoopLeaf(ctx=self.ctx, knobs=coop_reduce_knobs(r)) for r in coop_reduce_offers(self.ctx.skel)]
+        # ``self.knobs`` carries the free-axis THREAD tiles (BN/BM); each reduce
+        # leaf adds its (bk, fk, br).
+        return [_CoopLeaf(ctx=self.ctx, knobs={**self.knobs, **coop_reduce_knobs(r)}) for r in coop_reduce_offers(self.ctx.skel)]
 
 
 def build_coop_reduce_tree(skel: CoopReduceSkeleton, *, dag: IterDag, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
     """Root of the cooperative-reduce tree (one ``(bk, fk, br)`` decision); a
-    bare ``TileOp`` for a single legal variant, or ``None`` if none is legal."""
+    bare ``TileOp`` for a single legal variant, or ``None`` if none is legal. The
+    free-axis THREAD tiles (``BN``/``BM``, the strided-cooperative form) are pinned
+    once up front and ride every leaf."""
     offers = coop_reduce_offers(skel)
     if not offers:
         return None
+    free_knobs = coop_free_thread_knobs(skel)
     ctx = _Ctx(skel=skel, dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
     if len(offers) == 1:
-        return build_coop_reduce_tile(skel, coop_reduce_knobs(offers[0]), kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
-    return _CoopChooseReduce(ctx=ctx, knobs={})
+        full = {**free_knobs, **coop_reduce_knobs(offers[0])}
+        return build_coop_reduce_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+    return _CoopChooseReduce(ctx=ctx, knobs=free_knobs)

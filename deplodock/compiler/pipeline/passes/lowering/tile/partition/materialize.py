@@ -387,9 +387,13 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
     ``k_bound`` when symbolic), the combine is emitted downstream from
     ``Accum.axes ∩ ThreadTile``."""
     inner_n, outer_m, extra_outer = _free_axes(dag)
-    free_specs: list[_FreeSpec] = [(inner_n, 1, 1, True)]
+    # Free-axis THREAD tiles default to 1 (whole-CTA: one row per CTA). A pinned
+    # ``BN``/``BM`` > 1 thread-binds the free rows alongside ``BR`` — the strided-
+    # cooperative form (the segmented-shuffle combine, `cooperative_combine_geometry`).
+    bn, bm = knobs.get(MAP_N_THREAD.name, 1), knobs.get(MAP_M_THREAD.name, 1)
+    free_specs: list[_FreeSpec] = [(inner_n, bn, 1, True)]
     if outer_m is not None:
-        free_specs.append((outer_m, 1, 1, False))
+        free_specs.append((outer_m, bm, 1, False))
     bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
     k_c = Axis(f"{skel.k_name}_c", br, source_axis=src_k) if br > 1 else None
