@@ -122,8 +122,7 @@ class _ChooseThreadFlash(Fork):
     def expand(self) -> list:
         reg1 = reg_knobs(self.ctx.skel, (1, 1))
         return [
-            _Leaf(ctx=self.ctx, knobs={**thread_knobs(self.ctx.skel, t), **reg1})
-            for t in thread_offers(self.ctx.skel, self.ctx.budget)
+            _Leaf(ctx=self.ctx, knobs={**thread_knobs(self.ctx.skel, t), **reg1}) for t in thread_offers(self.ctx.skel, self.ctx.budget)
         ]
 
 
