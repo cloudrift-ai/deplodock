@@ -100,12 +100,35 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...],
     # cooperative MMA codegen — both survive at extent 1 so the
     # materializer can read the cell shape / warp count off the tower.
     _STRUCTURAL_ROLES = (Role.BLOCK, Role.WARP, Role.ATOM)
+
+    # A surviving RegisterTile (a register axis with extent > 1) must be hosted by
+    # a ThreadTile — the GridTile > ThreadTile > RegisterTile contract every
+    # downstream pass (``020_stage_inputs`` / ``010_split_register_axes`` via
+    # ``parallel_tile_of``) relies on. If the planner picked thread=1×1 with
+    # reg>1 (one thread per CTA owning the register cells), dropping the size-1
+    # THREAD axes would leave GridTile > RegisterTile with no ThreadTile, which
+    # ``parallel_tile_of`` can't navigate. So keep ONE degenerate THREAD axis in
+    # that case (an extent-1 threadIdx binding — correct, just a 1-thread CTA).
+    def _real(ax: Axis) -> bool:
+        return (not ax.extent.is_static) or ax.extent.as_static() > 1
+
+    register_present = any(role == Role.REGISTER and _real(axis) for axis, role in layers)
+    thread_axes = [axis for axis, role in layers if role == Role.THREAD]
+    keep_one_thread = register_present and bool(thread_axes) and not any(_real(ax) for ax in thread_axes)
+
     filtered: list[tuple[Axis, Role | None]] = []
+    kept_thread = False
     for axis, role in layers:
         if axis.extent.is_static and axis.extent.as_static() == 1 and role not in _STRUCTURAL_ROLES:
+            if role == Role.THREAD and keep_one_thread and not kept_thread:
+                filtered.append((axis, role))
+                kept_thread = True
+                continue
             sub = Sigma({axis.name: Literal(0, "int")})
             inner_body = tuple(c.rewrite(_identity_rename, sub) for c in inner_body)
             continue
+        if role == Role.THREAD:
+            kept_thread = True
         filtered.append((axis, role))
 
     # Walk outermost-first so consecutive parallel axes group naturally.
