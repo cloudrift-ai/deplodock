@@ -133,7 +133,10 @@ reduce; `TWISTED_MONOID`→legacy), producing the regime skeleton. Because non-r
 being rejected by a rigid envelope, a `MONOID` reduce followed by a scalar **epilogue** + a second-pass **map**
 loop composes with no new regime — that is how **RMSNorm / softmax** are covered (the reduce(s) and the
 different-named map loop are cooperative-split together, keyed by extent via `target_names`; the warp/tree combine
-is reused from `kernel/100` via `Accum.axes` σ-propagation). See `plans/move-composer-axis-walk-scheduler.md`.
+is reused from `kernel/100` via `Accum.axes` σ-propagation). **Symbolic free axes** (dynamic seq_len as rows / M /
+N) compose too — masked as a ceil-div grid + `< extent` store guard, scalar tier only (the warp path is
+clean-tile); a symbolic **K** (reduce) still needs the masked-K zero-fill and stays on legacy. See
+`plans/move-composer-axis-walk-scheduler.md`.
 Unlike
 the legacy planner — which enumerates a flat knob cartesian and groups it post-hoc via `build_fork_tree` — the
 composer **generates** the Fork tree move-by-move (`tree.py`): the root offers legal thread tiles, each branch

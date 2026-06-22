@@ -270,7 +270,10 @@ def build_matmul_tree(skel: MatmulSkeleton, *, loop_op, context, graph, base_kno
     eligible, or ``None`` when even the scalar tier has nothing legal."""
     ctx = _Ctx(skel=skel, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
     scalar = _scalar_subtree(ctx)
-    atoms = [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+    # The warp (tensor-core) path is clean-tile only — no masking — so a symbolic
+    # free axis (M/N tiled as a masked ceil-div) stays on the scalar tier.
+    symbolic_free = skel.inner_n.symbolic or skel.outer_m.symbolic
+    atoms = [] if symbolic_free else [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
     if not atoms:
         return scalar
     return _MmTensorize(ctx=ctx, scalar=scalar, atoms=tuple(atoms), knobs={})

@@ -46,10 +46,6 @@ def _free_chain(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], list[Loop]]:
     return leading, chain
 
 
-def _all_static(chain: list[Loop]) -> bool:
-    return all(lp.axis.extent.is_static for lp in chain)
-
-
 def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
     """Tag the nest and return the regime skeleton, or `None` for shapes the
     composer leaves to the legacy planner (symbolic axes, `TWISTED_MONOID`
@@ -75,8 +71,10 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
             leading=leading,
         )
 
-    if not _all_static(chain):
-        return None
+    # Symbolic *free* axes are fine — they tile as masked (ceil-div grid + a
+    # `< extent` store guard), the same path pointwise uses. A symbolic *K*
+    # (reduce) is not: it needs the masked-K zero-fill, which is a later phase,
+    # so require the reduce axis static here.
     k_loop = reduce_loops[0]
     if not k_loop.axis.extent.is_static:
         return None
