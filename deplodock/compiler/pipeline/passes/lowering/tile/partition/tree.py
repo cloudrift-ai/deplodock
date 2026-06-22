@@ -108,6 +108,22 @@ class _ChooseThread(Fork):
         ]
 
 
+@dataclass(frozen=True)
+class _ChooseThreadFlash(Fork):
+    """Flash root: a thread-tile-only fork. The streaming online-softmax carrier's
+    state (m/l/O) is seeded by an ``Init`` OUTSIDE the per-cell ``RegisterTile``,
+    so it can't span register cells — flash forces ``FM=FN=1`` (the same constraint
+    legacy's ``mask_f1`` enforces on a fused prologue). Register tiling is not a
+    search dimension; each thread choice is a terminal leaf."""
+
+    ctx: _Ctx
+    knobs: dict
+
+    def expand(self) -> list:
+        reg1 = reg_knobs(self.ctx.skel, (1, 1))
+        return [_Leaf(ctx=self.ctx, knobs={**thread_knobs(self.ctx.skel, t), **reg1}) for t in thread_offers(self.ctx.skel, self.ctx.budget)]
+
+
 def build_pointwise_tree(skel: PointwiseSkeleton, *, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
     """Return the root ``Fork`` of the generative tree, a bare ``TileOp`` when
     only one variant is legal (mirrors the legacy single-variant short-circuit),
@@ -131,14 +147,16 @@ def build_flash_tree(skel: FlashSkeleton, *, base_knobs: dict, kernel_name: str)
     the `FlashCombine` carrier owns the KV recurrence."""
     budget = Budget()
     threads = thread_offers(skel, budget)
-    regs = reg_offers(skel, budget)
-    if not threads or not regs:
+    if not threads:
         return None
+    # FM=FN=1 only (the streaming carrier can't span register cells), so the
+    # register tile is not a search dimension — just the thread tile.
     ctx = _Ctx(skel=skel, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name, tile_builder=build_flash_tile)
-    if len(threads) == 1 and len(regs) == 1:
-        full = {**thread_knobs(skel, threads[0]), **reg_knobs(skel, regs[0])}
+    reg1 = reg_knobs(skel, (1, 1))
+    if len(threads) == 1:
+        full = {**thread_knobs(skel, threads[0]), **reg1}
         return build_flash_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs)
-    return _ChooseThread(ctx=ctx, knobs={})
+    return _ChooseThreadFlash(ctx=ctx, knobs={})
 
 
 # --- Matmul (SEMIRING) generative tree: reduce → thread → register. ---
