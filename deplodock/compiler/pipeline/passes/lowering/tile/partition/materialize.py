@@ -190,32 +190,39 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
     )
 
 
-def _replace_k_coop(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, fk: int, br: int, k_c: Axis | None) -> tuple[Stmt, ...]:
-    """Replace the K reduce loop with the cooperative tower, σ-mapping
+def _replace_k_coop(
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, br: int, k_c: Axis | None
+) -> tuple[Stmt, ...]:
+    """Replace every K-extent loop named in ``target_names`` — the reduce(s) and
+    any second-pass map loop — with the cooperative tower, σ-mapping
     ``K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`` (``K_f`` only when
-    ``fk > 1``; ``K_c`` the stride-1 thread lane only when ``br > 1``). The
-    ``Accum.axes`` (originally ``(k,)``) propagate through σ to include ``K_c``,
-    which `escape_analysis` reads as cooperative → kernel/100 emits the combine.
-    The ``K_c`` THREAD axis is added to the tower by the caller."""
+    ``fk > 1``; ``K_c`` the stride-1 thread lane only when ``br > 1``). Each loop
+    gets its own ``K_o``/``K_i``/``K_f`` serial tiles but shares the one ``K_c``
+    THREAD axis (added by the caller), so the reduce accumulates and the map
+    writes over the same cooperative lane split. The reduce's ``Accum.axes``
+    propagate ``K_c`` through σ → kernel/100 emits the combine."""
     out: list[Stmt] = []
     for s in stmts:
-        if isinstance(s, Loop) and s.axis.name == k_name:
+        if isinstance(s, Loop) and s.axis.name in target_names:
+            kn = s.axis.name
             src = s.axis.source_axis or s.axis
             k_o_ext = k_extent // (br * bk * fk)
-            k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
-            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
+            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{kn}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(br * bk * fk, "int")
             k_f = None
             if fk > 1:
-                k_f = Axis(f"{k_name}_f", fk, source_axis=src)
+                k_f = Axis(f"{kn}_f", fk, source_axis=src)
                 expr = expr + Var(k_f.name) * Literal(br * bk, "int")
             expr = expr + Var(k_i.name) * Literal(br, "int")
             if k_c is not None:
                 expr = expr + Var(k_c.name)
-            sigma_k = Sigma({k_name: expr})
+            sigma_k = Sigma({kn: expr})
             new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             if k_f is not None:
-                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=True),)
+                # ``reduce`` follows the loop: the reduce loops accumulate (FK
+                # multiple-accumulator), the second-pass map loop only writes.
+                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
             out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
         else:
             out.append(s)
@@ -232,6 +239,7 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
     bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
     k_c = Axis(f"{skel.k_name}_c", br, source_axis=src_k) if br > 1 else None
+    targets = skel.target_names or frozenset({skel.k_name})
     return _assemble(
         free_specs,
         skel.inner_body,
@@ -240,7 +248,7 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_coop(body, skel.k_name, skel.k_extent, bk, fk, br, k_c),
+        k_transform=lambda body: _replace_k_coop(body, targets, skel.k_extent, bk, fk, br, k_c),
         coop_thread=(k_c,) if k_c is not None else (),
     )
 

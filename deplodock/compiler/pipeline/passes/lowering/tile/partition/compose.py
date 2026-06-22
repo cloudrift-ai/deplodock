@@ -13,29 +13,28 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
-    lift_coop_reduce,
-    lift_matmul,
-    lift_pointwise,
+    CoopReduceSkeleton,
+    MatmulSkeleton,
+    PointwiseSkeleton,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import (
     build_coop_reduce_tree,
     build_matmul_tree,
     build_pointwise_tree,
 )
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
 
 def try_compose(loop_op: LoopOp, ctx: Context, graph: Graph, *, kernel_name: str) -> Fork | TileOp | None:
-    """Compose ``loop_op`` if its regime is covered, else ``None``. ``ctx`` /
-    ``graph`` feed tensor-core atom eligibility (compute capability + operand
-    dtypes)."""
+    """Compose ``loop_op`` if the nest walk recognizes it, else ``None``. ``ctx``
+    / ``graph`` feed tensor-core atom eligibility (compute capability + operand
+    dtypes). One walk tags the nest; the skeleton type selects the builder."""
     base_knobs = dict(loop_op.knobs)
-    pointwise = lift_pointwise(loop_op)
-    if pointwise is not None:
-        return build_pointwise_tree(pointwise, base_knobs=base_knobs, kernel_name=kernel_name)
-    matmul = lift_matmul(loop_op)
-    if matmul is not None:
-        return build_matmul_tree(matmul, loop_op=loop_op, context=ctx, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name)
-    coop = lift_coop_reduce(loop_op, warp_size=ctx.warp_size)
-    if coop is not None:
-        return build_coop_reduce_tree(coop, base_knobs=base_knobs, kernel_name=kernel_name)
+    nest = walk_nest(loop_op, warp_size=ctx.warp_size)
+    if isinstance(nest, PointwiseSkeleton):
+        return build_pointwise_tree(nest, base_knobs=base_knobs, kernel_name=kernel_name)
+    if isinstance(nest, MatmulSkeleton):
+        return build_matmul_tree(nest, loop_op=loop_op, context=ctx, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name)
+    if isinstance(nest, CoopReduceSkeleton):
+        return build_coop_reduce_tree(nest, base_knobs=base_knobs, kernel_name=kernel_name)
     return None

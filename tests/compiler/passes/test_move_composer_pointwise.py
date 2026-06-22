@@ -21,8 +21,8 @@ from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_pointwise_tile
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import lift_pointwise
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_pointwise_tree
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import lift_pointwise
 
 _MAP_KEYS = {"MAP_N_THREAD", "MAP_N_REG", "MAP_M_THREAD", "MAP_M_REG"}
 

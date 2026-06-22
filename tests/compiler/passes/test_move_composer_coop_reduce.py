@@ -11,10 +11,51 @@ from __future__ import annotations
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum
+from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import ThreadTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_coop_reduce_tile
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import lift_coop_reduce
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import lift_coop_reduce, walk_nest
+
+
+def _reduce_epilogue_map(rows: int, k: int) -> LoopOp:
+    """`inv=1/sum_k x; o[i,k]=x[i,k]*inv` — a reduce, a scalar epilogue, and a
+    second-pass map loop over a *different-named* k axis of the same extent
+    (the RMSNorm/softmax shape)."""
+    return LoopOp(
+        body=(
+            Loop(
+                axis=Axis("i", rows),
+                body=(
+                    Loop(
+                        axis=Axis("kr", k),
+                        body=(
+                            Load(name="xv", input="x", index=(Var("i"), Var("kr"))),
+                            Accum(name="acc", value="xv", op=ElementwiseImpl("add"), axes=("kr",)),
+                        ),
+                    ),
+                    Assign(name="inv", op=ElementwiseImpl("reciprocal"), args=("acc",)),
+                    Loop(
+                        axis=Axis("km", k),
+                        body=(
+                            Load(name="xv2", input="x", index=(Var("i"), Var("km"))),
+                            Assign(name="ov", op=ElementwiseImpl("multiply"), args=("xv2", "inv")),
+                            Write(output="o", index=(Var("i"), Var("km")), value="ov"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_walk_recognizes_reduce_with_epilogue_and_map():
+    nest = walk_nest(_reduce_epilogue_map(64, 128))
+    assert nest is not None and nest.k_extent == 128
+    # Both the reduce and the second-pass map loop (different names, same extent)
+    # are cooperative-split targets.
+    assert len(nest.target_names) == 2, f"reduce + map should both be K targets: {nest.target_names}"
+    # The scalar epilogue (reciprocal) survives in the body to ride the row tile.
+    assert any(isinstance(s, Assign) for s in nest.inner_body), "epilogue Assign must survive the walk"
 
 
 def _sum(rows: int, k: int) -> LoopOp:

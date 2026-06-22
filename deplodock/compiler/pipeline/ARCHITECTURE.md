@@ -126,7 +126,15 @@ sidestep it). No variant is scored or materialized to rank it — the prior feat
 
 **Hierarchical move composer (opt-in, `DEPLODOCK_MOVE_COMPOSER`).** A from-scratch reimplementation of the
 partition stage as a stack of algebraically-justified *moves* lives under `lowering/tile/partition/`
-(`skeleton` → `moves` + `budget` → `tree` → `materialize`, sharing the extracted `_tower._wrap_tower`). Unlike
+(`walk` → `skeleton` → `moves` + `budget` → `tree` → `materialize`, sharing the extracted `_tower._wrap_tower`).
+The front-end is **one nest walk** (`walk.py::walk_nest`), not three template-matchers: it walks the loop nest once
+and tags it by each reduce loop's `Loop.algebra_kind` (`MAP`→pointwise, `SEMIRING`→matmul, `MONOID`→cooperative
+reduce; `TWISTED_MONOID`→legacy), producing the regime skeleton. Because non-reduce statements *ride* instead of
+being rejected by a rigid envelope, a `MONOID` reduce followed by a scalar **epilogue** + a second-pass **map**
+loop composes with no new regime — that is how **RMSNorm / softmax** are covered (the reduce(s) and the
+different-named map loop are cooperative-split together, keyed by extent via `target_names`; the warp/tree combine
+is reused from `kernel/100` via `Accum.axes` σ-propagation). See `plans/move-composer-axis-walk-scheduler.md`.
+Unlike
 the legacy planner — which enumerates a flat knob cartesian and groups it post-hoc via `build_fork_tree` — the
 composer **generates** the Fork tree move-by-move (`tree.py`): the root offers legal thread tiles, each branch
 offers the register tiles legal *given that thread tile* (incremental budget pruning), and each leaf

@@ -21,8 +21,8 @@ from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_warp_matmul_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import eligible_atoms
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import lift_matmul, lift_pointwise
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import lift_matmul, lift_pointwise
 
 _MM_KEYS = {"MAP_N_THREAD", "MAP_N_REG", "MAP_M_THREAD", "MAP_M_REG", "RED_BK", "RED_FK"}
 
