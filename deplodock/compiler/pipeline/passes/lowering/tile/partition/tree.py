@@ -11,14 +11,14 @@ reusing the ``Fork`` / ``LazyCandidate`` engine unchanged.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.stmt import Loop
+from deplodock.compiler.ir.algebra import AlgebraKind
+from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.ir.tile.ir import Atom, TileOp
 from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import AxisRole, IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import RED_FK, TC_ATOM, WARP_M, WARP_N
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
     build_coop_reduce_tile,
@@ -47,33 +47,41 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import (
     warp_reg_knobs,
     warp_reg_offers,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
-    CoopReduceSkeleton,
-    FlashSkeleton,
-    MatmulSkeleton,
-    PointwiseSkeleton,
-)
 
 
 @dataclass(frozen=True)
 class _Ctx:
-    """Per-LoopOp state shared by every node of one kernel's tree. ``tile_builder``
-    materializes a leaf — `build_pointwise_tile` by default, `build_flash_tile`
-    for the flash nest (both free-axis-tiled, differing only in the K transform).
-    ``dag`` is the iteration-DAG view the builders read free axes / inner body off."""
+    """Per-LoopOp state shared by every node of one kernel's tree. ``dag`` is the
+    iteration-DAG view the builders read free axes / inner body / K-info off;
+    ``target_names`` are the K-extent loop names a reduce transform rewrites
+    (regime-derived in :func:`build_partition`), ``k_bounds`` the symbolic flash
+    streaming bounds."""
 
-    skel: PointwiseSkeleton | MatmulSkeleton | FlashSkeleton
     dag: IterDag
     budget: Budget
     base_knobs: dict
     kernel_name: str
-    tile_builder: Callable = build_pointwise_tile
+    target_names: frozenset[str] = frozenset()
+    k_bounds: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class _Leaf(Fork):
-    """A complete move stack (thread + register tiles); ``expand`` materializes
-    the ``TileOp``."""
+    """A complete pointwise move stack (thread + register tiles); ``expand``
+    materializes the ``TileOp``."""
+
+    ctx: _Ctx
+    knobs: dict
+    is_leaf = True
+
+    def expand(self) -> list:
+        return [build_pointwise_tile(self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag)]
+
+
+@dataclass(frozen=True)
+class _FlashLeaf(Fork):
+    """A complete flash move stack; ``expand`` materializes via ``build_flash_tile``
+    (serial-transforms the streaming reduces; the carrier owns the recurrence)."""
 
     ctx: _Ctx
     knobs: dict
@@ -81,8 +89,13 @@ class _Leaf(Fork):
 
     def expand(self) -> list:
         return [
-            self.ctx.tile_builder(
-                self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag
+            build_flash_tile(
+                self.knobs,
+                kernel_name=self.ctx.kernel_name,
+                base_knobs=self.ctx.base_knobs,
+                dag=self.ctx.dag,
+                target_names=self.ctx.target_names,
+                k_bounds=self.ctx.k_bounds,
             )
         ]
 
@@ -98,7 +111,7 @@ class _ThreadChosen(Fork):
 
     def expand(self) -> list:
         return [
-            _Leaf(ctx=self.ctx, knobs={**self.knobs, **reg_knobs(self.ctx.skel, reg)}) for reg in reg_offers(self.ctx.skel, self.ctx.budget)
+            _Leaf(ctx=self.ctx, knobs={**self.knobs, **reg_knobs(self.ctx.dag, reg)}) for reg in reg_offers(self.ctx.dag, self.ctx.budget)
         ]
 
 
@@ -111,8 +124,7 @@ class _ChooseThread(Fork):
 
     def expand(self) -> list:
         return [
-            _ThreadChosen(ctx=self.ctx, thread=t, knobs=thread_knobs(self.ctx.skel, t))
-            for t in thread_offers(self.ctx.skel, self.ctx.budget)
+            _ThreadChosen(ctx=self.ctx, thread=t, knobs=thread_knobs(self.ctx.dag, t)) for t in thread_offers(self.ctx.dag, self.ctx.budget)
         ]
 
 
@@ -128,44 +140,46 @@ class _ChooseThreadFlash(Fork):
     knobs: dict
 
     def expand(self) -> list:
-        reg1 = reg_knobs(self.ctx.skel, (1, 1))
+        reg1 = reg_knobs(self.ctx.dag, (1, 1))
         return [
-            _Leaf(ctx=self.ctx, knobs={**thread_knobs(self.ctx.skel, t), **reg1}) for t in thread_offers(self.ctx.skel, self.ctx.budget)
+            _FlashLeaf(ctx=self.ctx, knobs={**thread_knobs(self.ctx.dag, t), **reg1}) for t in thread_offers(self.ctx.dag, self.ctx.budget)
         ]
 
 
-def build_pointwise_tree(skel: PointwiseSkeleton, *, dag: IterDag, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+def build_pointwise_tree(*, dag: IterDag, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
     """Return the root ``Fork`` of the generative tree, a bare ``TileOp`` when
     only one variant is legal (mirrors the legacy single-variant short-circuit),
     or ``None`` when nothing is legal (the dispatcher falls through to legacy)."""
     budget = Budget()
-    threads = thread_offers(skel, budget)
-    regs = reg_offers(skel, budget)
+    threads = thread_offers(dag, budget)
+    regs = reg_offers(dag, budget)
     if not threads or not regs:
         return None
-    ctx = _Ctx(skel=skel, dag=dag, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name)
+    ctx = _Ctx(dag=dag, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name)
     if len(threads) == 1 and len(regs) == 1:
-        full = {**thread_knobs(skel, threads[0]), **reg_knobs(skel, regs[0])}
-        return build_pointwise_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+        full = {**thread_knobs(dag, threads[0]), **reg_knobs(dag, regs[0])}
+        return build_pointwise_tile(full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
     return _ChooseThread(ctx=ctx, knobs={})
 
 
-def build_flash_tree(skel: FlashSkeleton, *, dag: IterDag, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+def build_flash_tree(
+    *, dag: IterDag, target_names: frozenset[str], k_bounds: dict, base_knobs: dict, kernel_name: str
+) -> Fork | TileOp | None:
     """Flash nest: the same free-axis (thread → register) generative tree as
     pointwise, but each leaf materializes via `build_flash_tile` (which serial-
     transforms the streaming reduces). The reduces aren't a search dimension —
     the `FlashCombine` carrier owns the KV recurrence."""
     budget = Budget()
-    threads = thread_offers(skel, budget)
+    threads = thread_offers(dag, budget)
     if not threads:
         return None
     # FM=FN=1 only (the streaming carrier can't span register cells), so the
     # register tile is not a search dimension — just the thread tile.
-    ctx = _Ctx(skel=skel, dag=dag, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name, tile_builder=build_flash_tile)
-    reg1 = reg_knobs(skel, (1, 1))
+    ctx = _Ctx(dag=dag, budget=budget, base_knobs=base_knobs, kernel_name=kernel_name, target_names=target_names, k_bounds=k_bounds)
+    reg1 = reg_knobs(dag, (1, 1))
     if len(threads) == 1:
-        full = {**thread_knobs(skel, threads[0]), **reg1}
-        return build_flash_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+        full = {**thread_knobs(dag, threads[0]), **reg1}
+        return build_flash_tile(full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag, target_names=target_names, k_bounds=k_bounds)
     return _ChooseThreadFlash(ctx=ctx, knobs={})
 
 
@@ -180,7 +194,13 @@ class _MmLeaf(Fork):
 
     def expand(self) -> list:
         return [
-            build_matmul_tile(self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag)
+            build_matmul_tile(
+                self.knobs,
+                kernel_name=self.ctx.kernel_name,
+                base_knobs=self.ctx.base_knobs,
+                dag=self.ctx.dag,
+                target_names=self.ctx.target_names,
+            )
         ]
 
 
@@ -195,8 +215,8 @@ class _MmThreadChosen(Fork):
     def expand(self) -> list:
         fk = self.knobs[RED_FK.name]
         return [
-            _MmLeaf(ctx=self.ctx, knobs={**self.knobs, **reg_knobs(self.ctx.skel, reg)})
-            for reg in matmul_reg_offers(self.ctx.skel, self.ctx.budget, fk)
+            _MmLeaf(ctx=self.ctx, knobs={**self.knobs, **reg_knobs(self.ctx.dag, reg)})
+            for reg in matmul_reg_offers(self.ctx.dag, self.ctx.budget, fk)
         ]
 
 
@@ -209,8 +229,8 @@ class _MmReduceChosen(Fork):
 
     def expand(self) -> list:
         return [
-            _MmThreadChosen(ctx=self.ctx, knobs={**self.knobs, **thread_knobs(self.ctx.skel, t)})
-            for t in matmul_thread_offers(self.ctx.skel, self.ctx.budget)
+            _MmThreadChosen(ctx=self.ctx, knobs={**self.knobs, **thread_knobs(self.ctx.dag, t)})
+            for t in matmul_thread_offers(self.ctx.dag, self.ctx.budget)
         ]
 
 
@@ -222,21 +242,21 @@ class _MmChooseReduce(Fork):
     knobs: dict
 
     def expand(self) -> list:
-        return [_MmReduceChosen(ctx=self.ctx, knobs=reduce_knobs(r)) for r in matmul_reduce_offers(self.ctx.skel)]
+        return [_MmReduceChosen(ctx=self.ctx, knobs=reduce_knobs(r)) for r in matmul_reduce_offers(self.ctx.dag)]
 
 
 def _scalar_subtree(ctx: _Ctx) -> Fork | TileOp | None:
     """The scalar-tier matmul subtree (reduce → thread → register), or a bare
     ``TileOp`` for a single variant, or ``None`` if nothing is legal."""
-    skel = ctx.skel
-    reduces = matmul_reduce_offers(skel)
-    threads = matmul_thread_offers(skel, ctx.budget)
+    dag = ctx.dag
+    reduces = matmul_reduce_offers(dag)
+    threads = matmul_thread_offers(dag, ctx.budget)
     if not reduces or not threads:
         return None
-    regs0 = matmul_reg_offers(skel, ctx.budget, reduces[0][1])
+    regs0 = matmul_reg_offers(dag, ctx.budget, reduces[0][1])
     if len(reduces) == 1 and len(threads) == 1 and len(regs0) == 1:
-        full = {**reduce_knobs(reduces[0]), **thread_knobs(skel, threads[0]), **reg_knobs(skel, regs0[0])}
-        return build_matmul_tile(skel, full, kernel_name=ctx.kernel_name, base_knobs=ctx.base_knobs, dag=ctx.dag)
+        full = {**reduce_knobs(reduces[0]), **thread_knobs(dag, threads[0]), **reg_knobs(dag, regs0[0])}
+        return build_matmul_tile(full, kernel_name=ctx.kernel_name, base_knobs=ctx.base_knobs, dag=dag, target_names=ctx.target_names)
     return _MmChooseReduce(ctx=ctx, knobs={})
 
 
@@ -253,7 +273,7 @@ class _WarpLeaf(Fork):
     def expand(self) -> list:
         return [
             build_warp_matmul_tile(
-                self.ctx.skel, self.atom, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag
+                self.atom, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag
             )
         ]
 
@@ -267,7 +287,7 @@ class _WarpChooseBk(Fork):
     def expand(self) -> list:
         return [
             _WarpLeaf(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_bk_knobs(bk)})
-            for bk in warp_bk_offers(self.ctx.skel, self.atom)
+            for bk in warp_bk_offers(self.ctx.dag, self.atom)
         ]
 
 
@@ -281,7 +301,7 @@ class _WarpChooseReg(Fork):
         warp = (self.knobs[WARP_M.name], self.knobs[WARP_N.name])
         return [
             _WarpChooseBk(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_reg_knobs(reg)})
-            for reg in warp_reg_offers(self.ctx.skel, self.atom, warp)
+            for reg in warp_reg_offers(self.ctx.dag, self.atom, warp)
         ]
 
 
@@ -294,7 +314,7 @@ class _WarpChooseWarp(Fork):
     def expand(self) -> list:
         return [
             _WarpChooseReg(ctx=self.ctx, atom=self.atom, knobs={**self.knobs, **warp_knobs(self.atom, w)})
-            for w in warp_offers(self.ctx.skel, self.atom, self.ctx.budget)
+            for w in warp_offers(self.ctx.dag, self.atom, self.ctx.budget)
         ]
 
 
@@ -320,15 +340,15 @@ class _MmTensorize(Fork):
 
 
 def build_matmul_tree(
-    skel: MatmulSkeleton, *, dag: IterDag, loop_op, context, graph, base_knobs: dict, kernel_name: str
+    *, dag: IterDag, target_names: frozenset[str], loop_op, context, graph, base_knobs: dict, kernel_name: str
 ) -> Fork | TileOp | None:
     """Root of the generative matmul tree. The scalar subtree is always
     available; eligible tensor-core atoms add warp subtrees under a top-level
     ``Tensorize`` choice. Returns the scalar subtree directly when no atom is
     eligible, or ``None`` when even the scalar tier has nothing legal."""
-    ctx = _Ctx(skel=skel, dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
+    ctx = _Ctx(dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name, target_names=target_names)
     scalar = _scalar_subtree(ctx)
-    n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
+    n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
     # A symbolic **M** (outer, row) axis reaches the warp tier as a masked mma.sync
     # tile (`_warp_axis` ceil-divides + stamps `real_extent`; `020`/`005` clamp the
     # A-slab load + add a per-cell store guard). This is verified-correct across
@@ -340,7 +360,7 @@ def build_matmul_tree(
     # `CUDA_ERROR_MISALIGNED_ADDRESS` — that masked-N warp path is not yet landed. A
     # multi-accum matmul (gated MLP) also stays scalar (the warp builder takes one
     # reduce; `is_atom_eligible` would still pass on the first, so gate explicitly).
-    scalar_only = skel.inner_n.symbolic or n_reduce > 1
+    scalar_only = dag.inner_n.symbolic or n_reduce > 1
     # Honor the legacy ``MMA`` pin (the aliased ``TC_ATOM`` knob): ``MMA=0`` forces
     # the scalar tier (e.g. the FK half2 window); ``MMA=<kind>`` restricts to that
     # atom; unset / truthy auto-enumerates every eligible atom.
@@ -350,7 +370,7 @@ def build_matmul_tree(
     if scalar_only or not mma_enabled:
         atoms: list = []
     else:
-        atoms = [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(skel, a, ctx.budget)]
+        atoms = [a for a in eligible_atoms(loop_op, context, graph) if warp_offers(dag, a, ctx.budget)]
         if mma_kind is not None:
             atoms = [a for a in atoms if a.name == mma_kind]
     if not atoms:
@@ -372,7 +392,11 @@ class _CoopLeaf(Fork):
     def expand(self) -> list:
         return [
             build_coop_reduce_tile(
-                self.ctx.skel, self.knobs, kernel_name=self.ctx.kernel_name, base_knobs=self.ctx.base_knobs, dag=self.ctx.dag
+                self.knobs,
+                kernel_name=self.ctx.kernel_name,
+                base_knobs=self.ctx.base_knobs,
+                dag=self.ctx.dag,
+                target_names=self.ctx.target_names,
             )
         ]
 
@@ -385,43 +409,126 @@ class _CoopChooseReduce(Fork):
     def expand(self) -> list:
         # ``self.knobs`` carries the free-axis THREAD tiles (BN/BM); each reduce
         # leaf adds its (bk, fk, br).
-        return [_CoopLeaf(ctx=self.ctx, knobs={**self.knobs, **coop_reduce_knobs(r)}) for r in coop_reduce_offers(self.ctx.skel)]
+        return [_CoopLeaf(ctx=self.ctx, knobs={**self.knobs, **coop_reduce_knobs(r)}) for r in coop_reduce_offers(self.ctx.dag)]
 
 
-def build_coop_reduce_tree(skel: CoopReduceSkeleton, *, dag: IterDag, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+def build_coop_reduce_tree(*, dag: IterDag, target_names: frozenset[str], base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
     """Root of the cooperative-reduce tree (one ``(bk, fk, br)`` decision); a
     bare ``TileOp`` for a single legal variant, or ``None`` if none is legal. The
     free-axis THREAD tiles (``BN``/``BM``, the strided-cooperative form) are pinned
     once up front and ride every leaf."""
-    offers = coop_reduce_offers(skel)
+    offers = coop_reduce_offers(dag)
     if not offers:
         return None
-    free_knobs = coop_free_thread_knobs(skel)
-    ctx = _Ctx(skel=skel, dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name)
+    free_knobs = coop_free_thread_knobs(dag)
+    ctx = _Ctx(dag=dag, budget=Budget(), base_knobs=base_knobs, kernel_name=kernel_name, target_names=target_names)
     if len(offers) == 1:
         full = {**free_knobs, **coop_reduce_knobs(offers[0])}
-        return build_coop_reduce_tile(skel, full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+        return build_coop_reduce_tile(full, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag, target_names=target_names)
     return _CoopChooseReduce(ctx=ctx, knobs=free_knobs)
 
 
-def build_partition(nest, *, dag: IterDag, loop_op, context, graph, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
-    """The single partition entry — one ``build_partition(dag)`` over the
-    iteration-DAG view, replacing the four per-regime tree entry points
-    (``build_pointwise_tree`` / ``build_matmul_tree`` / ``build_coop_reduce_tree``
-    / ``build_flash_tree``). The regime is the algebra ``walk_nest`` tagged the
-    nest with (still carried by the projected skeleton type pending the skeleton
-    dissolution); every branch offers the same ``legal_decomps`` family filtered
-    by carrier traits. Returns a ``Fork`` / ``TileOp`` for a covered regime, or
-    ``None`` to fall through. See ``plans/algebra-licensed-decomposition-moves.md``
-    (phase 6)."""
-    if isinstance(nest, PointwiseSkeleton):
-        return build_pointwise_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
-    if isinstance(nest, MatmulSkeleton):
-        return build_matmul_tree(
-            nest, dag=dag, loop_op=loop_op, context=context, graph=graph, base_knobs=base_knobs, kernel_name=kernel_name
-        )
-    if isinstance(nest, CoopReduceSkeleton):
-        return build_coop_reduce_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
-    if isinstance(nest, FlashSkeleton):
-        return build_flash_tree(nest, dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
+@dataclass(frozen=True)
+class _Regime:
+    """The transient classification handoff (not a typed skeleton): the regime tag
+    plus the K-info derived off the DAG — ``target_names`` (the K-extent loop names
+    a reduce transform rewrites) and the flash streaming ``k_bounds``."""
+
+    kind: str  # "pointwise" | "matmul" | "coop" | "flash"
+    target_names: frozenset[str] = frozenset()
+    k_bounds: dict = field(default_factory=dict)
+
+
+def classify(dag: IterDag) -> _Regime | None:
+    """Tag the nest's regime off the derived DAG (no typed-skeleton layer), or
+    ``None`` for a shape the composer leaves to the legacy planner. The regime is
+    the reduce axes' ``Loop.algebra_kind`` (``MAP`` → pointwise, ``SEMIRING`` →
+    matmul, ``MONOID`` → cooperative reduce, ``TWISTED_MONOID`` → flash if it nests
+    a reduce, else a cooperative monoid). This is the recognition predicate
+    ``005_split_demoted`` consults to decide whether a fused cone composes."""
+    if not dag.parallel:
+        return None
+    reduce_loops = [n.loop for n in dag.reduce]
+    algebras = dag.algebras
+    inner_body = dag.inner_body
+    # Flash = a TWISTED_MONOID stream wrapping a NESTED reduce (the QK^T SEMIRING
+    # inside the KV stream). A non-nested single monoid stream is a cooperative
+    # MONOID reduce (softmax LSE), handled on the coop path below.
+    nested_reduce = any(n.parent is not None and n.parent.role is AxisRole.REDUCE for n in dag.reduce)
+    coop_monoid = AlgebraKind.TWISTED_MONOID in algebras and not nested_reduce
+
+    if AlgebraKind.TWISTED_MONOID in algebras and nested_reduce:
+        # Fused flash: a symbolic ``seq_len`` lands on the free q-rows axis (masked
+        # tile) AND the streaming KV reduce (masked stream — ``k_bounds``); the
+        # nested QK^T reduce (head_dim) must stay static.
+        if len(dag.parallel) < 2:
+            return None
+        twisted = [lp for lp in reduce_loops if lp.algebra_kind == AlgebraKind.TWISTED_MONOID]
+        if any(not lp.axis.extent.is_static for lp in reduce_loops if lp.algebra_kind != AlgebraKind.TWISTED_MONOID):
+            return None
+        k_bounds = {lp.axis.name: lp.axis.extent.expr for lp in twisted if not lp.axis.extent.is_static}
+        return _Regime("flash", frozenset(lp.axis.name for lp in reduce_loops), k_bounds)
+
+    if not reduce_loops:  # PARALLEL-only — pointwise.
+        return _Regime("pointwise")
+
+    k_dim = reduce_loops[0].axis.extent
+    body_loops = [s for s in inner_body if isinstance(s, Loop)]
+
+    if algebras == {AlgebraKind.SEMIRING}:
+        # Matmul. A MAP epilogue (QK^T scale, matmul_add) rides the output tile;
+        # require static K, an M + N free pair, all body loops to BE reduces over
+        # the one K extent (reject a map-loop prologue), and a Write present.
+        if not k_dim.is_static or len(dag.parallel) < 2:
+            return None
+        if {lp.axis.extent for lp in reduce_loops} != {k_dim}:
+            return None
+        if not body_loops or any(lp.axis.extent != k_dim or not lp.is_reduce for lp in body_loops):
+            return None
+        if not any(isinstance(s, Write) for s in inner_body):
+            return None
+        return _Regime("matmul", frozenset(lp.axis.name for lp in body_loops))
+
+    if algebras == {AlgebraKind.MONOID} or coop_monoid:
+        # Cooperative reduce. The reduce(s) + any second-pass map loop iterate the
+        # SAME K axis. ``coop_monoid`` (a non-nested softmax LSE Monoid) is static-K
+        # only (the masked-K fill isn't wired for the tuple-state carrier).
+        if coop_monoid and not k_dim.is_static:
+            return None
+        k_extent = k_dim.as_static() if k_dim.is_static else (k_dim.hint or 0)
+        if k_extent < 1:
+            return None
+        if {lp.axis.extent for lp in reduce_loops} != {k_dim}:
+            return None
+        if any(lp.axis.extent != k_dim for lp in body_loops):
+            return None
+        return _Regime("coop", frozenset(lp.axis.name for lp in body_loops))
+
     return None
+
+
+def build_partition(*, dag: IterDag, loop_op, context, graph, base_knobs: dict, kernel_name: str) -> Fork | TileOp | None:
+    """The single partition entry — one ``build_partition(dag)`` over the derived
+    iteration-DAG view (no typed-skeleton layer). :func:`classify` tags the regime
+    + derives the K-info off the DAG; every regime offers the same ``legal_decomps``
+    family filtered by carrier traits. Returns a ``Fork`` / ``TileOp`` for a covered
+    regime, or ``None`` to fall through. See
+    ``plans/algebra-licensed-decomposition-moves.md`` (phase 6)."""
+    r = classify(dag)
+    if r is None:
+        return None
+    if r.kind == "pointwise":
+        return build_pointwise_tree(dag=dag, base_knobs=base_knobs, kernel_name=kernel_name)
+    if r.kind == "matmul":
+        return build_matmul_tree(
+            dag=dag,
+            target_names=r.target_names,
+            loop_op=loop_op,
+            context=context,
+            graph=graph,
+            base_knobs=base_knobs,
+            kernel_name=kernel_name,
+        )
+    if r.kind == "coop":
+        return build_coop_reduce_tree(dag=dag, target_names=r.target_names, base_knobs=base_knobs, kernel_name=kernel_name)
+    return build_flash_tree(dag=dag, target_names=r.target_names, k_bounds=r.k_bounds, base_knobs=base_knobs, kernel_name=kernel_name)

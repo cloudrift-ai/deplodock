@@ -37,9 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_warp_matmul_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import eligible_atoms
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree, classify
 
 # Move knobs are aliased to the legacy tile names (BN/BM/FN/FM/BK/FK/SPLITK/MMA/
 # WM/WN); reference via the alias ``.name`` so the assertions track the aliasing.
@@ -96,22 +94,22 @@ def _sum_reduce() -> LoopOp:
 
 
 def test_lift_matmul_names_axes():
-    skel = walk_nest(_matmul(64, 96, 128))
-    assert skel is not None
-    assert skel.inner_n.extent == 96
-    assert skel.outer_m.extent == 64
-    # axis names are canonicalized (a0/a1/a2…) by LoopOp normalization
-    assert skel.k_extent == 128
-    assert skel.k_name == skel.k_loop.axis.name
+    dag = iter_dag(_matmul(64, 96, 128))
+    assert classify(dag) is not None and classify(dag).kind == "matmul"
+    assert dag.inner_n.extent == 96
+    assert dag.outer_m.extent == 64
+    assert dag.k_extent == 128
+    assert dag.k_node.loop.axis.name == dag.reduce[0].axis.name
 
 
 def test_lift_matmul_rejects_non_matmul_reduce():
-    assert not isinstance(walk_nest(_sum_reduce()), MatmulSkeleton)
+    r = classify(iter_dag(_sum_reduce()))
+    assert r is None or r.kind != "matmul"
 
 
 def test_lift_pointwise_rejects_matmul():
     # the matmul must NOT be claimed by the pointwise regime (it has a reduce)
-    assert not isinstance(walk_nest(_matmul(64, 96, 128)), PointwiseSkeleton)
+    assert classify(iter_dag(_matmul(64, 96, 128))).kind != "pointwise"
 
 
 def _matmul_scaled(m: int, n: int, k: int) -> LoopOp:
@@ -146,10 +144,10 @@ def _matmul_scaled(m: int, n: int, k: int) -> LoopOp:
 def test_matmul_with_scale_epilogue_composes_and_forces_splitk1():
     from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import matmul_reduce_offers  # noqa: PLC0415
 
-    skel = walk_nest(_matmul_scaled(64, 96, 256))
-    assert isinstance(skel, MatmulSkeleton), "matmul + MAP epilogue should compose (epilogue rides the output tile)"
+    dag = iter_dag(_matmul_scaled(64, 96, 256))
+    assert classify(dag) is not None and classify(dag).kind == "matmul", "matmul + MAP epilogue should compose"
     # A MAP epilogue forces SPLITK=1 (cross-CTA atomic-add over a partial would be wrong).
-    assert {sk for _, _, sk in matmul_reduce_offers(skel)} == {1}
+    assert {sk for _, _, sk in matmul_reduce_offers(dag)} == {1}
 
 
 def _gated_matmul(m: int, n: int, k: int) -> LoopOp:
@@ -204,12 +202,12 @@ def test_multi_accumulator_matmul_composes():
     g.add_node(op=_gated_matmul(64, 96, 256), inputs=["a", "g", "u"], output=Tensor("o", (64, 96), dtype=F16), node_id="o")
     g.inputs = ["a", "g", "u"]
     g.outputs = ["o"]
-    skel = walk_nest(g.nodes["o"].op)
-    assert skel is not None, "gated MLP (multi-accumulator) should compose, not fall through to legacy"
+    dag = iter_dag(g.nodes["o"].op)
+    assert classify(dag) is not None, "gated MLP (multi-accumulator) should compose, not fall through to legacy"
     # Fusion merges the two same-K contractions into one loop with two Accums.
     from deplodock.compiler.ir.stmt import Body  # noqa: PLC0415
 
-    assert len(list(Body(skel.inner_body).iter_of_type(Accum))) == 2, "both gate + up accumulators present"
+    assert len(list(Body(dag.inner_body).iter_of_type(Accum))) == 2, "both gate + up accumulators present"
 
 
 def _graph(m: int, n: int, k: int, dtype):
@@ -227,9 +225,9 @@ _CTX = Context(compute_capability=(8, 0))
 
 def test_tree_leaves_complete_and_within_budget():
     g = _graph(128, 128, 128, F32)  # fp32 → scalar subtree only
-    skel = walk_nest(g.nodes["o"].op)
+    dag = iter_dag(g.nodes["o"].op)
     tree = build_matmul_tree(
-        skel, dag=iter_dag(g.nodes["o"].op), loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k"
+        dag=dag, target_names=classify(dag).target_names, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k"
     )
     leaves = flatten_leaves([tree])
     assert len(leaves) > 1
@@ -242,8 +240,7 @@ def test_tree_leaves_complete_and_within_budget():
 
 
 def test_materialize_emits_k_serial_tower():
-    lo = _matmul(128, 128, 128)
-    skel = walk_nest(lo)
+    dag = iter_dag(_matmul(128, 128, 128))
     knobs = {
         MAP_N_THREAD.name: 8,
         MAP_N_REG.name: 1,
@@ -253,7 +250,7 @@ def test_materialize_emits_k_serial_tower():
         RED_FK.name: 1,
         RED_SPLITK.name: 1,
     }
-    tile = build_matmul_tile(skel, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(lo))
+    tile = build_matmul_tile(knobs, kernel_name="k", base_knobs={}, dag=dag, target_names=classify(dag).target_names)
     assert isinstance(tile, TileOp)
     serials = list(tile.body.iter_of_type(SerialTile))
     kinds = {s.kind for s in serials}
@@ -291,9 +288,9 @@ def test_eligible_atoms_fp16_yes_fp32_no():
 
 def test_matmul_tree_offers_warp_for_fp16():
     g = _graph(64, 128, 64, F16)
-    skel = walk_nest(g.nodes["o"].op)
+    dag = iter_dag(g.nodes["o"].op)
     tree = build_matmul_tree(
-        skel, dag=iter_dag(g.nodes["o"].op), loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k"
+        dag=dag, target_names=classify(dag).target_names, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k"
     )
     leaves = flatten_leaves([tree])
     warp_leaves = [leaf for leaf in leaves if leaf.knobs.get(TC_ATOM.name)]
@@ -306,11 +303,11 @@ def test_matmul_tree_offers_warp_for_fp16():
 
 def test_build_warp_tile_emits_warp_atom_and_mma_knob():
     g = _graph(64, 128, 64, F16)
-    skel = walk_nest(g.nodes["o"].op)
+    dag = iter_dag(g.nodes["o"].op)
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
     # 64x128x64 / atom(16,8,16): cells_m=4, cells_n=16, kc=4 → wm=2,wn=2 ; pm=2,pn=8
     knobs = {TC_ATOM.name: atom.name, WARP_M.name: 2, WARP_N.name: 2, TC_REG_M.name: 2, TC_REG_N.name: 4, TC_BK.name: 4}
-    tile = build_warp_matmul_tile(skel, atom, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(g.nodes["o"].op))
+    tile = build_warp_matmul_tile(atom, knobs, kernel_name="k", base_knobs={}, dag=dag)
     assert isinstance(tile, TileOp)
     assert tile.knobs["MMA"] == atom.name, "warp tile must carry the MMA knob (020/005/is_warp tier discriminator)"
     assert list(tile.body.iter_of_type(WarpTile)), "warp tower must nest a WarpTile"
@@ -324,12 +321,19 @@ def test_build_warp_tile_emits_warp_atom_and_mma_knob():
 def test_build_matmul_tile_splitk_adds_grid_axis():
     # M=64 (tile 16·4=64 → M_b=1), N=64 (tile 8 → N_b=8); only the K_s axis has
     # extent 4. (Axis names canonicalize to a0/a1/… so match on extent, not name.)
-    lo = _matmul(64, 64, 256)
-    skel = walk_nest(lo)
-    dag = iter_dag(lo)
+    dag = iter_dag(_matmul(64, 64, 256))
+    tn = classify(dag).target_names
     base = {MAP_N_THREAD.name: 8, MAP_N_REG.name: 1, MAP_M_THREAD.name: 16, MAP_M_REG.name: 4, RED_BK.name: 1, RED_FK.name: 1}
-    g1 = list(build_matmul_tile(skel, {**base, RED_SPLITK.name: 1}, kernel_name="k", base_knobs={}, dag=dag).body.iter_of_type(GridTile))
-    g4 = list(build_matmul_tile(skel, {**base, RED_SPLITK.name: 4}, kernel_name="k", base_knobs={}, dag=dag).body.iter_of_type(GridTile))
+    g1 = list(
+        build_matmul_tile({**base, RED_SPLITK.name: 1}, kernel_name="k", base_knobs={}, dag=dag, target_names=tn).body.iter_of_type(
+            GridTile
+        )
+    )
+    g4 = list(
+        build_matmul_tile({**base, RED_SPLITK.name: 4}, kernel_name="k", base_knobs={}, dag=dag, target_names=tn).body.iter_of_type(
+            GridTile
+        )
+    )
     n1 = sum(len(g.axes) for g in g1)
     extents4 = [ax.extent.as_static() for g in g4 for ax in g.axes]
     assert sum(len(g.axes) for g in g4) == n1 + 1, "split-K must add exactly one grid axis"

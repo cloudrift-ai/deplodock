@@ -16,8 +16,7 @@ from deplodock.compiler.ir.tile.ir import ThreadTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import COOP_BR, RED_BK, RED_FK
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_coop_reduce_tile
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import CoopReduceSkeleton
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import classify
 
 
 def _reduce_epilogue_map(rows: int, k: int) -> LoopOp:
@@ -52,13 +51,14 @@ def _reduce_epilogue_map(rows: int, k: int) -> LoopOp:
 
 
 def test_walk_recognizes_reduce_with_epilogue_and_map():
-    nest = walk_nest(_reduce_epilogue_map(64, 128))
-    assert nest is not None and nest.k_extent == 128
+    dag = iter_dag(_reduce_epilogue_map(64, 128))
+    r = classify(dag)
+    assert r is not None and r.kind == "coop" and dag.k_extent == 128
     # Both the reduce and the second-pass map loop (different names, same extent)
     # are cooperative-split targets.
-    assert len(nest.target_names) == 2, f"reduce + map should both be K targets: {nest.target_names}"
+    assert len(r.target_names) == 2, f"reduce + map should both be K targets: {r.target_names}"
     # The scalar epilogue (reciprocal) survives in the body to ride the row tile.
-    assert any(isinstance(s, Assign) for s in nest.inner_body), "epilogue Assign must survive the walk"
+    assert any(isinstance(s, Assign) for s in dag.inner_body), "epilogue Assign must survive the walk"
 
 
 def _sum(rows: int, k: int) -> LoopOp:
@@ -83,29 +83,28 @@ def _sum(rows: int, k: int) -> LoopOp:
 
 
 def test_lift_coop_reduce_detects_monoid():
-    skel = walk_nest(_sum(64, 128))
-    assert skel is not None
-    assert skel.k_extent == 128
-    assert skel.inner_n.extent == 64
+    dag = iter_dag(_sum(64, 128))
+    assert classify(dag) is not None and classify(dag).kind == "coop"
+    assert dag.k_extent == 128
+    assert dag.inner_n.extent == 64
 
 
 def test_lift_coop_reduce_accepts_small_k():
     # K=16 < warp_size still composes — the builder deploys COOP_BR=1, a plain
     # per-row serial reduce (offers bound br·bk·fk ≤ k_extent), no warp shuffle.
-    assert isinstance(walk_nest(_sum(64, 16)), CoopReduceSkeleton)
+    assert classify(iter_dag(_sum(64, 16))).kind == "coop"
 
 
 def test_lift_coop_reduce_rejects_matmul():
     from tests.compiler.passes.test_move_composer_matmul import _matmul  # noqa: PLC0415
 
-    assert not isinstance(walk_nest(_matmul(64, 64, 128)), CoopReduceSkeleton)
+    assert classify(iter_dag(_matmul(64, 64, 128))).kind != "coop"
 
 
 def test_build_coop_tile_has_kc_thread_axis():
-    lo = _sum(64, 128)
-    skel = walk_nest(lo)
+    dag = iter_dag(_sum(64, 128))
     knobs = {RED_BK.name: 1, RED_FK.name: 1, COOP_BR.name: 128}
-    tile = build_coop_reduce_tile(skel, knobs, kernel_name="k", base_knobs={}, dag=iter_dag(lo))
+    tile = build_coop_reduce_tile(knobs, kernel_name="k", base_knobs={}, dag=dag, target_names=classify(dag).target_names)
     assert isinstance(tile, TileOp)
     # Axis names canonicalize to a0/a1/… — match on structure, not name. The
     # cooperative BR threads bind to a THREAD axis of extent 128.

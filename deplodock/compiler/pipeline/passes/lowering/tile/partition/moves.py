@@ -24,7 +24,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligi
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.decompose import legal_decomps
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import _carrier_of
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag, _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     BK_CHOICES,
     BR_CHOICES,
@@ -48,11 +48,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     WARP_CHOICES,
     WARP_M,
     WARP_N,
-)
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import (
-    CoopReduceSkeleton,
-    MatmulSkeleton,
-    PointwiseSkeleton,
 )
 
 
@@ -85,41 +80,41 @@ def _axis_thread_choices(extent: int) -> tuple[int, ...]:
 _THREAD_TARGET = 256
 
 
-def thread_offers(skel: PointwiseSkeleton, budget: Budget) -> list[tuple[int, int]]:
+def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(thread_n, thread_m)`` thread tiles within the CTA thread
     budget, best-first (≈``_THREAD_TARGET`` threads, larger to break ties).
     ``thread_m`` is ``1`` for a 1-D pointwise kernel (no M axis)."""
-    n_choices = _axis_thread_choices(skel.inner_n.extent)
-    m_choices = _axis_thread_choices(skel.outer_m.extent) if skel.outer_m is not None else (1,)
+    n_choices = _axis_thread_choices(dag.inner_n.extent)
+    m_choices = _axis_thread_choices(dag.outer_m.extent) if dag.outer_m is not None else (1,)
     out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
     out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
     return out
 
 
-def reg_offers(skel: PointwiseSkeleton, budget: Budget) -> list[tuple[int, int]]:
+def reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles within the cell budget, best-first
     (fewest cells — pointwise is bandwidth bound; prefer tiling the contiguous N
     axis on ties)."""
-    m_choices = _POINTWISE_REG_CHOICES if skel.outer_m is not None else (1,)
+    m_choices = _POINTWISE_REG_CHOICES if dag.outer_m is not None else (1,)
     out = [(r_n, r_m) for r_n in _POINTWISE_REG_CHOICES for r_m in m_choices if budget.cells_ok(r_n * r_m)]
     out.sort(key=lambda rm: (rm[0] * rm[1], -rm[0]))
     return out
 
 
-def thread_knobs(skel: PointwiseSkeleton, thread: tuple[int, int]) -> dict:
+def thread_knobs(dag: IterDag, thread: tuple[int, int]) -> dict:
     """Knob delta a thread-tile branch pins."""
     t_n, t_m = thread
     knobs = {MAP_N_THREAD.name: t_n}
-    if skel.outer_m is not None:
+    if dag.outer_m is not None:
         knobs[MAP_M_THREAD.name] = t_m
     return knobs
 
 
-def reg_knobs(skel: PointwiseSkeleton, reg: tuple[int, int]) -> dict:
+def reg_knobs(dag: IterDag, reg: tuple[int, int]) -> dict:
     """Knob delta a register-tile leaf adds on top of its thread branch."""
     r_n, r_m = reg
     knobs = {MAP_N_REG.name: r_n}
-    if skel.outer_m is not None:
+    if dag.outer_m is not None:
         knobs[MAP_M_REG.name] = r_m
     return knobs
 
@@ -129,7 +124,7 @@ def reg_knobs(skel: PointwiseSkeleton, reg: tuple[int, int]) -> dict:
 _CELL_TARGET = 16  # matmul wants a register tile big enough for ILP, small enough for occupancy
 
 
-def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
+def matmul_reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     """Legal ``(bk, fk, splitk)`` K-tilings: ``splitk·bk·fk`` divides the static
     K extent (so ``K_o = K/(splitk·bk·fk)`` is whole). Best-first: no split-K
     (``splitk=1``, a perf opt for small-MN/large-K), deep chunk (large ``bk``),
@@ -145,16 +140,16 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     # A MAP epilogue (QK^T scale, matmul_add) or a multi-accumulator matmul
     # (gated MLP — several same-K reduces) forces SPLITK=1: a non-linear epilogue
     # or a coupled multi-accum over a partial would corrupt the cross-CTA sum.
-    has_epilogue = any(not isinstance(s, (Loop, Write)) for s in skel.inner_body)
-    n_reduce = sum(1 for s in skel.inner_body if isinstance(s, Loop) and s.is_reduce)
+    has_epilogue = any(not isinstance(s, (Loop, Write)) for s in dag.inner_body)
+    n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
     allow_split = not (has_epilogue or n_reduce > 1)
     sks = (1,) if not allow_split else ((sk_pin,) if sk_pin else SPLITK_CHOICES)
     # Factor order [splitk (BLOCK), bk (STAGE_INNER), fk (REGISTER)] — the
     # partition (splitk) is factor 0, where the commutative-combine gate applies.
     decomps = legal_decomps(
-        _carrier_of(skel.k_loop),
-        skel.k_loop.axis,
-        skel.k_extent,
+        _carrier_of(dag.k_node.loop),
+        dag.k_node.loop.axis,
+        dag.k_extent,
         factor_menus=[sks, bks, fks],
         placement=[Role.BLOCK, Role.STAGE_INNER, Role.REGISTER],
         masked=False,
@@ -165,16 +160,16 @@ def matmul_reduce_offers(skel: MatmulSkeleton) -> list[tuple[int, int, int]]:
     return out
 
 
-def matmul_thread_offers(skel: MatmulSkeleton, budget: Budget) -> list[tuple[int, int]]:
+def matmul_thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(thread_n, thread_m)`` for a matmul, best-first (≈256 threads)."""
-    n_choices = _axis_thread_choices(skel.inner_n.extent)
-    m_choices = _axis_thread_choices(skel.outer_m.extent)
+    n_choices = _axis_thread_choices(dag.inner_n.extent)
+    m_choices = _axis_thread_choices(dag.outer_m.extent)
     out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
     out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
     return out
 
 
-def matmul_reg_offers(skel: MatmulSkeleton, budget: Budget, fk: int) -> list[tuple[int, int]]:
+def matmul_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles for a matmul under the cell budget
     (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells)."""
     out = [(r_n, r_m) for r_n in REG_CHOICES for r_m in REG_CHOICES if budget.cells_ok(fk * r_n * r_m)]
@@ -200,11 +195,11 @@ def eligible_atoms(loop_op, ctx, graph) -> list[Atom]:
     return [a for a in ATOM_REGISTRY.values() if is_atom_eligible(a, loop_op, ctx, graph=graph)]
 
 
-def warp_offers(skel: MatmulSkeleton, atom: Atom, budget: Budget) -> list[tuple[int, int]]:
+def warp_offers(dag: IterDag, atom: Atom, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(wm, wn)`` warp grids: divide the per-atom cell counts, ≥2 warps
     (single warp can't stage ldmatrix), ``wm·wn·32 ≤`` thread budget."""
-    cells_m = skel.outer_m.extent // atom.shape[0]
-    cells_n = skel.inner_n.extent // atom.shape[1]
+    cells_m = dag.outer_m.extent // atom.shape[0]
+    cells_n = dag.inner_n.extent // atom.shape[1]
     out = [
         (wm, wn)
         for wm in WARP_CHOICES
@@ -215,20 +210,20 @@ def warp_offers(skel: MatmulSkeleton, atom: Atom, budget: Budget) -> list[tuple[
     return out
 
 
-def warp_reg_offers(skel: MatmulSkeleton, atom: Atom, warp: tuple[int, int]) -> list[tuple[int, int]]:
+def warp_reg_offers(dag: IterDag, atom: Atom, warp: tuple[int, int]) -> list[tuple[int, int]]:
     """Legal ``(fm, fn)`` register cells per warp: divide the per-warp cell
     counts, ``fm·fn ≤`` the warp-cell budget."""
     wm, wn = warp
-    pm = (skel.outer_m.extent // atom.shape[0]) // wm
-    pn = (skel.inner_n.extent // atom.shape[1]) // wn
+    pm = (dag.outer_m.extent // atom.shape[0]) // wm
+    pn = (dag.inner_n.extent // atom.shape[1]) // wn
     out = [(fm, fn) for fm in TC_REG_CHOICES for fn in TC_REG_CHOICES if pm % fm == 0 and pn % fn == 0 and fm * fn <= _MAX_WARP_CELLS]
     out.sort(key=lambda r: (abs(r[0] * r[1] - 8), -r[0] * r[1]))
     return out
 
 
-def warp_bk_offers(skel: MatmulSkeleton, atom: Atom) -> list[int]:
+def warp_bk_offers(dag: IterDag, atom: Atom) -> list[int]:
     """Legal ``bk`` (K chunk in atom-K units): divides the atom-K cell count."""
-    kc = skel.k_extent // atom.shape[2]
+    kc = dag.k_extent // atom.shape[2]
     out = [bk for bk in BK_CHOICES if bk <= kc and kc % bk == 0]
     out.sort(key=lambda bk: -bk)
     return out
@@ -254,7 +249,7 @@ def warp_bk_knobs(bk: int) -> dict:
 _BR_TARGET = 128  # ~4 warps cooperating per row
 
 
-def coop_free_threads(skel: CoopReduceSkeleton) -> tuple[int, int]:
+def coop_free_threads(dag: IterDag) -> tuple[int, int]:
     """Free-axis THREAD tiles ``(bn, bm)`` for a cooperative reduce, default
     ``(1, 1)`` — the whole-CTA form (one row per CTA, ``BR`` threads reduce it).
     A pinned ``BN``/``BM`` > 1 thread-binds the free rows ALONGSIDE the ``BR``
@@ -262,11 +257,11 @@ def coop_free_threads(skel: CoopReduceSkeleton) -> tuple[int, int]:
     q/k-norm deploys a ``BN×BR`` CTA instead of a degenerate one). Honors the
     same ``DEPLODOCK_BN`` / ``DEPLODOCK_BM`` pins the legacy planner reads."""
     bn = _pin(MAP_N_THREAD) or 1
-    bm = (_pin(MAP_M_THREAD) or 1) if skel.outer_m is not None else 1
+    bm = (_pin(MAP_M_THREAD) or 1) if dag.outer_m is not None else 1
     return bn, bm
 
 
-def coop_reduce_offers(skel: CoopReduceSkeleton, *, warp_size: int = 32) -> list[tuple[int, int, int]]:
+def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, int, int]]:
     """Legal ``(bk, fk, br)`` for a cooperative reduce: ``br`` (the cooperative
     thread count) ≤ 1024. For a static K, ``br·bk·fk`` must divide K; a symbolic
     (masked) K only needs ``br·bk·fk ≤`` the hint — the final partial tile is
@@ -283,21 +278,21 @@ def coop_reduce_offers(skel: CoopReduceSkeleton, *, warp_size: int = 32) -> list
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     brs = (br_pin,) if br_pin else BR_CHOICES
-    masked = skel.k_bound is not None
+    masked = dag.k_bound is not None
     # A short reduce (static K < warp_size) stays pure-serial (BR=1): too small to
     # stage a meaningful cross-thread tree-halve combine — matching the legacy
     # WARP_SIZE gate. It still composes (the serial per-row reduce), just without
     # cooperative threads. (A symbolic/masked K tiles at the hint, which is large.)
-    br_floor_serial = (not masked) and skel.k_extent < 32
-    bn, bm = coop_free_threads(skel)
+    br_floor_serial = (not masked) and dag.k_extent < 32
+    bn, bm = coop_free_threads(dag)
     strided = bn * bm > 1
     # Same decomposition move as split-K: factor [br (cooperative THREAD), bk
     # (STAGE_INNER), fk (REGISTER)] — the masked-K fill is licensed by the
     # carrier's identity (has_identity), the cooperative partition by commutative.
     decomps = legal_decomps(
-        _carrier_of(skel.k_loop),
-        skel.k_loop.axis,
-        skel.k_extent,
+        _carrier_of(dag.k_node.loop),
+        dag.k_node.loop.axis,
+        dag.k_extent,
         factor_menus=[brs, bks, fks],
         placement=[Role.THREAD, Role.STAGE_INNER, Role.REGISTER],
         masked=masked,
@@ -329,12 +324,12 @@ def coop_reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     return {RED_BK.name: bk, RED_FK.name: fk, COOP_BR.name: br}
 
 
-def coop_free_thread_knobs(skel: CoopReduceSkeleton) -> dict:
+def coop_free_thread_knobs(dag: IterDag) -> dict:
     """Knob delta for the free-axis THREAD tiles (``BN``/``BM``) a cooperative
     reduce binds — default ``1`` (whole-CTA), or the pinned strided-cooperative
     value. ``BM`` only when an outer free axis exists."""
-    bn, bm = coop_free_threads(skel)
+    bn, bm = coop_free_threads(dag)
     knobs = {MAP_N_THREAD.name: bn}
-    if skel.outer_m is not None:
+    if dag.outer_m is not None:
         knobs[MAP_M_THREAD.name] = bm
     return knobs

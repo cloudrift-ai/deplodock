@@ -125,24 +125,14 @@ def test_one_move_expresses_splitk_coop_and_splitkv():
 def test_matmul_offers_byte_identical():
     from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.loop import Axis as LAxis
-    from deplodock.compiler.ir.loop import Load, Loop, Write
+    from deplodock.compiler.ir.loop import Load, Loop, LoopOp, Write
+    from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
     from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import BK_CHOICES, FK_CHOICES, SPLITK_CHOICES
     from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import matmul_reduce_offers
-    from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, _map_axis
 
     for k in (64, 128, 96):
-        kl = Loop(axis=LAxis("k", k), body=(Load(name="a", input="a", index=(Var("k"),)), Accum(name="acc", value="a")))
-        nl = Loop(axis=LAxis("n", 128), body=(kl, Write(output="o", index=(Var("n"),), value="acc")))
-        skel = MatmulSkeleton(
-            inner_n=_map_axis(nl),
-            outer_m=_map_axis(Loop(axis=LAxis("m", 128), body=())),
-            extra_outer=(),
-            k_loop=kl,
-            k_name="k",
-            k_extent=k,
-            inner_body=(kl, Write(output="o", index=(Var("n"),), value="acc")),
-            leading=(),
-            target_names=frozenset({"k"}),
-        )
+        kl = Loop(axis=LAxis("k", k), body=(Load(name="a", input="a", index=(Var("m"), Var("k"))), Accum(name="acc", value="a")))
+        nl = Loop(axis=LAxis("n", 128), body=(kl, Write(output="o", index=(Var("m"), Var("n")), value="acc")))
+        lo = LoopOp(body=(Loop(axis=LAxis("m", 128), body=(nl,)),))
         ref = _ref_matmul(k, allow_split=True, sk_choices=SPLITK_CHOICES, bk_choices=BK_CHOICES, fk_choices=FK_CHOICES)
-        assert matmul_reduce_offers(skel) == ref
+        assert matmul_reduce_offers(iter_dag(lo)) == ref

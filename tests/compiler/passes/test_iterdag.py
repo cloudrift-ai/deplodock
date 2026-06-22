@@ -15,7 +15,6 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import AxisRole, iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
 
 def _matmul(m: int, n: int, k) -> LoopOp:
@@ -117,15 +116,13 @@ def test_symbolic_axis_flagged_and_hint_extent():
     assert m.symbolic and m.extent == 512  # tiles at the Dim hint
 
 
-def test_dag_inner_body_and_leading_feed_skeleton():
-    # The skeleton walk reads its fields off the DAG: the projected MatmulSkeleton's
-    # inner_body / leading / k axis match the dag nodes.
+def test_dag_accessors_feed_the_partition():
+    # The partition consumes the DAG directly (no skeleton): the free-axis + K-info
+    # accessors give the tiled axes and the contraction extent/bound.
     lo = _matmul(128, 256, 64)
     dag = iter_dag(lo)
-    skel = walk_nest(lo)
-    assert skel is not None
-    assert skel.inner_body == dag.inner_body
-    assert skel.leading == dag.leading
-    assert skel.k_name == dag.reduce[0].axis.name
-    assert skel.inner_n.loop.axis.name == dag.parallel[-1].loop.axis.name
-    assert skel.outer_m.loop.axis.name == dag.parallel[-2].loop.axis.name
+    assert dag.inner_n is dag.parallel[-1] and dag.inner_n.extent == 256
+    assert dag.outer_m is dag.parallel[-2] and dag.outer_m.extent == 128
+    assert dag.extra_outer == ()
+    assert dag.k_node is dag.reduce[0]
+    assert dag.k_extent == 64 and dag.k_bound is None  # static K

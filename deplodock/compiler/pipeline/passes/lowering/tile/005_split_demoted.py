@@ -109,10 +109,10 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     from deplodock import config  # noqa: PLC0415
 
     if config.move_composer_enabled():
-        from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag  # noqa: PLC0415
+        from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import classify  # noqa: PLC0415
 
-        warp_size = ctx.warp_size if ctx is not None else 32
-        if walk_nest(keep_fused, warp_size=warp_size) is None:
+        if classify(iter_dag(keep_fused)) is None:
             return _stamp(split)
         return keep_fused
     # The split fork's ranking knobs carry the offer site's full knob base

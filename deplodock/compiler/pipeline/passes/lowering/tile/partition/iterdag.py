@@ -8,12 +8,11 @@ reduce axis, the carrier whose algebra a decomposition move queries
 (``associative`` / ``commutative`` / ``has_identity``). See
 ``plans/algebra-licensed-decomposition-moves.md`` (phase 2).
 
-This is the one structure the partition consumes. The four regime skeletons
-(``PointwiseSkeleton`` / ``MatmulSkeleton`` / ``CoopReduceSkeleton`` /
-``FlashSkeleton``) are *projections* of this view — ``walk_nest`` builds the DAG
-and reads the skeleton fields off it, so the DAG is proven to carry everything
-the skeletons did (one source of truth). Later phases dissolve the skeletons
-entirely in favour of ``build_partition(dag)``.
+This is **the one structure the partition consumes** — the typed regime skeletons
+are gone (phase 6). ``tree.classify(dag)`` tags the regime off this view and
+``tree.build_partition(dag)`` factors its axes; the free-axis / K-info accessors
+(``inner_n`` / ``outer_m`` / ``extra_outer`` / ``k_node`` / ``k_extent`` /
+``k_bound``) replace the skeletons' fields.
 """
 
 from __future__ import annotations
@@ -25,7 +24,17 @@ from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Stmt
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import _split_leading_non_loops
+
+
+def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
+    """Split a body into its leading non-loop statements (per-CTA / per-axis
+    prologue) and the loop-bearing remainder."""
+    leading: list[Stmt] = []
+    rest = tuple(body)
+    while rest and not isinstance(rest[0], Loop):
+        leading.append(rest[0])
+        rest = rest[1:]
+    return tuple(leading), rest
 
 
 class AxisRole(enum.Enum):
@@ -93,6 +102,46 @@ class IterDag:
     def algebras(self) -> set[AlgebraKind]:
         """The algebra kinds of the reduce axes (empty for pointwise)."""
         return {n.algebra for n in self.reduce if n.algebra is not None}
+
+    # --- Free-axis accessors (the tiled output axes). Replace the skeleton's
+    # ``inner_n`` / ``outer_m`` / ``extra_outer`` fields — the partition consumes
+    # these straight off the DAG. ---
+
+    @property
+    def inner_n(self) -> AxisNode:
+        """The innermost free (PARALLEL) axis — the ``N`` tile axis."""
+        return self.parallel[-1]
+
+    @property
+    def outer_m(self) -> AxisNode | None:
+        """The next-out free axis — the ``M`` tile axis, or ``None`` for a 1-D
+        (single free axis) nest."""
+        return self.parallel[-2] if len(self.parallel) >= 2 else None
+
+    @property
+    def extra_outer(self) -> tuple[Loop, ...]:
+        """Free loops outside ``M`` / ``N`` (extra outer BLOCK axes)."""
+        return tuple(n.loop for n in self.parallel[:-2])
+
+    # --- Reduce-axis (K) accessors. Replace the skeleton's ``k_loop`` / ``k_name``
+    # / ``k_extent`` / ``k_bound`` fields. ``k_node`` is the primary reduce. ---
+
+    @property
+    def k_node(self) -> AxisNode:
+        """The primary reduce (contraction) axis node."""
+        return self.reduce[0]
+
+    @property
+    def k_extent(self) -> int:
+        """The reduce-tiling extent: static K, or the ``Dim`` hint for a symbolic
+        (masked) K — uniform via ``AxisNode.extent``."""
+        return self.k_node.extent
+
+    @property
+    def k_bound(self):
+        """The symbolic-K runtime boundary ``Expr`` (``None`` for a static K)."""
+        ext = self.k_node.loop.axis.extent
+        return None if ext.is_static else ext.expr
 
 
 def _carrier_of(loop: Loop) -> ReduceCarrier | None:
