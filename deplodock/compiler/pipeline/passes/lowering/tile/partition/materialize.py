@@ -12,11 +12,13 @@ a ``Cond`` store guard, and the layers wrap innermost-first via the shared
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Select, SelectBranch, Stmt
 from deplodock.compiler.ir.tile.ir import Atom, RegisterTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
@@ -190,23 +192,52 @@ def build_matmul_tile(skel: MatmulSkeleton, knobs: dict, *, kernel_name: str, ba
     )
 
 
+def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask each ``Accum``'s folded value to the carrier's identity past a
+    masked-K boundary. Before each ``Accum(name, value=V, op)`` insert
+    ``Init(V_kid, op)`` (the op's neutral element — `0` for add, `-inf` for max)
+    and ``Select(V_km, V if pred else V_kid)``, then fold ``V_km``. The Accum
+    stays a direct child of the reduce loop (`is_reduce` + the cross-thread
+    combine intact); the Load was already index-clamped for a safe read."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Accum):
+            ident = f"{c.value}_kid"
+            masked = f"{c.value}_km"
+            out.append(Init(name=ident, op=c.op, dtype=c.dtype or F32))
+            out.append(
+                Select(
+                    name=masked,
+                    branches=(SelectBranch(value=c.value, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+                )
+            )
+            out.append(replace(c, value=masked))
+        else:
+            out.append(c)
+    return tuple(out)
+
+
 def _replace_k_coop(
-    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, br: int, k_c: Axis | None
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_dim, bk: int, fk: int, br: int, k_c: Axis | None, k_bound: object
 ) -> tuple[Stmt, ...]:
-    """Replace every K-extent loop named in ``target_names`` — the reduce(s) and
-    any second-pass map loop — with the cooperative tower, σ-mapping
+    """Replace every K loop named in ``target_names`` — the reduce(s) and any
+    second-pass map loop — with the cooperative tower, σ-mapping
     ``K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`` (``K_f`` only when
     ``fk > 1``; ``K_c`` the stride-1 thread lane only when ``br > 1``). Each loop
     gets its own ``K_o``/``K_i``/``K_f`` serial tiles but shares the one ``K_c``
-    THREAD axis (added by the caller), so the reduce accumulates and the map
-    writes over the same cooperative lane split. The reduce's ``Accum.axes``
-    propagate ``K_c`` through σ → kernel/100 emits the combine."""
+    THREAD axis (added by the caller). The reduce's ``Accum.axes`` propagate
+    ``K_c`` through σ → kernel/100 emits the combine.
+
+    When ``k_bound`` is set (symbolic K), ``K_o`` ceil-divides and the final
+    partial tile is masked: the reduce clamps its load index for a safe read and
+    folds the carrier identity past ``k_bound`` (`_mask_reduce_accums`); the map
+    loop guards its store with ``Cond(decoded_k < k_bound)``."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name in target_names:
             kn = s.axis.name
             src = s.axis.source_axis or s.axis
-            k_o_ext = k_extent // (br * bk * fk)
+            k_o_ext = k_dim.ceil_div(br * bk * fk) if k_bound is not None else k_dim // (br * bk * fk)
             k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{kn}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(br * bk * fk, "int")
@@ -218,7 +249,19 @@ def _replace_k_coop(
             if k_c is not None:
                 expr = expr + Var(k_c.name)
             sigma_k = Sigma({kn: expr})
-            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            if k_bound is not None:
+                decoded_k = sigma_k.apply(Var(kn))
+                pred = BinaryExpr("<", decoded_k, k_bound)
+                if s.is_reduce:
+                    # Clamp the read in-bounds, fold the carrier identity past the bound.
+                    clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", k_bound, Literal(1, "int")))
+                    body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in s.body)
+                    new_body = _mask_reduce_accums(body_c, pred)
+                else:
+                    body_u = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+                    new_body = (Cond(cond=pred, body=Body(body_u)),)
+            else:
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
             if k_f is not None:
                 # ``reduce`` follows the loop: the reduce loops accumulate (FK
                 # multiple-accumulator), the second-pass map loop only writes.
@@ -231,8 +274,9 @@ def _replace_k_coop(
 
 def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileOp:
     """Whole-CTA cooperative reduce: free rows → grid (thread/reg forced to 1),
-    ``BR`` threads (the ``K_c`` axis) reduce one row's K, the combine is emitted
-    downstream from ``Accum.axes ∩ ThreadTile``."""
+    ``BR`` threads (the ``K_c`` axis) reduce one row's K (masked-K fill past
+    ``k_bound`` when symbolic), the combine is emitted downstream from
+    ``Accum.axes ∩ ThreadTile``."""
     free_specs: list[_FreeSpec] = [(skel.inner_n.loop.axis, 1, 1, True)]
     if skel.outer_m is not None:
         free_specs.append((skel.outer_m.loop.axis, 1, 1, False))
@@ -240,6 +284,7 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
     src_k = skel.k_loop.axis.source_axis or skel.k_loop.axis
     k_c = Axis(f"{skel.k_name}_c", br, source_axis=src_k) if br > 1 else None
     targets = skel.target_names or frozenset({skel.k_name})
+    k_dim = skel.k_loop.axis.extent
     return _assemble(
         free_specs,
         skel.inner_body,
@@ -248,7 +293,7 @@ def build_coop_reduce_tile(skel: CoopReduceSkeleton, knobs: dict, *, kernel_name
         knobs=knobs,
         base_knobs=base_knobs,
         kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_coop(body, targets, skel.k_extent, bk, fk, br, k_c),
+        k_transform=lambda body: _replace_k_coop(body, targets, k_dim, bk, fk, br, k_c, skel.k_bound),
         coop_thread=(k_c,) if k_c is not None else (),
     )
 

@@ -229,19 +229,22 @@ _BR_TARGET = 128  # ~4 warps cooperating per row
 
 
 def coop_reduce_offers(skel: CoopReduceSkeleton) -> list[tuple[int, int, int]]:
-    """Legal ``(bk, fk, br)`` for a whole-CTA cooperative reduce: ``br·bk·fk``
-    divides K, ``br`` (the CTA thread count) ≤ 1024. Best-first: ≈``_BR_TARGET``
-    cooperative threads, no serial chunk / strip-mine. Env-pinnable for tests."""
+    """Legal ``(bk, fk, br)`` for a whole-CTA cooperative reduce: ``br`` (the CTA
+    thread count) ≤ 1024. For a static K, ``br·bk·fk`` must divide K; a symbolic
+    (masked) K only needs ``br·bk·fk ≤`` the hint — the final partial tile is
+    masked (ceil-div). Best-first: ≈``_BR_TARGET`` threads, no chunk / strip-mine.
+    Env-pinnable for tests."""
     bk_pin, fk_pin, br_pin = _pin(RED_BK), _pin(RED_FK), _pin(COOP_BR)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     brs = (br_pin,) if br_pin else BR_CHOICES
+    masked = skel.k_bound is not None
     out = [
         (bk, fk, br)
         for br in brs
         for bk in bks
         for fk in fks
-        if 1 <= br <= 1024 and br * bk * fk <= skel.k_extent and skel.k_extent % (br * bk * fk) == 0
+        if 1 <= br <= 1024 and br * bk * fk <= skel.k_extent and (masked or skel.k_extent % (br * bk * fk) == 0)
     ]
     out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
     return out

@@ -73,16 +73,14 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
 
     # Symbolic *free* axes are fine — they tile as masked (ceil-div grid + a
     # `< extent` store guard), the same path pointwise uses. A symbolic *K*
-    # (reduce) is not: it needs the masked-K zero-fill, which is a later phase,
-    # so require the reduce axis static here.
+    # (reduce) is handled only on the cooperative (MONOID) path below (masked-K
+    # fill with the carrier identity); the matmul path requires it static.
     k_loop = reduce_loops[0]
-    if not k_loop.axis.extent.is_static:
-        return None
 
     if algebras == {AlgebraKind.SEMIRING}:
         # Matmul — canonical envelope (multi-accumulator + fused prologue are
         # later phases, so keep the single-reduce, no-extra-stmts shape).
-        if len(reduce_loops) != 1 or len(chain) < 2:
+        if not k_loop.axis.extent.is_static or len(reduce_loops) != 1 or len(chain) < 2:
             return None
         loops_in = [s for s in inner_body if isinstance(s, Loop)]
         if loops_in != [k_loop] or not any(isinstance(s, Write) for s in inner_body):
@@ -107,16 +105,18 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
         # one canonical name, and `_replace_k_coop` rewrites every K-named loop.
         # So the epilogue MAP scalar stmts (RMSNorm rsqrt, softmax log) and the
         # normalize map loop just ride the row tile — no rigid envelope.
-        k_extent = k_loop.axis.extent.as_static()
+        k_dim = k_loop.axis.extent
+        # Tiling extent: static size, or the Dim hint for a symbolic K (masked).
+        k_extent = k_dim.as_static() if k_dim.is_static else (k_dim.hint or 0)
         if k_extent < warp_size:
             return None
-        if {lp.axis.extent.as_static() for lp in reduce_loops} != {k_extent}:
-            return None  # reduces over different-extent K axes — multi-axis is a later phase
-        # Every body loop must be a K-extent loop (a reduce or the second-pass
-        # map) — those are what get cooperatively split. A loop of any other
-        # extent is an unexpected shape; leave it to legacy.
+        # Match the reduce(s) and the second-pass map loop by K *Dim* (so static
+        # and symbolic match uniformly). A body loop of any other extent is an
+        # unexpected shape; leave it to legacy.
+        if {lp.axis.extent for lp in reduce_loops} != {k_dim}:
+            return None  # reduces over different K axes — multi-axis is a later phase
         body_loops = [s for s in inner_body if isinstance(s, Loop)]
-        if any(not lp.axis.extent.is_static or lp.axis.extent.as_static() != k_extent for lp in body_loops):
+        if any(lp.axis.extent != k_dim for lp in body_loops):
             return None
         return CoopReduceSkeleton(
             inner_n=_map_axis(inner_loop),
@@ -128,23 +128,7 @@ def walk_nest(loop_op: LoopOp, *, warp_size: int = 32) -> Skeleton | None:
             inner_body=inner_body,
             leading=leading,
             target_names=frozenset(lp.axis.name for lp in body_loops),
+            k_bound=None if k_dim.is_static else k_dim.expr,
         )
 
     return None
-
-
-# Thin type-filtered wrappers — the regime-specific entry points (tests +
-# back-compat). The single recognizer is `walk_nest`.
-def lift_pointwise(loop_op: LoopOp) -> PointwiseSkeleton | None:
-    nest = walk_nest(loop_op)
-    return nest if isinstance(nest, PointwiseSkeleton) else None
-
-
-def lift_matmul(loop_op: LoopOp) -> MatmulSkeleton | None:
-    nest = walk_nest(loop_op)
-    return nest if isinstance(nest, MatmulSkeleton) else None
-
-
-def lift_coop_reduce(loop_op: LoopOp, *, warp_size: int = 32) -> CoopReduceSkeleton | None:
-    nest = walk_nest(loop_op, warp_size=warp_size)
-    return nest if isinstance(nest, CoopReduceSkeleton) else None

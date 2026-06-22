@@ -83,12 +83,16 @@ class CoopReduceSkeleton:
     extra_outer: tuple[Loop, ...]
     k_loop: Loop
     k_name: str
-    k_extent: int
+    k_extent: int  # tiling extent: static size, or the Dim hint for a symbolic K
     inner_body: tuple[Stmt, ...]
     leading: tuple[Stmt, ...]
     # Every K-extent loop name to cooperatively split — the reduce(s) PLUS any
-    # second-pass map loop (RMSNorm normalize, softmax exp). Keyed by extent
-    # (== ``k_extent``) like the legacy planner, since the map loop carries a
-    # different axis name than the reduce (only sibling *reduces* are unified
-    # upstream). Defaults to ``{k_name}`` for the plain reduce.
+    # second-pass map loop (RMSNorm normalize, softmax exp). Keyed by the K
+    # ``Dim`` (so static and symbolic match uniformly), since the map loop
+    # carries a different axis name than the reduce (only sibling *reduces* are
+    # unified upstream). Defaults to ``{k_name}`` for the plain reduce.
     target_names: frozenset[str] = frozenset()
+    # The symbolic K boundary ``Expr`` (runtime ``seq_len``) when K is symbolic,
+    # else ``None``. A masked-K reduce tiles at the hint (``k_extent``) and fills
+    # past ``k_bound`` with each carrier's identity (``_mask_reduce_accums``).
+    k_bound: object = None

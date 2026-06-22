@@ -14,7 +14,8 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import ThreadTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_coop_reduce_tile
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import lift_coop_reduce, walk_nest
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import CoopReduceSkeleton
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
 
 def _reduce_epilogue_map(rows: int, k: int) -> LoopOp:
@@ -80,7 +81,7 @@ def _sum(rows: int, k: int) -> LoopOp:
 
 
 def test_lift_coop_reduce_detects_monoid():
-    skel = lift_coop_reduce(_sum(64, 128))
+    skel = walk_nest(_sum(64, 128))
     assert skel is not None
     assert skel.k_extent == 128
     assert skel.inner_n.extent == 64
@@ -88,17 +89,17 @@ def test_lift_coop_reduce_detects_monoid():
 
 def test_lift_coop_reduce_rejects_small_k():
     # K=16 < warp_size → stays on the legacy / pointwise path
-    assert lift_coop_reduce(_sum(64, 16)) is None
+    assert not isinstance(walk_nest(_sum(64, 16)), CoopReduceSkeleton)
 
 
 def test_lift_coop_reduce_rejects_matmul():
     from tests.compiler.passes.test_move_composer_matmul import _matmul  # noqa: PLC0415
 
-    assert lift_coop_reduce(_matmul(64, 64, 128)) is None
+    assert not isinstance(walk_nest(_matmul(64, 64, 128)), CoopReduceSkeleton)
 
 
 def test_build_coop_tile_has_kc_thread_axis():
-    skel = lift_coop_reduce(_sum(64, 128))
+    skel = walk_nest(_sum(64, 128))
     knobs = {"RED_BK": 1, "RED_FK": 1, "COOP_BR": 128}
     tile = build_coop_reduce_tile(skel, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)

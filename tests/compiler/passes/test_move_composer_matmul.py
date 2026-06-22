@@ -21,8 +21,9 @@ from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import build_matmul_tile, build_warp_matmul_tile
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.moves import eligible_atoms
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.skeleton import MatmulSkeleton, PointwiseSkeleton
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_matmul_tree
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import lift_matmul, lift_pointwise
+from deplodock.compiler.pipeline.passes.lowering.tile.partition.walk import walk_nest
 
 _MM_KEYS = {"MAP_N_THREAD", "MAP_N_REG", "MAP_M_THREAD", "MAP_M_REG", "RED_BK", "RED_FK"}
 
@@ -77,7 +78,7 @@ def _sum_reduce() -> LoopOp:
 
 
 def test_lift_matmul_names_axes():
-    skel = lift_matmul(_matmul(64, 96, 128))
+    skel = walk_nest(_matmul(64, 96, 128))
     assert skel is not None
     assert skel.inner_n.extent == 96
     assert skel.outer_m.extent == 64
@@ -87,12 +88,12 @@ def test_lift_matmul_names_axes():
 
 
 def test_lift_matmul_rejects_non_matmul_reduce():
-    assert lift_matmul(_sum_reduce()) is None
+    assert not isinstance(walk_nest(_sum_reduce()), MatmulSkeleton)
 
 
 def test_lift_pointwise_rejects_matmul():
     # the matmul must NOT be claimed by the pointwise regime (it has a reduce)
-    assert lift_pointwise(_matmul(64, 96, 128)) is None
+    assert not isinstance(walk_nest(_matmul(64, 96, 128)), PointwiseSkeleton)
 
 
 def _graph(m: int, n: int, k: int, dtype):
@@ -110,7 +111,7 @@ _CTX = Context(compute_capability=(8, 0))
 
 def test_tree_leaves_complete_and_within_budget():
     g = _graph(128, 128, 128, F32)  # fp32 → scalar subtree only
-    skel = lift_matmul(g.nodes["o"].op)
+    skel = walk_nest(g.nodes["o"].op)
     tree = build_matmul_tree(skel, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k")
     leaves = flatten_leaves([tree])
     assert len(leaves) > 1
@@ -123,7 +124,7 @@ def test_tree_leaves_complete_and_within_budget():
 
 
 def test_materialize_emits_k_serial_tower():
-    skel = lift_matmul(_matmul(128, 128, 128))
+    skel = walk_nest(_matmul(128, 128, 128))
     knobs = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 32, "RED_FK": 1, "RED_SPLITK": 1}
     tile = build_matmul_tile(skel, knobs, kernel_name="k", base_knobs={})
     assert isinstance(tile, TileOp)
@@ -164,7 +165,7 @@ def test_eligible_atoms_fp16_yes_fp32_no():
 
 def test_matmul_tree_offers_warp_for_fp16():
     g = _graph(64, 128, 64, F16)
-    skel = lift_matmul(g.nodes["o"].op)
+    skel = walk_nest(g.nodes["o"].op)
     tree = build_matmul_tree(skel, loop_op=g.nodes["o"].op, context=_CTX, graph=g, base_knobs={}, kernel_name="k")
     leaves = flatten_leaves([tree])
     warp_leaves = [leaf for leaf in leaves if leaf.knobs.get("TC_ATOM")]
@@ -177,7 +178,7 @@ def test_matmul_tree_offers_warp_for_fp16():
 
 def test_build_warp_tile_emits_warp_atom_and_mma_knob():
     g = _graph(64, 128, 64, F16)
-    skel = lift_matmul(g.nodes["o"].op)
+    skel = walk_nest(g.nodes["o"].op)
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
     # 64x128x64 / atom(16,8,16): cells_m=4, cells_n=16, kc=4 → wm=2,wn=2 ; pm=2,pn=8
     knobs = {"TC_ATOM": atom.name, "WARP_M": 2, "WARP_N": 2, "TC_REG_M": 2, "TC_REG_N": 4, "TC_BK": 4}
@@ -195,7 +196,7 @@ def test_build_warp_tile_emits_warp_atom_and_mma_knob():
 def test_build_matmul_tile_splitk_adds_grid_axis():
     # M=64 (tile 16·4=64 → M_b=1), N=64 (tile 8 → N_b=8); only the K_s axis has
     # extent 4. (Axis names canonicalize to a0/a1/… so match on extent, not name.)
-    skel = lift_matmul(_matmul(64, 64, 256))
+    skel = walk_nest(_matmul(64, 64, 256))
     base = {"MAP_N_THREAD": 8, "MAP_N_REG": 1, "MAP_M_THREAD": 16, "MAP_M_REG": 4, "RED_BK": 1, "RED_FK": 1}
     g1 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 1}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
     g4 = list(build_matmul_tile(skel, {**base, "RED_SPLITK": 4}, kernel_name="k", base_knobs={}).body.iter_of_type(GridTile))
