@@ -90,9 +90,19 @@
     `_stage_expand.emit_reduce_phase` over `threadIdx.x`-strided cells) emitted as a `GridTile` sibling *before* the
     matmul tower; the scale-application stays the compute phase, reading `v4` from the slab as a broadcast operand (the
     internal-slab branch of `_fuse_producers` — no gmem round-trip of `xn`). The producer's logical row axis σ-maps to
-    the consumer's M index (read off the `xn` load, since the kernel output may be batched 3D). GPU-verified by
-    `test_fused_rmsnorm_matmul_runs_correctly`. *Remaining:* the **warp tier** hits a separate nvcc `-Werror`
-    unused-`mma_*_bf16`-helper quirk at large shape (scalar tier is clean).
+    the consumer's M index (read off the `xn` load, since the kernel output may be batched 3D).
+  - *(c) warp (mma.sync) tier — LANDED.* Two warp-tier bugs fixed (`test_offering_fork_fused_edge_runs_correctly[warp]`,
+    8-shape greedy sweep): (1) the prologue picked its cooperative cells from the consumer's THREAD/REGISTER M axes and
+    σ-mapped the row to the full consumer M index — at the warp tier the rows are warp/atom-bound, so the slab sized to 1
+    entry and the reduce referenced the M *warp* coord the tower binds only AFTER the prologue (`a3 undefined`). Now
+    `_build_reduce_prologue` fills `rscale[local_m]` over a single `local_m` axis of extent `BM` (= product of the
+    consumer's NON-grid M extents — warp·register·atom), with `global_row = m_grid·BM + local_m` (`m_grid` in scope at
+    kernel top); `_m_tile` derives `(m_grid, BM)`. Prologue fill and the consumer's scale read share one `[0, BM)` index
+    space at every tier. (2) The MONOID scale chain computes in f32 (rsqrt/mean) so the slab declared float, but `xn` is
+    f16 and `ldmatrix` reads it as b16 → garbage; `_fuse_producers` now stamps the slab Write with the `xn` buffer dtype
+    (`040_demote` casts on store). A fully-constant MAP operand (the `0.5` in `0.5·x`) reads straight from gmem, no slab.
+    *Out of scope:* the pinned scalar sibling-cell-fused config (`compute_phase_info`'s documented decline) is never the
+    greedy pick.
 - **The offering fork — LANDED (pin-reachable), greedy default DEFERRED.** `split/005` now wires the keep branch to the
   SMEM fused edge: `_extract.seed_fused` turns a single-cone demoted `LoopOp` into a fused 2-block `TileGraphOp` (clean
   matmul consumer `blocks[0]` + producer cone `blocks[1]`, the `xn` edge `SMEM`-placed) carrying the *consumer's*
@@ -105,10 +115,12 @@
   two-pass SDPA softmax / multi-cone rotary / multi-accum gated-MLP stays a forced cut. **The unpinned greedy path still
   forces the cut**: greedy's "a cold compile never changes kernel sets" rule (`search/policy/greedy._pick_structural`
   filters the structural cut cold) would make the kernel-set-preserving keep(SMEM) the cold default the instant it is an
-  op-variant fork sibling — but the fused edge isn't yet robust at every knob config a cold compile can land on (the
-  scalar sibling-cell-fused tile; the warp-tier nvcc quirk). *Remaining:* make the fused edge robust across knob sets,
-  then promote keep(SMEM) to the greedy default + a live keep-vs-cut search fork (the two-level structural integration:
-  the trained prior prices `SMEM` Σ vs `GMEM` Σ).
+  op-variant fork sibling. The fused edge is now **robust at the warp tier** (sub-piece (c) — the natural greedy pick;
+  verified across 8 shapes + MAP/MONOID producers), so that robustness blocker is cleared; the one remaining declined
+  config (the pinned scalar sibling-cell-fused tile) is never the greedy pick. *Remaining:* promote keep(SMEM) to the
+  greedy default — flip `split/005` to emit the `[keep, cut]` fork + update the cut-specific tests (e.g.
+  `test_norm_linear_fp16_scalar_reduce_tma_alignment`, which pins a cut config, must pin `SPLIT_CONE=1`) — and wire the
+  live keep-vs-cut search fork (the two-level structural integration: the trained prior prices `SMEM` Σ vs `GMEM` Σ).
 
 ### The SMEM fused-edge codegen path (the next build)
 
