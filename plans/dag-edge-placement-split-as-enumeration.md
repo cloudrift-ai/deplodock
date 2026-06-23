@@ -74,9 +74,16 @@
     `Source`'s addressing, so the consumer reads it staged (`ldm=BK`, atom-strided) — matching how the compute filled it.
   This is the plan's "materialize-in-consumer-layout" item (item 4), the hardest codegen — and it falls out cleanly
   because the input and output slabs share one layout. `test_fused_edge` is parametrized over scalar + warp tiers.
-- **MONOID (rmsnorm) producer** — the headline case needs the compute phase generalized to carry a **reduce** (the
-  per-row sum-of-squares → scale in smem, then the scale-application compute phase) + the `nw[k]` broadcast operand
-  (different cache axes).
+- **MONOID (rmsnorm) producer** — the headline case. Two sub-pieces:
+  - *(a) broadcast operands — LANDED.* The fused compute phase now handles `x[m,k]·rs[m]·cs[k]` (`rs[m]` over k, `cs[k]`
+    over m) — the rmsnorm scale-application shape — at both scalar and warp tiers, GPU-verified. `_fused._project_source`
+    projects the `xn` slab's source onto each input's dims (full operand keeps all cache axes; a broadcast keeps only
+    its dims' axes, pinning the rest to their constant gmem index), and `compute_phase_extents` /
+    `005._compute_output_source` match the *full* operand for the output slab's layout.
+  - *(b) the reduce prologue — remaining.* `rs = rsqrt(mean(x²))` depends on the full row reduce, which must complete
+    *before* the matmul's first K-tile, so it can't be a per-K-tile compute phase — it needs a cooperative reduce
+    emitted before the `StageBundle` K-loop, writing `rs` into a per-row smem slab + a `__syncthreads`. With (a) done,
+    this is the last piece for a fully-fused rmsnorm→linear kernel.
 - **The offering fork** — so a demoted matmul seeds the fused 2-block graph **live** and the search prices `SMEM` vs
   `GMEM` (the two-level structural integration).
 
