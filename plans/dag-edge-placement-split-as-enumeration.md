@@ -80,10 +80,20 @@
     projects the `xn` slab's source onto each input's dims (full operand keeps all cache axes; a broadcast keeps only
     its dims' axes, pinning the rest to their constant gmem index), and `compute_phase_extents` /
     `005._compute_output_source` match the *full* operand for the output slab's layout.
-  - *(b) the reduce prologue — remaining.* `rs = rsqrt(mean(x²))` depends on the full row reduce, which must complete
-    *before* the matmul's first K-tile, so it can't be a per-K-tile compute phase — it needs a cooperative reduce
-    emitted before the `StageBundle` K-loop, writing `rs` into a per-row smem slab + a `__syncthreads`. With (a) done,
-    this is the last piece for a fully-fused rmsnorm→linear kernel.
+  - *(b) the reduce prologue — LANDED (scalar tier).* `rs = rsqrt(mean(x²))` depends on the full row reduce, which must
+    complete *before* the matmul's first K-tile, so it can't be a per-K-tile compute phase. The producer can't ride the
+    compute phase whole either — its per-row reduce runs over `BM` rows while the matmul binds an `M×N` thread grid, a
+    thread-count mismatch (so **no** `TileOp`-structure change: a cooperative-reduce *sibling* is the right shape, not a
+    fatter compute phase). `assemble_fused`'s MONOID branch (`_split_monoid_producer` → `_build_reduce_prologue`) splits
+    the producer into `[leading][reduce Loop][scalars→v4][scale Loop]`: the reduce becomes a `CoopReduce` prologue (a new
+    `Stmt` — cooperative per-row reduce → a per-row `<buf>__rscale` smem slab + `__syncthreads`, lowered by
+    `_stage_expand.emit_reduce_phase` over `threadIdx.x`-strided cells) emitted as a `GridTile` sibling *before* the
+    matmul tower; the scale-application stays the compute phase, reading `v4` from the slab as a broadcast operand (the
+    internal-slab branch of `_fuse_producers` — no gmem round-trip of `xn`). The producer's logical row axis σ-maps to
+    the consumer's M index (read off the `xn` load, since the kernel output may be batched 3D). GPU-verified by
+    `test_fused_rmsnorm_matmul_runs_correctly`. *Remaining:* the **warp tier** hits a separate nvcc `-Werror`
+    unused-`mma_*_bf16`-helper quirk at large shape (scalar tier is clean); the offering fork (next item) is still
+    needed to seed this live.
 - **The offering fork** — so a demoted matmul seeds the fused 2-block graph **live** and the search prices `SMEM` vs
   `GMEM` (the two-level structural integration).
 
@@ -106,8 +116,10 @@ So the **MAP-producer** fused edge (e.g. `relu(x) @ w` / `scale·x @ w`) maps st
 
 - **MAP producer (relu / scale)** — buildable on the existing machinery now; this is the first target. `_assemble_fused`
   reuses `_assemble_one` for the consumer and injects the producer as the `xn`-slab compute phase.
-- **MONOID producer (rmsnorm — the headline case)** — needs the compute phase generalized to carry a **reduce** (the
-  sum-of-squares) before the pointwise scale. A later generalization of `emit_compute_phase`.
+- **MONOID producer (rmsnorm — the headline case)** — LANDED at the scalar tier. *Not* a generalization of
+  `emit_compute_phase` (the per-row reduce over `BM` rows can't share the matmul's `M×N` thread grid) — instead a
+  `CoopReduce` **sibling** emitted before the K-loop tower writes `rs` into a per-row smem slab + `__syncthreads`, and
+  the pointwise scale rides the compute phase reading that slab. See the MONOID sub-piece (b) above.
 
 The co-tiling is **shared-knob** (one kernel, one knob set): the producer's slab fill is sized by the consumer's M tile,
 so it rides the consumer's tiling rather than enumerating independently — which is why the fused edge has *no*
