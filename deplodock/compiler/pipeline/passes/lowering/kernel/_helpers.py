@@ -91,16 +91,6 @@ def parallel_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:
     raise TypeError(f"parallel_tile_of: expected GridTile/ThreadTile/WarpTile, got {type(outer).__name__}")
 
 
-def thread_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:
-    """Deprecated alias for :func:`parallel_tile_of`. Kept for the
-    transition until in-flight MMA / WS-refactor consumers drop their
-    legacy import. Emits a ``DeprecationWarning`` via the module logger
-    so call sites surface in test logs.
-    """
-    _logger.warning("thread_tile_of is deprecated; use parallel_tile_of", stacklevel=2)
-    return parallel_tile_of(outer)
-
-
 def replace_parallel_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
     """Rebuild ``outer`` with the per-binding-tier scope's body replaced.
 
@@ -129,12 +119,6 @@ def replace_parallel_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
                 new_outer_body.append(child)
         return GridTile(axes=outer.axes, body=Body(new_outer_body), swizzle_group_m=outer.swizzle_group_m)
     raise TypeError(f"replace_parallel_tile_body: expected GridTile/ThreadTile/WarpTile, got {type(outer).__name__}")
-
-
-def replace_thread_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
-    """Deprecated alias for :func:`replace_parallel_tile_body`."""
-    _logger.warning("replace_thread_tile_body is deprecated; use replace_parallel_tile_body", stacklevel=2)
-    return replace_parallel_tile_body(outer, new_body)
 
 
 def single_tile(body: Body) -> tuple[int, ParallelTile]:
