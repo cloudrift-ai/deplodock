@@ -9,11 +9,19 @@ The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **three 
   kernel set: an `xn` operand-materialization producer beside a clean gemm consumer, returned as a `Graph` fragment the
   engine splices (a kernel-set change → the **outer** two-level tree). The familiar instance is the **score-materializing
   SDPA**: the fused softmax-prologue + P@V `k_sdpa_reduce` un-fuses into a softmax-normalizing `xn` producer + a clean
-  (static **or** symbolic-K) gemm consumer that both lower. When the fused form has a regime to keep (`classify`
-  non-None) it offers a `SPLIT_CONE` keep-vs-split fork; when it does not (the SDPA / fused-prologue shape the classifier
-  declines) it **forces** the split (single option). The cut names its products inline and `_assemble_fragment`
-  re-stamps the `S_*` structural features (the cut runs after `loop/stamp`, so the fragments don't re-flow through it).
-  The offer and the cut (`try_split_demoted` + helpers) live together in `005_split_demoted.py`.
+  (static **or** symbolic-K) gemm consumer that both lower. The decision is a **derived tier query**
+  (`enumeration/_cut.py`, R7 edge placement): it **forces** the split (single option) iff the fused body is
+  `UNBUILDABLE` — a demoted matmul whose cone operand keeps it below any buildable tier, which materializing the operand
+  strictly raises. (`tier(inline) is UNBUILDABLE` ⟺ `classify(fused) is None` — a cone-operand cell is never
+  atom-eligible — so this reproduces the legacy force condition through the lattice.) The buildable-fused keep-vs-split
+  `SPLIT_CONE` *fork* needs the lowerable fused-prologue regime the R7 backlog defers, so it is not offered yet. The cut
+  names its products inline and `_assemble_fragment` re-stamps the `S_*` structural features (the cut runs after
+  `loop/stamp`, so the fragments don't re-flow through it). The bespoke monolith is dissolved into three pieces: the
+  **offer policy** (`enumeration/_cut.py::cut_offers`, the derived `Tier` lattice), the **fission**
+  (`split/_extract.py::extract_block`), and the **thin fork shell** (`005_split_demoted.py`, holding no decision logic).
+  `split/` survives as a pre-build phase because the demoted matmul never classifies as a buildable seed
+  (`000_build` would `RuleSkip` it), so the cut can't yet fold into `enumeration/` as an edge-placement move — see
+  [`plans/dag-edge-placement-split-as-enumeration.md`](../../../../../../plans/dag-edge-placement-split-as-enumeration.md).
 - **`enumeration/`** — `LoopOp` → a generative `Fork` tree over a **stored algorithm refined in place by incremental
   body moves** (F3-b): `000_build` seeds a *logical* (un-tiled) `TileGraph`, then each fork rewrites it move by move.
   This is the **search**: every variant is a point in the move/schedule space. It is split into **per-family rule
@@ -93,7 +101,9 @@ shape-specific pattern matching.*
 
 | Module | Role |
 | ------ | ---- |
-| `005_split_demoted.py` | Fork (**structural**, R7) + the cut, in one module. The offer (`rewrite`): the `SPLIT_CONE` keep-vs-split decision on a demoted matmul `LoopOp` — returns the keep-fused op + the split `Graph` when `classify` keeps the fused form, or **forces** the split `Graph` when it does not (the SDPA / fused-prologue shape). Idempotent (`SPLIT_CONE` guard). Runs before `enumeration/000_build` on the un-tiled body. The cut (`try_split_demoted` + helpers): classify the body into `(leading, rows, prologue, outer_n, k_loop)`, backward-slice each computed/K-folded multiply-operand cone, build one `xn` producer per cone class + the rebuilt consumer (+ per-accum `mm_i` gemms for a multi-accum cell), wired into a `Graph` fragment by `_assemble_fragment` (which re-stamps `S_*` structural features). Reuses `kernel/_helpers` (`is_matmul_reduce` / `segmentable_k_extent`) + `Body.backward_cone` / `defs_die_at`. |
+| `005_split_demoted.py` | The **thin fork shell** (**structural**, R7) — holds no decision logic. `rewrite`: idempotent (`SPLIT_CONE` guard), runs before `enumeration/000_build` on the un-tiled body; calls `_extract.extract_block` (expressibility — `None` if not a cuttable demotion) then `_cut.cut_offers` (the offer verdict), **forcing** the split `Graph` when the fused body is `UNBUILDABLE`, else keeping fused. Honors `DEPLODOCK_SPLIT_CONE`; stamps `SPLIT_CONE` on both branches. |
+| `_cut.py` (in `enumeration/`) | The **offer policy** — the derived `Tier` lattice (`UNBUILDABLE` < `MAP` < `SCALAR_REDUCE` < `COOP_REDUCE` < `WARP_MMA`) + `tier(dag)` (built on `_atom.eligible_atoms` + `_classify.classify`) + `cut_offers(loop_op) -> CutDecision`. Offers (and v1-forces) iff `tier(inline) is UNBUILDABLE`: materializing the demoted operand strictly raises the consumer's tier. One auditable place for the which-cuts policy; `eval`-introspectable. |
+| `_extract.py` | The **fission** (`extract_block` + helpers, relocated from the legacy monolith): classify the body into `(leading, rows, prologue, outer_n, k_loop)`, backward-slice each computed/K-folded multiply-operand cone, build one `xn` producer per cone class + the rebuilt consumer (+ per-accum `mm_i` gemms for a multi-accum cell), wired into a `Graph` fragment by `_assemble_fragment` (which re-stamps `S_*` structural features). Reuses `kernel/_helpers` (`is_matmul_reduce` / `segmentable_k_extent`) + `Body.backward_cone` / `defs_die_at`. Returns `None` (its expressibility check) for any shape it can't cleanly cut. |
 
 ## `enumeration/` — the move composer
 
