@@ -119,5 +119,5 @@ def test_atomic_free_splitk_fork_pushes_structural(monkeypatch) -> None:
     search = _drive_one_terminal(_f32_matmul_graph(), (8, 0))
     structural_rules = {rule for rule, structural in search.pushes if structural}
     assert structural_rules == {"017_atomic_free_splitk"}, f"only 017's offer is structural, got {structural_rules}"
-    partition_pushes = [structural for rule, structural in search.pushes if rule == "010_partition_loops"]
+    partition_pushes = [structural for rule, structural in search.pushes if rule == "010_enumerate"]
     assert partition_pushes and not any(partition_pushes), "partition leaves are op-variant"

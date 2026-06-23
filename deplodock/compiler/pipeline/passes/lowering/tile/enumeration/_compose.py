@@ -1,8 +1,9 @@
-"""Dispatch entry for the move composer.
+"""Dispatch entry for the enumeration pass.
 
-``010_partition_loops`` calls :func:`try_compose` when the composer is enabled;
-it returns a ``Fork`` / ``TileOp`` for a regime the composer covers, or ``None``
-to fall through to the legacy planner.
+``010_enumerate`` calls :func:`try_compose`; it derives the iteration DAG and
+returns the generative ``Fork`` tree (or a bare ``TileOp``) for a regime the
+composer covers, or ``None`` for one it can't lower (the pass then raises — no
+fallback).
 """
 
 from __future__ import annotations

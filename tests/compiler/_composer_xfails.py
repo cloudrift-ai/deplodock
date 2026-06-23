@@ -83,6 +83,8 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural",
         # RMSNorm kernels need the cooperative-reduce regime (deleted).
         "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op",
+        # Reduction launch-geometry needs the cooperative-reduce regime (deleted).
+        "test_launch_geometry_rules.py::test_launch_geometry_fires_on_reduction",
         # Warp-tier atom lowering (deleted).
         "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct",
         # CLI compile of a reduce/dynamic snippet (coop / staging deleted).

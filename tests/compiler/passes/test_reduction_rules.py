@@ -73,7 +73,7 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     g.outputs = ["o"]
 
     out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
+    fired = recording_dump.fired_rules("lowering/tile/enumeration")
     assert _tile_has_combine(out)
     assert "chunk_matmul_k" not in fired
 

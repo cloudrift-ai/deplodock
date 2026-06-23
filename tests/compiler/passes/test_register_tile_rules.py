@@ -43,8 +43,8 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     # chosen variant has FM=FN=1, the extent-1 REG loops are eliminated by
     # the normalize pass before 006a sees them, so 006a doesn't fire. The
     # planner firing is the signal that the register-tile decision was made.
-    fired = recording_dump.fired_rules("lowering/tile")
-    assert "partition_loops" in fired, fired
+    fired = recording_dump.fired_rules("lowering/tile/enumeration")
+    assert "enumerate" in fired, fired
 
 
 def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
@@ -56,7 +56,7 @@ def test_pure_pointwise_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile/enumeration")
 
 
 def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
@@ -69,7 +69,7 @@ def test_single_buffer_reduce_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile/enumeration")
 
 
 def test_small_matmul_does_not_fire_register_tile(recording_dump):
@@ -83,7 +83,7 @@ def test_small_matmul_does_not_fire_register_tile(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile")
+    assert "split_register_axes" not in recording_dump.fired_rules("lowering/tile/enumeration")
 
 
 # --- behavior tests --------------------------------------------------

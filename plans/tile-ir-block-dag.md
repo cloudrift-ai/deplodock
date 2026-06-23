@@ -657,31 +657,111 @@ the whole tile phase.
 - **`Source`/`AffineAddressing`/`_stage_expand`** are precisely the assemble-time slab + cooperative-producer
   synthesis the `staged` annotation now drives — they move out of the IR into `assemble`.
 
-## Migration sequencing (each step gated on byte-identical CUDA + `make test`)
+## Recovery sequencing — build the foundation, recover tests tier by tier
 
-1. **Define the algorithm DAG + derived projections + `assemble`**, and make the composer emit a DAG + reference
-   Schedule that `assemble`s to today's tower byte-identically for every golden (pointwise/coop/matmul/flash, static +
-   `.dynM`). No move exists yet. *Highest-risk step; do it first.*
-2. **Port `hoist`** (the `scope` default) + delete `_assemble_matmul_prologue` and `dag.prologue`. → byte-identical.
-3. **Port `stage` + `partition_reduce`** — `020`/`026` collapse into the `staged` annotation + automatic slab
-   coalescing; split-/cooperative-K become the combine-block move. → byte-identical.
-4. **Port `retime` + `promote_transport` + `specialize_warps`** — `040`/`080`/`050`/`060`/`085` become Schedule
-   annotations; their tree surgery moves into `assemble`. → byte-identical, then perf-equal under tune.
-5. **Port `swizzle` + `atomize`** (the remaining forks) and the fixed-logic locals, then retire the tower builders. End
-   state = the two pass dirs of "Directory layout": `lowering/tile/enumeration/` (`000_build` + the forks `tensorize` /
-   `partition_reduce` / `register_tile` / `stage` / `retime` / `transport` / `warp_spec` / `swizzle`) →
-   `lowering/tile/assembly/` (`000_assemble` + the deterministic post-passes `peel` / `mask_order` / `pad` / `unroll`).
+This refactor was executed **demolition-first**: the legacy planner, the `005`–`009` structural passes, the `011`–`090`
+scheduling passes, the warp / cooperative / flash builders, and the legacy materializers were deleted, and `partition/`
+was reorganized into the `enumeration/` + `assembly/` subfolders this design calls for. So the work now is **recovery**,
+not a forward port from a working pipeline: rebuild each tier as its block-DAG foundation — an enumeration builder
+(`enumeration/_tree.py` etc.) **plus** its `assemble` synthesis (`assembly/_assemble.py`) — and recover that tier's
+quarantined tests as it lands. This section supersedes the earlier "forward port" framing.
 
-The DAG and the tree can coexist through 1–4: the composer builds the DAG, `assemble` lowers to the *current* tower, and
-the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.
+**Current state (verified empirically, branch `feature/tile-ir-block-dag`).** Structure already matches the target: one
+rule `010_partition_loops.py` over the `enumeration/` + `assembly/` packages. `classify()` still tags all four regimes,
+but `build_partition()` only *builds* **pointwise + scalar matmul**, which lower end-to-end (`LoopOp → TileOp → CudaOp`,
+incl. K-chunk). Coop and flash return `None` → `010` raises → quarantined; warp-MMA / staging-synthesis / transport /
+split-K combine / structural forks are deleted. `tests/compiler/` runs **~1175 passed · 28 failed · 166 xfailed · 89
+XPASSED** — so the floor is healthy, but two numbers are the real signal: the **89 XPASS** are quarantined-but-now-green
+(the registry is stale), and the **28 failed** are genuine, non-quarantined breakage.
 
-**Status (branch `feature/tile-ir-block-dag`).** Steps 1–2 are done: `assemble_block` lowers pointwise + scalar/warp
-matmul + cooperative reduce byte-identically (`build_dag.py` → `assemble.py`), the legacy pointwise/matmul materializers
-are deleted, and the 11 tower-rewrite scheduling passes (`021`–`090`) have been **deleted up front** to clear the deck —
-they are the predecessors the `tile/stage` … `tile/swizzle` enumeration forks + the `peel` / `mask_order` / `pad` /
-`unroll` deterministic post-passes are reborn from, not yet reimplemented. The staging regimes (warp MMA / coop / flash)
-still ride `materialize.py`'s tower builders in the interim. Next is steps 3–5: stand up the enumeration forks over the
-tile node and grow the materialization stage (`assemble` + the deterministic post-passes) to subsume them.
+**Two quarantine registries** in `tests/compiler/_composer_xfails.py`: the **`_DEMO`** set (34 funcs + 7 nodes + 16
+files, "restored when assemble synthesizes the Schedule") is *this* plan's targets; the **`_REASON`** set (13 + 3,
+`plans/composer-only-green-suite.md`) is an older symbolic/structural-gap plan that overlaps and folds in per phase.
+
+The phases below each rebuild one tier and are **done** when its quarantined tests XPASS and are deleted from
+`_composer_xfails.py` in the same commit (the registry docstring already mandates this), with the green floor unmoved.
+Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy tower shape is reproduced.
+
+- **R0 — Quarantine hygiene** (no tier rebuild). The "28 failures" are **not** real regressions — every one is a
+  deleted-tier gap that escaped the registry (appendix). Three mechanical fixes: **(i)** fix `mark_composer_xfails` to strip
+  the trailing `@cuda` / `[param]@cuda` suffix before matching — recovers 8 already-listed entries; **(ii)** add the 19
+  unregistered tier-gap tests under their R-phase; **(iii)** repoint the 1 refactor-stale import test
+  (`test_knob_features_mma_expansion`). Then **harvest the 89 XPASS** by deleting their registry entries, splitting the
+  too-coarse whole-file `_XFAIL_FILES_DEMO` masks (`test_matmul_mma.py`, `test_run.py` hide green scalar tests) into
+  per-test entries. *Gate: `make test` green with **0 failed, 0 XPASS** — every red test an `xfail` tagged with its
+  recovery phase.*
+- **R1 — Staging** (deps: none). `assemble` synthesizes the smem slab + cooperative producer from `Schedule.staged`; the
+  `stage` offer. *Recovers:* `test_stage_inputs_mma_probe.py`, `test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs`.
+- **R2 — Cooperative-reduce** (deps: none; parallel with R1; the biggest chunk). `build_coop_reduce_tree` + `(bk,fk,br)`
+  offer + warp-shuffle / hierarchical combine synthesis. *Recovers ~22:* `test_monoid_reduce_kernel.py`,
+  `test_cooperative_combine.py`, `test_masked_cooperative_reduce.py`, the six `test_reduction_rules.py` coop tests, the four
+  `test_dtype_cuda.py` fp16 reduce/softmax/rmsnorm, the six `test_accuracy.py` e2e reduce/rmsnorm/softmax, the six
+  `test_ops_vs_torch.py` reduce/mean/softmax/rmsnorm, `test_tile_naming.py::test_real_rms_norm_kernels_named_by_op`,
+  `test_tune_accuracy.py::…[rmsnorm]`.
+- **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). The `partition_reduce(K,GRID)` move + atomic /
+  atomic-free combine block. *Recovers:* `test_mma_atomic_free_splitk.py`,
+  `test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural`.
+- **R4 — Warp-tier MMA (`atomize`)** (deps: R1). Atom-fold builder + `RegFragment`/`Ldmatrix`/`MmaSyncPtx`/`RegStore`
+  synthesis. *Recovers:* `test_matmul_mma.py`, `…_residual.py`, `…_causal_epilogue.py`, `…_transposed_b.py` (+ its
+  symbolic-MN nodes), `…_parity.py` (non-TMA params), `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct`.
+  *Folds in `_REASON` Phase 1–2 (symbolic masked warp / masked-K).*
+- **R5 — Transport (cp.async / TMA)** (deps: R1, R4). `promote_transport` + descriptor/swizzle synthesis (`peel` post-pass
+  does the pipeline expansion). *Recovers:* the `test_matmul_mma_parity.py` TMA nodes (static + dynamic),
+  `test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment`. *Folds in `_REASON` Phase 3.*
+- **R6 — Flash / attention** (deps: R2, R4). Streaming `TWISTED_MONOID` builder (`FM=FN=1`) + flash synthesis. *Recovers:*
+  `test_flash_attention.py`, `test_flash_cooperative_kv.py`, `test_attention_chains.py`, the three
+  `test_ops_vs_torch.py` sdpa, `test_tune_accuracy.py::…[sdpa]`.
+- **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
+  reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
+  `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
+  / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
+
+```
+R0 ─┬─► R1 staging ───────► R4 warp-MMA ──► R5 transport ─┐
+    ├─► R2 coop-reduce ──────────────────────┐           ├─► R7 e2e / structural / prior
+    └─► R3 split-K ───────────────────────────┘           │
+                       R2 ──► R6 flash ◄── R4 ─────────────┘
+```
+
+R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's combine work; R4→R5, R2+R4→R6, all→R7. As each
+tier lands, retire the matching `composer-only-green-suite.md` phase into its R-phase here — that doc no longer tracks a
+live process.
+
+### Appendix — the 28 non-quarantined failures (R0 checklist)
+
+**None is a regression in the surviving pointwise / scalar-matmul path.** All 28 are deleted-tier gaps that *should* be
+xfailed but aren't — for three mechanical reasons:
+
+**(A) Registry-listed but the `@cuda` / `[param]` suffix slips past the matcher (8).** `mark_composer_xfails` matches with
+`func_path.endswith(entry)` / `nodeid.endswith(node)`, but the live nodeids carry a trailing `@cuda` (and the param entries
+carry `[rmsnorm]@cuda`), so the match fails. **Fix once: strip the `@…` suffix before matching** → these 8 flip to xfail
+with no registry change.
+- `test_dtype_cuda.py::{test_fp16_max_reduction_stays_in_fp16, test_fp16_reduction_uses_fp32_accumulator_on_cuda,
+  test_fp16_softmax_cuda, test_fp16_rmsnorm_cuda}@cuda` → R2
+- `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct@cuda` → R4
+- `test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue@cuda` (`_REASON`) → R7
+- `test_tune_accuracy.py::test_tuned_variant_matches_reference[rmsnorm]@cuda` → R2; `…[sdpa]@cuda` → R6
+
+**(B) Never registered — add under the recovering phase (19).** Confirmed tier-gap root causes (`RuleSkipped` /
+`IndexError: list index out of range` on the empty lowering / `TypeError: node … has non-CudaOp` / hoist-gap kernel
+bloat):
+- → R2 (coop): `test_emit.py::{test_reduce_emits_k_loop, test_softmax_emits_per_element_store,
+  test_softmax_emits_multiple_k_loops, test_reduce_runs_on_gpu, test_softmax_runs_on_gpu}`,
+  `test_launch_geometry_rules.py::test_launch_geometry_fires_on_reduction`,
+  `test_graph_capture.py::{test_bench_lowered_vs_torch_captures, test_deplodock_capture_failure_falls_back_uncaptured,
+  test_torch_capture_failure_disables_deplodock_capture}` (bench a reduce kernel → non-CudaOp),
+  `test_bench_worker_compare.py::test_compare_in_worker_returns_torch_and_deplodock`,
+  `test_dynamic_shapes.py::{test_cuda_softmax_over_symbolic_seq_len, test_cuda_symbolic_rmsnorm_traced_and_run,
+  test_capture_replay_cache_rmsnorm_over_capacity_buffers, test_capture_replay_device_io_matches_eager}`.
+- → R6 (flash): `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`.
+- → R7 (whole-model / hoist): `test_dynamic_shapes.py::{test_qwen_whole_model_dynamic_compiles_and_matches_eager,
+  test_qwen_whole_model_capture_replay_cache_matches_eager, test_qwen_layer_dynamic_compiles_and_matches_eager}`,
+  `test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget` (asserts the invariant prefix is
+  hoisted — fails because the hoist regime is gone).
+
+**(C) Refactor-stale — update, don't quarantine (1).** `test_knob.py::test_knob_features_mma_expansion` fails with
+`ImportError: cannot import name '_enumeration'` — it imports a module deleted in the package reorg; repoint it at the new
+`enumeration` package (or fold into R4 if the mma knob features aren't rebuilt yet).
 
 ## Open design decisions
 

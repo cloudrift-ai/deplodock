@@ -118,7 +118,7 @@ def test_trace_records_partition_fork() -> None:
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     terminal, trace = run.resolve(g, _option0)
-    part = [d for d in trace if d.rule_name == "010_partition_loops"]
+    part = [d for d in trace if d.rule_name == "010_enumerate"]
     assert len(part) == 1, f"one partition fork for one kernel, got {[d.rule_name for d in trace]}"
     d = part[0]
     assert d.node_id in terminal.nodes

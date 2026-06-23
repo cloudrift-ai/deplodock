@@ -108,14 +108,14 @@ def outer_pipeline() -> Pipeline:
     inner slice-sum path — their trigger knob (``SPLITK``) doesn't exist until
     partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
-    tile_rules = [r.name for r in Pass.load("lowering/tile", index=len(passes)).rules]
+    tile_rules = [r.name for r in Pass.load("lowering/tile/enumeration", index=len(passes)).rules]
     head = tile_rules[: tile_rules.index(PARTITION_RULE)]
     # Re-load with ``select`` (rather than slicing the loaded rules) so the
     # partial pass's ``declared_knobs`` covers only the pre-partition rule
     # modules — the pass-boundary OFF-fill must not stamp post-partition
     # lowering knobs onto fused LoopOps (that would churn every op_cache_key
     # away from what the assembled greedy run derives).
-    passes.append(Pass.load("lowering/tile", index=len(passes), select=set(head)))
+    passes.append(Pass.load("lowering/tile/enumeration", index=len(passes), select=set(head)))
     return Pipeline(passes=passes)
 
 

@@ -37,7 +37,7 @@ PASS_SHORTHAND = {
     "loop/fusion": "f",
     "loop/recognize": "r",
     "loop/stamp": "s",
-    "lowering/tile": "t",
+    "lowering/tile/enumeration": "t",
     "lowering/kernel": "k",
     "lowering/cuda": "c",
 }
