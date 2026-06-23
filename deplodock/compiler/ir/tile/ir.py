@@ -53,6 +53,7 @@ from typing import Literal as _Lit
 from deplodock.compiler.dtype import BF16, F16, F32, DataType
 from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -480,6 +481,32 @@ class TileGraph:
                     seen.add(e)
                     out.append(e)
         return tuple(out)
+
+    def structural_key(self) -> str:
+        """A canonical identity over the algorithm + Schedule, for ``op_cache_key``
+        (``plans/tile-ir-block-dag.md``: the key is ``canonical(compute bodies +
+        edge topology) + Schedule``). The derived projections never enter it."""
+        blocks = tuple((b.name, b.compute.structural_key()) for b in self.blocks)
+        binding = tuple(sorted((a, v.value) for a, v in self.schedule.binding.items()))
+        edges = tuple(sorted((e.src, e.dst, e.buffer) for e in self.edges))
+        return repr((blocks, binding, edges))
+
+
+@dataclass
+class TileGraphOp(Op):
+    """The ENUMERATION pass output: a chosen ``Schedule``'s :class:`TileGraph`,
+    BEFORE assembly. The one deterministic assembly pass
+    (``assembly/010_assemble``) turns it into the ``TileOp`` tower. Carries the
+    variant ``knobs`` (the search / perf-DB key) and the per-CTA ``leading``
+    prologue that ``assemble`` prepends — the only enumeration state assembly
+    needs that isn't on the ``TileGraph`` itself."""
+
+    name: str = ""
+    tilegraph: TileGraph | None = None
+    leading: tuple = ()
+
+    def structural_key(self) -> str:
+        return self.tilegraph.structural_key()
 
 
 # ===========================================================================

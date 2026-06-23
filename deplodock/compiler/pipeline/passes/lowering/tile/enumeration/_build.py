@@ -18,8 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph, TileGraphOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
@@ -202,21 +201,23 @@ def build_matmul_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_name
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers — build the DAG + assemble. The Fork-tree leaves call these;
-# the new block-DAG path is the SOLE pointwise / scalar-matmul lowering (the
-# legacy materialize.build_*_tile builders are deleted).
+# Routing helpers — the Fork-tree leaves call these to emit the ENUMERATION
+# output: a ``TileGraphOp`` carrying the chosen Schedule's ``TileGraph`` + the
+# full variant knob set. Assembly is a SEPARATE deterministic pass
+# (``assembly/010_assemble``); these do NOT call ``assemble`` (the new block-DAG
+# path is the sole pointwise / scalar-matmul lowering).
 # ---------------------------------------------------------------------------
 
 
-def lower_pointwise(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict):
-    """Lower a pointwise leaf via the block-DAG path."""
+def lower_pointwise(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileGraphOp:
+    """Emit the ``TileGraphOp`` for a pointwise leaf (enumeration only)."""
     tg = build_pointwise_dag(dag, knobs, kernel_name=kernel_name)
-    return assemble_block(tg, knobs=knobs, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
+    return TileGraphOp(name=kernel_name, tilegraph=tg, leading=tuple(dag.leading), knobs={**base_knobs, **knobs})
 
 
-def lower_matmul(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str]):
-    """Lower a scalar-matmul leaf via the block-DAG path."""
+def lower_matmul(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str]) -> TileGraphOp:
+    """Emit the ``TileGraphOp`` for a scalar-matmul leaf (enumeration only)."""
     tg = build_matmul_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
     # Scalar tier carries the warp-tier OFF sentinels.
     stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
-    return assemble_block(tg, knobs=stamped, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
+    return TileGraphOp(name=kernel_name, tilegraph=tg, leading=tuple(dag.leading), knobs={**base_knobs, **stamped})

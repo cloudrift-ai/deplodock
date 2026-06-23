@@ -33,7 +33,7 @@ def op_cache_key(op: object) -> str | None:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -52,6 +52,11 @@ def op_cache_key(op: object) -> str | None:
         # ``_propagate_expected`` walks the parent chain forever.
         knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
         return digest(type(op).__name__, op.body.structural_key(), knob_key)
+    if isinstance(op, TileGraphOp):
+        # The enumeration-pass output (a chosen Schedule's TileGraph, pre-assembly):
+        # key on the TileGraph's canonical algorithm + Schedule identity + knobs.
+        knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
+        return digest("TileGraphOp", op.structural_key(), knob_key)
     return None
 
 
@@ -70,6 +75,10 @@ def dialect_of(op: object) -> Dialect | None:
         return "tile"
     if isinstance(op, LoopOp):
         return "loop"
+    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+
+    if isinstance(op, TileGraphOp):
+        return "tile"  # the enumeration output, still the tile dialect (pre-assembly)
     return None
 
 
