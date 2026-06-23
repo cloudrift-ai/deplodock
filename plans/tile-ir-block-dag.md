@@ -866,13 +866,23 @@ never a tree-builder.
   `_mask_flash_monoid`. *Gate:* accuracy-vs-torch on the RTX 5090 — SDPA / causal / GQA / additive-mask flash, static
   **and** dynamic (symbolic `seq_len`, masked streaming). *Recovered:* `test_flash_attention.py` (all but
   `test_flash_off_keeps_decomposition`, re-tagged R7 — its blocker is the non-flash score-materializing SDPA
-  decomposition) + `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`. *Deferred (still quarantined, R6
-  follow-ups):* **cooperative-KV flash** (`test_flash_cooperative_kv.py` — the `BR>1` streaming split needs the `Monoid`
-  carrier's cross-thread `combine_states` wired to the `K_c` lane; the lane is laid but the combine doesn't yet fire),
-  **RoPE-fused attention chains** (`test_attention_chains.py` — the score producer is a RoPE-fused nest, a
-  recognition follow-up the plan already flagged), and the **score-materializing SDPA decomposition**
-  (`test_ops_vs_torch.py::test_sdpa*`, `test_tune_accuracy.py::…[sdpa]`, `flash_off` — FLASH-off static SDPA whose
-  softmax + P@V kernels don't yet lower).
+  decomposition) + `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`. **Cooperative-KV flash landed
+  (R6 follow-up).** The `BR>1` streaming split now lays the `K_c` cooperative THREAD lane on the **static** streaming KV
+  axis in `_build.flash_build` / `_replace_k_flash` (σ-split `K → K_o·br + K_c`, `K_c` bound THREAD innermost): each
+  lane streams a strided KV slice into its own online-softmax `(m, l, O)` partial, the `Monoid.axes` pick up `K_c`
+  through σ, and `kernel/100_materialize_tile` emits the carrier's `combine_states` warp-shuffle / smem-tree combine —
+  the same commutative-licensed THREAD partition the `MONOID` coop reduce uses (no new assemble work; the `Monoid`
+  already carries `combine_states` / `state_b`). `017_flash` enumerates `flash_br_offers × thread_offers`, budgets the
+  free thread tile by `BR`, and filters the free×BR layout via `flash_coop_geometry_ok` (whole-CTA tree vs strided
+  intra-warp segment). Default `BR=1` keeps the serial-KV form (opt-in via `DEPLODOCK_BR`; symbolic KV stays serial).
+  *Recovered:* `test_flash_cooperative_kv.py` (4 cases, accuracy vs torch SDPA). *Deferred (still quarantined, R7-gated
+  — they share the fused-prologue / `005_split_demoted` structural-split tier, not a flash patch):* the **score-
+  materializing SDPA decomposition** (`test_ops_vs_torch.py::test_sdpa*`, `test_tune_accuracy.py::…[sdpa]`, `flash_off`
+  — FLASH-off static SDPA whose fused softmax-prologue + P@V kernel `k_sdpa_reduce` doesn't classify: it mixes `MONOID`
+  prologue reduces with a `SEMIRING` P@V matmul over one axis, the rebuilt `_classify_fused_prologue` regime R7 owns)
+  and the **RoPE-fused attention chains** (`test_attention_chains.py` — same blocker: the chains hit the static
+  score-materializing path, so their `k_sdpa_*_reduce` needs the same fused-prologue lowering, plus the RoPE-fused score
+  producer recognition).
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
   reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
   `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
@@ -882,7 +892,7 @@ never a tree-builder.
 RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ✓ ┐
 (multi-pass split) ├─► R2 coop-reduce ✓ ───────────────────┐         ├─► R7 e2e / structural / prior
                 └─► R3 split-K ✓ ───────────────────────────┘         │
-                             R2 ✓ ─► R6 flash ◑ ◄── R4 ✓ ─────────────┘   (◑ scalar flash core; coop-KV / RoPE / SDPA-decomp follow-ups)
+                             R2 ✓ ─► R6 flash ◑ ◄── R4 ✓ ─────────────┘   (◑ scalar flash core + coop-KV ✓; RoPE / SDPA-decomp follow-ups are R7-gated)
 ```
 
 RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
@@ -941,8 +951,12 @@ greedy in-budget fallback (no longer the R2-blocked "over-stages the multi-accum
 The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). **The R4 follow-ups have landed** (the
 over-ceiling warp-reg pin is authoritative so the unstaged atom builds + lowers gmem-direct via the budget-aware
 staging decline, and the masked-tile hoist gained the SSA-safety refusal — see the R4 bullet); both quarantined R4
-tests are de-quarantined. The remaining **R6 follow-ups** (cooperative-KV flash's `combine_states` wiring, RoPE-fused
-attention recognition, the score-materializing SDPA decomposition) ride alongside R7, plus the `retime` / `warp_spec`
-forks + the `pad` post-pass + the deferred **R5 transport tiers with no recovery test** (the cp.async / `ASYNC`
-transport, the `RING` occupancy fork at depth 3–4, and the scalar / cooperative-reduce TMA promotion — the warp-tier
-TMA covers the recovery set, so these stay future work).
+tests are de-quarantined. **The cooperative-KV flash R6 follow-up has landed** (the `BR>1` streaming split lays the
+`K_c` THREAD lane in `_build.flash_build`, so the carrier's `combine_states` fires at `kernel/100` like the `MONOID`
+coop reduce — `test_flash_cooperative_kv.py` de-quarantined; see the R6 bullet). The two **remaining R6 follow-ups**
+(the score-materializing SDPA decomposition + the RoPE-fused attention chains that depend on it) are **R7-gated**: both
+need the fused softmax-prologue + P@V kernel to lower, which routes through R7's rebuilt `_classify_fused_prologue`
+regime / the `005_split_demoted` structural split — not a flash patch. They ride alongside R7, plus the `retime` /
+`warp_spec` forks + the `pad` post-pass + the deferred **R5 transport tiers with no recovery test** (the cp.async /
+`ASYNC` transport, the `RING` occupancy fork at depth 3–4, and the scalar / cooperative-reduce TMA promotion — the
+warp-tier TMA covers the recovery set, so these stay future work).
