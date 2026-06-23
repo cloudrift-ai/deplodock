@@ -33,6 +33,38 @@
   derived `xn` edge + GMEM placement). The fission was moved `split/_extract.py` → `enumeration/_extract.py` and split
   into `_fission` (shared) + `extract_block` (the GMEM `Graph` lowering, byte-identical) + `seed_demoted` (the new
   block-DAG seed). Not yet wired into `000_build` — `extract_block` stays the live cut.
+- **(2.5, increment 2) The edge-placement move — `TileGraph.place_edge`.** The inverse of the derived `placement`
+  view: it writes the `Schedule` fields a placement implies (`GMEM` → split launch groups; `SMEM` → one group + stage
+  the edge; `INLINE` → one group, no stage), so `stage`/`split`/fuse are one move over the block-DAG. Round-trips with
+  `placement` and drives cut-vs-fuse on the real demoted seed (`test_blockdag` / `test_seed_demoted`). This is the move
+  the future edge-placement fork applies to `seed_demoted`'s graph.
+
+### The SMEM fused-edge codegen path (the next build)
+
+The genuinely new capability — the fused edge that *beats* the cut (no gmem round-trip; the matmul reaches the warp
+tier reading a clean `xn` from smem). The key finding: **the existing `StageBundle.compute` mechanism is exactly this**,
+already lowered end-to-end (`kernel/_stage_expand.emit_compute_phase` + `100_materialize_tile`). It is the
+"sibling-smem → own-smem producer template": a cooperative compute phase that reads an already-staged sibling slab,
+applies a transform, and writes a freshly-derived smem slab.
+
+So the **MAP-producer** fused edge (e.g. `relu(x) @ w` / `scale·x @ w`) maps straight onto it:
+
+1. stage `x` into a smem slab (a normal gmem→smem `Source`);
+2. the producer (`relu`/`scale`) becomes the consumer's `xn`-slab `StageBundle.compute` phase, reading the `x` slab and
+   writing the `xn` slab;
+3. the consumer matmul reads the `xn` slab (`ldmatrix` → warp tier).
+
+`emit_compute_phase` handles only a **pointwise** compute body (flat `Load`/`Assign`/`Write`, no recursion), so:
+
+- **MAP producer (relu / scale)** — buildable on the existing machinery now; this is the first target. `_assemble_fused`
+  reuses `_assemble_one` for the consumer and injects the producer as the `xn`-slab compute phase.
+- **MONOID producer (rmsnorm — the headline case)** — needs the compute phase generalized to carry a **reduce** (the
+  sum-of-squares) before the pointwise scale. A later generalization of `emit_compute_phase`.
+
+The co-tiling is **shared-knob** (one kernel, one knob set): the producer's slab fill is sized by the consumer's M tile,
+so it rides the consumer's tiling rather than enumerating independently — which is why the fused edge has *no*
+knob-namespace problem (unlike GMEM). Remaining build: `_assemble_fused` (the producer-as-compute-phase wiring) + the
+placement fork that offers `SMEM` vs `GMEM` on the seed + wiring `seed_demoted`/`place_edge` into `000_build`.
 
 **Scoping note — what "deleting the legacy split" did and did not mean; and the next architectural decision.**
 
