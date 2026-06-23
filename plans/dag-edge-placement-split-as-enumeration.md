@@ -24,19 +24,42 @@
   tightness; the full compiler suite (the SDPA / attention / qwen-block / norm-linear CUDA accuracy tests that exercise
   the cut) stays green.
 
-**Scoping note — what "deleting the legacy split" did and did not mean.**
+- **(2.5, increment 1) The block-DAG seed of the cut — `seed_demoted`.** The demoted matmul is **not** one unbuildable
+  block: it is two clean blocks fusion glued together — a MONOID/MAP producer `--xn-->` a SEMIRING matmul consumer — so
+  "fused vs split" is the **placement** of that `xn` edge. `enumeration/_extract.py::seed_demoted` builds exactly that
+  block-DAG: the same `_fission` slicing as `extract_block`, but each piece is seeded as a logical `Block`
+  (`seed_graph(iter_dag(piece))`) and combined into one multi-block `TileGraph` (the `xn` edge is then *derived*, its
+  placement a `Schedule` view). `test_seed_demoted.py` pins it (norm→linear → MONOID producer + SEMIRING consumer +
+  derived `xn` edge + GMEM placement). The fission was moved `split/_extract.py` → `enumeration/_extract.py` and split
+  into `_fission` (shared) + `extract_block` (the GMEM `Graph` lowering, byte-identical) + `seed_demoted` (the new
+  block-DAG seed). Not yet wired into `000_build` — `extract_block` stays the live cut.
+
+**Scoping note — what "deleting the legacy split" did and did not mean; and the next architectural decision.**
 
 > The bespoke decision monolith (`try_split_demoted` + `_classify_cut`'s force heuristic) is **gone** — its offer policy
-> relocated to the derived `_cut.cut_offers` tier predicate, its fission to `extract_block`. But the **pre-build
-> `split/` phase itself survives** as a thin shell, because a **demoted matmul does not classify as a buildable seed**:
-> `classify(iter_dag(fused_norm_linear))` returns `None` (the matmul cell's operand is a computed cone, not a clean
-> `[Load, Load, mul, Accum]`), so `enumeration/000_build` would `RuleSkip` it. The cut therefore cannot *yet* fold into
-> `enumeration/` as a post-seed edge-placement fork over a `TileGraph` — it must intercept the raw `LoopOp` before build
-> rejects it. The full block-DAG form (`_cut.cut_offers(graph)` querying a multi-block `TileGraph`, `tier(C | inline)`
-> off `Block.atom`/`reads`, the cut as an outer fork that `extract_block` fissions in-place) needs **(2.5) a logical
-> fused-prologue (demoted-matmul) seed regime** in `classify`/`000_build` first — which overlaps the
-> "fused-prologue-into-warp-tile codegen" this plan's own non-goals defer. The general multi-block `assemble` (step 1)
-> and the derived `Placement`/`Tier` vocabulary (steps 2/4) are the scaffold that step (2.5) would plug into.
+> relocated to the derived `_cut.cut_offers` tier predicate, its fission to `extract_block`. The block-DAG **seed** now
+> also exists (`seed_demoted`, the MONOID `--xn-->` SEMIRING DAG). The remaining gate to wiring it live is a genuine
+> **architectural decision about knob namespacing**, surfaced while planning increment 2:
+>
+> - **GMEM (the cut) wants *separate* kernels with *independent* knobs.** A norm producer and a matmul consumer have
+>   unrelated optimal tilings (the producer's `BR`/coop vs the consumer's `BK`/`WM`…, colliding on shared names like
+>   `BN`). So GMEM naturally lowers to **separate single-block `TileGraphOp`s** — exactly the existing `extract_block`
+>   path. Forcing both kernels through one multi-block `TileGraphOp` + the step-1 multi-block `assemble` would make them
+>   **share one knob set**, which is wrong for independent kernels (the step-1 assemble's one-knob-set-per-graph
+>   assumption only holds for a *co-tiled* graph). So the 2-block-`TileGraphOp`-in-one-node is **not** the right form for
+>   GMEM.
+> - **The 2-block `TileGraph`'s real payoff is the SMEM/INLINE *fused* edge** — one kernel where the producer writes
+>   `xn` to smem, `__syncthreads`, and the consumer `ldmatrix`-reads it into the warp tier (no gmem round-trip; the form
+>   that *beats* the cut). There it is genuinely **one kernel with one *co-tiled* knob set** (producer + consumer share
+>   the row/M tiling), so the knob-namespace problem disappears. This needs (a) **multi-block enumeration with shared
+>   knobs** (each pass applies its move to the matching block) and (b) a **fused-prologue `assemble`** (producer-compute
+>   → smem slab → consumer read — a generalization of the `stage` move whose "source" is a producer block, not a gmem
+>   load). That is the substantive multi-week piece.
+>
+> So the corrected next step is **the SMEM fused edge**, not "GMEM via the multi-block path" (which would only re-do the
+> existing cut through a knob-colliding representation). `seed_demoted` is the foundation it builds on; step-1
+> multi-block `assemble` is for the *cut* side once a clean per-block-knob story exists, or is superseded by the fused
+> `assemble` for the co-tiled side.
 
 **Not done (out of this slice's scope):** (2.5) the logical fused-prologue seed regime; the block-DAG (post-seed) form
 of the cut as an outer fork over one `TileGraph`; the buildable-fused keep-vs-split **fork** (only the forced cut is
