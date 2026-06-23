@@ -438,6 +438,42 @@ prior / DB / MCTS machinery is untouched; `op_cache_key` becomes `canonical(bodi
   total function with no candidate to rank (a formula or a threshold). The test for landing here: *the rule has exactly
   one output for a given kernel.* If you find yourself wanting to bench two outcomes, it is a fork and belongs pre-`assemble`.
 
+**Directory layout — two pass dirs.** The loader treats each `passes/<name>/` directory as one pipeline pass: it globs
+that dir's numbered `*.py` rule files in order (non-recursively; `__init__.py` and `_`-prefixed files are helpers, not
+rules — `pipeline.py::Pass.load`). The two sub-stages are therefore two pass dirs, split exactly at the `assemble`
+boundary, and `TILE_PASSES` ends `…, "lowering/tile/enumeration", "lowering/tile/assembly"` in place of today's single
+`"lowering/tile"`:
+
+```
+passes/lowering/tile/
+  enumeration/                 # pass "lowering/tile/enumeration" — everything PRE-assemble: the seed + the forks
+    000_build.py               #   deterministic: LoopOp → TileGraph algorithm DAG (no fork — seeds the search root)
+    010_tensorize.py           #   fork (body):     atomize
+    015_partition_reduce.py    #   fork (body):     split-K / cooperative-K
+    020_register_tile.py       #   fork (schedule): bind REGISTER
+    030_stage.py               #   fork (schedule): stage + hoist
+    040_retime.py              #   fork (schedule): ring depth / distance
+    050_transport.py           #   fork (schedule): promote CPASYNC / TMA
+    060_warp_spec.py           #   fork (schedule): producer / consumer roles
+    070_swizzle.py             #   fork (schedule): grid swizzle
+    _moves.py  _knobs.py  …    #   shared offer/legality helpers (today's partition/moves.py, knobs.py)
+  assembly/                    # pass "lowering/tile/assembly" — assemble + deterministic POST-processing (no fork)
+    000_assemble.py            #   deterministic: (TileGraph + Schedule) → basic KernelOp tower
+    010_peel.py                #   det. post: pipeline σ-peel from ring_depth
+    020_mask_order.py          #   det. post: cooperative load above the mask Cond
+    030_pad.py                 #   det. post: bank-conflict pad (formula)
+    040_unroll.py              #   det. post: #pragma unroll (trip threshold)
+    _slab.py  _synth.py  …     #   shared materialization helpers (today's materialize.py, _stage_expand, …)
+```
+
+`enumeration/` holds the entire search side — the deterministic `000_build` seed plus the genuine forks; `assembly/`
+holds the deterministic materialization stage — `000_assemble` plus the fixed-logic post-passes, with no fork anywhere.
+**The `assemble` boundary is the dir boundary**, so "is this pass allowed to return a `Fork`?" reduces to "which dir is
+it in?" — a structural guardrail against fixed logic leaking into the search. Today's `partition/` package (the move
+composer) dissolves into these two: `build` + forks + move helpers → `enumeration/`, `assemble` + slab synthesis →
+`assembly/` (see "Relationship to existing code"). `000_build` is deterministic yet lives in `enumeration/` because it is
+the pre-`assemble` front that produces the DAG the forks annotate — the dir is the *stage*, not the "has-a-fork" flag.
+
 ## Pass rewrites
 
 Each current tile pass re-expressed against the IR above.
@@ -620,9 +656,9 @@ the whole tile phase.
 4. **Port `retime` + `promote_transport` + `specialize_warps`** — `040`/`080`/`050`/`060`/`085` become Schedule
    annotations; their tree surgery moves into `assemble`. → byte-identical, then perf-equal under tune.
 5. **Port `swizzle` + `atomize`** (the remaining forks) and the fixed-logic locals, then retire the tower builders. End
-   state = the pass list in "The pass structure": deterministic `tile/build` → the enumeration forks (`tensorize` /
-   `partition_reduce` / `register_tile` / `stage` / `retime` / `transport` / `warp_spec` / `swizzle`) → one
-   `tile/assemble` → the deterministic post-passes (`peel` / `mask_order` / `pad` / `unroll`).
+   state = the two pass dirs of "Directory layout": `lowering/tile/enumeration/` (`000_build` + the forks `tensorize` /
+   `partition_reduce` / `register_tile` / `stage` / `retime` / `transport` / `warp_spec` / `swizzle`) →
+   `lowering/tile/assembly/` (`000_assemble` + the deterministic post-passes `peel` / `mask_order` / `pad` / `unroll`).
 
 The DAG and the tree can coexist through 1–4: the composer builds the DAG, `assemble` lowers to the *current* tower, and
 the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.

@@ -103,12 +103,31 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op",
         # Warp-tier atom lowering (deleted).
         "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct",
+        # CLI compile of a reduce/dynamic snippet (coop / staging deleted).
+        "test_compile.py::test_compile_code_saves_default_cuda_to_output",
+        "test_compile.py::test_compile_dynamic_emits_runtime_arg",
         # Reductions / softmax / RMSNorm route through the cooperative-reduce
         # regime (deleted).
         "test_dtype_cuda.py::test_fp16_max_reduction_stays_in_fp16",
         "test_dtype_cuda.py::test_fp16_reduction_uses_fp32_accumulator_on_cuda",
         "test_dtype_cuda.py::test_fp16_softmax_cuda",
         "test_dtype_cuda.py::test_fp16_rmsnorm_cuda",
+        # e2e reduce / softmax / rmsnorm / sdpa — coop / flash regimes deleted.
+        "test_accuracy.py::test_e2e_reduce_sum",
+        "test_accuracy.py::test_e2e_reduce_sum_cooperative",
+        "test_accuracy.py::test_e2e_reduce_max_cooperative",
+        "test_accuracy.py::test_e2e_rmsnorm",
+        "test_accuracy.py::test_e2e_softmax",
+        "test_accuracy.py::test_e2e_softmax_cooperative",
+        "test_ops_vs_torch.py::test_reduce_sum",
+        "test_ops_vs_torch.py::test_reduce_max",
+        "test_ops_vs_torch.py::test_reduce_sum_keepdim",
+        "test_ops_vs_torch.py::test_mean",
+        "test_ops_vs_torch.py::test_sdpa",
+        "test_ops_vs_torch.py::test_sdpa_causal",
+        "test_ops_vs_torch.py::test_sdpa_gqa",
+        "test_ops_vs_torch.py::test_softmax_graph",
+        "test_ops_vs_torch.py::test_rmsnorm_graph",
     }
 )
 _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
@@ -146,6 +165,7 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_attention_chains.py",  # attention (SDPA/flash) chains (deleted)
         "test_split_demoted.py",  # demoted-split CUDA accuracy (warp/coop/split-K paths deleted)
         "test_program_rebind.py",  # dynamic re-bind across seq_lens (staging/coop)
+        "test_block.py",  # whole TinyLlama / Qwen block (needs coop + attention)
     }
 )
 
