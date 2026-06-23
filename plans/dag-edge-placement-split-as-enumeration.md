@@ -92,10 +92,23 @@
     internal-slab branch of `_fuse_producers` — no gmem round-trip of `xn`). The producer's logical row axis σ-maps to
     the consumer's M index (read off the `xn` load, since the kernel output may be batched 3D). GPU-verified by
     `test_fused_rmsnorm_matmul_runs_correctly`. *Remaining:* the **warp tier** hits a separate nvcc `-Werror`
-    unused-`mma_*_bf16`-helper quirk at large shape (scalar tier is clean); the offering fork (next item) is still
-    needed to seed this live.
-- **The offering fork** — so a demoted matmul seeds the fused 2-block graph **live** and the search prices `SMEM` vs
-  `GMEM` (the two-level structural integration).
+    unused-`mma_*_bf16`-helper quirk at large shape (scalar tier is clean).
+- **The offering fork — LANDED (pin-reachable), greedy default DEFERRED.** `split/005` now wires the keep branch to the
+  SMEM fused edge: `_extract.seed_fused` turns a single-cone demoted `LoopOp` into a fused 2-block `TileGraphOp` (clean
+  matmul consumer `blocks[0]` + producer cone `blocks[1]`, the `xn` edge `SMEM`-placed) carrying the *consumer's*
+  dag/regime — and the enumeration body moves already rebuild `blocks[0]` while preserving trailing blocks (the
+  multi-block-enumeration seam was free), so the consumer tiles and the producer rides; `assembly/010`'s fused
+  dispatch folds it into one `TileOp`. `cut_offers` gains `smem_fusible` (`force = unbuildable AND not smem_fusible`) so
+  the cut is offered-not-forced when the cone fuses on-chip. `DEPLODOCK_SPLIT_CONE=0` now builds a real fused edge
+  (RMSNorm → linear in ONE kernel, GPU-verified live via the full pass chain); `=1` the cut. The `seed_fused` gate
+  (`_producer_fusible`: pointwise MAP or single-reduce RMSNorm `MONOID`) keeps it to shapes `assemble_fused` builds — a
+  two-pass SDPA softmax / multi-cone rotary / multi-accum gated-MLP stays a forced cut. **The unpinned greedy path still
+  forces the cut**: greedy's "a cold compile never changes kernel sets" rule (`search/policy/greedy._pick_structural`
+  filters the structural cut cold) would make the kernel-set-preserving keep(SMEM) the cold default the instant it is an
+  op-variant fork sibling — but the fused edge isn't yet robust at every knob config a cold compile can land on (the
+  scalar sibling-cell-fused tile; the warp-tier nvcc quirk). *Remaining:* make the fused edge robust across knob sets,
+  then promote keep(SMEM) to the greedy default + a live keep-vs-cut search fork (the two-level structural integration:
+  the trained prior prices `SMEM` Σ vs `GMEM` Σ).
 
 ### The SMEM fused-edge codegen path (the next build)
 
