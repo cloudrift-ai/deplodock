@@ -818,12 +818,18 @@ never a tree-builder.
   `test_run.py::test_run_code_fp16_matmul_window_accuracy` `[4]`/`[8]` (a window-pinned fp16 matmul now honors its tile
   knobs; `[2]` still hits a separate fp16 nvcc codegen failure, R7). The cp.async / TMA `&b[...]` operand form the
   legacy clamp test asserted rides the deferred ASYNC transport tier, so the recovered tests assert the SYNC scalar
-  cooperative load + slab. *Still quarantined (R4 follow-ups):*
-  `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` (a distinct warp/atom-tier staging-decline heuristic —
-  an unstageable atom operand must drop its `STAGE` edge so the gmem-direct fragment path is exercised; the
-  scalar-geometry pin it uses also over-budgets the warp register file at `FM=26`), and
-  `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` (imports the deleted `021`; rewrite against
-  `_slab._hoist_masked`'s SSA-safety refusal). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the
+  cooperative load + slab. *R4 follow-ups landed (de-quarantined):*
+  `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` — the over-ceiling `FM=26` warp register pin is now
+  authoritative (`warp_reg_offers` bypasses the `_MAX_WARP_CELLS` *search* ceiling for a full `(FM, FN)` pin — the
+  ceiling prunes auto-enumerated candidates, not explicit pins), so the warp build + assemble proceed; and with **no**
+  `STAGE` pin the budget-aware `050_stage` filter prunes the over-budget staging subsets (the `FM=26` slabs blow the
+  smem cap) down to the empty one, so greedy stages nothing and the operands lower gmem-direct
+  (`dpl_mma_load_{a,b}_gmem`) — the staging-decline is the budget filter, not an override of an authoritative pin.
+  `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` — rewritten against `assembly/_slab._hoist_masked`,
+  which gained the legacy `021` SSA-safety refusal: a masked-tile
+  hoist that would lift a K-tower stmt above an SSA name defined by a stmt staying inside the boundary `Cond` (the
+  fused-prologue shape) returns `None` so the caller keeps the `Cond` in place (defense-in-depth — the planner doesn't
+  emit liftable masked prologue `Cond`s today). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the
   symbolic-K staging follow-up.*
 - **R5 — Transport (cp.async / TMA)** (deps: R1, R4). **Landed (warp-tier TMA).** Added the `promote_transport`
   enumeration fork `enumeration/052_transport` (the `TMA` BOOL on a fully-staged warp matmul — SYNC is option-0 so
@@ -932,8 +938,11 @@ mask filter + `_slab._hoist_masked`'s SYNC hoist-and-clamp — see the R4 bullet
 non-divisor `real_extent` tests are de-quarantined, and the over-staging the pin once exposed is now resolved by the
 greedy in-budget fallback (no longer the R2-blocked "over-stages the multi-accum matmul past the smem budget").
 
-The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). The remaining **R6 follow-ups**
-(cooperative-KV flash's `combine_states` wiring, RoPE-fused attention recognition, the score-materializing SDPA
-decomposition) and the remaining **R4 follow-ups** (the gmem-direct unstaged atom's warp/atom staging-decline
-heuristic, the hoist-refuses test rewrite against `_slab._hoist_masked`) ride alongside, plus the `retime` /
-`warp_spec` forks + the `pad` post-pass + the scalar/cp.async transport.
+The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). **The R4 follow-ups have landed** (the
+over-ceiling warp-reg pin is authoritative so the unstaged atom builds + lowers gmem-direct via the budget-aware
+staging decline, and the masked-tile hoist gained the SSA-safety refusal — see the R4 bullet); both quarantined R4
+tests are de-quarantined. The remaining **R6 follow-ups** (cooperative-KV flash's `combine_states` wiring, RoPE-fused
+attention recognition, the score-materializing SDPA decomposition) ride alongside R7, plus the `retime` / `warp_spec`
+forks + the `pad` post-pass + the deferred **R5 transport tiers with no recovery test** (the cp.async / `ASYNC`
+transport, the `RING` occupancy fork at depth 3–4, and the scalar / cooperative-reduce TMA promotion — the warp-tier
+TMA covers the recovery set, so these stay future work).
