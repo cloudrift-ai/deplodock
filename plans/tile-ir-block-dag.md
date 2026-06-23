@@ -516,19 +516,20 @@ inside THREAD but outside `K_o`/`K_i`. Fold-vs-unroll is derived: a REGISTER axi
 reduce-axes ⇒ independent accumulators + fold; else plain unroll. Multiple REGISTER axes (FM×FN) compose; `assemble`
 expands in `binding` order, intra-scope order by edge topo-sort.
 
-### locals — 070 pad + 025 swizzle + 090 unroll
+### locals — 025 swizzle + 090 unroll (pre) + 070 pad (post)
 
-No body edit, but these split across the `assemble` boundary by *which IR holds the object they touch* (see "The pass
-structure"). **025 (pre-assemble)** → `Schedule.grid_swizzle[block]` (L2 row-group), a genuine `TileGraph` annotation:
-its object is a GRID block + its grid axes, both in the IR; gate = the GRID block's derived `Carrier` is matmul and it
-has ≥2 GRID axes; `assemble` consumes it. **070 (post-assemble)** → bank-conflict pad of a staged read's smem slab — but
-the slab is an `assemble` *artifact*, so the decision reads the materialized inner-row byte span (skip when the slab's
-transport is TMA, the `AccessMap.block` is atom-strided, or no vectorizable `+1` run); it is a local `KernelOp`→`KernelOp`
-`Fork` that widens the slab alloc (coords stay logical). **090 (post-assemble)** → `#pragma unroll` on a materialized
-SERIAL loop when the nest-scoped product of its extents is under threshold (symbolic extents decline) — the concrete
-nest, including ring-buffer peels, only exists after `assemble`, so this too is a post-materialization local `Fork`. The
-`Schedule.pad` / `Schedule.unroll` fields still carry the chosen knob for variant identity / the perf DB, but they are
-recorded *by* the post-assemble pass, not *consumed by* `assemble`.
+No body edit. Per-source evidence places two pre-`assemble` and one post — the cut is *which IR holds the object the
+offer legality reads*. **025 (pre-assemble)** → `Schedule.grid_swizzle[block]` (L2 row-group), a genuine `TileGraph`
+annotation: its object is a GRID block + its grid axes, both in the IR; gate = the GRID block's derived `Carrier` is
+matmul and it has ≥2 GRID axes; `025` tags itself "Renderer-only," and `assemble` consumes it. **090 (pre-assemble)**
+→ `Schedule.unroll[axis]` on a SERIAL axis when the **logical** trip-count product (`loop.axis.extent.as_static()` over
+`K_o`/`K_i` + register chains, symbolic extents decline) is under threshold. It reads only logical axis extents that
+exist in the `TileGraph` domain — never the materialized nest — and peeling does not change the per-iteration unroll
+decision, so it is a clean annotation `assemble` reads when it emits the loop. **070 (post-assemble)** → bank-conflict pad
+of a staged read's smem slab: the slab is an `assemble` *artifact* and the safety gate reads materialized facts (the
+realized `ld.shared.v4` vectorized width; the MMA atom-strided `AccessMap.block` stamp; skip on TMA transport), so it is a
+local `KernelOp`→`KernelOp` `Fork` that widens the slab alloc (coords stay logical). The `Schedule.pad` field carries the
+chosen knob for variant identity, recorded *by* the post-`assemble` pass, not *consumed by* `assemble`.
 
 ## Lowering: `assemble` (TileGraph → KernelOp | Graph[KernelOp])
 

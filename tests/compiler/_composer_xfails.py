@@ -120,6 +120,24 @@ _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
 )
 
 
+# Whole test FILES that exercise a tier deleted in the demolition (warp-MMA,
+# cooperative-reduce, fused-flash, staging probes). Every test in these files is
+# quarantined until the assemble->KernelOp rebuild re-adds the tier.
+_XFAIL_FILES_DEMO: frozenset[str] = frozenset(
+    {
+        "test_matmul_mma.py",  # warp-tier MMA (011 atom fold + warp builder deleted)
+        "test_matmul_mma_residual.py",  # warp-tier fused residual
+        "test_matmul_mma_causal_epilogue.py",  # warp-tier causal epilogue
+        "test_matmul_mma_transposed_b.py",  # warp-tier transposed-B
+        "test_matmul_mma_parity.py",  # warp-tier static/dynamic parity
+        "test_matmul_mma_masked.py",  # warp-tier masked tile
+        "test_monoid_reduce_kernel.py",  # cooperative reduce (coop builder deleted)
+        "test_strided_coop_rows.py",  # strided cooperative reduce
+        "test_stage_inputs_mma_probe.py",  # 020 staging probe (pass deleted)
+    }
+)
+
+
 def mark_composer_xfails(items) -> None:
     """Apply the quarantine xfail to every collected item that matches the
     registry (called from ``conftest.pytest_collection_modifyitems``)."""
@@ -129,6 +147,9 @@ def mark_composer_xfails(items) -> None:
     )
     for item in items:
         nodeid = item.nodeid
+        if any(f"/{f}::" in nodeid or nodeid.startswith(f) or f"{f}::" in nodeid for f in _XFAIL_FILES_DEMO):
+            item.add_marker(pytest.mark.xfail(reason=_DEMO_REASON, strict=False))
+            continue
         func_path = nodeid.split("[", 1)[0]
         for funcs, nodes, reason in groups:
             if any(func_path.endswith(f) for f in funcs) or any(nodeid.endswith(n) for n in nodes):
