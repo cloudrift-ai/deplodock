@@ -436,6 +436,42 @@ class Schedule:
     def with_binding(self, **kw: Binding) -> Schedule:
         return replace(self, binding={**self.binding, **kw})
 
+    def pretty(self, indent: str = "") -> list[str]:
+        """Readable listing of the non-empty scheduling decisions (for
+        ``compile -vv`` / kernel dumps). ``binding`` is rendered on the
+        block domain axes by :meth:`TileGraph.pretty`, so it is omitted
+        here; every other non-empty field gets one line. Edge-keyed maps
+        (``staged`` / ``distance`` / ``cohort`` / ``ring_depth`` / ``pad``)
+        key on ``buffer:src->dst``."""
+
+        def edge_key(e: Edge) -> str:
+            return f"{e.buffer}:{e.src}->{e.dst}"
+
+        lines: list[str] = []
+        if self.scope:
+            lines.append(f"{indent}scope: " + ", ".join(f"{b}={'/'.join(s)}" for b, s in self.scope.items()))
+        if self.role:
+            lines.append(f"{indent}role: " + ", ".join(f"{b}={r.value}" for b, r in self.role.items()))
+        if self.launch:
+            lines.append(f"{indent}launch: " + ", ".join(f"{b}={g}" for b, g in self.launch.items()))
+        if self.staged:
+            lines.append(f"{indent}staged: " + ", ".join(f"{edge_key(e)}={t.value}" for e, t in self.staged.items()))
+        if self.distance:
+            lines.append(f"{indent}distance: " + ", ".join(f"{edge_key(e)}={list(d)}" for e, d in self.distance.items()))
+        if self.cohort:
+            lines.append(f"{indent}cohort: " + ", ".join(f"{edge_key(e)}={c}" for e, c in self.cohort.items()))
+        if self.ring_depth:
+            lines.append(f"{indent}ring_depth: " + ", ".join(f"{edge_key(e)}={n}" for e, n in self.ring_depth.items()))
+        if self.pad:
+            lines.append(f"{indent}pad: " + ", ".join(f"{edge_key(e)}={list(p)}" for e, p in self.pad.items()))
+        if self.reg_budget:
+            lines.append(f"{indent}reg_budget: " + ", ".join(f"{r.value}={n}" for r, n in self.reg_budget.items()))
+        if self.unroll:
+            lines.append(f"{indent}unroll: " + ", ".join(f"{a}={v}" for a, v in self.unroll.items()))
+        if self.grid_swizzle:
+            lines.append(f"{indent}grid_swizzle: " + ", ".join(f"{b}={n}" for b, n in self.grid_swizzle.items()))
+        return lines
+
 
 # ---------------------------------------------------------------------------
 # TileGraph — the new Tile IR
@@ -491,6 +527,39 @@ class TileGraph:
         edges = tuple(sorted((e.src, e.dst, e.buffer) for e in self.edges))
         return repr((blocks, binding, edges))
 
+    def pretty(self, indent: str = "") -> list[str]:
+        """Readable multi-line listing of the block-DAG (for ``compile -vv``
+        and kernel dumps): the logical buffers, each block's domain (axis +
+        binding) and compute body, the non-empty schedule decisions, and the
+        derived def-use edges. The verbose nested-dataclass ``repr`` is what
+        this replaces."""
+        lines: list[str] = [f"{indent}buffers:"]
+        for buf in self.buffers.values():
+            shape = ", ".join(d.pretty() if hasattr(d, "pretty") else str(d) for d in buf.shape)
+            space = "" if buf.space is Space.GMEM else f" {buf.space.value}"
+            lines.append(f"{indent}{INDENT}{buf.name}: {buf.dtype.name}[{shape}]{space}")
+        for b in self.blocks:
+            dom = ", ".join(_fmt_domain_axis(ax, self.schedule.binding.get(ax.name)) for ax in b.domain)
+            lines.append(f"{indent}block {b.name} [{dom}]")
+            lines.extend(pretty_body(b.compute, indent + INDENT))
+        sched = self.schedule.pretty(indent + INDENT)
+        if sched:
+            lines.append(f"{indent}schedule:")
+            lines.extend(sched)
+        edges = self.edges
+        if edges:
+            lines.append(f"{indent}edges:")
+            for e in edges:
+                lines.append(f"{indent}{INDENT}{e.buffer}: {e.src} -> {e.dst}")
+        return lines
+
+
+def _fmt_domain_axis(ax: Axis, binding: Binding | None) -> str:
+    """``name:extent`` plus ``=binding`` when the axis is bound — the compact
+    per-axis label in :meth:`TileGraph.pretty`'s block header."""
+    label = f"{ax.name}:{ax.extent}"
+    return f"{label}={binding.value}" if binding is not None else label
+
 
 @dataclass
 class TileGraphOp(Op):
@@ -533,6 +602,26 @@ class TileGraphOp(Op):
 
     def structural_key(self) -> str:
         return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
+
+    def pretty_body(self) -> str:
+        """Readable rendering of the stored algorithm for ``compile -vv`` /
+        kernel dumps — the regime header (``algebra`` / reduce ``targets``),
+        the leading hoisted stmts, then the ``TileGraph`` block-DAG. Replaces
+        the unreadable nested-dataclass ``repr`` the diff renderer fell back
+        to. The caller (``Candidate._format_nodes``) emits the surrounding
+        ``<out> = TileGraphOp(<inputs>)`` label, so none is prepended here."""
+        lines: list[str] = []
+        algebra = getattr(self.algebra, "value", self.algebra)
+        head = f"algebra={algebra}" if algebra is not None else "algebra=?"
+        if self.target_names:
+            head += f"  targets={{{', '.join(sorted(self.target_names))}}}"
+        lines.append(head)
+        if self.leading:
+            lines.append("leading:")
+            lines.extend(pretty_body(Body.coerce(self.leading), INDENT))
+        if self.tilegraph is not None:
+            lines.extend(self.tilegraph.pretty())
+        return "\n".join(lines)
 
 
 # ===========================================================================

@@ -965,6 +965,13 @@ stay plain ASCII and `awk` matches reliably even on colored output. Color follow
 fallback line cap are tuned via `--diff-context N` and `--diff-max-lines N`. `RuleRenderConfig` is set once from
 `commands/compile.py:handle_compile` via `rule_diff.set_config()`.
 
+Body-carrying ops render through their own `pretty_body` rather than a raw dataclass `repr`: `LoopOp` / `TileOp` /
+`KernelOp` / `CudaOp` print their kernel bodies, and `TileGraphOp` (the in-flight enumeration node) pretty-prints
+its block-DAG — the regime header (`algebra` / reduce `targets`), the leading hoisted stmts, then `TileGraph.pretty`
+(logical buffers, each block's domain with its per-axis `Schedule.binding`, the compute body, the non-empty schedule
+decisions, and the derived def-use edges). So a tile-pass diff (`awk '/^>>> t:/,/^<<< t:/'`) reads as a readable
+block-DAG delta, not a wall of nested `Block(...)` / `Schedule(...)` reprs.
+
 The structured `.rules.json` dump under `DEPLODOCK_DUMP_DIR` is unaffected — the diff is purely a presentation
 layer for the human-readable `_rule_texts` channel.
 
