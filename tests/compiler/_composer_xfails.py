@@ -63,8 +63,9 @@ _XFAIL_FILES: dict[str, str] = {
 # The R3 STRUCTURAL fork test + the R7 fp16-matmul-window / sdpa / structural /
 # prior tests stay quarantined (genuinely their own tiers).
 _XFAIL_FUNCS: dict[str, str] = {
-    # R3
-    "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": "R3",
+    # R3 — landed (atomic-free split-K): test_atomic_free_splitk_fork_pushes_structural
+    # de-quarantined (the 055_atomic_free_splitk structural fork). The R3 accuracy half
+    # (test_mma_atomic_free_splitk.py) was already de-quarantined under R2.
     # R4 — masked / unstaged warp follow-ups (the warp-tier matmul itself landed):
     # the masked cooperative-load clamp + non-divisor real_extent tests need env-pin
     # honoring in the scalar thread/reg offers (entangled with the cooperative

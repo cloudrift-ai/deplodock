@@ -773,9 +773,23 @@ never a tree-builder.
   *R4 masked-tile follow-ups stay quarantined:* the env-pin honoring they need still over-stages the multi-accum matmul
   past the smem budget (the staging-fork conservative fallback emits stage-all first), so it is **not** unblocked by the
   `MONOID` reduce — it rides the R4/R5 masked-staging-clamp + greedy-fallback work, not R2.
-- **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). The `partition_reduce(K,GRID)` move + atomic /
-  atomic-free combine block. *Recovers:* `test_mma_atomic_free_splitk.py`,
-  `test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural`.
+- **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). **Landed.** The cross-CTA split-K matmul
+  already binds its `K_s` GRID partition (the `reduce_decomp` body move when `SPLITK > 1`, codegen `atomicAdd`); R3 adds
+  the **atomic-free** combine as a structural fork. `enumeration/055_atomic_free_splitk` offers the `NOATOMIC` BOOL on a
+  fully-tiled scalar `SEMIRING` matmul: `False` keeps the `atomicAdd`; `True` splices a two-node `Graph` — the matmul's
+  output `Write` retargeted to a `partial[K_s, M, N]` workspace (`K_s` enters the index ⇒ a plain store) plus a sibling
+  additive reduce kernel folding `K_s`. The combine kernels are built by `enumeration/_partition.py`
+  (`additive_reduce_tilegraph` for the bit-identical `Accum` sum; `monoid_reduce_tilegraph` for a carrier-general
+  `combine_states` fold of a non-additive `(m, l)` online-softmax monoid) as fully-tiled single-`Block` `TileGraph`s
+  `assembly/010_assemble` materializes directly (`reduce_tilegraphop` stamps fixed/OFF knobs so the enumeration chain
+  skips them — fixed-schedule, not searched). *Gate:* accuracy-vs-torch on the RTX 5090 — split-K matmul `SPLITK=2/4`
+  (divisor + non-divisor output boundary `Cond`), max err 0; the structural-fork classification (`055` reads
+  `structural=True`, tiling forks op-variant). *Recovered (de-quarantined):* `test_monoid_reduce_kernel.py` (rebuilt
+  against `monoid_reduce_tilegraph`) + `test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural`.
+  `test_mma_atomic_free_splitk.py`'s accuracy half was already de-quarantined under R2 (the warp tier stays `SPLITK=1`).
+  *Deferred:* the warp/MMA-tier atomic-free split-K (the C-fragment-store retarget) rides R4's `SPLITK > 1` follow-up;
+  the early-body-move `partition_reduce` design (a combine `Block` joined by launch groups, assembled in one pass) stays
+  future work — R3 lands the kernel-set split via the structural splice over the working atomic split-K body move.
 - **R4 — Warp-tier MMA (`atomize`)** (deps: R1). **Landed (core warp tier; the warp/atom half of R1 with it).** Added
   the `atomize` body move (`_build.warp_build`: the four-way GRID/WARP/REGISTER/ATOM σ-split + K re-bracket at `atom_k`
   granularity + fuse the cell `[Load,Load,mul,Accum]` → `Mma`, `Block.atom` deriving from it) + the warp-tier fork chain
@@ -813,7 +827,7 @@ never a tree-builder.
 ```
 RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ─┐
 (multi-pass split) ├─► R2 coop-reduce ✓ ───────────────────┐         ├─► R7 e2e / structural / prior
-                └─► R3 split-K ─────────────────────────────┘         │
+                └─► R3 split-K ✓ ───────────────────────────┘         │
                              R2 ✓ ─► R6 flash ◄── R4 ✓ ───────────────┘
 ```
 
@@ -844,19 +858,21 @@ live process.
 The structural surface has converged: the algorithm is `name + domain + compute`, every projection is derived, every
 choice is a `Schedule` annotation, and — with **F3-b** landed — the algorithm is a stored structure refined in place by
 incremental body moves (`reduce_decomp` at `010`, `free_tile` at `030`, `coop_build` at `015`, `warp_build` at `009`),
-with `assemble` the one place the tower is materialized. **R1 (staging), R2 (cooperative reduce), and R4 (warp-tier
-`atomize`) have landed.** The scalar `Schedule`-move fork `enumeration/050_stage` reads the fully-tiled stored algorithm
+with `assemble` the one place the tower is materialized. **R1 (staging), R2 (cooperative reduce), R3 (split-K /
+atomic-free combine), and R4 (warp-tier `atomize`) have landed.** The scalar `Schedule`-move fork
+`enumeration/050_stage` reads the fully-tiled stored algorithm
 and writes `Schedule.staged`, and `assemble` synthesizes the smem slab + cooperative `StageBundle` (`assembly/_slab`) —
 the slab `block` multiplier now derived from the σ coefficients, unifying scalar (`()`) and warp (atom-strided) staging.
 The warp-tier fork chain (`005_tensorize`→`006`/`008`/`009`) builds the tensor-core matmul through the `atomize` body
 move, proven accuracy-vs-torch (`mma.sync` + `ldmatrix`). The cooperative-reduce fork `enumeration/015_coop_reduce`
 builds the `MONOID` reduce through the `coop_build` body move (the `K_c` cooperative-THREAD lane), reusing the surviving
-`kernel/100` + `kernel/_combine` warp-shuffle / hierarchical synthesis with **no new assemble work**. The pass structure
-is validated end to end across the smem (scalar + warp), tensor-core, and cooperative-reduce regimes.
+`kernel/100` + `kernel/_combine` warp-shuffle / hierarchical synthesis with **no new assemble work**. The split-K
+combine fork `enumeration/055_atomic_free_splitk` adds the `NOATOMIC` structural split (matmul → `partial[K_s, M, N]`
+workspace + sibling reduce kernel, built by `enumeration/_partition`), proven accuracy-vs-torch on `SPLITK=2/4`. The pass
+structure is validated end to end across the smem (scalar + warp), tensor-core, cooperative-reduce, and split-K regimes.
 
-The unblocked tiers are now: **R3** (split-K / `partition_reduce` — the cross-CTA partition + atomic / atomic-free
-combine block, on R2's combine work; also recovers `test_monoid_reduce_kernel.py`, re-tagged R3 from R2), **R5**
-(transport — cp.async / TMA `promote_transport` on top of R4's warp staging), and **R6** (flash, needing R2+R4). The
+The unblocked tiers are now: **R5**
+(transport — cp.async / TMA `promote_transport` on top of R4's warp staging) and **R6** (flash, needing R2+R4). The
 remaining R4 follow-ups (the masked cooperative-load clamp + non-divisor `real_extent`, the gmem-direct unstaged atom,
 the `020_mask_order` rewrite of the hoist test) and the `retime` / `warp_spec` forks + the `pad` / `mask_order`
 post-passes ride those tiers — the masked-tile env-pin honoring is **not** unblocked by R2 (honoring the pin over-stages

@@ -88,6 +88,7 @@ shape-specific pattern matching.*
 | `030_register_tile.py`| Fork (scalar): the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`; **applies the `free_tile` body move** (the algorithm is fully tiled after). Skips on a coop variant. |
 | `040_seal_scalar_tier.py`| Deterministic: stamp the reduce regime's scalar-tier OFF sentinels (`MMA=0 WM=0 WN=0 BR=1`). Knob-only; skips on a warp variant (it carries `MMA`) or a coop variant (it carries its own `BR`). |
 | `050_stage.py`        | Fork (`Schedule`-move): `stage_candidates` off the stored tiled `TileGraph` → a `STAGE` bitmask → `Schedule.staged[edge] = SYNC` (scalar **and** warp operands; the transposed-B operand is excluded — gmem-direct). Skips a `MONOID` coop variant (smem-free — no cross-thread reuse). |
+| `055_atomic_free_splitk.py` | Fork (**structural**, R3): the split-K combine — `NOATOMIC` BOOL on a fully-tiled scalar `SEMIRING` matmul with `SPLITK > 1`. `False` keeps the codegen `atomicAdd`; `True` splices a two-node `Graph` (matmul writing `partial[K_s, M, N]` + the additive reduce kernel `_partition.additive_reduce_tilegraph` folding `K_s`). Skips a warp variant (v1 `SPLITK=1`) / non-split / non-2D-static output. |
 | `_iterdag.py`         | `iter_dag` — the derived iteration-DAG view (axes tagged `PARALLEL` / `REDUCE` + carrier). |
 | `_classify.py`        | `classify` → `_Regime(algebra=AlgebraKind)`. |
 | `_atom.py`            | The warp-tier gate: `eligible_atoms` (per-atom eligibility over the dag + dtypes + cc) + `classify_matmul_operands` (the one A/B layout decision, shared by the gate and the `atomize` move). |
@@ -95,6 +96,7 @@ shape-specific pattern matching.*
 | `_stage.py`           | `stage_candidates` — the `stage` move's ranked offer set (AFFINE + fan-in reuse + K-tower) off the derived `Block.reads`; excludes the transposed-B operand. |
 | `_knobs.py`           | The knob schema (`BN`/`BM`/`BK`/`FK`/`STAGE`/`MMA`/`WM`/`WN`/… + the composer aliases `MAP_*` / `RED_*` / `TC_*`). |
 | `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `coop_build` (the cooperative-reduce K re-bracket + free split, R2), `warp_build` (the warp-tier four-way split + `atomize`); `build_dag` is the scalar composition (the byte-identity oracle). |
+| `_partition.py`       | The R3 split-K combine builders — `additive_reduce_tilegraph` (`Accum` sum) / `monoid_reduce_tilegraph` (carrier-general `combine_states` fold) emit a fully-tiled single-`Block` combine `TileGraph` (`GridTile(16×16) > ThreadTile > serial K_s reduce + boundary Cond`); `reduce_tilegraphop` wraps it with stamped fixed/OFF knobs so every enumeration fork skips it (fixed-schedule, not searched). |
 
 The per-pass moves serve every regime: a `MAP` nest applies only `free_tile` (`reduce_decomp` is a no-op without a
 contraction); a `SEMIRING` reduce applies both — `reduce_decomp` (gated on `target_names`) then `free_tile`; a `MONOID`
@@ -119,9 +121,11 @@ strip-mine) + the **`MONOID` cooperative-reduce** (R2 `coop_build` — softmax /
 symbolic-K masked-fill, whole-CTA and strided-cooperative rows, the warp-shuffle / hierarchical combine) + the
 **warp-tier `SEMIRING`** (tensor-core `mma.sync` via the R4 `atomize` move — matmul, residual / pointwise / causal-mask
 epilogue fold, transposed-B, symbolic M/N), with **smem staging** (`stage` move) on both the scalar reduce regimes (R1)
-and the warp operands (atom-strided slab + `ldmatrix`). Recognized by `classify` but not yet built (they re-enter the
-same uniform tree once their decomposition placement + assembly land): `TWISTED_MONOID` fused flash, the cross-CTA
-`partition_reduce` split-K, and the R5 transports
+and the warp operands (atom-strided slab + `ldmatrix`) + the **cross-CTA split-K combine** (R3 `055_atomic_free_splitk`
+— the `NOATOMIC` structural fork: the matmul's per-`K_s` partials either `atomicAdd` into the output or write a
+`partial[K_s, M, N]` workspace folded by a sibling additive / carrier-general combine kernel). Recognized by `classify`
+but not yet built (they re-enter the same uniform tree once their decomposition placement + assembly land):
+`TWISTED_MONOID` fused flash and the R5 transports
 (cp.async / TMA). Remaining R4 follow-ups still quarantined: the masked cooperative-load clamp + non-divisor
 `real_extent` (need scalar-offer env-pin honoring — still blocked, since honoring the pin over-stages the multi-accum
 matmul past the smem budget with no greedy fallback) and the gmem-direct unstaged atom. See `plans/tile-ir-block-dag.md`
