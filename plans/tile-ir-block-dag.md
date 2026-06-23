@@ -697,14 +697,6 @@ not a forward port from a working pipeline: rebuild each tier as its block-DAG f
 (`enumeration/_tree.py` etc.) **plus** its `assemble` synthesis (`assembly/_assemble.py`) — and recover that tier's
 quarantined tests as it lands. This section supersedes the earlier "forward port" framing.
 
-**Current state (verified empirically, branch `feature/tile-ir-block-dag`).** Structure already matches the target: one
-rule `010_partition_loops.py` over the `enumeration/` + `assembly/` packages. `classify()` still tags all four regimes,
-but `build_partition()` only *builds* **pointwise + scalar matmul**, which lower end-to-end (`LoopOp → TileOp → CudaOp`,
-incl. K-chunk). Coop and flash return `None` → `010` raises → quarantined; warp-MMA / staging-synthesis / transport /
-split-K combine / structural forks are deleted. `tests/compiler/` runs **~1175 passed · 28 failed · 166 xfailed · 89
-XPASSED** — so the floor is healthy, but two numbers are the real signal: the **89 XPASS** are quarantined-but-now-green
-(the registry is stale), and the **28 failed** are genuine, non-quarantined breakage.
-
 **Two quarantine registries** in `tests/compiler/_composer_xfails.py`: the **`_DEMO`** set (34 funcs + 7 nodes + 16
 files, "restored when assemble synthesizes the Schedule") is *this* plan's targets; the **`_REASON`** set (13 + 3,
 `plans/composer-only-green-suite.md`) is an older symbolic/structural-gap plan that overlaps and folds in per phase.
