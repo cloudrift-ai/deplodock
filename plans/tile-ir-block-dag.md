@@ -313,16 +313,20 @@ generalized). "Touches" = whether the move edits the body (algorithm) or only th
 
 The two headline consequences from the original design hold and are now literal: **prologue/epilogue are not special**
 (a fused-prologue reduce is a block whose reads are {M,K}; its default `scope` ends at `M_scope`, outside the N register
-tier — no special-case builder), and **pipelining / warp-spec stop being hand-peeled** (`assemble` emits the
-peel / `Cond` / mbarrier ring from `distance` / `role`, not a pass).
+tier — no special-case builder), and **pipelining / warp-spec stop being hand-peeled** (the peel / `Cond` / mbarrier
+ring is emitted deterministically from `distance` / `role` by the materialization stage — the `peel` post-pass +
+`assemble` — never an enumeration fork interleaved with the search).
 
 ## The pass structure: enumeration passes + one `assemble`
 
-The model above resolves into exactly **two kinds of search-relevant pass**, bookended by two deterministic transforms.
-The whole tile phase is: a deterministic `tile/build` seeds the root tile node, a pipeline of **enumeration passes**
-widens the search tree move-family by move-family, and one deterministic **materialization pass** (`assemble`) lowers the
-chosen leaf. This is the concrete realization of "the scheduling moves only edit the Schedule; `assemble` is the one
-place the tower is built."
+The model above resolves into two *sides* split at `assemble`. The whole tile phase is: a deterministic `tile/build`
+seeds the root tile node; a pipeline of **enumeration passes** (genuine forks) widens the search tree move-family by
+move-family — the **search side**; then the deterministic **materialization stage** lowers the chosen leaf — the
+`assemble` core plus the fixed-logic post-passes (`peel` / `mask_order` / `pad` / `unroll`). Only the enumeration side
+branches the MCTS; `build`, `assemble`, and the post-passes are all choice-free. This is the concrete realization of "the
+scheduling moves only edit the Schedule; the tower is built deterministically from them." (In the pass-rewrite and
+lowering sections below, "`assemble`" often names this whole materialization stage; where a specific fixed-logic
+post-pass does the work — `peel`, `mask_order`, `pad`, `unroll` — it is the one named in "Directory layout.")
 
 One question decides where a family lives, and it dominates every other: **is it a genuine fork?** — does it offer ≥2
 ranked candidates the search must *bench* to choose between (a tile size, a ring depth, transport on/off, specialize
@@ -420,10 +424,11 @@ one kernel, so it consumes this pass list with no engine change.
 **Knob-deltas are preserved.** Each *fork* still stamps its knob-delta onto the `Fork`
 (`{RING:2}`, `{TMA:1}`, the `BM/BN/FM/FN` tile knobs) — the variant identity the perf DB and learned prior key on. What
 changes is only the *realization*: the knob now drives a `Schedule` dict-write that the materialization stage reads,
-instead of an eager tower rewrite. A deterministic post-pass stamps its result too (`{PAD:4}`, `{UNROLL:1}`) so it joins
-the variant identity, but it is **not** a search dimension — same value for the same materialized kernel, every time. The
-prior / DB / MCTS machinery is untouched; `op_cache_key` becomes `canonical(bodies + edges) + Schedule + det-post knobs`
-(the derived projections stay out of the key, same as `algebra_kind` today).
+instead of an eager tower rewrite. A deterministic post-pass writes its result into the same `Schedule` (`pad` →
+`Schedule.pad`, `unroll` → `Schedule.unroll`) so it rides the variant identity like any other choice, but it is **not** a
+search dimension — same value for the same materialized kernel, every time. The prior / DB / MCTS machinery is untouched;
+`op_cache_key` becomes `canonical(bodies + edges) + Schedule` — the post-passes' `pad` / `unroll` are already inside that
+`Schedule`, so no extra term — and the derived projections stay out of the key, same as `algebra_kind` today.
 
 **Pass contracts — three kinds.**
 
@@ -587,7 +592,8 @@ deterministic post-pass, not consumed by `assemble`.
 
 ## Lowering: `assemble` (TileGraph → KernelOp | Graph[KernelOp])
 
-One deterministic pass turns (algorithm + Schedule) into the tower:
+The deterministic materialization stage turns (algorithm + Schedule) into the tower — the `assemble` core plus the
+fixed-logic post-passes (the steps a post-pass owns are flagged inline). No step makes a search choice:
 
 1. Partition blocks by `launch` group → one `KernelOp` per group (cross-group intermediate buffers become graph-node
    tensors); a single group yields one `KernelOp`.
@@ -598,13 +604,14 @@ One deterministic pass turns (algorithm + Schedule) into the tower:
    (the slab is emitted at its logical extent; the bank-conflict `pad` is applied later by the post-assemble `tile/pad`
    local pass, which can see the materialized byte span). **Coalesce slabs by `(buffer, access, distance)` — this is
    dedup, by construction.**
-4. Expand `distance>0` reads into prologue/steady/epilogue + waits, transport-parametrically.
+4. Expand `distance>0` reads into prologue/steady/epilogue + waits, transport-parametrically (factored into the `peel`
+   deterministic post-pass).
 5. Expand the `role` coloring into the warp-spec `Cond` + synthesized role axis + mbarrier ring + `SetMaxNReg` +
    consumer named-barrier.
 6. Replicate REGISTER-bound blocks per cell (SSA def-use closure first); for ATOM blocks, synthesize fragments + the
    `ldmatrix`/`mma.sync`/`RegStore` chain from the derived `atom`.
 7. Emit each block's derived guards (`domain.real_extent`, partition `K_s==0`/`lane==0`) as `Cond`s, coalesced across
-   co-scoped blocks.
+   co-scoped blocks (the `mask_order` post-pass then lifts cooperative loads above the masked-tile guard).
 
 Because 2–7 reproduce the current tower/`StageBundle`/`WarpSpecialize`/`AsyncWait` exactly, a "reference schedule" (the
 annotations the composer picks today) must `assemble` to **byte-identical CUDA**. That is the safety contract.
@@ -691,5 +698,5 @@ choice is a `Schedule` annotation, and `assemble` is the one place the tower is 
 byte-identical on pointwise / scalar+warp matmul / coop reduce (steps 1–2). The natural next step is to **stand up the
 first `Schedule`-move enumeration pass — `tile/stage`** — over the tile node (the simplest staging regime, reborn from
 the deleted `020`/`026`), with `assemble` synthesizing the slab + cooperative producer from `staged`. That validates the
-two-kind pass structure end to end (enumeration widens, `assemble` materializes) on a regime that actually touches smem,
-before `retime` / `transport` / `warp_spec` follow.
+pass structure end to end (an enumeration fork widens, the materialization stage lowers) on a regime that actually
+touches smem, before `retime` / `transport` / `warp_spec` follow.

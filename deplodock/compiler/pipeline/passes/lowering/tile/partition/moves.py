@@ -18,17 +18,13 @@ from __future__ import annotations
 import os
 
 from deplodock.compiler.ir.stmt import Loop, Write
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
 from deplodock.compiler.pipeline.knob import Knob
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import is_atom_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.decompose import legal_decomps
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag, _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     BK_CHOICES,
-    BR_CHOICES,
-    COOP_BR,
     FK_CHOICES,
     MAP_M_REG,
     MAP_M_THREAD,
@@ -39,15 +35,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     RED_SPLITK,
     REG_CHOICES,
     SPLITK_CHOICES,
-    TC_ATOM,
-    TC_BK,
-    TC_REG_CHOICES,
-    TC_REG_M,
-    TC_REG_N,
     THREAD_CHOICES,
-    WARP_CHOICES,
-    WARP_M,
-    WARP_N,
 )
 
 
@@ -187,149 +175,3 @@ def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
 
 _MAX_WARP_CELLS = 64  # FM·FN per warp-cell
 _WARP_TARGET = 4  # warps per CTA (~128 threads)
-
-
-def eligible_atoms(loop_op, ctx, graph) -> list[Atom]:
-    """The atoms whose tensor-core precondition holds for this matmul (compute
-    capability, operand dtypes, divisibility, foldable epilogue)."""
-    return [a for a in ATOM_REGISTRY.values() if is_atom_eligible(a, loop_op, ctx, graph=graph)]
-
-
-def warp_offers(dag: IterDag, atom: Atom, budget: Budget) -> list[tuple[int, int]]:
-    """Legal ``(wm, wn)`` warp grids: divide the per-atom cell counts, ≥2 warps
-    (single warp can't stage ldmatrix), ``wm·wn·32 ≤`` thread budget."""
-    cells_m = dag.outer_m.extent // atom.shape[0]
-    cells_n = dag.inner_n.extent // atom.shape[1]
-    out = [
-        (wm, wn)
-        for wm in WARP_CHOICES
-        for wn in WARP_CHOICES
-        if cells_m % wm == 0 and cells_n % wn == 0 and wm * wn >= 2 and budget.threads_ok(wm * wn * 32)
-    ]
-    out.sort(key=lambda w: (abs(w[0] * w[1] - _WARP_TARGET), -w[0] * w[1]))
-    return out
-
-
-def warp_reg_offers(dag: IterDag, atom: Atom, warp: tuple[int, int]) -> list[tuple[int, int]]:
-    """Legal ``(fm, fn)`` register cells per warp: divide the per-warp cell
-    counts, ``fm·fn ≤`` the warp-cell budget."""
-    wm, wn = warp
-    pm = (dag.outer_m.extent // atom.shape[0]) // wm
-    pn = (dag.inner_n.extent // atom.shape[1]) // wn
-    out = [(fm, fn) for fm in TC_REG_CHOICES for fn in TC_REG_CHOICES if pm % fm == 0 and pn % fn == 0 and fm * fn <= _MAX_WARP_CELLS]
-    out.sort(key=lambda r: (abs(r[0] * r[1] - 8), -r[0] * r[1]))
-    return out
-
-
-def warp_bk_offers(dag: IterDag, atom: Atom) -> list[int]:
-    """Legal ``bk`` (K chunk in atom-K units): divides the atom-K cell count."""
-    kc = dag.k_extent // atom.shape[2]
-    out = [bk for bk in BK_CHOICES if bk <= kc and kc % bk == 0]
-    out.sort(key=lambda bk: -bk)
-    return out
-
-
-def warp_knobs(atom: Atom, warp: tuple[int, int]) -> dict:
-    """Knob delta the tensorize+warp branch pins."""
-    wm, wn = warp
-    return {TC_ATOM.name: atom.name, WARP_M.name: wm, WARP_N.name: wn}
-
-
-def warp_reg_knobs(reg: tuple[int, int]) -> dict:
-    fm, fn = reg
-    return {TC_REG_M.name: fm, TC_REG_N.name: fn}
-
-
-def warp_bk_knobs(bk: int) -> dict:
-    return {TC_BK.name: bk}
-
-
-# --- Cooperative-reduce (MONOID) moves: SplitParallel(K) thread-bound. ---
-
-_BR_TARGET = 128  # ~4 warps cooperating per row
-
-
-def coop_free_threads(dag: IterDag) -> tuple[int, int]:
-    """Free-axis THREAD tiles ``(bn, bm)`` for a cooperative reduce, default
-    ``(1, 1)`` — the whole-CTA form (one row per CTA, ``BR`` threads reduce it).
-    A pinned ``BN``/``BM`` > 1 thread-binds the free rows ALONGSIDE the ``BR``
-    cooperative lanes — the **strided-cooperative rows** form (e.g. a per-head
-    q/k-norm deploys a ``BN×BR`` CTA instead of a degenerate one). Honors the
-    same ``DEPLODOCK_BN`` / ``DEPLODOCK_BM`` pins the legacy planner reads."""
-    bn = _pin(MAP_N_THREAD) or 1
-    bm = (_pin(MAP_M_THREAD) or 1) if dag.outer_m is not None else 1
-    return bn, bm
-
-
-def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, int, int]]:
-    """Legal ``(bk, fk, br)`` for a cooperative reduce: ``br`` (the cooperative
-    thread count) ≤ 1024. For a static K, ``br·bk·fk`` must divide K; a symbolic
-    (masked) K only needs ``br·bk·fk ≤`` the hint — the final partial tile is
-    masked (ceil-div). Best-first: ≈``_BR_TARGET`` threads, no chunk / strip-mine.
-    Env-pinnable for tests.
-
-    With **strided-cooperative rows** (a pinned ``BN·BM > 1`` free-axis thread
-    tile) the cross-thread combine is a SEGMENTED warp shuffle over each row's
-    ``BR`` lanes, so ``BR`` clips to a power of two ≤ ``warp_size`` (each row's
-    lanes must form an aligned intra-warp segment — matching the legacy
-    enumeration and ``cooperative_combine_geometry``), and ``bn·bm·br`` must fit
-    the CTA thread budget."""
-    bk_pin, fk_pin, br_pin = _pin(RED_BK), _pin(RED_FK), _pin(COOP_BR)
-    bks = (bk_pin,) if bk_pin else BK_CHOICES
-    fks = (fk_pin,) if fk_pin else FK_CHOICES
-    brs = (br_pin,) if br_pin else BR_CHOICES
-    masked = dag.k_bound is not None
-    # A short reduce (static K < warp_size) stays pure-serial (BR=1): too small to
-    # stage a meaningful cross-thread tree-halve combine — matching the legacy
-    # WARP_SIZE gate. It still composes (the serial per-row reduce), just without
-    # cooperative threads. (A symbolic/masked K tiles at the hint, which is large.)
-    br_floor_serial = (not masked) and dag.k_extent < 32
-    bn, bm = coop_free_threads(dag)
-    strided = bn * bm > 1
-    # Same decomposition move as split-K: factor [br (cooperative THREAD), bk
-    # (STAGE_INNER), fk (REGISTER)] — the masked-K fill is licensed by the
-    # carrier's identity (has_identity), the cooperative partition by commutative.
-    decomps = legal_decomps(
-        _carrier_of(dag.k_node.loop),
-        dag.k_node.loop.axis,
-        dag.k_extent,
-        factor_menus=[brs, bks, fks],
-        placement=[Role.THREAD, Role.STAGE_INNER, Role.REGISTER],
-        masked=masked,
-        allow_split=True,
-    )
-    out = [
-        (d.factors[1], d.factors[2], d.factors[0])
-        for d in decomps
-        if 1 <= d.factors[0] <= 1024
-        and (d.factors[0] == 1 or not br_floor_serial)
-        and (not strided or _strided_br_ok(d.factors[0], bn * bm, warp_size))
-    ]
-    out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
-    return out
-
-
-def _strided_br_ok(br: int, free_threads: int, warp_size: int) -> bool:
-    """A strided-cooperative ``BR`` must be a power of two ≤ ``warp_size`` (so the
-    segmented shuffle stays intra-warp), and ``free_threads·BR`` must fit the CTA
-    thread budget (1024)."""
-    if free_threads * br > 1024:
-        return False
-    return br == 1 or (br <= warp_size and br & (br - 1) == 0)
-
-
-def coop_reduce_knobs(reduce: tuple[int, int, int]) -> dict:
-    """Knob delta a cooperative-reduce leaf pins."""
-    bk, fk, br = reduce
-    return {RED_BK.name: bk, RED_FK.name: fk, COOP_BR.name: br}
-
-
-def coop_free_thread_knobs(dag: IterDag) -> dict:
-    """Knob delta for the free-axis THREAD tiles (``BN``/``BM``) a cooperative
-    reduce binds — default ``1`` (whole-CTA), or the pinned strided-cooperative
-    value. ``BM`` only when an outer free axis exists."""
-    bn, bm = coop_free_threads(dag)
-    knobs = {MAP_N_THREAD.name: bn}
-    if dag.outer_m is not None:
-        knobs[MAP_M_THREAD.name] = bm
-    return knobs

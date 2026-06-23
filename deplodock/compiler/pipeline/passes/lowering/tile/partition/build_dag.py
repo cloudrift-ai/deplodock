@@ -15,11 +15,12 @@ entries on the split axes.
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond
+from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
 from deplodock.compiler.ir.tile.blockdag import Binding, Block, Schedule, TileGraph
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import _identity_rename
+from deplodock.compiler.ir.tile.ir import RegisterTile
+from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
@@ -31,11 +32,76 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     RED_FK,
     RED_SPLITK,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize import (
-    _free_axes,
-    _replace_k_scalar,
-    _split_free_axis,
-)
+
+
+def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:
+    """The free (PARALLEL) axes to tile, read off the DAG's parallel chain:
+    ``(inner_n axis, outer_m axis | None, extra-outer loops)``."""
+    parallel = dag.parallel
+    inner_n = parallel[-1].loop.axis
+    outer_m = parallel[-2].loop.axis if len(parallel) >= 2 else None
+    extra_outer = tuple(n.loop for n in parallel[:-2])
+    return inner_n, outer_m, extra_outer
+
+
+def _split_free_axis(axis: Axis, thread: int, reg: int, *, interleave_when_masked: bool):
+    """Build the block/thread/register axes + σ entry + optional store-guard bound
+    for one free axis (``A → A_b·(T·R) + A_t·R + A_r``; interleaved on a masked
+    inner axis)."""
+    tr = thread * reg
+    masked = (not axis.extent.is_static) or (axis.extent.as_static() % tr != 0)
+    src = axis.source_axis or axis
+    a_b = Axis(
+        f"{axis.name}_b",
+        axis.extent.ceil_div(tr) if masked else axis.extent // tr,
+        source_axis=src,
+        real_extent=axis.extent.as_static() if masked and axis.extent.is_static else None,
+    )
+    a_t = Axis(f"{axis.name}_t", thread, source_axis=src)
+    a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
+    block = Var(a_b.name) * Literal(tr, "int")
+    if masked and interleave_when_masked:
+        expr = block + Var(a_r.name) * Literal(thread, "int") + Var(a_t.name)
+    else:
+        expr = block + Var(a_t.name) * Literal(reg, "int") + Var(a_r.name)
+    bound = axis.extent.expr if masked else None
+    return a_b, a_t, a_r, expr, bound
+
+
+def _replace_k_scalar(
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
+) -> tuple[Stmt, ...]:
+    """Replace every contraction loop named in ``target_names`` with a ``K_o``
+    (serial-outer) / ``K_i`` (stage-inner) tower, σ-mapping
+    ``K → K_s·(K_o_ext·bk·fk) + K_o·(bk·fk) + K_f·bk + K_i`` (``K_f`` only when
+    ``fk > 1``, ``K_s`` only when ``splitk > 1``). The ``K_s`` grid axis is added to
+    the outer BLOCK layers by the caller."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name in target_names:
+            kn = s.axis.name
+            src = s.axis.source_axis or s.axis
+            this_extent = s.axis.extent.as_static() if s.axis.extent.is_static else k_extent
+            k_o_ext = this_extent // (splitk * bk * fk)
+            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{kn}_i", bk, source_axis=src)
+            expr = Var(k_o.name) * Literal(bk * fk, "int")
+            k_f = None
+            if fk > 1:
+                k_f = Axis(f"{kn}_f", fk, source_axis=src)
+                expr = expr + Var(k_f.name) * Literal(bk, "int")
+            expr = expr + Var(k_i.name)
+            if k_s is not None:
+                expr = Var(k_s.name) * Literal(k_o_ext * bk * fk, "int") + expr
+            sigma_k = Sigma({kn: expr})
+            inner = _replace_k_scalar(tuple(s.body), target_names, k_extent, bk, fk, splitk, k_s)
+            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+            if k_f is not None:
+                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
 
 
 def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple:
