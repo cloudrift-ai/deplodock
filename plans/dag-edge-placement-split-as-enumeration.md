@@ -59,9 +59,16 @@
   fork is the remaining piece), so the suite is unaffected.
 
 **Remaining for the fused edge:**
-- **Warp-tier (mma) fused consumer** — greedy picks the tensor-core tier for f16, but the warp path drops the
-  compute-phase `Write` in kernel lowering (a warp + compute-phase interaction). The scalar tier works; warp is next
-  (this is the tier that actually *beats* the cut).
+- **Warp-tier (mma) fused consumer** — greedy picks the tensor-core tier for f16. Two issues, the first **fixed**:
+  - *(fixed)* the warp cell lowering (`kernel/005`) dropped the compute-phase `Write` — `_scan_cell` mistook the
+    producer's smem-slab fill `Write` for the mma cell output and the handler converted it to a fragment `RegStore`.
+    The compute phase is now **opaque** to the cell lowering (only `100_materialize` lowers it); the warp path compiles.
+  - *(remaining — the layout choreography)* the fused `xn` slab is sized/written from **raw cache-axis extents**
+    (`o__xn_smem` = `(1,2,2)`) while the matching input slab carries the **warp atom-stride block multipliers**
+    (`x_smem` = `(1,32,32)`), so the compute phase iterates the wrong elements → numerically wrong. The fused slab must
+    be laid out + filled in the warp operand's smem layout (atom strides / swizzle) so `ldmatrix` reads it correctly —
+    the plan's "materialize-in-consumer-layout" item (item 4), the hardest codegen. This is the tier that *beats* the
+    cut, so it is the key next step.
 - **MONOID (rmsnorm) producer** — the headline case needs the compute phase generalized to carry a **reduce** (the
   per-row sum-of-squares → scale in smem, then the scale-application compute phase) + the `nw[k]` broadcast operand
   (different cache axes).
