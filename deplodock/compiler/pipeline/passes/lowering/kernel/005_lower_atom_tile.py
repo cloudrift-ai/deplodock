@@ -192,6 +192,13 @@ def _lower_cell(
             # accumulator SSA name the fragment path never defines — drop them.
             if id(s) in strip_ids:
                 return ()
+            if isinstance(s, StageBundle) and s.compute is not None:
+                # The producer slab-fill compute phase (the SMEM fused edge) is opaque
+                # to the cell lowering — its Write fills an smem slab, NOT the mma
+                # accumulator, so it must NOT become a RegStore. Rewrite only the
+                # consumer body; 100_materialize lowers the compute phase.
+                inner = {**sources, **{src.name: src for src in s.sources}}
+                return (s.with_bodies((s.compute, map_staged(s.body, handler, sources=inner))),)
             if isinstance(s, Write):
                 return (
                     _emit_store(
@@ -310,6 +317,13 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
                 continue
             if isinstance(s, SerialTile) and s.is_reduce:
                 has_reduce = True
+                _walk(s.body)
+                continue
+            if isinstance(s, StageBundle):
+                # The producer slab-fill ``compute`` phase (the SMEM fused edge) is
+                # opaque to the cell scan — its Write targets an smem slab, not the
+                # mma output. Walk only the consumer body so ``write_stmt`` is the
+                # real cell output (``100_materialize`` lowers the compute phase).
                 _walk(s.body)
                 continue
             if s.nested():
