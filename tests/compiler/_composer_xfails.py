@@ -41,10 +41,8 @@ _XFAIL_FILES: dict[str, str] = {
     "test_cooperative_combine.py": "R2",
     "test_masked_cooperative_reduce.py": "R2",
     "test_monoid_reduce_kernel.py": "R2",
-    # R4
-    "test_matmul_mma_causal_epilogue.py": "R4",
-    "test_matmul_mma_transposed_b.py": "R4",
-    "test_stage_inputs_mma_probe.py": "R4",
+    # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
+    # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
     # R6
     "test_flash_attention.py": "R6",
     "test_flash_cooperative_kv.py": "R6",
@@ -83,23 +81,17 @@ _XFAIL_FUNCS: dict[str, str] = {
     # R3
     "test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": "R3",
     "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": "R3",
-    # R4
+    # R4 — masked / unstaged warp follow-ups (the warp-tier matmul itself landed):
+    # the masked cooperative-load clamp + non-divisor real_extent tests need env-pin
+    # honoring in the scalar thread/reg offers (entangled with the cooperative
+    # multi-accum regime, R2/R3) + masked-staging clamp synthesis; the gmem-direct
+    # atom path needs the staging-decline heuristic; the hoist test imports the
+    # deleted 021 pass and must be REWRITTEN against assembly/020_mask_order.
     "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": "R4",
     "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs": "R4",
     "test_masked_tile.py::test_masked_n_clamps_cooperative_load_index": "R4",
     "test_masked_tile.py::test_planner_admits_non_divisor_n_with_real_extent": "R4",
     "test_masked_tile.py::test_symbolic_m_cooperative_load_clamps_to_runtime_extent": "R4",
-    "test_matmul_mma.py::test_atom_cell_carries_through_staging": "R4",
-    "test_matmul_mma.py::test_mma_default_on_picks_warp_variant": "R4",
-    "test_matmul_mma.py::test_mma_matmul_matches_f32_reference": "R4",
-    "test_matmul_mma_residual.py::test_chain_epilogue_mma_matches_reference": "R4",
-    "test_matmul_mma_residual.py::test_epilogue_warp_rows_stay_splitk_one": "R4",
-    "test_matmul_mma_residual.py::test_multiply_epilogue_admits_warp_tier": "R4",
-    "test_matmul_mma_residual.py::test_pointwise_chain_with_broadcast_admits_warp_tier": "R4",
-    "test_matmul_mma_residual.py::test_residual_epilogue_admits_warp_tier": "R4",
-    "test_matmul_mma_residual.py::test_residual_mma_matches_reference": "R4",
-    "test_matmul_mma_residual.py::test_transposed_residual_admits_warp_tier": "R4",
-    "test_matmul_mma_residual.py::test_transposed_residual_mma_matches_reference": "R4",
     # R5
     "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment": "R5",
     # R6
@@ -173,9 +165,6 @@ _XFAIL_NODES: dict[str, str] = {
     "test_ops_vs_torch.py::test_rmsnorm_graph[cuda]": "R2",
     "test_ops_vs_torch.py::test_softmax_graph[cuda]": "R2",
     "test_tune_accuracy.py::test_tuned_variant_matches_reference[rmsnorm]": "R2",
-    # R4
-    "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-cp.async]": "R4",
-    "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-cp.async]": "R4",
     # R5
     "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": "R5",
     "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": "R5",
