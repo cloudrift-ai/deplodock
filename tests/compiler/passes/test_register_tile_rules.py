@@ -44,7 +44,7 @@ def test_plain_matmul_fires_register_tile(recording_dump):
     # the normalize pass before 006a sees them, so 006a doesn't fire. The
     # planner firing is the signal that the register-tile decision was made.
     fired = recording_dump.fired_rules("lowering/tile/enumeration")
-    assert "enumerate" in fired, fired
+    assert "build" in fired, fired
 
 
 def test_pure_pointwise_does_not_fire_register_tile(recording_dump):

@@ -494,19 +494,39 @@ class TileGraph:
 
 @dataclass
 class TileGraphOp(Op):
-    """The ENUMERATION pass output: a chosen ``Schedule``'s :class:`TileGraph`,
-    BEFORE assembly. The one deterministic assembly pass
-    (``assembly/010_assemble``) turns it into the ``TileOp`` tower. Carries the
-    variant ``knobs`` (the search / perf-DB key) and the per-CTA ``leading``
-    prologue that ``assemble`` prepends — the only enumeration state assembly
-    needs that isn't on the ``TileGraph`` itself."""
+    """The node the ENUMERATION passes pass between themselves and hand to
+    ASSEMBLY. It has two lives (the F3-a knob-accumulating model,
+    ``plans/tile-ir-block-dag.md``):
+
+    - **seed / in-flight** (``tilegraph is None``) — what ``000_build`` emits and
+      the per-family tile passes (``010_reduce_tile`` / ``020_thread_tile`` /
+      ``030_register_tile``) fork on: it carries the derived ``dag`` + regime
+      (``algebra`` / ``target_names``) the offer fns read, and the ``seed_key``
+      (the source ``LoopOp``'s structural key — its identity before any
+      ``TileGraph`` exists). Each fork pins one more knob group onto ``knobs``;
+      the carry-forward ``LoopOp`` knobs ride ``knobs`` automatically (the engine
+      merges a predecessor's knobs forward on every rebind).
+    - **built** (``tilegraph`` set) — what ``040_lower`` produces once every knob
+      group is pinned: the chosen ``Schedule``'s :class:`TileGraph` + the per-CTA
+      ``leading`` prologue ``assemble`` prepends. ``assembly/010_assemble`` turns
+      it into the ``TileOp`` tower.
+
+    ``op_cache_key`` keys on :meth:`structural_key` (``seed_key`` while in-flight,
+    the ``TileGraph`` identity once built) + ``knobs`` — distinct per variant, so
+    the search tree never self-parents."""
 
     name: str = ""
     tilegraph: TileGraph | None = None
     leading: tuple = ()
+    # --- enumeration state, carried while ``tilegraph is None`` (untyped to keep
+    # the ir layer free of a passes-layer import — set/read by the tile passes) ---
+    dag: object = None  # the IterDag the offer fns tile
+    algebra: object = None  # AlgebraKind — the regime the passes dispatch on
+    target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
+    seed_key: str = ""  # the source LoopOp's body structural key
 
     def structural_key(self) -> str:
-        return self.tilegraph.structural_key()
+        return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
 
 
 # ===========================================================================

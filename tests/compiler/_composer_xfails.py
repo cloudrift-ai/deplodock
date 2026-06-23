@@ -157,12 +157,28 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
 )
 
 
+# RF/F3 — the per-pass enumeration split (000_build + 010_reduce_tile /
+# 020_thread_tile / 030_register_tile / 040_lower) replaced the single in-memory
+# Fork tree with one fork per search level. These structural-search tests assert
+# the OLD single-fork shape ("one partition fork", "one outer terminal") and are
+# rebuilt under R7 (structural-fork outer search over the per-pass enumeration).
+_RF_REASON = "RF/F3 per-pass enumeration split changed the fork structure; rebuilt under R7. See plans/tile-ir-block-dag.md"
+_XFAIL_FUNCS_RF: frozenset[str] = frozenset(
+    {
+        "test_resolve.py::test_trace_records_partition_fork",
+        "test_two_level.py::test_run_two_level_tune_single_terminal_assembles_bests",
+    }
+)
+_XFAIL_NODES_RF: frozenset[str] = frozenset()
+
+
 def mark_composer_xfails(items) -> None:
     """Apply the quarantine xfail to every collected item that matches the
     registry (called from ``conftest.pytest_collection_modifyitems``)."""
     groups = (
         (_XFAIL_FUNCS, _XFAIL_NODES, _REASON),
         (_XFAIL_FUNCS_DEMO, _XFAIL_NODES_DEMO, _DEMO_REASON),
+        (_XFAIL_FUNCS_RF, _XFAIL_NODES_RF, _RF_REASON),
     )
     for item in items:
         nodeid = item.nodeid

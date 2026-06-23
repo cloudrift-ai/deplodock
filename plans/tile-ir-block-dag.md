@@ -524,6 +524,29 @@ sets the correctness floor; extra depth is a free occupancy knob (depth 3 at dis
 one `cohort`, hence one barrier/parity. The coupled-accum rejection (online-softmax running value) is a `retime`
 *precondition* over `Block.compute`, never an IR field.
 
+**Multi-level pipelining (gmem→smem→register).** Today `retime` parameterizes the **gmem→smem** stage only — pipelined
+along the outer K loop (`K_o`) — and the steady body then loads smem→register (`ldmatrix` / `ld.shared`) and issues the
+`Mma`/FMA **un-pipelined** (the legacy `080` behavior: an async `K_o` ring, then a direct smem load + mma on `K_i`). The
+model generalizes to a **second pipeline level — smem→register double-buffering along the inner K loop (`K_i`)** —
+because `distance` is **already per-serial-axis** (`tuple[(axis, offset), ...]`): a two-level mainloop is simply
+`distance[(A→mm)] = ((K_o, 1), (K_i, 1))` — prefetch the next smem stage *and* the next register fragment. Three changes
+realize it:
+
+- **`ring_depth` becomes per-(edge, axis)** (today `dict[Edge, int]`): the smem ring (depth `N` on `K_o`) and the register
+  double-buffer (depth `2` on `K_i`) carry independent depths. This is the one IR-schema touch.
+- **The smem→register level is the *same* edge's inner-axis retime, not a new `Edge`.** The smem slab is an `assemble`
+  artifact (not an IR object), so it can't be an `Edge` `src`; the register prefetch rides the gmem→mm edge's `K_i`
+  distance, and `assemble` emits **both** levels from that one edge's `(multi-axis distance, per-axis ring_depth)` — the
+  cp.async/TMA smem ring on `K_o` **and** the ping-pong `RegFragment` + lead `LdmatrixLoad` on `K_i`.
+- **`assemble`'s warp-MMA synthesis gains the register-prefetch path**: two `RegFragment` sets ping-ponged, the next
+  `LdmatrixLoad` issued before the current `MmaSyncPtx` — the real new codegen (the `atomize` section's single-buffered
+  `RegFragment`/`LdmatrixLoad`/`MmaSyncPtx` chain becomes double-buffered). The `peel` post-pass already peels by serial
+  axis, so it extends to peel `K_i` alongside `K_o`.
+
+This lands with **R4/R5** (warp-MMA + transport), not RF — the `ring_depth`-per-axis change is the only schema edit; the
+rest is `assemble`/`peel` codegen. A scalar-FMA mainloop generalizes the same way (`ld.shared` double-buffer on `K_i`),
+so it is not warp-tier-specific.
+
 ### specialize_warps — 085_warp_specialize
 
 `specialize_warps` writes `Schedule.role[block]` (PRODUCER on the TMA-staged loads, CONSUMER on the wait+reduce+`Write`
@@ -635,6 +658,14 @@ annotations the composer picks today) must `assemble` to **byte-identical CUDA**
   the derived read `AccessMap.clamp`.
 - **`cohort` invariant:** one transport + one barrier + one ring phase per cohort; a consumer's derived `Carrier.mask`
   ⇒ SYNC on its cohort's reads. **`ring_depth`** is independent, floored at `max(distance)+1`.
+- **Multi-level-pipeline carve-out (the `K_i` register level has no barrier):** the cohort/barrier rules above govern the
+  **gmem→smem** ring (the `K_o` distance) — its transport, `__syncthreads`/mbarrier parity, and one ring phase. The
+  **smem→register** double-buffer (the inner `K_i` distance from "Multi-level pipelining") is a **compiler-scheduled
+  register rotation** — its hazard is register WAR, resolved by instruction ordering (issue the next `LdmatrixLoad` before
+  the current `MmaSyncPtx`), **not** a barrier. So `assemble` emits **no** sync / mbarrier / cohort phase for a `K_i`
+  retime; `ring_depth[edge][K_i]` (= 2 for ping-pong) sizes the `RegFragment` rotation only. The `max(distance)+1` floor
+  and the one-phase-per-cohort rule apply **per axis**: independently on the `K_o` (smem, barriered) and `K_i` (register,
+  un-barriered) levels.
 
 ## Why moves compose (and pass-ordering lore dies)
 
@@ -695,27 +726,22 @@ Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy
 tier.* This is the Option-B groundwork that makes "The pass structure" / "Directory layout" real, refactoring **only** the
 existing pointwise + scalar-matmul composer (no new regime), gated **byte-identical**.
 
-**Already landed** (scaffolding — verified in the tree): the two pass dirs are registered
-`TILE_PASSES` now ends `…, "lowering/tile/enumeration", "lowering/tile/assembly"` (closes **G5**); **`TileGraphOp`** is a
-real graph-node op (`ir/tile/ir.py`) carrying `tilegraph` + variant `knobs` + `leading` (closes **G2**);
-`enumeration/010_enumerate` emits a `TileGraphOp` and the separate `assembly/010_assemble` materializes it `→ TileOp`
-(the enumeration/assembly split is done). Pointwise + scalar matmul lower end-to-end through both passes.
+**Landed (verified in the working tree; closes G1/G2/G5).** The two pass dirs are registered (`TILE_PASSES` ends
+`…, "lowering/tile/enumeration", "lowering/tile/assembly"`); **`TileGraphOp`** is a real graph-node op (`ir/tile/ir.py`)
+carrying `tilegraph` + `knobs` + `leading`; and the enumeration tree is now **split into per-family rule passes** —
+`enumeration/{000_build, 010_reduce_tile, 020_thread_tile, 030_register_tile, 040_lower}` plus the extracted
+`_classify.py`, with `010_enumerate.py` and the in-memory `_tree.py` (`_Choose*` nodes) deleted. `000_build` seeds the
+`TileGraphOp`; the `*_tile` passes each match it, compute offers (`_moves.py`'s `*_offers` fns), and return a `Fork`
+pinning one more knob group; `040_lower` builds the `TileGraph` and the separate `assembly/010_assemble` materializes it
+`→ TileOp`. Pointwise + scalar matmul lower end-to-end through the chain.
 
-**Still single-pass, the remaining RF work:** `enumeration/010_enumerate` is still **one** pass returning **one** in-memory
-`Fork` tree (`_ChooseThread → _ThreadChosen → _Leaf` for pointwise; `_MmChooseReduce → … → _MmLeaf` for matmul) whose leaf
-calls `_build.lower_{pointwise,matmul}` — and that builds the **whole** `TileGraph` from the **full** knob set at once
-(`build_pointwise_dag` σ-splits `Block.domain` by the thread/reg knobs; `Schedule` holds only `binding`). Two steps:
+**Which F3 path shipped — F3-a.** The build is **F3-a**: per-family passes accumulate knobs on the `TileGraphOp`
+(carrying the `dag`) and `040_lower` runs the unified `_build.build_dag` **once** at the end (the algorithm is still built
+all-at-once — `build_dag` σ-splits `Block.domain` by the full thread/reg/K knob set; `Schedule` holds `binding`). So the
+remaining RF debt is **F3-b** (the knob-invariant algorithm), recorded below as the open decision. The original two-step
+framing (F2 extract build / F3 split the tree) is **done**.
 
-- **F2 — extract `enumeration/000_build`** (deterministic, no fork): `LoopOp → TileGraphOp` seed (derive `iter_dag` +
-  `classify`, stamp the regime/`target_names`/`dag` the offer fns need). Today that derivation lives inside
-  `010_enumerate`'s rewrite.
-- **F3 — split `010_enumerate`'s tree into one rule pass per search level**: `010_reduce_tile` (matmul K-tiling),
-  `020_thread_tile`, `030_register_tile` — each matches the `TileGraphOp`, computes offers (the `_moves.py` fns
-  `matmul_reduce_offers` / `thread_offers` / `reg_offers` already exist), and returns a `Fork` whose leaves are
-  `TileGraphOp`s with one more knob group pinned (else passes through). This is the move from `_tree.py`'s in-memory
-  `_Choose*` nodes to rule `rewrite`s — closes **G1**.
-
-**Open decision blocking F3 — where the algorithm gets built.** `TileGraphOp` currently carries only the *finished*
+**Open decision — where the algorithm gets built (F3-b, deferred).** `TileGraphOp` currently carries only the *finished*
 `TileGraph` + knobs, and `build_*_dag` needs *all* tile knobs to σ-split `Block.domain`. So a per-family pass cannot just
 "annotate the Schedule" — the variant lives partly in the algorithm's domain. Two ways:
 - **F3-a (pragmatic, byte-identical-safe):** the per-family passes accumulate knobs on the `TileGraphOp` (carrying the

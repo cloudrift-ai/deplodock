@@ -26,7 +26,7 @@ def test_launch_geometry_fires_on_pointwise(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "enumerate" in recording_dump.fired_rules("lowering/tile/enumeration")
+    assert "build" in recording_dump.fired_rules("lowering/tile/enumeration")
 
 
 def test_launch_geometry_fires_on_reduction(recording_dump):
@@ -37,4 +37,4 @@ def test_launch_geometry_fires_on_reduction(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "enumerate" in recording_dump.fired_rules("lowering/tile/enumeration")
+    assert "build" in recording_dump.fired_rules("lowering/tile/enumeration")

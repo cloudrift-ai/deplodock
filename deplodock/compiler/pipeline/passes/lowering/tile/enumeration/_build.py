@@ -15,7 +15,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph, TileGraphOp
+from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
@@ -165,20 +165,3 @@ def build_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_names: froz
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
     return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
-
-
-# ---------------------------------------------------------------------------
-# ``lower`` — the Fork-tree leaf's terminal: emit the ENUMERATION output, a
-# ``TileGraphOp`` carrying the chosen Schedule's ``TileGraph`` + the full variant
-# knob set. Assembly is a SEPARATE deterministic pass (``assembly/010_assemble``);
-# this does NOT assemble.
-# ---------------------------------------------------------------------------
-
-
-def lower(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str] = frozenset()) -> TileGraphOp:
-    """Emit the ``TileGraphOp`` for a resolved leaf (enumeration only)."""
-    tg = build_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
-    # A reduce regime carries the warp-tier OFF sentinels (scalar tier — no
-    # tensor-core / cooperative bind); a MAP nest has no reduce knobs at all.
-    stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs} if target_names else knobs
-    return TileGraphOp(name=kernel_name, tilegraph=tg, leading=tuple(dag.leading), knobs={**base_knobs, **stamped})
