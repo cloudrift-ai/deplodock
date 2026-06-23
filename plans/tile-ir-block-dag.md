@@ -735,33 +735,22 @@ carrying `tilegraph` + `knobs` + `leading`; and the enumeration tree is now **sp
 pinning one more knob group; `040_lower` builds the `TileGraph` and the separate `assembly/010_assemble` materializes it
 `→ TileOp`. Pointwise + scalar matmul lower end-to-end through the chain.
 
-**Which F3 path shipped — F3-a.** The build is **F3-a**: per-family passes accumulate knobs on the `TileGraphOp`
-(carrying the `dag`) and `040_lower` runs the unified `_build.build_dag` **once** at the end (the algorithm is still built
-all-at-once — `build_dag` σ-splits `Block.domain` by the full thread/reg/K knob set; `Schedule` holds `binding`). So the
-remaining RF debt is **F3-b** (the knob-invariant algorithm), recorded below as the open decision. The original two-step
-framing (F2 extract build / F3 split the tree) is **done**.
+**F3-a shipped; F3-b is the one deferred follow-up.** `040_lower` runs the unified `_build.build_dag` **once** at the end
+of enumeration — the algorithm is still built all-at-once (`build_dag` σ-splits `Block.domain` by the full thread/reg/K
+knob set; `Schedule` holds `binding`). The only remaining RF debt is **F3-b** — a knob-*invariant* algorithm where
+`000_build` seeds logical axes, each tile pass applies an incremental `tile_axis` body move, and `assemble` does the
+register/thread replication from `Schedule`. F3-b reworks both `build_dag` **and** `assemble`, so it is deferred until a
+tier needs the invariant algorithm. The laziness guarantee (`pipeline/fork.py`) is unchanged: the per-family split
+materializes one thin knob-carrying `TileGraphOp` per resolved pass (vs one at the leaf before), never the full
+cartesian — the unexpanded frontier still materializes nothing.
 
-**Open decision — where the algorithm gets built (F3-b, deferred).** `TileGraphOp` currently carries only the *finished*
-`TileGraph` + knobs, and `build_*_dag` needs *all* tile knobs to σ-split `Block.domain`. So a per-family pass cannot just
-"annotate the Schedule" — the variant lives partly in the algorithm's domain. Two ways:
-- **F3-a (pragmatic, byte-identical-safe):** the per-family passes accumulate knobs on the `TileGraphOp` (carrying the
-  `dag`), and the `TileGraph` is built **once** at the end of enumeration (or assembly's front) via the current
-  `build_*_dag`. Splits the *search* into passes (closes G1) with minimal change; the algorithm is still built all-at-once.
-- **F3-b (design-true, larger):** make the algorithm **knob-invariant** — `000_build` seeds logical axes, each tile pass
-  applies an incremental `tile_axis` body move, and `assemble` does the register/thread replication from `Schedule`. This
-  is the real "invariant algorithm + Schedule variant" model, but it reworks `build_*_dag` **and** `assemble`.
-  *Recommendation: F3-a now (unblocks the tiers), F3-b as a later cleanup once a tier needs the invariant algorithm.*
-
-**Laziness — no 10K-node blow-up.** The split keeps the engine's existing guarantee (`pipeline/fork.py`): the `Fork`
-tree is **lazy** — `expand()` builds only the *next* level on demand, so a descent instantiates **O(path)** Forks, never
-the full cartesian (~42k for a matmul-class kernel; MCTS pays one level per pop). Forks are lightweight knob-delta
-dataclasses, **not** graph nodes — the ~10K search space lives as unexpanded Forks and never becomes graph nodes. A
-`TileGraphOp` graph node is materialized **only when the search resolves a leaf** to bench it, so the count of real graph
-nodes is bounded by the search **budget** (patience / iterations), not the space. The per-family split adds one wrinkle:
-a *resolved trajectory* now materializes one intermediate `TileGraphOp` per enumeration pass (vs one at the leaf today),
-so those intermediates must stay cheap — which is exactly why **F3-a** carries only accumulated knobs (+ the `dag`) and
-defers the single `build_*_dag` to the end, keeping each intermediate a thin knob-carrier. The unexpanded frontier
-materializes nothing.
+**Known consequence — greedy compile is now level-greedy.** `greedy_decide` flattens each fork to complete leaves and
+ranks via the prior; with one fork per search level it now ranks *partial* knob sets, and the cold `AnalyticPrior`
+calibrates those poorly (a scalar matmul can land a degenerate `BN=BM=1` pick — accuracy holds within fp32 noise, but
+the pick is no longer byte-identical to the legacy tower). The two-level MCTS / `tune` path enumerates the **identical**
+leaf set and is unaffected; partial-config prior calibration is a follow-up. Two search tests that asserted the old
+single-fork shape (`test_resolve.py::test_trace_records_partition_fork`,
+`test_two_level.py::test_run_two_level_tune_single_terminal_assembles_bests`) are quarantined under R7.
 
 *Gate: byte-identical `TileOp` for pointwise + scalar matmul; the green floor unmoved; the two-level MCTS enumerates the
 **identical leaf set** — it now branches across passes instead of within one tree.* The `→ KernelOp` switch (audit **G3**)
@@ -846,6 +835,100 @@ bloat):
 **(C) Refactor-stale — update, don't quarantine (1).** `test_knob.py::test_knob_features_mma_expansion` fails with
 `ImportError: cannot import name '_enumeration'` — it imports a module deleted in the package reorg; repoint it at the new
 `enumeration` package (or fold into R4 if the mma knob features aren't rebuilt yet).
+
+## Review findings & hardening backlog
+
+A six-lens review (consistency / scheduling coverage / performance / novelty / real-world fit / extensibility) surfaced
+the items below. Severity: **[B]** blocker before its dependent phase, **[M]** major, **[m]** minor.
+
+### Accuracy & consistency (sweep the design body)
+
+- **[M] `assemble → TileOp` today, not `KernelOp`.** The IR section, the pass table ("TileGraph → KernelOp"), and the
+  Lowering steps state `assemble → KernelOp`; the code (`assembly/_assemble.py`) returns **`TileOp`** (coexistence) and
+  `→ KernelOp` is the deferred **G3**. Restate as `TileOp` now / `KernelOp` end-state.
+- **[M] Stale paths/symbols throughout the design body.** `blockdag.py`→`ir/tile/ir.py`; `build_dag.py` / `materialize.py`
+  / `partition/` / `_tree.py` / `010_enumerate.py` / `lower_{pointwise,matmul}` / `build_pointwise_dag` → the live tree
+  (`enumeration/{000_build…040_lower}`, `_build.build_dag`, `_classify.py`, `assembly/`). Sweep them.
+- **[M] Drop the "coop reduce proven byte-identical" claim** ("Next step"): `assemble_block` is single-block /
+  single-launch only (it `raise`s otherwise), so coop combine + split-K (multi-block/multi-launch) have **no** oracle
+  yet. Multi-block `assemble` is an undeclared deliverable that gates R2/R3 — name it.
+- **[m] `ring_depth: dict[Edge, int]` ships as final** but multi-level pipelining needs per-(edge, axis); mark the field
+  provisional (the one R4/R5 schema edit).
+
+### Scheduling-decision coverage (Schedule growth points)
+
+- **[B] Vectorization width (ld/st/cp.async granularity) is nowhere** — a ranked perf fork (v4 vs v2 shifts register
+  pressure + predication), not a derived property; `070_pad`'s own gate reads the realized `ld.shared.v4` width. Add
+  `Schedule.vector_width` as an enumeration fork.
+- **[B] Warp-tile shape / warp arrangement is `atomize`-folded into body axis-splits**, not a Schedule field — yet it is
+  *the* dominant matmul knob (CUTLASS `WarpShape`); hiding it in `compute` makes retuning it a *body* move, breaking "the
+  Schedule is the search space." Make warps_m×warps_n + warp-tile extent explicit Schedule fields.
+- **[M] Occupancy / `__launch_bounds__` / CTA max-registers unmodeled** (`reg_budget` is warp-spec-only). Add
+  `Schedule.launch_bounds` per launch group.
+- **[M] smem capacity / carveout / dynamic-smem invisible** — `ring_depth × slab_bytes` can exceed the carveout and only
+  fail at bench. Model smem budget as a derived capacity constraint + a carveout launch attribute.
+- **[M] sm_90+ frontier absent** — CGA clusters (+ cluster dims, TMA multicast), persistent kernels, stream-K;
+  `partition_reduce(K,GRID)` is plain split-K only. Reserve a `CLUSTER` binding + persistent-loop flag or the IR caps at
+  Ampere-class scheduling.
+- **[M] smem XOR/B64/B128 swizzle conflated with `pad`** — TMA *requires* swizzle (and `pad` is skipped on TMA), so the
+  TMA path has no conflict lever but a derived swizzle-atom. Make swizzle-mode an explicit per-slab field.
+
+### Performance
+
+- **[B] The byte-identical gate caps perf at the legacy tower** — whose mainloop is **single-buffered at the register
+  level** (verified). "Byte-identical then perf-equal under tune" prevents regression but gives no path to *exceed*
+  legacy codegen. Scope the oracle to **migration fidelity only**; gate new-codegen features on accuracy + perf-gain.
+- **[B] Register-level pipelining is asserted, unvalidated, off-contract** — no legacy reference, no stated gate, no
+  register-pressure accounting for 2× `RegFragment` sets (which cut occupancy). Make it a first-class fork (`K_i` depth ∈
+  {1,2}) with reg-budget modeling + accuracy/bench gate.
+- **[M] Occupancy / register pressure is invisible to the search** — every fork moves it, nothing models the cliff; MCTS
+  only learns spill regions via bench. Add a derived occupancy estimate as a prior feature / prune.
+- **[M] `pad`/`unroll` "not a fork" is asserted, not measured** — pad interacts with vectorization + swizzle; over-unroll
+  spills. Add a sweep proving each is within ~2% of a searched optimum on the goldens before declaring it fixed-logic.
+
+### Maintainability & extensibility
+
+- **[B] Do R0 first, then flip the quarantine to `strict=True`.** Under `strict=False` the registry rots invisibly (the
+  `@cuda`-matcher miss under-quarantines; the 89 XPASS over-quarantine; file masks hide green tests). A `strict=True`
+  XPASS is the only forcing function that a closed gap *must* be retired.
+- **[M] `assemble` determinism is asserted with no enforcement.** Add a property test (`assemble(leaf)` twice ==
+  byte-identical) per recovered tier + a lint that `assembly/` imports no offer/knob module — else `_free_layers`-style
+  regime `if`s accrete into a god-function.
+- **[M] op_cache_key canonicalization is deferred but compounds** — the key is `canonical(bodies+edges)+Schedule` over
+  derived `Edge`s whose block names tiling renames; silent drift re-keys perf rows → prior poisoning. Land
+  canonicalization + a round-trip test in RF, not "later" (the prior/DB is the one thing a refactor can't migrate).
+- **[M] Sequence F3-b before R4.** Warp-MMA register replication and the `K_i` register pipeline *are* `Block.domain`
+  edits; F3-a's all-at-once build forces F3-b mid-recovery — the worst time. Do F3-b first, or state the
+  domain-as-partial-variant model honestly in the IR contract.
+- **[m] Guard the derived-view discipline** — a test asserting `Block.__dataclass_fields__ == {name, domain, compute}`
+  and `Schedule` holds only the 13 dicts, so no one reintroduces a stored projection.
+- **[m] `AccessMap` TEMPLATE fallback is silent-codegen fragility** (drives slab sizing / TMA-eligibility / clamp, not
+  just legality). Make `TEMPLATE`-declines-TMA a hard gate + a classifier golden set.
+
+### Novelty & positioning (don't over-claim)
+
+The design is a **Halide-lineage refactor**, not a new idea: "invariant algorithm + Schedule annotation + one
+deterministic `assemble`" is the Halide compute/schedule split (and MLIR transform-dialect / Exo "schedule as rewrites");
+the two-level MCTS is Ansor/MetaSchedule territory; "derived-never-stored" is standard analysis hygiene. The **one
+defensible delta** is the *carrier-algebra trait lattice* (`commutative` / `has_identity` / SEMIRING / MONOID /
+TWISTED_MONOID) as a **single uniform legality oracle** spanning split-K / cooperative-K / `atomize` / masked-K
+identity-fill — but it is incremental over `rfactor` + semiring-reduction work, and its most interesting case
+(TWISTED_MONOID / flash) is v1-restricted, so the contribution isn't realized until flash lands. It **lags** prior art on
+semantic-preservation proofs (Exo), composable layout algebra (CuTe/Graphene — `AccessMap`'s TEMPLATE escape-hatch is
+exactly where CuTe stays total), and MLIR's more general "scheduling as rewrites." *Add a short "Prior art & positioning"
+note so the doc doesn't over-claim.*
+
+### Real-world fit (scope honestly)
+
+This is an **internal IR refactor** — it changes deplodock's maintainability, not its capability, so its relevance is
+bounded by deplodock's: a small, fully-inspectable whole-model PyTorch→CUDA stack with built-in MCTS autotuning and
+symbolic-shape kernels — a **research / education / experimentation artifact**, not a production kernel source. For every
+kernel it targets, cuBLAS/cuDNN, CUTLASS/CuTe-DSL, Triton+max-autotune, FlashAttention, and torch.compile/Inductor are
+far stronger and converging; Meta's **Helion** (schedule-annotation-over-invariant-algorithm + autotune) is the same
+thesis with PyTorch backing. Honest framing: the Schedule-as-annotation refactor is the *right* call for *this* codebase's
+worst liability (brittle ordering-lore tree passes), and the algebra-licensed-scheduling idea has citable scientific value
+**if written up** — but the tool will perpetually lag NVIDIA's libraries on raw perf and shouldn't be sold as competing
+with them.
 
 ## Open design decisions
 
