@@ -483,10 +483,17 @@ def seed_demoted(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Ten
     blocks: list[Block] = []
     buffers: dict[str, Buffer] = {}
     for op, out_t in pieces:
-        regime = classify(iter_dag(op))
+        dag = iter_dag(op)
+        regime = classify(dag)
         if regime is None:
             return None  # a piece the move composer can't build as a clean block
-        block = seed_graph(iter_dag(op), kernel_name=op.name or out_t.name).blocks[0]
+        block = seed_graph(dag, kernel_name=op.name or out_t.name).blocks[0]
+        # Carry the per-CTA leading scope (e.g. the rmsnorm producer's ``1/H`` reciprocal
+        # and ``eps`` loads) into the block — the fused-edge reduce prologue needs them,
+        # and ``seed_graph`` (``dag.inner_body`` only) otherwise drops them, leaving the
+        # scalar chain (``acc·(1/H) + eps``) referencing undefined names.
+        if dag.leading:
+            block = replace(block, compute=Body((*dag.leading, *block.compute)))
         blocks.append(block)
         buffers[out_t.name] = Buffer(out_t.name, tuple(out_t.shape), out_t.dtype, space=Space.GMEM)
         for buf in op.inputs:
