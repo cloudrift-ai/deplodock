@@ -31,6 +31,8 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
     if MAP_N_THREAD.name in op.knobs or mma_atom(op.knobs) is not None:
         raise RuleSkipped("thread tile already pinned / warp tier")
+    if op.algebra is AlgebraKind.MONOID:
+        raise RuleSkipped("cooperative-reduce tier (015_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING and RED_BK.name not in op.knobs:
         raise RuleSkipped("reduce tile not yet pinned")
     offers = thread_offers(op.dag, Budget())

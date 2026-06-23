@@ -27,6 +27,7 @@ from dataclasses import replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, STAGE
@@ -39,6 +40,10 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     op: TileGraphOp = root.op
     if MAP_N_REG.name not in op.knobs or STAGE.name in op.knobs:
         raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via the STAGE knob)")
+    if op.algebra is AlgebraKind.MONOID:
+        # A cooperative reduce stays smem-free: each lane reads its own K_c-strided
+        # slice with no cross-thread reuse (legacy build_coop_reduce_tile never staged).
+        raise RuleSkipped("cooperative reduce stays smem-free (no cross-thread read reuse)")
     ranked = stage_candidates(op.tilegraph)
     n = len(ranked)
     if n == 0:

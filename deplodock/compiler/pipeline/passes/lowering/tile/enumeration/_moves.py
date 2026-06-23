@@ -26,6 +26,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Rol
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     BK_CHOICES,
+    BR_CHOICES,
+    COOP_BR,
     FK_CHOICES,
     MAP_M_REG,
     MAP_M_THREAD,
@@ -281,6 +283,99 @@ def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     """Knob delta a reduce-tile branch pins."""
     bk, fk, sk = reduce
     return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
+
+
+# --- Cooperative-reduce (MONOID) moves: the carrier's commutative-licensed
+# partition placed on a THREAD axis (``BR`` cooperative lanes per row) instead of
+# split-K's BLOCK axis. Same ``legal_decomps`` move; the realization (warp-shuffle /
+# tree combine) is the downstream cost choice. ---
+
+_BR_TARGET = 128  # ~4 warps cooperating per row
+
+
+def coop_free_threads(dag: IterDag) -> tuple[int, int]:
+    """Free-axis THREAD tiles ``(bn, bm)`` for a cooperative reduce, default
+    ``(1, 1)`` — the whole-CTA form (one row per CTA, ``BR`` threads reduce it).
+    A pinned ``BN``/``BM`` > 1 thread-binds the free rows ALONGSIDE the ``BR``
+    cooperative lanes — the **strided-cooperative rows** form (e.g. a per-head
+    q/k-norm deploys a ``BN×BR`` CTA instead of a degenerate one)."""
+    bn = _pin(MAP_N_THREAD) or 1
+    bm = (_pin(MAP_M_THREAD) or 1) if dag.outer_m is not None else 1
+    return bn, bm
+
+
+def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, int, int]]:
+    """Legal ``(bk, fk, br)`` for a cooperative reduce: ``br`` (the cooperative
+    thread count) ≤ 1024. For a static K, ``br·bk·fk`` must divide K; a symbolic
+    (masked) K only needs ``br·bk·fk ≤`` the hint — the final partial tile is
+    masked (ceil-div). Best-first: ≈``_BR_TARGET`` threads, no chunk / strip-mine.
+    Env-pinnable for tests.
+
+    With **strided-cooperative rows** (a pinned ``BN·BM > 1`` free-axis thread
+    tile) the cross-thread combine is a SEGMENTED warp shuffle over each row's
+    ``BR`` lanes, so ``BR`` clips to a power of two ≤ ``warp_size`` (each row's
+    lanes must form an aligned intra-warp segment — matching
+    ``cooperative_combine_geometry``), and ``bn·bm·br`` must fit the CTA thread
+    budget."""
+    bk_pin, fk_pin, br_pin = _pin(RED_BK), _pin(RED_FK), _pin(COOP_BR)
+    bks = (bk_pin,) if bk_pin else BK_CHOICES
+    fks = (fk_pin,) if fk_pin else FK_CHOICES
+    brs = (br_pin,) if br_pin else BR_CHOICES
+    masked = dag.k_bound is not None
+    # A short reduce (static K < warp_size) stays pure-serial (BR=1): too small to
+    # stage a meaningful cross-thread tree-halve combine. It still composes (the
+    # serial per-row reduce), just without cooperative threads. (A symbolic/masked
+    # K tiles at the hint, which is large.)
+    br_floor_serial = (not masked) and dag.k_extent < 32
+    bn, bm = coop_free_threads(dag)
+    strided = bn * bm > 1
+    # Same decomposition move as split-K: factor [br (cooperative THREAD), bk
+    # (STAGE_INNER), fk (REGISTER)] — the masked-K fill is licensed by the
+    # carrier's identity (has_identity), the cooperative partition by commutative.
+    decomps = legal_decomps(
+        _carrier_of(dag.k_node.loop),
+        dag.k_node.loop.axis,
+        dag.k_extent,
+        factor_menus=[brs, bks, fks],
+        placement=[Role.THREAD, Role.STAGE_INNER, Role.REGISTER],
+        masked=masked,
+        allow_split=True,
+    )
+    out = [
+        (d.factors[1], d.factors[2], d.factors[0])
+        for d in decomps
+        if 1 <= d.factors[0] <= 1024
+        and (d.factors[0] == 1 or not br_floor_serial)
+        and (not strided or _strided_br_ok(d.factors[0], bn * bm, warp_size))
+    ]
+    out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
+    return out
+
+
+def _strided_br_ok(br: int, free_threads: int, warp_size: int) -> bool:
+    """A strided-cooperative ``BR`` must be a power of two ≤ ``warp_size`` (so the
+    segmented shuffle stays intra-warp), and ``free_threads·BR`` must fit the CTA
+    thread budget (1024)."""
+    if free_threads * br > 1024:
+        return False
+    return br == 1 or (br <= warp_size and br & (br - 1) == 0)
+
+
+def coop_reduce_knobs(reduce: tuple[int, int, int]) -> dict:
+    """Knob delta a cooperative-reduce leaf pins."""
+    bk, fk, br = reduce
+    return {RED_BK.name: bk, RED_FK.name: fk, COOP_BR.name: br}
+
+
+def coop_free_thread_knobs(dag: IterDag) -> dict:
+    """Knob delta for the free-axis THREAD tiles (``BN``/``BM``) a cooperative
+    reduce binds — default ``1`` (whole-CTA), or the pinned strided-cooperative
+    value. ``BM`` only when an outer free axis exists."""
+    bn, bm = coop_free_threads(dag)
+    knobs = {MAP_N_THREAD.name: bn}
+    if dag.outer_m is not None:
+        knobs[MAP_M_THREAD.name] = bm
+    return knobs
 
 
 # --- Warp-tier (tensor-core ``atomize``) moves: the warp count, the per-warp

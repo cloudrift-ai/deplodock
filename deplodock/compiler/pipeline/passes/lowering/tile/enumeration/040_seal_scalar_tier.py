@@ -28,6 +28,6 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if MAP_N_REG.name not in op.knobs or not op.target_names or "MMA" in op.knobs:
-        raise RuleSkipped("not fully tiled / not a reduce regime / already sealed")
+    if MAP_N_REG.name not in op.knobs or not op.target_names or "MMA" in op.knobs or "BR" in op.knobs:
+        raise RuleSkipped("not fully tiled / not a reduce regime / already sealed / cooperative (BR pinned)")
     return replace(op, knobs={**op.knobs, "MMA": "0", "WM": 0, "WN": 0, "BR": 1})

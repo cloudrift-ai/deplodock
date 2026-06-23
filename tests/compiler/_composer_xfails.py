@@ -37,10 +37,11 @@ _PHASE_REASON = {
 
 # Whole files: every collected test exercises a deleted tier.
 _XFAIL_FILES: dict[str, str] = {
-    # R2
-    "test_cooperative_combine.py": "R2",
-    "test_masked_cooperative_reduce.py": "R2",
-    "test_monoid_reduce_kernel.py": "R2",
+    # R2 — landed (cooperative-reduce): test_cooperative_combine.py /
+    # test_masked_cooperative_reduce.py de-quarantined.
+    # R3 — test_monoid_reduce_kernel.py imports the deleted 017_atomic_free_splitk
+    # (build_monoid_reduce_tileop), the atomic-free split-K combine — R3, not R2.
+    "test_monoid_reduce_kernel.py": "R3",
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
     # R6
@@ -52,32 +53,6 @@ _XFAIL_FILES: dict[str, str] = {
 
 # Whole functions: every parametrization is red.
 _XFAIL_FUNCS: dict[str, str] = {
-    # R2
-    "test_bench_worker_compare.py::test_compare_in_worker_returns_torch_and_deplodock": "R2",
-    "test_dtype_cuda.py::test_fp16_max_reduction_stays_in_fp16": "R2",
-    "test_dtype_cuda.py::test_fp16_reduction_uses_fp32_accumulator_on_cuda": "R2",
-    "test_dtype_cuda.py::test_fp16_rmsnorm_cuda": "R2",
-    "test_dtype_cuda.py::test_fp16_softmax_cuda": "R2",
-    "test_dynamic_shapes.py::test_capture_replay_cache_rmsnorm_over_capacity_buffers": "R2",
-    "test_dynamic_shapes.py::test_capture_replay_device_io_matches_eager": "R2",
-    "test_dynamic_shapes.py::test_cuda_softmax_over_symbolic_seq_len": "R2",
-    "test_dynamic_shapes.py::test_cuda_symbolic_rmsnorm_traced_and_run": "R2",
-    "test_emit.py::test_reduce_emits_k_loop": "R2",
-    "test_emit.py::test_reduce_runs_on_gpu": "R2",
-    "test_emit.py::test_softmax_emits_multiple_k_loops": "R2",
-    "test_emit.py::test_softmax_emits_per_element_store": "R2",
-    "test_emit.py::test_softmax_runs_on_gpu": "R2",
-    "test_graph_capture.py::test_bench_lowered_vs_torch_captures": "R2",
-    "test_graph_capture.py::test_deplodock_capture_failure_falls_back_uncaptured": "R2",
-    "test_graph_capture.py::test_torch_capture_failure_disables_deplodock_capture": "R2",
-    "test_launch_geometry_rules.py::test_launch_geometry_fires_on_reduction": "R2",
-    "test_reduction_rules.py::test_block_cooperative_emits_hierarchical_reduce": "R2",
-    "test_reduction_rules.py::test_block_cooperative_skips_stage_inputs": "R2",
-    "test_reduction_rules.py::test_long_axis_sum_fires_cooperative_reduce": "R2",
-    "test_reduction_rules.py::test_warp_cooperative_emits_warpshuffle": "R2",
-    "test_reduction_rules.py::test_warp_cooperative_skips_stage_inputs": "R2",
-    "test_reduction_rules.py::test_warp_sized_axis_fires_cooperative_reduce": "R2",
-    "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op": "R2",
     # R3
     "test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": "R3",
     "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": "R3",
@@ -145,26 +120,6 @@ _XFAIL_FUNCS: dict[str, str] = {
 
 # Specific parametrizations (the function also has green params).
 _XFAIL_NODES: dict[str, str] = {
-    # R2
-    "test_accuracy.py::test_e2e_reduce_max_cooperative[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_reduce_max_cooperative[cuda-f32]": "R2",
-    "test_accuracy.py::test_e2e_reduce_sum[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_reduce_sum[cuda-f32]": "R2",
-    "test_accuracy.py::test_e2e_reduce_sum_cooperative[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_reduce_sum_cooperative[cuda-f32]": "R2",
-    "test_accuracy.py::test_e2e_rmsnorm[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_rmsnorm[cuda-f32]": "R2",
-    "test_accuracy.py::test_e2e_softmax[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_softmax[cuda-f32]": "R2",
-    "test_accuracy.py::test_e2e_softmax_cooperative[cuda-f16]": "R2",
-    "test_accuracy.py::test_e2e_softmax_cooperative[cuda-f32]": "R2",
-    "test_ops_vs_torch.py::test_mean[cuda]": "R2",
-    "test_ops_vs_torch.py::test_reduce_max[cuda]": "R2",
-    "test_ops_vs_torch.py::test_reduce_sum[cuda]": "R2",
-    "test_ops_vs_torch.py::test_reduce_sum_keepdim[cuda]": "R2",
-    "test_ops_vs_torch.py::test_rmsnorm_graph[cuda]": "R2",
-    "test_ops_vs_torch.py::test_softmax_graph[cuda]": "R2",
-    "test_tune_accuracy.py::test_tuned_variant_matches_reference[rmsnorm]": "R2",
     # R5
     "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": "R5",
     "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": "R5",

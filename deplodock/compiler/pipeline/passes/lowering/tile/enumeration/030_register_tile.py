@@ -30,6 +30,8 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
     if MAP_N_REG.name in op.knobs or MAP_N_THREAD.name not in op.knobs:
         raise RuleSkipped("register tile not applicable / already pinned")
+    if op.algebra is AlgebraKind.MONOID:
+        raise RuleSkipped("cooperative-reduce tier (015_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING:
         offers = reduce_reg_offers(op.dag, Budget(), op.knobs[RED_FK.name])
     else:

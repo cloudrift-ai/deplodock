@@ -26,9 +26,9 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag impor
 
 PATTERN = [Pattern("root", LoopOp)]
 
-# Regimes the move set currently builds. MONOID (coop) / TWISTED_MONOID (flash) are
-# recognised by classify but not yet built — they raise (quarantined).
-_BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING)
+# Regimes the move set currently builds. TWISTED_MONOID (flash) is recognised by
+# classify but not yet built — it raises (quarantined, R6).
+_BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 
 
 def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001

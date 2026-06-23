@@ -13,15 +13,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Mma, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Mma, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, SerialTile, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import classify_matmul_operands
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
+    COOP_BR,
     MAP_M_REG,
     MAP_M_THREAD,
     MAP_N_REG,
@@ -203,6 +205,151 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
     sigma_outer = Sigma(sigma_map)
     block = graph.blocks[0]
     compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
+    compute = _apply_masked_guards(compute, bounds, sigma_outer)
+    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
+    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+
+
+# === Cooperative-reduce (MONOID) build move (``plans/tile-ir-block-dag.md`` R2). ===
+# The coop tower is the same kind of body move as the scalar ``reduce_decomp`` +
+# ``free_tile``, but the carrier's commutative-licensed partition lands on a THREAD
+# axis (``K_c`` — ``BR`` cooperative lanes per row) rather than split-K's BLOCK axis,
+# and the free-axis register tile is forced to 1 (one element per cell-owner; the
+# rows thread- or grid-parallelize). The cross-thread combine is NOT in the body —
+# the reduce ``Accum.axes`` carry ``K_c`` through σ, and ``kernel/100_materialize_tile``
+# synthesizes the warp-shuffle / hierarchical tree from ``Accum.axes ∩ ThreadTile``.
+
+
+def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask each ``Accum``'s folded value to the carrier's identity past a
+    masked-K boundary (symbolic reduce). Before each ``Accum(name, value=V, op)``
+    insert ``Init(V_kid, op)`` (the op's neutral element — ``0`` for add, ``-inf``
+    for max) and ``Select(V_km, V if pred else V_kid)``, then fold ``V_km``. The
+    Accum stays a direct child of the reduce loop (``is_reduce`` + the cross-thread
+    combine intact); the Load was already index-clamped for a safe read."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Accum):
+            ident = f"{c.value}_kid"
+            masked = f"{c.value}_km"
+            out.append(Init(name=ident, op=c.op, dtype=c.dtype or F32))
+            out.append(
+                Select(
+                    name=masked,
+                    branches=(SelectBranch(value=c.value, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+                )
+            )
+            out.append(replace(c, value=masked))
+        else:
+            out.append(c)
+    return tuple(out)
+
+
+def _replace_k_coop(
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_dim, bk: int, fk: int, br: int, k_c: Axis | None, k_bound: object
+) -> tuple[Stmt, ...]:
+    """Replace every K loop named in ``target_names`` — the reduce(s) and any
+    second-pass map loop — with the cooperative tower, σ-mapping
+    ``K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`` (``K_f`` only when
+    ``fk > 1``; ``K_c`` the stride-1 thread lane only when ``br > 1``). Each loop
+    gets its own ``K_o``/``K_i``/``K_f`` serial tiles but shares the one ``K_c``
+    THREAD axis (laid into the domain by the caller). The reduce's ``Accum.axes``
+    propagate ``K_c`` through σ → ``kernel/100`` emits the combine.
+
+    When ``k_bound`` is set (symbolic K), ``K_o`` ceil-divides and the final
+    partial tile is masked: the reduce clamps its load index for a safe read and
+    folds the carrier identity past ``k_bound`` (``_mask_reduce_accums``); the map
+    loop guards its store with ``Cond(decoded_k < k_bound)``."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name in target_names:
+            kn = s.axis.name
+            src = s.axis.source_axis or s.axis
+            k_o_ext = k_dim.ceil_div(br * bk * fk) if k_bound is not None else k_dim // (br * bk * fk)
+            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{kn}_i", bk, source_axis=src)
+            expr = Var(k_o.name) * Literal(br * bk * fk, "int")
+            k_f = None
+            if fk > 1:
+                k_f = Axis(f"{kn}_f", fk, source_axis=src)
+                expr = expr + Var(k_f.name) * Literal(br * bk, "int")
+            expr = expr + Var(k_i.name) * Literal(br, "int")
+            if k_c is not None:
+                expr = expr + Var(k_c.name)
+            sigma_k = Sigma({kn: expr})
+            if k_bound is not None:
+                decoded_k = sigma_k.apply(Var(kn))
+                pred = BinaryExpr("<", decoded_k, k_bound)
+                if s.is_reduce:
+                    # Clamp the read in-bounds, fold the carrier identity past the bound.
+                    clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", k_bound, Literal(1, "int")))
+                    body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in s.body)
+                    new_body = _mask_reduce_accums(body_c, pred)
+                else:
+                    body_u = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+                    new_body = (Cond(cond=pred, body=Body(body_u)),)
+            else:
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in s.body)
+            if k_f is not None:
+                # ``reduce`` follows the loop: the reduce loops accumulate (FK
+                # multiple-accumulator), the second-pass map loop only writes.
+                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def coop_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
+    """The cooperative-reduce build move: σ-split the free axes (THREAD = the
+    pinned ``BN``/``BM``, REGISTER forced to 1) + re-bracket every K loop with the
+    cooperative tower (the ``K_c`` THREAD lane, masked-K fill past a symbolic
+    bound). The ``K_c`` axis is laid FIRST in ``Block.domain`` so it sits innermost
+    in the THREAD tier (fastest threadIdx bits) — matching the legacy
+    ``coop_thread`` placement; ``assemble`` reconstructs the tower from
+    ``domain`` + ``Schedule.binding`` and the downstream combine rides
+    ``Accum.axes``."""
+    bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
+    bn = knobs.get(MAP_N_THREAD.name, 1)
+    bm = knobs.get(MAP_M_THREAD.name, 1) if dag.outer_m is not None else 1
+
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    free_specs = [(inner_n, bn, 1, True)]
+    if outer_m is not None:
+        free_specs.append((outer_m, bm, 1, False))
+
+    sigma_map: dict = {}
+    bounds: list = []
+    domain: list = []
+    binding: dict[str, Binding] = {}
+
+    kax = dag.k_node.loop.axis
+    src_k = kax.source_axis or kax
+    k_c = Axis(f"{kax.name}_c", br, source_axis=src_k) if br > 1 else None
+    if k_c is not None:
+        # K_c first → innermost in the THREAD tier (matches the legacy coop_thread order).
+        domain.append(k_c)
+        binding[k_c.name] = Binding.THREAD
+
+    for axis, thread, reg, interleave in free_specs:
+        a_b, a_t, a_r, expr, bound = _split_free_axis(axis, thread, reg, interleave_when_masked=interleave)
+        sigma_map[axis.name] = expr
+        if bound is not None:
+            bounds.append((axis.name, bound))
+        domain.extend((a_b, a_t, a_r))
+        binding[a_b.name] = Binding.GRID
+        binding[a_t.name] = Binding.THREAD
+        binding[a_r.name] = Binding.REGISTER
+
+    for lp in reversed(extra_outer):
+        domain.append(lp.axis)
+        binding[lp.axis.name] = Binding.GRID
+
+    sigma_outer = Sigma(sigma_map)
+    block = graph.blocks[0]
+    targets = target_names or frozenset({kax.name})
+    compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
+    compute = _replace_k_coop(compute, targets, kax.extent, bk, fk, br, k_c, dag.k_bound)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
     return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
