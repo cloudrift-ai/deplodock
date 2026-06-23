@@ -12,6 +12,10 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Serving** (vLLM out-of-tree embedding plugin — deplodock-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md)
 - **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
 - **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
+- **Tile lowering** (LoopOp → TileOp: `enumeration` builds the block-DAG `TileGraph` + searches the `Schedule`,
+  `assembly` assembles the tower; **purely algebraic moveset — no shape specializations**, dispatch on the carrier
+  algebra `MAP`/`SEMIRING`/`MONOID`/`TWISTED_MONOID`) →
+  [`deplodock/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before answering — they hold details that are no longer in the README.
 

@@ -726,6 +726,17 @@ calls `_build.lower_{pointwise,matmul}` — and that builds the **whole** `TileG
   is the real "invariant algorithm + Schedule variant" model, but it reworks `build_*_dag` **and** `assemble`.
   *Recommendation: F3-a now (unblocks the tiers), F3-b as a later cleanup once a tier needs the invariant algorithm.*
 
+**Laziness — no 10K-node blow-up.** The split keeps the engine's existing guarantee (`pipeline/fork.py`): the `Fork`
+tree is **lazy** — `expand()` builds only the *next* level on demand, so a descent instantiates **O(path)** Forks, never
+the full cartesian (~42k for a matmul-class kernel; MCTS pays one level per pop). Forks are lightweight knob-delta
+dataclasses, **not** graph nodes — the ~10K search space lives as unexpanded Forks and never becomes graph nodes. A
+`TileGraphOp` graph node is materialized **only when the search resolves a leaf** to bench it, so the count of real graph
+nodes is bounded by the search **budget** (patience / iterations), not the space. The per-family split adds one wrinkle:
+a *resolved trajectory* now materializes one intermediate `TileGraphOp` per enumeration pass (vs one at the leaf today),
+so those intermediates must stay cheap — which is exactly why **F3-a** carries only accumulated knobs (+ the `dag`) and
+defers the single `build_*_dag` to the end, keeping each intermediate a thin knob-carrier. The unexpanded frontier
+materializes nothing.
+
 *Gate: byte-identical `TileOp` for pointwise + scalar matmul; the green floor unmoved; the two-level MCTS enumerates the
 **identical leaf set** — it now branches across passes instead of within one tree.* The `→ KernelOp` switch (audit **G3**)
 and the deterministic post-passes (**G4**) remain later steps. Every tier below assumes this foundation: each **adds one

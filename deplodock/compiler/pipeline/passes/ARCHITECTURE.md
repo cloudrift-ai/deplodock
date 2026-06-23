@@ -1,7 +1,10 @@
 # Pass-authoring invariants
 
 Rules that apply to EVERY pass in this tree (`frontend/`, `loop/`, `lowering/`). Per-dialect details live in
-[`../ARCHITECTURE.md`](../ARCHITECTURE.md) (pass order, knob table, fork semantics).
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) (pass order, knob table, fork semantics). The **tile-lowering** phase
+([`lowering/tile/ARCHITECTURE.md`](lowering/tile/ARCHITECTURE.md)) is the canonical instance of the invariant below —
+a **purely algebraic moveset, no specializations**: it dispatches on the carrier algebra (`MAP` / `SEMIRING` /
+`MONOID` / `TWISTED_MONOID`), never on a named shape (matmul / pointwise / attention).
 
 ## No shape-specific pattern matching
 

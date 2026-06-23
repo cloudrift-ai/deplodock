@@ -31,7 +31,9 @@ pipeline/
     │   ├── lifting/        # tensor ops → trivial LoopOp nodes
     │   └── fusion/         # fuse fan-out indexmaps into all consumers, merge adjacent LoopOp pairs (splice), then stamp name + structural-feature (`S_*`) knobs
     └── lowering/
-        ├── tile/           # LoopOp → TileOp (tileify + scheduling rules)
+        ├── tile/           # LoopOp → TileOp: enumeration (build TileGraph + search Schedule)
+        │                   #   → assembly (assemble the tower). Purely algebraic moveset, no
+        │                   #   shape specializations → lowering/tile/ARCHITECTURE.md
         ├── kernel/         # TileOp → KernelOp (materialize scheduling)
         └── cuda/           # KernelOp → CudaOp (render source string)
 ```

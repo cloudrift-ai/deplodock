@@ -58,6 +58,7 @@ autotuning cache doesn't bust on cosmetic edits.
 | `ir/`                 | Op-type definitions per dialect         | `ir/ARCHITECTURE.md`         |
 | `trace/`              | PyTorch/HuggingFace → Graph IR          | `trace/ARCHITECTURE.md`      |
 | `pipeline/`           | Rewrite engine, passes, dump hooks      | `pipeline/ARCHITECTURE.md`   |
+| `pipeline/passes/lowering/tile/` | LoopOp → TileOp: enumeration + assembly; **purely algebraic moveset, no specializations** | `pipeline/passes/lowering/tile/ARCHITECTURE.md` |
 | `backend/`            | Execution (numpy / loop / cuda)         | `backend/ARCHITECTURE.md`    |
 | `loader/`             | Bind constants (safetensors / `nn.Module` → `input_data`) | —              |
 | `pipeline/search/`    | Autotune DB + MCTS tree (see below)     | `pipeline/ARCHITECTURE.md`   |
