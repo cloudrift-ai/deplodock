@@ -15,9 +15,10 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Mma, Select, SelectBranch, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Mma, Monoid, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, SerialTile, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import classify_matmul_operands
@@ -353,6 +354,83 @@ def coop_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: fro
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
     return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+
+
+# === Flash (streaming ``TWISTED_MONOID``) build move (``plans/tile-ir-block-dag.md`` R6). ===
+# Flash is the simplest reduce build: the free output axes (q-rows / head-dim) tile
+# like a pointwise nest, and BOTH contraction axes — the streaming KV reduce and its
+# nested QK^T reduce — serial-transform with ``bk=fk=splitk=1`` (each output element
+# streams its own KV; the carrier can't span register cells or split-K). The coupled
+# ``Monoid`` carrier (the online-softmax m/l/O recurrence) rides through σ untouched —
+# ``kernel/100_materialize_tile`` + ``kernel/_combine`` synthesize its rescale. This is
+# literally ``reduce_decomp`` (knobs forced to 1) then ``free_tile`` (register forced to
+# 1) — the legacy ``build_flash_tile``, re-expressed as the two existing body moves.
+
+
+def _mask_flash_monoid(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask the streaming flash carrier's score to ``-inf`` past a symbolic-K bound.
+    Before each ``Monoid`` with partial ``(score, value)`` insert
+    ``Init(score_kid, maximum)`` (seeds ``-inf``, the score component's identity) +
+    ``Select(score_km, score if pred else score_kid)``, then fold ``score_km`` — the
+    masked key contributes nothing (``max(m, -inf) = m``, ``exp(-inf) = 0``) while the
+    in-place online-softmax state update stays unconditional."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Monoid):
+            score = c.partial[0]
+            ident, masked = f"{score}_kid", f"{score}_km"
+            out.append(Init(name=ident, op=ElementwiseImpl("maximum"), dtype=F32))
+            out.append(
+                Select(
+                    name=masked,
+                    branches=(SelectBranch(value=score, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+                )
+            )
+            out.append(replace(c, partial=(masked, *c.partial[1:])))
+        else:
+            out.append(c)
+    return tuple(out)
+
+
+def _replace_k_flash(stmts: tuple[Stmt, ...], target_names: frozenset[str]) -> tuple[Stmt, ...]:
+    """Serial-transform each flash contraction loop (``bk=fk=splitk=1``): a static
+    axis (the nested QK^T reduce) gets a plain ``K_o``/``K_i`` tower; a **symbolic**
+    streaming axis (dynamic ``seq_len`` KV) ceil-divides, clamps its load index for a
+    safe read, and masks the ``Monoid`` score to ``-inf`` past the runtime bound (the
+    ``TWISTED_MONOID`` identity — fold nothing for an out-of-range key)."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name in target_names:
+            kn = s.axis.name
+            src = s.axis.source_axis or s.axis
+            symbolic = not s.axis.extent.is_static
+            k_o_ext = s.axis.extent.ceil_div(1) if symbolic else Literal(s.axis.extent.as_static(), "int")
+            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+            k_i = Axis(f"{kn}_i", 1, source_axis=src)
+            sigma_k = Sigma({kn: Var(k_o.name) + Var(k_i.name)})
+            inner = _replace_k_flash(tuple(s.body), target_names)
+            if symbolic:
+                decoded_k = sigma_k.apply(Var(kn))
+                pred = BinaryExpr("<", decoded_k, s.axis.extent.expr)
+                clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", s.axis.extent.expr, Literal(1, "int")))
+                body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in inner)
+                new_body = _mask_flash_monoid(body_c, pred)
+            else:
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def flash_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
+    """The flash build move: serial-transform every contraction axis
+    (``bk=fk=splitk=1``, masked streaming for a symbolic KV) then σ-split the free
+    axes (``FM=FN=1``). The caller (``017_flash``) pins those knobs."""
+    block = graph.blocks[0]
+    compute = _replace_k_flash(tuple(block.compute), target_names)
+    g = replace(graph, blocks=(replace(block, compute=Body(compute)),))
+    return free_tile(g, dag, knobs, target_names=target_names)
 
 
 # === Warp-tier (tensor-core ``atomize``) build move (``plans/tile-ir-block-dag.md`` R4). ===

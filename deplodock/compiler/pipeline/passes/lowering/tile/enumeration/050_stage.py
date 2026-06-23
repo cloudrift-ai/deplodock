@@ -40,10 +40,10 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     op: TileGraphOp = root.op
     if MAP_N_REG.name not in op.knobs or STAGE.name in op.knobs:
         raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via the STAGE knob)")
-    if op.algebra is AlgebraKind.MONOID:
-        # A cooperative reduce stays smem-free: each lane reads its own K_c-strided
-        # slice with no cross-thread reuse (legacy build_coop_reduce_tile never staged).
-        raise RuleSkipped("cooperative reduce stays smem-free (no cross-thread read reuse)")
+    if op.algebra in (AlgebraKind.MONOID, AlgebraKind.TWISTED_MONOID):
+        # A cooperative reduce / flash stream stays smem-free: each lane reads its own
+        # K-strided slice with no cross-thread reuse (legacy coop / flash never staged).
+        raise RuleSkipped("cooperative reduce / flash stays smem-free (no cross-thread read reuse)")
     ranked = stage_candidates(op.tilegraph)
     n = len(ranked)
     if n == 0:

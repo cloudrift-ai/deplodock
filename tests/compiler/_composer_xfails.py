@@ -43,8 +43,10 @@ _XFAIL_FILES: dict[str, str] = {
     # de-quarantined (rebuilt against enumeration/_partition.monoid_reduce_tilegraph).
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
-    # R6
-    "test_flash_attention.py": "R6",
+    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/017_flash +
+    # _build.flash_build, masked streaming for symbolic seq_len): test_flash_attention.py
+    # de-quarantined except test_flash_off_keeps_decomposition (a func entry below — its
+    # blocker is the non-flash score-materializing SDPA decomposition, R7).
     "test_flash_cooperative_kv.py": "R6",
     # R7 — test_program_rebind.py de-quarantined: R2's cooperative-reduce lowering
     # made the rmsnorm-bearing rebind kernels compile, so all three rebind tests pass.
@@ -83,11 +85,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     # TMA-decline it nominally guards is moot until the kernel lowers at all.
     "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment": "R7",
     # R6
+    "test_flash_attention.py::test_flash_off_keeps_decomposition": "R7",
     "test_attention_chains.py::test_full_self_attn_tinyllama": "R6",
     "test_attention_chains.py::test_full_self_attn_tinyllama_seq512": "R6",
     "test_attention_chains.py::test_qkv_attn_no_rope": "R6",
     "test_attention_chains.py::test_sdpa_explicit_additive_mask": "R6",
-    "test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len": "R6",
     # R7
     "test_analytic.py::test_pick_matmul_lands_in_geometry_band": "R7",
     "test_analytic.py::test_pick_matmul_warp_dispatch_by_dtype": "R7",
