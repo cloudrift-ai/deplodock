@@ -26,12 +26,25 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Assign, Body, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import AffineAddressing, Block, Edge, Source, StageBundle, TileGraph, TileOp, Transport
+from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt import Assign, Body, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.tile.ir import (
+    AffineAddressing,
+    Binding,
+    Block,
+    CoopReduce,
+    Edge,
+    Source,
+    StageBundle,
+    TileGraph,
+    TileOp,
+    Transport,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import _free_layers
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
 
 
 def is_fused_graph(graph: TileGraph) -> bool:
@@ -147,8 +160,15 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
                 op_src = _project_source(src, ld, dim_of_axis, in_dtype)
                 if op_src is None:
                     raise NotImplementedError(f"fused SMEM edge: cannot project operand {ld.input!r} (collapsed/transposed index)")
-                new_sources.append(op_src)
-                compute.append(Load(names=ld.names, input=op_src.name, index=tuple(Var(ax.name) for ax in op_src.cache_axes)))
+                idx = tuple(Var(ax.name) for ax in op_src.cache_axes)
+                if ld.input in graph.buffers:
+                    new_sources.append(op_src)  # a gmem operand — stage it
+                    compute.append(Load(names=ld.names, input=op_src.name, index=idx))
+                else:
+                    # an INTERNAL slab (the rmsnorm prologue's v4_smem, produced by the
+                    # CoopReduce) — read it directly at its projected (M) cache axes, no
+                    # gmem source to stage.
+                    compute.append(Load(names=ld.names, input=ld.input, index=idx))
             compute += [*assigns, Write(output=src.name, index=tuple(Var(ax.name) for ax in src.cache_axes), value=write.values[0])]
         return replace(stmt, sources=tuple(new_sources), compute=Body(tuple(compute)) if compute else None)
 
@@ -167,6 +187,19 @@ def assemble_fused(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_na
         raise NotImplementedError(f"fused SMEM edge: expected one consumer block, got {[b.name for b in consumers]}")
     consumer = consumers[0]
 
+    # A MONOID (rmsnorm) producer needs a reduce PROLOGUE — split it off as a CoopReduce,
+    # the scale-application stays the compute phase (with the per-row scale read from the
+    # prologue's smem slab as a broadcast operand).
+    prologues: list[CoopReduce] = []
+    producer_of = dict(producer_of)
+    for buf, blk in list(producer_of.items()):
+        split = _split_monoid_producer(blk)
+        if split is None:
+            continue
+        prologue, scale_block = _build_reduce_prologue(split, buf, consumer, graph.schedule.binding)
+        prologues.append(prologue)
+        producer_of[buf] = scale_block  # the MAP scale-application (reads the v4 slab)
+
     # Stage each intermediate edge into the consumer, then fold in the producers.
     staged = {e: t for e, t in graph.schedule.staged.items() if e.dst == consumer.name}
     for buf in intermediates:
@@ -176,8 +209,91 @@ def assemble_fused(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_na
     fused_body = _fuse_producers(staged_body, producer_of, graph)
 
     layers = _free_layers(consumer, graph.schedule)
-    chain_body = _wrap_tower(layers, tuple(fused_body), atom=consumer.atom)
+    if prologues:
+        # Emit the prologue(s) as GridTile-level siblings before the matmul tower: build
+        # the inner (sub-grid) tower, then wrap [CoopReduce…, inner] in the GRID layer.
+        grid = [ll for ll in layers if ll[1] is Role.BLOCK]
+        inner = [ll for ll in layers if ll[1] is not Role.BLOCK]
+        inner_chain = _wrap_tower(inner, tuple(fused_body), atom=consumer.atom)
+        chain_body = _wrap_tower(grid, (*prologues, *inner_chain))
+    else:
+        chain_body = _wrap_tower(layers, tuple(fused_body), atom=consumer.atom)
     knobs_full = {**base_knobs, **knobs}
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
+
+
+def _split_monoid_producer(block: Block):
+    """A MONOID (rmsnorm) producer block → ``(leading, reduce_loop, scalars, scale_body,
+    scale_indexed, v4_name)`` or ``None`` for a plain MAP. The block is ``[leading
+    consts] [reduce Loop → acc] [scalar chain → v4] [scale Loop → xn]``; ``scale_body``
+    is the scale loop's per-element body and ``v4_name`` the scale SSA the compute phase
+    reads from the prologue slab."""
+    stmts = list(block.compute)
+    leading: list[Stmt] = []
+    reduce_loop: Loop | None = None
+    scalars: list[Stmt] = []
+    scale_loop: Loop | None = None
+    for s in stmts:
+        if isinstance(s, Loop) and s.is_reduce and reduce_loop is None:
+            reduce_loop = s
+        elif isinstance(s, Loop) and not s.is_reduce:
+            scale_loop = s
+        elif reduce_loop is None:
+            leading.append(s)
+        else:
+            scalars.append(s)
+    if reduce_loop is None or scale_loop is None or not scalars:
+        return None
+    v4_name = scalars[-1].defines()[0] if scalars[-1].defines() else None
+    if v4_name is None:
+        return None
+    return tuple(leading), reduce_loop, tuple(scalars), tuple(scale_loop.body), v4_name
+
+
+def _build_reduce_prologue(split, out_buf: str, consumer: Block, binding: dict) -> tuple[CoopReduce, Block]:
+    """From a MONOID producer split, build the :class:`CoopReduce` prologue (the per-row
+    reduce → ``<out_buf>__rscale`` smem slab) and the rewritten MAP scale block (the
+    scale-application that reads that slab). The producer's logical row axis is σ-mapped
+    to the consumer's M index (read off the consumer's output ``Write``), whose
+    THREAD/REGISTER cache axes become the prologue's cooperative cells + slab index."""
+    leading, reduce_loop, scalars, scale_body, v4_name = split
+    # The consumer reads the intermediate ``xn[M, K]`` (2D) as its A operand — its M
+    # index is the row the prologue must reduce. (The kernel output ``o`` may be batched
+    # 3D, so its index[0] is the batch, not M — read M off the xn load instead.)
+    xn_load = next(ld for ld in consumer.compute.iter_of_type(Load) if ld.input == out_buf)
+    m_expr = xn_load.index[0]
+    row_axis = _producer_row_axis(reduce_loop)
+    cells = tuple(a for a in consumer.domain if a.name in m_expr.free_vars() and binding.get(a.name) in (Binding.THREAD, Binding.REGISTER))
+    slab = f"{out_buf}__rscale"
+    sigma = Sigma({row_axis: m_expr})
+    body = (
+        reduce_loop.rewrite(_id, sigma),
+        *(s.rewrite(_id, sigma) for s in scalars),
+        Write(output=slab, index=tuple(Var(c.name) for c in cells), value=v4_name),
+    )
+    prologue = CoopReduce(cells=cells, leading=Body(leading), body=Body(body), out_slab=slab, out_dtype=F32)
+    # The scale block: the per-element scale-application reading v4 from the slab (an
+    # internal-slab operand the broadcast machinery reads directly, no gmem staging).
+    scale_block = Block(
+        name=f"{out_buf}__scale",
+        domain=(),
+        compute=Body((Load(names=(v4_name,), input=slab, index=(Var(row_axis),)), *scale_body)),
+    )
+    return prologue, scale_block
+
+
+def _producer_row_axis(reduce_loop: Loop) -> str:
+    """The producer's logical row (M) axis — the non-reduce free var of the reduce's
+    ``x`` load (its index is ``x[…, row, k]``; the reduce axis is the K it loops)."""
+    k = reduce_loop.axis.name
+    for ld in reduce_loop.body.iter_of_type(Load):
+        rows = [v for e in ld.index for v in e.free_vars() if v != k]
+        if rows:
+            return rows[0]
+    raise ValueError("reduce loop has no row-indexed load")
+
+
+def _id(n: str) -> str:
+    return n

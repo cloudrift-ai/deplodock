@@ -870,17 +870,15 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_pr
 
 def _cta_threads(tile: ThreadTile | WarpTile, warp_size: int) -> tuple:
     """The CTA's ``(tid_expr, n_threads)`` read off the matmul tile — what a
-    ``CoopReduce`` prologue sibling cooperates over. A ``WarpTile`` is ``warp_id`` ×
-    32 lanes (``threadIdx.x``); a ``ThreadTile`` is the row-major thread flatten."""
-    if isinstance(tile, WarpTile):
-        n = warp_size
-        for ax in tile.axes:
-            n *= ax.extent.as_static()
-        return Builtin("thread_idx.x"), n
-    n = 1
+    ``CoopReduce`` prologue sibling cooperates over. The prologue runs **before** the
+    matmul's ``ThreadTile``/``WarpTile`` binds its per-coord axes, so the cooperative
+    index is the raw ``threadIdx.x`` (not the matmul thread-axis flatten, whose vars
+    aren't in scope yet); the thread count is the tile's total (× 32 lanes for a warp
+    tile)."""
+    n = warp_size if isinstance(tile, WarpTile) else 1
     for ax in tile.axes:
         n *= ax.extent.as_static()
-    return _build_linear_tid(tile.axes), n
+    return Builtin("thread_idx.x"), n
 
 
 def _build_linear_tid(thread_axes: tuple[Axis, ...]):

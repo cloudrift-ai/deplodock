@@ -252,3 +252,63 @@ def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier, p
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
     ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
     np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
+
+
+@requires_cuda
+def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
+    """The **MONOID** producer (rmsnorm) fuses: ``rmsnorm(x)·nw @ w`` computes in one
+    kernel — a cooperative reduce PROLOGUE (``CoopReduce``) computes the per-row scale
+    into smem, and the scale-application compute phase reads it as a broadcast operand
+    feeding the matmul. The reduce over the full row precedes the matmul K-loop. Scalar
+    tier (the warp-tier rmsnorm hits a separate nvcc unused-helper quirk at this shape)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.algebra import AlgebraKind
+    from deplodock.compiler.ir.stmt import Write
+    from deplodock.compiler.ir.tile.ir import Placement, TileGraphOp
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
+    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
+
+    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("DEPLODOCK_BM", "16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    M, K, N = 32, 1024, 3072
+    g = _norm_linear_graph()
+    lo = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    node = next(n for n in lo.nodes.values() if type(n.op).__name__ == "LoopOp")
+    f = _fission(node.op, graph=lo, node_id=node.id, out_tensor=node.output)
+    cdag = iter_dag(f.consumer)
+    creg = classify(cdag)
+    tg = seed_demoted(node.op, graph=lo, node_id=node.id, out_tensor=node.output)
+    prod = next(b for b in tg.blocks if b.carrier and b.carrier.kind is AlgebraKind.MONOID)
+    cons = next(b for b in tg.blocks if b.carrier and b.carrier.kind is AlgebraKind.SEMIRING)
+    xn = next(e for e in tg.edges if e.src == prod.name and e.dst == cons.name)
+    tg = replace(tg, blocks=(cons, prod)).place_edge(xn, Placement.SMEM)
+    op = TileGraphOp(name="k_fused", tilegraph=tg, dag=cdag, algebra=creg.algebra, target_names=creg.target_names, buffers=tg.buffers)
+
+    ext = {nid: n.output for nid, n in lo.nodes.items()}
+    out_name = next(w.output for w in cons.compute.iter_of_type(Write))
+    inputs = [n for n in tg.buffers if n not in {"o__xn", "o", out_name}]
+    fg = Graph()
+    for nid in inputs:
+        t = ext[nid]
+        fg.add_node(InputOp(), [], Tensor(nid, tuple(t.shape), t.dtype), node_id=nid)
+    fg.add_node(op, inputs, Tensor(out_name, tuple(node.output.shape), node.output.dtype), node_id=out_name)
+    fg.inputs, fg.outputs = inputs, [out_name]
+
+    res = Pipeline.build(["lowering/tile/enumeration", "lowering/tile/assembly"]).run(fg, ctx=Context.from_target((12, 0)))
+    assert sum(1 for n in res.nodes.values() if isinstance(n.op, TileOp)) == 1  # ONE fused kernel
+    compiled = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(res, ctx=Context.from_target((12, 0)))
+    rng = np.random.default_rng(0)
+    data = {}
+    for nid in inputs:
+        shp, npdt = tuple(d.as_static() for d in ext[nid].shape), ext[nid].dtype.np
+        if nid == "xn_mean_count":
+            data[nid] = np.full(shp, float(K), dtype=npdt)  # the rmsnorm reduction size
+        elif nid == "xn_eps":
+            data[nid] = np.full(shp, 1e-6, dtype=npdt)
+        else:
+            data[nid] = rng.standard_normal(shp).astype(npdt)
+    got = list(CudaBackend().run(compiled, input_data=data)[0].outputs.values())[0].reshape(M, N).astype(np.float32)
+    x, nw, wg = data["x"].astype(np.float32), data["nw"].astype(np.float32), data["wg"].astype(np.float32)
+    xn_ref = x[0] * (1.0 / np.sqrt((x[0] ** 2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
+    np.testing.assert_allclose(got, xn_ref @ wg.T, atol=1.0, rtol=0.5)
