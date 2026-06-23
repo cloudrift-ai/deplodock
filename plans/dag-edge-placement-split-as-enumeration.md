@@ -49,6 +49,25 @@
   structure + the end-to-end CUDA run. Remaining: the MONOID (rmsnorm) producer (a compute-phase reduce) + the placement
   fork + wiring `seed_demoted`/`place_edge` into `000_build`.
 
+- **(2.5, increment 4) Multi-input MAP producer + live enumeration/assembly path.** The fused compute phase now carries a
+  **multi-input** MAP transform over same-shape operands (`(x·y) @ w` in one kernel — the structural prerequisite for
+  rmsnorm's `x·scale·nw`). And a fused 2-block `TileGraph` now lowers through the **real tile pipeline**: the body moves
+  (`reduce_decomp`/`free_tile`/`warp_build`) preserve auxiliary blocks (`blocks=(new, *blocks[1:])`) so the consumer
+  (`blocks[0]`) tiles while the logical producer is preserved, and `assembly/010_assemble` dispatches a same-group
+  multi-block `TileGraph` to `assemble_fused`. Verified end-to-end (`test_fused_edge`: a `(x·y) @ w` seed →
+  enumeration → assembly → kernel → cuda → one correct kernel, scalar tier). Inert for non-fused graphs (the offering
+  fork is the remaining piece), so the suite is unaffected.
+
+**Remaining for the fused edge:**
+- **Warp-tier (mma) fused consumer** — greedy picks the tensor-core tier for f16, but the warp path drops the
+  compute-phase `Write` in kernel lowering (a warp + compute-phase interaction). The scalar tier works; warp is next
+  (this is the tier that actually *beats* the cut).
+- **MONOID (rmsnorm) producer** — the headline case needs the compute phase generalized to carry a **reduce** (the
+  per-row sum-of-squares → scale in smem, then the scale-application compute phase) + the `nw[k]` broadcast operand
+  (different cache axes).
+- **The offering fork** — so a demoted matmul seeds the fused 2-block graph **live** and the search prices `SMEM` vs
+  `GMEM` (the two-level structural integration).
+
 ### The SMEM fused-edge codegen path (the next build)
 
 The genuinely new capability — the fused edge that *beats* the cut (no gmem round-trip; the matmul reaches the warp
