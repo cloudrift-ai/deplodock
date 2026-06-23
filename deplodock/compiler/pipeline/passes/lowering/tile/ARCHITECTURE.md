@@ -84,6 +84,7 @@ shape-specific pattern matching.*
 | `008_warp_reg.py`     | Fork (warp): the per-warp register cells — `warp_reg_offers` → `(FM, FN)`. Knob-only. A fully-pinned `(DEPLODOCK_FM, DEPLODOCK_FN)` is authoritative and bypasses the `_MAX_WARP_CELLS` *search* ceiling (the ceiling prunes auto-enumerated candidates, not explicit pins). |
 | `009_warp_build.py`   | Fork (warp): the K chunk — `warp_bk_offers` → `BK`; **applies the `warp_build` body move** (four-way σ-split + K re-bracket + `atomize` the cell → `Mma`). |
 | `015_coop_reduce.py`  | Fork (cooperative `MONOID`, R2): the one `(bk, fk, br)` decision — `coop_reduce_offers`; **applies the `coop_build` body move** (K re-bracket with the `K_c` cooperative-THREAD lane + free-axis σ-split, reg forced to 1). Owns the `MONOID` regime end to end (`020`/`030`/`040`/`050_stage` gate off). |
+| `017_flash.py`        | Fork (streaming `TWISTED_MONOID`, R6): the free-axis thread tile × cooperative-KV `BR` — `thread_offers` × `flash_br_offers`; **applies the `flash_build` body move** (serial-transform both contraction axes, `FM=FN=1`/`BK=FK=SPLITK=1`; a pinned `BR>1` lays the `K_c` THREAD lane on the **static** streaming KV axis so each lane streams a strided slice and the carrier's `combine_states` merges them at materialize, like the `MONOID` coop reduce). `flash_coop_geometry_ok` constrains the free×BR layout (whole-CTA tree vs strided intra-warp); default `BR=1` is the serial-KV form, symbolic KV stays serial. Owns the `TWISTED_MONOID` regime end to end (`050_stage` skips — smem-free). |
 | `010_reduce_tile.py`  | Fork (scalar `SEMIRING`): the reduce decomposition — `reduce_offers` → `(bk, fk, splitk)`; **applies the `reduce_decomp` body move**. Skips on a warp variant. |
 | `020_thread_tile.py`  | Fork (scalar): the free-axis thread tile — `thread_offers` → `(thread_n, thread_m)`. Pins the thread knob, **no body move**. Skips on a warp or coop variant. |
 | `030_register_tile.py`| Fork (scalar): the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`; **applies the `free_tile` body move** (the algorithm is fully tiled after). Skips on a coop variant. |
@@ -98,7 +99,7 @@ shape-specific pattern matching.*
 | `_stage.py`           | `stage_candidates` — the `stage` move's ranked offer set (AFFINE + fan-in reuse + K-tower) off the derived `Block.reads`; excludes the transposed-B operand. |
 | `_transport.py`       | `tma_eligible` (R5) — the `promote_transport` legality oracle over the prospective slab `Source`s (`assembly/_slab.prospective_sources`): sm_90+, affine box ≤ 256 / 16 B-aligned source + box inner, source inner ≥ 2× box, a ringable `serial_outer` K loop. Ported from the deleted legacy `050_use_tma._source_eligible`. |
 | `_knobs.py`           | The knob schema (`BN`/`BM`/`BK`/`FK`/`STAGE`/`MMA`/`WM`/`WN`/… + the composer aliases `MAP_*` / `RED_*` / `TC_*`). |
-| `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `coop_build` (the cooperative-reduce K re-bracket + free split, R2), `warp_build` (the warp-tier four-way split + `atomize`); `build_dag` is the scalar composition (the byte-identity oracle). |
+| `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `coop_build` (the cooperative-reduce K re-bracket + free split, R2), `flash_build` (the streaming `TWISTED_MONOID` serial K-transform + free split, R6 — `BR>1` lays the `K_c` cooperative lane on the static streaming axis), `warp_build` (the warp-tier four-way split + `atomize`); `build_dag` is the scalar composition (the byte-identity oracle). |
 | `_partition.py`       | The R3 split-K combine builders — `additive_reduce_tilegraph` (`Accum` sum) / `monoid_reduce_tilegraph` (carrier-general `combine_states` fold) emit a fully-tiled single-`Block` combine `TileGraph` (`GridTile(16×16) > ThreadTile > serial K_s reduce + boundary Cond`); `reduce_tilegraphop` wraps it with stamped fixed/OFF knobs so every enumeration fork skips it (fixed-schedule, not searched). |
 
 The per-pass moves serve every regime: a `MAP` nest applies only `free_tile` (`reduce_decomp` is a no-op without a
@@ -130,9 +131,10 @@ and the warp operands (atom-strided slab + `ldmatrix`) + the **cross-CTA split-K
 `partial[K_s, M, N]` workspace folded by a sibling additive / carrier-general combine kernel) + the **warp-tier TMA
 transport** (R5 `052_transport` + `assembly/020_peel`: the `promote_transport` fork promotes a static-shape warp
 matmul's staged operands to a double-buffered `cp.async.bulk.tensor` ring with per-source swizzle, software-pipelined
-into prologue/main/epilogue — greedy stays SYNC, the tuner/`DEPLODOCK_TMA=1` selects TMA). Recognized by `classify`
-but not yet built (they re-enter the same uniform tree once their decomposition placement + assembly land):
-`TWISTED_MONOID` fused flash (R6). The **masked scalar-tile staging clamp** landed (R4 follow-up): scalar-offer
+into prologue/main/epilogue — greedy stays SYNC, the tuner/`DEPLODOCK_TMA=1` selects TMA) + the **streaming
+`TWISTED_MONOID` flash** (R6 `017_flash` + `flash_build` — SDPA / causal / GQA / additive-mask online-softmax, static
+**and** symbolic-`seq_len` masked streaming, scalar-KV by default and **cooperative-KV** when `DEPLODOCK_BR>1` lays the
+`K_c` THREAD lane on a static streaming axis). The **masked scalar-tile staging clamp** landed (R4 follow-up): scalar-offer
 env-pin honoring (`_pin` in `thread_offers`/`reduce_reg_offers`) reaches the masked σ-split, the over-staging it
 exposed is resolved by `050_stage`'s budget-aware mask filter (greedy falls back to the largest in-budget staging),
 and `_slab._hoist_masked` lifts the cooperative load above the boundary `Cond` + clamps the SYNC gmem read to the

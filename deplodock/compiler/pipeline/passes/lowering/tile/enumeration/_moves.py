@@ -397,6 +397,40 @@ def coop_free_thread_knobs(dag: IterDag) -> dict:
     return knobs
 
 
+def flash_br_offers(dag: IterDag) -> list[int]:
+    """Cooperative-KV ``BR`` candidates for the flash streaming axis. ``[1]`` (the
+    serial-KV streaming form) unless ``DEPLODOCK_BR`` is pinned to a ``br`` (``1 < br
+    ≤ 1024``) that evenly splits the **static** streaming KV extent — then the KV
+    axis partitions across ``br`` cooperative THREAD lanes whose per-lane online-
+    softmax partials merge via the carrier's ``combine_states``. Cooperative-KV flash
+    is opt-in (pin-only), not yet a default search dimension; a symbolic streaming KV
+    stays serial."""
+    br = _pin(COOP_BR)
+    if br is None or br <= 1:
+        return [1]
+    stream = dag.k_node.loop.axis
+    if stream.extent.is_static and br <= 1024 and stream.extent.as_static() % br == 0:
+        return [br]
+    return [1]
+
+
+def flash_coop_geometry_ok(br: int, free_threads: int, warp_size: int = 32) -> bool:
+    """Whether a cooperative-KV flash leaf with ``br`` lanes and ``free_threads``
+    free-axis THREAD lanes has a legal cross-lane combine. ``br == 1`` is the serial
+    form (always legal). A **whole-CTA** layout (``free_threads == 1``) folds all
+    ``br`` lanes via the warp-shuffle (``br ≤ warp_size``) or the smem tree (any
+    ``br``). A **strided** layout (``free_threads > 1``) folds each row's lanes via a
+    SEGMENTED warp shuffle, so ``br`` must be a power of two ≤ ``warp_size`` (an
+    aligned intra-warp segment — matching ``cooperative_combine_geometry``). The CTA
+    thread budget (``free_threads · br ≤ 1024``) is enforced by the caller's
+    ``Budget``."""
+    if br <= 1:
+        return True
+    if free_threads <= 1:
+        return br <= MAX_THREADS_PER_CTA
+    return br <= warp_size and br & (br - 1) == 0
+
+
 # --- Warp-tier (tensor-core ``atomize``) moves: the warp count, the per-warp
 # register cells, and the K chunk in atom-K units (``plans/tile-ir-block-dag.md``
 # R4). Legality is the per-CTA resource budget (threads / cells) + the atom-K

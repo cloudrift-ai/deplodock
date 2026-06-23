@@ -392,23 +392,40 @@ def _mask_flash_monoid(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]
     return tuple(out)
 
 
-def _replace_k_flash(stmts: tuple[Stmt, ...], target_names: frozenset[str]) -> tuple[Stmt, ...]:
+def _replace_k_flash(
+    stmts: tuple[Stmt, ...], target_names: frozenset[str], *, coop_axis: str | None = None, k_c: Axis | None = None, br: int = 1
+) -> tuple[Stmt, ...]:
     """Serial-transform each flash contraction loop (``bk=fk=splitk=1``): a static
     axis (the nested QK^T reduce) gets a plain ``K_o``/``K_i`` tower; a **symbolic**
     streaming axis (dynamic ``seq_len`` KV) ceil-divides, clamps its load index for a
     safe read, and masks the ``Monoid`` score to ``-inf`` past the runtime bound (the
-    ``TWISTED_MONOID`` identity — fold nothing for an out-of-range key)."""
+    ``TWISTED_MONOID`` identity — fold nothing for an out-of-range key).
+
+    When ``br > 1`` the streaming axis ``coop_axis`` instead σ-splits ``K → K_o·br +
+    K_c`` (the ``br`` cooperative THREAD lanes ``k_c``, laid into the domain by the
+    caller): each lane streams a strided KV slice into its own ``(m, l, O)`` partial,
+    and the ``Monoid.axes`` pick up ``K_c`` through σ so ``kernel/100_materialize_tile``
+    emits the cross-thread ``combine_states`` over the lanes."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name in target_names:
             kn = s.axis.name
             src = s.axis.source_axis or s.axis
             symbolic = not s.axis.extent.is_static
+            inner = _replace_k_flash(tuple(s.body), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
+            if k_c is not None and kn == coop_axis:
+                # Cooperative streaming split: ``br`` THREAD lanes (``K_c``) reduce in
+                # parallel, ``K_o`` serial over the strided slice. The carrier's
+                # cross-lane combine is synthesized at materialize (rides ``Monoid.axes``).
+                k_o = Axis(f"{kn}_o", s.axis.extent // br, source_axis=src)
+                sigma_k = Sigma({kn: Var(k_o.name) * Literal(br, "int") + Var(k_c.name)})
+                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+                out.extend(_wrap_tower([(k_o, Role.SERIAL_OUTER)], new_body))
+                continue
             k_o_ext = s.axis.extent.ceil_div(1) if symbolic else Literal(s.axis.extent.as_static(), "int")
             k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{kn}_i", 1, source_axis=src)
             sigma_k = Sigma({kn: Var(k_o.name) + Var(k_i.name)})
-            inner = _replace_k_flash(tuple(s.body), target_names)
             if symbolic:
                 decoded_k = sigma_k.apply(Var(kn))
                 pred = BinaryExpr("<", decoded_k, s.axis.extent.expr)
@@ -426,11 +443,32 @@ def _replace_k_flash(stmts: tuple[Stmt, ...], target_names: frozenset[str]) -> t
 def flash_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
     """The flash build move: serial-transform every contraction axis
     (``bk=fk=splitk=1``, masked streaming for a symbolic KV) then σ-split the free
-    axes (``FM=FN=1``). The caller (``017_flash``) pins those knobs."""
+    axes (``FM=FN=1``). The caller (``017_flash``) pins those knobs.
+
+    With ``BR > 1`` (cooperative-KV) the **static** streaming axis additionally lays a
+    ``K_c`` THREAD lane (``br`` cooperative lanes per row, innermost in the THREAD
+    tier): each lane reduces a strided KV slice into its own online-softmax partial,
+    merged at materialize via the carrier's ``combine_states`` (``Accum.axes`` analog
+    for the ``Monoid`` — ``kernel/100`` emits the warp-shuffle / smem-tree combine)."""
     block = graph.blocks[0]
-    compute = _replace_k_flash(tuple(block.compute), target_names)
-    g = replace(graph, blocks=(replace(block, compute=Body(compute)),))
-    return free_tile(g, dag, knobs, target_names=target_names)
+    br = knobs.get(COOP_BR.name, 1)
+    stream = dag.k_node.loop.axis
+    k_c, coop_axis = None, None
+    if br > 1 and stream.extent.is_static and stream.extent.as_static() % br == 0:
+        k_c = Axis(f"{stream.name}_c", br, source_axis=stream.source_axis or stream)
+        coop_axis = stream.name
+    compute = _replace_k_flash(tuple(block.compute), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
+    g = free_tile(replace(graph, blocks=(replace(block, compute=Body(compute)),)), dag, knobs, target_names=target_names)
+    if k_c is not None:
+        # Lay K_c FIRST in domain (innermost THREAD bits — matches coop_build, so the
+        # segmented cross-lane combine stays an aligned intra-warp segment).
+        nb = g.blocks[0]
+        g = replace(
+            g,
+            blocks=(replace(nb, domain=(k_c, *nb.domain)),),
+            schedule=replace(g.schedule, binding={**g.schedule.binding, k_c.name: Binding.THREAD}),
+        )
+    return g
 
 
 # === Warp-tier (tensor-core ``atomize``) build move (``plans/tile-ir-block-dag.md`` R4). ===
