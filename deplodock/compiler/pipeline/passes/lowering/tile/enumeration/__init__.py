@@ -1,5 +1,5 @@
-"""Move composer (enumeration): build the TileGraph DAG + search the Schedule."""
+"""Move composer (enumeration): build the TileGraph DAG + search the Schedule.
 
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._compose import try_compose
-
-__all__ = ["try_compose"]
+The pass (``010_enumerate``) is the public entry, loaded by the pipeline; the
+``_*`` modules are its helpers.
+"""
