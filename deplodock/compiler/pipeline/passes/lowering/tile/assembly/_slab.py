@@ -41,13 +41,16 @@ from deplodock.compiler.ir.tile.ir import (
 
 
 def _cache_axis_names(block: Block, binding: dict) -> dict[str, Axis]:
-    """The cache-eligible axes (name -> Axis): THREAD / REGISTER free axes (from
-    ``binding``) + the within-stage K axes (the ``stage_inner`` serial loop and any
-    reduce ``RegisterTile``). These span the smem slab; GRID and serial-outer K
-    fold into the slab origin."""
+    """The cache-eligible axes (name -> Axis): THREAD / WARP / REGISTER free axes
+    (from ``binding``) + the within-stage K axes (the ``stage_inner`` serial loop
+    and any reduce ``RegisterTile``). These span the smem slab; GRID and
+    serial-outer K fold into the slab origin. The ATOM cell axes are
+    non-addressable (excluded) — their per-cell extent rides the cache axes'
+    ``AffineAddressing.block`` multiplier instead, derived from the σ coefficients
+    in :func:`_source_from_load`."""
     from deplodock.compiler.ir.tile.ir import Binding  # noqa: PLC0415
 
-    out: dict[str, Axis] = {a.name: a for a in block.domain if binding.get(a.name) in (Binding.THREAD, Binding.REGISTER)}
+    out: dict[str, Axis] = {a.name: a for a in block.domain if binding.get(a.name) in (Binding.THREAD, Binding.WARP, Binding.REGISTER)}
     for s in block.compute.iter():
         if isinstance(s, SerialTile) and s.kind == "stage_inner":
             out[s.axis.name] = s.axis
@@ -57,11 +60,38 @@ def _cache_axis_names(block: Block, binding: dict) -> dict[str, Axis]:
     return out
 
 
+def _derive_block(group: list[tuple[str, int]], cache_axes: dict[str, Axis]) -> dict[str, int]:
+    """Per-axis atom-cell stride multiplier for one source dim's cache axes.
+
+    The cache vars of one dim are ordered most-significant-first (largest σ
+    coefficient); walking right-to-left, ``block_ax = coef // suffix_product`` and
+    ``suffix_product *= extent · block_ax``. For a scalar tile every ``block_ax``
+    is ``1`` (the σ coefficient is exactly the suffix product of inner cache
+    extents); a warp/atom tile carries the ``atom_m`` / ``atom_k`` factor on the
+    innermost output / K cache axis (the ATOM cell is non-addressable, so its
+    extent rides this multiplier). Raises on a non-divisible coefficient (a
+    layout the additive slab can't size — TEMPLATE, out of R1 scope)."""
+    out: dict[str, int] = {}
+    suffix = 1
+    for v, coef in reversed(group):  # group is most-significant-first → reverse = inner-first
+        if coef % suffix != 0:
+            raise NotImplementedError(f"stage: cache coefficient {coef} not a multiple of inner span {suffix}")
+        block_ax = coef // suffix
+        if block_ax < 1:
+            raise NotImplementedError(f"stage: degenerate cache coefficient {coef}")
+        out[v] = block_ax
+        suffix *= cache_axes[v].extent.as_static() * block_ax
+    return out
+
+
 def _source_from_load(load: Load, src_name: str, cache_axes: dict[str, Axis], dtype) -> tuple[Source, tuple[Expr, ...]]:
     """Classify one consumer ``Load``'s index into a :class:`Source` (slab spec) +
     the rewritten consumer slab index. Each source dim is decomposed affinely; vars
     in ``cache_axes`` become cache axes (most-significant — highest coefficient —
-    first within a dim), everything else folds into the per-dim origin anchor."""
+    first within a dim), everything else folds into the per-dim origin anchor. The
+    per-axis ``AffineAddressing.block`` multiplier is derived from the σ
+    coefficients (:func:`_derive_block`) — ``()`` for a scalar tile, atom-strided
+    for a warp/atom tile."""
     per_dim_cache: list[tuple[int, str, int]] = []  # (dim, var, coef)
     origin: list[Expr] = []
     for d, e in enumerate(load.index):
@@ -78,16 +108,25 @@ def _source_from_load(load: Load, src_name: str, cache_axes: dict[str, Axis], dt
         origin.append(anchor)
     # Cache-axis layout order: by source dim, most-significant (largest coef) first
     # within a dim — matches the σ-split's composite stride so ``affine_decode_per_dim``
-    # (block=()) reconstructs the original gmem index from the cache extents alone.
+    # reconstructs the original gmem index from the cache extents × block multipliers.
     per_dim_cache.sort(key=lambda t: (t[0], -t[2]))
     ordered_axes = tuple(cache_axes[v] for _, v, _ in per_dim_cache)
     dims = tuple(d for d, _, _ in per_dim_cache)
+    # Derive the per-axis block multiplier per source dim, then align it to the
+    # cache-axis order. Collapse to () when every multiplier is 1 (scalar tile).
+    block_of: dict[str, int] = {}
+    for d in {dd for dd, _, _ in per_dim_cache}:
+        grp = [(v, c) for dd, v, c in per_dim_cache if dd == d]  # already most-sig-first (sorted by -coef)
+        block_of.update(_derive_block(grp, cache_axes))
+    block_tuple = tuple(block_of.get(v, 1) for _, v, _ in per_dim_cache)
+    if all(b == 1 for b in block_tuple):
+        block_tuple = ()
     source = Source(
         name=f"{src_name}_smem",
         buf=load.input,
         cache_axes=ordered_axes,
         origin=tuple(origin),
-        addressing=AffineAddressing(dims=dims, block=()),
+        addressing=AffineAddressing(dims=dims, block=block_tuple),
         dtype=dtype,
     )
     slab_index = tuple(Var(ax.name) for ax in ordered_axes)

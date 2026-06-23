@@ -16,9 +16,10 @@ from dataclasses import replace
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
-from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Mma, Stmt, Write
+from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, SerialTile, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import classify_matmul_operands
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     MAP_M_REG,
@@ -204,6 +205,157 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
     compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
+    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+
+
+# === Warp-tier (tensor-core ``atomize``) build move (``plans/tile-ir-block-dag.md`` R4). ===
+# The warp tower is the same kind of body move as the scalar ``free_tile`` /
+# ``reduce_decomp``, but it splits each output axis FOUR ways
+# (``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom``, bound GRID/WARP/REGISTER/ATOM)
+# and re-brackets K at ``atom_k`` granularity, then FUSES the cell
+# ``[Load,Load,mul,Accum]`` into one ``Mma`` (the ``atomize`` edit — ``Block.atom``
+# then derives from that ``Mma``). ``assemble`` materializes the AtomTile/WarpTile
+# tower around it via the shared ``_free_layers`` + ``_wrap_tower``.
+
+
+def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
+    """4-level output-axis split for the warp tier:
+    ``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom`` (the per-lane ``A_a`` offset
+    is owned by ``mma.sync``, so it is NOT in σ — the ``A_a`` ATOM axis carries
+    the cell extent but binds no σ term). A symbolic / non-divisible axis is
+    masked: ``A_b`` ceil-divides and carries ``real_extent``; the boundary ``Expr``
+    is returned for the per-cell store ``Cond``."""
+    src = axis.source_axis or axis
+    per_block = warp * reg * atom_cell
+    masked = (not axis.extent.is_static) or (axis.extent.as_static() % per_block != 0)
+    b_ext = axis.extent.ceil_div(per_block) if masked else axis.extent // per_block
+    a_b = Axis(
+        f"{axis.name}_b",
+        b_ext,
+        source_axis=src,
+        real_extent=axis.extent.as_static() if (masked and axis.extent.is_static) else None,
+    )
+    a_w = Axis(f"{axis.name}_w", warp, source_axis=src)
+    a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
+    a_a = Axis(f"{axis.name}_a", atom_cell, source_axis=src)
+    expr = (
+        Var(a_b.name) * Literal(per_block, "int")
+        + Var(a_w.name) * Literal(reg * atom_cell, "int")
+        + Var(a_r.name) * Literal(atom_cell, "int")
+    )
+    bound = axis.extent.expr if masked else None
+    return a_b, a_w, a_r, a_a, expr, bound
+
+
+def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, atom_k: int) -> tuple[Stmt, ...]:
+    """Replace the K reduce loop with the ``atom_k``-strided ``K_o`` / ``K_i``
+    tower: ``σ(K) = K_o·(bk·atom_k) + K_i·atom_k`` (each ``K_i`` step is one
+    ``mma.sync`` over ``atom_k`` K-elements). No split-K / strip-mine (v1)."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Loop) and s.axis.name == k_name:
+            src = s.axis.source_axis or s.axis
+            k_o = Axis(f"{k_name}_o", k_extent // (bk * atom_k), source_axis=src)
+            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
+            expr = Var(k_o.name) * Literal(bk * atom_k, "int") + Var(k_i.name) * Literal(atom_k, "int")
+            new_body = tuple(c.rewrite(_identity_rename, Sigma({k_name: expr})) for c in s.body)
+            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...]:
+    """The ``atomize`` body edit: fuse the canonical matmul cell
+    ``[Load a, Load b, Assign(mul), Accum]`` into ``[Load a*, Load b*, Mma]`` (the
+    operand ``Load``s kept plain, the ``Mma`` naming its A/B by SSA value +
+    carrying the ``atom`` spec). Walks the K tower (``SerialTile(reduce)``) to the
+    cell; ``Block.atom`` then derives from the emitted ``Mma``."""
+    write = next((s for s in body if isinstance(s, Write)), write)
+    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write)
+    if tagged is not None:
+        return tagged
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, SerialTile) and s.is_reduce:
+            out.append(s.with_bodies((Body(_atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write)),)))
+        elif s.nested():
+            out.append(s.with_bodies(tuple(Body(_atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write)) for sub in s.nested())))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _try_atomize_here(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...] | None:
+    """If ``body`` is the canonical matmul cell, return ``[*rest, Load a, Load b,
+    Mma]``; else ``None``."""
+    loads = [s for s in body if isinstance(s, Load)]
+    assigns = [s for s in body if isinstance(s, Assign)]
+    accums = [s for s in body if isinstance(s, Accum)]
+    if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
+        return None
+    mul, accum = assigns[0], accums[0]
+    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
+        return None
+    out_index = write.index if (write is not None and write.index) else None
+    a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index) if k_name is not None else (None, None)
+    if a_load is None or b_load is None:
+        return None
+    b_trans = _is_transposed_b(b_load, k_name=k_name)
+    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes, b_trans=b_trans)
+    rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
+    return (*rest, a_load, b_load, mma)
+
+
+def _is_transposed_b(b_load: Load, *, k_name: str | None) -> bool:
+    """True iff the B operand is stored N×K (K contiguous in its last dim AND
+    nowhere else) — a Q @ K^T cell, loaded ``ldmatrix`` without ``.trans``."""
+    if not b_load.index or k_name is None:
+        return False
+    in_last = k_name in b_load.index[-1].free_vars()
+    in_earlier = any(k_name in e.free_vars() for e in b_load.index[:-1])
+    return in_last and not in_earlier
+
+
+def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> TileGraph:
+    """The warp-tier ``atomize`` build move: take the logical seed graph and σ-split
+    the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
+    granularity + fuse the cell into an ``Mma``, laying the domain axes + bindings.
+    ``assemble`` reconstructs the AtomTile/WarpTile tower from ``domain`` + ``Mma``."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_BK, TC_REG_M, TC_REG_N, WARP_M, WARP_N
+
+    atom_m, atom_n, atom_k = atom.shape
+    wm, wn = knobs[WARP_M.name], knobs[WARP_N.name]
+    fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
+    bk = knobs[TC_BK.name]
+
+    inner_n, outer_m, extra_outer = _free_axes(dag)
+    n_b, n_w, n_r, n_a, n_expr, n_bound = _warp_axis(inner_n, wn, fn, atom_n)
+    m_b, m_w, m_r, m_a, m_expr, m_bound = _warp_axis(outer_m, wm, fm, atom_m)
+    sigma_outer = Sigma({inner_n.name: n_expr, outer_m.name: m_expr})
+
+    block = graph.blocks[0]
+    new_inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
+    new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_extent, bk, atom_k)
+    new_inner = _atomize_cell(new_inner, atom=atom, k_name=None, write=None)
+    bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
+    new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)
+
+    # Domain: N then M, each split b/w/r/a. ``_free_layers`` orders the tiers
+    # (ATOM innermost … GRID outermost) for ``assemble``; extra-outer trail GRID.
+    domain: list[Axis] = []
+    binding: dict[str, Binding] = {}
+    for a_b, a_w, a_r, a_a in ((n_b, n_w, n_r, n_a), (m_b, m_w, m_r, m_a)):
+        domain.extend((a_b, a_w, a_r, a_a))
+        binding[a_b.name] = Binding.GRID
+        binding[a_w.name] = Binding.WARP
+        binding[a_r.name] = Binding.REGISTER
+        binding[a_a.name] = Binding.ATOM
+    for lp in reversed(extra_outer):
+        domain.append(lp.axis)
+        binding[lp.axis.name] = Binding.GRID
+
+    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(new_inner))
     return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
 
 

@@ -18,6 +18,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import reduce_decomp
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import RED_BK
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import reduce_knobs, reduce_offers
@@ -27,8 +28,8 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.SEMIRING or RED_BK.name in op.knobs:
-        raise RuleSkipped("reduce tile not applicable / already pinned")
+    if op.algebra is not AlgebraKind.SEMIRING or RED_BK.name in op.knobs or mma_atom(op.knobs) is not None:
+        raise RuleSkipped("reduce tile not applicable / already pinned / warp tier")
     offers = reduce_offers(op.dag)
     if not offers:
         raise RuleSkipped("no legal reduce tiling")

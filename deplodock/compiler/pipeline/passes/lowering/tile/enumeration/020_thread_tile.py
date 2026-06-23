@@ -20,6 +20,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_THREAD, RED_BK
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, thread_knobs, thread_offers
 
@@ -28,8 +29,8 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if MAP_N_THREAD.name in op.knobs:
-        raise RuleSkipped("thread tile already pinned")
+    if MAP_N_THREAD.name in op.knobs or mma_atom(op.knobs) is not None:
+        raise RuleSkipped("thread tile already pinned / warp tier")
     if op.algebra is AlgebraKind.SEMIRING and RED_BK.name not in op.knobs:
         raise RuleSkipped("reduce tile not yet pinned")
     offers = thread_offers(op.dag, Budget())

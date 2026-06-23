@@ -38,7 +38,15 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     RED_SPLITK,
     REG_CHOICES,
     SPLITK_CHOICES,
+    TC_ATOM,
+    TC_BK,
+    TC_REG_CHOICES,
+    TC_REG_M,
+    TC_REG_N,
     THREAD_CHOICES,
+    WARP_CHOICES,
+    WARP_M,
+    WARP_N,
 )
 
 # --- Resource budget (merged from _budget.py) ---
@@ -273,3 +281,61 @@ def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     """Knob delta a reduce-tile branch pins."""
     bk, fk, sk = reduce
     return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
+
+
+# --- Warp-tier (tensor-core ``atomize``) moves: the warp count, the per-warp
+# register cells, and the K chunk in atom-K units (``plans/tile-ir-block-dag.md``
+# R4). Legality is the per-CTA resource budget (threads / cells) + the atom-K
+# divisibility; the atom eligibility itself is the gate in ``enumeration/_atom``. ---
+
+_MAX_WARP_CELLS = 64  # cells (atom tiles) per warp — the register-file ceiling
+_WARP_CELL_TARGET = 16  # a warp wants a register tile big enough for ILP, small enough for occupancy
+
+
+def warp_offers(atom) -> list[tuple[int, int]]:
+    """Legal ``(wm, wn)`` warp counts: ``wm·wn ≥ 2`` (single-warp mma.sync is
+    pruned — ``ldmatrix`` is smem→register only) and ``wm·wn·group_size`` within
+    the CTA thread budget. Best-first: fewest warps, square-ish."""
+    wm_pin, wn_pin = _pin(WARP_M), _pin(WARP_N)
+    wms = (wm_pin,) if wm_pin else WARP_CHOICES
+    wns = (wn_pin,) if wn_pin else WARP_CHOICES
+    out = [(wm, wn) for wm in wms for wn in wns if wm * wn >= 2 and wm * wn * atom.group_size <= MAX_THREADS_PER_CTA]
+    out.sort(key=lambda wmn: (wmn[0] * wmn[1], abs(wmn[0] - wmn[1])))
+    return out
+
+
+def warp_reg_offers(atom) -> list[tuple[int, int]]:  # noqa: ARG001
+    """Legal ``(fm, fn)`` per-warp register cells under the cell ceiling
+    (``fm·fn ≤ _MAX_WARP_CELLS``), best-first (≈``_WARP_CELL_TARGET`` cells)."""
+    fm_pin, fn_pin = _pin(TC_REG_M), _pin(TC_REG_N)
+    fms = (fm_pin,) if fm_pin else TC_REG_CHOICES
+    fns = (fn_pin,) if fn_pin else TC_REG_CHOICES
+    out = [(fm, fn) for fm in fms for fn in fns if fm * fn <= _MAX_WARP_CELLS]
+    out.sort(key=lambda fmn: (abs(fmn[0] * fmn[1] - _WARP_CELL_TARGET), -fmn[0] * fmn[1]))
+    return out
+
+
+def warp_bk_offers(dag: IterDag, atom) -> list[int]:
+    """Legal ``bk`` K-chunks (in atom-K units): ``bk`` divides the atom-K step
+    count ``K / atom_k`` so ``K_o = K/(bk·atom_k)`` is whole. Largest-first
+    (``BK_CHOICES`` is descending)."""
+    atom_k = atom.shape[2]
+    k_atoms = max(1, dag.k_extent // atom_k)
+    bk_pin = _pin(TC_BK)
+    cands = (bk_pin,) if bk_pin else BK_CHOICES
+    return [bk for bk in cands if bk >= 1 and k_atoms % bk == 0]
+
+
+def warp_geom_knobs(wm: int, wn: int) -> dict:
+    """Knob delta the warp-geometry branch pins."""
+    return {WARP_M.name: wm, WARP_N.name: wn}
+
+
+def warp_reg_knobs(fm: int, fn: int) -> dict:
+    """Knob delta a warp register-tile branch pins."""
+    return {TC_REG_M.name: fm, TC_REG_N.name: fn}
+
+
+def warp_bk_knobs(atom, bk: int) -> dict:
+    """Knob delta the warp K-chunk branch pins (incl. the atom-kind stamp)."""
+    return {TC_ATOM.name: atom.name, TC_BK.name: bk}
