@@ -125,6 +125,28 @@ class Transport(enum.Enum):
     TMA = "tma"  # sm_90+
 
 
+class Placement(enum.Enum):
+    """Where a DAG edge's producer→consumer value is materialized — the unifying
+    edge-placement annotation (``plans/dag-edge-placement-split-as-enumeration.md``).
+    DERIVED from the ``Schedule`` (``staged`` + ``launch``), never stored: every
+    scheduling choice already lives in those fields, so placement is a projection
+    of them the same way ``Block.atom`` / ``TileGraph.edges`` are projections of the
+    body — see :meth:`TileGraph.placement`.
+
+    - ``INLINE`` — the value rides registers inside the consumer block (a fused
+      cone or a plain gmem-direct read); the default, no annotation.
+    - ``SMEM`` — a staged smem slab (``Schedule.staged[edge]``); today's ``stage``
+      move.
+    - ``GMEM`` — a global intermediate buffer; the producer and consumer live in
+      different launch groups (a grid barrier — the ``GMEM`` cut). Says *where the
+      buffer lives*, not *how many kernels*: v1 realizes every grid-crossing edge
+      as two launches, so a ``GMEM`` edge is exactly a cross-launch-group edge."""
+
+    INLINE = "inline"
+    SMEM = "smem"
+    GMEM = "gmem"
+
+
 class Role(enum.Enum):
     PRODUCER = "producer"
     CONSUMER = "consumer"
@@ -517,6 +539,21 @@ class TileGraph:
                     seen.add(e)
                     out.append(e)
         return tuple(out)
+
+    def placement(self, edge: Edge) -> Placement:
+        """The DERIVED :class:`Placement` of one edge — read off ``Schedule.staged``
+        + ``Schedule.launch`` (``plans/dag-edge-placement-split-as-enumeration.md``).
+        ``stage`` and the ``GMEM`` cut become two values of one query, with ``INLINE``
+        the default. A cross-launch-group edge is ``GMEM`` regardless of whether the
+        consumer also stages its read of the materialized buffer (the buffer lives in
+        gmem either way), so ``GMEM`` is checked first."""
+        sched = self.schedule
+        block_names = {b.name for b in self.blocks}
+        if edge.src in block_names and sched.launch.get(edge.src, edge.src) != sched.launch.get(edge.dst, edge.dst):
+            return Placement.GMEM
+        if edge in sched.staged:
+            return Placement.SMEM
+        return Placement.INLINE
 
     def structural_key(self) -> str:
         """A canonical identity over the algorithm + Schedule, for ``op_cache_key``

@@ -20,6 +20,7 @@ from deplodock.compiler.ir.tile.ir import (
     Block,
     Buffer,
     Edge,
+    Placement,
     Schedule,
     Space,
     TileGraph,
@@ -232,3 +233,71 @@ def test_tilegraph_pretty_readable():
 
 def test_schedule_pretty_empty_is_blank():
     assert Schedule().pretty() == []
+
+
+# --- derived edge placement --------------------------------------------------
+
+
+def _prod_cons_graph(schedule: Schedule) -> TileGraph:
+    """``xn = relu(x)`` (block ``prod``) → ``y = xn + b`` (block ``cons``), with the
+    given ``schedule`` — the chain the placement query reads off."""
+    n = Axis("n", 128)
+    producer = Block(
+        name="prod",
+        domain=(n,),
+        compute=(
+            Load(name="x_v", input="x", index=(Var("n"),)),
+            Assign(name="xn", op=ElementwiseImpl("relu"), args=("x_v",)),
+            Write(output="xn", index=(Var("n"),), value="xn"),
+        ),
+    )
+    consumer = Block(
+        name="cons",
+        domain=(n,),
+        compute=(
+            Load(name="xn_v", input="xn", index=(Var("n"),)),
+            Load(name="b_v", input="b", index=(Var("n"),)),
+            Assign(name="o", op=ElementwiseImpl("add"), args=("xn_v", "b_v")),
+            Write(output="y", index=(Var("n"),), value="o"),
+        ),
+    )
+    one = (Literal(128, "int"),)
+    return TileGraph(
+        name="g",
+        buffers={k: Buffer(k, one, F32) for k in ("x", "b", "xn", "y")},
+        blocks=(producer, consumer),
+        schedule=schedule,
+    )
+
+
+def test_placement_inline_for_unstaged_input_read():
+    # an input-source read with no staging / cut is INLINE (gmem-direct in body)
+    g = _prod_cons_graph(Schedule())
+    assert g.placement(Edge(src="x", dst="prod", buffer="x")) is Placement.INLINE
+    assert g.placement(Edge(src="b", dst="cons", buffer="b")) is Placement.INLINE
+
+
+def test_placement_smem_when_staged():
+    e = Edge(src="b", dst="cons", buffer="b")
+    g = _prod_cons_graph(Schedule(staged={e: Transport.SYNC}))
+    assert g.placement(e) is Placement.SMEM
+    # an un-staged sibling input read stays INLINE
+    assert g.placement(Edge(src="x", dst="prod", buffer="x")) is Placement.INLINE
+
+
+def test_placement_gmem_for_cross_block_edge():
+    # a block->block edge is materialized in gmem — by default each block is its own
+    # launch group (v1 two-launch cut), so the xn intermediate defaults to GMEM...
+    assert _prod_cons_graph(Schedule()).placement(Edge(src="prod", dst="cons", buffer="xn")) is Placement.GMEM
+    # ...and an explicit differing launch group is GMEM too
+    g = _prod_cons_graph(Schedule(launch={"prod": 0, "cons": 1}))
+    assert g.placement(Edge(src="prod", dst="cons", buffer="xn")) is Placement.GMEM
+    assert g.placement(Edge(src="b", dst="cons", buffer="b")) is Placement.INLINE
+
+
+def test_placement_gmem_dominates_smem_on_cut_edge():
+    # a cross-group edge whose consumer ALSO stages its read is still GMEM (the
+    # buffer lives in gmem; the smem stage is the consumer's read transport)
+    e = Edge(src="prod", dst="cons", buffer="xn")
+    g = _prod_cons_graph(Schedule(launch={"prod": 0, "cons": 1}, staged={e: Transport.SYNC}))
+    assert g.placement(e) is Placement.GMEM

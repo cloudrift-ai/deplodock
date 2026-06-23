@@ -47,10 +47,14 @@ One file, two comment-block sections:
 
 - **ENUMERATION** — the *invariant algorithm* + the *variant* `Schedule` the composer searches: `Block`
   (`name + domain + compute`), `Buffer`, `Edge`, `Schedule`, `TileGraph`. The derived projections
-  (`Block.reads`/`writes`/`carrier`/`atom`, `TileGraph.edges`) are **computed on demand, never stored** — the same
-  discipline as `Loop.algebra_kind`, so they can't drift and don't enter `op_cache_key`. `TileGraphOp` wraps a chosen
-  `TileGraph` as a graph node (the enumeration-pass output; `op_cache_key` keys it on `TileGraph.structural_key` +
-  knobs).
+  (`Block.reads`/`writes`/`carrier`/`atom`, `TileGraph.edges`, `TileGraph.placement(edge)`) are **computed on demand,
+  never stored** — the same discipline as `Loop.algebra_kind`, so they can't drift and don't enter `op_cache_key`.
+  `TileGraph.placement(edge)` is the unifying **edge-placement** view
+  (`plans/dag-edge-placement-split-as-enumeration.md`): `INLINE` (default, register/gmem-direct), `SMEM`
+  (`Schedule.staged` — today's `stage` move), or `GMEM` (a cross-launch-group cut — the buffer lives in gmem) read off
+  `Schedule.staged` + `Schedule.launch`, so `stage` and `split` are two values of one query. `TileGraphOp` wraps a
+  chosen `TileGraph` as a graph node (the enumeration-pass output; `op_cache_key` keys it on `TileGraph.structural_key`
+  + knobs).
 - **MATERIALIZED** — what `assemble` emits: `TileOp` + the typed tile flavors (`GridTile` / `ThreadTile` /
   `RegisterTile` / `WarpTile` / `AtomTile` / `SerialTile`) + `StageBundle` / `Source` / `WarpSpecialize` / `AsyncWait` /
   `Atom`. (Slated for removal once `assemble` emits `KernelOp` directly.)
