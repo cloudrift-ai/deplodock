@@ -26,6 +26,6 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     op: TileGraphOp = root.op
     if op.tilegraph is not None or MAP_N_REG.name not in op.knobs:
         raise RuleSkipped("not fully tiled / already built")
-    tg = build_dag(op.dag, op.knobs, kernel_name=op.name, target_names=op.target_names)
+    tg = build_dag(op.dag, op.knobs, kernel_name=op.name, target_names=op.target_names, buffers=op.buffers)
     knobs = {**op.knobs, "MMA": "0", "WM": 0, "WN": 0, "BR": 1} if op.target_names else op.knobs
     return replace(op, tilegraph=tg, knobs=knobs)

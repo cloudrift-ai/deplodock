@@ -758,9 +758,31 @@ and the deterministic post-passes (**G4**) remain later steps. Every tier below 
 enumeration pass** (its move family) + grows `assemble`'s `Schedule`-driven synthesis — never
 a tree-builder.
 
-- **R1 — Staging** (deps: RF). Add `enumeration/040_stage`; `assemble` synthesizes the smem slab + cooperative producer
-  from `Schedule.staged`. *Recovers:* `test_stage_inputs_mma_probe.py`,
-  `test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs`.
+- **R1 — Staging** (deps: RF). **Landed (scalar tier).** Added the first `Schedule`-move enumeration fork
+  `enumeration/050_stage.py` (it runs *after* `040_lower` on the built `TileGraphOp`, reads the derived `Block.reads` +
+  `Schedule.binding`, and forks on a `STAGE` bitmask — writing the chosen `Edge`s straight into `Schedule.staged`, the
+  source of truth `assemble` reads) + the candidate/legality helper `enumeration/_stage.py` (a read is stageable iff
+  AFFINE + fan-in reuse across a parallel axis + a K-tower to stage through) + the `STAGE` BINMASK knob. `assemble`
+  synthesizes the smem slab + cooperative producer from `Schedule.staged` in the new `assembly/_slab.py`
+  (`synthesize_staging`): one SYNC `StageBundle` per K-tower, a `Source` per staged buffer whose affine `source_index`
+  reconstructs the operand's original σ-rewritten gmem index (cache axes = THREAD/REGISTER tile + the within-stage K
+  axes; GRID + serial-outer `K_o` fold into the slab origin; `block=()`, the composite stride rides the cache-axis
+  extents). Handles both the multi-stage K loop (bundle reloads inside `serial_outer`) and the `BK == K` single-stage
+  whole-K slab. `TileGraph.buffers` is now populated (logical gmem `Buffer`s from the source `LoopOp`'s I/O, carried on
+  the `TileGraphOp` seed) so `assemble` can size slabs + stamp `Source.dtype`. The downstream kernel passes
+  (`_stage_expand` / `100_materialize_tile`) — which were never deleted — expand the bundle untouched. *Gate:*
+  accuracy-vs-torch (byte-exact, max err 0.0) for every stage subset (both / A-only / B-only / none) on `64³`, a masked
+  non-divisor `64×47×64`, and `128³`; new test `tests/compiler/passes/test_stage_scalar.py` (16 cases). Green floor
+  unmoved (28 baseline failures unchanged).
+  *Recovery-test attribution corrected.* The two tests this bullet originally named are **not** recoverable by scalar
+  staging and stay quarantined: `test_stage_inputs_mma_probe.py` pins `DEPLODOCK_MMA` and asserts a warp-tier `Mma` +
+  `StageBundle` — that needs the `atomize` tier (**R4**); `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs`
+  `import`s the deleted `021_hoist_staged_loads_above_mask` and tests its legacy `_lift_if_match` internals — it must be
+  rewritten against the new `assembly/020_mask_order` (the masked-load hoist, deferred with the masked tiers), not
+  "recovered." Scalar masked staging itself works today (the bundle sits inside the boundary `Cond`, so masked threads
+  skip the cooperative load — no OOB, no hoist needed; the hoist is a perf/transport requirement for cp.async/TMA).
+  **Deferred follow-ups:** warp/atom + symbolic-K (masked-K zero-fill) staging ride R4; the `retime` / `transport` /
+  `warp_spec` forks and the `pad` / `mask_order` post-passes are their own tiers.
 - **R2 — Cooperative-reduce** (deps: RF; the biggest chunk). Add the coop `classify`→build path + an
   `enumeration/050_coop_reduce` pass (`(bk,fk,br)` offer) + `assemble`'s warp-shuffle / hierarchical combine synthesis.
   *Recovers ~22:* `test_monoid_reduce_kernel.py`,
@@ -789,8 +811,8 @@ a tree-builder.
   / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
 
 ```
-R0 ─► RF foundation ─┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
-   (multi-pass split) ├─► R2 coop-reduce ─────────────────┐           ├─► R7 e2e / structural / prior
+R0 ─► RF foundation ──┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
+   (multi-pass split) ├─► R2 coop-reduce ──────────────────┐           ├─► R7 e2e / structural / prior
                       └─► R3 split-K ──────────────────────┘           │
                                    R2 ──► R6 flash ◄── R4 ─────────────┘
 ```
@@ -946,9 +968,11 @@ with them.
 ## Next step
 
 The structural surface has converged: the algorithm is `name + domain + compute`, every projection is derived, every
-choice is a `Schedule` annotation, and `assemble` is the one place the tower is built. `assemble` is now proven
-byte-identical on pointwise / scalar+warp matmul / coop reduce (steps 1–2). The natural next step is to **stand up the
-first `Schedule`-move enumeration pass — `tile/stage`** — over the tile node (the simplest staging regime, reborn from
-the deleted `020`/`026`), with `assemble` synthesizing the slab + cooperative producer from `staged`. That validates the
-pass structure end to end (an enumeration fork widens, the materialization stage lowers) on a regime that actually
-touches smem, before `retime` / `transport` / `warp_spec` follow.
+choice is a `Schedule` annotation, and `assemble` is the one place the tower is built. **R1 (staging, scalar tier) has
+landed** — the first `Schedule`-move enumeration fork (`enumeration/050_stage`) writes `Schedule.staged`, and
+`assemble` synthesizes the smem slab + cooperative `StageBundle` from it (`assembly/_slab`), proven accuracy-vs-torch
+on scalar matmul (static + masked). The pass structure is now validated end to end on a regime that touches smem (an
+enumeration fork widens; the materialization stage lowers). Two independent tiers are unblocked: **R2** (cooperative
+reduce — the biggest chunk, the coop `classify`→build path + `enumeration/050`-style `(bk,fk,br)` offer + warp-shuffle
+combine synthesis) and **R4** (warp-tier `atomize` — which also brings warp/atom + symbolic-K staging, the deferred
+half of R1). `retime` / `transport` / `warp_spec` forks and the `pad` / `mask_order` post-passes follow on top.

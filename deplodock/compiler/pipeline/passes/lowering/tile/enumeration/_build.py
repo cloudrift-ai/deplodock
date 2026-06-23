@@ -110,7 +110,14 @@ def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple
     return body
 
 
-def build_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_names: frozenset[str] = frozenset()) -> TileGraph:
+def build_dag(
+    dag: IterDag,
+    knobs: dict,
+    *,
+    kernel_name: str,
+    target_names: frozenset[str] = frozenset(),
+    buffers: dict | None = None,
+) -> TileGraph:
     """Build a single-block ``TileGraph`` from the iteration DAG + a move choice.
 
     Two algebra-licensed moves compose here, both σ-rewriting the body:
@@ -164,4 +171,4 @@ def build_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_names: froz
         compute = _replace_k_scalar(compute, target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], splitk, k_s)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
-    return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
+    return TileGraph(name=kernel_name, buffers=dict(buffers or {}), blocks=(block,), schedule=Schedule(binding=binding))

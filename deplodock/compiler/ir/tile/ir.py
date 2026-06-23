@@ -524,6 +524,7 @@ class TileGraphOp(Op):
     algebra: object = None  # AlgebraKind — the regime the passes dispatch on
     target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
     seed_key: str = ""  # the source LoopOp's body structural key
+    buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
 
     def structural_key(self) -> str:
         return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
@@ -536,7 +537,6 @@ class TileGraphOp(Op):
 # + the typed tile flavors + ``StageBundle`` / ``Source`` / ``WarpSpecialize`` /
 # ``AsyncWait`` + ``Atom`` / ``ATOM_REGISTRY``. Slated for removal once
 # ``assemble`` emits ``KernelOp`` directly.
-
 
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]

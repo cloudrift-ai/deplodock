@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.ir import Binding, Block, TileGraph, TileOp
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
 
 # Schedule ``Binding`` → tower ``Role``. SERIAL has no free-axis use yet (the K
@@ -75,8 +76,11 @@ def assemble_block(
         raise NotImplementedError("assemble_block: expected exactly one block (multi-launch DAGs not yet ported)")
     block = graph.blocks[0]
     atom = block.atom
+    # Materialize ``Schedule.staged`` into smem slabs + a cooperative StageBundle
+    # (a no-op when nothing is staged), then wrap the binding tower around it.
+    staged_body = synthesize_staging(graph)
     layers = _free_layers(block, graph.schedule)
-    chain_body = _wrap_tower(layers, tuple(block.compute), atom=atom)
+    chain_body = _wrap_tower(layers, tuple(staged_body), atom=atom)
 
     knobs_full = {**base_knobs, **knobs}
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}

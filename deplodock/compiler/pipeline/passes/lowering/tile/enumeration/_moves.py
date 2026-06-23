@@ -259,6 +259,8 @@ def reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     out = [(d.factors[1], d.factors[2], d.factors[0]) for d in decomps]
     out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out
+
+
 def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles for a reduce regime under the cell budget
     (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells)."""
@@ -271,5 +273,3 @@ def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     """Knob delta a reduce-tile branch pins."""
     bk, fk, sk = reduce
     return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
-
-

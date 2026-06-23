@@ -14,7 +14,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.tile.ir import TileGraphOp
+from deplodock.compiler.ir.tile.ir import Buffer, Space, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -35,6 +35,13 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     regime = classify(dag)
     if regime is None or regime.algebra not in _BUILDABLE:
         raise RuleSkipped(f"move composer cannot lower kernel {loop_op.name!r}")
+    # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
+    # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
+    buffers: dict[str, Buffer] = {}
+    for name, t in loop_op.inputs.items():
+        buffers[name] = Buffer(name=name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
+    for t in loop_op.outputs.values():
+        buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
     return TileGraphOp(
         name=loop_op.name,
         dag=dag,
@@ -42,4 +49,5 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
         target_names=regime.target_names,
         leading=tuple(dag.leading),
         seed_key=loop_op.body.structural_key(),
+        buffers=buffers,
     )
