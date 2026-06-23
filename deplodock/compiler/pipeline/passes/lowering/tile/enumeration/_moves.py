@@ -193,9 +193,18 @@ _THREAD_TARGET = 256
 def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(thread_n, thread_m)`` thread tiles within the CTA thread
     budget, best-first (≈``_THREAD_TARGET`` threads, larger to break ties).
-    ``thread_m`` is ``1`` for a 1-D nest (no M axis)."""
-    n_choices = _axis_thread_choices(dag.inner_n.extent)
-    m_choices = _axis_thread_choices(dag.outer_m.extent) if dag.outer_m is not None else (1,)
+    ``thread_m`` is ``1`` for a 1-D nest (no M axis).
+
+    A pinned ``DEPLODOCK_BN``/``BM`` narrows its axis to that single extent (the
+    same ``_pin`` idiom :func:`reduce_offers` uses for ``BK``/``FK``/``SPLITK``) so a
+    test / golden can force a specific (masked) free-axis tile — without it greedy
+    would always take the best-first ≈``_THREAD_TARGET`` offer and silently drop the pin."""
+    bn_pin, bm_pin = _pin(MAP_N_THREAD), _pin(MAP_M_THREAD)
+    n_choices = (bn_pin,) if bn_pin else _axis_thread_choices(dag.inner_n.extent)
+    if dag.outer_m is None:
+        m_choices: tuple[int, ...] = (1,)
+    else:
+        m_choices = (bm_pin,) if bm_pin else _axis_thread_choices(dag.outer_m.extent)
     out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
     out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
     return out
@@ -204,9 +213,15 @@ def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
 def map_reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles within the cell budget, best-first
     (fewest cells — a MAP nest is bandwidth bound; prefer tiling the contiguous N
-    axis on ties)."""
-    m_choices = _MAP_REG_CHOICES if dag.outer_m is not None else (1,)
-    out = [(r_n, r_m) for r_n in _MAP_REG_CHOICES for r_m in m_choices if budget.cells_ok(r_n * r_m)]
+    axis on ties). A pinned ``DEPLODOCK_FN``/``FM`` narrows its axis (see
+    :func:`thread_offers`)."""
+    fn_pin, fm_pin = _pin(MAP_N_REG), _pin(MAP_M_REG)
+    n_choices = (fn_pin,) if fn_pin else _MAP_REG_CHOICES
+    if dag.outer_m is None:
+        m_choices: tuple[int, ...] = (1,)
+    else:
+        m_choices = (fm_pin,) if fm_pin else _MAP_REG_CHOICES
+    out = [(r_n, r_m) for r_n in n_choices for r_m in m_choices if budget.cells_ok(r_n * r_m)]
     out.sort(key=lambda rm: (rm[0] * rm[1], -rm[0]))
     return out
 
@@ -273,8 +288,12 @@ def reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
 
 def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles for a reduce regime under the cell budget
-    (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells)."""
-    out = [(r_n, r_m) for r_n in REG_CHOICES for r_m in REG_CHOICES if budget.cells_ok(fk * r_n * r_m)]
+    (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells). A pinned
+    ``DEPLODOCK_FN``/``FM`` narrows its axis (see :func:`thread_offers`)."""
+    fn_pin, fm_pin = _pin(MAP_N_REG), _pin(MAP_M_REG)
+    n_choices = (fn_pin,) if fn_pin else REG_CHOICES
+    m_choices = (fm_pin,) if fm_pin else REG_CHOICES
+    out = [(r_n, r_m) for r_n in n_choices for r_m in m_choices if budget.cells_ok(fk * r_n * r_m)]
     out.sort(key=lambda rm: (abs(rm[0] * rm[1] - _CELL_TARGET), -rm[0] * rm[1]))
     return out
 

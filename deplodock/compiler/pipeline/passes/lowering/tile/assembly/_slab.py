@@ -310,19 +310,68 @@ def _is_k_stmt(s: Stmt) -> bool:
     return isinstance(s, StageBundle) or (isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner"))
 
 
-def _hoist_masked_tma(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs) -> tuple[Stmt, ...] | None:
-    """Masked-tile TMA staging: a symbolic / non-divisor warp matmul wraps its K
-    tower + output ``Write`` in a boundary ``Cond(σ(M) < bound)``. A divergent TMA
-    pipeline deadlocks the mbarrier (some warps skip the cooperative issue), so the
-    cooperative load must be hoisted **above** the guard — every warp issues TMA
-    uniformly (the hardware OOB zero-fill replaces the overhang rows with 0, so the
-    masked rows accumulate 0 and the gated ``Write`` never stores them). Returns the
-    hoisted body (K tower above, ``Cond`` gating just the epilogue/``Write``) when the
-    pattern matches and TMA is in play, else ``None`` (caller falls back to the plain
-    in-place wrap — the ``mask_order`` hoist is a TMA-only requirement)."""
+def _input_extents(buffers: dict) -> dict[str, tuple]:
+    """``{gmem buffer name -> per-dim extents}`` for the masked cooperative-load
+    clamp. A static dim contributes its ``int`` extent; a symbolic dim its ``Expr``
+    (``Var('seq_len')``), which renders the clamp ternary against the runtime kernel
+    arg. Buffers with an unparseable dim are skipped (no clamp)."""
+    out: dict[str, tuple] = {}
+    for name, buf in buffers.items():
+        exts: list[int | Expr] = []
+        for d in buf.shape:
+            if getattr(d, "is_static", False):
+                exts.append(d.as_static())
+            elif getattr(d, "expr", None) is not None:
+                exts.append(d.expr)
+            else:
+                break
+        else:
+            out[name] = tuple(exts)
+    return out
+
+
+def _stamp_gmem_extents(stmt: Stmt, input_extents: dict) -> Stmt:
+    """Recursively stamp ``Source.gmem_extents`` on every SYNC ``StageBundle`` source
+    whose ``buf`` is a kernel input — so ``_stage_expand.emit_stage`` clamps the
+    hoisted cooperative gmem read to ``[0, extent)``. Only the SYNC transport needs
+    it: a TMA bundle relies on the hardware OOB zero-fill (descriptor globalDim =
+    runtime extent), so its sources are left unstamped."""
+    if isinstance(stmt, StageBundle):
+        if stmt.policy is StagePolicy.SYNC:
+            new_sources = tuple(
+                replace(src, gmem_extents=input_extents[src.buf]) if src.buf in input_extents and src.gmem_extents is None else src
+                for src in stmt.sources
+            )
+            stmt = replace(stmt, sources=new_sources)
+        return stmt
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    new_bodies = tuple(Body(tuple(_stamp_gmem_extents(s, input_extents) for s in body)) for body in nested)
+    return stmt.with_bodies(new_bodies)
+
+
+def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs) -> tuple[Stmt, ...] | None:
+    """Masked-tile staging: a symbolic / non-divisor matmul wraps its K tower +
+    output ``Write`` in a boundary ``Cond(σ(M|N) < bound)``. The cooperative load
+    must be hoisted **above** the guard so every thread issues it uniformly (a SYNC
+    ``__syncthreads`` / cp.async / TMA inside divergent control flow is a hang, and a
+    skipping overhang thread leaves the slab half-filled). The overhang then reads
+    past the buffer: SYNC sources are clamped to the gmem bounds
+    (``_stamp_gmem_extents`` → ``_stage_expand``), TMA sources rely on the hardware
+    OOB zero-fill. Either way the masked rows accumulate harmless values the gated
+    ``Write`` never stores. Returns the hoisted body (K tower above, ``Cond`` gating
+    just the epilogue/``Write``) when the pattern matches, else ``None`` (caller falls
+    back to the plain in-place wrap — a clean-divisor tile has no boundary ``Cond``).
+
+    Gated on a ``<`` boundary predicate: the ``==`` split-K invariant guard
+    (``Cond(K_s == 0, ...)``) must NOT hoist its loads above the guard (it would
+    re-run the cooperative load on the CTAs the guard skips)."""
     if len(stmts) != 1 or not isinstance(stmts[0], Cond) or stmts[0].else_body:
         return None
     cond = stmts[0]
+    if not (isinstance(cond.cond, BinaryExpr) and cond.cond.op == "<"):
+        return None
     inner = tuple(cond.body)
     if not any(isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner") for s in inner):
         return None
@@ -331,6 +380,8 @@ def _hoist_masked_tma(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers,
     rest = tuple(s for s in wrapped if not _is_k_stmt(s))
     if not k_part:
         return None
+    extents = _input_extents(buffers)
+    k_part = tuple(_stamp_gmem_extents(s, extents) for s in k_part)
     return (*k_part, Cond(cond=cond.cond, body=Body(rest), else_body=()))
 
 
@@ -347,8 +398,7 @@ def synthesize_staging(graph: TileGraph) -> Body:
     compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
     stmts = tuple(compute)
-    if bool(staged_bufs) and staged_bufs <= tma_bufs:
-        hoisted = _hoist_masked_tma(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs)
-        if hoisted is not None:
-            return Body(hoisted)
+    hoisted = _hoist_masked(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs)
+    if hoisted is not None:
+        return Body(hoisted)
     return Body(_wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs))

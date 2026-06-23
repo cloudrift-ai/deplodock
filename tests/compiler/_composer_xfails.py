@@ -68,17 +68,24 @@ _XFAIL_FUNCS: dict[str, str] = {
     # R3 — landed (atomic-free split-K): test_atomic_free_splitk_fork_pushes_structural
     # de-quarantined (the 055_atomic_free_splitk structural fork). The R3 accuracy half
     # (test_mma_atomic_free_splitk.py) was already de-quarantined under R2.
-    # R4 — masked / unstaged warp follow-ups (the warp-tier matmul itself landed):
-    # the masked cooperative-load clamp + non-divisor real_extent tests need env-pin
-    # honoring in the scalar thread/reg offers (entangled with the cooperative
-    # multi-accum regime, R2/R3) + masked-staging clamp synthesis; the gmem-direct
-    # atom path needs the staging-decline heuristic; the hoist test imports the
-    # deleted 021 pass and must be REWRITTEN against assembly/020_mask_order.
+    # R4 — masked-tile follow-ups: env-pin honoring in the scalar thread/reg offers
+    # (_moves.thread_offers / map_reg_offers / reduce_reg_offers now read DEPLODOCK_BN/
+    # BM/FN/FM via _pin, like reduce_offers) + masked SYNC staging clamp (the
+    # assembly/_slab._hoist_masked hoist lifts the cooperative load above the boundary
+    # Cond and stamps Source.gmem_extents) de-quarantined three tests:
+    # test_planner_admits_non_divisor_n_with_real_extent,
+    # test_masked_n_clamps_cooperative_load_index,
+    # test_symbolic_m_cooperative_load_clamps_to_runtime_extent.
+    #
+    # Still quarantined (distinct warp-tier mechanisms, not the masked-tile clamp):
+    # - test_unstaged_atom_lowers_gmem_direct needs the staging-DECLINE heuristic for
+    #   the atom tier (an unstageable atom operand must drop its STAGE edge so
+    #   005_lower_atom_tile lowers it gmem-direct), independent of the masked clamp.
+    # - test_hoist_refuses_lift_when_pipeline_reads_guarded_defs imports the deleted
+    #   021 pass and must be REWRITTEN against assembly/_slab._hoist_masked's
+    #   SSA-safety check (the fused-prologue lift refusal).
     "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": "R4",
     "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs": "R4",
-    "test_masked_tile.py::test_masked_n_clamps_cooperative_load_index": "R4",
-    "test_masked_tile.py::test_planner_admits_non_divisor_n_with_real_extent": "R4",
-    "test_masked_tile.py::test_symbolic_m_cooperative_load_clamps_to_runtime_extent": "R4",
     # R5 transport landed, but this test's real blocker is the fused norm+linear
     # (RmsNorm prologue + matmul) scalar regime — its 'y' LoopOp doesn't lower yet
     # (the fused-prologue tier, R7 test_fused_rmsnorm_linear_blocked_prologue). The
@@ -103,8 +110,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     "test_resolve.py::test_trace_records_partition_fork": "R7",
     # test_run.py: the fp16-matmul-window + sdpa kernels stay quarantined (R7 matmul
     # window / R6 sdpa); the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2).
+    # The R4 scalar pin-honoring recovered test_run_code_fp16_matmul_window_accuracy's
+    # [4]/[8] params (a window-pinned fp16 matmul now honors its tile knobs); the [2]
+    # param still hits a separate fp16 nvcc codegen failure (R7), so it stays a node
+    # entry below.
     "test_run.py::test_compile_fp16_matmul_window_emits_half2": "R7",
-    "test_run.py::test_run_code_fp16_matmul_window_accuracy": "R7",
     "test_run.py::test_run_code_sdpa_k_chunked": "R7",
     "test_run.py::test_run_code_sdpa_seq1024_dynamic_smem": "R7",
     "test_run.py::test_run_code_sdpa_tinyllama_full": "R7",
@@ -130,6 +140,9 @@ _XFAIL_NODES: dict[str, str] = {
     "test_tune_accuracy.py::test_tuned_variant_matches_reference[sdpa]": "R6",
     # R7
     "test_block.py::test_tinyllama_block_accuracy[cuda]": "R7",
+    # Only the [2] window param still fails (fp16 nvcc codegen); [4]/[8] recovered
+    # under the R4 scalar pin-honoring (see the test_run.py note above).
+    "test_run.py::test_run_code_fp16_matmul_window_accuracy[2]": "R7",
 }
 
 

@@ -804,14 +804,27 @@ never a tree-builder.
   per-CTA scale / causal-mask Load hoisted into `dag.leading`/`mid` via `outer_loads`. The warp tier is v1 `SPLITK=1`
   (no cross-CTA split-K — R3). *Recovered (50 nodes, de-quarantined):* `test_matmul_mma.py`, `…_residual.py`,
   `…_causal_epilogue.py`, `…_transposed_b.py` (+ its symbolic-MN nodes), `…_parity.py` cp.async nodes,
-  `test_stage_inputs_mma_probe.py`. *Still quarantined (R4 follow-ups):*
-  `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` (needs the staging-decline heuristic so the
-  gmem-direct atom path is exercised), the `test_masked_tile.py` masked cooperative-load clamp + non-divisor
-  `real_extent` nodes (need env-pin honoring in the scalar `thread_offers`/`reg_offers` — which currently breaks the
-  not-yet-built cooperative multi-accum regime — plus masked-staging clamp synthesis), and
+  `test_stage_inputs_mma_probe.py`. *Masked scalar-tile staging clamp landed (R4 follow-up):* scalar-offer env-pin
+  honoring (`_pin` in `_moves.thread_offers` / `map_reg_offers` / `reduce_reg_offers`, mirroring `reduce_offers`'s
+  `BK`/`FK`/`SPLITK`) lets a pinned masked tile (e.g. `BN=8` over `N=47`) reach the masked σ-split; the over-staging
+  this exposes is resolved in `enumeration/050_stage` by a **budget-aware mask filter** (the auto-enumerated subsets are
+  pruned to those whose `_slab_bytes` fit `ctx.max_dynamic_smem`, so greedy's option-0 is the largest in-budget staging
+  and the deterministic compile no longer over-stages a large pinned tile past smem with no fallback — a
+  `DEPLODOCK_STAGE` pin stays authoritative); and the SYNC masked cooperative load is hoisted above the boundary `Cond`
+  + clamped to the buffer extent by `assembly/_slab._hoist_masked` (generalized from the TMA-only `_hoist_masked_tma`,
+  stamping `Source.gmem_extents` on SYNC sources so `_stage_expand` clamps — static `int` and symbolic `Var('seq_len')`
+  alike). *Recovered (de-quarantined):* `test_masked_tile.py::test_planner_admits_non_divisor_n_with_real_extent`,
+  `…::test_masked_n_clamps_cooperative_load_index`, `…::test_symbolic_m_cooperative_load_clamps_to_runtime_extent`, and
+  `test_run.py::test_run_code_fp16_matmul_window_accuracy` `[4]`/`[8]` (a window-pinned fp16 matmul now honors its tile
+  knobs; `[2]` still hits a separate fp16 nvcc codegen failure, R7). The cp.async / TMA `&b[...]` operand form the
+  legacy clamp test asserted rides the deferred ASYNC transport tier, so the recovered tests assert the SYNC scalar
+  cooperative load + slab. *Still quarantined (R4 follow-ups):*
+  `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` (a distinct warp/atom-tier staging-decline heuristic —
+  an unstageable atom operand must drop its `STAGE` edge so the gmem-direct fragment path is exercised; the
+  scalar-geometry pin it uses also over-budgets the warp register file at `FM=26`), and
   `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` (imports the deleted `021`; rewrite against
-  `assembly/020_mask_order`). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the symbolic-K
-  staging follow-up.*
+  `_slab._hoist_masked`'s SSA-safety refusal). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the
+  symbolic-K staging follow-up.*
 - **R5 — Transport (cp.async / TMA)** (deps: R1, R4). **Landed (warp-tier TMA).** Added the `promote_transport`
   enumeration fork `enumeration/052_transport` (the `TMA` BOOL on a fully-staged warp matmul — SYNC is option-0 so
   greedy stays byte-identical, TMA the eligible second offer / `DEPLODOCK_TMA=1` pin, writing
@@ -914,10 +927,13 @@ builds the streaming `TWISTED_MONOID` online-softmax (SDPA / causal / GQA / addi
 `flash_build` body move, and the TMA fork `enumeration/052_transport` promotes a staged warp matmul to the
 double-buffered `cp.async.bulk.tensor` ring (`assembly/_slab` + `020_peel` + the `mask_order` hoist).
 
+**The R4 masked scalar-tile staging clamp has landed** (scalar-offer env-pin honoring + `050_stage`'s budget-aware
+mask filter + `_slab._hoist_masked`'s SYNC hoist-and-clamp — see the R4 bullet): the masked cooperative-load clamp +
+non-divisor `real_extent` tests are de-quarantined, and the over-staging the pin once exposed is now resolved by the
+greedy in-budget fallback (no longer the R2-blocked "over-stages the multi-accum matmul past the smem budget").
+
 The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). The remaining **R6 follow-ups**
 (cooperative-KV flash's `combine_states` wiring, RoPE-fused attention recognition, the score-materializing SDPA
-decomposition) and the **R4 follow-ups** (the masked cooperative-load clamp + non-divisor `real_extent`, the gmem-direct
-unstaged atom, the `020_mask_order` rewrite of the hoist test) ride alongside, plus the `retime` / `warp_spec` forks +
-the `pad` post-pass + the scalar/cp.async transport — the masked-tile env-pin honoring is **not** unblocked by R2
-(honoring the pin over-stages the multi-accum matmul past the smem budget with no greedy fallback, an R4/R5
-masked-staging + fallback fix).
+decomposition) and the remaining **R4 follow-ups** (the gmem-direct unstaged atom's warp/atom staging-decline
+heuristic, the hoist-refuses test rewrite against `_slab._hoist_masked`) ride alongside, plus the `retime` /
+`warp_spec` forks + the `pad` post-pass + the scalar/cp.async transport.

@@ -272,16 +272,20 @@ def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
 
     Regression for ``CUDA_ERROR_ILLEGAL_ADDRESS`` in masked linear-projection
     kernels (e.g. TinyLlama q/k/v at N=256 tiled 192-wide, or lm_head): the
-    output store is guarded by the boundary ``Cond``, but
-    ``021_hoist_staged_loads_above_mask`` lifts the cooperative load above
-    that guard so it runs for every thread — including the overhang columns
-    past the real N extent. Without a clamp the producer reads 1+ element
-    past the weight buffer. ``021`` now stamps ``Source.gmem_extents`` on the
-    hoisted affine sources and ``_stage_expand.emit_stage`` clamps each gmem
+    output store is guarded by the boundary ``Cond``, but the masked-tile
+    staging hoist (``assembly/_slab._hoist_masked``, the block-DAG successor of
+    the legacy ``021_hoist_staged_loads_above_mask``) lifts the cooperative load
+    above that guard so it runs for every thread — including the overhang
+    columns past the real N extent. Without a clamp the producer reads 1+
+    element past the weight buffer. The hoist stamps ``Source.gmem_extents`` on
+    the hoisted SYNC sources and ``_stage_expand.emit_stage`` clamps each gmem
     index dim to ``[0, extent)``.
 
     Asserts the rendered weight read carries the clamp ternary
-    (``... < 47 ? ... : 46``) — the N source dim clamped to its extent.
+    (``... < 47 ? ... : 46``) — the N source dim clamped to its extent. The
+    staged transport is SYNC (a scalar ``b[clamped]`` cooperative load + a
+    ``b_smem`` slab); cp.async's ``&b[...]`` operand form rides the deferred
+    ASYNC transport tier.
     """
     from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
 
@@ -307,7 +311,7 @@ def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
     # The weight 'b' [2048, 47] is the masked-N operand. Its staged cooperative
     # load must clamp the N coord to < 47 (the extent), falling back to 46.
     # The clamp renders as ``(<n-expr> < 47) ? (<n-expr>) : (46)``.
-    assert "&b[" in src, f"weight 'b' should be staged (cooperative load present):\n{src}"
+    assert "b_smem" in src, f"weight 'b' should be staged (smem slab present):\n{src}"
     assert "< 47) ?" in src, f"masked cooperative load missing N-extent clamp ternary:\n{src}"
     assert ": (46)" in src, f"masked clamp should fall back to extent-1 (46):\n{src}"
 
@@ -338,11 +342,12 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
 def test_symbolic_m_cooperative_load_clamps_to_runtime_extent(recording_dump, monkeypatch):
     """A symbolic-M masked tile whose A operand is staged must clamp the
     hoisted cooperative load's M coord against the RUNTIME extent — the
-    ``seq_len`` kernel arg — not the hint. ``021`` previously skipped
-    symbolic-shaped buffers when stamping ``gmem_extents`` ("M9 follow-up"),
-    so the hoisted load read past the runtime-sized activation for every
-    seq_len that wasn't tile-aligned. The clamp ternary's bound is now the
-    symbolic ``Var``, rendered against the kernel's ``seq_len`` argument."""
+    ``seq_len`` kernel arg — not the hint. The masked-tile staging hoist
+    (``assembly/_slab._hoist_masked``) stamps ``gmem_extents`` from the buffer's
+    symbolic dim (``Var('seq_len')``), so the hoisted load clamps to the runtime
+    size for every seq_len that isn't tile-aligned. The clamp ternary's bound is
+    the symbolic ``Var``, rendered against the kernel's ``seq_len`` argument. The
+    staged transport is SYNC (a scalar ``a[clamped]`` load + an ``a_smem`` slab)."""
     from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
 
     # Same staging-friendly knobs as the static clamp test: K=2048 makes the
@@ -363,7 +368,7 @@ def test_symbolic_m_cooperative_load_clamps_to_runtime_extent(recording_dump, mo
     # The activation 'a' (seq_len, 2048) is the masked-M operand. Its staged
     # cooperative load must clamp the M coord to < seq_len, falling back to
     # seq_len - 1 — both referencing the runtime symbol, not a literal.
-    assert "&a[" in src, f"activation 'a' should be staged (cooperative load present):\n{src}"
+    assert "a_smem" in src, f"activation 'a' should be staged (smem slab present):\n{src}"
     assert "< seq_len) ?" in src, f"masked cooperative load missing runtime-extent clamp ternary:\n{src}"
     assert "seq_len - 1" in src, f"masked clamp should fall back to seq_len - 1:\n{src}"
 

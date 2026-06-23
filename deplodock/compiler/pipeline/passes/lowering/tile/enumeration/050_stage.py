@@ -30,10 +30,37 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, STAGE
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 PATTERN = [Pattern("root", TileGraphOp)]
+
+
+def _slab_bytes(graph, ranked) -> dict[str, int]:
+    """Smem bytes ``assemble`` would allocate per staged buffer's slab — the budget
+    the auto-enumerated fork ranks against. Each buffer's slab is independent of which
+    others stage, so size them once from the all-staged ``prospective_sources``
+    (the byte count matches ``KernelOp.smem_bytes`` exactly — the slab is
+    ``∏(cache_extent · block) · dtype.nbytes``, pre-padding). A buffer whose source
+    can't be sized (an exotic non-affine layout) is omitted ⇒ treated as free, so the
+    filter never removes a staging it can't price (preserves the legacy offer)."""
+    full = replace(graph, schedule=replace(graph.schedule, staged={e: Transport.SYNC for e in ranked}))
+    try:
+        sources = prospective_sources(full)
+    except Exception:  # noqa: BLE001 — best-effort sizing; fall back to no filter
+        return {}
+    out: dict[str, int] = {}
+    for s in sources:
+        block = getattr(s.addressing, "block", ()) or ()
+        elems = 1
+        for i, ax in enumerate(s.cache_axes):
+            if not ax.extent.is_static:
+                break
+            elems *= ax.extent.as_static() * (block[i] if block else 1)
+        else:
+            out[s.buf] = elems * (s.dtype.nbytes if s.dtype else 4)
+    return out
 
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
@@ -50,10 +77,28 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
         raise RuleSkipped("no stageable read-sites (pointwise / no reuse / no K-tower)")
 
     # Env pin (``DEPLODOCK_STAGE=11`` / ``all`` / ``none``) collapses the fork to one
-    # mask; otherwise offer every subset, most-staged-first (option-0 = stage all,
-    # best when smem fits — matches the search's prefer-deeper-first heuristic).
+    # mask and is authoritative (no budget filter); otherwise offer every subset,
+    # most-staged-first (option-0 = stage the most, best when smem fits — matches the
+    # search's prefer-deeper-first heuristic).
     raw = STAGE.raw()
-    masks = [STAGE.parse(raw, width=n)] if raw else sorted(range(1 << n), key=lambda m: (-bin(m).count("1"), m))
+    if raw:
+        masks = [STAGE.parse(raw, width=n)]
+    else:
+        # Budget-aware: drop any subset whose slabs exceed the smem cap so greedy's
+        # option-0 deterministically picks the largest IN-BUDGET staging (mask 0 = no
+        # staging always fits → never empty). Without this the deterministic compile
+        # would pick stage-all and fail downstream with no fallback when a large pinned
+        # tile over-stages (the multi-accum / masked linear-projection case).
+        budget = ctx.max_dynamic_smem if ctx is not None else None
+        buf_bytes = _slab_bytes(op.tilegraph, ranked)
+
+        def _fits(m: int) -> bool:
+            if budget is None:
+                return True
+            total = sum(buf_bytes.get(e.buffer, 0) for i, e in enumerate(ranked) if m & (1 << i))
+            return total <= budget
+
+        masks = [m for m in sorted(range(1 << n), key=lambda m: (-bin(m).count("1"), m)) if _fits(m)]
 
     out: list[TileGraphOp] = []
     for mask in masks:
