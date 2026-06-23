@@ -394,58 +394,56 @@ def test_clean_divisor_n_uses_blocked_thread_major_decode(recording_dump):
 
 
 def test_hoist_refuses_lift_when_pipeline_reads_guarded_defs():
-    """021's lift is refused when a hoisted K-pipeline reads an SSA name
-    defined by a stmt staying inside the boundary Cond (the fused-prologue
-    shape: a matmul consuming the rsqrt of its row stats). Hoisting would
-    order the consumer above its definition — undefined identifier at
-    render. The Cond is left intact instead (defense-in-depth: the planner
-    doesn't emit liftable masked prologue Conds today)."""
-    import importlib
-
+    """``assembly/_slab._hoist_masked``'s lift is refused when a hoisted K-tower
+    reads an SSA name defined by a stmt staying inside the boundary ``Cond`` (the
+    fused-prologue shape: a matmul consuming the rsqrt of its row stats). Hoisting
+    would order the consumer above its definition — undefined identifier at render
+    — so ``_hoist_masked`` returns ``None`` and the caller falls back to the plain
+    in-place wrap (the ``Cond`` stays intact). Defense-in-depth: the planner doesn't
+    emit liftable masked prologue Conds today (static-K prologue kernels stay
+    degenerate, symbolic-K ones never stage)."""
+    from deplodock.compiler.dtype import F32
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load
-    from deplodock.compiler.ir.tile.ir import AffineAddressing, Source, StageBundle, StagePolicy
+    from deplodock.compiler.ir.stmt import Accum, Assign, Body
+    from deplodock.compiler.ir.tile.ir import Buffer, SerialTile
+    from deplodock.compiler.pipeline.passes.lowering.tile.assembly import _slab
 
-    hoist = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.021_hoist_staged_loads_above_mask")
+    cache_axes = {"a5": Axis("a5", 64)}
+    staged_bufs = frozenset({"w"})
+    buffers = {"w": Buffer(name="w", shape=(Dim(64),), dtype=F32)}
+    write = Write(output="o", index=(Var("m"),), values=("acc",))
 
-    src = Source(
-        name="w_smem",
-        buf="w",
-        cache_axes=(Axis("a5", 64),),
-        origin=(Literal(0, "int"),),
-        addressing=AffineAddressing(dims=(0,)),
-    )
-    # The staged pipeline consumes ``scale`` — defined by the Assign that
-    # stays inside the Cond (it is not a K-pipeline stmt).
-    pipeline = StageBundle(
-        sources=(src,),
+    # The staged K-tower (``serial_outer`` → wrapped in a ``StageBundle`` by
+    # ``_wrap_k_body``) consumes ``scale`` — defined by the Assign that stays
+    # inside the Cond (it is not a K-pipeline stmt).
+    ktower = SerialTile(
+        axis=Axis("a2", 4),
         body=Body(
             (
-                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Load(name="wv", input="w", index=(Var("a5"),)),
                 Assign(name="prod", op=ElementwiseImpl("multiply"), args=("wv", "scale")),
                 Accum(name="acc", value="prod"),
             )
         ),
-        policy=StagePolicy.SYNC,
+        kind="serial_outer",
     )
     scale_def = Assign(name="scale", op=ElementwiseImpl("rsqrt"), args=("stat",))
-    write = Write(output="o", index=(Var("m"),), value="acc")
-    cond = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((scale_def, pipeline, write)))
+    cond = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((scale_def, ktower, write)))
 
-    out = hoist._lift_if_match(cond, {"w": (64,)})
-    assert out is cond, "lift must be refused — the pipeline reads 'scale' defined inside the Cond"
+    out = _slab._hoist_masked((cond,), staged_bufs, cache_axes, buffers, frozenset())
+    assert out is None, "lift must be refused — the hoisted K-tower reads 'scale' defined inside the Cond"
 
-    # Same shape without the dependency lifts normally.
-    indep_pipeline = StageBundle(
-        sources=(src,),
+    # Same shape without the dependency lifts normally (K tower above, residual Cond below).
+    indep = SerialTile(
+        axis=Axis("a2", 4),
         body=Body(
             (
-                Load(name="wv", input="w_smem", index=(Literal(0, "int"),)),
+                Load(name="wv", input="w", index=(Var("a5"),)),
                 Accum(name="acc", value="wv"),
             )
         ),
-        policy=StagePolicy.SYNC,
+        kind="serial_outer",
     )
-    cond2 = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((indep_pipeline, write)))
-    out2 = hoist._lift_if_match(cond2, {"w": (64,)})
-    assert isinstance(out2, tuple) and len(out2) == 2, "independent pipeline must still lift (bundle above, residual Cond below)"
+    cond2 = Cond(cond=BinaryExpr("<", Var("m"), Var("seq_len")), body=Body((indep, write)))
+    out2 = _slab._hoist_masked((cond2,), staged_bufs, cache_axes, buffers, frozenset())
+    assert out2 is not None and len(out2) == 2, "independent K-tower must still lift (tower above, residual Cond below)"

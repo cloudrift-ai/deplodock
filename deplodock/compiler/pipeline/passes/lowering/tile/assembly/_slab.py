@@ -380,6 +380,18 @@ def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma
     rest = tuple(s for s in wrapped if not _is_k_stmt(s))
     if not k_part:
         return None
+    # SSA-dependency safety: refuse the lift when a hoisted K-tower stmt reads a
+    # name defined by a stmt staying inside the ``Cond`` (the fused-prologue shape
+    # — e.g. a matmul consuming the rsqrt of its row stats). Hoisting would order
+    # the consumer ABOVE its definition (undefined identifier at render). Leaving
+    # the ``Cond`` intact (caller falls back to the in-place wrap) keeps the body
+    # well-formed. Defense-in-depth: the planner doesn't emit liftable masked
+    # prologue ``Cond``s today (static-K prologue kernels stay degenerate,
+    # symbolic-K ones never stage), but a future planner change / exotic pin could.
+    k_reads = {name for s in k_part for st in Body((s,)).iter() for name in st.deps()}
+    rest_defs = {name for s in rest for st in Body((s,)).iter() for name in st.defines()}
+    if k_reads & rest_defs:
+        return None
     extents = _input_extents(buffers)
     k_part = tuple(_stamp_gmem_extents(s, extents) for s in k_part)
     return (*k_part, Cond(cond=cond.cond, body=Body(rest), else_body=()))

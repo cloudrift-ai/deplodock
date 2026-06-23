@@ -81,11 +81,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     # - test_unstaged_atom_lowers_gmem_direct needs the staging-DECLINE heuristic for
     #   the atom tier (an unstageable atom operand must drop its STAGE edge so
     #   005_lower_atom_tile lowers it gmem-direct), independent of the masked clamp.
-    # - test_hoist_refuses_lift_when_pipeline_reads_guarded_defs imports the deleted
-    #   021 pass and must be REWRITTEN against assembly/_slab._hoist_masked's
-    #   SSA-safety check (the fused-prologue lift refusal).
+    # test_hoist_refuses_lift_when_pipeline_reads_guarded_defs — LANDED: rewritten
+    # against assembly/_slab._hoist_masked's SSA-safety check (the fused-prologue
+    # lift refusal — a hoisted K-tower reading a name defined inside the Cond
+    # refuses the lift), de-quarantined.
     "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": "R4",
-    "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs": "R4",
     # R5 transport landed, but this test's real blocker is the fused norm+linear
     # (RmsNorm prologue + matmul) scalar regime — its 'y' LoopOp doesn't lower yet
     # (the fused-prologue tier, R7 test_fused_rmsnorm_linear_blocked_prologue). The
