@@ -121,7 +121,6 @@ legitimate runtime read, not an unmodeled scope — see ``dim_names`` below.
 
 from __future__ import annotations
 
-import importlib
 from dataclasses import dataclass, replace
 from string import ascii_lowercase
 from typing import TYPE_CHECKING
@@ -137,6 +136,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Wr
 from deplodock.compiler.ir.stmt.body import Cone
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
 from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
@@ -552,13 +552,10 @@ def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id:
     frag.outputs = [cons_id]
 
     # Every new body differs from the fused one — restamp the structural
-    # identity (992 ran at fusion end and never re-runs; stale S_* would make
-    # the split kernels featurize as the fused kernel for the learned prior).
-    feats = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
+    # identity (the stamp pass ran at fusion end and never re-runs; stale S_*
+    # would make the split kernels featurize as the fused kernel for the prior).
     for nid in (*xn_ids, cons_id):
-        op = frag.nodes[nid].op
-        op.knobs = {k: v for k, v in op.knobs.items() if not k.startswith("S_")}
-        op.knobs.update(feats.structure_features(op.body, frag))
+        restamp_structural_features(frag.nodes[nid].op, frag)
     return frag
 
 

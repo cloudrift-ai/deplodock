@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler import provenance
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.loop.stamp._stamp import name_for_loop
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -29,5 +29,4 @@ PATTERN = [Pattern("root", LoopOp)]
 def rewrite(match: Match, root: Node) -> LoopOp | None:
     if root.op.name:
         raise RuleSkipped("LoopOp already named")
-    name = provenance.name_for(root.op, root.id, provenance.get(root), provenance.totals(match.graph))
-    return replace(root.op, name=name)
+    return replace(root.op, name=name_for_loop(root.op, root, match.graph))

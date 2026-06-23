@@ -1,5 +1,5 @@
 """Unit tests for structural feature extraction
-(``loop/stamp/020_stamp_structural_features.structure_features``).
+(``loop/stamp/_stamp.structure_features``).
 
 Hand-built ``Body`` fixtures (same style as ``tests/compiler/ir/stmt/
 test_structural_key.py``) exercise the skeleton histogram, the extent-free
@@ -9,8 +9,6 @@ attention-like) through the loop passes and checks the stamped features.
 """
 
 from __future__ import annotations
-
-import importlib
 
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph
@@ -23,11 +21,8 @@ from deplodock.compiler.ir.stmt.blocks import Loop
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
 from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
+from deplodock.compiler.pipeline.passes.loop.stamp._stamp import structure_features
 from deplodock.compiler.tensor import Tensor
-
-# ``structure_features`` lives in the stamp pass (loaded under a bare stem).
-_stamp = importlib.import_module("deplodock.compiler.pipeline.passes.loop.stamp.020_stamp_structural_features")
-structure_features = _stamp.structure_features
 
 
 def _rms_body(ext_i: int = 8, ext_k: int = 64) -> Body:
