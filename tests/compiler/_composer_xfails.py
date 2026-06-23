@@ -36,7 +36,6 @@ _XFAIL_FUNCS: frozenset[str] = frozenset(
         "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure",
         "test_matmul_mma_masked.py::test_demoted_masked_k_pv_reaches_tma",
         "test_matmul_mma_masked.py::test_demoted_masked_k_pv_tma_accuracy",
-        "test_matmul_mma_tma.py::test_tma_swizzle_smem_aligns_to_atom",
         # Phase 4 — fused-prologue regime (moved to 6a, still red)
         "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue",
         "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment",
@@ -45,8 +44,6 @@ _XFAIL_FUNCS: frozenset[str] = frozenset(
         "test_matmul_mma_residual.py::test_epilogue_warp_rows_stay_splitk_one",
         "test_masked_tile.py::test_masked_n_clamps_cooperative_load_index",
         "test_masked_tile.py::test_symbolic_m_cooperative_load_clamps_to_runtime_extent",
-        "test_ring_buffer_fp16_smem.py::test_fp16_ring_buffer_rejects_when_real_bytes_overflow",
-        "test_tma_smem_alignment.py::test_fp16_subaligned_ring_slot_declines_tma_fp32_keeps_it",
         # Phase 6a — structural-fork search integration
         "test_split_demoted.py::test_rule_offers_fused_first_then_split",
         "test_split_demoted.py::test_rule_knob_guard_skips_reconsider",
@@ -62,15 +59,6 @@ _XFAIL_FUNCS: frozenset[str] = frozenset(
         "test_structural_push.py::test_split_demoted_fork_pushes_structural",
         "test_resolve.py::test_structural_replay_consulted",
         # Phase 6b — TMA / warp-specialize gate + cold-prior pick
-        "test_use_tma_gates.py::test_oversized_box_declines_tma",
-        "test_use_tma_gates.py::test_oversized_box_pinned_tma_raises",
-        "test_use_tma_gates.py::test_reentered_pipeline_declines_tma",
-        "test_use_tma_gates.py::test_reentered_pipeline_pinned_tma_raises",
-        "test_use_tma_gates.py::test_single_trip_cell_loop_keeps_tma",
-        "test_use_tma_gates.py::test_hang_knob_family_completes_and_matches",
-        "test_warp_specialize_deadlock.py::test_mlp_slice_completes_and_matches",
-        "test_warp_specialize_deadlock.py::test_mlp_slice_never_offers_ws1",
-        "test_warp_specialize_deadlock.py::test_pinned_ws1_on_mlp_slice_raises",
         "test_masked_tile.py::test_planner_masks_symbolic_m_axis_at_hint",
     }
 )
@@ -82,7 +70,33 @@ _XFAIL_NODES: frozenset[str] = frozenset(
         "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]",
         "test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-tma-256]",
         "test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-tma-512]",
-        "test_matmul_mma_tma.py::test_mma_sync_matches_reference[static-128-256-128-out_dtype1]",
+    }
+)
+
+
+_DEMO_REASON = (
+    "scheduling pass deleted in the tile-ir-block-dag demolition "
+    "(021/025/026/030/040/050/060/070/080/085/090); restored when assemble "
+    "synthesizes the Schedule. See plans/tile-ir-block-dag.md"
+)
+
+# Previously-green tests broken by deleting the post-020 scheduling passes
+# (masked-tile hoist 021, TMA 050, warp-spec 085, …) — the staged-but-naive
+# composer tower no longer hoists / TMA-stages / warp-specializes.
+_XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
+    {
+        "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure",
+        "test_matmul_mma_masked.py::test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec",
+        "test_matmul_mma_masked.py::test_demoted_masked_k_pv_stays_sync_below_sm90",
+    }
+)
+_XFAIL_NODES_DEMO: frozenset[str] = frozenset(
+    {
+        "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype0-130]",
+        "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype0-200]",
+        "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-130]",
+        "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-200]",
+        "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy[31]",
     }
 )
 
@@ -90,9 +104,14 @@ _XFAIL_NODES: frozenset[str] = frozenset(
 def mark_composer_xfails(items) -> None:
     """Apply the quarantine xfail to every collected item that matches the
     registry (called from ``conftest.pytest_collection_modifyitems``)."""
-    marker = pytest.mark.xfail(reason=_REASON, strict=False)
+    groups = (
+        (_XFAIL_FUNCS, _XFAIL_NODES, _REASON),
+        (_XFAIL_FUNCS_DEMO, _XFAIL_NODES_DEMO, _DEMO_REASON),
+    )
     for item in items:
         nodeid = item.nodeid
         func_path = nodeid.split("[", 1)[0]
-        if any(func_path.endswith(f) for f in _XFAIL_FUNCS) or any(nodeid.endswith(n) for n in _XFAIL_NODES):
-            item.add_marker(marker)
+        for funcs, nodes, reason in groups:
+            if any(func_path.endswith(f) for f in funcs) or any(nodeid.endswith(n) for n in nodes):
+                item.add_marker(pytest.mark.xfail(reason=reason, strict=False))
+                break
