@@ -89,6 +89,16 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_masked.py::test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec",
         "test_matmul_mma_masked.py::test_demoted_masked_k_pv_stays_sync_below_sm90",
         "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs",
+        # Cooperative-reduce regime deleted (coop builder gone).
+        "test_reduction_rules.py::test_long_axis_sum_fires_cooperative_reduce",
+        "test_reduction_rules.py::test_warp_sized_axis_fires_cooperative_reduce",
+        "test_reduction_rules.py::test_warp_cooperative_skips_stage_inputs",
+        "test_reduction_rules.py::test_warp_cooperative_emits_warpshuffle",
+        "test_reduction_rules.py::test_block_cooperative_emits_hierarchical_reduce",
+        "test_reduction_rules.py::test_block_cooperative_skips_stage_inputs",
+        # Split-K residual / atomic-free (015/017) deleted.
+        "test_merge_split_glue.py::test_outer_terminal_matches_greedy_kernel_count",
+        "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural",
     }
 )
 _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
