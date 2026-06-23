@@ -370,8 +370,8 @@ Concrete pass list — pipeline order *is* decision order:
 | `tile/stage`            | enum (schedule)   | `stage`, `hoist`                     | `staged`, `scope`              | `020`/`021`/`026`/`030`               |
 | `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`       | `040`/`080`                           |
 | `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                 | `050`/`060`                           |
-| `tile/warp_spec`        | enum (fork)       | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
-| `tile/swizzle`          | enum (fork)       | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
+| `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
+| `tile/swizzle`          | enum (schedule)   | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
 | `tile/assemble`         | **materialize**   | apply `Schedule` → basic tower       | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
 | `tile/peel`             | **det. (post)**   | pipeline σ-peel from `ring_depth`    | KernelOp serial nest           | `080`                                 |
 | `tile/mask_order`       | **det. (post)**   | cooperative load above mask `Cond`   | KernelOp masked tile           | `021`                                 |
@@ -411,9 +411,11 @@ in enumeration even though it is a "local."
 **This maps straight onto the two-level MCTS.** The body-vs-schedule split is *orthogonal* to outer-vs-inner; the MCTS
 boundary is *kernel-set-changing*. The kernel-set-changing enumeration passes (`partition_reduce` across CTAs, the
 `005_split_demoted` cut at the partition head) branch the **outer** tree — one terminal per kernel set — while every
-other enumeration pass branches the **inner** per-kernel tree. `assemble` sits below both: the inner search's reward is
-`assemble`→cuda→bench of one leaf, summed per op for the outer reward. The inner search already chains `Fork`s across
-sequential per-kernel lowering passes for one kernel, so it consumes this pass list with no engine change.
+other enumeration pass branches the **inner** per-kernel tree. The deterministic materialization stage sits below both:
+the inner search's reward is `assemble`→(`peel`/`mask_order`/`pad`/`unroll`)→cuda→bench of one leaf, summed per op for
+the outer reward. Because the post-passes carry no fork, they add **zero** nodes to either tree — they are part of
+evaluating a leaf, not part of the search. The inner search already chains `Fork`s across sequential per-kernel forks for
+one kernel, so it consumes this pass list with no engine change.
 
 **Knob-deltas are preserved.** Each *fork* still stamps its knob-delta onto the `Fork`
 (`{RING:2}`, `{TMA:1}`, the `BM/BN/FM/FN` tile knobs) — the variant identity the perf DB and learned prior key on. What
@@ -617,9 +619,10 @@ the whole tile phase.
    coalescing; split-/cooperative-K become the combine-block move. → byte-identical.
 4. **Port `retime` + `promote_transport` + `specialize_warps`** — `040`/`080`/`050`/`060`/`085` become Schedule
    annotations; their tree surgery moves into `assemble`. → byte-identical, then perf-equal under tune.
-5. **Port the locals + `atomize`** and retire the tower builders. End state = the pass list in "The pass structure":
-   deterministic `tile/build` → the enumeration passes (`tensorize` / `partition_reduce` / `register_tile` / `stage` /
-   `retime` / `transport` / `warp_spec` / `locals`) → one `tile/assemble`.
+5. **Port `swizzle` + `atomize`** (the remaining forks) and the fixed-logic locals, then retire the tower builders. End
+   state = the pass list in "The pass structure": deterministic `tile/build` → the enumeration forks (`tensorize` /
+   `partition_reduce` / `register_tile` / `stage` / `retime` / `transport` / `warp_spec` / `swizzle`) → one
+   `tile/assemble` → the deterministic post-passes (`peel` / `mask_order` / `pad` / `unroll`).
 
 The DAG and the tree can coexist through 1–4: the composer builds the DAG, `assemble` lowers to the *current* tower, and
 the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.
@@ -627,8 +630,8 @@ the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.
 **Status (branch `feature/tile-ir-block-dag`).** Steps 1–2 are done: `assemble_block` lowers pointwise + scalar/warp
 matmul + cooperative reduce byte-identically (`build_dag.py` → `assemble.py`), the legacy pointwise/matmul materializers
 are deleted, and the 11 tower-rewrite scheduling passes (`021`–`090`) have been **deleted up front** to clear the deck —
-they are the predecessors the `tile/stage` … `tile/locals` enumeration passes are reborn from, not yet reimplemented as
-`Schedule` moves. The staging regimes (warp MMA / coop / flash) still ride `materialize.py`'s tower builders in the
+they are the predecessors the `tile/stage` … `tile/swizzle` enumeration forks + the `peel` / `mask_order` / `pad` /
+`unroll` deterministic post-passes are reborn from, not yet reimplemented. The staging regimes (warp MMA / coop / flash) still ride `materialize.py`'s tower builders in the
 interim. Next is steps 3–5: stand up the enumeration passes over the tile node and grow `assemble`'s `Schedule`-driven
 synthesis to subsume them.
 

@@ -138,6 +138,13 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_strided_coop_rows.py",  # strided cooperative reduce
         "test_stage_inputs_mma_probe.py",  # 020 staging probe (pass deleted)
         "test_run.py",  # CLI compile/run of RMSNorm/softmax/SDPA/IR-stages (coop/flash/staging)
+        "test_flash_attention.py",  # fused flash (deleted)
+        "test_flash_cooperative_kv.py",  # flash + cooperative KV (deleted)
+        "test_cooperative_combine.py",  # cooperative reduce combine (deleted)
+        "test_masked_cooperative_reduce.py",  # masked cooperative reduce (deleted)
+        "test_mma_atomic_free_splitk.py",  # 017 atomic-free split-K + warp (deleted)
+        "test_attention_chains.py",  # attention (SDPA/flash) chains (deleted)
+        "test_split_demoted.py",  # demoted-split CUDA accuracy (warp/coop/split-K paths deleted)
     }
 )
 
