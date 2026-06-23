@@ -87,39 +87,51 @@ _XFAIL_FUNCS: dict[str, str] = {
     # against assembly/_slab._hoist_masked's SSA-safety check (the fused-prologue
     # lift refusal — a hoisted K-tower reading a name defined inside the Cond
     # refuses the lift), de-quarantined.
-    # R5 transport landed, but this test's real blocker is the fused norm+linear
-    # (RmsNorm prologue + matmul) scalar regime — its 'y' LoopOp doesn't lower yet
-    # (the fused-prologue tier, R7 test_fused_rmsnorm_linear_blocked_prologue). The
-    # TMA-decline it nominally guards is moot until the kernel lowers at all.
-    "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment": "R7",
-    # R6
-    "test_flash_attention.py::test_flash_off_keeps_decomposition": "R7",
-    "test_attention_chains.py::test_full_self_attn_tinyllama": "R6",
-    "test_attention_chains.py::test_full_self_attn_tinyllama_seq512": "R6",
-    "test_attention_chains.py::test_qkv_attn_no_rope": "R6",
-    "test_attention_chains.py::test_sdpa_explicit_additive_mask": "R6",
-    # R7
+    # test_norm_linear_fp16_scalar_reduce_tma_alignment de-quarantined: the fused
+    # norm+linear (RmsNorm prologue + matmul) now force-splits via tile/split/
+    # 005_split_demoted (the demoted matmul's RMSNorm cone un-fuses into an xn producer
+    # + a clean gemm), so its kernel lowers and the TMA-alignment assertion fires.
+    # R6 — score-materializing SDPA landed (tile/split/005_split_demoted): the fused
+    # softmax-prologue + P@V LoopOp (k_sdpa_reduce) un-fuses into a softmax-normalizing
+    # xn producer + a clean (symbolic-K) gemm consumer, both of which lower. The
+    # forced-split path (the fused form has no fused-prologue regime to keep) recovered
+    # test_ops_vs_torch sdpa[cuda]/causal/gqa, test_tune_accuracy[sdpa], the four
+    # test_run sdpa rows, and test_attention_chains qkv_attn_no_rope /
+    # sdpa_explicit_additive_mask (all de-quarantined).
+    # test_flash_off_keeps_decomposition de-quarantined: the FLASH-off SDPA now lowers
+    # via the split (scores + softmax xn producer + gemm = 3 kernels), so the
+    # "score-materializing multi-kernel path is kept" assertion (len(kernels) > 1) holds
+    # — exactly the score-materializing decomposition the test guards, now lowerable.
+    # Still quarantined: the o_proj collapsed-attn-out read (a K-folded TEMPLATE Load)
+    # hits the segmented-K staging tier (`TEMPLATE slabs are not in R1 scope`), a
+    # separate blocker from the SDPA split — re-tagged R7.
+    "test_attention_chains.py::test_full_self_attn_tinyllama": "R7",
+    "test_attention_chains.py::test_full_self_attn_tinyllama_seq512": "R7",
+    # R7 — analytic / prior / structural-search tiers
     "test_analytic.py::test_pick_matmul_lands_in_geometry_band": "R7",
     "test_analytic.py::test_pick_matmul_warp_dispatch_by_dtype": "R7",
     "test_block.py::test_qwen_block_accuracy": "R7",
-    "test_dynamic_shapes.py::test_qwen_layer_dynamic_compiles_and_matches_eager": "R7",
-    "test_dynamic_shapes.py::test_qwen_whole_model_capture_replay_cache_matches_eager": "R7",
-    "test_dynamic_shapes.py::test_qwen_whole_model_dynamic_compiles_and_matches_eager": "R7",
+    # The three qwen-dynamic tests de-quarantined: the whole-model / layer SDPA now
+    # lowers via tile/split/005_split_demoted (incl. the symbolic-seq P@V), so the
+    # dynamic compile + capture-replay paths match eager.
     "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
     "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": "R7",
     "test_resolve.py::test_structural_replay_consulted": "R7",
     "test_resolve.py::test_trace_records_partition_fork": "R7",
-    # test_run.py: the fp16-matmul-window + sdpa kernels stay quarantined (R7 matmul
-    # window / R6 sdpa); the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2).
+    # test_run.py: the fp16-matmul-window kernel stays quarantined (R7 matmul window);
+    # the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2). The four sdpa rows
+    # (k_chunked / seq1024_dynamic_smem / tinyllama_full / tinyllama_per_head)
+    # de-quarantined under R6 — the tile/split/005_split_demoted cut lowers them.
     # The R4 scalar pin-honoring recovered test_run_code_fp16_matmul_window_accuracy's
     # [4]/[8] params (a window-pinned fp16 matmul now honors its tile knobs); the [2]
     # param still hits a separate fp16 nvcc codegen failure (R7), so it stays a node
     # entry below.
     "test_run.py::test_compile_fp16_matmul_window_emits_half2": "R7",
-    "test_run.py::test_run_code_sdpa_k_chunked": "R7",
-    "test_run.py::test_run_code_sdpa_seq1024_dynamic_smem": "R7",
-    "test_run.py::test_run_code_sdpa_tinyllama_full": "R7",
-    "test_run.py::test_run_code_sdpa_tinyllama_per_head": "R7",
+    # test_split_demoted_fork_pushes_structural stays R7: the keep-vs-split FORK needs
+    # the keep-fused option to be lowerable (a fused-prologue regime), which the new
+    # classifier lacks — so the SDPA-style split is FORCED (single option, no fork) and
+    # the structural-fork-branching tests (this + the test_two_level / test_resolve
+    # structural ones) still need the R7 fused-prologue regime to offer both branches.
     "test_structural_push.py::test_split_demoted_fork_pushes_structural": "R7",
     "test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": "R7",
     "test_two_level.py::test_identical_offer_sites_take_the_same_side": "R7",
@@ -134,11 +146,9 @@ _XFAIL_NODES: dict[str, str] = {
     # R5 — landed (warp-tier promote_transport + TMA ring/swizzle/peel synthesis,
     # incl. masked-tile TMA staging via the mask_order hoist): static + dynamic
     # test_pinned_transport_and_shape_fire de-quarantined.
-    # R6
-    "test_ops_vs_torch.py::test_sdpa[cuda]": "R6",
-    "test_ops_vs_torch.py::test_sdpa_causal[cuda]": "R6",
-    "test_ops_vs_torch.py::test_sdpa_gqa[cuda]": "R6",
-    "test_tune_accuracy.py::test_tuned_variant_matches_reference[sdpa]": "R6",
+    # R6 — score-materializing SDPA landed (tile/split/005_split_demoted): test_sdpa
+    # [cuda] / sdpa_causal[cuda] / sdpa_gqa[cuda] + test_tune_accuracy[sdpa]
+    # de-quarantined (the softmax+P@V un-fuses into xn producer + clean gemm).
     # R7
     "test_block.py::test_tinyllama_block_accuracy[cuda]": "R7",
     # Only the [2] window param still fails (fp16 nvcc codegen); [4]/[8] recovered

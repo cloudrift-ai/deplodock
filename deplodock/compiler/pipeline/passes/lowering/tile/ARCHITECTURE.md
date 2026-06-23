@@ -1,8 +1,19 @@
 # Tile lowering — enumeration + assembly over the block-DAG IR
 
-The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **two passes** over the block-DAG Tile IR
+The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **three passes** over the block-DAG Tile IR
 (`ir/tile/ir.py`), following `plans/tile-ir-block-dag.md`:
 
+- **`split/`** — the **pre-build structural-fork head** (R7 `005_split_demoted`). Runs FIRST, on the still-un-tiled
+  `LoopOp`, and may un-fuse a **demoted matmul** (a multiply operand reading a computed / K-folded cone instead of a
+  plain `Load` — fusion merged a producer chain into the matmul reduce, killing the warp tier) into a producer/consumer
+  kernel set: an `xn` operand-materialization producer beside a clean gemm consumer, returned as a `Graph` fragment the
+  engine splices (a kernel-set change → the **outer** two-level tree). The familiar instance is the **score-materializing
+  SDPA**: the fused softmax-prologue + P@V `k_sdpa_reduce` un-fuses into a softmax-normalizing `xn` producer + a clean
+  (static **or** symbolic-K) gemm consumer that both lower. When the fused form has a regime to keep (`classify`
+  non-None) it offers a `SPLIT_CONE` keep-vs-split fork; when it does not (the SDPA / fused-prologue shape the classifier
+  declines) it **forces** the split (single option). The cut names its products inline and `_assemble_fragment`
+  re-stamps the `S_*` structural features (the cut runs after `loop/stamp`, so the fragments don't re-flow through it).
+  See `_split_demoted.py`.
 - **`enumeration/`** — `LoopOp` → a generative `Fork` tree over a **stored algorithm refined in place by incremental
   body moves** (F3-b): `000_build` seeds a *logical* (un-tiled) `TileGraph`, then each fork rewrites it move by move.
   This is the **search**: every variant is a point in the move/schedule space. It is split into **per-family rule
@@ -25,9 +36,9 @@ The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **two pa
   search here.
 
 ```
-                          ┌─ scalar: reduce_decomp ─(thread)─ free_tile ─ 040_seal ─┐
-LoopOp ─000_build─▶ logical TileGraph ─005_tensorize┤─ coop:   015_coop_reduce (coop_build) ──┼─ 050_stage ─ 052_transport ─▶ tiled TileGraphOp ─010_assemble ─ 020_peel ─▶ TileOp
-                          └─ warp:   006/008 geom+reg ─ 009_warp_build (atomize) ───┘
+              ┌─ split? (xn producer + clean gemm)        ┌─ scalar: reduce_decomp ─(thread)─ free_tile ─ 040_seal ─┐
+LoopOp ─split─┤                              ─000_build─▶ logical TileGraph ─005_tensorize┤─ coop: 015_coop_reduce (coop_build) ─┼─ 050_stage ─ 052_transport ─▶ tiled TileGraphOp ─010_assemble ─ 020_peel ─▶ TileOp
+              └─ keep fused ─────────────────▶            (per LoopOp)         └─ warp: 006/008 geom+reg ─ 009_warp_build ───────┘
 ```
 
 ## The block-DAG Tile IR (`ir/tile/ir.py`)
@@ -73,6 +84,13 @@ The only algebra-*conditioned* heuristic is a **ranking** cost model, not a code
 bandwidth-biased for a `MAP` nest (`map_reg_offers`) and compute/ILP-biased for a reduce regime (`reduce_reg_offers`).
 This is the tile-phase instance of the global rule in [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) — *No
 shape-specific pattern matching.*
+
+## `split/` — pre-build structural forks
+
+| Module | Role |
+| ------ | ---- |
+| `005_split_demoted.py` | Fork (**structural**, R7): the `SPLIT_CONE` keep-vs-split offer on a demoted matmul `LoopOp`. Returns the keep-fused op + the split `Graph` when `classify` keeps the fused form, or **forces** the split `Graph` when it does not (the SDPA / fused-prologue shape). Idempotent (`SPLIT_CONE` guard). Runs before `enumeration/000_build` on the un-tiled body. |
+| `_split_demoted.py`    | `try_split_demoted` — the cut: classify the body into `(leading, rows, prologue, outer_n, k_loop)`, backward-slice each computed/K-folded multiply-operand cone, build one `xn` producer per cone class + the rebuilt consumer (+ per-accum `mm_i` gemms for a multi-accum cell), wired into a `Graph` fragment by `_assemble_fragment` (which re-stamps `S_*` structural features). Self-contained; reuses `kernel/_helpers` (`is_matmul_reduce` / `segmentable_k_extent`) + `Body.backward_cone` / `defs_die_at`. |
 
 ## `enumeration/` — the move composer
 

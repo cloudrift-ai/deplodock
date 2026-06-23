@@ -875,14 +875,28 @@ never a tree-builder.
   already carries `combine_states` / `state_b`). `017_flash` enumerates `flash_br_offers × thread_offers`, budgets the
   free thread tile by `BR`, and filters the free×BR layout via `flash_coop_geometry_ok` (whole-CTA tree vs strided
   intra-warp segment). Default `BR=1` keeps the serial-KV form (opt-in via `DEPLODOCK_BR`; symbolic KV stays serial).
-  *Recovered:* `test_flash_cooperative_kv.py` (4 cases, accuracy vs torch SDPA). *Deferred (still quarantined, R7-gated
-  — they share the fused-prologue / `005_split_demoted` structural-split tier, not a flash patch):* the **score-
-  materializing SDPA decomposition** (`test_ops_vs_torch.py::test_sdpa*`, `test_tune_accuracy.py::…[sdpa]`, `flash_off`
-  — FLASH-off static SDPA whose fused softmax-prologue + P@V kernel `k_sdpa_reduce` doesn't classify: it mixes `MONOID`
-  prologue reduces with a `SEMIRING` P@V matmul over one axis, the rebuilt `_classify_fused_prologue` regime R7 owns)
-  and the **RoPE-fused attention chains** (`test_attention_chains.py` — same blocker: the chains hit the static
-  score-materializing path, so their `k_sdpa_*_reduce` needs the same fused-prologue lowering, plus the RoPE-fused score
-  producer recognition).
+  *Recovered:* `test_flash_cooperative_kv.py` (4 cases, accuracy vs torch SDPA). **Score-materializing SDPA landed
+  (R6 follow-up) — `005_split_demoted` reborn.** The structural split is back as the new pre-build pass dir
+  `lowering/tile/split` (a one-rule pass before `enumeration`, run on the un-tiled `LoopOp`): `005_split_demoted` +
+  `_split_demoted` (ported from the deleted legacy, only the `_helpers` import redirected to `kernel/_helpers` and the
+  `classify`/`iter_dag` imports to `enumeration`). It un-fuses a **demoted matmul** — a multiply operand reading a
+  computed/K-folded cone — into an `xn` operand producer + a clean gemm consumer, returned as a `Graph` the engine
+  splices. For the FLASH-off SDPA the fused softmax-prologue + P@V `k_sdpa_reduce` (which mixes `MONOID` softmax-stat
+  reduces with a `SEMIRING` P@V matmul, so the new `classify` declines it) is **forced** to split into a
+  softmax-normalizing `xn` producer (a `MONOID`/pointwise that lowers) + a clean static-**or-symbolic-K** gemm consumer
+  (the masked-K mma tier), both of which lower. The cut names its products inline + `_assemble_fragment` re-stamps `S_*`
+  features (no separate post-split name/feature pass needed — those legacy `008`/`009` aliases served the `006`
+  re-fusion glue, which is a perf-only cleanup not restored). *Recovered:* `test_ops_vs_torch.py::test_sdpa[cuda]` /
+  `_causal` / `_gqa`, `test_tune_accuracy.py::…[sdpa]`, the four `test_run.py::test_run_code_sdpa_*` (incl. the dynamic
+  symbolic-K `seq1024_dynamic_smem`), `test_flash_attention.py::test_flash_off_keeps_decomposition` (FLASH-off now
+  lowers the 3-kernel decomposition it asserts), and `test_attention_chains.py::test_qkv_attn_no_rope` /
+  `test_sdpa_explicit_additive_mask`. *Still deferred (R7):* the **keep-vs-split FORK** tests
+  (`test_structural_push.py::test_split_demoted_fork_pushes_structural`, the `test_two_level` / `test_resolve`
+  structural ones) need the keep-fused branch to be lowerable — the **`_classify_fused_prologue` regime** the new
+  classifier lacks, so today the split is forced not offered; and the **full self-attention chains**
+  (`test_attention_chains.py::test_full_self_attn_tinyllama` / `_seq512`) hit a separate blocker — the o_proj collapsed
+  attn-out (a K-folded `TEMPLATE` Load) chokes the staging tier (`TEMPLATE slabs are not in R1 scope`, the segmented-K
+  gmem-direct path), plus the RoPE-fused score-producer recognition.
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
   reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
   `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
