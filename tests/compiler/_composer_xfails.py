@@ -101,6 +101,8 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural",
         # RMSNorm kernels need the cooperative-reduce regime (deleted).
         "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op",
+        # Warp-tier atom lowering (deleted).
+        "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct",
         # Reductions / softmax / RMSNorm route through the cooperative-reduce
         # regime (deleted).
         "test_dtype_cuda.py::test_fp16_max_reduction_stays_in_fp16",
@@ -117,23 +119,6 @@ _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-200]",
         "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy[31]",
         "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]",
-        # test_knob_pinning article configs that pin a deleted transport/locals
-        # feature (TMA / cp.async / pipeline / ring / pad / interleave) or a
-        # masked tile needing the deleted 021 hoist. Non-transport configs pass.
-        "test_knob_pinning.py::test_article_reproduction_configs[bm8_pin_outside_hints---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_overhang_masked---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[multisrc_tma_fm1_fn1---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[multi_axis_affine_fn4---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[multi_axis_affine_fm4_fn4---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[interleave_loads_disabled---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[article_exact_fm26_masked_tma---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_masked_cpasync---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fn26_masked_cpasync---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm4_fn4_cpasync---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_masked_tma_no_pipe---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_masked_cpasync_no_pipe---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_masked_sync_db---]",
-        "test_knob_pinning.py::test_article_reproduction_configs[fm26_masked_sync_no_pipe---]",
     }
 )
 

@@ -391,23 +391,22 @@ mask-ordering (`021`) could likewise be folded into `assemble`; they are listed 
 preference for a minimal `assemble` core with composable deterministic post-passes — the assemble/post boundary among the
 fixed-logic mechanics is a modularity choice, but **none of them is enumeration**, which is the property that matters.
 
-**Exactly one local lives *after* `assemble`: `tile/pad`.** The per-source-evidence sweep was sharper than the first cut
-here — only `pad` genuinely needs the materialized kernel. The smem slab is "only ever an assemble artifact" (the IR's
-own words), and the pad's *safety gate* keys on `assemble`-time facts: the realized vectorized-load width (`ld.shared.v4`)
-and the MMA atom-strided slab stamp (`AccessMap.block`). So `tile/pad` is a small `KernelOp`→`KernelOp` local `Fork`
-(legacy `070`, essentially unchanged), running after `assemble`, reading the slab it produced. The `Schedule.pad` field
-records the chosen knob for variant identity, but the choosing pass reads the materialized slab — `assemble` does not
-consume it.
+**`pad` and `unroll` are both `det. (post)` — and for the same reason: neither is a fork.** An earlier cut here split
+them on "does the decision read a materialized artifact" (`pad` yes, `unroll` no) and put `unroll` pre-`assemble`. That
+test is real but secondary; the governing test is the fork test, and both fail it. `070_pad_smem` computes one pad value
+from a bank-conflict *formula* (`_max_conflict` / `lane_bank_distribution`), and `090_mark_unroll` unrolls every `SERIAL`
+loop whose logical trip product is ≤ a threshold — **neither offers candidates to rank.** So both leave the search tree
+and run as deterministic post-`assemble` passes. `pad` *also* happens to need the materialized slab (its safety gate
+reads the realized `ld.shared.v4` width + the MMA atom-strided `AccessMap.block` stamp), which is why post-`assemble` is
+its *only* legal home; `unroll` could in principle compute its threshold pre-`assemble` from logical axis extents, but
+since it has no fork it belongs out of enumeration anyway, and running it on the materialized loop nest is the natural
+home for a deterministic `#pragma`-stamping pass. The `Schedule.pad` / `Schedule.unroll` fields persist the chosen value
+for variant identity, written *by* the deterministic post-pass, not consumed by `assemble`.
 
-**`unroll` and `swizzle` stay *pre*-`assemble`** — the evidence corrected the intuition that grouped `unroll` with `pad`.
-`090_mark_unroll` only ever reads **logical** `SERIAL` axis extents (`loop.axis.extent.as_static()`, a trip-count product
-vs a threshold; symbolic extents decline) — the `K_o`/`K_i` and register-tile axes that all exist in the `TileGraph`
-domain pre-`assemble`. It never consults the materialized nest, and a peeled ring loop's steady body equals one logical
-iteration, so peeling does not change the per-iteration unroll decision. It is therefore a clean `Schedule.unroll`
-annotation that `assemble` reads when it emits the loop. `swizzle` is likewise pre-`assemble`: its object — a GRID block
-and its grid axes — *is* in the IR (a blockIdx remap, no materialized detail needed); `025` even tags itself
-"Renderer-only," writing only the `grid_swizzle` field. The cut is empirical, not aesthetic: a family is post-`assemble`
-**iff its decision reads an `assemble` artifact** — `pad` does, `unroll`/`swizzle` do not.
+**`swizzle` is the one local that stays an enumeration fork.** `025_swizzle_blocks` carries a real `GROUP_M` knob with
+ranked candidates the search benches — a genuine fork — and its object (a GRID block + its grid axes) is in the IR, so it
+is a pre-`assemble` `Schedule.grid_swizzle` annotation. It is fixed-logic's opposite: a small but real choice, so it stays
+in enumeration even though it is a "local."
 
 **This maps straight onto the two-level MCTS.** The body-vs-schedule split is *orthogonal* to outer-vs-inner; the MCTS
 boundary is *kernel-set-changing*. The kernel-set-changing enumeration passes (`partition_reduce` across CTAs, the
@@ -416,22 +415,26 @@ other enumeration pass branches the **inner** per-kernel tree. `assemble` sits b
 `assemble`→cuda→bench of one leaf, summed per op for the outer reward. The inner search already chains `Fork`s across
 sequential per-kernel lowering passes for one kernel, so it consumes this pass list with no engine change.
 
-**Knob-deltas are preserved.** Each enumeration move still stamps its knob-delta onto the `Fork`
+**Knob-deltas are preserved.** Each *fork* still stamps its knob-delta onto the `Fork`
 (`{RING:2}`, `{TMA:1}`, the `BM/BN/FM/FN` tile knobs) — the variant identity the perf DB and learned prior key on. What
-changes is only the *realization*: the knob now drives a `Schedule` dict-write that `assemble` reads, instead of an eager
-tower rewrite. The prior / DB / MCTS machinery is untouched; `op_cache_key` becomes `canonical(bodies + edges) +
-Schedule` (the derived projections stay out of the key, same as `algebra_kind` today).
+changes is only the *realization*: the knob now drives a `Schedule` dict-write that the materialization stage reads,
+instead of an eager tower rewrite. A deterministic post-pass stamps its result too (`{PAD:4}`, `{UNROLL:1}`) so it joins
+the variant identity, but it is **not** a search dimension — same value for the same materialized kernel, every time. The
+prior / DB / MCTS machinery is untouched; `op_cache_key` becomes `canonical(bodies + edges) + Schedule + det-post knobs`
+(the derived projections stay out of the key, same as `algebra_kind` today).
 
-**Pass contracts.**
+**Pass contracts — three kinds.**
 
-- *Enumeration pass:* `rewrite(tile_node) -> Fork | tile_node | RuleSkipped`. Returns a `Fork` whose leaves are scheduled
-  tile nodes when the family has ≥2 legal offers; the node unchanged (or `RuleSkipped`) for 0–1; **never** a `KernelOp`.
-  Offer legality is a pure function of derived projections + the current `Schedule`; the body is read-only except for the
-  three body moves.
-- *Materialization pass:* `rewrite(tile_node) -> KernelOp | Graph[KernelOp]`. No `Fork`, no `RuleSkipped` on a
-  well-formed leaf. Must be deterministic and total. The load-bearing constraint: **if porting a regime tempts a
-  tie-break heuristic inside `assemble`, that decision belongs upstream as an enumeration move + a `Schedule` field** —
-  keeping the leaf the sole source of variant identity is what makes it cacheable and byte-identical-verifiable.
+- *Enumeration pass (genuine fork):* `rewrite(tile_node) -> Fork | tile_node | RuleSkipped`. Returns a `Fork` whose
+  leaves are scheduled tile nodes **only when the family has ≥2 ranked offers**; the node unchanged (or `RuleSkipped`)
+  for 0–1 — a one-child `Fork` is a bug, not a degenerate fork. **Never** a `KernelOp`. Offer legality is a pure function
+  of derived projections + the current `Schedule`; the body is read-only except for the three body moves.
+- *Materialization pass (`assemble`):* `rewrite(tile_node) -> KernelOp | Graph[KernelOp]`. No `Fork`, no `RuleSkipped` on
+  a well-formed leaf. Deterministic and total. The load-bearing constraint: **if porting a regime tempts a tie-break
+  heuristic, that decision belongs upstream as a fork + a `Schedule` field**, never inside the materialization stage.
+- *Deterministic post-pass (fixed-logic):* `rewrite(kernel_op) -> KernelOp`. Runs after `assemble`. **No `Fork`** — a
+  total function with no candidate to rank (a formula or a threshold). The test for landing here: *the rule has exactly
+  one output for a given kernel.* If you find yourself wanting to bench two outcomes, it is a fork and belongs pre-`assemble`.
 
 ## Pass rewrites
 
@@ -529,20 +532,20 @@ inside THREAD but outside `K_o`/`K_i`. Fold-vs-unroll is derived: a REGISTER axi
 reduce-axes ⇒ independent accumulators + fold; else plain unroll. Multiple REGISTER axes (FM×FN) compose; `assemble`
 expands in `binding` order, intra-scope order by edge topo-sort.
 
-### locals — 025 swizzle + 090 unroll (pre) + 070 pad (post)
+### locals — 025 swizzle (fork, pre) + 070 pad & 090 unroll (det., post)
 
-No body edit. Per-source evidence places two pre-`assemble` and one post — the cut is *which IR holds the object the
-offer legality reads*. **025 (pre-assemble)** → `Schedule.grid_swizzle[block]` (L2 row-group), a genuine `TileGraph`
-annotation: its object is a GRID block + its grid axes, both in the IR; gate = the GRID block's derived `Carrier` is
-matmul and it has ≥2 GRID axes; `025` tags itself "Renderer-only," and `assemble` consumes it. **090 (pre-assemble)**
-→ `Schedule.unroll[axis]` on a SERIAL axis when the **logical** trip-count product (`loop.axis.extent.as_static()` over
-`K_o`/`K_i` + register chains, symbolic extents decline) is under threshold. It reads only logical axis extents that
-exist in the `TileGraph` domain — never the materialized nest — and peeling does not change the per-iteration unroll
-decision, so it is a clean annotation `assemble` reads when it emits the loop. **070 (post-assemble)** → bank-conflict pad
-of a staged read's smem slab: the slab is an `assemble` *artifact* and the safety gate reads materialized facts (the
-realized `ld.shared.v4` vectorized width; the MMA atom-strided `AccessMap.block` stamp; skip on TMA transport), so it is a
-local `KernelOp`→`KernelOp` `Fork` that widens the slab alloc (coords stay logical). The `Schedule.pad` field carries the
-chosen knob for variant identity, recorded *by* the post-`assemble` pass, not *consumed by* `assemble`.
+No body edit. The fork test splits them: one carries a ranked knob, two are deterministic. **025 (enumeration fork,
+pre-`assemble`)** → `Schedule.grid_swizzle[block]` (L2 row-group): a real `GROUP_M` knob with candidates the search
+benches; its object is a GRID block + its grid axes, both in the IR; gate = the GRID block's derived `Carrier` is matmul
+and it has ≥2 GRID axes; `025` tags itself "Renderer-only," and `assemble` consumes the field. **070 (deterministic,
+post-`assemble`)** → bank-conflict pad of a staged read's smem slab: the pad value is a *formula*
+(`_max_conflict` / `lane_bank_distribution`), not a ranked choice, and the slab it reads is an `assemble` artifact (its
+gate reads the realized `ld.shared.v4` width + the MMA atom-strided `AccessMap.block` stamp; skip on TMA), so it is a
+deterministic `KernelOp`→`KernelOp` pass that widens the slab alloc (coords stay logical). **090 (deterministic,
+post-`assemble`)** → `#pragma unroll` on every materialized SERIAL loop whose logical trip product is under a fixed
+threshold (symbolic extents decline) — again no candidate to rank, so a deterministic post-pass, not an enumeration node.
+The `Schedule.pad` / `Schedule.unroll` fields persist the chosen value for variant identity, written *by* the
+deterministic post-pass, not consumed by `assemble`.
 
 ## Lowering: `assemble` (TileGraph → KernelOp | Graph[KernelOp])
 
