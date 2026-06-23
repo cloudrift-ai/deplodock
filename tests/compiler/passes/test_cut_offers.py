@@ -123,8 +123,18 @@ def test_tier_lattice_is_ordered():
 
 def test_cut_offered_and_forced_on_demoted_matmul():
     d = _offer(_norm_linear_graph())
-    assert d.offered and d.force  # the fused form is UNBUILDABLE → the cut must be taken
+    # Absent an expressible on-chip fused edge, the cut is forced (the GMEM cut is the
+    # lone lowerable option for an UNBUILDABLE-inline body).
+    assert d.offered and d.force
     assert d.tier_inline is Tier.UNBUILDABLE
+
+
+def test_cut_offered_not_forced_when_smem_fusible():
+    # When the SMEM fused edge IS expressible (the fork pass supplies smem_fusible from
+    # seed_fused), the cut is offered-not-forced — a real keep(SMEM)-vs-cut(GMEM) fork.
+    lo = _fused_loop(_norm_linear_graph())
+    d = cut_offers(lo, compute_capability=_CC, dtype_of=_dtype_of(lo), smem_fusible=True)
+    assert d.offered and not d.force
 
 
 def test_no_cut_on_clean_matmul():

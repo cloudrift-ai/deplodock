@@ -37,12 +37,17 @@ preserve the atom layout inline). Profitability stays the search's job: a ``GMEM
 still pays a gmem round-trip, so the offer is a **necessary condition** (a tier gain is
 available), not a verdict.
 
-**v1 scope.** Only the *forced* cut is wired (``offered`` ⟺ ``force`` ⟺ ``UNBUILDABLE``
-— the fused form can't lower, so there is no keep-fused option). A buildable-fused
-demoted matmul whose operand *would* reach ``WARP_MMA`` if materialized is a genuine
-keep-vs-split **fork**, but that needs the lowerable fused-prologue regime the R7
-backlog defers, so it stays fused for now (the offer predicate would price it, the fork
-is future work).
+**The keep-vs-cut fork.** A demoted matmul whose fused body is ``UNBUILDABLE`` *inline*
+may still be buildable as an **SMEM fused edge** — the producer cone materialized into an
+on-chip smem slab the consumer ``ldmatrix``-reads, one kernel, no gmem round-trip (the
+cut-beating form). That realization is ``_extract.seed_fused``'s expressibility check, so
+``cut_offers`` takes it as the ``smem_fusible`` input: when the fused edge lowers, the cut
+is **offered, not forced** (``force=False``) — a real keep(SMEM)-vs-cut(GMEM) fork the
+search prices. The cut stays **forced** (``force=True``) only when the fused edge is *not*
+expressible (multi-cone rotary / multi-accum gated-MLP that ``assemble_fused`` can't fuse
+yet), so the GMEM cut is the lone lowerable option. Splitting the tier verdict (here) from
+the fission expressibility (``seed_fused`` / ``extract_block``, paired at the fork pass)
+keeps this module free of the body-surgery dependency.
 
 Prefixed ``_`` so the pipeline rule loader skips it.
 """
@@ -99,8 +104,9 @@ class CutDecision:
     """The typed offer the ``split/005_split_demoted`` fork consumes. ``offered``: a
     tier-monotonic ``GMEM`` cut is available (materializing the demoted operand raises
     the consumer's tier). ``force``: the cut must be taken — the fused form is
-    ``UNBUILDABLE``, so there is no lowerable keep-fused option (v1: ``offered`` ⟺
-    ``force``; the buildable-fused keep-vs-split fork is R7). ``tier_inline``: the
+    ``UNBUILDABLE`` inline AND not expressible as an SMEM fused edge, so the GMEM cut is
+    the lone lowerable option. When the SMEM fused edge IS expressible (``smem_fusible``)
+    the cut is offered-not-forced — a keep(SMEM)-vs-cut(GMEM) fork. ``tier_inline``: the
     fused body's tier, for ``eval`` introspection."""
 
     offered: bool
@@ -108,13 +114,15 @@ class CutDecision:
     tier_inline: Tier
 
 
-def cut_offers(loop_op: LoopOp, *, compute_capability: tuple[int, int], dtype_of) -> CutDecision:
+def cut_offers(loop_op: LoopOp, *, compute_capability: tuple[int, int], dtype_of, smem_fusible: bool = False) -> CutDecision:
     """The cut-offer verdict for a (still-un-tiled) fused ``LoopOp`` — read off the
-    derived ``tier`` of its inline body. Offer (and force) the ``GMEM`` cut iff the
-    fused form is ``UNBUILDABLE``: a demoted matmul whose operand cone keeps it below
-    any buildable tier, which materializing the operand (the ``extract_block`` fission)
-    strictly raises. Holds **no** fission logic — the fork pass pairs this verdict with
-    ``extract_block``'s expressibility check."""
+    derived ``tier`` of its inline body. Offer the ``GMEM`` cut iff the fused form is
+    ``UNBUILDABLE``: a demoted matmul whose operand cone keeps it below any buildable
+    tier, which materializing the operand strictly raises. **Force** it only when the
+    fused edge isn't also expressible on-chip (``smem_fusible`` False) — otherwise the
+    SMEM fused edge is a lowerable keep option, so the cut is offered-not-forced (a real
+    fork). Holds **no** fission logic — the fork pass supplies ``smem_fusible`` (the
+    ``seed_fused`` expressibility check) and pairs this verdict with ``extract_block``."""
     t = tier(iter_dag(loop_op), compute_capability=compute_capability, dtype_of=dtype_of)
     unbuildable = t is Tier.UNBUILDABLE
-    return CutDecision(offered=unbuildable, force=unbuildable, tier_inline=t)
+    return CutDecision(offered=unbuildable, force=unbuildable and not smem_fusible, tier_inline=t)

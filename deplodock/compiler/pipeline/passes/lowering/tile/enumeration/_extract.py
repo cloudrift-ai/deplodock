@@ -90,13 +90,13 @@ from string import ascii_lowercase
 from deplodock.compiler import dtype as dtype_mod
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.algebra import contains_matmul_reduce
+from deplodock.compiler.ir.algebra import AlgebraKind, contains_matmul_reduce
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.stmt.body import Cone
-from deplodock.compiler.ir.tile.ir import Block, Buffer, Schedule, Space, TileGraph
+from deplodock.compiler.ir.tile.ir import Block, Buffer, Placement, Schedule, Space, TileGraph, TileGraphOp
 from deplodock.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
 from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
@@ -504,6 +504,90 @@ def seed_demoted(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Ten
                 return None
             buffers[buf] = Buffer(buf, tuple(ext.output.shape), ext.output.dtype, space=Space.GMEM)
     return TileGraph(name=node_id, buffers=buffers, blocks=tuple(blocks), schedule=Schedule())
+
+
+def seed_fused(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> TileGraphOp | None:
+    """The **SMEM fused-edge seed** of the cut: a single-cone demoted matmul ``LoopOp`` →
+    a fused 2-block ``TileGraphOp`` the enumeration tiles into one kernel
+    (``plans/dag-edge-placement-split-as-enumeration.md`` → the keep(SMEM)-vs-cut fork).
+
+    The same fission as :func:`extract_block` / :func:`seed_demoted`, but laid out for the
+    *fused* assemble: the clean matmul **consumer is ``blocks[0]``** (a logical seed the
+    enumeration body moves tile — every move rebuilds ``blocks[0]`` and preserves the
+    trailing blocks) writing the kernel's real output, and the producer cone rides as
+    ``blocks[1]`` with its ``xn`` edge placed ``SMEM`` (one launch group + staged); the
+    producer folds into the consumer's slab ``compute`` phase at ``assemble_fused``. The
+    op carries the *consumer's* ``dag`` / regime / leading so the forks tile the matmul.
+
+    Returns ``None`` (the caller forces the GMEM cut / keeps fused) when: the body isn't
+    cuttable, the fission has more than one producer (multi-cone rotary / multi-accum
+    gated-MLP — not yet fusible on-chip), a piece doesn't classify (the consumer must be a
+    buildable ``SEMIRING`` matmul, the producer a buildable block), or the producer is a
+    shape ``assemble_fused`` can't realize (only a pointwise MAP transform or a
+    single-reduce ``MONOID`` rmsnorm-style prologue — a two-pass softmax / multi-reduce
+    producer, the SDPA P@V cone, stays a forced GMEM cut)."""
+    f = _fission(loop_op, graph=graph, node_id=node_id, out_tensor=out_tensor)
+    if f is None or len(f.producers) != 1:
+        return None
+    prod_op, prod_t = f.producers[0]
+    # The consumer writes the kernel's real output (the GMEM fission renamed it to a
+    # distinct ``__mm`` node id for the two-kernel fragment; the fused kernel IS the
+    # output, so rename back to the original output name).
+    consumer = _rename_write_output(f.consumer, old=f.cons_id, new=out_tensor.name)
+    cons_dag = iter_dag(consumer)
+    cons_regime = classify(cons_dag)
+    if cons_regime is None or cons_regime.algebra is not AlgebraKind.SEMIRING:
+        return None  # the consumer must reach the matmul (scalar/warp) tier
+    prod_dag = iter_dag(prod_op)
+    if classify(prod_dag) is None:
+        return None  # a producer the move composer can't build as a clean block
+    cons_block = seed_graph(cons_dag, kernel_name=consumer.name or out_tensor.name).blocks[0]
+    prod_block = seed_graph(prod_dag, kernel_name=prod_op.name or prod_t.name).blocks[0]
+    # The producer's per-CTA leading scope (the rmsnorm reduce's ``1/H`` / ``eps``) rides
+    # its block — the fused reduce prologue needs it (``seed_graph`` drops ``dag.leading``).
+    if prod_dag.leading:
+        prod_block = replace(prod_block, compute=Body((*prod_dag.leading, *prod_block.compute)))
+    if not _producer_fusible(prod_block):
+        return None  # a producer assemble_fused can't realize — fall back to the GMEM cut
+    buffers: dict[str, Buffer] = {}
+    produced = {prod_t.name, out_tensor.name}
+    for op, out_t in ((prod_op, prod_t), (consumer, out_tensor)):
+        buffers[out_t.name] = Buffer(out_t.name, tuple(out_t.shape), out_t.dtype, space=Space.GMEM)
+        for buf in op.inputs:
+            if buf in buffers or buf in produced:
+                continue
+            ext = graph.nodes.get(buf)
+            if ext is None:
+                return None
+            buffers[buf] = Buffer(buf, tuple(ext.output.shape), ext.output.dtype, space=Space.GMEM)
+    tg = TileGraph(name=node_id, buffers=buffers, blocks=(cons_block, prod_block), schedule=Schedule())
+    xn_edge = next(e for e in tg.edges if e.buffer == prod_t.name and e.src == prod_block.name and e.dst == cons_block.name)
+    tg = tg.place_edge(xn_edge, Placement.SMEM)
+    return TileGraphOp(
+        name=loop_op.name or node_id,
+        tilegraph=tg,
+        dag=cons_dag,
+        algebra=cons_regime.algebra,
+        target_names=cons_regime.target_names,
+        leading=tuple(cons_dag.leading),
+        seed_key=consumer.body.structural_key(),
+        buffers=buffers,
+    )
+
+
+def _producer_fusible(block: Block) -> bool:
+    """Whether ``assemble_fused`` can realize this producer block as a fused SMEM edge:
+    a flat pointwise MAP transform (``_map_transform``), or a single-reduce ``MONOID``
+    rmsnorm-style prologue (``_split_monoid_producer`` + exactly one reduce loop — the
+    sum-of-squares the reduce-prologue path expects; a two-pass softmax has two reduces
+    the path can't fold). The gate that keeps the keep(SMEM) fork to shapes the fused
+    assemble actually lowers — every other demoted matmul stays a forced GMEM cut."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.assembly._fused import _map_transform, _split_monoid_producer
+
+    if _map_transform(block) is not None:
+        return True
+    n_reduce = sum(1 for s in block.compute.iter_of_type(Loop) if s.is_reduce)
+    return n_reduce == 1 and _split_monoid_producer(block) is not None
 
 
 def _classify_cut(loop_op: LoopOp):

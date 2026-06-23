@@ -312,3 +312,73 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     x, nw, wg = data["x"].astype(np.float32), data["nw"].astype(np.float32), data["wg"].astype(np.float32)
     xn_ref = x[0] * (1.0 / np.sqrt((x[0] ** 2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
     np.testing.assert_allclose(got, xn_ref @ wg.T, atol=1.0, rtol=0.5)
+
+
+_TILE_PASSES = ["lowering/tile/split", "lowering/tile/enumeration", "lowering/tile/assembly"]
+
+
+def _n_kernels(graph):
+    from deplodock.compiler.ir.loop import LoopOp
+
+    return sum(1 for n in graph.nodes.values() if isinstance(n.op, (TileOp, LoopOp)))
+
+
+def test_split_cone_keep_builds_fused_edge_cut_stays_default(monkeypatch):
+    """``split/005`` → ``seed_fused``: ``DEPLODOCK_SPLIT_CONE=0`` now builds the **SMEM
+    fused edge** — ONE kernel (the RMSNorm cone on-chip, no gmem round-trip) — where it
+    used to have no lowerable keep branch. The unpinned greedy default stays the proven
+    GMEM **cut** (two kernels): greedy's "a cold compile never changes kernel sets" rule
+    keeps the kernel-set-preserving fused edge off the cold path until it is a robust
+    default. ``=1`` pins the cut. The structural half, no GPU."""
+    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
+
+    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("DEPLODOCK_BM", "16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    ctx = Context.from_target((12, 0))
+
+    def lower(env_split):
+        if env_split is None:
+            monkeypatch.delenv("DEPLODOCK_SPLIT_CONE", raising=False)
+        else:
+            monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", env_split)
+        lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)
+        return Pipeline.build(_TILE_PASSES).run(lo, ctx=ctx)
+
+    greedy = lower(None)
+    assert _n_kernels(greedy) == 2  # unpinned cold default — the proven GMEM cut
+    kept = lower("0")
+    assert _n_kernels(kept) == 1  # SPLIT_CONE=0 → the SMEM fused edge, one kernel
+    assert sum(1 for n in kept.nodes.values() if isinstance(n.op, TileOp)) == 1
+    assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
+
+
+@requires_cuda
+def test_offering_fork_fused_edge_runs_correctly(monkeypatch):
+    """End-to-end through the LIVE pass chain (no hand-built seed): the offering fork's
+    kept SMEM edge lowers ``RMSNorm → linear`` to one fused kernel that matches the torch
+    reference — proving ``seed_fused`` wires the demoted matmul into the fused assemble."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
+
+    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("DEPLODOCK_BM", "16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept fused edge (scalar tier)
+    ctx = Context.from_target((12, 0))
+    s, h, i = 32, 1024, 3072
+    lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)
+    tiled = Pipeline.build(_TILE_PASSES).run(lo, ctx=ctx)
+    assert sum(1 for n in tiled.nodes.values() if isinstance(n.op, TileOp)) == 1  # one fused kernel
+    out = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(tiled, ctx=ctx)
+
+    rng = np.random.default_rng(0)
+    ins = {
+        "x": rng.standard_normal((1, s, h)).astype(np.float16),
+        "nw": rng.standard_normal((h,)).astype(np.float16),
+        "wg": rng.standard_normal((i, h)).astype(np.float16),
+    }
+    got = list(CudaBackend().run(out, input_data=ins)[0].outputs.values())[0].reshape(s, i).astype(np.float32)
+    x, nw, wg = ins["x"][0].astype(np.float32), ins["nw"].astype(np.float32), ins["wg"].astype(np.float32)
+    rms = x * (1.0 / np.sqrt((x**2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
+    np.testing.assert_allclose(got, rms @ wg.T, atol=1.0, rtol=0.5)
