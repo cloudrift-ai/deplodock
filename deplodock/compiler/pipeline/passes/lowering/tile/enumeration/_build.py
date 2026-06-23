@@ -164,7 +164,7 @@ def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: 
     compute = _replace_k_scalar(
         tuple(block.compute), target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name], k_s
     )
-    return replace(graph, blocks=(replace(block, compute=Body(compute)),))
+    return replace(graph, blocks=(replace(block, compute=Body(compute)), *graph.blocks[1:]))
 
 
 def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
@@ -208,7 +208,9 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
     compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
-    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+    return replace(
+        graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding})
+    )
 
 
 # === Cooperative-reduce (MONOID) build move (``plans/tile-ir-block-dag.md`` R2). ===
@@ -353,7 +355,9 @@ def coop_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: fro
     compute = _replace_k_coop(compute, targets, kax.extent, bk, fk, br, k_c, dag.k_bound)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
-    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+    return replace(
+        graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding})
+    )
 
 
 # === Flash (streaming ``TWISTED_MONOID``) build move (``plans/tile-ir-block-dag.md`` R6). ===
@@ -619,7 +623,9 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
         binding[lp.axis.name] = Binding.GRID
 
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(new_inner))
-    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+    return replace(
+        graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding})
+    )
 
 
 def build_dag(

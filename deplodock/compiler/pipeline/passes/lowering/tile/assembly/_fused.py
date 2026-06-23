@@ -45,6 +45,15 @@ def is_fused_graph(graph: TileGraph) -> bool:
     return len(groups) == 1
 
 
+def fused_producer_blocks(graph: TileGraph) -> set[str]:
+    """The names of the producer blocks in a fused graph — those writing an
+    intermediate another block reads. They stay logical (un-tiled): the consumer rides
+    them as its slab ``compute`` phase, so the assembly readiness check exempts them."""
+    writer = {p.buffer: b.name for b in graph.blocks for p in b.writes}
+    read_any = {p.buffer for b in graph.blocks for p in b.reads}
+    return {writer[buf] for buf in writer if buf in read_any}
+
+
 def _map_transform(block: Block):
     """A MAP producer block → ``(inputs, assigns, out_buf, out_value)`` — the pointwise
     transform ``xn = f(x, y, …)``. ``inputs`` is ``[(buf, name), …]``, one per input

@@ -17,6 +17,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._fused import assemble_fused, fused_producer_blocks, is_fused_graph
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -32,8 +33,21 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
 
     A multi-block ``TileGraph`` (the edge-placement ``GMEM`` cut, R7) assembles to a
     ``Graph`` of ``TileOp`` kernels the engine splices, the same shape the structural
-    forks (``055_atomic_free_splitk``) already return."""
+    forks (``055_atomic_free_splitk``) already return. A **same-launch-group** multi-block
+    ``TileGraph`` (the ``SMEM`` fused edge) assembles to **one** fused ``TileOp`` via
+    ``assemble_fused`` — the producer rides the consumer's slab, so only the consumer must
+    be tiled (the logical producer becomes the slab's ``compute`` phase)."""
     op: TileGraphOp = root.op
-    if op.tilegraph is None or any(not b.domain for b in op.tilegraph.blocks):
+    if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
-    return assemble_block(op.tilegraph, knobs=op.knobs, base_knobs={}, kernel_name=op.name, leading=op.leading)
+    tg = op.tilegraph
+    if is_fused_graph(tg):
+        # The SMEM fused edge: only the consumer needs tiling; the producer blocks
+        # stay logical (they fold into the consumer's slab compute phase).
+        producers = fused_producer_blocks(tg)
+        if any(not b.domain for b in tg.blocks if b.name not in producers):
+            raise RuleSkipped("fused consumer not yet tiled")
+        return assemble_fused(tg, knobs=op.knobs, base_knobs={}, kernel_name=op.name, leading=op.leading)
+    if any(not b.domain for b in tg.blocks):
+        raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
+    return assemble_block(tg, knobs=op.knobs, base_knobs={}, kernel_name=op.name, leading=op.leading)

@@ -24,10 +24,11 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import Buffer, Edge, Space, StageBundle, TileGraph, TileOp, Transport
+from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._fused import assemble_fused, is_fused_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from tests.compiler.conftest import requires_cuda
 from tests.compiler.passes.test_tile_ir_invariants import _oracle_tilegraph
@@ -139,4 +140,76 @@ def test_fused_map_matmul_runs_correctly(producer, np_ref):
     res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
     ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
+    np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
+
+
+def _loopop(g: Graph):
+    out = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    return next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
+
+
+def _fused_seed_op(M=64, K=64, N=64) -> TileGraphOp:
+    """A fused 2-block ``TileGraphOp`` seed: a LOGICAL matmul consumer (``o = xn @ w``,
+    un-tiled — the enumeration tiles it) + a logical MAP producer (``xn = x * y``), the
+    ``xn`` edge SMEM-placed. Carries the consumer's dag/regime so the enumeration forks
+    tile ``blocks[0]`` (the consumer) while preserving ``blocks[1]`` (the producer)."""
+    cg = Graph()
+    cg.add_node(InputOp(), [], Tensor("o__xn", (M, K), F16), node_id="o__xn")
+    cg.add_node(InputOp(), [], Tensor("w", (K, N), F16), node_id="w")
+    cg.add_node(MatmulOp(), ["o__xn", "w"], Tensor("o", (M, N), F16), node_id="o")
+    cg.inputs, cg.outputs = ["o__xn", "w"], ["o"]
+    clo = _loopop(cg)
+    cdag = iter_dag(clo)
+    creg = classify(cdag)
+    cons = seed_graph(cdag, kernel_name="k_cons").blocks[0]
+
+    pg = Graph()  # producer xn = x * y, writing the o__xn intermediate
+    pg.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
+    pg.add_node(InputOp(), [], Tensor("y", (M, K), F16), node_id="y")
+    pg.add_node(ElementwiseOp("multiply"), ["x", "y"], Tensor("o__xn", (M, K), F16), node_id="o__xn")
+    pg.inputs, pg.outputs = ["x", "y"], ["o__xn"]
+    plo = _loopop(pg)
+    prod = replace(seed_graph(iter_dag(plo), kernel_name="prod").blocks[0], name="prod")
+
+    buffers: dict = {}
+    for lo in (clo, plo):
+        for name, t in {**lo.inputs, **lo.outputs}.items():
+            buffers[name] = Buffer(name, tuple(t.shape), t.dtype, space=Space.GMEM)
+    tg = TileGraph(
+        name="fused",
+        buffers=buffers,
+        blocks=(cons, prod),
+        schedule=replace(_oracle_tilegraph(_mm_xn_graph(M, K, N), _KN).schedule, binding={}, launch={}, staged={}),
+    )
+    tg = tg.place_edge(Edge(src="prod", dst="k_cons", buffer="o__xn"), Placement.SMEM)
+    return TileGraphOp(name="k_fused", tilegraph=tg, dag=cdag, algebra=creg.algebra, target_names=creg.target_names, buffers=buffers)
+
+
+@requires_cuda
+def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch):
+    """The full tile pipeline (enumeration tiles the consumer + assembly dispatches to
+    ``assemble_fused``) lowers a fused 2-block seed to one correct kernel — proving the
+    body-move auxiliary-block preservation + the assembly fused dispatch. Pinned to the
+    scalar tier (the warp-tier fused compute phase is a follow-on)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("DEPLODOCK_BM", "16")
+    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    M = K = N = 64
+    g = Graph()
+    for name in ("x", "y", "w"):
+        g.add_node(InputOp(), [], Tensor(name, (M, K) if name != "w" else (K, N), F16), node_id=name)
+    g.add_node(_fused_seed_op(M, K, N), ["x", "y", "w"], Tensor("o", (M, N), F16), node_id="o")
+    g.inputs, g.outputs = ["x", "y", "w"], ["o"]
+
+    out = Pipeline.build(["lowering/tile/enumeration", "lowering/tile/assembly"]).run(g, ctx=Context.from_target((12, 0)))
+    assert any(isinstance(n.op, TileOp) for n in out.nodes.values())  # one fused kernel, not two
+    assert sum(1 for n in out.nodes.values() if isinstance(n.op, TileOp)) == 1
+    compiled = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(out, ctx=Context.from_target((12, 0)))
+    rng = np.random.default_rng(0)
+    ins = {n: rng.standard_normal((M, K) if n != "w" else (K, N)).astype(np.float16) for n in ("x", "y", "w")}
+    res = CudaBackend().run(compiled, input_data=ins)[0].outputs
+    got = list(res.values())[0].reshape(M, N).astype(np.float32)
+    ref = (ins["x"].astype(np.float32) * ins["y"].astype(np.float32)) @ ins["w"].astype(np.float32)
     np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
