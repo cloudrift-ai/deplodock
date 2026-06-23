@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt import ReduceCarrier
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
 
 
 @dataclass(frozen=True)

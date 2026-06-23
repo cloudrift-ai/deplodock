@@ -46,7 +46,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import BK, BM, BN, FM, FN, SPLITK
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import BK, BM, BN, FM, FN, SPLITK
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.body import Body

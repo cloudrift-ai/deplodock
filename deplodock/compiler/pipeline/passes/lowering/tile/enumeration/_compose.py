@@ -12,8 +12,8 @@ from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.tree import build_partition
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._tree import build_partition
 
 
 def try_compose(loop_op: LoopOp, ctx: Context, graph: Graph, *, kernel_name: str) -> Fork | TileOp | None:

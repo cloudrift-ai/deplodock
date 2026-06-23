@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import MAX_CELLS_PER_THREAD, MAX_THREADS_PER_CTA
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_CELLS_PER_THREAD, MAX_THREADS_PER_CTA
 
 
 @dataclass(frozen=True)

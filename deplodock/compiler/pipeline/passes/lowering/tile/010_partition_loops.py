@@ -17,7 +17,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.fork import Fork
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.compose import try_compose
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._compose import try_compose
 
 PATTERN = [Pattern("root", LoopOp)]
 

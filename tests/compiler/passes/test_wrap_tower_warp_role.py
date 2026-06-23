@@ -18,7 +18,7 @@ from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 # ``Role`` / ``_wrap_tower`` / ``_layer_kind_for`` were extracted from the
 # partition planner into the shared ``partition._tower`` module (the legacy
 # planner imports them back); the move composer reuses the same mechanics.
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _layer_kind_for, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _layer_kind_for, _wrap_tower
 
 
 def _stub_inner() -> tuple:

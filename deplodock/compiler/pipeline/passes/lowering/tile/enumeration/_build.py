@@ -19,10 +19,10 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
 from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     MAP_M_REG,
     MAP_M_THREAD,
     MAP_N_REG,

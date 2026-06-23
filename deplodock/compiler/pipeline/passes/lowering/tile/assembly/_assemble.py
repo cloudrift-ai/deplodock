@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile.ir import Binding, Block, TileGraph, TileOp
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
 
 # Schedule ``Binding`` → tower ``Role``. SERIAL has no free-axis use yet (the K
 # re-bracket emits its own SERIAL_OUTER / STAGE_INNER layers); mapped to plain

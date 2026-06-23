@@ -19,11 +19,11 @@ import os
 
 from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.pipeline.knob import Knob
-from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.budget import Budget
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.decompose import legal_decomps
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag, _carrier_of
-from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._budget import Budget
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._decompose import legal_decomps
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     BK_CHOICES,
     FK_CHOICES,
     MAP_M_REG,
