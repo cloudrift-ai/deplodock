@@ -145,6 +145,7 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_mma_atomic_free_splitk.py",  # 017 atomic-free split-K + warp (deleted)
         "test_attention_chains.py",  # attention (SDPA/flash) chains (deleted)
         "test_split_demoted.py",  # demoted-split CUDA accuracy (warp/coop/split-K paths deleted)
+        "test_program_rebind.py",  # dynamic re-bind across seq_lens (staging/coop)
     }
 )
 

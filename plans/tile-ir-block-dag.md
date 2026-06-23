@@ -631,9 +631,9 @@ the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.
 matmul + cooperative reduce byte-identically (`build_dag.py` → `assemble.py`), the legacy pointwise/matmul materializers
 are deleted, and the 11 tower-rewrite scheduling passes (`021`–`090`) have been **deleted up front** to clear the deck —
 they are the predecessors the `tile/stage` … `tile/swizzle` enumeration forks + the `peel` / `mask_order` / `pad` /
-`unroll` deterministic post-passes are reborn from, not yet reimplemented. The staging regimes (warp MMA / coop / flash) still ride `materialize.py`'s tower builders in the
-interim. Next is steps 3–5: stand up the enumeration passes over the tile node and grow `assemble`'s `Schedule`-driven
-synthesis to subsume them.
+`unroll` deterministic post-passes are reborn from, not yet reimplemented. The staging regimes (warp MMA / coop / flash)
+still ride `materialize.py`'s tower builders in the interim. Next is steps 3–5: stand up the enumeration forks over the
+tile node and grow the materialization stage (`assemble` + the deterministic post-passes) to subsume them.
 
 ## Open design decisions
 
