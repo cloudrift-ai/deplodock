@@ -39,9 +39,8 @@ _PHASE_REASON = {
 _XFAIL_FILES: dict[str, str] = {
     # R2 — landed (cooperative-reduce): test_cooperative_combine.py /
     # test_masked_cooperative_reduce.py de-quarantined.
-    # R3 — test_monoid_reduce_kernel.py imports the deleted 017_atomic_free_splitk
-    # (build_monoid_reduce_tileop), the atomic-free split-K combine — R3, not R2.
-    "test_monoid_reduce_kernel.py": "R3",
+    # R3 — landed (atomic-free split-K combine): test_monoid_reduce_kernel.py
+    # de-quarantined (rebuilt against enumeration/_partition.monoid_reduce_tilegraph).
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
     # R6
