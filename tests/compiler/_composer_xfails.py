@@ -88,6 +88,7 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure",
         "test_matmul_mma_masked.py::test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec",
         "test_matmul_mma_masked.py::test_demoted_masked_k_pv_stays_sync_below_sm90",
+        "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs",
     }
 )
 _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
@@ -97,6 +98,7 @@ _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-130]",
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-200]",
         "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy[31]",
+        "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]",
     }
 )
 

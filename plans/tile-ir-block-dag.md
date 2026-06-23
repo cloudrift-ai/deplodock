@@ -316,6 +316,74 @@ The two headline consequences from the original design hold and are now literal:
 tier — no special-case builder), and **pipelining / warp-spec stop being hand-peeled** (`assemble` emits the
 peel / `Cond` / mbarrier ring from `distance` / `role`, not a pass).
 
+## The pass structure: enumeration passes + one `assemble`
+
+The model above resolves into exactly **two kinds of search-relevant pass**, bookended by two deterministic transforms.
+The whole tile phase is: a deterministic `tile/build` seeds the root tile node, a pipeline of **enumeration passes**
+widens the search tree move-family by move-family, and one deterministic **materialization pass** (`assemble`) lowers the
+chosen leaf. This is the concrete realization of "the scheduling moves only edit the Schedule; `assemble` is the one
+place the tower is built."
+
+- **Enumeration passes** — *generate subtrees for the search.* Each owns one move family. It matches the tile node,
+  computes its legal offers from the **derived projections + the current `Schedule`** (never from tower shape), and
+  returns a `Fork` whose children apply that family's moves — each child a new tile node with an edited `Schedule` (or,
+  for the three body moves, edited `Block`s). An enumeration pass **never emits a `KernelOp`**; it only widens the tree.
+  This is the existing `moves.py`/`tree.py` model, unchanged, now spanning the whole tile phase rather than ending at the
+  partition head.
+- **One materialization pass — `assemble`** — *materializes the chosen leaf.* It matches a fully-scheduled tile node and
+  deterministically lowers `(algorithm + Schedule) → KernelOp | Graph[KernelOp]`. It is **total and choice-free**: every
+  decision already lives in the leaf, so `assemble` makes none. It is the **only** pass that emits the tower.
+
+**The inter-pass IR is the tile node, not the tower.** Today `010` resolves its `Fork` to a `TileOp` and the (now
+deleted) `020`–`090` rewrote that tower; the brittle ordering lore — "did the previous pass leave the tree in the shape
+my matcher wants" — was a direct consequence of scheduling living in tree shape. In the new structure every enumeration
+pass matches and returns the **same stable `TileGraph`-bearing node**, so the pass order is just the MCTS decision order:
+`retime` runs after `stage` because `retime`'s offer set reads a `staged` edge — an explicit fact on derived state, not a
+matcher coincidence. (The plumbing reuses the engine unchanged: a tile node is a graph node whose op payload is a
+`TileGraph`; a `Fork` resolves to a new such node, exactly as `010`'s `Fork` resolves to a `TileOp` today.)
+
+Concrete pass list — pipeline order *is* decision order:
+
+| pass                    | kind              | move family                          | edits                          | predecessor (deleted / legacy)        |
+|-------------------------|-------------------|--------------------------------------|--------------------------------|---------------------------------------|
+| `tile/build`            | deterministic     | — derive algorithm DAG from `LoopOp` | seeds node + reference `Schedule` | `010` front half (`build_dag.py`)  |
+| `tile/tensorize`        | enum (body)       | `atomize`                            | `Block.compute`                | `011` + warp tower                    |
+| `tile/partition_reduce` | enum (body)       | split-K / cooperative-K              | insert combine `Block`         | `015`/`017`                           |
+| `tile/register_tile`    | enum (schedule)   | `register_tile` = `bind(REGISTER)`   | `binding`                      | `010` reg split                       |
+| `tile/stage`            | enum (schedule)   | `stage`, `hoist`                     | `staged`, `scope`              | `020`/`021`/`026`/`030`               |
+| `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`       | `040`/`080`                           |
+| `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                 | `050`/`060`                           |
+| `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
+| `tile/locals`           | enum (schedule)   | `pad` / `swizzle` / `unroll`         | `pad` / `grid_swizzle` / `unroll` | `070`/`025`/`090`                  |
+| `tile/assemble`         | **materialize**   | —                                    | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
+
+(`tile_axis` is not its own pass — the free-axis σ-splits fold into `tile/build` and the reduce σ-split rides
+`partition_reduce`/`tensorize`, exactly as `_split_free_axis` / `_replace_k_scalar` do in `build_dag.py` today.)
+
+**This maps straight onto the two-level MCTS.** The body-vs-schedule split is *orthogonal* to outer-vs-inner; the MCTS
+boundary is *kernel-set-changing*. The kernel-set-changing enumeration passes (`partition_reduce` across CTAs, the
+`005_split_demoted` cut at the partition head) branch the **outer** tree — one terminal per kernel set — while every
+other enumeration pass branches the **inner** per-kernel tree. `assemble` sits below both: the inner search's reward is
+`assemble`→cuda→bench of one leaf, summed per op for the outer reward. The inner search already chains `Fork`s across
+sequential per-kernel lowering passes for one kernel, so it consumes this pass list with no engine change.
+
+**Knob-deltas are preserved.** Each enumeration move still stamps its knob-delta onto the `Fork`
+(`{RING:2}`, `{TMA:1}`, the `BM/BN/FM/FN` tile knobs) — the variant identity the perf DB and learned prior key on. What
+changes is only the *realization*: the knob now drives a `Schedule` dict-write that `assemble` reads, instead of an eager
+tower rewrite. The prior / DB / MCTS machinery is untouched; `op_cache_key` becomes `canonical(bodies + edges) +
+Schedule` (the derived projections stay out of the key, same as `algebra_kind` today).
+
+**Pass contracts.**
+
+- *Enumeration pass:* `rewrite(tile_node) -> Fork | tile_node | RuleSkipped`. Returns a `Fork` whose leaves are scheduled
+  tile nodes when the family has ≥2 legal offers; the node unchanged (or `RuleSkipped`) for 0–1; **never** a `KernelOp`.
+  Offer legality is a pure function of derived projections + the current `Schedule`; the body is read-only except for the
+  three body moves.
+- *Materialization pass:* `rewrite(tile_node) -> KernelOp | Graph[KernelOp]`. No `Fork`, no `RuleSkipped` on a
+  well-formed leaf. Must be deterministic and total. The load-bearing constraint: **if porting a regime tempts a
+  tie-break heuristic inside `assemble`, that decision belongs upstream as an enumeration move + a `Schedule` field** —
+  keeping the leaf the sole source of variant identity is what makes it cacheable and byte-identical-verifiable.
+
 ## Pass rewrites
 
 Each current tile pass re-expressed against the IR above.
@@ -488,11 +556,20 @@ the whole tile phase.
    coalescing; split-/cooperative-K become the combine-block move. → byte-identical.
 4. **Port `retime` + `promote_transport` + `specialize_warps`** — `040`/`080`/`050`/`060`/`085` become Schedule
    annotations; their tree surgery moves into `assemble`. → byte-identical, then perf-equal under tune.
-5. **Port the locals + `atomize`** and delete the tower-based passes. The tile phase is: build DAG → search Schedule
-   moves → `assemble`.
+5. **Port the locals + `atomize`** and retire the tower builders. End state = the pass list in "The pass structure":
+   deterministic `tile/build` → the enumeration passes (`tensorize` / `partition_reduce` / `register_tile` / `stage` /
+   `retime` / `transport` / `warp_spec` / `locals`) → one `tile/assemble`.
 
 The DAG and the tree can coexist through 1–4: the composer builds the DAG, `assemble` lowers to the *current* tower, and
 the not-yet-ported tree passes run unchanged on it. Big-bang is avoided.
+
+**Status (branch `feature/tile-ir-block-dag`).** Steps 1–2 are done: `assemble_block` lowers pointwise + scalar/warp
+matmul + cooperative reduce byte-identically (`build_dag.py` → `assemble.py`), the legacy pointwise/matmul materializers
+are deleted, and the 11 tower-rewrite scheduling passes (`021`–`090`) have been **deleted up front** to clear the deck —
+they are the predecessors the `tile/stage` … `tile/locals` enumeration passes are reborn from, not yet reimplemented as
+`Schedule` moves. The staging regimes (warp MMA / coop / flash) still ride `materialize.py`'s tower builders in the
+interim. Next is steps 3–5: stand up the enumeration passes over the tile node and grow `assemble`'s `Schedule`-driven
+synthesis to subsume them.
 
 ## Open design decisions
 
