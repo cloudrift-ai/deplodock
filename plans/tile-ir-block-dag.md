@@ -749,8 +749,10 @@ never a tree-builder.
   rewritten against the new `assembly/020_mask_order` (the masked-load hoist, deferred with the masked tiers), not
   "recovered." Scalar masked staging itself works today (the bundle sits inside the boundary `Cond`, so masked threads
   skip the cooperative load — no OOB, no hoist needed; the hoist is a perf/transport requirement for cp.async/TMA).
-  **Deferred follow-ups:** warp/atom + symbolic-K (masked-K zero-fill) staging ride R4; the `retime` / `transport` /
-  `warp_spec` forks and the `pad` / `mask_order` post-passes are their own tiers.
+  **Deferred follow-ups:** warp/atom staging **landed with R4** (the slab `block` multiplier is now derived from the σ
+  coefficients in `assembly/_slab`, unifying the scalar `()` and warp atom-strided cases); symbolic-K (masked-K
+  zero-fill) staging and the `retime` / `transport` / `warp_spec` forks + the `pad` / `mask_order` post-passes remain
+  their own tiers.
 - **R2 — Cooperative-reduce** (deps: RF; the biggest chunk). Add the coop `classify`→build path + an
   `enumeration/050_coop_reduce` pass (`(bk,fk,br)` offer) + `assemble`'s warp-shuffle / hierarchical combine synthesis.
   *Recovers ~22:* `test_monoid_reduce_kernel.py`,
@@ -761,11 +763,28 @@ never a tree-builder.
 - **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). The `partition_reduce(K,GRID)` move + atomic /
   atomic-free combine block. *Recovers:* `test_mma_atomic_free_splitk.py`,
   `test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural`.
-- **R4 — Warp-tier MMA (`atomize`)** (deps: R1). Add `enumeration/060_tensorize` (atom-fold body move) + `assemble`'s
-  `RegFragment`/`Ldmatrix`/`MmaSyncPtx`/`RegStore` synthesis. *Recovers:* `test_matmul_mma.py`, `…_residual.py`,
-  `…_causal_epilogue.py`, `…_transposed_b.py` (+ its
-  symbolic-MN nodes), `…_parity.py` (non-TMA params), `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct`.
-  *Folds in `_REASON` Phase 1–2 (symbolic masked warp / masked-K).*
+- **R4 — Warp-tier MMA (`atomize`)** (deps: R1). **Landed (core warp tier; the warp/atom half of R1 with it).** Added
+  the `atomize` body move (`_build.warp_build`: the four-way GRID/WARP/REGISTER/ATOM σ-split + K re-bracket at `atom_k`
+  granularity + fuse the cell `[Load,Load,mul,Accum]` → `Mma`, `Block.atom` deriving from it) + the warp-tier fork chain
+  `enumeration/{005_tensorize, 006_warp_geometry, 008_warp_reg, 009_warp_build}` (atom-vs-scalar, then `WM/WN`, `FM/FN`,
+  `BK`+build; the scalar passes `010`/`020`/`030`/`040` gate off when an `MMA` atom is pinned) + the atom-eligibility
+  gate `enumeration/_atom.py` (`eligible_atoms` + the shared `classify_matmul_operands`). `assemble` reuses the existing
+  `_free_layers` (ATOM/REGISTER/WARP/GRID tier order) + `_wrap_tower` (the `Mma` rides inside the `AtomTile`); the
+  surviving `kernel/005_lower_atom_tile` synthesizes the `RegFragment`/`ldmatrix`/`mma.sync`/`RegStore` chain. **Warp
+  staging** rides `050_stage` + `assembly/_slab` (the atom-strided slab `block`; the transposed-B operand is excluded —
+  it lowers gmem-direct, ldmatrix having no `.trans`-from-smem path; a size-1 REGISTER cell is dropped before
+  classification so its atom stride migrates to the surviving warp axis). The fragment-epilogue gate resolves a fused
+  per-CTA scale / causal-mask Load hoisted into `dag.leading`/`mid` via `outer_loads`. The warp tier is v1 `SPLITK=1`
+  (no cross-CTA split-K — R3). *Recovered (50 nodes, de-quarantined):* `test_matmul_mma.py`, `…_residual.py`,
+  `…_causal_epilogue.py`, `…_transposed_b.py` (+ its symbolic-MN nodes), `…_parity.py` cp.async nodes,
+  `test_stage_inputs_mma_probe.py`. *Still quarantined (R4 follow-ups):*
+  `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` (needs the staging-decline heuristic so the
+  gmem-direct atom path is exercised), the `test_masked_tile.py` masked cooperative-load clamp + non-divisor
+  `real_extent` nodes (need env-pin honoring in the scalar `thread_offers`/`reg_offers` — which currently breaks the
+  not-yet-built cooperative multi-accum regime — plus masked-staging clamp synthesis), and
+  `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` (imports the deleted `021`; rewrite against
+  `assembly/020_mask_order`). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the symbolic-K
+  staging follow-up.*
 - **R5 — Transport (cp.async / TMA)** (deps: R1, R4). `promote_transport` + descriptor/swizzle synthesis (`peel` post-pass
   does the pipeline expansion). *Recovers:* the `test_matmul_mma_parity.py` TMA nodes (static + dynamic),
   `test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment`. *Folds in `_REASON` Phase 3.*
@@ -779,10 +798,10 @@ never a tree-builder.
   / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
 
 ```
-RF foundation ──┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
-(multi-pass split) ├─► R2 coop-reduce ──────────────────┐        ├─► R7 e2e / structural / prior
-                └─► R3 split-K ──────────────────────────┘        │
-                             R2 ──► R6 flash ◄── R4 ──────────────┘
+RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ─┐
+(multi-pass split) ├─► R2 coop-reduce ─────────────────────┐         ├─► R7 e2e / structural / prior
+                └─► R3 split-K ─────────────────────────────┘         │
+                             R2 ──► R6 flash ◄── R4 ✓ ────────────────┘
 ```
 
 RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
@@ -811,12 +830,18 @@ live process.
 
 The structural surface has converged: the algorithm is `name + domain + compute`, every projection is derived, every
 choice is a `Schedule` annotation, and — with **F3-b** landed — the algorithm is a stored structure refined in place by
-incremental body moves (`reduce_decomp` at `010`, `free_tile` at `030`), with `assemble` the one place the tower is
-materialized. **R1 (staging, scalar tier) has landed** and its inversion is fixed — the first `Schedule`-move
-enumeration fork (`enumeration/050_stage`) is now a pre-assemble fork that reads the fully-tiled stored algorithm and
-writes `Schedule.staged`, and `assemble` synthesizes the smem slab + cooperative `StageBundle` (`assembly/_slab`),
-proven accuracy-vs-torch on scalar matmul (static + masked). The pass structure is now validated end to end on a regime that touches smem (an
-enumeration fork widens; the materialization stage lowers). Two independent tiers are unblocked: **R2** (cooperative
-reduce — the biggest chunk, the coop `classify`→build path + `enumeration/050`-style `(bk,fk,br)` offer + warp-shuffle
-combine synthesis) and **R4** (warp-tier `atomize` — which also brings warp/atom + symbolic-K staging, the deferred
-half of R1). `retime` / `transport` / `warp_spec` forks and the `pad` / `mask_order` post-passes follow on top.
+incremental body moves (`reduce_decomp` at `010`, `free_tile` at `030`, `warp_build` at `009`), with `assemble` the one
+place the tower is materialized. **R1 (staging) and R4 (warp-tier `atomize`) have landed.** The scalar `Schedule`-move
+fork `enumeration/050_stage` reads the fully-tiled stored algorithm and writes `Schedule.staged`, and `assemble`
+synthesizes the smem slab + cooperative `StageBundle` (`assembly/_slab`) — the slab `block` multiplier now derived from
+the σ coefficients, unifying scalar (`()`) and warp (atom-strided) staging. The warp-tier fork chain
+(`005_tensorize`→`006`/`008`/`009`) builds the tensor-core matmul through the `atomize` body move, proven
+accuracy-vs-torch (`mma.sync` + `ldmatrix`) on matmul, residual / pointwise / causal-mask epilogue, transposed-B, and
+symbolic M/N. The pass structure is validated end to end across the smem (scalar + warp) and tensor-core regimes.
+
+The unblocked tiers are now: **R2** (cooperative reduce — the biggest chunk, the coop `classify`→build path +
+`enumeration/050`-style `(bk,fk,br)` offer + warp-shuffle combine synthesis; it also unblocks the env-pin honoring the
+masked-tile R4 follow-ups need), **R5** (transport — cp.async / TMA `promote_transport` on top of R4's warp staging),
+and **R6** (flash, needing R2+R4). The remaining R4 follow-ups (the masked cooperative-load clamp, the gmem-direct
+unstaged atom, the `020_mask_order` rewrite of the hoist test) and the `retime` / `warp_spec` forks + the `pad` /
+`mask_order` post-passes ride those tiers.
