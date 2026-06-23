@@ -812,9 +812,29 @@ never a tree-builder.
   `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` (imports the deleted `021`; rewrite against
   `assembly/020_mask_order`). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the symbolic-K
   staging follow-up.*
-- **R5 — Transport (cp.async / TMA)** (deps: R1, R4). `promote_transport` + descriptor/swizzle synthesis (`peel` post-pass
-  does the pipeline expansion). *Recovers:* the `test_matmul_mma_parity.py` TMA nodes (static + dynamic),
-  `test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment`. *Folds in `_REASON` Phase 3.*
+- **R5 — Transport (cp.async / TMA)** (deps: R1, R4). **Landed (warp-tier TMA).** Added the `promote_transport`
+  enumeration fork `enumeration/052_transport` (the `TMA` BOOL on a fully-staged warp matmul — SYNC is option-0 so
+  greedy stays byte-identical, TMA the eligible second offer / `DEPLODOCK_TMA=1` pin, writing
+  `Schedule.staged[edge] = Transport.TMA`) + the eligibility oracle `enumeration/_transport.tma_eligible` (sm_90+,
+  affine box ≤ 256 / 16 B-aligned, a ringable K loop — ported from the deleted legacy `050_use_tma._source_eligible`).
+  `assembly/_slab` synthesizes a `Transport.TMA` edge into the double-buffered `cp.async.bulk.tensor` ring
+  (`buffer_count=2`, `phase = K_o % 2` prepended to the consumer slab Loads, per-source B64/B128 swizzle via
+  `pick_swizzle_atom`; `prospective_sources` exposes the slab `Source`s the fork's eligibility reads pre-assemble), and
+  the deterministic `assembly/020_peel` post-pass software-pipelines the ring K loop into prologue/main/epilogue (shape
+  D, ported from the deleted legacy `080_pipeline_stages`). **Masked-tile TMA staging** (the symbolic / non-divisor warp
+  matmul wraps its K tower in a boundary `Cond`) rides the `mask_order` hoist in `synthesize_staging`: the TMA-staged K
+  tower is lifted **above** the guard so every warp issues uniformly (the hardware OOB zero-fill — descriptor globalDim
+  = runtime `seq_len` — replaces the overhang rows with 0, so masked rows accumulate 0 and the gated `Write` never
+  stores them). *Gate:* accuracy-vs-torch on the RTX 5090 (sm_120) — static + dynamic mma TMA matmul at divisor
+  `M=256/512`, max err ≤ 3.5e-4; static-render structure (sm_120 forced) asserts `cp.async.bulk.tensor` + `CUtensorMap`
+  + (dynamic) the runtime `seq_len` arg. *Recovered:* `test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire`
+  (static + dynamic). *Deferred:* the cp.async (`ASYNC`) transport — not needed by any recovery test (the parity
+  `cp.async` param only asserts TMA is **absent**, satisfied by SYNC staging); the `RING` occupancy fork (depth 3-4,
+  fixed at 2 here); and the scalar/cooperative-reduce TMA promotion (its fp16-ring-slot strict-align decline) — the warp
+  tier covers the recovery set. *Re-attributed:* `test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment`
+  is **R7**, not R5 — its real blocker is the fused norm+linear scalar regime not lowering (the `y` LoopOp survives), not
+  the TMA decision; the TMA-decline it nominally guards is moot until the kernel lowers. *`_REASON` Phase 3's masked-TMA
+  follow-ups (the cooperative-load clamp + non-divisor `real_extent`) stay with the R4 SYNC-masked-staging tier.*
 - **R6 — Flash / attention** (deps: R2, R4). Add the flash build path (streaming `TWISTED_MONOID`, `FM=FN=1`) +
   `assemble`'s flash synthesis. *Recovers:*
   `test_flash_attention.py`, `test_flash_cooperative_kv.py`, `test_attention_chains.py`, the three
@@ -825,7 +845,7 @@ never a tree-builder.
   / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
 
 ```
-RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ─┐
+RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ✓ ┐
 (multi-pass split) ├─► R2 coop-reduce ✓ ───────────────────┐         ├─► R7 e2e / structural / prior
                 └─► R3 split-K ✓ ───────────────────────────┘         │
                              R2 ✓ ─► R6 flash ◄── R4 ✓ ───────────────┘
@@ -868,12 +888,15 @@ move, proven accuracy-vs-torch (`mma.sync` + `ldmatrix`). The cooperative-reduce
 builds the `MONOID` reduce through the `coop_build` body move (the `K_c` cooperative-THREAD lane), reusing the surviving
 `kernel/100` + `kernel/_combine` warp-shuffle / hierarchical synthesis with **no new assemble work**. The split-K
 combine fork `enumeration/055_atomic_free_splitk` adds the `NOATOMIC` structural split (matmul → `partial[K_s, M, N]`
-workspace + sibling reduce kernel, built by `enumeration/_partition`), proven accuracy-vs-torch on `SPLITK=2/4`. The pass
-structure is validated end to end across the smem (scalar + warp), tensor-core, cooperative-reduce, and split-K regimes.
+workspace + sibling reduce kernel, built by `enumeration/_partition`), proven accuracy-vs-torch on `SPLITK=2/4`. The
+warp-tier TMA transport fork `enumeration/052_transport` promotes a staged warp matmul's operands to the double-buffered
+`cp.async.bulk.tensor` ring (`assembly/_slab` swizzle/ring synthesis + `assembly/020_peel` software-pipeline + the
+`mask_order` hoist for symbolic-M tiles), proven accuracy-vs-torch static + dynamic. The pass structure is validated end
+to end across the smem (scalar + warp), tensor-core, cooperative-reduce, split-K, and TMA-transport regimes.
 
-The unblocked tiers are now: **R5**
-(transport — cp.async / TMA `promote_transport` on top of R4's warp staging) and **R6** (flash, needing R2+R4). The
+The unblocked tier is now **R6** (flash, needing R2+R4). The
 remaining R4 follow-ups (the masked cooperative-load clamp + non-divisor `real_extent`, the gmem-direct unstaged atom,
-the `020_mask_order` rewrite of the hoist test) and the `retime` / `warp_spec` forks + the `pad` / `mask_order`
-post-passes ride those tiers — the masked-tile env-pin honoring is **not** unblocked by R2 (honoring the pin over-stages
-the multi-accum matmul past the smem budget with no greedy fallback, an R4/R5 masked-staging + fallback fix).
+the `020_mask_order` rewrite of the hoist test) and the `retime` / `warp_spec` forks + the `pad` post-pass + the
+scalar/cp.async transport ride those tiers — the masked-tile env-pin honoring is **not** unblocked by R2 (honoring the
+pin over-stages the multi-accum matmul past the smem budget with no greedy fallback, an R4/R5 masked-staging + fallback
+fix).
