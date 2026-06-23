@@ -32,7 +32,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.knobs import (
     MAP_N_THREAD,
     RED_BK,
     RED_FK,
-    RED_SPLITK,
     TC_BK,
     TC_REG_M,
     TC_REG_N,
@@ -136,22 +135,6 @@ def _assemble(
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
 
 
-def build_pointwise_tile(knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag) -> TileOp:
-    inner_n, outer_m, extra_outer = _free_axes(dag)
-    free_specs: list[_FreeSpec] = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
-    if outer_m is not None:
-        free_specs.append((outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
-    return _assemble(
-        free_specs,
-        dag.inner_body,
-        leading=dag.leading,
-        extra_outer=extra_outer,
-        knobs=knobs,
-        base_knobs=base_knobs,
-        kernel_name=kernel_name,
-    )
-
-
 def _replace_k_scalar(
     stmts: tuple[Stmt, ...],
     target_names: frozenset[str],
@@ -223,35 +206,6 @@ def _replace_k_scalar(
         else:
             out.append(s)
     return tuple(out)
-
-
-def build_matmul_tile(knobs: dict, *, kernel_name: str, base_knobs: dict, dag: IterDag, target_names: frozenset[str]) -> TileOp:
-    inner_n, outer_m, extra_outer = _free_axes(dag)
-    free_specs: list[_FreeSpec] = [
-        (inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True),
-        (outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False),
-    ]
-    bk, fk, splitk = knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name]
-    kax = dag.k_node.loop.axis
-    src_k = kax.source_axis or kax
-    k_s = Axis(f"{kax.name}_s", splitk, source_axis=src_k) if splitk > 1 else None
-    targets = target_names or frozenset({kax.name})
-    # Scalar tier: stamp the warp-tier knobs as explicit OFF sentinels (``MMA="0"``
-    # so ``is_warp`` reads False; ``WM=WN=0``) plus the scalar ``BR=1`` (no
-    # cooperative-K), so the leaf carries the complete, uniform knob set the tune
-    # DB / prior key on (the warp builder stamps ``MMA=<atom>`` + ``WM``/``WN``).
-    knobs = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
-    return _assemble(
-        free_specs,
-        dag.inner_body,
-        leading=dag.leading,
-        extra_outer=extra_outer,
-        knobs=knobs,
-        base_knobs=base_knobs,
-        kernel_name=kernel_name,
-        k_transform=lambda body: _replace_k_scalar(body, targets, dag.k_extent, bk, fk, splitk, k_s),
-        extra_block=(k_s,) if k_s is not None else (),
-    )
 
 
 def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:

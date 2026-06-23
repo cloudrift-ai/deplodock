@@ -15,8 +15,9 @@ entries on the split axes.
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import BinaryExpr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body
+from deplodock.compiler.ir.stmt import Body, Cond
 from deplodock.compiler.ir.tile.blockdag import Binding, Block, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import _identity_rename
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block
@@ -34,9 +35,18 @@ from deplodock.compiler.pipeline.passes.lowering.tile.partition.materialize impo
     _free_axes,
     _replace_k_scalar,
     _split_free_axis,
-    build_matmul_tile,
-    build_pointwise_tile,
 )
+
+
+def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple:
+    """Wrap ``body`` in a boundary ``Cond`` per masked free axis — the derived
+    store guard (``plans/tile-ir-block-dag.md``: masked-ness is ``real_extent`` vs
+    tile, a derived ``Cond``). Mirrors ``materialize._assemble`` exactly, so the
+    σ-split + guarded body stays byte-identical."""
+    for name, bound in bounds:
+        pred = sigma_outer.reduce(Var(name), SimplifyCtx({}))
+        body = (Cond(cond=BinaryExpr("<", pred, bound), body=Body(body)),)
+    return body
 
 
 def build_pointwise_dag(dag: IterDag, knobs: dict, *, kernel_name: str) -> TileGraph:
@@ -55,13 +65,14 @@ def build_pointwise_dag(dag: IterDag, knobs: dict, *, kernel_name: str) -> TileG
         free_specs.append((outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
 
     sigma_map: dict = {}
+    bounds: list = []
     domain: list = []
     binding: dict[str, Binding] = {}
     for axis, thread, reg, interleave in free_specs:
         a_b, a_t, a_r, expr, bound = _split_free_axis(axis, thread, reg, interleave_when_masked=interleave)
-        if bound is not None:
-            raise NotImplementedError("build_pointwise_dag: masked axes not yet ported")
         sigma_map[axis.name] = expr
+        if bound is not None:
+            bounds.append((axis.name, bound))
         domain.extend((a_b, a_t, a_r))
         binding[a_b.name] = Binding.GRID
         binding[a_t.name] = Binding.THREAD
@@ -72,6 +83,7 @@ def build_pointwise_dag(dag: IterDag, knobs: dict, *, kernel_name: str) -> TileG
 
     sigma_outer = Sigma(sigma_map)
     compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
+    compute = _apply_masked_guards(compute, bounds, sigma_outer)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
     return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
 
@@ -97,13 +109,14 @@ def build_matmul_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_name
     targets = target_names or frozenset({kax.name})
 
     sigma_map: dict = {}
+    bounds: list = []
     domain: list = []
     binding: dict[str, Binding] = {}
     for axis, thread, reg, interleave in free_specs:
         a_b, a_t, a_r, expr, bound = _split_free_axis(axis, thread, reg, interleave_when_masked=interleave)
-        if bound is not None:
-            raise NotImplementedError("build_matmul_dag: masked free axes not yet ported")
         sigma_map[axis.name] = expr
+        if bound is not None:
+            bounds.append((axis.name, bound))
         domain.extend((a_b, a_t, a_r))
         binding[a_b.name] = Binding.GRID
         binding[a_t.name] = Binding.THREAD
@@ -118,36 +131,27 @@ def build_matmul_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_name
     sigma_outer = Sigma(sigma_map)
     inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
     compute = _replace_k_scalar(inner, targets, dag.k_extent, bk, fk, splitk, k_s)
+    compute = _apply_masked_guards(compute, bounds, sigma_outer)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
     return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers — build the DAG + assemble, with a legacy fallback for the
-# regimes/shapes not yet ported (masked axes). The Fork-tree leaves call these,
-# so the pipeline lowers covered shapes through the new IR while unported shapes
-# stay on the legacy materializer. assemble is byte-identical, so this is a pure
-# substitution (verified by tests/compiler/passes/test_assemble_blockdag.py).
+# Routing helpers — build the DAG + assemble. The Fork-tree leaves call these;
+# the new block-DAG path is the SOLE pointwise / scalar-matmul lowering (the
+# legacy materialize.build_*_tile builders are deleted).
 # ---------------------------------------------------------------------------
 
 
 def lower_pointwise(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict):
-    """Lower a pointwise leaf via the block-DAG path, falling back to the legacy
-    materializer for shapes ``build_pointwise_dag`` doesn't yet cover."""
-    try:
-        tg = build_pointwise_dag(dag, knobs, kernel_name=kernel_name)
-    except NotImplementedError:
-        return build_pointwise_tile(knobs, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag)
+    """Lower a pointwise leaf via the block-DAG path."""
+    tg = build_pointwise_dag(dag, knobs, kernel_name=kernel_name)
     return assemble_block(tg, knobs=knobs, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
 
 
 def lower_matmul(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str]):
-    """Lower a scalar-matmul leaf via the block-DAG path, falling back to the
-    legacy materializer for shapes ``build_matmul_dag`` doesn't yet cover."""
-    try:
-        tg = build_matmul_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
-    except NotImplementedError:
-        return build_matmul_tile(knobs, kernel_name=kernel_name, base_knobs=base_knobs, dag=dag, target_names=target_names)
-    # Scalar tier carries the warp-tier OFF sentinels (matches build_matmul_tile).
+    """Lower a scalar-matmul leaf via the block-DAG path."""
+    tg = build_matmul_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
+    # Scalar tier carries the warp-tier OFF sentinels.
     stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
     return assemble_block(tg, knobs=stamped, base_knobs=base_knobs, kernel_name=kernel_name, leading=dag.leading)
