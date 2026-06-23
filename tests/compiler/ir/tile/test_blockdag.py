@@ -301,3 +301,31 @@ def test_placement_gmem_dominates_smem_on_cut_edge():
     e = Edge(src="prod", dst="cons", buffer="xn")
     g = _prod_cons_graph(Schedule(launch={"prod": 0, "cons": 1}, staged={e: Transport.SYNC}))
     assert g.placement(e) is Placement.GMEM
+
+
+def test_place_edge_round_trips_with_placement():
+    # place_edge writes the Schedule fields a placement implies; placement reads them
+    # back — the two are inverse over the block→block edge.
+    g = _prod_cons_graph(Schedule())
+    xn = Edge(src="prod", dst="cons", buffer="xn")
+    for p in (Placement.GMEM, Placement.SMEM, Placement.INLINE):
+        assert g.place_edge(xn, p).placement(xn) is p
+
+
+def test_place_edge_smem_stages_and_co_locates():
+    # SMEM fuses: one launch group + the edge staged (the producer fills an smem slab
+    # inside one kernel, the consumer reads it)
+    g = _prod_cons_graph(Schedule())
+    xn = Edge(src="prod", dst="cons", buffer="xn")
+    placed = g.place_edge(xn, Placement.SMEM)
+    assert placed.schedule.launch["prod"] == placed.schedule.launch["cons"]
+    assert placed.schedule.staged[xn] is Transport.SYNC
+
+
+def test_place_edge_gmem_splits_launch_groups():
+    # GMEM cuts: producer and consumer in different launch groups, no staging
+    g = _prod_cons_graph(Schedule())
+    xn = Edge(src="prod", dst="cons", buffer="xn")
+    placed = g.place_edge(xn, Placement.GMEM)
+    assert placed.schedule.launch["prod"] != placed.schedule.launch["cons"]
+    assert xn not in placed.schedule.staged

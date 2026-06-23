@@ -14,7 +14,7 @@ from dataclasses import replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import Placement, Schedule
+from deplodock.compiler.ir.tile.ir import Placement, Schedule, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import seed_demoted
 from tests.compiler.passes.test_cut_offers import _f32_matmul_graph, _norm_linear_graph, _pointwise_graph
@@ -68,6 +68,24 @@ def test_demoted_seed_edge_placement_is_derived():
     # live in registers/smem inside one kernel (the future SMEM/INLINE placement)
     fused = replace(tg, schedule=Schedule(launch={prod.name: 0, cons.name: 0}))
     assert fused.placement(xn) is not Placement.GMEM
+
+
+def test_demoted_seed_place_edge_fuses_or_cuts():
+    """``place_edge`` drives the cut-vs-fuse decision over the real demoted seed: SMEM
+    co-locates the two blocks + stages ``xn`` (the fused edge); GMEM splits them into
+    separate launch groups (the cut)."""
+    tg = _seed(_norm_linear_graph())
+    prod, cons = tg.blocks
+    xn = next(e for e in tg.edges if e.src == prod.name and e.dst == cons.name)
+
+    fused = tg.place_edge(xn, Placement.SMEM)
+    assert fused.placement(xn) is Placement.SMEM
+    assert fused.schedule.launch[prod.name] == fused.schedule.launch[cons.name]
+    assert fused.schedule.staged[xn] is Transport.SYNC
+
+    cut = tg.place_edge(xn, Placement.GMEM)
+    assert cut.placement(xn) is Placement.GMEM
+    assert cut.schedule.launch[prod.name] != cut.schedule.launch[cons.name]
 
 
 def test_clean_matmul_does_not_seed_demoted():

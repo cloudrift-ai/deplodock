@@ -555,6 +555,37 @@ class TileGraph:
             return Placement.SMEM
         return Placement.INLINE
 
+    def place_edge(self, edge: Edge, placement: Placement, *, transport: Transport = Transport.SYNC) -> TileGraph:
+        """Return a copy of this ``TileGraph`` with ``edge`` placed — the unifying
+        edge-placement **move** (``plans/dag-edge-placement-split-as-enumeration.md``).
+        The inverse of :meth:`placement`: it writes the ``Schedule`` fields a placement
+        implies, so ``stage``/``split``/fuse become one operation over the block-DAG.
+
+        - ``GMEM`` (the cut) — put the producer and consumer in **different** launch
+          groups (a grid barrier — the multi-launch ``assemble`` then emits separate
+          kernels with a gmem intermediate). Drops any stale staging of the edge.
+        - ``SMEM`` (the fused edge) — put both in the **same** launch group and stage
+          the edge (``staged[edge] = transport``); the intermediate rides an smem slab
+          inside one kernel (the producer fills it, the consumer reads it).
+        - ``INLINE`` — same launch group, no staging (the value rides registers).
+
+        Only meaningful for a block→block edge (``edge.src`` is a producer block); an
+        input-source edge has no producer to co-place, so only ``SMEM``/``INLINE``
+        (its staging) apply and the launch keys are left untouched."""
+        sched = self.schedule
+        block_names = {b.name for b in self.blocks}
+        launch = dict(sched.launch)
+        staged = {e: t for e, t in sched.staged.items() if e != edge}
+        if edge.src in block_names:
+            if placement is Placement.GMEM:
+                launch[edge.src] = launch.get(edge.src, 0)
+                launch[edge.dst] = launch[edge.src] + 1  # a distinct group → the cut
+            else:
+                launch[edge.dst] = launch[edge.src] = launch.get(edge.src, 0)  # one kernel
+        if placement is Placement.SMEM:
+            staged[edge] = transport
+        return replace(self, schedule=replace(sched, launch=launch, staged=staged))
+
     def structural_key(self) -> str:
         """A canonical identity over the algorithm + Schedule, for ``op_cache_key``
         (``plans/tile-ir-block-dag.md``: the key is ``canonical(compute bodies +
