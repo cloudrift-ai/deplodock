@@ -89,6 +89,21 @@ SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA 
 # (pointwise / no reuse / no K-tower) — an explicit "decided: unused".
 STAGE = Knob("STAGE", KnobType.BINMASK, help="Bitmask over ranked stageable read-sites (char i = candidate i)", off="")
 
+# Transport knob (the ``promote_transport`` move, ``052_transport``): a BOOL over a
+# fully-staged warp-tier matmul. ``True`` promotes the staged ``Edge``s from
+# ``Transport.SYNC`` to ``Transport.TMA`` (``assembly/_slab`` then synthesizes the
+# double-buffered ``cp.async.bulk.tensor`` ring + per-source swizzle; ``assembly/020_peel``
+# software-pipelines it); ``False`` keeps the SYNC cooperative load. Hints
+# ``(True, False)`` so TMA is preferred first on sm_90+; arch-gated + eligibility-gated
+# by the fork. ``off=False`` = decided-unused (scalar / ineligible / non-sm90).
+TMA = Knob(
+    "TMA",
+    KnobType.BOOL,
+    hints=(True, False),
+    help="Promote staged warp-tier matmul read-sites to TMA (cp.async.bulk.tensor). 0 = keep SYNC staging.",
+    off=False,
+)
+
 
 # Candidate menus, shared by the move ``offers``. Thread-tile extents are the
 # per-CTA thread fan-out per axis; register-tile factors are cells-per-thread.

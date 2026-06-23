@@ -115,9 +115,10 @@ _XFAIL_FUNCS: dict[str, str] = {
 
 # Specific parametrizations (the function also has green params).
 _XFAIL_NODES: dict[str, str] = {
-    # R5
+    # R5 — static-tma landed (warp-tier promote_transport + TMA ring/swizzle/peel
+    # synthesis). dynamic-tma needs masked-tile TMA staging + the mask_order hoist
+    # (an R4 follow-up), so it stays quarantined with that work.
     "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": "R5",
-    "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": "R5",
     # R6
     "test_ops_vs_torch.py::test_sdpa[cuda]": "R6",
     "test_ops_vs_torch.py::test_sdpa_causal[cuda]": "R6",

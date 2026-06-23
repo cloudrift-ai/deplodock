@@ -18,14 +18,15 @@ The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **two pa
   applying the **coop build body move** (re-bracket K with the `K_c` cooperative-THREAD lane + free-axis σ-split with the
   register tile forced to 1); the scalar passes `020`/`030`/`040` + `050_stage` gate off `MONOID` (a cooperative reduce
   is one decision and stays smem-free). The algorithm is built up across the passes, never all-at-once.
-- **`assembly/`** (`010_assemble`) — the fully-tiled `TileGraphOp` → `TileOp`, in one deterministic step. No build here:
-  `assemble_block` only **materializes** the stored algorithm — the register/thread tower (`_wrap_tower`) + slab
-  synthesis from `Schedule.staged`. Every scheduling decision already lives on the `TileGraph` / `Schedule`, so there is
-  no search here.
+- **`assembly/`** (`010_assemble` + `020_peel`) — the fully-tiled `TileGraphOp` → `TileOp`, in one deterministic step
+  followed by deterministic post-passes. No build here: `assemble_block` only **materializes** the stored algorithm —
+  the register/thread tower (`_wrap_tower`) + slab synthesis from `Schedule.staged`; `020_peel` then software-pipelines a
+  ring-staged (TMA) K loop. Every scheduling decision already lives on the `TileGraph` / `Schedule`, so there is no
+  search here.
 
 ```
                           ┌─ scalar: reduce_decomp ─(thread)─ free_tile ─ 040_seal ─┐
-LoopOp ─000_build─▶ logical TileGraph ─005_tensorize┤─ coop:   015_coop_reduce (coop_build) ──┼─ 050_stage ─▶ tiled TileGraphOp ─010_assemble (materialize)─▶ TileOp
+LoopOp ─000_build─▶ logical TileGraph ─005_tensorize┤─ coop:   015_coop_reduce (coop_build) ──┼─ 050_stage ─ 052_transport ─▶ tiled TileGraphOp ─010_assemble ─ 020_peel ─▶ TileOp
                           └─ warp:   006/008 geom+reg ─ 009_warp_build (atomize) ───┘
 ```
 
@@ -88,12 +89,14 @@ shape-specific pattern matching.*
 | `030_register_tile.py`| Fork (scalar): the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`; **applies the `free_tile` body move** (the algorithm is fully tiled after). Skips on a coop variant. |
 | `040_seal_scalar_tier.py`| Deterministic: stamp the reduce regime's scalar-tier OFF sentinels (`MMA=0 WM=0 WN=0 BR=1`). Knob-only; skips on a warp variant (it carries `MMA`) or a coop variant (it carries its own `BR`). |
 | `050_stage.py`        | Fork (`Schedule`-move): `stage_candidates` off the stored tiled `TileGraph` → a `STAGE` bitmask → `Schedule.staged[edge] = SYNC` (scalar **and** warp operands; the transposed-B operand is excluded — gmem-direct). Skips a `MONOID` coop variant (smem-free — no cross-thread reuse). |
+| `052_transport.py`    | Fork (`Schedule`-move, R5): `promote_transport` — `TMA` BOOL on a fully-staged **warp-tier** matmul. `False` (option-0, greedy-default) keeps SYNC staging; `True` promotes every staged `Edge` to `Schedule.staged[edge] = TMA` when `_transport.tma_eligible` (sm_90+, affine box ≤ 256 / 16 B-aligned, a ringable K loop) — `assembly/_slab` then synthesizes the double-buffered `cp.async.bulk.tensor` ring + per-source swizzle. Skips scalar / coop / unstaged variants. |
 | `055_atomic_free_splitk.py` | Fork (**structural**, R3): the split-K combine — `NOATOMIC` BOOL on a fully-tiled scalar `SEMIRING` matmul with `SPLITK > 1`. `False` keeps the codegen `atomicAdd`; `True` splices a two-node `Graph` (matmul writing `partial[K_s, M, N]` + the additive reduce kernel `_partition.additive_reduce_tilegraph` folding `K_s`). Skips a warp variant (v1 `SPLITK=1`) / non-split / non-2D-static output. |
 | `_iterdag.py`         | `iter_dag` — the derived iteration-DAG view (axes tagged `PARALLEL` / `REDUCE` + carrier). |
 | `_classify.py`        | `classify` → `_Regime(algebra=AlgebraKind)`. |
 | `_atom.py`            | The warp-tier gate: `eligible_atoms` (per-atom eligibility over the dag + dtypes + cc) + `classify_matmul_operands` (the one A/B layout decision, shared by the gate and the `atomize` move). |
 | `_moves.py`           | `Budget` + `legal_decomps` + the offers (`thread_offers`, `map_reg_offers`, `reduce_offers`, `reduce_reg_offers`, `coop_reduce_offers` / `coop_free_threads`, `warp_offers` / `warp_reg_offers` / `warp_bk_offers`) + knob deltas. |
 | `_stage.py`           | `stage_candidates` — the `stage` move's ranked offer set (AFFINE + fan-in reuse + K-tower) off the derived `Block.reads`; excludes the transposed-B operand. |
+| `_transport.py`       | `tma_eligible` (R5) — the `promote_transport` legality oracle over the prospective slab `Source`s (`assembly/_slab.prospective_sources`): sm_90+, affine box ≤ 256 / 16 B-aligned source + box inner, source inner ≥ 2× box, a ringable `serial_outer` K loop. Ported from the deleted legacy `050_use_tma._source_eligible`. |
 | `_knobs.py`           | The knob schema (`BN`/`BM`/`BK`/`FK`/`STAGE`/`MMA`/`WM`/`WN`/… + the composer aliases `MAP_*` / `RED_*` / `TC_*`). |
 | `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `coop_build` (the cooperative-reduce K re-bracket + free split, R2), `warp_build` (the warp-tier four-way split + `atomize`); `build_dag` is the scalar composition (the byte-identity oracle). |
 | `_partition.py`       | The R3 split-K combine builders — `additive_reduce_tilegraph` (`Accum` sum) / `monoid_reduce_tilegraph` (carrier-general `combine_states` fold) emit a fully-tiled single-`Block` combine `TileGraph` (`GridTile(16×16) > ThreadTile > serial K_s reduce + boundary Cond`); `reduce_tilegraphop` wraps it with stamped fixed/OFF knobs so every enumeration fork skips it (fixed-schedule, not searched). |
@@ -110,8 +113,9 @@ byte-identity oracle for the distribution.
 | Module | Role |
 | ------ | ---- |
 | `010_assemble.py` | The pass: fully-tiled `TileGraphOp` → `TileOp`. **No build** — `assemble_block` materializes the stored algorithm (tower + slab synthesis). |
+| `020_peel.py`     | Deterministic post-`assemble` (R5): software-pipeline a ring-staged `serial_outer` K loop (a `StageBundle` with `policy ∈ {ASYNC, TMA}`, `pipeline_depth == 1`, static extent ≥ `buffer_count`) into prologue / `K_o-1` main loop with issue-next + `AsyncWait` + reduce / epilogue drains — the peeled shape D `kernel/005_lower_atom_tile` lowers. **No fork** (the transport decision was the fork; the peel has one output per ring depth). Ported from the deleted legacy `080_pipeline_stages`. |
 | `_assemble.py`    | `assemble_block` — synthesize staging (`_slab`), then reconstruct the binding tower from `Schedule.binding` (ATOM/REGISTER/WARP/THREAD/GRID tiers) over the block's σ-rewritten `compute`; the warp tier's `Mma` cell rides inside the `AtomTile` for `kernel/005` to lower. |
-| `_slab.py`        | `synthesize_staging` — materialize `Schedule.staged` into one SYNC `StageBundle` per K-tower (a `Source` per staged buffer, cache axes off the consumer `Load`, GRID + serial-outer K folded to the slab origin). The per-axis `AffineAddressing.block` multiplier is **derived from the σ coefficients** — `()` for a scalar tile, atom-strided for a warp tile (the ATOM cell rides the surviving cache axis); a size-1 REGISTER cell is dropped first so its atom stride migrates to the warp axis. |
+| `_slab.py`        | `synthesize_staging` — materialize `Schedule.staged` into one `StageBundle` per K-tower (a `Source` per staged buffer, cache axes off the consumer `Load`, GRID + serial-outer K folded to the slab origin). SYNC by default; a `Transport.TMA` edge yields the double-buffered TMA ring (`buffer_count=2`, `phase = K_o % 2` prepended to the consumer slab Loads, per-source swizzle via `pick_swizzle_atom`). `prospective_sources` exposes the slab `Source`s the transport fork's eligibility oracle reads pre-assemble. The per-axis `AffineAddressing.block` multiplier is **derived from the σ coefficients** — `()` for a scalar tile, atom-strided for a warp tile; a size-1 REGISTER cell is dropped first so its atom stride migrates to the warp axis. |
 | `_tower.py`       | `_wrap_tower` — the shared innermost-first tower-building primitive (`Role` → tile flavor). |
 
 ## Coverage
@@ -123,10 +127,15 @@ symbolic-K masked-fill, whole-CTA and strided-cooperative rows, the warp-shuffle
 epilogue fold, transposed-B, symbolic M/N), with **smem staging** (`stage` move) on both the scalar reduce regimes (R1)
 and the warp operands (atom-strided slab + `ldmatrix`) + the **cross-CTA split-K combine** (R3 `055_atomic_free_splitk`
 — the `NOATOMIC` structural fork: the matmul's per-`K_s` partials either `atomicAdd` into the output or write a
-`partial[K_s, M, N]` workspace folded by a sibling additive / carrier-general combine kernel). Recognized by `classify`
+`partial[K_s, M, N]` workspace folded by a sibling additive / carrier-general combine kernel) + the **warp-tier TMA
+transport** (R5 `052_transport` + `assembly/020_peel`: the `promote_transport` fork promotes a static-shape warp
+matmul's staged operands to a double-buffered `cp.async.bulk.tensor` ring with per-source swizzle, software-pipelined
+into prologue/main/epilogue — greedy stays SYNC, the tuner/`DEPLODOCK_TMA=1` selects TMA). Recognized by `classify`
 but not yet built (they re-enter the same uniform tree once their decomposition placement + assembly land):
-`TWISTED_MONOID` fused flash and the R5 transports
-(cp.async / TMA). Remaining R4 follow-ups still quarantined: the masked cooperative-load clamp + non-divisor
-`real_extent` (need scalar-offer env-pin honoring — still blocked, since honoring the pin over-stages the multi-accum
-matmul past the smem budget with no greedy fallback) and the gmem-direct unstaged atom. See `plans/tile-ir-block-dag.md`
+`TWISTED_MONOID` fused flash (R6). Remaining R4/R5 follow-ups still quarantined: the masked cooperative-load clamp +
+non-divisor `real_extent` (need scalar-offer env-pin honoring — still blocked, since honoring the pin over-stages the
+multi-accum matmul past the smem budget with no greedy fallback), the gmem-direct unstaged atom, and **masked-tile TMA
+staging** (the dynamic / symbolic-M warp matmul wraps its K loop in a boundary `Cond`, so TMA staging needs the
+`mask_order` cooperative-load hoist above the guard — `test_matmul_mma_parity.py::…[dynamic-tma]`).
+See `plans/tile-ir-block-dag.md`
 and `plans/algebra-licensed-decomposition-moves.md`.

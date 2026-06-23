@@ -22,11 +22,14 @@ is reconstructed by ``affine_decode_per_dim`` from the cache-axis extents
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
+    BYTES_PER_ELEM,
     AffineAddressing,
     Binding,
     Block,
@@ -36,11 +39,19 @@ from deplodock.compiler.ir.tile.ir import (
     StageBundle,
     StagePolicy,
     TileGraph,
+    Transport,
     _add,
     _affine_terms,
     _mul_const,
+    pick_swizzle_atom,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _identity_rename
+
+# Double-buffer ring depth for TMA-staged K loops. R5 fixes the depth at 2 (the
+# classical compute-current / fill-next double-buffer); the occupancy ``RING`` fork
+# (depth 3-4) rides a later tier. The matching ``assembly/020_peel`` software-pipeline
+# reads this off ``StageBundle.buffer_count``.
+_TMA_RING = 2
 
 
 def _cache_axis_names(block: Block, binding: dict) -> dict[str, Axis]:
@@ -136,9 +147,37 @@ def _source_from_load(load: Load, src_name: str, cache_axes: dict[str, Axis], dt
     return source, slab_index
 
 
-def _make_bundle(inner: tuple[Stmt, ...], staged_bufs: frozenset[str], cache_axes: dict[str, Axis], buffers: dict) -> StageBundle:
-    """One SYNC ``StageBundle`` over ``inner``: a Source per staged buffer (from its
-    first consumer ``Load``) + ``inner`` with every staged Load rewritten to the slab."""
+def _source_inner_elems(src: Source) -> int:
+    """Collapsed inner-row element span of ``src``'s slab — the product of
+    ``(cache_extent × block)`` over every cache axis mapping to the innermost
+    *source* dim (``max(dims)`` — the contiguous, fastest-varying source dim).
+    Used to pick the TMA swizzle atom; mirrors the materializer's box reshape."""
+    addressing = src.addressing
+    assert isinstance(addressing, AffineAddressing)
+    dims, block = addressing.dims, addressing.block
+    inner_dim = max(dims)
+    inner = 1
+    for i, (d, ax) in enumerate(zip(dims, src.cache_axes, strict=True)):
+        if d == inner_dim:
+            b = block[i] if block else 1
+            inner *= ax.extent.as_static() * b
+    return inner
+
+
+def _stamp_swizzle(src: Source) -> Source:
+    """Stamp one TMA source's :class:`SwizzleMode` from its inner-row byte span (A
+    64 B → B64, B 128 B → B128 — distinct modes on sources sharing one bundle). Only
+    affine sources swizzle; the materializer reads ``src.swizzle`` into each
+    descriptor and the matching ldmatrix XOR (``kernel/005_lower_atom_tile``)."""
+    if not isinstance(src.addressing, AffineAddressing):
+        return src
+    elem_bytes = src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM
+    _, mode = pick_swizzle_atom(_source_inner_elems(src), elem_bytes)
+    return replace(src, swizzle=mode)
+
+
+def _bundle_sources(inner: tuple[Stmt, ...], staged_bufs: frozenset[str], cache_axes: dict[str, Axis], buffers: dict) -> list[Source]:
+    """A :class:`Source` per staged buffer (from its first consumer ``Load``)."""
     sources: list[Source] = []
     for ld in Body(inner).iter_of_type(Load):
         if ld.input not in staged_bufs or any(src.buf == ld.input for src in sources):
@@ -146,19 +185,61 @@ def _make_bundle(inner: tuple[Stmt, ...], staged_bufs: frozenset[str], cache_axe
         dtype = buffers[ld.input].dtype if ld.input in buffers else None
         source, _ = _source_from_load(ld, ld.input, cache_axes, dtype)
         sources.append(source)
+    return sources
+
+
+def _make_bundle(
+    inner: tuple[Stmt, ...],
+    staged_bufs: frozenset[str],
+    cache_axes: dict[str, Axis],
+    buffers: dict,
+    *,
+    tma_phase: Expr | None = None,
+) -> StageBundle:
+    """One ``StageBundle`` over ``inner``: a Source per staged buffer + ``inner`` with
+    every staged Load rewritten to the slab. SYNC by default; when ``tma_phase`` is
+    given (a ``Var(K_o) % RING`` ring slot) the bundle is the double-buffered TMA
+    transport — each source swizzle-stamped, ``buffer_count = RING``, ``phase`` set —
+    materialized as ``cp.async.bulk.tensor`` box copies (``assembly/020_peel`` then
+    software-pipelines it)."""
+    sources = _bundle_sources(inner, staged_bufs, cache_axes, buffers)
     by_buf = {src.buf: src for src in sources}
-    return StageBundle(sources=tuple(sources), body=Body(_rewrite_loads(inner, by_buf)), policy=StagePolicy.SYNC)
+    if tma_phase is None:
+        return StageBundle(sources=tuple(sources), body=Body(_rewrite_loads(inner, by_buf)), policy=StagePolicy.SYNC)
+    # Double-buffered TMA: the slab is allocated ``[phase, *cache_axes]``; the
+    # consumer slab Loads carry the ring slot as a leading index dim so the
+    # ldmatrix lowering (``kernel/005_lower_atom_tile._mma_src_index``) reads the
+    # right slot (it detects the prefix via ``len(index) > len(cache_axes)``).
+    return StageBundle(
+        sources=tuple(_stamp_swizzle(s) for s in sources),
+        body=Body(_rewrite_loads(inner, by_buf, phase=tma_phase)),
+        policy=StagePolicy.TMA,
+        buffer_count=_TMA_RING,
+        phase=tma_phase,
+    )
 
 
-def _wrap_k_body(stmts: tuple[Stmt, ...], staged_bufs: frozenset[str], cache_axes: dict[str, Axis], buffers: dict) -> tuple[Stmt, ...]:
+def _wrap_k_body(
+    stmts: tuple[Stmt, ...],
+    staged_bufs: frozenset[str],
+    cache_axes: dict[str, Axis],
+    buffers: dict,
+    *,
+    tma_bufs: frozenset[str] = frozenset(),
+) -> tuple[Stmt, ...]:
     """Wrap the K-tower in a ``StageBundle``. With a multi-stage K loop the bundle
     sits *inside* the ``serial_outer`` loop (the slab reloads per stage); when ``BK
     == K`` collapses ``serial_outer`` away, the ``stage_inner`` loop alone is wrapped
-    (the whole-K slab, loaded once)."""
+    (the whole-K slab, loaded once). When every staged buffer is in ``tma_bufs`` the
+    ``serial_outer`` bundle is the double-buffered TMA transport (phase ``K_o % RING``)
+    — only the ringable multi-stage loop is TMA-promoted (the single-stage whole-K
+    slab can't pipeline, so it stays SYNC)."""
+    all_tma = bool(staged_bufs) and staged_bufs <= tma_bufs
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
-            bundle = _make_bundle(tuple(s.body), staged_bufs, cache_axes, buffers)
+            phase = BinaryExpr("%", Var(s.axis.name), Literal(_TMA_RING, "int")) if all_tma else None
+            bundle = _make_bundle(tuple(s.body), staged_bufs, cache_axes, buffers, tma_phase=phase)
             out.append(SerialTile(axis=s.axis, body=Body((bundle,)), kind=s.kind))
         elif isinstance(s, SerialTile) and s.kind == "stage_inner":
             out.append(_make_bundle((s,), staged_bufs, cache_axes, buffers))
@@ -167,19 +248,23 @@ def _wrap_k_body(stmts: tuple[Stmt, ...], staged_bufs: frozenset[str], cache_axe
     return tuple(out)
 
 
-def _rewrite_loads(stmts: tuple[Stmt, ...], by_buf: dict[str, Source]) -> tuple[Stmt, ...]:
+def _rewrite_loads(stmts: tuple[Stmt, ...], by_buf: dict[str, Source], *, phase: Expr | None = None) -> tuple[Stmt, ...]:
     """Recursively rewrite every staged ``Load`` to read its smem slab; descend
-    through nested tile bodies, leaving non-staged Loads and all other stmts intact."""
+    through nested tile bodies, leaving non-staged Loads and all other stmts intact.
+    When ``phase`` is given (a double-buffered ring slot) it is prepended as the
+    leading slab index dim."""
     out: list[Stmt] = []
     for s in stmts:
         if isinstance(s, Load) and s.input in by_buf:
             src = by_buf[s.input]
             slab_index = tuple(Var(ax.name) for ax in src.cache_axes)
+            if phase is not None:
+                slab_index = (phase, *slab_index)
             out.append(Load(name=s.name, input=src.name, index=slab_index))
             continue
         nested = s.nested() if hasattr(s, "nested") else ()
         if nested:
-            new_bodies = tuple(Body(_rewrite_loads(tuple(b), by_buf)) for b in nested)
+            new_bodies = tuple(Body(_rewrite_loads(tuple(b), by_buf, phase=phase)) for b in nested)
             out.append(s.with_bodies(new_bodies))
         else:
             out.append(s)
@@ -204,6 +289,21 @@ def _drop_size1_registers(block: Block, binding: dict) -> Body:
     return Body(tuple(s.rewrite(_identity_rename, sigma) for s in block.compute))
 
 
+def prospective_sources(graph: TileGraph) -> list[Source]:
+    """The smem ``Source``s ``assemble`` *would* synthesize for ``graph``'s staged
+    read-sites — the derived projection the ``promote_transport`` fork's eligibility
+    oracle (``enumeration/_transport``) reads, without materializing the tower. Empty
+    when nothing is staged."""
+    staged = graph.schedule.staged
+    block = graph.blocks[0]
+    if not staged:
+        return []
+    staged_bufs = frozenset(e.buffer for e in staged)
+    compute = _drop_size1_registers(block, graph.schedule.binding)
+    cache_axes = _cache_axis_names(block, graph.schedule.binding)
+    return _bundle_sources(tuple(compute), staged_bufs, cache_axes, graph.buffers)
+
+
 def synthesize_staging(graph: TileGraph) -> Body:
     """Return the single block's ``compute`` rewritten so each ``Schedule.staged``
     read-site reads an smem slab, with one ``StageBundle`` wrapping the K-tower. A
@@ -213,6 +313,7 @@ def synthesize_staging(graph: TileGraph) -> Body:
     if not staged:
         return block.compute
     staged_bufs = frozenset(e.buffer for e in staged)
+    tma_bufs = frozenset(e.buffer for e, t in staged.items() if t is Transport.TMA)
     compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
-    return Body(_wrap_k_body(tuple(compute), staged_bufs, cache_axes, graph.buffers))
+    return Body(_wrap_k_body(tuple(compute), staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs))
