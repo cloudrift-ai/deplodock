@@ -1,4 +1,4 @@
-"""Derived-projection tests for the block-DAG Tile IR (``ir/tile/blockdag.py``).
+"""Derived-projection tests for the block-DAG Tile IR (``ir/tile/ir.py``).
 
 The whole point of the new IR is that ``reads`` / ``writes`` / ``carrier`` /
 ``atom`` / ``edges`` are *projections* of the body — never stored. These tests
@@ -14,7 +14,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.stmt.blocks import Loop
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from deplodock.compiler.ir.tile.blockdag import (
+from deplodock.compiler.ir.tile.ir import (
     AddrKind,
     Block,
     Buffer,

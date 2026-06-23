@@ -18,8 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Loop, Stmt
-from deplodock.compiler.ir.tile.blockdag import Binding, Block, Schedule, TileGraph
-from deplodock.compiler.ir.tile.ir import RegisterTile
+from deplodock.compiler.ir.tile.ir import Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.partition._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.assemble import assemble_block
 from deplodock.compiler.pipeline.passes.lowering.tile.partition.iterdag import IterDag
