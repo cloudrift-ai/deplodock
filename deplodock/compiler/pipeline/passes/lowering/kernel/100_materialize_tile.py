@@ -80,6 +80,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._combine import (
     find_nested_reduce_accums,
 )
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
+    compute_phase_extents,
     compute_phase_info,
     emit_compute_phase,
     emit_stage,
@@ -304,9 +305,12 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         if stmt.compute is not None:
             from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
-            fused_name, fused_axes, fused_value_dtype = compute_phase_info(stmt.compute, stmt.sources)
+            fused_name, _fused_axes, fused_value_dtype = compute_phase_info(stmt.compute, stmt.sources)
             if fused_name not in declared_smem:
-                fused_extents = tuple(ax.extent.as_static() for ax in fused_axes)
+                # PHYSICAL extents (cache × atom-stride block) so the fused slab matches
+                # the input operand slabs' layout — the same sizing emit_compute_phase
+                # iterates (scalar tier: == cache extents).
+                fused_extents = compute_phase_extents(stmt.compute, stmt.sources)
                 if buf_count > 1:
                     fused_extents = (buf_count, *fused_extents)
                 fused_dtype = cuda_name(fused_value_dtype) if fused_value_dtype is not None else "float"

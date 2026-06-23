@@ -13,6 +13,7 @@ The leading-underscore module name keeps the pass loader (which globs
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import to_dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
@@ -421,13 +422,35 @@ def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source
     return write.output, cache_axes, write.value_dtype
 
 
+def compute_phase_extents(compute, sources) -> tuple[int, ...]:  # noqa: ANN001
+    """The fused slab's **physical** per-dim extents — the input slabs' ``alloc_extents``
+    (cache extent × atom-stride ``block``) when the compute reads a block-multiplied
+    (warp-tier) operand slab, else the bare cache extents (scalar tier, ``block=()``).
+
+    The SMEM fused edge (``assembly/_fused``) builds every input slab from one operand
+    ``Source``, so they share one physical layout; iterating the **full physical slab**
+    (not the logical cache cell) makes the producer a layout-agnostic element-wise
+    smem→smem transform — correct for a 32×32 warp micro-tile where the bare cache cell
+    is only 2×2. For the scalar tier ``alloc_extents == cache extents``, so it is a
+    no-op there."""
+    _name, cache_axes, _dtype = compute_phase_info(compute, sources)
+    by_name = {s.name: s for s in sources}
+    for ld in compute.iter_of_type(Load):
+        src = by_name.get(ld.input)
+        if src is not None and isinstance(src.addressing, AffineAddressing) and src.addressing.block:
+            return tuple(src.alloc_extents)
+    return tuple(ax.extent.as_static() for ax in cache_axes)
+
+
 def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:  # noqa: ANN001
     """Emit producer scaffolding for a ``StageBundle.compute`` phase.
 
-    Wraps the compute body in a cooperative ``StridedLoop`` over the fused
-    cache axes — each thread executes the compute template once per cell it
-    owns, σ-substituting cache-axis Vars with row-major flat-iter decoded
-    coords. The fused slab name / cache axes are recovered from the body via
+    Wraps the compute body in a cooperative ``StridedLoop`` over the fused slab's
+    **physical** extents (:func:`compute_phase_extents` — the full warp micro-tile, not
+    the logical cache cell), σ-substituting the cache-axis Vars with row-major flat-iter
+    decoded coords. Because the fused edge's input and output slabs share one physical
+    layout, the same physical coords index every slab → a correct element-wise fill.
+    The fused slab name / cache axes are recovered from the body via
     :func:`compute_phase_info` (no output ``Source`` is carried).
 
     The fused slab's smem decl is hoisted to kernel scope by
@@ -439,14 +462,18 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
     from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
     name, cache_axes, _dtype = compute_phase_info(compute, sources)
+    extents = compute_phase_extents(compute, sources)
+    # Re-stamp the cache axes with the physical extents for the decode + iteration
+    # (same names, so the σ-substitution still reaches the compute body's index Vars).
+    axes = tuple(Axis(name=ax.name, extent=to_dim(e)) for ax, e in zip(cache_axes, extents, strict=True))
     total = 1
-    for ax in cache_axes:
-        total *= ax.extent.as_static()
+    for e in extents:
+        total *= e
     iter_axis = Axis(name=f"{name}_flat", extent=total)
-    if len(cache_axes) == 1:
-        coord_for = {cache_axes[0].name: Var(iter_axis.name)}
+    if len(axes) == 1:
+        coord_for = {axes[0].name: Var(iter_axis.name)}
     else:
-        coord_for = flat_decode(cache_axes, iter_axis.name)
+        coord_for = flat_decode(axes, iter_axis.name)
     sigma = Sigma(coord_for)
 
     # σ-substitute cache vars in every stmt of the compute body. Loads /
@@ -457,7 +484,6 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
     for s in compute:
         new_stmts.append(s.rewrite(lambda n: n, sigma))
 
-    extents = tuple(ax.extent.as_static() for ax in cache_axes)
     full_extents = (buffer_count, *extents) if buffer_count > 1 else extents
     body_out: list[Stmt] = [
         Sync(),

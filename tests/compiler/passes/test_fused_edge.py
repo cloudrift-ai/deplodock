@@ -186,16 +186,19 @@ def _fused_seed_op(M=64, K=64, N=64) -> TileGraphOp:
 
 
 @requires_cuda
-def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch):
+@pytest.mark.parametrize("tier", ["scalar", "warp"])
+def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier):
     """The full tile pipeline (enumeration tiles the consumer + assembly dispatches to
     ``assemble_fused``) lowers a fused 2-block seed to one correct kernel — proving the
-    body-move auxiliary-block preservation + the assembly fused dispatch. Pinned to the
-    scalar tier (the warp-tier fused compute phase is a follow-on)."""
+    body-move auxiliary-block preservation + the assembly fused dispatch. Covers both the
+    scalar tier and the **warp (mma.sync) tier** — the latter is the form that beats the
+    cut: the matmul reads the cooperatively-computed ``xn`` from smem via ``ldmatrix``."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
-    monkeypatch.setenv("DEPLODOCK_BM", "16")
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    if tier == "scalar":
+        monkeypatch.setenv("DEPLODOCK_BN", "16")
+        monkeypatch.setenv("DEPLODOCK_BM", "16")
+        monkeypatch.setenv("DEPLODOCK_MMA", "0")
     M = K = N = 64
     g = Graph()
     for name in ("x", "y", "w"):

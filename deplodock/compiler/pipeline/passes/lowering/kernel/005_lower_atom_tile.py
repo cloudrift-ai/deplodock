@@ -69,6 +69,8 @@ nothing and the pass skips.
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
+
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
@@ -85,8 +87,28 @@ from deplodock.compiler.ir.tile.ir import (
     map_staged,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _compute_output_source(bundle: StageBundle) -> tuple[str, Source] | None:
+    """A ``Source`` for a ``StageBundle.compute`` phase's **output** slab (the SMEM
+    fused edge's ``xn``): the consumer reads it as a *staged* operand (``ldmatrix``),
+    but it is the compute output — not in ``bundle.sources`` — so the cell lowering
+    would otherwise treat it as un-staged and read the wrong layout. It shares the
+    physical layout of the input slabs the compute reads (``assembly/_fused`` builds
+    them from one operand ``Source``), so give it the matching input ``Source``'s
+    addressing under the output slab's name. ``None`` if the compute reads no
+    registered source (nothing to mirror)."""
+    if bundle.compute is None:
+        return None
+    out_name = compute_phase_info(bundle.compute, bundle.sources)[0]
+    by_name = {src.name: src for src in bundle.sources}
+    for ld in bundle.compute.iter_of_type(Load):
+        if ld.input in by_name:
+            return out_name, dc_replace(by_name[ld.input], name=out_name, buf=out_name)
+    return None
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -169,6 +191,9 @@ def _lower_cell(
         if isinstance(s, StageBundle):
             for src in s.sources:
                 bundle_sources[src.name] = src
+            out = _compute_output_source(s)
+            if out is not None:  # the SMEM fused edge's compute-output slab, read staged
+                bundle_sources[out[0]] = out[1]
         return None
 
     map_staged(atom_body, _gather)
