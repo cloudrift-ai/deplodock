@@ -47,14 +47,24 @@ _XFAIL_FILES: dict[str, str] = {
     # R6
     "test_flash_attention.py": "R6",
     "test_flash_cooperative_kv.py": "R6",
-    # R7
-    "test_program_rebind.py": "R7",
+    # R7 — test_program_rebind.py de-quarantined: R2's cooperative-reduce lowering
+    # made the rmsnorm-bearing rebind kernels compile, so all three rebind tests pass.
 }
 
 # Whole functions: every parametrization is red.
+#
+# R2 incidentally recovered a set of R3/R7-tagged tests whose bodies exercise a
+# cooperative reduce (rmsnorm / softmax / mean) that now lowers — they are
+# de-quarantined here to keep the green floor at 0 XPASS:
+#   - test_mma_atomic_free_splitk.py::…_accurate_and_no_atomic (R3 accuracy half)
+#   - test_compile.py::{test_compile_code_saves_default_cuda_to_output, …_dynamic_emits_runtime_arg}
+#   - test_run.py::{rmsnorm/softmax accuracy/blockify/fk, run_ir_*, run_bench_prints_table,
+#                   run_code_dynamic_seq_len, run_positional_json_like_ir}
+#   - test_program_rebind.py (whole file, above)
+# The R3 STRUCTURAL fork test + the R7 fp16-matmul-window / sdpa / structural /
+# prior tests stay quarantined (genuinely their own tiers).
 _XFAIL_FUNCS: dict[str, str] = {
     # R3
-    "test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": "R3",
     "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": "R3",
     # R4 — masked / unstaged warp follow-ups (the warp-tier matmul itself landed):
     # the masked cooperative-load clamp + non-divisor real_extent tests need env-pin
@@ -79,8 +89,6 @@ _XFAIL_FUNCS: dict[str, str] = {
     "test_analytic.py::test_pick_matmul_lands_in_geometry_band": "R7",
     "test_analytic.py::test_pick_matmul_warp_dispatch_by_dtype": "R7",
     "test_block.py::test_qwen_block_accuracy": "R7",
-    "test_compile.py::test_compile_code_saves_default_cuda_to_output": "R7",
-    "test_compile.py::test_compile_dynamic_emits_runtime_arg": "R7",
     "test_dynamic_shapes.py::test_qwen_layer_dynamic_compiles_and_matches_eager": "R7",
     "test_dynamic_shapes.py::test_qwen_whole_model_capture_replay_cache_matches_eager": "R7",
     "test_dynamic_shapes.py::test_qwen_whole_model_dynamic_compiles_and_matches_eager": "R7",
@@ -88,27 +96,14 @@ _XFAIL_FUNCS: dict[str, str] = {
     "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": "R7",
     "test_resolve.py::test_structural_replay_consulted": "R7",
     "test_resolve.py::test_trace_records_partition_fork": "R7",
+    # test_run.py: the fp16-matmul-window + sdpa kernels stay quarantined (R7 matmul
+    # window / R6 sdpa); the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2).
     "test_run.py::test_compile_fp16_matmul_window_emits_half2": "R7",
-    "test_run.py::test_run_bench_prints_table": "R7",
-    "test_run.py::test_run_code_dynamic_seq_len": "R7",
     "test_run.py::test_run_code_fp16_matmul_window_accuracy": "R7",
-    "test_run.py::test_run_code_rmsnorm_accuracy": "R7",
-    "test_run.py::test_run_code_rmsnorm_blockify": "R7",
-    "test_run.py::test_run_code_rmsnorm_fk_accuracy": "R7",
-    "test_run.py::test_run_code_rmsnorm_via_pow_neg_half": "R7",
     "test_run.py::test_run_code_sdpa_k_chunked": "R7",
     "test_run.py::test_run_code_sdpa_seq1024_dynamic_smem": "R7",
     "test_run.py::test_run_code_sdpa_tinyllama_full": "R7",
     "test_run.py::test_run_code_sdpa_tinyllama_per_head": "R7",
-    "test_run.py::test_run_code_softmax_blockify": "R7",
-    "test_run.py::test_run_code_softmax_fk_accuracy": "R7",
-    "test_run.py::test_run_ir_bench": "R7",
-    "test_run.py::test_run_ir_cuda_stage_no_tail": "R7",
-    "test_run.py::test_run_ir_kernel_stage": "R7",
-    "test_run.py::test_run_ir_loop_stage": "R7",
-    "test_run.py::test_run_ir_seed_reproducible": "R7",
-    "test_run.py::test_run_ir_tile_stage": "R7",
-    "test_run.py::test_run_positional_json_like_ir": "R7",
     "test_structural_push.py::test_split_demoted_fork_pushes_structural": "R7",
     "test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": "R7",
     "test_two_level.py::test_identical_offer_sites_take_the_same_side": "R7",
