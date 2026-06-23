@@ -77,8 +77,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     "test_masked_tile.py::test_masked_n_clamps_cooperative_load_index": "R4",
     "test_masked_tile.py::test_planner_admits_non_divisor_n_with_real_extent": "R4",
     "test_masked_tile.py::test_symbolic_m_cooperative_load_clamps_to_runtime_extent": "R4",
-    # R5
-    "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment": "R5",
+    # R5 transport landed, but this test's real blocker is the fused norm+linear
+    # (RmsNorm prologue + matmul) scalar regime — its 'y' LoopOp doesn't lower yet
+    # (the fused-prologue tier, R7 test_fused_rmsnorm_linear_blocked_prologue). The
+    # TMA-decline it nominally guards is moot until the kernel lowers at all.
+    "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment": "R7",
     # R6
     "test_attention_chains.py::test_full_self_attn_tinyllama": "R6",
     "test_attention_chains.py::test_full_self_attn_tinyllama_seq512": "R6",
@@ -115,10 +118,9 @@ _XFAIL_FUNCS: dict[str, str] = {
 
 # Specific parametrizations (the function also has green params).
 _XFAIL_NODES: dict[str, str] = {
-    # R5 — static-tma landed (warp-tier promote_transport + TMA ring/swizzle/peel
-    # synthesis). dynamic-tma needs masked-tile TMA staging + the mask_order hoist
-    # (an R4 follow-up), so it stays quarantined with that work.
-    "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": "R5",
+    # R5 — landed (warp-tier promote_transport + TMA ring/swizzle/peel synthesis,
+    # incl. masked-tile TMA staging via the mask_order hoist): static + dynamic
+    # test_pinned_transport_and_shape_fire de-quarantined.
     # R6
     "test_ops_vs_torch.py::test_sdpa[cuda]": "R6",
     "test_ops_vs_torch.py::test_sdpa_causal[cuda]": "R6",

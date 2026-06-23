@@ -27,7 +27,7 @@ from dataclasses import replace
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Body, Cond, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -304,6 +304,36 @@ def prospective_sources(graph: TileGraph) -> list[Source]:
     return _bundle_sources(tuple(compute), staged_bufs, cache_axes, graph.buffers)
 
 
+def _is_k_stmt(s: Stmt) -> bool:
+    """The hoistable K-tower stmts: a ``serial_outer`` / ``stage_inner`` ``SerialTile``
+    (post-``_wrap_k_body`` the bundle rides inside one) or a bare ``StageBundle``."""
+    return isinstance(s, StageBundle) or (isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner"))
+
+
+def _hoist_masked_tma(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs) -> tuple[Stmt, ...] | None:
+    """Masked-tile TMA staging: a symbolic / non-divisor warp matmul wraps its K
+    tower + output ``Write`` in a boundary ``Cond(σ(M) < bound)``. A divergent TMA
+    pipeline deadlocks the mbarrier (some warps skip the cooperative issue), so the
+    cooperative load must be hoisted **above** the guard — every warp issues TMA
+    uniformly (the hardware OOB zero-fill replaces the overhang rows with 0, so the
+    masked rows accumulate 0 and the gated ``Write`` never stores them). Returns the
+    hoisted body (K tower above, ``Cond`` gating just the epilogue/``Write``) when the
+    pattern matches and TMA is in play, else ``None`` (caller falls back to the plain
+    in-place wrap — the ``mask_order`` hoist is a TMA-only requirement)."""
+    if len(stmts) != 1 or not isinstance(stmts[0], Cond) or stmts[0].else_body:
+        return None
+    cond = stmts[0]
+    inner = tuple(cond.body)
+    if not any(isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner") for s in inner):
+        return None
+    wrapped = _wrap_k_body(inner, staged_bufs, cache_axes, buffers, tma_bufs=tma_bufs)
+    k_part = tuple(s for s in wrapped if _is_k_stmt(s))
+    rest = tuple(s for s in wrapped if not _is_k_stmt(s))
+    if not k_part:
+        return None
+    return (*k_part, Cond(cond=cond.cond, body=Body(rest), else_body=()))
+
+
 def synthesize_staging(graph: TileGraph) -> Body:
     """Return the single block's ``compute`` rewritten so each ``Schedule.staged``
     read-site reads an smem slab, with one ``StageBundle`` wrapping the K-tower. A
@@ -316,4 +346,9 @@ def synthesize_staging(graph: TileGraph) -> Body:
     tma_bufs = frozenset(e.buffer for e, t in staged.items() if t is Transport.TMA)
     compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
-    return Body(_wrap_k_body(tuple(compute), staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs))
+    stmts = tuple(compute)
+    if bool(staged_bufs) and staged_bufs <= tma_bufs:
+        hoisted = _hoist_masked_tma(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs)
+        if hoisted is not None:
+            return Body(hoisted)
+    return Body(_wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs))
