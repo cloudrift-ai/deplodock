@@ -15,7 +15,6 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import enumerate_cartesian
 from deplodock.gpu import DEFAULT_GPU
 
 # Occupancy reference fallback when a context carries no SM count (GPU-less hosts) —
@@ -31,23 +30,12 @@ THREAD_KNOBS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
 WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
 
 
-def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:
-    """Reconstruct the planner's enumeration for a matmul shape + the knob tuple to
-    match a golden on. Rows are in enumeration (construction) order — ranking is the
-    caller's ``scorer`` (the :class:`AnalyticPrior` by default), not an enumeration
-    sort."""
-    if dtype == "fp32":
-        rows = enumerate_cartesian(E_M=M, E_N=N, E_K=K, ctx=ctx, priority_mode="matmul", m_axis_name="m", n_axis_name="n")
-        return rows, THREAD_KNOBS
-
-    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
-
-    atom = ATOM_REGISTRY.get({"fp16": "mma_m16n8k16_f16", "bf16": "mma_m16n8k16_bf16"}.get(dtype, ""))
-    if atom is None:
-        return [], WARP_KNOBS
-    rows = enumerate_cartesian(E_M=M, E_N=N, E_K=K, ctx=ctx, priority_mode=("matmul", "warp"), atoms=(atom,))
-    rows = [r for r in rows if r["WM"] * r["WN"] != 1]
-    return rows, WARP_KNOBS
+def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:  # noqa: ARG001
+    """Golden-eval enumeration — REMOVED with the cartesian enumerator (invalid
+    under the move-composer architecture). Returns no rows so the golden-rank
+    diagnostics degrade to "nothing enumerates" until the eval harness is rebuilt
+    over the move tree (``plans/tile-ir-block-dag.md``)."""
+    return [], (THREAD_KNOBS if dtype == "fp32" else WARP_KNOBS)
 
 
 def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = False) -> Callable[[dict], float]:
