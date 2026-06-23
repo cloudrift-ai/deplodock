@@ -713,17 +713,12 @@ The phases below each rebuild one tier and are **done** when its quarantined tes
 `_composer_xfails.py` in the same commit (the registry docstring already mandates this), with the green floor unmoved.
 Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy tower shape is reproduced.
 
-- **R0 — Quarantine hygiene** (no tier rebuild). The "28 failures" are **not** real regressions — every one is a
-  deleted-tier gap that escaped the registry (appendix). Three mechanical fixes: **(i)** fix `mark_composer_xfails` to strip
-  the trailing `@cuda` / `[param]@cuda` suffix before matching — recovers 8 already-listed entries; **(ii)** add the 19
-  unregistered tier-gap tests under their R-phase; **(iii)** repoint the 1 refactor-stale import test
-  (`test_knob_features_mma_expansion`). Then **harvest the 89 XPASS** by deleting their registry entries, splitting the
-  too-coarse whole-file `_XFAIL_FILES_DEMO` masks (`test_matmul_mma.py`, `test_run.py` hide green scalar tests) into
-  per-test entries. *Gate: `make test` green with **0 failed, 0 XPASS** — every red test an `xfail` tagged with its
-  recovery phase.*
+(R0 — quarantine hygiene — has **landed**: the registry `tests/compiler/_composer_xfails.py` was rebuilt from the
+empirical true-failure set so every red test is an `xfail(strict=False)` tagged with its recovery phase (R2–R7) and no
+green test is masked; `make test` is green with 0 failed / 0 XPASS.)
 
-**Foundation (RF) — split the single enumeration pass into per-family tree-expansion passes.** *Do after R0, before any
-tier.* This is the Option-B groundwork that makes "The pass structure" / "Directory layout" real, refactoring **only** the
+**Foundation (RF) — split the single enumeration pass into per-family tree-expansion passes.** *Done before any tier.*
+This is the Option-B groundwork that makes "The pass structure" / "Directory layout" real, refactoring **only** the
 existing pointwise + scalar-matmul composer (no new regime), gated **byte-identical**.
 
 **Landed (verified in the working tree; closes G1/G2/G5).** The two pass dirs are registered (`TILE_PASSES` ends
@@ -811,52 +806,16 @@ a tree-builder.
   / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
 
 ```
-R0 ─► RF foundation ──┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
-   (multi-pass split) ├─► R2 coop-reduce ──────────────────┐           ├─► R7 e2e / structural / prior
-                      └─► R3 split-K ──────────────────────┘           │
-                                   R2 ──► R6 flash ◄── R4 ─────────────┘
+RF foundation ──┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
+(multi-pass split) ├─► R2 coop-reduce ──────────────────┐        ├─► R7 e2e / structural / prior
+                └─► R3 split-K ──────────────────────────┘        │
+                             R2 ──► R6 flash ◄── R4 ──────────────┘
 ```
 
 RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
 combine work; R4→R5, R2+R4→R6, all→R7. As each
 tier lands, retire the matching `composer-only-green-suite.md` phase into its R-phase here — that doc no longer tracks a
 live process.
-
-### Appendix — the 28 non-quarantined failures (R0 checklist)
-
-**None is a regression in the surviving pointwise / scalar-matmul path.** All 28 are deleted-tier gaps that *should* be
-xfailed but aren't — for three mechanical reasons:
-
-**(A) Registry-listed but the `@cuda` / `[param]` suffix slips past the matcher (8).** `mark_composer_xfails` matches with
-`func_path.endswith(entry)` / `nodeid.endswith(node)`, but the live nodeids carry a trailing `@cuda` (and the param entries
-carry `[rmsnorm]@cuda`), so the match fails. **Fix once: strip the `@…` suffix before matching** → these 8 flip to xfail
-with no registry change.
-- `test_dtype_cuda.py::{test_fp16_max_reduction_stays_in_fp16, test_fp16_reduction_uses_fp32_accumulator_on_cuda,
-  test_fp16_softmax_cuda, test_fp16_rmsnorm_cuda}@cuda` → R2
-- `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct@cuda` → R4
-- `test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue@cuda` (`_REASON`) → R7
-- `test_tune_accuracy.py::test_tuned_variant_matches_reference[rmsnorm]@cuda` → R2; `…[sdpa]@cuda` → R6
-
-**(B) Never registered — add under the recovering phase (19).** Confirmed tier-gap root causes (`RuleSkipped` /
-`IndexError: list index out of range` on the empty lowering / `TypeError: node … has non-CudaOp` / hoist-gap kernel
-bloat):
-- → R2 (coop): `test_emit.py::{test_reduce_emits_k_loop, test_softmax_emits_per_element_store,
-  test_softmax_emits_multiple_k_loops, test_reduce_runs_on_gpu, test_softmax_runs_on_gpu}`,
-  `test_launch_geometry_rules.py::test_launch_geometry_fires_on_reduction`,
-  `test_graph_capture.py::{test_bench_lowered_vs_torch_captures, test_deplodock_capture_failure_falls_back_uncaptured,
-  test_torch_capture_failure_disables_deplodock_capture}` (bench a reduce kernel → non-CudaOp),
-  `test_bench_worker_compare.py::test_compare_in_worker_returns_torch_and_deplodock`,
-  `test_dynamic_shapes.py::{test_cuda_softmax_over_symbolic_seq_len, test_cuda_symbolic_rmsnorm_traced_and_run,
-  test_capture_replay_cache_rmsnorm_over_capacity_buffers, test_capture_replay_device_io_matches_eager}`.
-- → R6 (flash): `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`.
-- → R7 (whole-model / hoist): `test_dynamic_shapes.py::{test_qwen_whole_model_dynamic_compiles_and_matches_eager,
-  test_qwen_whole_model_capture_replay_cache_matches_eager, test_qwen_layer_dynamic_compiles_and_matches_eager}`,
-  `test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget` (asserts the invariant prefix is
-  hoisted — fails because the hoist regime is gone).
-
-**(C) Refactor-stale — update, don't quarantine (1).** `test_knob.py::test_knob_features_mma_expansion` fails with
-`ImportError: cannot import name '_enumeration'` — it imports a module deleted in the package reorg; repoint it at the new
-`enumeration` package (or fold into R4 if the mma knob features aren't rebuilt yet).
 
 ## Open design decisions
 

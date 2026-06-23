@@ -350,7 +350,7 @@ def test_knob_features_typed_knobs(monkeypatch):
 def test_knob_features_mma_expansion():
     # MMA expansion now dispatches through the MMA Knob's ``features`` callable,
     # so the declaring module must be loaded + present in the registry.
-    from deplodock.compiler.pipeline.passes.lowering.tile import _enumeration  # noqa: F401, PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knobs  # noqa: F401, PLC0415
 
     knob_mod.reset_registry()
     feats = knob_features({"MMA": "mma_m16n8k16_f16"})

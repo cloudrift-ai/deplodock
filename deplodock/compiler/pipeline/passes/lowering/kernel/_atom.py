@@ -272,5 +272,3 @@ def classify_fragment_epilogue(
 # operand dtype come from the spec). Kept parallel to the registry rather than
 # on ``Atom`` so the spec stays a pure data record in ``ir/tile/ir.py`` with no
 # loop/graph/context dependency.
-
-
