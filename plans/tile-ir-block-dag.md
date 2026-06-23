@@ -361,22 +361,22 @@ matcher coincidence. (The plumbing reuses the engine unchanged: a tile node is a
 
 Concrete pass list — pipeline order *is* decision order:
 
-| pass                    | kind              | move family                          | edits                          | predecessor (deleted / legacy)        |
-|-------------------------|-------------------|--------------------------------------|--------------------------------|---------------------------------------|
-| `tile/build`            | deterministic     | — derive algorithm DAG from `LoopOp` | seeds node + reference `Schedule` | `010` front half (`build_dag.py`)  |
-| `tile/tensorize`        | enum (body)       | `atomize`                            | `Block.compute`                | `011` + warp tower                    |
-| `tile/partition_reduce` | enum (body)       | split-K / cooperative-K              | insert combine `Block`         | `015`/`017`                           |
-| `tile/register_tile`    | enum (schedule)   | `register_tile` = `bind(REGISTER)`   | `binding`                      | `010` reg split                       |
-| `tile/stage`            | enum (schedule)   | `stage`, `hoist`                     | `staged`, `scope`              | `020`/`021`/`026`/`030`               |
-| `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`       | `040`/`080`                           |
-| `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                 | `050`/`060`                           |
-| `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
-| `tile/swizzle`          | enum (schedule)   | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
-| `tile/assemble`         | **materialize**   | apply `Schedule` → basic tower       | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
-| `tile/peel`             | **det. (post)**   | pipeline σ-peel from `ring_depth`    | KernelOp serial nest           | `080`                                 |
-| `tile/mask_order`       | **det. (post)**   | cooperative load above mask `Cond`   | KernelOp masked tile           | `021`                                 |
-| `tile/pad`              | **det. (post)**   | bank-conflict pad (formula)          | KernelOp smem-slab alloc       | `070`                                 |
-| `tile/unroll`           | **det. (post)**   | `#pragma unroll` (trip threshold)    | KernelOp SERIAL loop           | `090`                                 |
+| pass                    | kind              | move family                          | edits                             | predecessor (deleted / legacy)         |
+|-------------------------|-------------------|--------------------------------------|-----------------------------------|----------------------------------------|
+| `tile/build`            | deterministic     | — derive algorithm DAG from `LoopOp` | seeds node + reference `Schedule` | `010` front half (`build_dag.py`)      |
+| `tile/tensorize`        | enum (body)       | `atomize`                            | `Block.compute`                   | `011` + warp tower                     |
+| `tile/partition_reduce` | enum (body)       | split-K / cooperative-K              | insert combine `Block`            | `015`/`017`                            |
+| `tile/register_tile`    | enum (schedule)   | `register_tile` = `bind(REGISTER)`   | `binding`                         | `010` reg split                        |
+| `tile/stage`            | enum (schedule)   | `stage`, `hoist`                     | `staged`, `scope`                 | `020`/`021`/`026`/`030`                |
+| `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`          | `040`/`080`                            |
+| `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                    | `050`/`060`                            |
+| `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`              | `085`                                  |
+| `tile/swizzle`          | enum (schedule)   | `swizzle`                            | `grid_swizzle`                    | `025`                                  |
+| `tile/assemble`         | **materialize**   | apply `Schedule` → basic tower       | TileGraph → KernelOp              | the tower builders + `assemble_block`  |
+| `tile/peel`             | **det. (post)**   | pipeline σ-peel from `ring_depth`    | KernelOp serial nest              | `080`                                  |
+| `tile/mask_order`       | **det. (post)**   | cooperative load above mask `Cond`   | KernelOp masked tile              | `021`                                  |
+| `tile/pad`              | **det. (post)**   | bank-conflict pad (formula)          | KernelOp smem-slab alloc          | `070`                                  |
+| `tile/unroll`           | **det. (post)**   | `#pragma unroll` (trip threshold)    | KernelOp SERIAL loop              | `090`                                  |
 
 Every `enum` row is a **genuine fork** (a ranked knob the search benches); `enum (body)` additionally edits `Block`s.
 Every `det. (post)` row is **fixed-logic** — a deterministic `KernelOp`→`KernelOp` total function, no knob to branch, run

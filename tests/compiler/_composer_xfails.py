@@ -45,13 +45,6 @@ _XFAIL_FUNCS: frozenset[str] = frozenset(
         "test_masked_tile.py::test_masked_n_clamps_cooperative_load_index",
         "test_masked_tile.py::test_symbolic_m_cooperative_load_clamps_to_runtime_extent",
         # Phase 6a — structural-fork search integration
-        "test_split_demoted.py::test_rule_offers_fused_first_then_split",
-        "test_split_demoted.py::test_rule_knob_guard_skips_reconsider",
-        "test_split_demoted.py::test_greedy_compile_keeps_fused_kernel",
-        "test_split_demoted.py::test_greedy_trained_prior_deploys_split",
-        "test_split_demoted.py::test_greedy_cold_stub_prior_keeps_fused",
-        "test_split_demoted.py::test_greedy_structural_pick_falls_back_on_lowering_failure",
-        "test_split_demoted.py::test_tune_explores_fused_and_split_terminals",
         "test_two_level.py::test_decomposition_rows_sum_kernel_set_costs",
         "test_two_level.py::test_identical_offer_sites_take_the_same_side",
         "test_two_level.py::test_outer_branches_on_structural_fork",
@@ -96,8 +89,7 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         "test_reduction_rules.py::test_warp_cooperative_emits_warpshuffle",
         "test_reduction_rules.py::test_block_cooperative_emits_hierarchical_reduce",
         "test_reduction_rules.py::test_block_cooperative_skips_stage_inputs",
-        # Split-K residual / atomic-free (015/017) deleted.
-        "test_merge_split_glue.py::test_outer_terminal_matches_greedy_kernel_count",
+        # Split-K atomic-free (017) deleted.
         "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural",
         # RMSNorm kernels need the cooperative-reduce regime (deleted).
         "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op",
@@ -163,7 +155,6 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_masked_cooperative_reduce.py",  # masked cooperative reduce (deleted)
         "test_mma_atomic_free_splitk.py",  # 017 atomic-free split-K + warp (deleted)
         "test_attention_chains.py",  # attention (SDPA/flash) chains (deleted)
-        "test_split_demoted.py",  # demoted-split CUDA accuracy (warp/coop/split-K paths deleted)
         "test_program_rebind.py",  # dynamic re-bind across seq_lens (staging/coop)
         "test_block.py",  # whole TinyLlama / Qwen block (needs coop + attention)
     }
