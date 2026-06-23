@@ -307,7 +307,16 @@ def _replicate_along_axis(
             else:
                 wrapper_bound = frozenset()
             own_refs_axis = axis not in wrapper_bound and any(axis in e.free_vars() for e in s.exprs())
-            if nested and not own_refs_axis:
+            if isinstance(s, StageBundle) and nested and not own_refs_axis:
+                # A StageBundle's COMPUTE phase is a cooperative slab fill (the
+                # SMEM fused edge's producer — it writes the WHOLE slab, every
+                # register cell; ``emit_compute_phase`` re-iterates its cache
+                # axes), so it must NOT be register-replicated. Only the consumer
+                # BODY descends — its Loads read the cell's own slab position and
+                # so replicate across the REGISTER axis. (Source-side state stays
+                # untouched: the cache-axis Vars are smem-local, masked above.)
+                out.append(s.with_bodies((s.compute if s.compute is not None else Body(()), go(s.body))))
+            elif nested and not own_refs_axis:
                 # Wrap-body Stage's consumer body must be descended so the
                 # consumer Loads inside the staged scope replicate across the
                 # REGISTER axis. Stage's source-side state (cache_axes, origin)
