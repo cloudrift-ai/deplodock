@@ -39,6 +39,16 @@
   `placement` and drives cut-vs-fuse on the real demoted seed (`test_blockdag` / `test_seed_demoted`). This is the move
   the future edge-placement fork applies to `seed_demoted`'s graph.
 
+- **(2.5, increment 3) Working SMEM fused-edge kernel — `assemble_fused`.** The fused edge that *beats* the cut, landed
+  for the MAP-producer case: `relu(x) @ w` compiles to **one** kernel, the matmul reading `xn` from smem (no gmem
+  round-trip), accuracy-verified vs a numpy reference. `assembly/_fused.py::assemble_fused` reuses the existing
+  `StageBundle.compute` mechanism — stage `x` into a slab, `_fuse_producers` patches the `xn` source → `x_smem` + emits
+  the producer transform as the `compute` phase writing `xn_smem`. Required one kernel-side fix: `010_split_register_axes`
+  must **not** register-replicate a `StageBundle.compute` phase (the cooperative fill writes the whole slab; only the
+  consumer body replicates) — byte-identical for the no-compute case, safe across the suite. `test_fused_edge.py` pins the
+  structure + the end-to-end CUDA run. Remaining: the MONOID (rmsnorm) producer (a compute-phase reduce) + the placement
+  fork + wiring `seed_demoted`/`place_edge` into `000_build`.
+
 ### The SMEM fused-edge codegen path (the next build)
 
 The genuinely new capability — the fused edge that *beats* the cut (no gmem round-trip; the matmul reaches the warp
