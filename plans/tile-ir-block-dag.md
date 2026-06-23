@@ -709,78 +709,17 @@ Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy
 empirical true-failure set so every red test is an `xfail(strict=False)` tagged with its recovery phase (R2–R7) and no
 green test is masked; `make test` is green with 0 failed / 0 XPASS.)
 
-**Foundation (RF) — split the single enumeration pass into per-family tree-expansion passes.** *Done before any tier.*
-This is the Option-B groundwork that makes "The pass structure" / "Directory layout" real, refactoring **only** the
-existing pointwise + scalar-matmul composer (no new regime), gated **byte-identical**.
-
-**Landed (verified in the working tree; closes G1/G2/G5).** The two pass dirs are registered (`TILE_PASSES` ends
-`…, "lowering/tile/enumeration", "lowering/tile/assembly"`); **`TileGraphOp`** is a real graph-node op (`ir/tile/ir.py`)
-carrying `tilegraph` + `knobs` + `leading`; and the enumeration tree is now **split into per-family rule passes** —
-`enumeration/{000_build, 010_reduce_tile, 020_thread_tile, 030_register_tile, 040_lower}` plus the extracted
-`_classify.py`, with `010_enumerate.py` and the in-memory `_tree.py` (`_Choose*` nodes) deleted. `000_build` seeds the
-`TileGraphOp`; the `*_tile` passes each match it, compute offers (`_moves.py`'s `*_offers` fns), and return a `Fork`
-pinning one more knob group; `040_lower` builds the `TileGraph` and the separate `assembly/010_assemble` materializes it
-`→ TileOp`. Pointwise + scalar matmul lower end-to-end through the chain.
-
-**F3-a and F3-b have both shipped — F3-b as its literal incremental mechanism.** F3-a split enumeration into per-family
-passes; **F3-b** then reworked `build_dag` from a monolith into **per-pass incremental body moves over a stored
-algorithm**, exactly as the model calls for ("`000_build` seeds logical axes, each tile pass applies an incremental
-`tile_axis` body move, and `assemble` does the register/thread replication"):
-
-- `000_build` seeds the **logical** (un-tiled) `TileGraph` (`_build.seed_graph` — one `Block` whose `compute` is the
-  DAG's inner body, empty `domain` / `Schedule`); `op.tilegraph` is **stored and refined in place** for the rest of the
-  search (not a `None` seed, not re-derived from a knob dict — "knob-invariant" means the algorithm is a first-class
-  structure mutated by moves).
-- `010_reduce_tile` applies the **`reduce_decomp` body move** (re-bracket K into the `K_o` / `K_i` tower in
-  `Block.compute`); `020_thread_tile` pins the thread knob with **no** body move; `030_register_tile` applies the
-  **`free_tile` body move** (the free-axis σ-split `A → A_b·(T·R) + A_t·R + A_r`, laid into `Block.domain` +
-  `Schedule.binding`, masked guards applied). The free-axis split is one body move (not two) because a byte-identical
-  layout needs both the thread *and* register knob — so it lands at the last free fork, with `020_thread_tile` only
-  fixing the extent the search ranks on.
-- `050_stage` is a **pre-assemble** `Schedule`-move fork that reads the now-fully-tiled stored `tilegraph` and writes
-  `Schedule.staged` directly; `assembly/010_assemble` does **no build** — it only materializes the stored algorithm
-  (`assemble_block`: the register/thread tower replication + slab synthesis). This is the F3-b inversion fix: `stage` is
-  a peer schedule move after the body moves, not a pass behind a separate monolithic build.
-
-`build_dag` survives only as the **composition** `seed_graph → reduce_decomp → free_tile` — the byte-identity oracle for
-the distribution (and the entry point unit / equivalence callers keep). Its composition order (reduce **then** free)
-reverses the old monolith (free then reduce), but the two σ-rewrites touch disjoint axis sets (the contraction K vs the
-free N/M) so they **commute** — verified byte-identical end to end (scalar matmul staged / unstaged, masked non-divisor,
-and pointwise; the whole `tests/compiler/` floor unmoved). The reduce regime's scalar-tier OFF sentinels
-(`MMA=0 WM=0 WN=0 BR=1`) are stamped by a small deterministic knob-only `040_seal_scalar_tier` pass at the same
-post-register level the old `040_lower` stamped them, so the per-level greedy ranking sees the identical partial knob set
-at every fork and the deployed pick stays byte-identical. The laziness guarantee (`pipeline/fork.py`) is unchanged: the
-per-family split materializes one thin `TileGraphOp` per resolved pass, never the full cartesian.
-
-**What this unblocks.** R4's `atomize` is the third body move and now has a natural home: a `060_tensorize` fork applies
-an `atomize` body move to the stored algorithm (fuse the cell to `Mma`) the same way `010`/`030` apply theirs, and
-`assemble` reads the derived `Block.atom`. The stored-algorithm + incremental-move machinery the warp/MMA and split-K
-(`partition_reduce`) tiers want is now in place, not just the single-build property.
-
-**RF invariant guards landed** (`tests/compiler/passes/test_tile_ir_invariants.py`): (1) **derived-view discipline** —
-`Block.__dataclass_fields__ == {name, domain, compute}` (every projection computed, none stored); (2) **assemble
-determinism** — the same `TileGraph` lowers to the byte-identical `TileOp` (stable `op_cache_key`); (3) **op_cache_key
-canonicality** — two independent builds of the same shape + knobs key the same (the round-trip a perf row depends on),
-a changed knob keys differently; (4) **`build_dag` is the live oracle, not a dead duplicate** — the `TILE_PASSES`
-pipeline (moves applied pass by pass) and the `build_dag` composition (`seed_graph → reduce_decomp → free_tile` in one
-call) assemble to the same `op_cache_key`, so the two paths can't drift; (5) **assembly ⟂ enumeration** — the
-materialization side imports nothing from the search side's offer / knob / move vocabulary (the gate in
-`assembly/010_assemble` reads a populated `Block.domain`, not a knob). The perf DB / prior key on the byte-identical
-**`TileOp`** (not the intermediate `TileGraphOp`), so the one thing a refactor can't migrate is held by guards (2)–(4).
-
-**Known consequence — greedy compile is now level-greedy.** `greedy_decide` flattens each fork to complete leaves and
-ranks via the prior; with one fork per search level it now ranks *partial* knob sets, and the cold `AnalyticPrior`
-calibrates those poorly (a scalar matmul can land a degenerate `BN=BM=1` pick — accuracy holds within fp32 noise, but
-the pick is no longer byte-identical to the legacy tower). The two-level MCTS / `tune` path enumerates the **identical**
-leaf set and is unaffected; partial-config prior calibration is a follow-up. Two search tests that asserted the old
-single-fork shape (`test_resolve.py::test_trace_records_partition_fork`,
-`test_two_level.py::test_run_two_level_tune_single_terminal_assembles_bests`) are quarantined under R7.
-
-*Gate: byte-identical `TileOp` for pointwise + scalar matmul; the green floor unmoved; the two-level MCTS enumerates the
-**identical leaf set** — it now branches across passes instead of within one tree.* The `→ KernelOp` switch (audit **G3**)
-and the deterministic post-passes (**G4**) remain later steps. Every tier below assumes this foundation: each **adds one
-enumeration pass** (its move family) + grows `assemble`'s `Schedule`-driven synthesis — never
-a tree-builder.
+**Foundation (RF) — landed.** The single enumeration pass is split into per-family forks
+(`enumeration/{000_build, 010_reduce_tile, 020_thread_tile, 030_register_tile, 040_seal_scalar_tier, 050_stage}` +
+`assembly/`), and F3-b shipped in its literal incremental form — `000_build` seeds the logical `TileGraph`, each tile
+pass applies an incremental body move to the stored algorithm, and `assembly/010_assemble` only materializes it.
+Invariant guards (derived-view discipline, assemble determinism, op_cache_key canonicality, oracle-vs-pipeline
+equivalence, assembly ⟂ enumeration) live in `tests/compiler/passes/test_tile_ir_invariants.py`. Two items stay open:
+greedy compile is now **level-greedy** (the cold `AnalyticPrior` calibrates partial knob sets poorly; the two-level
+MCTS / `tune` path enumerates the identical leaf set and is unaffected — partial-config calibration is a follow-up), and
+the `→ KernelOp` switch (**G3**) + deterministic post-passes (**G4**) are later steps. Every tier below assumes this
+foundation: each **adds one enumeration pass** (its move family) + grows `assemble`'s `Schedule`-driven synthesis —
+never a tree-builder.
 
 - **R1 — Staging** (deps: RF). **Landed (scalar tier); the inversion is fixed (F3-b shipped).** Added the first
   `Schedule`-move enumeration fork `enumeration/050_stage.py`. It originally ran *after* `040_lower` on a built `TileGraphOp` —
