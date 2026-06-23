@@ -292,7 +292,7 @@ def _drop_size1_registers(block: Block, binding: dict) -> Body:
 def prospective_sources(graph: TileGraph) -> list[Source]:
     """The smem ``Source``s ``assemble`` *would* synthesize for ``graph``'s staged
     read-sites — the derived projection the ``promote_transport`` fork's eligibility
-    oracle (``enumeration/_transport``) reads, without materializing the tower. Empty
+    oracle (``enumeration/052_transport``) reads, without materializing the tower. Empty
     when nothing is staged."""
     staged = graph.schedule.staged
     block = graph.blocks[0]

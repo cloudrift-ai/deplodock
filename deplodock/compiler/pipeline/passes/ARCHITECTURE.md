@@ -17,7 +17,7 @@ layout rules that drift apart) and silently narrows coverage to the shapes someo
 
 How to comply:
 
-- **Write the rule per element, not per shape.** Example: `lowering/tile/_split_demoted.try_split_demoted`
+- **Write the rule per element, not per shape.** Example: `lowering/tile/split/005_split_demoted.try_split_demoted`
   classifies each multiply operand independently (plain `Load` stays put; computed cone becomes a producer
   materialized over exactly the axes it reads). Norm→linear, scale→matmul, SDPA P@V, and rotary QK^T are
   *instances* of that one rule, not branches — and a shape nobody designed for (a weight-side dequant cone) is

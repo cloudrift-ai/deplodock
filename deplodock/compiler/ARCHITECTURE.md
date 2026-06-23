@@ -118,17 +118,17 @@ autotuning cache doesn't bust on cosmetic edits.
   reaching the masked warp tier) — so e.g. the dynamic o_proj's collapsed attn-out splits into a
   contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The symbolic-N B
   operand `xnb[…, K, N]` further reaches the **TMA + warp-specialized** tier (matching its static twin,
-  not just cp.async): `_split_demoted._pad_inner_for_tma` rounds the materialized inner N up to a
+  not just cp.async): `005_split_demoted._pad_inner_for_tma` rounds the materialized inner N up to a
   multiple of 64 so the K dim's gmem stride stays 16 B-aligned at any runtime `seq_len`, which is the
   `cuTensorMapEncodeTiled` requirement `050_use_tma` otherwise declines a symbolic innermost dim for
   (`_inner_stride_aligned`). The buffer stays runtime-sized (correct above the hint, unlike a fixed
   static width), and the padded `[seq_len, round_up)` overhang columns feed the mma only into
   store-masked output positions, so they can't contaminate a live score. The cut keeps a
   symbolic ROW/N buffer's runtime dim var (`seq_len` in a collapsed-reshape stride) as a legitimate read,
-  not an unmodeled-scope bail (`_split_demoted.dim_names`). A symbolic **K** (reduce) reaches the warp tier
+  not an unmodeled-scope bail (`005_split_demoted.dim_names`). A symbolic **K** (reduce) reaches the warp tier
   too via the split: the demoted P@V un-fuses into a softmax-prob A cone `xn[H, m, k]` + a clean symbolic-K
   gemm whose masked reduce is a hint-tiled `mma.sync` with the partial final K slab zero-filled. That cone's
-  reduce axis is innermost, so `_split_demoted._pad_inner_for_tma` pads it to a 64-multiple (16 B-aligned
+  reduce axis is innermost, so `005_split_demoted._pad_inner_for_tma` pads it to a 64-multiple (16 B-aligned
   stride) and the consumer reaches **TMA**: the reduce overhang must read 0, which TMA's hardware OOB
   zero-fill delivers on the *middle-K* B operand (V, allocated at the real `seq_len`, so its descriptor
   globalDim is `seq_len`) — binding every overhang product to 0 regardless of the padded A overhang (which

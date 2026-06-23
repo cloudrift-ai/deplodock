@@ -225,7 +225,7 @@ axes excluded), plus `external_reads`, the names read from outside (axis vars an
 Construction never fails: unresolved names are data, and chaining scope levels means seeding the next level's
 `backward_cone` with the previous one's `external_reads`. `Body.defs_die_at(members, roots=…, allowed=…)` is the
 matching escape check (may the cone be cut out, with only the designated consumers reading its roots?). This is
-the shared substrate behind the rules that slice cones (`_split_demoted`'s producer cut, `021`'s masked-load
+the shared substrate behind the rules that slice cones (`005_split_demoted`'s producer cut, `021`'s masked-load
 guard) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. Two dataflow walks
 deliberately do NOT use it: `classify_fragment_epilogue` (single pass interleaving reduce-scope flags with its
 negative-form blocker reporting) and `030_hoist_invariant_compute` (all-deps saturation under an axis-invariance
