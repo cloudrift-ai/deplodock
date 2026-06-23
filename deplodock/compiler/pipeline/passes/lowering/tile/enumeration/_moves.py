@@ -337,5 +337,8 @@ def warp_reg_knobs(fm: int, fn: int) -> dict:
 
 
 def warp_bk_knobs(atom, bk: int) -> dict:
-    """Knob delta the warp K-chunk branch pins (incl. the atom-kind stamp)."""
-    return {TC_ATOM.name: atom.name, TC_BK.name: bk}
+    """Knob delta the warp K-chunk branch pins: the atom-kind stamp, the K chunk,
+    and the v1 ``SPLITK = 1`` invariant (the warp tier has no cross-CTA split-K —
+    the fragment-store fold relies on it; ``SPLITK`` has no OFF sentinel, so it is
+    stamped explicitly here rather than by ``apply_off_defaults``)."""
+    return {TC_ATOM.name: atom.name, TC_BK.name: bk, RED_SPLITK.name: 1}

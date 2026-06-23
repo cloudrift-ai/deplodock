@@ -23,10 +23,12 @@ is reconstructed by ``affine_decode_per_dim`` from the cache-axis extents
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Var
+from deplodock.compiler.ir.expr import Expr, Literal, Var
+from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
+    Binding,
     Block,
     RegisterTile,
     SerialTile,
@@ -38,6 +40,7 @@ from deplodock.compiler.ir.tile.ir import (
     _affine_terms,
     _mul_const,
 )
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _identity_rename
 
 
 def _cache_axis_names(block: Block, binding: dict) -> dict[str, Axis]:
@@ -183,6 +186,24 @@ def _rewrite_loads(stmts: tuple[Stmt, ...], by_buf: dict[str, Source]) -> tuple[
     return tuple(out)
 
 
+def _drop_size1_registers(block: Block, binding: dict) -> Body:
+    """Substitute every static extent-1 REGISTER axis var → 0 in ``compute``, the
+    same drop ``_wrap_tower`` applies later (a size-1 REGISTER cell is inlined).
+    Doing it BEFORE slab classification keeps the slab in lock-step with the
+    materialized tower: an atom-strided block multiplier on a dropped ``A_r`` cell
+    (the ``FM=1`` warp case) migrates onto the surviving ``A_w`` warp axis instead
+    of dangling on an axis the tower won't emit (an undefined ldmatrix index var)."""
+    sub = {
+        a.name: Literal(0, "int")
+        for a in block.domain
+        if binding.get(a.name) is Binding.REGISTER and a.extent.is_static and a.extent.as_static() == 1
+    }
+    if not sub:
+        return block.compute
+    sigma = Sigma(sub)
+    return Body(tuple(s.rewrite(_identity_rename, sigma) for s in block.compute))
+
+
 def synthesize_staging(graph: TileGraph) -> Body:
     """Return the single block's ``compute`` rewritten so each ``Schedule.staged``
     read-site reads an smem slab, with one ``StageBundle`` wrapping the K-tower. A
@@ -192,5 +213,6 @@ def synthesize_staging(graph: TileGraph) -> Body:
     if not staged:
         return block.compute
     staged_bufs = frozenset(e.buffer for e in staged)
+    compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
-    return Body(_wrap_k_body(tuple(block.compute), staged_bufs, cache_axes, graph.buffers))
+    return Body(_wrap_k_body(tuple(compute), staged_bufs, cache_axes, graph.buffers))

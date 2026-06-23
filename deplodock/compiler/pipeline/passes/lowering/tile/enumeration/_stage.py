@@ -21,6 +21,7 @@ return with later tiers.
 
 from __future__ import annotations
 
+from deplodock.compiler.ir.stmt import Load, Mma
 from deplodock.compiler.ir.tile.ir import AddrKind, Binding, Block, Edge, SerialTile, TileGraph
 
 
@@ -49,21 +50,32 @@ def _stage_k_extent(block: Block) -> int:
     return ext
 
 
+def _transposed_b_bufs(block: Block) -> set[str]:
+    """Buffers read as a **transposed-B** (Q @ K^T) operand — the native col-major
+    B (``Mma.b_trans``). ``ldmatrix`` has no ``.trans``-from-smem path, so a
+    transposed-B operand can't be staged; it lowers gmem-direct
+    (``kernel/005_lower_atom_tile``). Map each such ``Mma.b`` SSA name back to its
+    operand ``Load``'s buffer."""
+    b_names = {m.b for m in block.compute.iter_of_type(Mma) if m.b_trans}
+    return {ld.input for ld in block.compute.iter_of_type(Load) if ld.names and ld.names[0] in b_names}
+
+
 def stage_candidates(graph: TileGraph) -> list[Edge]:
     """The ranked stageable input read-sites of ``graph``'s single block."""
     block = graph.blocks[0]
     sched = graph.schedule
     if not _has_k_tower(block):
         return []
-    parallel = {a.name for a in block.domain if sched.binding.get(a.name) in (Binding.GRID, Binding.THREAD)}
+    parallel = {a.name for a in block.domain if sched.binding.get(a.name) in (Binding.GRID, Binding.THREAD, Binding.WARP)}
     written = {p.buffer for b in graph.blocks for p in b.writes}
+    no_stage = _transposed_b_bufs(block)
     k_ext = _stage_k_extent(block)
 
     ranked: list[tuple[int, str, Edge]] = []
     seen: set[str] = set()
     for p in block.reads:
         buf = p.buffer
-        if buf in written or buf in seen:  # only input reads; one slab per buffer
+        if buf in written or buf in seen or buf in no_stage:  # only input reads; one slab per buffer; never transposed-B
             continue
         acc = p.access
         if acc.kind is not AddrKind.AFFINE:
