@@ -835,10 +835,25 @@ never a tree-builder.
   is **R7**, not R5 — its real blocker is the fused norm+linear scalar regime not lowering (the `y` LoopOp survives), not
   the TMA decision; the TMA-decline it nominally guards is moot until the kernel lowers. *`_REASON` Phase 3's masked-TMA
   follow-ups (the cooperative-load clamp + non-divisor `real_extent`) stay with the R4 SYNC-masked-staging tier.*
-- **R6 — Flash / attention** (deps: R2, R4). Add the flash build path (streaming `TWISTED_MONOID`, `FM=FN=1`) +
-  `assemble`'s flash synthesis. *Recovers:*
-  `test_flash_attention.py`, `test_flash_cooperative_kv.py`, `test_attention_chains.py`, the three
-  `test_ops_vs_torch.py` sdpa, `test_tune_accuracy.py::…[sdpa]`.
+- **R6 — Flash / attention** (deps: R2, R4). **Landed (scalar flash core).** Added the streaming-`TWISTED_MONOID`
+  build path: `000_build._BUILDABLE` gained `TWISTED_MONOID`; the flash fork `enumeration/017_flash` owns the regime end
+  to end (like `015_coop_reduce` owns `MONOID`) — it enumerates the free-axis THREAD tile, forces `FM=FN=1` +
+  `BK=FK=SPLITK=1`, and applies the `flash_build` body move per leaf; `050_stage` skips `TWISTED_MONOID` (flash is
+  smem-free). `_build.flash_build` / `_replace_k_flash` serial-transform both contraction axes (the streaming KV reduce
+  + its nested QK^T reduce), and for a **symbolic** KV (dynamic `seq_len`) ceil-divide + clamp the load index +
+  `_mask_flash_monoid` masks the `Monoid` score to `-inf` past the runtime bound (the `TWISTED_MONOID` identity — fold
+  nothing for an out-of-range key). The coupled `Monoid` carrier rides through σ untouched — `kernel/100` +
+  `kernel/_combine` synthesize the m/l/O rescale (no new assemble work). Ported from the legacy `build_flash_tile` /
+  `_mask_flash_monoid`. *Gate:* accuracy-vs-torch on the RTX 5090 — SDPA / causal / GQA / additive-mask flash, static
+  **and** dynamic (symbolic `seq_len`, masked streaming). *Recovered:* `test_flash_attention.py` (all but
+  `test_flash_off_keeps_decomposition`, re-tagged R7 — its blocker is the non-flash score-materializing SDPA
+  decomposition) + `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`. *Deferred (still quarantined, R6
+  follow-ups):* **cooperative-KV flash** (`test_flash_cooperative_kv.py` — the `BR>1` streaming split needs the `Monoid`
+  carrier's cross-thread `combine_states` wired to the `K_c` lane; the lane is laid but the combine doesn't yet fire),
+  **RoPE-fused attention chains** (`test_attention_chains.py` — the score producer is a RoPE-fused nest, a
+  recognition follow-up the plan already flagged), and the **score-materializing SDPA decomposition**
+  (`test_ops_vs_torch.py::test_sdpa*`, `test_tune_accuracy.py::…[sdpa]`, `flash_off` — FLASH-off static SDPA whose
+  softmax + P@V kernels don't yet lower).
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
   reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
   `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
@@ -848,7 +863,7 @@ never a tree-builder.
 RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ✓ ┐
 (multi-pass split) ├─► R2 coop-reduce ✓ ───────────────────┐         ├─► R7 e2e / structural / prior
                 └─► R3 split-K ✓ ───────────────────────────┘         │
-                             R2 ✓ ─► R6 flash ◄── R4 ✓ ───────────────┘
+                             R2 ✓ ─► R6 flash ◑ ◄── R4 ✓ ─────────────┘   (◑ scalar flash core; coop-KV / RoPE / SDPA-decomp follow-ups)
 ```
 
 RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
@@ -894,9 +909,15 @@ warp-tier TMA transport fork `enumeration/052_transport` promotes a staged warp 
 `mask_order` hoist for symbolic-M tiles), proven accuracy-vs-torch static + dynamic. The pass structure is validated end
 to end across the smem (scalar + warp), tensor-core, cooperative-reduce, split-K, and TMA-transport regimes.
 
-The unblocked tier is now **R6** (flash, needing R2+R4). The
-remaining R4 follow-ups (the masked cooperative-load clamp + non-divisor `real_extent`, the gmem-direct unstaged atom,
-the `020_mask_order` rewrite of the hoist test) and the `retime` / `warp_spec` forks + the `pad` post-pass + the
-scalar/cp.async transport ride those tiers — the masked-tile env-pin honoring is **not** unblocked by R2 (honoring the
-pin over-stages the multi-accum matmul past the smem budget with no greedy fallback, an R4/R5 masked-staging + fallback
-fix).
+**R5 (transport — warp-tier TMA) and the R6 scalar flash core have landed.** The flash fork `enumeration/017_flash`
+builds the streaming `TWISTED_MONOID` online-softmax (SDPA / causal / GQA / additive-mask, static + dynamic) through the
+`flash_build` body move, and the TMA fork `enumeration/052_transport` promotes a staged warp matmul to the
+double-buffered `cp.async.bulk.tensor` ring (`assembly/_slab` + `020_peel` + the `mask_order` hoist).
+
+The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). The remaining **R6 follow-ups**
+(cooperative-KV flash's `combine_states` wiring, RoPE-fused attention recognition, the score-materializing SDPA
+decomposition) and the **R4 follow-ups** (the masked cooperative-load clamp + non-divisor `real_extent`, the gmem-direct
+unstaged atom, the `020_mask_order` rewrite of the hoist test) ride alongside, plus the `retime` / `warp_spec` forks +
+the `pad` post-pass + the scalar/cp.async transport — the masked-tile env-pin honoring is **not** unblocked by R2
+(honoring the pin over-stages the multi-accum matmul past the smem budget with no greedy fallback, an R4/R5
+masked-staging + fallback fix).
