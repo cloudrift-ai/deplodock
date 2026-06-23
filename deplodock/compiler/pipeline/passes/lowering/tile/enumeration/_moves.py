@@ -16,12 +16,13 @@ param dicts; ``materialize.py`` realizes a complete choice into the tower.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
+from dataclasses import dataclass
 
-from deplodock.compiler.ir.stmt import Loop, Write
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Write
 from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._budget import Budget
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._decompose import legal_decomps
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     BK_CHOICES,
@@ -30,6 +31,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     MAP_M_THREAD,
     MAP_N_REG,
     MAP_N_THREAD,
+    MAX_CELLS_PER_THREAD,
+    MAX_THREADS_PER_CTA,
     RED_BK,
     RED_FK,
     RED_SPLITK,
@@ -37,6 +40,115 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     SPLITK_CHOICES,
     THREAD_CHOICES,
 )
+
+# --- Resource budget (merged from _budget.py) ---
+
+
+@dataclass(frozen=True)
+class Budget:
+    """Incremental resource accounting threaded through the move ``offers`` —
+    a composition that would blow a per-CTA ceiling is never offered."""
+
+    max_threads: int = MAX_THREADS_PER_CTA
+    max_cells: int = MAX_CELLS_PER_THREAD
+
+    def threads_ok(self, threads: int) -> bool:
+        return 1 <= threads <= self.max_threads
+
+    def cells_ok(self, cells: int) -> bool:
+        return 1 <= cells <= self.max_cells
+
+
+# --- The carrier-licensed decomposition move (merged from _decompose.py) ---
+
+
+@dataclass(frozen=True)
+class AxisDecomp:
+    """A factorization of one reduce ``axis`` into ``factors`` (extent product
+    ``== axis.extent`` unless masked), each piece placed by ``placement``.
+
+    The recombine operator and the realization are NOT stored — they are derived:
+    the recombine is ``carrier.combine_partials()`` (algebra); the realization
+    (atomic / shuffle / tree / mma / serial) is the cost+hardware choice keyed off
+    ``placement``."""
+
+    axis: Axis
+    factors: tuple[int, ...]
+    placement: tuple[Role, ...]
+
+
+def legal_decomps(
+    carrier: ReduceCarrier | None,
+    axis: Axis,
+    extent: int,
+    *,
+    factor_menus: Sequence[Sequence[int]],
+    placement: Sequence[Role],
+    masked: bool,
+    allow_split: bool = True,
+) -> list[AxisDecomp]:
+    """The factorizations the ``carrier`` algebra licenses over ``axis``.
+
+    ``factor_menus`` is one candidate menu per factored piece (e.g. split / chunk
+    / strip for matmul, or cooperative / chunk / strip for coop reduce);
+    ``placement`` names where each piece lands (the same length). The legality is
+    a carrier-trait query:
+
+    - **associative** licenses splitting the axis at all. A non-associative
+      carrier admits only the trivial all-``1`` factorization (no recombine).
+    - **commutative** licenses a *partitioning* factor > 1 whose recombine
+      reorders partials (split-K cross-CTA / cooperative-tree) — the FIRST factor
+      by convention (``placement[0]`` is the partition: ``BLOCK`` split-K /
+      ``THREAD`` cooperative). ``allow_split`` is the orthogonal cost/soundness
+      gate the caller supplies (a non-linear epilogue / multi-accumulator matmul
+      forbids split-K regardless of algebra).
+    - **has_identity** licenses a ``masked`` (ceil-div + identity-fill)
+      factorization of a non-divisible / symbolic axis; without it the product
+      must divide ``extent`` exactly.
+
+    A **PARALLEL** axis (``carrier is None``) is the degenerate, no-recombine case
+    (phase 7): free-axis tiling (block × thread × register) and the tensorize
+    atom-block are product decompositions of *independent* work, so every
+    factorization is legal (no associativity needed — there is nothing to
+    recombine), masking is a plain boundary store-guard (no carrier identity), and
+    a partition factor needs no commutativity.
+
+    Returns the legal :class:`AxisDecomp`s unranked — pruning / best-first
+    ordering stays with the caller (cost, not algebra)."""
+    parallel = carrier is None
+    if masked and not parallel and not carrier.has_identity:
+        return []  # can't identity-fill a fill-less reduce carrier (a parallel axis masks via a store guard)
+    splittable = parallel or carrier.associative
+    can_partition = parallel or (allow_split and carrier.commutative)
+    placement_t = tuple(placement)
+
+    out: list[AxisDecomp] = []
+
+    def _emit(combo: tuple[int, ...]) -> None:
+        product = 1
+        for f in combo:
+            product *= f
+        if product > extent:
+            return
+        if not masked and extent % product != 0:
+            return
+        if not splittable and product != 1:
+            return
+        if combo[0] != 1 and not can_partition:
+            return
+        out.append(AxisDecomp(axis=axis, factors=combo, placement=placement_t))
+
+    _enumerate(factor_menus, (), _emit)
+    return out
+
+
+def _enumerate(menus: Sequence[Sequence[int]], prefix: tuple[int, ...], emit) -> None:
+    """Cartesian product of the per-factor menus, calling ``emit`` per combo."""
+    if not menus:
+        emit(prefix)
+        return
+    for v in menus[0]:
+        _enumerate(menus[1:], (*prefix, v), emit)
 
 
 def _pin(knob: Knob) -> int | None:

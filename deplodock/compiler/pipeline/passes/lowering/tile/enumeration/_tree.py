@@ -20,11 +20,11 @@ from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.stmt import Loop, Write
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.fork import Fork
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._budget import Budget
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import lower_matmul, lower_pointwise
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import AxisRole, IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import RED_FK
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
+    Budget,
     matmul_reduce_offers,
     matmul_reg_offers,
     matmul_thread_offers,
