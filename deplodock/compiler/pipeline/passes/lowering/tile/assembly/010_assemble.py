@@ -13,7 +13,7 @@ does the register/thread replication (``_wrap_tower``) + slab synthesis from the
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
+from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
@@ -21,15 +21,19 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import 
 PATTERN = [Pattern("root", TileGraphOp)]
 
 
-def rewrite(ctx: Context, root: Node, match) -> TileOp:  # noqa: ARG001
+def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     """Assemble the fully-tiled ``TileGraphOp`` into its ``TileOp`` tower. The variant
     knobs are already merged onto ``op.knobs`` (so ``base_knobs`` is empty); ``op.leading``
     is the per-CTA prologue ``assemble`` prepends. A still-logical seed (the free-axis tile
     not yet applied — its block ``domain`` still empty) is left for the enumeration passes
     to finish. The "fully tiled" test reads the materialization side's own state (a
     populated ``Block.domain``), never a search-side knob — assembly stays independent of
-    the enumeration vocabulary."""
+    the enumeration vocabulary.
+
+    A multi-block ``TileGraph`` (the edge-placement ``GMEM`` cut, R7) assembles to a
+    ``Graph`` of ``TileOp`` kernels the engine splices, the same shape the structural
+    forks (``055_atomic_free_splitk``) already return."""
     op: TileGraphOp = root.op
-    if op.tilegraph is None or not op.tilegraph.blocks[0].domain:
+    if op.tilegraph is None or any(not b.domain for b in op.tilegraph.blocks):
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     return assemble_block(op.tilegraph, knobs=op.knobs, base_knobs={}, kernel_name=op.name, leading=op.leading)
