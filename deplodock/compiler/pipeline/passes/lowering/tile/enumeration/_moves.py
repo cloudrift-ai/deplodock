@@ -1,4 +1,4 @@
-"""Moves: ``TileMap`` on each free axis, ``TileSerial`` on a matmul's reduce axis.
+"""Moves: ``TileMap`` on each free axis, ``TileSerial`` on a contraction (reduce) axis.
 
 A ``TileMap`` on a map axis contributes a thread-tile factor and a register-tile
 factor; the block-tile count is derived from the extent at materialize time
@@ -6,7 +6,7 @@ factor; the block-tile count is derived from the extent at materialize time
 a store guard). Map axes carry no carrier, so these moves have no algebraic
 precondition; legality is purely the resource budget. ``TileSerial`` re-brackets
 a ``SEMIRING`` reduce axis into a ``(bk, fk)`` K-chunk + strip-mine — its
-precondition (``carrier.associative``) holds for any matmul reduce, so here too
+precondition (``carrier.associative``) holds for any associative reduce, so here too
 legality reduces to ``bk·fk`` dividing the K extent plus the cell budget.
 
 This module owns the **legal offer set** (the search dimensions) and the knob
@@ -90,7 +90,7 @@ def legal_decomps(
     """The factorizations the ``carrier`` algebra licenses over ``axis``.
 
     ``factor_menus`` is one candidate menu per factored piece (e.g. split / chunk
-    / strip for matmul, or cooperative / chunk / strip for coop reduce);
+    / strip for a SEMIRING split, or cooperative / chunk / strip for a MONOID reduce);
     ``placement`` names where each piece lands (the same length). The legality is
     a carrier-trait query:
 
@@ -100,7 +100,7 @@ def legal_decomps(
       reorders partials (split-K cross-CTA / cooperative-tree) — the FIRST factor
       by convention (``placement[0]`` is the partition: ``BLOCK`` split-K /
       ``THREAD`` cooperative). ``allow_split`` is the orthogonal cost/soundness
-      gate the caller supplies (a non-linear epilogue / multi-accumulator matmul
+      gate the caller supplies (a non-linear epilogue / multi-accumulator reduce
       forbids split-K regardless of algebra).
     - **has_identity** licenses a ``masked`` (ceil-div + identity-fill)
       factorization of a non-divisible / symbolic axis; without it the product
@@ -160,8 +160,8 @@ def _pin(knob: Knob) -> int | None:
 
 # Pointwise is memory-bandwidth bound, so a conservative register-tile menu
 # keeps the generative tree small without losing the configs that matter
-# (richer reduce / matmul reg menus arrive with their regimes).
-_POINTWISE_REG_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+# (richer reduce-regime reg menus arrive with their regimes).
+_MAP_REG_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 
 
 def _axis_thread_choices(extent: int) -> tuple[int, ...]:
@@ -173,7 +173,7 @@ def _axis_thread_choices(extent: int) -> tuple[int, ...]:
     return tuple(seen)
 
 
-# A pointwise CTA wants ~256 threads (8 warps): enough occupancy without
+# A free-axis (MAP) CTA wants ~256 threads (8 warps): enough occupancy without
 # starving the grid. The cold prior has no weighted feature for the greenfield
 # knobs yet (Phase 4 retrain), so emission order is the effective ranking —
 # emit the sanest tile first.
@@ -183,7 +183,7 @@ _THREAD_TARGET = 256
 def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(thread_n, thread_m)`` thread tiles within the CTA thread
     budget, best-first (≈``_THREAD_TARGET`` threads, larger to break ties).
-    ``thread_m`` is ``1`` for a 1-D pointwise kernel (no M axis)."""
+    ``thread_m`` is ``1`` for a 1-D nest (no M axis)."""
     n_choices = _axis_thread_choices(dag.inner_n.extent)
     m_choices = _axis_thread_choices(dag.outer_m.extent) if dag.outer_m is not None else (1,)
     out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
@@ -191,12 +191,12 @@ def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     return out
 
 
-def reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
+def map_reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles within the cell budget, best-first
-    (fewest cells — pointwise is bandwidth bound; prefer tiling the contiguous N
+    (fewest cells — a MAP nest is bandwidth bound; prefer tiling the contiguous N
     axis on ties)."""
-    m_choices = _POINTWISE_REG_CHOICES if dag.outer_m is not None else (1,)
-    out = [(r_n, r_m) for r_n in _POINTWISE_REG_CHOICES for r_m in m_choices if budget.cells_ok(r_n * r_m)]
+    m_choices = _MAP_REG_CHOICES if dag.outer_m is not None else (1,)
+    out = [(r_n, r_m) for r_n in _MAP_REG_CHOICES for r_m in m_choices if budget.cells_ok(r_n * r_m)]
     out.sort(key=lambda rm: (rm[0] * rm[1], -rm[0]))
     return out
 
@@ -219,12 +219,13 @@ def reg_knobs(dag: IterDag, reg: tuple[int, int]) -> dict:
     return knobs
 
 
-# --- Matmul (SEMIRING) moves: TileMap on M/N + TileSerial on K. ---
+# --- Reduce decomposition move (SEMIRING / MONOID): the carrier-licensed
+# legal_decomps over a contraction axis, + its compute-bound register menu. ---
 
-_CELL_TARGET = 16  # matmul wants a register tile big enough for ILP, small enough for occupancy
+_CELL_TARGET = 16  # a reduce regime wants a register tile big enough for ILP, small enough for occupancy
 
 
-def matmul_reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
+def reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     """Legal ``(bk, fk, splitk)`` K-tilings: ``splitk·bk·fk`` divides the static
     K extent (so ``K_o = K/(splitk·bk·fk)`` is whole). Best-first: no split-K
     (``splitk=1``, a perf opt for small-MN/large-K), deep chunk (large ``bk``),
@@ -237,8 +238,8 @@ def matmul_reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     # Split-K atomic-adds per-CTA partials, sound only for a bare single reduce.
-    # A MAP epilogue (QK^T scale, matmul_add) or a multi-accumulator matmul
-    # (gated MLP — several same-K reduces) forces SPLITK=1: a non-linear epilogue
+    # A MAP epilogue (a fused scale / residual add) or a multi-accumulator reduce
+    # (several same-K reduces) forces SPLITK=1: a non-linear epilogue
     # or a coupled multi-accum over a partial would corrupt the cross-CTA sum.
     has_epilogue = any(not isinstance(s, (Loop, Write)) for s in dag.inner_body)
     n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
@@ -258,19 +259,8 @@ def matmul_reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     out = [(d.factors[1], d.factors[2], d.factors[0]) for d in decomps]
     out.sort(key=lambda t: (t[2] != 1, -t[0], t[1], t[2]))
     return out
-
-
-def matmul_thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
-    """Legal ``(thread_n, thread_m)`` for a matmul, best-first (≈256 threads)."""
-    n_choices = _axis_thread_choices(dag.inner_n.extent)
-    m_choices = _axis_thread_choices(dag.outer_m.extent)
-    out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
-    out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
-    return out
-
-
-def matmul_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
-    """Legal ``(reg_n, reg_m)`` register tiles for a matmul under the cell budget
+def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
+    """Legal ``(reg_n, reg_m)`` register tiles for a reduce regime under the cell budget
     (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells)."""
     out = [(r_n, r_m) for r_n in REG_CHOICES for r_m in REG_CHOICES if budget.cells_ok(fk * r_n * r_m)]
     out.sort(key=lambda rm: (abs(rm[0] * rm[1] - _CELL_TARGET), -rm[0] * rm[1]))
@@ -283,7 +273,3 @@ def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
     return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
 
 
-# --- Tensorize move (warp-tier MMA): gated on atom eligibility. ---
-
-_MAX_WARP_CELLS = 64  # FM·FN per warp-cell
-_WARP_TARGET = 4  # warps per CTA (~128 threads)

@@ -1,15 +1,12 @@
 """Build the block-DAG ``TileGraph`` from the iteration DAG + a move choice.
 
-This is the composer's new front half (``plans/tile-ir-block-dag.md`` step 1):
-instead of materializing the ``TileOp`` tower directly, it emits the invariant
-algorithm (one or more :class:`Block`\\ s) plus a reference :class:`Schedule`,
-which :func:`assemble.assemble_pointwise` (etc.) lowers to today's tower
-byte-identically.
-
-**Covered so far: pointwise.** The free-axis σ-split is the ``tile_axis`` body
-move — done here, reusing ``materialize._split_free_axis`` verbatim so the body
-is identical — and the GRID/THREAD/REGISTER tiers become ``Schedule.binding``
-entries on the split axes.
+The composer's front half (``plans/tile-ir-block-dag.md``): instead of
+materializing the ``TileOp`` tower, ``build_dag`` emits the invariant algorithm (a
+:class:`Block`) + a reference :class:`Schedule` (the binding), and ``lower`` wraps
+it in the ``TileGraphOp`` the enumeration pass returns. One ``build_dag`` serves
+every regime — a ``MAP`` nest tiles its free axes; a ``SEMIRING`` / ``MONOID``
+reduce additionally re-brackets its contraction axis (``target_names``). There is
+no per-shape code: the moves are algebra-licensed, applied uniformly.
 """
 
 from __future__ import annotations
@@ -113,16 +110,23 @@ def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple
     return body
 
 
-def build_pointwise_dag(dag: IterDag, knobs: dict, *, kernel_name: str) -> TileGraph:
-    """Build a single-block pointwise ``TileGraph`` from the iteration DAG.
+def build_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_names: frozenset[str] = frozenset()) -> TileGraph:
+    """Build a single-block ``TileGraph`` from the iteration DAG + a move choice.
 
-    Mirrors ``materialize.build_pointwise_tile``'s free-axis split (so the σ-
-    rewritten body is byte-identical) but records the tiers as ``Schedule.binding``
-    instead of wrapping the tower. ``assemble_pointwise`` then rebuilds the tower.
+    Two algebra-licensed moves compose here, both σ-rewriting the body:
 
-    The split axes are laid into ``Block.domain`` per-free-axis (``N_b, N_t, N_r,
-    M_b, M_t, M_r, …``) so each binding tier reads back in inner→outer order, with
-    extra-outer GRID axes (reversed) trailing — the order ``_assemble`` emits."""
+    - **``tile_axis`` on each free (``PARALLEL`` / ``MAP``) axis** — split it into
+      GRID / THREAD / REGISTER (``A → A_b·(T·R) + A_t·R + A_r``); the tiers become
+      ``Schedule.binding`` entries. Always legal (no carrier).
+    - **the reduce decomposition on each contraction axis named in
+      ``target_names``** (a ``SEMIRING`` / ``MONOID`` reduce; empty for a ``MAP``
+      nest) — re-bracket it into the ``K_o`` (serial-outer) / ``K_i`` (stage-inner)
+      tower with an optional ``K_f`` strip-mine, embedded in ``compute``; a
+      partition factor (split-K ``K_s``) becomes one more GRID binding.
+
+    The split axes lay into ``Block.domain`` per free axis (``N_b, N_t, N_r, M_b,
+    …``) so each binding tier reads back inner→outer, with the partition + extra-
+    outer GRID axes trailing — the order ``assemble`` emits."""
     inner_n, outer_m, extra_outer = _free_axes(dag)
     free_specs = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
     if outer_m is not None:
@@ -141,83 +145,40 @@ def build_pointwise_dag(dag: IterDag, knobs: dict, *, kernel_name: str) -> TileG
         binding[a_b.name] = Binding.GRID
         binding[a_t.name] = Binding.THREAD
         binding[a_r.name] = Binding.REGISTER
+
+    k_s = None
+    if target_names:  # a contraction axis is present (SEMIRING / MONOID)
+        kax = dag.k_node.loop.axis
+        splitk = knobs[RED_SPLITK.name]
+        k_s = Axis(f"{kax.name}_s", splitk, source_axis=kax.source_axis or kax) if splitk > 1 else None
+        if k_s is not None:
+            domain.append(k_s)
+            binding[k_s.name] = Binding.GRID
     for lp in reversed(extra_outer):
         domain.append(lp.axis)
         binding[lp.axis.name] = Binding.GRID
 
     sigma_outer = Sigma(sigma_map)
     compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
-    compute = _apply_masked_guards(compute, bounds, sigma_outer)
-    block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
-    return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
-
-
-def build_matmul_dag(dag: IterDag, knobs: dict, *, kernel_name: str, target_names: frozenset[str]) -> TileGraph:
-    """Build a single-block scalar-matmul ``TileGraph``.
-
-    Mirrors ``materialize.build_matmul_tile``: free axes M / N split into
-    GRID/THREAD/REGISTER (the ``tile_axis`` map move), and the contraction axis
-    re-bracketed into the ``K_o`` (serial-outer) / ``K_i`` (stage-inner) tower with
-    an optional ``K_f`` strip-mine (the ``tile_axis`` reduce move, embedded in
-    ``compute``). Split-K's ``K_s`` is one GRID binding placed after the free block
-    axes. Masked (non-divisible) M / N / K not yet ported."""
-    inner_n, outer_m, extra_outer = _free_axes(dag)
-    free_specs = [
-        (inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True),
-        (outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False),
-    ]
-    bk, fk, splitk = knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name]
-    kax = dag.k_node.loop.axis
-    src_k = kax.source_axis or kax
-    k_s = Axis(f"{kax.name}_s", splitk, source_axis=src_k) if splitk > 1 else None
-    targets = target_names or frozenset({kax.name})
-
-    sigma_map: dict = {}
-    bounds: list = []
-    domain: list = []
-    binding: dict[str, Binding] = {}
-    for axis, thread, reg, interleave in free_specs:
-        a_b, a_t, a_r, expr, bound = _split_free_axis(axis, thread, reg, interleave_when_masked=interleave)
-        sigma_map[axis.name] = expr
-        if bound is not None:
-            bounds.append((axis.name, bound))
-        domain.extend((a_b, a_t, a_r))
-        binding[a_b.name] = Binding.GRID
-        binding[a_t.name] = Binding.THREAD
-        binding[a_r.name] = Binding.REGISTER
-    if k_s is not None:
-        domain.append(k_s)
-        binding[k_s.name] = Binding.GRID
-    for lp in reversed(extra_outer):
-        domain.append(lp.axis)
-        binding[lp.axis.name] = Binding.GRID
-
-    sigma_outer = Sigma(sigma_map)
-    inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
-    compute = _replace_k_scalar(inner, targets, dag.k_extent, bk, fk, splitk, k_s)
+    if target_names:
+        compute = _replace_k_scalar(compute, target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], splitk, k_s)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
     block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
     return TileGraph(name=kernel_name, buffers={}, blocks=(block,), schedule=Schedule(binding=binding))
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers — the Fork-tree leaves call these to emit the ENUMERATION
-# output: a ``TileGraphOp`` carrying the chosen Schedule's ``TileGraph`` + the
-# full variant knob set. Assembly is a SEPARATE deterministic pass
-# (``assembly/010_assemble``); these do NOT call ``assemble`` (the new block-DAG
-# path is the sole pointwise / scalar-matmul lowering).
+# ``lower`` — the Fork-tree leaf's terminal: emit the ENUMERATION output, a
+# ``TileGraphOp`` carrying the chosen Schedule's ``TileGraph`` + the full variant
+# knob set. Assembly is a SEPARATE deterministic pass (``assembly/010_assemble``);
+# this does NOT assemble.
 # ---------------------------------------------------------------------------
 
 
-def lower_pointwise(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict) -> TileGraphOp:
-    """Emit the ``TileGraphOp`` for a pointwise leaf (enumeration only)."""
-    tg = build_pointwise_dag(dag, knobs, kernel_name=kernel_name)
-    return TileGraphOp(name=kernel_name, tilegraph=tg, leading=tuple(dag.leading), knobs={**base_knobs, **knobs})
-
-
-def lower_matmul(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str]) -> TileGraphOp:
-    """Emit the ``TileGraphOp`` for a scalar-matmul leaf (enumeration only)."""
-    tg = build_matmul_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
-    # Scalar tier carries the warp-tier OFF sentinels.
-    stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs}
+def lower(dag: IterDag, knobs: dict, *, kernel_name: str, base_knobs: dict, target_names: frozenset[str] = frozenset()) -> TileGraphOp:
+    """Emit the ``TileGraphOp`` for a resolved leaf (enumeration only)."""
+    tg = build_dag(dag, knobs, kernel_name=kernel_name, target_names=target_names)
+    # A reduce regime carries the warp-tier OFF sentinels (scalar tier — no
+    # tensor-core / cooperative bind); a MAP nest has no reduce knobs at all.
+    stamped = {"MMA": "0", "WM": 0, "WN": 0, "BR": 1, **knobs} if target_names else knobs
     return TileGraphOp(name=kernel_name, tilegraph=tg, leading=tuple(dag.leading), knobs={**base_knobs, **stamped})

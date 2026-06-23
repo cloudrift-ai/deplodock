@@ -100,7 +100,7 @@ class IterDag:
 
     @property
     def algebras(self) -> set[AlgebraKind]:
-        """The algebra kinds of the reduce axes (empty for pointwise)."""
+        """The algebra kinds of the reduce axes (empty for a MAP nest)."""
         return {n.algebra for n in self.reduce if n.algebra is not None}
 
     # --- Free-axis accessors (the tiled output axes). Replace the skeleton's

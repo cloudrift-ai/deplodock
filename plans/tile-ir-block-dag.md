@@ -690,10 +690,54 @@ Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy
   too-coarse whole-file `_XFAIL_FILES_DEMO` masks (`test_matmul_mma.py`, `test_run.py` hide green scalar tests) into
   per-test entries. *Gate: `make test` green with **0 failed, 0 XPASS** — every red test an `xfail` tagged with its
   recovery phase.*
-- **R1 — Staging** (deps: none). `assemble` synthesizes the smem slab + cooperative producer from `Schedule.staged`; the
-  `stage` offer. *Recovers:* `test_stage_inputs_mma_probe.py`, `test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs`.
-- **R2 — Cooperative-reduce** (deps: none; parallel with R1; the biggest chunk). `build_coop_reduce_tree` + `(bk,fk,br)`
-  offer + warp-shuffle / hierarchical combine synthesis. *Recovers ~22:* `test_monoid_reduce_kernel.py`,
+
+**Foundation (RF) — split the single enumeration pass into per-family tree-expansion passes.** *Do after R0, before any
+tier.* This is the Option-B groundwork that makes "The pass structure" / "Directory layout" real, refactoring **only** the
+existing pointwise + scalar-matmul composer (no new regime), gated **byte-identical**.
+
+**Already landed** (scaffolding — verified in the tree): the two pass dirs are registered
+`TILE_PASSES` now ends `…, "lowering/tile/enumeration", "lowering/tile/assembly"` (closes **G5**); **`TileGraphOp`** is a
+real graph-node op (`ir/tile/ir.py`) carrying `tilegraph` + variant `knobs` + `leading` (closes **G2**);
+`enumeration/010_enumerate` emits a `TileGraphOp` and the separate `assembly/010_assemble` materializes it `→ TileOp`
+(the enumeration/assembly split is done). Pointwise + scalar matmul lower end-to-end through both passes.
+
+**Still single-pass, the remaining RF work:** `enumeration/010_enumerate` is still **one** pass returning **one** in-memory
+`Fork` tree (`_ChooseThread → _ThreadChosen → _Leaf` for pointwise; `_MmChooseReduce → … → _MmLeaf` for matmul) whose leaf
+calls `_build.lower_{pointwise,matmul}` — and that builds the **whole** `TileGraph` from the **full** knob set at once
+(`build_pointwise_dag` σ-splits `Block.domain` by the thread/reg knobs; `Schedule` holds only `binding`). Two steps:
+
+- **F2 — extract `enumeration/000_build`** (deterministic, no fork): `LoopOp → TileGraphOp` seed (derive `iter_dag` +
+  `classify`, stamp the regime/`target_names`/`dag` the offer fns need). Today that derivation lives inside
+  `010_enumerate`'s rewrite.
+- **F3 — split `010_enumerate`'s tree into one rule pass per search level**: `010_reduce_tile` (matmul K-tiling),
+  `020_thread_tile`, `030_register_tile` — each matches the `TileGraphOp`, computes offers (the `_moves.py` fns
+  `matmul_reduce_offers` / `thread_offers` / `reg_offers` already exist), and returns a `Fork` whose leaves are
+  `TileGraphOp`s with one more knob group pinned (else passes through). This is the move from `_tree.py`'s in-memory
+  `_Choose*` nodes to rule `rewrite`s — closes **G1**.
+
+**Open decision blocking F3 — where the algorithm gets built.** `TileGraphOp` currently carries only the *finished*
+`TileGraph` + knobs, and `build_*_dag` needs *all* tile knobs to σ-split `Block.domain`. So a per-family pass cannot just
+"annotate the Schedule" — the variant lives partly in the algorithm's domain. Two ways:
+- **F3-a (pragmatic, byte-identical-safe):** the per-family passes accumulate knobs on the `TileGraphOp` (carrying the
+  `dag`), and the `TileGraph` is built **once** at the end of enumeration (or assembly's front) via the current
+  `build_*_dag`. Splits the *search* into passes (closes G1) with minimal change; the algorithm is still built all-at-once.
+- **F3-b (design-true, larger):** make the algorithm **knob-invariant** — `000_build` seeds logical axes, each tile pass
+  applies an incremental `tile_axis` body move, and `assemble` does the register/thread replication from `Schedule`. This
+  is the real "invariant algorithm + Schedule variant" model, but it reworks `build_*_dag` **and** `assemble`.
+  *Recommendation: F3-a now (unblocks the tiers), F3-b as a later cleanup once a tier needs the invariant algorithm.*
+
+*Gate: byte-identical `TileOp` for pointwise + scalar matmul; the green floor unmoved; the two-level MCTS enumerates the
+**identical leaf set** — it now branches across passes instead of within one tree.* The `→ KernelOp` switch (audit **G3**)
+and the deterministic post-passes (**G4**) remain later steps. Every tier below assumes this foundation: each **adds one
+enumeration pass** (its move family) + grows `assemble`'s `Schedule`-driven synthesis — never
+a tree-builder.
+
+- **R1 — Staging** (deps: RF). Add `enumeration/040_stage`; `assemble` synthesizes the smem slab + cooperative producer
+  from `Schedule.staged`. *Recovers:* `test_stage_inputs_mma_probe.py`,
+  `test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs`.
+- **R2 — Cooperative-reduce** (deps: RF; the biggest chunk). Add the coop `classify`→build path + an
+  `enumeration/050_coop_reduce` pass (`(bk,fk,br)` offer) + `assemble`'s warp-shuffle / hierarchical combine synthesis.
+  *Recovers ~22:* `test_monoid_reduce_kernel.py`,
   `test_cooperative_combine.py`, `test_masked_cooperative_reduce.py`, the six `test_reduction_rules.py` coop tests, the four
   `test_dtype_cuda.py` fp16 reduce/softmax/rmsnorm, the six `test_accuracy.py` e2e reduce/rmsnorm/softmax, the six
   `test_ops_vs_torch.py` reduce/mean/softmax/rmsnorm, `test_tile_naming.py::test_real_rms_norm_kernels_named_by_op`,
@@ -701,14 +745,16 @@ Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy
 - **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). The `partition_reduce(K,GRID)` move + atomic /
   atomic-free combine block. *Recovers:* `test_mma_atomic_free_splitk.py`,
   `test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural`.
-- **R4 — Warp-tier MMA (`atomize`)** (deps: R1). Atom-fold builder + `RegFragment`/`Ldmatrix`/`MmaSyncPtx`/`RegStore`
-  synthesis. *Recovers:* `test_matmul_mma.py`, `…_residual.py`, `…_causal_epilogue.py`, `…_transposed_b.py` (+ its
+- **R4 — Warp-tier MMA (`atomize`)** (deps: R1). Add `enumeration/060_tensorize` (atom-fold body move) + `assemble`'s
+  `RegFragment`/`Ldmatrix`/`MmaSyncPtx`/`RegStore` synthesis. *Recovers:* `test_matmul_mma.py`, `…_residual.py`,
+  `…_causal_epilogue.py`, `…_transposed_b.py` (+ its
   symbolic-MN nodes), `…_parity.py` (non-TMA params), `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct`.
   *Folds in `_REASON` Phase 1–2 (symbolic masked warp / masked-K).*
 - **R5 — Transport (cp.async / TMA)** (deps: R1, R4). `promote_transport` + descriptor/swizzle synthesis (`peel` post-pass
   does the pipeline expansion). *Recovers:* the `test_matmul_mma_parity.py` TMA nodes (static + dynamic),
   `test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment`. *Folds in `_REASON` Phase 3.*
-- **R6 — Flash / attention** (deps: R2, R4). Streaming `TWISTED_MONOID` builder (`FM=FN=1`) + flash synthesis. *Recovers:*
+- **R6 — Flash / attention** (deps: R2, R4). Add the flash build path (streaming `TWISTED_MONOID`, `FM=FN=1`) +
+  `assemble`'s flash synthesis. *Recovers:*
   `test_flash_attention.py`, `test_flash_cooperative_kv.py`, `test_attention_chains.py`, the three
   `test_ops_vs_torch.py` sdpa, `test_tune_accuracy.py::…[sdpa]`.
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
@@ -717,13 +763,14 @@ Gate: **accuracy-vs-torch** for new synthesis; **byte-identical** where a legacy
   / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
 
 ```
-R0 ─┬─► R1 staging ───────► R4 warp-MMA ──► R5 transport ─┐
-    ├─► R2 coop-reduce ──────────────────────┐           ├─► R7 e2e / structural / prior
-    └─► R3 split-K ───────────────────────────┘           │
-                       R2 ──► R6 flash ◄── R4 ─────────────┘
+R0 ─► RF foundation ─┬─► R1 staging ──► R4 warp-MMA ──► R5 transport ─┐
+   (multi-pass split) ├─► R2 coop-reduce ─────────────────┐           ├─► R7 e2e / structural / prior
+                      └─► R3 split-K ──────────────────────┘           │
+                                   R2 ──► R6 flash ◄── R4 ─────────────┘
 ```
 
-R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's combine work; R4→R5, R2+R4→R6, all→R7. As each
+RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
+combine work; R4→R5, R2+R4→R6, all→R7. As each
 tier lands, retire the matching `composer-only-green-suite.md` phase into its R-phase here — that doc no longer tracks a
 live process.
 
