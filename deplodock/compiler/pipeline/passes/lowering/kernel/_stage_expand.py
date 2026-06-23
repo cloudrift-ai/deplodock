@@ -17,7 +17,7 @@ from deplodock.compiler.dim import to_dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
-from deplodock.compiler.ir.stmt import Assign, Load, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Assign, Body, Load, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
@@ -504,6 +504,36 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
         Sync(),
     ]
     return body_out
+
+
+def emit_reduce_phase(cr, tid_expr, n_threads: int) -> list[Stmt]:  # noqa: ANN001 — CoopReduce
+    """Expand a :class:`~deplodock.compiler.ir.tile.ir.CoopReduce` prologue (the SMEM
+    fused edge's rmsnorm reduce) into the cooperative ``StridedLoop`` reduce.
+
+    Emits the per-CTA ``leading`` constants once, declares the per-row ``out_slab``, then
+    a ``tid``-strided loop over the M ``cells`` — each iteration σ-substitutes the cell
+    coord into the per-cell reduce body (a serial reduce over the full row + the
+    ``rsqrt`` scalar chain + the ``Write out_slab[cell]``). A trailing ``Sync`` makes the
+    freshly computed slab CTA-visible to the matmul's scale-application compute phase."""
+    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+    from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+
+    extents = tuple(ax.extent.as_static() for ax in cr.cells)
+    total = 1
+    for e in extents:
+        total *= e
+    iter_axis = Axis(name=f"{cr.out_slab}_flat", extent=total)
+    coord_for = {cr.cells[0].name: Var(iter_axis.name)} if len(cr.cells) == 1 else flat_decode(cr.cells, iter_axis.name)
+    sigma = Sigma(coord_for)
+    cell_body = tuple(s.rewrite(lambda n: n, sigma) for s in cr.body)
+    dtype = cuda_name(cr.out_dtype) if cr.out_dtype is not None else "float"
+    align = 16 if dtype == "__half" else 0
+    return [
+        *cr.leading,
+        Smem(name=cr.out_slab, extents=extents, dtype=dtype, align=align),
+        StridedLoop(axis=iter_axis, start=tid_expr, step=Literal(n_threads, "int"), body=Body(cell_body)),
+        Sync(),
+    ]
 
 
 def flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:

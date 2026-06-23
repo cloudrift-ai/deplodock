@@ -838,6 +838,65 @@ class AsyncWait(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# CoopReduce — cooperative per-row reduce prologue (SMEM fused edge, R7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CoopReduce(Stmt):
+    """A cooperative per-row reduce **prologue** for the SMEM fused edge (the rmsnorm
+    producer). All CTA threads stride over the ``cells`` (the M cache axes), each
+    reducing the producer's contraction over the **full** row and writing a per-row
+    scalar slab (``out_slab``); the matmul's scale-application compute phase then reads
+    that slab as a broadcast operand. Emitted as a ``GridTile``-level sibling **before**
+    the matmul tower — no second ``ThreadTile``, the cooperative ``StridedLoop`` uses the
+    kernel's own thread count. ``100_materialize`` expands it via ``emit_reduce_phase``.
+
+    - ``cells`` — the M cache axes: the cooperative iteration domain + the ``out_slab``
+      index. (Materialize flat-decodes a ``tid``-strided index into these.)
+    - ``leading`` — per-CTA constants, emitted **once** before the cooperative loop (the
+      rmsnorm ``1/H`` reciprocal + ``eps`` loads).
+    - ``body`` — the per-cell reduce: a serial reduce loop over the contraction axis + the
+      scalar chain (``rsqrt(acc·(1/H)+eps)``) + the ``Write out_slab[cells]``.
+    - ``out_slab`` / ``out_dtype`` — the produced per-row smem slab + its element dtype.
+
+    The bodies ARE exposed via :meth:`nested` so ``020_place_inits`` seeds the reduce
+    ``Accum`` and ``030_stamp_types`` stamps dtypes; ``010_split_register_axes`` skips it
+    (the cooperative fill must not be register-replicated, like ``StageBundle.compute``)."""
+
+    cells: tuple[Axis, ...]
+    leading: Body
+    body: Body
+    out_slab: str
+    out_dtype: DataType
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.leading, Body):
+            object.__setattr__(self, "leading", Body.coerce(self.leading))
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body.coerce(self.body))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.leading, self.body)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        return replace(self, leading=bodies[0], body=bodies[1])
+
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(ld.input for b in (self.leading, self.body) for ld in b.iter_of_type(Load))
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.out_slab,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        cells = ", ".join(f"{a.name}:{a.extent}" for a in self.cells)
+        lines = [f"{indent}coop_reduce[{cells}] -> {self.out_slab}:"]
+        lines.extend(pretty_body(self.leading, indent + INDENT))
+        lines.extend(pretty_body(self.body, indent + INDENT))
+        return lines
+
+
+# ---------------------------------------------------------------------------
 # WarpSpecialize — producer/consumer split for TMA-pipelined kernels
 # ---------------------------------------------------------------------------
 #

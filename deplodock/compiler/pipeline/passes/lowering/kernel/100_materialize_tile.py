@@ -58,6 +58,7 @@ from deplodock.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     AsyncWait,
+    CoopReduce,
     GridTile,
     RegisterTile,
     SerialTile,
@@ -83,6 +84,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
     compute_phase_extents,
     compute_phase_info,
     emit_compute_phase,
+    emit_reduce_phase,
     emit_stage,
     smem_cuda_dtype,
 )
@@ -142,10 +144,17 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
     from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
     if isinstance(top, GridTile):
+        # The SMEM fused edge's rmsnorm prologue: a CoopReduce sibling of the matmul
+        # tile, expanded with the CTA's own tid / thread count (read off the matmul
+        # ThreadTile/WarpTile) into the cooperative reduce → v4_smem.
+        mm_tile = next((c for c in top.body if isinstance(c, (ThreadTile, WarpTile))), None)
+        cta_tid, cta_threads = _cta_threads(mm_tile, warp_size) if mm_tile is not None else (None, 1)
         new_outer: list[Stmt] = []
         for child in top.body:
             if isinstance(child, (ThreadTile, WarpTile)):
                 new_outer.append(_materialize(child, warp_size=warp_size, escape=escape))
+            elif isinstance(child, CoopReduce):
+                new_outer.extend(emit_reduce_phase(child, cta_tid, cta_threads))
             else:
                 new_outer.append(child)
         return GridTile(axes=top.axes, body=Body(new_outer), swizzle_group_m=top.swizzle_group_m)
@@ -857,6 +866,21 @@ def _emit_loop(loop, tid_expr, n_threads, transform, filter_emit, emit_bundle_pr
         return transform(s)
 
     return loop.with_bodies((loop.body.map(materialize_leaf),))
+
+
+def _cta_threads(tile: ThreadTile | WarpTile, warp_size: int) -> tuple:
+    """The CTA's ``(tid_expr, n_threads)`` read off the matmul tile — what a
+    ``CoopReduce`` prologue sibling cooperates over. A ``WarpTile`` is ``warp_id`` ×
+    32 lanes (``threadIdx.x``); a ``ThreadTile`` is the row-major thread flatten."""
+    if isinstance(tile, WarpTile):
+        n = warp_size
+        for ax in tile.axes:
+            n *= ax.extent.as_static()
+        return Builtin("thread_idx.x"), n
+    n = 1
+    for ax in tile.axes:
+        n *= ax.extent.as_static()
+    return _build_linear_tid(tile.axes), n
 
 
 def _build_linear_tid(thread_axes: tuple[Axis, ...]):
