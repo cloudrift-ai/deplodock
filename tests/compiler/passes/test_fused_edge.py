@@ -260,7 +260,8 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     kernel — a cooperative reduce PROLOGUE (``CoopReduce``) computes the per-row scale
     into smem, and the scale-application compute phase reads it as a broadcast operand
     feeding the matmul. The reduce over the full row precedes the matmul K-loop. Scalar
-    tier (the warp-tier rmsnorm hits a separate nvcc unused-helper quirk at this shape)."""
+    tier here; the live warp-tier path is covered by
+    ``test_offering_fork_fused_edge_runs_correctly[warp]``."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.algebra import AlgebraKind
     from deplodock.compiler.ir.stmt import Write
@@ -354,17 +355,21 @@ def test_split_cone_keep_builds_fused_edge_cut_stays_default(monkeypatch):
 
 
 @requires_cuda
-def test_offering_fork_fused_edge_runs_correctly(monkeypatch):
+@pytest.mark.parametrize("tier", ["warp", "scalar"])
+def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
     """End-to-end through the LIVE pass chain (no hand-built seed): the offering fork's
     kept SMEM edge lowers ``RMSNorm → linear`` to one fused kernel that matches the torch
-    reference — proving ``seed_fused`` wires the demoted matmul into the fused assemble."""
+    reference — proving ``seed_fused`` wires the demoted matmul into the fused assemble.
+    Covers the **warp tier** (the natural greedy pick — the matmul reads the
+    cooperatively-reduced per-row scale from smem via ``ldmatrix``) and the scalar tier."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
-    monkeypatch.setenv("DEPLODOCK_BM", "16")
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept fused edge (scalar tier)
+    if tier == "scalar":
+        monkeypatch.setenv("DEPLODOCK_BN", "16")
+        monkeypatch.setenv("DEPLODOCK_BM", "16")
+        monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept fused edge
     ctx = Context.from_target((12, 0))
     s, h, i = 32, 1024, 3072
     lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)

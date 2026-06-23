@@ -17,9 +17,15 @@ fills it, the consumer `ldmatrix`/scalar-reads it — no gmem round-trip, the fo
 So the producer rides the consumer's tiling (the slab cache axes), which is why the fused
 edge is **shared-knob** (one kernel, one knob set) — no knob-namespace problem.
 
-v1 scope: a **single-input MAP producer** (e.g. `relu(x)` / `scale·x`) — `emit_compute_phase`
-lowers a pointwise compute body. A MONOID producer (rmsnorm) needs the compute phase
-generalized to carry a reduce; this raises `NotImplementedError` for now.
+Producers handled: a **MAP** producer (single-input `relu(x)` / `scale·x`, multi-input, or
+broadcast-operand `x·rs[m]·cs[k]`) lowers as the pointwise compute body above; a
+**MONOID** producer (rmsnorm) additionally splits its per-row reduce off as a `CoopReduce`
+prologue (`_build_reduce_prologue`) — a cooperative reduce over the per-CTA M rows into a
+`<xn>__rscale` smem slab, emitted before the matmul tower — with the pointwise scale riding
+the compute phase as a broadcast read of that slab. Both reach the warp (mma.sync) tier:
+the slab is stamped at the `xn` buffer dtype so `ldmatrix` reads it correctly. A two-pass
+softmax / multi-cone producer is not fused (it stays a GMEM cut — `_producer_fusible` in
+`enumeration/_extract` gates the offer).
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
@@ -169,7 +176,15 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
                     # CoopReduce) — read it directly at its projected (M) cache axes, no
                     # gmem source to stage.
                     compute.append(Load(names=ld.names, input=ld.input, index=idx))
-            compute += [*assigns, Write(output=src.name, index=tuple(Var(ax.name) for ax in src.cache_axes), value=write.values[0])]
+            # Stamp the slab Write with the xn buffer dtype (``src.dtype``) so the fused
+            # slab declares that dtype, not the value SSA's: a MONOID scale chain computes
+            # in f32 (rsqrt / mean) but xn is f16, and the warp tier's ``ldmatrix`` reads
+            # the slab as b16 — a float slab would feed it garbage. ``040_demote`` casts the
+            # f32 result on store. (A MAP producer's value is already the slab dtype.)
+            compute += [
+                *assigns,
+                Write(output=src.name, index=tuple(Var(ax.name) for ax in src.cache_axes), value=write.values[0], value_dtype=src.dtype),
+            ]
         return replace(stmt, sources=tuple(new_sources), compute=Body(tuple(compute)) if compute else None)
 
     return Body(tuple(patch(s) for s in body))
@@ -255,33 +270,69 @@ def _split_monoid_producer(block: Block):
 def _build_reduce_prologue(split, out_buf: str, consumer: Block, binding: dict) -> tuple[CoopReduce, Block]:
     """From a MONOID producer split, build the :class:`CoopReduce` prologue (the per-row
     reduce → ``<out_buf>__rscale`` smem slab) and the rewritten MAP scale block (the
-    scale-application that reads that slab). The producer's logical row axis is σ-mapped
-    to the consumer's M index (read off the consumer's output ``Write``), whose
-    THREAD/REGISTER cache axes become the prologue's cooperative cells + slab index."""
+    scale-application that reads that slab).
+
+    The prologue fills one scale per M row of the **per-CTA M tile**, indexed by a single
+    cooperative ``local_m`` axis of extent ``BM`` (= the product of the consumer's NON-grid
+    M-axis extents — warp · register · atom at the warp tier, thread · register at the
+    scalar tier). This decouples the reduce from how the consumer assigns rows to
+    warps/threads: the producer's logical row σ-maps to ``m_grid·BM + local_m`` (``m_grid``
+    the M GRID/block coord, in scope at the kernel top), so the reduce loads
+    ``x[m_grid·BM + local_m, k]`` and writes ``rscale[local_m]``. The matmul's
+    scale-application then reads ``rscale`` at its own within-tile M sub-coord (the
+    materializer maps the producer row to the ``xn`` slab's M cache axis = the same
+    ``[0, BM)`` index), so prologue fill and consumer read share one index space at every
+    tier — fixing the warp tier, where the old THREAD/REGISTER-cell slab sized to 1 entry
+    and the reduce referenced the not-yet-bound warp coord."""
     leading, reduce_loop, scalars, scale_body, v4_name = split
-    # The consumer reads the intermediate ``xn[M, K]`` (2D) as its A operand — its M
-    # index is the row the prologue must reduce. (The kernel output ``o`` may be batched
-    # 3D, so its index[0] is the batch, not M — read M off the xn load instead.)
+    # The consumer reads the intermediate ``xn[M, K]`` (2D) as its A operand — its M index
+    # is the global row. (The kernel output ``o`` may be batched 3D, so its index[0] is the
+    # batch, not M — read M off the xn load instead.) The M source axis + its per-CTA tile
+    # come off that index's domain axes.
     xn_load = next(ld for ld in consumer.compute.iter_of_type(Load) if ld.input == out_buf)
     m_expr = xn_load.index[0]
+    m_grid, bm = _m_tile(m_expr, consumer, binding)
     row_axis = _producer_row_axis(reduce_loop)
-    cells = tuple(a for a in consumer.domain if a.name in m_expr.free_vars() and binding.get(a.name) in (Binding.THREAD, Binding.REGISTER))
     slab = f"{out_buf}__rscale"
-    sigma = Sigma({row_axis: m_expr})
+    local_m = Axis(f"{slab}_m", bm)
+    global_row = (
+        Var(local_m.name) if m_grid is None else BinaryExpr("+", BinaryExpr("*", Var(m_grid), Literal(bm, "int")), Var(local_m.name))
+    )
+    sigma = Sigma({row_axis: global_row})
     body = (
         reduce_loop.rewrite(_id, sigma),
         *(s.rewrite(_id, sigma) for s in scalars),
-        Write(output=slab, index=tuple(Var(c.name) for c in cells), value=v4_name),
+        Write(output=slab, index=(Var(local_m.name),), value=v4_name),
     )
-    prologue = CoopReduce(cells=cells, leading=Body(leading), body=Body(body), out_slab=slab, out_dtype=F32)
+    prologue = CoopReduce(cells=(local_m,), leading=Body(leading), body=Body(body), out_slab=slab, out_dtype=F32)
     # The scale block: the per-element scale-application reading v4 from the slab (an
-    # internal-slab operand the broadcast machinery reads directly, no gmem staging).
+    # internal-slab operand the broadcast machinery reads directly, no gmem staging). It
+    # indexes by the producer row, which the materializer resolves to the xn slab's M
+    # sub-coord — the same ``[0, BM)`` index the prologue filled.
     scale_block = Block(
         name=f"{out_buf}__scale",
         domain=(),
         compute=Body((Load(names=(v4_name,), input=slab, index=(Var(row_axis),)), *scale_body)),
     )
     return prologue, scale_block
+
+
+def _m_tile(m_expr, consumer: Block, binding: dict) -> tuple[str | None, int]:
+    """The consumer's M tiling for the reduce prologue: ``(m_grid_axis_name | None, BM)``,
+    where ``m_grid`` is the M axis bound GRID (the block coord, in scope at the kernel top)
+    and ``BM`` is the product of the NON-grid M-axis extents (the per-CTA M tile —
+    warp·register·atom at the warp tier, thread·register at the scalar tier; the atom M
+    lane is a domain axis even though it carries no σ term, so it counts toward ``BM``).
+    The M source axis is read off any free var of ``m_expr`` (the xn-load M index)."""
+    fv = m_expr.free_vars()
+    m_src = next(((a.source_axis or a).name for a in consumer.domain if a.name in fv), None)
+    m_axes = [a for a in consumer.domain if (a.source_axis or a).name == m_src]
+    m_grid = next((a.name for a in m_axes if binding.get(a.name) is Binding.GRID), None)
+    bm = 1
+    for a in m_axes:
+        if binding.get(a.name) is not Binding.GRID:
+            bm *= a.extent.as_static()
+    return m_grid, bm
 
 
 def _producer_row_axis(reduce_loop: Loop) -> str:
