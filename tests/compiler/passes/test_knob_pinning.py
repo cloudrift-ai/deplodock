@@ -343,19 +343,31 @@ def test_scalar_matmul_f16(monkeypatch):
 @requires_cuda
 def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     """When the greedy compile picks the tensor-core atom variant but its operands
-    aren't staged for ``ldmatrix`` (``TMA=0`` + scalar-tile geometry), ``005_lower_atom_tile``
-    now lowers them to a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``)
-    instead of raising — ldmatrix is smem-only, so the gmem path lets an unstageable
-    MMA tile compile rather than crash. Compile-only (inspects the kernel source)."""
+    aren't staged for ``ldmatrix`` (``TMA=0`` + a deliberately-large warp register
+    tile whose slabs don't fit the smem budget), ``005_lower_atom_tile`` lowers them
+    to a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``) instead of
+    raising — ldmatrix is smem-only, so the gmem path lets an unstageable MMA tile
+    compile rather than crash. Compile-only (inspects the kernel source).
+
+    Two facts make this fire: (1) the over-ceiling ``FM=26`` warp register pin is
+    authoritative (``warp_reg_offers`` bypasses the ``_MAX_WARP_CELLS`` search
+    ceiling for a full pin), so the warp build proceeds; (2) with **no** ``STAGE``
+    pin the budget-aware ``050_stage`` filter prunes every over-budget staging subset
+    to the empty one (``FM=26`` slabs blow the smem cap), so greedy's option-0 stages
+    nothing and the operands lower gmem-direct."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
+    # Pin the scalar geometry EXCEPT STAGE — an explicit STAGE pin is authoritative
+    # (no budget filter), but here we want the budget-aware filter to decline the
+    # over-budget staging so the operands fall to the gmem-direct path.
     for k, v in _SCALAR_F16_KNOBS.items():
+        if k == "STAGE":
+            continue
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
-    # tier), so greedy MUST take the atom variant — and with TMA=0 + this geometry
-    # the staging passes decline, so the operands hit the gmem-direct path.
+    # tier), so greedy MUST take the atom variant.
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     compiled = CudaBackend().compile(g)  # no longer raises
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))

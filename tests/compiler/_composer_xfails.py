@@ -77,15 +77,14 @@ _XFAIL_FUNCS: dict[str, str] = {
     # test_masked_n_clamps_cooperative_load_index,
     # test_symbolic_m_cooperative_load_clamps_to_runtime_extent.
     #
-    # Still quarantined (distinct warp-tier mechanisms, not the masked-tile clamp):
-    # - test_unstaged_atom_lowers_gmem_direct needs the staging-DECLINE heuristic for
-    #   the atom tier (an unstageable atom operand must drop its STAGE edge so
-    #   005_lower_atom_tile lowers it gmem-direct), independent of the masked clamp.
+    # test_unstaged_atom_lowers_gmem_direct — LANDED: the over-ceiling FM=26 warp
+    # register pin is now authoritative (warp_reg_offers bypasses _MAX_WARP_CELLS
+    # for a full pin), and with no STAGE pin the budget-aware 050_stage filter
+    # declines the over-budget staging so the operands lower gmem-direct.
     # test_hoist_refuses_lift_when_pipeline_reads_guarded_defs — LANDED: rewritten
     # against assembly/_slab._hoist_masked's SSA-safety check (the fused-prologue
     # lift refusal — a hoisted K-tower reading a name defined inside the Cond
     # refuses the lift), de-quarantined.
-    "test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": "R4",
     # R5 transport landed, but this test's real blocker is the fused norm+linear
     # (RmsNorm prologue + matmul) scalar regime — its 'y' LoopOp doesn't lower yet
     # (the fused-prologue tier, R7 test_fused_rmsnorm_linear_blocked_prologue). The

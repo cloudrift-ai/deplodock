@@ -420,8 +420,20 @@ def warp_offers(atom) -> list[tuple[int, int]]:
 
 def warp_reg_offers(atom) -> list[tuple[int, int]]:  # noqa: ARG001
     """Legal ``(fm, fn)`` per-warp register cells under the cell ceiling
-    (``fm·fn ≤ _MAX_WARP_CELLS``), best-first (≈``_WARP_CELL_TARGET`` cells)."""
+    (``fm·fn ≤ _MAX_WARP_CELLS``), best-first (≈``_WARP_CELL_TARGET`` cells).
+
+    A *fully* pinned ``(DEPLODOCK_FM, DEPLODOCK_FN)`` is authoritative and bypasses
+    the ceiling: the cell ceiling is a search-pruning heuristic (don't enumerate
+    huge register tiles), not a hardware bound, and a user / test pin is
+    authoritative everywhere else (the ``_pin`` doctrine). Honoring an over-ceiling
+    pin lets a deliberately-large pinned warp tile (e.g. ``FM=26`` reusing a
+    scalar-geometry sweep) reach the build + assemble path — its slabs then exceed
+    the smem budget, so the budget-aware ``050_stage`` filter declines staging and
+    the operands lower gmem-direct — instead of vanishing into ``no legal warp
+    register tile``. The ceiling still prunes the auto-enumerated candidates."""
     fm_pin, fn_pin = _pin(TC_REG_M), _pin(TC_REG_N)
+    if fm_pin and fn_pin:
+        return [(fm_pin, fn_pin)]
     fms = (fm_pin,) if fm_pin else TC_REG_CHOICES
     fns = (fn_pin,) if fn_pin else TC_REG_CHOICES
     out = [(fm, fn) for fm in fms for fn in fns if fm * fn <= _MAX_WARP_CELLS]
