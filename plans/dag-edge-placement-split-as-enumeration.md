@@ -15,25 +15,33 @@
   `split` are two values of one query). `ir/tile/ir.py::Placement` + `TileGraph.placement`; pinned in
   `test_blockdag.py`.
 
-**Blocked / not yet done — and why.** Steps (3)–(6) (the `extract_block` fission, the `_cut`-driven `GMEM` fork, the
-legacy `split/` deletion, the R7-test de-quarantine) hit a prerequisite this plan under-specified:
+- **(3)+(4)+(5) Dissolve the legacy cut into `_cut` + `extract_block` + a thin fork shell.** The bespoke
+  `005_split_demoted` monolith is split into: the **offer policy** `enumeration/_cut.py` (the derived `Tier` lattice +
+  `tier(dag)` on `eligible_atoms`/`classify` + `cut_offers`), the **fission** `split/_extract.py::extract_block`, and the
+  **thin fork** `005_split_demoted.py` (holds no decision logic). The cut is **forced** iff `tier(inline) is
+  UNBUILDABLE`, which `≡ classify(fused) is None` (a cone-operand cell is never atom-eligible) — so it reproduces the
+  legacy force condition exactly while expressing it through the lattice. `test_cut_offers.py` pins the predicate's
+  tightness; the full compiler suite (the SDPA / attention / qwen-block / norm-linear CUDA accuracy tests that exercise
+  the cut) stays green.
 
-> A **demoted matmul does not classify as a buildable seed.** `classify(iter_dag(fused_norm_linear))` returns `None`
-> (the matmul cell's operand is a computed cone, not a clean `[Load, Load, mul, Accum]`), so `enumeration/000_build`
-> `RuleSkipped`s it — the demoted matmul never becomes a logical block-DAG `TileGraph`. That is exactly *why* the legacy
-> `005_split_demoted` runs on the raw `LoopOp` **before** enumeration. For the cut to become a block-DAG outer fork
-> (`_cut.cut_offers(graph)` querying a `TileGraph`, `tier(C | inline)` computable off `Block.atom`/`reads`), the seed
-> builder must first be able to represent the demoted matmul as a single **logical fused-prologue block** — which
-> overlaps the "fused-prologue-into-warp-tile codegen" this plan's own non-goals defer as the separate, harder
-> follow-up. The `tier`/`eligible_atoms` machinery the predicate needs DOES already work at the `IterDag` layer
-> (`eligible_atoms(dag)` is empty for the demoted f16 matmul, non-empty once the operand is a clean `Load`), so the
-> predicate is buildable — but it has nothing to *consume* it until the seed can carry the un-fissioned demoted block,
-> and building it against the raw `LoopOp` would just duplicate the legacy `_classify_cut` it is meant to replace.
+**Scoping note — what "deleting the legacy split" did and did not mean.**
 
-So the corrected sequence is: **(2.5) teach `000_build` / `classify` a logical fused-prologue (demoted-matmul) regime**
-— the seed that the cut fissions — *before* (3)/(4). Until then `_cut.py` would be unwireable infra and the R7
-structural-fork tests (`test_two_level`, `test_structural_push`) stay quarantined on the same missing keep-fused regime
-the xfail registry already records. The legacy `split/005_split_demoted` stays the working cut in the meantime.
+> The bespoke decision monolith (`try_split_demoted` + `_classify_cut`'s force heuristic) is **gone** — its offer policy
+> relocated to the derived `_cut.cut_offers` tier predicate, its fission to `extract_block`. But the **pre-build
+> `split/` phase itself survives** as a thin shell, because a **demoted matmul does not classify as a buildable seed**:
+> `classify(iter_dag(fused_norm_linear))` returns `None` (the matmul cell's operand is a computed cone, not a clean
+> `[Load, Load, mul, Accum]`), so `enumeration/000_build` would `RuleSkip` it. The cut therefore cannot *yet* fold into
+> `enumeration/` as a post-seed edge-placement fork over a `TileGraph` — it must intercept the raw `LoopOp` before build
+> rejects it. The full block-DAG form (`_cut.cut_offers(graph)` querying a multi-block `TileGraph`, `tier(C | inline)`
+> off `Block.atom`/`reads`, the cut as an outer fork that `extract_block` fissions in-place) needs **(2.5) a logical
+> fused-prologue (demoted-matmul) seed regime** in `classify`/`000_build` first — which overlaps the
+> "fused-prologue-into-warp-tile codegen" this plan's own non-goals defer. The general multi-block `assemble` (step 1)
+> and the derived `Placement`/`Tier` vocabulary (steps 2/4) are the scaffold that step (2.5) would plug into.
+
+**Not done (out of this slice's scope):** (2.5) the logical fused-prologue seed regime; the block-DAG (post-seed) form
+of the cut as an outer fork over one `TileGraph`; the buildable-fused keep-vs-split **fork** (only the forced cut is
+wired); and (6) de-quarantining the R7 structural-fork tests (`test_two_level`, `test_structural_push`), which stay
+blocked on the same missing keep-fused regime the xfail registry records.
 
 
 
@@ -250,11 +258,13 @@ tensor (its `Buffer` shape/dtype derived from the producer `Write`). This is the
 - **Then** the cut + fission moves + the derived offer predicate, replacing `lowering/tile/split/`.
 
 Order: (1) general multi-block `assemble` + a determinism/byte-identical guard **[done]**; (2) `place_edge` derived view
-+ fold `stage` into it **[done]**; (2.5) logical fused-prologue seed regime so the demoted matmul builds **[blocker for
-the rest]**; (3) `extract_block` fission body move; (4) `enumeration/_cut.py` (the `tier` lattice + `cut_offers`
-predicate — buildable on the `IterDag` `eligible_atoms` machinery once (2.5) gives it a `TileGraph` to query) with its
-own unit tests, then the thin `GMEM` cut fork that consumes it; (5) delete the legacy `lowering/tile/split/` restore;
-(6) de-quarantine the R7 structural tests.
++ fold `stage` into it **[done]**; (3) `extract_block` fission body move **[done — `split/_extract.py`]**; (4)
+`enumeration/_cut.py` (the `tier` lattice + `cut_offers` predicate, on the `IterDag` `eligible_atoms` machinery) with its
+own unit tests, then the cut fork that consumes it **[done — forced cut; the keep-vs-split fork awaits the fused-prologue
+regime]**; (5) delete the legacy `lowering/tile/split/` monolith **[done — dissolved into `_cut` + `extract_block` + a
+thin shell; the pre-build `split/` *phase* survives pending (2.5)]**; (2.5) logical fused-prologue seed regime so the
+demoted matmul builds, enabling the post-seed block-DAG form of the cut **[remaining — blocker for the full vision]**;
+(6) de-quarantine the R7 structural tests **[remaining — blocked on (2.5)]**.
 
 ## Gate
 
