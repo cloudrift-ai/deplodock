@@ -165,11 +165,18 @@ def _atom_eligible(atom: Atom, dag: IterDag, *, compute_capability: tuple[int, i
         if a_ld is None or b_ld is None:
             return False
         accum_names.add(accum.name)
+    # Loop-invariant leaf Loads (a fused per-CTA / per-row scale / mask) the
+    # frontend hoisted above the free chain land in ``dag.leading`` / ``dag.mid``,
+    # not ``inner_body`` — pass them as ``outer_loads`` so the fold can resolve an
+    # epilogue operand defined there (the causal-mask scale / fill), mirroring
+    # ``kernel/005``'s ``_collect_outer_loads`` over the materialized tower.
+    outer_loads = {ld.names[0]: ld for ld in (*dag.leading, *dag.mid) if isinstance(ld, Load) and ld.names}
     _slice, blocker = classify_fragment_epilogue(
         Body.coerce(dag.inner_body),
         accum_names,
         produced=produced,
         leaf_dtype=lambda buf: dt.name if (dt := dtype_of(buf)) is not None else None,
+        outer_loads=outer_loads,
     )
     if blocker is not None:
         return False
