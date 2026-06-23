@@ -1,14 +1,24 @@
-"""``extract_block`` — the demoted-matmul fission (R7 edge placement).
+"""The demoted-matmul fission — the cut's body surgery (R7 edge placement).
 
 ``plans/dag-edge-placement-split-as-enumeration.md`` → "``extract_block(cone)`` — the
 body move that fission realizes a ``GMEM``/cut placement with: lift an inline
 sub-computation into a new ``Block``, rewrite the consumer ``Load`` to the new
 intermediate ``Buffer``, choose the intermediate's layout from the consumer's
-``atom``/``AccessMap``." This module is that fission; ``enumeration/_cut.py`` owns the
+``atom``/``AccessMap``." This module is that fission. ``enumeration/_cut.py`` owns the
 *offer* decision (whether a cut is worth it), and ``split/005_split_demoted`` is the
-thin fork that pairs them. The split here is the relocation of the legacy
-``005_split_demoted`` monolith's cut: the offer policy moved out to ``_cut``, the body
-surgery stayed and is renamed.
+thin fork that pairs them.
+
+The fission has **two consumers**, sharing one slicing (``_fission`` → the producer +
+consumer ``LoopOp`` pieces):
+
+- :func:`extract_block` — the **legacy GMEM lowering**: wires the pieces into a
+  ``Graph`` of separate ``LoopOp`` nodes the engine splices (two kernels, each
+  re-seeded by ``000_build``). The proven path the accuracy tests pin.
+- :func:`seed_demoted` — the **block-DAG seed**: seeds each piece as a logical
+  :class:`~deplodock.compiler.ir.tile.ir.Block` and returns one multi-block
+  ``TileGraph`` (the MONOID/MAP producer ``--xn-->`` SEMIRING consumer DAG), so the
+  *edge placement* (``GMEM`` cut vs the future ``SMEM``/``INLINE`` fused edge) becomes
+  an explicit ``Schedule`` choice over one block-DAG rather than a graph-surgery pass.
 
 Loop fusion can merge a producer chain INTO a matmul's reduce body (the gated-MLP norm,
 an elementwise scale, softmax stats, rotary): a multiply operand feeding the ``Accum``
@@ -86,8 +96,12 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.stmt.body import Cone
+from deplodock.compiler.ir.tile.ir import Block, Buffer, Schedule, Space, TileGraph
 from deplodock.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
 from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
 # Element-count multiple a symbolic N (inner) extent is padded up to so the
 # materialized B operand's above-inner gmem stride stays 16 B-aligned for TMA
@@ -136,11 +150,36 @@ class _RootCone:
         return (*self.cell.members, *self.pro.members)
 
 
+@dataclass(frozen=True)
+class Fission:
+    """The raw pieces of one demoted-matmul cut, shared by both lowerings
+    (``extract_block``'s GMEM ``Graph`` and ``seed_demoted``'s block-DAG): the
+    ``xn`` / ``mm_i`` producer ``LoopOp``\\ s (each with its output ``Tensor``),
+    the rebuilt consumer, the consumer's node id, and the kernel's output."""
+
+    producers: tuple[tuple[LoopOp, Tensor], ...]
+    consumer: LoopOp
+    cons_id: str
+    out_tensor: Tensor
+
+
 def extract_block(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> Graph | None:
-    """Build the producer(s)+consumer split fragment for a demoted matmul
-    ``LoopOp``, or ``None`` when the body isn't a cleanly-cuttable demotion. The
-    ``None`` return is the fission's expressibility check — the fork pairs it with
-    ``_cut.cut_offers``' tier verdict."""
+    """The **GMEM lowering** of the cut: build the producer(s)+consumer split
+    fragment for a demoted matmul ``LoopOp`` as a ``Graph`` of separate ``LoopOp``
+    nodes (two kernels the engine splices), or ``None`` when the body isn't a
+    cleanly-cuttable demotion. The ``None`` return is the fission's expressibility
+    check — the fork pairs it with ``_cut.cut_offers``' tier verdict."""
+    f = _fission(loop_op, graph=graph, node_id=node_id, out_tensor=out_tensor)
+    if f is None:
+        return None
+    return _assemble_fragment(graph, producers=f.producers, consumer_op=f.consumer, cons_id=f.cons_id, out_tensor=f.out_tensor)
+
+
+def _fission(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> Fission | None:
+    """Slice a demoted matmul ``LoopOp`` into its producer(s)+consumer ``LoopOp``
+    pieces (the shared body surgery), or ``None`` when the body isn't a cleanly-
+    cuttable demotion. Both the GMEM ``extract_block`` and the block-DAG
+    ``seed_demoted`` build their representation from this one slicing."""
     cut = _classify_cut(loop_op)
     if cut is None:
         return None
@@ -393,7 +432,7 @@ def extract_block(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Te
     consumer_op.name = loop_op.name
     consumer_op = _drop_dangling_leads(consumer_op, kept_lead)
 
-    return _assemble_fragment(graph, producers=tuple(producers), consumer_op=consumer_op, cons_id=cons_id, out_tensor=out_tensor)
+    return Fission(producers=tuple(producers), consumer=consumer_op, cons_id=cons_id, out_tensor=out_tensor)
 
 
 def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id: str, out_tensor: Tensor) -> Graph | None:
@@ -422,6 +461,42 @@ def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id:
     for nid in (*xn_ids, cons_id):
         restamp_structural_features(frag.nodes[nid].op, frag)
     return frag
+
+
+def seed_demoted(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> TileGraph | None:
+    """The **block-DAG seed** of the cut: a demoted matmul ``LoopOp`` → one multi-block
+    ``TileGraph`` (``plans/dag-edge-placement-split-as-enumeration.md`` → step 2.5).
+
+    The same fission as :func:`extract_block`, but each producer/consumer piece is
+    seeded as a logical :class:`Block` (``seed_graph(iter_dag(piece))``) and the pieces
+    are combined into one ``TileGraph`` — the MONOID/MAP producer(s) ``--xn-->``
+    SEMIRING consumer DAG. The ``xn`` edge is then *derived* (``TileGraph.edges``) and
+    its **placement** an explicit ``Schedule`` choice: ``GMEM`` (the cut — separate
+    launch groups) vs. the future ``SMEM``/``INLINE`` fused edge. Returns ``None`` when
+    the body isn't cuttable, or a piece doesn't classify as a buildable regime (the
+    caller falls back to the GMEM ``Graph`` lowering or keeps fused)."""
+    f = _fission(loop_op, graph=graph, node_id=node_id, out_tensor=out_tensor)
+    if f is None:
+        return None
+    pieces = (*f.producers, (f.consumer, f.out_tensor))  # (op, its output Tensor)
+    produced = {t.name for _, t in pieces}  # the intermediate + output buffers the blocks write
+    blocks: list[Block] = []
+    buffers: dict[str, Buffer] = {}
+    for op, out_t in pieces:
+        regime = classify(iter_dag(op))
+        if regime is None:
+            return None  # a piece the move composer can't build as a clean block
+        block = seed_graph(iter_dag(op), kernel_name=op.name or out_t.name).blocks[0]
+        blocks.append(block)
+        buffers[out_t.name] = Buffer(out_t.name, tuple(out_t.shape), out_t.dtype, space=Space.GMEM)
+        for buf in op.inputs:
+            if buf in buffers or buf in produced:
+                continue  # already declared, or a sibling block's intermediate
+            ext = graph.nodes.get(buf)
+            if ext is None:
+                return None
+            buffers[buf] = Buffer(buf, tuple(ext.output.shape), ext.output.dtype, space=Space.GMEM)
+    return TileGraph(name=node_id, buffers=buffers, blocks=tuple(blocks), schedule=Schedule())
 
 
 def _classify_cut(loop_op: LoopOp):

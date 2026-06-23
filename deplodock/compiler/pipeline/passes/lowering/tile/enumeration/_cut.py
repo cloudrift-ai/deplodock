@@ -22,7 +22,7 @@ Mechanically this is the existing ``eligible_atoms`` / ``classify`` machinery re
 the fused (inline) body: a demoted matmul's cone operand defeats the clean
 ``[Load, Load, mul, Accum]`` cell, so ``classify`` returns ``None`` and ``tier`` is
 ``UNBUILDABLE`` — exactly when the fused form has no buildable regime. The fission
-(``split/_extract.extract_block``) then materializes the operand into a clean ``Load``,
+(``_extract.extract_block``) then materializes the operand into a clean ``Load``,
 so the consumer rebuilds at a real tier (``WARP_MMA`` for an f16 gemm, ``SCALAR_REDUCE``
 for an f32 one); the tier strictly rises. A demoted cell with a cone operand is **never**
 atom-eligible (the cell isn't ``[Load, Load, mul, Accum]``), so ``tier(inline) is

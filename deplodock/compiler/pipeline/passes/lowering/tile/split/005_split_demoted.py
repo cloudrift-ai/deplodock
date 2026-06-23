@@ -16,8 +16,8 @@ two relocated pieces:
   predicate. Offer (and, v1, force) the ``GMEM`` cut iff the fused body is
   ``UNBUILDABLE`` (a demoted matmul whose cone operand keeps it below any buildable
   tier — which materializing the operand strictly raises).
-- :func:`~deplodock.compiler.pipeline.passes.lowering.tile.split._extract.extract_block`
-  (``split/_extract.py``) — the **fission**: lift each computed/K-folded cone into an
+- :func:`~deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract.extract_block`
+  (``enumeration/_extract.py``) — the **fission**: lift each computed/K-folded cone into an
   ``xn`` producer kernel and rebuild the consumer reading the materialized intermediate,
   wired into a ``Graph`` fragment the engine splices (a kernel-set change → the **outer**
   two-level tree). ``None`` is its expressibility check.
@@ -57,7 +57,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._cut import cut_offers
-from deplodock.compiler.pipeline.passes.lowering.tile.split._extract import extract_block
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import extract_block
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
