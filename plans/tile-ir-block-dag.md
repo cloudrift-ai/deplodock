@@ -324,6 +324,14 @@ widens the search tree move-family by move-family, and one deterministic **mater
 chosen leaf. This is the concrete realization of "the scheduling moves only edit the Schedule; `assemble` is the one
 place the tower is built."
 
+`assemble` is the *boundary*, and enumeration runs on **both sides** of it. Almost every move family enumerates
+**pre-assemble** over the `TileGraph` (the dataflow / structural / scheduling moves, whose objects — edges, axes, blocks,
+the Schedule — live in the IR). Exactly one family, **`pad`**, enumerates **post-assemble** over the materialized
+`KernelOp`, because its decision reads an `assemble` *output* (the slab's byte layout + the realized vectorized-load
+width) — see the note after the pass list. The decision rule is empirical: a family is post-`assemble` **iff its offer
+legality reads an `assemble` artifact**. The pass *kind* is still binary (enumeration vs materialization); it is the
+enumeration *phase* that the `assemble` boundary splits.
+
 - **Enumeration passes** — *generate subtrees for the search.* Each owns one move family. It matches the tile node,
   computes its legal offers from the **derived projections + the current `Schedule`** (never from tower shape), and
   returns a `Fork` whose children apply that family's moves — each child a new tile node with an edited `Schedule` (or,
@@ -354,11 +362,39 @@ Concrete pass list — pipeline order *is* decision order:
 | `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`       | `040`/`080`                           |
 | `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                 | `050`/`060`                           |
 | `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
-| `tile/locals`           | enum (schedule)   | `pad` / `swizzle` / `unroll`         | `pad` / `grid_swizzle` / `unroll` | `070`/`025`/`090`                  |
+| `tile/swizzle`          | enum (schedule)   | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
+| `tile/unroll`           | enum (schedule)   | `unroll`                             | `unroll`                       | `090`                                 |
 | `tile/assemble`         | **materialize**   | —                                    | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
+| `tile/pad`              | enum (**local, post-assemble**) | `pad`                  | KernelOp smem-slab alloc       | `070`                                 |
 
 (`tile_axis` is not its own pass — the free-axis σ-splits fold into `tile/build` and the reduce σ-split rides
 `partition_reduce`/`tensorize`, exactly as `_split_free_axis` / `_replace_k_scalar` do in `build_dag.py` today.)
+
+Three legacy passes are **not in the list at all** — a per-source-evidence sweep of the deleted files found they survive
+only as `assemble`-internal *mechanics*, with no decision to enumerate: **`026`** (sibling-stage dedup) is automatic once
+`assemble` coalesces slabs by `(buffer, access, distance)`; **`080`** (pipeline peel) is pure σ-shifted prologue/steady/
+epilogue replication driven by `ring_depth` (the depth is `retime`'s knob, not `080`'s — `080` has no surviving search
+choice); **`021`** (hoist staged loads above the mask `Cond`) is the correctness ordering `assemble` must produce when it
+materializes a masked tile over a staged transport. None is a `Fork`; each was already a `RuleSkipped`-or-rewrite with no
+knob. They move *into* `assemble`, not into the pass list.
+
+**Exactly one local lives *after* `assemble`: `tile/pad`.** The per-source-evidence sweep was sharper than the first cut
+here — only `pad` genuinely needs the materialized kernel. The smem slab is "only ever an assemble artifact" (the IR's
+own words), and the pad's *safety gate* keys on `assemble`-time facts: the realized vectorized-load width (`ld.shared.v4`)
+and the MMA atom-strided slab stamp (`AccessMap.block`). So `tile/pad` is a small `KernelOp`→`KernelOp` local `Fork`
+(legacy `070`, essentially unchanged), running after `assemble`, reading the slab it produced. The `Schedule.pad` field
+records the chosen knob for variant identity, but the choosing pass reads the materialized slab — `assemble` does not
+consume it.
+
+**`unroll` and `swizzle` stay *pre*-`assemble`** — the evidence corrected the intuition that grouped `unroll` with `pad`.
+`090_mark_unroll` only ever reads **logical** `SERIAL` axis extents (`loop.axis.extent.as_static()`, a trip-count product
+vs a threshold; symbolic extents decline) — the `K_o`/`K_i` and register-tile axes that all exist in the `TileGraph`
+domain pre-`assemble`. It never consults the materialized nest, and a peeled ring loop's steady body equals one logical
+iteration, so peeling does not change the per-iteration unroll decision. It is therefore a clean `Schedule.unroll`
+annotation that `assemble` reads when it emits the loop. `swizzle` is likewise pre-`assemble`: its object — a GRID block
+and its grid axes — *is* in the IR (a blockIdx remap, no materialized detail needed); `025` even tags itself
+"Renderer-only," writing only the `grid_swizzle` field. The cut is empirical, not aesthetic: a family is post-`assemble`
+**iff its decision reads an `assemble` artifact** — `pad` does, `unroll`/`swizzle` do not.
 
 **This maps straight onto the two-level MCTS.** The body-vs-schedule split is *orthogonal* to outer-vs-inner; the MCTS
 boundary is *kernel-set-changing*. The kernel-set-changing enumeration passes (`partition_reduce` across CTAs, the
@@ -482,11 +518,17 @@ expands in `binding` order, intra-scope order by edge topo-sort.
 
 ### locals — 070 pad + 025 swizzle + 090 unroll
 
-Three `Schedule` annotations, no body edit. **070** → `Schedule.pad[edge]` on a staged read's slab (`assemble` widens
-the slab alloc; coords stay logical); skip when the read's transport is TMA, or its derived `AccessMap.block` is set
-(atom-strided), or the reads show no vectorizable `+1` run. **025** → `Schedule.grid_swizzle[block]` (L2 row-group); gate
-= the GRID block's derived `Carrier` is matmul and it has ≥2 GRID axes. **090** → `Schedule.unroll[axis]` on a SERIAL
-axis when the nest-scoped product of SERIAL `Axis` extents is under threshold; symbolic extents decline.
+No body edit, but these split across the `assemble` boundary by *which IR holds the object they touch* (see "The pass
+structure"). **025 (pre-assemble)** → `Schedule.grid_swizzle[block]` (L2 row-group), a genuine `TileGraph` annotation:
+its object is a GRID block + its grid axes, both in the IR; gate = the GRID block's derived `Carrier` is matmul and it
+has ≥2 GRID axes; `assemble` consumes it. **070 (post-assemble)** → bank-conflict pad of a staged read's smem slab — but
+the slab is an `assemble` *artifact*, so the decision reads the materialized inner-row byte span (skip when the slab's
+transport is TMA, the `AccessMap.block` is atom-strided, or no vectorizable `+1` run); it is a local `KernelOp`→`KernelOp`
+`Fork` that widens the slab alloc (coords stay logical). **090 (post-assemble)** → `#pragma unroll` on a materialized
+SERIAL loop when the nest-scoped product of its extents is under threshold (symbolic extents decline) — the concrete
+nest, including ring-buffer peels, only exists after `assemble`, so this too is a post-materialization local `Fork`. The
+`Schedule.pad` / `Schedule.unroll` fields still carry the chosen knob for variant identity / the perf DB, but they are
+recorded *by* the post-assemble pass, not *consumed by* `assemble`.
 
 ## Lowering: `assemble` (TileGraph → KernelOp | Graph[KernelOp])
 
@@ -497,8 +539,10 @@ One deterministic pass turns (algorithm + Schedule) into the tower:
 2. Per block, take `Schedule.scope[block]` (or the derived max-hoist default); reconstruct the loop nest from those
    axes + `Schedule.binding` (GRID → SERIAL → THREAD/WARP → REGISTER/ATOM); merge blocks sharing a scope prefix;
    **intra-scope block order = the derived edge topo-sort**.
-3. For each `staged` read, synthesize the smem slab `Buffer` (+ `pad`), the cooperative producer, and the consumer's
-   slab `Load`. **Coalesce slabs by `(buffer, access, distance)` — this is dedup, by construction.**
+3. For each `staged` read, synthesize the smem slab `Buffer`, the cooperative producer, and the consumer's slab `Load`
+   (the slab is emitted at its logical extent; the bank-conflict `pad` is applied later by the post-assemble `tile/pad`
+   local pass, which can see the materialized byte span). **Coalesce slabs by `(buffer, access, distance)` — this is
+   dedup, by construction.**
 4. Expand `distance>0` reads into prologue/steady/epilogue + waits, transport-parametrically.
 5. Expand the `role` coloring into the warp-spec `Cond` + synthesized role axis + mbarrier ring + `SetMaxNReg` +
    consumer named-barrier.
