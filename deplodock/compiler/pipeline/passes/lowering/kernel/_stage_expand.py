@@ -427,19 +427,26 @@ def compute_phase_extents(compute, sources) -> tuple[int, ...]:  # noqa: ANN001
     (cache extent × atom-stride ``block``) when the compute reads a block-multiplied
     (warp-tier) operand slab, else the bare cache extents (scalar tier, ``block=()``).
 
-    The SMEM fused edge (``assembly/_fused``) builds every input slab from one operand
-    ``Source``, so they share one physical layout; iterating the **full physical slab**
-    (not the logical cache cell) makes the producer a layout-agnostic element-wise
-    smem→smem transform — correct for a 32×32 warp micro-tile where the bare cache cell
-    is only 2×2. For the scalar tier ``alloc_extents == cache extents``, so it is a
-    no-op there."""
-    _name, cache_axes, _dtype = compute_phase_info(compute, sources)
+    The SMEM fused edge (``assembly/_fused``) builds every input slab by projecting one
+    operand ``Source``, so the **full** operand's slab shares the output slab's physical
+    layout; iterating that full physical slab (not the logical cache cell) makes the
+    producer a layout-agnostic element-wise smem→smem transform — correct for a 32×32
+    warp micro-tile where the bare cache cell is only 2×2. The match is by the output
+    cache axes (the full operand, not a broadcast sub-slab like ``rs[m]``/``nw[k]``). For
+    the scalar tier ``alloc_extents == cache extents``, so it is a no-op there."""
+    _name, out_axes, _dtype = compute_phase_info(compute, sources)
+    out_names = [ax.name for ax in out_axes]
     by_name = {s.name: s for s in sources}
     for ld in compute.iter_of_type(Load):
         src = by_name.get(ld.input)
-        if src is not None and isinstance(src.addressing, AffineAddressing) and src.addressing.block:
+        if (
+            src is not None
+            and isinstance(src.addressing, AffineAddressing)
+            and src.addressing.block
+            and [ax.name for ax in src.cache_axes] == out_names
+        ):
             return tuple(src.alloc_extents)
-    return tuple(ax.extent.as_static() for ax in cache_axes)
+    return tuple(ax.extent.as_static() for ax in out_axes)
 
 
 def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:  # noqa: ANN001

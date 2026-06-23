@@ -103,11 +103,15 @@ def _compute_output_source(bundle: StageBundle) -> tuple[str, Source] | None:
     registered source (nothing to mirror)."""
     if bundle.compute is None:
         return None
-    out_name = compute_phase_info(bundle.compute, bundle.sources)[0]
+    out_name, out_axes, _ = compute_phase_info(bundle.compute, bundle.sources)
+    out_names = [ax.name for ax in out_axes]
     by_name = {src.name: src for src in bundle.sources}
     for ld in bundle.compute.iter_of_type(Load):
-        if ld.input in by_name:
-            return out_name, dc_replace(by_name[ld.input], name=out_name, buf=out_name)
+        src = by_name.get(ld.input)
+        # Mirror the FULL operand (cache axes == the output's), not a broadcast
+        # sub-slab (``rs[m]`` / ``nw[k]``) — the consumer reads the full xn layout.
+        if src is not None and [ax.name for ax in src.cache_axes] == out_names:
+            return out_name, dc_replace(src, name=out_name, buf=out_name)
     return None
 
 

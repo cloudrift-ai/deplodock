@@ -62,6 +62,19 @@ def _mul_producer(M, K) -> Graph:
     return g
 
 
+def _broadcast_producer(M, K) -> Graph:
+    """``xn[m,k] = x[m,k] · rs[m] · cs[k]`` — a row broadcast (``rs[m]`` over k) and a col
+    broadcast (``cs[k]`` over m), the scale-application shape of rmsnorm."""
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("rs", (M, 1), F16), node_id="rs")
+    g.add_node(InputOp(), [], Tensor("cs", (1, K), F16), node_id="cs")
+    g.add_node(ElementwiseOp("multiply"), ["x", "rs"], Tensor("t", (M, K), F16), node_id="t")
+    g.add_node(ElementwiseOp("multiply"), ["t", "cs"], Tensor("xn", (M, K), F16), node_id="xn")
+    g.inputs, g.outputs = ["x", "rs", "cs"], ["xn"]
+    return g
+
+
 def _producer_block(producer_graph: Graph):
     out = Pipeline.build(LOOP_PASSES).run(producer_graph, ctx=Context.from_target((12, 0)))
     lo = next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
@@ -74,7 +87,8 @@ def _fused_graph(producer_graph: Graph, M=64, K=64, N=64) -> TileGraph:
     cons_tg = _oracle_tilegraph(_mm_xn_graph(M, K, N), _KN)
     cons = cons_tg.blocks[0]
     prod = _producer_block(producer_graph)
-    buffers = {n: Buffer(n, (M, K), F16, space=Space.GMEM) for n in (*producer_graph.inputs, "xn")}
+    buffers = {n: Buffer(n, tuple(producer_graph.nodes[n].output.shape), F16, space=Space.GMEM) for n in producer_graph.inputs}
+    buffers["xn"] = Buffer("xn", (M, K), F16, space=Space.GMEM)
     buffers["w"] = Buffer("w", (K, N), F16, space=Space.GMEM)
     buffers["o"] = Buffer("o", (M, N), F16, space=Space.GMEM)
     xn_edge = Edge(src="prod", dst=cons.name, buffer="xn")
@@ -115,28 +129,31 @@ def test_assemble_fused_builds_compute_phase():
     [
         (_relu_producer, lambda ins: np.maximum(ins["x"], 0)),  # single-input MAP
         (_mul_producer, lambda ins: ins["x"] * ins["y"]),  # multi-input MAP (same-shape operands)
+        (_broadcast_producer, lambda ins: ins["x"] * ins["rs"] * ins["cs"]),  # row + col broadcasts
     ],
-    ids=["relu", "multiply"],
+    ids=["relu", "multiply", "broadcast"],
 )
 def test_fused_map_matmul_runs_correctly(producer, np_ref):
     """End-to-end: ``f(x, …) @ w`` computes in **one** launch, matching a numpy
     reference — the matmul reads ``xn`` from smem (the fused edge), no separate producer
-    kernel. Covers a single-input (relu) and a multi-input (multiply) MAP producer."""
+    kernel. Covers single-input (relu), multi-input (multiply), and **broadcast-operand**
+    (``x·rs[m]·cs[k]`` — the rmsnorm scale-application shape) MAP producers."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    M = K = N = 64
+    M, K, N = 32, 64, 32  # M != K so the row / col broadcasts are unambiguous
     pg = producer(M, K)
+    shape_of = {name: tuple(d.as_static() for d in pg.nodes[name].output.shape) for name in pg.inputs}
+    shape_of["w"] = (K, N)
     top = assemble_fused(_fused_graph(pg, M, K, N), knobs=_KN, base_knobs={}, kernel_name="k_fused")
     fg = Graph()
     for name in (*pg.inputs, "w"):
-        shape = (K, N) if name == "w" else (M, K)
-        fg.add_node(InputOp(), [], Tensor(name, shape, F16), node_id=name)
+        fg.add_node(InputOp(), [], Tensor(name, shape_of[name], F16), node_id=name)
     fg.add_node(top, [*pg.inputs, "w"], Tensor("o", (M, N), F16), node_id="o")
     fg.inputs, fg.outputs = [*pg.inputs, "w"], ["o"]
 
     compiled = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(fg, ctx=Context.from_target((12, 0)))
     rng = np.random.default_rng(0)
-    ins = {name: rng.standard_normal((M, K) if name != "w" else (K, N)).astype(np.float16) for name in (*pg.inputs, "w")}
+    ins = {name: rng.standard_normal(shape_of[name]).astype(np.float16) for name in (*pg.inputs, "w")}
     res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
     ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
@@ -148,11 +165,25 @@ def _loopop(g: Graph):
     return next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
 
 
-def _fused_seed_op(M=64, K=64, N=64) -> TileGraphOp:
+def _renamed_producer(producer_graph: Graph, M, K) -> Graph:
+    """``producer_graph`` rewired to write the ``o__xn`` intermediate (the consumer's
+    input name) instead of ``xn``."""
+    pg = Graph()
+    for nid, node in producer_graph.nodes.items():
+        out = node.output
+        name = "o__xn" if nid == "xn" else nid
+        shape = tuple(d.as_static() for d in out.shape)
+        pg.add_node(node.op, [("o__xn" if i == "xn" else i) for i in node.inputs], Tensor(name, shape, F16), node_id=name)
+    pg.inputs, pg.outputs = list(producer_graph.inputs), ["o__xn"]
+    return pg
+
+
+def _fused_seed_op(producer_graph: Graph, M, K, N) -> TileGraphOp:
     """A fused 2-block ``TileGraphOp`` seed: a LOGICAL matmul consumer (``o = xn @ w``,
-    un-tiled — the enumeration tiles it) + a logical MAP producer (``xn = x * y``), the
-    ``xn`` edge SMEM-placed. Carries the consumer's dag/regime so the enumeration forks
-    tile ``blocks[0]`` (the consumer) while preserving ``blocks[1]`` (the producer)."""
+    un-tiled — the enumeration tiles it) + a logical MAP producer (``producer_graph``,
+    rewired to write ``o__xn``), the ``xn`` edge SMEM-placed. Carries the consumer's
+    dag/regime so the enumeration forks tile ``blocks[0]`` (the consumer) while
+    preserving ``blocks[1]`` (the producer)."""
     cg = Graph()
     cg.add_node(InputOp(), [], Tensor("o__xn", (M, K), F16), node_id="o__xn")
     cg.add_node(InputOp(), [], Tensor("w", (K, N), F16), node_id="w")
@@ -163,12 +194,7 @@ def _fused_seed_op(M=64, K=64, N=64) -> TileGraphOp:
     creg = classify(cdag)
     cons = seed_graph(cdag, kernel_name="k_cons").blocks[0]
 
-    pg = Graph()  # producer xn = x * y, writing the o__xn intermediate
-    pg.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
-    pg.add_node(InputOp(), [], Tensor("y", (M, K), F16), node_id="y")
-    pg.add_node(ElementwiseOp("multiply"), ["x", "y"], Tensor("o__xn", (M, K), F16), node_id="o__xn")
-    pg.inputs, pg.outputs = ["x", "y"], ["o__xn"]
-    plo = _loopop(pg)
+    plo = _loopop(_renamed_producer(producer_graph, M, K))
     prod = replace(seed_graph(iter_dag(plo), kernel_name="prod").blocks[0], name="prod")
 
     buffers: dict = {}
@@ -187,32 +213,42 @@ def _fused_seed_op(M=64, K=64, N=64) -> TileGraphOp:
 
 @requires_cuda
 @pytest.mark.parametrize("tier", ["scalar", "warp"])
-def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier):
+@pytest.mark.parametrize(
+    "producer, np_ref",
+    [(_mul_producer, lambda i: i["x"] * i["y"]), (_broadcast_producer, lambda i: i["x"] * i["rs"] * i["cs"])],
+    ids=["mul", "broadcast"],
+)
+def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier, producer, np_ref):
     """The full tile pipeline (enumeration tiles the consumer + assembly dispatches to
     ``assemble_fused``) lowers a fused 2-block seed to one correct kernel — proving the
-    body-move auxiliary-block preservation + the assembly fused dispatch. Covers both the
-    scalar tier and the **warp (mma.sync) tier** — the latter is the form that beats the
-    cut: the matmul reads the cooperatively-computed ``xn`` from smem via ``ldmatrix``."""
+    body-move auxiliary-block preservation + the assembly fused dispatch. Covers the
+    scalar tier and the **warp (mma.sync) tier** (the cut-beating form — the matmul reads
+    the cooperatively-computed ``xn`` from smem via ``ldmatrix``), over a same-shape and a
+    **broadcast-operand** (``x·rs[m]·cs[k]`` — the rmsnorm scale shape) producer."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     if tier == "scalar":
         monkeypatch.setenv("DEPLODOCK_BN", "16")
         monkeypatch.setenv("DEPLODOCK_BM", "16")
         monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    M = K = N = 64
+    M, K, N = 32, 64, 32
+    pg = producer(M, K)
+    shape_of = {name: tuple(d.as_static() for d in pg.nodes[name].output.shape) for name in pg.inputs}
+    shape_of["w"] = (K, N)
+    inputs = [*pg.inputs, "w"]
     g = Graph()
-    for name in ("x", "y", "w"):
-        g.add_node(InputOp(), [], Tensor(name, (M, K) if name != "w" else (K, N), F16), node_id=name)
-    g.add_node(_fused_seed_op(M, K, N), ["x", "y", "w"], Tensor("o", (M, N), F16), node_id="o")
-    g.inputs, g.outputs = ["x", "y", "w"], ["o"]
+    for name in inputs:
+        g.add_node(InputOp(), [], Tensor(name, shape_of[name], F16), node_id=name)
+    g.add_node(_fused_seed_op(pg, M, K, N), inputs, Tensor("o", (M, N), F16), node_id="o")
+    g.inputs, g.outputs = inputs, ["o"]
 
     out = Pipeline.build(["lowering/tile/enumeration", "lowering/tile/assembly"]).run(g, ctx=Context.from_target((12, 0)))
     assert any(isinstance(n.op, TileOp) for n in out.nodes.values())  # one fused kernel, not two
     assert sum(1 for n in out.nodes.values() if isinstance(n.op, TileOp)) == 1
     compiled = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(out, ctx=Context.from_target((12, 0)))
     rng = np.random.default_rng(0)
-    ins = {n: rng.standard_normal((M, K) if n != "w" else (K, N)).astype(np.float16) for n in ("x", "y", "w")}
+    ins = {name: rng.standard_normal(shape_of[name]).astype(np.float16) for name in inputs}
     res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
-    ref = (ins["x"].astype(np.float32) * ins["y"].astype(np.float32)) @ ins["w"].astype(np.float32)
+    ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
     np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)

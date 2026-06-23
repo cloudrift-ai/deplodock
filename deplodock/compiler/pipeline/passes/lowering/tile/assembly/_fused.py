@@ -28,7 +28,7 @@ from dataclasses import replace
 
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import Block, Edge, Source, StageBundle, TileGraph, TileOp, Transport
+from deplodock.compiler.ir.tile.ir import AffineAddressing, Block, Edge, Source, StageBundle, TileGraph, TileOp, Transport
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import _free_layers
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _wrap_tower
@@ -55,32 +55,70 @@ def fused_producer_blocks(graph: TileGraph) -> set[str]:
 
 
 def _map_transform(block: Block):
-    """A MAP producer block → ``(inputs, assigns, out_buf, out_value)`` — the pointwise
-    transform ``xn = f(x, y, …)``. ``inputs`` is ``[(buf, name), …]``, one per input
-    ``Load``. ``None`` for anything else: a reduce-bearing producer (the MONOID rmsnorm
-    — a compute-phase reduce is future work) or an input whose index differs from the
-    output's (a ``nw[k]``-style broadcast — different cache axes, also future work)."""
+    """A MAP producer block → ``(input_loads, assigns, write)`` — the pointwise transform
+    ``xn = f(x, y, …)``: the input ``Load`` stmts (each indexing some subset of the
+    output axes — a full operand, or a broadcast like ``rs[m]`` / ``nw[k]``), the
+    transform ``Assign``\\ s, and the output ``Write``. ``None`` for a non-pointwise body
+    (a reduce loop / extra stmt — the MONOID rmsnorm reduce, a compute-phase reduce being
+    future work)."""
     stmts = list(block.compute)
     loads = [s for s in stmts if isinstance(s, Load)]
     writes = [s for s in stmts if isinstance(s, Write)]
     assigns = [s for s in stmts if isinstance(s, Assign)]
     if len(writes) != 1 or len(stmts) != len(loads) + len(writes) + len(assigns):
         return None  # not a flat pointwise body (a reduce loop / extra stmt)
-    w = writes[0]
-    inputs: list[tuple[str, str]] = []
-    for ld in loads:
-        if len(ld.names) != 1 or ld.index != w.index:
-            return None  # broadcast / differing-shape operand — different cache axes
-        inputs.append((ld.input, ld.names[0]))
-    if not inputs:
+    if not loads or any(len(ld.names) != 1 for ld in loads):
         return None
-    return inputs, tuple(assigns), w.output, w.values[0]
+    return tuple(loads), tuple(assigns), writes[0]
+
+
+def _project_source(xn_src: Source, load: Load, dim_of_axis: dict[str, int], dtype) -> Source | None:
+    """The ``Source`` for one producer-input gmem ``Load``, by **projecting** the ``xn``
+    slab's source onto the output dims the input varies over. A full operand (``x[m,k]``)
+    keeps all cache axes; a broadcast (``rs[m]`` / ``nw[k]``) keeps only its dims' cache
+    axes and pins the others to their constant gmem index — so ``rs`` is staged as an
+    ``[m]`` slab read at the M sub-coords, ``nw`` as ``[k]`` over K. The operand shares
+    the output's per-dim layout (anchor + atom-stride block), so the xn source's
+    ``origin``/``block`` carry over per dim. ``None`` for an index dim with more than one
+    free axis (a collapsed/transposed operand — not a simple broadcast)."""
+    by_xn_dim: dict[int, list[tuple]] = {}  # xn source dim -> [(Axis, block)]
+    block = xn_src.addressing.block
+    for i, (ax, d) in enumerate(zip(xn_src.cache_axes, xn_src.addressing.dims, strict=True)):
+        by_xn_dim.setdefault(d, []).append((ax, block[i] if block else 1))
+    new_origin: list = []
+    new_cache: list = []
+    new_dims: list[int] = []
+    new_block: list[int] = []
+    for d, e in enumerate(load.index):
+        fv = e.free_vars()
+        if not fv:
+            new_origin.append(e)  # a constant (broadcast / size-1) gmem dim
+            continue
+        if len(fv) != 1 or next(iter(fv)) not in dim_of_axis:
+            return None  # >1 axis in one dim, or an axis not in the output's index
+        xn_dim = dim_of_axis[next(iter(fv))]
+        new_origin.append(xn_src.origin[xn_dim])
+        for ax, blk in by_xn_dim.get(xn_dim, []):
+            new_cache.append(ax)
+            new_dims.append(d)
+            new_block.append(blk)
+    block_t = tuple(new_block) if any(b != 1 for b in new_block) else ()
+    return replace(
+        xn_src,
+        name=f"{load.input}_smem",
+        buf=load.input,
+        dtype=dtype,
+        cache_axes=tuple(new_cache),
+        origin=tuple(new_origin),
+        addressing=AffineAddressing(dims=tuple(new_dims), block=block_t),
+    )
 
 
 def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph) -> Body:
     """Patch every ``StageBundle`` whose source loads an intermediate ``xn``: swap the
-    ``xn`` source for an ``x_smem`` source (the producer's gmem input) and emit the
-    producer's transform as the bundle's ``compute`` phase writing the ``xn_smem`` slab."""
+    ``xn`` source for the producer's gmem input sources (each projected onto the axes it
+    reads — full or broadcast) and emit the producer's transform as the bundle's
+    ``compute`` phase writing the ``xn_smem`` slab."""
 
     def patch(stmt: Stmt) -> Stmt:
         nested = stmt.nested() if hasattr(stmt, "nested") else ()
@@ -97,20 +135,21 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
             t = _map_transform(producer_of[src.buf])
             if t is None:
                 raise NotImplementedError(
-                    f"fused SMEM edge: producer of {src.buf!r} is not a MAP transform over same-shape operands "
-                    "(MONOID/reduce or broadcast producers need a compute-phase reduce / multi-cache-axis fill — not yet supported)"
+                    f"fused SMEM edge: producer of {src.buf!r} is not a flat MAP transform "
+                    "(the MONOID rmsnorm reduce needs a compute-phase reduce — not yet supported)"
                 )
-            inputs, assigns, _out_buf, out_value = t
-            cache_idx = tuple(Var(ax.name) for ax in src.cache_axes)
-            # The producer transform over the slab: stage each input into its own
-            # slab (same cache axes as xn), read them, apply the assigns, and write
-            # the xn_smem slab (the consumer body already reads src.name).
-            for in_buf, in_name in inputs:
-                in_dtype = graph.buffers[in_buf].dtype if in_buf in graph.buffers else src.dtype
-                in_src = replace(src, buf=in_buf, name=f"{in_buf}_smem", dtype=in_dtype)
-                new_sources.append(in_src)
-                compute.append(Load(names=(in_name,), input=in_src.name, index=cache_idx))
-            compute += [*assigns, Write(output=src.name, index=cache_idx, value=out_value)]
+            input_loads, assigns, write = t
+            # Map each producer output axis to the xn slab's source dim (read off the
+            # producer Write index), so a broadcast operand projects onto the right axes.
+            dim_of_axis = {v: d for d, e in enumerate(write.index) for v in e.free_vars()}
+            for ld in input_loads:
+                in_dtype = graph.buffers[ld.input].dtype if ld.input in graph.buffers else src.dtype
+                op_src = _project_source(src, ld, dim_of_axis, in_dtype)
+                if op_src is None:
+                    raise NotImplementedError(f"fused SMEM edge: cannot project operand {ld.input!r} (collapsed/transposed index)")
+                new_sources.append(op_src)
+                compute.append(Load(names=ld.names, input=op_src.name, index=tuple(Var(ax.name) for ax in op_src.cache_axes)))
+            compute += [*assigns, Write(output=src.name, index=tuple(Var(ax.name) for ax in src.cache_axes), value=write.values[0])]
         return replace(stmt, sources=tuple(new_sources), compute=Body(tuple(compute)) if compute else None)
 
     return Body(tuple(patch(s) for s in body))
