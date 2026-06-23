@@ -46,19 +46,26 @@ def is_fused_graph(graph: TileGraph) -> bool:
 
 
 def _map_transform(block: Block):
-    """A single-input MAP producer block → ``(in_buf, in_name, assigns, out_buf,
-    out_value)`` — the pointwise transform ``xn = f(x)``. ``None`` for anything else
-    (a multi-input or reduce-bearing producer the v1 compute phase can't carry)."""
+    """A MAP producer block → ``(inputs, assigns, out_buf, out_value)`` — the pointwise
+    transform ``xn = f(x, y, …)``. ``inputs`` is ``[(buf, name), …]``, one per input
+    ``Load``. ``None`` for anything else: a reduce-bearing producer (the MONOID rmsnorm
+    — a compute-phase reduce is future work) or an input whose index differs from the
+    output's (a ``nw[k]``-style broadcast — different cache axes, also future work)."""
     stmts = list(block.compute)
     loads = [s for s in stmts if isinstance(s, Load)]
     writes = [s for s in stmts if isinstance(s, Write)]
     assigns = [s for s in stmts if isinstance(s, Assign)]
-    if len(loads) != 1 or len(writes) != 1 or len(stmts) != len(loads) + len(writes) + len(assigns):
-        return None  # not a flat single-input pointwise body (a reduce loop / extra stmt)
-    ld, w = loads[0], writes[0]
-    if len(ld.names) != 1:
+    if len(writes) != 1 or len(stmts) != len(loads) + len(writes) + len(assigns):
+        return None  # not a flat pointwise body (a reduce loop / extra stmt)
+    w = writes[0]
+    inputs: list[tuple[str, str]] = []
+    for ld in loads:
+        if len(ld.names) != 1 or ld.index != w.index:
+            return None  # broadcast / differing-shape operand — different cache axes
+        inputs.append((ld.input, ld.names[0]))
+    if not inputs:
         return None
-    return ld.input, ld.names[0], tuple(assigns), w.output, w.values[0]
+    return inputs, tuple(assigns), w.output, w.values[0]
 
 
 def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph) -> Body:
@@ -81,21 +88,20 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
             t = _map_transform(producer_of[src.buf])
             if t is None:
                 raise NotImplementedError(
-                    f"fused SMEM edge: producer of {src.buf!r} is not a single-input MAP transform "
-                    "(MONOID/reduce producers need a compute-phase reduce — not yet supported)"
+                    f"fused SMEM edge: producer of {src.buf!r} is not a MAP transform over same-shape operands "
+                    "(MONOID/reduce or broadcast producers need a compute-phase reduce / multi-cache-axis fill — not yet supported)"
                 )
-            in_buf, in_name, assigns, _out_buf, out_value = t
-            in_dtype = graph.buffers[in_buf].dtype if in_buf in graph.buffers else src.dtype
-            x_src = replace(src, buf=in_buf, name=f"{in_buf}_smem", dtype=in_dtype)
-            new_sources.append(x_src)
+            inputs, assigns, _out_buf, out_value = t
             cache_idx = tuple(Var(ax.name) for ax in src.cache_axes)
-            # the producer transform over the slab: read x_smem, apply the assigns,
-            # write the xn_smem slab (the consumer body already reads src.name).
-            compute += [
-                Load(names=(in_name,), input=x_src.name, index=cache_idx),
-                *assigns,
-                Write(output=src.name, index=cache_idx, value=out_value),
-            ]
+            # The producer transform over the slab: stage each input into its own
+            # slab (same cache axes as xn), read them, apply the assigns, and write
+            # the xn_smem slab (the consumer body already reads src.name).
+            for in_buf, in_name in inputs:
+                in_dtype = graph.buffers[in_buf].dtype if in_buf in graph.buffers else src.dtype
+                in_src = replace(src, buf=in_buf, name=f"{in_buf}_smem", dtype=in_dtype)
+                new_sources.append(in_src)
+                compute.append(Load(names=(in_name,), input=in_src.name, index=cache_idx))
+            compute += [*assigns, Write(output=src.name, index=cache_idx, value=out_value)]
         return replace(stmt, sources=tuple(new_sources), compute=Body(tuple(compute)) if compute else None)
 
     return Body(tuple(patch(s) for s in body))

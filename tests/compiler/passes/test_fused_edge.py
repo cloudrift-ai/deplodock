@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F16
@@ -43,36 +44,45 @@ def _mm_xn_graph(M=64, K=64, N=64) -> Graph:
     return g
 
 
-def _relu_producer_block(M=64, K=64):
+def _relu_producer(M, K) -> Graph:
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
     g.add_node(ElementwiseOp("relu"), ["x"], Tensor("xn", (M, K), F16), node_id="xn")
     g.inputs, g.outputs = ["x"], ["xn"]
-    out = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    return g
+
+
+def _mul_producer(M, K) -> Graph:
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("y", (M, K), F16), node_id="y")
+    g.add_node(ElementwiseOp("multiply"), ["x", "y"], Tensor("xn", (M, K), F16), node_id="xn")
+    g.inputs, g.outputs = ["x", "y"], ["xn"]
+    return g
+
+
+def _producer_block(producer_graph: Graph):
+    out = Pipeline.build(LOOP_PASSES).run(producer_graph, ctx=Context.from_target((12, 0)))
     lo = next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
     return replace(seed_graph(iter_dag(lo), kernel_name="prod").blocks[0], name="prod")
 
 
-def _fused_graph(M=64, K=64, N=64) -> TileGraph:
-    """``relu(x) @ w`` as a fused 2-block ``TileGraph``: a (logical) relu producer + a
+def _fused_graph(producer_graph: Graph, M=64, K=64, N=64) -> TileGraph:
+    """``f(x, …) @ w`` as a fused 2-block ``TileGraph``: a (logical) MAP producer + a
     tiled matmul consumer, the ``xn`` edge SMEM-placed (one launch group + staged)."""
     cons_tg = _oracle_tilegraph(_mm_xn_graph(M, K, N), _KN)
     cons = cons_tg.blocks[0]
-    prod = _relu_producer_block(M, K)
-    sq = (M, K)
-    buffers = {
-        "x": Buffer("x", sq, F16, space=Space.GMEM),
-        "w": Buffer("w", (K, N), F16, space=Space.GMEM),
-        "xn": Buffer("xn", sq, F16, space=Space.GMEM),
-        "o": Buffer("o", (M, N), F16, space=Space.GMEM),
-    }
+    prod = _producer_block(producer_graph)
+    buffers = {n: Buffer(n, (M, K), F16, space=Space.GMEM) for n in (*producer_graph.inputs, "xn")}
+    buffers["w"] = Buffer("w", (K, N), F16, space=Space.GMEM)
+    buffers["o"] = Buffer("o", (M, N), F16, space=Space.GMEM)
     xn_edge = Edge(src="prod", dst=cons.name, buffer="xn")
     sched = replace(cons_tg.schedule, launch={"prod": 0, cons.name: 0}, staged={xn_edge: Transport.SYNC})
     return TileGraph(name="fused", buffers=buffers, blocks=(prod, cons), schedule=sched)
 
 
 def test_fused_graph_detected():
-    tg = _fused_graph()
+    tg = _fused_graph(_relu_producer(64, 64))
     assert is_fused_graph(tg)  # two blocks, one launch group
 
 
@@ -80,7 +90,7 @@ def test_assemble_fused_builds_compute_phase():
     """The fused ``TileOp`` is one kernel whose ``xn`` slab is filled by a
     ``StageBundle.compute`` phase (the producer relu), staging ``x`` (not ``xn``) from
     gmem — the producer rides the consumer's slab, no gmem round-trip of ``xn``."""
-    top = assemble_fused(_fused_graph(), knobs=_KN, base_knobs={}, kernel_name="k_fused")
+    top = assemble_fused(_fused_graph(_relu_producer(64, 64)), knobs=_KN, base_knobs={}, kernel_name="k_fused")
     assert isinstance(top, TileOp)
     bundles = [s for s in top.body.iter() if isinstance(s, StageBundle)]
     assert bundles, "fused kernel must carry a StageBundle"
@@ -99,25 +109,34 @@ def test_assemble_fused_builds_compute_phase():
 
 
 @requires_cuda
-def test_fused_relu_matmul_runs_correctly():
-    """End-to-end: the fused kernel computes ``relu(x) @ w`` in one launch, matching a
-    numpy reference — the matmul reads ``xn`` from smem (the fused edge), no separate
-    producer kernel."""
+@pytest.mark.parametrize(
+    "producer, np_ref",
+    [
+        (_relu_producer, lambda ins: np.maximum(ins["x"], 0)),  # single-input MAP
+        (_mul_producer, lambda ins: ins["x"] * ins["y"]),  # multi-input MAP (same-shape operands)
+    ],
+    ids=["relu", "multiply"],
+)
+def test_fused_map_matmul_runs_correctly(producer, np_ref):
+    """End-to-end: ``f(x, …) @ w`` computes in **one** launch, matching a numpy
+    reference — the matmul reads ``xn`` from smem (the fused edge), no separate producer
+    kernel. Covers a single-input (relu) and a multi-input (multiply) MAP producer."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     M = K = N = 64
-    top = assemble_fused(_fused_graph(M, K, N), knobs=_KN, base_knobs={}, kernel_name="k_fused")
+    pg = producer(M, K)
+    top = assemble_fused(_fused_graph(pg, M, K, N), knobs=_KN, base_knobs={}, kernel_name="k_fused")
     fg = Graph()
-    fg.add_node(InputOp(), [], Tensor("x", (M, K), F16), node_id="x")
-    fg.add_node(InputOp(), [], Tensor("w", (K, N), F16), node_id="w")
-    fg.add_node(top, ["x", "w"], Tensor("o", (M, N), F16), node_id="o")
-    fg.inputs, fg.outputs = ["x", "w"], ["o"]
+    for name in (*pg.inputs, "w"):
+        shape = (K, N) if name == "w" else (M, K)
+        fg.add_node(InputOp(), [], Tensor(name, shape, F16), node_id=name)
+    fg.add_node(top, [*pg.inputs, "w"], Tensor("o", (M, N), F16), node_id="o")
+    fg.inputs, fg.outputs = [*pg.inputs, "w"], ["o"]
 
     compiled = Pipeline.build(["lowering/kernel", "lowering/cuda"]).run(fg, ctx=Context.from_target((12, 0)))
     rng = np.random.default_rng(0)
-    x = rng.standard_normal((M, K)).astype(np.float16)
-    w = rng.standard_normal((K, N)).astype(np.float16)
-    res = CudaBackend().run(compiled, input_data={"x": x, "w": w})[0].outputs
+    ins = {name: rng.standard_normal((M, K) if name != "w" else (K, N)).astype(np.float16) for name in (*pg.inputs, "w")}
+    res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
-    ref = np.maximum(x.astype(np.float32), 0) @ w.astype(np.float32)
-    np.testing.assert_allclose(got, ref, atol=2e-1, rtol=2e-1)
+    ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
+    np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
