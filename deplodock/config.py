@@ -42,6 +42,9 @@ TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
 TUNE_EPS = "DEPLODOCK_TUNE_EPS"
 O3_TOL = "DEPLODOCK_O3_TOL"
 ANALYTIC_TILT = "DEPLODOCK_ANALYTIC_TILT"
+CATBOOST_ITERATIONS = "DEPLODOCK_CATBOOST_ITERATIONS"
+CATBOOST_DEPTH = "DEPLODOCK_CATBOOST_DEPTH"
+CATBOOST_LR = "DEPLODOCK_CATBOOST_LR"
 BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
 CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
 NO_NVCC = "DEPLODOCK_NO_NVCC"
@@ -216,6 +219,20 @@ def analytic_tilt(default: float = 0.3) -> float:
     toward configs it favors without overriding the learned scale (``W=0`` =
     pure learned, large ``W`` = analytic dominates). See the method docstring."""
     return float_env(ANALYTIC_TILT, default)
+
+
+def catboost_params() -> dict[str, float | int]:
+    """The learned ``CatBoostPrior``'s training hyperparameters, overridable for
+    ML-experiment sweeps via ``DEPLODOCK_CATBOOST_ITERATIONS`` / ``_DEPTH`` / ``_LR``.
+    Defaults match :class:`CatBoostPrior`'s historical constants (400 / 6 / 0.05), so
+    an unset environment leaves training behavior unchanged — this is pure plumbing
+    so a sweep can vary regularization-via-depth / capacity and track the effect on
+    pick quality (see ``scripts/experiment.py``)."""
+    return {
+        "iterations": int_env(CATBOOST_ITERATIONS, 400),
+        "depth": int_env(CATBOOST_DEPTH, 6),
+        "learning_rate": float_env(CATBOOST_LR, 0.05),
+    }
 
 
 def serving_static(default: bool = False) -> bool:

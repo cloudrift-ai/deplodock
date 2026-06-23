@@ -35,12 +35,10 @@ from deplodock.compiler.pipeline.search.prior.base import Prior
 class CatBoostPrior(Prior):
     """CatBoost-backed global prior over knob features."""
 
-    ITERATIONS = 400
-    DEPTH = 6
-    LEARNING_RATE = 0.05
-
-    def __init__(self, *, iterations: int = ITERATIONS, **kwargs) -> None:
+    def __init__(self, *, iterations: int | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
+        # ``None`` → defer to ``config.catboost_params()`` at fit time (the env may be
+        # set after construction); an explicit int pins it (tests / direct callers).
         self._iterations = iterations
         self._cols: list[str] | None = None
         self._model = None
@@ -68,6 +66,8 @@ class CatBoostPrior(Prior):
         prior with ``tune --clean``."""
         from catboost import CatBoostRegressor  # noqa: PLC0415
 
+        from deplodock import config  # noqa: PLC0415
+
         rows = [(k, lab) for k, lab in self._dataset if lab > 0]
         feats = [knob.knob_features(k) for k, _ in rows]
         cols = sorted({c for f in feats for c in f})
@@ -75,10 +75,14 @@ class CatBoostPrior(Prior):
             return
         x = np.array([[f.get(c, np.nan) for c in cols] for f in feats], dtype=float)
         y = np.log(np.array([lab for _, lab in rows], dtype=float))
+        # Hyperparameters from config (env-overridable for experiment sweeps); an
+        # explicit constructor ``iterations`` still pins that one. Defaults match the
+        # class constants, so an unset environment trains exactly as before.
+        params = config.catboost_params()
         model = CatBoostRegressor(
-            iterations=self._iterations,
-            depth=self.DEPTH,
-            learning_rate=self.LEARNING_RATE,
+            iterations=self._iterations if self._iterations is not None else params["iterations"],
+            depth=params["depth"],
+            learning_rate=params["learning_rate"],
             loss_function="RMSE",
             random_seed=self._seed,
             thread_count=-1,

@@ -141,6 +141,13 @@ class OpResult:
     op_key: str
     best_us: float | None
     multiplicity: int = 1
+    # Inner-search effort, for ML-experiment tracking (search speed): total GPU
+    # benches this op did, the bench index at which the best was found
+    # (benches-to-best), and why the search stopped (``patience`` / ``max_visits``).
+    # Read off the live ``TuningSearch`` at op completion — see ``_inner_reward_async``.
+    benches: int = 0
+    benches_to_best: int | None = None
+    stop_reason: str | None = None
 
 
 @dataclass
@@ -150,6 +157,7 @@ class InnerReward:
     total_us: float
     ok: bool  # every kernel had a clean ``ok`` measurement
     per_op: list[OpResult] = field(default_factory=list)
+    total_benches: int = 0  # Σ benches across ``per_op`` — the terminal's search cost
     # Learned-prior end-of-run sanity block(s) — printed by the command after
     # the progress bar closes.
     prior_summaries: list[str] = field(default_factory=list)
@@ -339,7 +347,15 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
                 if prior.maybe_refit():
                     prior.checkpoint()
             best = db.best_per_op_time(ctx_key, key, backend=backend_name)
-            results[op_idx] = OpResult(name=name, op_key=key, best_us=best, multiplicity=count)
+            results[op_idx] = OpResult(
+                name=name,
+                op_key=key,
+                best_us=best,
+                multiplicity=count,
+                benches=inner.tree.root.visits,
+                benches_to_best=inner._visits_at_best,
+                stop_reason=inner.stop_reason,
+            )
             if progress is not None:
                 progress.op_done(name, slot=op_idx)
         finally:
@@ -371,7 +387,7 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
             total += _FAIL_US * r.multiplicity
         else:
             total += r.best_us * r.multiplicity
-    return InnerReward(total_us=total, ok=ok, per_op=per_op, prior_summaries=[])
+    return InnerReward(total_us=total, ok=ok, per_op=per_op, total_benches=sum(r.benches for r in per_op), prior_summaries=[])
 
 
 async def run_two_level_tune(

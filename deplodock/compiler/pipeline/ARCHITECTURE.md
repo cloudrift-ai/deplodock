@@ -558,6 +558,10 @@ fork's *effect* (the spawn-site `Op`-rebind / `Graph`-splice classification — 
   multiplicity-weighted (bit-for-bit the same as per-node iteration). `OpResult.multiplicity` carries the count;
   positions = `sum(r.multiplicity for r in reward.per_op)`. The progress denominator is the deduped count, so
   Qwen3-Embedding-0.6B's ~14 unique kernels show as 14/14 not 14/337.
+  `OpResult` also carries **search-speed** telemetry read off the live inner `TuningSearch` at op completion —
+  `benches` (`tree.root.visits`), `benches_to_best` (`_visits_at_best`), and `stop_reason` (`patience` / `max_visits`) —
+  which `InnerReward.total_benches` sums across `per_op`. These are inert for the search itself (additive defaults); the
+  ML-experiment tracker (`scripts/experiment.py`) is the consumer, recording per-op search cost alongside kernel quality.
 
 **Separability + the structural handoff.** Op-variant forks are separable: every multi-option fork is an in-place `Op`
 rebind that leaves the graph unchanged, so whole-graph time is `Σ_k t_k`. Results key structurally (`op_cache_key` =

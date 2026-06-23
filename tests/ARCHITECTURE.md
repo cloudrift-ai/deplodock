@@ -107,7 +107,8 @@ tests/
 │   └── diagnostics/
 │       └── test_bank_conflicts.py
 ├── scripts/
-│   └── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
+│   ├── test_plot_mcr_sweep.py  # load_results() from scripts/plot_mcr_sweep.py
+│   └── test_experiment.py      # build_record() + OpResult/InnerReward search-speed fields (scripts/experiment.py)
 ```
 
 ## Test Layers
@@ -136,6 +137,7 @@ Test individual functions in isolation with synthetic inputs.
 | `provisioning/test_cloudrift.py` | `deplodock.provisioning.cloudrift._api_request()`, `_rent_instance()`, etc. — CloudRift API helpers |
 | `provisioning/test_gcp.py` | `deplodock.provisioning.gcp._gcloud_*_cmd()` — GCP command builders |
 | `scripts/test_plot_mcr_sweep.py` | `load_results()` — benchmark JSON loading and sorting from `scripts/plot_mcr_sweep.py` |
+| `scripts/test_experiment.py` | `build_record()` record assembly + `OpResult`/`InnerReward` search-speed fields from `scripts/experiment.py` |
 
 Unit tests use **fixtures from `conftest.py`** (`tmp_recipe_dir`, `sample_config`, `sample_config_multi`) to supply pre-built recipe directories and config dicts.
 
