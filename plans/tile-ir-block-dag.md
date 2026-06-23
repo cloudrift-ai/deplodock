@@ -890,13 +890,21 @@ never a tree-builder.
   `_causal` / `_gqa`, `test_tune_accuracy.py::…[sdpa]`, the four `test_run.py::test_run_code_sdpa_*` (incl. the dynamic
   symbolic-K `seq1024_dynamic_smem`), `test_flash_attention.py::test_flash_off_keeps_decomposition` (FLASH-off now
   lowers the 3-kernel decomposition it asserts), and `test_attention_chains.py::test_qkv_attn_no_rope` /
-  `test_sdpa_explicit_additive_mask`. *Still deferred (R7):* the **keep-vs-split FORK** tests
+  `test_sdpa_explicit_additive_mask`. **RoPE-fused attention landed (R6 follow-up — the last R6 gap).** The split made
+  the whole attention block lower, exposing a staging miscompute in the **RoPE-fused score producer**
+  (`k_sdpa_linear_reduce`): a rotary table is read at **two distinct accesses** (`cos[m,d]` for Q, `cos[n,d]` for K) and
+  the projection both straight (`q·cos`) and rotate-half (a conditional/`TEMPLATE` index), but `assembly/_slab` builds
+  exactly one slab per buffer — serving one access and silently corrupting the other (or choking on the `TEMPLATE`
+  rotate-half). Fixed in `enumeration/_stage._multi_access_bufs`: a buffer read at >1 distinct `AccessMap` is excluded
+  from staging (stays gmem-direct; only same-access reads collapse to one slab — the `026` dedup by construction).
+  Verified by bisection (`DEPLODOCK_STAGE=none` was already bit-exact, so the RoPE *structure* was correct — only the
+  slab sharing was wrong). *Recovered:* `test_attention_chains.py::test_full_self_attn_tinyllama` / `_seq512` and the
+  whole-block `test_block.py::test_tinyllama_block_accuracy[cuda]` / `test_qwen_block_accuracy` (RoPE attention + MLP
+  end-to-end). **R6 is now complete** (scalar flash + cooperative-KV + score-materializing SDPA + RoPE-fused
+  attention). *Still deferred (R7, not an R6 gap):* the **keep-vs-split FORK** tests
   (`test_structural_push.py::test_split_demoted_fork_pushes_structural`, the `test_two_level` / `test_resolve`
   structural ones) need the keep-fused branch to be lowerable — the **`_classify_fused_prologue` regime** the new
-  classifier lacks, so today the split is forced not offered; and the **full self-attention chains**
-  (`test_attention_chains.py::test_full_self_attn_tinyllama` / `_seq512`) hit a separate blocker — the o_proj collapsed
-  attn-out (a K-folded `TEMPLATE` Load) chokes the staging tier (`TEMPLATE slabs are not in R1 scope`, the segmented-K
-  gmem-direct path), plus the RoPE-fused score-producer recognition.
+  classifier lacks, so today the split is forced not offered.
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
   reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
   `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
@@ -906,7 +914,7 @@ never a tree-builder.
 RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ✓ ┐
 (multi-pass split) ├─► R2 coop-reduce ✓ ───────────────────┐         ├─► R7 e2e / structural / prior
                 └─► R3 split-K ✓ ───────────────────────────┘         │
-                             R2 ✓ ─► R6 flash ◑ ◄── R4 ✓ ─────────────┘   (◑ scalar flash core + coop-KV ✓; RoPE / SDPA-decomp follow-ups are R7-gated)
+                             R2 ✓ ─► R6 flash ✓ ◄── R4 ✓ ─────────────┘   (scalar flash + coop-KV + score-materializing SDPA + RoPE-fused attention)
 ```
 
 RF (the per-family-pass split) gates every tier. R1 and R2 are independent (R2 is larger and unblocks R6); R3 rides R2's
@@ -965,12 +973,16 @@ greedy in-budget fallback (no longer the R2-blocked "over-stages the multi-accum
 The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). **The R4 follow-ups have landed** (the
 over-ceiling warp-reg pin is authoritative so the unstaged atom builds + lowers gmem-direct via the budget-aware
 staging decline, and the masked-tile hoist gained the SSA-safety refusal — see the R4 bullet); both quarantined R4
-tests are de-quarantined. **The cooperative-KV flash R6 follow-up has landed** (the `BR>1` streaming split lays the
-`K_c` THREAD lane in `_build.flash_build`, so the carrier's `combine_states` fires at `kernel/100` like the `MONOID`
-coop reduce — `test_flash_cooperative_kv.py` de-quarantined; see the R6 bullet). The two **remaining R6 follow-ups**
-(the score-materializing SDPA decomposition + the RoPE-fused attention chains that depend on it) are **R7-gated**: both
-need the fused softmax-prologue + P@V kernel to lower, which routes through R7's rebuilt `_classify_fused_prologue`
-regime / the `005_split_demoted` structural split — not a flash patch. They ride alongside R7, plus the `retime` /
-`warp_spec` forks + the `pad` post-pass + the deferred **R5 transport tiers with no recovery test** (the cp.async /
-`ASYNC` transport, the `RING` occupancy fork at depth 3–4, and the scalar / cooperative-reduce TMA promotion — the
-warp-tier TMA covers the recovery set, so these stay future work).
+tests are de-quarantined. **R6 is now complete** — all four follow-ups landed: the **cooperative-KV flash** (`BR>1`
+lays the `K_c` THREAD lane in `_build.flash_build`, `combine_states` fires at `kernel/100`), the **score-materializing
+SDPA** (the reborn `005_split_demoted` in the new `lowering/tile/split` pass dir forces the softmax+P@V un-fusion into
+an `xn` producer + a clean static-or-symbolic-K gemm), and the **RoPE-fused attention** (the `_stage._multi_access_bufs`
+exclusion keeps a buffer read at >1 distinct access — the rotary `cos[m]`/`cos[n]`, the straight + rotate-half
+projection — gmem-direct instead of corrupting one slab). De-quarantined `test_flash_cooperative_kv.py`, the SDPA set
+(`test_ops_vs_torch` / `test_tune_accuracy` / `test_run` / `flash_off`), `test_attention_chains.py` (incl.
+`test_full_self_attn_tinyllama`), and the whole-block `test_block.py::test_tinyllama_block_accuracy[cuda]` /
+`test_qwen_block_accuracy`. The remaining quarantined tests are genuinely **R7** (structural-search FORK / prior /
+CLI-e2e): the keep-vs-split fork needs the `_classify_fused_prologue` regime (so today the SDPA split is forced not
+offered), plus the `retime` / `warp_spec` forks + the `pad` post-pass + the deferred **R5 transport tiers with no
+recovery test** (the cp.async / `ASYNC` transport, the `RING` occupancy fork at depth 3–4, and the scalar /
+cooperative-reduce TMA promotion — the warp-tier TMA covers the recovery set, so these stay future work).

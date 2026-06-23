@@ -102,15 +102,19 @@ _XFAIL_FUNCS: dict[str, str] = {
     # via the split (scores + softmax xn producer + gemm = 3 kernels), so the
     # "score-materializing multi-kernel path is kept" assertion (len(kernels) > 1) holds
     # — exactly the score-materializing decomposition the test guards, now lowerable.
-    # Still quarantined: the o_proj collapsed-attn-out read (a K-folded TEMPLATE Load)
-    # hits the segmented-K staging tier (`TEMPLATE slabs are not in R1 scope`), a
-    # separate blocker from the SDPA split — re-tagged R7.
-    "test_attention_chains.py::test_full_self_attn_tinyllama": "R7",
-    "test_attention_chains.py::test_full_self_attn_tinyllama_seq512": "R7",
+    # test_full_self_attn_tinyllama / _seq512 de-quarantined: the RoPE-fused score
+    # producer (k_sdpa_linear_reduce) now lowers correctly. The fix is in _stage:
+    # _multi_access_bufs excludes any buffer read at >1 distinct access from staging
+    # (the rotary cos/sin are read at both the Q row `cos[m,d]` and the K row `cos[n,d]`,
+    # and the projection both straight `q·cos` and rotate-half — one slab per buffer
+    # served only one access and silently corrupted the other / choked on the TEMPLATE
+    # rotate-half). They stay gmem-direct; only same-access reads collapse to one slab.
     # R7 — analytic / prior / structural-search tiers
     "test_analytic.py::test_pick_matmul_lands_in_geometry_band": "R7",
     "test_analytic.py::test_pick_matmul_warp_dispatch_by_dtype": "R7",
-    "test_block.py::test_qwen_block_accuracy": "R7",
+    # test_qwen_block_accuracy / test_tinyllama_block_accuracy[cuda] de-quarantined:
+    # the whole-block forward (RoPE attention + MLP) now lowers correctly end-to-end
+    # via the SDPA split + the multi-access staging fix.
     # The three qwen-dynamic tests de-quarantined: the whole-model / layer SDPA now
     # lowers via tile/split/005_split_demoted (incl. the symbolic-seq P@V), so the
     # dynamic compile + capture-replay paths match eager.
@@ -149,8 +153,9 @@ _XFAIL_NODES: dict[str, str] = {
     # R6 — score-materializing SDPA landed (tile/split/005_split_demoted): test_sdpa
     # [cuda] / sdpa_causal[cuda] / sdpa_gqa[cuda] + test_tune_accuracy[sdpa]
     # de-quarantined (the softmax+P@V un-fuses into xn producer + clean gemm).
+    # test_tinyllama_block_accuracy[cuda] de-quarantined: the whole-block RoPE
+    # attention + MLP forward now lowers correctly (SDPA split + multi-access staging).
     # R7
-    "test_block.py::test_tinyllama_block_accuracy[cuda]": "R7",
     # Only the [2] window param still fails (fp16 nvcc codegen); [4]/[8] recovered
     # under the R4 scalar pin-honoring (see the test_run.py note above).
     "test_run.py::test_run_code_fp16_matmul_window_accuracy[2]": "R7",

@@ -60,6 +60,21 @@ def _transposed_b_bufs(block: Block) -> set[str]:
     return {ld.input for ld in block.compute.iter_of_type(Load) if ld.names and ld.names[0] in b_names}
 
 
+def _multi_access_bufs(block: Block) -> set[str]:
+    """Buffers read at more than one DISTINCT access (the `AccessMap` differs across
+    its `Load` sites) — a single staged slab can only reconstruct one access, so these
+    must stay gmem-direct. Same-access repeats (the `026` sibling-stage dedup) share one
+    slab by construction and are NOT excluded."""
+    first: dict[str, object] = {}
+    multi: set[str] = set()
+    for p in block.reads:
+        if p.buffer not in first:
+            first[p.buffer] = p.access
+        elif p.access != first[p.buffer]:
+            multi.add(p.buffer)
+    return multi
+
+
 def stage_candidates(graph: TileGraph) -> list[Edge]:
     """The ranked stageable input read-sites of ``graph``'s single block."""
     block = graph.blocks[0]
@@ -69,14 +84,24 @@ def stage_candidates(graph: TileGraph) -> list[Edge]:
     parallel = {a.name for a in block.domain if sched.binding.get(a.name) in (Binding.GRID, Binding.THREAD, Binding.WARP)}
     written = {p.buffer for b in graph.blocks for p in b.writes}
     no_stage = _transposed_b_bufs(block)
+    # A buffer read at >1 DISTINCT access can't be served by one slab (assembly builds
+    # exactly one slab per buffer, from its first consumer Load — `_bundle_sources`).
+    # The RoPE-fused score producer reads each rotary table at two row positions
+    # (`cos[m,d]` for Q, `cos[n,d]` for K) and its projection both straight (`q·cos`)
+    # and rotate-half (a conditional / TEMPLATE index) — staging either as one slab
+    # serves one access and silently corrupts the other (or chokes `_source_from_load`
+    # on the TEMPLATE sibling). Exclude any buffer whose reads aren't all the SAME
+    # access, so it stays gmem-direct (only same-access reads collapse to one slab —
+    # the legacy 026 dedup, now by construction).
+    mixed_access = _multi_access_bufs(block)
     k_ext = _stage_k_extent(block)
 
     ranked: list[tuple[int, str, Edge]] = []
     seen: set[str] = set()
     for p in block.reads:
         buf = p.buffer
-        if buf in written or buf in seen or buf in no_stage:  # only input reads; one slab per buffer; never transposed-B
-            continue
+        if buf in written or buf in seen or buf in no_stage or buf in mixed_access:
+            continue  # only input reads; one slab per buffer; never transposed-B / multi-access
         acc = p.access
         if acc.kind is not AddrKind.AFFINE:
             continue  # TEMPLATE collapsed reshape — not slab-sizable (R1)
