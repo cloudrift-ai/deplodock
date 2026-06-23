@@ -1,5 +1,42 @@
 # Edge placement: make split a block-DAG enumeration move (cross-kernel edges)
 
+## Status (in progress, branch `feature/tile-ir-block-dag`)
+
+**Landed** (foundational, additive, no behavior change to the live single-block pipeline):
+
+- **(1) General multi-block / multi-launch `assemble`** — the [BLOCKER]. `assemble_block` no longer `raise`s on `>1`
+  block: it partitions `blocks` by `Schedule.launch` (one group = one kernel), topo-sorts by the derived edge DAG, and
+  emits a `Graph` of `TileOp` kernels with every cross-group edge materialized as an intermediate tensor (shape/dtype
+  from the declared `TileGraph.buffers`). Single-block input is byte-identical to before. v1 = one block per launch
+  group (the two-launch cut); a multi-block group (cooperative `grid.sync`) raises as a later field.
+  `assembly/_assemble.py::_assemble_multi`; `test_multi_block_assemble.py` pins partition/wiring/determinism.
+- **(2) Edge-placement unification of `stage`** — `TileGraph.placement(edge) -> INLINE | SMEM | GMEM`, a **derived**
+  view over `Schedule.staged` + `Schedule.launch` (not new stored state — the IR's derived-view discipline: `stage` and
+  `split` are two values of one query). `ir/tile/ir.py::Placement` + `TileGraph.placement`; pinned in
+  `test_blockdag.py`.
+
+**Blocked / not yet done — and why.** Steps (3)–(6) (the `extract_block` fission, the `_cut`-driven `GMEM` fork, the
+legacy `split/` deletion, the R7-test de-quarantine) hit a prerequisite this plan under-specified:
+
+> A **demoted matmul does not classify as a buildable seed.** `classify(iter_dag(fused_norm_linear))` returns `None`
+> (the matmul cell's operand is a computed cone, not a clean `[Load, Load, mul, Accum]`), so `enumeration/000_build`
+> `RuleSkipped`s it — the demoted matmul never becomes a logical block-DAG `TileGraph`. That is exactly *why* the legacy
+> `005_split_demoted` runs on the raw `LoopOp` **before** enumeration. For the cut to become a block-DAG outer fork
+> (`_cut.cut_offers(graph)` querying a `TileGraph`, `tier(C | inline)` computable off `Block.atom`/`reads`), the seed
+> builder must first be able to represent the demoted matmul as a single **logical fused-prologue block** — which
+> overlaps the "fused-prologue-into-warp-tile codegen" this plan's own non-goals defer as the separate, harder
+> follow-up. The `tier`/`eligible_atoms` machinery the predicate needs DOES already work at the `IterDag` layer
+> (`eligible_atoms(dag)` is empty for the demoted f16 matmul, non-empty once the operand is a clean `Load`), so the
+> predicate is buildable — but it has nothing to *consume* it until the seed can carry the un-fissioned demoted block,
+> and building it against the raw `LoopOp` would just duplicate the legacy `_classify_cut` it is meant to replace.
+
+So the corrected sequence is: **(2.5) teach `000_build` / `classify` a logical fused-prologue (demoted-matmul) regime**
+— the seed that the cut fissions — *before* (3)/(4). Until then `_cut.py` would be unwireable infra and the R7
+structural-fork tests (`test_two_level`, `test_structural_push`) stay quarantined on the same missing keep-fused regime
+the xfail registry already records. The legacy `split/005_split_demoted` stays the working cut in the meantime.
+
+
+
 Fold the structural split (`005_split_demoted`) into the block-DAG enumeration as a generic **edge-placement** move,
 instead of a bespoke pre-enumeration pass that does graph surgery on `LoopOp`s. The thesis of
 [`tile-ir-block-dag.md`](tile-ir-block-dag.md) is "every scheduling choice is a `Schedule` annotation over an invariant
@@ -201,17 +238,23 @@ tensor (its `Buffer` shape/dtype derived from the producer `Write`). This is the
 
 ## Prerequisites & sequencing
 
-- **[BLOCKER] General multi-block / multi-launch `assemble`.** R3's atomic-free split-K introduced *a* multi-launch path;
-  confirm it generalizes to arbitrary N blocks + arbitrary derived edges before stacking cuts on it. If `assemble_block`
-  still `raise`s on the general >1-block case, that is the first task — not the cut move.
-- **Edge-placement unification of `stage`.** Re-key `Schedule.staged` (or add `Schedule.placement: dict[Edge, Placement]`)
-  so `stage` and `split` are two values of one field. Keep `staged` as a compatibility view if cheaper.
+- **[BLOCKER — LANDED] General multi-block / multi-launch `assemble`.** R3's atomic-free split-K introduced *a*
+  multi-launch path; this generalizes it to arbitrary N blocks + arbitrary derived edges. `assemble_block` no longer
+  `raise`s on the >1-block case (see Status above).
+- **[LANDED] Edge-placement unification of `stage`.** Added the **derived** `TileGraph.placement(edge)` over
+  `Schedule.staged` + `Schedule.launch` (no new stored state — `staged` stays the SMEM source of truth; the derived view
+  is the "compatibility view" option, the cheaper + more idiomatic one given the IR's derived-view discipline).
+- **[NEW PREREQUISITE — see Status] Logical fused-prologue (demoted-matmul) seed regime.** `classify` / `000_build` must
+  represent a demoted matmul as a single logical block before the cut can fission it on the block-DAG; today it
+  `RuleSkipped`s (the operand cone fails the clean-cell classifier). This overlaps the deferred fused-prologue non-goal.
 - **Then** the cut + fission moves + the derived offer predicate, replacing `lowering/tile/split/`.
 
-Order: (1) general multi-block `assemble` + a determinism/byte-identical guard; (2) `place_edge` field + fold `stage`
-into it; (3) `extract_block` fission body move; (4) `enumeration/_cut.py` (the `tier` lattice + `cut_offers` predicate)
-with its own unit tests, then the thin `GMEM` cut fork that consumes it; (5) delete the legacy `lowering/tile/split/`
-restore; (6) de-quarantine the R7 structural tests.
+Order: (1) general multi-block `assemble` + a determinism/byte-identical guard **[done]**; (2) `place_edge` derived view
++ fold `stage` into it **[done]**; (2.5) logical fused-prologue seed regime so the demoted matmul builds **[blocker for
+the rest]**; (3) `extract_block` fission body move; (4) `enumeration/_cut.py` (the `tier` lattice + `cut_offers`
+predicate — buildable on the `IterDag` `eligible_atoms` machinery once (2.5) gives it a `TileGraph` to query) with its
+own unit tests, then the thin `GMEM` cut fork that consumes it; (5) delete the legacy `lowering/tile/split/` restore;
+(6) de-quarantine the R7 structural tests.
 
 ## Gate
 
