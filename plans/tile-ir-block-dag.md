@@ -587,6 +587,9 @@ synthesis to subsume them.
 ## Next step
 
 The structural surface has converged: the algorithm is `name + domain + compute`, every projection is derived, every
-choice is a `Schedule` annotation, and `assemble` is the one place the tower is built. The natural next step is to
-**prototype `assemble(TileGraph) -> KernelOp | Graph[KernelOp]` on one golden per regime** (pointwise / coop / matmul /
-warp-MMA) — the by-construction byte-identical test that validates the IR far harder than further review.
+choice is a `Schedule` annotation, and `assemble` is the one place the tower is built. `assemble` is now proven
+byte-identical on pointwise / scalar+warp matmul / coop reduce (steps 1–2). The natural next step is to **stand up the
+first `Schedule`-move enumeration pass — `tile/stage`** — over the tile node (the simplest staging regime, reborn from
+the deleted `020`/`026`), with `assemble` synthesizing the slab + cooperative producer from `staged`. That validates the
+two-kind pass structure end to end (enumeration widens, `assemble` materializes) on a regime that actually touches smem,
+before `retime` / `transport` / `warp_spec` follow.
