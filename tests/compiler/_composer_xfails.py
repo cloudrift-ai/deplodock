@@ -99,6 +99,14 @@ _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
         # Split-K residual / atomic-free (015/017) deleted.
         "test_merge_split_glue.py::test_outer_terminal_matches_greedy_kernel_count",
         "test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural",
+        # RMSNorm kernels need the cooperative-reduce regime (deleted).
+        "test_tile_naming.py::test_real_rms_norm_kernels_named_by_op",
+        # Reductions / softmax / RMSNorm route through the cooperative-reduce
+        # regime (deleted).
+        "test_dtype_cuda.py::test_fp16_max_reduction_stays_in_fp16",
+        "test_dtype_cuda.py::test_fp16_reduction_uses_fp32_accumulator_on_cuda",
+        "test_dtype_cuda.py::test_fp16_softmax_cuda",
+        "test_dtype_cuda.py::test_fp16_rmsnorm_cuda",
     }
 )
 _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
@@ -144,6 +152,7 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_monoid_reduce_kernel.py",  # cooperative reduce (coop builder deleted)
         "test_strided_coop_rows.py",  # strided cooperative reduce
         "test_stage_inputs_mma_probe.py",  # 020 staging probe (pass deleted)
+        "test_run.py",  # CLI compile/run of RMSNorm/softmax/SDPA/IR-stages (coop/flash/staging)
     }
 )
 

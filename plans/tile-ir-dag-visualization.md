@@ -12,13 +12,13 @@ The view needs four things a statistical-chart engine doesn't have: a **layered 
 **nested + overlapping grouping** (launch / scope / cohort), and **interactivity** (pan/zoom, expand a block's body,
 toggle the schedule overlay). Online survey of the 2026 options against those needs:
 
-| Engine | Layered DAG layout | Node content | Grouping | Build step | Verdict |
-|---|---|---|---|---|---|
-| **AntV G6 v5** | built-in `antv-dagre` | **real HTML nodes** (`type:'html'`, full CSS) | **Combos** (nested) + **BubbleSets** (overlapping sets) | none — UMD CDN, vanilla JS | **chosen** |
-| Apache ECharts | none (`graph` is force/circular/manual) | symbol + label | none (fake with markArea) | none | keep for bar charts only |
-| React Flow (xyflow) | none — bolt on dagre/ELK | fanciest (DOM/React) | sub-flows | **React + bundler** | clashes with the one-HTML-file convention |
-| Cytoscape.js | dagre/elk extension | canvas (HTML via extension) | compound nodes | none | nodes not HTML; cards are harder |
-| Graphviz (wasm) | best static layout | SVG tables | clusters | none | static; weak interactivity |
+| Engine              | Layered DAG layout                      | Node content                                  | Grouping                                                | Build step                 | Verdict                                   |
+|---------------------|-----------------------------------------|-----------------------------------------------|---------------------------------------------------------|----------------------------|-------------------------------------------|
+| **AntV G6 v5**      | built-in `antv-dagre`                   | **real HTML nodes** (`type:'html'`, full CSS) | **Combos** (nested) + **BubbleSets** (overlapping sets) | none — UMD CDN, vanilla JS | **chosen**                                |
+| Apache ECharts      | none (`graph` is force/circular/manual) | symbol + label                                | none (fake with markArea)                               | none                       | keep for bar charts only                  |
+| React Flow (xyflow) | none — bolt on dagre/ELK                | fanciest (DOM/React)                          | sub-flows                                               | **React + bundler**        | clashes with the one-HTML-file convention |
+| Cytoscape.js        | dagre/elk extension                     | canvas (HTML via extension)                   | compound nodes                                          | none                       | nodes not HTML; cards are harder          |
+| Graphviz (wasm)     | best static layout                      | SVG tables                                    | clusters                                                | none                       | static; weak interactivity                |
 
 G6 is the only option that is simultaneously **fancy + interactive**, **HTML-rendered nodes**, has a **built-in layered
 layout** (no separate layout lib to wire), offers **both nested Combos and overlapping BubbleSets** (which exactly fits

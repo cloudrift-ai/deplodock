@@ -324,13 +324,22 @@ widens the search tree move-family by move-family, and one deterministic **mater
 chosen leaf. This is the concrete realization of "the scheduling moves only edit the Schedule; `assemble` is the one
 place the tower is built."
 
-`assemble` is the *boundary*, and enumeration runs on **both sides** of it. Almost every move family enumerates
-**pre-assemble** over the `TileGraph` (the dataflow / structural / scheduling moves, whose objects — edges, axes, blocks,
-the Schedule — live in the IR). Exactly one family, **`pad`**, enumerates **post-assemble** over the materialized
-`KernelOp`, because its decision reads an `assemble` *output* (the slab's byte layout + the realized vectorized-load
-width) — see the note after the pass list. The decision rule is empirical: a family is post-`assemble` **iff its offer
-legality reads an `assemble` artifact**. The pass *kind* is still binary (enumeration vs materialization); it is the
-enumeration *phase* that the `assemble` boundary splits.
+One question decides where a family lives, and it dominates every other: **is it a genuine fork?** — does it offer ≥2
+ranked candidates the search must *bench* to choose between (a tile size, a ring depth, transport on/off, specialize
+on/off)? Enumeration exists to hand the MCTS something to branch on; a family that has nothing to rank must not be an
+enumeration pass, because it would plant a tree node with a single child — pure overhead that contaminates the search.
+
+- **Genuine forks → enumeration passes, all pre-`assemble`.** They *must* be pre-`assemble`: the search explores them
+  before any leaf is materialized. Every genuine fork's legality reads only derived projections + the current `Schedule`,
+  so they all sit pre-`assemble` with no exception.
+- **Fixed-logic (a deterministic rule — a threshold, a bank-conflict formula, a σ-peel driven by an already-chosen
+  depth) → NOT an enumeration pass.** It runs as a **deterministic post-`assemble` pass** (the default — a
+  `KernelOp`→`KernelOp` total function that keeps `assemble` minimal), or **inside `assemble`** when it is a
+  by-construction property of materialization (e.g. slab coalescing).
+
+So there is **no post-`assemble` enumeration**: post-`assemble` is deterministic-only. The materialization side is one
+deterministic *stage* — `assemble` (core) followed by the deterministic post-passes — and the search tree sits entirely
+in front of it. This is the load-bearing discipline: **enumeration is for genuine forks; fixed logic stays out of it.**
 
 - **Enumeration passes** — *generate subtrees for the search.* Each owns one move family. It matches the tile node,
   computes its legal offers from the **derived projections + the current `Schedule`** (never from tower shape), and
@@ -361,22 +370,26 @@ Concrete pass list — pipeline order *is* decision order:
 | `tile/stage`            | enum (schedule)   | `stage`, `hoist`                     | `staged`, `scope`              | `020`/`021`/`026`/`030`               |
 | `tile/retime`           | enum (schedule)   | `retime`                             | `distance`, `ring_depth`       | `040`/`080`                           |
 | `tile/transport`        | enum (schedule)   | `promote_transport`                  | `staged` value                 | `050`/`060`                           |
-| `tile/warp_spec`        | enum (schedule)   | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
-| `tile/swizzle`          | enum (schedule)   | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
-| `tile/unroll`           | enum (schedule)   | `unroll`                             | `unroll`                       | `090`                                 |
-| `tile/assemble`         | **materialize**   | —                                    | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
-| `tile/pad`              | enum (**local, post-assemble**) | `pad`                  | KernelOp smem-slab alloc       | `070`                                 |
+| `tile/warp_spec`        | enum (fork)       | `specialize_warps`                   | `role`, `reg_budget`           | `085`                                 |
+| `tile/swizzle`          | enum (fork)       | `swizzle`                            | `grid_swizzle`                 | `025`                                 |
+| `tile/assemble`         | **materialize**   | apply `Schedule` → basic tower       | TileGraph → KernelOp           | the tower builders + `assemble_block`  |
+| `tile/peel`             | **det. (post)**   | pipeline σ-peel from `ring_depth`    | KernelOp serial nest           | `080`                                 |
+| `tile/mask_order`       | **det. (post)**   | cooperative load above mask `Cond`   | KernelOp masked tile           | `021`                                 |
+| `tile/pad`              | **det. (post)**   | bank-conflict pad (formula)          | KernelOp smem-slab alloc       | `070`                                 |
+| `tile/unroll`           | **det. (post)**   | `#pragma unroll` (trip threshold)    | KernelOp SERIAL loop           | `090`                                 |
 
-(`tile_axis` is not its own pass — the free-axis σ-splits fold into `tile/build` and the reduce σ-split rides
-`partition_reduce`/`tensorize`, exactly as `_split_free_axis` / `_replace_k_scalar` do in `build_dag.py` today.)
+Every `enum` row is a **genuine fork** (a ranked knob the search benches); `enum (body)` additionally edits `Block`s.
+Every `det. (post)` row is **fixed-logic** — a deterministic `KernelOp`→`KernelOp` total function, no knob to branch, run
+after `assemble` so it never enters the search tree. (`tile_axis` is not its own pass — the free-axis σ-splits fold into
+`tile/build` and the reduce σ-split rides `partition_reduce`/`tensorize`, as `_split_free_axis` / `_replace_k_scalar` do
+in `build_dag.py` today.)
 
-Three legacy passes are **not in the list at all** — a per-source-evidence sweep of the deleted files found they survive
-only as `assemble`-internal *mechanics*, with no decision to enumerate: **`026`** (sibling-stage dedup) is automatic once
-`assemble` coalesces slabs by `(buffer, access, distance)`; **`080`** (pipeline peel) is pure σ-shifted prologue/steady/
-epilogue replication driven by `ring_depth` (the depth is `retime`'s knob, not `080`'s — `080` has no surviving search
-choice); **`021`** (hoist staged loads above the mask `Cond`) is the correctness ordering `assemble` must produce when it
-materializes a masked tile over a staged transport. None is a `Fork`; each was already a `RuleSkipped`-or-rewrite with no
-knob. They move *into* `assemble`, not into the pass list.
+One ex-pass dissolves with no pass at all: **`026`** (sibling-stage dedup) becomes automatic the moment `assemble`
+coalesces slabs by `(buffer, access, distance)` — the duplicate is never created, so there is nothing to deduplicate. It
+is the one fixed-logic case that is `assemble`-internal *by construction* rather than a post-pass. The peel (`080`) and
+mask-ordering (`021`) could likewise be folded into `assemble`; they are listed as separate `det. (post)` passes per the
+preference for a minimal `assemble` core with composable deterministic post-passes — the assemble/post boundary among the
+fixed-logic mechanics is a modularity choice, but **none of them is enumeration**, which is the property that matters.
 
 **Exactly one local lives *after* `assemble`: `tile/pad`.** The per-source-evidence sweep was sharper than the first cut
 here — only `pad` genuinely needs the materialized kernel. The smem slab is "only ever an assemble artifact" (the IR's
