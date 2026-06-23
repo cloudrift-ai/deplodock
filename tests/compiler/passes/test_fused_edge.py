@@ -387,3 +387,39 @@ def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
     x, nw, wg = ins["x"][0].astype(np.float32), ins["nw"].astype(np.float32), ins["wg"].astype(np.float32)
     rms = x * (1.0 / np.sqrt((x**2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
     np.testing.assert_allclose(got, rms @ wg.T, atol=1.0, rtol=0.5)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "expr",
+    ["(0.5 * x) @ w", "torch.sigmoid(x) @ w", "torch.relu(x) @ w"],
+    ids=["scale_const", "sigmoid", "relu"],
+)
+def test_fused_map_producer_warp_tier_live(monkeypatch, expr):
+    """MAP-producer demoted matmuls fuse correctly at the **warp tier** through the live
+    pass chain, matching torch. Covers a **scalar-constant** operand (``0.5·x`` — the
+    fully-broadcast operand read straight from gmem, no slab) alongside a unary activation,
+    the producer shapes a real model emits before a linear."""
+
+    from deplodock.commands.trace import graph_from_code
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.ir.base import InputOp
+
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept SMEM fused edge (warp tier)
+    code = (
+        "import torch\ntorch.manual_seed(0)\n"
+        "x = torch.randn(64, 256, dtype=torch.float16) * 0.3\n"
+        "w = torch.randn(256, 128, dtype=torch.float16) * 0.3\n" + expr
+    )
+    g, _slug, (mod, args, kwargs) = graph_from_code(code)
+    out = Pipeline.build([*LOOP_PASSES, *_TILE_PASSES, "lowering/kernel", "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
+    ref = mod(*args, **kwargs).detach().cpu().numpy().astype(np.float32)
+    argv = [a.detach().cpu().numpy() for a in args]
+    ins = {}
+    for nid, node in out.nodes.items():
+        if isinstance(node.op, InputOp):
+            shp = tuple(d.as_static() for d in node.output.shape)
+            match = next((a for a in argv if a.shape == shp), None)
+            ins[nid] = match.astype(node.output.dtype.np)
+    got = list(CudaBackend().run(out, input_data=ins)[0].outputs.values())[0].reshape(ref.shape).astype(np.float32)
+    np.testing.assert_allclose(got, ref, atol=max(0.5, 0.05 * float(np.abs(ref).max())), rtol=0.2)

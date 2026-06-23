@@ -168,7 +168,12 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
                 if op_src is None:
                     raise NotImplementedError(f"fused SMEM edge: cannot project operand {ld.input!r} (collapsed/transposed index)")
                 idx = tuple(Var(ax.name) for ax in op_src.cache_axes)
-                if ld.input in graph.buffers:
+                if op_src.cache_axes == ():
+                    # A fully-constant operand (a scalar like ``0.5`` in ``0.5·x``) varies
+                    # over no output axis, so there is nothing to stage — read it straight
+                    # from gmem at its (constant) index, per compute-phase element.
+                    compute.append(Load(names=ld.names, input=ld.input, index=ld.index))
+                elif ld.input in graph.buffers:
                     new_sources.append(op_src)  # a gmem operand — stage it
                     compute.append(Load(names=ld.names, input=op_src.name, index=idx))
                 else:
