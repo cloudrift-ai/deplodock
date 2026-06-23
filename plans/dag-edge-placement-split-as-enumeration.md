@@ -59,16 +59,21 @@
   fork is the remaining piece), so the suite is unaffected.
 
 **Remaining for the fused edge:**
-- **Warp-tier (mma) fused consumer** — greedy picks the tensor-core tier for f16. Two issues, the first **fixed**:
-  - *(fixed)* the warp cell lowering (`kernel/005`) dropped the compute-phase `Write` — `_scan_cell` mistook the
-    producer's smem-slab fill `Write` for the mma cell output and the handler converted it to a fragment `RegStore`.
-    The compute phase is now **opaque** to the cell lowering (only `100_materialize` lowers it); the warp path compiles.
-  - *(remaining — the layout choreography)* the fused `xn` slab is sized/written from **raw cache-axis extents**
-    (`o__xn_smem` = `(1,2,2)`) while the matching input slab carries the **warp atom-stride block multipliers**
-    (`x_smem` = `(1,32,32)`), so the compute phase iterates the wrong elements → numerically wrong. The fused slab must
-    be laid out + filled in the warp operand's smem layout (atom strides / swizzle) so `ldmatrix` reads it correctly —
-    the plan's "materialize-in-consumer-layout" item (item 4), the hardest codegen. This is the tier that *beats* the
-    cut, so it is the key next step.
+- **Warp-tier (mma) fused consumer — LANDED (the cut-beating form).** `(x·y) @ w` / `relu(x) @ w` fuse into **one
+  tensor-core kernel**, the `mma.sync` reading the cooperatively-computed `xn` from smem via `ldmatrix` (no gmem
+  round-trip), accuracy-verified. Three fixes, in order of discovery:
+  - the cell lowering (`kernel/005`) dropped the compute-phase `Write` (`_scan_cell` mistook the slab-fill for the mma
+    output; the handler converted it to a `RegStore`) → the compute phase is now **opaque** to the cell lowering.
+  - the fused slab was sized/filled from **raw cache-axis extents** (the 2×2 logical cell) while the matching input slab
+    carries the **warp atom-stride block multipliers** (the 32×32 micro-tile) → `compute_phase_extents` returns the
+    **physical** extents (`alloc_extents`); `emit_compute_phase` iterates the full physical slab and `100_materialize`
+    sizes it to match. Since the fused edge's input + output slabs share one physical layout, the producer is a
+    layout-agnostic element-wise smem→smem fill. (Scalar tier `block=()` → unchanged.)
+  - `ldmatrix` read the slab **un-staged** (wrong layout) because the compute-output slab is not in
+    `StageBundle.sources` → `005._compute_output_source` registers it in the cell source table with the matching input
+    `Source`'s addressing, so the consumer reads it staged (`ldm=BK`, atom-strided) — matching how the compute filled it.
+  This is the plan's "materialize-in-consumer-layout" item (item 4), the hardest codegen — and it falls out cleanly
+  because the input and output slabs share one layout. `test_fused_edge` is parametrized over scalar + warp tiers.
 - **MONOID (rmsnorm) producer** — the headline case needs the compute phase generalized to carry a **reduce** (the
   per-row sum-of-squares → scale in smem, then the scale-application compute phase) + the `nw[k]` broadcast operand
   (different cache axes).
