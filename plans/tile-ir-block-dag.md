@@ -11,7 +11,7 @@ derived cache, not a second source of truth… never enters equality / `op_cache
 The new IR extends that to the whole tile phase: `reads`, `writes`, `carrier`, `atom`, and the edge topology are all
 *derived from the body + connectivity*, never stored as attributes that could drift.
 
-The IR below is the result of three co-design rounds that re-expressed all 15 current tile passes against it; each
+The IR below is the result of three co-design rounds that re-expressed every current tile pass against it; each
 pass's rewrite is in "Pass rewrites." The earlier strawmen and round-by-round feedback are not reproduced — only the
 converged result.
 
@@ -310,6 +310,11 @@ generalized). "Touches" = whether the move edits the body (algorithm) or only th
 | `specialize_warps(2-coloring)`          | `Schedule.role[block] = …`                                        | schedule  | Dep (cut antichain) + crossing edges async/TMA     | `085_warp_specialize`                             |
 | `pad/swizzle/unroll`                    | `Schedule.pad`/`grid_swizzle`/`unroll`                            | schedule  | perf-only                                          | `070`, `025`, `090`                               |
 | `guard`                                 | derived from `domain.real_extent` vs tile (not a move)            | derived   | —                                                  | masked-tile `Cond` / `real_extent` / `kmask`      |
+
+This table catalogs the scheduling *operations* and their legality; it is orthogonal to *where each runs*. Of the
+perf-only row, only `swizzle` is a genuine enumeration fork; `pad` and `unroll` are fixed-logic (a formula / a threshold)
+and run as deterministic post-`assemble` passes, not search moves — the fork-vs-fixed-logic split and pass placement live
+in "The pass structure."
 
 The two headline consequences from the original design hold and are now literal: **prologue/epilogue are not special**
 (a fused-prologue reduce is a block whose reads are {M,K}; its default `scope` ends at `M_scope`, outside the N register

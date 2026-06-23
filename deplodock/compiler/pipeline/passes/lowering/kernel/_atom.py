@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import is_matmul_reduce, segmentable_k_extent
+from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context

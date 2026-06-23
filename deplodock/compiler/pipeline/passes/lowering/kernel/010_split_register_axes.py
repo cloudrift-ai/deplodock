@@ -37,7 +37,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Stmt
 from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
+from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 

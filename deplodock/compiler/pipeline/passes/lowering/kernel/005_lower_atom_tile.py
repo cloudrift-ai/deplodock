@@ -351,7 +351,7 @@ def _scan_epilogue(
     blocker here means the gate and this fold disagree — fail loud rather than
     emit a kernel referencing the undefined scalar accumulator."""
     from deplodock.compiler.ir.stmt import Write  # noqa: PLC0415
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import classify_fragment_epilogue  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.kernel._atom import classify_fragment_epilogue  # noqa: PLC0415
 
     produced = {w.output for w in body.iter_of_type(Write)}
 

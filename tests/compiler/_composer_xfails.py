@@ -28,14 +28,7 @@ _REASON = "composer-completion gap (legacy planner deleted); see plans/composer-
 _XFAIL_FUNCS: frozenset[str] = frozenset(
     {
         # Phase 2 — masked-K mma.sync tile (symbolic reduce)
-        "test_matmul_mma_masked.py::test_symbolic_k_masked_mma_accuracy",
-        "test_matmul_mma_masked.py::test_batched_symbolic_mk_masked_mma_accuracy",
-        "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp",
         # Phase 3 — TMA descriptor for masked / symbolic tiles
-        "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_accuracy",
-        "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure",
-        "test_matmul_mma_masked.py::test_demoted_masked_k_pv_reaches_tma",
-        "test_matmul_mma_masked.py::test_demoted_masked_k_pv_tma_accuracy",
         # Phase 4 — fused-prologue regime (moved to 6a, still red)
         "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue",
         "test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment",
@@ -78,9 +71,6 @@ _DEMO_REASON = (
 # composer tower no longer hoists / TMA-stages / warp-specializes.
 _XFAIL_FUNCS_DEMO: frozenset[str] = frozenset(
     {
-        "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure",
-        "test_matmul_mma_masked.py::test_demoted_symbolic_n_b_operand_reaches_tma_and_warpspec",
-        "test_matmul_mma_masked.py::test_demoted_masked_k_pv_stays_sync_below_sm90",
         "test_masked_tile.py::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs",
         # Cooperative-reduce regime deleted (coop builder gone).
         "test_reduction_rules.py::test_long_axis_sum_fires_cooperative_reduce",
@@ -128,7 +118,6 @@ _XFAIL_NODES_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype0-200]",
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-130]",
         "test_matmul_mma_transposed_b.py::test_transposed_b_mma_symbolic_mn[out_dtype1-200]",
-        "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy[31]",
         "test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]",
     }
 )
@@ -144,9 +133,7 @@ _XFAIL_FILES_DEMO: frozenset[str] = frozenset(
         "test_matmul_mma_causal_epilogue.py",  # warp-tier causal epilogue
         "test_matmul_mma_transposed_b.py",  # warp-tier transposed-B
         "test_matmul_mma_parity.py",  # warp-tier static/dynamic parity
-        "test_matmul_mma_masked.py",  # warp-tier masked tile
         "test_monoid_reduce_kernel.py",  # cooperative reduce (coop builder deleted)
-        "test_strided_coop_rows.py",  # strided cooperative reduce
         "test_stage_inputs_mma_probe.py",  # 020 staging probe (pass deleted)
         "test_run.py",  # CLI compile/run of RMSNorm/softmax/SDPA/IR-stages (coop/flash/staging)
         "test_flash_attention.py",  # fused flash (deleted)

@@ -27,7 +27,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile._atom import ATOM_REGISTRY
+from deplodock.compiler.pipeline.passes.lowering.kernel._atom import ATOM_REGISTRY
 from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import _enumerate_warp_matmul_impl
 
 from .conftest import requires_sm90

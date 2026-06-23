@@ -95,7 +95,7 @@ from deplodock.compiler.ir.stmt import Body, Load, Stmt, Write
 from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, is_warp
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import (
+from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import (
     loads_reading,
     parallel_tile_of,
     replace_parallel_tile_body,
