@@ -2,16 +2,17 @@
 
 ``plans/tile-ir-block-dag.md`` makes staging / pipelining / warp-spec / register
 tiling / split-K / placement all the same kind of operation: a :class:`Schedule`
-annotation over an invariant algorithm. ``assemble`` applies the Schedule to the
-algorithm and emits today's ``TileOp`` tower (the migration oracle is
-byte-identical CUDA — the downstream kernel/cuda passes stay untouched during
-coexistence).
+annotation over an invariant algorithm. By the time a ``TileGraph`` reaches here the
+enumeration body moves have already σ-split it (F3-b: ``reduce_decomp`` re-bracketed
+K, ``free_tile`` split the free axes); ``assemble`` **does no build** — it applies the
+``Schedule`` to the stored algorithm and emits the ``TileOp`` tower (the migration
+oracle is byte-identical CUDA — the downstream kernel/cuda passes stay untouched).
 
-This module ports the regimes incrementally. **Covered so far: pointwise** — one
-block, free axes already σ-split by the ``tile_axis`` body move, bound
-GRID/THREAD/REGISTER. ``assemble`` reconstructs the layer order the legacy
-``materialize._assemble`` produced (``REGISTER`` cells innermost, then THREAD,
-then GRID, extra-outer GRID axes last) and wraps via the shared
+**Covered today: pointwise + scalar ``SEMIRING`` matmul (incl. masked / symbolic free
+axes, split-K, ``FK`` strip-mine), with smem staging (R1).** ``assemble`` synthesizes
+``Schedule.staged`` into slabs (``_slab``) then reconstructs the binding tower in the
+layer order the legacy ``materialize._assemble`` produced (``REGISTER`` cells
+innermost, then THREAD, then GRID, extra-outer GRID axes last) via the shared
 :func:`_wrap_tower`, so the output is the same ``TileOp``.
 """
 

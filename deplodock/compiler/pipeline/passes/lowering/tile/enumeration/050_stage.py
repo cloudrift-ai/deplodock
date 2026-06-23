@@ -3,15 +3,18 @@
 ``plans/tile-ir-block-dag.md`` R1: ``stage(read)`` writes
 ``Schedule.staged[edge] = SYNC`` for a reused gmem read; it inserts **no block**
 and edits **no body** — the smem slab + cooperative producer are synthesized later
-by ``assembly/_slab`` from the annotation. This pass runs *after* ``040_lower``
-(so the ``TileGraph`` — algorithm + binding — exists and its derived ``Block.reads``
-are readable) and forks on the stage *mask*: each child pins a different subset of
-the ranked stageable read-sites into ``Schedule.staged``.
+by ``assembly/_slab`` from the annotation.
 
-The chosen ``Edge`` set in ``Schedule.staged`` is the source of truth ``assemble``
-reads; the ``STAGE`` knob string is the variant identity the perf DB / learned
-prior key on. Ordering is decision order, not matcher coincidence: ``stage`` reads
-the *built* graph's derived projections, so it can only run once a graph is built.
+Post-F3-b this is a **pre-assemble** schedule fork over the **stored, fully-tiled
+algorithm** (the inversion R1 carried before F3-b — ``stage`` running *after* a
+separate monolithic build pass — is gone). The body moves (``010_reduce_tile`` /
+``030_register_tile``) already refined ``op.tilegraph`` in place, so ``stage`` reads
+its derived ``Block.reads`` + the ranked stageable read-sites directly and forks on
+the stage *mask*, writing the chosen ``Edge``s straight into ``Schedule.staged`` —
+the source of truth ``assemble`` reads. The mask string is the variant identity the
+perf DB / learned prior key on; ordering is decision order (``stage`` reads derived
+projections of the fully-tiled algorithm, so it runs once every free-axis tile is
+pinned: ``MAP_N_REG``).
 
 R1 scope: scalar (no-MMA) reduce regimes. ``stage_candidates`` returns nothing for
 pointwise (no K-tower) / no-reuse kernels, so this pass is a no-op there
@@ -26,7 +29,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import STAGE
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, STAGE
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -34,8 +37,8 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.tilegraph is None or STAGE.name in op.knobs:
-        raise RuleSkipped("stage runs once on the built TileGraph (idempotence via the STAGE knob)")
+    if MAP_N_REG.name not in op.knobs or STAGE.name in op.knobs:
+        raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via the STAGE knob)")
     ranked = stage_candidates(op.tilegraph)
     n = len(ranked)
     if n == 0:

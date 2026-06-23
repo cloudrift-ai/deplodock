@@ -722,14 +722,51 @@ carrying `tilegraph` + `knobs` + `leading`; and the enumeration tree is now **sp
 pinning one more knob group; `040_lower` builds the `TileGraph` and the separate `assembly/010_assemble` materializes it
 `→ TileOp`. Pointwise + scalar matmul lower end-to-end through the chain.
 
-**F3-a shipped; F3-b is the one deferred follow-up.** `040_lower` runs the unified `_build.build_dag` **once** at the end
-of enumeration — the algorithm is still built all-at-once (`build_dag` σ-splits `Block.domain` by the full thread/reg/K
-knob set; `Schedule` holds `binding`). The only remaining RF debt is **F3-b** — a knob-*invariant* algorithm where
-`000_build` seeds logical axes, each tile pass applies an incremental `tile_axis` body move, and `assemble` does the
-register/thread replication from `Schedule`. F3-b reworks both `build_dag` **and** `assemble`, so it is deferred until a
-tier needs the invariant algorithm. The laziness guarantee (`pipeline/fork.py`) is unchanged: the per-family split
-materializes one thin knob-carrying `TileGraphOp` per resolved pass (vs one at the leaf before), never the full
-cartesian — the unexpanded frontier still materializes nothing.
+**F3-a and F3-b have both shipped — F3-b as its literal incremental mechanism.** F3-a split enumeration into per-family
+passes; **F3-b** then reworked `build_dag` from a monolith into **per-pass incremental body moves over a stored
+algorithm**, exactly as the model calls for ("`000_build` seeds logical axes, each tile pass applies an incremental
+`tile_axis` body move, and `assemble` does the register/thread replication"):
+
+- `000_build` seeds the **logical** (un-tiled) `TileGraph` (`_build.seed_graph` — one `Block` whose `compute` is the
+  DAG's inner body, empty `domain` / `Schedule`); `op.tilegraph` is **stored and refined in place** for the rest of the
+  search (not a `None` seed, not re-derived from a knob dict — "knob-invariant" means the algorithm is a first-class
+  structure mutated by moves).
+- `010_reduce_tile` applies the **`reduce_decomp` body move** (re-bracket K into the `K_o` / `K_i` tower in
+  `Block.compute`); `020_thread_tile` pins the thread knob with **no** body move; `030_register_tile` applies the
+  **`free_tile` body move** (the free-axis σ-split `A → A_b·(T·R) + A_t·R + A_r`, laid into `Block.domain` +
+  `Schedule.binding`, masked guards applied). The free-axis split is one body move (not two) because a byte-identical
+  layout needs both the thread *and* register knob — so it lands at the last free fork, with `020_thread_tile` only
+  fixing the extent the search ranks on.
+- `050_stage` is a **pre-assemble** `Schedule`-move fork that reads the now-fully-tiled stored `tilegraph` and writes
+  `Schedule.staged` directly; `assembly/010_assemble` does **no build** — it only materializes the stored algorithm
+  (`assemble_block`: the register/thread tower replication + slab synthesis). This is the F3-b inversion fix: `stage` is
+  a peer schedule move after the body moves, not a pass behind a separate monolithic build.
+
+`build_dag` survives only as the **composition** `seed_graph → reduce_decomp → free_tile` — the byte-identity oracle for
+the distribution (and the entry point unit / equivalence callers keep). Its composition order (reduce **then** free)
+reverses the old monolith (free then reduce), but the two σ-rewrites touch disjoint axis sets (the contraction K vs the
+free N/M) so they **commute** — verified byte-identical end to end (scalar matmul staged / unstaged, masked non-divisor,
+and pointwise; the whole `tests/compiler/` floor unmoved). The reduce regime's scalar-tier OFF sentinels
+(`MMA=0 WM=0 WN=0 BR=1`) are stamped by a small deterministic knob-only `040_seal_scalar_tier` pass at the same
+post-register level the old `040_lower` stamped them, so the per-level greedy ranking sees the identical partial knob set
+at every fork and the deployed pick stays byte-identical. The laziness guarantee (`pipeline/fork.py`) is unchanged: the
+per-family split materializes one thin `TileGraphOp` per resolved pass, never the full cartesian.
+
+**What this unblocks.** R4's `atomize` is the third body move and now has a natural home: a `060_tensorize` fork applies
+an `atomize` body move to the stored algorithm (fuse the cell to `Mma`) the same way `010`/`030` apply theirs, and
+`assemble` reads the derived `Block.atom`. The stored-algorithm + incremental-move machinery the warp/MMA and split-K
+(`partition_reduce`) tiers want is now in place, not just the single-build property.
+
+**RF invariant guards landed** (`tests/compiler/passes/test_tile_ir_invariants.py`): (1) **derived-view discipline** —
+`Block.__dataclass_fields__ == {name, domain, compute}` (every projection computed, none stored); (2) **assemble
+determinism** — the same `TileGraph` lowers to the byte-identical `TileOp` (stable `op_cache_key`); (3) **op_cache_key
+canonicality** — two independent builds of the same shape + knobs key the same (the round-trip a perf row depends on),
+a changed knob keys differently; (4) **`build_dag` is the live oracle, not a dead duplicate** — the `TILE_PASSES`
+pipeline (moves applied pass by pass) and the `build_dag` composition (`seed_graph → reduce_decomp → free_tile` in one
+call) assemble to the same `op_cache_key`, so the two paths can't drift; (5) **assembly ⟂ enumeration** — the
+materialization side imports nothing from the search side's offer / knob / move vocabulary (the gate in
+`assembly/010_assemble` reads a populated `Block.domain`, not a knob). The perf DB / prior key on the byte-identical
+**`TileOp`** (not the intermediate `TileGraphOp`), so the one thing a refactor can't migrate is held by guards (2)–(4).
 
 **Known consequence — greedy compile is now level-greedy.** `greedy_decide` flattens each fork to complete leaves and
 ranks via the prior; with one fork per search level it now ranks *partial* knob sets, and the cold `AnalyticPrior`
@@ -745,12 +782,17 @@ and the deterministic post-passes (**G4**) remain later steps. Every tier below 
 enumeration pass** (its move family) + grows `assemble`'s `Schedule`-driven synthesis — never
 a tree-builder.
 
-- **R1 — Staging** (deps: RF). **Landed (scalar tier).** Added the first `Schedule`-move enumeration fork
-  `enumeration/050_stage.py` (it runs *after* `040_lower` on the built `TileGraphOp`, reads the derived `Block.reads` +
-  `Schedule.binding`, and forks on a `STAGE` bitmask — writing the chosen `Edge`s straight into `Schedule.staged`, the
-  source of truth `assemble` reads) + the candidate/legality helper `enumeration/_stage.py` (a read is stageable iff
-  AFFINE + fan-in reuse across a parallel axis + a K-tower to stage through) + the `STAGE` BINMASK knob. `assemble`
-  synthesizes the smem slab + cooperative producer from `Schedule.staged` in the new `assembly/_slab.py`
+- **R1 — Staging** (deps: RF). **Landed (scalar tier); the inversion is fixed (F3-b shipped).** Added the first
+  `Schedule`-move enumeration fork `enumeration/050_stage.py`. It originally ran *after* `040_lower` on a built `TileGraphOp` —
+  an **inversion** R1 carried only because F3-b had not landed yet (a `Schedule`-move fork forced to run *behind* a
+  monolithic build pass). With F3-b shipped that is gone: the body moves (`010_reduce_tile` / `030_register_tile`)
+  refine the stored `op.tilegraph` in place, so `050_stage` is now a **pre-assemble** schedule fork that reads the
+  fully-tiled algorithm's derived `Block.reads` + ranked stageable read-sites directly and writes the chosen `Edge`s
+  straight into `Schedule.staged` — the source of truth `assemble` reads (`assembly/010_assemble` does no build, only
+  materializes). Plus the candidate/legality helper `enumeration/_stage.py`
+  (a read is stageable iff AFFINE + fan-in reuse across a parallel axis + a K-tower to stage through) + the `STAGE`
+  BINMASK knob. `assemble` synthesizes the smem slab + cooperative producer from `Schedule.staged` in the new
+  `assembly/_slab.py`
   (`synthesize_staging`): one SYNC `StageBundle` per K-tower, a `Source` per staged buffer whose affine `source_index`
   reconstructs the operand's original σ-rewritten gmem index (cache axes = THREAD/REGISTER tile + the within-stage K
   axes; GRID + serial-outer `K_o` fold into the slab origin; `block=()`, the composite stride rides the cache-axis
@@ -816,7 +858,11 @@ live process.
   partition_reduce on the streaming axis (matches today's degenerate `FM=FN=1`), revisit with online-softmax-flash.
 - **Canonical body form for caching.** `op_cache_key` is now `canonical(compute bodies + edge topology) + Schedule`.
   The bodies still need a canonical SSA/axis renaming (today's `normalize_body`) and the Schedule a canonical
-  serialization — smaller than before (no derived projections), but still required before the DAG can key perf rows.
+  serialization — smaller than before (no derived projections), but still required before the DAG can key perf rows. The
+  **canonicality + round-trip** of the key the perf DB actually uses (the assembled `TileOp`) is now guarded
+  (`test_tile_ir_invariants.py`): independent rebuilds of one shape key the same, and the pipeline build matches the
+  `build_dag` oracle. The remaining open piece is the `TileGraphOp.structural_key` Schedule serialization, exercised once
+  the `retime` / `transport` / `role` fields are populated.
 - **AccessMap quasi-affine escape hatch — decided.** Affine core (`dims`/`block`/`offset`) + a `TEMPLATE` verbatim
   fallback for collapsed-reshape views; matches today's `AffineAddressing`/`TemplateAddressing` split.
 - **Masking as derived guard — decided.** Masked-ness is `domain.real_extent` vs tile, a derived `Cond` + clamped
@@ -825,10 +871,12 @@ live process.
 ## Next step
 
 The structural surface has converged: the algorithm is `name + domain + compute`, every projection is derived, every
-choice is a `Schedule` annotation, and `assemble` is the one place the tower is built. **R1 (staging, scalar tier) has
-landed** — the first `Schedule`-move enumeration fork (`enumeration/050_stage`) writes `Schedule.staged`, and
-`assemble` synthesizes the smem slab + cooperative `StageBundle` from it (`assembly/_slab`), proven accuracy-vs-torch
-on scalar matmul (static + masked). The pass structure is now validated end to end on a regime that touches smem (an
+choice is a `Schedule` annotation, and — with **F3-b** landed — the algorithm is a stored structure refined in place by
+incremental body moves (`reduce_decomp` at `010`, `free_tile` at `030`), with `assemble` the one place the tower is
+materialized. **R1 (staging, scalar tier) has landed** and its inversion is fixed — the first `Schedule`-move
+enumeration fork (`enumeration/050_stage`) is now a pre-assemble fork that reads the fully-tiled stored algorithm and
+writes `Schedule.staged`, and `assemble` synthesizes the smem slab + cooperative `StageBundle` (`assembly/_slab`),
+proven accuracy-vs-torch on scalar matmul (static + masked). The pass structure is now validated end to end on a regime that touches smem (an
 enumeration fork widens; the materialization stage lowers). Two independent tiers are unblocked: **R2** (cooperative
 reduce — the biggest chunk, the coop `classify`→build path + `enumeration/050`-style `(bk,fk,br)` offer + warp-shuffle
 combine synthesis) and **R4** (warp-tier `atomize` — which also brings warp/atom + symbolic-K staging, the deferred

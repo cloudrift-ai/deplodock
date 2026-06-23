@@ -11,6 +11,8 @@ no per-shape code: the moves are algebra-licensed, applied uniformly.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -110,30 +112,66 @@ def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple
     return body
 
 
-def build_dag(
-    dag: IterDag,
-    knobs: dict,
-    *,
-    kernel_name: str,
-    target_names: frozenset[str] = frozenset(),
-    buffers: dict | None = None,
-) -> TileGraph:
-    """Build a single-block ``TileGraph`` from the iteration DAG + a move choice.
+def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis | None:
+    """The split-K GRID axis ``K_s`` (the cross-CTA partition factor), or ``None``
+    when there is no contraction (``MAP``) or ``SPLITK == 1``. Computed identically
+    by the reduce-decomp body move (it σ-maps ``K`` through ``K_s``) and the
+    free-tile move (it binds ``K_s`` GRID) — a pure function of the knobs, so the
+    two agree without sharing state."""
+    if not target_names:
+        return None
+    splitk = knobs[RED_SPLITK.name]
+    if splitk <= 1:
+        return None
+    kax = dag.k_node.loop.axis
+    return Axis(f"{kax.name}_s", splitk, source_axis=kax.source_axis or kax)
 
-    Two algebra-licensed moves compose here, both σ-rewriting the body:
 
-    - **``tile_axis`` on each free (``PARALLEL`` / ``MAP``) axis** — split it into
-      GRID / THREAD / REGISTER (``A → A_b·(T·R) + A_t·R + A_r``); the tiers become
-      ``Schedule.binding`` entries. Always legal (no carrier).
-    - **the reduce decomposition on each contraction axis named in
-      ``target_names``** (a ``SEMIRING`` / ``MONOID`` reduce; empty for a ``MAP``
-      nest) — re-bracket it into the ``K_o`` (serial-outer) / ``K_i`` (stage-inner)
-      tower with an optional ``K_f`` strip-mine, embedded in ``compute``; a
-      partition factor (split-K ``K_s``) becomes one more GRID binding.
+# === The per-pass body moves (``plans/tile-ir-block-dag.md`` F3-b). ===
+# ``build_dag`` is no longer a monolith called at one site: it is the COMPOSITION of
+# the incremental moves the enumeration passes apply one at a time to the stored,
+# knob-invariant algorithm. ``000_build`` seeds the logical block; ``010_reduce_tile``
+# applies ``reduce_decomp`` (the K re-bracket); ``030_register_tile`` applies
+# ``free_tile`` (the free-axis σ-split — needs both the thread + register knobs, so it
+# is the one free-axis body move, at the last free fork). The composition order
+# (reduce **then** free) is the reverse of the old monolith (free then reduce), but
+# the two σ-rewrites touch disjoint axis sets (K vs the free N/M), so they commute and
+# the built block is byte-identical — the migration oracle.
 
-    The split axes lay into ``Block.domain`` per free axis (``N_b, N_t, N_r, M_b,
-    …``) so each binding tier reads back inner→outer, with the partition + extra-
-    outer GRID axes trailing — the order ``assemble`` emits."""
+
+def seed_graph(dag: IterDag, *, kernel_name: str, buffers: dict | None = None) -> TileGraph:
+    """The logical (un-tiled) algorithm: one ``Block`` whose ``compute`` is the DAG's
+    inner body verbatim and whose ``domain`` / ``Schedule`` are empty. The moves below
+    refine it in place; nothing is built all-at-once."""
+    block = Block(name=kernel_name, domain=(), compute=Body(tuple(dag.inner_body)))
+    return TileGraph(name=kernel_name, buffers=dict(buffers or {}), blocks=(block,), schedule=Schedule(binding={}))
+
+
+def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
+    """The reduce-decomposition body move (``010_reduce_tile``): re-bracket each
+    contraction axis named in ``target_names`` into the ``K_o`` (serial-outer) /
+    ``K_i`` (stage-inner) tower with an optional ``K_f`` strip-mine, σ-mapped through
+    the split-K factor ``K_s`` — embedded directly in ``compute``. No-op for a ``MAP``
+    nest. Touches only the body (the ``K_s`` GRID binding is added by ``free_tile``)."""
+    if not target_names:
+        return graph
+    k_s = _k_s_axis(dag, knobs, target_names)
+    block = graph.blocks[0]
+    compute = _replace_k_scalar(
+        tuple(block.compute), target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name], k_s
+    )
+    return replace(graph, blocks=(replace(block, compute=Body(compute)),))
+
+
+def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
+    """The free-axis ``tile_axis`` body move (``030_register_tile`` — the last free
+    fork, where both the thread + register knobs are pinned): split each free
+    (``PARALLEL`` / ``MAP``) axis ``A → A_b·(T·R) + A_t·R + A_r``, σ-rewriting the
+    body, laying ``A_b, A_t, A_r`` into ``Block.domain`` (bound GRID / THREAD /
+    REGISTER) with the split-K ``K_s`` + extra-outer axes trailing GRID, and wrapping
+    each masked free axis in its boundary ``Cond``. This is the only free-axis split;
+    ``020_thread_tile`` just pins the thread knob (the layout needs the register knob
+    too, so a byte-identical split can't be staged across the two forks)."""
     inner_n, outer_m, extra_outer = _free_axes(dag)
     free_specs = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
     if outer_m is not None:
@@ -153,22 +191,35 @@ def build_dag(
         binding[a_t.name] = Binding.THREAD
         binding[a_r.name] = Binding.REGISTER
 
-    k_s = None
-    if target_names:  # a contraction axis is present (SEMIRING / MONOID)
-        kax = dag.k_node.loop.axis
-        splitk = knobs[RED_SPLITK.name]
-        k_s = Axis(f"{kax.name}_s", splitk, source_axis=kax.source_axis or kax) if splitk > 1 else None
-        if k_s is not None:
-            domain.append(k_s)
-            binding[k_s.name] = Binding.GRID
+    k_s = _k_s_axis(dag, knobs, target_names)
+    if k_s is not None:
+        domain.append(k_s)
+        binding[k_s.name] = Binding.GRID
     for lp in reversed(extra_outer):
         domain.append(lp.axis)
         binding[lp.axis.name] = Binding.GRID
 
     sigma_outer = Sigma(sigma_map)
-    compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in dag.inner_body)
-    if target_names:
-        compute = _replace_k_scalar(compute, target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], splitk, k_s)
+    block = graph.blocks[0]
+    compute = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
     compute = _apply_masked_guards(compute, bounds, sigma_outer)
-    block = Block(name=kernel_name, domain=tuple(domain), compute=Body(compute))
-    return TileGraph(name=kernel_name, buffers=dict(buffers or {}), blocks=(block,), schedule=Schedule(binding=binding))
+    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
+    return replace(graph, blocks=(new_block,), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding}))
+
+
+def build_dag(
+    dag: IterDag,
+    knobs: dict,
+    *,
+    kernel_name: str,
+    target_names: frozenset[str] = frozenset(),
+    buffers: dict | None = None,
+) -> TileGraph:
+    """The full single-block ``TileGraph`` for a knob choice — now the COMPOSITION of
+    the per-pass moves (``seed_graph`` → ``reduce_decomp`` → ``free_tile``), kept as
+    one entry point for unit / equivalence callers. The enumeration passes apply the
+    same three moves incrementally (F3-b); this wrapper makes the composition explicit
+    and is the byte-identity oracle for that distribution."""
+    graph = seed_graph(dag, kernel_name=kernel_name, buffers=buffers)
+    graph = reduce_decomp(graph, dag, knobs, target_names=target_names)
+    return free_tile(graph, dag, knobs, target_names=target_names)

@@ -495,30 +495,35 @@ class TileGraph:
 @dataclass
 class TileGraphOp(Op):
     """The node the ENUMERATION passes pass between themselves and hand to
-    ASSEMBLY. It has two lives (the F3-a knob-accumulating model,
-    ``plans/tile-ir-block-dag.md``):
+    ASSEMBLY. It carries the **stored algorithm being refined in place** by the F3-b
+    incremental body moves (``plans/tile-ir-block-dag.md``): ``000_build`` seeds the
+    **logical** (un-tiled) ``TileGraph`` (``_build.seed_graph``), then the tile passes
+    rewrite it move by move — the algorithm is a first-class structure refined as the
+    search descends, never a function re-derived from a stored knob dict (that is the
+    "knob-invariant algorithm" the model calls for).
 
-    - **seed / in-flight** (``tilegraph is None``) — what ``000_build`` emits and
-      the per-family tile passes (``010_reduce_tile`` / ``020_thread_tile`` /
-      ``030_register_tile``) fork on: it carries the derived ``dag`` + regime
-      (``algebra`` / ``target_names``) the offer fns read, and the ``seed_key``
-      (the source ``LoopOp``'s structural key — its identity before any
-      ``TileGraph`` exists). Each fork pins one more knob group onto ``knobs``;
-      the carry-forward ``LoopOp`` knobs ride ``knobs`` automatically (the engine
-      merges a predecessor's knobs forward on every rebind).
-    - **built** (``tilegraph`` set) — what ``040_lower`` produces once every knob
-      group is pinned: the chosen ``Schedule``'s :class:`TileGraph` + the per-CTA
-      ``leading`` prologue ``assemble`` prepends. ``assembly/010_assemble`` turns
-      it into the ``TileOp`` tower.
+    - **logical seed → tiled** (``tilegraph`` set throughout) — ``000_build`` emits the
+      logical block; ``010_reduce_tile`` applies the reduce-decomposition body move
+      (``reduce_decomp``); ``020_thread_tile`` pins the thread knob (no body move);
+      ``030_register_tile`` applies the free-axis σ-split body move (``free_tile``),
+      after which the algorithm is fully tiled; ``040_seal_scalar_tier`` stamps the
+      reduce regime's scalar-tier OFF sentinels; ``050_stage`` annotates
+      ``Schedule.staged``. It also carries the derived ``dag`` + regime (``algebra`` /
+      ``target_names``) the offer fns read. Each fork pins one more knob group onto
+      ``knobs``; the carry-forward ``LoopOp`` knobs ride ``knobs`` automatically (the
+      engine merges a predecessor's knobs forward on every rebind).
+    - **assembly** consumes the fully-tiled ``tilegraph`` directly
+      (``assembly/010_assemble`` → ``assemble_block``): no build there, only the tower
+      materialization + slab synthesis from the ``Schedule``.
 
-    ``op_cache_key`` keys on :meth:`structural_key` (``seed_key`` while in-flight,
-    the ``TileGraph`` identity once built) + ``knobs`` — distinct per variant, so
-    the search tree never self-parents."""
+    ``op_cache_key`` keys on :meth:`structural_key` (the stored ``TileGraph``'s
+    canonical algorithm + ``Schedule``) + ``knobs`` — distinct per variant, so the
+    search tree never self-parents."""
 
     name: str = ""
     tilegraph: TileGraph | None = None
     leading: tuple = ()
-    # --- enumeration state, carried while ``tilegraph is None`` (untyped to keep
+    # --- enumeration state carried alongside the stored algorithm (untyped to keep
     # the ir layer free of a passes-layer import — set/read by the tile passes) ---
     dag: object = None  # the IterDag the offer fns tile
     algebra: object = None  # AlgebraKind — the regime the passes dispatch on

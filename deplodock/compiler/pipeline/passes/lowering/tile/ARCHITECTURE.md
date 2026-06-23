@@ -3,18 +3,21 @@
 The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **two passes** over the block-DAG Tile IR
 (`ir/tile/ir.py`), following `plans/tile-ir-block-dag.md`:
 
-- **`enumeration/`** — `LoopOp` → a generative `Fork` tree whose leaves are built `TileGraphOp`s (a chosen `Schedule`'s
-  `TileGraph`). This is the **search**: every variant is a point in the move/schedule space. It is split into
-  **per-family rule passes** (`plans/tile-ir-block-dag.md` RF) — `000_build` seeds the `TileGraphOp`, then one fork per
-  search level pins one more knob group: `010_reduce_tile` → `020_thread_tile` → `030_register_tile` → `040_lower`
-  (builds the `TileGraph` from the pinned knobs) → `050_stage` (the first `Schedule`-move fork — writes
-  `Schedule.staged`).
-- **`assembly/`** (`010_assemble`) — `TileGraphOp` → `TileOp` (the materialized tower the `lowering/kernel` passes
-  lower to `KernelOp`). This is **one deterministic step** — every scheduling decision already lives on the
-  `Schedule`, so there is no search here.
+- **`enumeration/`** — `LoopOp` → a generative `Fork` tree over a **stored algorithm refined in place by incremental
+  body moves** (F3-b): `000_build` seeds a *logical* (un-tiled) `TileGraph`, then each fork rewrites it move by move.
+  This is the **search**: every variant is a point in the move/schedule space. It is split into **per-family rule
+  passes** (`plans/tile-ir-block-dag.md` RF/F3-b) — `010_reduce_tile` applies the **reduce-decomposition body move**
+  (re-bracket K), `020_thread_tile` pins the thread knob (no body move), `030_register_tile` applies the **free-axis
+  σ-split body move** (after which the algorithm is fully tiled), `040_seal_scalar_tier` (deterministic: stamps the
+  reduce regime's scalar-tier OFF sentinels), `050_stage` (the first `Schedule`-move fork — annotates
+  `Schedule.staged`). The algorithm is built up across the passes, never all-at-once.
+- **`assembly/`** (`010_assemble`) — the fully-tiled `TileGraphOp` → `TileOp`, in one deterministic step. No build here:
+  `assemble_block` only **materializes** the stored algorithm — the register/thread tower (`_wrap_tower`) + slab
+  synthesis from `Schedule.staged`. Every scheduling decision already lives on the `TileGraph` / `Schedule`, so there is
+  no search here.
 
 ```
-LoopOp ─000_build─▶ seed ─reduce/thread/register forks─▶ 040_lower (build TileGraph) ─050_stage─▶ TileGraphOp ─010_assemble─▶ TileOp
+LoopOp ─000_build─▶ logical TileGraph ─reduce_decomp ─(thread)─ free_tile body moves─▶ 040_seal ─050_stage (Schedule.staged)─▶ tiled TileGraphOp ─010_assemble (materialize)─▶ TileOp
 ```
 
 ## The block-DAG Tile IR (`ir/tile/ir.py`)
@@ -60,28 +63,29 @@ shape-specific pattern matching.*
 
 | Module | Role |
 | ------ | ---- |
-| `000_build.py`        | Seed pass: `LoopOp` → `iter_dag` + `classify` → an unbuilt `TileGraphOp` (carries the dag, regime, logical `buffers`). |
-| `010_reduce_tile.py`  | Fork (`SEMIRING`): the reduce decomposition — `reduce_offers` → `(bk, fk, splitk)`. |
-| `020_thread_tile.py`  | Fork: the free-axis thread tile — `thread_offers` → `(thread_n, thread_m)`. |
-| `030_register_tile.py`| Fork: the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`. |
-| `040_lower.py`        | Deterministic: `build_dag(op.knobs)` → a built `TileGraphOp` (the `TileGraph` + binding `Schedule`). |
-| `050_stage.py`        | Fork (`Schedule`-move): `stage_candidates` → a `STAGE` bitmask → `Schedule.staged[edge] = SYNC`. |
+| `000_build.py`        | Seed pass: `LoopOp` → `iter_dag` + `classify` → a `TileGraphOp` carrying the **logical** `TileGraph` (`seed_graph`) + dag + regime. |
+| `010_reduce_tile.py`  | Fork (`SEMIRING`): the reduce decomposition — `reduce_offers` → `(bk, fk, splitk)`; **applies the `reduce_decomp` body move**. |
+| `020_thread_tile.py`  | Fork: the free-axis thread tile — `thread_offers` → `(thread_n, thread_m)`. Pins the thread knob, **no body move**. |
+| `030_register_tile.py`| Fork: the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`; **applies the `free_tile` body move** (the algorithm is fully tiled after). |
+| `040_seal_scalar_tier.py`| Deterministic: stamp the reduce regime's scalar-tier OFF sentinels (`MMA=0 WM=0 WN=0 BR=1`). Knob-only. |
+| `050_stage.py`        | Fork (`Schedule`-move): `stage_candidates` off the stored tiled `TileGraph` → a `STAGE` bitmask → `Schedule.staged[edge] = SYNC`. |
 | `_iterdag.py`         | `iter_dag` — the derived iteration-DAG view (axes tagged `PARALLEL` / `REDUCE` + carrier). |
 | `_classify.py`        | `classify` → `_Regime(algebra=AlgebraKind)`. |
 | `_moves.py`           | `Budget` + `legal_decomps` + the offers (`thread_offers`, `map_reg_offers`, `reduce_offers`, `reduce_reg_offers`) + knob deltas. |
 | `_stage.py`           | `stage_candidates` — the `stage` move's ranked offer set (AFFINE + fan-in reuse + K-tower) off the derived `Block.reads`. |
 | `_knobs.py`           | The knob schema (`BN`/`BM`/`BK`/`FK`/`STAGE`/… + the composer aliases `MAP_*` / `RED_*` / `TC_*`). |
-| `_build.py`           | `build_dag` (free-axis tile + optional reduce re-bracket + logical buffers → `TileGraph`). |
+| `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split); `build_dag` is their composition (the byte-identity oracle, for unit / equivalence callers). |
 
-One `build_dag` serves every regime: a `MAP` nest tiles only its free axes; a `SEMIRING` reduce additionally
-re-brackets its contraction axis — the reduce re-bracket only fires when `target_names` (the contraction axes) is
-non-empty.
+The per-pass moves serve every regime: a `MAP` nest applies only `free_tile` (`reduce_decomp` is a no-op without a
+contraction); a `SEMIRING` reduce applies both — `reduce_decomp` (gated on `target_names`) then `free_tile`. The
+composition order (reduce then free) reverses the old monolith (free then reduce), but the two σ-rewrites touch disjoint
+axis sets (K vs the free N/M) so they commute — `build_dag` stays the byte-identity oracle for the distribution.
 
 ## `assembly/` — `assemble`
 
 | Module | Role |
 | ------ | ---- |
-| `010_assemble.py` | The pass: `TileGraphOp` → `TileOp` via `assemble_block`. |
+| `010_assemble.py` | The pass: fully-tiled `TileGraphOp` → `TileOp`. **No build** — `assemble_block` materializes the stored algorithm (tower + slab synthesis). |
 | `_assemble.py`    | `assemble_block` — synthesize staging (`_slab`), then reconstruct the binding tower from `Schedule.binding` (ATOM/REGISTER/WARP/THREAD/GRID tiers) over the block's σ-rewritten `compute`. |
 | `_slab.py`        | `synthesize_staging` — materialize `Schedule.staged` into one SYNC `StageBundle` per K-tower (a `Source` per staged buffer, cache axes off the consumer `Load`, GRID + serial-outer K folded to the slab origin). |
 | `_tower.py`       | `_wrap_tower` — the shared innermost-first tower-building primitive (`Role` → tile flavor). |
