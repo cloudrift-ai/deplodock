@@ -118,8 +118,8 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
 
 
 # Structural fork: deploy the fused streaming nest, or fall through to the
-# score-materializing 010_sdpa path. Declared like 005_split_demoted's SPLIT_CONE;
-# auto-registered by knob.registry()'s module walk.
+# score-materializing 010_sdpa path. A structural-decision BOOL like the cut fork's
+# CUT mask; auto-registered by knob.registry()'s module walk.
 FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into the streaming online-softmax flash nest")
 
 

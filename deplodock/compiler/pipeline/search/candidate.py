@@ -259,7 +259,7 @@ class LazyCandidate:
     # down the tree to featurize a node for the prior — without this, a
     # RESOLVED ancestor's delta would vanish from every descendant's feature
     # vector, so e.g. the structural branch's continuation would be scored
-    # without its ``SPLIT_CONE`` (an off-distribution generic row) while the
+    # without its ``CUT`` (an off-distribution generic row) while the
     # unresolved keep-fused sibling keeps full knobs — an asymmetric, noisy
     # PUCT comparison.
     resolved_knobs: dict | None = None

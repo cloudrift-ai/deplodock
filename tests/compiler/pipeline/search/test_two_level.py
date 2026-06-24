@@ -339,7 +339,7 @@ class _RecordingPrior:
 def _is_decomposition_row(knobs: dict) -> bool:
     """Composed Σ rows carry the decision knob but no tile-level knobs — every
     inner per-kernel / branch row carries at least one partition-level knob."""
-    return "SPLIT_CONE" in knobs and not any(k in knobs for k in ("BM", "BN", "BR", "MMA", "WM", "FM"))
+    return "CUT" in knobs and not any(k in knobs for k in ("BM", "BN", "BR", "MMA", "WM", "FM"))
 
 
 def test_outer_branches_on_structural_fork(monkeypatch) -> None:
@@ -372,10 +372,10 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     # producer + consumer (2 op leaves) — the denominators the progress bar sees.
     assert sorted(progress.terminal_sizes) == [1, 2]
     assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
-    # Both sides' composed rows reached the prior: SPLIT_CONE=False labeled
-    # with the fused best, SPLIT_CONE=True with the split kernels' Σ.
+    # Both sides' composed rows reached the prior: CUT="0" (keep) labeled
+    # with the fused best, CUT="1" (cut) with the split kernels' Σ.
     decomp = [(k, us) for k, us in rec.rows if _is_decomposition_row(k)]
-    assert {k["SPLIT_CONE"] for k, _ in decomp} == {False, True}
+    assert {k["CUT"] for k, _ in decomp} == {"0", "1"}
     assert all(us > 0 for _, us in decomp)
     # The decision hop never enters the ``lowering`` table (one best child per
     # parent — a multi-kernel decomposition's parent must not resolve through
@@ -405,16 +405,16 @@ def test_split_kernels_attribute_to_pre_decision_op() -> None:
     terminals = _outer_terminals(_norm_linear("a"))
     split = next(t for t in terminals if len(_loops(t)) == 2)
     kernels = _loops(split)
-    assert all(k.knobs.get("SPLIT_CONE") is True for k in kernels)
+    assert all(k.knobs.get("CUT") == "1" for k in kernels)
     assert all(k.source is not None for k in kernels)
     assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
     site = kernels[0].source
-    assert "SPLIT_CONE" not in site.knobs
+    assert "CUT" not in site.knobs
     assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
 
     fused = next(t for t in terminals if len(_loops(t)) == 1)
     keep = _loops(fused)[0]
-    assert keep.knobs.get("SPLIT_CONE") is False
+    assert keep.knobs.get("CUT") == "0"
     assert keep.source is not None and op_cache_key(keep.source) == op_cache_key(site), (
         "the keep side must attribute to the SAME offer-site op as the split side"
     )
@@ -423,15 +423,15 @@ def test_split_kernels_attribute_to_pre_decision_op() -> None:
 def test_outer_descends_prior_preferred_branch_first() -> None:
     """With a prior ranking the split side cheaper, the outer PUCT explores it
     FIRST — including past the fork's resolve: the resolved branch's
-    continuation keeps its ``SPLIT_CONE`` delta (``LazyCandidate.resolved_knobs``),
+    continuation keeps its ``CUT`` delta (``LazyCandidate.resolved_knobs``),
     so it isn't out-scored by the unresolved keep-fused sibling as a knob-less
     generic row (the regression this test pins)."""
 
     class _SplitCheapPrior(_RecordingPrior):
         def score(self, knobs) -> float:
-            if knobs.get("SPLIT_CONE") is True:
+            if knobs.get("CUT") == "1":
                 return 1.0
-            return 2.0 if "SPLIT_CONE" in knobs else 3.0
+            return 2.0 if "CUT" in knobs else 3.0
 
     ctx = Context.from_target((12, 0))
     search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
@@ -454,7 +454,7 @@ def test_decomposition_rows_sum_kernel_set_costs() -> None:
     assert len(rows) == 1
     feats, label = rows[0]
     assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
-    assert feats["SPLIT_CONE"] is True
+    assert feats["CUT"] == "1"
     site = _loops(split)[0].source
     site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
     assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
@@ -465,7 +465,7 @@ def test_decomposition_rows_sum_kernel_set_costs() -> None:
     assert len(rows) == 1
     feats, label = rows[0]
     assert label == pytest.approx(42.0)
-    assert feats["SPLIT_CONE"] is False
+    assert feats["CUT"] == "0"
 
 
 def test_identical_offer_sites_take_the_same_side() -> None:

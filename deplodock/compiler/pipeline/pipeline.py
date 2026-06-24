@@ -960,7 +960,7 @@ def _replay_structural_decision(graph: Graph, root_op, options: list) -> object 
     The earlier decision is read off the candidate's own graph, not a
     side-table: a decided site leaves its evidence in the IR by contract —
     every structural rule stamps its decision knob onto the surviving ops
-    (the ``SPLIT_CONE`` considered-vs-declined idiom), and those ops chain to
+    (the ``CUT`` considered-vs-declined idiom), and those ops chain to
     the pre-decision offer op via the engine-owned ``Op.source`` (stamped
     unconditionally on rebinds, stamped across loop-dialect splices,
     preserved by ``_rename_buf_in_op``). So: find any op carrying every

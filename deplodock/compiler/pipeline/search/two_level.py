@@ -186,7 +186,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
     taken on via ``Op.source`` (``Candidate.apply`` stamps loop→loop splice
     hops; the keep-side ``Op`` rebind stamps as always). Group the terminal's
     unique kernels by that pre-decision ancestor + the decision-knob delta the
-    hop stamped (``SPLIT_CONE: True/False``, never the per-body ``S_*``
+    hop stamped (the ``CUT`` mask ``"1"``/``"0"``, never the per-body ``S_*``
     restamps), and label each group with the **Σ of its kernels' tuned bests**
     — the kernel-set cost of taking that side. The row's features
     (``{ctx, pre-decision op knobs, decision delta}``) are exactly what the
@@ -420,7 +420,7 @@ async def run_two_level_tune(
 
     prior = load_prior(seed=prior_seed)
     # The global prior drives the outer PUCT too: at a structural fork the
-    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, decision
+    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, CUT decision
     # knob}`` — the exact feature shape :func:`_decomposition_rows` trains on
     # below — so once composed Σ rows accumulate, the outer descends the
     # predicted-cheaper kernel set first instead of emission order.
