@@ -34,14 +34,11 @@ class Role(enum.Enum):
     tower. Not part of the IR — never reaches downstream passes (which
     discriminate on tile-flavor type instead).
 
-    ``WARP`` is reserved for the MMA fragment-factorization consumer plan
-    (``plans/mma-fragment-factorization.md``) and the warp-specialized TMA
-    refactor — ``tile/085_warp_specialize.py`` emits it today by rewriting a
-    post-080 ``ThreadTile``; once M3 of the MMA plan lands the planner emits
-    it directly for warp-tier matmul rows. ``ATOM`` is reserved for the MMA
-    plan's hardware-atomic cell tier (``AtomTile``). ``_layer_kind_for`` /
-    ``_wrap_tower`` recognise both roles so consumer plans can flip a tier
-    without revisiting the tower-building mechanics.
+    ``WARP`` (→ ``WarpTile``) and ``ATOM`` (→ ``AtomTile``, the
+    hardware-atomic MMA cell tier) are emitted today for warp-tier matmul
+    rows by the enumeration ``atomize`` move (``enumeration/009_warp_build``).
+    ``_layer_kind_for`` / ``_wrap_tower`` recognise every role so a consumer
+    plan can flip a tier without revisiting the tower-building mechanics.
     """
 
     BLOCK = "block"
@@ -166,19 +163,16 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...],
         elif kind == "register":
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "warp":
-            # Warp-cooperative tier (consumer plans flip a tier to
-            # ``Role.WARP``). ``tile/085_warp_specialize.py`` emits it
-            # today by rewriting a post-080 ThreadTile; once the MMA plan's
-            # M3 lands the planner emits it directly for warp-tier matmul.
+            # Warp-cooperative tier — the per-CTA warp grid (WM×WN) of a
+            # warp-tier matmul, emitted by ``enumeration/009_warp_build``.
             current = (WarpTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "atom":
-            # Hardware-atomic cell tier (MMA fragment factorization). Marker
-            # for the per-cell tensor-core extent; consumed by the MMA cell
-            # materializer (``kernel/010_split_register_axes`` MMA arm), so
-            # no AtomTile reaches kernel render. No rule emits this today —
-            # the case wires the tower builder so M3 of
-            # ``plans/mma-fragment-factorization.md`` lands without
-            # revisiting ``_wrap_tower`` mechanics.
+            # Hardware-atomic cell tier (the tensor-core MMA cell). Marker
+            # for the per-cell tensor-core extent; the MMA cell materializer
+            # (``kernel/005_lower_atom_tile``) lowers it to the
+            # ``ldmatrix`` + ``mma.sync`` chain, so no AtomTile reaches
+            # kernel render. Emitted by ``enumeration/009_warp_build``'s
+            # ``atomize`` move.
             assert atom is not None, "_wrap_tower: an ATOM layer requires the atom spec"
             current = (AtomTile(axes=tuple(axes), body=Body(current), atom=atom),)
         else:  # serial — one axis per layer
