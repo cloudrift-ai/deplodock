@@ -2,8 +2,10 @@
 ``plans/algebraic-carrier-analysis.md``).
 
 `classify_algebra` / `Loop.algebra_kind` tags each reduce loop by reading its
-carrier: a matmul cell → ``SEMIRING``, a plain associative `Accum` → ``MONOID``,
-a recognized `Monoid` → ``TWISTED_MONOID``, a non-reduce scope → ``MAP``. The
+carrier: a matmul cell → ``SEMIRING``, an associative `Accum` → ``MONOID``, a
+recognized tuple `Monoid` → ``MONOID`` too (a twisted monoid is a monoid —
+transport of structure; the streaming-flash schedule is selected structurally one
+layer below, not by a distinct algebra kind), a non-reduce scope → ``MAP``. The
 tag is a derived read — it never enters equality / `op_cache_key` and stays
 consistent across a normalize round-trip.
 """
@@ -87,8 +89,11 @@ def test_max_reduce_is_monoid():
     assert _reduce_loop("maximum").algebra_kind is AlgebraKind.MONOID
 
 
-def test_monoid_carrier_is_twisted_monoid():
-    assert _monoid_loop().algebra_kind is AlgebraKind.TWISTED_MONOID
+def test_monoid_carrier_is_monoid():
+    # A tuple `Monoid` carrier (online-softmax LSE) IS a monoid (transport of
+    # structure), so it classifies as MONOID — same kind as a scalar `Accum`. The
+    # streaming-flash schedule is structural (nested contraction), chosen below.
+    assert _monoid_loop().algebra_kind is AlgebraKind.MONOID
 
 
 def test_non_reduce_loop_is_map():

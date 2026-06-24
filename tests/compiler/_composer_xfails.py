@@ -31,7 +31,7 @@ _PHASE_REASON = {
     "R3": "R3 split-K / partition_reduce tier not yet rebuilt (atomic / atomic-free combine block)",
     "R4": "R4 warp-tier MMA (atomize) tier not yet rebuilt (RegFragment/Ldmatrix/MmaSyncPtx/RegStore synthesis)",
     "R5": "R5 transport tier not yet rebuilt (cp.async / TMA promote + descriptor/swizzle synthesis)",
-    "R6": "R6 flash / attention tier not yet rebuilt (streaming TWISTED_MONOID flash synthesis)",
+    "R6": "R6 flash / attention tier not yet rebuilt (streaming-flash MONOID synthesis)",
     "R7": "R7 e2e / CLI / structural-search / prior tier not yet rebuilt",
 }
 
@@ -43,7 +43,7 @@ _XFAIL_FILES: dict[str, str] = {
     # de-quarantined (rebuilt against enumeration/_partition.monoid_reduce_tilegraph).
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
-    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/080_streaming +
+    # R6 — flash landed (streaming-flash MONOID build: enumeration/080_streaming +
     # _build.streaming_build, masked streaming for symbolic seq_len): test_flash_attention.py
     # de-quarantined except test_flash_off_keeps_decomposition (a func entry below — its
     # blocker is the non-flash score-materializing SDPA decomposition, R7).

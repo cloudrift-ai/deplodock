@@ -1,14 +1,18 @@
 """Unit tests for the strict per-op knob-pin validator (``enumeration/_validate``).
 
 Each kernel lowers on ONE tier (MAP / scalar SEMIRING / warp MMA / cooperative
-MONOID / streaming TWISTED_MONOID), and each tier owns a disjoint slice of the knob
+MONOID / streaming-flash MONOID), and each tier owns a disjoint slice of the knob
 schema. A force-pinned ``DEPLODOCK_<KNOB>`` foreign to the tier an op resolves to used
 to be silently dropped (or overwritten by an OFF sentinel); the validator turns that
 into a hard :class:`KnobPinError`.
 
+A twisted monoid is the MONOID algebra (transport of structure), so the streaming-flash
+tier is selected by ``validate_pins(MONOID, streaming=True)`` — its own parametrized cases
+below — not a distinct algebra kind.
+
 These tests call :func:`validate_pins` directly (no graph, no CUDA) — the contradiction
-is purely a function of ``(algebra, env pins)``. End-to-end refusal through the real
-pipeline is covered by ``test_knob_pinning.py`` (CUDA).
+is purely a function of ``(algebra, streaming, env pins)``. End-to-end refusal through the
+real pipeline is covered by ``test_knob_pinning.py`` (CUDA).
 """
 
 from __future__ import annotations
@@ -53,14 +57,9 @@ _REFUSED = [
     (AlgebraKind.MAP, {"BR": 4}, "cooperative lanes on a pointwise nest"),
     (AlgebraKind.MAP, {"MMA": _ATOM}, "tensor-core atom on a pointwise nest"),
     (AlgebraKind.MAP, {"WM": 2}, "warp count on a pointwise nest"),
-    # A streaming TWISTED_MONOID flash nest: warp / split-K / tensor-core are foreign.
-    (AlgebraKind.TWISTED_MONOID, {"WM": 2}, "warp count on a streaming flash nest"),
-    (AlgebraKind.TWISTED_MONOID, {"MMA": _ATOM}, "tensor-core atom on a streaming flash nest"),
-    (AlgebraKind.TWISTED_MONOID, {"SPLITK": 4}, "split-K on a streaming flash nest"),
     # Staging / transport on a tier that never stages (smem-free reduce / no K-tower).
     (AlgebraKind.MONOID, {"STAGE": 11}, "STAGE on an smem-free cooperative reduce"),
     (AlgebraKind.MONOID, {"TMA": 1}, "TMA on an smem-free cooperative reduce"),
-    (AlgebraKind.TWISTED_MONOID, {"STAGE": 1}, "STAGE on an smem-free flash nest"),
     (AlgebraKind.MAP, {"STAGE": 11}, "STAGE on a pointwise nest with no K-tower"),
     (AlgebraKind.MAP, {"TMA": 1}, "TMA on a pointwise nest with no K-tower"),
 ]
@@ -93,8 +92,6 @@ _ALLOWED = [
     (AlgebraKind.MONOID, {"BN": 128, "BM": 1, "BR": 4, "BK": 32, "FK": 2}),
     # A cooperative reduce keeps the register tile at 1 — pinning FM=FN=1 is inert.
     (AlgebraKind.MONOID, {"MMA": 0, "FM": 1, "FN": 1, "SPLITK": 1}),
-    # A streaming flash nest: free THREAD tile + cooperative BR.
-    (AlgebraKind.TWISTED_MONOID, {"BN": 32, "BM": 1, "BR": 4}),
     # A pointwise nest: only the free-axis thread + register tile.
     (AlgebraKind.MAP, {"BN": 64, "BM": 4, "FN": 4, "FM": 2}),
     # STAGE / TMA on the staged tiers (scalar reduce / warp matmul) is fine. An all-zero
@@ -110,6 +107,34 @@ _ALLOWED = [
 def test_allows_tier_native_pins(algebra, pins, monkeypatch):
     _pin(monkeypatch, pins)
     validate_pins(algebra)  # must not raise
+
+
+# --- Streaming-flash MONOID (validate_pins(MONOID, streaming=True)) -----------
+# Flash is the MONOID algebra on the streaming schedule. The STREAMING tier owns a
+# free THREAD tile + cooperative BR but, unlike the COOP reduce, forbids the BK/FK
+# K-chunk (each output element streams its own reduction) and all warp / split-K /
+# tensor-core / staging knobs — the distinction the streaming flag carries.
+_REFUSED_STREAMING = [
+    ({"WM": 2}, "warp count on a streaming flash nest"),
+    ({"MMA": _ATOM}, "tensor-core atom on a streaming flash nest"),
+    ({"SPLITK": 4}, "split-K on a streaming flash nest"),
+    ({"STAGE": 1}, "STAGE on an smem-free flash nest"),
+    ({"BK": 32}, "K-chunk on a streaming flash nest (COOP-legal, STREAMING-foreign)"),
+    ({"FK": 4}, "strip-mine on a streaming flash nest (COOP-legal, STREAMING-foreign)"),
+]
+
+
+@pytest.mark.parametrize(("pins", "why"), _REFUSED_STREAMING, ids=lambda v: v if isinstance(v, str) else "")
+def test_refuses_streaming_foreign_pin(pins, why, monkeypatch):
+    _pin(monkeypatch, pins)
+    with pytest.raises(KnobPinError):
+        validate_pins(AlgebraKind.MONOID, streaming=True)
+
+
+def test_allows_streaming_native_pins(monkeypatch):
+    # A streaming flash nest: free THREAD tile + cooperative BR (no K-chunk).
+    _pin(monkeypatch, {"BN": 32, "BM": 1, "BR": 4})
+    validate_pins(AlgebraKind.MONOID, streaming=True)  # must not raise
 
 
 def test_greedy_pipeline_refuses_end_to_end(monkeypatch):

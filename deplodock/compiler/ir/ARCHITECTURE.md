@@ -144,16 +144,19 @@ constants; `Monoid` reports `associative` / `has_identity` `True` by constructio
 with a per-instance `commutative` field).
 
 **Bottom-up algebra analysis** (`ir/algebra.py`). `Loop.algebra_kind` derives
-each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (a plain
-associative `Accum`) / `SEMIRING` (a matmul-shaped reduce whose product
-distributes over its reduce — `Mma`, or an `Accum` fed by a distributing
-product) / `TWISTED_MONOID` (a recognized `Monoid`, e.g. flash's online softmax)
-— by *reading back* the carrier already in the body. It is a **derived cache,
-not a second source of truth**: computed on demand, so it can never contradict
-the carrier's traits and never enters equality / `op_cache_key`. The expensive
-match (raw coupled-accumulator → verified twisted monoid) is done once by
-`loop/recognize` (which emits the `Monoid`); this is a cheap read of that
-carrier. The structural matmul predicate `matmul_reduce` lives here too — the
+each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (an associative
+reduce: a scalar `Accum`, OR a recognized tuple `Monoid` such as flash's online
+softmax — a twisted monoid **is** a monoid, transport of structure) / `SEMIRING`
+(a matmul-shaped reduce whose product distributes over its reduce — `Mma`, or an
+`Accum` fed by a distributing product) — by *reading back* the carrier already in
+the body. It is a **derived cache, not a second source of truth**: computed on
+demand, so it can never contradict the carrier's traits and never enters equality
+/ `op_cache_key`. The expensive match (raw coupled-accumulator → verified twisted
+monoid) is done once by `loop/recognize` (which emits the `Monoid`); this is a
+cheap read of that carrier. The streaming-flash *schedule* (a `Monoid` carrier
+streaming over a nested contraction) is selected structurally by the tile
+classifier (`lowering/tile/enumeration/_classify`), one layer below the algebra —
+see [`plans/twisted-monoid-carrier-design.md`](../../../plans/twisted-monoid-carrier-design.md). The structural matmul predicate `matmul_reduce` lives here too — the
 single source `lowering/_predicates.is_matmul_reduce` delegates to (adding only
 its tile-layer type guard).
 
