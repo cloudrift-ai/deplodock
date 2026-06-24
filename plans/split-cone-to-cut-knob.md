@@ -23,12 +23,28 @@
     knobs). Precise intermediate bytes (split from the consumer's own M·N output) need **per-operand shape stamping** —
     a separate change. `D_cone_fanout` / `D_recompute_flops` are decision-level (computable at the `_cut` fork site via
     `_fission`, but only the **decomposition-row** path — `two_level._decomposition_rows`, the outer-MCTS training
-    signal, currently R7-quarantined — consumes decision-level features; greedy does not). Both are deferred with this
-    finding rather than shipped as noisy proxies.
-  - The end-to-end deploy (greedy picking the cut when its Σ is cheaper) stays the parent plan's "two-level pricing
-    integration" bullet ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)) —
-    blocked on a *trained* prior + de-quarantining the structural-search tier (and the `_split_free_axis` `thread=0`
-    pricing-candidate bug), not on these features.
+    signal — consumes decision-level features; greedy does not). Both are deferred with this finding rather than shipped
+    as noisy proxies.
+- **(c) Two-level structural-search tier — LANDED.** The outer two-level tree now branches on the cut, prices each
+  side, and trains the prior end-to-end (the R7 structural-search rows are de-quarantined and green):
+  - `two_level.outer_pipeline` drives `frontend` + `loop` + the **`split` phase only** — the cut is the lone
+    kernel-set-changing move. Tiling (`enumeration`) stays **inner**: branching the outer tree on tile knobs (which
+    don't change the kernel set) exploded/hung it. The split boundary is where the kernel set is fixed but tiling is
+    not — the right outer/inner seam.
+  - `slice` / `two_level._kernel_nodes` count `TileGraphOp` terminal kernels (the keep side is one fused `TileGraphOp`,
+    the cut side producer + consumer); `_decomposition_rows` reads the `CUT` decision off the kernel and groups the
+    Σ by the **deepest `S_*` loop ancestor** (the pre-decision site), so the cut's producer+consumer sum into one
+    kernel-set Σ.
+  - `pipeline._bench_terminal` skips the lowering-row hop that *introduces* a structural-decision knob
+    (`keys.introduces_structural_decision`) — the keep side's `loop→tile` `seed_fused` jump carries `CUT` and the old
+    `loop→loop`-only guard leaked it into the `lowering` table (greedy would bypass `_pick_structural`'s Σ).
+  - `candidate.from_option` surfaces a `Graph` option's `CUT` knob (`_graph_decision_knobs`) so the outer PUCT ranks
+    the cut branch instead of scoring it as a knob-less generic row.
+  - Shared `keys.STRUCTURAL_DECISION_KNOBS = ("CUT",)` is the one place naming the kernel-set-changing knobs.
+  - **Still open:** greedy's `_pick_structural` deploys the cut only behind a *trained* `CatBoostPrior`
+    (`prior.fitted`); a cold compile keeps the kernel-set-preserving fused edge. So a `tune` must train the prior on
+    the decomposition Σ rows (now produced) before `compile`/`run` will pick the cut. The `_split_free_axis`
+    `thread=0` pricing-candidate path the old notes flagged is not hit by any current test.
 
 When the structural split becomes a per-edge placement move
 ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)), the single graph-level
