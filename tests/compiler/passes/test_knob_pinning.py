@@ -374,6 +374,25 @@ def test_article_tma_sgemm_reproduction(monkeypatch):
     assert "cp.async.bulk.tensor" in src, "scalar-tile TMA box copy emitted"
 
 
+def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
+    """``assembly/030_mark_unroll`` flags the small FMA inner reduce (the ``BK=32`` K
+    loop, ≤ 64 trips) for ``#pragma unroll``, giving ptxas the register-resident
+    operand reuse + ILP the hand-tuned SGEMM relies on (the ``TM=26`` hero tile runs
+    at 255 regs / ~293 µs with the unroll, ~126 regs / ~384 µs without — the lever for
+    the article's ~96 %-of-cuBLAS number). The K-outer pipeline loop (> 64 unrolled
+    trips) stays rolled. Compile-only (inspects the kernel source). No CUDA needed."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+
+    g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
+    src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
+    assert "#pragma unroll" in src, "the small FMA inner reduce must be marked for #pragma unroll"
+
+
 @requires_cuda
 def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     """When the greedy compile picks the tensor-core atom variant but its operands
