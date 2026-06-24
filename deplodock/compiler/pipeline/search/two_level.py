@@ -108,6 +108,12 @@ def outer_pipeline() -> Pipeline:
     inner slice-sum path — their trigger knob (``SPLITK``) doesn't exist until
     partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
+    # The structural fork emitter (``005_split_demoted``) lives in the ``split``
+    # phase, which runs *before* ``enumeration``/partition (``TILE_PASSES`` order).
+    # Include it so the keep-vs-cut offer branches the OUTER tree — it changes the
+    # kernel set, the defining property of an outer fork. Its only knob (``CUT``)
+    # has no ``off=``, so the pass-boundary OFF-fill stamps nothing.
+    passes.append(Pass.load("lowering/tile/split", index=len(passes)))
     tile_rules = [r.name for r in Pass.load("lowering/tile/enumeration", index=len(passes)).rules]
     head = tile_rules[: tile_rules.index(PARTITION_RULE)]
     # Re-load with ``select`` (rather than slicing the loaded rules) so the
@@ -173,28 +179,48 @@ def _point_stats(us: float) -> PerfStats:
 
 
 def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
-    """Post-fusion kernel nodes — ``(node_id, op)`` for every ``LoopOp``."""
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    """Post-fusion kernel nodes — ``(node_id, op)`` for every kernel-bearing op.
 
-    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)]
+    An outer terminal's cursor sits at :data:`PARTITION_RULE` (``030_register_tile``),
+    *past* ``enumeration/000_build``, so its kernels are ``TileGraphOp`` seeds — the
+    structural-fork keep side (a fused ``TileGraphOp``) and the cut side's
+    producer/consumer (also ``TileGraphOp``s). A ``LoopOp`` survives only when
+    ``000_build`` ``RuleSkip``ped it (the un-fusible keep-fused demoted matmul); count
+    it too so its slice still tunes."""
+    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+
+    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, (LoopOp, TileGraphOp))]
+
+
+# The structural-fork decision knobs the outer tree branches on — stamped by the
+# pre-partition ``split`` phase (``005_split_demoted``'s ``CUT`` mask: ``"1"`` cut /
+# ``"0"`` keep). Read **directly off the terminal kernel**: the cut fragments carry
+# it on their LoopOps (inherited by the built ``TileGraphOp``), but the keep(SMEM)
+# side is a fused ``TileGraphOp`` (``seed_fused``) carrying ``CUT`` with no
+# CUT-bearing LoopOp in its chain — so a source-chain delta can't recover it
+# uniformly, while the op itself always can.
+_STRUCTURAL_DECISION_KNOBS = ("CUT",)
 
 
 def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
     """Composed value-of-position training rows for structural decompositions.
 
-    A terminal's kernels attribute back to the op a structural decision was
-    taken on via ``Op.source`` (``Candidate.apply`` stamps loop→loop splice
-    hops; the keep-side ``Op`` rebind stamps as always). Group the terminal's
-    unique kernels by that pre-decision ancestor + the decision-knob delta the
-    hop stamped (the ``CUT`` mask ``"1"``/``"0"``, never the per-body ``S_*``
-    restamps), and label each group with the **Σ of its kernels' tuned bests**
-    — the kernel-set cost of taking that side. The row's features
-    (``{ctx, pre-decision op knobs, decision delta}``) are exactly what the
-    outer MCTS's PUCT queries at the structural fork's siblings, so these rows
-    are what make that selection informed instead of uniform. They are
-    estimates for *search ordering*; greedy's deploy decision keeps the sharper
-    compositional probe (``policy/greedy._pick_structural``)."""
-    from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+    A terminal's kernels (post-build ``TileGraphOp``s) attribute back through
+    ``Op.source`` to the op the structural decision was offered on. Group the
+    terminal's unique kernels by that **pre-decision site** — the deepest
+    ``S_*``-stamped *loop* ancestor (the original demoted matmul, before the
+    fission re-stamped each fragment's own shallower ``S_*``) — plus the decision
+    delta (the ``CUT`` mask ``"1"``/``"0"``, read off the kernel), and label each
+    group with the **Σ of its kernels' tuned bests** — the kernel-set cost of that
+    side. Both cut fragments + the keep kernel converge on the one site, so the
+    cut's producer+consumer sum into a single kernel-set Σ. The row's features
+    (``{ctx, site S_*, decision delta}``) are exactly what the outer MCTS's PUCT
+    queries at the structural fork's siblings, so these rows make that selection
+    informed instead of uniform. They are estimates for *search ordering*; greedy's
+    deploy decision keeps the sharper compositional probe
+    (``policy/greedy._pick_structural``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain  # noqa: PLC0415
 
     best = {r.op_key: r.best_us for r in per_op}
     unique: dict[str, object] = {}
@@ -204,20 +230,21 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
             unique[key] = op
     groups: dict[tuple, tuple[dict, list[float | None]]] = {}
     for key, op in unique.items():
-        site = op.source
-        if site is None or dialect_of(site) != "loop":
+        delta = {k: op.knobs[k] for k in _STRUCTURAL_DECISION_KNOBS if k in op.knobs}
+        if not delta:
+            continue  # a kernel from no structural decision (no offer fired)
+        site = None
+        for anc in source_chain(op):
+            if dialect_of(anc) == "loop" and any(k.startswith("S_") for k in getattr(anc, "knobs", {})):
+                site = anc  # keep the LAST (deepest) — the pre-decision offer op
+        if site is None:
             continue
         site_key = op_cache_key(site)
         if site_key is None:
             continue
-        # The decision delta: knobs this hop introduced. ``S_*`` keys are
-        # excluded — fragment kernels restamp their own structural features,
-        # which describe the child body, not the decision.
-        delta = {k: v for k, v in op.knobs.items() if k not in site.knobs and not k.startswith("S_")}
-        if not delta:
-            continue  # not a decision hop (e.g. a name-only rebind ancestor)
         gkey = (site_key, tuple(sorted((k, str(v)) for k, v in delta.items())))
-        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site.knobs, **delta}, []))
+        site_s = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
+        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site_s, **delta}, []))
         labels.append(best.get(key))
     return [(feats, float(sum(labels))) for feats, labels in groups.values() if labels and all(us is not None for us in labels)]
 
