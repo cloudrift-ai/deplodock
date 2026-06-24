@@ -90,6 +90,19 @@ aspect ratios / `BN==1` when a square alternative exists at equal thread count).
 the carried "seed the inner search with golden knobs" item, because it fixes *what gets sampled* rather than patching
 around it. Until then, fp32 thread-tier matmul deploys 2–2.6× off cuBLAS.
 
+**Update — fixed (combines (a) + (b)).** `_moves.thread_offers` now takes a `balanced` flag (set by `090_thread_tile`
+for the `SEMIRING` matmul regime): it drops the degenerate-aspect tiles (one axis collapsed to 1) and leads with a
+square-ish, coalesced `BN >= BM` tile, with a fall-back to the bare order for a genuinely 1-wide axis (gemv). MAP
+(pointwise) / streaming keep `balanced=False` (byte-identical). Validated: a **cold** 768³ matmul now deploys
+`BN=32, BM=8, BK=32` (was a `BN=1` degenerate), and re-tuning **`square.512`** drops the deployed kernel **28.0 → 9.3 µs**
+(now `BM=8, BN=32` — **1.33× faster than cuBLAS**, beats the golden). **Partial for `square.1024`:** the thread tile is
+fixed (`BN=1 → BN=32`) but the deployed config now pairs it with `STAGE=00` (no smem staging) + `SPLITK=16` vs the
+golden's `STAGE=11`/`SPLITK=1`, so it only improves 138.6 → 119 µs — a **separate** staging/split-K degenerate-default
+(the `120_stage` / split-K tier has the same "emission order = cold pick" pathology as `thread_offers` did). Tracked as a
+follow-up; the thread-tile fix is necessary but not sufficient where staging also mis-defaults. A full
+`tune --dataset golden --clean` re-sweep is still owed to refresh every shape's reservoir + the learned prior under the
+fixed enumeration (this sweep only re-tuned `square.512`/`square.1024` to validate).
+
 ## Finding 2 — the analytic prior's dynamic weight set `_W_A_DYN` was ~random on this branch; refit 839 → 86
 
 The branch's OVERHANG→`S_masked_{m,n,k}` featurization change invalidated the masked-tile weight set the old `_W_A_DYN`

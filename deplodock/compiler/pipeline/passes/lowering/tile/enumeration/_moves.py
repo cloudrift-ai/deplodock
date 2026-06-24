@@ -190,7 +190,7 @@ def _axis_thread_choices(extent: int) -> tuple[int, ...]:
 _THREAD_TARGET = 256
 
 
-def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
+def thread_offers(dag: IterDag, budget: Budget, *, balanced: bool = False) -> list[tuple[int, int]]:
     """Legal ``(thread_n, thread_m)`` thread tiles within the CTA thread
     budget, best-first (≈``_THREAD_TARGET`` threads, larger to break ties).
     ``thread_m`` is ``1`` for a 1-D nest (no M axis).
@@ -198,7 +198,18 @@ def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     A pinned ``DEPLODOCK_BN``/``BM`` narrows its axis to that single extent (the
     same ``_pin`` idiom :func:`reduce_offers` uses for ``BK``/``FK``/``SPLITK``) so a
     test / golden can force a specific (masked) free-axis tile — without it greedy
-    would always take the best-first ≈``_THREAD_TARGET`` offer and silently drop the pin."""
+    would always take the best-first ≈``_THREAD_TARGET`` offer and silently drop the pin.
+
+    ``balanced`` (the **SEMIRING matmul** regime, set by ``090_thread_tile``) drops
+    the degenerate-aspect tiles — one axis collapsed to ``1`` — and leads with a
+    square-ish, coalesced tile (``BN >= BM``). The bare ≈``_THREAD_TARGET`` sort ties
+    a ``(BN=1, BM=256)`` tile with a balanced ``(16, 16)`` (both 256 threads) and
+    emits the degenerate one first on choice order — and emission order *is* the cold
+    greedy pick / the search's first trajectory, so the clean search would sample and
+    deploy a ``BN=1`` (no-coalescing) / ``BM=1`` (no M-reuse) tile 2–3× off the golden
+    band. Only matmul wants this: a MAP (pointwise) nest is bandwidth-bound and keeps
+    the wide-N order (``balanced=False``), and a genuinely 1-wide axis (gemv) falls
+    back to the bare order so it is never stranded."""
     bn_pin, bm_pin = _pin(MAP_N_THREAD), _pin(MAP_M_THREAD)
     n_choices = (bn_pin,) if bn_pin else _axis_thread_choices(dag.inner_n.extent)
     if dag.outer_m is None:
@@ -206,6 +217,13 @@ def thread_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     else:
         m_choices = (bm_pin,) if bm_pin else _axis_thread_choices(dag.outer_m.extent)
     out = [(t_n, t_m) for t_n in n_choices for t_m in m_choices if budget.threads_ok(t_n * t_m)]
+    if balanced and dag.outer_m is not None:
+        non_degenerate = [tm for tm in out if tm[0] > 1 and tm[1] > 1]
+        if non_degenerate:
+            # near the thread target, then most balanced (low aspect), then the wider
+            # extent on the contiguous N axis (BN >= BM), then larger to break ties.
+            non_degenerate.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), max(tm) // min(tm), tm[1] > tm[0], -tm[0] * tm[1]))
+            return non_degenerate
     out.sort(key=lambda tm: (abs(tm[0] * tm[1] - _THREAD_TARGET), -tm[0] * tm[1]))
     return out
 

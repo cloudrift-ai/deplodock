@@ -35,7 +35,9 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
         raise RuleSkipped("cooperative-reduce tier (070_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING and RED_BK.name not in op.knobs:
         raise RuleSkipped("reduce tile not yet pinned")
-    offers = thread_offers(op.dag, Budget())
+    # A SEMIRING (matmul) 2-D output tile wants a balanced, coalesced shape; a MAP
+    # (pointwise) nest stays bandwidth-bound / wide-N. (MONOID is skipped above.)
+    offers = thread_offers(op.dag, Budget(), balanced=op.algebra is AlgebraKind.SEMIRING)
     if not offers:
         raise RuleSkipped("no legal thread tile")
     return [replace(op, knobs={**op.knobs, **thread_knobs(op.dag, t)}) for t in offers]
