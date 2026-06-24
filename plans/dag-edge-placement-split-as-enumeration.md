@@ -103,24 +103,23 @@
     (`040_demote` casts on store). A fully-constant MAP operand (the `0.5` in `0.5·x`) reads straight from gmem, no slab.
     *Out of scope:* the pinned scalar sibling-cell-fused config (`compute_phase_info`'s documented decline) is never the
     greedy pick.
-- **The offering fork — LANDED (pin-reachable), greedy default DEFERRED.** `split/005` now wires the keep branch to the
-  SMEM fused edge: `_extract.seed_fused` turns a single-cone demoted `LoopOp` into a fused 2-block `TileGraphOp` (clean
-  matmul consumer `blocks[0]` + producer cone `blocks[1]`, the `xn` edge `SMEM`-placed) carrying the *consumer's*
-  dag/regime — and the enumeration body moves already rebuild `blocks[0]` while preserving trailing blocks (the
-  multi-block-enumeration seam was free), so the consumer tiles and the producer rides; `assembly/010`'s fused
-  dispatch folds it into one `TileOp`. `cut_offers` gains `smem_fusible` (`force = unbuildable AND not smem_fusible`) so
-  the cut is offered-not-forced when the cone fuses on-chip. `DEPLODOCK_SPLIT_CONE=0` now builds a real fused edge
-  (RMSNorm → linear in ONE kernel, GPU-verified live via the full pass chain); `=1` the cut. The `seed_fused` gate
-  (`_producer_fusible`: pointwise MAP or single-reduce RMSNorm `MONOID`) keeps it to shapes `assemble_fused` builds — a
-  two-pass SDPA softmax / multi-cone rotary / multi-accum gated-MLP stays a forced cut. **The unpinned greedy path still
-  forces the cut**: greedy's "a cold compile never changes kernel sets" rule (`search/policy/greedy._pick_structural`
-  filters the structural cut cold) would make the kernel-set-preserving keep(SMEM) the cold default the instant it is an
-  op-variant fork sibling. The fused edge is now **robust at the warp tier** (sub-piece (c) — the natural greedy pick;
-  verified across 8 shapes + MAP/MONOID producers), so that robustness blocker is cleared; the one remaining declined
-  config (the pinned scalar sibling-cell-fused tile) is never the greedy pick. *Remaining:* promote keep(SMEM) to the
-  greedy default — flip `split/005` to emit the `[keep, cut]` fork + update the cut-specific tests (e.g.
-  `test_norm_linear_fp16_scalar_reduce_tma_alignment`, which pins a cut config, must pin `SPLIT_CONE=1`) — and wire the
-  live keep-vs-cut search fork (the two-level structural integration: the trained prior prices `SMEM` Σ vs `GMEM` Σ).
+- **The offering fork — LANDED (greedy default = keep(SMEM)).** `split/005` wires the keep branch to the SMEM fused edge:
+  `_extract.seed_fused` turns a single-cone demoted `LoopOp` into a fused 2-block `TileGraphOp` (clean matmul consumer
+  `blocks[0]` + producer cone `blocks[1]`, the `xn` edge `SMEM`-placed) carrying the *consumer's* dag/regime — and the
+  enumeration body moves already rebuild `blocks[0]` while preserving trailing blocks (the multi-block-enumeration seam
+  was free), so the consumer tiles and the producer rides; `assembly/010`'s fused dispatch folds it into one `TileOp`.
+  `cut_offers` gains `smem_fusible` (`force = unbuildable AND not smem_fusible`) so the cut is offered-not-forced when the
+  cone fuses on-chip, and `split/005` emits the real **`[keep, cut]` fork**. Greedy's "a cold compile never changes kernel
+  sets" rule (`search/policy/greedy._pick_structural` filters the structural cut when the prior is cold) now deploys the
+  kernel-set-preserving **keep(SMEM)** as the cold default — so an unpinned `compile`/`run` of RMSNorm → linear / scale →
+  matmul deploys ONE fused kernel (no gmem round-trip) instead of the two-kernel cut. `DEPLODOCK_SPLIT_CONE=1` pins the
+  cut, `=0` the fused edge. The `seed_fused` gate (`_producer_fusible`: pointwise MAP or single-reduce RMSNorm `MONOID`)
+  keeps it to shapes `assemble_fused` builds — a two-pass SDPA softmax / multi-cone rotary / multi-accum gated-MLP stays a
+  forced cut. The live structural push is verified by the de-quarantined `test_split_demoted_fork_pushes_structural`.
+  *Remaining:* the **two-level pricing integration** — the trained prior pricing the cut's `GMEM` Σ vs keep's `SMEM` Σ so
+  greedy deploys the cut when faster; the `test_two_level` structural rows stay R7-xfailed (the structural-pricing / prior
+  tier, plus a `_split_free_axis` `thread=0` ZeroDivisionError surfaced by a pinned-config pricing candidate — gated
+  behind a *trained* prior, so it never reaches a cold greedy compile).
 
 ### The SMEM fused-edge codegen path (the next build)
 
