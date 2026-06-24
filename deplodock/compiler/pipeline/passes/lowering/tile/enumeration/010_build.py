@@ -27,9 +27,10 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._validate impo
 
 PATTERN = [Pattern("root", LoopOp)]
 
-# Regimes the move set builds: MAP / SEMIRING / MONOID + TWISTED_MONOID (flash, R6 —
-# the streaming online-softmax nest, built by enumeration/080_streaming).
-_BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID, AlgebraKind.TWISTED_MONOID)
+# Regimes the move set builds: MAP / SEMIRING / MONOID. Flash (R6 — the streaming
+# online-softmax nest, built by enumeration/080_streaming) is the MONOID algebra on the
+# streaming schedule, flagged structurally by ``regime.streaming``, not a distinct kind.
+_BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 
 
 def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
@@ -46,7 +47,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     # compile/run only — the tune search (``ctx.validate_pins=False``) explores
     # tier-foreign forks and union-pinned multi-op graphs (see ``Run.drive``).
     if ctx.validate_pins:
-        validate_pins(regime.algebra)
+        validate_pins(regime.algebra, streaming=regime.streaming)
     # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
     # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
     buffers: dict[str, Buffer] = {}
@@ -59,6 +60,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
         tilegraph=seed_graph(dag, kernel_name=loop_op.name, buffers=buffers),
         dag=dag,
         algebra=regime.algebra,
+        streaming=regime.streaming,
         target_names=regime.target_names,
         leading=tuple(dag.leading),
         seed_key=loop_op.body.structural_key(),

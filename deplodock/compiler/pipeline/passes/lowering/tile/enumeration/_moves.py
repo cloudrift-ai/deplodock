@@ -398,7 +398,7 @@ def coop_free_thread_knobs(dag: IterDag) -> dict:
 
 
 def streaming_br_offers(dag: IterDag) -> list[int]:
-    """Cooperative ``BR`` candidates for the streaming ``TWISTED_MONOID`` reduce axis
+    """Cooperative ``BR`` candidates for the streaming-flash reduce axis
     (e.g. flash attention's streaming KV). ``[1]`` (the serial-stream form) unless
     ``DEPLODOCK_BR`` is pinned to a ``br`` (``1 < br ≤ 1024``) that evenly splits the
     **static** streaming extent — then the axis partitions across ``br`` cooperative

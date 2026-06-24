@@ -39,8 +39,8 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.MONOID or COOP_BR.name in op.knobs:
-        raise RuleSkipped("cooperative reduce applies once, to a MONOID seed")
+    if op.algebra is not AlgebraKind.MONOID or op.streaming or COOP_BR.name in op.knobs:
+        raise RuleSkipped("cooperative reduce applies once, to a non-streaming MONOID seed")
     offers = coop_reduce_offers(op.dag)
     if not offers:
         raise RuleSkipped("no legal cooperative-reduce decomposition")

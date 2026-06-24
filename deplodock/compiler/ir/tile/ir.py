@@ -639,6 +639,7 @@ class TileGraphOp(Op):
     # the ir layer free of a passes-layer import — set/read by the tile passes) ---
     dag: object = None  # the IterDag the offer fns tile
     algebra: object = None  # AlgebraKind — the regime the passes dispatch on
+    streaming: bool = False  # a MONOID nest on the streaming-flash schedule (tuple Monoid carrier + nested reduce)
     target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
     seed_key: str = ""  # the source LoopOp's body structural key
     buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
@@ -656,6 +657,8 @@ class TileGraphOp(Op):
         lines: list[str] = []
         algebra = getattr(self.algebra, "value", self.algebra)
         head = f"algebra={algebra}" if algebra is not None else "algebra=?"
+        if self.streaming:
+            head += " (streaming)"
         if self.target_names:
             head += f"  targets={{{', '.join(sorted(self.target_names))}}}"
         lines.append(head)

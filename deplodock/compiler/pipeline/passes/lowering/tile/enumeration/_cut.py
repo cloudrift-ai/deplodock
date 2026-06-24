@@ -81,8 +81,7 @@ class Tier(enum.IntEnum):
 _ALGEBRA_TIER = {
     AlgebraKind.MAP: Tier.MAP,
     AlgebraKind.SEMIRING: Tier.SCALAR_REDUCE,
-    AlgebraKind.MONOID: Tier.COOP_REDUCE,
-    AlgebraKind.TWISTED_MONOID: Tier.COOP_REDUCE,  # streaming flash — a cooperative reduce regime
+    AlgebraKind.MONOID: Tier.COOP_REDUCE,  # cooperative reduce AND streaming flash (both MONOID)
 }
 
 

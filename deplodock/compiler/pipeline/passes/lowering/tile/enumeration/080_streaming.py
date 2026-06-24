@@ -1,6 +1,11 @@
-"""Streaming pass (fork) — the streaming ``TWISTED_MONOID`` regime (e.g. online-softmax).
+"""Streaming pass (fork) — the streaming-flash regime (e.g. online-softmax).
 
-``plans/tile-ir-block-dag.md`` R6: a ``TWISTED_MONOID`` nest (e.g. a fused flash-attention
+A flash nest is the ``MONOID`` algebra on the **streaming schedule** — a tuple `Monoid`
+carrier streaming over a nested contraction, flagged ``op.streaming`` by ``_classify`` (a
+twisted monoid is a monoid, so it is not a distinct algebra kind; see
+``plans/twisted-monoid-carrier-design.md``).
+
+``plans/tile-ir-block-dag.md`` R6: a streaming nest (e.g. a fused flash-attention
 kernel — the ``loop/recognize/010_recognize_flash`` rewrite produces one streaming
 online-softmax kernel) tiles its free output axes (for attention, q-rows / head-dim)
 like a MAP nest, then serial-transforms BOTH contraction axes (the streaming reduce + its
@@ -20,7 +25,7 @@ streaming carrier reuses no cross-thread slab).
 **Cooperative stream (``BR > 1``).** A pinned ``DEPLODOCK_BR`` partitions the **static**
 streaming axis (for attention, the KV axis) across ``BR`` cooperative THREAD lanes (the
 same commutative-licensed THREAD partition the ``MONOID`` coop reduce uses, here on the
-streaming ``TWISTED_MONOID`` carrier): each lane streams a strided slice into its own
+streaming `Monoid` carrier): each lane streams a strided slice into its own
 ``(m, l, O)`` online-softmax partial, and the per-lane partials merge via the carrier's
 ``combine_states`` (``kernel/100_materialize_tile`` emits the warp-shuffle / smem-tree
 combine, exactly as for a plain monoid reduce). The free-axis THREAD tile is budgeted by
@@ -35,7 +40,6 @@ from dataclasses import replace
 
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import streaming_build
@@ -62,8 +66,8 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.TWISTED_MONOID or MAP_N_THREAD.name in op.knobs:
-        raise RuleSkipped("streaming applies once, to a TWISTED_MONOID seed")
+    if not op.streaming or MAP_N_THREAD.name in op.knobs:
+        raise RuleSkipped("streaming applies once, to a streaming MONOID seed")
     # Cooperative stream (``BR > 1``): the streaming axis splits across BR THREAD lanes,
     # the per-lane online-softmax partials merged via the carrier's cross-thread
     # ``combine_states``. Default ``BR = 1`` (the serial-stream form) — the

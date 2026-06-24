@@ -360,7 +360,7 @@ def coop_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: fro
     )
 
 
-# === Streaming ``TWISTED_MONOID`` build move (``plans/tile-ir-block-dag.md`` R6). ===
+# === Streaming-flash build move (the MONOID streaming schedule, ``plans/tile-ir-block-dag.md`` R6). ===
 # The streaming reduce is the simplest reduce build: the free output axes tile like a
 # MAP nest, and BOTH contraction axes serial-transform with ``bk=fk=splitk=1`` (each
 # output element streams its own reduction; the carrier can't span register cells or
@@ -405,7 +405,7 @@ def _replace_k_streaming(
     axis (e.g. flash attention's nested QK^T reduce) gets a plain ``K_o``/``K_i`` tower;
     a **symbolic** streaming axis (dynamic ``seq_len`` KV) ceil-divides, clamps its load index for a
     safe read, and masks the ``Monoid`` score to ``-inf`` past the runtime bound (the
-    ``TWISTED_MONOID`` identity — fold nothing for an out-of-range key).
+    `Monoid` identity — fold nothing for an out-of-range key).
 
     When ``br > 1`` the streaming axis ``coop_axis`` instead σ-splits ``K → K_o·br +
     K_c`` (the ``br`` cooperative THREAD lanes ``k_c``, laid into the domain by the
@@ -447,7 +447,8 @@ def _replace_k_streaming(
 
 
 def streaming_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
-    """The streaming ``TWISTED_MONOID`` build move (e.g. flash attention): serial-
+    """The streaming-flash build move (the MONOID streaming schedule, e.g. flash
+    attention): serial-
     transform every contraction axis (``bk=fk=splitk=1``, masked streaming for a
     symbolic KV) then σ-split the free axes (``FM=FN=1``). The caller (``080_streaming``)
     pins those knobs.
