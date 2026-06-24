@@ -17,10 +17,15 @@ the enumeration seed (``000_build``), so a contradictory pin fails before any ti
 search rather than disappearing into a quietly-wrong kernel.
 
 The legality table is value-aware: a knob at its universal / OFF value (``SPLITK=1``,
-``FK=1``, ``BR=1``, ``FM=1``) constrains nothing — only a *meaningful* pin
-(``SPLITK>1`` cross-CTA split-K, ``BR>1`` cooperative lanes, ``MMA=<kind>`` tensor
-core) narrows the tier. Transport knobs (``STAGE`` / ``TMA``) are intentionally left
-unconstrained here — they ride the staging schedule, not the tile geometry.
+``FK=1``, ``BR=1``, ``FM=1``, ``STAGE=`` empty, ``TMA=0``) constrains nothing — only a
+*meaningful* pin (``SPLITK>1`` cross-CTA split-K, ``BR>1`` cooperative lanes,
+``MMA=<kind>`` tensor core, ``STAGE`` selecting a read-site, ``TMA=1``) narrows the
+tier. The staging / transport knobs ``STAGE`` / ``TMA`` are legal only on the **staged**
+tiers (``SCALAR`` / ``WARP``): a cooperative ``MONOID`` reduce and a streaming
+``TWISTED_MONOID`` flash are smem-free, and a pointwise ``MAP`` nest has no K-tower, so
+neither stages anything. (Scalar-tile ``TMA`` transport is not yet wired — see
+``052_transport`` — but it is not *senseless*, so it stays allowed rather than refused;
+the gap is tracked by an xfail in ``test_knob_pinning.py``.)
 """
 
 from __future__ import annotations
@@ -39,6 +44,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     FN,
     MMA,
     SPLITK,
+    STAGE,
+    TMA,
     WM,
     WN,
 )
@@ -61,6 +68,7 @@ class Tier(Enum):
 
 
 _NON_WARP = frozenset({Tier.MAP, Tier.SCALAR, Tier.COOP, Tier.STREAMING})
+_STAGED = frozenset({Tier.SCALAR, Tier.WARP})  # the tiers that synthesize an smem slab
 
 # The tiers an op's algebra can resolve to (before any pin narrows further). SEMIRING
 # is the only fork — scalar register-tile FMA vs the tensor-core warp atom.
@@ -104,6 +112,14 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         return frozenset({Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == BR.name:
         return frozenset({Tier.COOP, Tier.STREAMING}) if _as_int(raw) > 1 else None  # cooperative lanes
+    if name == STAGE.name:
+        # Staging a read-site: only the scalar reduce / warp matmul stage (COOP / STREAMING
+        # are smem-free, MAP has no K-tower). A mask with no selected bit is inert.
+        return _STAGED if "1" in raw else None
+    if name == TMA.name:
+        # TMA transport rides the staging schedule, so it shares STAGE's staged tiers. Only
+        # WARP is wired today (052_transport); scalar-tile TMA is unimplemented, not senseless.
+        return _STAGED if raw.strip().lower() in {"1", "true", "yes", "on"} else None
     return None
 
 
@@ -114,9 +130,9 @@ def _as_int(raw: str) -> int:
         return 0
 
 
-# The geometry knobs whose env pin this validator audits (transport knobs STAGE/TMA
-# are intentionally excluded — see the module docstring).
-_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR)
+# The knobs whose env pin this validator audits — tile geometry + the staging /
+# transport schedule (STAGE / TMA), each legal only on the tiers in ``_legal_tiers``.
+_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR, STAGE, TMA)
 
 
 def validate_pins(algebra: AlgebraKind) -> None:

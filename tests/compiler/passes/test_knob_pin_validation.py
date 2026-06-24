@@ -57,6 +57,12 @@ _REFUSED = [
     (AlgebraKind.TWISTED_MONOID, {"WM": 2}, "warp count on a streaming flash nest"),
     (AlgebraKind.TWISTED_MONOID, {"MMA": _ATOM}, "tensor-core atom on a streaming flash nest"),
     (AlgebraKind.TWISTED_MONOID, {"SPLITK": 4}, "split-K on a streaming flash nest"),
+    # Staging / transport on a tier that never stages (smem-free reduce / no K-tower).
+    (AlgebraKind.MONOID, {"STAGE": 11}, "STAGE on an smem-free cooperative reduce"),
+    (AlgebraKind.MONOID, {"TMA": 1}, "TMA on an smem-free cooperative reduce"),
+    (AlgebraKind.TWISTED_MONOID, {"STAGE": 1}, "STAGE on an smem-free flash nest"),
+    (AlgebraKind.MAP, {"STAGE": 11}, "STAGE on a pointwise nest with no K-tower"),
+    (AlgebraKind.MAP, {"TMA": 1}, "TMA on a pointwise nest with no K-tower"),
 ]
 
 
@@ -91,6 +97,12 @@ _ALLOWED = [
     (AlgebraKind.TWISTED_MONOID, {"BN": 32, "BM": 1, "BR": 4}),
     # A pointwise nest: only the free-axis thread + register tile.
     (AlgebraKind.MAP, {"BN": 64, "BM": 4, "FN": 4, "FM": 2}),
+    # STAGE / TMA on the staged tiers (scalar reduce / warp matmul) is fine. An all-zero
+    # STAGE mask and TMA=0 are inert everywhere (universal / OFF values).
+    (AlgebraKind.SEMIRING, {"STAGE": 11, "TMA": 1}),
+    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "STAGE": 11, "TMA": 1}),
+    (AlgebraKind.MONOID, {"STAGE": "00", "TMA": 0}),
+    (AlgebraKind.MAP, {"STAGE": "0", "TMA": 0}),
 ]
 
 

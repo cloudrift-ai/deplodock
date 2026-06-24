@@ -344,6 +344,26 @@ def test_scalar_matmul_f16(monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
+@pytest.mark.xfail(strict=True, reason="scalar-tile TMA transport not yet wired (052_transport is warp-only)")
+def test_scalar_tile_tma_transport_is_unimplemented(monkeypatch):
+    """``TMA=1`` on a scalar (``MMA=0``) staged matmul is *allowed* by the knob-pin
+    validator (TMA rides the staging schedule, which the scalar tier has — it is not
+    senseless), but ``052_transport`` only promotes the warp-tier atom today, so the
+    scalar kernel stays on SYNC cooperative loads and emits no ``cp.async.bulk.tensor``.
+    This xfail tracks the gap (TODO in ``052_transport``); implementing scalar-tile TMA
+    flips it to pass. Compile-only (inspects the kernel source). No CUDA needed."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+
+    g, _, _ = _build_2d_matmul_graph(_CPASYNC_DIMS)
+    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((9, 0)))
+    src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
+    assert "cp.async.bulk.tensor" in src, "scalar-tile TMA transport engaged"
+
+
 @requires_cuda
 def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     """When the greedy compile picks the tensor-core atom variant but its operands
