@@ -905,10 +905,18 @@ never a tree-builder.
   (`test_structural_push.py::test_split_demoted_fork_pushes_structural`, the `test_two_level` / `test_resolve`
   structural ones) need the keep-fused branch to be lowerable — the **`_classify_fused_prologue` regime** the new
   classifier lacks, so today the split is forced not offered.
-- **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). Structural-fork outer search (`005_split_demoted`
-  reborn), analytic/cold prior over the rebuilt enumeration, whole-program paths. *Recovers:* `test_run.py`,
-  `test_block.py`, `test_program_rebind.py`, the two `test_compile.py`, the `test_two_level.py` / `test_structural_push.py`
-  / `test_resolve.py` structural tests, the two `test_analytic.py::test_pick_matmul…`. *Folds in `_REASON` Phase 4 + 6.*
+- **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). **Largely landed.** Structural-fork outer search
+  (`005_split_demoted` reborn) + `test_resolve.py` / `test_two_level.py` / `test_structural_push.py` structural tests, the
+  whole-program / `test_block.py` / `test_program_rebind.py` paths landed earlier. Newly landed: the cold **analytic
+  prior** over the rebuilt enumeration (`search/analytic._enumerate` recomposed over the per-family `enumeration/_moves`
+  offers + the golden-plausible `_matmul_thread_gate` band → `test_pick_matmul…` recovered); the **per-family trace**
+  rewrite (`test_trace_records_partition_fork` off the old monolithic `010_enumerate`); the **fp16 half2 window** rewired
+  into the enumeration (`010_reduce_tile` FK→FKWIN reinterpretation + `kernel/015_pack_fk_window`/`010_split_register_axes`
+  StageBundle handling → `test_run_code_fp16_matmul_window_*`); and the **fused-prologue demoted matmul** (RMSNorm→Linear
+  SMEM edge — extent-1 cache-axis recovery in `kernel/_stage_expand` + prologue SSA-prefix in `assembly/_fused` →
+  `test_fused_rmsnorm_linear_blocked_prologue`). **Remaining gap:** the **masked-overhang** fused demoted matmul
+  (`test_qwen_lmhead_variant_compiles_within_budget`, N=4099 non-divisor + a stale `STAGE=1` over-staging pin) still OOBs.
+  *Folds in `_REASON` Phase 4 + 6.*
 
 ```
 RF foundation ──┬─► R1 staging ✓ ──► R4 warp-MMA ✓ ──► R5 transport ✓ ┐
