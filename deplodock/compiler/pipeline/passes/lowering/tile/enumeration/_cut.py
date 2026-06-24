@@ -100,29 +100,59 @@ def tier(dag, *, compute_capability: tuple[int, int], dtype_of) -> Tier:
 
 
 @dataclass(frozen=True)
-class CutDecision:
-    """The typed offer the ``split/005_split_demoted`` fork consumes. ``offered``: a
-    tier-monotonic ``GMEM`` cut is available (materializing the demoted operand raises
-    the consumer's tier). ``force``: the cut must be taken — the fused form is
-    ``UNBUILDABLE`` inline AND not expressible as an SMEM fused edge, so the GMEM cut is
-    the lone lowerable option. When the SMEM fused edge IS expressible (``smem_fusible``)
-    the cut is offered-not-forced — a keep(SMEM)-vs-cut(GMEM) fork. ``tier_inline``: the
-    fused body's tier, for ``eval`` introspection."""
+class CutOffer:
+    """One ranked cuttable edge — a single keep-vs-cut decision the ``CUT`` BINMASK
+    indexes (bit ``i`` = cut ranked offer ``i``). A demoted ``LoopOp`` exposes exactly
+    **one** offer today: the whole-cone cut is all-or-nothing (the per-edge multi-producer
+    fission — cut cone A, keep cone B in one graph — is the deferred follow-up that lands
+    with multi-producer ``assemble_fused``), so the mask is width-1. The list shape is the
+    additive-widening seam: when fission becomes per-edge, ``cut_offers`` returns one
+    ``CutOffer`` per independently-fusible cone and the mask widens with no re-key.
+    ``tier_inline`` (the fused body's tier the cut raises — ``UNBUILDABLE`` today) is
+    recorded for ``eval`` introspection + the future ``D_*`` edge-pricing features."""
 
-    offered: bool
+    tier_inline: Tier
+
+
+@dataclass(frozen=True)
+class CutDecision:
+    """The typed offer the ``split/005_split_demoted`` fork consumes. ``offers``: the
+    ranked cuttable edges (each a tier-monotonic ``GMEM`` cut whose materialization raises
+    the consumer's tier); the ``CUT`` mask width is ``len(offers)``, empty when no cut is
+    available. ``force``: the cut must be taken — the fused form is ``UNBUILDABLE`` inline
+    AND not expressible as an SMEM fused edge, so the GMEM cut is the lone lowerable
+    option. When the SMEM fused edge IS expressible (``smem_fusible``) the cut is
+    offered-not-forced — a keep(SMEM)-vs-cut(GMEM) fork. ``tier_inline``: the fused body's
+    tier, for ``eval`` introspection."""
+
+    offers: tuple[CutOffer, ...]
     force: bool
     tier_inline: Tier
+
+    @property
+    def offered(self) -> bool:
+        """A tier-monotonic ``GMEM`` cut is available (at least one ranked offer)."""
+        return bool(self.offers)
+
+    @property
+    def width(self) -> int:
+        """The ``CUT`` BINMASK width — the number of independent cut decisions (1 today,
+        the all-or-nothing whole-cone cut)."""
+        return len(self.offers)
 
 
 def cut_offers(loop_op: LoopOp, *, compute_capability: tuple[int, int], dtype_of, smem_fusible: bool = False) -> CutDecision:
     """The cut-offer verdict for a (still-un-tiled) fused ``LoopOp`` — read off the
     derived ``tier`` of its inline body. Offer the ``GMEM`` cut iff the fused form is
     ``UNBUILDABLE``: a demoted matmul whose operand cone keeps it below any buildable
-    tier, which materializing the operand strictly raises. **Force** it only when the
-    fused edge isn't also expressible on-chip (``smem_fusible`` False) — otherwise the
-    SMEM fused edge is a lowerable keep option, so the cut is offered-not-forced (a real
-    fork). Holds **no** fission logic — the fork pass supplies ``smem_fusible`` (the
-    ``seed_fused`` expressibility check) and pairs this verdict with ``extract_block``."""
+    tier, which materializing the operand strictly raises. Returns the ranked
+    ``offers`` (one whole-cone offer today — the per-edge fission is deferred) so the
+    ``CUT`` mask width derives from it. **Force** the cut only when the fused edge isn't
+    also expressible on-chip (``smem_fusible`` False) — otherwise the SMEM fused edge is a
+    lowerable keep option, so the cut is offered-not-forced (a real fork). Holds **no**
+    fission logic — the fork pass supplies ``smem_fusible`` (the ``seed_fused``
+    expressibility check) and pairs this verdict with ``extract_block``."""
     t = tier(iter_dag(loop_op), compute_capability=compute_capability, dtype_of=dtype_of)
     unbuildable = t is Tier.UNBUILDABLE
-    return CutDecision(offered=unbuildable, force=unbuildable and not smem_fusible, tier_inline=t)
+    offers = (CutOffer(tier_inline=t),) if unbuildable else ()
+    return CutDecision(offers=offers, force=unbuildable and not smem_fusible, tier_inline=t)
