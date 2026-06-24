@@ -1,5 +1,20 @@
 # `SPLIT_CONE` → `CUT`: per-edge cut knob + prior pricing
 
+## Status
+
+- **(a) Substrate — LANDED.** `cut_offers` now returns a ranked `offers` tuple (one whole-cone offer today →
+  width-1 mask; `enumeration/_cut.py`), and `SPLIT_CONE: bool` is renamed to `CUT`, a width-1 `BINMASK` over those
+  ranked edges (`split/005_split_demoted.py`). Behavior is **byte-identical**: `"0"` = keep fused (greedy cold pick),
+  `"1"` = cut every ranked edge; `DEPLODOCK_SPLIT_CONE` still pins via the `CUT` alias. This is §1's knob, paid as one
+  perf-DB re-key now, so the per-edge widening below is additive (no second re-key). The §1/§4 *enumeration* machinery
+  (per-independent-edge `argmin`, full `2^k` masks for coupled cones) lands **with multi-producer `assemble_fused`** —
+  that is the first graph that can expose a width>1 mask (today a multi-cone body is force-cut, not forked). Until
+  then the mask stays width-1 and the boolean semantics are exact.
+- **(b) Pricing — open, tracked under the parent.** §2's indirect-control mechanism (`_pick_structural` Σ-pricing, the
+  prior never reads `CUT`) is already live; §3's `D_*` edge features are the remaining gap and live under the parent
+  plan's "two-level pricing integration" bullet
+  ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)).
+
 When the structural split becomes a per-edge placement move
 ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)), the single graph-level
 `SPLIT_CONE: bool` no longer fits: one graph can have **N independently-cuttable edges**. This plan converts the boolean
