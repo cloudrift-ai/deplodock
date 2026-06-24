@@ -368,6 +368,56 @@ def _stamp_gmem_extents(stmt: Stmt, input_extents: dict) -> Stmt:
     return stmt.with_bodies(new_bodies)
 
 
+def _reduce_cache_names(block: Block) -> frozenset[str]:
+    """The within-stage K (reduce) cache-axis names — the ``stage_inner`` serial loop
+    + any reduce ``RegisterTile`` (the K axes that span the slab), as opposed to the
+    free THREAD/WARP/REGISTER axes. A staged operand's source dim mapped to one of
+    these is its contraction (K) dim; when that gmem dim is symbolic, the slab's
+    partial-final-K overhang must be zero-filled (``Source.kmask`` → ``_stage_expand``)."""
+    names: set[str] = set()
+    for s in block.compute.iter():
+        if isinstance(s, SerialTile) and s.kind == "stage_inner":
+            names.add(s.axis.name)
+        elif isinstance(s, RegisterTile) and s.reduce:
+            names.update(ax.name for ax in s.axes)
+    return frozenset(names)
+
+
+def _kmask_source(src: Source, reduce_names: frozenset[str], input_extents: dict) -> Source:
+    """Stamp ``Source.kmask = (k_dim, bound)`` when the source's contraction (K) gmem
+    dim is symbolic — so ``_stage_expand`` zero-fills the partial-final-K smem overhang
+    (the masked-K mma tier: reads past the runtime extent contribute 0; a clamped
+    duplicate would corrupt the reduction). ``k_dim`` is the source dim the K cache
+    axis maps to (``AffineAddressing.dims`` is aligned with ``cache_axes``)."""
+    if src.kmask is not None or not isinstance(src.addressing, AffineAddressing):
+        return src
+    exts = input_extents.get(src.buf)
+    if exts is None:
+        return src
+    for i, ax in enumerate(src.cache_axes):
+        if ax.name not in reduce_names:
+            continue
+        k_dim = src.addressing.dims[i]
+        if k_dim < len(exts) and not isinstance(exts[k_dim], int):  # a symbolic K gmem dim
+            return replace(src, kmask=(k_dim, exts[k_dim]))
+    return src
+
+
+def _stamp_kmask(stmt: Stmt, reduce_names: frozenset[str], input_extents: dict) -> Stmt:
+    """Recursively stamp ``Source.kmask`` on every SYNC ``StageBundle`` source with a
+    symbolic contraction dim (mirrors ``_stamp_gmem_extents``; the masked-K zero-fill
+    is SYNC-only — ``_stage_expand`` forces ``cp_v=0`` and a kmask source pins SYNC —
+    so cp.async / TMA bundles, which can't ternary a copied value, are left alone)."""
+    if isinstance(stmt, StageBundle):
+        if stmt.policy is StagePolicy.SYNC:
+            stmt = replace(stmt, sources=tuple(_kmask_source(s, reduce_names, input_extents) for s in stmt.sources))
+        return stmt
+    nested = stmt.nested()
+    if not nested:
+        return stmt
+    return stmt.with_bodies(tuple(Body(tuple(_stamp_kmask(s, reduce_names, input_extents) for s in body)) for body in nested))
+
+
 def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs, swizzled=True) -> tuple[Stmt, ...] | None:
     """Masked-tile staging: a symbolic / non-divisor matmul wraps its K tower +
     output ``Write`` in a boundary ``Cond(σ(M|N) < bound)``. The cooperative load
@@ -431,7 +481,12 @@ def synthesize_staging(graph: TileGraph) -> Body:
     compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
     stmts = tuple(compute)
+    # Masked-K zero-fill: stamp ``Source.kmask`` on SYNC sources whose contraction
+    # dim is symbolic, so the partial-final-K smem overhang is zero-filled rather than
+    # left reading stale smem (the masked-K mma tier — correct under concurrent load).
+    reduce_names = _reduce_cache_names(block)
+    input_extents = _input_extents(graph.buffers)
     hoisted = _hoist_masked(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs, swizzled=swizzled)
-    if hoisted is not None:
-        return Body(hoisted)
-    return Body(_wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs, swizzled=swizzled))
+    if hoisted is None:
+        hoisted = _wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs, swizzled=swizzled)
+    return Body(tuple(_stamp_kmask(s, reduce_names, input_extents) for s in hoisted))
