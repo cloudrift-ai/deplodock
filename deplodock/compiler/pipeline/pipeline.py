@@ -852,6 +852,12 @@ class Run:
 
         search = self.search
         assert search is not None, "Run.drive needs a search policy; use Run.resolve for deterministic resolution"
+        # The tune search is exempt from the strict knob-pin validator: it explores
+        # tier-foreign forks and steers heterogeneous multi-op graphs with a union pin
+        # vector (each op takes its tier's subset). A per-op contradiction is a pruned
+        # branch here, not the loud user error the greedy compile wants (``_validate``).
+        if self.ctx.validate_pins:
+            self.ctx = replace(self.ctx, validate_pins=False)
         # Seed candidate: no parent token — the policy roots it itself.
         search.push(Candidate(run=self, graph=graph, cursor=Cursor(run=self)).lazy())
 

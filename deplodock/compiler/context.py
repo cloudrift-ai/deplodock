@@ -126,6 +126,16 @@ class Context:
     # stale -O1 number. Populated from the env by :meth:`probe` /
     # :meth:`from_target`.
     compile_flags: str = ""
+    # Whether the strict knob-pin validator (``lowering/tile/enumeration/_validate``)
+    # is active. ``True`` on the deterministic greedy compile (``compile`` / ``run``),
+    # where a force-pinned env knob foreign to the kernel's resolved tier is a user
+    # error that should fail loudly instead of silently mis-compiling. ``False`` under
+    # the tune SEARCH (``Run.drive`` flips it): the search legitimately explores
+    # tier-foreign forks and steers heterogeneous multi-op graphs with a UNION pin
+    # vector (warp ``WM``/``WN`` + scalar ``BM``/``BN`` together — each op takes its
+    # tier's subset), so a per-op contradiction is a pruned branch, not an error. NOT
+    # in ``structural_key`` (it changes no codegen, only whether a contradiction raises).
+    validate_pins: bool = True
 
     @classmethod
     def from_target(cls, cap: tuple[int, int], *, gpu_name: str | None = None) -> Context:

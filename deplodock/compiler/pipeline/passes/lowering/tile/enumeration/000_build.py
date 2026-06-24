@@ -23,6 +23,7 @@ from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._validate import validate_pins
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -40,6 +41,12 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     regime = classify(dag)
     if regime is None or regime.algebra not in _BUILDABLE:
         raise RuleSkipped(f"move composer cannot lower kernel {loop_op.name!r}")
+    # Strict per-op knob-pin validation: a force-pinned env knob foreign to the tier
+    # this op resolves to is a hard error, not a silent drop (``_validate``). Greedy
+    # compile/run only — the tune search (``ctx.validate_pins=False``) explores
+    # tier-foreign forks and union-pinned multi-op graphs (see ``Run.drive``).
+    if ctx.validate_pins:
+        validate_pins(regime.algebra)
     # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
     # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
     buffers: dict[str, Buffer] = {}

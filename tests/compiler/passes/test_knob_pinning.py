@@ -363,12 +363,13 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
-    # Pin the scalar geometry EXCEPT STAGE — an explicit STAGE pin is authoritative
-    # (no budget filter), but here we want the budget-aware filter to decline the
-    # over-budget staging so the operands fall to the gmem-direct path.
-    for k, v in _SCALAR_F16_KNOBS.items():
-        if k == "STAGE":
-            continue
+    # Pin only the WARP-tier geometry (the over-ceiling register tile + atom-K chunk)
+    # and leave STAGE unpinned — an explicit STAGE pin is authoritative (no budget
+    # filter), but here we want the budget-aware filter to decline the over-budget
+    # staging so the operands fall to the gmem-direct path. Scalar-tier knobs (BN/BM)
+    # are deliberately NOT pinned: they are foreign to the warp tier and the strict
+    # knob-pin validator (``_validate``) rejects them alongside a ``MMA=<kind>`` pin.
+    for k, v in {"FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
     # tier), so greedy MUST take the atom variant.
