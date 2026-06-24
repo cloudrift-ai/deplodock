@@ -419,7 +419,7 @@ in enumeration even though it is a "local."
 
 **This maps straight onto the two-level MCTS.** The body-vs-schedule split is *orthogonal* to outer-vs-inner; the MCTS
 boundary is *kernel-set-changing*. The kernel-set-changing enumeration passes (`partition_reduce` across CTAs, the
-`005_split_demoted` cut at the partition head) branch the **outer** tree — one terminal per kernel set — while every
+`010_split_demoted` cut at the partition head) branch the **outer** tree — one terminal per kernel set — while every
 other enumeration pass branches the **inner** per-kernel tree. The deterministic materialization stage sits below both:
 the inner search's reward is `assemble`→(`peel`/`mask_order`/`pad`/`unroll`)→cuda→bench of one leaf, summed per op for
 the outer reward. Because the post-passes carry no fork, they add **zero** nodes to either tree — they are part of
@@ -457,7 +457,7 @@ boundary, and `TILE_PASSES` ends `…, "lowering/tile/enumeration", "lowering/ti
 ```
 passes/lowering/tile/
   enumeration/                 # pass "lowering/tile/enumeration" — everything PRE-assemble: the seed + the forks
-    000_build.py               #   deterministic: LoopOp → TileGraph algorithm DAG (no fork — seeds the search root)
+    010_build.py               #   deterministic: LoopOp → TileGraph algorithm DAG (no fork — seeds the search root)
     010_tensorize.py           #   fork (body):     atomize
     015_partition_reduce.py    #   fork (body):     split-K / cooperative-K
     020_register_tile.py       #   fork (schedule): bind REGISTER
@@ -476,12 +476,12 @@ passes/lowering/tile/
     _slab.py  _synth.py  …     #   shared materialization helpers (today's materialize.py, _stage_expand, …)
 ```
 
-`enumeration/` holds the entire search side — the deterministic `000_build` seed plus the genuine forks; `assembly/`
+`enumeration/` holds the entire search side — the deterministic `010_build` seed plus the genuine forks; `assembly/`
 holds the deterministic materialization stage — `000_assemble` plus the fixed-logic post-passes, with no fork anywhere.
 **The `assemble` boundary is the dir boundary**, so "is this pass allowed to return a `Fork`?" reduces to "which dir is
 it in?" — a structural guardrail against fixed logic leaking into the search. Today's `partition/` package (the move
 composer) dissolves into these two: `build` + forks + move helpers → `enumeration/`, `assemble` + slab synthesis →
-`assembly/` (see "Relationship to existing code"). `000_build` is deterministic yet lives in `enumeration/` because it is
+`assembly/` (see "Relationship to existing code"). `010_build` is deterministic yet lives in `enumeration/` because it is
 the pre-`assemble` front that produces the DAG the forks annotate — the dir is the *stage*, not the "has-a-fork" flag.
 
 ## Pass rewrites
@@ -710,8 +710,8 @@ empirical true-failure set so every red test is an `xfail(strict=False)` tagged 
 green test is masked; `make test` is green with 0 failed / 0 XPASS.)
 
 **Foundation (RF) — landed.** The single enumeration pass is split into per-family forks
-(`enumeration/{000_build, 010_reduce_tile, 020_thread_tile, 030_register_tile, 040_seal_scalar_tier, 050_stage}` +
-`assembly/`), and F3-b shipped in its literal incremental form — `000_build` seeds the logical `TileGraph`, each tile
+(`enumeration/{010_build, 060_reduce_tile, 090_thread_tile, 100_register_tile, 110_seal_scalar_tier, 120_stage}` +
+`assembly/`), and F3-b shipped in its literal incremental form — `010_build` seeds the logical `TileGraph`, each tile
 pass applies an incremental body move to the stored algorithm, and `assembly/010_assemble` only materializes it.
 Invariant guards (derived-view discipline, assemble determinism, op_cache_key canonicality, oracle-vs-pipeline
 equivalence, assembly ⟂ enumeration) live in `tests/compiler/passes/test_tile_ir_invariants.py`. Two items stay open:
@@ -722,10 +722,10 @@ foundation: each **adds one enumeration pass** (its move family) + grows `assemb
 never a tree-builder.
 
 - **R1 — Staging** (deps: RF). **Landed (scalar tier); the inversion is fixed (F3-b shipped).** Added the first
-  `Schedule`-move enumeration fork `enumeration/050_stage.py`. It originally ran *after* `040_lower` on a built `TileGraphOp` —
+  `Schedule`-move enumeration fork `enumeration/120_stage.py`. It originally ran *after* `040_lower` on a built `TileGraphOp` —
   an **inversion** R1 carried only because F3-b had not landed yet (a `Schedule`-move fork forced to run *behind* a
-  monolithic build pass). With F3-b shipped that is gone: the body moves (`010_reduce_tile` / `030_register_tile`)
-  refine the stored `op.tilegraph` in place, so `050_stage` is now a **pre-assemble** schedule fork that reads the
+  monolithic build pass). With F3-b shipped that is gone: the body moves (`060_reduce_tile` / `100_register_tile`)
+  refine the stored `op.tilegraph` in place, so `120_stage` is now a **pre-assemble** schedule fork that reads the
   fully-tiled algorithm's derived `Block.reads` + ranked stageable read-sites directly and writes the chosen `Edge`s
   straight into `Schedule.staged` — the source of truth `assemble` reads (`assembly/010_assemble` does no build, only
   materializes). Plus the candidate/legality helper `enumeration/_stage.py`
@@ -757,11 +757,11 @@ never a tree-builder.
   (`MONOID` recognised); R2 added the coop build move (`_build.coop_build` + `_replace_k_coop`: the `K_c` cooperative-
   THREAD lane re-bracket `K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`, masked-K identity-fill past a symbolic bound
   via `_mask_reduce_accums`, free-axis σ-split with the register tile forced to 1) + the **single** `(bk,fk,br)` fork
-  `enumeration/015_coop_reduce` (a cooperative reduce is one decision, unlike the scalar `SEMIRING` chain) + the coop
+  `enumeration/070_coop_reduce` (a cooperative reduce is one decision, unlike the scalar `SEMIRING` chain) + the coop
   offers in `_moves` (`coop_reduce_offers` / `coop_free_threads` / `_strided_br_ok`). `assemble` needed **no new
   synthesis** — `K_c` is laid first in `Block.domain` so it sits innermost in the THREAD tier, and the warp-shuffle /
   hierarchical combine is the surviving `kernel/100_materialize_tile` + `kernel/_combine` deriving it from `Accum.axes ∩
-  ThreadTile`. The scalar passes `020`/`030`/`040` + `050_stage` gate off `MONOID` (`000_build._BUILDABLE` gained it).
+  ThreadTile`. The scalar passes `020`/`030`/`040` + `120_stage` gate off `MONOID` (`010_build._BUILDABLE` gained it).
   *Gate:* accuracy-vs-torch on the RTX 5090 — static + symbolic-K softmax/rmsnorm, warp-shuffle (BR≤32) and hierarchical
   (multi-warp BR) combines, whole-CTA and strided-cooperative rows. *Recovered ~21 (de-quarantined):*
   `test_cooperative_combine.py`, `test_masked_cooperative_reduce.py`, the six `test_reduction_rules.py` coop tests, the
@@ -775,7 +775,7 @@ never a tree-builder.
   `MONOID` reduce — it rides the R4/R5 masked-staging-clamp + greedy-fallback work, not R2.
 - **R3 — Split-K / `partition_reduce`** (deps: R2's combine synthesis). **Landed.** The cross-CTA split-K matmul
   already binds its `K_s` GRID partition (the `reduce_decomp` body move when `SPLITK > 1`, codegen `atomicAdd`); R3 adds
-  the **atomic-free** combine as a structural fork. `enumeration/055_atomic_free_splitk` offers the `NOATOMIC` BOOL on a
+  the **atomic-free** combine as a structural fork. `enumeration/140_atomic_free_splitk` offers the `NOATOMIC` BOOL on a
   fully-tiled scalar `SEMIRING` matmul: `False` keeps the `atomicAdd`; `True` splices a two-node `Graph` — the matmul's
   output `Write` retargeted to a `partial[K_s, M, N]` workspace (`K_s` enters the index ⇒ a plain store) plus a sibling
   additive reduce kernel folding `K_s`. The combine kernels are built by `enumeration/_partition.py`
@@ -793,12 +793,12 @@ never a tree-builder.
 - **R4 — Warp-tier MMA (`atomize`)** (deps: R1). **Landed (core warp tier; the warp/atom half of R1 with it).** Added
   the `atomize` body move (`_build.warp_build`: the four-way GRID/WARP/REGISTER/ATOM σ-split + K re-bracket at `atom_k`
   granularity + fuse the cell `[Load,Load,mul,Accum]` → `Mma`, `Block.atom` deriving from it) + the warp-tier fork chain
-  `enumeration/{005_tensorize, 006_warp_geometry, 008_warp_reg, 009_warp_build}` (atom-vs-scalar, then `WM/WN`, `FM/FN`,
+  `enumeration/{020_tensorize, 030_warp_geometry, 040_warp_reg, 050_warp_build}` (atom-vs-scalar, then `WM/WN`, `FM/FN`,
   `BK`+build; the scalar passes `010`/`020`/`030`/`040` gate off when an `MMA` atom is pinned) + the atom-eligibility
   gate `enumeration/_atom.py` (`eligible_atoms` + the shared `classify_matmul_operands`). `assemble` reuses the existing
   `_free_layers` (ATOM/REGISTER/WARP/GRID tier order) + `_wrap_tower` (the `Mma` rides inside the `AtomTile`); the
   surviving `kernel/005_lower_atom_tile` synthesizes the `RegFragment`/`ldmatrix`/`mma.sync`/`RegStore` chain. **Warp
-  staging** rides `050_stage` + `assembly/_slab` (the atom-strided slab `block`; the transposed-B operand is excluded —
+  staging** rides `120_stage` + `assembly/_slab` (the atom-strided slab `block`; the transposed-B operand is excluded —
   it lowers gmem-direct, ldmatrix having no `.trans`-from-smem path; a size-1 REGISTER cell is dropped before
   classification so its atom stride migrates to the surviving warp axis). The fragment-epilogue gate resolves a fused
   per-CTA scale / causal-mask Load hoisted into `dag.leading`/`mid` via `outer_loads`. The warp tier is v1 `SPLITK=1`
@@ -807,7 +807,7 @@ never a tree-builder.
   `test_stage_inputs_mma_probe.py`. *Masked scalar-tile staging clamp landed (R4 follow-up):* scalar-offer env-pin
   honoring (`_pin` in `_moves.thread_offers` / `map_reg_offers` / `reduce_reg_offers`, mirroring `reduce_offers`'s
   `BK`/`FK`/`SPLITK`) lets a pinned masked tile (e.g. `BN=8` over `N=47`) reach the masked σ-split; the over-staging
-  this exposes is resolved in `enumeration/050_stage` by a **budget-aware mask filter** (the auto-enumerated subsets are
+  this exposes is resolved in `enumeration/120_stage` by a **budget-aware mask filter** (the auto-enumerated subsets are
   pruned to those whose `_slab_bytes` fit `ctx.max_dynamic_smem`, so greedy's option-0 is the largest in-budget staging
   and the deterministic compile no longer over-stages a large pinned tile past smem with no fallback — a
   `DEPLODOCK_STAGE` pin stays authoritative); and the SYNC masked cooperative load is hoisted above the boundary `Cond`
@@ -822,7 +822,7 @@ never a tree-builder.
   `test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct` — the over-ceiling `FM=26` warp register pin is now
   authoritative (`warp_reg_offers` bypasses the `_MAX_WARP_CELLS` *search* ceiling for a full `(FM, FN)` pin — the
   ceiling prunes auto-enumerated candidates, not explicit pins), so the warp build + assemble proceed; and with **no**
-  `STAGE` pin the budget-aware `050_stage` filter prunes the over-budget staging subsets (the `FM=26` slabs blow the
+  `STAGE` pin the budget-aware `120_stage` filter prunes the over-budget staging subsets (the `FM=26` slabs blow the
   smem cap) down to the empty one, so greedy stages nothing and the operands lower gmem-direct
   (`dpl_mma_load_{a,b}_gmem`) — the staging-decline is the budget filter, not an override of an authoritative pin.
   `…::test_hoist_refuses_lift_when_pipeline_reads_guarded_defs` — rewritten against `assembly/_slab._hoist_masked`,
@@ -832,7 +832,7 @@ never a tree-builder.
   emit liftable masked prologue `Cond`s today). *`_REASON` Phase 1–2 (symbolic masked warp / masked-K) folds in with the
   symbolic-K staging follow-up.*
 - **R5 — Transport (cp.async / TMA)** (deps: R1, R4). **Landed (warp-tier TMA).** Added the `promote_transport`
-  enumeration fork `enumeration/052_transport` (the `TMA` BOOL on a fully-staged warp matmul — SYNC is option-0 so
+  enumeration fork `enumeration/130_transport` (the `TMA` BOOL on a fully-staged warp matmul — SYNC is option-0 so
   greedy stays byte-identical, TMA the eligible second offer / `DEPLODOCK_TMA=1` pin, writing
   `Schedule.staged[edge] = Transport.TMA`) + the eligibility oracle `enumeration/_transport.tma_eligible` (sm_90+,
   affine box ≤ 256 / 16 B-aligned, a ringable K loop — ported from the deleted legacy `050_use_tma._source_eligible`).
@@ -855,9 +855,9 @@ never a tree-builder.
   the TMA decision; the TMA-decline it nominally guards is moot until the kernel lowers. *`_REASON` Phase 3's masked-TMA
   follow-ups (the cooperative-load clamp + non-divisor `real_extent`) stay with the R4 SYNC-masked-staging tier.*
 - **R6 — Flash / attention** (deps: R2, R4). **Landed (scalar flash core).** Added the streaming-`TWISTED_MONOID`
-  build path: `000_build._BUILDABLE` gained `TWISTED_MONOID`; the flash fork `enumeration/017_streaming` owns the regime end
-  to end (like `015_coop_reduce` owns `MONOID`) — it enumerates the free-axis THREAD tile, forces `FM=FN=1` +
-  `BK=FK=SPLITK=1`, and applies the `streaming_build` body move per leaf; `050_stage` skips `TWISTED_MONOID` (flash is
+  build path: `010_build._BUILDABLE` gained `TWISTED_MONOID`; the flash fork `enumeration/080_streaming` owns the regime end
+  to end (like `070_coop_reduce` owns `MONOID`) — it enumerates the free-axis THREAD tile, forces `FM=FN=1` +
+  `BK=FK=SPLITK=1`, and applies the `streaming_build` body move per leaf; `120_stage` skips `TWISTED_MONOID` (flash is
   smem-free). `_build.streaming_build` / `_replace_k_streaming` serial-transform both contraction axes (the streaming KV reduce
   + its nested QK^T reduce), and for a **symbolic** KV (dynamic `seq_len`) ceil-divide + clamp the load index +
   `_mask_streaming_carrier` masks the `Monoid` score to `-inf` past the runtime bound (the `TWISTED_MONOID` identity — fold
@@ -872,12 +872,12 @@ never a tree-builder.
   lane streams a strided KV slice into its own online-softmax `(m, l, O)` partial, the `Monoid.axes` pick up `K_c`
   through σ, and `kernel/100_materialize_tile` emits the carrier's `combine_states` warp-shuffle / smem-tree combine —
   the same commutative-licensed THREAD partition the `MONOID` coop reduce uses (no new assemble work; the `Monoid`
-  already carries `combine_states` / `state_b`). `017_streaming` enumerates `streaming_br_offers × thread_offers`, budgets the
+  already carries `combine_states` / `state_b`). `080_streaming` enumerates `streaming_br_offers × thread_offers`, budgets the
   free thread tile by `BR`, and filters the free×BR layout via `streaming_coop_geometry_ok` (whole-CTA tree vs strided
   intra-warp segment). Default `BR=1` keeps the serial-KV form (opt-in via `DEPLODOCK_BR`; symbolic KV stays serial).
   *Recovered:* `test_flash_cooperative_kv.py` (4 cases, accuracy vs torch SDPA). **Score-materializing SDPA landed
-  (R6 follow-up) — `005_split_demoted` reborn.** The structural split is back as the new pre-build pass dir
-  `lowering/tile/split` (a one-rule pass before `enumeration`, run on the un-tiled `LoopOp`): `005_split_demoted` +
+  (R6 follow-up) — `010_split_demoted` reborn.** The structural split is back as the new pre-build pass dir
+  `lowering/tile/split` (a one-rule pass before `enumeration`, run on the un-tiled `LoopOp`): `010_split_demoted` +
   `_split_demoted` (ported from the deleted legacy, only the `_helpers` import redirected to `kernel/_helpers` and the
   `classify`/`iter_dag` imports to `enumeration`). It un-fuses a **demoted matmul** — a multiply operand reading a
   computed/K-folded cone — into an `xn` operand producer + a clean gemm consumer, returned as a `Graph` the engine
@@ -906,12 +906,12 @@ never a tree-builder.
   structural ones) need the keep-fused branch to be lowerable — the **`_classify_fused_prologue` regime** the new
   classifier lacks, so today the split is forced not offered.
 - **R7 — e2e / CLI / structural-search / prior** (deps: R1–R6). **Largely landed.** Structural-fork outer search
-  (`005_split_demoted` reborn) + `test_resolve.py` / `test_two_level.py` / `test_structural_push.py` structural tests, the
+  (`010_split_demoted` reborn) + `test_resolve.py` / `test_two_level.py` / `test_structural_push.py` structural tests, the
   whole-program / `test_block.py` / `test_program_rebind.py` paths landed earlier. Newly landed: the cold **analytic
   prior** over the rebuilt enumeration (`search/analytic._enumerate` recomposed over the per-family `enumeration/_moves`
   offers + the golden-plausible `_matmul_thread_gate` band → `test_pick_matmul…` recovered); the **per-family trace**
   rewrite (`test_trace_records_partition_fork` off the old monolithic `010_enumerate`); the **fp16 half2 window** rewired
-  into the enumeration (`010_reduce_tile` FK→FKWIN reinterpretation + `kernel/015_pack_fk_window`/`010_split_register_axes`
+  into the enumeration (`060_reduce_tile` FK→FKWIN reinterpretation + `kernel/015_pack_fk_window`/`010_split_register_axes`
   StageBundle handling → `test_run_code_fp16_matmul_window_*`); and the **fused-prologue demoted matmul** (RMSNorm→Linear
   SMEM edge — extent-1 cache-axis recovery in `kernel/_stage_expand` + prologue SSA-prefix in `assembly/_fused` →
   `test_fused_rmsnorm_linear_blocked_prologue`). **Remaining gap:** the **masked-overhang** fused demoted matmul
@@ -954,26 +954,26 @@ choice is a `Schedule` annotation, and — with **F3-b** landed — the algorith
 incremental body moves (`reduce_decomp` at `010`, `free_tile` at `030`, `coop_build` at `015`, `warp_build` at `009`),
 with `assemble` the one place the tower is materialized. **R1 (staging), R2 (cooperative reduce), R3 (split-K /
 atomic-free combine), and R4 (warp-tier `atomize`) have landed.** The scalar `Schedule`-move fork
-`enumeration/050_stage` reads the fully-tiled stored algorithm
+`enumeration/120_stage` reads the fully-tiled stored algorithm
 and writes `Schedule.staged`, and `assemble` synthesizes the smem slab + cooperative `StageBundle` (`assembly/_slab`) —
 the slab `block` multiplier now derived from the σ coefficients, unifying scalar (`()`) and warp (atom-strided) staging.
-The warp-tier fork chain (`005_tensorize`→`006`/`008`/`009`) builds the tensor-core matmul through the `atomize` body
-move, proven accuracy-vs-torch (`mma.sync` + `ldmatrix`). The cooperative-reduce fork `enumeration/015_coop_reduce`
+The warp-tier fork chain (`020_tensorize`→`006`/`008`/`009`) builds the tensor-core matmul through the `atomize` body
+move, proven accuracy-vs-torch (`mma.sync` + `ldmatrix`). The cooperative-reduce fork `enumeration/070_coop_reduce`
 builds the `MONOID` reduce through the `coop_build` body move (the `K_c` cooperative-THREAD lane), reusing the surviving
 `kernel/100` + `kernel/_combine` warp-shuffle / hierarchical synthesis with **no new assemble work**. The split-K
-combine fork `enumeration/055_atomic_free_splitk` adds the `NOATOMIC` structural split (matmul → `partial[K_s, M, N]`
+combine fork `enumeration/140_atomic_free_splitk` adds the `NOATOMIC` structural split (matmul → `partial[K_s, M, N]`
 workspace + sibling reduce kernel, built by `enumeration/_partition`), proven accuracy-vs-torch on `SPLITK=2/4`. The
-warp-tier TMA transport fork `enumeration/052_transport` promotes a staged warp matmul's operands to the double-buffered
+warp-tier TMA transport fork `enumeration/130_transport` promotes a staged warp matmul's operands to the double-buffered
 `cp.async.bulk.tensor` ring (`assembly/_slab` swizzle/ring synthesis + `assembly/020_peel` software-pipeline + the
 `mask_order` hoist for symbolic-M tiles), proven accuracy-vs-torch static + dynamic. The pass structure is validated end
 to end across the smem (scalar + warp), tensor-core, cooperative-reduce, split-K, and TMA-transport regimes.
 
-**R5 (transport — warp-tier TMA) and the R6 scalar flash core have landed.** The flash fork `enumeration/017_streaming`
+**R5 (transport — warp-tier TMA) and the R6 scalar flash core have landed.** The flash fork `enumeration/080_streaming`
 builds the streaming `TWISTED_MONOID` online-softmax (SDPA / causal / GQA / additive-mask, static + dynamic) through the
-`streaming_build` body move, and the TMA fork `enumeration/052_transport` promotes a staged warp matmul to the
+`streaming_build` body move, and the TMA fork `enumeration/130_transport` promotes a staged warp matmul to the
 double-buffered `cp.async.bulk.tensor` ring (`assembly/_slab` + `020_peel` + the `mask_order` hoist).
 
-**The R4 masked scalar-tile staging clamp has landed** (scalar-offer env-pin honoring + `050_stage`'s budget-aware
+**The R4 masked scalar-tile staging clamp has landed** (scalar-offer env-pin honoring + `120_stage`'s budget-aware
 mask filter + `_slab._hoist_masked`'s SYNC hoist-and-clamp — see the R4 bullet): the masked cooperative-load clamp +
 non-divisor `real_extent` tests are de-quarantined, and the over-staging the pin once exposed is now resolved by the
 greedy in-budget fallback (no longer the R2-blocked "over-stages the multi-accum matmul past the smem budget").
@@ -983,7 +983,7 @@ over-ceiling warp-reg pin is authoritative so the unstaged atom builds + lowers 
 staging decline, and the masked-tile hoist gained the SSA-safety refusal — see the R4 bullet); both quarantined R4
 tests are de-quarantined. **R6 is now complete** — all four follow-ups landed: the **cooperative-KV flash** (`BR>1`
 lays the `K_c` THREAD lane in `_build.streaming_build`, `combine_states` fires at `kernel/100`), the **score-materializing
-SDPA** (the reborn `005_split_demoted` in the new `lowering/tile/split` pass dir forces the softmax+P@V un-fusion into
+SDPA** (the reborn `010_split_demoted` in the new `lowering/tile/split` pass dir forces the softmax+P@V un-fusion into
 an `xn` producer + a clean static-or-symbolic-K gemm), and the **RoPE-fused attention** (the `_stage._multi_access_bufs`
 exclusion keeps a buffer read at >1 distinct access — the rotary `cos[m]`/`cos[n]`, the straight + rotate-half
 projection — gmem-direct instead of corrupting one slab). De-quarantined `test_flash_cooperative_kv.py`, the SDPA set

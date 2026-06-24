@@ -348,7 +348,7 @@ def test_article_tma_sgemm_reproduction(monkeypatch):
     """The matmul-optimization blogs' hero kernel is a SCALAR fp32 SGEMM whose staged
     operands ride the **TMA** transport (``cp.async.bulk.tensor.2d`` double buffer) —
     the ``TM=26`` tile (``BM=8 BN=32 FM=26 FN=4 BK=32``) reaching ~106 % of cuBLAS at
-    2048³. ``052_transport`` promotes any staged matmul with a ringable K loop, scalar
+    2048³. ``130_transport`` promotes any staged matmul with a ringable K loop, scalar
     as well as warp-tier; the scalar tier's plain-``Load`` consumer reads an unswizzled
     (``SwizzleMode.NONE``) deposit (``_slab._make_bundle``, keyed on ``Block.atom``)
     where the warp tier's ``ldmatrix`` reads a swizzled one. This asserts both that the
@@ -405,7 +405,7 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     Two facts make this fire: (1) the over-ceiling ``FM=26`` warp register pin is
     authoritative (``warp_reg_offers`` bypasses the ``_MAX_WARP_CELLS`` search
     ceiling for a full pin), so the warp build proceeds; (2) with **no** ``STAGE``
-    pin the budget-aware ``050_stage`` filter prunes every over-budget staging subset
+    pin the budget-aware ``120_stage`` filter prunes every over-budget staging subset
     to the empty one (``FM=26`` slabs blow the smem cap), so greedy's option-0 stages
     nothing and the operands lower gmem-direct."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
@@ -461,7 +461,7 @@ def test_unstaged_atom_mma_accuracy(monkeypatch):
 #   layout) must still produce correct output.
 #
 # NOTE: the article's defining optimization — **TMA** (``cp.async.bulk.tensor``) on
-# the scalar SGEMM tile — is NOT reproduced here: ``052_transport`` only promotes the
+# the scalar SGEMM tile — is NOT reproduced here: ``130_transport`` only promotes the
 # warp-tier MMA atom, so ``TMA=1`` on a scalar fp32 tile is currently inert (it lowers
 # to plain SYNC cooperative loads). That gap is tracked as an xfail
 # (``test_article_tma_sgemm_reproduction``), not silently passed as a no-op TMA row.
@@ -497,7 +497,7 @@ def _build_2d_matmul_graph(dims: dict):
 # Every row is the SCALAR fp32 tier (no MMA atom is eligible for fp32). Most rows stage
 # via plain SYNC cooperative loads; the ``*_tma`` rows pin ``TMA=1`` so the staged
 # operands ride the ``cp.async.bulk.tensor`` double-buffer ring (the article's hero
-# transport — ``052_transport`` now promotes the scalar tier, depositing the slab
+# transport — ``130_transport`` now promotes the scalar tier, depositing the slab
 # unswizzled for the plain-``Load`` consumer; see ``test_article_tma_sgemm_reproduction``
 # for the tile-level check). The dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose
 # passes were removed in the block-DAG rewrite) were dropped here.

@@ -36,7 +36,7 @@ class Role(enum.Enum):
 
     ``WARP`` (→ ``WarpTile``) and ``ATOM`` (→ ``AtomTile``, the
     hardware-atomic MMA cell tier) are emitted today for warp-tier matmul
-    rows by the enumeration ``atomize`` move (``enumeration/009_warp_build``).
+    rows by the enumeration ``atomize`` move (``enumeration/050_warp_build``).
     ``_layer_kind_for`` / ``_wrap_tower`` recognise every role so a consumer
     plan can flip a tier without revisiting the tower-building mechanics.
     """
@@ -164,14 +164,14 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...],
             current = (RegisterTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "warp":
             # Warp-cooperative tier — the per-CTA warp grid (WM×WN) of a
-            # warp-tier matmul, emitted by ``enumeration/009_warp_build``.
+            # warp-tier matmul, emitted by ``enumeration/050_warp_build``.
             current = (WarpTile(axes=tuple(axes), body=Body(current)),)
         elif kind == "atom":
             # Hardware-atomic cell tier (the tensor-core MMA cell). Marker
             # for the per-cell tensor-core extent; the MMA cell materializer
             # (``kernel/005_lower_atom_tile``) lowers it to the
             # ``ldmatrix`` + ``mma.sync`` chain, so no AtomTile reaches
-            # kernel render. Emitted by ``enumeration/009_warp_build``'s
+            # kernel render. Emitted by ``enumeration/050_warp_build``'s
             # ``atomize`` move.
             assert atom is not None, "_wrap_tower: an ATOM layer requires the atom spec"
             current = (AtomTile(axes=tuple(axes), body=Body(current), atom=atom),)

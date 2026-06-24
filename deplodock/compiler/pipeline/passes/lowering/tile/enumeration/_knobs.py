@@ -81,7 +81,7 @@ FK = Knob(
 )
 BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
 SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
-# Staging knob (the ``stage`` move, ``050_stage``): a bitmask over the ranked
+# Staging knob (the ``stage`` move, ``120_stage``): a bitmask over the ranked
 # stageable read-sites (``Edge``s) of a reduce kernel — char ``i`` selects ranked
 # candidate ``i``. The fork writes the chosen ``Edge``s into ``Schedule.staged``
 # (the source of truth ``assemble`` reads); the mask string is the variant
@@ -89,7 +89,7 @@ SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA 
 # (pointwise / no reuse / no K-tower) — an explicit "decided: unused".
 STAGE = Knob("STAGE", KnobType.BINMASK, help="Bitmask over ranked stageable read-sites (char i = candidate i)", off="")
 
-# Transport knob (the ``promote_transport`` move, ``052_transport``): a BOOL over a
+# Transport knob (the ``promote_transport`` move, ``130_transport``): a BOOL over a
 # fully-staged warp-tier matmul. ``True`` promotes the staged ``Edge``s from
 # ``Transport.SYNC`` to ``Transport.TMA`` (``assembly/_slab`` then synthesizes the
 # double-buffered ``cp.async.bulk.tensor`` ring + per-source swizzle; ``assembly/020_peel``

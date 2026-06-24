@@ -6,8 +6,8 @@
 ranked first (``ldmatrix``/``mma.sync`` outrank scalar register tiles), scalar
 last as the always-available fallback. An atom branch stamps ``MMA=<kind>`` (no
 body move yet — the warp build runs once the geometry knobs are pinned, at
-``009_warp_build``); the scalar branch leaves the op untouched so the scalar
-passes (``010``/``020``/``030``) fire and ``040`` seals ``MMA=0``.
+``050_warp_build``); the scalar branch leaves the op untouched so the scalar
+passes (``060``/``090``/``100``) fire and ``110`` seals ``MMA=0``.
 
 ``DEPLODOCK_MMA`` collapses the fork: ``0`` (falsy) → scalar only (``RuleSkipped``
 → the scalar chain runs); a kind name → that atom only (pin); unset / truthy →

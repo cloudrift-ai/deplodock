@@ -167,7 +167,7 @@ class Candidate:
         knob merge, which is idempotent for rules that already merged
         manually). A
         lowering-tier ``Graph`` splice of a loop-dialect kernel (a
-        structural decomposition — ``tile/005_split_demoted``'s split)
+        structural decomposition — ``tile/010_split_demoted``'s split)
         stamps the consumed root op as each fragment kernel's
         ``source``, so the chain also records *which op a decomposition
         came from*: the two-level tuner groups a terminal's kernels by

@@ -54,7 +54,7 @@ def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
 
 def _loop_dag_buffers(graph: Graph):
     """The fused ``LoopOp`` + its ``iter_dag`` / regime / logical buffers — the seed the
-    move composer tiles. Mirrors ``000_build`` so the oracle path matches the pipeline."""
+    move composer tiles. Mirrors ``010_build`` so the oracle path matches the pipeline."""
     loop = next(n.op for n in Pipeline.build(LOOP_PASSES).run(graph).nodes.values() if type(n.op).__name__ == "LoopOp")
     dag = iter_dag(loop)
     buffers = {name: Buffer(name=name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM) for name, t in loop.inputs.items()}

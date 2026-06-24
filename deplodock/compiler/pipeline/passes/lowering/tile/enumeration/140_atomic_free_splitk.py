@@ -16,7 +16,7 @@ per-partition partials one of two ways; this pass forks between them:
 
 This succeeds the deleted ``017_atomic_free_splitk``: same ``NOATOMIC`` BOOL fork and
 Write-retarget, now over the block-DAG ``TileGraph`` (the fork runs once the matmul is
-fully tiled, after ``050_stage``) instead of the legacy ``TileOp`` tower. Idempotent:
+fully tiled, after ``120_stage``) instead of the legacy ``TileOp`` tower. Idempotent:
 re-running on an op whose ``knobs`` already names ``NOATOMIC`` skips. The warp / MMA
 tier is ``SPLITK=1`` today (no cross-CTA split — R4), so this fires only on the scalar
 ``SEMIRING`` matmul.

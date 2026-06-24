@@ -46,7 +46,7 @@ def _f32_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
 
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
     """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
     f16 = _dt.get("f16")
     g = g if g is not None else Graph()
     x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
@@ -116,15 +116,15 @@ def test_trace_records_partition_fork() -> None:
     kernel's node id and the decide's score annotation (None for the unranked
     option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds. The block-DAG
     Tile IR splits the old monolithic ``010_enumerate`` into the per-family
-    chain (``010_reduce_tile`` → ``020_thread_tile`` → ``030_register_tile`` →
-    ``050_stage``), so one kernel records that chain rather than one fork, and
+    chain (``060_reduce_tile`` → ``090_thread_tile`` → ``100_register_tile`` →
+    ``120_stage``), so one kernel records that chain rather than one fork, and
     the cumulative knob row carries the complete tile (``{BM, BN}``) by the
     thread-tile fork."""
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     terminal, trace = run.resolve(g, _option0)
-    part = [d for d in trace if d.rule_name in {"010_reduce_tile", "020_thread_tile", "030_register_tile"}]
-    assert [d.rule_name for d in part] == ["010_reduce_tile", "020_thread_tile", "030_register_tile"], (
+    part = [d for d in trace if d.rule_name in {"060_reduce_tile", "090_thread_tile", "100_register_tile"}]
+    assert [d.rule_name for d in part] == ["060_reduce_tile", "090_thread_tile", "100_register_tile"], (
         f"the inner tile-fork chain for one kernel, got {[d.rule_name for d in trace]}"
     )
     for d in part:
@@ -132,7 +132,7 @@ def test_trace_records_partition_fork() -> None:
         assert d.chosen_kind == "op"
         assert d.score is None
         assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
-    thread = next(d for d in part if d.rule_name == "020_thread_tile")
+    thread = next(d for d in part if d.rule_name == "090_thread_tile")
     assert {"BM", "BN"} <= set(thread.knob_delta), f"the thread-tile decision carries the complete free tile row, got {thread.knob_delta}"
 
 
@@ -173,9 +173,9 @@ def test_structural_replay_consulted() -> None:
         return _option0(fp)
 
     terminal, trace = Run(pipeline=outer_pipeline(), ctx=Context.from_target((12, 0))).resolve(g, split_first)
-    assert seen.count("005_split_demoted") == 1, f"the second offer site must replay, decide saw {seen}"
-    assert sum(1 for d in trace if d.rule_name == "005_split_demoted") == 1
+    assert seen.count("010_split_demoted") == 1, f"the second offer site must replay, decide saw {seen}"
+    assert sum(1 for d in trace if d.rule_name == "010_split_demoted") == 1
     assert sum(1 for n in terminal.nodes.values() if isinstance(n.op, LoopOp)) == 4, "both sites must take the split side"
-    split = next(d for d in trace if d.rule_name == "005_split_demoted")
+    split = next(d for d in trace if d.rule_name == "010_split_demoted")
     assert split.chosen_kind == "graph"
     assert split.knob_delta.get("CUT") == "1"

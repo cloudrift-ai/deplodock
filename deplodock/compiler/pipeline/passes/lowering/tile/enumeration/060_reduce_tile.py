@@ -5,7 +5,7 @@ For a ``SEMIRING`` seed, offer the carrier-licensed ``(bk, fk, splitk)`` K-tilin
 reduce-decomposition body move** (``_build.reduce_decomp``: re-bracket K into the
 ``K_o`` / ``K_i`` tower in ``Block.compute``) to the stored algorithm and pins its
 reduce-knob group. The first of the F3-b incremental body moves; the free-axis split
-follows at ``030_register_tile``. A ``MAP`` nest has no contraction, so this passes
+follows at ``100_register_tile``. A ``MAP`` nest has no contraction, so this passes
 through (``RuleSkipped``).
 """
 

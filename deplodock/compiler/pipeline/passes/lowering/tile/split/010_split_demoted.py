@@ -1,10 +1,10 @@
 """Offer the demoted-matmul cut as a structural fork — the thin shell (R7 edge placement).
 
 The **pre-build structural-fork head** of the tile phase. Runs before
-``enumeration/000_build`` on the still-un-tiled ``LoopOp`` (the only dialect where every
+``enumeration/010_build`` on the still-un-tiled ``LoopOp`` (the only dialect where every
 piece of a split can re-enter planning with its own tiling), and the demoted matmul never
 builds a seed anyway (``classify`` returns ``None`` for a cone-operand cell, so
-``000_build`` would ``RuleSkip`` it) — which is why the cut stays a pre-build operation
+``010_build`` would ``RuleSkip`` it) — which is why the cut stays a pre-build operation
 and ``split/`` survives rather than folding into ``enumeration/`` as an edge-placement
 move (``plans/dag-edge-placement-split-as-enumeration.md`` → "Status / step 2.5").
 

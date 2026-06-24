@@ -13,7 +13,7 @@ read is **stageable** iff:
   slab only pays off inside the serial K loop; a pointwise nest has no stage).
 
 Returns the ranked stageable ``Edge``s (most-bytes-first, buffer name as a stable
-tiebreak). ``050_stage`` masks them into ``Schedule.staged`` and ``assembly/_slab``
+tiebreak). ``120_stage`` masks them into ``Schedule.staged`` and ``assembly/_slab``
 materializes each into one smem slab + cooperative producer. R1 covers the scalar
 (no-MMA) reduce regimes (matmul / fused-prologue); warp/atom + symbolic-K staging
 return with later tiers.

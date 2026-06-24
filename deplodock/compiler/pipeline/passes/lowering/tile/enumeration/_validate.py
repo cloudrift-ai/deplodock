@@ -13,7 +13,7 @@ This module makes that a **hard error** (strict per-op policy): given the op's
 :class:`~deplodock.compiler.ir.algebra.AlgebraKind` and the live env pins, it computes
 the set of tiers that could satisfy *every* force-pinned knob and raises
 :class:`KnobPinError` when that set is empty. It is called once, deterministically, at
-the enumeration seed (``000_build``), so a contradictory pin fails before any tile
+the enumeration seed (``010_build``), so a contradictory pin fails before any tile
 search rather than disappearing into a quietly-wrong kernel.
 
 The legality table is value-aware: a knob at its universal / OFF value (``SPLITK=1``,
@@ -24,7 +24,7 @@ tier. The staging / transport knobs ``STAGE`` / ``TMA`` are legal only on the **
 tiers (``SCALAR`` / ``WARP``): a cooperative ``MONOID`` reduce and a streaming
 ``TWISTED_MONOID`` flash are smem-free, and a pointwise ``MAP`` nest has no K-tower, so
 neither stages anything. ``TMA`` is wired on both staged tiers — the warp-tier
-``ldmatrix`` matmul and the scalar register-tiled SGEMM (``052_transport`` promotes any
+``ldmatrix`` matmul and the scalar register-tiled SGEMM (``130_transport`` promotes any
 staged matmul with a ringable K loop).
 """
 
@@ -107,7 +107,7 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         return frozenset({Tier.SCALAR, Tier.COOP}) if _as_int(raw) > 1 else None
     if name == SPLITK.name:
         # Cross-CTA split-K: the scalar reduce AND the warp tier (the atomic-free
-        # split-K combine, ``055_atomic_free_splitk``). A non-linear epilogue downgrades
+        # split-K combine, ``140_atomic_free_splitk``). A non-linear epilogue downgrades
         # it to 1 at the shape level — that is the pipeline's job, not a pin contradiction.
         return frozenset({Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == BR.name:
@@ -118,7 +118,7 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         return _STAGED if "1" in raw else None
     if name == TMA.name:
         # TMA transport rides the staging schedule, so it shares STAGE's staged tiers
-        # (scalar SGEMM + warp matmul — both wired in 052_transport).
+        # (scalar SGEMM + warp matmul — both wired in 130_transport).
         return _STAGED if raw.strip().lower() in {"1", "true", "yes", "on"} else None
     return None
 

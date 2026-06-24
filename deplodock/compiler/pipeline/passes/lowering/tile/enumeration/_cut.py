@@ -2,7 +2,7 @@
 
 ``plans/dag-edge-placement-split-as-enumeration.md`` → "Cut-decision module —
 ``enumeration/_cut.py``". All cut-offer logic lives here, one auditable place, so the
-fork pass (``split/005_split_demoted``) holds **no** decision logic and ``eval``-style
+fork pass (``split/010_split_demoted``) holds **no** decision logic and ``eval``-style
 introspection can ask "what cut does ``_cut`` offer for this kernel, and why" directly
 — mirroring how ``_stage.py`` owns the staging offer set and ``_atom.py`` owns atom
 eligibility.
@@ -116,7 +116,7 @@ class CutOffer:
 
 @dataclass(frozen=True)
 class CutDecision:
-    """The typed offer the ``split/005_split_demoted`` fork consumes. ``offers``: the
+    """The typed offer the ``split/010_split_demoted`` fork consumes. ``offers``: the
     ranked cuttable edges (each a tier-monotonic ``GMEM`` cut whose materialization raises
     the consumer's tier); the ``CUT`` mask width is ``len(offers)``, empty when no cut is
     available. ``force``: the cut must be taken — the fused form is ``UNBUILDABLE`` inline

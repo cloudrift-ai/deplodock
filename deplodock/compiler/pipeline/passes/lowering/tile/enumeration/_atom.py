@@ -1,7 +1,7 @@
 """Per-atom *eligibility* — the tensorize fork's gate for each matmul atom.
 
 ``plans/tile-ir-block-dag.md`` R4 (``atomize``): the warp-tier MMA fork
-(``006_tensorize``) offers each :class:`~deplodock.compiler.ir.tile.ir.Atom`
+(``020_tensorize``) offers each :class:`~deplodock.compiler.ir.tile.ir.Atom`
 the kernel admits. The eligibility predicate is the gate — a pure query over the
 iteration DAG (the derived view) + operand dtypes + device compute capability:
 does this ``LoopOp`` admit this atom?

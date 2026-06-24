@@ -1,7 +1,7 @@
 """Seal-scalar-tier pass (deterministic) — stamp the scalar-tier OFF sentinels.
 
 ``plans/tile-ir-block-dag.md`` F3-b: this pass is **knob-only** — it does not touch
-the stored algorithm (the body moves run in ``010_reduce_tile`` / ``030_register_tile``).
+the stored algorithm (the body moves run in ``060_reduce_tile`` / ``100_register_tile``).
 It seals the reduce regime's warp-tier knobs to their scalar-tier OFF sentinels
 (``MMA=0 / WM=0 / WN=0`` plus ``BR=1`` — serial, not the warp-OFF ``BR=0``) so every
 reduce variant carries the full knob set the perf DB / learned prior key on.

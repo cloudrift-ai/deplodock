@@ -910,7 +910,7 @@ def _is_structural_option(option: object) -> bool:
     ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
     changes which ops exist — **structural**; an ``Op`` rebind is in-place —
     **op-variant**. The Op/Graph return type IS the classification; rules wrap
-    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/005_split_demoted``),
+    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/010_split_demoted``),
     whose ``option`` is readable without firing any thunk. A *branch* ``Fork``
     reads op-variant: the sole branch-Fork emitter today is the partition
     planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —

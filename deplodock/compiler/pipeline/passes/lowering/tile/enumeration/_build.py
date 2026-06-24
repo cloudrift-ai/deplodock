@@ -134,8 +134,8 @@ def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis |
 # === The per-pass body moves (``plans/tile-ir-block-dag.md`` F3-b). ===
 # ``build_dag`` is no longer a monolith called at one site: it is the COMPOSITION of
 # the incremental moves the enumeration passes apply one at a time to the stored,
-# knob-invariant algorithm. ``000_build`` seeds the logical block; ``010_reduce_tile``
-# applies ``reduce_decomp`` (the K re-bracket); ``030_register_tile`` applies
+# knob-invariant algorithm. ``010_build`` seeds the logical block; ``060_reduce_tile``
+# applies ``reduce_decomp`` (the K re-bracket); ``100_register_tile`` applies
 # ``free_tile`` (the free-axis σ-split — needs both the thread + register knobs, so it
 # is the one free-axis body move, at the last free fork). The composition order
 # (reduce **then** free) is the reverse of the old monolith (free then reduce), but
@@ -152,7 +152,7 @@ def seed_graph(dag: IterDag, *, kernel_name: str, buffers: dict | None = None) -
 
 
 def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
-    """The reduce-decomposition body move (``010_reduce_tile``): re-bracket each
+    """The reduce-decomposition body move (``060_reduce_tile``): re-bracket each
     contraction axis named in ``target_names`` into the ``K_o`` (serial-outer) /
     ``K_i`` (stage-inner) tower with an optional ``K_f`` strip-mine, σ-mapped through
     the split-K factor ``K_s`` — embedded directly in ``compute``. No-op for a ``MAP``
@@ -168,13 +168,13 @@ def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: 
 
 
 def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
-    """The free-axis ``tile_axis`` body move (``030_register_tile`` — the last free
+    """The free-axis ``tile_axis`` body move (``100_register_tile`` — the last free
     fork, where both the thread + register knobs are pinned): split each free
     (``PARALLEL`` / ``MAP``) axis ``A → A_b·(T·R) + A_t·R + A_r``, σ-rewriting the
     body, laying ``A_b, A_t, A_r`` into ``Block.domain`` (bound GRID / THREAD /
     REGISTER) with the split-K ``K_s`` + extra-outer axes trailing GRID, and wrapping
     each masked free axis in its boundary ``Cond``. This is the only free-axis split;
-    ``020_thread_tile`` just pins the thread knob (the layout needs the register knob
+    ``090_thread_tile`` just pins the thread knob (the layout needs the register knob
     too, so a byte-identical split can't be staged across the two forks)."""
     inner_n, outer_m, extra_outer = _free_axes(dag)
     free_specs = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
@@ -449,7 +449,7 @@ def _replace_k_streaming(
 def streaming_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
     """The streaming ``TWISTED_MONOID`` build move (e.g. flash attention): serial-
     transform every contraction axis (``bk=fk=splitk=1``, masked streaming for a
-    symbolic KV) then σ-split the free axes (``FM=FN=1``). The caller (``017_streaming``)
+    symbolic KV) then σ-split the free axes (``FM=FN=1``). The caller (``080_streaming``)
     pins those knobs.
 
     With ``BR > 1`` (cooperative-KV) the **static** streaming axis additionally lays a

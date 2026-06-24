@@ -266,7 +266,7 @@ def test_inner_reward_parallel_matches_serial() -> None:
 
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
     """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
     f16 = _dt.get("f16")
     g = g if g is not None else Graph()
     x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
@@ -391,9 +391,9 @@ def _outer_terminals(graph: Graph) -> list[Graph]:
 
 
 def _kernels(graph: Graph) -> list:
-    """Outer-terminal kernel ops. A terminal sits past ``000_build``, so its
+    """Outer-terminal kernel ops. A terminal sits past ``010_build``, so its
     kernels are ``TileGraphOp`` seeds (the keep(SMEM) fused kernel + the cut's
-    producer/consumer); a ``LoopOp`` survives only when ``000_build`` skipped it."""
+    producer/consumer); a ``LoopOp`` survives only when ``010_build`` skipped it."""
     from deplodock.compiler.ir.tile.ir import TileGraphOp
 
     return [n.op for n in graph.nodes.values() if isinstance(n.op, (LoopOp, TileGraphOp))]

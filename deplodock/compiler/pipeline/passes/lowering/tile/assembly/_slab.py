@@ -240,11 +240,11 @@ def _wrap_k_body(
     sits *inside* the ``serial_outer`` loop (the slab reloads per stage); when ``BK
     == K`` collapses ``serial_outer`` away, the ``stage_inner`` loop alone is wrapped
     (the whole-K slab, loaded once). The transport is **decided in enumeration**
-    (``052_transport``, whose ``tma_eligible`` gates on a ringable K loop) and read off
+    (``130_transport``, whose ``tma_eligible`` gates on a ringable K loop) and read off
     here via ``tma_bufs`` — assembly never re-decides it. When every staged buffer is in
     ``tma_bufs`` the ``serial_outer`` bundle is the double-buffered TMA transport (phase
     ``K_o % RING``). A single-stage whole-K ``stage_inner`` slab has no ring to pipeline,
-    so ``052_transport`` never marks it TMA; we assert that contract rather than silently
+    so ``130_transport`` never marks it TMA; we assert that contract rather than silently
     downgrade — if a future transport fork breaks it, fail loud here instead of
     mis-lowering a TMA-marked buffer onto a SYNC bundle."""
     all_tma = bool(staged_bufs) and staged_bufs <= tma_bufs
@@ -257,7 +257,7 @@ def _wrap_k_body(
         elif isinstance(s, SerialTile) and s.kind == "stage_inner":
             assert not (staged_bufs & tma_bufs), (
                 f"whole-K stage_inner slab has TMA-marked buffer(s) {sorted(staged_bufs & tma_bufs)} but no ringable "
-                "serial_outer loop — 052_transport.tma_eligible should never have promoted these to TMA"
+                "serial_outer loop — 130_transport.tma_eligible should never have promoted these to TMA"
             )
             out.append(_make_bundle((s,), staged_bufs, cache_axes, buffers))
         else:
@@ -309,7 +309,7 @@ def _drop_size1_registers(block: Block, binding: dict) -> Body:
 def prospective_sources(graph: TileGraph) -> list[Source]:
     """The smem ``Source``s ``assemble`` *would* synthesize for ``graph``'s staged
     read-sites — the derived projection the ``promote_transport`` fork's eligibility
-    oracle (``enumeration/052_transport``) reads, without materializing the tower. Empty
+    oracle (``enumeration/130_transport``) reads, without materializing the tower. Empty
     when nothing is staged."""
     staged = graph.schedule.staged
     block = graph.blocks[0]

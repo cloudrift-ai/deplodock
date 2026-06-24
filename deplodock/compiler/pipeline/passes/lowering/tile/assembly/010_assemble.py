@@ -33,7 +33,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
 
     A multi-block ``TileGraph`` (the edge-placement ``GMEM`` cut, R7) assembles to a
     ``Graph`` of ``TileOp`` kernels the engine splices, the same shape the structural
-    forks (``055_atomic_free_splitk``) already return. A **same-launch-group** multi-block
+    forks (``140_atomic_free_splitk``) already return. A **same-launch-group** multi-block
     ``TileGraph`` (the ``SMEM`` fused edge) assembles to **one** fused ``TileOp`` via
     ``assemble_fused`` — the producer rides the consumer's slab, so only the consumer must
     be tiled (the logical producer becomes the slab's ``compute`` phase)."""

@@ -6,8 +6,8 @@ RF/F3-b). Derives the iteration DAG (``iter_dag``) and classifies the regime
 (un-tiled) algorithm** (``_build.seed_graph`` — one ``Block`` whose ``compute`` is
 the DAG's inner body, empty ``domain`` / ``Schedule``) plus the ``dag`` + regime the
 downstream tile passes' offer fns read. The algorithm is then refined **in place** by
-the tile passes' incremental body moves (F3-b: ``010_reduce_tile`` re-brackets K,
-``030_register_tile`` σ-splits the free axes); nothing is built all-at-once. No fork
+the tile passes' incremental body moves (F3-b: ``060_reduce_tile`` re-brackets K,
+``100_register_tile`` σ-splits the free axes); nothing is built all-at-once. No fork
 — one deterministic rewrite. A regime the moves can't build (coop / flash) raises
 here, so the ``LoopOp`` never enters the tile-pass chain.
 """
@@ -28,7 +28,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._validate impo
 PATTERN = [Pattern("root", LoopOp)]
 
 # Regimes the move set builds: MAP / SEMIRING / MONOID + TWISTED_MONOID (flash, R6 —
-# the streaming online-softmax nest, built by enumeration/017_streaming).
+# the streaming online-softmax nest, built by enumeration/080_streaming).
 _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID, AlgebraKind.TWISTED_MONOID)
 
 

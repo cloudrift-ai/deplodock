@@ -5,10 +5,10 @@ The engine classifies every multi-option fork at the spawn site in ``Run.drive``
 ``Search.push(structural=)``: any ``Graph``-splicing option (a kernel-set
 change) marks the fork structural; pure ``Op`` rebinds and the body-move tiling
 forks are op-variant. These tests pin the predicate itself and the engine-level
-flag for the two structural emitters (``tile/005_split_demoted`` — R7,
-``tile/enumeration/055_atomic_free_splitk``) vs the op-variant rules (the
-``010_reduce_tile`` / ``020_thread_tile`` / ``030_register_tile`` tiling forks,
-``050_stage`` rebinds). No GPU: terminals stay in the tile dialect
+flag for the two structural emitters (``tile/010_split_demoted`` — R7,
+``tile/enumeration/140_atomic_free_splitk``) vs the op-variant rules (the
+``060_reduce_tile`` / ``090_thread_tile`` / ``100_register_tile`` tiling forks,
+``120_stage`` rebinds). No GPU: terminals stay in the tile dialect
 (``TILE_PASSES``) and nothing is benched.
 """
 
@@ -106,7 +106,7 @@ def test_split_demoted_fork_pushes_structural(monkeypatch) -> None:
     target_mod.set_target((12, 0))
     search = _drive_one_terminal(_norm_linear_graph(), (12, 0))
     structural_rules = {rule for rule, structural in search.pushes if structural}
-    assert structural_rules == {"005_split_demoted"}, f"only 005's offer is structural, got {structural_rules}"
+    assert structural_rules == {"010_split_demoted"}, f"only 005's offer is structural, got {structural_rules}"
     # The fully-pinned partition enumeration collapses to a single inline
     # option (no fork pushed) — partition-leaf classification is covered by
     # the 017 test below, whose tree stays multi-leaf.
@@ -120,6 +120,6 @@ def test_atomic_free_splitk_fork_pushes_structural(monkeypatch) -> None:
     target_mod.set_target((8, 0))
     search = _drive_one_terminal(_f32_matmul_graph(), (8, 0))
     structural_rules = {rule for rule, structural in search.pushes if structural}
-    assert structural_rules == {"055_atomic_free_splitk"}, f"only 055's offer is structural, got {structural_rules}"
-    tiling = [(rule, st) for rule, st in search.pushes if rule in {"010_reduce_tile", "020_thread_tile", "030_register_tile"}]
+    assert structural_rules == {"140_atomic_free_splitk"}, f"only 055's offer is structural, got {structural_rules}"
+    tiling = [(rule, st) for rule, st in search.pushes if rule in {"060_reduce_tile", "090_thread_tile", "100_register_tile"}]
     assert tiling and not any(st for _, st in tiling), "the body-move tiling forks are op-variant"

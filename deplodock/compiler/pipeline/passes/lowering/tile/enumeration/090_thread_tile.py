@@ -6,7 +6,7 @@ tile is pinned (for a ``SEMIRING`` regime) so the cell budget is known downstrea
 
 It pins a knob but applies **no body move**: the free-axis σ-split needs both the
 thread *and* register knob to lay out ``A → A_b·(T·R) + A_t·R + A_r`` byte-identically
-(register innermost), and the register knob isn't pinned until ``030_register_tile``
+(register innermost), and the register knob isn't pinned until ``100_register_tile``
 — so the single free-axis body move (``_build.free_tile``) is applied there, with this
 pass only fixing the thread extent the search ranks on (F3-b).
 """
@@ -32,7 +32,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     if MAP_N_THREAD.name in op.knobs or mma_atom(op.knobs) is not None:
         raise RuleSkipped("thread tile already pinned / warp tier")
     if op.algebra is AlgebraKind.MONOID:
-        raise RuleSkipped("cooperative-reduce tier (015_coop_reduce owns the MONOID free-axis tile)")
+        raise RuleSkipped("cooperative-reduce tier (070_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING and RED_BK.name not in op.knobs:
         raise RuleSkipped("reduce tile not yet pinned")
     offers = thread_offers(op.dag, Budget())

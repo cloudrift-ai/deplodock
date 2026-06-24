@@ -7,8 +7,8 @@ by ``assembly/_slab`` from the annotation.
 
 Post-F3-b this is a **pre-assemble** schedule fork over the **stored, fully-tiled
 algorithm** (the inversion R1 carried before F3-b — ``stage`` running *after* a
-separate monolithic build pass — is gone). The body moves (``010_reduce_tile`` /
-``030_register_tile``) already refined ``op.tilegraph`` in place, so ``stage`` reads
+separate monolithic build pass — is gone). The body moves (``060_reduce_tile`` /
+``100_register_tile``) already refined ``op.tilegraph`` in place, so ``stage`` reads
 its derived ``Block.reads`` + the ranked stageable read-sites directly and forks on
 the stage *mask*, writing the chosen ``Edge``s straight into ``Schedule.staged`` —
 the source of truth ``assemble`` reads. The mask string is the variant identity the

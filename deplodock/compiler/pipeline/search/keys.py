@@ -28,7 +28,7 @@ from deplodock.compiler.structural import digest
 Dialect = Literal["loop", "tile", "kernel", "cuda"]
 
 # Knobs that mark a **structural** (kernel-set-changing) decision rather than an
-# op-variant lowering choice — today only ``005_split_demoted``'s ``CUT`` mask
+# op-variant lowering choice — today only ``010_split_demoted``'s ``CUT`` mask
 # (keep-vs-cut). A source-chain hop that *introduces* one is a decomposition hop
 # whose cost is a Σ owned by the two-level tuner, NOT a ``lowering`` row (which
 # holds one best child per parent). Read by the bench-terminal lowering recorder

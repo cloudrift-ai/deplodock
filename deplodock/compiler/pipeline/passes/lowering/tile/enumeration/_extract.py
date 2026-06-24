@@ -5,7 +5,7 @@ body move that fission realizes a ``GMEM``/cut placement with: lift an inline
 sub-computation into a new ``Block``, rewrite the consumer ``Load`` to the new
 intermediate ``Buffer``, choose the intermediate's layout from the consumer's
 ``atom``/``AccessMap``." This module is that fission. ``enumeration/_cut.py`` owns the
-*offer* decision (whether a cut is worth it), and ``split/005_split_demoted`` is the
+*offer* decision (whether a cut is worth it), and ``split/010_split_demoted`` is the
 thin fork that pairs them.
 
 The fission has **two consumers**, sharing one slicing (``_fission`` → the producer +
@@ -13,7 +13,7 @@ consumer ``LoopOp`` pieces):
 
 - :func:`extract_block` — the **legacy GMEM lowering**: wires the pieces into a
   ``Graph`` of separate ``LoopOp`` nodes the engine splices (two kernels, each
-  re-seeded by ``000_build``). The proven path the accuracy tests pin.
+  re-seeded by ``010_build``). The proven path the accuracy tests pin.
 - :func:`seed_demoted` — the **block-DAG seed**: seeds each piece as a logical
   :class:`~deplodock.compiler.ir.tile.ir.Block` and returns one multi-block
   ``TileGraph`` (the MONOID/MAP producer ``--xn-->`` SEMIRING consumer DAG), so the

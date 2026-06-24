@@ -85,7 +85,7 @@ _ALLOWED = [
     (AlgebraKind.SEMIRING, {"MMA": 0, "BN": 16, "BM": 16, "SPLITK": 4}),
     # A full warp matmul pin (atom + warp counts + register cells + atom-K chunk).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2}),
-    # Warp-tier split-K (the atomic-free combine, 055_atomic_free_splitk) is supported.
+    # Warp-tier split-K (the atomic-free combine, 140_atomic_free_splitk) is supported.
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2, "SPLITK": 2}),
     # Universal / OFF values are inert next to a warp pin (the value-aware table).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "SPLITK": 1, "FK": 1, "BR": 1, "FM": 1, "FN": 1}),
@@ -114,7 +114,7 @@ def test_allows_tier_native_pins(algebra, pins, monkeypatch):
 
 def test_greedy_pipeline_refuses_end_to_end(monkeypatch):
     """The refusal propagates through a real greedy compile (``Pipeline.run`` →
-    ``000_build`` → ``validate_pins``): a warp atom pinned beside a scalar THREAD
+    ``010_build`` → ``validate_pins``): a warp atom pinned beside a scalar THREAD
     width fails loudly instead of silently dropping ``BN``. No CUDA — the validator
     fires at the enumeration seed, before any kernel is emitted."""
     from deplodock.compiler.graph import Graph, Tensor

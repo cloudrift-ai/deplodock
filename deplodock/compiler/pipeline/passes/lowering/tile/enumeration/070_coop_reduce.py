@@ -12,7 +12,7 @@ forks), a cooperative reduce is one ``(bk, fk, br)`` decision (legacy
 ``build_coop_reduce_tree``), so this is a single fork that applies the whole
 ``coop_build`` body move per leaf. The free-axis THREAD tiles (``BN``/``BM``, default
 1 = whole-CTA, or the pinned strided-cooperative value) ride every leaf. The scalar
-passes ``020``/``030``/``040`` and ``050_stage`` gate off ``MONOID`` (a cooperative
+passes ``090``/``100``/``110`` and ``120_stage`` gate off ``MONOID`` (a cooperative
 reduce stays smem-free — each lane reads its own ``K_c``-strided slice with no
 cross-thread reuse), so this pass owns the regime end to end.
 """

@@ -3,7 +3,7 @@
 ``plans/tile-ir-block-dag.md`` R4: the third warp-tier fork (after the geometry
 is pinned). Offers the legal ``(fm, fn)`` cells under the register-file budget
 (``_moves.warp_reg_offers``) and forks — still knob-only; the warp build (the
-``atomize`` body move) lands at ``009_warp_build`` once the K chunk is pinned
+``atomize`` body move) lands at ``050_warp_build`` once the K chunk is pinned
 too. Fires only on a warp variant whose geometry is set.
 """
 

@@ -4,7 +4,7 @@ The two ``loop/stamp`` rules are thin rewrite wrappers around the functions
 here: ``010_stamp_loop_names`` calls :func:`name_for_loop`, and
 ``020_stamp_structural_features`` calls :func:`structure_features`. Factoring
 the logic out lets callsites that build LoopOps *outside* the pass pipeline —
-e.g. the ``lowering/tile/split/005_split_demoted`` fragment assembler — name
+e.g. the ``lowering/tile/split/010_split_demoted`` fragment assembler — name
 and re-stamp their kernels with a plain import instead of reaching into a
 leading-digit pass module via ``importlib`` (a pass file's ``NNN_…`` stem
 isn't a legal import name).

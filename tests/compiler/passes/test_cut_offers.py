@@ -1,7 +1,7 @@
 """The cut-offer policy — the derived tier-monotonicity predicate (R7 edge placement).
 
 ``plans/dag-edge-placement-split-as-enumeration.md`` relocates the demoted-matmul cut's
-*offer* decision out of the legacy ``005_split_demoted`` monolith into a single auditable
+*offer* decision out of the legacy ``010_split_demoted`` monolith into a single auditable
 derived-view query, ``enumeration/_cut.py``. These tests pin the predicate's **tightness**
 (the plan's stated key risk): it must offer exactly on a demoted matmul (a fused operand
 cone keeps it below any buildable tier) and decline a clean matmul / pointwise body.

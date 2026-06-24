@@ -608,18 +608,18 @@ def _fmt_domain_axis(ax: Axis, binding: Binding | None) -> str:
 class TileGraphOp(Op):
     """The node the ENUMERATION passes pass between themselves and hand to
     ASSEMBLY. It carries the **stored algorithm being refined in place** by the F3-b
-    incremental body moves (``plans/tile-ir-block-dag.md``): ``000_build`` seeds the
+    incremental body moves (``plans/tile-ir-block-dag.md``): ``010_build`` seeds the
     **logical** (un-tiled) ``TileGraph`` (``_build.seed_graph``), then the tile passes
     rewrite it move by move — the algorithm is a first-class structure refined as the
     search descends, never a function re-derived from a stored knob dict (that is the
     "knob-invariant algorithm" the model calls for).
 
-    - **logical seed → tiled** (``tilegraph`` set throughout) — ``000_build`` emits the
-      logical block; ``010_reduce_tile`` applies the reduce-decomposition body move
-      (``reduce_decomp``); ``020_thread_tile`` pins the thread knob (no body move);
-      ``030_register_tile`` applies the free-axis σ-split body move (``free_tile``),
-      after which the algorithm is fully tiled; ``040_seal_scalar_tier`` stamps the
-      reduce regime's scalar-tier OFF sentinels; ``050_stage`` annotates
+    - **logical seed → tiled** (``tilegraph`` set throughout) — ``010_build`` emits the
+      logical block; ``060_reduce_tile`` applies the reduce-decomposition body move
+      (``reduce_decomp``); ``090_thread_tile`` pins the thread knob (no body move);
+      ``100_register_tile`` applies the free-axis σ-split body move (``free_tile``),
+      after which the algorithm is fully tiled; ``110_seal_scalar_tier`` stamps the
+      reduce regime's scalar-tier OFF sentinels; ``120_stage`` annotates
       ``Schedule.staged``. It also carries the derived ``dag`` + regime (``algebra`` /
       ``target_names``) the offer fns read. Each fork pins one more knob group onto
       ``knobs``; the carry-forward ``LoopOp`` knobs ride ``knobs`` automatically (the

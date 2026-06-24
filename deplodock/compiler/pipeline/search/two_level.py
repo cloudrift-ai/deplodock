@@ -21,7 +21,7 @@ pass index:
 - **Outer** (:func:`run_two_level_tune`) drives the graph-changing passes —
   ``frontend`` + ``loop`` plus the pre-partition head of ``lowering/tile``
   (:func:`outer_pipeline`), where the structural fork emitters live (today
-  ``005_split_demoted``'s keep-vs-split offer). A terminal is the state where
+  ``010_split_demoted``'s keep-vs-split offer). A terminal is the state where
   the cursor reaches ``partition_loops`` with every structural fork resolved —
   every op post-fusion and structurally final, split producers/consumers
   included as real ``LoopOp`` nodes. Each terminal is a candidate fused graph;
@@ -92,7 +92,7 @@ LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
 def outer_pipeline() -> Pipeline:
     """The graph-changing passes the outer search drives: ``frontend`` + ``loop``
     (any fusion forks) **plus the ``split`` phase** — the structural fork emitter
-    (``005_split_demoted``'s keep-vs-cut ``CUT`` offer), the only move that changes
+    (``010_split_demoted``'s keep-vs-cut ``CUT`` offer), the only move that changes
     *which kernels exist*. An outer terminal is a graph whose kernel set is final:
     the keep(SMEM) side is one fused ``TileGraphOp`` (``seed_fused``), the cut side
     its producer + consumer; :func:`_inner_reward_async` picks each up as its own
@@ -105,10 +105,10 @@ def outer_pipeline() -> Pipeline:
     every structural choice) with no kernel-set distinction. The split boundary is
     exactly where the kernel set is fixed but tiling is not — the right outer/inner
     seam (``plans/structural-forks-in-two-level.md`` step 2). Sub-partition splices
-    (``017_atomic_free_splitk``'s combine) likewise stay inner — their trigger knob
+    (``140_atomic_free_splitk``'s combine) likewise stay inner — their trigger knob
     (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
-    # ``005_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary
+    # ``010_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary
     # OFF-fill stamps nothing onto the fused/cut ops (their ``op_cache_key`` stays what
     # the assembled greedy run derives).
     passes.append(Pass.load("lowering/tile/split", index=len(passes)))
@@ -406,7 +406,7 @@ async def run_two_level_tune(
     because its terminal reward comes from the inner tuning, not
     ``_bench_terminal_async``. The outer pipeline (:func:`outer_pipeline`) runs
     through the pre-partition tile rules, so each structural fork (the
-    keep-vs-split offer of ``005_split_demoted``) branches the outer tree —
+    keep-vs-split offer of ``010_split_demoted``) branches the outer tree —
     one terminal per kernel-set, compared by Σ-per-op cost. A graph with no
     structural offers yields a single terminal and this reduces to "tune each
     op once, sum, assemble". Identical offer sites within one trajectory

@@ -112,7 +112,7 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
             for t in threads:
                 thr = _moves.thread_knobs(dag, t)
                 for r in regs:
-                    # BR=1 is the scalar-tier seal (040_seal_scalar_tier) — a SEMIRING
+                    # BR=1 is the scalar-tier seal (110_seal_scalar_tier) — a SEMIRING
                     # matmul has no cooperative-K lane; stamp it so the row carries the
                     # complete THREAD_KNOBS projection a golden is matched on.
                     rows.append({**red, **thr, **_moves.reg_knobs(dag, r), "BR": 1})

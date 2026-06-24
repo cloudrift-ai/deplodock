@@ -9,12 +9,12 @@ reduction; the coupled ``Monoid`` carrier can't span register cells or split-K. 
 carrier's m/l/O rescale is **not** a search dimension and rides through σ untouched
 (``kernel/100_materialize_tile`` + ``kernel/_combine`` synthesize it).
 
-Like the cooperative reduce (``015_coop_reduce``), this is one fork that owns the
+Like the cooperative reduce (``070_coop_reduce``), this is one fork that owns the
 regime end to end: it enumerates the free-axis THREAD tile (``thread_offers``) with the
 register tile forced to ``FM=FN=1``, pins ``BK=FK=SPLITK=1``, and applies the whole
 ``streaming_build`` body move per leaf. The scalar / warp / coop passes gate off
-(``005``/``010`` need ``SEMIRING``, ``015`` needs ``MONOID``); ``040_seal`` stamps the
-scalar-tier OFF sentinels and ``050_stage`` skips (a streaming nest is smem-free — the
+(``020``/``060`` need ``SEMIRING``, ``070`` needs ``MONOID``); ``110_seal`` stamps the
+scalar-tier OFF sentinels and ``120_stage`` skips (a streaming nest is smem-free — the
 streaming carrier reuses no cross-thread slab).
 
 **Cooperative stream (``BR > 1``).** A pinned ``DEPLODOCK_BR`` partitions the **static**

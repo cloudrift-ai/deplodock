@@ -43,7 +43,7 @@ _XFAIL_FILES: dict[str, str] = {
     # de-quarantined (rebuilt against enumeration/_partition.monoid_reduce_tilegraph).
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
-    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/017_streaming +
+    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/080_streaming +
     # _build.streaming_build, masked streaming for symbolic seq_len): test_flash_attention.py
     # de-quarantined except test_flash_off_keeps_decomposition (a func entry below — its
     # blocker is the non-flash score-materializing SDPA decomposition, R7).
@@ -68,7 +68,7 @@ _XFAIL_FILES: dict[str, str] = {
 # prior tests stay quarantined (genuinely their own tiers).
 _XFAIL_FUNCS: dict[str, str] = {
     # R3 — landed (atomic-free split-K): test_atomic_free_splitk_fork_pushes_structural
-    # de-quarantined (the 055_atomic_free_splitk structural fork). The R3 accuracy half
+    # de-quarantined (the 140_atomic_free_splitk structural fork). The R3 accuracy half
     # (test_mma_atomic_free_splitk.py) was already de-quarantined under R2.
     # R4 — masked-tile follow-ups: env-pin honoring in the scalar thread/reg offers
     # (_moves.thread_offers / map_reg_offers / reduce_reg_offers now read DEPLODOCK_BN/
@@ -81,7 +81,7 @@ _XFAIL_FUNCS: dict[str, str] = {
     #
     # test_unstaged_atom_lowers_gmem_direct — LANDED: the over-ceiling FM=26 warp
     # register pin is now authoritative (warp_reg_offers bypasses _MAX_WARP_CELLS
-    # for a full pin), and with no STAGE pin the budget-aware 050_stage filter
+    # for a full pin), and with no STAGE pin the budget-aware 120_stage filter
     # declines the over-budget staging so the operands lower gmem-direct.
     # test_hoist_refuses_lift_when_pipeline_reads_guarded_defs — LANDED: rewritten
     # against assembly/_slab._hoist_masked's SSA-safety check (the fused-prologue
@@ -89,9 +89,9 @@ _XFAIL_FUNCS: dict[str, str] = {
     # refuses the lift), de-quarantined.
     # test_norm_linear_fp16_scalar_reduce_tma_alignment de-quarantined: the fused
     # norm+linear (RmsNorm prologue + matmul) now force-splits via tile/split/
-    # 005_split_demoted (the demoted matmul's RMSNorm cone un-fuses into an xn producer
+    # 010_split_demoted (the demoted matmul's RMSNorm cone un-fuses into an xn producer
     # + a clean gemm), so its kernel lowers and the TMA-alignment assertion fires.
-    # R6 — score-materializing SDPA landed (tile/split/005_split_demoted): the fused
+    # R6 — score-materializing SDPA landed (tile/split/010_split_demoted): the fused
     # softmax-prologue + P@V LoopOp (k_sdpa_reduce) un-fuses into a softmax-normalizing
     # xn producer + a clean (symbolic-K) gemm consumer, both of which lower. The
     # forced-split path (the fused form has no fused-prologue regime to keep) recovered
@@ -118,7 +118,7 @@ _XFAIL_FUNCS: dict[str, str] = {
     # the whole-block forward (RoPE attention + MLP) now lowers correctly end-to-end
     # via the SDPA split + the multi-access staging fix.
     # The three qwen-dynamic tests de-quarantined: the whole-model / layer SDPA now
-    # lowers via tile/split/005_split_demoted (incl. the symbolic-seq P@V), so the
+    # lowers via tile/split/010_split_demoted (incl. the symbolic-seq P@V), so the
     # dynamic compile + capture-replay paths match eager.
     # test_fused_rmsnorm_linear_blocked_prologue DE-QUARANTINED: the fused-prologue
     # demoted-matmul (RMSNorm -> Linear, SMEM-fused edge) now lowers correctly. Two fixes:
@@ -136,22 +136,22 @@ _XFAIL_FUNCS: dict[str, str] = {
     "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
     # test_structural_replay_consulted + test_trace_records_partition_fork DE-QUARANTINED
     # with the two-level structural tier (the outer cut fork branches + replays; the inner
-    # per-family tile forks 010_reduce_tile/020_thread_tile/030_register_tile trace under
+    # per-family tile forks 060_reduce_tile/090_thread_tile/100_register_tile trace under
     # their own rule names — the test was rewritten off the old monolithic 010_enumerate).
     # test_run.py: the fp16-matmul-window kernel stays quarantined (R7 matmul window);
     # the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2). The four sdpa rows
     # (k_chunked / seq1024_dynamic_smem / tinyllama_full / tinyllama_per_head)
-    # de-quarantined under R6 — the tile/split/005_split_demoted cut lowers them.
+    # de-quarantined under R6 — the tile/split/010_split_demoted cut lowers them.
     # test_compile_fp16_matmul_window_emits_half2 + test_run_code_fp16_matmul_window_accuracy[2]
     # DE-QUARANTINED: the fp16 half2 window is rewired into the block-DAG enumeration —
-    # 010_reduce_tile reinterprets an even FK==bk fp16-matmul offer as the half2 window
+    # 060_reduce_tile reinterprets an even FK==bk fp16-matmul offer as the half2 window
     # (register FK=1 + stamp FKWIN), kernel/015_pack_fk_window now recurses into the
     # StageBundle to find the staged window loop, and kernel/010_split_register_axes
     # treats a StageBundle as transparent to the K-serial nest so the FK cross-accumulator
     # fold lands after K_o (fixing the [2] out-of-scope master-accumulator codegen).
     # test_split_demoted_fork_pushes_structural DE-QUARANTINED: the keep-vs-split FORK is
     # now live — the keep(SMEM) fused edge is a lowerable keep option (``seed_fused`` →
-    # ``assemble_fused``), so ``005_split_demoted`` offers ``[keep, cut]`` instead of forcing
+    # ``assemble_fused``), so ``010_split_demoted`` offers ``[keep, cut]`` instead of forcing
     # the cut, and the structural push fires.
     # The test_two_level structural rows are ALSO DE-QUARANTINED: the outer two-level tree
     # now branches on the cut (``outer_pipeline`` drives the ``split`` phase; tiling stays
@@ -165,7 +165,7 @@ _XFAIL_NODES: dict[str, str] = {
     # R5 — landed (warp-tier promote_transport + TMA ring/swizzle/peel synthesis,
     # incl. masked-tile TMA staging via the mask_order hoist): static + dynamic
     # test_pinned_transport_and_shape_fire de-quarantined.
-    # R6 — score-materializing SDPA landed (tile/split/005_split_demoted): test_sdpa
+    # R6 — score-materializing SDPA landed (tile/split/010_split_demoted): test_sdpa
     # [cuda] / sdpa_causal[cuda] / sdpa_gqa[cuda] + test_tune_accuracy[sdpa]
     # de-quarantined (the softmax+P@V un-fuses into xn producer + clean gemm).
     # test_tinyllama_block_accuracy[cuda] de-quarantined: the whole-block RoPE

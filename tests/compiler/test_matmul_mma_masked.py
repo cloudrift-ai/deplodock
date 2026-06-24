@@ -259,14 +259,14 @@ def test_symbolic_m_masked_mma_residual_epilogue_accuracy(monkeypatch):
 
 # --- demoted symbolic-N B operand: TMA + warp-spec --------------------------
 # The rotary QK^T's key cone materializes the canonical B operand ``xnb[…, K, N]``
-# with a symbolic inner N (``seq_len``); ``005_split_demoted`` pads the inner N up
+# with a symbolic inner N (``seq_len``); ``010_split_demoted`` pads the inner N up
 # to a 16 B-aligned multiple so ``050_use_tma`` accepts it and warp-spec follows.
 
 
 def _demoted_symbolic_n_graph(M=None, N=None, K: int = 128) -> Graph:
     """Computed-B-cone matmul (the rotary QK^T shape): an elementwise scale on
     BOTH operands feeds a transposed-``[N, K]`` Linear, so fusion demotes the
-    matmul and ``005_split_demoted`` materializes the canonical ``xnb[K, N]``
+    matmul and ``010_split_demoted`` materializes the canonical ``xnb[K, N]``
     producer. M and N default to the same ``Dim('seq_len')`` (the [seq, seq]
     scores)."""
     from deplodock.compiler.ir.frontend.ir import LinearOp  # noqa: PLC0415
@@ -423,7 +423,7 @@ def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):
 
 def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
     """Softmax(scores) @ V with the reduce K = ``seq_len`` symbolic (the SDPA P@V
-    shape). Fusion demotes the matmul; ``005_split_demoted`` materializes the
+    shape). Fusion demotes the matmul; ``010_split_demoted`` materializes the
     softmax-prob A cone ``xn[H, seq, seq]`` + the clean symbolic-K gemm."""
     from deplodock.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
 

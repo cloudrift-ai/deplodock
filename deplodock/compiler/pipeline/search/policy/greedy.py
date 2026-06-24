@@ -61,7 +61,7 @@ _TILE_IDENTITY = ("BN", "BM", "FM", "FN", "BK", "FK", "SPLITK", "BR", "WM", "WN"
 # complete tile row at the partition fork is the per-kernel cost the structural
 # pricing sums (defined here, not in ``two_level``, because that module imports
 # this package at module scope — the reverse would cycle).
-PARTITION_RULE = "030_register_tile"
+PARTITION_RULE = "100_register_tile"
 
 
 def tile_identity(knobs: dict) -> frozenset:
