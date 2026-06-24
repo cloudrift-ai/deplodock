@@ -324,13 +324,13 @@ def _n_kernels(graph):
     return sum(1 for n in graph.nodes.values() if isinstance(n.op, (TileOp, LoopOp)))
 
 
-def test_split_cone_keep_builds_fused_edge_cut_stays_default(monkeypatch):
-    """``split/005`` → ``seed_fused``: ``DEPLODOCK_SPLIT_CONE=0`` now builds the **SMEM
-    fused edge** — ONE kernel (the RMSNorm cone on-chip, no gmem round-trip) — where it
-    used to have no lowerable keep branch. The unpinned greedy default stays the proven
-    GMEM **cut** (two kernels): greedy's "a cold compile never changes kernel sets" rule
-    keeps the kernel-set-preserving fused edge off the cold path until it is a robust
-    default. ``=1`` pins the cut. The structural half, no GPU."""
+def test_offering_fork_keeps_fused_by_default_splits_when_pinned(monkeypatch):
+    """The offering fork (``split/005`` → ``seed_fused``): a demoted matmul (RMSNorm →
+    linear) is a real keep(SMEM)-vs-cut(GMEM) fork. Greedy's "a cold compile never changes
+    kernel sets" rule deploys the kernel-set-preserving keep(SMEM) — the **default is now
+    ONE fused kernel** (the RMSNorm cone on-chip, no gmem round-trip). ``DEPLODOCK_SPLIT_CONE
+    =1`` pins the GMEM cut (two kernels); ``=0`` pins the fused edge. The structural half,
+    no GPU."""
     from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
     monkeypatch.setenv("DEPLODOCK_BN", "16")
@@ -347,10 +347,10 @@ def test_split_cone_keep_builds_fused_edge_cut_stays_default(monkeypatch):
         return Pipeline.build(_TILE_PASSES).run(lo, ctx=ctx)
 
     greedy = lower(None)
-    assert _n_kernels(greedy) == 2  # unpinned cold default — the proven GMEM cut
-    kept = lower("0")
-    assert _n_kernels(kept) == 1  # SPLIT_CONE=0 → the SMEM fused edge, one kernel
-    assert sum(1 for n in kept.nodes.values() if isinstance(n.op, TileOp)) == 1
+    assert _n_kernels(greedy) == 1  # unpinned cold default — the SMEM fused edge, one kernel
+    assert sum(1 for n in greedy.nodes.values() if isinstance(n.op, TileOp)) == 1
+    assert _n_kernels(lower("0")) == 1  # pinned keep — same fused edge
+    assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
     assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
 
 

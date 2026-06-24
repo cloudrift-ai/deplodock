@@ -223,6 +223,10 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
     ``cp.async.bulk.tensor`` store and hung (``HungKernelError``); this test would
     time out. The numpy reference is the static graph; the forced CUDA run uses
     the mode's graph."""
+    # This pins a scalar cooperative-reduce config for the demoted matmul's CUT producer
+    # kernel (the #244 TMA wedge); SPLIT_CONE=1 forces that GMEM cut (the default is now the
+    # keep(SMEM) fused edge, which has no separate norm-reduce producer to wedge).
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     static_graph, input_shapes, (out_name, _) = _build_norm_linear_graph(_NORM_DIMS)
     forced_graph, _, _ = _build_norm_linear_graph(_NORM_DIMS, mode=shape_mode)
     rng = np.random.default_rng(0)

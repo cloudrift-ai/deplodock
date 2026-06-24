@@ -38,16 +38,13 @@ is offered-not-forced (``cut_offers`` reports ``force=False``); otherwise (multi
 rotary, two-pass SDPA softmax, multi-accum gated-MLP) the cut is **forced** — the GMEM cut
 is the lone lowerable option.
 
-**Greedy default vs the pinned keep.** Even when the SMEM fused edge is expressible, the
-**unpinned** path still emits the GMEM cut: greedy's "a cold compile never changes kernel
-sets" rule (``search/policy/greedy._pick_structural``) would make the kernel-set-preserving
-keep(SMEM) the cold default the instant it is an op-variant fork sibling, and the fused
-edge isn't yet robust at every knob config a cold compile can land on (the scalar
-sibling-cell-fused tile; the warp-tier nvcc quirk). So the proven golden-tuned cut stays
-the cold deployment; the SMEM fused edge is reachable via ``DEPLODOCK_SPLIT_CONE=0`` (the
-now-working keep branch — ``seed_fused`` → ``assemble_fused``). ``=1`` pins the cut.
-Promoting keep(SMEM) to the greedy default + a live keep-vs-cut search fork is the next R7
-step (gated on fused-edge robustness).
+**Greedy default = keep(SMEM).** When the SMEM fused edge is expressible the rule emits the
+real ``[keep, cut]`` fork. Greedy's "a cold compile never changes kernel sets" rule
+(``search/policy/greedy._pick_structural`` filters the structural cut when the prior is
+cold) deploys the kernel-set-preserving keep(SMEM) — the fused edge, robust at the warp tier
+(the cold pick). The *trained* prior prices the cut's GMEM Σ vs keep's SMEM Σ and deploys
+the cut when it predicts faster; ``tune``'s MCTS walks both branches. ``DEPLODOCK_SPLIT_CONE
+=0`` pins the fused edge, ``=1`` the GMEM cut.
 
 Both branches stamp the decision into ``op.knobs`` — keep carries ``SPLIT_CONE:
 False``, every split-fragment kernel carries ``SPLIT_CONE: True`` — the standard
@@ -153,13 +150,11 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     decision = cut_offers(root.op, compute_capability=cc, dtype_of=_dtype_of(root.op, match.graph), smem_fusible=smem_fusible)
     if decision.force:
         return _stamp(split)
-    # Offered-not-forced (``smem_fusible``): the SMEM fused edge IS a lowerable keep. But
-    # greedy's "a cold compile never changes kernel sets" rule (search/policy/greedy.
-    # _pick_structural) makes the kernel-set-PRESERVING keep(SMEM) the cold default the
-    # moment it is an op-variant fork sibling — and the fused edge isn't yet robust at
-    # every knob config a cold compile can land on (the scalar sibling-cell-fused tile,
-    # the warp-tier nvcc quirk). So until it is a deployable default, the unpinned path
-    # forces the cut (today's proven, golden-tuned kernel set); the SMEM fused edge stays
-    # reachable via ``DEPLODOCK_SPLIT_CONE=0`` (the now-working keep branch). Promoting it
-    # to the greedy default + a live keep-vs-cut search fork is the next R7 step.
-    return _stamp(split)
+    # Offered-not-forced (``smem_fusible``): a real keep(SMEM)-vs-cut(GMEM) fork. Greedy's
+    # "a cold compile never changes kernel sets" rule (search/policy/greedy._pick_structural
+    # filters the structural cut when the prior is cold) deploys the kernel-set-PRESERVING
+    # keep(SMEM) — the fused edge, robust at the warp tier (the cold pick). The trained prior
+    # prices the cut's GMEM Σ vs keep's SMEM Σ and deploys the cut when it predicts faster;
+    # ``tune``'s MCTS walks both. Keep first = the documented no-prior emission-order
+    # fallback (the SMEM fused edge — no gmem round-trip). ``DEPLODOCK_SPLIT_CONE=1/0`` pins.
+    return [keep, _stamp(split)]

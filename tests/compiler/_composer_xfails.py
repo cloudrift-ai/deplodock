@@ -131,12 +131,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     # param still hits a separate fp16 nvcc codegen failure (R7), so it stays a node
     # entry below.
     "test_run.py::test_compile_fp16_matmul_window_emits_half2": "R7",
-    # test_split_demoted_fork_pushes_structural stays R7: the keep-vs-split FORK needs
-    # the keep-fused option to be lowerable (a fused-prologue regime), which the new
-    # classifier lacks — so the SDPA-style split is FORCED (single option, no fork) and
-    # the structural-fork-branching tests (this + the test_two_level / test_resolve
-    # structural ones) still need the R7 fused-prologue regime to offer both branches.
-    "test_structural_push.py::test_split_demoted_fork_pushes_structural": "R7",
+    # test_split_demoted_fork_pushes_structural DE-QUARANTINED: the keep-vs-split FORK is
+    # now live — the keep(SMEM) fused edge is a lowerable keep option (``seed_fused`` →
+    # ``assemble_fused``), so ``005_split_demoted`` offers ``[keep, cut]`` instead of forcing
+    # the cut, and the structural push fires. The test_two_level rows below still need the
+    # R7 structural-pricing / prior tier (the trained prior pricing SMEM Σ vs GMEM Σ).
     "test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": "R7",
     "test_two_level.py::test_identical_offer_sites_take_the_same_side": "R7",
     "test_two_level.py::test_outer_branches_on_structural_fork": "R7",

@@ -80,14 +80,19 @@ def test_plain_matmul_fires_split_k_and_blockify(recording_dump):
     assert "build" in fired
 
 
-def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
+def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump, monkeypatch):
+    # An elementwise-LHS matmul is a demoted matmul: the default keep(SMEM) fused edge
+    # pre-seeds the consumer (``seed_fused``, no ``build``); SPLIT_CONE=1 pins the GMEM cut,
+    # whose split pieces re-seed through ``build`` — the split path this test guards.
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     Pipeline.build(TILE_PASSES).run(_make_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile/enumeration")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
     assert "build" in fired
 
 
-def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump):
+def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump, monkeypatch):
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # pin the GMEM cut (see above)
     Pipeline.build(TILE_PASSES).run(_make_two_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile/enumeration")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
