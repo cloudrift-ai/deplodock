@@ -133,9 +133,7 @@ def test_trace_records_partition_fork() -> None:
         assert d.score is None
         assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
     thread = next(d for d in part if d.rule_name == "020_thread_tile")
-    assert {"BM", "BN"} <= set(thread.knob_delta), (
-        f"the thread-tile decision carries the complete free tile row, got {thread.knob_delta}"
-    )
+    assert {"BM", "BN"} <= set(thread.knob_delta), f"the thread-tile decision carries the complete free tile row, got {thread.knob_delta}"
 
 
 def test_decide_score_lands_on_trace() -> None:
