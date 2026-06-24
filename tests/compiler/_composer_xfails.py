@@ -130,11 +130,13 @@ _XFAIL_FUNCS: dict[str, str] = {
     # the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2). The four sdpa rows
     # (k_chunked / seq1024_dynamic_smem / tinyllama_full / tinyllama_per_head)
     # de-quarantined under R6 — the tile/split/005_split_demoted cut lowers them.
-    # The R4 scalar pin-honoring recovered test_run_code_fp16_matmul_window_accuracy's
-    # [4]/[8] params (a window-pinned fp16 matmul now honors its tile knobs); the [2]
-    # param still hits a separate fp16 nvcc codegen failure (R7), so it stays a node
-    # entry below.
-    "test_run.py::test_compile_fp16_matmul_window_emits_half2": "R7",
+    # test_compile_fp16_matmul_window_emits_half2 + test_run_code_fp16_matmul_window_accuracy[2]
+    # DE-QUARANTINED: the fp16 half2 window is rewired into the block-DAG enumeration —
+    # 010_reduce_tile reinterprets an even FK==bk fp16-matmul offer as the half2 window
+    # (register FK=1 + stamp FKWIN), kernel/015_pack_fk_window now recurses into the
+    # StageBundle to find the staged window loop, and kernel/010_split_register_axes
+    # treats a StageBundle as transparent to the K-serial nest so the FK cross-accumulator
+    # fold lands after K_o (fixing the [2] out-of-scope master-accumulator codegen).
     # test_split_demoted_fork_pushes_structural DE-QUARANTINED: the keep-vs-split FORK is
     # now live — the keep(SMEM) fused edge is a lowerable keep option (``seed_fused`` →
     # ``assemble_fused``), so ``005_split_demoted`` offers ``[keep, cut]`` instead of forcing
@@ -156,10 +158,9 @@ _XFAIL_NODES: dict[str, str] = {
     # de-quarantined (the softmax+P@V un-fuses into xn producer + clean gemm).
     # test_tinyllama_block_accuracy[cuda] de-quarantined: the whole-block RoPE
     # attention + MLP forward now lowers correctly (SDPA split + multi-access staging).
-    # R7
-    # Only the [2] window param still fails (fp16 nvcc codegen); [4]/[8] recovered
-    # under the R4 scalar pin-honoring (see the test_run.py note above).
-    "test_run.py::test_run_code_fp16_matmul_window_accuracy[2]": "R7",
+    # R7 — test_run_code_fp16_matmul_window_accuracy[2] DE-QUARANTINED with the fp16
+    # half2 window rewire (see the _XFAIL_FUNCS note): the StageBundle-transparent FK
+    # fold placement in kernel/010_split_register_axes fixes the [2] out-of-scope codegen.
 }
 
 

@@ -129,7 +129,19 @@ def _replicate_register_tiles(body: Body, *, in_k_serial: bool = False) -> tuple
             # independently and re-attached via ``with_bodies``. A K serial
             # loop body propagates ``in_k_serial=True`` so any reduce fold from
             # below keeps bubbling until the loop closes.
-            child_in_k = isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner")
+            #
+            # A ``StageBundle`` is **transparent** to the K-serial nesting: it
+            # wraps the staged K_i loop *inside* K_o (gmem→smem cooperative load +
+            # the inner reduce loop), so a reduce fold generated under it must keep
+            # bubbling past K_o, not stop at the bundle scope. Propagate the
+            # current ``in_k_serial`` through it rather than resetting to False
+            # (without this, a multi-stage fp16 matmul drops the FK cross-accumulator
+            # fold inside K_o — its master accumulators are then out of scope at the
+            # post-K_o store).
+            if isinstance(s, StageBundle):
+                child_in_k = in_k_serial
+            else:
+                child_in_k = isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner")
             new_bodies: list[Body] = []
             child_folds: list[Stmt] = []
             for sub in s.nested():
