@@ -43,12 +43,12 @@ _XFAIL_FILES: dict[str, str] = {
     # de-quarantined (rebuilt against enumeration/_partition.monoid_reduce_tilegraph).
     # R4 — landed (warp-tier atomize): test_matmul_mma_causal_epilogue.py /
     # test_matmul_mma_transposed_b.py / test_stage_inputs_mma_probe.py de-quarantined.
-    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/017_flash +
-    # _build.flash_build, masked streaming for symbolic seq_len): test_flash_attention.py
+    # R6 — flash landed (streaming TWISTED_MONOID build: enumeration/017_streaming +
+    # _build.streaming_build, masked streaming for symbolic seq_len): test_flash_attention.py
     # de-quarantined except test_flash_off_keeps_decomposition (a func entry below — its
     # blocker is the non-flash score-materializing SDPA decomposition, R7).
     # R6 cooperative-KV flash landed (the BR>1 streaming split lays the K_c THREAD lane
-    # in _build.flash_build / _replace_k_flash; the carrier's combine_states fires at
+    # in _build.streaming_build / _replace_k_streaming; the carrier's combine_states fires at
     # kernel/100 like the MONOID coop reduce): test_flash_cooperative_kv.py de-quarantined.
     # R7 — test_program_rebind.py de-quarantined: R2's cooperative-reduce lowering
     # made the rmsnorm-bearing rebind kernels compile, so all three rebind tests pass.

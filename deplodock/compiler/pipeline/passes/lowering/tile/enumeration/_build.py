@@ -360,19 +360,21 @@ def coop_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: fro
     )
 
 
-# === Flash (streaming ``TWISTED_MONOID``) build move (``plans/tile-ir-block-dag.md`` R6). ===
-# Flash is the simplest reduce build: the free output axes (q-rows / head-dim) tile
-# like a pointwise nest, and BOTH contraction axes — the streaming KV reduce and its
-# nested QK^T reduce — serial-transform with ``bk=fk=splitk=1`` (each output element
-# streams its own KV; the carrier can't span register cells or split-K). The coupled
-# ``Monoid`` carrier (the online-softmax m/l/O recurrence) rides through σ untouched —
-# ``kernel/100_materialize_tile`` + ``kernel/_combine`` synthesize its rescale. This is
-# literally ``reduce_decomp`` (knobs forced to 1) then ``free_tile`` (register forced to
-# 1) — the legacy ``build_flash_tile``, re-expressed as the two existing body moves.
+# === Streaming ``TWISTED_MONOID`` build move (``plans/tile-ir-block-dag.md`` R6). ===
+# The streaming reduce is the simplest reduce build: the free output axes tile like a
+# MAP nest, and BOTH contraction axes serial-transform with ``bk=fk=splitk=1`` (each
+# output element streams its own reduction; the carrier can't span register cells or
+# split-K). For flash attention these axes are the streaming KV reduce + its nested
+# QK^T reduce, the free axes q-rows / head-dim, and the coupled ``Monoid`` carrier is
+# the online-softmax m/l/O recurrence — it rides through σ untouched
+# (``kernel/100_materialize_tile`` + ``kernel/_combine`` synthesize its rescale). This
+# is literally ``reduce_decomp`` (knobs forced to 1) then ``free_tile`` (register forced
+# to 1), re-expressed as the two existing body moves.
 
 
-def _mask_flash_monoid(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
-    """Mask the streaming flash carrier's score to ``-inf`` past a symbolic-K bound.
+def _mask_streaming_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
+    """Mask the streaming carrier's score to ``-inf`` past a symbolic-K bound (the
+    flash-attention case: a key past the runtime ``seq_len``).
     Before each ``Monoid`` with partial ``(score, value)`` insert
     ``Init(score_kid, maximum)`` (seeds ``-inf``, the score component's identity) +
     ``Select(score_km, score if pred else score_kid)``, then fold ``score_km`` — the
@@ -396,12 +398,12 @@ def _mask_flash_monoid(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]
     return tuple(out)
 
 
-def _replace_k_flash(
+def _replace_k_streaming(
     stmts: tuple[Stmt, ...], target_names: frozenset[str], *, coop_axis: str | None = None, k_c: Axis | None = None, br: int = 1
 ) -> tuple[Stmt, ...]:
-    """Serial-transform each flash contraction loop (``bk=fk=splitk=1``): a static
-    axis (the nested QK^T reduce) gets a plain ``K_o``/``K_i`` tower; a **symbolic**
-    streaming axis (dynamic ``seq_len`` KV) ceil-divides, clamps its load index for a
+    """Serial-transform each streaming contraction loop (``bk=fk=splitk=1``): a static
+    axis (e.g. flash attention's nested QK^T reduce) gets a plain ``K_o``/``K_i`` tower;
+    a **symbolic** streaming axis (dynamic ``seq_len`` KV) ceil-divides, clamps its load index for a
     safe read, and masks the ``Monoid`` score to ``-inf`` past the runtime bound (the
     ``TWISTED_MONOID`` identity — fold nothing for an out-of-range key).
 
@@ -416,7 +418,7 @@ def _replace_k_flash(
             kn = s.axis.name
             src = s.axis.source_axis or s.axis
             symbolic = not s.axis.extent.is_static
-            inner = _replace_k_flash(tuple(s.body), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
+            inner = _replace_k_streaming(tuple(s.body), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
             if k_c is not None and kn == coop_axis:
                 # Cooperative streaming split: ``br`` THREAD lanes (``K_c``) reduce in
                 # parallel, ``K_o`` serial over the strided slice. The carrier's
@@ -435,7 +437,7 @@ def _replace_k_flash(
                 pred = BinaryExpr("<", decoded_k, s.axis.extent.expr)
                 clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", s.axis.extent.expr, Literal(1, "int")))
                 body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in inner)
-                new_body = _mask_flash_monoid(body_c, pred)
+                new_body = _mask_streaming_carrier(body_c, pred)
             else:
                 new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
             out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
@@ -444,10 +446,11 @@ def _replace_k_flash(
     return tuple(out)
 
 
-def flash_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
-    """The flash build move: serial-transform every contraction axis
-    (``bk=fk=splitk=1``, masked streaming for a symbolic KV) then σ-split the free
-    axes (``FM=FN=1``). The caller (``017_flash``) pins those knobs.
+def streaming_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
+    """The streaming ``TWISTED_MONOID`` build move (e.g. flash attention): serial-
+    transform every contraction axis (``bk=fk=splitk=1``, masked streaming for a
+    symbolic KV) then σ-split the free axes (``FM=FN=1``). The caller (``017_streaming``)
+    pins those knobs.
 
     With ``BR > 1`` (cooperative-KV) the **static** streaming axis additionally lays a
     ``K_c`` THREAD lane (``br`` cooperative lanes per row, innermost in the THREAD
@@ -461,7 +464,7 @@ def flash_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: fr
     if br > 1 and stream.extent.is_static and stream.extent.as_static() % br == 0:
         k_c = Axis(f"{stream.name}_c", br, source_axis=stream.source_axis or stream)
         coop_axis = stream.name
-    compute = _replace_k_flash(tuple(block.compute), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
+    compute = _replace_k_streaming(tuple(block.compute), target_names, coop_axis=coop_axis, k_c=k_c, br=br)
     g = free_tile(replace(graph, blocks=(replace(block, compute=Body(compute)),)), dag, knobs, target_names=target_names)
     if k_c is not None:
         # Lay K_c FIRST in domain (innermost THREAD bits — matches coop_build, so the

@@ -27,7 +27,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag impor
 PATTERN = [Pattern("root", LoopOp)]
 
 # Regimes the move set builds: MAP / SEMIRING / MONOID + TWISTED_MONOID (flash, R6 —
-# the streaming online-softmax nest, built by enumeration/017_flash).
+# the streaming online-softmax nest, built by enumeration/017_streaming).
 _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID, AlgebraKind.TWISTED_MONOID)
 
 

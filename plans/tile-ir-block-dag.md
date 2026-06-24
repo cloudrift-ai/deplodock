@@ -855,25 +855,25 @@ never a tree-builder.
   the TMA decision; the TMA-decline it nominally guards is moot until the kernel lowers. *`_REASON` Phase 3's masked-TMA
   follow-ups (the cooperative-load clamp + non-divisor `real_extent`) stay with the R4 SYNC-masked-staging tier.*
 - **R6 — Flash / attention** (deps: R2, R4). **Landed (scalar flash core).** Added the streaming-`TWISTED_MONOID`
-  build path: `000_build._BUILDABLE` gained `TWISTED_MONOID`; the flash fork `enumeration/017_flash` owns the regime end
+  build path: `000_build._BUILDABLE` gained `TWISTED_MONOID`; the flash fork `enumeration/017_streaming` owns the regime end
   to end (like `015_coop_reduce` owns `MONOID`) — it enumerates the free-axis THREAD tile, forces `FM=FN=1` +
-  `BK=FK=SPLITK=1`, and applies the `flash_build` body move per leaf; `050_stage` skips `TWISTED_MONOID` (flash is
-  smem-free). `_build.flash_build` / `_replace_k_flash` serial-transform both contraction axes (the streaming KV reduce
+  `BK=FK=SPLITK=1`, and applies the `streaming_build` body move per leaf; `050_stage` skips `TWISTED_MONOID` (flash is
+  smem-free). `_build.streaming_build` / `_replace_k_streaming` serial-transform both contraction axes (the streaming KV reduce
   + its nested QK^T reduce), and for a **symbolic** KV (dynamic `seq_len`) ceil-divide + clamp the load index +
-  `_mask_flash_monoid` masks the `Monoid` score to `-inf` past the runtime bound (the `TWISTED_MONOID` identity — fold
+  `_mask_streaming_carrier` masks the `Monoid` score to `-inf` past the runtime bound (the `TWISTED_MONOID` identity — fold
   nothing for an out-of-range key). The coupled `Monoid` carrier rides through σ untouched — `kernel/100` +
   `kernel/_combine` synthesize the m/l/O rescale (no new assemble work). Ported from the legacy `build_flash_tile` /
-  `_mask_flash_monoid`. *Gate:* accuracy-vs-torch on the RTX 5090 — SDPA / causal / GQA / additive-mask flash, static
+  `_mask_streaming_carrier`. *Gate:* accuracy-vs-torch on the RTX 5090 — SDPA / causal / GQA / additive-mask flash, static
   **and** dynamic (symbolic `seq_len`, masked streaming). *Recovered:* `test_flash_attention.py` (all but
   `test_flash_off_keeps_decomposition`, re-tagged R7 — its blocker is the non-flash score-materializing SDPA
   decomposition) + `test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len`. **Cooperative-KV flash landed
   (R6 follow-up).** The `BR>1` streaming split now lays the `K_c` cooperative THREAD lane on the **static** streaming KV
-  axis in `_build.flash_build` / `_replace_k_flash` (σ-split `K → K_o·br + K_c`, `K_c` bound THREAD innermost): each
+  axis in `_build.streaming_build` / `_replace_k_streaming` (σ-split `K → K_o·br + K_c`, `K_c` bound THREAD innermost): each
   lane streams a strided KV slice into its own online-softmax `(m, l, O)` partial, the `Monoid.axes` pick up `K_c`
   through σ, and `kernel/100_materialize_tile` emits the carrier's `combine_states` warp-shuffle / smem-tree combine —
   the same commutative-licensed THREAD partition the `MONOID` coop reduce uses (no new assemble work; the `Monoid`
-  already carries `combine_states` / `state_b`). `017_flash` enumerates `flash_br_offers × thread_offers`, budgets the
-  free thread tile by `BR`, and filters the free×BR layout via `flash_coop_geometry_ok` (whole-CTA tree vs strided
+  already carries `combine_states` / `state_b`). `017_streaming` enumerates `streaming_br_offers × thread_offers`, budgets the
+  free thread tile by `BR`, and filters the free×BR layout via `streaming_coop_geometry_ok` (whole-CTA tree vs strided
   intra-warp segment). Default `BR=1` keeps the serial-KV form (opt-in via `DEPLODOCK_BR`; symbolic KV stays serial).
   *Recovered:* `test_flash_cooperative_kv.py` (4 cases, accuracy vs torch SDPA). **Score-materializing SDPA landed
   (R6 follow-up) — `005_split_demoted` reborn.** The structural split is back as the new pre-build pass dir
@@ -960,9 +960,9 @@ warp-tier TMA transport fork `enumeration/052_transport` promotes a staged warp 
 `mask_order` hoist for symbolic-M tiles), proven accuracy-vs-torch static + dynamic. The pass structure is validated end
 to end across the smem (scalar + warp), tensor-core, cooperative-reduce, split-K, and TMA-transport regimes.
 
-**R5 (transport — warp-tier TMA) and the R6 scalar flash core have landed.** The flash fork `enumeration/017_flash`
+**R5 (transport — warp-tier TMA) and the R6 scalar flash core have landed.** The flash fork `enumeration/017_streaming`
 builds the streaming `TWISTED_MONOID` online-softmax (SDPA / causal / GQA / additive-mask, static + dynamic) through the
-`flash_build` body move, and the TMA fork `enumeration/052_transport` promotes a staged warp matmul to the
+`streaming_build` body move, and the TMA fork `enumeration/052_transport` promotes a staged warp matmul to the
 double-buffered `cp.async.bulk.tensor` ring (`assembly/_slab` + `020_peel` + the `mask_order` hoist).
 
 **The R4 masked scalar-tile staging clamp has landed** (scalar-offer env-pin honoring + `050_stage`'s budget-aware
@@ -974,7 +974,7 @@ The unblocked tier is now **R7** (e2e / CLI / structural-search / prior). **The 
 over-ceiling warp-reg pin is authoritative so the unstaged atom builds + lowers gmem-direct via the budget-aware
 staging decline, and the masked-tile hoist gained the SSA-safety refusal — see the R4 bullet); both quarantined R4
 tests are de-quarantined. **R6 is now complete** — all four follow-ups landed: the **cooperative-KV flash** (`BR>1`
-lays the `K_c` THREAD lane in `_build.flash_build`, `combine_states` fires at `kernel/100`), the **score-materializing
+lays the `K_c` THREAD lane in `_build.streaming_build`, `combine_states` fires at `kernel/100`), the **score-materializing
 SDPA** (the reborn `005_split_demoted` in the new `lowering/tile/split` pass dir forces the softmax+P@V un-fusion into
 an `xn` producer + a clean static-or-symbolic-K gemm), and the **RoPE-fused attention** (the `_stage._multi_access_bufs`
 exclusion keeps a buffer read at >1 distinct access — the rotary `cos[m]`/`cos[n]`, the straight + rotate-half

@@ -213,7 +213,3 @@ def _assemble_multi(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_n
         frag.add_node(tile_op, inputs, Tensor(out_buf, buf.shape, buf.dtype), node_id=out_buf)
     frag.outputs = list(out_bufs)
     return frag
-
-
-# Back-compat alias (the pointwise equivalence test + early callers).
-assemble_pointwise = assemble_block
