@@ -65,14 +65,24 @@ as `Block.reads`), so they are compliant, not a leak. So there was no pile of re
 What the bullet list names as the *stamp targets* — `Schedule.cohort` / `distance` / `ring_depth` / `reg_budget` /
 `grid_swizzle` — turned out to be **dead fields**: zero writers (no move populates them), zero readers (assemble only
 `keep()`d the empty dicts; the live ring fact rides `StageBundle.buffer_count` / `AsyncWait` /
-`WarpSpecialize.ring_depth`, which are *different* fields). They were scaffolding for moves that don't exist yet (barrier
-cohorts, retiming distance, warp-spec register redistribution, L2 grid swizzle). Per Simplicity-First (no speculative
-state) those five were **removed** from `Schedule` (+ their `pretty()` branches + the `_assemble._restrict_schedule`
-`keep()`s) — the genuine simplification. They return with the move that first needs them (the cohort field with the
-cooperative-`grid.sync` barrier mechanism of Fix 3 / the edge-placement plan; `distance` with software-pipeline
-retiming). The surviving `Schedule` fields are exactly the ones a pass reads: `binding` / `scope` / `role` / `launch` /
-`staged` / `pad` / `unroll`. The firewall is the durable boundary guard: it makes Fix 2's mechanical-pass rule
-enforceable and blocks a new kernel pass from re-accreting the leak.
+`WarpSpecialize.ring_depth`, which are *different* fields). An audit of the *rest* of the class found the same for
+`scope` / `role` / `unroll` / `pad` — `unroll` is the sharpest: the real unroll decision rides the body `Loop` /
+`SerialTile` (`020_peel` reads `kouter.unroll`), and `Schedule.unroll` was a never-populated overlay slot for a fact
+that lives in the body. So **`Schedule` had drifted to advertise a large scheduling surface while holding only three
+live overlay fields** — exactly the "some state here, some scattered in the body" muddle.
+
+The fix (Simplicity-First, no speculative state): trim `Schedule` to **exactly its live overlay** — `binding` (axis →
+hardware coord), `staged` (edge → SMEM transport), `launch` (block → kernel group) — the three a move writes and
+`assemble` reads. Removed `cohort` / `distance` / `ring_depth` / `reg_budget` / `grid_swizzle` / `scope` / `role` /
+`unroll` (+ their `pretty()` branches, the `_assemble._restrict_schedule` `keep()`s, and the now-orphaned
+producer/consumer `Role` enum that only `Schedule.role` referenced — distinct from the live tower `Role` in
+`assembly/_tower.py`). This makes the **invariant legible from the class**: the tiled *algorithm* (iteration structure)
+lives in `Block.compute`; the hardware *overlay* is `Schedule`; one move co-writes both (the σ-split creates an axis in
+the body, the binding maps it in the overlay), keyed by name. A field returns here only when a move actually writes it —
+a fact decided *at assemble* (ring depth, slab pad) rides the materialized node, not a never-populated slot (the cohort
+field with Fix 3's cooperative-`grid.sync` barrier; `distance` with software-pipeline retiming). The firewall is the
+durable boundary guard: it makes Fix 2's mechanical-pass rule enforceable and blocks a new kernel pass from re-accreting
+the leak.
 
 ## Fix 2 — Pull leaked forks above assemble (the real content of G3/G4) [high value]
 

@@ -147,11 +147,6 @@ class Placement(enum.Enum):
     GMEM = "gmem"
 
 
-class Role(enum.Enum):
-    PRODUCER = "producer"
-    CONSUMER = "consumer"
-
-
 class AddrKind(enum.Enum):
     AFFINE = "affine"  # source_index[d] = offset[d] + Σ_{i: dims[i]==d} block[i]·Var(axes[i])
     TEMPLATE = "template"  # verbatim coords, domain vars symbolic (collapsed reshape `/`,`%`)
@@ -438,17 +433,21 @@ class Edge:
 
 @dataclass(frozen=True)
 class Schedule:
-    """The variant — every scheduling choice. The scheduling moves edit only
-    this; ``assemble`` applies it to the algorithm. Staging keys are read-sites
-    (the derived ``Edge``); a read absent from ``staged`` is gmem-direct."""
+    """The variant — every scheduling choice the moves search, exactly the
+    **hardware overlay** over the invariant algorithm (the tiled iteration
+    structure lives in ``Block.compute``, never here): how each axis binds
+    (``binding``), where each edge's value is placed (``staged``), and how blocks
+    partition into kernels (``launch``). One move co-writes the body (the σ-split
+    that creates an axis) and this overlay (that axis's binding), keyed by name;
+    ``assemble`` composes the two into the materialized ``TileOp``. Staging keys
+    are read-sites (the derived ``Edge``); a read absent from ``staged`` is
+    gmem-direct. Fields are added back here only when a move actually writes one
+    (a fact decided at assemble — ring depth, slab pad — rides the materialized
+    node, not a never-populated slot here)."""
 
     binding: dict[str, Binding] = field(default_factory=dict)  # axis -> hardware role
-    scope: dict[str, tuple[str, ...]] = field(default_factory=dict)  # block -> enclosing nest override
-    role: dict[str, Role] = field(default_factory=dict)  # block -> producer/consumer (warp-spec)
     launch: dict[str, int] = field(default_factory=dict)  # block -> launch group (one group = one kernel)
     staged: dict[Edge, Transport] = field(default_factory=dict)  # read-site -> SMEM fill transport
-    pad: dict[Edge, tuple[int, ...]] = field(default_factory=dict)  # staged read-site -> slab bank-conflict pad
-    unroll: dict[str, bool] = field(default_factory=dict)  # SERIAL axis -> #pragma unroll
 
     def with_binding(self, **kw: Binding) -> Schedule:
         return replace(self, binding={**self.binding, **kw})
@@ -457,25 +456,17 @@ class Schedule:
         """Readable listing of the non-empty scheduling decisions (for
         ``compile -vv`` / kernel dumps). ``binding`` is rendered on the
         block domain axes by :meth:`TileGraph.pretty`, so it is omitted
-        here; every other non-empty field gets one line. Edge-keyed maps
-        (``staged`` / ``pad``) key on ``buffer:src->dst``."""
+        here; ``launch`` / ``staged`` each get one line. The ``staged``
+        edge-keyed map keys on ``buffer:src->dst``."""
 
         def edge_key(e: Edge) -> str:
             return f"{e.buffer}:{e.src}->{e.dst}"
 
         lines: list[str] = []
-        if self.scope:
-            lines.append(f"{indent}scope: " + ", ".join(f"{b}={'/'.join(s)}" for b, s in self.scope.items()))
-        if self.role:
-            lines.append(f"{indent}role: " + ", ".join(f"{b}={r.value}" for b, r in self.role.items()))
         if self.launch:
             lines.append(f"{indent}launch: " + ", ".join(f"{b}={g}" for b, g in self.launch.items()))
         if self.staged:
             lines.append(f"{indent}staged: " + ", ".join(f"{edge_key(e)}={t.value}" for e, t in self.staged.items()))
-        if self.pad:
-            lines.append(f"{indent}pad: " + ", ".join(f"{edge_key(e)}={list(p)}" for e, p in self.pad.items()))
-        if self.unroll:
-            lines.append(f"{indent}unroll: " + ", ".join(f"{a}={v}" for a, v in self.unroll.items()))
         return lines
 
 

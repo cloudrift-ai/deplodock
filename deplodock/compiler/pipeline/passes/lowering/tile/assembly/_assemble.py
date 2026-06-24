@@ -23,7 +23,7 @@ from dataclasses import replace
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile.ir import Binding, Block, Edge, Schedule, TileGraph, TileOp
+from deplodock.compiler.ir.tile.ir import Binding, Block, Edge, Schedule, TileGraph, TileOp, Transport
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
@@ -120,20 +120,15 @@ def _assemble_one(
 
 
 def _restrict_schedule(sched: Schedule, block_name: str) -> Schedule:
-    """The ``Schedule`` as one block sees it: the edge-keyed maps narrowed to edges
-    consumed by this block (``dst == block_name``) so the slab synthesizer stages
-    only this kernel's reads. The axis-/block-keyed fields (binding / scope / role /
-    launch / unroll) are harmless to a block that does not reference them and pass
-    through unchanged."""
+    """The ``Schedule`` as one block sees it: the edge-keyed ``staged`` map narrowed
+    to edges consumed by this block (``dst == block_name``) so the slab synthesizer
+    stages only this kernel's reads. The axis-/block-keyed fields (binding / launch)
+    are harmless to a block that does not reference them and pass through unchanged."""
 
-    def keep(d: dict[Edge, object]) -> dict:
+    def keep(d: dict[Edge, Transport]) -> dict[Edge, Transport]:
         return {e: v for e, v in d.items() if e.dst == block_name}
 
-    return replace(
-        sched,
-        staged=keep(sched.staged),
-        pad=keep(sched.pad),
-    )
+    return replace(sched, staged=keep(sched.staged))
 
 
 def _launch_groups(graph: TileGraph) -> dict[object, list[Block]]:
