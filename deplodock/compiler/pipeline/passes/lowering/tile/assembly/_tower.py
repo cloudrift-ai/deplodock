@@ -1,11 +1,8 @@
-"""Tower-building primitives shared by the legacy planner and the move
-composer: the planner-internal :class:`Role` label and :func:`_wrap_tower`,
-which wraps a body in the nested typed tile flavors (``GridTile`` /
-``ThreadTile`` / ``RegisterTile`` / ``WarpTile`` / ``AtomTile`` /
-``SerialTile``).
-
-Extracted verbatim from ``010_partition_loops`` so the new composer can
-reuse the exact tower mechanics (the legacy planner imports them back).
+"""Tower-building primitives for the assembly phase: the internal :class:`Role`
+label and :func:`_wrap_tower`, which wraps a body in the nested typed tile
+flavors (``GridTile`` / ``ThreadTile`` / ``RegisterTile`` / ``WarpTile`` /
+``AtomTile`` / ``SerialTile``). Used by ``assembly/_assemble`` + ``assembly/_fused``
+to materialize the binding tower from a chosen ``Schedule``.
 """
 
 from __future__ import annotations

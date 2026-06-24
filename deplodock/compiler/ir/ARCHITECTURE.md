@@ -225,7 +225,7 @@ axes excluded), plus `external_reads`, the names read from outside (axis vars an
 Construction never fails: unresolved names are data, and chaining scope levels means seeding the next level's
 `backward_cone` with the previous one's `external_reads`. `Body.defs_die_at(members, roots=…, allowed=…)` is the
 matching escape check (may the cone be cut out, with only the designated consumers reading its roots?). This is
-the shared substrate behind the rules that slice cones (`010_split_demoted`'s producer cut, `021`'s masked-load
+the shared substrate behind the rules that slice cones (`010_split_demoted`'s producer cut, `assembly/_slab._hoist_masked`'s masked-load
 guard) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. Two dataflow walks
 deliberately do NOT use it: `classify_fragment_epilogue` (single pass interleaving reduce-scope flags with its
 negative-form blocker reporting) and `030_hoist_invariant_compute` (all-deps saturation under an axis-invariance
@@ -384,7 +384,7 @@ wraps `Accum`s — the flag also routes `FK`-vs-`FM`/`FN` knob stamping. `partit
 shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
 itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.
-Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
+Right after, `tile/enumeration/050_warp_build` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
 (`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
 `ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,

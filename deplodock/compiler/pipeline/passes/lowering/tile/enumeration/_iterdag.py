@@ -65,10 +65,6 @@ class AxisNode:
         return self.loop.axis
 
     @property
-    def symbolic(self) -> bool:
-        return not self.loop.axis.extent.is_static
-
-    @property
     def extent(self) -> int:
         """Static extent, or the ``Dim`` hint for a symbolic axis (``0`` if no
         hint) — the size a tile is shaped for."""

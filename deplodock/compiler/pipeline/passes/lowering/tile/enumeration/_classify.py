@@ -8,7 +8,7 @@ no contraction, ``SEMIRING`` a contraction, ``MONOID`` a plain reduce,
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.stmt import Loop, Write
@@ -18,12 +18,10 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag impor
 @dataclass(frozen=True)
 class _Regime:
     """The classification handoff: the nest's algebra + the contraction-axis names
-    a reduce decomposition rewrites (``target_names``), plus the flash streaming
-    ``k_bounds``."""
+    a reduce decomposition rewrites (``target_names``)."""
 
     algebra: AlgebraKind  # MAP | SEMIRING | MONOID | TWISTED_MONOID
     target_names: frozenset[str] = frozenset()
-    k_bounds: dict = field(default_factory=dict)
 
 
 def classify(dag: IterDag) -> _Regime | None:
@@ -40,11 +38,9 @@ def classify(dag: IterDag) -> _Regime | None:
     if AlgebraKind.TWISTED_MONOID in algebras and nested_reduce:
         if len(dag.parallel) < 2:
             return None
-        twisted = [lp for lp in reduce_loops if lp.algebra_kind == AlgebraKind.TWISTED_MONOID]
         if any(not lp.axis.extent.is_static for lp in reduce_loops if lp.algebra_kind != AlgebraKind.TWISTED_MONOID):
             return None
-        k_bounds = {lp.axis.name: lp.axis.extent.expr for lp in twisted if not lp.axis.extent.is_static}
-        return _Regime(AlgebraKind.TWISTED_MONOID, frozenset(lp.axis.name for lp in reduce_loops), k_bounds)
+        return _Regime(AlgebraKind.TWISTED_MONOID, frozenset(lp.axis.name for lp in reduce_loops))
 
     if not reduce_loops:  # no contraction — a MAP nest.
         return _Regime(AlgebraKind.MAP)

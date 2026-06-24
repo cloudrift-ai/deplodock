@@ -1,6 +1,6 @@
 """Lower the tensor-core matmul cell to the kernel-IR MMA fragment chain.
 
-The matmul cell arrives in tensor-core form: ``tile/011_lower_atom_cell`` fused
+The matmul cell arrives in tensor-core form: ``tile/enumeration/050_warp_build`` fused
 the compute into an :class:`~deplodock.compiler.ir.stmt.Mma` (which names its A
 / B operands by SSA value and carries the ``Atom`` spec) and left the operand
 ``Load``s **plain**, and the staging passes carried both through (the loads

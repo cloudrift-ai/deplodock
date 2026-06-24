@@ -15,12 +15,6 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.context import Context
-from deplodock.gpu import DEFAULT_GPU
-
-# Occupancy reference fallback when a context carries no SM count (GPU-less hosts) —
-# the default card's memorized SM count (RTX 5090 / sm_120 = 170; the golden set was
-# measured there). Single source: the common GPU registry (:mod:`deplodock.gpu`).
-DEFAULT_SM_COUNT = DEFAULT_GPU.sm_count
 
 # Knobs the thread-tier / warp-tier enumeration decides — the projection a golden
 # is matched on (STAGE / RING / WARPSPEC / NOATOMIC are stamped by later passes,
@@ -164,7 +158,6 @@ def evaluate_golden(
     dtype: str,
     golden_knobs: dict,
     ctx: Context,
-    sm_count: int | None = None,  # noqa: ARG001 — kept for call-site compat; the analytic prior reads ctx.sm_count
     scorer: Callable[[dict], float] | None = None,
     dynamic: bool = False,
 ) -> tuple[dict, int | None, int]:
@@ -190,8 +183,8 @@ def evaluate_golden(
     return rows[best], rank, len(rows)
 
 
-def pick_matmul(M: int, N: int, K: int, dtype: str, ctx: Context, sm_count: int | None = None) -> dict:
+def pick_matmul(M: int, N: int, K: int, dtype: str, ctx: Context) -> dict:
     """Best knob row for an ``(M, K) @ (K, N)`` matmul under the analytic prior —
     no learned data, no measurements. Thin wrapper over :func:`evaluate_golden`
     (no golden to match). Returns ``{}`` if nothing enumerates."""
-    return evaluate_golden(M, N, K, dtype, {}, ctx, sm_count)[0]
+    return evaluate_golden(M, N, K, dtype, {}, ctx)[0]

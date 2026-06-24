@@ -95,8 +95,8 @@ autotuning cache doesn't bust on cosmetic edits.
   size (default `DEFAULT_SEQ_HINT=512`, set automatically so reconstruction can't lose it; an explicit
   `Dim(name, hint=...)` overrides). The hint is pure metadata (excluded from `==`/`hash`/structural keys),
   read only by the tuner / partition planner to size tiles for a dynamic axis.
-- **A symbolic free axis is tiled for its hint and emitted as a *masked* tile.** The partition planner
-  (`pipeline/passes/lowering/tile/010_partition_loops.py`) treats a symbolic M/N axis as size `hint`,
+- **A symbolic free axis is tiled for its hint and emitted as a *masked* tile.** The enumeration free-axis σ-split
+  (`pipeline/passes/lowering/tile/enumeration/100_register_tile.py`) treats a symbolic M/N axis as size `hint`,
   always-overhang: the block axis becomes a composite ceil-div over the symbolic extent
   (`(seq_len + bf - 1)//bf`), and a boundary `Cond(decoded_coord < seq_len)` wraps the body. So one cached
   kernel runs at any runtime `seq_len` — the grid (`ir/cuda/ir.py:GridDimSpec` now accepts an `Expr`
@@ -112,15 +112,15 @@ autotuning cache doesn't bust on cosmetic edits.
   K** (P@V — which never stages) get masked THREAD tiles
   with `FM = FN = 1` (`mask_f1`); static-K prologue kernels (fused gated-MLP) and cooperative-reduce
   kernels keep symbolic axes degenerate (one element per thread) — their staged pipelines can't coexist
-  with the per-row guard (`021`'s hoist would break the prologue's SSA ordering; it now refuses such
+  with the per-row guard (`assembly/_slab._hoist_masked`'s hoist would break the prologue's SSA ordering; it now refuses such
   lifts), and their deployment path is the structural split (`010_split_demoted`), which offers on
   symbolic ROW **and** symbolic N axes (the rotary QK^T's symbolic-N key cone materializes canonically,
   reaching the masked warp tier) — so e.g. the dynamic o_proj's collapsed attn-out splits into a
   contiguizing `xn` producer + a warp-tier consumer instead of staying fused-scalar. The symbolic-N B
   operand `xnb[…, K, N]` further reaches the **TMA + warp-specialized** tier (matching its static twin,
-  not just cp.async): `010_split_demoted._pad_inner_for_tma` rounds the materialized inner N up to a
+  not just cp.async): `_extract._pad_inner_for_tma` rounds the materialized inner N up to a
   multiple of 64 so the K dim's gmem stride stays 16 B-aligned at any runtime `seq_len`, which is the
-  `cuTensorMapEncodeTiled` requirement `050_use_tma` otherwise declines a symbolic innermost dim for
+  `cuTensorMapEncodeTiled` requirement `enumeration/130_transport` otherwise declines a symbolic innermost dim for
   (`_inner_stride_aligned`). The buffer stays runtime-sized (correct above the hint, unlike a fixed
   static width), and the padded `[seq_len, round_up)` overhang columns feed the mma only into
   store-masked output positions, so they can't contaminate a live score. The cut keeps a

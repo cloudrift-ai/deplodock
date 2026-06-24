@@ -565,7 +565,7 @@ class Mma(ReduceCarrier):
     """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
-    cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
+    cell on the tensor-core path. Emitted by ``tile/enumeration/050_warp_build``
     alongside its two operand ``Load``s — which stay **plain** (no tensor-core
     tag): the ``Mma`` is the sole carrier of the cell's :class:`Atom` spec +
     operand identity, naming its A/B operands by SSA value, so
@@ -588,7 +588,7 @@ class Mma(ReduceCarrier):
       transposed-B ``Q @ K^T`` cell. This is the native ``mma.row.col`` B layout
       (col-major K×N), so ``kernel/005_lower_atom_tile`` loads it via ``ldmatrix``
       WITHOUT ``.trans`` (the default canonical B[k,n] uses ``.trans``). Set by
-      ``tile/011_lower_atom_cell`` from the classified B Load's K position.
+      ``tile/enumeration/050_warp_build`` from the classified B Load's K position.
     """
 
     c: str

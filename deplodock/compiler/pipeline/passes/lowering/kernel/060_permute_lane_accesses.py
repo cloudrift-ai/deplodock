@@ -166,7 +166,7 @@ def _maybe_rewrite(body: Body, *, lds128_bytes: int, F: int) -> Body | None:
     # convention that's the N axis post-split_register_axes — its extent is
     # ``BN/FN``, and its consumer Loads carry the ``Var(lane) * FN + c``
     # pattern we rewrite. Lane stride ``F = knobs["FN"]`` is the register-tile
-    # factor stamped by ``003_register_tile``.
+    # factor stamped by ``tile/enumeration/100_register_tile``.
     lane = thread_axes[-1]
     vec_elems = _vec_elems_for_lane(tile, lane.name, lds128_bytes=lds128_bytes)
     if vec_elems is None:

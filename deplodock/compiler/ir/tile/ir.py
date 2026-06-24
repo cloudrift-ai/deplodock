@@ -913,9 +913,8 @@ class WarpSpecialize(Stmt):
       ``consumer_is_warp``). The materializer feeds these into a nested
       ``ThreadTile`` / ``WarpTile`` carrying ``tid_offset=n_producer_threads``
       so consumer threads decode ``threadIdx.x - n_producer_threads`` back into
-      these axis names. ``()`` is the legacy / pre-refactor shape, kept for
-      back-compat with any caller that doesn't track the axes yet — the new
-      materializer arm raises if it's empty when expected.
+      these axis names. Required (no default) — the WarpTile-based materializer
+      arm raises on empty axes (the stranded-consumer deadlock guard).
 
     The K_o axis the WS pass aligned scheduling against is identified by
     the materializer structurally — the (single) ``SerialTile(serial_outer)``
@@ -935,7 +934,7 @@ class WarpSpecialize(Stmt):
     consumer_body: Body
     ring_depth: int
     n_producer_threads: int
-    consumer_thread_axes: tuple[Axis, ...] = ()
+    consumer_thread_axes: tuple[Axis, ...]
     # When True the consumer axes are *warp*-granularity (the warp-tier MMA
     # tower: ``consumer_thread_axes`` are the WM×WN warp axes, 32 lanes each),
     # so the materializer wraps the consumer body in
@@ -1292,51 +1291,6 @@ def affine_decode_per_dim(
     return out
 
 
-def trivial_stage_body(
-    name: str,
-    buf: str,
-    origin: tuple[Expr, ...],
-    axes: tuple[Axis, ...],
-    addressing: AffineAddressing | TemplateAddressing,
-) -> Body:
-    """**Deprecated** — kept for import compatibility during stage-wrap-body refactor.
-
-    Pre-refactor: built the canonical ``Load + Write`` cooperative-load body
-    for a Stage. Post-refactor: producer body is reconstructed at materialize
-    time from ``Source`` entries; no caller should need this helper. Phase C
-    bucket 12 (swizzle split) removes the last reference.
-    """
-    cache_index = tuple(Var(ax.name) for ax in axes)
-    if isinstance(addressing, AffineAddressing):
-        coord_for = {ax.name: cache_index[i] for i, ax in enumerate(axes)}
-        src_index = addressing.source_index(axes, coord_for, origin)
-    else:
-        src_index = addressing.exprs
-    load_name = f"{name}__src"
-    return Body(
-        (
-            Load(name=load_name, input=buf, index=src_index),
-            Write(output=name, index=cache_index, value=load_name),
-        )
-    )
-
-
-def _source_pretty(src: Source) -> str:
-    """Legacy single-line source description — kept for debugging / dump
-    output. New consumer-facing pretty-print uses ``_source_decl_line``
-    which formats each source as ``shared name[...] = buf[...]`` at the
-    Stage's indent.
-    """
-    dims = src.addressing.dims if isinstance(src.addressing, AffineAddressing) else tuple(range(len(src.cache_axes)))
-    cache = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(src.cache_axes, dims, strict=True))
-    origin = ", ".join(e.pretty() for e in src.origin)
-    pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
-    tpl = ""
-    if isinstance(src.addressing, TemplateAddressing):
-        tpl = " template=[" + ", ".join(e.pretty() for e in src.addressing.exprs) + "]"
-    return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
-
-
 def _source_decl_line(src: Source) -> str:
     """Render one ``Source`` as ``shared <name>[<cache_axes>] = <buf>[<source_index>];``.
 
@@ -1659,12 +1613,12 @@ class AtomTile(ParallelTile):
     Marker for the per-cell hardware-atomic extent on a matmul-reduce kernel
     (see ``plans/mma-fragment-factorization.md``). The axes carry the cell
     shape (e.g. ``(M=16, N=8)``); the body inside is the per-cell compute that
-    ``011_lower_atom_cell`` turns into an ``Mma`` + the lowering replaces with
+    ``050_warp_build`` turns into an ``Mma`` + the lowering replaces with
     the fragment chain.
 
     ``atom`` is the :class:`Atom` this cell realises, carried **structurally**
     on the tile — its presence (and this field) is the "this kernel factorizes
-    through tensor cores" signal, and ``011_lower_atom_cell`` reads ``.atom``
+    through tensor cores" signal, and ``050_warp_build`` reads ``.atom``
     off it to build the ``Mma`` (no ``ATOM_KIND`` knob lookup; the knob is the
     tuning shadow of the same choice, not the semantic source). Scalar matmul
     kernels never emit an ``AtomTile``.
@@ -1679,7 +1633,7 @@ class AtomTile(ParallelTile):
         raise NotImplementedError(
             "AtomTile must be consumed by the MMA materializer "
             "(kernel/005_lower_atom_tile) before render — an AtomTile here "
-            "usually means tile/011_lower_atom_cell could not tag the cell "
+            "usually means tile/enumeration/050_warp_build could not tag the cell "
             "(operand A/B classification failed) — "
             f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
         )
@@ -2328,7 +2282,6 @@ __all__ = [
     # Source-aware traversal (transformer / visitor over staged bodies)
     "map_staged",
     "StagedHandler",
-    "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     "Stmt",
     # Top-level

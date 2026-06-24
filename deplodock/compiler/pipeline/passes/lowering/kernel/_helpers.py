@@ -7,7 +7,7 @@
   directory.
 - :func:`parallel_tile_of` — return the per-binding-tier inner scope
   (ThreadTile or WarpTile) for an outer ``GridTile`` / ``ThreadTile`` /
-  ``WarpTile``. ``thread_tile_of`` is kept as a deprecated alias.
+  ``WarpTile`` (renamed from the pre-WarpTile ``thread_tile_of``).
 - :func:`compute_capability` — re-exported from
   :mod:`deplodock.compiler.target` so passes can import it locally.
   Honors the ``--target sm_NN`` CLI override.
@@ -57,8 +57,7 @@ def parallel_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:
 
     Renamed from ``thread_tile_of`` to reflect the addition of
     ``WarpTile`` (which is also a valid per-tier scope under the same
-    outer ``GridTile`` shape). ``thread_tile_of`` is kept as a
-    deprecation-warning alias.
+    outer ``GridTile`` shape).
     """
     if isinstance(outer, (ThreadTile, WarpTile)):
         return outer
@@ -78,8 +77,7 @@ def replace_parallel_tile_body(outer: ParallelTile, new_body) -> ParallelTile:
     needs propagating here.
 
     Renamed from ``replace_thread_tile_body`` to reflect ``WarpTile``
-    support. ``replace_thread_tile_body`` is kept as a deprecation-
-    warning alias.
+    support.
     """
     new_body = Body.coerce(new_body) if not isinstance(new_body, Body) else new_body
     if isinstance(outer, ThreadTile):
