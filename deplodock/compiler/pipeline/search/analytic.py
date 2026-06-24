@@ -30,12 +30,112 @@ THREAD_KNOBS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
 WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
 
 
-def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:  # noqa: ARG001
-    """Golden-eval enumeration — REMOVED with the cartesian enumerator (invalid
-    under the move-composer architecture). Returns no rows so the golden-rank
-    diagnostics degrade to "nothing enumerates" until the eval harness is rebuilt
-    over the move tree (``plans/tile-ir-block-dag.md``)."""
-    return [], (THREAD_KNOBS if dtype == "fp32" else WARP_KNOBS)
+def _matmul_thread_gate(r: dict) -> bool:
+    """The heuristic-plausible band for thread-tier matmul tiles, distilled from
+    the measured ``GOLDEN_CONFIGS`` (every recorded golden satisfies it). Used to
+    prune the enumeration so the cold ``AnalyticPrior`` can't argmin onto an
+    *unbenched* degenerate tile (e.g. ``BN=8`` from the now-default wide candidate
+    menu) and override the golden-shaped option. Coalesced wide inner axis, short
+    outer axis, large K-chunk, light split-K, clean output-column width. The caller
+    falls back to the ungated set when this empties (tiny / unusual shapes with no
+    in-band candidate), so it only ever *narrows*, never strands a shape."""
+    bn, bm = r["BN"], r["BM"]
+    threads = bn * bm
+    tile_n = bn * r["FN"]
+    return (
+        16 <= bn <= 64
+        and 8 <= bm <= 16
+        and bn >= bm
+        and r["BK"] >= 32
+        and r["SPLITK"] <= 2
+        and threads in (128, 256, 512, 1024)
+        and tile_n in (32, 64, 128)
+    )
+
+
+def _matmul_dag(M: int, N: int, K: int, dtype: str, ctx: Context):
+    """Build a single ``(M, K) @ (K, N)`` matmul ``LoopOp`` and return its
+    ``IterDag`` — the shape the per-family enumeration offers are composed over.
+
+    Reuses the real frontend → loop lowering (``LOOP_PASSES``, option-0 greedy
+    resolve, no GPU) so the dag's axes / extents / carrier match what the live
+    pipeline tiles. Returns ``None`` if nothing lowers (a degenerate shape)."""
+    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
+    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline.fork import Fork  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
+    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+
+    dt = _dt.get({"fp32": "f32", "fp16": "f16", "bf16": "bf16"}.get(dtype, dtype))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (M, K), dt), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (K, N), dt), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("o", (M, N), dt), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+
+    def _option0(fp):
+        o = fp.options[0]
+        while isinstance(o, Fork) and not o.is_leaf:
+            o = o.expand()[0]
+        return o
+
+    terminal, _ = Run(pipeline=Pipeline.build(LOOP_PASSES), ctx=ctx).resolve(g, _option0)
+    loops = [n.op for n in terminal.nodes.values() if isinstance(n.op, LoopOp)]
+    return iter_dag(loops[0]) if loops else None
+
+
+def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:
+    """Reconstruct the planner's matmul enumeration for a shape + the knob tuple to
+    match a golden on. Composes the per-family enumeration offers
+    (``enumeration/_moves``) into the cartesian of legal knob rows — the thread
+    tier for ``fp32`` (reduce K-tiling × free thread tile × register tile), the
+    warp tier for ``fp16``/``bf16`` (atom × warp counts × register cells × K-chunk).
+    Rows are in enumeration (construction) order; ranking is the caller's
+    ``scorer`` (the :class:`AnalyticPrior` by default), not an enumeration sort."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+
+    dag = _matmul_dag(M, N, K, dtype, ctx)
+    if dag is None:
+        return [], (THREAD_KNOBS if dtype == "fp32" else WARP_KNOBS)
+    budget = _moves.Budget()
+
+    if dtype == "fp32":
+        rows: list[dict] = []
+        threads = _moves.thread_offers(dag, budget)
+        for bk, fk, sk in _moves.reduce_offers(dag):
+            red = _moves.reduce_knobs((bk, fk, sk))
+            regs = _moves.reduce_reg_offers(dag, budget, fk)
+            for t in threads:
+                thr = _moves.thread_knobs(dag, t)
+                for r in regs:
+                    # BR=1 is the scalar-tier seal (040_seal_scalar_tier) — a SEMIRING
+                    # matmul has no cooperative-K lane; stamp it so the row carries the
+                    # complete THREAD_KNOBS projection a golden is matched on.
+                    rows.append({**red, **thr, **_moves.reg_knobs(dag, r), "BR": 1})
+        # Narrow to the golden-plausible band so the cold prior can't argmin onto a
+        # degenerate tile; fall back to the ungated set if no in-band candidate exists.
+        gated = [r for r in rows if _matmul_thread_gate(r)]
+        return (gated or rows), THREAD_KNOBS
+
+    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+
+    atom = ATOM_REGISTRY.get({"fp16": "mma_m16n8k16_f16", "bf16": "mma_m16n8k16_bf16"}.get(dtype, ""))
+    if atom is None:
+        return [], WARP_KNOBS
+    rows = []
+    bks = _moves.warp_bk_offers(dag, atom)
+    regs = _moves.warp_reg_offers(atom)
+    for wm, wn in _moves.warp_offers(atom):  # wm·wn ≥ 2 already (single-warp mma pruned)
+        geom = _moves.warp_geom_knobs(wm, wn)
+        for fm, fn in regs:
+            reg = _moves.warp_reg_knobs(fm, fn)
+            for bk in bks:
+                rows.append({**geom, **reg, **_moves.warp_bk_knobs(atom, bk)})
+    return rows, WARP_KNOBS
 
 
 def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = False) -> Callable[[dict], float]:

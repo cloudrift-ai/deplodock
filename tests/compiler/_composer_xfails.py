@@ -109,9 +109,11 @@ _XFAIL_FUNCS: dict[str, str] = {
     # and the projection both straight `q·cos` and rotate-half — one slab per buffer
     # served only one access and silently corrupted the other / choked on the TEMPLATE
     # rotate-half). They stay gmem-direct; only same-access reads collapse to one slab.
-    # R7 — analytic / prior / structural-search tiers
-    "test_analytic.py::test_pick_matmul_lands_in_geometry_band": "R7",
-    "test_analytic.py::test_pick_matmul_warp_dispatch_by_dtype": "R7",
+    # R7 — analytic pick DE-QUARANTINED: search/analytic._enumerate is rebuilt over
+    # the per-family enumeration offers (enumeration/_moves) — fp32 thread tier
+    # (reduce K-tiling × thread tile × register tile, narrowed by the golden-plausible
+    # _matmul_thread_gate band) and fp16/bf16 warp tier (atom × WM/WN × FM/FN × BK).
+    # pick_matmul lands in the geometry band and dispatches the atom by dtype.
     # test_qwen_block_accuracy / test_tinyllama_block_accuracy[cuda] de-quarantined:
     # the whole-block forward (RoPE attention + MLP) now lowers correctly end-to-end
     # via the SDPA split + the multi-access staging fix.
