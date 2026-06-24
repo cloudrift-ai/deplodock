@@ -10,10 +10,25 @@
   (per-independent-edge `argmin`, full `2^k` masks for coupled cones) lands **with multi-producer `assemble_fused`** —
   that is the first graph that can expose a width>1 mask (today a multi-cone body is force-cut, not forked). Until
   then the mask stays width-1 and the boolean semantics are exact.
-- **(b) Pricing — open, tracked under the parent.** §2's indirect-control mechanism (`_pick_structural` Σ-pricing, the
-  prior never reads `CUT`) is already live; §3's `D_*` edge features are the remaining gap and live under the parent
-  plan's "two-level pricing integration" bullet
-  ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)).
+- **(b) Pricing — partially landed.** §2's indirect-control mechanism (`_pick_structural` Σ-pricing, the prior never
+  reads `CUT`) is already live. §3's edge features: **`D_cut_roundtrip` landed** — a coarse, gated, re-key-free
+  `knob_features` term (`knob.py::_cut_features`): positive on a cut fragment (`CUT` mask popcount > 0), **zero on the
+  fused keep**, absent on never-offered kernels — the cost axis that discriminates the two realizations of one decision,
+  on the live greedy per-kernel pricing path. Unit-pinned (`test_knob.py::test_knob_features_cut_roundtrip`).
+  - **Feasibility finding (why the rest is deferred).** Literal §3 wants *precise per-kernel intermediate bytes* +
+    cross-kernel `D_cone_fanout` / `D_recompute_flops`, all feeding greedy's per-kernel Σ. But the structural-feature
+    vocabulary is deliberately coarse (`S_ext_*` extent **products** only — no per-operand shapes), so a cut fragment's
+    free output (`S_ext_free_prod`) is the cleanest materialized-volume proxy available, and the cross-kernel
+    fanout/recompute terms don't fit a single kernel's feature vector at all (greedy prices each kernel from its own
+    knobs). Precise intermediate bytes (split from the consumer's own M·N output) need **per-operand shape stamping** —
+    a separate change. `D_cone_fanout` / `D_recompute_flops` are decision-level (computable at the `_cut` fork site via
+    `_fission`, but only the **decomposition-row** path — `two_level._decomposition_rows`, the outer-MCTS training
+    signal, currently R7-quarantined — consumes decision-level features; greedy does not). Both are deferred with this
+    finding rather than shipped as noisy proxies.
+  - The end-to-end deploy (greedy picking the cut when its Σ is cheaper) stays the parent plan's "two-level pricing
+    integration" bullet ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)) —
+    blocked on a *trained* prior + de-quarantining the structural-search tier (and the `_split_free_axis` `thread=0`
+    pricing-candidate bug), not on these features.
 
 When the structural split becomes a per-edge placement move
 ([`dag-edge-placement-split-as-enumeration.md`](dag-edge-placement-split-as-enumeration.md)), the single graph-level

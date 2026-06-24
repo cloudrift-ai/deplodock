@@ -484,6 +484,29 @@ def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
 # --- Feature vector ---------------------------------------------------------
 
 
+def _cut_features(knobs: dict) -> dict[str, float]:
+    """The engineered ``D_*`` edge-cost feature for the demoted-matmul cut (the
+    ``CUT`` knob — ``plans/split-cone-to-cut-knob.md`` §3). A cut materializes the
+    demoted operand cone to a **gmem intermediate** — a round-trip the fused keep
+    avoids — so the prior needs the materialized volume to price the cut's Σ vs.
+    keep's. ``D_cut_roundtrip`` is the cost axis that discriminates the two
+    realizations of one decision: positive on a cut fragment (``CUT`` mask
+    popcount > 0), **zero on the fused keep** (``CUT="0"``) and absent on a
+    never-offered kernel (no ``CUT`` key → the prior's NaN "not considered").
+
+    Coarse like the rest of the ``D_*`` family — sized from the ``S_ext_free_prod``
+    product the structural vocabulary carries (a cut producer's free output IS the
+    materialized intermediate). Precise per-operand intermediate bytes (split from
+    the consumer's own M·N output) and the cross-kernel ``D_cone_fanout`` /
+    ``D_recompute_flops`` terms need per-operand shape stamping the coarse
+    ``S_ext_*`` skeleton lacks — the deferred §3 follow-up."""
+    import math  # noqa: PLC0415
+
+    cut = str(knobs.get("CUT", "")).count("1")
+    free = float(knobs.get("S_ext_free_prod", 0.0) or 0.0)
+    return {"D_cut_roundtrip": math.log2(free) if (cut and free > 1.0) else 0.0}
+
+
 def knob_features(knobs: dict) -> dict[str, float]:
     """Convert a knob dict into a flat numeric feature vector for the (future)
     learned planner prior — the single featurizer over the whole dict.
@@ -536,6 +559,8 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # ``plans/golden-sweep-report.md``).
     if is_warp(knobs):
         feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
+    if "CUT" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
+        feats.update(_cut_features(knobs))
     return feats
 
 

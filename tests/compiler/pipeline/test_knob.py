@@ -378,6 +378,21 @@ def test_knob_features_differs_by_one_knob():
     assert a["S_n_write"] == b["S_n_write"]
 
 
+def test_knob_features_cut_roundtrip():
+    import math
+
+    # A cut fragment (CUT mask cuts) carries the materialized round-trip volume,
+    # sized from the coarse S_ext_free_prod product; the fused keep (CUT="0")
+    # carries it as 0.0 — the cost axis that discriminates the two realizations.
+    cut = knob_features({"CUT": "1", "S_ext_free_prod": 4096.0})
+    assert cut["D_cut_roundtrip"] == math.log2(4096.0)
+    keep = knob_features({"CUT": "0", "S_ext_free_prod": 4096.0})
+    assert keep["D_cut_roundtrip"] == 0.0
+    # Never-offered kernels (no CUT key) stay free of the feature — the prior's
+    # "not considered" NaN state, never a spurious 0.
+    assert "D_cut_roundtrip" not in knob_features({"S_ext_free_prod": 4096.0})
+
+
 def test_format_tuning_knobs_skips_struct():
     out = format_tuning_knobs({"BN": 64, "S_n_load": 3.0, "S_ext_free_prod": 512.0})
     assert "S_n_load" not in out and "S_ext_free_prod" not in out
