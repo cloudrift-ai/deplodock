@@ -120,10 +120,10 @@ _XFAIL_FUNCS: dict[str, str] = {
     # dynamic compile + capture-replay paths match eager.
     "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
     "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": "R7",
-    # test_structural_replay_consulted DE-QUARANTINED with the two-level structural tier
-    # (the outer cut fork branches + replays); test_trace_records_partition_fork still needs
-    # the inner partition-fork trace recording.
-    "test_resolve.py::test_trace_records_partition_fork": "R7",
+    # test_structural_replay_consulted + test_trace_records_partition_fork DE-QUARANTINED
+    # with the two-level structural tier (the outer cut fork branches + replays; the inner
+    # per-family tile forks 010_reduce_tile/020_thread_tile/030_register_tile trace under
+    # their own rule names — the test was rewritten off the old monolithic 010_enumerate).
     # test_run.py: the fp16-matmul-window kernel stays quarantined (R7 matmul window);
     # the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2). The four sdpa rows
     # (k_chunked / seq1024_dynamic_smem / tinyllama_full / tinyllama_per_head)

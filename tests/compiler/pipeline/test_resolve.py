@@ -112,20 +112,30 @@ def test_option0_decide_matches_no_prior_greedy() -> None:
 
 
 def test_trace_records_partition_fork() -> None:
-    """The partition fork traces under its rule name with the kernel's node id,
-    a complete tile knob row, and the decide's score annotation (None for the
-    unranked option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds."""
+    """The inner partition forks trace under their per-family rule names with the
+    kernel's node id and the decide's score annotation (None for the unranked
+    option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds. The block-DAG
+    Tile IR splits the old monolithic ``010_enumerate`` into the per-family
+    chain (``010_reduce_tile`` → ``020_thread_tile`` → ``030_register_tile`` →
+    ``050_stage``), so one kernel records that chain rather than one fork, and
+    the cumulative knob row carries the complete tile (``{BM, BN}``) by the
+    thread-tile fork."""
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     terminal, trace = run.resolve(g, _option0)
-    part = [d for d in trace if d.rule_name == "010_enumerate"]
-    assert len(part) == 1, f"one partition fork for one kernel, got {[d.rule_name for d in trace]}"
-    d = part[0]
-    assert d.node_id in terminal.nodes
-    assert d.chosen_kind == "op"
-    assert d.score is None
-    assert d.n_options == 1, "the planner emits ONE lazy fork tree as its raw option"
-    assert {"BM", "BN"} <= set(d.knob_delta), f"a leaf decision carries the complete tile row, got {d.knob_delta}"
+    part = [d for d in trace if d.rule_name in {"010_reduce_tile", "020_thread_tile", "030_register_tile"}]
+    assert [d.rule_name for d in part] == ["010_reduce_tile", "020_thread_tile", "030_register_tile"], (
+        f"the inner tile-fork chain for one kernel, got {[d.rule_name for d in trace]}"
+    )
+    for d in part:
+        assert d.node_id in terminal.nodes
+        assert d.chosen_kind == "op"
+        assert d.score is None
+        assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
+    thread = next(d for d in part if d.rule_name == "020_thread_tile")
+    assert {"BM", "BN"} <= set(thread.knob_delta), (
+        f"the thread-tile decision carries the complete free tile row, got {thread.knob_delta}"
+    )
 
 
 def test_decide_score_lands_on_trace() -> None:
