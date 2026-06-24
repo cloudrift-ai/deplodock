@@ -49,7 +49,12 @@ def classify(dag: IterDag) -> _Regime | None:
     body_loops = [s for s in inner_body if isinstance(s, Loop)]
 
     if algebras == {AlgebraKind.SEMIRING}:
-        if not k_dim.is_static or len(dag.parallel) < 2:
+        # A symbolic (masked) K tiles at the ``Dim`` hint and zero-fills the partial
+        # final K tile past the runtime bound (the masked-K mma tier — the warp build
+        # ceil-divides ``K_o`` and the smem slab / ldmatrix load zero-fills the overhang,
+        # so the mma accumulates 0 past ``k_bound``). A static K must be a real extent.
+        k_extent = k_dim.as_static() if k_dim.is_static else (k_dim.hint or 0)
+        if k_extent < 1 or len(dag.parallel) < 2:
             return None
         if {lp.axis.extent for lp in reduce_loops} != {k_dim}:
             return None

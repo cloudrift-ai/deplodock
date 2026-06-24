@@ -326,9 +326,35 @@ def test_demoted_symbolic_n_accuracy(monkeypatch, seq):
 # closes; see ``plans/tile-ir-block-dag.md`` ("The masked overhang for the fused
 # demoted matmul is the remaining R7 gap").
 
+# PARTIALLY CLOSED: the PLAIN symbolic-K matmul now lowers + runs correctly across
+# seq ∈ {16, 31, 130, 512, 700} (de-quarantined ``test_symbolic_k_masked_mma_accuracy``
+# + ``test_batched_symbolic_mk_reaches_warp``). Two fixes: (1) ``_classify`` admits a
+# symbolic-K SEMIRING (tiles K at the ``Dim`` hint); (2) ``_build._replace_k_warp``
+# ceil-divides ``K_o`` for a symbolic K so the loop bound is the runtime
+# ``ceil(seq_len/(BK·atom_k))`` (covers seq > hint) and ``seq_len`` enters the kernel
+# signature, while the existing ``dpl_mma_load_*_kzero`` helpers zero-fill the partial
+# final K tile. STILL OPEN below: the BATCHED M+K consumer is accurate only at seq ==
+# hint (the H-leading layout's masking; ``test_batched_symbolic_mk_masked_mma_accuracy``)
+# and the TMA-staged demoted P@V mis-classifies as a MONOID coop kernel under
+# validate_pins (``test_demoted_masked_k_pv_tma_accuracy``).
 _R7_MASKED_K = (
-    "R7: masked-K (symbolic reduce) does not lower to a CudaOp through this synthetic entry shape "
-    "(consumer stays LoopOp); plans/tile-ir-block-dag.md masked-overhang gap"
+    "R7: masked-K (symbolic reduce) — batched M+K accuracy at seq != hint / TMA-demoted "
+    "P@V validate_pins MONOID misclassify; plans/tile-ir-block-dag.md masked-overhang gap"
+)
+
+# The plain symbolic-K mma matmul now lowers + reaches the warp tier (the classify +
+# _replace_k_warp ceil-div fixes) and is correct IN ISOLATION, but a residual zero-fill
+# bug remains: the staged masked-K smem slab does not zero its partial-final-K overhang
+# slots, so the mma reads STALE smem for the K columns past the runtime extent. In a
+# fresh CUDA context that smem is 0 (the test passes run alone), but under concurrent
+# GPU load (``make test`` ``-n auto``) it holds garbage from a prior kernel → a small
+# accuracy error (e.g. seq=31: max abs err ~0.07 > 0.05 tol). Kept xfail(strict=False)
+# until the staged masked-K overhang zero-fill (``kernel/_stage_expand`` /
+# ``005_lower_atom_tile``) is made robust — it is a correctness gap, not infra flakiness.
+_R7_MASKED_K_ZEROFILL = (
+    "R7: masked-K mma reaches the warp tier + is correct in isolation, but the staged "
+    "partial-K smem overhang is not zero-filled (reads stale smem under concurrent load); "
+    "plans/tile-ir-block-dag.md masked-overhang gap"
 )
 
 
@@ -345,7 +371,7 @@ def _symbolic_k_graph(*, M: int = 64, N: int = 128) -> Graph:
 
 @requires_sm90
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
-@pytest.mark.xfail(reason=_R7_MASKED_K, strict=False)
+@pytest.mark.xfail(reason=_R7_MASKED_K_ZEROFILL, strict=False)
 @pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
 def test_symbolic_k_masked_mma_accuracy(monkeypatch, seq):
     """One compiled symbolic-K kernel must be accurate at runtime reduce extents
@@ -382,7 +408,6 @@ def _batched_symbolic_mk_graph(*, H: int = 16, N: int = 128) -> Graph:
     return g
 
 
-@pytest.mark.xfail(reason=_R7_MASKED_K, strict=False)
 def test_batched_symbolic_mk_reaches_warp(monkeypatch):
     """The batched masked-M + masked-K P@V consumer must reach the mma.sync tier
     (the ``classify_matmul_operands`` batch-aware B test), not stay a LoopOp."""

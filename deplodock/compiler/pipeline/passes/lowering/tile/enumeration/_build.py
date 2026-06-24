@@ -517,15 +517,25 @@ def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
     return a_b, a_w, a_r, a_a, expr, bound
 
 
-def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_extent: int, bk: int, atom_k: int) -> tuple[Stmt, ...]:
+def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_dim, bk: int, atom_k: int, k_bound=None) -> tuple[Stmt, ...]:
     """Replace the K reduce loop with the ``atom_k``-strided ``K_o`` / ``K_i``
     tower: ``σ(K) = K_o·(bk·atom_k) + K_i·atom_k`` (each ``K_i`` step is one
-    ``mma.sync`` over ``atom_k`` K-elements). No split-K / strip-mine (v1)."""
+    ``mma.sync`` over ``atom_k`` K-elements). No split-K / strip-mine (v1).
+
+    For a **symbolic (masked) K** (``k_bound`` set — SDPA P@V over ``seq_len``),
+    ``K_o`` ceil-divides the runtime extent (``ceil(seq_len/(bk·atom_k))`` serial
+    steps, so the loop bound — and thus ``seq_len`` — enters the kernel signature
+    and seq > hint is covered); the partial final tile past ``k_bound`` is
+    ZERO-filled in smem / by the ``dpl_mma_load_*_kzero`` gmem-direct helper
+    (``kernel/005_lower_atom_tile`` + ``_stage_expand``), so the mma accumulates 0
+    past the runtime extent (a clamped duplicate would corrupt the reduction)."""
     out: list[Stmt] = []
+    stride = bk * atom_k
     for s in stmts:
         if isinstance(s, Loop) and s.axis.name == k_name:
             src = s.axis.source_axis or s.axis
-            k_o = Axis(f"{k_name}_o", k_extent // (bk * atom_k), source_axis=src)
+            k_o_ext = k_dim.ceil_div(stride) if k_bound is not None else k_dim // stride
+            k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
             k_i = Axis(f"{k_name}_i", bk, source_axis=src)
             expr = Var(k_o.name) * Literal(bk * atom_k, "int") + Var(k_i.name) * Literal(atom_k, "int")
             new_body = tuple(c.rewrite(_identity_rename, Sigma({k_name: expr})) for c in s.body)
@@ -606,7 +616,7 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
 
     block = graph.blocks[0]
     new_inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
-    new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_extent, bk, atom_k)
+    new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_node.loop.axis.extent, bk, atom_k, dag.k_bound)
     new_inner = _atomize_cell(new_inner, atom=atom, k_name=None, write=None)
     bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
     new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)

@@ -82,6 +82,25 @@ def stage_candidates(graph: TileGraph) -> list[Edge]:
     if not _has_k_tower(block):
         return []
     parallel = {a.name for a in block.domain if sched.binding.get(a.name) in (Binding.GRID, Binding.THREAD, Binding.WARP)}
+    # Genuine smem fan-in reuse is an INTRA-CTA (THREAD / WARP) parallel axis absent
+    # from the read AND non-degenerate (extent > 1, or symbolic / runtime-large): many
+    # threads in one CTA share one cached tile. A GRID axis is a separate CTA with its
+    # own smem (no sharing), and an extent-1 axis is a single thread (nothing to share)
+    # — neither pays for a slab. Staging a no-reuse operand wastes smem and can blow the
+    # budget: a degenerate M-tile (BM·FM = 1) over a wide N register tile makes the
+    # ``wl[N, K]`` weight slab 1 MB, which fails ``validate(ctx)`` with no in-budget
+    # fallback when ``DEPLODOCK_STAGE`` pinned it.
+    ext_of = {a.name: a.extent for a in block.domain}
+
+    def _reuse_axes(free: frozenset[str]) -> bool:
+        for ax in parallel - free:
+            if sched.binding.get(ax) not in (Binding.THREAD, Binding.WARP):
+                continue
+            e = ext_of.get(ax)
+            if e is not None and (not e.is_static or e.as_static() > 1):
+                return True
+        return False
+
     written = {p.buffer for b in graph.blocks for p in b.writes}
     no_stage = _transposed_b_bufs(block)
     # A buffer read at >1 DISTINCT access can't be served by one slab (assembly builds
@@ -106,8 +125,8 @@ def stage_candidates(graph: TileGraph) -> list[Edge]:
         if acc.kind is not AddrKind.AFFINE:
             continue  # TEMPLATE collapsed reshape — not slab-sizable (R1)
         free = acc.free_axes()
-        if not (parallel - free):
-            continue  # every parallel axis present → no fan-in reuse, skip
+        if not _reuse_axes(free):
+            continue  # no non-degenerate intra-CTA fan-in reuse → staging caches nothing, skip
         # Slab bytes: the non-GRID (THREAD/REGISTER) tile span × the K stage span ×
         # element width. GRID axes are CTA-uniform (they fold into the slab origin),
         # so they don't enlarge the slab.

@@ -128,12 +128,14 @@ _XFAIL_FUNCS: dict[str, str] = {
     # prefixes the CoopReduce prologue's SSA so it doesn't collide with the consumer
     # matmul's identically-named loads (the kernel-global literal-constant env was
     # clobbering the consumer's in0/in1 with the prologue's xn_mean_count/xn_eps values).
-    # test_qwen_lmhead_variant_compiles_within_budget stays quarantined: its STAGE=1 pin is
-    # stale for the block-DAG pipeline (it now stages the full FN=64 N-tile of wl = 1 MB,
-    # over the smem budget — the fused-edge xn staging is automatic now), AND the N=4099
-    # masked-overhang fused-prologue path still hits an OOB even gmem-direct. The masked
-    # overhang for the fused demoted matmul is the remaining R7 gap.
-    "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
+    # test_qwen_lmhead_variant_compiles_within_budget DE-QUARANTINED (the R7 masked-overhang
+    # fused demoted matmul). Two fixes: (1) enumeration/_stage.stage_candidates only offers a
+    # read with genuine intra-CTA fan-in reuse (an absent THREAD/WARP axis of extent > 1) — a
+    # degenerate M-tile (BM·FM=1) no longer stages the wl[N,K] weight into a 1 MB slab that
+    # blows the smem budget, so STAGE=1 lowers gmem-direct; (2) the new kernel pass
+    # 009_clamp_masked_gmem_reads clamps each gmem-direct Load index dim that equals a masked
+    # OUTPUT coord to `(coord < bound) ? coord : bound-1`, restoring the read-side edge-clamp
+    # the staged path already had (the N=4099 overhang no longer OOBs).
     # test_structural_replay_consulted + test_trace_records_partition_fork DE-QUARANTINED
     # with the two-level structural tier (the outer cut fork branches + replays; the inner
     # per-family tile forks 060_reduce_tile/090_thread_tile/100_register_tile trace under
