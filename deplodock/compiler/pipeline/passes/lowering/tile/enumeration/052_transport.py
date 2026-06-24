@@ -173,14 +173,6 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     op: TileGraphOp = root.op
     if STAGE.name not in op.knobs or TMA.name in op.knobs:
         raise RuleSkipped("transport runs once, after stage decided the staged read-sites (idempotence via the TMA knob)")
-    if mma_atom(op.knobs) is None:
-        # TODO(scalar-tile TMA): a staged scalar reduce / matmul could also promote its
-        # cooperative SYNC loads to a cp.async.bulk.tensor ring, but the peel + slab
-        # synthesis are only wired for the warp-tier atom today. The knob-pin validator
-        # (``_validate``) treats ``TMA=1`` on a scalar tile as allowed-but-inert (not
-        # senseless) for this reason; ``test_scalar_tile_tma_transport_is_unimplemented``
-        # is the xfail tracking the gap.
-        raise RuleSkipped("R5 promote_transport applies to the warp-tier mma matmul (scalar tiers stay SYNC)")
     if not op.tilegraph.schedule.staged:
         raise RuleSkipped("nothing staged — no read-site to promote")
 
