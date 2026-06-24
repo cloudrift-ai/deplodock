@@ -48,6 +48,21 @@ unenforceable (a pass *must* pattern-match to do its job), and every new kernel 
 stamped `TileOp` attribute but not call a classifier. Plus a test: assemble stamps every fact its kernel passes consume
 (no kernel pass reads tree *shape* for a schedule decision).
 
+**Landed (the firewall — Gate):** `tests/architecture/test_layering.py` now carries the three guards
+(`test_lowering_kernel_does_not_import_enumeration` — no kernel pass imports `tile/enumeration/` or `tile/split/`;
+`test_lowering_kernel_calls_no_schedule_classifier` — no kernel pass calls an offer / classifier / cut fn, allow-listing
+the mechanical `classify_fragment_epilogue`; `test_materialized_tile_flavors_stamp_schedule_facts` — the facts kernel
+passes consume are explicit fields: `StageBundle.{policy, buffer_count, phase, pipeline_depth}`, `SerialTile.kind`,
+`WarpSpecialize.{ring_depth, n_producer_threads, consumer_thread_axes}`, `AtomTile.atom`). The **stamp** half was
+already in place — the materialized typed flavors carry each consumed schedule fact as a typed attribute, and
+every kernel pass already reads those attributes (verified clean: no kernel pass re-derives a decision from tree shape).
+The remaining `Schedule` fields the bullet list names (`cohort` / `distance` / `reg_budget`, and `WarpSpecialize`) have
+**no live producer** in the current pipeline — no enumeration pass sets them and no assemble path constructs a
+`WarpSpecialize` (its emitting pass was deleted in the block-DAG refactor; warp-spec transport is future work). Stamping
+those onto materialized nodes now would be speculative, so it rides the work that revives each producer. The firewall is
+the durable deliverable: it makes Fix 2's mechanical-pass rule enforceable and blocks a new kernel pass from
+re-accreting the leak.
+
 ## Fix 2 — Pull leaked forks above assemble (the real content of G3/G4) [high value]
 
 The audit: which `lowering/kernel/` passes make a **benched choice** vs. apply a deterministic rule?
@@ -98,7 +113,8 @@ shape-tweak can't silently re-key the prior. Fold into Fix 1's stamping work (th
 ## Prioritization & sequencing
 
 1. **Fix 1** (stamp + lint/test) — the firewall; unblocks Fix 2's discipline. Self-contained, low risk, no behavior
-   change (additive attributes + a lint).
+   change (additive attributes + a lint). **Landed** — the three layering guards; the stamp half was already in place via
+   the typed flavors (see the Fix 1 "Landed" note above).
 2. **Fix 2** (vectorization fork first, then the kernel-pass audit) — the one known leaked fork, then prove the rest
    mechanical. Behavior-neutral under byte-identical, then opens `vector_width` to tuning.
 3. **Fix 3** (guard the multi-phase ceiling) — cheap guard now; the node itself rides the sm_90/persistent work whenever
