@@ -69,8 +69,11 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `post`) over the flattened `[num_tokens, H]` layout, and exposes `embed` / `forward_layer_pre(L,…)→(q,k,v)`
   (un-rotated 2-D seam) / `forward_layer_post(L, attn_out, residual)→hidden` / `final_norm`. The caller stitches between
   `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention` in Phase 3). Host numpy
-  `rebind` I/O for now (the device zero-copy + captured-replay path is the Phase-3/4 perf step); two capacity programs
-  per layer is the memory budget the plan flags (Top risk #9).
+  `rebind` I/O for now (the device zero-copy + captured-replay path is the Phase-3/4 perf step). **Decode bucket:** it
+  also compiles a **static M=`decode_bucket` (default 16)** `pre`/`post` twin per layer and uses it when
+  `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode M=1
+  (`plans/generative-decode-perf-findings.md`); falls back to symbolic above the bucket or if a static compile fails. So
+  up to 4 capacity programs/layer — the memory budget the plan flags (Top risk #9).
 - `vllm_model_gen.py` — `DeplodockGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
   builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs
   paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.

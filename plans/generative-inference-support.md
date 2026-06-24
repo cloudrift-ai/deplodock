@@ -29,8 +29,12 @@
 - **Phase 3 ✅** — `DeplodockGenModel` vLLM plugin (`serving/vllm_model_gen.py`) + `serve --generate`. In-process vLLM
   engine, greedy decode token-for-token vs HF eager on a tiny Llama.
 - **Phase 4 ◑** — flattened-width bound enforced (`serve` caps `--max-num-batched-tokens` at `DYNAMIC_DIM_MAX`);
-  prefill + decode exercised. **Remaining is perf**: the device zero-copy interleave (the numpy host I/O at the seam is
-  functional but slow) + Phase-5 decode-shaped golden tuning + bench vs stock vLLM.
+  prefill + decode exercised. **Decode-bucket landed**: profiling found decode was dominated (~95%) by one symbolic
+  kernel whose hint-512 M-tile is pathological at decode M=1 (~66× off cuBLAS); the runner now compiles a **static
+  small-M (bucket) program** per layer used when `num_tokens ≤ bucket` — ~32× on that kernel (measured). The device
+  zero-copy interleave (~1%) and captured-graph replay (~0%) were **ruled out by measurement** — see
+  [`generative-decode-perf-findings.md`](generative-decode-perf-findings.md). **Remaining perf**: multi-bucket /
+  per-`Dim`-hint for high-concurrency decode + Phase-5 golden tuning + bench vs stock vLLM.
 
 **Known limits:** full-causal attention only (sliding-window / per-layer-sliding / dual-chunk configs are **rejected**,
 not miscomputed), fp16, TP=1; `serve` compiles **2× n_layers** programs, so startup + memory scale with depth (small
@@ -300,14 +304,22 @@ Wire Phase 2's runner into a vLLM generative model.
 ### Phase 4 — Prefill + decode hardening
 
 Make it robust across vLLM's two regimes: **prefill** (`num_tokens` = prompt length, large) and **decode**
-(`num_tokens` = concurrently-decoding sequences, small / 1). The same two dynamic per-layer programs (`pre` + `post`)
-serve both.
+(`num_tokens` = concurrently-decoding sequences, small / 1). The symbolic `pre`/`post` programs serve prefill; decode
+uses **static small-M (bucket) twins** (see below — the symbolic hint-512 M-tile is ~66× too slow at decode M=1).
 
 - **Bound the flattened width `T` (capacity sizing):** `T` = `num_tokens` is the **sum of newly-scheduled tokens across
   all requests** in a step (continuous batching), **not** one request's length — so `--max-model-len` does NOT bound it.
   The cap is vLLM's `scheduler_config.max_num_batched_tokens`; assert it `≤ DYNAMIC_DIM_MAX` (4096, `trace/dynamic.py`)
   and **size the programs' capacity buffers from `max_num_batched_tokens`**, not max-model-len. `commands/serve.py`'s
   generative branch sets `--max-num-batched-tokens` accordingly (and rejects a larger value).
+- **Decode-bucket programs (landed; see `generative-decode-perf-findings.md`):** the symbolic kernel tiles `num_tokens`
+  as one masked tile sized to the hint (512) — at decode M=1 it computes the full 512-row tile (~66× off cuBLAS, ~95%
+  of the decode step). The runner compiles a **static M=`decode_bucket` (default 16)** `pre`/`post` per layer, used when
+  `num_tokens ≤ bucket`: pad activations to the bucket → run → slice the real rows. Safe because pre/post are
+  per-token-independent, and the vLLM attention seam still sees exactly `num_tokens` (the padding is internal to the
+  deplodock calls, so the `attn_metadata` concern below does not apply). `num_tokens > bucket` falls back to symbolic;
+  static M=1 can't be used (demoted-matmul cold-lowering gap), hence a bucket ≥ ~8. Multi-bucket / per-`Dim` hints for
+  high-concurrency decode are follow-ups.
 - **Captured-graph reuse:** decode runs at small, recurring `num_tokens`; confirm capture is keyed on `num_tokens` and
   steady-state decode hits the replay path (**two replays / layer / step** — `pre` and `post`, bracketing vLLM
   attention), not recapture. **Do NOT pad q/k/v to bucket widths the way the embedding runner does** — vLLM's
