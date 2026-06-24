@@ -315,26 +315,20 @@ def test_demoted_symbolic_n_accuracy(monkeypatch, seq):
     assert diff < 5e-2, f"seq={seq}: demoted symbolic-N MMA mismatch (max abs err {diff})"
 
 
-# --- masked-K (symbolic reduce) mma tier — R7. ----------------------------------
+# --- masked-K (symbolic reduce) mma tier — R7, fully recovered. ------------------
 # The masked-K mma tier (a symbolic ``seq_len`` reduce on the tensor-core path) now
-# lowers + runs correctly through these SYNTHETIC standalone graphs. Three fixes
+# lowers + runs correctly through these SYNTHETIC standalone graphs. Four fixes
 # landed: (1) ``_classify`` admits a symbolic-K SEMIRING (tiles K at the ``Dim``
 # hint); (2) ``_build._replace_k_warp`` ceil-divides ``K_o`` so the loop bound is the
 # runtime ``ceil(seq_len/(BK·atom_k))`` (covers seq > hint) and ``seq_len`` enters the
 # kernel signature; (3) ``assembly/_slab._stamp_kmask`` stamps ``Source.kmask`` on the
 # staged operands so ``_stage_expand`` ZERO-fills the partial-final-K smem overhang
 # (previously the field was never populated, so the slab read stale smem past
-# ``seq_len`` — correct in a fresh context, wrong under concurrent load). The plain
-# symbolic-K matmul and the batched M+K P@V split-consumer are de-quarantined.
-#
-# STILL OPEN: the TMA-staged demoted softmax P@V (``test_demoted_masked_k_pv_tma_*``)
-# mis-classifies as a MONOID coop kernel under ``validate_pins`` (``MMA`` pin then
-# contradicts the coop tier) — a classifier issue on the demoted-split shape, distinct
-# from the masked-K zero-fill. See ``plans/tile-ir-block-dag.md`` masked-overhang gap.
-_R7_MASKED_K = (
-    "R7: TMA-staged demoted softmax P@V mis-classifies as a MONOID coop kernel under "
-    "validate_pins (MMA pin contradicts the coop tier); plans/tile-ir-block-dag.md gap"
-)
+# ``seq_len`` — correct in a fresh context, wrong under concurrent load); (4) the
+# demoted softmax-P@V split's MONOID ``xn`` producer no longer trips ``validate_pins``
+# on the union ``MMA`` pin — ``enumeration/010_build`` skips the strict per-op check
+# for a multi-op kernel set (``_is_union_pinned``), since a global pin is a union pin
+# across the producer + gemm consumer. All masked-K tests are de-quarantined.
 
 
 def _symbolic_k_graph(*, M: int = 64, N: int = 128) -> Graph:
@@ -440,7 +434,6 @@ def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
 
 
 @pytest.mark.skipif(not _supports_tma(), reason="TMA (cp.async.bulk.tensor) needs sm_90+")
-@pytest.mark.xfail(reason=_R7_MASKED_K, strict=False)
 @pytest.mark.parametrize("seq", [16, 31, 130, 512, 700])
 def test_demoted_masked_k_pv_tma_accuracy(monkeypatch, seq):
     """The TMA-staged masked-K P@V (the demoted softmax-P@V split-consumer) must be

@@ -17,6 +17,7 @@ from __future__ import annotations
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
+from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import Buffer, Space, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
@@ -33,7 +34,22 @@ PATTERN = [Pattern("root", LoopOp)]
 _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 
 
-def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
+def _is_union_pinned(match) -> bool:
+    """True when the graph is a **multi-op kernel set** — a split-produced
+    ``xn`` producer + gemm consumer (``split/010_split_demoted``), or a whole-model
+    graph. A global ``DEPLODOCK_<KNOB>`` pin is then a UNION pin: each op takes its
+    tier's subset (e.g. ``MMA`` lands on the SEMIRING consumer, the MONOID softmax
+    producer ignores it), so a per-op tier-foreign pin is NOT a user contradiction.
+    A single-kernel graph keeps the strict ``validate_pins`` check — matching the
+    tune search's own ``validate_pins=False`` exemption for union-pinned graphs."""
+    graph = getattr(match, "graph", None)
+    if graph is None:
+        return False
+    compute = sum(1 for n in graph.nodes.values() if not isinstance(n.op, (InputOp, ConstantOp)))
+    return compute > 1
+
+
+def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:
     """Seed a ``TileGraphOp`` from the fused ``LoopOp`` — the logical algorithm + the
     dag + regime the tile passes fork on. The carry-forward ``LoopOp`` knobs ride
     ``op.knobs`` (the engine merges them forward)."""
@@ -46,7 +62,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     # this op resolves to is a hard error, not a silent drop (``_validate``). Greedy
     # compile/run only — the tune search (``ctx.validate_pins=False``) explores
     # tier-foreign forks and union-pinned multi-op graphs (see ``Run.drive``).
-    if ctx.validate_pins:
+    if ctx.validate_pins and not _is_union_pinned(match):
         validate_pins(regime.algebra, streaming=regime.streaming)
     # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
     # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
