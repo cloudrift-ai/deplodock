@@ -120,7 +120,9 @@ _XFAIL_FUNCS: dict[str, str] = {
     # dynamic compile + capture-replay paths match eager.
     "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
     "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": "R7",
-    "test_resolve.py::test_structural_replay_consulted": "R7",
+    # test_structural_replay_consulted DE-QUARANTINED with the two-level structural tier
+    # (the outer cut fork branches + replays); test_trace_records_partition_fork still needs
+    # the inner partition-fork trace recording.
     "test_resolve.py::test_trace_records_partition_fork": "R7",
     # test_run.py: the fp16-matmul-window kernel stays quarantined (R7 matmul window);
     # the rmsnorm/softmax/run-ir/bench rows de-quarantined (R2). The four sdpa rows
@@ -134,14 +136,12 @@ _XFAIL_FUNCS: dict[str, str] = {
     # test_split_demoted_fork_pushes_structural DE-QUARANTINED: the keep-vs-split FORK is
     # now live — the keep(SMEM) fused edge is a lowerable keep option (``seed_fused`` →
     # ``assemble_fused``), so ``005_split_demoted`` offers ``[keep, cut]`` instead of forcing
-    # the cut, and the structural push fires. The test_two_level rows below still need the
-    # R7 structural-pricing / prior tier (the trained prior pricing SMEM Σ vs GMEM Σ).
-    "test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": "R7",
-    "test_two_level.py::test_identical_offer_sites_take_the_same_side": "R7",
-    "test_two_level.py::test_outer_branches_on_structural_fork": "R7",
-    "test_two_level.py::test_outer_descends_prior_preferred_branch_first": "R7",
-    "test_two_level.py::test_run_two_level_tune_single_terminal_assembles_bests": "R7",
-    "test_two_level.py::test_split_kernels_attribute_to_pre_decision_op": "R7",
+    # the cut, and the structural push fires.
+    # The test_two_level structural rows are ALSO DE-QUARANTINED: the outer two-level tree
+    # now branches on the cut (``outer_pipeline`` drives the ``split`` phase; tiling stays
+    # inner), slices/prices the TileGraphOp terminal kernels, groups the decomposition Σ by
+    # the pre-decision site, keeps the structural decision out of the ``lowering`` table, and
+    # the outer PUCT ranks the cut branch via its surfaced ``CUT`` knob.
 }
 
 # Specific parametrizations (the function also has green params).

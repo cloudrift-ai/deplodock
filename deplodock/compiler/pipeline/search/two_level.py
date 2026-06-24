@@ -64,7 +64,6 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.policy.greedy import PARTITION_RULE
 from deplodock.compiler.pipeline.search.slice import single_node_graph
 
 if TYPE_CHECKING:
@@ -73,11 +72,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ``PARTITION_RULE`` (imported from the greedy policy, which prices kernels at
-# that fork) is the rule that finalizes the kernel set: everything in
-# ``lowering/tile`` *before* it is a structural (kernel-set-changing) decision
-# the outer search owns; everything from it on is op-variant lowering the
-# inner search tunes.
+# The structural / op-variant boundary is the ``split`` phase: the keep-vs-cut
+# ``CUT`` offer is the only kernel-set-changing decision, so the outer search owns
+# ``frontend`` + ``loop`` + ``split`` and the inner tunes everything from
+# ``enumeration`` (tiling) on — see :func:`outer_pipeline`.
 
 # Lowering-only passes (post-fusion): ``tile → kernel → cuda``. The inner
 # per-op search runs these on a single-node slice so the finalized LoopOp body
@@ -92,36 +90,28 @@ LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
 
 
 def outer_pipeline() -> Pipeline:
-    """The graph-changing passes the outer search drives: ``frontend`` +
-    ``loop`` (any fusion forks) **plus the pre-partition head of
-    ``lowering/tile``** — the structural fork emitters that change which
-    kernels exist before partition finalizes them (today ``005_split_demoted``;
-    the boundary is the *effect*, not the pass index — see
-    ``plans/structural-forks-in-two-level.md`` step 2). An outer terminal is a
-    fused graph whose kernel set is final: the cursor reached
-    :data:`PARTITION_RULE` with every structural fork resolved, so split
-    producers/consumers are real ``LoopOp`` nodes picked up by
-    :func:`_inner_reward_async` like any kernel — own slice, own patience, own
-    progress leaf, deduped by ``op_cache_key`` across layers and terminals.
+    """The graph-changing passes the outer search drives: ``frontend`` + ``loop``
+    (any fusion forks) **plus the ``split`` phase** — the structural fork emitter
+    (``005_split_demoted``'s keep-vs-cut ``CUT`` offer), the only move that changes
+    *which kernels exist*. An outer terminal is a graph whose kernel set is final:
+    the keep(SMEM) side is one fused ``TileGraphOp`` (``seed_fused``), the cut side
+    its producer + consumer; :func:`_inner_reward_async` picks each up as its own
+    slice (own patience, own progress leaf, deduped by ``op_cache_key``) and tunes
+    its tiling via :data:`LOWERING_PASSES`.
 
-    Sub-partition splices (``017_atomic_free_splitk``'s combine) stay on the
-    inner slice-sum path — their trigger knob (``SPLITK``) doesn't exist until
-    partition runs."""
+    Tiling (``enumeration``/partition) is **inner**, deliberately NOT driven here:
+    a tile-knob fork (``MMA`` / ``BN`` / …) does not change the kernel set, so
+    branching the OUTER tree on it would explode the tree (every tile combination ×
+    every structural choice) with no kernel-set distinction. The split boundary is
+    exactly where the kernel set is fixed but tiling is not — the right outer/inner
+    seam (``plans/structural-forks-in-two-level.md`` step 2). Sub-partition splices
+    (``017_atomic_free_splitk``'s combine) likewise stay inner — their trigger knob
+    (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
-    # The structural fork emitter (``005_split_demoted``) lives in the ``split``
-    # phase, which runs *before* ``enumeration``/partition (``TILE_PASSES`` order).
-    # Include it so the keep-vs-cut offer branches the OUTER tree — it changes the
-    # kernel set, the defining property of an outer fork. Its only knob (``CUT``)
-    # has no ``off=``, so the pass-boundary OFF-fill stamps nothing.
+    # ``005_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary
+    # OFF-fill stamps nothing onto the fused/cut ops (their ``op_cache_key`` stays what
+    # the assembled greedy run derives).
     passes.append(Pass.load("lowering/tile/split", index=len(passes)))
-    tile_rules = [r.name for r in Pass.load("lowering/tile/enumeration", index=len(passes)).rules]
-    head = tile_rules[: tile_rules.index(PARTITION_RULE)]
-    # Re-load with ``select`` (rather than slicing the loaded rules) so the
-    # partial pass's ``declared_knobs`` covers only the pre-partition rule
-    # modules — the pass-boundary OFF-fill must not stamp post-partition
-    # lowering knobs onto fused LoopOps (that would churn every op_cache_key
-    # away from what the assembled greedy run derives).
-    passes.append(Pass.load("lowering/tile/enumeration", index=len(passes), select=set(head)))
     return Pipeline(passes=passes)
 
 
@@ -181,26 +171,15 @@ def _point_stats(us: float) -> PerfStats:
 def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
     """Post-fusion kernel nodes — ``(node_id, op)`` for every kernel-bearing op.
 
-    An outer terminal's cursor sits at :data:`PARTITION_RULE` (``030_register_tile``),
-    *past* ``enumeration/000_build``, so its kernels are ``TileGraphOp`` seeds — the
-    structural-fork keep side (a fused ``TileGraphOp``) and the cut side's
-    producer/consumer (also ``TileGraphOp``s). A ``LoopOp`` survives only when
-    ``000_build`` ``RuleSkip``ped it (the un-fusible keep-fused demoted matmul); count
-    it too so its slice still tunes."""
+    An outer terminal sits at the ``split`` boundary (:func:`outer_pipeline`): the
+    keep(SMEM) side is a fused ``TileGraphOp`` (``seed_fused``), the cut side its
+    producer + consumer ``LoopOp``s (un-built — the inner tiles them). Count both
+    ``LoopOp`` and ``TileGraphOp`` so every kernel of either side gets its own inner
+    slice."""
     from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
     from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
 
     return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, (LoopOp, TileGraphOp))]
-
-
-# The structural-fork decision knobs the outer tree branches on — stamped by the
-# pre-partition ``split`` phase (``005_split_demoted``'s ``CUT`` mask: ``"1"`` cut /
-# ``"0"`` keep). Read **directly off the terminal kernel**: the cut fragments carry
-# it on their LoopOps (inherited by the built ``TileGraphOp``), but the keep(SMEM)
-# side is a fused ``TileGraphOp`` (``seed_fused``) carrying ``CUT`` with no
-# CUT-bearing LoopOp in its chain — so a source-chain delta can't recover it
-# uniformly, while the op itself always can.
-_STRUCTURAL_DECISION_KNOBS = ("CUT",)
 
 
 def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
@@ -220,7 +199,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
     informed instead of uniform. They are estimates for *search ordering*; greedy's
     deploy decision keeps the sharper compositional probe
     (``policy/greedy._pick_structural``)."""
-    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.keys import STRUCTURAL_DECISION_KNOBS, dialect_of, source_chain  # noqa: PLC0415
 
     best = {r.op_key: r.best_us for r in per_op}
     unique: dict[str, object] = {}
@@ -230,7 +209,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
             unique[key] = op
     groups: dict[tuple, tuple[dict, list[float | None]]] = {}
     for key, op in unique.items():
-        delta = {k: op.knobs[k] for k in _STRUCTURAL_DECISION_KNOBS if k in op.knobs}
+        delta = {k: op.knobs[k] for k in STRUCTURAL_DECISION_KNOBS if k in op.knobs}
         if not delta:
             continue  # a kernel from no structural decision (no offer fired)
         site = None

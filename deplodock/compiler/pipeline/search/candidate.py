@@ -272,7 +272,15 @@ class LazyCandidate:
         ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
         leaf — an ``Op``'s knob delta rides along as the fork's ``knobs``."""
         if not isinstance(option, Fork):
-            knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
+            if isinstance(option, Op):
+                knobs = dict(getattr(option, "knobs", None) or {})
+            else:
+                # A ``Graph`` option is a structural decomposition (the cut's
+                # producer+consumer): the graph itself has no knobs, but its
+                # kernels carry the ``CUT`` decision. Surface it so the prior can
+                # rank the split branch — without this the cut scores as a
+                # knob-less generic row and the outer PUCT never prefers it.
+                knobs = _graph_decision_knobs(option)
             option = OptionFork(option=option, knobs=knobs)
         return cls(inner=inner, cursor=cursor, pending=(match, option))
 
@@ -346,6 +354,21 @@ class LazyCandidate:
 # routed to ``pipeline.dump.on_rule`` when a dump sink is set).
 # Module-private helpers used only by :meth:`Candidate._log_apply`.
 # ---------------------------------------------------------------------------
+
+
+def _graph_decision_knobs(graph: Graph) -> dict:
+    """The structural-decision knobs (``CUT``) carried by a ``Graph`` option's
+    kernels — the cut's producer/consumer stamp the decision; the graph itself
+    has none. Lets the outer prior rank a structural decomposition option (else
+    it scores as a knob-less generic row, never preferred)."""
+    from deplodock.compiler.pipeline.search.keys import STRUCTURAL_DECISION_KNOBS  # noqa: PLC0415
+
+    for node in graph.nodes.values():
+        kn = getattr(node.op, "knobs", None) or {}
+        hit = {k: kn[k] for k in STRUCTURAL_DECISION_KNOBS if k in kn}
+        if hit:
+            return hit
+    return {}
 
 
 def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph, *, pass_name: str | None = None) -> str:

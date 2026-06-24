@@ -27,6 +27,25 @@ from deplodock.compiler.structural import digest
 
 Dialect = Literal["loop", "tile", "kernel", "cuda"]
 
+# Knobs that mark a **structural** (kernel-set-changing) decision rather than an
+# op-variant lowering choice — today only ``005_split_demoted``'s ``CUT`` mask
+# (keep-vs-cut). A source-chain hop that *introduces* one is a decomposition hop
+# whose cost is a Σ owned by the two-level tuner, NOT a ``lowering`` row (which
+# holds one best child per parent). Read by the bench-terminal lowering recorder
+# (``pipeline._bench_terminal``) and the decomposition-row featurizer
+# (``two_level._decomposition_rows``).
+STRUCTURAL_DECISION_KNOBS = ("CUT",)
+
+
+def introduces_structural_decision(parent_op: object, child_op: object) -> bool:
+    """True when ``child_op`` introduces a structural-decision knob the
+    ``parent_op`` lacks — the 005 keep-vs-cut fork hop. Covers both the cut
+    (loop→loop fragment splice) and the keep (loop→tile ``seed_fused`` jump),
+    so the recorder skips the decision hop regardless of dialect crossing."""
+    p = getattr(parent_op, "knobs", None) or {}
+    c = getattr(child_op, "knobs", None) or {}
+    return any(c.get(k) is not None and p.get(k) is None for k in STRUCTURAL_DECISION_KNOBS)
+
 
 def op_cache_key(op: object) -> str | None:
     """Cache key for any kernel-bearing op, or ``None`` if not cacheable."""

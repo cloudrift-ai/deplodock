@@ -380,7 +380,7 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     # The decision hop never enters the ``lowering`` table (one best child per
     # parent — a multi-kernel decomposition's parent must not resolve through
     # ONE fragment kernel's median): the pre-decision op has no lowering row.
-    site = next(n.op.source for n in result.best_fused.nodes.values() if isinstance(n.op, LoopOp) and n.op.source is not None)
+    site = next(_site(n.op) for n in result.best_fused.nodes.values() if _site(n.op) is not None)
     assert db.lookup_lowering(op_cache_key(site)) is None
 
 
@@ -390,8 +390,26 @@ def _outer_terminals(graph: Graph) -> list[Graph]:
     return [cand.graph for cand in drained]
 
 
-def _loops(graph: Graph) -> list:
-    return [n.op for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+def _kernels(graph: Graph) -> list:
+    """Outer-terminal kernel ops. A terminal sits past ``000_build``, so its
+    kernels are ``TileGraphOp`` seeds (the keep(SMEM) fused kernel + the cut's
+    producer/consumer); a ``LoopOp`` survives only when ``000_build`` skipped it."""
+    from deplodock.compiler.ir.tile.ir import TileGraphOp
+
+    return [n.op for n in graph.nodes.values() if isinstance(n.op, (LoopOp, TileGraphOp))]
+
+
+def _site(op):
+    """The pre-decision offer site — the deepest ``S_*``-stamped loop ancestor,
+    mirroring ``two_level._decomposition_rows`` (the original demoted matmul,
+    before the fission re-stamped each fragment's own shallower ``S_*``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain
+
+    site = None
+    for anc in source_chain(op):
+        if dialect_of(anc) == "loop" and any(k.startswith("S_") for k in getattr(anc, "knobs", {})):
+            site = anc
+    return site
 
 
 def test_split_kernels_attribute_to_pre_decision_op() -> None:
@@ -403,19 +421,19 @@ def test_split_kernels_attribute_to_pre_decision_op() -> None:
     into ``source`` — honoring the copy used to point the link past the offer
     site)."""
     terminals = _outer_terminals(_norm_linear("a"))
-    split = next(t for t in terminals if len(_loops(t)) == 2)
-    kernels = _loops(split)
+    split = next(t for t in terminals if len(_kernels(t)) == 2)
+    kernels = _kernels(split)
     assert all(k.knobs.get("CUT") == "1" for k in kernels)
-    assert all(k.source is not None for k in kernels)
-    assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
-    site = kernels[0].source
+    assert all(_site(k) is not None for k in kernels)
+    assert len({op_cache_key(_site(k)) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
+    site = _site(kernels[0])
     assert "CUT" not in site.knobs
     assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
 
-    fused = next(t for t in terminals if len(_loops(t)) == 1)
-    keep = _loops(fused)[0]
+    fused = next(t for t in terminals if len(_kernels(t)) == 1)
+    keep = _kernels(fused)[0]
     assert keep.knobs.get("CUT") == "0"
-    assert keep.source is not None and op_cache_key(keep.source) == op_cache_key(site), (
+    assert _site(keep) is not None and op_cache_key(_site(keep)) == op_cache_key(site), (
         "the keep side must attribute to the SAME offer-site op as the split side"
     )
 
@@ -437,7 +455,7 @@ def test_outer_descends_prior_preferred_branch_first() -> None:
     search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
     drained = drain_tune(outer_pipeline(), _norm_linear("a"), search=search, ctx=ctx, db=SearchDB(), on=lambda c: True)
     first = drained[0]
-    assert len(_loops(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
+    assert len(_kernels(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
 
 
 def test_decomposition_rows_sum_kernel_set_costs() -> None:
@@ -445,22 +463,22 @@ def test_decomposition_rows_sum_kernel_set_costs() -> None:
     knobs + the decision delta (never the kids' restamped ``S_*``), label =
     the Σ of the side's per-kernel bests."""
     terminals = _outer_terminals(_norm_linear("a"))
-    by_size = {len(_loops(t)): t for t in terminals}
+    by_size = {len(_kernels(t)): t for t in terminals}
     ctx = Context.from_target((12, 0))
 
     split = by_size[2]
-    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_loops(split), (7.0, 13.0), strict=True)]
+    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_kernels(split), (7.0, 13.0), strict=True)]
     rows = _decomposition_rows(split, per_op, ctx)
     assert len(rows) == 1
     feats, label = rows[0]
     assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
     assert feats["CUT"] == "1"
-    site = _loops(split)[0].source
+    site = _site(_kernels(split)[0])
     site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
     assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
 
     fused = by_size[1]
-    fop = _loops(fused)[0]
+    fop = _kernels(fused)[0]
     rows = _decomposition_rows(fused, [OpResult(name="k", op_key=op_cache_key(fop), best_us=42.0)], ctx)
     assert len(rows) == 1
     feats, label = rows[0]
@@ -479,7 +497,7 @@ def test_identical_offer_sites_take_the_same_side() -> None:
         cand.graph
         for cand in drain_tune(outer_pipeline(), g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
     ]
-    sizes = sorted(sum(1 for n in t.nodes.values() if isinstance(n.op, LoopOp)) for t in terminals)
+    sizes = sorted(len(_kernels(t)) for t in terminals)
     assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
 
 
