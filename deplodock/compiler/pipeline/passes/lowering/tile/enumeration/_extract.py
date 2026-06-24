@@ -98,7 +98,12 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Wr
 from deplodock.compiler.ir.stmt.body import Cone
 from deplodock.compiler.ir.tile.ir import Block, Buffer, Placement, Schedule, Space, TileGraph, TileGraphOp
 from deplodock.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
-from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
+from deplodock.compiler.pipeline.passes.lowering._predicates import (
+    is_matmul_reduce,
+    map_transform,
+    segmentable_k_extent,
+    split_monoid_producer,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -581,13 +586,15 @@ def _producer_fusible(block: Block) -> bool:
     rmsnorm-style prologue (``_split_monoid_producer`` + exactly one reduce loop — the
     sum-of-squares the reduce-prologue path expects; a two-pass softmax has two reduces
     the path can't fold). The gate that keeps the keep(SMEM) fork to shapes the fused
-    assemble actually lowers — every other demoted matmul stays a forced GMEM cut."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.assembly._fused import _map_transform, _split_monoid_producer
+    assemble actually lowers — every other demoted matmul stays a forced GMEM cut.
 
-    if _map_transform(block) is not None:
+    The block decomposition (``map_transform`` / ``split_monoid_producer``) is the shared
+    fused-edge vocabulary in ``lowering/_predicates`` — the same functions ``assembly/_fused``
+    realizes the edge with, so the offer gate can't drift from what assemble can build."""
+    if map_transform(block) is not None:
         return True
     n_reduce = sum(1 for s in block.compute.iter_of_type(Loop) if s.is_reduce)
-    return n_reduce == 1 and _split_monoid_producer(block) is not None
+    return n_reduce == 1 and split_monoid_producer(block) is not None
 
 
 def _classify_cut(loop_op: LoopOp):

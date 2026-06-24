@@ -48,6 +48,35 @@ def test_lowering_tile_does_not_import_kernel_ir() -> None:
     assert not offenders, "lowering/tile/*.py must not import from ir.kernel — layering violation.\n" + "\n".join(offenders)
 
 
+def test_lowering_tile_does_not_import_kernel_passes() -> None:
+    """``lowering/tile/**/*.py`` may not import from the ``lowering/kernel`` pass layer.
+
+    The tile layer (``enumeration`` + ``assembly`` + ``split``) runs ABOVE the
+    kernel pass layer; a tile pass importing ``lowering.kernel`` is a back-edge in
+    the pass DAG — a tile pass depending on a downstream kernel pass's internals.
+    Structural predicates the two layers share (``is_matmul_reduce``,
+    ``segmentable_k_extent``, ``reduce_body_has_coupled_accum``,
+    ``classify_fragment_epilogue``, the fused-edge ``map_transform`` /
+    ``split_monoid_producer``) live in ``lowering/_predicates.py`` — pure ``ir.*``
+    queries imported by both layers.
+
+    If this fires: move the shared helper into ``lowering/_predicates`` and import
+    it there from both layers, rather than reaching down into ``lowering/kernel``.
+    """
+    tile_dir = _REPO_ROOT / "deplodock" / "compiler" / "pipeline" / "passes" / "lowering" / "tile"
+    assert tile_dir.is_dir(), f"lowering/tile/ not found at {tile_dir}"
+    forbidden = "deplodock.compiler.pipeline.passes.lowering.kernel"
+    offenders: list[str] = []
+    for py in sorted(tile_dir.rglob("*.py")):
+        for lineno, line in enumerate(py.read_text().splitlines(), start=1):
+            if forbidden in line and "import" in line:
+                offenders.append(f"{py.relative_to(_REPO_ROOT)}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "lowering/tile/**/*.py must not import from lowering/kernel — back-edge in the pass DAG.\n"
+        "Shared structural predicates live in lowering/_predicates.\n" + "\n".join(offenders)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fix 1 firewall (plans/tileop-schedule-boundary-fixes.md) — keep the
 # assemble→TileOp boundary clean: every benched scheduling choice lives in the
@@ -72,9 +101,9 @@ _FORBIDDEN_IMPORTS = (
 
 # Schedule-decision functions (offer enumeration / algebra classifiers / the
 # edge-placement cut). A kernel pass must not *call* one — not even a re-rolled
-# local copy. ``classify_fragment_epilogue`` (``kernel/_atom.py``) is the one
-# allowed ``classify*`` name: it is a mechanical fragment-epilogue lowering
-# analysis, not a ranked scheduling choice.
+# local copy. ``classify_fragment_epilogue`` (``lowering/_predicates.py``) is the
+# one allowed ``classify*`` name: it is a mechanical fragment-epilogue lowering
+# analysis shared by both layers, not a ranked scheduling choice.
 _FORBIDDEN_CALL_RE = re.compile(
     r"\b("
     r"\w*_offers"  # thread_offers / map_reg_offers / warp_bk_offers / coop_reduce_offers / …

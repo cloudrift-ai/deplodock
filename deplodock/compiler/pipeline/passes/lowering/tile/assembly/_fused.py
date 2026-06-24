@@ -36,7 +36,7 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Assign, Body, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     AffineAddressing,
     Binding,
@@ -49,6 +49,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
+from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import _free_layers
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
@@ -72,24 +73,6 @@ def fused_producer_blocks(graph: TileGraph) -> set[str]:
     writer = {p.buffer: b.name for b in graph.blocks for p in b.writes}
     read_any = {p.buffer for b in graph.blocks for p in b.reads}
     return {writer[buf] for buf in writer if buf in read_any}
-
-
-def _map_transform(block: Block):
-    """A MAP producer block → ``(input_loads, assigns, write)`` — the pointwise transform
-    ``xn = f(x, y, …)``: the input ``Load`` stmts (each indexing some subset of the
-    output axes — a full operand, or a broadcast like ``rs[m]`` / ``nw[k]``), the
-    transform ``Assign``\\ s, and the output ``Write``. ``None`` for a non-pointwise body
-    (a reduce loop / extra stmt — the MONOID rmsnorm reduce, a compute-phase reduce being
-    future work)."""
-    stmts = list(block.compute)
-    loads = [s for s in stmts if isinstance(s, Load)]
-    writes = [s for s in stmts if isinstance(s, Write)]
-    assigns = [s for s in stmts if isinstance(s, Assign)]
-    if len(writes) != 1 or len(stmts) != len(loads) + len(writes) + len(assigns):
-        return None  # not a flat pointwise body (a reduce loop / extra stmt)
-    if not loads or any(len(ld.names) != 1 for ld in loads):
-        return None
-    return tuple(loads), tuple(assigns), writes[0]
 
 
 def _project_source(xn_src: Source, load: Load, dim_of_axis: dict[str, int], dtype) -> Source | None:
@@ -152,7 +135,7 @@ def _fuse_producers(body: Body, producer_of: dict[str, Block], graph: TileGraph)
             if src.buf not in producer_of:
                 new_sources.append(src)
                 continue
-            t = _map_transform(producer_of[src.buf])
+            t = map_transform(producer_of[src.buf])
             if t is None:
                 raise NotImplementedError(
                     f"fused SMEM edge: producer of {src.buf!r} is not a flat MAP transform "
@@ -213,7 +196,7 @@ def assemble_fused(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_na
     prologues: list[CoopReduce] = []
     producer_of = dict(producer_of)
     for buf, blk in list(producer_of.items()):
-        split = _split_monoid_producer(blk)
+        split = split_monoid_producer(blk)
         if split is None:
             continue
         prologue, scale_block = _build_reduce_prologue(split, buf, consumer, graph.schedule.binding)
@@ -242,34 +225,6 @@ def assemble_fused(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_na
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
-
-
-def _split_monoid_producer(block: Block):
-    """A MONOID (rmsnorm) producer block → ``(leading, reduce_loop, scalars, scale_body,
-    scale_indexed, v4_name)`` or ``None`` for a plain MAP. The block is ``[leading
-    consts] [reduce Loop → acc] [scalar chain → v4] [scale Loop → xn]``; ``scale_body``
-    is the scale loop's per-element body and ``v4_name`` the scale SSA the compute phase
-    reads from the prologue slab."""
-    stmts = list(block.compute)
-    leading: list[Stmt] = []
-    reduce_loop: Loop | None = None
-    scalars: list[Stmt] = []
-    scale_loop: Loop | None = None
-    for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and reduce_loop is None:
-            reduce_loop = s
-        elif isinstance(s, Loop) and not s.is_reduce:
-            scale_loop = s
-        elif reduce_loop is None:
-            leading.append(s)
-        else:
-            scalars.append(s)
-    if reduce_loop is None or scale_loop is None or not scalars:
-        return None
-    v4_name = scalars[-1].defines()[0] if scalars[-1].defines() else None
-    if v4_name is None:
-        return None
-    return tuple(leading), reduce_loop, tuple(scalars), tuple(scale_loop.body), v4_name
 
 
 def _build_reduce_prologue(split, out_buf: str, consumer: Block, binding: dict) -> tuple[CoopReduce, Block]:

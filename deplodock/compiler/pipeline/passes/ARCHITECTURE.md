@@ -23,7 +23,7 @@ How to comply:
   *instances* of that one rule, not branches — and a shape nobody designed for (a weight-side dequant cone) is
   covered for free.
 - **Gate in the negative.** Enumerating admissible shapes is shape matching by another name. Walk the body and
-  report the first thing the transform *fundamentally cannot do*, like `tile/_atom.classify_fragment_epilogue`
+  report the first thing the transform *fundamentally cannot do*, like `lowering/_predicates.classify_fragment_epilogue`
   (the epilogue folds unless it has an ineligible op/dependency) — the eligible set then grows with the renderer
   instead of with a hand-maintained list.
 - **Bail conservatively on well-formedness, never on shape identity.** `return None` / `RuleSkipped` for a body

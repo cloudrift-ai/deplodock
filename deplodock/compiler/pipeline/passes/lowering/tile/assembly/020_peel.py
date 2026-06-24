@@ -27,7 +27,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import reduce_body_has_coupled_accum
+from deplodock.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
 
 PATTERN = [Pattern("root", TileOp)]
 

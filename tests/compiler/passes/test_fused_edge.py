@@ -157,7 +157,7 @@ def test_fused_map_matmul_runs_correctly(producer, np_ref):
     res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
     ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
-    np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
+    np.testing.assert_allclose(got, ref, atol=0.1, rtol=2e-2)
 
 
 def _loopop(g: Graph):
@@ -251,7 +251,7 @@ def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier, p
     res = CudaBackend().run(compiled, input_data=ins)[0].outputs
     got = list(res.values())[0].reshape(M, N).astype(np.float32)
     ref = np_ref({k: v.astype(np.float32) for k, v in ins.items()}) @ ins["w"].astype(np.float32)
-    np.testing.assert_allclose(got, ref, atol=3e-1, rtol=3e-1)
+    np.testing.assert_allclose(got, ref, atol=0.1, rtol=2e-2)
 
 
 @requires_cuda
@@ -312,7 +312,12 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     got = list(CudaBackend().run(compiled, input_data=data)[0].outputs.values())[0].reshape(M, N).astype(np.float32)
     x, nw, wg = data["x"].astype(np.float32), data["nw"].astype(np.float32), data["wg"].astype(np.float32)
     xn_ref = x[0] * (1.0 / np.sqrt((x[0] ** 2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
-    np.testing.assert_allclose(got, xn_ref @ wg.T, atol=1.0, rtol=0.5)
+    # The MONOID fused-prologue path (cooperative rms-scale reduce + fp16 matmul accumulate
+    # at K=1024) carries ~7% relative error on the large elements — a known-fragile path, see
+    # plans/tile-ir-block-dag-branch-review-2026-06-23.md P1. rtol=0.1 reflects that real
+    # precision (tighter than the old blanket rtol=0.5) so a regression is still caught;
+    # atol=0.5 absorbs the near-zero elements where relative error is meaningless.
+    np.testing.assert_allclose(got, xn_ref @ wg.T, atol=0.5, rtol=0.1)
 
 
 _TILE_PASSES = ["lowering/tile/split", "lowering/tile/enumeration", "lowering/tile/assembly"]
@@ -386,7 +391,9 @@ def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
     got = list(CudaBackend().run(out, input_data=ins)[0].outputs.values())[0].reshape(s, i).astype(np.float32)
     x, nw, wg = ins["x"][0].astype(np.float32), ins["nw"].astype(np.float32), ins["wg"].astype(np.float32)
     rms = x * (1.0 / np.sqrt((x**2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
-    np.testing.assert_allclose(got, rms @ wg.T, atol=1.0, rtol=0.5)
+    # [warp] is accurate (~0.06 abs); [scalar] takes the fragile fp16 fused-prologue path
+    # (~7% on large elements). rtol=0.1 covers both — far tighter than the old rtol=0.5.
+    np.testing.assert_allclose(got, rms @ wg.T, atol=0.1, rtol=0.1)
 
 
 @requires_cuda
@@ -422,4 +429,4 @@ def test_fused_map_producer_warp_tier_live(monkeypatch, expr):
             match = next((a for a in argv if a.shape == shp), None)
             ins[nid] = match.astype(node.output.dtype.np)
     got = list(CudaBackend().run(out, input_data=ins)[0].outputs.values())[0].reshape(ref.shape).astype(np.float32)
-    np.testing.assert_allclose(got, ref, atol=max(0.5, 0.05 * float(np.abs(ref).max())), rtol=0.2)
+    np.testing.assert_allclose(got, ref, atol=0.1, rtol=2e-2)

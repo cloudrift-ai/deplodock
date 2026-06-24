@@ -1,35 +1,144 @@
-"""Per-kernel atom *eligibility* — the planner-side gate for each matmul atom.
+"""Shared structural IR predicates for the tile + kernel lowering layers.
 
-The :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (cell shape, per-operand
-dtypes, group size) + the ``ATOM_REGISTRY`` live in ``ir/tile/ir.py`` (next to
-the other tile-IR types, and carried directly on the ``Mma`` op). They are
-re-exported here so existing ``from ...tile._atom import ATOM_REGISTRY`` call
-sites keep working.
+Pure, side-effect-free queries over Loop / Body / Block IR — the structural
+vocabulary both ``lowering/tile`` (enumeration + assembly) and ``lowering/kernel``
+dispatch on. They live ABOVE both subpackages so a tile pass can ask a structural
+question without importing the kernel layer (the back-edge
+``tests/architecture/test_layering.py::test_lowering_tile_does_not_import_kernel``
+forbids), and assemble + enumeration can share the fused-edge block decomposition
+(``_map_transform`` / ``_split_monoid_producer``) without a circular import.
 
-This module owns only the part that *can't* live in the IR layer: the per-kind
-**eligibility** predicate (does a given ``LoopOp`` admit this atom on this
-device?). It depends on the loop body / graph / context and on
-``is_matmul_reduce`` — pipeline-layer concerns — so it stays in the planner.
-:func:`is_atom_eligible` dispatches via the ``_ELIGIBILITY`` map; adding a kind
-(future: wgmma, NVFP4) registers an ``Atom`` in ``ir/tile/ir.py`` and a
-predicate here.
+Depends only on ``ir.*`` — never on a tile/ or kernel/ pass module.
 
-Prefixed ``_`` so the pipeline rule loader (``_load_rules``) skips it.
+Prefixed ``_`` so the engine rule loader (``_load_rules``) skips it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
-
-# Back-compat re-exports (canonical definitions live in ``ir/tile/ir.py``).
-__all__ = [
-    "ATOM_REGISTRY",
-    "Atom",
-]
+from deplodock.compiler.ir.algebra import matmul_reduce
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.tile.ir import Block, SerialTile, StridedTile
 
 _EPILOGUE_LEAF_DTYPES = frozenset({"f16", "bf16", "f32"})
+
+
+# --- reduce-shape predicates (shared by tile enumeration + kernel passes) ---
+
+
+def is_matmul_reduce(loop) -> bool:
+    """True iff ``loop`` is a reduce-loop whose body matches the matmul
+    signature: ≥2 distinct buffers with K-indexed Loads (where K is
+    ``loop.axis.name``) plus at least one ``Accum`` (or its tensor-core fused
+    form ``Mma``).
+
+    Accepts both Loop-IR ``Loop`` / ``StridedLoop`` and Tile-IR ``SerialTile`` /
+    ``StridedTile`` bodies. Used by the tile enumeration to locate the matmul K
+    reduce inside a LoopOp body, and by downstream tile passes to confirm a
+    matmul-shaped reduce survived.
+
+    The structural core lives in ``ir/algebra.matmul_reduce`` (the single source
+    the bottom-up ``AlgebraKind`` classifier shares); this wrapper adds the
+    tile-layer type guard.
+    """
+    return isinstance(loop, (Loop, StridedLoop, SerialTile, StridedTile)) and matmul_reduce(loop)
+
+
+def segmentable_k_extent(load: Load, k_name: str) -> int | None:
+    """For a folded-K matmul operand (the reduce axis spread across >1 index dim
+    — the collapsed-reshape / transpose ``o_proj`` attn-out read), return the
+    inner contiguous extent ``C`` when the read is **segmentable**; else ``None``.
+
+    Segmentable signature: the innermost (stride-1) index dim is ``expr % C`` with
+    a literal ``C`` carrying ``k_name`` — i.e. K's contiguous run has extent ``C``
+    and the remaining K-dims are higher-order delinearization of the same flat
+    offset. A C-aligned K split (``k_per_block == C`` ⇒ ``K_o`` = strided-outer
+    segment, ``K_i·atom_k`` = the contiguous inner run) folds the delinearization
+    to a clean ``[outer, …, inner]`` read (the range-aware ``Expr.simplify``), so
+    the matmul reaches the mma tier reading gmem directly — no transpose producer.
+
+    Returns ``None`` for a single-K-dim load (already stageable) or a fold whose
+    inner dim isn't a literal-modulus contiguous run (not safely C-alignable)."""
+    from deplodock.compiler.ir.expr import BinaryExpr, Literal  # noqa: PLC0415
+
+    if not load.index:
+        return None
+    k_dims = [d for d, e in enumerate(load.index) if k_name in e.free_vars()]
+    if len(k_dims) <= 1:
+        return None
+    inner = load.index[-1]
+    if (
+        isinstance(inner, BinaryExpr)
+        and inner.op == "%"
+        and isinstance(inner.right, Literal)
+        and inner.right.dtype == "int"
+        and isinstance(inner.right.value, int)
+        and k_name in inner.left.free_vars()
+    ):
+        return inner.right.value
+    return None
+
+
+def reduce_body_has_coupled_accum(body: Body) -> bool:
+    """True iff a non-Accum stmt in ``body`` reads a sibling Accum's running
+    value — the online / coupled-reduction shape (online softmax, Welford) whose
+    cross-Accum dependency the ring-buffer / pipeline-stage peels can't preserve.
+    Used by ``assembly/020_peel`` to decline peeling a coupled reduce."""
+    body = Body.coerce(body)
+    return any(any(isinstance(d, Accum) for d in body.deps_of(c) if d is not None) for c in body if not isinstance(c, Accum))
+
+
+# --- fused-edge block decomposition (shared by enumeration offer gate + assemble) ---
+
+
+def map_transform(block: Block):
+    """A MAP producer block → ``(input_loads, assigns, write)`` — the pointwise transform
+    ``xn = f(x, y, …)``: the input ``Load`` stmts (each indexing some subset of the
+    output axes — a full operand, or a broadcast like ``rs[m]`` / ``nw[k]``), the
+    transform ``Assign``\\ s, and the output ``Write``. ``None`` for a non-pointwise body
+    (a reduce loop / extra stmt — the MONOID rmsnorm reduce, a compute-phase reduce being
+    future work)."""
+    stmts = list(block.compute)
+    loads = [s for s in stmts if isinstance(s, Load)]
+    writes = [s for s in stmts if isinstance(s, Write)]
+    assigns = [s for s in stmts if isinstance(s, Assign)]
+    if len(writes) != 1 or len(stmts) != len(loads) + len(writes) + len(assigns):
+        return None  # not a flat pointwise body (a reduce loop / extra stmt)
+    if not loads or any(len(ld.names) != 1 for ld in loads):
+        return None
+    return tuple(loads), tuple(assigns), writes[0]
+
+
+def split_monoid_producer(block: Block):
+    """A MONOID (rmsnorm) producer block → ``(leading, reduce_loop, scalars, scale_body,
+    scale_indexed, v4_name)`` or ``None`` for a plain MAP. The block is ``[leading
+    consts] [reduce Loop → acc] [scalar chain → v4] [scale Loop → xn]``; ``scale_body``
+    is the scale loop's per-element body and ``v4_name`` the scale SSA the compute phase
+    reads from the prologue slab."""
+    stmts = list(block.compute)
+    leading: list[Stmt] = []
+    reduce_loop: Loop | None = None
+    scalars: list[Stmt] = []
+    scale_loop: Loop | None = None
+    for s in stmts:
+        if isinstance(s, Loop) and s.is_reduce and reduce_loop is None:
+            reduce_loop = s
+        elif isinstance(s, Loop) and not s.is_reduce:
+            scale_loop = s
+        elif reduce_loop is None:
+            leading.append(s)
+        else:
+            scalars.append(s)
+    if reduce_loop is None or scale_loop is None or not scalars:
+        return None
+    v4_name = scalars[-1].defines()[0] if scalars[-1].defines() else None
+    if v4_name is None:
+        return None
+    return tuple(leading), reduce_loop, tuple(scalars), tuple(scale_loop.body), v4_name
+
+
+# --- fragment-epilogue fold analysis (shared by enumeration warp gate + kernel/005) ---
 
 
 @dataclass(frozen=True)
@@ -266,9 +375,3 @@ def classify_fragment_epilogue(
         ),
         None,
     )
-
-
-# Per-atom eligibility predicates, keyed by the ``Atom`` itself (cell shape +
-# operand dtype come from the spec). Kept parallel to the registry rather than
-# on ``Atom`` so the spec stays a pure data record in ``ir/tile/ir.py`` with no
-# loop/graph/context dependency.

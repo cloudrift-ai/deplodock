@@ -25,8 +25,11 @@ from collections.abc import Callable
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Write
 from deplodock.compiler.ir.stmt.blocks import Body
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
-from deplodock.compiler.pipeline.passes.lowering.kernel._atom import classify_fragment_epilogue
-from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import is_matmul_reduce, segmentable_k_extent
+from deplodock.compiler.pipeline.passes.lowering._predicates import (
+    classify_fragment_epilogue,
+    is_matmul_reduce,
+    segmentable_k_extent,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 
 

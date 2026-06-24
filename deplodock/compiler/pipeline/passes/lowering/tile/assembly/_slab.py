@@ -239,10 +239,14 @@ def _wrap_k_body(
     """Wrap the K-tower in a ``StageBundle``. With a multi-stage K loop the bundle
     sits *inside* the ``serial_outer`` loop (the slab reloads per stage); when ``BK
     == K`` collapses ``serial_outer`` away, the ``stage_inner`` loop alone is wrapped
-    (the whole-K slab, loaded once). When every staged buffer is in ``tma_bufs`` the
-    ``serial_outer`` bundle is the double-buffered TMA transport (phase ``K_o % RING``)
-    — only the ringable multi-stage loop is TMA-promoted (the single-stage whole-K
-    slab can't pipeline, so it stays SYNC)."""
+    (the whole-K slab, loaded once). The transport is **decided in enumeration**
+    (``052_transport``, whose ``tma_eligible`` gates on a ringable K loop) and read off
+    here via ``tma_bufs`` — assembly never re-decides it. When every staged buffer is in
+    ``tma_bufs`` the ``serial_outer`` bundle is the double-buffered TMA transport (phase
+    ``K_o % RING``). A single-stage whole-K ``stage_inner`` slab has no ring to pipeline,
+    so ``052_transport`` never marks it TMA; we assert that contract rather than silently
+    downgrade — if a future transport fork breaks it, fail loud here instead of
+    mis-lowering a TMA-marked buffer onto a SYNC bundle."""
     all_tma = bool(staged_bufs) and staged_bufs <= tma_bufs
     out: list[Stmt] = []
     for s in stmts:
@@ -251,6 +255,10 @@ def _wrap_k_body(
             bundle = _make_bundle(tuple(s.body), staged_bufs, cache_axes, buffers, tma_phase=phase, swizzled=swizzled)
             out.append(SerialTile(axis=s.axis, body=Body((bundle,)), kind=s.kind))
         elif isinstance(s, SerialTile) and s.kind == "stage_inner":
+            assert not (staged_bufs & tma_bufs), (
+                f"whole-K stage_inner slab has TMA-marked buffer(s) {sorted(staged_bufs & tma_bufs)} but no ringable "
+                "serial_outer loop — 052_transport.tma_eligible should never have promoted these to TMA"
+            )
             out.append(_make_bundle((s,), staged_bufs, cache_axes, buffers))
         else:
             out.append(s)

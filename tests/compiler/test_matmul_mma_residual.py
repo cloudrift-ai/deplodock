@@ -10,7 +10,7 @@ The fold (CUTLASS epilogue-visitor pattern): each lane knows the (row, col) of i
 (per-dim ``m``/``n``/``fixed`` roles at each buffer's own stride, so transposed / broadcast operands read
 correctly) and the ops render via the scalar ``op_to_expr`` translation.
 
-Eligibility is the NEGATIVE rule (``tile/_atom.classify_fragment_epilogue``): the backward slice from the Write
+Eligibility is the NEGATIVE rule (``lowering/_predicates.classify_fragment_epilogue``): the backward slice from the Write
 to the accumulator is foldable unless it contains an ineligible operation / dependency — accumulator consumed
 inside a reduce loop, multiple accumulators, multiple / vector Writes, escaping slice values, non-Load leaves,
 in-kernel-produced leaf buffers, unconvertible dtypes, ops without a rendering, or leaf index dims the lane
