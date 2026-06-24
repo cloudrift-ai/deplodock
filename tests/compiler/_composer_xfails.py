@@ -120,8 +120,20 @@ _XFAIL_FUNCS: dict[str, str] = {
     # The three qwen-dynamic tests de-quarantined: the whole-model / layer SDPA now
     # lowers via tile/split/005_split_demoted (incl. the symbolic-seq P@V), so the
     # dynamic compile + capture-replay paths match eager.
+    # test_fused_rmsnorm_linear_blocked_prologue DE-QUARANTINED: the fused-prologue
+    # demoted-matmul (RMSNorm -> Linear, SMEM-fused edge) now lowers correctly. Two fixes:
+    # (1) kernel/_stage_expand.compute_phase_info recovers a degenerate extent-1 cache axis
+    # the BM=1 thread/cell-binding σ literalized to 0 (instead of rejecting it as an
+    # un-lowerable sibling-cell-fused fill); (2) assembly/_fused._build_reduce_prologue
+    # prefixes the CoopReduce prologue's SSA so it doesn't collide with the consumer
+    # matmul's identically-named loads (the kernel-global literal-constant env was
+    # clobbering the consumer's in0/in1 with the prologue's xn_mean_count/xn_eps values).
+    # test_qwen_lmhead_variant_compiles_within_budget stays quarantined: its STAGE=1 pin is
+    # stale for the block-DAG pipeline (it now stages the full FN=64 N-tile of wl = 1 MB,
+    # over the smem budget — the fused-edge xn staging is automatic now), AND the N=4099
+    # masked-overhang fused-prologue path still hits an OOB even gmem-direct. The masked
+    # overhang for the fused demoted matmul is the remaining R7 gap.
     "test_fuse_sibling_register_cells.py::test_qwen_lmhead_variant_compiles_within_budget": "R7",
-    "test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": "R7",
     # test_structural_replay_consulted + test_trace_records_partition_fork DE-QUARANTINED
     # with the two-level structural tier (the outer cut fork branches + replays; the inner
     # per-family tile forks 010_reduce_tile/020_thread_tile/030_register_tile trace under

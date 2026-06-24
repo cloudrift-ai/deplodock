@@ -396,30 +396,60 @@ def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source
     for src in sources:
         for ax in src.cache_axes:
             axis_map[ax.name] = ax
-    # Each index entry must be a bare ``Var`` naming one of the sibling cone's
-    # cache axes. A sibling-cell fusion (``012_fuse_sibling_register_cells``)
-    # can σ-collapse a cache-axis ``Var`` to a constant ``Literal`` in this
-    # self-describing Write (the compute body is exposed via
-    # ``StageBundle.nested()``, so generic index substitution reaches it) —
-    # the slab is then co-filled by N sibling bundles, each writing one pinned
-    # cell. The hoisted-compute materializer derives ONE iteration domain /
-    # slab shape from a single Write, so it can't represent that multi-bundle
-    # fill; flag it as un-lowerable. Under ``tune`` this prunes the offending
-    # search branch (``Run.drive`` containment); the deployable greedy pick
-    # never reaches this fork.
-    bad = [v for v in write.index if not (isinstance(v, Var) and v.name in axis_map)]
-    if bad:
-        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
-
-        raise LoweringError(
-            f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
-            f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} (axes {tuple(axis_map)!r}) — a sibling-cell-fused "
-            f"slab fill the single-Write materializer can't represent"
-        )
-    cache_axes = tuple(axis_map[v.name] for v in write.index)
+    # Each index entry is normally a bare ``Var`` naming one of the sibling
+    # cone's cache axes. Two ways a ``Literal`` shows up instead:
+    #
+    #   1. **Degenerate (extent-1) cache axis.** A thread/cell-binding σ pins an
+    #      extent-1 cache axis to its only coord — e.g. ``BM=1`` literalizes the
+    #      M cache axis to ``0`` in both the read and the Write. The axis is still
+    #      a legitimate cache dim (extent 1); recover it positionally from the
+    #      input ``Source`` whose cache_axes align (Var positions match by name),
+    #      so the single-Write materializer iterates the correct domain.
+    #   2. **Sibling-cell fusion** (``012_fuse_sibling_register_cells``) pinning a
+    #      genuine (extent > 1) cache axis to one cell ``i`` — the slab is co-filled
+    #      by N sibling bundles, which the single-Write materializer can't represent.
+    #      Flag un-lowerable. Under ``tune`` this prunes the branch; greedy avoids it.
+    #
+    # Distinguish by the pinned axis's extent: extent-1 → case 1 (lowerable),
+    # extent > 1 → case 2 (raise).
+    if all(isinstance(v, Var) and v.name in axis_map for v in write.index):
+        cache_axes = tuple(axis_map[v.name] for v in write.index)
+    else:
+        cache_axes = _recover_degenerate_cache_axes(write, sources)
     if not cache_axes:
         raise ValueError(f"compute phase {write.output!r}: needs at least one cache axis")
     return write.output, cache_axes, write.value_dtype
+
+
+def _recover_degenerate_cache_axes(write, sources):  # noqa: ANN001 — Write, tuple[Source, ...]
+    """Recover the Write's per-position cache axes when a ``Literal`` index entry
+    pins a degenerate (extent-1) axis. Aligns the Write index against an input
+    ``Source`` whose cache_axes match at the ``Var`` positions; a ``Literal`` then
+    resolves to that source's same-position cache axis, accepted only when its
+    extent is 1. Raises :class:`LoweringError` (the sibling-cell-fused multi-bundle
+    fill) when no source aligns with every ``Literal`` over an extent-1 axis."""
+    for src in sources:
+        if len(src.cache_axes) != len(write.index):
+            continue
+        ok = True
+        for entry, ax in zip(write.index, src.cache_axes, strict=True):
+            if isinstance(entry, Var):
+                if entry.name != ax.name:  # this source doesn't define the Write's axis order
+                    ok = False
+                    break
+            elif not (ax.extent.is_static and ax.extent.as_static() == 1):
+                ok = False  # a Literal pinning a real (extent > 1) axis — case 2, not this source
+                break
+        if ok:
+            return tuple(src.cache_axes)
+    from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+    bad = [v for v in write.index if not isinstance(v, Var)]
+    raise LoweringError(
+        f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
+        f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} pinning a non-degenerate axis — a sibling-cell-fused "
+        f"slab fill the single-Write materializer can't represent"
+    )
 
 
 def compute_phase_extents(compute, sources) -> tuple[int, ...]:  # noqa: ANN001

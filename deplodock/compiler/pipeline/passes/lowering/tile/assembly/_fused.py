@@ -309,6 +309,21 @@ def _build_reduce_prologue(split, out_buf: str, consumer: Block, binding: dict) 
         *(s.rewrite(_id, sigma) for s in scalars),
         Write(output=slab, index=(Var(local_m.name),), value=v4_name),
     )
+    # The prologue and the consumer matmul are independently-numbered blocks fused into
+    # one kernel; their SSA namespaces collide (both reuse ``in0``/``v0``/…). That breaks
+    # the SSA invariant the renderer relies on — its literal-constant env is keyed by SSA
+    # name and kernel-global, so the prologue's constant operand loads (``xn_mean_count`` =
+    # 1024, ``xn_eps`` = 1e-6) would clobber the consumer's identically-named operand loads
+    # (the matmul's ``v0 = in0·in1`` rendering as ``1024·1e-6``). Prefix the prologue's SSA
+    # value names so the producer side is disjoint; its only cross-block link is the slab
+    # buffer (the scale block re-reads it under its own name), so renaming internal SSA is
+    # sound. Restrict the rename to actual defs — axis/grid Vars in index exprs share the
+    # Var namespace and must NOT be touched.
+    pfx = f"{slab}__"
+    defined = {n for s in (*leading, *body) for st in Body.coerce((s,)).iter() for n in st.defines()}
+    ren = lambda n: f"{pfx}{n}" if n in defined else n  # noqa: E731
+    leading = tuple(s.rewrite(ren) for s in leading)
+    body = tuple(s.rewrite(ren) for s in body)
     prologue = CoopReduce(cells=(local_m,), leading=Body(leading), body=Body(body), out_slab=slab, out_dtype=F32)
     # The scale block: the per-element scale-application reading v4 from the slab (an
     # internal-slab operand the broadcast machinery reads directly, no gmem staging). It
