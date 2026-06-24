@@ -123,8 +123,8 @@ def _restrict_schedule(sched: Schedule, block_name: str) -> Schedule:
     """The ``Schedule`` as one block sees it: the edge-keyed maps narrowed to edges
     consumed by this block (``dst == block_name``) so the slab synthesizer stages
     only this kernel's reads. The axis-/block-keyed fields (binding / scope / role /
-    launch / unroll / grid_swizzle / reg_budget) are harmless to a block that does
-    not reference them and pass through unchanged."""
+    launch / unroll) are harmless to a block that does not reference them and pass
+    through unchanged."""
 
     def keep(d: dict[Edge, object]) -> dict:
         return {e: v for e, v in d.items() if e.dst == block_name}
@@ -132,9 +132,6 @@ def _restrict_schedule(sched: Schedule, block_name: str) -> Schedule:
     return replace(
         sched,
         staged=keep(sched.staged),
-        distance=keep(sched.distance),
-        cohort=keep(sched.cohort),
-        ring_depth=keep(sched.ring_depth),
         pad=keep(sched.pad),
     )
 

@@ -447,13 +447,8 @@ class Schedule:
     role: dict[str, Role] = field(default_factory=dict)  # block -> producer/consumer (warp-spec)
     launch: dict[str, int] = field(default_factory=dict)  # block -> launch group (one group = one kernel)
     staged: dict[Edge, Transport] = field(default_factory=dict)  # read-site -> SMEM fill transport
-    distance: dict[Edge, tuple[tuple[str, int], ...]] = field(default_factory=dict)  # read-site -> retiming offset
-    cohort: dict[Edge, int] = field(default_factory=dict)  # read-site -> barrier / pipeline / transport cohort
-    ring_depth: dict[Edge, int] = field(default_factory=dict)  # staged read-site -> ring slots; >= max(distance)+1
     pad: dict[Edge, tuple[int, ...]] = field(default_factory=dict)  # staged read-site -> slab bank-conflict pad
-    reg_budget: dict[Role, int] = field(default_factory=dict)  # warp-spec register redistribution (SetMaxNReg)
     unroll: dict[str, bool] = field(default_factory=dict)  # SERIAL axis -> #pragma unroll
-    grid_swizzle: dict[str, int] = field(default_factory=dict)  # GRID block -> L2 row-group remap
 
     def with_binding(self, **kw: Binding) -> Schedule:
         return replace(self, binding={**self.binding, **kw})
@@ -463,8 +458,7 @@ class Schedule:
         ``compile -vv`` / kernel dumps). ``binding`` is rendered on the
         block domain axes by :meth:`TileGraph.pretty`, so it is omitted
         here; every other non-empty field gets one line. Edge-keyed maps
-        (``staged`` / ``distance`` / ``cohort`` / ``ring_depth`` / ``pad``)
-        key on ``buffer:src->dst``."""
+        (``staged`` / ``pad``) key on ``buffer:src->dst``."""
 
         def edge_key(e: Edge) -> str:
             return f"{e.buffer}:{e.src}->{e.dst}"
@@ -478,20 +472,10 @@ class Schedule:
             lines.append(f"{indent}launch: " + ", ".join(f"{b}={g}" for b, g in self.launch.items()))
         if self.staged:
             lines.append(f"{indent}staged: " + ", ".join(f"{edge_key(e)}={t.value}" for e, t in self.staged.items()))
-        if self.distance:
-            lines.append(f"{indent}distance: " + ", ".join(f"{edge_key(e)}={list(d)}" for e, d in self.distance.items()))
-        if self.cohort:
-            lines.append(f"{indent}cohort: " + ", ".join(f"{edge_key(e)}={c}" for e, c in self.cohort.items()))
-        if self.ring_depth:
-            lines.append(f"{indent}ring_depth: " + ", ".join(f"{edge_key(e)}={n}" for e, n in self.ring_depth.items()))
         if self.pad:
             lines.append(f"{indent}pad: " + ", ".join(f"{edge_key(e)}={list(p)}" for e, p in self.pad.items()))
-        if self.reg_budget:
-            lines.append(f"{indent}reg_budget: " + ", ".join(f"{r.value}={n}" for r, n in self.reg_budget.items()))
         if self.unroll:
             lines.append(f"{indent}unroll: " + ", ".join(f"{a}={v}" for a, v in self.unroll.items()))
-        if self.grid_swizzle:
-            lines.append(f"{indent}grid_swizzle: " + ", ".join(f"{b}={n}" for b, n in self.grid_swizzle.items()))
         return lines
 
 

@@ -54,14 +54,25 @@ stamped `TileOp` attribute but not call a classifier. Plus a test: assemble stam
 the mechanical `classify_fragment_epilogue`; `test_materialized_tile_flavors_stamp_schedule_facts` — the facts kernel
 passes consume are explicit fields: `StageBundle.{policy, buffer_count, phase, pipeline_depth}`, `SerialTile.kind`,
 `WarpSpecialize.{ring_depth, n_producer_threads, consumer_thread_axes}`, `AtomTile.atom`). The **stamp** half was
-already in place — the materialized typed flavors carry each consumed schedule fact as a typed attribute, and
-every kernel pass already reads those attributes (verified clean: no kernel pass re-derives a decision from tree shape).
-The remaining `Schedule` fields the bullet list names (`cohort` / `distance` / `reg_budget`, and `WarpSpecialize`) have
-**no live producer** in the current pipeline — no enumeration pass sets them and no assemble path constructs a
-`WarpSpecialize` (its emitting pass was deleted in the block-DAG refactor; warp-spec transport is future work). Stamping
-those onto materialized nodes now would be speculative, so it rides the work that revives each producer. The firewall is
-the durable deliverable: it makes Fix 2's mechanical-pass rule enforceable and blocks a new kernel pass from
-re-accreting the leak.
+already in place — the block-DAG / typed-flavor refactor that built the materialized tile flavors had already moved each
+**live** schedule fact onto a typed attribute read directly: `StageBundle.{policy, buffer_count, phase}` (transport /
+ring), `AsyncWait.{phase, slot}` (peel-stamped ring slot/phase), `SerialTile.kind` (`serial_outer` / `stage_inner`),
+`AtomTile.atom`, `Source.{gmem_extents, kmask, swizzle}`. The materializer's residual derivations
+(`Body.coordination`: `accum_cooperative_axes = Accum.axes ∩ ThreadTile.axes`, `atomic_axes = block_axes − write_index`)
+are **projections of the stamped binding**, not tree-adjacency inference — the repo's "derived, never stored" rule (same
+as `Block.reads`), so they are compliant, not a leak. So there was no pile of re-derivation left to delete.
+
+What the bullet list names as the *stamp targets* — `Schedule.cohort` / `distance` / `ring_depth` / `reg_budget` /
+`grid_swizzle` — turned out to be **dead fields**: zero writers (no move populates them), zero readers (assemble only
+`keep()`d the empty dicts; the live ring fact rides `StageBundle.buffer_count` / `AsyncWait` /
+`WarpSpecialize.ring_depth`, which are *different* fields). They were scaffolding for moves that don't exist yet (barrier
+cohorts, retiming distance, warp-spec register redistribution, L2 grid swizzle). Per Simplicity-First (no speculative
+state) those five were **removed** from `Schedule` (+ their `pretty()` branches + the `_assemble._restrict_schedule`
+`keep()`s) — the genuine simplification. They return with the move that first needs them (the cohort field with the
+cooperative-`grid.sync` barrier mechanism of Fix 3 / the edge-placement plan; `distance` with software-pipeline
+retiming). The surviving `Schedule` fields are exactly the ones a pass reads: `binding` / `scope` / `role` / `launch` /
+`staged` / `pad` / `unroll`. The firewall is the durable boundary guard: it makes Fix 2's mechanical-pass rule
+enforceable and blocks a new kernel pass from re-accreting the leak.
 
 ## Fix 2 — Pull leaked forks above assemble (the real content of G3/G4) [high value]
 
