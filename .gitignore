@@ -37,7 +37,7 @@ experiments/
 recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*
 !recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*.txt
 !recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/*.json
-!recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/recipe.yaml
+recipes/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/recipe.yaml
 recipes/**/benchmark*.log
 recipes/**/instances.json
 recipes/**/tasks.json
