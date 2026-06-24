@@ -195,13 +195,20 @@ def _make_bundle(
     buffers: dict,
     *,
     tma_phase: Expr | None = None,
+    swizzled: bool = True,
 ) -> StageBundle:
     """One ``StageBundle`` over ``inner``: a Source per staged buffer + ``inner`` with
     every staged Load rewritten to the slab. SYNC by default; when ``tma_phase`` is
     given (a ``Var(K_o) % RING`` ring slot) the bundle is the double-buffered TMA
-    transport — each source swizzle-stamped, ``buffer_count = RING``, ``phase`` set —
-    materialized as ``cp.async.bulk.tensor`` box copies (``assembly/020_peel`` then
-    software-pipelines it)."""
+    transport — ``buffer_count = RING``, ``phase`` set — materialized as
+    ``cp.async.bulk.tensor`` box copies (``assembly/020_peel`` then software-pipelines
+    it). The TMA sources are swizzle-stamped only on the **warp tier** (``swizzled``):
+    the descriptor's hardware swizzle deposits the slab permuted, and only the
+    ``ldmatrix`` consumer (``kernel/005_lower_atom_tile``) reads it back with the
+    matching XOR. A **scalar** tile reads the slab with plain affine ``Load``s, so it
+    must deposit linearly (``SwizzleMode.NONE``) — a swizzled deposit read flat returns
+    the wrong elements. The bank-conflict cost of the unswizzled scalar read is the
+    ``PAD_SMEM`` pass's concern, not the transport's."""
     sources = _bundle_sources(inner, staged_bufs, cache_axes, buffers)
     by_buf = {src.buf: src for src in sources}
     if tma_phase is None:
@@ -210,8 +217,9 @@ def _make_bundle(
     # consumer slab Loads carry the ring slot as a leading index dim so the
     # ldmatrix lowering (``kernel/005_lower_atom_tile._mma_src_index``) reads the
     # right slot (it detects the prefix via ``len(index) > len(cache_axes)``).
+    tma_sources = tuple(_stamp_swizzle(s) for s in sources) if swizzled else tuple(sources)
     return StageBundle(
-        sources=tuple(_stamp_swizzle(s) for s in sources),
+        sources=tma_sources,
         body=Body(_rewrite_loads(inner, by_buf, phase=tma_phase)),
         policy=StagePolicy.TMA,
         buffer_count=_TMA_RING,
@@ -226,6 +234,7 @@ def _wrap_k_body(
     buffers: dict,
     *,
     tma_bufs: frozenset[str] = frozenset(),
+    swizzled: bool = True,
 ) -> tuple[Stmt, ...]:
     """Wrap the K-tower in a ``StageBundle``. With a multi-stage K loop the bundle
     sits *inside* the ``serial_outer`` loop (the slab reloads per stage); when ``BK
@@ -239,7 +248,7 @@ def _wrap_k_body(
     for s in stmts:
         if isinstance(s, SerialTile) and s.kind == "serial_outer":
             phase = BinaryExpr("%", Var(s.axis.name), Literal(_TMA_RING, "int")) if all_tma else None
-            bundle = _make_bundle(tuple(s.body), staged_bufs, cache_axes, buffers, tma_phase=phase)
+            bundle = _make_bundle(tuple(s.body), staged_bufs, cache_axes, buffers, tma_phase=phase, swizzled=swizzled)
             out.append(SerialTile(axis=s.axis, body=Body((bundle,)), kind=s.kind))
         elif isinstance(s, SerialTile) and s.kind == "stage_inner":
             out.append(_make_bundle((s,), staged_bufs, cache_axes, buffers))
@@ -351,7 +360,7 @@ def _stamp_gmem_extents(stmt: Stmt, input_extents: dict) -> Stmt:
     return stmt.with_bodies(new_bodies)
 
 
-def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs) -> tuple[Stmt, ...] | None:
+def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma_bufs, swizzled=True) -> tuple[Stmt, ...] | None:
     """Masked-tile staging: a symbolic / non-divisor matmul wraps its K tower +
     output ``Write`` in a boundary ``Cond(σ(M|N) < bound)``. The cooperative load
     must be hoisted **above** the guard so every thread issues it uniformly (a SYNC
@@ -375,7 +384,7 @@ def _hoist_masked(stmts: tuple[Stmt, ...], staged_bufs, cache_axes, buffers, tma
     inner = tuple(cond.body)
     if not any(isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner") for s in inner):
         return None
-    wrapped = _wrap_k_body(inner, staged_bufs, cache_axes, buffers, tma_bufs=tma_bufs)
+    wrapped = _wrap_k_body(inner, staged_bufs, cache_axes, buffers, tma_bufs=tma_bufs, swizzled=swizzled)
     k_part = tuple(s for s in wrapped if _is_k_stmt(s))
     rest = tuple(s for s in wrapped if not _is_k_stmt(s))
     if not k_part:
@@ -407,10 +416,14 @@ def synthesize_staging(graph: TileGraph) -> Body:
         return block.compute
     staged_bufs = frozenset(e.buffer for e in staged)
     tma_bufs = frozenset(e.buffer for e, t in staged.items() if t is Transport.TMA)
+    # Swizzle the TMA deposit only when the consumer is the warp-tier ``ldmatrix``
+    # (``block.atom``), which reads the slab back with the matching XOR; a scalar
+    # tile reads it with plain affine ``Load``s and needs a linear deposit.
+    swizzled = block.atom is not None
     compute = _drop_size1_registers(block, graph.schedule.binding)
     cache_axes = _cache_axis_names(block, graph.schedule.binding)
     stmts = tuple(compute)
-    hoisted = _hoist_masked(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs)
+    hoisted = _hoist_masked(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs, swizzled=swizzled)
     if hoisted is not None:
         return Body(hoisted)
-    return Body(_wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs))
+    return Body(_wrap_k_body(stmts, staged_bufs, cache_axes, graph.buffers, tma_bufs=tma_bufs, swizzled=swizzled))

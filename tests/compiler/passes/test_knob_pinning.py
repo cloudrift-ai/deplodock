@@ -344,27 +344,34 @@ def test_scalar_matmul_f16(monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-@pytest.mark.xfail(strict=True, reason="scalar-tile TMA transport not yet wired (052_transport is warp-only)")
 def test_article_tma_sgemm_reproduction(monkeypatch):
     """The matmul-optimization blogs' hero kernel is a SCALAR fp32 SGEMM whose staged
     operands ride the **TMA** transport (``cp.async.bulk.tensor.2d`` double buffer) —
     the ``TM=26`` tile (``BM=8 BN=32 FM=26 FN=4 BK=32``) reaching ~106 % of cuBLAS at
-    2048³. ``TMA=1`` on that scalar tile is *allowed* by the knob-pin validator (TMA
-    rides the staging schedule, which the scalar tier has — it is not senseless), but
-    ``052_transport`` only promotes the warp-tier MMA atom today, so the kernel stays on
-    SYNC cooperative loads and emits no ``cp.async.bulk.tensor``. This xfail tracks that
-    gap (TODO in ``052_transport``); wiring scalar-tile TMA flips it to pass. Compile-only
-    (inspects the kernel source). No CUDA needed."""
+    2048³. ``052_transport`` promotes any staged matmul with a ringable K loop, scalar
+    as well as warp-tier; the scalar tier's plain-``Load`` consumer reads an unswizzled
+    (``SwizzleMode.NONE``) deposit (``_slab._make_bundle``, keyed on ``Block.atom``)
+    where the warp tier's ``ldmatrix`` reads a swizzled one. This asserts both that the
+    staged bundles flip to ``StagePolicy.TMA`` and that the lowered kernel emits the
+    ``cp.async.bulk.tensor`` box copy. Tile-level (inspects the staging policy + source).
+    No CUDA needed."""
     from deplodock.compiler.context import Context
     from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+    from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+    from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
     for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
-    res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
-    src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
-    assert "cp.async.bulk.tensor" in src, "scalar-tile TMA transport engaged"
+    res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
+    assert bundles, "the staged scalar tile must synthesize at least one StageBundle"
+    assert any(b.policy is StagePolicy.TMA for b in bundles), "scalar-tile TMA transport engaged"
+
+    g2, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    cuda = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g2, ctx=Context.from_target((12, 0)))
+    src = "\n".join(n.op.kernel_source for n in cuda.nodes.values() if isinstance(n.op, CudaOp))
+    assert "cp.async.bulk.tensor" in src, "scalar-tile TMA box copy emitted"
 
 
 @requires_cuda
@@ -468,11 +475,13 @@ def _build_2d_matmul_graph(dims: dict):
 # per-launch watchdog in ``program.py`` is 1 s and the masked kernels are scalar
 # (SYNC) here, so the small shape keeps comfortably inside it under parallel xdist.
 #
-# Every row is the SCALAR fp32 tier (no MMA atom is eligible for fp32). The transport
-# is plain SYNC cooperative staging — the article's TMA path is a separate xfail
-# (``test_article_tma_sgemm_reproduction``), since ``052_transport`` is warp-only. The
-# dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose passes were removed in the
-# block-DAG rewrite) and the inert scalar-tile ``TMA=1`` pin were dropped here.
+# Every row is the SCALAR fp32 tier (no MMA atom is eligible for fp32). Most rows stage
+# via plain SYNC cooperative loads; the ``*_tma`` rows pin ``TMA=1`` so the staged
+# operands ride the ``cp.async.bulk.tensor`` double-buffer ring (the article's hero
+# transport — ``052_transport`` now promotes the scalar tier, depositing the slab
+# unswizzled for the plain-``Load`` consumer; see ``test_article_tma_sgemm_reproduction``
+# for the tile-level check). The dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose
+# passes were removed in the block-DAG rewrite) were dropped here.
 _SMALL_DIMS = {"M": 512, "K": 512, "N": 512}
 _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
     # BM=8 outside _TUNE_AXIS_CHOICES — the pin must be honored authoritatively.
@@ -497,6 +506,11 @@ _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
     ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
     # Symmetric masked-N: FN=26 FM=4 on 512³ → a 320-col overhang (boundary Cond on N).
     ("fn26_masked_n", _SMALL_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # Scalar-tile TMA: the staged operands ride the cp.async.bulk.tensor ring (unswizzled
+    # deposit, plain-Load consumer). A clean (FM=4 FN=4) tile and the masked-M hero tile
+    # (FM=26 FN=4 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
+    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
+    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
 )
 
 
@@ -519,9 +533,11 @@ def test_masked_tile_accuracy_configs(label: str, dims: dict, knobs: dict, env: 
     the matmul-optimization blog posts. Each row pins a tile that once emitted a
     wrong-output kernel; a failure flags a regression in (a) ``Knob.narrow``
     authoritative pin semantics, (b) the masked-tile (FM=26 / FN=26) ceil-div grid +
-    boundary-Cond codegen, (c) the multi-axis composite-stride staging round-trip, or
-    (d) the ``095_interleave_loads`` opt-out. The transport is plain SYNC staging — the
-    article's TMA SGEMM is tracked separately by ``test_article_tma_sgemm_reproduction``."""
+    boundary-Cond codegen, (c) the multi-axis composite-stride staging round-trip,
+    (d) the ``095_interleave_loads`` opt-out, or (e) the scalar-tile TMA transport
+    (``*_tma`` rows — the unswizzled ``cp.async.bulk.tensor`` deposit + plain-``Load``
+    consumer). ``test_article_tma_sgemm_reproduction`` covers the same TMA tile at the
+    tile/kernel level (no CUDA)."""
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)

@@ -23,9 +23,9 @@ The legality table is value-aware: a knob at its universal / OFF value (``SPLITK
 tier. The staging / transport knobs ``STAGE`` / ``TMA`` are legal only on the **staged**
 tiers (``SCALAR`` / ``WARP``): a cooperative ``MONOID`` reduce and a streaming
 ``TWISTED_MONOID`` flash are smem-free, and a pointwise ``MAP`` nest has no K-tower, so
-neither stages anything. (Scalar-tile ``TMA`` transport is not yet wired — see
-``052_transport`` — but it is not *senseless*, so it stays allowed rather than refused;
-the gap is tracked by an xfail in ``test_knob_pinning.py``.)
+neither stages anything. ``TMA`` is wired on both staged tiers — the warp-tier
+``ldmatrix`` matmul and the scalar register-tiled SGEMM (``052_transport`` promotes any
+staged matmul with a ringable K loop).
 """
 
 from __future__ import annotations
@@ -117,8 +117,8 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         # are smem-free, MAP has no K-tower). A mask with no selected bit is inert.
         return _STAGED if "1" in raw else None
     if name == TMA.name:
-        # TMA transport rides the staging schedule, so it shares STAGE's staged tiers. Only
-        # WARP is wired today (052_transport); scalar-tile TMA is unimplemented, not senseless.
+        # TMA transport rides the staging schedule, so it shares STAGE's staged tiers
+        # (scalar SGEMM + warp matmul — both wired in 052_transport).
         return _STAGED if raw.strip().lower() in {"1", "true", "yes", "on"} else None
     return None
 

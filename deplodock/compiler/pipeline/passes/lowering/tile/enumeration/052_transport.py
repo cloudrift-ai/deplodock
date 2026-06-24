@@ -13,19 +13,24 @@ projection, no tower) and the TMA-eligibility oracle (:func:`tma_eligible` below
 sm_90+, affine box ≤ 256 / 16 B-aligned, a ringable K loop), then writes the chosen
 ``Transport.TMA`` straight into ``Schedule.staged``.
 
-R5 scope: the **warp-tier** ``mma.sync`` matmul (an ``Atom`` is pinned). Greedy stays
-byte-identical to today — the SYNC decision is offered first (option-0), so a cold compile
-keeps SYNC staging; the TMA variant is the second offer the tuner explores (or a
-``DEPLODOCK_TMA=1`` pin selects directly). Scalar / cooperative-reduce / pointwise tiers
-skip here (``RuleSkipped`` → ``apply_off_defaults`` stamps ``TMA=False``).
+Scope: any **staged matmul** with a ringable K loop — the **warp-tier** ``mma.sync`` atom
+*and* the **scalar** register-tiled SGEMM (the matmul-optimization blogs' hero
+``TM=26`` fp32 tile). The two differ only in how the slab is read back: the warp tier's
+``ldmatrix`` consumer reads a hardware-swizzled deposit (B64 / B128), so ``assembly/_slab``
+swizzle-stamps its sources; the scalar tier reads with plain affine ``Load``s, so its
+deposit stays linear (``SwizzleMode.NONE``) — that branch lives in ``_slab._make_bundle``
+(keyed on ``Block.atom``), not here. Greedy stays byte-identical to today — the SYNC
+decision is offered first (option-0), so a cold compile keeps SYNC staging; the TMA variant
+is the second offer the tuner explores (or a ``DEPLODOCK_TMA=1`` pin selects directly).
+Cooperative-reduce / pointwise tiers stage nothing ringable, so they fall out via the empty
+``schedule.staged`` / no-ringable-K-loop guards (``RuleSkipped`` → ``apply_off_defaults``
+stamps ``TMA=False``).
 
 The TMA-eligibility predicate (:func:`tma_eligible`, ported from the deleted legacy
 ``050_use_tma._source_eligible``) reads only the **derived** projections — the prospective
 smem ``Source`` ``assembly/_slab`` would build for each staged read-site (its
 ``AffineAddressing`` + cache-axis box) plus the logical gmem ``Buffer.shape`` — never tower
-shape. The staged operands feed ``ldmatrix`` and the slab is swizzled (B64 / B128); the
-scalar cooperative-reduce / pointwise tiers stay on SYNC staging (their TMA promotion, and
-its fp16-ring-slot alignment decline, rides a later follow-up).
+shape.
 """
 
 from __future__ import annotations
@@ -44,7 +49,6 @@ from deplodock.compiler.ir.tile.ir import (
     Transport,
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import STAGE, TMA
 
