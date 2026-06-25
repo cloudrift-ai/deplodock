@@ -1773,3 +1773,34 @@ def _(s: RegStore, rename, sigma, axis_fn):
         m_guard=_sub_guard(s.m_guard),
         n_guard=_sub_guard(s.n_guard),
     )
+
+
+# --- flash fragment-softmax rewrites ---------------------------------------
+#
+# The online-softmax ops carried INSIDE a streaming-flash ``TileOp`` (so they flow
+# through the kernel passes, not only KernelOp→render). Each routes its SSA names
+# through ``rename`` (the SSA canonicalizer / per-cell replicator); ``rename`` is
+# identity on non-SSA strings, so a literal scale (``"0.25f"``) passes through
+# unchanged while an SSA scalar (``"a0"``) renames.
+
+
+@_rewrite.register
+def _(s: Reassign, rename, sigma, axis_fn):
+    return Reassign(name=rename(s.name), value=rename(s.value))
+
+
+@_rewrite.register
+def _(s: FragmentExp, rename, sigma, axis_fn):
+    return FragmentExp(out=rename(s.out), src=rename(s.src), top_sub=rename(s.top_sub), bot_sub=rename(s.bot_sub))
+
+
+@_rewrite.register
+def _(s: FragmentScale, rename, sigma, axis_fn):
+    return FragmentScale(frag=rename(s.frag), top=rename(s.top), bot=rename(s.bot))
+
+
+@_rewrite.register
+def _(s: FragmentRowReduce, rename, sigma, axis_fn):
+    return FragmentRowReduce(
+        top=rename(s.top), bot=rename(s.bot), frags=tuple(rename(f) for f in s.frags), op=s.op, group=s.group, dtype=s.dtype
+    )

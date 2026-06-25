@@ -1,13 +1,18 @@
-"""The warp-chain assembler — build the fused tensor-core flash as **kernel-IR**
-(``plans/tensor-core-streaming-flash-mma.md`` Phase 2.3 + Phase 3).
+"""The warp-chain assembler — build the fused tensor-core flash as a **TileOp**
+(``plans/tensor-core-streaming-flash-mma.md`` Phase 2.3 + Phase 3, step 2 of the
+"Generalized ``_tower``" migration).
 
-Produces a :class:`KernelOp` (NOT a source string) that the standard
-``cuda/010_lower_kernelop`` renders via ``render_kernelop``: the QK^T / P@V mma + the
-A/V ldmatrix loads fall out of the **same** kernel-IR ops as the warp-tier matmul
-(``MmaSyncPtx`` / ``LdmatrixLoad`` / ``RegStore``), and the fragment online-softmax is
-the ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` ops + the carried
-``m``/``l`` recurrence (``Init`` + ``Reassign``). The validated reference kernel
-(``tests/compiler/e2e/test_flash_tensorcore_reference.py``) is the oracle.
+Produces a :class:`TileOp` (``GridTile > WarpTile > [init] SerialTile [epilogue]``) that
+flows through the **generic kernel passes** (``kernel/005``…``100`` → ``cuda``), NOT a
+KernelOp that bypasses them — so the flash shares the matmul's own lowering chain. The
+QK^T / P@V mma + the A/V ldmatrix loads are the **same** kernel-IR ops as the warp-tier
+matmul (``MmaSyncPtx`` / ``LdmatrixLoad`` / ``RegStore``), and the fragment online-softmax
+is the ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` ops + the carried
+``m``/``l`` recurrence (``Init`` + ``Reassign``) — all now ``rewrite``-registered so they
+survive the SSA-rewriting passes. The validated reference kernel
+(``tests/compiler/e2e/test_flash_tensorcore_reference.py``) is the oracle. (The mma cells
+are still hand-emitted here; the next step routes them through ``005``'s AtomTile
+lowering via the fragment-output / fragment-A cell paths already landed there.)
 
 Geometry: one warp per 16 query rows; Q/K/V/O are addressed as flat ``(B·H·S·D)``
 buffers (gmem-direct mma operands — no smem staging of Q/K/V), the score ``P`` rides an
@@ -31,7 +36,6 @@ from deplodock.compiler.ir.kernel.ir import (
     FragmentExp,
     FragmentRowReduce,
     FragmentScale,
-    KernelOp,
     LdmatrixLoad,
     MmaSyncPtx,
     Reassign,
@@ -42,6 +46,7 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Assign, Init, Mma
+from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, wrap_carry_tower
 
 
@@ -66,10 +71,12 @@ def _mul(a, b: int):
     return _add() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
 
 
-def build_warp_chain_kernelop(
+def build_warp_chain_tileop(
     loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma
-) -> KernelOp:
-    """The fused TC flash kernel-IR for ``(B,H,S,D)`` fp16, non-causal.
+) -> TileOp:
+    """The fused TC flash as a **TileOp** (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
+    for ``(B,H,S,D)`` fp16, non-causal — routed through the generic kernel passes
+    (``kernel/005``…``100`` → ``cuda``), NOT a KernelOp bypassing them.
 
     ``qk`` / ``pv`` are the two cells' atomized ``Mma``s (built by the ``split`` pass via
     the ``atomize`` move — the layering keeps the ``enumeration`` ``atomize`` import out of
@@ -189,18 +196,19 @@ def build_warp_chain_kernelop(
         epilogue=tuple(epilogue),
     )
     body = wrap_carry_tower(carry, warp_axes=(Axis("w", Dim(1)),), grid_axes=(Axis("bh", Dim(B * H)), Axis("qb", Dim(S // 16))))
-    return KernelOp(name=loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}", body=body)
+    name = loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}"
+    return TileOp(body=body, name=name, knobs={})
 
 
 def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma) -> Graph:
-    """Build a single-``KernelOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
-    inputs + one kernel node. Spliced by the engine; the standard cuda lowering renders it.
+    """Build a single-``TileOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
+    inputs + one kernel node. Spliced by the engine; the generic kernel passes lower it.
     ``qk`` / ``pv`` are the cells' atomized ``Mma``s (the ``split`` pass ran the ``atomize``
     move)."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
-    kop = build_warp_chain_kernelop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
+    kop = build_warp_chain_tileop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
 
     g = Graph()
     for nid in (q_id, k_id, v_id):
