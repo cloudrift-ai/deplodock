@@ -26,28 +26,20 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.cuda.ir import CudaOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.kernel.ir import FragmentRowReduce
+from deplodock.compiler.ir.kernel.render import _MMA_SYNC_PRELUDE
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt.base import RenderCtx
 
-_PRELUDE = r"""
-#include <cuda_fp16.h>
-__device__ __forceinline__ void dpl_wc_mma(float* d, const unsigned* a, const unsigned* b, const float* c){
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-    : "=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3])
-    : "r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]), "r"(b[0]),"r"(b[1]),
-      "f"(c[0]),"f"(c[1]),"f"(c[2]),"f"(c[3]));
-}
-__device__ __forceinline__ void dpl_wc_ldm_a(unsigned* r, const __half* sm, int ldm){
-  int lane=threadIdx.x&31; unsigned addr=__cvta_generic_to_shared(sm + (lane%16)*ldm + (lane/16)*8);
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-    :"=r"(r[0]),"=r"(r[1]),"=r"(r[2]),"=r"(r[3]):"r"(addr));
-}
-__device__ __forceinline__ void dpl_wc_ldm_b_trans(unsigned* r, const __half* sm, int ldm){
-  int lane=threadIdx.x&31; unsigned addr=__cvta_generic_to_shared(sm + (lane%16)*ldm);
-  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
-    :"=r"(r[0]),"=r"(r[1]):"r"(addr));
-}
+# Reuse the project's SHARED tensor-core codegen (the exact ``dpl_mma_m16n8k16_*`` /
+# ``dpl_ldmatrix_x4`` / ``dpl_ldmatrix_x2_trans`` helpers ``render_kernelop`` emits for the
+# warp-tier matmul) — the QK^T / P@V mma + the A / V ldmatrix loads fall out of the same
+# ops as the matmul. Only the transposed-B (Q@K^T) native smem pack is bespoke: the shared
+# lib lowers a transposed-B operand gmem-direct (``ir/kernel`` raises on a staged transposed-B
+# ldmatrix), so the smem-staged native pack is the one genuinely-new primitive here.
+_PRELUDE = (
+    "\n#include <cuda_fp16.h>\n"
+    + _MMA_SYNC_PRELUDE
+    + r"""
 __device__ __forceinline__ void dpl_wc_load_b_native(unsigned* r, const __half* sm, int ldm){
   int lane=threadIdx.x&31; int n=lane/4; int kb=(lane%4)*2;
   __half2 h0=__halves2half2(sm[n*ldm+kb+0], sm[n*ldm+kb+1]);
@@ -55,6 +47,7 @@ __device__ __forceinline__ void dpl_wc_load_b_native(unsigned* r, const __half* 
   r[0]=*reinterpret_cast<unsigned*>(&h0); r[1]=*reinterpret_cast<unsigned*>(&h1);
 }
 """
+)
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -78,7 +71,7 @@ def warp_chain_kernel_source(kname: str, *, B: int, H: int, S: int, D: int, scal
     rowmax = _reduce_lines("r0", "r1", ("Sf[0]", "Sf[1]"), "maximum", ctx)
     rowsum = _reduce_lines("s0", "s1", ("Pf[0]", "Pf[1]"), "add", ctx)
 
-    qa_load = "\n".join(f"    dpl_wc_ldm_a(qa[{t}], qs + {t * 16}, {D});" for t in range(kt))
+    qa_load = "\n".join(f"    dpl_ldmatrix_x4(qa[{t}], &qs[(lane%16)*{D} + (lane/16)*8 + {t * 16}]);" for t in range(kt))
     of_decl = ", ".join(["{0,0,0,0}"] * nd)
     # QK^T: 2 N-atoms (kv 0-7 / 8-15), accumulate over kt K-tiles.
     qk = []
@@ -87,7 +80,7 @@ def warp_chain_kernel_source(kname: str, *, B: int, H: int, S: int, D: int, scal
         for t in range(kt):
             off = nt * 8 * D + t * 16
             qk.append(f"        {{ unsigned kb[2]; dpl_wc_load_b_native(kb, ks + {off}, {D});")
-            qk.append(f"          dpl_wc_mma(acc, qa[{t}], kb, acc); }}")
+            qk.append(f"          dpl_mma_m16n8k16_f16(acc, qa[{t}], kb, acc); }}")
         qk.append(f"        for(int e=0;e<4;e++) Sf[{nt}][e]=acc[e]*{scale!r}f; }}")
     qk_body = "\n".join(qk)
     # P (exp(S - m)) per N-atom + rowsum partials.
@@ -104,7 +97,8 @@ def warp_chain_kernel_source(kname: str, *, B: int, H: int, S: int, D: int, scal
         for nt in range(2)
     )
     pv = "\n".join(
-        f"      {{ unsigned vb[2]; dpl_wc_ldm_b_trans(vb, vs + {n * 8}, {D});\n        dpl_wc_mma(Of[{n}], pa, vb, Of[{n}]); }}"
+        f"      {{ unsigned vb[2]; dpl_ldmatrix_x2_trans(vb, &vs[(lane%16)*{D} + {n * 8}]);\n"
+        f"        dpl_mma_m16n8k16_f16(Of[{n}], pa, vb, Of[{n}]); }}"
         for n in range(nd)
     )
     store = "\n".join(
@@ -141,7 +135,7 @@ extern "C" __global__ void {kname}(const __half* Q,const __half* K,const __half*
 {rescale}
 {p_store}
     __syncwarp();
-    unsigned pa[4]; dpl_wc_ldm_a(pa, ps, 16);
+    unsigned pa[4]; dpl_ldmatrix_x4(pa, &ps[(lane%16)*16 + (lane/16)*8]);
 {pv}
     m0=mn0; m1=mn1;
   }}

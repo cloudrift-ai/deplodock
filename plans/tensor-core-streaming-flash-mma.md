@@ -334,10 +334,18 @@ single `mma.sync` kernel that matches torch end-to-end (`max_diff ≈ 5e-4`, fp1
 over the shape, reusing the `FragmentRowReduce` op for the fragment softmax and the atom-layer's two cells (QK^T
 fragment-output + P@V fragment-`A`). The default path (no `CHAIN` pin) is byte-unchanged — this only fires under the
 explicit opt-in. **v1 scope:** fp16, non-causal, equal-head, `D%16==0`, `S%16==0`; out of scope falls back to the scalar
-chain / materialized path. **Caveat:** `_warp_chain` is a direct **source emit** (a `CudaOp` spliced in pre-build), not
-yet routed through the generic IR assembly — the pragmatic v1 that gets a real tensor-core flash deploying; folding it
-into the algebraic moveset (so it falls out of the moves like the matmul) is the architectural follow-up, alongside
-masking / GQA / symbolic-`seq_len` / the warp-tower geometry forks.
+chain / materialized path.
+
+**Toward the algebraic moveset (in progress).** The generated kernel's tensor-core primitives now reuse the project's
+**shared** codegen — `dpl_mma_m16n8k16_f16` + `dpl_ldmatrix_x4` / `dpl_ldmatrix_x2_trans` (the exact helpers
+`render_kernelop` emits for the warp-tier matmul) — so the QK^T / P@V mma + the A/V ldmatrix loads genuinely fall out of
+the *same ops as the matmul*, not bespoke asm. The one bespoke primitive left is the smem-staged transposed-B (Q@K^T)
+native pack (the shared lib lowers a transposed-B operand gmem-direct, raising on a staged ldmatrix — a real gap).
+**Caveat — still impure:** `_warp_chain` is a direct **source emit** (a `CudaOp` spliced pre-build by the
+`005_warp_chain` *recognizer*), so the kernel STRUCTURE is hand-built, not produced by `chain_build` + the `atomize`
+move + the generic assembly. Folding the structure into the moveset (the warp-tower geometry + `atomize` composing the
+two cells through the assembly, the carrier lowered not templated) is the large remaining refactor, alongside masking /
+GQA / symbolic-`seq_len` / the warp-tower geometry forks.
 
 **Warp-chain codegen — started (the kernel-IR primitive).** The first codegen primitive is built + GPU-validated:
 `ir/kernel/ir.py::FragmentRowReduce` emits the fragment `rowmax`/`rowsum` over the `m16n8` C-fragment's N lanes (the

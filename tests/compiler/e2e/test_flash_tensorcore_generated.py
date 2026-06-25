@@ -47,7 +47,8 @@ def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
     backend, compiled, graph, kernels = _compile(q, k, v)
     assert len(kernels) == 1, f"fused TC flash should be one kernel, got {len(kernels)}"
     src = compiled.nodes[kernels[0]].op.kernel_source
-    assert "mma.sync" in src and "dpl_wc_mma" in src, "the generated kernel must use the tensor-core warp-chain"
+    # The TC primitives are the project's SHARED codegen helpers (the same the matmul emits).
+    assert "dpl_mma_m16n8k16_f16" in src and "dpl_ldmatrix_x4" in src, "the generated kernel must use the shared tensor-core ops"
 
     def ref():
         with torch.no_grad():
@@ -69,4 +70,5 @@ def test_default_path_is_not_the_warp_chain(monkeypatch):
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 32, 16, dtype=torch.float16) for _ in range(3))
     _backend, compiled, _graph, kernels = _compile(q, k, v)
-    assert not any("dpl_wc_mma" in compiled.nodes[k].op.kernel_source for k in kernels), "default must not be the warp-chain"
+    # ``dpl_wc_load_b_native`` (the transposed-B native pack) is unique to the warp-chain kernel.
+    assert not any("dpl_wc_load_b_native" in compiled.nodes[k].op.kernel_source for k in kernels), "default must not be the warp-chain"
