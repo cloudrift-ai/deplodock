@@ -2,16 +2,40 @@
 
 > Post-merge investigation of `deplodock serve --generate` / the per-layer `DeplodockGenRunner` decode latency on
 > **TinyLlama-1.1B-Chat** (22 layers), RTX 4080, fp16. Measure-first: we profiled before optimizing, which redirected
-> the work away from two ~1% "fixes" and onto the real ~50× lever. Companion to
+> the work away from two ~1% "fixes" and onto the real decode lever (the ~63× kernel). Companion to
 > [`generative-inference-support.md`](generative-inference-support.md).
 
 ## TL;DR
 
 The generative decode bottleneck is **one kernel** — the symbolic-`num_tokens` matmul tiled for the hint (512) is
 pathological at decode (M=1): it computes a full 512-row masked tile when only 1 row is real. A **static small-M
-(bucket) program** for the per-layer kernels recovers ~32× (validated: static M=8 post = 0.29 ms vs symbolic-at-1 =
-9.5 ms vs cuBLAS = 0.14 ms). The fix is a decode-specialized program in the runner — not the device interleave, not
-captured-graph replay, not generic autotuning.
+(bucket) program** for the per-layer kernels recovers it: at the **shipped bucket (M=16)** the post drops from
+**9.43 ms → 0.53 ms (~17.7×, ≈3.6× cuBLAS)**; an M=8 spot-check probes the floor at 0.29 ms (≈2× cuBLAS). The
+9.43 ms → 0.53 ms/layer recovery is what turns the ~221 ms decode step into ~22 ms — the realized **~10× / ~46 tok/s**
+(matching the merged ~11× / ~50 tok/s). The fix is a decode-specialized program in the runner — not the device
+interleave, not captured-graph replay, not generic autotuning. All times below are CUDA-graph-captured pure-GPU
+measurements; see **Methodology**.
+
+## Methodology
+
+How every latency here was produced — so the numbers are reproducible, not anecdotal:
+
+- **Hardware / model:** RTX 4080 (16 GB, driver 595.71.05), fp16, TinyLlama-1.1B-Chat layer 0's carved `post` subgraph
+  (`build_attention_split_wrapper` → o_proj + residual + post-norm + gated MLP).
+- **deplodock rows:** the committed `CompiledProgram` capture path — `capture_program_graph()` (one CUDA graph over
+  every launch at the bound shape) then `time_program_window(N)` (one CUDA-event window around N back-to-back replays,
+  divided to per-replay ms). This is the same pure-GPU, dispatch-free measurement `run --bench` / `tune --bench` use, so
+  the deplodock numbers are deployable, not dispatch-inflated. The `pre` / `post` programs are built by the exact
+  `_compile_split` calls `DeplodockGenRunner.from_model` makes (symbolic = `argnames` set; static decode-bucket =
+  `argnames=None`).
+- **cuBLAS row:** the same `post` module in torch eager on CUDA, timed with `torch.cuda.Event` over the same window
+  after warmup. Labeled "cuBLAS" because the post is matmul-dominated (four linears).
+- **Knobs:** WARMUP=50 untimed, WINDOW=200 replays/window, WINDOWS=30, report the **median** per-replay time; seed=0;
+  single stream, no concurrent load.
+- **Reproduce:** `python scripts/bench_gen_post.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` (the committed
+  layer-0 reproducer; `--bucket 8` reproduces the spot-check floor, `--layer N` another layer).
+- **Caveat:** point measurements from a focused layer-0 reproducer. Run-to-run drift is a few %; the cross-step ratios
+  (≈63× before, ≈3.6× after) are stable and reconcile with the realized ~10×.
 
 ## The measurement chain
 
@@ -53,7 +77,7 @@ captured-graph replay, not generic autotuning.
 |---|---|
 | symbolic (hint 512), run at M=1 | 9.29 ms |
 | **static M=1** | **fails to compile** — `add` left as `LoopOp` (the M=1 *demoted-matmul* cold-lowering gap, same as the Phase-0 lm_head) |
-| **static M=8** | **0.288 ms** (×32 faster; ~2× cuBLAS) |
+| **static M=8** | **0.288 ms** (spot-check floor; ×32 vs symbolic, ~2× cuBLAS — the **shipped** bucket is M=16, ~3.6×; see "Measured impact" below) |
 
 The symbolic kernel tiles the `num_tokens` axis as **one masked tile sized to `DEFAULT_SEQ_HINT=512`**. At decode it
 still computes the full 512-row tile (~64× wasted work; 9.29 / 0.16 ≈ 512 / 8). The `pre` kernels are *also* symbolic-M
@@ -74,7 +98,21 @@ Why a bucket and not static M=1: static M=1 hits the demoted-matmul cold-lowerin
 static M that lowers (≥ ~8). 16 covers single-stream and small-batch decode; larger concurrent batches fall back to
 symbolic until multi-bucket / per-`Dim` hints land.
 
-**Projected impact:** post 9.5 ms → ~0.3 ms/layer ⇒ decode step ~221 ms → ~7–10 ms ≈ **~100–140 tok/s** (from ~4.5).
+**Measured impact (shipped bucket M=16, captured pure-GPU, RTX 4080):**
+
+| post @ decode | ms | vs cuBLAS |
+|---|---|---|
+| deplodock symbolic (hint 512) @ M=1 (before) | 9.429 | 63× |
+| **deplodock static decode-bucket M=16 (shipped)** | **0.532** | **3.6×** |
+| torch eager (cuBLAS) @ M=16 | 0.150 | 1× |
+
+So the deployed post is **9.43 → 0.53 ms/layer (~17.7×)**, ~3.6× cuBLAS — not the ~2× the M=8 spot-check (0.288 ms,
+above) suggested. The bucket runs all 16 rows even for a single real decode token, and cuBLAS is latency-flat at this M,
+so doubling the bucket (8→16) roughly doubles deplodock's time while cuBLAS barely moves — that 8→16 gap is the whole
+difference between "~2× cuBLAS" and "~3.6× cuBLAS". End-to-end this lands the decode step at **22 × 0.53 + pre 7.1 +
+host 2.9 ≈ 22 ms ⇒ ~46 tok/s** — the realized **~10×** over the ~4.5 tok/s baseline, matching the merged ~11× / ~50
+tok/s (the earlier "~100–140 tok/s" projection over-extrapolated from the M=8 floor; the shipped M=16 is the real
+number).
 
 ## Ruled out / deferred
 
