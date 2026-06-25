@@ -327,6 +327,15 @@ once and is the **executable spec** the warp-chain codegen must generate:
 Remaining: emit this from the compiler (the warp-chain build wiring the two `Mma`s + the fragment-softmax codegen + the
 smem C→A), gated under `CHAIN=1` + an atom pin, then validate the generated kernel against this reference.
 
+**Warp-chain codegen — started.** The first codegen primitive is built + GPU-validated:
+`ir/kernel/ir.py::FragmentRowReduce` emits the fragment `rowmax`/`rowsum` over the `m16n8` C-fragment's N lanes (the
+in-lane col-pair combine across N-atoms +
+the `__shfl_xor` butterfly over the 4-lane col group), rendering the exact validated pattern. `rowmax` AND `rowsum` match
+numpy on hardware (`tests/compiler/passes/test_fragment_row_reduce.py`). This is the hardest Phase-3 piece, now a real
+kernel-IR op the warp-chain build will emit. Next codegen bricks: the per-row `m`/`l`/`α` online update + `exp(S−m)` in
+fragment-distributed form, the smem C→A handoff op, then the `chain_warp_build` move wiring the two `Mma`s + these ops
+into the warp tower, lowered to match the reference kernel.
+
 Open 1c follow-ups feeding in (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV (`BR>1`)
 under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the P@V output
 is the inner free axis.

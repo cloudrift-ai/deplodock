@@ -584,6 +584,67 @@ class MonoidWarpShuffle(Stmt):
 
 
 @dataclass(frozen=True)
+class FragmentRowReduce(Stmt):
+    """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
+    flash fragment-softmax ``rowmax`` / ``rowsum`` (Phase 3 of
+    ``plans/tensor-core-streaming-flash-mma.md``, validated in
+    ``tests/compiler/e2e/test_flash_tensorcore_reference.py``).
+
+    Each lane of an ``m16n8`` C-fragment owns 4 f32 elements: rows ``g`` / ``g+8``
+    (``g = lane/4``), cols ``(lane%4)*2 + {0,1}``. A ``BN``-wide score tile is
+    ``len(frags)`` such fragments (one per N-atom). Reducing over N (the kv columns)
+    is: combine each fragment's in-lane col pair (``frag[0]∘frag[1]`` for row ``g``,
+    ``frag[2]∘frag[3]`` for row ``g+8``) across all N-atoms, then a ``__shfl_xor``
+    butterfly over the ``group``-lane column set (``group=4`` for ``m16n8`` — lanes
+    differing in ``lane%4`` hold the 8 distinct cols of a row). After the butterfly
+    every lane in a column group holds the full per-row reduction, so the two outputs
+    ``top`` (rows ``g``) / ``bot`` (rows ``g+8``) are correct on every lane — the
+    fragment-distributed (2 rows/lane) form the online-softmax stats need.
+
+    Distinct from :class:`MonoidWarpShuffle` (which reduces a whole per-thread state
+    over a cooperative-K lane set): this reduces *within* one warp's C-fragment over
+    the atom's N direction, keyed on the PTX C-layout."""
+
+    top: str  # the per-row reduction for rows g (broadcast across the column group)
+    bot: str  # the per-row reduction for rows g+8
+    frags: tuple[str, ...]  # the C-fragment arrays (float[4] each), one per N-atom of the BN tile
+    op: ElementwiseImpl  # the reduce op (maximum for rowmax, add for rowsum)
+    group: int = 4  # column-group lane span (m16n8: 4 lanes hold a row's 8 cols)
+    dtype: DataType = F32
+
+    def deps(self) -> tuple[str, ...]:
+        return self.frags
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.top, self.bot)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentRowReduce({self.top}, {self.bot} <- {', '.join(self.frags)}, op={self.op.name})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        f32 = ctx.type_name("f32")
+
+        def combine(parts: list[str]) -> str:
+            e = parts[0]
+            for p in parts[1:]:
+                e = _binary_combine_expr(self.op, e, p, ctx.target, "f32")
+            return e
+
+        top_parts = [f"{f}[{i}]" for f in self.frags for i in (0, 1)]
+        bot_parts = [f"{f}[{i}]" for f in self.frags for i in (2, 3)]
+        out = [f"{pad}{f32} {self.top} = {combine(top_parts)};", f"{pad}{f32} {self.bot} = {combine(bot_parts)};"]
+        ctx.ssa_dtypes[self.top] = ctx.ssa_dtypes[self.bot] = "f32"
+        s = int(self.group) // 2
+        while s > 0:
+            for nm in (self.top, self.bot):
+                shfl = f"__shfl_xor_sync(0xffffffff, {nm}, {s})"
+                out.append(f"{pad}{nm} = {_binary_combine_expr(self.op, nm, shfl, ctx.target, 'f32')};")
+            s >>= 1
+        return out
+
+
+@dataclass(frozen=True)
 class MonoidTreeHalve(Stmt):
     """Cross-thread combine of a multi-component monoid state over ``length``
     threads via a power-of-two smem tree (the >warp_size fallback for
