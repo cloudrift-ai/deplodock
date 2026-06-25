@@ -66,6 +66,26 @@ def test_transposed_b_cell_sets_b_trans():
     assert mma.b_trans is True
 
 
+def test_fragment_output_cell_uses_explicit_out_index():
+    """The Phase-2 flash QK^T cell: a transposed-B Q@K^T whose result is an INLINE
+    register fragment (the score), so there is NO ``Write`` to read the M / N coords
+    from. ``out_index`` supplies them explicitly (M = query, N = kv), and the cell
+    fuses to ``Mma(c=acc, a=Q, b=K, b_trans=True)`` exactly as the Write-driven path."""
+    # Q[m, dd] @ K[kv, dd]^T -> score[m, kv]; the reduce is dd, both operands carry it last.
+    cell = (
+        Load(name="q_v", input="q", index=(Var("m"), Var("dd"))),
+        Load(name="k_v", input="k", index=(Var("kv"), Var("dd"))),
+        Assign(name="qk", op=ElementwiseImpl("multiply"), args=("q_v", "k_v")),
+        Accum(name="acc", value="qk"),
+    )
+    out = atomize_cell(cell, atom=_ATOM, k_name="dd", write=None, out_index=(Var("m"), Var("kv")))
+    mma = _only_mma(out)
+    assert (mma.c, mma.a, mma.b) == ("acc", "q_v", "k_v")
+    assert mma.b_trans is True
+    # Without the coords the transposed-B cell can't disambiguate A from B — no fuse.
+    assert not any(isinstance(s, Mma) for s in atomize_cell(cell, atom=_ATOM, k_name="dd", write=None))
+
+
 def test_walks_serial_tile_reduce_tower_to_cell():
     """Called with ``k_name=None`` (as ``warp_build`` does), the move recurses
     through a ``SerialTile`` reduce tower and reads the K name off the reduce axis."""

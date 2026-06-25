@@ -212,32 +212,46 @@ def eligible_atoms(dag: IterDag, *, compute_capability: tuple[int, int], dtype_o
 # contractions). The free-axis geometry + gmem I/O stay in ``_build.warp_build``.
 
 
-def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...]:
+def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None) -> tuple[Stmt, ...]:
     """The ``atomize`` body edit: fuse the canonical matmul cell
     ``[Load a, Load b, Assign(mul), Accum]`` into ``[Load a*, Load b*, Mma]`` (the
     operand ``Load``s kept plain, the ``Mma`` naming its A/B by SSA value +
     carrying the ``atom`` spec). Walks the K tower (``SerialTile(reduce)``) to the
     cell; ``Block.atom`` then derives from the emitted ``Mma``. The unit a Phase-2
     MONOID nest can call directly on its inner contractions — agnostic to operand
-    provenance (gmem ``Load`` or a register / smem fragment)."""
+    provenance (gmem ``Load`` or a register / smem fragment).
+
+    ``out_index`` supplies the output ``(M, N)`` coordinates explicitly, for a cell
+    whose result is an **INLINE register fragment** with no ``Write`` (the Phase-2 flash
+    QK^T, whose score never reaches gmem). It overrides the ``Write``-derived coords the
+    transposed-B A/B disambiguation reads; ``None`` keeps the legacy ``Write``-driven
+    behavior (a matmul cell that does write its output)."""
     write = next((s for s in body if isinstance(s, Write)), write)
-    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write)
+    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write, out_index=out_index)
     if tagged is not None:
         return tagged
     out: list[Stmt] = []
     for s in body:
         if isinstance(s, SerialTile) and s.is_reduce:
-            out.append(s.with_bodies((Body(atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write)),)))
+            out.append(s.with_bodies((Body(atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write, out_index=out_index)),)))
         elif s.nested():
-            out.append(s.with_bodies(tuple(Body(atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write)) for sub in s.nested())))
+            out.append(
+                s.with_bodies(
+                    tuple(Body(atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write, out_index=out_index)) for sub in s.nested())
+                )
+            )
         else:
             out.append(s)
     return tuple(out)
 
 
-def _try_atomize_here(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...] | None:
+def _try_atomize_here(
+    body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None
+) -> tuple[Stmt, ...] | None:
     """If ``body`` is the canonical matmul cell, return ``[*rest, Load a, Load b,
-    Mma]``; else ``None``."""
+    Mma]``; else ``None``. ``out_index`` (explicit output ``(M, N)`` coords) takes
+    precedence over the ``Write``-derived coords — the fragment-output (no-``Write``)
+    Phase-2 QK^T path."""
     loads = [s for s in body if isinstance(s, Load)]
     assigns = [s for s in body if isinstance(s, Assign)]
     accums = [s for s in body if isinstance(s, Accum)]
@@ -246,7 +260,8 @@ def _try_atomize_here(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None,
     mul, accum = assigns[0], accums[0]
     if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
         return None
-    out_index = write.index if (write is not None and write.index) else None
+    if out_index is None:
+        out_index = write.index if (write is not None and write.index) else None
     a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index) if k_name is not None else (None, None)
     if a_load is None or b_load is None:
         return None

@@ -277,13 +277,32 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   Phase 6). Matches torch end-to-end (`max_diff ≈ 5e-7`) across static non-causal / causal / GQA / additive-mask SDPA
   (`tests/compiler/e2e/test_flash_attention.py::test_flash_chain_*`); structural tests in `test_contraction_chain.py`.
   Symbolic-`seq_len` + cooperative-KV (`BR>1`) under the chain form, and the search-fork, are follow-ups.
-- **Next: Phase 2 — `atomize` over the two cells.** The chain restructuring (1c) emits the two SEMIRING cells (the inner
-  QK^T producing the `INLINE` score fragment + the register-tiled P@V accumulation `O[BM,D]`); Phase 2 composes
-  `_atom.atomize_cell` on each — the `OptionFork` shape of `020_tensorize`, on the MONOID pass over the coupled geometry,
-  reusing the `Mma` op + `kernel/005` codegen verbatim. The genuinely new constraints (the Phase-2 reuse boundary): two
-  cells per body, register-fragment operand provenance (the score fragment feeds the P@V `A` operand — `atomize_cell` is
-  already provenance-agnostic), and ONE joint `WM/WN/FM/FN` geometry propagated across both cells rather than enumerated
-  independently. Then Phase 3 (the fragment-layout softmax + the C→A handoff as the edge placement) and the dtype /
-  masking / fork-integration phases. Open 1c follow-ups feeding in: symbolic-`seq_len` masked streaming + cooperative-KV
-  (`BR>1`) under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the
-  P@V output is the inner free axis.
+### Phase 2 — `atomize` composes over the two cells (in progress)
+
+The chain restructuring (1c) emits the two SEMIRING cells — the inner QK^T producing the `INLINE` score fragment + the
+register-tiled P@V accumulation `O[BM,D]`. Phase 2 composes `_atom.atomize_cell` on each (the `OptionFork` shape of
+`020_tensorize`, reusing the `Mma` op + `kernel/005` codegen).
+
+- **2.1 — QK^T fragment-output atomization — done, green.** `atomize_cell` gained an `out_index` param so a cell whose
+  result is an INLINE register fragment with **no `Write`** (the flash QK^T score) can supply its `(M=query, N=kv)` coords
+  explicitly; the transposed-B Q@K^T then fuses to `Mma(c=score, a=Q, b=K, b_trans=True)` reducing `dd`. Unit-tested
+  (`tests/compiler/passes/test_atomize_cell.py::test_fragment_output_cell_uses_explicit_out_index`). The first reuse
+  boundary the test file's note anticipated; the warp-chain-build (below) calls it.
+
+The remaining Phase 2 work is coupled and needs a **warp-tiled chain build** (the geometry `chain_build` doesn't yet
+set):
+
+- **2.2 — P@V fragment-`A` atomization.** `Mma(c=O, a=P, b=V)` reducing the KV tile: the score-derived probability `P`
+  is the `A` operand **in registers** (no `Load`), so `atomize_cell` needs a fragment-`A` path (today it requires two
+  `Load`s) + the `A` fragment's logical `(M, K)` coords supplied (like 2.1's `out_index`, for `A`), and the carrier's
+  `O = O·α + p·v` must split into a separate rescale (`O *= α`) + a clean `Accum` (`O += p·v`) so the cell is canonical.
+- **2.3 — joint geometry.** ONE coupled `WM/WN/FM/FN` propagated across both cells (QK^T's `N`-fragment layout = the
+  softmax row-reduction = P@V's `A`-operand layout), needs `BN ≥ atom_k` (the score `[BM,BN]` tile, where 1c is `BN=1`)
+  and `D % atom_k == 0`.
+- These are **not runnable without Phase 3** (the fragment-layout softmax `__shfl_xor` row reduction + the C→A handoff
+  as the edge placement). The plan's "minimum working tensor-core flash = Phase 1 + 2 + 3" holds: 2.2/2.3 build the
+  structure, Phase 3 makes it execute, validated end-to-end then.
+
+Open 1c follow-ups feeding in (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV (`BR>1`)
+under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the P@V output
+is the inner free axis.
