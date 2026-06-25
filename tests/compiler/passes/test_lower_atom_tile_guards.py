@@ -238,3 +238,37 @@ def test_fragment_output_cell_lowers_without_a_store():
     kinds = [type(s) for s in out.iter()]
     assert MmaSyncPtx in kinds and RegFragment in kinds and LdmatrixLoad in kinds
     assert RegStore not in kinds, "a fragment-output cell must not store its result"
+
+
+def test_fragment_a_pv_cell_lowers_b_only_into_carried_accumulator():
+    """The flash **P@V** cell: ``O += P · V`` where ``A = P`` is a pre-existing register
+    fragment (no ``Load`` — the C→A handoff) and ``C = O`` is a carried accumulator. The
+    shared lowering emits only ``ldmatrix B + mma`` into the LIVE ``P`` / ``O`` fragments:
+    no ``RegFragment`` decl for A or C (they exist already), no A ``LdmatrixLoad``, no
+    ``RegStore`` (O accumulates across the kv stream, stored in the epilogue outside the
+    cell). Only the B operand is declared + loaded — the kernel-side of Phase 2.2."""
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
+    from deplodock.compiler.ir.stmt import Mma
+    from deplodock.compiler.ir.tile.ir import AtomTile
+
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    # P@V: A = P (live fragment, no Load), B = V (loaded), C = O (carried).
+    cell = (
+        Load(name="vv", input="V", index=(Var("kv"), Var("d"))),
+        Mma(c="O", a="p_frag", b="vv", atom=atom, b_trans=False),
+    )
+    at = AtomTile(axes=(Axis("m", Dim(16)), Axis("n", Dim(8))), body=Body(cell), atom=atom)
+    out, found = _mod.lower_atom_cells(Body((at,)), smem_sources={})
+    assert found
+    stmts = list(out.iter())
+    mmas = [s for s in stmts if isinstance(s, MmaSyncPtx)]
+    assert len(mmas) == 1 and mmas[0].c_frag == "O" and mmas[0].a_frag == "p_frag"
+    # Only the B operand is loaded — A is the live register fragment.
+    lds = [s for s in stmts if isinstance(s, LdmatrixLoad)]
+    assert len(lds) == 1 and lds[0].role == "b"
+    # No decl for the live A (P) / carried C (O) — only the B fragment is declared.
+    frags = {s.name for s in stmts if isinstance(s, RegFragment)}
+    assert "O" not in frags and "p_frag" not in frags and frags, "only B is declared"
+    assert RegStore not in [type(s) for s in stmts], "O is carried — stored in the epilogue, not the cell"

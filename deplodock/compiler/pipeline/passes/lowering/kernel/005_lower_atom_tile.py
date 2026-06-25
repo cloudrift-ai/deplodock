@@ -265,6 +265,29 @@ def _lower_cell(
     # via ``gmem_guard``, staged loads read the in-bounds slab, and the store
     # carries the per-element guards. The Cond was only a whole-tile skip.
     a_load, b_load, b_trans = _find_role_loads(atom_body)
+    # Fragment-A cell (the flash P@V C→A handoff): the A operand is a pre-existing register
+    # fragment (the softmax-derived ``P`` — no Load, named by the Mma's ``a`` SSA) and the C
+    # accumulator is carried from an enclosing ``init`` (the streaming ``O``). Neither is
+    # declared/reset here — only B is loaded; the mma accumulates into the live C using the
+    # live A. (The atom layer marks this shape with ``frag_a`` — ``_atom.atomize_cell``; here
+    # the signal is simply that the Mma's A operand has no co-located Load.)
+    if a_load is None and b_load is not None:
+        b_frag = f"{b_seed}_frag"
+        decl_b = RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtype("b"))
+        chain = _emit_chain(
+            spec,
+            a_load=None,
+            b_load=b_load,
+            a_frag=a_seed,
+            b_frag=b_frag,
+            c_frag=c_seed,
+            smem_sources=bundle_sources,
+            m_guard=m_guard,
+            n_guard=n_guard,
+            b_trans=b_trans,
+            graph=graph,
+        )
+        return (decl_b, *chain)
     if a_load is None or b_load is None:
         raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
     chain = _emit_chain(
@@ -572,7 +595,7 @@ def _masked_k_zero(load: Load, src_index: tuple, role: str, graph: Graph | None)
 def _emit_chain(
     spec: Atom,
     *,
-    a_load: Load,
+    a_load: Load | None,
     b_load: Load,
     a_frag: str,
     b_frag: str,
@@ -583,9 +606,39 @@ def _emit_chain(
     b_trans: bool = False,
     graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
-    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
-    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
+    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step.
+
+    ``a_load`` is ``None`` for a **fragment-A** cell (the flash P@V C→A handoff): the A
+    operand is a pre-existing live register fragment (``a_frag``, the softmax-derived ``P``),
+    so no ``ldmatrix`` loads it — the chain is just ``ldmatrix b + mma`` accumulating into
+    the live C fragment. Everything A-side (staging / masked-K / guard) is skipped."""
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
+    if a_load is None:
+        # Fragment-A: B-only load + mma into the live A / C fragments.
+        b_staged = b_load.input in smem_sources
+        b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
+        if not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph):
+            from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+            raise LoweringError("masked-K (symbolic reduce) fragment-A mma operand can't lower gmem-direct — needs staging")
+        b_guard = n_guard if (n_guard is not None and not b_staged) else None
+        b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
+        return (
+            LdmatrixLoad(
+                frag=b_frag,
+                src_buffer=b_load.input,
+                src_index=b_src_index,
+                role="b",
+                ldm=b_ldm,
+                swizzle=b_swz,
+                staged=b_staged,
+                gmem_guard=b_guard,
+                b_trans=b_trans,
+                k_zero=b_kz,
+            ),
+            MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
+        )
+    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
     # ldmatrix is smem→register only, so each operand's transport depends on
     # whether an enclosing StageBundle staged it. Staged → ldmatrix (with the
     # Source's TMA swizzle); unstaged → a gmem-direct fragment load (the staging
