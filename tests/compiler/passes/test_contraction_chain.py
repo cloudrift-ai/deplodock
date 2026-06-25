@@ -25,7 +25,10 @@ from deplodock.compiler.ir.stmt import Load, Monoid
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import legal_decomps
 
 
 def _flash_loop(*, causal: bool = False, group: int = 1) -> LoopOp:
@@ -95,15 +98,68 @@ def test_causal_chain_still_exposes_the_chain():
     assert chain.inner.algebra is AlgebraKind.SEMIRING
 
 
-def test_plain_reduce_has_no_chain():
-    """A flat (non-streaming) reduce is not a chain — ``chain`` is ``None`` there,
-    so the view stays specific to the carried-contraction shape."""
+def _reduce_loop() -> LoopOp:
+    """A flat (non-streaming) ``sum``-reduce ``LoopOp`` — the MONOID counterpoint to
+    the streaming flash, for the ``chain is None`` / ``inner_algebra is None`` cases."""
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 64)), node_id="x")
     g.add_node(ReduceOp(op="sum", axis=-1), ["x"], Tensor("o", (4, 1)), node_id="o")
     g.inputs, g.outputs = ["x"], ["o"]
     out = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((12, 0)))
-    lo = next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
-    dag = iter_dag(lo)
+    return next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
+
+
+def test_plain_reduce_has_no_chain():
+    """A flat (non-streaming) reduce is not a chain — ``chain`` is ``None`` there,
+    so the view stays specific to the carried-contraction shape."""
+    dag = iter_dag(_reduce_loop())
     assert not dag.streaming
     assert dag.chain is None
+
+
+# --- 1b: classify recognizes MONOID(SEMIRING) -------------------------------------
+
+
+def test_classify_streaming_is_compositional():
+    """A streaming flash classifies as the compositional algebra ``MONOID(SEMIRING)``:
+    the outer carrier is MONOID, the embedded P@V on the hinge is SEMIRING. Both the
+    hinge and the inner QK^T axis are reduce targets."""
+    dag = iter_dag(_flash_loop())
+    regime = classify(dag)
+    assert regime is not None
+    assert regime.algebra is AlgebraKind.MONOID
+    assert regime.inner_algebra is AlgebraKind.SEMIRING
+    # Both contraction axes (the hinge kv stream + the inner QK^T reduce) are rewritten.
+    assert {dag.chain.hinge_name, dag.chain.inner_name} <= regime.target_names
+
+
+def test_classify_flat_monoid_is_not_compositional():
+    """A flat MONOID reduce has no embedded contraction — ``inner_algebra is None``,
+    so the compositional reading stays specific to the twisted (streaming) carrier."""
+    regime = classify(iter_dag(_reduce_loop()))
+    assert regime is not None
+    assert regime.algebra is AlgebraKind.MONOID
+    assert regime.inner_algebra is None
+
+
+def test_legal_decomps_splits_the_hinge_under_both_traits():
+    """The hinge ``kv`` split is licensed BOTH ways by the twisted carrier's traits:
+    associativity (the carrier reduce → a serial / register re-bracket) and
+    commutativity (the embedded P@V reduce → a THREAD partition, whose additive
+    recombine is the Monoid's ``combine_states``). One ``Monoid`` carrier carries both,
+    which is exactly why the shared-axis tiling (1c) is sound."""
+    dag = iter_dag(_flash_loop())
+    chain = dag.chain
+    carrier, kv, ext = chain.carrier, chain.hinge.loop.axis, chain.hinge.extent
+    bn = 4
+    placement = [Role.THREAD, Role.STAGE_INNER, Role.REGISTER]
+
+    # Associative trait (the streaming carrier reduce): a serial BN re-bracket of kv
+    # (no partition — factor[0] == 1) is licensed.
+    serial = legal_decomps(carrier, kv, ext, factor_menus=[[1], [bn], [1]], placement=placement, masked=False)
+    assert any(d.factors == (1, bn, 1) for d in serial)
+
+    # Commutative trait (the embedded P@V reduce): a THREAD partition of kv
+    # (factor[0] == bn — cooperative-KV / split reduce) is licensed.
+    partition = legal_decomps(carrier, kv, ext, factor_menus=[[bn], [1], [1]], placement=placement, masked=False)
+    assert any(d.factors == (bn, 1, 1) for d in partition)

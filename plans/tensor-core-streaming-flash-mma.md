@@ -259,7 +259,11 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   `enumeration/_iterdag.py`): the dual-role hinge `kv`, the nested SEMIRING QK^T contraction, and the `Monoid` carrier
   (its first partial = the INLINE score edge). A derived view (`None` off a non-streaming nest), structurally unit-tested
   (`tests/compiler/passes/test_contraction_chain.py`). No build-path change yet — 1b/1c consume it.
-- **Next: Phase 1 the view layer (1b → 1c).** Start at `iter_dag`: represent the carried contraction chain + the
+- **Phase 1b — done, green.** `classify` returns the compositional algebra `MONOID(SEMIRING)` for a streaming nest
+  (`_Regime.inner_algebra=SEMIRING`, derived from `dag.chain`); `legal_decomps` licenses the hinge `kv` split under both
+  the carrier's associative trait (serial re-bracket) and its commutative trait (the embedded P@V's THREAD partition),
+  which is what makes the shared-axis tiling sound. Structural tests in `test_contraction_chain.py`.
+- **Next: Phase 1c the view layer.** Start at `iter_dag`: represent the carried contraction chain + the
   dual-role hinge axis; then `classify` → `MONOID(SEMIRING)`; then the `INLINE` score edge + the shared-axis
   `reduce_decomp`. Structural tests at 1a/1b, end-to-end accuracy at 1c. Phase 2 then composes `_atom.atomize_cell` with
   no new build move — the boundary Phase 0 set up.

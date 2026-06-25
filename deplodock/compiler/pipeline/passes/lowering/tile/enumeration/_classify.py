@@ -29,10 +29,20 @@ class _Regime:
     """The classification handoff: the nest's algebra + the contraction-axis names
     a reduce decomposition rewrites (``target_names``). The streaming-flash schedule
     is **not** carried here — it is a derived property of the DAG (``IterDag.streaming``)
-    queried on demand by the moves that need it."""
+    queried on demand by the moves that need it.
+
+    ``inner_algebra`` carries the **compositional** algebra of a twisted carrier
+    (``plans/tensor-core-streaming-flash-mma.md`` Unification 2): a streaming-flash
+    ``Monoid`` carrier is ``MONOID(SEMIRING)`` — its online-softmax combine is a
+    SEMIRING accumulation (the embedded P@V ``O += p·v`` over the hinge ``kv``) twisted
+    by the MONOID rescale (``α``). ``inner_algebra = SEMIRING`` surfaces that embedded
+    contraction so the shared-axis ``reduce_decomp`` (Phase 1c) can tile the hinge as
+    BOTH a carrier reduce and a P@V reduce. ``None`` for a flat (non-compositional)
+    carrier — a plain reduce is just its ``algebra``."""
 
     algebra: AlgebraKind  # MAP | SEMIRING | MONOID
     target_names: frozenset[str] = frozenset()
+    inner_algebra: AlgebraKind | None = None  # the embedded contraction's algebra for a twisted carrier (flash: SEMIRING P@V on the hinge)
 
 
 def classify(dag: IterDag) -> _Regime | None:
@@ -50,7 +60,11 @@ def classify(dag: IterDag) -> _Regime | None:
             return None
         if any(not n.loop.axis.extent.is_static for n in dag.reduce if not isinstance(n.carrier, Monoid)):
             return None
-        return _Regime(AlgebraKind.MONOID, frozenset(lp.axis.name for lp in reduce_loops))
+        # The twisted carrier is compositional: ``MONOID(SEMIRING)`` when the DAG exposes
+        # the carried contraction chain (the embedded P@V on the hinge ``kv``). The chain
+        # is a structural property (``dag.chain``), so this stays a derived read.
+        inner = AlgebraKind.SEMIRING if dag.chain is not None else None
+        return _Regime(AlgebraKind.MONOID, frozenset(lp.axis.name for lp in reduce_loops), inner_algebra=inner)
 
     if not reduce_loops:  # no contraction — a MAP nest.
         return _Regime(AlgebraKind.MAP)
