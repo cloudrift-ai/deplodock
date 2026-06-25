@@ -1,9 +1,14 @@
 # Tensor-core streaming flash (mma.sync) — flash as an edge placement, not a kernel
 
 **Branch:** `feature/tile-ir-block-dag`
-**Status:** Phase 0 landed (green); **Phase 1 fully landed (green)** — step 1 (KV re-bracket) + 1a (the `dag.chain`
-view) + 1b (`classify` → `MONOID(SEMIRING)`) + 1c (`chain_build`, the FA-2 shared-score restructuring, matching torch
-end-to-end behind `DEPLODOCK_CHAIN=1`). Phase 2 (`atomize` over the two cells) is next; the rest is the design below.
+**Status:** **The compiler GENERATES a working fused tensor-core flash** (`DEPLODOCK_CHAIN=1`, fp16, matching torch
+across `(B,H,S,D)`). Phases 0–3 landed green: the view layer (1a–1c, incl. a GPU-validated scalar shared-score flash),
+the atom layer (the two cells via `atomize`), and the codegen (a `KernelOp` built from the shared mma ops + the new
+`Fragment*` ops, rendered by the standard renderer — no source template). The kernel **structure** is a dedicated
+`assembly/_warp_chain` assembler (the flash's fused-streaming shape doesn't fit the generic single-cell assembly — see
+**Architecture** below); the default path is byte-unchanged (pin-gated). Remaining is **functional** (Phases 4–7:
+bf16 / causal / GQA / symbolic-seq / the geometry forks + cost-based deploy / the perf bench) — see **Remaining work**.
+Full `tests/compiler/` green throughout. Detailed history + the architectural boundary are in the live status below.
 
 The streaming-flash `MONOID` tier is built and correct but **scalar** — `QK^T` and `P@V` lower to FMA loops, the
 online-softmax carrier `(m, d, O)` updates one KV element at a time. This plan brings the **`mma.sync` tensor-core tier**
@@ -277,11 +282,15 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   Phase 6). Matches torch end-to-end (`max_diff ≈ 5e-7`) across static non-causal / causal / GQA / additive-mask SDPA
   (`tests/compiler/e2e/test_flash_attention.py::test_flash_chain_*`); structural tests in `test_contraction_chain.py`.
   Symbolic-`seq_len` + cooperative-KV (`BR>1`) under the chain form, and the search-fork, are follow-ups.
-### Phase 2 — `atomize` composes over the two cells (in progress)
+### Phase 2 — `atomize` composes over the two cells — **done (green)**
 
 The chain restructuring (1c) emits the two SEMIRING cells — the inner QK^T producing the `INLINE` score fragment + the
-register-tiled P@V accumulation `O[BM,D]`. Phase 2 composes `_atom.atomize_cell` on each (the `OptionFork` shape of
-`020_tensorize`, reusing the `Mma` op + `kernel/005` codegen).
+register-tiled P@V accumulation `O[BM,D]`. Phase 2 composes `_atom.atomize_cell` on each, reusing the `Mma` op +
+`kernel/005` codegen. The atom-layer reuse boundary (2.1/2.2 below) is unit-tested; the deployed warp-chain kernel
+derives BOTH cells' layout via `atomize_cell` (`split/005_warp_chain._classify_cell`). NOTE: the *deployment* took the
+dedicated-assembler route (see **Architecture**), not the `020_tensorize`-fork-on-`chain_build` route originally
+sketched — the fused-streaming structure doesn't fit the generic warp tower; the atom-layer composition is the part that
+generalized.
 
 - **2.1 — QK^T fragment-output atomization — done, green.** `atomize_cell` gained an `out_index` param so a cell whose
   result is an INLINE register fragment with **no `Write`** (the flash QK^T score) can supply its `(M=query, N=kv)` coords
@@ -297,17 +306,16 @@ register-tiled P@V accumulation `O[BM,D]`. Phase 2 composes `_atom.atomize_cell`
   (`test_atomize_cell.py::test_fragment_a_pv_cell_fuses_with_register_a` + the off-by-default guard). The atom-layer
   reuse boundary for BOTH chain cells is now complete (2.1 QK^T fragment-output + 2.2 P@V fragment-`A`).
 
-The remaining Phase 2 work is the **warp-tiled chain build** (the geometry `chain_build` doesn't yet set), coupled with
-Phase 3:
+> **What actually shipped** (vs the originally-planned 2.2-build-side / 2.3-joint-geometry below): the warp-tiled fused
+> kernel is emitted by the dedicated `assembly/_warp_chain` (one warp / 16 query rows, the score `[16,BN=16]` tile, the
+> two cells via `atomize_cell`), NOT by tiling `chain_build`'s scalar nest through the generic warp tower. The
+> joint-geometry / `BN`/`WM`/`WN` forks are deferred to Phase 6 (v1 fixes one warp / one BM tile). The notes below are
+> the original sketch, kept for the design rationale.
 
-- **2.2 build-side.** Split the carrier's `O = O·α + p·v` into a separate rescale (`O *= α`) + a clean `Accum`
-  (`O += p·v`) so the P@V cell is canonical for the `frag_a` atomize above.
-- **2.3 — joint geometry.** ONE coupled `WM/WN/FM/FN` propagated across both cells (QK^T's `N`-fragment layout = the
-  softmax row-reduction = P@V's `A`-operand layout), needs `BN ≥ atom_k` (the score `[BM,BN]` tile, where 1c is `BN=1`)
-  and `D % atom_k == 0`.
-- These are **not runnable without Phase 3** (the fragment-layout softmax `__shfl_xor` row reduction over the `m16n8`
-  C-fragment + the C→A handoff as the edge placement). The plan's "minimum working tensor-core flash = Phase 1 + 2 + 3"
-  holds: the build wires the two `Mma`s + the geometry, Phase 3's codegen makes it execute, validated end-to-end then.
+- **2.2 build-side (sketch).** Split the carrier's `O = O·α + p·v` into a separate rescale (`O *= α`) + a clean `Accum`
+  (`O += p·v`) so the P@V cell is canonical for the `frag_a` atomize.
+- **2.3 — joint geometry (deferred to Phase 6).** ONE coupled `WM/WN/FM/FN` across both cells (QK^T's `N`-fragment
+  layout = the softmax row-reduction = P@V's `A`-operand layout), `BN ≥ atom_k`, `D % atom_k == 0`.
 
 **Phase 3 design — validated end-to-end on hardware (the codegen target).** Before writing the codegen, the whole fused
 tensor-core flash was proven by a hand-written FA-2 kernel that matches torch SDPA across the KV stream (S ∈ {16…128},
@@ -346,26 +354,48 @@ online-softmax is `FragmentRowReduce` + the new `FragmentExp` / `FragmentScale` 
 BN stride — the bug that bit D>16). Validated vs torch across `(B,H,S,D)` D∈{16,32,64}, S≤256 (`max_diff ≤ 5e-4`); full
 `tests/compiler/` = 1668 passed.
 
-**Toward routing the structure through the generic assembly.** Two foundations landed: (1) the warp-chain cells'
-operand layout (`b_trans`, the atom) is now DERIVED via `atomize_cell` (`_warp_chain._classify_cell`), not hard-coded —
-the deployed kernel exercises the algebraic `atomize` move; (2) the shared cell-lowering `kernel/005._lower_cell` now
-handles a **fragment-output cell** (operand Loads + `Mma`, no `Write`) — it emits the fragment chain (`RegFragment` +
-`LdmatrixLoad` + `MmaSyncPtx`) with no `RegStore`, keeping the C-fragment live (the flash QK^T score, the INLINE edge).
-So the flash QK^T cell can now be lowered by the **same** pass the matmul uses. The remaining reroute: build the warp
-chain as a `TileOp` (`GridTile/WarpTile` + `AtomTile` cells + the fragment carrier) and run the kernel passes on it (so
-the mma + the tower come from the generic assembly, not hand-built), then derive the softmax recurrence from the
-carrier's `merge`/`combine_states`. Plus masking / GQA / symbolic-`seq_len` / the `BN`/`WM`/`WN` geometry forks
-(Phase 5/6).
+### Architecture — what's on the shared/algebraic path, and the genuine boundary
 
-**Warp-chain codegen — started (the kernel-IR primitive).** The first codegen primitive is built + GPU-validated:
-`ir/kernel/ir.py::FragmentRowReduce` emits the fragment `rowmax`/`rowsum` over the `m16n8` C-fragment's N lanes (the
-in-lane col-pair combine across N-atoms +
-the `__shfl_xor` butterfly over the 4-lane col group), rendering the exact validated pattern. `rowmax` AND `rowsum` match
-numpy on hardware (`tests/compiler/passes/test_fragment_row_reduce.py`). This is the hardest Phase-3 piece, now a real
-kernel-IR op the warp-chain build will emit. Next codegen bricks: the per-row `m`/`l`/`α` online update + `exp(S−m)` in
-fragment-distributed form, the smem C→A handoff op, then the `chain_warp_build` move wiring the two `Mma`s + these ops
-into the warp tower, lowered to match the reference kernel.
+The warp-chain flash's **dispatch + codegen + cell-classification** are on the shared / algebraic path; only the kernel
+**structure** is hand-assembled (in `assembly/_warp_chain`), because the flash's fused-streaming shape genuinely does not
+fit the generic single-cell assembly. What landed (all committed, green):
 
-Open 1c follow-ups feeding in (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV (`BR>1`)
-under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the P@V output
-is the inner free axis.
+| Layer | State |
+| ----- | ----- |
+| kernel form | a **`KernelOp`** (kernel-IR), rendered by the standard `render_kernelop` + lowered by `cuda/010_lower_kernelop` — the source-string template is **deleted** |
+| TC primitives | the **shared** `dpl_mma_m16n8k16_f16` / `dpl_ldmatrix_x4` / `dpl_ldmatrix_x2_trans` (the exact helpers the warp-tier matmul emits) |
+| mma / softmax codegen | the standard kernel-IR ops: `MmaSyncPtx` / `LdmatrixLoad` / `RegStore` + the new `FragmentRowReduce` / `FragmentExp` / `FragmentScale` / `Reassign` |
+| cell **layout** (`b_trans`, atom) | **derived** by the `atomize` move (`split/005_warp_chain._classify_cell` → `atomize_cell` → `classify_matmul_operands`) — QK^T transposed-B, P@V canonical-B fall out, not hard-coded |
+| cell **lowering** | `kernel/005._lower_cell` now lowers a **fragment-output cell** (operand Loads + `Mma`, no `Write` → the fragment chain, no `RegStore`, the C-fragment stays live) — the flash QK^T can be lowered by the matmul's own pass |
+| dispatch | a `split/`-phase structural fork (`005_warp_chain`), keyed on the algebra (`dag.chain` + atom-eligibility) — analogous to `010_split_demoted`, NOT a named-shape recognizer |
+| layering | clean (`assembly/` ↛ `enumeration/`; the `atomize` derivation lives in the `split` phase) |
+
+**The genuine boundary (why the structure stays hand-assembled).** Routing the *structure* through the generic
+assembly + kernel passes is not a reroute — it needs a **new model** in the shared assembly, because the flash differs
+from a matmul in three ways the single-cell machinery can't express: (1) a **streaming accumulator** — `O` persists
+across the **kv-stream loop**, which is *outside* the cell, whereas the matmul accumulator is cell-local (persists
+across the cell's K-reduce); `005` would reset `O` per kv tile. (2) **two mmas + a shared reduce loop** — `_scan_cell`
+assumes one `Mma` per `AtomTile`, but the kv loop holds QK^T *and* P@V *and* the softmax, sharing the loop (the score
+must flow QK^T→softmax→P@V within one iteration). (3) it is a **matmul→softmax→matmul** fusion — the one fusion the
+generic assembly does (`_fused.py`, the SMEM edge) is a MAP/rmsnorm producer + a matmul, not two tensor-core mmas. So a
+focused dedicated assembler for this shape (like `_fused.py` is for the SMEM-edge shape) is the architecturally
+reasonable form; forcing it into the generic single-cell assembly would be a large extension to shared matmul code for
+one consumer. **Conclusion: the current state is a clean architectural endpoint for the fused flash** — the invariant
+("no shape-specific *build move* in the composer") holds; the remaining valuable work is **functional**, below.
+
+### Remaining work (functional — Phases 4–7 + the scalar-chain follow-ups)
+
+- **Phase 4 dtype:** bf16 (a trivial atom swap; v1 is f16-only). The fp32/`cc<8` fallback already routes to the scalar
+  chain / materialized path.
+- **Phase 5 masking + coverage:** causal (skip above-diagonal KV tiles + diagonal `-inf` mask), GQA (K/V at
+  `head//group`), symbolic-`seq_len` (the masked-K machinery onto the KV loop), partial tiles (`S`/`D` not a multiple of
+  16). v1 is non-causal / equal-head / static / `D%16==0` / `S%16==0`.
+- **Phase 6 geometry forks + cold pick:** the warp chain is `CHAIN=1` pin-only — make `BN`/`WM`/`WN`/multi-warp-`BM` /
+  the v2 register C→A `OptionFork`s the tuner explores + the prior prices, and promote it from a pin to a cost-based
+  greedy pick (so it deploys by default when cheaper than the materialized path).
+- **Phase 7 validation:** the perf bench (TC flash vs scalar vs materialized vs eager / `torch.compile` / FlashAttention
+  at seq 512/2048/8192, causal/non-causal, MHA/GQA), accuracy vs fp64, and an mma-flash golden. Correctness vs torch is
+  validated; the speedup is not yet measured.
+- **Scalar-chain (1c) follow-ups** (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV
+  (`BR>1`) under the scalar chain form, and a generalized `_chain_axes` for layouts where the P@V output is the inner
+  free axis.
