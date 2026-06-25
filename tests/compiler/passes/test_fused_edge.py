@@ -26,7 +26,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._fused import assemble_fused, is_fused_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, is_fused_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -105,7 +105,7 @@ def test_assemble_fused_builds_compute_phase():
     """The fused ``TileOp`` is one kernel whose ``xn`` slab is filled by a
     ``StageBundle.compute`` phase (the producer relu), staging ``x`` (not ``xn``) from
     gmem — the producer rides the consumer's slab, no gmem round-trip of ``xn``."""
-    top = assemble_fused(_fused_graph(_relu_producer(64, 64)), knobs=_KN, base_knobs={}, kernel_name="k_fused")
+    top = assemble_block(_fused_graph(_relu_producer(64, 64)), knobs=_KN, base_knobs={}, kernel_name="k_fused")
     assert isinstance(top, TileOp)
     bundles = [s for s in top.body.iter() if isinstance(s, StageBundle)]
     assert bundles, "fused kernel must carry a StageBundle"
@@ -144,7 +144,7 @@ def test_fused_map_matmul_runs_correctly(producer, np_ref):
     pg = producer(M, K)
     shape_of = {name: tuple(d.as_static() for d in pg.nodes[name].output.shape) for name in pg.inputs}
     shape_of["w"] = (K, N)
-    top = assemble_fused(_fused_graph(pg, M, K, N), knobs=_KN, base_knobs={}, kernel_name="k_fused")
+    top = assemble_block(_fused_graph(pg, M, K, N), knobs=_KN, base_knobs={}, kernel_name="k_fused")
     fg = Graph()
     for name in (*pg.inputs, "w"):
         fg.add_node(InputOp(), [], Tensor(name, shape_of[name], F16), node_id=name)
