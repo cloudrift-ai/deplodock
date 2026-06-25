@@ -5,14 +5,16 @@
 Produces a :class:`TileOp` (``GridTile > WarpTile > [init] SerialTile [epilogue]``) that
 flows through the **generic kernel passes** (``kernel/005``…``100`` → ``cuda``), NOT a
 KernelOp that bypasses them — so the flash shares the matmul's own lowering chain. The
-QK^T / P@V mma + the A/V ldmatrix loads are the **same** kernel-IR ops as the warp-tier
-matmul (``MmaSyncPtx`` / ``LdmatrixLoad`` / ``RegStore``), and the fragment online-softmax
-is the ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` ops + the carried
-``m``/``l`` recurrence (``Init`` + ``Reassign``) — all now ``rewrite``-registered so they
-survive the SSA-rewriting passes. The validated reference kernel
-(``tests/compiler/e2e/test_flash_tensorcore_reference.py``) is the oracle. (The mma cells
-are still hand-emitted here; the next step routes them through ``005``'s AtomTile
-lowering via the fragment-output / fragment-A cell paths already landed there.)
+QK^T / P@V mma codegen goes through the **shared** ``kernel/005`` AtomTile lowering — the
+``produce`` phase is a transposed-B **fragment-output** ``AtomTile`` (the score C-fragment
+stays live) and ``consume`` is a **fragment-A** ``AtomTile`` (the C→A handoff), exactly the
+two cell paths ``005`` grew; no hand-emitted ``MmaSyncPtx`` remains. ``005`` names the live
+QK^T C-fragment ``Sf{nt}_frag``, which the softmax below reads. What is still authored here
+is the **carrier**: the fragment online-softmax (``FragmentRowReduce`` / ``FragmentExp`` /
+``FragmentScale``) + the carried ``m``/``l`` recurrence (``Init`` + ``Reassign``) + the
+C→A smem handoff — all ``rewrite``-registered so they survive the SSA-rewriting passes. The
+validated reference kernel (``tests/compiler/e2e/test_flash_tensorcore_reference.py``) is
+the oracle.
 
 Geometry: one warp per 16 query rows; Q/K/V/O are addressed as flat ``(B·H·S·D)``
 buffers (gmem-direct mma operands — no smem staging of Q/K/V), the score ``P`` rides an
@@ -37,7 +39,6 @@ from deplodock.compiler.ir.kernel.ir import (
     FragmentRowReduce,
     FragmentScale,
     LdmatrixLoad,
-    MmaSyncPtx,
     Reassign,
     RegFragment,
     RegStore,
@@ -46,7 +47,7 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Mma
-from deplodock.compiler.ir.tile.ir import AtomTile, TileOp
+from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, wrap_carry_tower
 
 
@@ -84,7 +85,6 @@ def build_warp_chain_tileop(
     atom (cell shape + dtype) are read off them, not hard-coded (the v1 path assumes
     ``m16n8k16``)."""
     atom_m, atom_n, atom_k = qk.atom.shape
-    ab_dt = qk.atom.operand_dtype("a").name
     assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
 
     atom_shape = qk.atom.shape
@@ -116,25 +116,35 @@ def build_warp_chain_tileop(
         Init(name="l1", op=add, dtype=F32),
     ]
     init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
-    for t in range(kt):
-        init.append(RegFragment(name=f"qa{t}", role="a", shape=atom_shape, dtype=F16))
-        init.append(ld(f"qa{t}", q, _add(qrow, t * 16), "a"))
     init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(F16), align=16))
 
-    # produce — QK^T: 2 N-atoms (kv cols 0-7 / 8-15), accumulate over kt K-tiles → the
-    # INLINE score fragments ``Sf{nt}``, scaled by 1/sqrt(D).
+    # produce — QK^T: 2 N-atoms (kv cols 0-7 / 8-15), reduce over kt K-tiles → the INLINE
+    # score fragments ``Sf{nt}``, scaled by 1/sqrt(D). Each N-atom is a **fragment-output
+    # AtomTile** (transposed-B Q@K^T, no ``Write`` → the C-fragment stays live) that
+    # ``kernel/005`` lowers — the mma codegen is the matmul's own pass, not hand-emitted.
+    # ``005`` names the live C-fragment ``Sf{nt}_frag`` (the softmax below reads that).
     produce: list = []
     for nt in range(2):
-        produce.append(RegFragment(name=f"Sf{nt}", role="c", shape=atom_shape, dtype=F32))
-        for t in range(kt):
-            produce.append(RegFragment(name=f"kb{nt}_{t}", role="b", shape=atom_shape, dtype=F16))
-            produce.append(ld(f"kb{nt}_{t}", k, _add(kvrow, _mul(Literal(1, "int"), nt * 8 * D), t * 16), "b", b_trans=qk.b_trans))
-            produce.append(MmaSyncPtx(c_frag=f"Sf{nt}", a_frag=f"qa{t}", b_frag=f"kb{nt}_{t}", shape=atom_shape, ab_dtype=ab_dt))
-        produce.append(FragmentScale(frag=f"Sf{nt}", top=scale, bot=scale))
+        if kt > 1:
+            ko = Var(f"ko{nt}")
+            rbody = (
+                Load(name=f"qv{nt}", input=q, index=(_add(qrow, _mul(ko, 16)),)),
+                Load(name=f"kc{nt}", input=k, index=(_add(kvrow, nt * 8 * D, _mul(ko, 16)),)),
+                Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans),
+            )
+            cellbody: tuple = (SerialTile(axis=Axis(f"ko{nt}", Dim(kt)), body=Body(rbody), kind="plain"),)
+        else:
+            cellbody = (
+                Load(name=f"qv{nt}", input=q, index=(qrow,)),
+                Load(name=f"kc{nt}", input=k, index=(_add(kvrow, nt * 8 * D),)),
+                Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans),
+            )
+        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=qk.atom))
+    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
 
     # merge — the carrier's new state from this tile: rowmax → m_new / alpha; P = exp(S - m_new); rowsum → l.
     merge: list = [
-        FragmentRowReduce(top="r0", bot="r1", frags=("Sf0", "Sf1"), op=mx),
+        FragmentRowReduce(top="r0", bot="r1", frags=("Sf0_frag", "Sf1_frag"), op=mx),
         Assign(name="mn0", op=mx, args=("m0", "r0")),
         Assign(name="mn1", op=mx, args=("m1", "r1")),
         Assign(name="dm0", op=ElementwiseImpl("subtract"), args=("m0", "mn0")),
@@ -142,7 +152,7 @@ def build_warp_chain_tileop(
         Assign(name="alpha0", op=ElementwiseImpl("exp"), args=("dm0",)),
         Assign(name="alpha1", op=ElementwiseImpl("exp"), args=("dm1",)),
     ]
-    merge += [FragmentExp(out=f"Pf{nt}", src=f"Sf{nt}", top_sub="mn0", bot_sub="mn1") for nt in range(2)]
+    merge += [FragmentExp(out=f"Pf{nt}", src=f"Sf{nt}_frag", top_sub="mn0", bot_sub="mn1") for nt in range(2)]
     merge += [
         FragmentRowReduce(top="s0", bot="s1", frags=("Pf0", "Pf1"), op=add),
         Assign(name="lm0", op=ElementwiseImpl("multiply"), args=("l0", "alpha0")),
