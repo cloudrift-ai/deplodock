@@ -425,123 +425,96 @@ class MbarrierWait(Stmt):
 
 @dataclass(frozen=True)
 class TreeHalve(Stmt):
-    """Cooperative power-of-two tree reduction over a 1D smem buffer.
+    """Cross-thread combine of a (possibly multi-component) monoid state over a
+    PRE-POPULATED power-of-two smem tree — the > warp_size fallback for
+    :class:`WarpShuffle`.
 
-    Reduces ``buf[0..length)`` into ``buf[0]`` using ``op`` as the combine.
-    ``tid_var`` names the cooperative thread axis. ``length`` must be a
-    power of two and ``≤ blockDim.x``. ``dtype`` is the element type of
-    the smem buffer and the dtype the combine operates in — the renderer
-    picks the right intrinsic spelling (``fmaxf`` vs ``__hmax``, etc.)
-    via the target.
+    Each state component has its own smem slab ``bufs[i][0..length)``, populated by
+    the caller (``emit_combine`` writes the per-thread partials, or the
+    hierarchical path writes one per-warp partial per slot). This stmt tree-reduces
+    each slab into ``bufs[i][0]`` applying the carrier's ``combine_states`` at every
+    halving step (rendered at ``dtype``), then broadcast-reassigns every
+    ``state[i]`` from ``bufs[i][0]`` **in place** (no ``_b`` rename — every thread
+    ends holding the full reduction in the carried SSA names). ``length`` is a power
+    of two ≤ ``blockDim.x``. A scalar reduce is the 1-component case
+    (``state=("acc",)``, ``combine_states=(Assign("acc", op, ("acc","acc__o")),)``).
+
+    Named-barrier support: ``barrier_id > 0`` routes the per-iter sync to
+    ``bar.sync <id>, <count>`` instead of ``__syncthreads()`` — required inside a
+    warp-specialized consumer branch (a __syncthreads on a warp-divergent cond is
+    UB).
     """
 
-    buf: str
-    op: ElementwiseImpl
+    bufs: tuple[str, ...]
+    state: tuple[str, ...]
+    state_b: tuple[str, ...]
+    combine_states: tuple[Assign, ...]
     length: int
     tid_var: str
     dtype: DataType = F32
-    # Named-barrier support: when ``barrier_id > 0`` the per-iter sync
-    # renders as ``bar.sync <id>, <count>;`` instead of ``__syncthreads()``.
-    # Required when this TreeHalve sits inside a warp-specialized consumer
-    # branch — __syncthreads on a warp-divergent condition is UB.
     barrier_id: int = 0
     barrier_count: int | None = None
 
+    def deps(self) -> tuple[str, ...]:
+        return tuple(self.state)
+
     def pretty(self, indent: str = "") -> list[str]:
         bar = "" if self.barrier_id == 0 else f", bar={self.barrier_id}/{self.barrier_count}"
-        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var}{bar})"]
+        return [f"{indent}TreeHalve({', '.join(self.state)}, length={self.length}, tid={self.tid_var}{bar})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
         pad = _pad(ctx.indent)
-        inner_pad = _pad(ctx.indent + 1)
-        halve_pad = _pad(ctx.indent + 2)
-        op_expr = _binary_combine_expr(
-            self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name
-        )
-        half = int(self.length) // 2
+        in1 = _pad(ctx.indent + 1)
+        in2 = _pad(ctx.indent + 2)
+        t = self.tid_var
+        ty = ctx.type_name(self.dtype.name)
         if self.barrier_id == 0:
-            sync_line = f"{inner_pad}__syncthreads();"
+            sync_line = f"{in1}__syncthreads();"
         else:
             if self.barrier_count is None:
                 raise ValueError(f"TreeHalve(barrier_id={self.barrier_id}) requires barrier_count")
-            sync_line = f'{inner_pad}asm volatile("bar.sync {self.barrier_id}, {self.barrier_count};\\n" ::: "memory");'
-        return [
-            f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
-            f"{inner_pad}if ({self.tid_var} < s) {{",
-            f"{halve_pad}{self.buf}[{self.tid_var}] = {op_expr};",
-            f"{inner_pad}}}",
-            sync_line,
-            f"{pad}}}",
-        ]
-
-
-@dataclass(frozen=True)
-class WarpShuffle(Stmt):
-    """Warp-shuffle reduction: combine ``value`` across ``length`` lanes
-    via ``__shfl_xor_sync`` and bind the broadcast result to ``name``.
-
-    Renders as a register-only butterfly (no smem, no syncthreads):
-
-        <type> <name> = <value>;
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/2));
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/4));
-        ...
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, 1));
-
-    Used by ``materialize_tile._emit_combine`` when the cooperative
-    thread count fits in a single warp (``length ≤ 32``, power of two).
-    Replaces the ``Smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + ``Load``
-    sequence — kills the smem alloc, the two block barriers, and the
-    smem-staged broadcast load. ``dtype`` is the parent accumulator's
-    dtype; the renderer declares the local + picks the combine intrinsic
-    at that dtype via the target.
-    """
-
-    name: str
-    value: str
-    op: ElementwiseImpl
-    length: int
-    dtype: DataType = F32
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}WarpShuffle({self.dtype.name} {self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        acc_dt = self.dtype.name
-        value_dt = ctx.ssa_dtypes.get(self.value, acc_dt)
-        src_expr = ctx.target.convert(self.value, value_dt, acc_dt)
-        ctx.ssa_dtypes[self.name] = acc_dt
-        out = [f"{pad}{ctx.type_name(acc_dt)} {self.name} = {src_expr};"]
-        s = int(self.length) // 2
-        while s > 0:
-            shfl = f"__shfl_xor_sync(0xffffffff, {self.name}, {s})"
-            combined = _binary_combine_expr(self.op, self.name, shfl, ctx.target, acc_dt)
-            out.append(f"{pad}{self.name} = {combined};")
-            s >>= 1
+            sync_line = f'{in1}asm volatile("bar.sync {self.barrier_id}, {self.barrier_count};\\n" ::: "memory");'
+        half = int(self.length) // 2
+        out: list[str] = [f"{pad}for (int s = {half}; s > 0; s >>= 1) {{", f"{in1}if ({t} < s) {{"]
+        # Shadow temps named after the carried state so ``combine_states`` (which
+        # reassigns ``state``) folds ``buf[t+s]`` into ``buf[t]`` per component.
+        for buf, st, sb in zip(self.bufs, self.state, self.state_b, strict=True):
+            out.append(f"{in2}{ty} {st} = {buf}[{t}];")
+            out.append(f"{in2}{ty} {sb} = {buf}[{t} + s];")
+            ctx.ssa_dtypes[st] = self.dtype.name
+            ctx.ssa_dtypes[sb] = self.dtype.name
+        out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=in2, dtype=self.dtype))
+        for buf, st in zip(self.bufs, self.state, strict=True):
+            out.append(f"{in2}{buf}[{t}] = {st};")
+        out.append(f"{in1}}}")
+        out.append(sync_line)
+        out.append(f"{pad}}}")
+        # Broadcast the reduced state back into the carried SSA names (in place).
+        for buf, st in zip(self.bufs, self.state, strict=True):
+            out.append(f"{pad}{st} = {buf}[0];")
+            ctx.ssa_dtypes[st] = self.dtype.name
         return out
 
 
 @dataclass(frozen=True)
-class MonoidWarpShuffle(Stmt):
-    """Cross-thread combine of a multi-component **monoid** state (a ``Monoid``
-    carrier) over ``length`` lanes via ``__shfl_xor_sync``.
+class WarpShuffle(Stmt):
+    """Cross-thread combine of a (possibly multi-component) monoid state over
+    ``length`` lanes via ``__shfl_xor_sync`` — a register-only butterfly (no smem,
+    no syncthreads).
 
-    The tuple-valued generalization of :class:`WarpShuffle`: each lane holds a
-    full per-thread partial ``state`` tuple (seeded from the carrier's identity,
-    reduced over the lane's strided K slice by the streaming ``merge``). Each
-    butterfly step shuffles **every** state component down and applies the
-    carrier's ``combine_states`` (the state-merges-state monoid op) to fold the
-    shuffled neighbor state into this lane's. After the last step every lane holds
-    the full reduction in the SAME ``state`` SSA names — reassigned **in place**,
-    so the post-reduce epilogue reads them with no rename (unlike ``WarpShuffle``'s
-    ``<name>_b`` broadcast).
+    Each lane holds a full per-thread partial ``state`` tuple (a scalar reduce is
+    the 1-component case ``state=("acc",)``). Each butterfly step shuffles **every**
+    component down into ``state_b`` and applies the carrier's ``combine_states``
+    (the state-merges-state monoid op, rendered at ``dtype``) to fold the shuffled
+    neighbor into this lane's state, reassigning ``state`` **in place**. After the
+    last step every lane holds the full reduction in the SAME SSA names — so the
+    post-reduce epilogue reads them with no rename (kills the old scalar ``<name>_b``
+    broadcast).
 
     ``length`` must be a power of two ≤ ``warp_size``; the XOR butterfly never
-    crosses an aligned ``length``-lane group, so this is also the SEGMENTED
-    per-row combine for strided-cooperative rows. ``commutative`` (required — the
-    butterfly reorders) is checked at the carrier; the partials reduce in fp32.
+    crosses an aligned ``length``-lane group, so this is also the SEGMENTED per-row
+    combine for strided-cooperative rows. ``commutative`` (required — the butterfly
+    reorders) is checked at the carrier.
     """
 
     state: tuple[str, ...]
@@ -553,10 +526,13 @@ class MonoidWarpShuffle(Stmt):
     def deps(self) -> tuple[str, ...]:
         return tuple(self.state)
 
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}WarpShuffle({', '.join(self.state)}, length={self.length})"]
+
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         inner = _pad(ctx.indent + 1)
-        f32 = ctx.type_name("f32")
+        ty = ctx.type_name(self.dtype.name)
         out: list[str] = []
         s = int(self.length) // 2
         while s > 0:
@@ -564,9 +540,9 @@ class MonoidWarpShuffle(Stmt):
             # cleanly per round (the carried state is declared by an enclosing Init).
             out.append(f"{pad}{{")
             for st, sb in zip(self.state, self.state_b, strict=True):
-                out.append(f"{inner}{f32} {sb} = __shfl_xor_sync(0xffffffff, {st}, {s});")
-                ctx.ssa_dtypes[sb] = "f32"
-            out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=inner))
+                out.append(f"{inner}{ty} {sb} = __shfl_xor_sync(0xffffffff, {st}, {s});")
+                ctx.ssa_dtypes[sb] = self.dtype.name
+            out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=inner, dtype=self.dtype))
             out.append(f"{pad}}}")
             s >>= 1
         return out
@@ -668,7 +644,7 @@ class FragmentRowReduce(Stmt):
     ``top`` (rows ``g``) / ``bot`` (rows ``g+8``) are correct on every lane — the
     fragment-distributed (2 rows/lane) form the online-softmax stats need.
 
-    Distinct from :class:`MonoidWarpShuffle` (which reduces a whole per-thread state
+    Distinct from :class:`WarpShuffle` (which reduces a whole per-thread monoid state
     over a cooperative-K lane set): this reduces *within* one warp's C-fragment over
     the atom's N direction, keyed on the PTX C-layout."""
 
@@ -708,65 +684,6 @@ class FragmentRowReduce(Stmt):
                 shfl = f"__shfl_xor_sync(0xffffffff, {nm}, {s})"
                 out.append(f"{pad}{nm} = {_binary_combine_expr(self.op, nm, shfl, ctx.target, 'f32')};")
             s >>= 1
-        return out
-
-
-@dataclass(frozen=True)
-class MonoidTreeHalve(Stmt):
-    """Cross-thread combine of a multi-component monoid state over ``length``
-    threads via a power-of-two smem tree (the >warp_size fallback for
-    :class:`MonoidWarpShuffle`).
-
-    Each component gets its own smem slab ``bufs[i][length]`` (declared
-    separately, before this stmt). This stmt: (1) writes each thread's partial
-    ``state[i]`` to ``bufs[i][tid]``; (2) ``__syncthreads``; (3) a tree reduces
-    ``bufs[i][0..length)`` into ``bufs[i][0]`` applying ``combine_states`` at each
-    halving step; (4) broadcast-reassigns every ``state[i]`` from ``bufs[i][0]``,
-    in place (like :class:`MonoidWarpShuffle`). ``length`` must be a power of two
-    ≤ ``blockDim.x``. The reduction runs in fp32.
-    """
-
-    bufs: tuple[str, ...]
-    state: tuple[str, ...]
-    state_b: tuple[str, ...]
-    combine_states: tuple[Assign, ...]
-    length: int
-    tid_var: str
-    dtype: DataType = F32
-
-    def deps(self) -> tuple[str, ...]:
-        return tuple(self.state)
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        in1 = _pad(ctx.indent + 1)
-        in2 = _pad(ctx.indent + 2)
-        t = self.tid_var
-        f32 = ctx.type_name("f32")
-        out: list[str] = []
-        # (1) write each thread's partial state to its slab.
-        for buf, st in zip(self.bufs, self.state, strict=True):
-            out.append(f"{pad}{buf}[{t}] = {st};")
-        out.append(f"{pad}__syncthreads();")
-        # (3) tree reduce: each active thread folds buf[t+s] into buf[t].
-        half = int(self.length) // 2
-        out.append(f"{pad}for (int s = {half}; s > 0; s >>= 1) {{")
-        out.append(f"{in1}if ({t} < s) {{")
-        for buf, st, sb in zip(self.bufs, self.state, self.state_b, strict=True):
-            out.append(f"{in2}{f32} {st} = {buf}[{t}];")
-            out.append(f"{in2}{f32} {sb} = {buf}[{t} + s];")
-            ctx.ssa_dtypes[st] = "f32"
-            ctx.ssa_dtypes[sb] = "f32"
-        out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=in2))
-        for buf, st in zip(self.bufs, self.state, strict=True):
-            out.append(f"{in2}{buf}[{t}] = {st};")
-        out.append(f"{in1}}}")
-        out.append(f"{in1}__syncthreads();")
-        out.append(f"{pad}}}")
-        # (4) broadcast the reduced state back into the carried SSA names.
-        for buf, st in zip(self.bufs, self.state, strict=True):
-            out.append(f"{pad}{st} = {buf}[0];")
-            ctx.ssa_dtypes[st] = "f32"
         return out
 
 
@@ -1675,14 +1592,32 @@ def _(s: SetMaxNReg, rename, sigma, axis_fn):
 
 @_rewrite.register
 def _(s: TreeHalve, rename, sigma, axis_fn):
-    return s
+    # The carried state, the second-operand state, and the combine_states program
+    # all reference SSA names — thread them through ``rename`` so the canonicalizer
+    # can renumber. ``bufs`` are smem slab names (absent from the rename map → no-op)
+    # and ``tid_var`` is a loop var, left untouched.
+    return TreeHalve(
+        bufs=tuple(rename(b) for b in s.bufs),
+        state=tuple(rename(n) for n in s.state),
+        state_b=tuple(rename(n) for n in s.state_b),
+        combine_states=tuple(_rewrite(a, rename, sigma, axis_fn) for a in s.combine_states),
+        length=s.length,
+        tid_var=s.tid_var,
+        dtype=s.dtype,
+        barrier_id=s.barrier_id,
+        barrier_count=s.barrier_count,
+    )
 
 
 @_rewrite.register
 def _(s: WarpShuffle, rename, sigma, axis_fn):
-    # ``name`` is the SSA output; ``value`` is the SSA input — both pass
-    # through ``rename`` so the SSA canonicalizer can renumber them.
-    return WarpShuffle(name=rename(s.name), value=rename(s.value), op=s.op, length=s.length)
+    return WarpShuffle(
+        state=tuple(rename(n) for n in s.state),
+        state_b=tuple(rename(n) for n in s.state_b),
+        combine_states=tuple(_rewrite(a, rename, sigma, axis_fn) for a in s.combine_states),
+        length=s.length,
+        dtype=s.dtype,
+    )
 
 
 # --- MMA fragment rewrites -------------------------------------------------

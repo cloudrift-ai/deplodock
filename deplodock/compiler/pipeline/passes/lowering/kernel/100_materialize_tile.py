@@ -35,7 +35,6 @@ passes can pattern-match on it.
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
@@ -76,9 +75,7 @@ from deplodock.compiler.pipeline import Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import (
     cooperative_combine_geometry,
     emit_combine,
-    emit_combine_states,
-    find_nested_monoids,
-    find_nested_reduce_accums,
+    find_nested_reduce_carriers,
 )
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
     compute_phase_extents,
@@ -213,11 +210,10 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
     for ax in thread_axes:
         n_threads *= ax.extent.as_static()
 
-    rename: dict[str, str] = {}
-
     def transform(s: Stmt) -> Stmt:
-        if rename:
-            s = s.rewrite(lambda n: rename.get(n, n))
+        # The cooperative combine now reassigns the carried state in place (no
+        # ``<name>_b`` rename), so there is no downstream-consumer rewrite to apply;
+        # ``transform`` stays as the leaf-emit seam threaded through ``_emit_loop``.
         return s
 
     new_body: list[Stmt] = []
@@ -764,44 +760,27 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         if isinstance(stmt, (SerialTile, StridedTile, RegisterTile)):
             single = _emit_loop(stmt, tid_expr, n_threads, transform, filter_emit, emit_bundle_producer, ews)
             extra: list[Stmt] = []
+            # Reduce carriers (Accum / Monoid) whose reduce axis is split across the
+            # CTA's threads get a cross-thread combine, keyed by the first carried
+            # name; ``emit_combine`` reassigns the carried state in place (no _b
+            # rename — every thread ends holding the full reduction).
             if isinstance(stmt, (SerialTile, StridedTile)) and stmt.is_reduce:
-                accums_in_scope = {a.name: a for a in stmt.body if isinstance(a, Accum)}
-                combines_in_scope = {c.state[0]: c for c in stmt.body if isinstance(c, Monoid)}
+                carriers_in_scope = {c.carried_names()[0]: c for c in stmt.body if isinstance(c, (Accum, Monoid))}
             else:
-                accums_in_scope = find_nested_reduce_accums(stmt.body)
-                combines_in_scope = find_nested_monoids(stmt.body)
-            for acc_name, acc in accums_in_scope.items():
-                coop_names = escape.accum_cooperative_axes.get(acc_name) if escape is not None else None
+                carriers_in_scope = find_nested_reduce_carriers(stmt.body)
+            for key, carrier in carriers_in_scope.items():
+                coop_names = escape.accum_cooperative_axes.get(key) if escape is not None else None
                 if coop_names:
                     tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
-                    dt = acc.dtype or F32
-                    extra.extend(emit_combine(acc_name, acc.op, tid_var, n_coop, dt, warp_size=warp_size))
-                    rename[acc_name] = f"{acc_name}_b"
-            # Monoid (Monoid) carriers: the tuple-valued cross-thread combine via
-            # combine_states. Keyed by the first state name; reassigns the state in
-            # place (no _b rename — the butterfly / tree leaves every thread holding
-            # the full reduction in the carried SSA names).
-            for first_state, carrier in combines_in_scope.items():
-                coop_names = escape.accum_cooperative_axes.get(first_state) if escape is not None else None
-                if coop_names:
-                    tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
-                    extra.extend(emit_combine_states(carrier, tid_var, n_coop, warp_size=warp_size))
+                    extra.extend(emit_combine(carrier, tid_var, n_coop, warp_size=warp_size))
             return [single, *extra]
-        if isinstance(stmt, Accum):
+        if isinstance(stmt, (Accum, Monoid)):
             out_local = [transform(stmt)]
-            coop_names = escape.accum_cooperative_axes.get(stmt.name) if escape is not None else None
+            key = stmt.carried_names()[0]
+            coop_names = escape.accum_cooperative_axes.get(key) if escape is not None else None
             if coop_names:
                 tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
-                dt = stmt.dtype or F32
-                out_local.extend(emit_combine(stmt.name, stmt.op, tid_var, n_coop, dt, warp_size=warp_size))
-                rename[stmt.name] = f"{stmt.name}_b"
-            return out_local
-        if isinstance(stmt, Monoid):
-            out_local = [transform(stmt)]
-            coop_names = escape.accum_cooperative_axes.get(stmt.state[0]) if escape is not None else None
-            if coop_names:
-                tid_var, n_coop = cooperative_combine_geometry(thread_axes, coop_names, warp_size=warp_size)
-                out_local.extend(emit_combine_states(stmt, tid_var, n_coop, warp_size=warp_size))
+                out_local.extend(emit_combine(stmt, tid_var, n_coop, warp_size=warp_size))
             return out_local
         return [transform(stmt)]
 

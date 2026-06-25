@@ -3,8 +3,8 @@
 Step 2 of ``plans/atomic-free-monoid-combine.md``: a cooperative-K reduce whose
 carrier is a tuple-valued ``Monoid`` (online-softmax ``(m, l)``) — not an
 ``Accum`` — splits across the CTA's threads and merges the per-thread partial
-states via the carrier's ``combine_states`` (the materializer's
-``emit_combine_states`` → ``MonoidWarpShuffle`` / ``MonoidTreeHalve``), instead of
+states via the carrier's ``combine_states`` (the materializer's ``emit_combine`` →
+the tuple-aware ``WarpShuffle`` / ``TreeHalve``), instead of
 running one thread serially. Verifies accuracy on GPU against numpy softmax for
 both the warp-shuffle path (BR ≤ warp) and the smem-tree path (BR > warp), and
 that the emitted kernel actually carries the cross-thread monoid combine.

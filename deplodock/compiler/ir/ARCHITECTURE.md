@@ -354,13 +354,17 @@ the body at materialize / render time via ``ir/tile/escape_analysis.py``:
 cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
 atomic-write classification from enclosing ``GridTile.axes`` vs
 ``Write.index``, broadcast-write guards from cooperative thread axes vs
-``Write.index``. The same cooperative analysis covers the general monoid
-carrier: a ``Monoid``'s cooperative axes are keyed by each of its ``state``
-component names, and the materializer emits a **multi-component** cross-thread
-combine — ``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the
-full state tuple, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, >
-warp), both folding via the carrier's ``combine_states`` and reassigning the
-state in place (no ``_b`` rename). No explicit coordination stmt or per-tile tag
+``Write.index``. One cooperative analysis covers every reduce carrier — a scalar
+``Accum`` is the degenerate 1-component monoid (its ``combine_partials`` is the
+one-``Assign`` op-fold), the general ``Monoid`` (flash online-softmax) the
+multi-component case — keyed by the carrier's first carried name. The
+materializer's single ``emit_combine`` emits the cross-thread fold off the
+carrier's ``carried_names`` / ``combine_operands`` / ``combine_partials``:
+``WarpShuffle`` (register ``__shfl_xor_sync`` butterfly, ≤ warp), a hierarchical
+per-warp ``WarpShuffle`` + ``n_warps``-wide ``TreeHalve`` (power-of-two warp
+multiple), or a block-wide per-component ``TreeHalve`` (> warp) — all folding via
+the carrier's ``combine_states`` and reassigning the state in place (no ``_b``
+rename). No explicit coordination stmt or per-tile tag
 carries this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
 and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
 ``Accum.axes`` carries the names of the loops being reduced over and is
