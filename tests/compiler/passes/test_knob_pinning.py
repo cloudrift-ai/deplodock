@@ -461,10 +461,10 @@ def test_unstaged_atom_mma_accuracy(monkeypatch):
 #   layout) must still produce correct output.
 #
 # NOTE: the article's defining optimization — **TMA** (``cp.async.bulk.tensor``) on
-# the scalar SGEMM tile — is NOT reproduced here: ``130_transport`` only promotes the
-# warp-tier MMA atom, so ``TMA=1`` on a scalar fp32 tile is currently inert (it lowers
-# to plain SYNC cooperative loads). That gap is tracked as an xfail
-# (``test_article_tma_sgemm_reproduction``), not silently passed as a no-op TMA row.
+# the scalar SGEMM tile — is covered separately by ``test_article_tma_sgemm_reproduction``
+# (the ``*_tma`` rows below also pin ``TMA=1``): ``130_transport`` promotes the scalar
+# fp32 tier as well as the warp-tier MMA atom, depositing the slab unswizzled for the
+# plain-``Load`` consumer.
 
 # 2048×2048 fp32 matmul = the blogs' hero shape. The configs are benched against a
 # numpy reference at this size so the masked-tile (FM=26) overhang math + the
@@ -521,7 +521,7 @@ _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
     # The blogs' hero register tile: BM=8 BN=32 FM=26 FN=4 BK=32 → a 208×128 masked-M
-    # tile (TM=26 ≈ 106 % of cuBLAS at 2048³ with the TMA transport the xfail tracks).
+    # tile (TM=26 ≈ 106 % of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
     ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
     # Symmetric masked-N: FN=26 FM=4 on 512³ → a 320-col overhang (boundary Cond on N).
     ("fn26_masked_n", _SMALL_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1}, {}),

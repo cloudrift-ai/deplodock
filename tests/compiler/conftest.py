@@ -17,13 +17,6 @@ from collections.abc import Callable
 import numpy as np
 import pytest
 
-from ._composer_xfails import mark_composer_xfails
-
-
-def pytest_collection_modifyitems(config, items):  # noqa: ARG001
-    """Quarantine the composer-completion gaps as xfail (see _composer_xfails)."""
-    mark_composer_xfails(items)
-
 
 def has_cuda_gpu() -> bool:
     """Check if cupy is importable and sees at least one CUDA device."""

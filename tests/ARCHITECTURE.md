@@ -47,7 +47,7 @@ tests/
 │   ├── cases.py                   # curated (op, shape) cases + torch/deplodock builders
 │   ├── conftest.py                # `bench_pair` fixture, session summary, JSON dump
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
-│   └── test_fused.py              # SDPA (xfail until fusion lands)
+│   └── test_fused.py              # SDPA fused-kernel perf comparison
 ├── compiler/                       # mirrors deplodock/compiler/
 │   ├── conftest.py                     # requires_cuda / requires_sm90 markers, run_graph fixture,
 │   │                                   # device_compute_capability(), matmul_graph(m,k,n) shared builder

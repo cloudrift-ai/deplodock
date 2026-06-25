@@ -13,8 +13,7 @@ fp32 matmul (the regime that has reuse and lowers today):
 - the staged kernel matches a numpy reference for every stage mask, including a
   masked (non-divisor) output axis.
 
-The warp-tier MMA staging probe (``test_stage_inputs_mma_probe.py``) needs the
-``atomize`` tier (R4) and stays quarantined until then.
+The warp-tier MMA staging probe lives in ``test_stage_inputs_mma_probe.py``.
 """
 
 from __future__ import annotations

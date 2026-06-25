@@ -17,20 +17,11 @@ in ``test_matmul_mma_parity.py`` cannot reach. CPU structure tests pin an explic
 launch path (the extent is resolved off the input array shapes) at sizes below,
 at, and above the 512 hint.
 
-Branch status — ``feature/tile-ir-block-dag``: the warp-MMA tier (R4) + transport
-(R5) + the score-materializing SDPA split (R6) have landed; the symbolic-M / -M+N
-masked warp tiers lower and run. The MASKED-K cases fed as a synthetic standalone
-graph (raw symbolic-K matmul, the batched P@V split-consumer, the demoted P@V) do
-NOT yet lower to a CudaOp through these direct entry shapes — the consumer matmul
-survives as a ``LoopOp`` — and the multi-kernel demoted-N graph can't take a global
-``DEPLODOCK_MMA`` pin (the producer ``map`` kernel rejects the warp pin under the
-new per-regime ``enumeration/_validate.validate_pins``). Those are the documented
-R7 masked-overhang gap (see ``plans/tile-ir-block-dag.md`` — "The masked overhang
-for the fused demoted matmul is the remaining R7 gap"); the symbolic-K P@V DOES
-lower + run accurately through the real SDPA decomposition (covered by the
-de-quarantined ``e2e/test_ops_vs_torch.py`` sdpa rows). Those synthetic-entry cases
-are kept here as ``xfail(strict=False)`` so the coverage returns automatically when
-R7 closes — they are NOT deleted.
+The full masked warp tier lowers and runs: symbolic-M, symbolic-M+N, symbolic-K
+(zero-filled partial slab), the batched P@V split-consumer, and the demoted P@V —
+each fed as a synthetic standalone graph here and accuracy-checked at off-hint
+sizes, alongside the symbolic-K P@V's real-SDPA-decomposition coverage in
+``e2e/test_ops_vs_torch.py``.
 """
 
 from __future__ import annotations

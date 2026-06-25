@@ -13,7 +13,8 @@ producer-side. See ``plans/qwen3-embedding-tune-hung-kernel.md``.
 The block-DAG rewrite **removed** the ``085_warp_specialize`` producer pass and its
 ``DEPLODOCK_WARP_SPECIALIZE`` knob entirely, so that producer-side guard is no longer
 reachable (the regression of pinning WS=1 onto this shape simply cannot be expressed). The
-test that exercised it is kept below, xfailed, as documentation of the deleted path.
+old WS=1-pinning test is gone (no code path left to exercise); ``test_mlp_slice_never_offers_ws1``
+below is its present-day replacement — see the note there.
 
 What is still live is (a) the present-day invariant that this shape never lowers to a
 ``WarpSpecialize`` node at all — no path can deploy WS=1 here — and (b) the materializer's
