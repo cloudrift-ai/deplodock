@@ -8,6 +8,7 @@ to materialize the binding tower from a chosen ``Schedule``.
 from __future__ import annotations
 
 import enum
+from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal
@@ -22,6 +23,46 @@ from deplodock.compiler.ir.tile.ir import (
     ThreadTile,
     WarpTile,
 )
+
+
+@dataclass(frozen=True)
+class CarryScope:
+    """A reduce axis that carries accumulator state ACROSS its serial loop — the
+    re-bracketable reduction the generalized ``_tower`` is built on
+    (``plans/tensor-core-streaming-flash-mma.md`` → "Generalized ``_tower``"). State is
+    declared ABOVE the loop (``init``), combined per-iteration, and normalized AFTER
+    (``epilogue``); a matmul's K-reduce and flash's kv-stream are both ``CarryScope``s —
+    they differ ONLY in which phase slots are populated (the carrier algebra). The
+    per-iteration body is the ``MONOID(SEMIRING)`` shape Unification 2/3 names, spliced in
+    order: ``produce`` the inner-contraction tile output (the INLINE edge), ``merge`` the
+    new carrier state from it, ``rescale`` the accumulator by the carrier (the twist),
+    ``handoff`` the C→A edge realization, ``consume`` (accumulate the consumer cell into the
+    rescaled accumulator), ``update`` (commit the carrier state). A degenerate SEMIRING
+    K-reduce populates only ``consume`` (the ``Mma`` accumulates in place)."""
+
+    axis: Axis
+    init: tuple[Stmt, ...] = ()
+    produce: tuple[Stmt, ...] = ()
+    merge: tuple[Stmt, ...] = ()
+    rescale: tuple[Stmt, ...] = ()
+    handoff: tuple[Stmt, ...] = ()
+    consume: tuple[Stmt, ...] = ()
+    update: tuple[Stmt, ...] = ()
+    epilogue: tuple[Stmt, ...] = ()
+
+
+def wrap_carry_tower(carry: CarryScope, *, warp_axes: tuple[Axis, ...], grid_axes: tuple[Axis, ...]) -> Body:
+    """Wrap a :class:`CarryScope` into the ``GridTile > WarpTile > [init] SerialTile [epilogue]``
+    nest. The per-iteration phases are spliced in carrier order inside the serial loop; the
+    carry's ``init`` state is hoisted above the loop and its ``epilogue`` (normalize + store)
+    trails it — so the accumulator persists across the serial axis instead of resetting per
+    tile (the streaming accumulator the generic single-cell assembly can't express)."""
+    loop_body = carry.produce + carry.merge + carry.rescale + carry.handoff + carry.consume + carry.update
+    serial = SerialTile(axis=carry.axis, body=Body(loop_body), kind="serial_outer")
+    warp_body = carry.init + (serial,) + carry.epilogue
+    warp = WarpTile(axes=warp_axes, body=Body(warp_body))
+    grid = GridTile(axes=grid_axes, body=Body((warp,)))
+    return Body((grid,))
 
 
 class Role(enum.Enum):

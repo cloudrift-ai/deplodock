@@ -224,15 +224,15 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
 
 ## Mapping to the blog placeholders
 
-| Blog section (placeholder)                                   | Closed by              |
-| ------------------------------------------------------------ | ---------------------- |
-| §Tensor cores in the softmax seam (mma + fragment softmax)   | Phases 1, 2, 3, 4      |
-| §Work partitioning (FA-2: q-block parallel, warp split-Q)    | Phase 2 (warp tower) + the free-axis grid split; cp.async KV double-buffer = follow-up |
-| §Async / Hopper (FA-3)                                       | **out of scope**       |
-| §Long context = split-KV (Flash-Decoding)                    | the `BR` cooperative-KV lane already folds carrier partials; the score-edge `INLINE`/`GMEM` placement *is* the streaming-vs-materialized choice; compose with the atom tier + a standalone decode combine (`monoid_reduce_tilegraph`) |
-| §Numerics at the metal (fp32 stats, α ≤ 1, fp8 caveat)        | Phases 4, 7 (fp8 caveat stays narrative) |
-| §The payoff (one MONOID pass + atom, beside hand-written FA-2)| Phases 1–3 — the payoff *is* the unification: flash = SDPA split @ INLINE, lowered by the same moves as the matmul |
-| §Validation (bench vs eager / torch.compile / FlashAttention)| Phase 7                |
+| Blog section (placeholder)                                     | Closed by                                                                                                                                                                                                                             |
+|----------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| §Tensor cores in the softmax seam (mma + fragment softmax)     | Phases 1, 2, 3, 4                                                                                                                                                                                                                     |
+| §Work partitioning (FA-2: q-block parallel, warp split-Q)      | Phase 2 (warp tower) + the free-axis grid split; cp.async KV double-buffer = follow-up                                                                                                                                                |
+| §Async / Hopper (FA-3)                                         | **out of scope**                                                                                                                                                                                                                      |
+| §Long context = split-KV (Flash-Decoding)                      | the `BR` cooperative-KV lane already folds carrier partials; the score-edge `INLINE`/`GMEM` placement *is* the streaming-vs-materialized choice; compose with the atom tier + a standalone decode combine (`monoid_reduce_tilegraph`) |
+| §Numerics at the metal (fp32 stats, α ≤ 1, fp8 caveat)         | Phases 4, 7 (fp8 caveat stays narrative)                                                                                                                                                                                              |
+| §The payoff (one MONOID pass + atom, beside hand-written FA-2) | Phases 1–3 — the payoff *is* the unification: flash = SDPA split @ INLINE, lowered by the same moves as the matmul                                                                                                                    |
+| §Validation (bench vs eager / torch.compile / FlashAttention)  | Phase 7                                                                                                                                                                                                                               |
 
 ## Sequencing & risk
 
@@ -360,15 +360,15 @@ The warp-chain flash's **dispatch + codegen + cell-classification** are on the s
 **structure** is hand-assembled (in `assembly/_warp_chain`), because the flash's fused-streaming shape genuinely does not
 fit the generic single-cell assembly. What landed (all committed, green):
 
-| Layer | State |
-| ----- | ----- |
-| kernel form | a **`KernelOp`** (kernel-IR), rendered by the standard `render_kernelop` + lowered by `cuda/010_lower_kernelop` — the source-string template is **deleted** |
-| TC primitives | the **shared** `dpl_mma_m16n8k16_f16` / `dpl_ldmatrix_x4` / `dpl_ldmatrix_x2_trans` (the exact helpers the warp-tier matmul emits) |
-| mma / softmax codegen | the standard kernel-IR ops: `MmaSyncPtx` / `LdmatrixLoad` / `RegStore` + the new `FragmentRowReduce` / `FragmentExp` / `FragmentScale` / `Reassign` |
-| cell **layout** (`b_trans`, atom) | **derived** by the `atomize` move (`split/005_warp_chain._classify_cell` → `atomize_cell` → `classify_matmul_operands`) — QK^T transposed-B, P@V canonical-B fall out, not hard-coded |
-| cell **lowering** | `kernel/005._lower_cell` now lowers a **fragment-output cell** (operand Loads + `Mma`, no `Write` → the fragment chain, no `RegStore`, the C-fragment stays live) — the flash QK^T can be lowered by the matmul's own pass |
-| dispatch | a `split/`-phase structural fork (`005_warp_chain`), keyed on the algebra (`dag.chain` + atom-eligibility) — analogous to `010_split_demoted`, NOT a named-shape recognizer |
-| layering | clean (`assembly/` ↛ `enumeration/`; the `atomize` derivation lives in the `split` phase) |
+| Layer                             | State                                                                                                                                                                                                                      |
+|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| kernel form                       | a **`KernelOp`** (kernel-IR), rendered by the standard `render_kernelop` + lowered by `cuda/010_lower_kernelop` — the source-string template is **deleted**                                                                |
+| TC primitives                     | the **shared** `dpl_mma_m16n8k16_f16` / `dpl_ldmatrix_x4` / `dpl_ldmatrix_x2_trans` (the exact helpers the warp-tier matmul emits)                                                                                         |
+| mma / softmax codegen             | the standard kernel-IR ops: `MmaSyncPtx` / `LdmatrixLoad` / `RegStore` + the new `FragmentRowReduce` / `FragmentExp` / `FragmentScale` / `Reassign`                                                                        |
+| cell **layout** (`b_trans`, atom) | **derived** by the `atomize` move (`split/005_warp_chain._classify_cell` → `atomize_cell` → `classify_matmul_operands`) — QK^T transposed-B, P@V canonical-B fall out, not hard-coded                                      |
+| cell **lowering**                 | `kernel/005._lower_cell` now lowers a **fragment-output cell** (operand Loads + `Mma`, no `Write` → the fragment chain, no `RegStore`, the C-fragment stays live) — the flash QK^T can be lowered by the matmul's own pass |
+| dispatch                          | a `split/`-phase structural fork (`005_warp_chain`), keyed on the algebra (`dag.chain` + atom-eligibility) — analogous to `010_split_demoted`, NOT a named-shape recognizer                                                |
+| layering                          | clean (`assembly/` ↛ `enumeration/`; the `atomize` derivation lives in the `split` phase)                                                                                                                                  |
 
 **The genuine boundary (why the structure stays hand-assembled).** Routing the *structure* through the generic
 assembly + kernel passes is not a reroute — it needs a **new model** in the shared assembly, because the flash differs
@@ -380,8 +380,98 @@ must flow QK^T→softmax→P@V within one iteration). (3) it is a **matmul→sof
 generic assembly does (`_fused.py`, the SMEM edge) is a MAP/rmsnorm producer + a matmul, not two tensor-core mmas. So a
 focused dedicated assembler for this shape (like `_fused.py` is for the SMEM-edge shape) is the architecturally
 reasonable form; forcing it into the generic single-cell assembly would be a large extension to shared matmul code for
-one consumer. **Conclusion: the current state is a clean architectural endpoint for the fused flash** — the invariant
-("no shape-specific *build move* in the composer") holds; the remaining valuable work is **functional**, below.
+one consumer. **Conclusion: the dedicated assembler is a correct *waypoint*, not the endpoint** — the invariant ("no
+shape-specific *build move* in the composer") holds, so it is a legitimate ship-it-first form; but the three "boundary"
+items above are facets of *one* limitation in the assembly model, and the principled endpoint dissolves all three. See
+**Generalized `_tower`** next.
+
+### Generalized `_tower` — the principled endpoint (the re-bracketable reduction)
+
+The "genuine boundary" above is genuine *relative to today's `_tower` model*, not fundamental. All three items —
+streaming accumulator outside the cell / two mmas sharing a loop / matmul→softmax→matmul — are facets of a **single**
+limitation: `assembly/_tower._wrap_tower` hard-codes *one bracketing* of the reduction (one reduce level, accumulator
+cell-local, one `Mma` per `AtomTile`, the body a single compute site). Make the bracketing a parameter and all three
+dissolve at once — and `_fused.py` + `_warp_chain.py` collapse into the one `_assemble` path.
+
+**The key observation: the IR already carries the model.** `TileGraph` is a DAG of `Block`s with derived `Edge`s and a
+three-value placement lattice `Placement ∈ {INLINE, SMEM, GMEM}` (`ir/tile/ir.py`). `assemble_block` realizes `GMEM`
+(→ launch groups, `_assemble_multi`) and the one SMEM-fused shape (→ the dedicated `_fused.py`). **`INLINE` between two
+blocks *within one kernel* is the unimplemented cell of the lattice** — and that cell is exactly the flash gap. The
+generalization is not a new abstraction; it is filling in the missing placement realization plus making the accumulator
+level a parameter. Two orthogonal moves:
+
+**G1 — placeable carry scope (the re-bracketing).** Today the reduce nest (`SerialTile(K_o)` + `RegisterTile(reduce)`)
+is always innermost, accumulator reset per cell. Lift "which serial axis carries accumulator state, and how it combines"
+into an explicit input:
+
+```python
+@dataclass(frozen=True)
+class CarryScope:
+    """A reduce axis that carries state ACROSS its serial loop — state init'd ABOVE the
+    loop, combined per-iteration, not reset inside. Matmul's K-reduce and flash's kv-stream
+    are both CarryScopes; they differ ONLY in (init, combine) = the carrier algebra."""
+    axis: Axis
+    init: tuple[Stmt, ...]      # Init / RegFragment hoisted ABOVE the SerialTile
+    combine: tuple[Stmt, ...]   # the per-iteration merge at the loop tail (the carrier's algebra)
+```
+
+- **SEMIRING K-reduce** (matmul): `init=[Accum=0]`, `combine=[]` (the `Mma` writes the accumulator in place). Innermost
+  — byte-identical to today.
+- **MONOID kv-stream** (flash): `init=[m, l, O-fragment]`, `combine=[FragmentRowReduce, FragmentExp, FragmentScale,
+  Reassign…]` — the online-softmax merge `_warp_chain` hand-writes. There can be **more than one** carry nested (flash
+  has both QK^T's cell-local `dd`-reduce and the kv-stream over the whole QK^T→softmax→P@V body). "Placeable accumulator
+  level" = the carry scope is any `SerialTile`, not forced innermost. The MONOID-over-SEMIRING carrier *interleaves* its
+  merge/rescale/update around the inner SEMIRING accumulate (compute S → merge stats → rescale O → accumulate P@V →
+  update m/l), which is precisely Unification 2's `MONOID(SEMIRING)`.
+
+**G2 — the reduce body is a cell sub-DAG, not one cell.** Let the carry-scoped body be a sub-`TileGraph` and make
+`assemble` **recurse** on it; the cell-DAG + edge-placement machinery is then the *same* machinery as the top level,
+nested one level down. The internal edge (flash's score) is realized at its `Placement`: `INLINE` → registers (v2: the
+mma C→A register shuffle), `SMEM` → a `_slab` (v1: `RegStore`→smem→`ldmatrix`-back — exactly what `_fused` already does
+for its producer→matmul edge), `GMEM` → impossible inside a kernel. The spine:
+
+```python
+def _assemble_group(blocks, schedule, carries):     # blocks sharing one launch group, edges INLINE/SMEM
+    order  = topo(blocks)
+    cells  = [cell_body(b) for b in order]           # G2: each block -> its AtomTile(s)
+    realize_internal_edges(order, schedule)          # INLINE=registers / SMEM=_slab
+    return wrap_tower(layers, sequence(cells), carries=carries)   # G1: hoist init, emit combine
+```
+
+**How the three assemblers collapse into one:**
+
+| Assembler | `CellDAG` | internal edge | `carries` |
+|-----------|-----------|---------------|-----------|
+| matmul (`_assemble`)      | 1 cell                                     | —                     | `[K-reduce]` (SEMIRING, innermost)        |
+| fused prod+matmul (`_fused`) | 2 cells (MAP/MONOID producer + matmul) | 1 × `SMEM`            | `[K-reduce]` (+ producer reduce if MONOID)|
+| flash (`_warp_chain`)     | 2 cells (QK^T + P@V)                        | 1 × `SMEM`(v1)/`INLINE`(v2) | `[QK^T K-reduce, kv-stream MONOID]` |
+
+`_fused`'s "patch the `StageBundle`" trick *is* "realize this edge at SMEM"; `_warp_chain`'s hand-written `m`/`l`/`O`
+recurrence *is* a MONOID `CarryScope.combine`. Both become inputs to one tower builder, not separate files.
+
+**Migration oracle (byte-identical, the discipline `_assemble.py` already follows).** Mirrors the plan's own "BN=1
+reproduces scalar flash" de-risking:
+
+1. Realize a 2-block `INLINE`/`SMEM` group in one tower — replace `_assemble_multi`'s `NotImplementedError` for
+   multi-block launch groups with `_assemble_group`. Target: reproduce `_fused`'s `TileOp` **byte-for-byte** → delete
+   `_fused.py`. (Single SEMIRING carry; no carry-scope work yet.)
+2. Add the MONOID `CarryScope` → reproduce `_warp_chain`'s output byte-for-byte → delete `_warp_chain.py`'s hand-rolled
+   body.
+
+Each step has an exact oracle (an existing assembler's output) — the "migration oracle = byte-identical CUDA" invariant.
+
+**What does *not* fall out for free** (so this is not oversold): (a) the MONOID `combine` is **layout-aware** — it runs
+in the mma C-fragment layout (`FragmentRowReduce`/`FragmentScale`), so `CarryScope.combine` must be produced by the same
+`atomize` move that produced the cells, not a generic scalar combine (Phase 3 already built those fragment ops — they
+just need to be emitted by the carry mechanism instead of hand-written); (b) `INLINE`-between-two-atoms is genuinely new
+codegen (the register C→A shuffle, v2) — `SMEM`-between-atoms (v1) is reuse; (c) keeping `Block.compute` as one site and
+nesting sub-`TileGraph`s under a carry scope is cleaner than relaxing `Block`, but needs `synthesize_staging`/`_slab` to
+compose under nesting — the main unknown to spike.
+
+**Implementation status.** Step toward G1 landed: the `CarryScope` abstraction + a `wrap_carry_tower` helper
+(`assembly/_tower`), with the warp-chain KernelOp body rebuilt on it (the kv-stream MONOID carry + the two-cell body
+expressed through the helper, the hand-listed `Init`/`Reassign`/softmax wiring deleted). The `_fused`/`_assemble`
+recursion (G2, migration steps 1–2 above) is the staged remainder.
 
 ### Remaining work (functional — Phases 4–7 + the scalar-chain follow-ups)
 
