@@ -51,26 +51,26 @@ class Case:
         case. Used by the perf bencher to drive ``deplodock run --bench
         --profile`` per case so the benchmarking infra is shared with
         the CLI. Each input tensor is materialized via ``torch.randn``
-        on the same shape; the final expression is what gets traced."""
+        on the same shape; the final expression is what gets traced.
+
+        No ``import`` preamble — the ``--code`` evaluator already binds
+        ``torch`` / ``nn`` / ``F`` in scope (``commands/trace.trace_inline_code``),
+        so the string drops straight into ``deplodock run -c "<this>"``."""
         s = self.shapes
-        preamble = "import torch; import torch.nn.functional as F"
         if self.op == "matmul":
-            return f"{preamble}; a=torch.randn({s[0]}); b=torch.randn({s[1]}); torch.matmul(a,b)"
+            return f"a=torch.randn({s[0]}); b=torch.randn({s[1]}); torch.matmul(a,b)"
         if self.op == "rmsnorm":
-            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); F.rms_norm(x, {tuple(s[1])}, w, eps=1e-6)"
+            return f"x=torch.randn({s[0]}); w=torch.randn({s[1]}); F.rms_norm(x, {tuple(s[1])}, w, eps=1e-6)"
         if self.op == "sdpa":
             gqa = "True" if s[0][-3] != s[1][-3] else "False"
             return (
-                f"{preamble}; q=torch.randn({s[0]}); k=torch.randn({s[1]}); v=torch.randn({s[2]}); "
+                f"q=torch.randn({s[0]}); k=torch.randn({s[1]}); v=torch.randn({s[2]}); "
                 f"F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa={gqa})"
             )
         if self.op == "matmul_add":
-            return f"{preamble}; x=torch.randn({s[0]}); w=torch.randn({s[1]}); r=torch.randn({s[2]}); torch.matmul(x,w)+r"
+            return f"x=torch.randn({s[0]}); w=torch.randn({s[1]}); r=torch.randn({s[2]}); torch.matmul(x,w)+r"
         if self.op == "gated_mlp":
-            return (
-                f"{preamble}; x=torch.randn({s[0]}); wg=torch.randn({s[1]}); wu=torch.randn({s[2]}); "
-                f"F.silu(torch.matmul(x,wg))*torch.matmul(x,wu)"
-            )
+            return f"x=torch.randn({s[0]}); wg=torch.randn({s[1]}); wu=torch.randn({s[2]}); F.silu(torch.matmul(x,wg))*torch.matmul(x,wu)"
         raise ValueError(f"unknown op: {self.op}")
 
     @property
