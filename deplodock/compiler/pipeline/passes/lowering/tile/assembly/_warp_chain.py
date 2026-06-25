@@ -1,53 +1,50 @@
-"""The warp-chain assembler — emit the fused tensor-core flash kernel
+"""The warp-chain assembler — build the fused tensor-core flash as **kernel-IR**
 (``plans/tensor-core-streaming-flash-mma.md`` Phase 2.3 + Phase 3).
 
-Generates the FA-2 kernel validated end-to-end in
-``tests/compiler/e2e/test_flash_tensorcore_reference.py``, generalized over the flash
-shape ``(B, H, S, D)``: one warp per 16 query rows, the QK^T `mma` (Q ``ldmatrix.x4`` A
-over ``D/16`` K-tiles, K transposed-B native pack) → the score C-fragment → the
-fragment online-softmax (the validated ``FragmentRowReduce`` op for ``rowmax``/``rowsum``
-+ the per-row ``m``/``l``/``α`` recurrence in fragment-distributed form) → the C→A handoff
-(``P`` C-fragment → smem row-major → ``ldmatrix.x4`` A) → the P@V `mma` over ``D/8``
-N-tiles. The two ``mma`` cells are exactly the atom-layer's QK^T (fragment-output) +
-P@V (fragment-``A``) — the reuse boundary Phase 2.1/2.2 fixed.
+Produces a :class:`KernelOp` (NOT a source string) that the standard
+``cuda/010_lower_kernelop`` renders via ``render_kernelop``: the QK^T / P@V mma + the
+A/V ldmatrix loads fall out of the **same** kernel-IR ops as the warp-tier matmul
+(``MmaSyncPtx`` / ``LdmatrixLoad`` / ``RegStore``), and the fragment online-softmax is
+the ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` ops + the carried
+``m``/``l`` recurrence (``Init`` + ``Reassign``). The validated reference kernel
+(``tests/compiler/e2e/test_flash_tensorcore_reference.py``) is the oracle.
 
-v1 scope: **fp16, non-causal, equal-head (no GQA), `D % 16 == 0`, `S % 16 == 0`**.
-:func:`warp_chain_eligible` gates it; an out-of-scope flash falls back to the scalar
-chain (``chain_build``). Masking / GQA / the symbolic-`seq_len` stream are follow-ups.
+Geometry: one warp per 16 query rows; Q/K/V/O are addressed as flat ``(B·H·S·D)``
+buffers (gmem-direct mma operands — no smem staging of Q/K/V), the score ``P`` rides an
+smem slab for the C→A handoff. v1 scope: fp16, non-causal, equal-head, ``D%16==0``,
+``S%16==0`` (:func:`warp_chain_eligible`).
 """
 
 from __future__ import annotations
 
 import math
 
-from deplodock.compiler.dtype import F16
+from deplodock.compiler.backend.cuda.dtype import cuda_name
+from deplodock.compiler.dim import Dim
+from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.kernel.ir import FragmentRowReduce
-from deplodock.compiler.ir.kernel.render import _MMA_SYNC_PRELUDE
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt.base import RenderCtx
-
-# Reuse the project's SHARED tensor-core codegen (the exact ``dpl_mma_m16n8k16_*`` /
-# ``dpl_ldmatrix_x4`` / ``dpl_ldmatrix_x2_trans`` helpers ``render_kernelop`` emits for the
-# warp-tier matmul) — the QK^T / P@V mma + the A / V ldmatrix loads fall out of the same
-# ops as the matmul. Only the transposed-B (Q@K^T) native smem pack is bespoke: the shared
-# lib lowers a transposed-B operand gmem-direct (``ir/kernel`` raises on a staged transposed-B
-# ldmatrix), so the smem-staged native pack is the one genuinely-new primitive here.
-_PRELUDE = (
-    "\n#include <cuda_fp16.h>\n"
-    + _MMA_SYNC_PRELUDE
-    + r"""
-__device__ __forceinline__ void dpl_wc_load_b_native(unsigned* r, const __half* sm, int ldm){
-  int lane=threadIdx.x&31; int n=lane/4; int kb=(lane%4)*2;
-  __half2 h0=__halves2half2(sm[n*ldm+kb+0], sm[n*ldm+kb+1]);
-  __half2 h1=__halves2half2(sm[n*ldm+kb+8+0], sm[n*ldm+kb+8+1]);
-  r[0]=*reinterpret_cast<unsigned*>(&h0); r[1]=*reinterpret_cast<unsigned*>(&h1);
-}
-"""
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.kernel.ir import (
+    FragmentExp,
+    FragmentRowReduce,
+    FragmentScale,
+    KernelOp,
+    LdmatrixLoad,
+    MmaSyncPtx,
+    Reassign,
+    RegFragment,
+    RegStore,
+    Smem,
+    Sync,
 )
+from deplodock.compiler.ir.loop import LoopOp
+from deplodock.compiler.ir.stmt import Assign, Body, Init
+from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, WarpTile
+
+_ATOM = (16, 8, 16)
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -56,120 +53,119 @@ def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: b
     return not symbolic and not causal and not mask and group == 1 and D % 16 == 0 and S % 16 == 0 and 16 <= D <= 256 and S >= 16
 
 
-def _reduce_lines(top: str, bot: str, frags: tuple[str, ...], op: str, ctx: RenderCtx) -> str:
-    """Render the validated ``FragmentRowReduce`` op into the generated source — the
-    same primitive ``test_fragment_row_reduce.py`` pins."""
-    return "\n".join(FragmentRowReduce(top=top, bot=bot, frags=frags, op=ElementwiseImpl(op), group=4).render(ctx))
+def _add(*terms):
+    """Sum a list of int / Expr terms into one Expr (dropping literal zeros)."""
+    out = None
+    for t in terms:
+        e = Literal(t, "int") if isinstance(t, int) else t
+        if isinstance(e, Literal) and e.value == 0:
+            continue
+        out = e if out is None else BinaryExpr("+", out, e)
+    return out if out is not None else Literal(0, "int")
 
 
-def warp_chain_kernel_source(kname: str, *, B: int, H: int, S: int, D: int, scale: float) -> str:
-    """The fused TC flash ``__global__`` source for ``(B,H,S,D)`` fp16, non-causal."""
+def _mul(a, b: int):
+    return _add() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
+
+
+def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int) -> KernelOp:
+    """The fused TC flash kernel-IR for ``(B,H,S,D)`` fp16, non-causal."""
+    scale = f"{1.0 / math.sqrt(D)!r}f"
     kt = D // 16  # QK^T K-tiles (reduce over D)
     nd = D // 8  # P@V N-tiles (output over D)
-    ctx = RenderCtx(indent=2)
+    add = ElementwiseImpl("add")
+    mx = ElementwiseImpl("maximum")
 
-    rowmax = _reduce_lines("r0", "r1", ("Sf[0]", "Sf[1]"), "maximum", ctx)
-    rowsum = _reduce_lines("s0", "s1", ("Pf[0]", "Pf[1]"), "add", ctx)
+    bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
+    base = _mul(bh, S * D)  # (b,h) offset into the flat buffer
+    qrow = _add(base, _mul(qb, 16 * D))  # query-row base
+    kvrow = _add(base, _mul(kv, 16 * D))  # kv-tile base
 
-    qa_load = "\n".join(f"    dpl_ldmatrix_x4(qa[{t}], &qs[(lane%16)*{D} + (lane/16)*8 + {t * 16}]);" for t in range(kt))
-    of_decl = ", ".join(["{0,0,0,0}"] * nd)
-    # QK^T: 2 N-atoms (kv 0-7 / 8-15), accumulate over kt K-tiles.
-    qk = []
+    def ld(frag, buf, src_index, role, *, b_trans=False, staged=False, ldm=D):
+        return LdmatrixLoad(frag=frag, src_buffer=buf, src_index=(src_index,), role=role, ldm=ldm, staged=staged, b_trans=b_trans)
+
+    body: list = []
+    # --- carried state + the Q A-fragments (loaded once, reused across the KV stream) ---
+    body.append(Init(name="m0", op=mx, dtype=F32))
+    body.append(Init(name="m1", op=mx, dtype=F32))
+    body.append(Init(name="l0", op=add, dtype=F32))
+    body.append(Init(name="l1", op=add, dtype=F32))
+    for n in range(nd):
+        body.append(RegFragment(name=f"Of{n}", role="c", shape=_ATOM, dtype=F32))
+    for t in range(kt):
+        body.append(RegFragment(name=f"qa{t}", role="a", shape=_ATOM, dtype=F16))
+        body.append(ld(f"qa{t}", q, _add(qrow, t * 16), "a"))
+    body.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(F16), align=16))
+
+    # --- the KV stream body ---
+    kvb: list = []
+    # QK^T: 2 N-atoms (kv cols 0-7 / 8-15), accumulate over kt K-tiles.
     for nt in range(2):
-        qk.append("      { float acc[4]={0,0,0,0};")
+        kvb.append(RegFragment(name=f"Sf{nt}", role="c", shape=_ATOM, dtype=F32))
         for t in range(kt):
-            off = nt * 8 * D + t * 16
-            qk.append(f"        {{ unsigned kb[2]; dpl_wc_load_b_native(kb, ks + {off}, {D});")
-            qk.append(f"          dpl_mma_m16n8k16_f16(acc, qa[{t}], kb, acc); }}")
-        qk.append(f"        for(int e=0;e<4;e++) Sf[{nt}][e]=acc[e]*{scale!r}f; }}")
-    qk_body = "\n".join(qk)
-    # P (exp(S - m)) per N-atom + rowsum partials.
-    p_body = "\n".join(
-        f"      Pf[{nt}][0]=__expf(Sf[{nt}][0]-mn0); Pf[{nt}][1]=__expf(Sf[{nt}][1]-mn0);"
-        f" Pf[{nt}][2]=__expf(Sf[{nt}][2]-mn1); Pf[{nt}][3]=__expf(Sf[{nt}][3]-mn1);"
-        for nt in range(2)
-    )
-    rescale = "\n".join(f"      Of[{n}][0]*=a0; Of[{n}][1]*=a0; Of[{n}][2]*=a1; Of[{n}][3]*=a1;" for n in range(nd))
-    # Write P C-fragment to smem row-major [16][16] (C->A handoff).
-    p_store = "\n".join(
-        f"      ps[g*16 + {nt}*8 + c0+0]=__float2half(Pf[{nt}][0]); ps[g*16 + {nt}*8 + c0+1]=__float2half(Pf[{nt}][1]);"
-        f" ps[(g+8)*16 + {nt}*8 + c0+0]=__float2half(Pf[{nt}][2]); ps[(g+8)*16 + {nt}*8 + c0+1]=__float2half(Pf[{nt}][3]);"
-        for nt in range(2)
-    )
-    pv = "\n".join(
-        f"      {{ unsigned vb[2]; dpl_ldmatrix_x2_trans(vb, &vs[(lane%16)*{D} + {n * 8}]);\n"
-        f"        dpl_mma_m16n8k16_f16(Of[{n}], pa, vb, Of[{n}]); }}"
-        for n in range(nd)
-    )
-    store = "\n".join(
-        f"    O[base + ((qb*16)+g)*{D} + {n}*8 + c0+0]=__float2half(Of[{n}][0]/l0);"
-        f" O[base + ((qb*16)+g)*{D} + {n}*8 + c0+1]=__float2half(Of[{n}][1]/l0);"
-        f" O[base + ((qb*16)+g+8)*{D} + {n}*8 + c0+0]=__float2half(Of[{n}][2]/l1);"
-        f" O[base + ((qb*16)+g+8)*{D} + {n}*8 + c0+1]=__float2half(Of[{n}][3]/l1);"
-        for n in range(nd)
-    )
-    return f"""{_PRELUDE}
-extern "C" __global__ void {kname}(const __half* Q,const __half* K,const __half* V,__half* O){{
-  int nqb={S // 16}; int blk=blockIdx.x; int qb=blk%nqb; int bh=blk/nqb;
-  long base=(long)bh*{S}*{D};
-  int lane=threadIdx.x&31; int g=lane/4; int c0=(lane%4)*2;
-  __shared__ __half qs[16*{D}], ks[16*{D}], vs[16*{D}], ps[16*16];
-  for(int i=lane;i<16*{D};i+=32) qs[i]=Q[base + (qb*16)*{D} + i];
-  __syncwarp();
-  unsigned qa[{kt}][4];
-{qa_load}
-  float m0=-1e30f,m1=-1e30f,l0=0,l1=0;
-  float Of[{nd}][4]={{{of_decl}}};
-  for(int kv0=0; kv0<{S}; kv0+=16){{
-    for(int i=lane;i<16*{D};i+=32){{ ks[i]=K[base+kv0*{D}+i]; vs[i]=V[base+kv0*{D}+i]; }}
-    __syncwarp();
-    float Sf[2][4];
-{qk_body}
-{rowmax}
-    float mn0=fmaxf(m0,r0), mn1=fmaxf(m1,r1);
-    float a0=__expf(m0-mn0), a1=__expf(m1-mn1);
-    float Pf[2][4];
-{p_body}
-{rowsum}
-    l0=l0*a0+s0; l1=l1*a1+s1;
-{rescale}
-{p_store}
-    __syncwarp();
-    unsigned pa[4]; dpl_ldmatrix_x4(pa, &ps[(lane%16)*16 + (lane/16)*8]);
-{pv}
-    m0=mn0; m1=mn1;
-  }}
-{store}
-}}
-"""
+            kvb.append(RegFragment(name=f"kb{nt}_{t}", role="b", shape=_ATOM, dtype=F16))
+            kvb.append(ld(f"kb{nt}_{t}", k, _add(kvrow, _mul(Literal(1, "int"), nt * 8 * D), t * 16), "b", b_trans=True))
+            kvb.append(MmaSyncPtx(c_frag=f"Sf{nt}", a_frag=f"qa{t}", b_frag=f"kb{nt}_{t}", shape=_ATOM, ab_dtype="f16"))
+        kvb.append(FragmentScale(frag=f"Sf{nt}", top=scale, bot=scale))
+    # fragment softmax: rowmax -> m_new / alpha; P = exp(S - m_new); rowsum -> l.
+    kvb.append(FragmentRowReduce(top="r0", bot="r1", frags=("Sf0", "Sf1"), op=mx))
+    kvb.append(Assign(name="mn0", op=mx, args=("m0", "r0")))
+    kvb.append(Assign(name="mn1", op=mx, args=("m1", "r1")))
+    kvb.append(Assign(name="dm0", op=ElementwiseImpl("subtract"), args=("m0", "mn0")))
+    kvb.append(Assign(name="dm1", op=ElementwiseImpl("subtract"), args=("m1", "mn1")))
+    kvb.append(Assign(name="a0", op=ElementwiseImpl("exp"), args=("dm0",)))
+    kvb.append(Assign(name="a1", op=ElementwiseImpl("exp"), args=("dm1",)))
+    for nt in range(2):
+        kvb.append(FragmentExp(out=f"Pf{nt}", src=f"Sf{nt}", top_sub="mn0", bot_sub="mn1"))
+    kvb.append(FragmentRowReduce(top="s0", bot="s1", frags=("Pf0", "Pf1"), op=add))
+    kvb.append(Assign(name="lm0", op=ElementwiseImpl("multiply"), args=("l0", "a0")))
+    kvb.append(Assign(name="lm1", op=ElementwiseImpl("multiply"), args=("l1", "a1")))
+    kvb.append(Assign(name="ln0", op=add, args=("lm0", "s0")))
+    kvb.append(Assign(name="ln1", op=add, args=("lm1", "s1")))
+    kvb.append(Reassign(name="l0", value="ln0"))
+    kvb.append(Reassign(name="l1", value="ln1"))
+    for n in range(nd):
+        kvb.append(FragmentScale(frag=f"Of{n}", top="a0", bot="a1"))  # rescale O *= alpha
+    # C->A handoff: write P C-fragment to the smem slab, ldmatrix it back as the A operand.
+    for nt in range(2):
+        kvb.append(
+            RegStore(dst_buffer="flash_pv_smem", dst_index=(Literal(0, "int"), Literal(nt * 8, "int")), frag=f"Pf{nt}", shape=_ATOM, ldm=16)
+        )
+    kvb.append(Sync())  # the warp must finish writing ps before ldmatrix reads it back
+    kvb.append(RegFragment(name="pa", role="a", shape=_ATOM, dtype=F16))
+    kvb.append(ld("pa", "flash_pv_smem", Literal(0, "int"), "a", staged=True, ldm=16))  # ps row stride = BN = 16, not D
+    # P@V: A = P (smem), B = V (gmem-direct), accumulate into O over the KV tile.
+    for n in range(nd):
+        kvb.append(RegFragment(name=f"vb{n}", role="b", shape=_ATOM, dtype=F16))
+        kvb.append(ld(f"vb{n}", v, _add(kvrow, n * 8), "b", b_trans=False))
+        kvb.append(MmaSyncPtx(c_frag=f"Of{n}", a_frag="pa", b_frag=f"vb{n}", shape=_ATOM, ab_dtype="f16"))
+    kvb.append(Sync())  # finish reading ps (the ldmatrix) before the next KV tile overwrites it
+    kvb.append(Reassign(name="m0", value="mn0"))
+    kvb.append(Reassign(name="m1", value="mn1"))
+    body.append(SerialTile(axis=Axis("kv", Dim(S // 16)), body=Body(tuple(kvb)), kind="serial_outer"))
+
+    # --- epilogue: O /= l, store. ---
+    for n in range(nd):
+        body.append(FragmentScale(frag=f"Of{n}", top="(1.0f/l0)", bot="(1.0f/l1)"))
+        body.append(RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=_ATOM, ldm=D))
+
+    warp = WarpTile(axes=(Axis("w", Dim(1)),), body=Body(tuple(body)))
+    grid = GridTile(axes=(Axis("bh", Dim(B * H)), Axis("qb", Dim(S // 16))), body=Body((warp,)))
+    return KernelOp(name=loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}", body=Body((grid,)))
 
 
 def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int) -> Graph:
-    """Build a single-``CudaOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
-    inputs + one kernel node. Spliced by the engine in place of the streaming LoopOp."""
-    # Q/K/V are the rank-4 inputs in declared order (the scale/ninf constants are rank-1).
+    """Build a single-``KernelOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
+    inputs + one kernel node. Spliced by the engine; the standard cuda lowering renders it."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
-    out = next(iter(loop_op.outputs.values()))
-    scale = 1.0 / math.sqrt(D)
-    kname = loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}"
-    src = warp_chain_kernel_source(kname, B=B, H=H, S=S, D=D, scale=scale)
+    out_t = next(iter(loop_op.outputs.values()))
+    kop = build_warp_chain_kernelop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D)
 
     g = Graph()
     for nid in (q_id, k_id, v_id):
         t = loop_op.inputs[nid]
         g.add_node(op=InputOp(), inputs=[], output=Tensor(nid, tuple(t.shape), F16), node_id=nid)
-    g.add_node(
-        op=CudaOp(
-            kernel_source=src,
-            kernel_name=kname,
-            arg_order=(q_id, k_id, v_id, out.name),
-            grid=((B * H * (S // 16),), (1,), (1,)),
-            block=((32,), (1,), (1,)),
-        ),
-        inputs=[q_id, k_id, v_id],
-        output=Tensor(out.name, tuple(out.shape), out.dtype),
-        node_id=out.name,
-    )
-    g.outputs = [out.name]
+    g.add_node(op=kop, inputs=[q_id, k_id, v_id], output=Tensor(out_t.name, tuple(out_t.shape), out_t.dtype), node_id=out_t.name)
+    g.outputs = [out_t.name]
     return g

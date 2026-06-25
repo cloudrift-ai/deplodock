@@ -584,6 +584,86 @@ class MonoidWarpShuffle(Stmt):
 
 
 @dataclass(frozen=True)
+class Reassign(Stmt):
+    """Reassign an already-declared carried scalar — ``name = value;`` (no ``float``
+    decl). The streaming-flash online-softmax stats (``m`` / ``l``) are carried across
+    the KV-tile loop: an enclosing ``Init`` declares them, the per-tile recurrence
+    computes fresh SSA temps, and this rebinds the carried name to the new value
+    (``Assign`` always *declares*, which would shadow the carried value)."""
+
+    name: str
+    value: str
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.name} := {self.value}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f"{_pad(ctx.indent)}{self.name} = {self.value};"]
+
+
+@dataclass(frozen=True)
+class FragmentExp(Stmt):
+    """Per-element ``exp(in − row_sub)`` over an ``mma.sync`` ``m16n8`` C-fragment — the
+    flash ``P = exp(S − m)`` (Phase 3 of ``plans/tensor-core-streaming-flash-mma.md``).
+
+    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g=lane/4``): elements ``[0,1]``
+    are row ``g`` (subtract ``top_sub``), ``[2,3]`` are row ``g+8`` (subtract ``bot_sub``)
+    — the per-row online-softmax max in fragment-distributed form. Writes the result to
+    ``out`` (declared as ``float out[4]``)."""
+
+    out: str
+    src: str
+    top_sub: str  # the per-row max for rows g (an SSA scalar)
+    bot_sub: str  # the per-row max for rows g+8
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.src, self.top_sub, self.bot_sub)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.out,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentExp({self.out} <- exp({self.src} - [{self.top_sub},{self.bot_sub}]))"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        exp = ctx.target.intrinsic("exp", "f32")
+        subs = (self.top_sub, self.top_sub, self.bot_sub, self.bot_sub)
+        return [f"{pad}float {self.out}[4];"] + [
+            f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)
+        ]
+
+
+@dataclass(frozen=True)
+class FragmentScale(Stmt):
+    """Per-row in-place scale of an ``mma.sync`` ``m16n8`` C-fragment — the flash
+    accumulator rescale ``O *= α`` and the epilogue ``O /= l`` (Phase 3). Elements
+    ``[0,1]`` (rows ``g``) scale by ``top``, ``[2,3]`` (rows ``g+8``) by ``bot`` (SSA
+    scalars or literals). A uniform scale (``top == bot``) is the score ``S *= scale``."""
+
+    frag: str
+    top: str
+    bot: str
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag, self.top, self.bot)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentScale({self.frag} *= [{self.top},{self.bot}])"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        scales = (self.top, self.top, self.bot, self.bot)
+        return [f"{pad}{self.frag}[{i}] *= {scales[i]};" for i in range(4)]
+
+
+@dataclass(frozen=True)
 class FragmentRowReduce(Stmt):
     """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
     flash fragment-softmax ``rowmax`` / ``rowsum`` (Phase 3 of
