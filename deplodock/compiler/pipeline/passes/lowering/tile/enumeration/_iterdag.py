@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Stmt
+from deplodock.compiler.ir.stmt import Loop, Monoid, ReduceCarrier, Stmt
 
 
 def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -98,6 +98,18 @@ class IterDag:
     def algebras(self) -> set[AlgebraKind]:
         """The algebra kinds of the reduce axes (empty for a MAP nest)."""
         return {n.algebra for n in self.reduce if n.algebra is not None}
+
+    @property
+    def streaming(self) -> bool:
+        """The streaming-flash schedule — a tuple ``Monoid`` carrier streaming over a
+        *nested* contraction (flash's QK^T reduce inside the KV stream). A **derived**
+        structural property (a reduce whose parent is a reduce, with a ``Monoid``
+        carrier), computed on demand exactly like ``algebras`` — never stored, so it
+        can't drift and doesn't enter ``op_cache_key``. A move that needs the
+        distinction (the streaming fork, the knob-pin validator) queries this."""
+        nested_reduce = any(n.parent is not None and n.parent.role is AxisRole.REDUCE for n in self.reduce)
+        has_monoid = any(isinstance(n.carrier, Monoid) for n in self.reduce)
+        return nested_reduce and has_monoid
 
     # --- Free-axis accessors (the tiled output axes). Replace the skeleton's
     # ``inner_n`` / ``outer_m`` / ``extra_outer`` fields — the partition consumes

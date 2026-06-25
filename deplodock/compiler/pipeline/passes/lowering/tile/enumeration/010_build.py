@@ -30,7 +30,7 @@ PATTERN = [Pattern("root", LoopOp)]
 
 # Regimes the move set builds: MAP / SEMIRING / MONOID. Flash (R6 — the streaming
 # online-softmax nest, built by enumeration/080_streaming) is the MONOID algebra on the
-# streaming schedule, flagged structurally by ``regime.streaming``, not a distinct kind.
+# streaming schedule, derived structurally on demand (``dag.streaming``), not a distinct kind.
 _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 
 
@@ -63,7 +63,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:
     # compile/run only — the tune search (``ctx.validate_pins=False``) explores
     # tier-foreign forks and union-pinned multi-op graphs (see ``Run.drive``).
     if ctx.validate_pins and not _is_union_pinned(match):
-        validate_pins(regime.algebra, streaming=regime.streaming)
+        validate_pins(regime.algebra, streaming=dag.streaming)
     # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
     # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
     buffers: dict[str, Buffer] = {}
@@ -76,7 +76,6 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:
         tilegraph=seed_graph(dag, kernel_name=loop_op.name, buffers=buffers),
         dag=dag,
         algebra=regime.algebra,
-        streaming=regime.streaming,
         target_names=regime.target_names,
         leading=tuple(dag.leading),
         seed_key=loop_op.body.structural_key(),

@@ -1,7 +1,7 @@
 """Streaming pass (fork) — the streaming-flash regime (e.g. online-softmax).
 
 A flash nest is the ``MONOID`` algebra on the **streaming schedule** — a tuple `Monoid`
-carrier streaming over a nested contraction, flagged ``op.streaming`` by ``_classify`` (a
+carrier streaming over a nested contraction, derived on demand (``op.dag.streaming``) (a
 twisted monoid is a monoid, so it is not a distinct algebra kind; see
 ``plans/twisted-monoid-carrier-design.md``).
 
@@ -66,7 +66,7 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if not op.streaming or MAP_N_THREAD.name in op.knobs:
+    if not op.dag.streaming or MAP_N_THREAD.name in op.knobs:
         raise RuleSkipped("streaming applies once, to a streaming MONOID seed")
     # Cooperative stream (``BR > 1``): the streaming axis splits across BR THREAD lanes,
     # the per-lane online-softmax partials merged via the carrier's cross-thread
