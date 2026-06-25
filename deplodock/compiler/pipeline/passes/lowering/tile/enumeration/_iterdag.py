@@ -73,6 +73,39 @@ class AxisNode:
 
 
 @dataclass(frozen=True)
+class ContractionChain:
+    """The **carried contraction chain** of a streaming-flash nest — Unification 3 of
+    ``plans/tensor-core-streaming-flash-mma.md``. Two SEMIRING contractions share a
+    *dual-role* hinge axis ``kv``, recombined by the ``Monoid`` carrier folding over it::
+
+        S[m,kv] = Σ_e Q[m,e]·K[kv,e]     # inner: reduce ``e``,  free-output ``kv``
+        P[m,kv] = softmax_kv(S)           # the ``Monoid`` carrier, over ``kv``
+        O[m,n]  = Σ_kv P[m,kv]·V[kv,n]    # outer: reduce ``kv``, free-output ``n``
+
+    ``kv`` is the **hinge**: free-output of the inner contraction, reduce of BOTH the
+    outer contraction and the carrier. The outer P@V contraction is not a distinct
+    ``Loop`` — it lives inside the carrier's ``O = O·α + p·v`` accumulation (a SEMIRING
+    accumulation twisted by the online-softmax rescale: ``MONOID(SEMIRING)``), so it is
+    characterized by ``carrier`` + ``hinge`` rather than by its own node. A **derived**
+    view (computed on demand, like :attr:`IterDag.streaming`) — never stored, so it can't
+    drift and doesn't enter ``op_cache_key``. The shared-axis ``reduce_decomp`` (Phase 1c)
+    tiles ``hinge`` by ``BN``, materializing :attr:`score` as the INLINE register edge."""
+
+    hinge: AxisNode  # ``kv`` — the dual-role hinge (the streaming ``Monoid`` reduce)
+    carrier: Monoid  # the online-softmax carrier folding over the hinge (its embedded P@V is the outer contraction)
+    inner: AxisNode  # the QK^T inner SEMIRING contraction, nested inside the hinge
+    score: str  # the inner contraction's result SSA name (the carrier's first partial) — the INLINE score edge
+
+    @property
+    def hinge_name(self) -> str:
+        return self.hinge.axis.name
+
+    @property
+    def inner_name(self) -> str:
+        return self.inner.axis.name
+
+
+@dataclass(frozen=True)
 class IterDag:
     """The derived iteration-DAG view of one ``LoopOp`` body.
 
@@ -110,6 +143,31 @@ class IterDag:
         nested_reduce = any(n.parent is not None and n.parent.role is AxisRole.REDUCE for n in self.reduce)
         has_monoid = any(isinstance(n.carrier, Monoid) for n in self.reduce)
         return nested_reduce and has_monoid
+
+    @property
+    def chain(self) -> ContractionChain | None:
+        """The carried contraction chain (Unification 3) for a streaming-flash nest, else
+        ``None``. Derived on demand: the ``Monoid``-carrier hinge axis ``kv``, the SEMIRING
+        contraction (QK^T) nested inside it that produces the score, and the carrier whose
+        embedded P@V is a SEMIRING accumulation over the hinge. The view the score INLINE
+        edge + the shared-axis ``reduce_decomp`` (Phase 1c) tile — see
+        :class:`ContractionChain`."""
+        if not self.streaming:
+            return None
+        hinge = next((n for n in self.reduce if isinstance(n.carrier, Monoid)), None)
+        if hinge is None or not hinge.carrier.partial:
+            return None
+        inner = next(
+            (
+                n
+                for n in self.reduce
+                if n.parent is not None and n.parent.axis.name == hinge.axis.name and n.algebra is AlgebraKind.SEMIRING
+            ),
+            None,
+        )
+        if inner is None:
+            return None
+        return ContractionChain(hinge=hinge, carrier=hinge.carrier, inner=inner, score=hinge.carrier.partial[0])
 
     # --- Free-axis accessors (the tiled output axes). Replace the skeleton's
     # ``inner_n`` / ``outer_m`` / ``extra_outer`` fields — the partition consumes

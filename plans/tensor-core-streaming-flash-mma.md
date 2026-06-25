@@ -255,7 +255,11 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   `134086db` collapse validator). Full `tests/compiler/` = 1635 passed.
 - **Phase 1 step 1 — done, green** (`d6feb244`): serial KV re-bracket, `BK` honored on the streaming axis, `BK ∈ {2,4}`
   verified vs torch.
-- **Next: Phase 1 the view layer (1a → 1b → 1c).** Start at `iter_dag`: represent the carried contraction chain + the
+- **Phase 1a — done, green.** `IterDag.chain` derives the carried contraction chain (`ContractionChain` in
+  `enumeration/_iterdag.py`): the dual-role hinge `kv`, the nested SEMIRING QK^T contraction, and the `Monoid` carrier
+  (its first partial = the INLINE score edge). A derived view (`None` off a non-streaming nest), structurally unit-tested
+  (`tests/compiler/passes/test_contraction_chain.py`). No build-path change yet — 1b/1c consume it.
+- **Next: Phase 1 the view layer (1b → 1c).** Start at `iter_dag`: represent the carried contraction chain + the
   dual-role hinge axis; then `classify` → `MONOID(SEMIRING)`; then the `INLINE` score edge + the shared-axis
   `reduce_decomp`. Structural tests at 1a/1b, end-to-end accuracy at 1c. Phase 2 then composes `_atom.atomize_cell` with
   no new build move — the boundary Phase 0 set up.
