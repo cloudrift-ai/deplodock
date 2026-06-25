@@ -312,17 +312,6 @@ class TmaLoad(Stmt):
         ]
 
 
-def _mbar_addr_expr(mbar: str, slot: Expr | None) -> str:
-    """``__cvta_generic_to_shared(&<mbar>[<slot>])`` — one mbarrier per slot
-    of a ring buffer is the only correct pattern for pipelined TMA, since
-    multiple ``arrive.expect_tx`` calls on the *same* mbarrier within one
-    phase accumulate into one phase rather than queueing per-slot phases.
-    ``slot=None`` means scalar mbar (single-slot, no ring buffering)."""
-    if slot is None:
-        return f"__cvta_generic_to_shared(&{mbar})"
-    return f"__cvta_generic_to_shared(&{mbar}[{{slot_expr}}])".replace("{slot_expr}", "%(slot)s")
-
-
 @dataclass(frozen=True)
 class MbarrierInit(Stmt):
     """``mbarrier.init.shared.b64 [&mbar[slot]], count;`` — one-shot init.
@@ -632,9 +621,7 @@ class FragmentExp(Stmt):
         pad = _pad(ctx.indent)
         exp = ctx.target.intrinsic("exp", "f32")
         subs = (self.top_sub, self.top_sub, self.bot_sub, self.bot_sub)
-        return [f"{pad}float {self.out}[4];"] + [
-            f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)
-        ]
+        return [f"{pad}float {self.out}[4];"] + [f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)]
 
 
 @dataclass(frozen=True)

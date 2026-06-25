@@ -71,9 +71,8 @@ class Cone:
 
 def _exposed_defines(s: Stmt) -> set[str]:
     """SSA names ``s`` makes visible at its own scope level — own defines
-    plus every nested define. Deliberately identical to the tile helpers'
-    ``collect_invariant_names`` over-approximation: nested non-Accum names
-    don't truly cross a Loop boundary, but well-formed SSA never reads them
+    plus every nested define. A deliberate over-approximation: nested non-Accum
+    names don't truly cross a Loop boundary, but well-formed SSA never reads them
     from outside, so resolving through them is harmless and cheap."""
     out = set(s.defines())
     for body in s.nested():

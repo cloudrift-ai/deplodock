@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Load
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -117,29 +117,6 @@ def single_tile(body: Body) -> tuple[int, ParallelTile]:
         if isinstance(s, (GridTile, ThreadTile, WarpTile)):
             return (i, s)
     raise RuleSkipped("TileOp has no outer ParallelTile (degenerate single-thread body)")
-
-
-def collect_invariant_names(stmt: Stmt) -> set[str]:
-    """SSA names that ``stmt`` defines and exposes to its enclosing scope.
-
-    For leaf stmts (Load, Assign, Select, Accum, Stage, etc.)
-    that's just ``stmt.defines()``. For wrapper stmts (Loop, Tile,
-    Cond, StridedLoop) it recursively collects every Accum name in
-    every nested body — those are the values the wrapper exposes
-    upward once the loop / scope closes.
-
-    Used by passes that need to know "what cross-loop SSA names are
-    safe to read" — names defined in a *prior sibling stmt* at the
-    same scope are loop-invariant w.r.t. any subsequent K-outer Loop
-    here, so cross-loop reads of them don't compound fp32 drift in a
-    pipelined rewrite the way reads of a *current* Accum's running
-    value would.
-    """
-    out = set(stmt.defines())
-    for body in stmt.nested():
-        for s in body.iter():
-            out.update(s.defines())
-    return out
 
 
 # ---------------------------------------------------------------------------
