@@ -309,6 +309,24 @@ Phase 3:
   C-fragment + the C→A handoff as the edge placement). The plan's "minimum working tensor-core flash = Phase 1 + 2 + 3"
   holds: the build wires the two `Mma`s + the geometry, Phase 3's codegen makes it execute, validated end-to-end then.
 
+**Phase 3 design — validated end-to-end on hardware (the codegen target).** Before writing the codegen, the whole fused
+tensor-core flash was proven by a hand-written FA-2 kernel that matches torch SDPA across the KV stream (S ∈ {16…128},
+`max_diff ≈ 1e-4`, fp16) — `tests/compiler/e2e/test_flash_tensorcore_reference.py`. It de-risks every Phase-3 unknown at
+once and is the **executable spec** the warp-chain codegen must generate:
+
+- **Fragment row-reduction** (the plan's "third risk", unit-tested in isolation first): `rowmax`/`rowsum` over the score
+  C-fragment's N (kv) lanes is `max(in-lane col pair, across the 2 N-tiles)` then a `__shfl_xor` butterfly (`xor 2`,
+  `xor 1`) over the 4-lane col group — exact vs numpy. The C-fragment layout is rows `g`/`g+8` (`g=lane/4`), cols
+  `(lane%4)*2+{0,1}` (the `ir/kernel` `RegStore` layout).
+- **C→A handoff (v1 SMEM):** the `P` C-fragment writes row-major to smem, `ldmatrix.x4`-loads back as the P@V `A` — no
+  register shuffle (v2 is the perf follow-up).
+- **Operand layouts confirmed:** `Q`/`P` → `ldmatrix.x4` A; `K` (transposed-B Q@K^T) → native col-major manual pack
+  (`n=lane/4`, `k=(lane%4)*2{+8}`); `V` (canonical B) → `ldmatrix.x2.trans`. The `α` rescale + `m`/`l` update are the
+  carrier's `merge`/`combine_states` in fragment-distributed (per-row, 2 rows/lane) form.
+
+Remaining: emit this from the compiler (the warp-chain build wiring the two `Mma`s + the fragment-softmax codegen + the
+smem C→A), gated under `CHAIN=1` + an atom pin, then validate the generated kernel against this reference.
+
 Open 1c follow-ups feeding in (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV (`BR>1`)
 under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the P@V output
 is the inner free axis.
