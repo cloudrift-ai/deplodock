@@ -18,10 +18,10 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Mma, Monoid, Select, SelectBranch, Stmt, Write
-from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, SerialTile, TileGraph
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Monoid, Select, SelectBranch, Stmt
+from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import classify_matmul_operands
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     COOP_BR,
@@ -484,9 +484,12 @@ def streaming_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names
 # ``reduce_decomp``, but it splits each output axis FOUR ways
 # (``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom``, bound GRID/WARP/REGISTER/ATOM)
 # and re-brackets K at ``atom_k`` granularity, then FUSES the cell
-# ``[Load,Load,mul,Accum]`` into one ``Mma`` (the ``atomize`` edit — ``Block.atom``
-# then derives from that ``Mma``). ``assemble`` materializes the AtomTile/WarpTile
-# tower around it via the shared ``_free_layers`` + ``_wrap_tower``.
+# ``[Load,Load,mul,Accum]`` into one ``Mma`` via ``_atom.atomize_cell`` (the atom
+# layer's body edit — provenance-agnostic, naming A/B by SSA value; ``Block.atom``
+# then derives from that ``Mma``). The staging geometry below (free-axis σ-split,
+# K re-bracket, gmem I/O) is the matmul-staging layer ``warp_build`` composes with
+# the atom layer. ``assemble`` materializes the AtomTile/WarpTile tower around it
+# via the shared ``_free_layers`` + ``_wrap_tower``.
 
 
 def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
@@ -546,58 +549,6 @@ def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_dim, bk: int, atom_k
     return tuple(out)
 
 
-def _atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...]:
-    """The ``atomize`` body edit: fuse the canonical matmul cell
-    ``[Load a, Load b, Assign(mul), Accum]`` into ``[Load a*, Load b*, Mma]`` (the
-    operand ``Load``s kept plain, the ``Mma`` naming its A/B by SSA value +
-    carrying the ``atom`` spec). Walks the K tower (``SerialTile(reduce)``) to the
-    cell; ``Block.atom`` then derives from the emitted ``Mma``."""
-    write = next((s for s in body if isinstance(s, Write)), write)
-    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write)
-    if tagged is not None:
-        return tagged
-    out: list[Stmt] = []
-    for s in body:
-        if isinstance(s, SerialTile) and s.is_reduce:
-            out.append(s.with_bodies((Body(_atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write)),)))
-        elif s.nested():
-            out.append(s.with_bodies(tuple(Body(_atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write)) for sub in s.nested())))
-        else:
-            out.append(s)
-    return tuple(out)
-
-
-def _try_atomize_here(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...] | None:
-    """If ``body`` is the canonical matmul cell, return ``[*rest, Load a, Load b,
-    Mma]``; else ``None``."""
-    loads = [s for s in body if isinstance(s, Load)]
-    assigns = [s for s in body if isinstance(s, Assign)]
-    accums = [s for s in body if isinstance(s, Accum)]
-    if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
-        return None
-    mul, accum = assigns[0], accums[0]
-    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
-        return None
-    out_index = write.index if (write is not None and write.index) else None
-    a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index) if k_name is not None else (None, None)
-    if a_load is None or b_load is None:
-        return None
-    b_trans = _is_transposed_b(b_load, k_name=k_name)
-    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes, b_trans=b_trans)
-    rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
-    return (*rest, a_load, b_load, mma)
-
-
-def _is_transposed_b(b_load: Load, *, k_name: str | None) -> bool:
-    """True iff the B operand is stored N×K (K contiguous in its last dim AND
-    nowhere else) — a Q @ K^T cell, loaded ``ldmatrix`` without ``.trans``."""
-    if not b_load.index or k_name is None:
-        return False
-    in_last = k_name in b_load.index[-1].free_vars()
-    in_earlier = any(k_name in e.free_vars() for e in b_load.index[:-1])
-    return in_last and not in_earlier
-
-
 def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> TileGraph:
     """The warp-tier ``atomize`` build move: take the logical seed graph and σ-split
     the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
@@ -618,7 +569,7 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     block = graph.blocks[0]
     new_inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
     new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_node.loop.axis.extent, bk, atom_k, dag.k_bound)
-    new_inner = _atomize_cell(new_inner, atom=atom, k_name=None, write=None)
+    new_inner = atomize_cell(new_inner, atom=atom, k_name=None, write=None)
     bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
     new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)
 

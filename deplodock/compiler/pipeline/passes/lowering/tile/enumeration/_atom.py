@@ -1,19 +1,27 @@
-"""Per-atom *eligibility* — the tensorize fork's gate for each matmul atom.
+"""The atom layer — the warp-tier MMA *eligibility gate* + the ``atomize`` body edit.
 
 ``plans/tile-ir-block-dag.md`` R4 (``atomize``): the warp-tier MMA fork
 (``020_tensorize``) offers each :class:`~deplodock.compiler.ir.tile.ir.Atom`
-the kernel admits. The eligibility predicate is the gate — a pure query over the
-iteration DAG (the derived view) + operand dtypes + device compute capability:
-does this ``LoopOp`` admit this atom?
+the kernel admits, and ``050_warp_build`` fuses the matmul cell into one
+:class:`~deplodock.compiler.ir.stmt.Mma`. Both concerns live here, the
+**atom layer** — provenance-agnostic, naming operands by SSA value:
 
-It mirrors the legacy ``tile/_atom.py`` (deleted in the block-DAG demolition),
-re-expressed against :class:`IterDag` instead of the raw ``LoopOp`` body: the
-matmul reduces are ``dag.reduce`` nodes, the free extents come off
-``dag.parallel``, and dtypes resolve through a ``dtype_of`` lookup (the seed
-``Buffer``s) rather than ``graph.nodes``. :func:`classify_matmul_operands` is the
-ONE A/B layout decision shared by the gate and the ``atomize`` body move, so a
-cell the move can't classify is never offered the warp tier (an untagged
-``AtomTile`` would survive unconsumed to render and crash).
+- :func:`eligible_atoms` / :func:`_atom_eligible` — the gate. A pure query over the
+  iteration DAG (the derived view) + operand dtypes + device compute capability:
+  does this ``LoopOp`` admit this atom? Mirrors the legacy ``tile/_atom.py``
+  (deleted in the block-DAG demolition), re-expressed against :class:`IterDag`
+  instead of the raw ``LoopOp`` body.
+- :func:`atomize_cell` — the body edit (``plans/...`` Phase 0): fuse the canonical
+  matmul cell ``[Load, Load, Assign(mul), Accum]`` into one ``Mma``. It is
+  **independent of why the matmul exists or where its operands come from** — it
+  names A / B by SSA value, so it lowers a cell whose operands are gmem ``Load``s
+  (the SEMIRING matmul today) **or** a register / smem fragment (the MONOID flash
+  inner contractions of Phase 2). The matmul-staging geometry (free-axis σ-split,
+  K re-bracket, gmem-I/O) stays in ``_build.warp_build``, which composes the two.
+
+:func:`classify_matmul_operands` is the ONE A/B layout decision shared by the gate
+and :func:`atomize_cell`, so a cell the move can't classify is never offered the
+warp tier (an untagged ``AtomTile`` would survive unconsumed to render and crash).
 
 Prefixed ``_`` so the pipeline rule loader skips it.
 """
@@ -22,9 +30,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.stmt.blocks import Body
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom, SerialTile
 from deplodock.compiler.pipeline.passes.lowering._predicates import (
     classify_fragment_epilogue,
     is_matmul_reduce,
@@ -195,3 +203,64 @@ def eligible_atoms(dag: IterDag, *, compute_capability: tuple[int, int], dtype_o
     """The atoms ``dag`` admits, in ``ATOM_REGISTRY`` priority order (f16 first).
     Empty for a non-matmul / scalar-only kernel."""
     return [a for a in ATOM_REGISTRY.values() if _atom_eligible(a, dag, compute_capability=compute_capability, dtype_of=dtype_of)]
+
+
+# === The ``atomize`` body edit (the atom layer's move) =====================
+# Provenance-agnostic: fuses the canonical matmul cell into one ``Mma`` naming its
+# A / B operands by SSA value, so it lowers a cell whose operands are gmem ``Load``s
+# (the SEMIRING matmul) **or** a register / smem fragment (the MONOID flash inner
+# contractions). The free-axis geometry + gmem I/O stay in ``_build.warp_build``.
+
+
+def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...]:
+    """The ``atomize`` body edit: fuse the canonical matmul cell
+    ``[Load a, Load b, Assign(mul), Accum]`` into ``[Load a*, Load b*, Mma]`` (the
+    operand ``Load``s kept plain, the ``Mma`` naming its A/B by SSA value +
+    carrying the ``atom`` spec). Walks the K tower (``SerialTile(reduce)``) to the
+    cell; ``Block.atom`` then derives from the emitted ``Mma``. The unit a Phase-2
+    MONOID nest can call directly on its inner contractions — agnostic to operand
+    provenance (gmem ``Load`` or a register / smem fragment)."""
+    write = next((s for s in body if isinstance(s, Write)), write)
+    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write)
+    if tagged is not None:
+        return tagged
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, SerialTile) and s.is_reduce:
+            out.append(s.with_bodies((Body(atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write)),)))
+        elif s.nested():
+            out.append(s.with_bodies(tuple(Body(atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write)) for sub in s.nested())))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _try_atomize_here(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None) -> tuple[Stmt, ...] | None:
+    """If ``body`` is the canonical matmul cell, return ``[*rest, Load a, Load b,
+    Mma]``; else ``None``."""
+    loads = [s for s in body if isinstance(s, Load)]
+    assigns = [s for s in body if isinstance(s, Assign)]
+    accums = [s for s in body if isinstance(s, Accum)]
+    if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
+        return None
+    mul, accum = assigns[0], accums[0]
+    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
+        return None
+    out_index = write.index if (write is not None and write.index) else None
+    a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index) if k_name is not None else (None, None)
+    if a_load is None or b_load is None:
+        return None
+    b_trans = _is_transposed_b(b_load, k_name=k_name)
+    mma = Mma(c=accum.name, a=a_load.names[0], b=b_load.names[0], atom=atom, axes=accum.axes, b_trans=b_trans)
+    rest = [s for s in body if s not in (a_load, b_load, mul, accum)]
+    return (*rest, a_load, b_load, mma)
+
+
+def _is_transposed_b(b_load: Load, *, k_name: str | None) -> bool:
+    """True iff the B operand is stored N×K (K contiguous in its last dim AND
+    nowhere else) — a Q @ K^T cell, loaded ``ldmatrix`` without ``.trans``."""
+    if not b_load.index or k_name is None:
+        return False
+    in_last = k_name in b_load.index[-1].free_vars()
+    in_earlier = any(k_name in e.free_vars() for e in b_load.index[:-1])
+    return in_last and not in_earlier
