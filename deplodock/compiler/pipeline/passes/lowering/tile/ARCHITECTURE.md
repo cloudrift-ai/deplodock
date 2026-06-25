@@ -35,10 +35,14 @@ The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **three 
   atom-vs-scalar choice, `030_warp_geometry` / `040_warp_reg` pin the warp counts + register cells, `050_warp_build`
   applies the **warp build body move** (four-way GRID/WARP/REGISTER/ATOM σ-split + K re-bracket at `atom_k` granularity +
   fuse the cell into an `Mma`); the scalar passes gate off when an `MMA` atom is pinned, and `120_stage` then stages the
-  warp operands too. The **cooperative-reduce** chain (R2 `MONOID`): `070_coop_reduce` is a single `(bk, fk, br)` fork
-  applying the **coop build body move** (re-bracket K with the `K_c` cooperative-THREAD lane + free-axis σ-split with the
-  register tile forced to 1); the scalar passes `090`/`100`/`110` + `120_stage` gate off `MONOID` (a cooperative reduce
-  is one decision and stays smem-free). The algorithm is built up across the passes, never all-at-once.
+  warp operands too. The **MONOID** chain (R2/R6): `070_coop_reduce` is the **single MONOID pass** — it owns BOTH the
+  flat cooperative reduce (softmax / rmsnorm / mean / max) AND the streaming flash (online-softmax over a nested QK^T),
+  applying the **`monoid_build` body move** (apply the reduce-decomposition tower to each contraction axis the DAG
+  exposes — recursive for the nested stream — with the `K_c` cooperative-THREAD lane on the primary axis + free-axis
+  σ-split with the register tile forced to 1). Only the **offer set** differs by regime (the algebra-conditioned ranking
+  heuristic, not a code path): a flat reduce searches `(bk, fk, br)`; a streaming flash searches the free THREAD tile with
+  `BK=FK=1` and `BR` over the static KV axis. The scalar passes `090`/`100`/`110` + `120_stage` gate off `MONOID` (a
+  monoid reduce stays smem-free). The algorithm is built up across the passes, never all-at-once.
 - **`assembly/`** (`010_assemble` + `020_peel` + `030_mark_unroll`) — the fully-tiled `TileGraphOp` → `TileOp`, in one
   deterministic step followed by deterministic post-passes. No build here: `assemble_block` only **materializes** the
   stored algorithm — the register/thread tower (`_wrap_tower`) + slab synthesis from `Schedule.staged`; `020_peel` then
@@ -48,7 +52,7 @@ The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **three 
 
 ```
               ┌─ split? (xn producer + clean gemm)        ┌─ scalar: reduce_decomp ─(thread)─ free_tile ─ 110_seal ─┐
-LoopOp ─split─┤                              ─010_build─▶ logical TileGraph ─020_tensorize┤─ coop: 070_coop_reduce (coop_build) ─┼─ 120_stage ─ 130_transport ─▶ tiled TileGraphOp ─010_assemble ─ 020_peel ─ 030_mark_unroll ─▶ TileOp
+LoopOp ─split─┤                              ─010_build─▶ logical TileGraph ─020_tensorize┤─ monoid: 070_coop_reduce (monoid_build) ─┼─ 120_stage ─ 130_transport ─▶ tiled TileGraphOp ─010_assemble ─ 020_peel ─ 030_mark_unroll ─▶ TileOp
               └─ keep fused ─────────────────▶            (per LoopOp)         └─ warp: 030/040 geom+reg ─ 050_warp_build ───────┘
 ```
 
@@ -76,8 +80,9 @@ One file, two comment-block sections:
 dispatches on the reduce axes' **carrier algebra** (`ir/algebra.py::AlgebraKind`) — `MAP` / `SEMIRING` / `MONOID` —
 read off the body by `_tree.classify`. A "matmul" is just a `SEMIRING`; "pointwise" a `MAP`; "RMSNorm" / "softmax" /
 "flash attention" all a `MONOID` (a twisted monoid **is** a monoid — transport of structure). Flash differs only in its
-*schedule*: a tuple `Monoid` carrier streaming over a nested contraction is flagged `_Regime.streaming` structurally and
-lowered on the streaming tier, one layer below the algebra (see
+*schedule*: a tuple `Monoid` carrier streaming over a nested contraction is a **derived** structural property
+(`dag.streaming`, computed on demand — never stored) that the one `MONOID` pass (`070_coop_reduce`) reads to pick the
+streaming offer set; the build move (`monoid_build`) is shared with the cooperative reduce (see
 [`plans/twisted-monoid-carrier-design.md`](../../../../../../plans/twisted-monoid-carrier-design.md)). Adding a model
 architecture is **never** a new branch — it is the same move set on its algebra.
 
@@ -126,8 +131,7 @@ shape-specific pattern matching.*
 | `030_warp_geometry.py`| Fork (warp): the per-CTA warp counts — `warp_offers` → `(WM, WN)`. Knob-only. |
 | `040_warp_reg.py`     | Fork (warp): the per-warp register cells — `warp_reg_offers` → `(FM, FN)`. Knob-only. A fully-pinned `(DEPLODOCK_FM, DEPLODOCK_FN)` is authoritative and bypasses the `_MAX_WARP_CELLS` *search* ceiling (the ceiling prunes auto-enumerated candidates, not explicit pins). |
 | `050_warp_build.py`   | Fork (warp): the K chunk — `warp_bk_offers` → `BK`; **applies the `warp_build` body move** (four-way σ-split + K re-bracket + `atomize` the cell → `Mma`). A **symbolic (masked) K** (`_classify` now admits a symbolic-K `SEMIRING`, tiling K at the `Dim` hint) ceil-divides `K_o` in `_replace_k_warp` — the loop bound is the runtime `ceil(seq_len/(BK·atom_k))`, so seq > hint is covered **and** `seq_len` enters the kernel signature; the `dpl_mma_load_*_kzero` helpers (`kernel/005`) zero-fill the partial final K tile (a clamped duplicate would corrupt the reduction). |
-| `070_coop_reduce.py`  | Fork (cooperative `MONOID`, R2): the one `(bk, fk, br)` decision — `coop_reduce_offers`; **applies the `coop_build` body move** (K re-bracket with the `K_c` cooperative-THREAD lane + free-axis σ-split, reg forced to 1). Owns the `MONOID` regime end to end (`090`/`100`/`110`/`120_stage` gate off). |
-| `080_streaming.py`    | Fork (streaming flash — a `MONOID` nest with `op.streaming`, R6 — e.g. flash attention): the free-axis thread tile × cooperative `BR` — `thread_offers` × `streaming_br_offers`; **applies the `streaming_build` body move** (serial-transform both contraction axes, `FM=FN=1`/`BK=FK=SPLITK=1`; a pinned `BR>1` lays the `K_c` THREAD lane on the **static** streaming axis so each lane streams a strided slice and the carrier's `combine_states` merges them at materialize, like the `MONOID` coop reduce). `streaming_coop_geometry_ok` constrains the free×BR layout (whole-CTA tree vs strided intra-warp); default `BR=1` is the serial-stream form, a symbolic streaming axis stays serial. Owns the streaming-flash regime end to end (`070_coop_reduce` skips `op.streaming`; `120_stage` skips — smem-free). |
+| `070_coop_reduce.py`  | Fork (**MONOID**, R2/R6): the **single MONOID pass** — owns the flat cooperative reduce (softmax / rmsnorm / mean / max) AND the streaming flash (online-softmax over a nested QK^T — a twisted monoid is a monoid, selected structurally via `op.dag.streaming`). **Applies the `monoid_build` body move** (the reduce-decomposition tower on each contraction axis the DAG exposes — recursive for the nested stream — `K_c` cooperative-THREAD lane on the primary axis + free-axis σ-split, reg forced to 1). Only the offer set differs by regime: a flat reduce searches `(bk, fk, br)` (`coop_reduce_offers` / whole-CTA / strided-cooperative free tile); a streaming flash searches the free THREAD tile (`thread_offers`) with `BK=FK=SPLITK=1` and `BR` over the **static** KV axis (`streaming_br_offers` — cooperative-KV, opt-in, `streaming_coop_geometry_ok`-constrained; a symbolic streaming axis stays serial). Owns the `MONOID` regime end to end (`090`/`100`/`110`/`120_stage` gate off — smem-free). |
 | `060_reduce_tile.py`  | Fork (scalar `SEMIRING`): the reduce decomposition — `reduce_offers` → `(bk, fk, splitk)`; **applies the `reduce_decomp` body move**. Skips on a warp variant. For an **fp16 matmul** (`_is_fp16_matmul`: every K-indexed operand `Load` is `F16`, no fused prologue/epilogue) an even `fk == bk` offer is reinterpreted as the **half2 accumulation window**: it builds the FK=1 fp32 K factorization (no `K_f` register fold) and stamps `FKWIN` so `kernel/015_pack_fk_window` packs the even bk inner loop into `__hfma2` (`plans/fk-half2-fp16-matmul.md`). The register FK fold and the half2 window are mutually exclusive realizations of `FK`; fp32/bf16 keep the fold, and `fk=1` (greedy default) keeps the scalar fp32-accumulate path. |
 | `090_thread_tile.py`  | Fork (scalar): the free-axis thread tile — `thread_offers` → `(thread_n, thread_m)`. Pins the thread knob, **no body move**. Skips on a warp or coop variant. For `SEMIRING` (matmul) it passes `balanced=True` so `thread_offers` drops degenerate-aspect tiles (`BN=1`/`BM=1`) and leads with a square-ish coalesced `BN >= BM` tile (the bare ≈256-thread sort ties `(BN=1, BM=256)` with `(16, 16)` and emits the degenerate one first — and emission order *is* the cold pick); MAP keeps the wide-N order. |
 | `100_register_tile.py`| Fork (scalar): the free-axis register tile — `map_reg_offers` / `reduce_reg_offers` → `(reg_n, reg_m)`; **applies the `free_tile` body move** (the algorithm is fully tiled after). Skips on a coop variant. |
@@ -141,13 +145,14 @@ shape-specific pattern matching.*
 | `_moves.py`           | `Budget` + `legal_decomps` + the offers (`thread_offers`, `map_reg_offers`, `reduce_offers`, `reduce_reg_offers`, `coop_reduce_offers` / `coop_free_threads`, `warp_offers` / `warp_reg_offers` / `warp_bk_offers`) + knob deltas. Every scalar/warp offer honors its `DEPLODOCK_<KNOB>` env pin via `_pin` (the `thread_offers`/`map_reg_offers`/`reduce_reg_offers` narrow `BN`/`BM`/`FN`/`FM` to the pin, like `reduce_offers` does for `BK`/`FK`/`SPLITK`) — a pinned masked tile (e.g. `BN=8` over `N=47`) reaches the masked σ-split instead of being dropped for the best-first ≈256-thread default. |
 | `_stage.py`           | `stage_candidates` — the `stage` move's ranked offer set (AFFINE + non-degenerate intra-CTA fan-in reuse + K-tower) off the derived `Block.reads`; excludes the transposed-B operand **and any buffer read at >1 distinct access** (`_multi_access_bufs` — a single slab can reconstruct only one access; the RoPE-fused score producer reads a rotary table at both the Q row `cos[m,d]` and K row `cos[n,d]`, and its projection both straight and rotate-half, so they stay gmem-direct — only same-access reads collapse to one slab, the `026` dedup by construction). |
 | `_knobs.py`           | The knob schema (`BN`/`BM`/`BK`/`FK`/`STAGE`/`MMA`/`WM`/`WN`/… + the composer aliases `MAP_*` / `RED_*` / `TC_*`). |
-| `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `coop_build` (the cooperative-reduce K re-bracket + free split, R2), `streaming_build` (the streaming-flash serial K-transform + free split, R6 — e.g. flash attention; `BR>1` lays the `K_c` cooperative lane on the static streaming axis), `warp_build` (the warp-tier four-way split + K re-bracket — the matmul-staging geometry — composed with `_atom.atomize_cell`, the provenance-agnostic atom-layer body edit); `build_dag` is the scalar composition (the byte-identity oracle). |
+| `_build.py`           | The F3-b incremental body moves — `seed_graph` (logical block), `reduce_decomp` (K re-bracket), `free_tile` (free-axis σ-split), `monoid_build` (the **one** MONOID move for the flat cooperative reduce AND the streaming flash — R2/R6: the reduce-decomposition tower `_replace_k_monoid` applied to each contraction axis the DAG exposes, recursive for the nested stream, `K_c` cooperative lane on the primary axis, carrier-aware masked-K fill via `_mask_carrier`; then `free_tile`), `warp_build` (the warp-tier four-way split + K re-bracket — the matmul-staging geometry — composed with `_atom.atomize_cell`, the provenance-agnostic atom-layer body edit); `build_dag` is the scalar composition (the byte-identity oracle). |
 | `_partition.py`       | The R3 split-K combine builders — `additive_reduce_tilegraph` (`Accum` sum) / `monoid_reduce_tilegraph` (carrier-general `combine_states` fold) emit a fully-tiled single-`Block` combine `TileGraph` (`GridTile(16×16) > ThreadTile > serial K_s reduce + boundary Cond`); `reduce_tilegraphop` wraps it with stamped fixed/OFF knobs so every enumeration fork skips it (fixed-schedule, not searched). |
 
 The per-pass moves serve every regime: a `MAP` nest applies only `free_tile` (`reduce_decomp` is a no-op without a
 contraction); a `SEMIRING` reduce applies both — `reduce_decomp` (gated on `target_names`) then `free_tile`; a `MONOID`
-reduce applies the single `coop_build` (free split + the cooperative `K_c` THREAD lane, the cross-thread combine derived
-downstream from `Accum.axes`). The scalar composition order (reduce then free) reverses the old monolith (free then
+reduce (flat OR streaming) applies the single `monoid_build` (the reduce-decomposition tower on each contraction axis +
+free split + the cooperative `K_c` THREAD lane, the cross-thread combine derived downstream from the carrier's `axes`).
+The scalar composition order (reduce then free) reverses the old monolith (free then
 reduce), but the two σ-rewrites touch disjoint axis sets (K vs the free N/M) so they commute — `build_dag` stays the
 byte-identity oracle for the distribution.
 
@@ -166,8 +171,9 @@ byte-identity oracle for the distribution.
 ## Coverage
 
 Built today: **`MAP`** + scalar **`SEMIRING`** (including masked / symbolic free axes, split-K, and the `FK`
-strip-mine) + the **`MONOID` cooperative-reduce** (R2 `coop_build` — softmax / rmsnorm / mean / max, static **and**
-symbolic-K masked-fill, whole-CTA and strided-cooperative rows, the warp-shuffle / hierarchical combine) + the
+strip-mine) + the **`MONOID` reduce** (R2/R6 `monoid_build` — the one move for the flat cooperative reduce (softmax /
+rmsnorm / mean / max, static **and** symbolic-K masked-fill, whole-CTA and strided-cooperative rows, the warp-shuffle /
+hierarchical combine) AND the streaming flash, below) + the
 **warp-tier `SEMIRING`** (tensor-core `mma.sync` via the R4 `atomize` move — matmul, residual / pointwise / causal-mask
 epilogue fold, transposed-B, symbolic M/N), with **smem staging** (`stage` move) on both the scalar reduce regimes (R1)
 and the warp operands (atom-strided slab + `ldmatrix`) + the **cross-CTA split-K combine** (R3 `140_atomic_free_splitk`
@@ -178,8 +184,9 @@ operands to a double-buffered `cp.async.bulk.tensor` ring, software-pipelined in
 TMA-first when eligible — option-0 takes the ring; the tuner/`DEPLODOCK_TMA=0` can force SYNC). Both staged tiers promote: the **warp-tier** `ldmatrix` matmul (slab
 swizzled per-source) and the **scalar register-tiled SGEMM** (the blogs' `TM=26` fp32 hero tile — its plain-`Load`
 consumer reads an unswizzled `SwizzleMode.NONE` deposit) + the **streaming-flash
-`MONOID`** (R6 `080_streaming` + `streaming_build` — SDPA / causal / GQA / additive-mask online-softmax, static
-**and** symbolic-`seq_len` masked streaming, scalar-KV by default and **cooperative-KV** when `DEPLODOCK_BR>1` lays the
+`MONOID`** (R6 — the **same** `070_coop_reduce` pass + `monoid_build` move as the cooperative reduce, selected
+structurally via `op.dag.streaming` — SDPA / causal / GQA / additive-mask online-softmax, static **and**
+symbolic-`seq_len` masked streaming, scalar-KV by default and **cooperative-KV** when `DEPLODOCK_BR>1` lays the
 `K_c` THREAD lane on a static streaming axis). The **masked scalar-tile staging clamp** landed (R4 follow-up): scalar-offer
 env-pin honoring (`_pin` in `thread_offers`/`reduce_reg_offers`) reaches the masked σ-split, the over-staging it
 exposed is resolved by `120_stage`'s budget-aware mask filter (greedy falls back to the largest in-budget staging),
