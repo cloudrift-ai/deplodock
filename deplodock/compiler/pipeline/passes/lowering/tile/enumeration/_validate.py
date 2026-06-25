@@ -2,12 +2,14 @@
 
 A ``DEPLODOCK_<KNOB>`` env pin is global, but every kernel is lowered on exactly
 ONE *tier* (the codegen regime its body + pins resolve to): a pointwise ``MAP``, a
-scalar ``SEMIRING`` reduce, a tensor-core ``WARP`` matmul, a cooperative ``MONOID``
-reduce, or a streaming-flash ``MONOID`` nest. Each tier owns a disjoint slice of
-the knob schema (a warp tile has no ``BN``/``BM`` THREAD width; a cooperative reduce
-has no ``WM``/``WN`` warp count; a pointwise nest has no ``BK`` K-chunk). Pinning a
-knob the resolved tier never reads used to be **silently dropped** (or overwritten by
-an OFF sentinel) — the user pinned a config and got a different one with no warning.
+scalar ``SEMIRING`` reduce, a tensor-core ``WARP`` matmul, or a ``MONOID`` reduce (the
+flat cooperative reduce **and** the streaming flash — one tier, since both share the
+``monoid_build`` move and knob slice; the streaming schedule is a derived structural
+property, not a separate tier). Each tier owns a disjoint slice of the knob schema (a
+warp tile has no ``BN``/``BM`` THREAD width; a ``MONOID`` reduce has no ``WM``/``WN``
+warp count; a pointwise nest has no ``BK`` K-chunk). Pinning a knob the resolved tier
+never reads used to be **silently dropped** (or overwritten by an OFF sentinel) — the
+user pinned a config and got a different one with no warning.
 
 This module makes that a **hard error** (strict per-op policy): given the op's
 :class:`~deplodock.compiler.ir.algebra.AlgebraKind` and the live env pins, it computes
@@ -20,10 +22,12 @@ The legality table is value-aware: a knob at its universal / OFF value (``SPLITK
 ``FK=1``, ``BR=1``, ``FM=1``, ``STAGE=`` empty, ``TMA=0``) constrains nothing — only a
 *meaningful* pin (``SPLITK>1`` cross-CTA split-K, ``BR>1`` cooperative lanes,
 ``MMA=<kind>`` tensor core, ``STAGE`` selecting a read-site, ``TMA=1``) narrows the
-tier. The staging / transport knobs ``STAGE`` / ``TMA`` are legal only on the **staged**
-tiers (``SCALAR`` / ``WARP``): a cooperative ``MONOID`` reduce and a streaming-flash
-``MONOID`` nest are smem-free, and a pointwise ``MAP`` nest has no K-tower, so
-neither stages anything. ``TMA`` is wired on both staged tiers — the warp-tier
+tier. The K-chunk knobs ``BK``/``FK`` are legal on the ``MONOID`` tier (split-KV / serial
+re-bracketing is associativity-licensed on the nested monoid too — the streaming flash
+re-brackets its KV stream the same way the cooperative reduce chunks its K). The staging
+/ transport knobs ``STAGE`` / ``TMA`` are legal only on the **staged** tiers (``SCALAR`` /
+``WARP``): a ``MONOID`` reduce is smem-free and a pointwise ``MAP`` nest has no K-tower,
+so neither stages anything. ``TMA`` is wired on both staged tiers — the warp-tier
 ``ldmatrix`` matmul and the scalar register-tiled SGEMM (``130_transport`` promotes any
 staged matmul with a ringable K loop).
 """
@@ -63,21 +67,22 @@ class Tier(Enum):
     MAP = "map"  # pointwise functor (free-axis thread + register tile only)
     SCALAR = "scalar"  # scalar SEMIRING reduce / matmul (thread tile + K-chunk + split-K)
     WARP = "warp"  # tensor-core MMA matmul (warp counts + register cells + atom-K chunk)
-    COOP = "coop"  # cooperative MONOID reduce (free thread + BR lanes + K-chunk, reg forced 1)
-    STREAMING = "streaming"  # streaming-flash MONOID nest (free thread + BR lanes)
+    MONOID = "monoid"  # MONOID reduce — flat cooperative AND streaming flash (free thread + BR lanes + K-chunk, reg 1)
 
 
-_NON_WARP = frozenset({Tier.MAP, Tier.SCALAR, Tier.COOP, Tier.STREAMING})
+_NON_WARP = frozenset({Tier.MAP, Tier.SCALAR, Tier.MONOID})
 _STAGED = frozenset({Tier.SCALAR, Tier.WARP})  # the tiers that synthesize an smem slab
 
 # The tiers an op's algebra can resolve to (before any pin narrows further). SEMIRING
-# is the only fork — scalar register-tile FMA vs the tensor-core warp atom. MONOID covers
-# both the cooperative reduce (``COOP``) and the streaming-flash schedule (``STREAMING``):
-# ``validate_pins(streaming=...)`` picks which, since a twisted monoid is the MONOID algebra.
+# is the only fork — scalar register-tile FMA vs the tensor-core warp atom. MONOID is one
+# tier: the cooperative reduce and the streaming flash share the same ``monoid_build`` move
+# and knob slice (a twisted monoid is a monoid — the streaming schedule is derived, not a
+# separate tier), so the K-chunk knobs (``BK``/``FK``) are legal on it (split-KV / serial
+# re-bracketing is associativity-licensed on the nested monoid too).
 _CANDIDATES: dict[AlgebraKind, frozenset[Tier]] = {
     AlgebraKind.MAP: frozenset({Tier.MAP}),
     AlgebraKind.SEMIRING: frozenset({Tier.SCALAR, Tier.WARP}),
-    AlgebraKind.MONOID: frozenset({Tier.COOP}),
+    AlgebraKind.MONOID: frozenset({Tier.MONOID}),
 }
 
 
@@ -101,18 +106,19 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         # cell pin > 1 is foreign to them; = 1 is the universal value.
         return frozenset({Tier.MAP, Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == BK.name:
-        # K-chunk: the reduce tiers + warp. A pointwise MAP has no K; streaming forces BK=1.
-        return frozenset({Tier.SCALAR, Tier.COOP, Tier.WARP}) if _as_int(raw) > 1 else None
+        # K-chunk: the reduce tiers (scalar SEMIRING + MONOID — split-KV is legal on the
+        # nested monoid too) + warp. A pointwise MAP has no K.
+        return frozenset({Tier.SCALAR, Tier.MONOID, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == FK.name:
-        # Strip-mine accumulators: the scalar / cooperative reduce only.
-        return frozenset({Tier.SCALAR, Tier.COOP}) if _as_int(raw) > 1 else None
+        # Strip-mine accumulators: the scalar SEMIRING + MONOID reduce.
+        return frozenset({Tier.SCALAR, Tier.MONOID}) if _as_int(raw) > 1 else None
     if name == SPLITK.name:
         # Cross-CTA split-K: the scalar reduce AND the warp tier (the atomic-free
         # split-K combine, ``140_atomic_free_splitk``). A non-linear epilogue downgrades
         # it to 1 at the shape level — that is the pipeline's job, not a pin contradiction.
         return frozenset({Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == BR.name:
-        return frozenset({Tier.COOP, Tier.STREAMING}) if _as_int(raw) > 1 else None  # cooperative lanes
+        return frozenset({Tier.MONOID}) if _as_int(raw) > 1 else None  # cooperative lanes (flat reduce or stream)
     if name == STAGE.name:
         # Staging a read-site: only the scalar reduce / warp matmul stage (COOP / STREAMING
         # are smem-free, MAP has no K-tower). A mask with no selected bit is inert.
@@ -136,15 +142,17 @@ def _as_int(raw: str) -> int:
 _AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR, STAGE, TMA)
 
 
-def validate_pins(algebra: AlgebraKind, *, streaming: bool = False) -> None:
+def validate_pins(algebra: AlgebraKind) -> None:
     """Raise :class:`KnobPinError` when the live ``DEPLODOCK_<KNOB>`` pins cannot all be
     satisfied by any tier an op of ``algebra`` resolves to. No-op when no geometry knob
     is pinned, or every pin is a universal / OFF value, or the pins agree on a tier.
 
-    ``streaming`` selects the streaming-flash tier for a ``MONOID`` nest (a twisted monoid
-    is the MONOID algebra; its schedule is structural) — ``STREAMING`` forbids the
-    cooperative reduce's ``BK``/``FK`` K-chunk, so the distinction is load-bearing."""
-    candidates = frozenset({Tier.STREAMING}) if (algebra is AlgebraKind.MONOID and streaming) else _CANDIDATES.get(algebra)
+    A ``MONOID`` nest — the flat cooperative reduce **and** the streaming flash — resolves
+    to the single ``MONOID`` tier (the streaming schedule is a derived structural property,
+    not a separate tier; both share ``monoid_build``), so ``BK``/``FK``/``BR`` are legal on
+    it. Whether a particular shape realizes a pinned ``BK`` is the pipeline's job (like a
+    non-linear matmul downgrading ``SPLITK``), not a pin contradiction."""
+    candidates = _CANDIDATES.get(algebra)
     if candidates is None:
         return
     feasible = candidates

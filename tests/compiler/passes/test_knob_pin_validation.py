@@ -1,18 +1,19 @@
 """Unit tests for the strict per-op knob-pin validator (``enumeration/_validate``).
 
-Each kernel lowers on ONE tier (MAP / scalar SEMIRING / warp MMA / cooperative
-MONOID / streaming-flash MONOID), and each tier owns a disjoint slice of the knob
-schema. A force-pinned ``DEPLODOCK_<KNOB>`` foreign to the tier an op resolves to used
-to be silently dropped (or overwritten by an OFF sentinel); the validator turns that
-into a hard :class:`KnobPinError`.
+Each kernel lowers on ONE tier (MAP / scalar SEMIRING / warp MMA / MONOID), and each
+tier owns a disjoint slice of the knob schema. A force-pinned ``DEPLODOCK_<KNOB>`` foreign
+to the tier an op resolves to used to be silently dropped (or overwritten by an OFF
+sentinel); the validator turns that into a hard :class:`KnobPinError`.
 
-A twisted monoid is the MONOID algebra (transport of structure), so the streaming-flash
-tier is selected by ``validate_pins(MONOID, streaming=True)`` — its own parametrized cases
-below — not a distinct algebra kind.
+A twisted monoid is the MONOID algebra (transport of structure), and the streaming flash
+shares the cooperative reduce's ``monoid_build`` move + knob slice — so it is the SAME
+``MONOID`` tier, not a separate one. ``BK``/``FK`` are therefore legal on a flash nest
+(split-KV / serial re-bracketing is associativity-licensed), whether or not a given shape
+realizes them (the pipeline's job, like ``SPLITK`` on a non-linear matmul).
 
 These tests call :func:`validate_pins` directly (no graph, no CUDA) — the contradiction
-is purely a function of ``(algebra, streaming, env pins)``. End-to-end refusal through the
-real pipeline is covered by ``test_knob_pinning.py`` (CUDA).
+is purely a function of ``(algebra, env pins)``. End-to-end refusal through the real
+pipeline is covered by ``test_knob_pinning.py`` (CUDA).
 """
 
 from __future__ import annotations
@@ -109,32 +110,18 @@ def test_allows_tier_native_pins(algebra, pins, monkeypatch):
     validate_pins(algebra)  # must not raise
 
 
-# --- Streaming-flash MONOID (validate_pins(MONOID, streaming=True)) -----------
-# Flash is the MONOID algebra on the streaming schedule. The STREAMING tier owns a
-# free THREAD tile + cooperative BR but, unlike the COOP reduce, forbids the BK/FK
-# K-chunk (each output element streams its own reduction) and all warp / split-K /
-# tensor-core / staging knobs — the distinction the streaming flag carries.
-_REFUSED_STREAMING = [
-    ({"WM": 2}, "warp count on a streaming flash nest"),
-    ({"MMA": _ATOM}, "tensor-core atom on a streaming flash nest"),
-    ({"SPLITK": 4}, "split-K on a streaming flash nest"),
-    ({"STAGE": 1}, "STAGE on an smem-free flash nest"),
-    ({"BK": 32}, "K-chunk on a streaming flash nest (COOP-legal, STREAMING-foreign)"),
-    ({"FK": 4}, "strip-mine on a streaming flash nest (COOP-legal, STREAMING-foreign)"),
-]
-
-
-@pytest.mark.parametrize(("pins", "why"), _REFUSED_STREAMING, ids=lambda v: v if isinstance(v, str) else "")
-def test_refuses_streaming_foreign_pin(pins, why, monkeypatch):
-    _pin(monkeypatch, pins)
-    with pytest.raises(KnobPinError):
-        validate_pins(AlgebraKind.MONOID, streaming=True)
-
-
-def test_allows_streaming_native_pins(monkeypatch):
-    # A streaming flash nest: free THREAD tile + cooperative BR (no K-chunk).
-    _pin(monkeypatch, {"BN": 32, "BM": 1, "BR": 4})
-    validate_pins(AlgebraKind.MONOID, streaming=True)  # must not raise
+# --- The streaming flash IS the MONOID tier (no separate streaming tier) -------
+# Flash shares the cooperative reduce's ``monoid_build`` move + knob slice, so it lowers
+# on the same ``MONOID`` tier. Warp / split-K / tensor-core / staging knobs are foreign to
+# it (identical to the cooperative-reduce ``_REFUSED`` rows above), but the K-chunk knobs
+# ``BK``/``FK`` are now LEGAL on it (split-KV / serial re-bracketing is associativity-
+# licensed on the nested monoid too) — the tier-split collapse of Phase 0.
+def test_streaming_flash_uses_the_one_monoid_tier(monkeypatch):
+    # BK/FK no longer hard-error on a flash (MONOID) nest — they are legal on the tier
+    # (a particular shape may downgrade them, the pipeline's job, not a pin contradiction).
+    for pins in ({"BK": 32}, {"FK": 4}, {"BN": 32, "BM": 1, "BR": 4}):
+        _pin(monkeypatch, pins)
+        validate_pins(AlgebraKind.MONOID)  # must not raise
 
 
 def test_greedy_pipeline_refuses_end_to_end(monkeypatch):

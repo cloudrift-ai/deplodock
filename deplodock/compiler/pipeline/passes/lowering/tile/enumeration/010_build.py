@@ -63,7 +63,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:
     # compile/run only — the tune search (``ctx.validate_pins=False``) explores
     # tier-foreign forks and union-pinned multi-op graphs (see ``Run.drive``).
     if ctx.validate_pins and not _is_union_pinned(match):
-        validate_pins(regime.algebra, streaming=dag.streaming)
+        validate_pins(regime.algebra)
     # Logical gmem Buffers (inputs + outputs) — the ``stage`` move reads operand
     # dtypes off these to size smem slabs; ``assemble`` stamps ``Source.dtype``.
     buffers: dict[str, Buffer] = {}
