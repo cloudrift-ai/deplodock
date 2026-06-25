@@ -483,18 +483,23 @@ compose under nesting — the main unknown to spike.
   - **The flash is a `TileOp`, routed through the generic kernel passes** (`kernel/005`…`100` → `cuda`), not a KernelOp
     that bypassed them. This surfaced (and fixed) that the flash-only fragment-softmax ops
     (`FragmentScale`/`FragmentRowReduce`/`FragmentExp`/`Reassign`) had no `rewrite` registration — they were terminal
-    (KernelOp→render only); now registered, so they survive the SSA-rewriting passes. The mma cells are **still
-    hand-emitted** (`MmaSyncPtx`) in the tower body — the next step routes them through `005`'s AtomTile lowering.
-  - **Blocker found for the AtomTile cell routing (the next slice).** Converting the P@V `consume` to a fragment-A
-    `AtomTile` mostly works but mis-renders the **grid axis** `bh` in the `005`-derived `LdmatrixLoad`'s `src_index`:
-    it renders as a **value** name (`v4`, colliding with the `alpha` float) instead of the grid coord (`a0`) — the
-    epilogue store in the *same* kernel renders `bh` correctly, so the AtomTile lowering specifically drops `bh` from
-    the σ axis-substitution within the cell scope (`_mma_src_index` returns `load.index` verbatim; the materializer
-    doesn't σ-map the outermost grid axis there). Resolve the axis-var σ-mapping before converting the cells, then
-    delete `_warp_chain`'s hand-emitted mma codegen.
-  - **Remaining (the large part):** the AtomTile cell routing (above) + the carried `O` / fragment-softmax glue as a
-    first-class tower, validated against the dedicated builder / torch, then delete `_warp_chain`'s hand-built
-    structure.
+    (KernelOp→render only); now registered, so they survive the SSA-rewriting passes.
+  - **Both mma cells now go through the shared `kernel/005` AtomTile lowering — no hand-emitted `MmaSyncPtx` remains.**
+    The `produce` (QK^T) phase is a transposed-B **fragment-output** `AtomTile` per N-atom (with a `ko` K-reduce
+    `SerialTile` for `kt>1`/`D>16`); `consume` (P@V) is a **fragment-A** `AtomTile` (the C→A handoff). `005` lowers both
+    to the same `ldmatrix`+`mma` chains the matmul emits, and names the live QK^T C-fragment `Sf{nt}_frag` (the softmax
+    reads it). Two name-collision bugs fixed en route: the softmax `alpha` values were named `a0`/`a1` (collide with the
+    canonical AXIS names `a0`/`a1` of the grid axes when a `Load` index is value-renamed) → renamed `alpha0`/`alpha1`;
+    and a reduce var must match its `SerialTile` axis NAME (`ko{nt}`) or the index references an undefined `ko` after
+    canonicalization.
+  - **State now:** `_warp_chain` is a focused **carrier** assembler — it authors only the `MONOID(SEMIRING)` carrier
+    (the fragment online-softmax `merge`/`rescale`/`update` + the C→A smem handoff) and wires the two atomized cells +
+    the carried `O` through the shared `wrap_carry_tower`. That carrier is the irreducible flash-specific realization,
+    the exact analogue of `_fused`'s `_fuse_producers` for the SMEM edge — all the matmul codegen (cells, mma, ldmatrix,
+    tower) is now shared. The dispatch stays a `split/` fork (`005_warp_chain`), the architecturally-accepted form. To
+    fully retire the file the carrier would need to flow through `assemble_block` as a fused-TileGraph carrier branch
+    (representing the online-softmax in a `Block` + `CarryScope`), but that is past the point of diminishing returns
+    given the split-fork dispatch is already clean.
 
 ### Remaining work (functional — Phases 4–7 + the scalar-chain follow-ups)
 
