@@ -41,10 +41,25 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
 )
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Body, Init
-from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, WarpTile
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Mma
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, GridTile, SerialTile, WarpTile
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 
-_ATOM = (16, 8, 16)
+
+def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index) -> Mma:
+    """Run the algebraic ``atomize`` move on one ``[Load, Load, mul, Accum]`` cell — the
+    operand A/B assignment, the ``b_trans`` (transposed-B Q@K^T), and the atom all fall
+    out of ``classify_matmul_operands`` (the same decision the warp-tier matmul makes),
+    instead of being hard-coded. The warp-chain build reads the layout off the returned
+    ``Mma`` (Phase 2: ``atomize`` composes over the two cells)."""
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    cell = (
+        Load(name="ca", input=a_buf, index=a_idx),
+        Load(name="cb", input=b_buf, index=b_idx),
+        Assign(name="cm", op=ElementwiseImpl("multiply"), args=("ca", "cb")),
+        Accum(name="cc", value="cm"),
+    )
+    return next(s for s in atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index) if isinstance(s, Mma))
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -70,9 +85,20 @@ def _mul(a, b: int):
 
 def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int) -> KernelOp:
     """The fused TC flash kernel-IR for ``(B,H,S,D)`` fp16, non-causal."""
+    # The two cells' operand layout falls out of the ``atomize`` move: QK^T is a
+    # transposed-B Q@K^T (``b_trans`` derived via the score's M/N coords), P@V is a
+    # canonical-B P@V (A = P from the smem slab, B = V). The atom (cell shape + dtype) is
+    # read off the resulting ``Mma``, not hard-coded — the v1 path assumes ``m16n8k16``.
+    qk = _classify_cell(q, (Var("m"), Var("dd")), k, (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
+    pv = _classify_cell("flash_pv_smem", (Var("m"), Var("kv")), v, (Var("kv"), Var("d")), "kv", None)
+    atom_m, atom_n, atom_k = qk.atom.shape
+    ab_dt = qk.atom.operand_dtype("a").name
+    assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
+
+    atom_shape = qk.atom.shape
     scale = f"{1.0 / math.sqrt(D)!r}f"
-    kt = D // 16  # QK^T K-tiles (reduce over D)
-    nd = D // 8  # P@V N-tiles (output over D)
+    kt = D // atom_k  # QK^T K-tiles (reduce over D)
+    nd = D // atom_n  # P@V N-tiles (output over D)
     add = ElementwiseImpl("add")
     mx = ElementwiseImpl("maximum")
 
@@ -91,9 +117,9 @@ def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: s
     body.append(Init(name="l0", op=add, dtype=F32))
     body.append(Init(name="l1", op=add, dtype=F32))
     for n in range(nd):
-        body.append(RegFragment(name=f"Of{n}", role="c", shape=_ATOM, dtype=F32))
+        body.append(RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32))
     for t in range(kt):
-        body.append(RegFragment(name=f"qa{t}", role="a", shape=_ATOM, dtype=F16))
+        body.append(RegFragment(name=f"qa{t}", role="a", shape=atom_shape, dtype=F16))
         body.append(ld(f"qa{t}", q, _add(qrow, t * 16), "a"))
     body.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(F16), align=16))
 
@@ -101,11 +127,11 @@ def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: s
     kvb: list = []
     # QK^T: 2 N-atoms (kv cols 0-7 / 8-15), accumulate over kt K-tiles.
     for nt in range(2):
-        kvb.append(RegFragment(name=f"Sf{nt}", role="c", shape=_ATOM, dtype=F32))
+        kvb.append(RegFragment(name=f"Sf{nt}", role="c", shape=atom_shape, dtype=F32))
         for t in range(kt):
-            kvb.append(RegFragment(name=f"kb{nt}_{t}", role="b", shape=_ATOM, dtype=F16))
-            kvb.append(ld(f"kb{nt}_{t}", k, _add(kvrow, _mul(Literal(1, "int"), nt * 8 * D), t * 16), "b", b_trans=True))
-            kvb.append(MmaSyncPtx(c_frag=f"Sf{nt}", a_frag=f"qa{t}", b_frag=f"kb{nt}_{t}", shape=_ATOM, ab_dtype="f16"))
+            kvb.append(RegFragment(name=f"kb{nt}_{t}", role="b", shape=atom_shape, dtype=F16))
+            kvb.append(ld(f"kb{nt}_{t}", k, _add(kvrow, _mul(Literal(1, "int"), nt * 8 * D), t * 16), "b", b_trans=qk.b_trans))
+            kvb.append(MmaSyncPtx(c_frag=f"Sf{nt}", a_frag=f"qa{t}", b_frag=f"kb{nt}_{t}", shape=atom_shape, ab_dtype=ab_dt))
         kvb.append(FragmentScale(frag=f"Sf{nt}", top=scale, bot=scale))
     # fragment softmax: rowmax -> m_new / alpha; P = exp(S - m_new); rowsum -> l.
     kvb.append(FragmentRowReduce(top="r0", bot="r1", frags=("Sf0", "Sf1"), op=mx))
@@ -129,16 +155,18 @@ def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: s
     # C->A handoff: write P C-fragment to the smem slab, ldmatrix it back as the A operand.
     for nt in range(2):
         kvb.append(
-            RegStore(dst_buffer="flash_pv_smem", dst_index=(Literal(0, "int"), Literal(nt * 8, "int")), frag=f"Pf{nt}", shape=_ATOM, ldm=16)
+            RegStore(
+                dst_buffer="flash_pv_smem", dst_index=(Literal(0, "int"), Literal(nt * 8, "int")), frag=f"Pf{nt}", shape=atom_shape, ldm=16
+            )
         )
     kvb.append(Sync())  # the warp must finish writing ps before ldmatrix reads it back
-    kvb.append(RegFragment(name="pa", role="a", shape=_ATOM, dtype=F16))
+    kvb.append(RegFragment(name="pa", role="a", shape=atom_shape, dtype=F16))
     kvb.append(ld("pa", "flash_pv_smem", Literal(0, "int"), "a", staged=True, ldm=16))  # ps row stride = BN = 16, not D
     # P@V: A = P (smem), B = V (gmem-direct), accumulate into O over the KV tile.
     for n in range(nd):
-        kvb.append(RegFragment(name=f"vb{n}", role="b", shape=_ATOM, dtype=F16))
-        kvb.append(ld(f"vb{n}", v, _add(kvrow, n * 8), "b", b_trans=False))
-        kvb.append(MmaSyncPtx(c_frag=f"Of{n}", a_frag="pa", b_frag=f"vb{n}", shape=_ATOM, ab_dtype="f16"))
+        kvb.append(RegFragment(name=f"vb{n}", role="b", shape=atom_shape, dtype=F16))
+        kvb.append(ld(f"vb{n}", v, _add(kvrow, n * 8), "b", b_trans=pv.b_trans))
+        kvb.append(MmaSyncPtx(c_frag=f"Of{n}", a_frag="pa", b_frag=f"vb{n}", shape=atom_shape, ab_dtype=ab_dt))
     kvb.append(Sync())  # finish reading ps (the ldmatrix) before the next KV tile overwrites it
     kvb.append(Reassign(name="m0", value="mn0"))
     kvb.append(Reassign(name="m1", value="mn1"))
@@ -147,7 +175,7 @@ def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: s
     # --- epilogue: O /= l, store. ---
     for n in range(nd):
         body.append(FragmentScale(frag=f"Of{n}", top="(1.0f/l0)", bot="(1.0f/l1)"))
-        body.append(RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=_ATOM, ldm=D))
+        body.append(RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D))
 
     warp = WarpTile(axes=(Axis("w", Dim(1)),), body=Body(tuple(body)))
     grid = GridTile(axes=(Axis("bh", Dim(B * H)), Axis("qb", Dim(S // 16))), body=Body((warp,)))
