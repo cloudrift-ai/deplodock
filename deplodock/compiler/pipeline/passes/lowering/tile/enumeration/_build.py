@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
+from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
@@ -228,66 +228,42 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
 # the warp-shuffle / tree / online-softmax-rescale from ``carrier.axes ∩ ThreadTile``.
 
 
-def _mask_reduce_accums(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
-    """Mask each ``Accum``'s folded value to the carrier's identity past a
-    masked-K boundary (symbolic reduce). Before each ``Accum(name, value=V, op)``
-    insert ``Init(V_kid, op)`` (the op's neutral element — ``0`` for add, ``-inf``
-    for max) and ``Select(V_km, V if pred else V_kid)``, then fold ``V_km``. The
-    Accum stays a direct child of the reduce loop (``is_reduce`` + the cross-thread
-    combine intact); the Load was already index-clamped for a safe read."""
-    out: list[Stmt] = []
-    for c in body:
-        if isinstance(c, Accum):
-            ident = f"{c.value}_kid"
-            masked = f"{c.value}_km"
-            out.append(Init(name=ident, op=c.op, dtype=c.dtype or F32))
-            out.append(
-                Select(
-                    name=masked,
-                    branches=(SelectBranch(value=c.value, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
-                )
-            )
-            out.append(replace(c, value=masked))
-        else:
-            out.append(c)
-    return tuple(out)
-
-
-def _mask_streaming_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
-    """Mask the streaming carrier's score to ``-inf`` past a symbolic-K bound (the
-    flash-attention case: a key past the runtime ``seq_len``).
-    Before each ``Monoid`` with partial ``(score, value)`` insert
-    ``Init(score_kid, maximum)`` (seeds ``-inf``, the score component's identity) +
-    ``Select(score_km, score if pred else score_kid)``, then fold ``score_km`` — the
-    masked key contributes nothing (``max(m, -inf) = m``, ``exp(-inf) = 0``) while the
-    in-place online-softmax state update stays unconditional."""
-    out: list[Stmt] = []
-    for c in body:
-        if isinstance(c, Monoid):
-            score = c.partial[0]
-            ident, masked = f"{score}_kid", f"{score}_km"
-            out.append(Init(name=ident, op=ElementwiseImpl("maximum"), dtype=F32))
-            out.append(
-                Select(
-                    name=masked,
-                    branches=(SelectBranch(value=score, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
-                )
-            )
-            out.append(replace(c, partial=(masked, *c.partial[1:])))
-        else:
-            out.append(c)
-    return tuple(out)
+def _mask_partial(partial: str, op: ElementwiseImpl, dtype: DataType, pred: object) -> tuple[str, list[Stmt]]:
+    """Neutralize one folded ``partial`` past a masked-K boundary: ``Init(kid, op)``
+    (the op's neutral element — ``0`` for add, ``-inf`` for max) +
+    ``Select(km, partial if pred else kid)``. Returns the masked name + the two
+    stmts to splice before the carrier (the Load was already index-clamped for a
+    safe read; this only neutralizes the contribution)."""
+    ident, masked = f"{partial}_kid", f"{partial}_km"
+    return masked, [
+        Init(name=ident, op=op, dtype=dtype),
+        Select(
+            name=masked,
+            branches=(SelectBranch(value=partial, select=pred), SelectBranch(value=ident, select=Literal(1, "int"))),
+        ),
+    ]
 
 
 def _mask_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
     """Mask a symbolic-K reduce loop's body past the runtime bound, dispatching on
-    the carrier the loop folds: a ``Monoid`` (streaming online-softmax) masks its
-    score to ``-inf`` (``_mask_streaming_carrier``); a plain ``Accum`` reduce folds
-    the op's identity (``_mask_reduce_accums``). The Loads were already index-clamped
-    for a safe read by the caller; this only neutralizes the folded contribution."""
-    if any(isinstance(c, Monoid) for c in body):
-        return _mask_streaming_carrier(body, pred)
-    return _mask_reduce_accums(body, pred)
+    the carrier the loop folds. A scalar ``Accum`` masks its folded ``value`` to the
+    op's identity. A streaming ``Monoid`` (flash online-softmax) masks its score
+    (``partial[0]``) to ``-inf`` (maximum's identity) so the masked key contributes
+    nothing (``max(m, -inf) = m``, ``exp(-inf) = 0``) while the in-place state update
+    stays unconditional; ``partial[1:]`` (the value) is left untouched. Both share
+    the :func:`_mask_partial` skeleton; the carrier stays a direct child of the
+    reduce loop (``is_reduce`` + the cross-thread combine intact)."""
+    out: list[Stmt] = []
+    for c in body:
+        if isinstance(c, Accum):
+            masked, stmts = _mask_partial(c.value, c.op, c.dtype or F32, pred)
+            out.extend([*stmts, replace(c, value=masked)])
+        elif isinstance(c, Monoid):
+            masked, stmts = _mask_partial(c.partial[0], ElementwiseImpl("maximum"), F32, pred)
+            out.extend([*stmts, replace(c, partial=(masked, *c.partial[1:]))])
+        else:
+            out.append(c)
+    return tuple(out)
 
 
 def _replace_k_monoid(
