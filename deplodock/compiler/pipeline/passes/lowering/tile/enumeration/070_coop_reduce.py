@@ -44,6 +44,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
+    _pin,
     coop_free_thread_knobs,
     coop_reduce_knobs,
     coop_reduce_offers,
@@ -52,6 +53,28 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import 
     thread_knobs,
     thread_offers,
 )
+
+
+def _streaming_bk(dag) -> int:
+    """The KV-tile factor ``BK`` re-bracketing the streaming reduce — Phase 1's
+    ``S_k → S_k/BK · BK`` (``plans/tensor-core-streaming-flash-mma.md``). Honored from a
+    ``DEPLODOCK_BK`` pin only when it divides EVERY reduce extent the move tiles (the KV
+    stream + the nested QK^T), since ``_replace_k_monoid`` applies it uniformly; else ``1``
+    (the serial-stream default). A symbolic axis (no static extent) stays ``1``.
+
+    This is the **serial** re-bracket (each ``K_i`` step still folds one key through the
+    ``Monoid``); it makes ``BK`` a realized knob on the streaming axis — closing the Phase-0
+    validator-collapse gap (``BK`` was legal on the MONOID tier but forced to 1 here) — and
+    is the foundation for the register-score / P@V-cell surfacing the tensor-core tier needs.
+    Default (unpinned) is ``1``, so greedy / the scalar tier are unchanged."""
+    bk = _pin(RED_BK)
+    if not bk or bk <= 1:
+        return 1
+    for n in dag.reduce:
+        ext = n.loop.axis.extent
+        if not ext.is_static or ext.as_static() % bk != 0:
+            return 1
+    return bk
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -85,10 +108,12 @@ def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:
 
 def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     """Streaming flash: the free-axis THREAD tile × cooperative ``BR`` over the static KV
-    axis, with ``BK = FK = SPLITK = 1`` (each output element streams its own reduction;
-    the coupled ``Monoid`` carrier can't span register cells or split-K). ``BR > 1`` lays
-    the ``K_c`` lane on the streaming axis (cooperative-KV), constrained by the cross-lane
-    combine geometry (whole-CTA tree vs strided intra-warp segment)."""
+    axis, with ``FK = SPLITK = 1`` (the coupled ``Monoid`` carrier can't span register
+    cells or split-K) and ``BK`` the KV-tile re-bracket of the streaming axis (Phase 1 —
+    default 1, honored from a ``DEPLODOCK_BK`` pin via :func:`_streaming_bk`). ``BR > 1``
+    lays the ``K_c`` lane on the streaming axis (cooperative-KV), constrained by the
+    cross-lane combine geometry (whole-CTA tree vs strided intra-warp segment)."""
+    bk = _streaming_bk(op.dag)  # Phase 1: KV-tile re-bracket of the streaming axis (pin-honored)
     out: list[TileGraphOp] = []
     for br in streaming_br_offers(op.dag):
         offers = thread_offers(op.dag, Budget(max_threads=max(1, MAX_THREADS_PER_CTA // br)))
@@ -99,7 +124,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
                 **op.knobs,
                 **thread_knobs(op.dag, t),
                 MAP_N_REG.name: 1,
-                RED_BK.name: 1,
+                RED_BK.name: bk,
                 RED_FK.name: 1,
                 RED_SPLITK.name: 1,
                 COOP_BR.name: br,

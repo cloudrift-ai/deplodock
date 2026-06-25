@@ -70,6 +70,33 @@ def test_flash_sdpa_matches_torch(monkeypatch, B, H, S, D):
 
 
 @requires_cuda
+@pytest.mark.parametrize("bk", [2, 4])
+def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
+    """Phase 1 KV tiling (``plans/tensor-core-streaming-flash-mma.md``): a ``DEPLODOCK_BK``
+    pin re-brackets the streaming reduce ``S_k → S_k/BK · BK`` (serial within the tile). The
+    fused flash kernel must still match torch — BN=1 is degenerate-identical, BN>1 the
+    re-bracketed serial fold. ``S=32`` / ``D=16`` are divisible by both 2 and 4, so the pin
+    is honored (``_streaming_bk`` requires every reduce extent divisible)."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_BK", str(bk))
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 3, 32, 16) for _ in range(3))
+
+    backend, compiled, kernels = _compile_sdpa(q, k, v)
+    assert len(kernels) == 1, f"flash should still fuse to one kernel under BK={bk}, got {len(kernels)}"
+
+    def eager_pre_run() -> np.ndarray:
+        with torch.no_grad():
+            return torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda()).cpu().flatten().numpy()
+
+    run_result, eager = backend.run(compiled, input_data={"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, pre_run=eager_pre_run)
+    got = list(run_result.outputs.values())[0].flatten()
+    assert not np.any(np.isnan(got))
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 1e-4, f"BK={bk} KV-tiled flash vs torch SDPA max_diff={max_diff:.6e}"
+
+
+@requires_cuda
 def test_flash_sdpa_dynamic_matches_torch(monkeypatch):
     """Symbolic ``seq_len`` (Q/K/V dim -2): ONE cached kernel carrying ``int
     seq_len`` serves every runtime size — flash's single dynamic axis lands on
