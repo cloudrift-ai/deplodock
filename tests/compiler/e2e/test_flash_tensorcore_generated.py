@@ -92,6 +92,48 @@ def test_generated_tensorcore_flash_bf16_matches_torch(monkeypatch, B, H, S, D):
     assert max_diff < 5e-2, f"generated bf16 TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
 
 
+class _CausalSdpa(torch.nn.Module):
+    def forward(self, q, k, v):
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+@requires_cuda
+@pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (2, 3, 64, 32), (1, 4, 128, 64), (1, 1, 16, 16)])
+def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D):
+    """Phase 5 — causal masking at the fragment tier. The fused warp-chain inserts a
+    per-element ``FragmentCausalMask`` on the score fragment (strict upper triangle →
+    ``-1e30`` before the rowmax), matching torch's ``is_causal=True`` SDPA."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    torch.manual_seed(S + D)
+    q, k, v = (torch.randn(B, H, S, D, dtype=torch.float16) for _ in range(3))
+    graph = trace_module(_CausalSdpa().cpu(), (q, k, v))
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    kernels = [nid for nid in compiled.nodes if getattr(compiled.nodes[nid].op, "kernel_source", None)]
+    assert len(kernels) == 1, f"fused causal TC flash should be one kernel, got {len(kernels)}"
+    assert "flash_pv_smem" in compiled.nodes[kernels[0]].op.kernel_source, "must be the fused warp-chain"
+
+    def ref():
+        with torch.no_grad():
+            return (
+                torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda(), is_causal=True)
+                .cpu()
+                .flatten()
+                .float()
+                .numpy()
+            )
+
+    data = {n: t for n, t in zip(graph.inputs, (q.numpy(), k.numpy(), v.numpy()), strict=True)}
+    run_result, eager = backend.run(compiled, input_data=data, pre_run=ref)
+    got = list(run_result.outputs.values())[0].flatten().astype(np.float32)
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 5e-3, f"generated causal TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
+
+
 def test_warp_chain_cell_layout_falls_out_of_atomize():
     """The two cells' operand layout (``b_trans``, the atom) is DERIVED by the ``atomize``
     move (``_classify_cell`` → ``atomize_cell`` → ``classify_matmul_operands``), not

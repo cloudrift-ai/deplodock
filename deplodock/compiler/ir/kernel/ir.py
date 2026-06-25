@@ -687,6 +687,53 @@ class FragmentRowReduce(Stmt):
         return out
 
 
+@dataclass(frozen=True)
+class FragmentCausalMask(Stmt):
+    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment
+    (Phase 5 of ``plans/tensor-core-streaming-flash-mma.md``). Sets ``frag[i]`` to the
+    softmax max-identity (``-1e30``, the same soft ``-inf`` the carrier's ``m`` is seeded
+    with — avoids ``-inf − -inf = nan`` when a whole row is masked) wherever the element's
+    absolute key column exceeds its absolute query row (the strict upper triangle), so the
+    masked key contributes nothing to the online-softmax (``max(m, -1e30) = m``,
+    ``exp(-1e30 − m) = 0``). Applied to the scaled score before the rowmax.
+
+    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g = lane/4``), cols
+    ``(lane%4)*2 + {0,1}`` within the N-atom. ``q_row_base`` is the absolute row of element
+    ``(0,0)`` (the query-tile origin ``qb*16``); ``kv_col_base`` the absolute col of
+    element ``(0,0)`` (the kv-tile + N-atom origin ``kv*16 + nt*8``). Because the predicate
+    is over absolute coordinates, the same op is a no-op on fully-below-diagonal tiles and
+    masks everything on fully-above-diagonal tiles — correct on every kv tile."""
+
+    frag: str
+    q_row_base: Expr
+    kv_col_base: Expr
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.q_row_base, self.kv_col_base)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentCausalMask({self.frag} where col {self.kv_col_base.pretty()} > row {self.q_row_base.pretty()})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        lane = "(threadIdx.x & 31)"
+        qb, kb = self.q_row_base.render(ctx), self.kv_col_base.render(ctx)
+        ninf = ctx.identity_literal(-1e30, "f32")
+        lines = [f"{pad}{{ const int _g = {lane} >> 2, _t = {lane} & 3;"]
+        for i in range(4):
+            row = "_g" if i < 2 else "(_g + 8)"
+            col = f"(_t * 2 + {i & 1})"
+            lines.append(f"{pad}  if (({kb}) + {col} > ({qb}) + {row}) {self.frag}[{i}] = {ninf};")
+        lines.append(f"{pad}}}")
+        return lines
+
+
 # ---------------------------------------------------------------------------
 # Warp-level MMA: ``mma.sync.aligned`` + ``ldmatrix`` (the ``s16816`` path
 # cuBLAS / CUTLASS use) — the sole tensor-core Stmt family. Operands are
@@ -1726,3 +1773,10 @@ def _(s: FragmentRowReduce, rename, sigma, axis_fn):
     return FragmentRowReduce(
         top=rename(s.top), bot=rename(s.bot), frags=tuple(rename(f) for f in s.frags), op=s.op, group=s.group, dtype=s.dtype
     )
+
+
+@_rewrite.register
+def _(s: FragmentCausalMask, rename, sigma, axis_fn):
+    # ``frag`` is SSA (the score fragment); the base coords σ-substitute so the
+    # canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``).
+    return FragmentCausalMask(frag=rename(s.frag), q_row_base=sigma.apply(s.q_row_base), kv_col_base=sigma.apply(s.kv_col_base))

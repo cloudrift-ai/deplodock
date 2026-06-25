@@ -35,6 +35,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import (
+    FragmentCausalMask,
     FragmentExp,
     FragmentRowReduce,
     FragmentScale,
@@ -52,10 +53,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Car
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
-    """The v1 fused-TC-flash scope: static 16-bit (fp16 / bf16 — Phase 4), non-causal,
-    equal-head, both extents a multiple of 16. Everything else falls back to the scalar
-    chain. (Dtype is gated upstream in ``_flash_params``; this checks only geometry.)"""
-    return not symbolic and not causal and not mask and group == 1 and D % 16 == 0 and S % 16 == 0 and 16 <= D <= 256 and S >= 16
+    """The fused-TC-flash scope: static 16-bit (fp16 / bf16 — Phase 4), causal **or**
+    non-causal (Phase 5 masks the upper triangle at the score fragment), equal-head, both
+    extents a multiple of 16. Additive-mask / GQA / symbolic still fall back to the scalar
+    chain. (Dtype is gated upstream in ``_flash_params``; this checks only geometry —
+    ``causal`` is accepted, the parameter is kept so the gate reads explicitly.)"""
+    return not symbolic and not mask and group == 1 and D % 16 == 0 and S % 16 == 0 and 16 <= D <= 256 and S >= 16
 
 
 def _add(*terms):
@@ -74,11 +77,13 @@ def _mul(a, b: int):
 
 
 def build_warp_chain_tileop(
-    loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma
+    loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, causal: bool = False
 ) -> TileOp:
     """The fused TC flash as a **TileOp** (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
-    for ``(B,H,S,D)`` fp16, non-causal — routed through the generic kernel passes
-    (``kernel/005``…``100`` → ``cuda``), NOT a KernelOp bypassing them.
+    for ``(B,H,S,D)`` 16-bit, optionally causal — routed through the generic kernel passes
+    (``kernel/005``…``100`` → ``cuda``), NOT a KernelOp bypassing them. ``causal`` inserts a
+    per-element ``FragmentCausalMask`` on the score fragment (the strict upper triangle
+    ``kv_col > q_row`` masked to ``-1e30`` before the rowmax — Phase 5).
 
     ``qk`` / ``pv`` are the two cells' atomized ``Mma``s (built by the ``split`` pass via
     the ``atomize`` move — the layering keeps the ``enumeration`` ``atomize`` import out of
@@ -143,6 +148,14 @@ def build_warp_chain_tileop(
             )
         produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=qk.atom))
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
+    if causal:
+        # The strict upper triangle (absolute key col > absolute query row) masked to
+        # -1e30 before the rowmax. q_row_base = qb*16 (the query-tile origin); kv_col_base
+        # = kv*16 + nt*8 (the kv-tile + N-atom origin). Same predicate on every tile —
+        # a no-op below the diagonal, all-masked above it.
+        produce += [
+            FragmentCausalMask(frag=f"Sf{nt}_frag", q_row_base=_mul(qb, 16), kv_col_base=_add(_mul(kv, 16), nt * 8)) for nt in range(2)
+        ]
 
     # merge — the carrier's new state from this tile: rowmax → m_new / alpha; P = exp(S - m_new); rowsum → l.
     merge: list = [
@@ -217,15 +230,15 @@ def build_warp_chain_tileop(
     return TileOp(body=body, name=name, knobs={})
 
 
-def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma) -> Graph:
+def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, causal: bool = False) -> Graph:
     """Build a single-``TileOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
     inputs + one kernel node. Spliced by the engine; the generic kernel passes lower it.
     ``qk`` / ``pv`` are the cells' atomized ``Mma``s (the ``split`` pass ran the ``atomize``
-    move)."""
+    move). ``causal`` masks the strict upper triangle at the score fragment (Phase 5)."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
-    kop = build_warp_chain_tileop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
+    kop = build_warp_chain_tileop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal)
 
     g = Graph()
     for nid in (q_id, k_id, v_id):
