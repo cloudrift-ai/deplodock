@@ -18,7 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Loop, Monoid, Select, SelectBranch, Stmt
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
@@ -392,6 +392,168 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
             schedule=replace(g.schedule, binding={**g.schedule.binding, k_c.name: Binding.THREAD}),
         )
     return g
+
+
+# === The carried-contraction-chain build move (the shared-axis reduce_decomp) ===
+# (``plans/tensor-core-streaming-flash-mma.md`` Phase 1c). A ``MONOID(SEMIRING)``
+# nest — a twisted carrier streaming over a nested contraction whose combine embeds a
+# SECOND contraction (flash: online softmax over QK^T, with P@V embedded in
+# ``O = O·α + p·v``) — is restructured so the **P@V free output ``d``** rides a register
+# vector ``O[BM, D]`` *inside* the stream and the score is computed ONCE per KV step and
+# **shared** across ``d`` (the INLINE score edge), instead of being recomputed per ``d``
+# block. This is the FA-2 nest the warp tier needs: the score becomes a register
+# fragment, the inner QK^T and the embedded P@V become two cells, and the twisted
+# carrier splits into a **scalar stats carrier** (row max / denom, ``d``-invariant) +
+# a **register-tiled accumulation carrier** (``O[d]``, reading the stats' rescale ``α``
+# and probability ``p``). Not flash-specific: it dispatches on the compositional
+# ``MONOID(SEMIRING)`` algebra the chain view exposes (``IterDag.chain``), the
+# ``MONOID(SEMIRING)`` analog of ``monoid_build``.
+
+
+def _value_dependent(merge: tuple[Assign, ...], value_name: str) -> set[str]:
+    """Fixpoint over a twisted carrier's ``merge`` program: the SSA names that
+    transitively read the value partial (``value_name`` — flash's V load). These are
+    the P@V accumulation (``O·α + p·v`` and its temps + the ``O`` state update); the
+    rest is the ``d``-invariant softmax-stats update. A fixpoint (not one pass) because
+    the state's own update (``O = om + pv``) precedes a temp that reads it (``om = O·α``)
+    in program order."""
+    dvar = {value_name}
+    changed = True
+    while changed:
+        changed = False
+        for a in merge:
+            if a.name not in dvar and any(arg in dvar for arg in a.args):
+                dvar.add(a.name)
+                changed = True
+    return dvar
+
+
+def _split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str]:
+    """Split a twisted ``MONOID(SEMIRING)`` carrier into ``(stats, accum, d_state)``:
+    the ``d``-invariant softmax-stats ``Monoid`` (state minus the accumulator, partial =
+    the score) and the ``d``-varying accumulation ``Monoid`` (the accumulator state,
+    partial = the value), which reads the stats carrier's rescale/probability temps by
+    name (they render inline, visible to the sibling carrier). ``d_state`` is the
+    accumulator state component (flash's ``O``)."""
+    dvar = _value_dependent(carrier.merge, value_name)
+    accum_merge = tuple(a for a in carrier.merge if a.name in dvar)
+    stats_merge = tuple(a for a in carrier.merge if a.name not in dvar)
+    d_states = [s for s in carrier.state if s in dvar]
+    stats_states = [s for s in carrier.state if s not in dvar]
+    if len(d_states) != 1:
+        raise ValueError(f"chain_build: expected exactly one accumulator state, got {d_states}")
+    d_state = d_states[0]
+    ident = dict(zip(carrier.state, carrier.identity, strict=True)) if carrier.identity else {}
+    stats = Monoid(
+        state=tuple(stats_states),
+        partial=(carrier.partial[0],),
+        merge=stats_merge,
+        identity=tuple(ident[s] for s in stats_states) if ident else (),
+        commutative=carrier.commutative,
+        axes=carrier.axes,
+    )
+    accum = Monoid(
+        state=(d_state,),
+        partial=(value_name,),
+        merge=accum_merge,
+        identity=(ident[d_state],) if ident else (),
+        commutative=carrier.commutative,
+        axes=carrier.axes,
+    )
+    return stats, accum, d_state
+
+
+def _chain_axes(dag: IterDag, value_load: Load) -> tuple[Axis, Axis, tuple[Loop, ...]]:
+    """Classify the free axes of a chain nest off the def-use: the **P@V output ``d``**
+    (a free axis in the value load's index but NOT in the inner QK^T contraction — the
+    score is independent of it), the **query row ``m``** (in the inner contraction, not
+    the value), and the shared **grid** axes (in both — batch / head). Structural, not
+    a named-shape match."""
+    parallel = {n.axis.name: n.axis for n in dag.parallel}
+    inner_free = {v for ld in dag.chain.inner.body for v in _index_vars(ld)} & parallel.keys()
+    value_free = {v for e in value_load.index for v in e.free_vars()} & parallel.keys()
+    d_names = value_free - inner_free
+    m_names = inner_free - value_free
+    if len(d_names) != 1 or len(m_names) != 1:
+        raise ValueError(f"chain_build: ambiguous chain free axes (d={d_names}, m={m_names})")
+    d_axis = parallel[next(iter(d_names))]
+    m_axis = parallel[next(iter(m_names))]
+    grid = tuple(n.loop for n in dag.parallel if n.axis.name not in d_names | m_names)
+    return d_axis, m_axis, grid
+
+
+def _index_vars(stmt: Stmt) -> set[str]:
+    """The index Vars a ``Load`` references (empty for a non-Load) — used to read a
+    cell's free-axis footprint."""
+    if isinstance(stmt, Load):
+        return {v for e in stmt.index for v in e.free_vars()}
+    return set()
+
+
+def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
+    """The shared-axis reduce_decomp (Phase 1c): restructure a ``MONOID(SEMIRING)``
+    chain nest into the FA-2 form — the P@V output ``d`` as a register vector ``O[d]``
+    inside the stream, the score computed once per KV step (the INLINE score edge,
+    shared across ``d``), the twisted carrier split into a scalar stats carrier + a
+    register-tiled accumulation carrier.
+
+    ``d`` becomes a **REGISTER domain axis** (so the tower wraps the whole block once);
+    the register-replication pass (``kernel/010_split_register_axes``) then replicates
+    ONLY the statements that depend on the ``d`` var — the value load + the accumulation
+    carrier ``O[d]`` — while the score + the scalar stats carrier (which the split made
+    ``d``-independent) pass through shared, once per KV step. ``m`` binds THREAD, the
+    shared axes GRID. The reduce axes stay serial (``BN=1`` per step — the per-KV online
+    fold)."""
+    chain = dag.chain
+    if chain is None:
+        raise ValueError("chain_build requires a carried-contraction-chain (streaming MONOID(SEMIRING)) nest")
+    block = graph.blocks[0]
+    body = tuple(block.compute)
+    carrier = chain.carrier
+    value_name = carrier.partial[1]
+
+    # Locate the KV stream loop + its carrier / value load.
+    kv_loop = next(s for s in body if isinstance(s, Loop) and s.axis.name == chain.hinge_name)
+    kv_body = tuple(kv_loop.body)
+    value_load = next(s for s in kv_body if isinstance(s, Load) and s.name == value_name)
+    monoid = next(s for s in kv_body if isinstance(s, Monoid))
+    prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
+
+    stats, accum, _d_state = _split_carrier(carrier, value_name)
+    d_axis, m_axis, grid = _chain_axes(dag, value_load)
+
+    # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
+    d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
+    m_thread = knobs.get(MAP_N_THREAD.name, 1) if m_axis.name == dag.inner_n.axis.name else knobs.get(MAP_M_THREAD.name, 1)
+    m_b, m_t, m_r, m_expr, m_bound = _split_free_axis(m_axis, m_thread, 1, interleave_when_masked=True)
+
+    # The carrier-state Inits + epilogue stay where they are; the register-replication
+    # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
+    head_inits = tuple(s for s in body if isinstance(s, Init))
+    epilogue = tuple(s for s in body if isinstance(s, (Assign, Write)))
+    new_kv = replace(kv_loop, body=Body((*prefix, stats, value_load, accum)))
+    compute: tuple[Stmt, ...] = (*head_inits, new_kv, *epilogue)
+
+    # σ-rewrite: ``d`` -> the register axis var; ``m`` -> its block/thread split.
+    sigma = Sigma({d_axis.name: Var(d_r.name), m_axis.name: m_expr})
+    compute = tuple(s.rewrite(_identity_rename, sigma) for s in compute)
+    if m_bound is not None:
+        compute = _apply_masked_guards(compute, [(m_axis.name, m_bound)], sigma)
+
+    # Domain ordered register..thread..grid (inner→outer) so the tower groups
+    # GridTile > ThreadTile > RegisterTile cleanly; ``d_r`` is the innermost register.
+    domain: list[Axis] = [d_r, m_r, m_t, m_b]
+    binding: dict[str, Binding] = {
+        d_r.name: Binding.REGISTER,
+        m_r.name: Binding.REGISTER,
+        m_t.name: Binding.THREAD,
+        m_b.name: Binding.GRID,
+    }
+    for lp in reversed(grid):
+        domain.append(lp.axis)
+        binding[lp.axis.name] = Binding.GRID
+    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
+    return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
 
 
 # === Warp-tier (tensor-core ``atomize``) build move (``plans/tile-ir-block-dag.md`` R4). ===

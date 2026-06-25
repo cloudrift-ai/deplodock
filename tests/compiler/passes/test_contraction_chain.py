@@ -23,11 +23,14 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Load, Monoid
 from deplodock.compiler.ir.tensor.ir import ReduceOp
+from deplodock.compiler.ir.tile.ir import Binding, RegisterTile
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_M_THREAD, MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import legal_decomps
 
 
@@ -163,3 +166,72 @@ def test_legal_decomps_splits_the_hinge_under_both_traits():
     # (factor[0] == bn — cooperative-KV / split reduce) is licensed.
     partition = legal_decomps(carrier, kv, ext, factor_menus=[[bn], [1], [1]], placement=placement, masked=False)
     assert any(d.factors == (bn, 1, 1) for d in partition)
+
+
+# --- 1c: chain_build — the shared-axis reduce_decomp (the FA-2 restructuring) --------
+
+
+def _build_chain(causal: bool = False):
+    dag = iter_dag(_flash_loop(causal=causal))
+    knobs = {MAP_N_THREAD.name: _S, MAP_M_THREAD.name: 1}
+    return chain_build(seed_graph(dag, kernel_name="flash"), dag, knobs), dag
+
+
+def _monoids(body):
+    from deplodock.compiler.ir.stmt import Monoid as _M  # noqa: PLC0415
+
+    return [s for s in body.iter() if isinstance(s, _M)]
+
+
+def test_chain_build_splits_the_carrier_into_two_cells():
+    """The shared-axis reduce_decomp splits the twisted carrier into TWO cells: a
+    scalar **stats** carrier (row max / denom — the carrier's non-accumulator state,
+    folding the score) and a **register-tiled accumulation** carrier (``O[d]``, folding
+    the value). The accumulation rides a ``RegisterTile`` over the P@V output ``d``; the
+    stats stay scalar — that split is what shares the score across ``d``."""
+    tg, dag = _build_chain()
+    block = tg.blocks[0]
+    carriers = _monoids(block.compute)
+    assert len(carriers) == 2, "the twisted carrier must split into a stats + an accumulation cell"
+    # The accumulation carrier folds ONE state (the d-indexed accumulator); the stats
+    # carrier folds the rest (the row max + denom).
+    by_state = sorted(carriers, key=lambda m: len(m.state))
+    accum, stats = by_state[0], by_state[1]
+    assert len(accum.state) == 1 and len(stats.state) == 2
+    # The accumulation carrier folds the value partial; the stats carrier folds the score.
+    assert accum.partial[0] == dag.chain.carrier.partial[1]  # the value (V)
+    assert stats.partial[0] == dag.chain.carrier.partial[0]  # the score
+
+
+def test_chain_build_puts_the_pv_output_in_registers():
+    """The P@V output ``d`` becomes a REGISTER domain axis (the ``O[BM, D]`` accumulator),
+    so the register-replication pass shares the score across it instead of recomputing it
+    per ``d`` block — the INLINE score edge."""
+    tg, dag = _build_chain()
+    block = tg.blocks[0]
+    binding = tg.schedule.binding
+    reg_axes = [a for a in block.domain if binding.get(a.name) is Binding.REGISTER and a.extent.as_static() > 1]
+    assert len(reg_axes) == 1, "exactly one (non-degenerate) register axis — the P@V output d"
+    assert reg_axes[0].extent.as_static() == _D
+
+
+def test_chain_build_shares_the_score_across_d():
+    """The score (the inner QK^T contraction) is computed ONCE per KV step, in the
+    ``d``-invariant prefix — NOT inside the register tile over ``d``. So the inner
+    contraction loop sits at the KV-stream scope, above any ``RegisterTile``."""
+    tg, _ = _build_chain()
+    block = tg.blocks[0]
+    # No RegisterTile in the block compute carries the inner QK^T reduce: the score is
+    # shared (the register replication keys on the d var, which the score never reads).
+    for rt in (s for s in block.compute.iter() if isinstance(s, RegisterTile)):
+        assert not any(getattr(s, "is_reduce", False) for s in rt.body.iter()), "the QK^T reduce must not ride the d register tile"
+
+
+def test_chain_build_degenerates_to_torch_oracle_offline():
+    """``chain_build`` only fires for a real carried-contraction chain; a non-chain seed
+    raises rather than silently mis-lowering."""
+    import pytest  # noqa: PLC0415
+
+    dag = iter_dag(_reduce_loop())
+    with pytest.raises(ValueError, match="carried-contraction-chain"):
+        chain_build(seed_graph(dag, kernel_name="r"), dag, {})

@@ -43,6 +43,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     BM,
     BN,
     BR,
+    CHAIN,
     FK,
     FM,
     FN,
@@ -127,6 +128,9 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         # TMA transport rides the staging schedule, so it shares STAGE's staged tiers
         # (scalar SGEMM + warp matmul — both wired in 130_transport).
         return _STAGED if raw.strip().lower() in {"1", "true", "yes", "on"} else None
+    if name == CHAIN.name:
+        # The FA-2 shared-score restructuring is a MONOID(SEMIRING) streaming-flash move.
+        return frozenset({Tier.MONOID}) if raw.strip().lower() in {"1", "true", "yes", "on"} else None
     return None
 
 
@@ -139,7 +143,7 @@ def _as_int(raw: str) -> int:
 
 # The knobs whose env pin this validator audits — tile geometry + the staging /
 # transport schedule (STAGE / TMA), each legal only on the tiers in ``_legal_tiers``.
-_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR, STAGE, TMA)
+_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR, STAGE, TMA, CHAIN)
 
 
 def validate_pins(algebra: AlgebraKind) -> None:

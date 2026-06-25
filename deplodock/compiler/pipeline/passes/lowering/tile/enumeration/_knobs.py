@@ -104,6 +104,23 @@ TMA = Knob(
     off=False,
 )
 
+# Chain knob (the shared-axis reduce_decomp, ``_build.chain_build``,
+# ``plans/tensor-core-streaming-flash-mma.md`` Phase 1c): a BOOL over a streaming
+# ``MONOID(SEMIRING)`` flash nest. ``True`` restructures it into the FA-2 shared-score
+# form — the P@V output ``d`` rides a register vector ``O[d]`` inside the stream, the
+# score is computed once per KV step (the INLINE score edge, shared across ``d``), and
+# the twisted carrier splits into a scalar stats carrier + a register-tiled accumulation
+# carrier (the two SEMIRING cells the tensor-core tier atomizes). ``False`` keeps the
+# scalar streaming nest (the score recomputed per ``d`` block). ``off=False`` = the
+# scalar streaming default; greedy picks it until the search-fork integration (Phase 6).
+CHAIN = Knob(
+    "CHAIN",
+    KnobType.BOOL,
+    hints=(False, True),
+    help="Restructure a streaming flash into the FA-2 shared-score form (register O[d] + INLINE score). 0 = scalar streaming nest.",
+    off=False,
+)
+
 
 # Candidate menus, shared by the move ``offers``. Thread-tile extents are the
 # per-CTA thread fan-out per axis; register-tile factors are cells-per-thread.

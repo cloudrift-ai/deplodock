@@ -1,7 +1,9 @@
 # Tensor-core streaming flash (mma.sync) — flash as an edge placement, not a kernel
 
 **Branch:** `feature/tile-ir-block-dag`
-**Status:** Phase 0 landed (green); Phase 1 step 1 landed (green); the rest is the ambitious-clean design below.
+**Status:** Phase 0 landed (green); **Phase 1 fully landed (green)** — step 1 (KV re-bracket) + 1a (the `dag.chain`
+view) + 1b (`classify` → `MONOID(SEMIRING)`) + 1c (`chain_build`, the FA-2 shared-score restructuring, matching torch
+end-to-end behind `DEPLODOCK_CHAIN=1`). Phase 2 (`atomize` over the two cells) is next; the rest is the design below.
 
 The streaming-flash `MONOID` tier is built and correct but **scalar** — `QK^T` and `P@V` lower to FMA loops, the
 online-softmax carrier `(m, d, O)` updates one KV element at a time. This plan brings the **`mma.sync` tensor-core tier**
@@ -120,7 +122,7 @@ derived on demand (`IterDag.streaming`); the validator's `COOP`/`STREAMING` tier
 (`_atom.atomize_cell`, unit-tested cell→`Mma`) — the reuse boundary Phase 2 depends on. Full `tests/compiler/` suite
 (1635) green. This is the foundation: one MONOID move to enrich, one reusable atom layer.
 
-### Phase 1 — the view layer: the carried contraction chain (the crux), as classification + an edge value
+### Phase 1 — the view layer: the carried contraction chain (the crux), as classification + an edge value — **DONE (green)**
 
 The whole crux is here, and it is a **view** change plus one new value in the placement lattice — no bespoke build path.
 Three coordinated, individually structural-testable sub-steps:
@@ -263,14 +265,25 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   (`_Regime.inner_algebra=SEMIRING`, derived from `dag.chain`); `legal_decomps` licenses the hinge `kv` split under both
   the carrier's associative trait (serial re-bracket) and its commutative trait (the embedded P@V's THREAD partition),
   which is what makes the shared-axis tiling sound. Structural tests in `test_contraction_chain.py`.
-- **Next: Phase 1c — the shared-axis `reduce_decomp` (the build move).** The view layer (1a `dag.chain` + 1b
-  `MONOID(SEMIRING)`) is in place; 1c consumes it. **Grounded diagnosis from the realized kernel** (`compile --ir cuda`
-  on a static SDPA): today's streaming kernel binds the head-dim `d` to **GRID** and recomputes the QK^T score
-  independently for every `d` (`O_i` is a *scalar* accumulator; the `for a4 (kv) > for a5 (dd)` nest re-runs per `d`
-  block — a `D`× redundant inner contraction). 1c's target kernel needs `O[BM, D]` as a **register accumulator vector**
-  with `d` pulled *inside* the KV stream as the **P@V cell's free output**, so the score `S[BM,BN]` is computed once per
-  KV tile and shared across `d`. That is a loop-nest **reorder** (move `d` from a free-chain axis to inside the stream) +
-  un-fusing the carrier's `O = O·α + p·v` into a separate SEMIRING P@V cell reading the `INLINE` score buffer — not a
-  local edit. The safety oracle stays `BN=1` byte-identical to the current `monoid_build` (default greedy path
-  unchanged), with end-to-end GPU accuracy the BN>1 milestone. Phase 2 then composes `_atom.atomize_cell` on the two
-  cells with no new build move — the boundary Phase 0 set up.
+- **Phase 1c — done, green.** `_build.chain_build` restructures a static `MONOID(SEMIRING)` streaming flash into the
+  **FA-2 shared-score** form: the P@V output `d` becomes a REGISTER domain axis (`O[BM,D]` register accumulator), so the
+  register-replication pass (`kernel/010_split_register_axes`) shares the score across `d` instead of recomputing it per
+  `d` block (the INLINE score edge), and `_split_carrier` splits the twisted carrier into a **scalar stats** `Monoid` +
+  a **register-tiled accumulation** `Monoid` (the two SEMIRING cells Phase 2 atomizes) — the accumulation reads the
+  stats carrier's rescale `α` / probability `p` temps, which render inline (visible to the sibling carrier). The key
+  realization that unlocked it: a single register tile over the whole block + the split carrier shares the score
+  *automatically*, because the replication keys on the `d` var and the split made the stats/score `d`-independent. The
+  `DEPLODOCK_CHAIN=1` pin opts in (`070_coop_reduce`); greedy default stays the scalar streaming nest (search-fork =
+  Phase 6). Matches torch end-to-end (`max_diff ≈ 5e-7`) across static non-causal / causal / GQA / additive-mask SDPA
+  (`tests/compiler/e2e/test_flash_attention.py::test_flash_chain_*`); structural tests in `test_contraction_chain.py`.
+  Symbolic-`seq_len` + cooperative-KV (`BR>1`) under the chain form, and the search-fork, are follow-ups.
+- **Next: Phase 2 — `atomize` over the two cells.** The chain restructuring (1c) emits the two SEMIRING cells (the inner
+  QK^T producing the `INLINE` score fragment + the register-tiled P@V accumulation `O[BM,D]`); Phase 2 composes
+  `_atom.atomize_cell` on each — the `OptionFork` shape of `020_tensorize`, on the MONOID pass over the coupled geometry,
+  reusing the `Mma` op + `kernel/005` codegen verbatim. The genuinely new constraints (the Phase-2 reuse boundary): two
+  cells per body, register-fragment operand provenance (the score fragment feeds the P@V `A` operand — `atomize_cell` is
+  already provenance-agnostic), and ONE joint `WM/WN/FM/FN` geometry propagated across both cells rather than enumerated
+  independently. Then Phase 3 (the fragment-layout softmax + the C→A handoff as the edge placement) and the dtype /
+  masking / fork-integration phases. Open 1c follow-ups feeding in: symbolic-`seq_len` masked streaming + cooperative-KV
+  (`BR>1`) under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the
+  P@V output is the inner free axis.

@@ -97,6 +97,83 @@ def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
 
 
 @requires_cuda
+@pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
+def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
+    """Phase 1c (``plans/tensor-core-streaming-flash-mma.md``): ``DEPLODOCK_CHAIN=1``
+    restructures the streaming flash into the FA-2 **shared-score** form — the P@V output
+    ``d`` rides a register vector ``O[BM, D]``, the QK^T score is computed once per KV step
+    and shared across ``d`` (the INLINE score edge), the twisted carrier splits into a
+    scalar stats cell + a register-tiled accumulation cell. Still one kernel, still matches
+    torch (scalar FMA P@V — the first accuracy check of the crux)."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
+    backend, compiled, kernels = _compile_sdpa(q, k, v)
+    assert len(kernels) == 1, f"chain flash should fuse to one kernel, got {len(kernels)}"
+    # The shared-score form carries the register accumulator vector O_i_0 (not a grid-d scalar).
+    assert "O_i_0" in compiled.nodes[kernels[0]].op.kernel_source, "chain form must carry the O[d] register vector"
+
+    def ref():
+        with torch.no_grad():
+            return torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda()).cpu().flatten().numpy()
+
+    md = _run_flash(backend, compiled, {"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, ref)
+    assert md < 1e-4, f"chain flash max_diff={md:.6e}"
+
+
+@requires_cuda
+def test_flash_chain_causal_and_gqa_match_torch(monkeypatch):
+    """The chain form keeps the causal / GQA masks in the ``d``-invariant score prefix, so
+    masked + grouped-head flash also shares the score and matches torch."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    torch.manual_seed(0)
+
+    q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
+    backend, compiled, kernels = _compile_causal(q, k, v)
+    assert len(kernels) == 1
+
+    def rc():
+        with torch.no_grad():
+            return torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda(), is_causal=True).cpu().flatten().numpy()
+
+    assert _run_flash(backend, compiled, {"q": q.numpy(), "k": k.numpy(), "v": v.numpy()}, rc) < 1e-4
+
+    qg = torch.randn(1, 4, 16, 8)
+    kg, vg = (torch.randn(1, 2, 16, 8) for _ in range(2))
+    graph = trace_module(_Gqa().cpu(), (qg, kg, vg))
+    compiled = CudaBackend().compile(graph)
+
+    def rg():
+        with torch.no_grad():
+            return (
+                torch.nn.functional.scaled_dot_product_attention(qg.cuda(), kg.cuda(), vg.cuda(), is_causal=True, enable_gqa=True)
+                .cpu()
+                .flatten()
+                .numpy()
+            )
+
+    assert _run_flash(CudaBackend(), compiled, {"q": qg.numpy(), "k": kg.numpy(), "v": vg.numpy()}, rg) < 1e-4
+
+
+@requires_cuda
+def test_flash_chain_default_off_keeps_scalar_stream(monkeypatch):
+    """Greedy default (no ``CHAIN`` pin) keeps the scalar streaming nest — the
+    restructuring is opt-in until the search-fork integration (Phase 6), so the deployed
+    flash kernel is unchanged."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.delenv("DEPLODOCK_CHAIN", raising=False)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
+    _backend, compiled, kernels = _compile_sdpa(q, k, v)
+    assert "O_i_0" not in compiled.nodes[kernels[0]].op.kernel_source, "default flash must stay the scalar streaming nest"
+
+
+@requires_cuda
 def test_flash_sdpa_dynamic_matches_torch(monkeypatch):
     """Symbolic ``seq_len`` (Q/K/V dim -2): ONE cached kernel carrying ``int
     seq_len`` serves every runtime size — flash's single dynamic axis lands on

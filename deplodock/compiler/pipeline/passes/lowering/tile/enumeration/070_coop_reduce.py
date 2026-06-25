@@ -32,8 +32,9 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import monoid_build
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
+    CHAIN,
     COOP_BR,
     MAP_M_REG,
     MAP_N_REG,
@@ -75,6 +76,7 @@ def _streaming_bk(dag) -> int:
         if not ext.is_static or ext.as_static() % bk != 0:
             return 1
     return bk
+
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -131,6 +133,26 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
             }
             if op.dag.outer_m is not None:
                 knobs[MAP_M_REG.name] = 1
-            tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
+            if _chain_pinned() and _chain_applicable(op, br):
+                # Phase 1c: the FA-2 shared-score restructuring (register O[d] + INLINE
+                # score edge + the split carrier). Pin-driven opt-in for now — greedy keeps
+                # the scalar streaming nest until the search-fork integration (Phase 6).
+                knobs[CHAIN.name] = True
+                tg = chain_build(op.tilegraph, op.dag, knobs)
+            else:
+                tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
             out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out
+
+
+def _chain_pinned() -> bool:
+    """The ``DEPLODOCK_CHAIN`` opt-in for the FA-2 shared-score restructuring."""
+    raw = CHAIN.raw()
+    return raw is not None and CHAIN.parse(raw)
+
+
+def _chain_applicable(op: TileGraphOp, br: int) -> bool:
+    """Whether ``chain_build`` covers this nest: a carried-contraction chain, a static
+    streaming axis (the symbolic-K masked stream is future work), and no cooperative-KV
+    (``BR == 1`` — the cooperative combine isn't wired through the split carrier yet)."""
+    return op.dag.chain is not None and br == 1 and all(n.loop.axis.extent.is_static for n in op.dag.reduce)
