@@ -476,14 +476,25 @@ compose under nesting — the main unknown to spike.
   (single / SMEM-fused-group / GMEM-launch-split); `_fused.py` is **deleted**, its logic absorbed as `_assemble_group`,
   and the assembly pass lost its special-case dispatch (now just `assembly_ready` + `assemble_block`).
 - **Migration step 2 — in progress** (route flash through the generic tower→kernel lowering, so `_warp_chain` collapses
-  into `_assemble`). The kernel-side cell lowering is landing piecewise in the **shared** `kernel/005`: the QK^T
-  **fragment-output** cell (no `Write` → the C-fragment stays live) and now the P@V **fragment-A** cell (A a live
-  register fragment, C a carried accumulator → only `ldmatrix B + mma`, no A/C decl, no `RegStore`) both lower through
-  the matmul's own pass. **Remaining (the large part):** the build side — emit the flash as a TileOp **tower** (two
-  `AtomTile`s + the fragment-softmax glue + the carried `O` across the kv `SerialTile`) instead of the dedicated
-  `KernelOp`, and thread the fragment-softmax ops (`FragmentRowReduce`/`FragmentExp`/`FragmentScale`) through the
-  generic kernel passes — then validate the generic-path kernel against the dedicated builder / torch and delete
-  `_warp_chain`'s hand-built structure.
+  into `_assemble`). Landed:
+  - **Cell lowering in the shared `kernel/005`.** The QK^T **fragment-output** cell (no `Write` → the C-fragment stays
+    live) and the P@V **fragment-A** cell (A a live register fragment, C a carried accumulator → only `ldmatrix B +
+    mma`, no A/C decl, no `RegStore`) both lower through the matmul's own pass.
+  - **The flash is a `TileOp`, routed through the generic kernel passes** (`kernel/005`…`100` → `cuda`), not a KernelOp
+    that bypassed them. This surfaced (and fixed) that the flash-only fragment-softmax ops
+    (`FragmentScale`/`FragmentRowReduce`/`FragmentExp`/`Reassign`) had no `rewrite` registration — they were terminal
+    (KernelOp→render only); now registered, so they survive the SSA-rewriting passes. The mma cells are **still
+    hand-emitted** (`MmaSyncPtx`) in the tower body — the next step routes them through `005`'s AtomTile lowering.
+  - **Blocker found for the AtomTile cell routing (the next slice).** Converting the P@V `consume` to a fragment-A
+    `AtomTile` mostly works but mis-renders the **grid axis** `bh` in the `005`-derived `LdmatrixLoad`'s `src_index`:
+    it renders as a **value** name (`v4`, colliding with the `alpha` float) instead of the grid coord (`a0`) — the
+    epilogue store in the *same* kernel renders `bh` correctly, so the AtomTile lowering specifically drops `bh` from
+    the σ axis-substitution within the cell scope (`_mma_src_index` returns `load.index` verbatim; the materializer
+    doesn't σ-map the outermost grid axis there). Resolve the axis-var σ-mapping before converting the cells, then
+    delete `_warp_chain`'s hand-emitted mma codegen.
+  - **Remaining (the large part):** the AtomTile cell routing (above) + the carried `O` / fragment-softmax glue as a
+    first-class tower, validated against the dedicated builder / torch, then delete `_warp_chain`'s hand-built
+    structure.
 
 ### Remaining work (functional — Phases 4–7 + the scalar-chain follow-ups)
 
