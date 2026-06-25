@@ -657,6 +657,18 @@ def _geom_feats(
         out["D_log2_waves"] = waves  # CTAs relative to SM count
         out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
         out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
+        # Split-K beyond what occupancy needs is pure atomic/combine waste. The free
+        # axes alone give ``free_ctas = free_prod/area`` CTAs; split-K is justified
+        # only to lift that toward the ~2·SM ``D_near_waves`` target. The terms above
+        # fold ``splitk`` straight into ``ctas``, so they CANNOT tell "≈2 waves via a
+        # small tile" (golden, free) from "≈2 waves via heavy split-K on a big tile"
+        # (atomic-bound) — both score the same waves / ctas≥sm. This credits split-K
+        # up to the need and penalizes the excess, the engineered signal the learned
+        # prior needs to separate the SPLITK=1/2 goldens from the SPLITK=8/16 tiles
+        # the -O1 sweep over-ranks (the analytic prior already gets it via D_splitk_le2).
+        free_ctas = float(free_prod) / area
+        needed = max(2.0 * sm / max(free_ctas, 1.0), 1.0)
+        out["D_splitk_excess"] = math.log2(max(splitk / needed, 1.0))
         # Register-tile intensity × occupancy interaction: a wide per-thread
         # register tile (big FM·FN) is a win only while the grid still covers
         # the SMs — the flat D_cells* terms can't express that, so the big-FM

@@ -19,9 +19,12 @@ Scope: any **staged matmul** with a ringable K loop — the **warp-tier** ``mma.
 ``ldmatrix`` consumer reads a hardware-swizzled deposit (B64 / B128), so ``assembly/_slab``
 swizzle-stamps its sources; the scalar tier reads with plain affine ``Load``s, so its
 deposit stays linear (``SwizzleMode.NONE``) — that branch lives in ``_slab._make_bundle``
-(keyed on ``Block.atom``), not here. Greedy stays byte-identical to today — the SYNC
-decision is offered first (option-0), so a cold compile keeps SYNC staging; the TMA variant
-is the second offer the tuner explores (or a ``DEPLODOCK_TMA=1`` pin selects directly).
+(keyed on ``Block.atom``), not here. **TMA is offered first (option-0) when the tile is
+eligible**, so a cold / greedy compile takes it: the bulk-async ring is 1.3-1.9x faster
+than SYNC on every eligible tile and the choice is then deterministic regardless of the
+loaded prior (the old SYNC-first default let a pinned config's transport flip with the
+prior — see ``rewrite``). The tuner still explores SYNC (the second offer) for any tile
+where it wins; a ``DEPLODOCK_TMA=0`` pin forces it directly. An ineligible tile stays SYNC.
 Cooperative-reduce / pointwise tiers stage nothing ringable, so they fall out via the empty
 ``schedule.staged`` / no-ringable-K-loop guards (``RuleSkipped`` → ``apply_off_defaults``
 stamps ``TMA=False``).
@@ -107,7 +110,7 @@ def _has_ringable_kloop(graph) -> bool:  # noqa: ANN001
     return False
 
 
-def _source_eligible(src: Source, src_shapes: dict, inner_symbolic_bufs: set[str]) -> bool:
+def _source_eligible(src: Source, src_shapes: dict, inner_symbolic_bufs: set[str], *, swizzled: bool) -> bool:
     if not isinstance(src.addressing, AffineAddressing):
         return False
     if src.buf in inner_symbolic_bufs:
@@ -138,13 +141,20 @@ def _source_eligible(src: Source, src_shapes: dict, inner_symbolic_bufs: set[str
     if any(ext > _TMA_MAX_BOX_DIM for ext in box_per_dim.values()):
         return False
     inner_extent = box_per_dim[dims[-1]]
-    # Alignment checks use the lenient fp32 ``BYTES_PER_ELEM`` (matching the legacy
-    # swizzle path): a 32-elem fp16 inner box (64 B true) reads as 128 B and stays
-    # eligible — the swizzle atom keeps the ring-slot stride aligned.
-    if (inner_extent * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
+    # Slot / box 128 B alignment, tier-aware. The WARP tier's slab is hardware-swizzled
+    # (``swizzled`` — ``_slab`` stamps a B64/B128 atom keyed on ``block.atom``), and the
+    # swizzle keeps each ring slot aligned, so the lenient fp32 ``BYTES_PER_ELEM`` is
+    # sound there: a 32-elem fp16 inner box (64 B true) reads as 128 B and stays eligible.
+    # The SCALAR tier deposits LINEARLY (``SwizzleMode.NONE``, plain affine ``Load``s), so
+    # a sub-128 B box genuinely lands the second ``RING`` slot at a misaligned offset and
+    # ``cp.async.bulk.tensor`` faults with ``CUDA_ERROR_MISALIGNED_ADDRESS`` (the #244 fp16
+    # ``BK=32`` = 64 B wedge). Size the check off the TRUE dtype width there so such a slab
+    # declines TMA → cp.async.
+    elem_bytes = BYTES_PER_ELEM if swizzled else (src.dtype.nbytes if src.dtype is not None else BYTES_PER_ELEM)
+    if (inner_extent * elem_bytes) % _TMA_ALIGN_BYTES != 0:
         return False
     src_inner = src_shape[-1]
-    if (src_inner * BYTES_PER_ELEM) % _TMA_ALIGN_BYTES != 0:
+    if (src_inner * elem_bytes) % _TMA_ALIGN_BYTES != 0:
         return False
     if src_inner < inner_extent * 2:
         return False
@@ -170,7 +180,11 @@ def tma_eligible(graph, sources: list[Source], ctx: Context) -> bool:  # noqa: A
         for name, buf in graph.buffers.items()
         if buf.shape and not buf.shape[-1].is_static and not _inner_stride_aligned(buf.shape[-1], buf.dtype.nbytes)
     }
-    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs) for src in sources)
+    # The slab is hardware-swizzled only on the warp/atom tier (``_slab`` keys the
+    # swizzle on ``block.atom``); a scalar tile deposits linearly and needs a truly
+    # 128 B-aligned box (see ``_source_eligible``).
+    swizzled = graph.blocks[0].atom is not None
+    return all(_source_eligible(src, src_shapes, inner_symbolic_bufs, swizzled=swizzled) for src in sources)
 
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
@@ -186,8 +200,16 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
         # A pin is authoritative; an ineligible pinned-on shape declines gracefully to SYNC.
         decisions = [TMA.parse(pin) and eligible]
     else:
-        # Greedy-safe: SYNC first (option-0, byte-identical to today), TMA second when eligible.
-        decisions = [False, *([True] if eligible else [])]
+        # TMA-first when eligible (option-0 = the cold / analytic / greedy default). The
+        # strict ``tma_eligible`` gate only passes tiles that benefit, and the bulk-async
+        # ring measures 1.3-1.9x faster than SYNC on every eligible matmul (square.1024
+        # 51 vs 93 us, o_proj.s512 52 vs 97). Making it the default keeps the deployed
+        # kernel DETERMINISTIC regardless of the loaded prior — the SYNC-first default let
+        # a pinned golden's transport flip with the prior (TMA only when the learned prior
+        # ranked it), so the same golden knobs benched 51 us (prior) vs 93 us (cold), and
+        # the no-TMA cold/analytic path was needlessly slow. The tuner still explores SYNC
+        # (the second offer) for any tile where it wins.
+        decisions = [True, False] if eligible else [False]
 
     out: list[TileGraphOp] = []
     for use in decisions:
