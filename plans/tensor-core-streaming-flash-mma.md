@@ -327,7 +327,19 @@ once and is the **executable spec** the warp-chain codegen must generate:
 Remaining: emit this from the compiler (the warp-chain build wiring the two `Mma`s + the fragment-softmax codegen + the
 smem C→A), gated under `CHAIN=1` + an atom pin, then validate the generated kernel against this reference.
 
-**Warp-chain codegen — started.** The first codegen primitive is built + GPU-validated:
+**Warp-chain codegen — the compiler now GENERATES a working fused tensor-core flash (v1).** A fp16 non-causal SDPA
+compiled with `DEPLODOCK_CHAIN=1` lowers — via `split/005_warp_chain` → `assembly/_warp_chain.assemble_warp_chain` — to a
+single `mma.sync` kernel that matches torch end-to-end (`max_diff ≈ 5e-4`, fp16) across `(B,H,S,D)`
+(`tests/compiler/e2e/test_flash_tensorcore_generated.py`). The generated kernel is the validated reference generalized
+over the shape, reusing the `FragmentRowReduce` op for the fragment softmax and the atom-layer's two cells (QK^T
+fragment-output + P@V fragment-`A`). The default path (no `CHAIN` pin) is byte-unchanged — this only fires under the
+explicit opt-in. **v1 scope:** fp16, non-causal, equal-head, `D%16==0`, `S%16==0`; out of scope falls back to the scalar
+chain / materialized path. **Caveat:** `_warp_chain` is a direct **source emit** (a `CudaOp` spliced in pre-build), not
+yet routed through the generic IR assembly — the pragmatic v1 that gets a real tensor-core flash deploying; folding it
+into the algebraic moveset (so it falls out of the moves like the matmul) is the architectural follow-up, alongside
+masking / GQA / symbolic-`seq_len` / the warp-tower geometry forks.
+
+**Warp-chain codegen — started (the kernel-IR primitive).** The first codegen primitive is built + GPU-validated:
 `ir/kernel/ir.py::FragmentRowReduce` emits the fragment `rowmax`/`rowsum` over the `m16n8` C-fragment's N lanes (the
 in-lane col-pair combine across N-atoms +
 the `__shfl_xor` butterfly over the 4-lane col group), rendering the exact validated pattern. `rowmax` AND `rowsum` match
