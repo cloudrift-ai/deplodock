@@ -468,10 +468,22 @@ codegen (the register C→A shuffle, v2) — `SMEM`-between-atoms (v1) is reuse;
 nesting sub-`TileGraph`s under a carry scope is cleaner than relaxing `Block`, but needs `synthesize_staging`/`_slab` to
 compose under nesting — the main unknown to spike.
 
-**Implementation status.** Step toward G1 landed: the `CarryScope` abstraction + a `wrap_carry_tower` helper
-(`assembly/_tower`), with the warp-chain KernelOp body rebuilt on it (the kv-stream MONOID carry + the two-cell body
-expressed through the helper, the hand-listed `Init`/`Reassign`/softmax wiring deleted). The `_fused`/`_assemble`
-recursion (G2, migration steps 1–2 above) is the staged remainder.
+**Implementation status.**
+- **G1 abstraction — landed.** `CarryScope` + `wrap_carry_tower` (`assembly/_tower`); the warp-chain KernelOp body is
+  rebuilt on it (the kv-stream MONOID carry + the two-cell body through the helper, the hand-listed
+  `Init`/`Reassign`/softmax wiring deleted).
+- **Migration step 1 — done.** `assemble_block` is the **single assembly entry that realizes the placement lattice**
+  (single / SMEM-fused-group / GMEM-launch-split); `_fused.py` is **deleted**, its logic absorbed as `_assemble_group`,
+  and the assembly pass lost its special-case dispatch (now just `assembly_ready` + `assemble_block`).
+- **Migration step 2 — in progress** (route flash through the generic tower→kernel lowering, so `_warp_chain` collapses
+  into `_assemble`). The kernel-side cell lowering is landing piecewise in the **shared** `kernel/005`: the QK^T
+  **fragment-output** cell (no `Write` → the C-fragment stays live) and now the P@V **fragment-A** cell (A a live
+  register fragment, C a carried accumulator → only `ldmatrix B + mma`, no A/C decl, no `RegStore`) both lower through
+  the matmul's own pass. **Remaining (the large part):** the build side — emit the flash as a TileOp **tower** (two
+  `AtomTile`s + the fragment-softmax glue + the carried `O` across the kv `SerialTile`) instead of the dedicated
+  `KernelOp`, and thread the fragment-softmax ops (`FragmentRowReduce`/`FragmentExp`/`FragmentScale`) through the
+  generic kernel passes — then validate the generic-path kernel against the dedicated builder / torch and delete
+  `_warp_chain`'s hand-built structure.
 
 ### Remaining work (functional — Phases 4–7 + the scalar-chain follow-ups)
 
