@@ -63,6 +63,35 @@ def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
     assert max_diff < 5e-3, f"generated TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
 
 
+@requires_cuda
+@pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (1, 4, 128, 64)])
+def test_generated_tensorcore_flash_bf16_matches_torch(monkeypatch, B, H, S, D):
+    """Phase 4 — bf16 in, f32 accumulate. Same fused warp-chain as fp16 (the 16-bit
+    operand dtype only swaps the mma atom / PTX dtype field); validated vs torch SDPA."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    torch.manual_seed(S + D + 1)
+    q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
+    backend, compiled, graph, kernels = _compile(q, k, v)
+    assert len(kernels) == 1, f"fused TC flash should be one kernel, got {len(kernels)}"
+    src = compiled.nodes[kernels[0]].op.kernel_source
+    assert "dpl_mma_m16n8k16_bf16" in src, "the bf16 flash must use the bf16 mma atom"
+    assert "flash_pv_smem" in src, "the generated kernel must be the fused warp-chain (C->A smem handoff)"
+
+    def ref():
+        with torch.no_grad():
+            return torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda()).cpu().flatten().float().numpy()
+
+    # bf16 has no native numpy dtype — the backend maps it to uint16 (the raw bit
+    # pattern), so feed the bf16 bits as uint16 and reinterpret the uint16 output back.
+    data = {n: t.view(torch.uint16).numpy() for n, t in zip(graph.inputs, (q, k, v), strict=True)}
+    run_result, eager = backend.run(compiled, input_data=data, pre_run=ref)
+    got_bits = list(run_result.outputs.values())[0].flatten().astype(np.uint16)
+    got = torch.from_numpy(got_bits).view(torch.bfloat16).float().numpy()
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 5e-2, f"generated bf16 TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
+
+
 def test_warp_chain_cell_layout_falls_out_of_atomize():
     """The two cells' operand layout (``b_trans``, the atom) is DERIVED by the ``atomize``
     move (``_classify_cell`` → ``atomize_cell`` → ``classify_matmul_operands``), not

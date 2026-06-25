@@ -28,7 +28,7 @@ import math
 
 from deplodock.compiler.backend.cuda.dtype import cuda_name
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F16, F32
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
@@ -52,8 +52,9 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Car
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
-    """The v1 fused-TC-flash scope: static fp16, non-causal, equal-head, both extents a
-    multiple of 16. Everything else falls back to the scalar chain."""
+    """The v1 fused-TC-flash scope: static 16-bit (fp16 / bf16 — Phase 4), non-causal,
+    equal-head, both extents a multiple of 16. Everything else falls back to the scalar
+    chain. (Dtype is gated upstream in ``_flash_params``; this checks only geometry.)"""
     return not symbolic and not causal and not mask and group == 1 and D % 16 == 0 and S % 16 == 0 and 16 <= D <= 256 and S >= 16
 
 
@@ -88,6 +89,7 @@ def build_warp_chain_tileop(
     assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
 
     atom_shape = qk.atom.shape
+    ab_dt = qk.atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16) — Phase 4
     scale = f"{1.0 / math.sqrt(D)!r}f"
     kt = D // atom_k  # QK^T K-tiles (reduce over D)
     nd = D // atom_n  # P@V N-tiles (output over D)
@@ -116,7 +118,7 @@ def build_warp_chain_tileop(
         Init(name="l1", op=add, dtype=F32),
     ]
     init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
-    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(F16), align=16))
+    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
 
     # produce — QK^T: 2 N-atoms (kv cols 0-7 / 8-15), reduce over kt K-tiles → the INLINE
     # score fragments ``Sf{nt}``, scaled by 1/sqrt(D). Each N-atom is a **fragment-output
@@ -174,7 +176,7 @@ def build_warp_chain_tileop(
         for nt in range(2)
     ]
     handoff.append(Sync())  # the warp must finish writing ps before ldmatrix reads it back
-    handoff.append(RegFragment(name="pa", role="a", shape=atom_shape, dtype=F16))
+    handoff.append(RegFragment(name="pa", role="a", shape=atom_shape, dtype=ab_dt))
     handoff.append(ld("pa", "flash_pv_smem", Literal(0, "int"), "a", staged=True, ldm=16))  # ps row stride = BN = 16, not D
 
     # consume — P@V: A = P (the live ``pa`` fragment), B = V (gmem-direct), accumulate into O
@@ -228,7 +230,7 @@ def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: 
     g = Graph()
     for nid in (q_id, k_id, v_id):
         t = loop_op.inputs[nid]
-        g.add_node(op=InputOp(), inputs=[], output=Tensor(nid, tuple(t.shape), F16), node_id=nid)
+        g.add_node(op=InputOp(), inputs=[], output=Tensor(nid, tuple(t.shape), t.dtype), node_id=nid)
     g.add_node(op=kop, inputs=[q_id, k_id, v_id], output=Tensor(out_t.name, tuple(out_t.shape), out_t.dtype), node_id=out_t.name)
     g.outputs = [out_t.name]
     return g

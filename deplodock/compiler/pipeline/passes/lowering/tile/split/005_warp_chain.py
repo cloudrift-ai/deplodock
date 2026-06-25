@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dtype import F16
+from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
@@ -49,16 +49,18 @@ def _static(d) -> int | None:
 
 
 def _flash_params(op: LoopOp):
-    """``(B, H, S, D, group)`` for an eligible flash LoopOp, or ``None`` (out of scope:
-    GQA / mask / causal / symbolic / non-fp16). The 3 rank-4 inputs in declared order are
-    Q/K/V; a 4th rank-4 input is an additive mask, a ``*ninf*`` input is the causal bias."""
+    """``(B, H, S, D, group, dtype)`` for an eligible flash LoopOp, or ``None`` (out of
+    scope: GQA / mask / causal / symbolic / non-16-bit). The 3 rank-4 inputs in declared
+    order are Q/K/V; a 4th rank-4 input is an additive mask, a ``*ninf*`` input is the
+    causal bias. The 16-bit operand dtype (``F16`` / ``BF16``) selects the mma atom kind
+    (Phase 4) — f16 and bf16 share the fragment layout, differ only in the mma dtype."""
     rank4 = [(n, t) for n, t in op.inputs.items() if len(t.shape) == 4]
     if len(rank4) != 3:  # a mask adds a 4th rank-4 input
         return None
     if any("ninf" in n for n in op.inputs):  # causal bias
         return None
     (qn, q), (_kn, k), (_vn, _v) = rank4
-    if q.dtype != F16:
+    if q.dtype not in (F16, BF16):
         return None
     dims = [_static(d) for d in q.shape]
     kdims = [_static(d) for d in k.shape]
@@ -66,7 +68,7 @@ def _flash_params(op: LoopOp):
         return None
     B, H, S, D = dims
     group = H // kdims[1]
-    return B, H, S, D, group
+    return B, H, S, D, group, q.dtype
 
 
 def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
@@ -79,22 +81,24 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     params = _flash_params(op)
     if params is None:
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
-    B, H, S, D, group = params
+    B, H, S, D, group, dt = params
     if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=False, mask=False, symbolic=False):
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
     # Run the algebraic ``atomize`` move on the two cells HERE (the ``split`` phase may
     # import ``enumeration``; the ``assembly`` may not) — the operand layout (``b_trans``
     # transposed-B Q@K^T vs canonical-B P@V) + the atom fall out of the move, not hard-coded.
-    qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
-    pv = _classify_cell("P", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None)
+    kind = "mma_m16n8k16_bf16" if dt == BF16 else "mma_m16n8k16_f16"
+    qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")), kind=kind)
+    pv = _classify_cell("P", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None, kind=kind)
     return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
 
 
-def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index):
+def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):
     """Atomize one ``[Load, Load, mul, Accum]`` cell → its ``Mma`` (the A/B assignment,
     ``b_trans``, and atom from ``classify_matmul_operands`` — the same decision the
-    warp-tier matmul makes). Phase 2: ``atomize`` composes over the two flash cells."""
-    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    warp-tier matmul makes). Phase 2: ``atomize`` composes over the two flash cells.
+    ``kind`` selects the mma atom (``mma_m16n8k16_{f16,bf16}``, Phase 4)."""
+    atom = ATOM_REGISTRY[kind]
     cell = (
         Load(name="ca", input=a_buf, index=a_idx),
         Load(name="cb", input=b_buf, index=b_idx),
