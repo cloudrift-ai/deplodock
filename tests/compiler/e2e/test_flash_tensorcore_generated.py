@@ -67,8 +67,11 @@ def test_warp_chain_cell_layout_falls_out_of_atomize():
     """The two cells' operand layout (``b_trans``, the atom) is DERIVED by the ``atomize``
     move (``_classify_cell`` → ``atomize_cell`` → ``classify_matmul_operands``), not
     hard-coded: QK^T is a transposed-B Q@K^T, P@V a canonical-B P@V. CPU-only."""
+    import importlib
+
     from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.pipeline.passes.lowering.tile.assembly._warp_chain import _classify_cell
+
+    _classify_cell = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.split.005_warp_chain")._classify_cell
 
     qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
     pv = _classify_cell("flash_pv_smem", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None)

@@ -213,3 +213,28 @@ def test_unstaged_masked_k_gate_detection():
     assert f(ld("dense"), "b", g) is False
     assert f(ld("dense"), "a", None) is False  # no graph → no info, don't gate
     assert f(ld("missing"), "a", g) is False  # buffer absent from graph → don't gate
+
+
+def test_fragment_output_cell_lowers_without_a_store():
+    """A **fragment-output** cell (operand Loads + ``Mma``, NO ``Write``) lowers to the
+    fragment chain (``RegFragment`` + ``LdmatrixLoad`` + ``MmaSyncPtx``) with **no**
+    ``RegStore`` — the C-fragment stays live for a downstream consumer (the flash QK^T
+    score, the INLINE edge). The same shared lowering the matmul uses, minus the store."""
+    from deplodock.compiler.dim import Dim
+    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
+    from deplodock.compiler.ir.stmt import Mma
+    from deplodock.compiler.ir.tile.ir import AtomTile
+
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    cell = (
+        Load(name="qv", input="Q", index=(Var("m"), Var("dd"))),
+        Load(name="kv", input="K", index=(Var("kvx"), Var("dd"))),
+        Mma(c="sc", a="qv", b="kv", atom=atom, b_trans=True),
+    )
+    at = AtomTile(axes=(Axis("m", Dim(16)), Axis("n", Dim(8))), body=Body(cell), atom=atom)
+    out, found = _mod.lower_atom_cells(Body((at,)), smem_sources={})
+    assert found
+    kinds = [type(s) for s in out.iter()]
+    assert MmaSyncPtx in kinds and RegFragment in kinds and LdmatrixLoad in kinds
+    assert RegStore not in kinds, "a fragment-output cell must not store its result"

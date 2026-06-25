@@ -16,9 +16,14 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._warp_chain import assemble_warp_chain, warp_chain_eligible
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import CHAIN
 
@@ -77,4 +82,23 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     B, H, S, D, group = params
     if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=False, mask=False, symbolic=False):
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
-    return assemble_warp_chain(op, B=B, H=H, S=S, D=D)
+    # Run the algebraic ``atomize`` move on the two cells HERE (the ``split`` phase may
+    # import ``enumeration``; the ``assembly`` may not) — the operand layout (``b_trans``
+    # transposed-B Q@K^T vs canonical-B P@V) + the atom fall out of the move, not hard-coded.
+    qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
+    pv = _classify_cell("P", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None)
+    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
+
+
+def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index):
+    """Atomize one ``[Load, Load, mul, Accum]`` cell → its ``Mma`` (the A/B assignment,
+    ``b_trans``, and atom from ``classify_matmul_operands`` — the same decision the
+    warp-tier matmul makes). Phase 2: ``atomize`` composes over the two flash cells."""
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+    cell = (
+        Load(name="ca", input=a_buf, index=a_idx),
+        Load(name="cb", input=b_buf, index=b_idx),
+        Assign(name="cm", op=ElementwiseImpl("multiply"), args=("ca", "cb")),
+        Accum(name="cc", value="cm"),
+    )
+    return next(s for s in atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index) if isinstance(s, Mma))

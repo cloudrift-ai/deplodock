@@ -41,25 +41,8 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
 )
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Mma
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, GridTile, SerialTile, WarpTile
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
-
-
-def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index) -> Mma:
-    """Run the algebraic ``atomize`` move on one ``[Load, Load, mul, Accum]`` cell — the
-    operand A/B assignment, the ``b_trans`` (transposed-B Q@K^T), and the atom all fall
-    out of ``classify_matmul_operands`` (the same decision the warp-tier matmul makes),
-    instead of being hard-coded. The warp-chain build reads the layout off the returned
-    ``Mma`` (Phase 2: ``atomize`` composes over the two cells)."""
-    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
-    cell = (
-        Load(name="ca", input=a_buf, index=a_idx),
-        Load(name="cb", input=b_buf, index=b_idx),
-        Assign(name="cm", op=ElementwiseImpl("multiply"), args=("ca", "cb")),
-        Accum(name="cc", value="cm"),
-    )
-    return next(s for s in atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index) if isinstance(s, Mma))
+from deplodock.compiler.ir.stmt import Assign, Body, Init, Mma
+from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, WarpTile
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -83,14 +66,16 @@ def _mul(a, b: int):
     return _add() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
 
 
-def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int) -> KernelOp:
-    """The fused TC flash kernel-IR for ``(B,H,S,D)`` fp16, non-causal."""
-    # The two cells' operand layout falls out of the ``atomize`` move: QK^T is a
-    # transposed-B Q@K^T (``b_trans`` derived via the score's M/N coords), P@V is a
-    # canonical-B P@V (A = P from the smem slab, B = V). The atom (cell shape + dtype) is
-    # read off the resulting ``Mma``, not hard-coded — the v1 path assumes ``m16n8k16``.
-    qk = _classify_cell(q, (Var("m"), Var("dd")), k, (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
-    pv = _classify_cell("flash_pv_smem", (Var("m"), Var("kv")), v, (Var("kv"), Var("d")), "kv", None)
+def build_warp_chain_kernelop(
+    loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma
+) -> KernelOp:
+    """The fused TC flash kernel-IR for ``(B,H,S,D)`` fp16, non-causal.
+
+    ``qk`` / ``pv`` are the two cells' atomized ``Mma``s (built by the ``split`` pass via
+    the ``atomize`` move — the layering keeps the ``enumeration`` ``atomize`` import out of
+    ``assembly``): the operand ``b_trans`` (transposed-B Q@K^T vs canonical-B P@V) + the
+    atom (cell shape + dtype) are read off them, not hard-coded (the v1 path assumes
+    ``m16n8k16``)."""
     atom_m, atom_n, atom_k = qk.atom.shape
     ab_dt = qk.atom.operand_dtype("a").name
     assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
@@ -182,13 +167,15 @@ def build_warp_chain_kernelop(loop_op: LoopOp, *, q: str, k: str, v: str, out: s
     return KernelOp(name=loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}", body=Body((grid,)))
 
 
-def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int) -> Graph:
+def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma) -> Graph:
     """Build a single-``KernelOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
-    inputs + one kernel node. Spliced by the engine; the standard cuda lowering renders it."""
+    inputs + one kernel node. Spliced by the engine; the standard cuda lowering renders it.
+    ``qk`` / ``pv`` are the cells' atomized ``Mma``s (the ``split`` pass ran the ``atomize``
+    move)."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
-    kop = build_warp_chain_kernelop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D)
+    kop = build_warp_chain_kernelop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv)
 
     g = Graph()
     for nid in (q_id, k_id, v_id):

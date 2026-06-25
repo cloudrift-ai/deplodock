@@ -203,12 +203,19 @@ def _lower_cell(
     map_staged(atom_body, _gather)
 
     write_stmt, a_seed, b_seed, c_seed, has_reduce, spec = _scan_cell(atom_body)
-    if write_stmt is None:
-        raise RuleSkipped("AtomTile body unrecognised — no Write")
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
-    m_guard, n_guard = _boundary_guards(atom_body, write_stmt)
-    epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph, outer_loads=outer_loads)
+    # A **fragment-output** cell (no ``Write``) keeps its C-fragment in registers for a
+    # downstream consumer instead of storing it — the flash QK^T score (Phase 3 of
+    # ``plans/tensor-core-streaming-flash-mma.md``: the INLINE score edge, no gmem
+    # round-trip). The same lowering (operand fragments + ldmatrix + mma) minus the
+    # ``RegStore`` epilogue; the ``Mma``'s ``c`` (``<c>_frag``) is the live result.
+    fragment_output = write_stmt is None
+    if fragment_output:
+        m_guard, n_guard, epilogue, strip_ids = None, None, None, set()
+    else:
+        m_guard, n_guard = _boundary_guards(atom_body, write_stmt)
+        epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph, outer_loads=outer_loads)
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
@@ -273,6 +280,8 @@ def _lower_cell(
         b_trans=b_trans,
         graph=graph,
     )
+    if fragment_output:  # the score edge stays in the C-fragment — no store
+        return (*fragments, *chain)
     store = _emit_store(
         spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, epilogue=epilogue, m_guard=m_guard, n_guard=n_guard
     )

@@ -346,10 +346,16 @@ online-softmax is `FragmentRowReduce` + the new `FragmentExp` / `FragmentScale` 
 BN stride — the bug that bit D>16). Validated vs torch across `(B,H,S,D)` D∈{16,32,64}, S≤256 (`max_diff ≤ 5e-4`); full
 `tests/compiler/` = 1668 passed.
 
-**Remaining impurity + follow-ups.** The structure is still hand-built in `_warp_chain` and triggered by the
-`005_warp_chain` *recognizer* (pattern-matches the flash `LoopOp`), not yet produced by `chain_build` + the `atomize`
-move (the cells aren't routed through `atomize_cell`, the geometry isn't a warp-tower fork). Closing that — plus masking
-/ GQA / symbolic-`seq_len` / the `BN`/`WM`/`WN` geometry forks (Phase 5/6) — is the remaining work.
+**Toward routing the structure through the generic assembly.** Two foundations landed: (1) the warp-chain cells'
+operand layout (`b_trans`, the atom) is now DERIVED via `atomize_cell` (`_warp_chain._classify_cell`), not hard-coded —
+the deployed kernel exercises the algebraic `atomize` move; (2) the shared cell-lowering `kernel/005._lower_cell` now
+handles a **fragment-output cell** (operand Loads + `Mma`, no `Write`) — it emits the fragment chain (`RegFragment` +
+`LdmatrixLoad` + `MmaSyncPtx`) with no `RegStore`, keeping the C-fragment live (the flash QK^T score, the INLINE edge).
+So the flash QK^T cell can now be lowered by the **same** pass the matmul uses. The remaining reroute: build the warp
+chain as a `TileOp` (`GridTile/WarpTile` + `AtomTile` cells + the fragment carrier) and run the kernel passes on it (so
+the mma + the tower come from the generic assembly, not hand-built), then derive the softmax recurrence from the
+carrier's `merge`/`combine_states`. Plus masking / GQA / symbolic-`seq_len` / the `BN`/`WM`/`WN` geometry forks
+(Phase 5/6).
 
 **Warp-chain codegen — started (the kernel-IR primitive).** The first codegen primitive is built + GPU-validated:
 `ir/kernel/ir.py::FragmentRowReduce` emits the fragment `rowmax`/`rowsum` over the `m16n8` C-fragment's N lanes (the
