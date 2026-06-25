@@ -289,19 +289,25 @@ register-tiled P@V accumulation `O[BM,D]`. Phase 2 composes `_atom.atomize_cell`
   (`tests/compiler/passes/test_atomize_cell.py::test_fragment_output_cell_uses_explicit_out_index`). The first reuse
   boundary the test file's note anticipated; the warp-chain-build (below) calls it.
 
-The remaining Phase 2 work is coupled and needs a **warp-tiled chain build** (the geometry `chain_build` doesn't yet
-set):
+- **2.2 — P@V fragment-`A` atomization (atom-layer part) — done, green.** `atomize_cell` gained a `frag_a` flag for the
+  fragment-`A` cell shape: one gmem `B` `Load` + a register `A` fragment → `Mma(c=O, a=P, b=V)` reducing the KV tile (the
+  score-derived probability `P` is the `A` operand in registers — the C→A handoff). OFF by default and the
+  caller opts in (the one-`Load` `mul` cell is ambiguous with a scalar-scaled reduce `acc += x·s`), so the generic
+  `warp_build` matmul path is unchanged. Unit-tested
+  (`test_atomize_cell.py::test_fragment_a_pv_cell_fuses_with_register_a` + the off-by-default guard). The atom-layer
+  reuse boundary for BOTH chain cells is now complete (2.1 QK^T fragment-output + 2.2 P@V fragment-`A`).
 
-- **2.2 — P@V fragment-`A` atomization.** `Mma(c=O, a=P, b=V)` reducing the KV tile: the score-derived probability `P`
-  is the `A` operand **in registers** (no `Load`), so `atomize_cell` needs a fragment-`A` path (today it requires two
-  `Load`s) + the `A` fragment's logical `(M, K)` coords supplied (like 2.1's `out_index`, for `A`), and the carrier's
-  `O = O·α + p·v` must split into a separate rescale (`O *= α`) + a clean `Accum` (`O += p·v`) so the cell is canonical.
+The remaining Phase 2 work is the **warp-tiled chain build** (the geometry `chain_build` doesn't yet set), coupled with
+Phase 3:
+
+- **2.2 build-side.** Split the carrier's `O = O·α + p·v` into a separate rescale (`O *= α`) + a clean `Accum`
+  (`O += p·v`) so the P@V cell is canonical for the `frag_a` atomize above.
 - **2.3 — joint geometry.** ONE coupled `WM/WN/FM/FN` propagated across both cells (QK^T's `N`-fragment layout = the
   softmax row-reduction = P@V's `A`-operand layout), needs `BN ≥ atom_k` (the score `[BM,BN]` tile, where 1c is `BN=1`)
   and `D % atom_k == 0`.
-- These are **not runnable without Phase 3** (the fragment-layout softmax `__shfl_xor` row reduction + the C→A handoff
-  as the edge placement). The plan's "minimum working tensor-core flash = Phase 1 + 2 + 3" holds: 2.2/2.3 build the
-  structure, Phase 3 makes it execute, validated end-to-end then.
+- These are **not runnable without Phase 3** (the fragment-layout softmax `__shfl_xor` row reduction over the `m16n8`
+  C-fragment + the C→A handoff as the edge placement). The plan's "minimum working tensor-core flash = Phase 1 + 2 + 3"
+  holds: the build wires the two `Mma`s + the geometry, Phase 3's codegen makes it execute, validated end-to-end then.
 
 Open 1c follow-ups feeding in (off the critical path): symbolic-`seq_len` masked streaming + cooperative-KV (`BR>1`)
 under the chain form (today gated to static / `BR=1`), and a generalized `_chain_axes` for layouts where the P@V output

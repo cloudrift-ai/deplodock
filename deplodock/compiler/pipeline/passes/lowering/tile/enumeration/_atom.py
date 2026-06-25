@@ -212,7 +212,9 @@ def eligible_atoms(dag: IterDag, *, compute_capability: tuple[int, int], dtype_o
 # contractions). The free-axis geometry + gmem I/O stay in ``_build.warp_build``.
 
 
-def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None) -> tuple[Stmt, ...]:
+def atomize_cell(
+    body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None, frag_a: bool = False
+) -> tuple[Stmt, ...]:
     """The ``atomize`` body edit: fuse the canonical matmul cell
     ``[Load a, Load b, Assign(mul), Accum]`` into ``[Load a*, Load b*, Mma]`` (the
     operand ``Load``s kept plain, the ``Mma`` naming its A/B by SSA value +
@@ -225,19 +227,30 @@ def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, writ
     whose result is an **INLINE register fragment** with no ``Write`` (the Phase-2 flash
     QK^T, whose score never reaches gmem). It overrides the ``Write``-derived coords the
     transposed-B A/B disambiguation reads; ``None`` keeps the legacy ``Write``-driven
-    behavior (a matmul cell that does write its output)."""
+    behavior (a matmul cell that does write its output).
+
+    ``frag_a`` opts the cell into the **fragment-``A``** shape (one gmem ``B`` operand +
+    a register ``A`` fragment — the Phase-2 flash P@V, ``O += P·V`` with ``A = P`` arriving
+    from the QK^T C-fragment). OFF by default and set deliberately by the caller: a
+    one-``Load`` ``mul`` cell is otherwise ambiguous (a scalar-scaled reduce ``acc += x·s``
+    has the same shape), so only the warp-chain build that knows the cell is a P@V passes
+    ``frag_a=True``; the generic ``warp_build`` matmul path never does."""
     write = next((s for s in body if isinstance(s, Write)), write)
-    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write, out_index=out_index)
+    tagged = _try_atomize_here(body, atom=atom, k_name=k_name, write=write, out_index=out_index, frag_a=frag_a)
     if tagged is not None:
         return tagged
     out: list[Stmt] = []
     for s in body:
         if isinstance(s, SerialTile) and s.is_reduce:
-            out.append(s.with_bodies((Body(atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write, out_index=out_index)),)))
+            inner = atomize_cell(tuple(s.body), atom=atom, k_name=s.axis.name, write=write, out_index=out_index, frag_a=frag_a)
+            out.append(s.with_bodies((Body(inner),)))
         elif s.nested():
             out.append(
                 s.with_bodies(
-                    tuple(Body(atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write, out_index=out_index)) for sub in s.nested())
+                    tuple(
+                        Body(atomize_cell(tuple(sub), atom=atom, k_name=k_name, write=write, out_index=out_index, frag_a=frag_a))
+                        for sub in s.nested()
+                    )
                 )
             )
         else:
@@ -246,23 +259,49 @@ def atomize_cell(body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, writ
 
 
 def _try_atomize_here(
-    body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None
+    body: tuple[Stmt, ...], *, atom: Atom, k_name: str | None, write: Write | None, out_index=None, frag_a: bool = False
 ) -> tuple[Stmt, ...] | None:
-    """If ``body`` is the canonical matmul cell, return ``[*rest, Load a, Load b,
-    Mma]``; else ``None``. ``out_index`` (explicit output ``(M, N)`` coords) takes
-    precedence over the ``Write``-derived coords — the fragment-output (no-``Write``)
-    Phase-2 QK^T path."""
+    """If ``body`` is a canonical matmul cell, fuse it to one ``Mma``; else ``None``.
+
+    Two cell shapes:
+
+    - **two gmem operands** ``[Load a, Load b, Assign(mul), Accum]`` → ``[*rest, Load a,
+      Load b, Mma]`` (the scalar / warp matmul). ``out_index`` (explicit ``(M, N)``
+      coords) overrides the ``Write``-derived coords — the fragment-output (no-``Write``)
+      Phase-2 QK^T.
+    - **one gmem operand + one register fragment** (``frag_a``) ``[Load b, Assign(mul(
+      a_frag, b)), Accum]`` → ``[*rest, Load b, Mma(a=a_frag, …)]`` (the Phase-2 flash
+      **P@V**: ``A`` is the score-derived probability fragment in registers, ``B = V`` the
+      staged value; the C→A handoff). Only ``B`` is a ``Load``; ``A`` is named by its SSA
+      value, the provenance-agnostic contract. Gated by ``frag_a`` — the shape is
+      ambiguous with a scalar-scaled reduce, so the caller opts in."""
     loads = [s for s in body if isinstance(s, Load)]
     assigns = [s for s in body if isinstance(s, Assign)]
     accums = [s for s in body if isinstance(s, Accum)]
-    if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
+    if not (len(assigns) == 1 and len(accums) == 1) or k_name is None:
         return None
     mul, accum = assigns[0], accums[0]
-    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or set(mul.args) != {ld.names[0] for ld in loads if ld.names}:
+    if not mul.op.distributes_over(accum.op) or accum.value != mul.name or len(mul.args) != 2:
+        return None
+    load_names = {ld.names[0] for ld in loads if ld.names}
+
+    if frag_a and len(loads) == 1:
+        # Fragment-A cell: B is the lone Load (must carry K), A the other (register) arg.
+        (b_load,) = loads
+        if b_load.names[0] not in mul.args or not b_load.index:
+            return None
+        a_frag = next(arg for arg in mul.args if arg != b_load.names[0])
+        if a_frag in load_names or k_name not in {v for e in b_load.index for v in e.free_vars()}:
+            return None
+        b_trans = _is_transposed_b(b_load, k_name=k_name)
+        mma = Mma(c=accum.name, a=a_frag, b=b_load.names[0], atom=atom, axes=accum.axes, b_trans=b_trans)
+        return (*[s for s in body if s not in (b_load, mul, accum)], b_load, mma)
+
+    if len(loads) != 2 or set(mul.args) != load_names:
         return None
     if out_index is None:
         out_index = write.index if (write is not None and write.index) else None
-    a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index) if k_name is not None else (None, None)
+    a_load, b_load = classify_matmul_operands(loads, k_name, out_index=out_index)
     if a_load is None or b_load is None:
         return None
     b_trans = _is_transposed_b(b_load, k_name=k_name)

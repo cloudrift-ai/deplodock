@@ -86,6 +86,36 @@ def test_fragment_output_cell_uses_explicit_out_index():
     assert not any(isinstance(s, Mma) for s in atomize_cell(cell, atom=_ATOM, k_name="dd", write=None))
 
 
+def test_fragment_a_pv_cell_fuses_with_register_a():
+    """The Phase-2 flash P@V cell: ``O[m,d] += P[m,kv] · V[kv,d]`` where ``A = P`` is the
+    score-derived probability **fragment in registers** (no ``Load`` — the C→A handoff)
+    and ``B = V`` is the staged value load. Only ``B`` is a ``Load``; with ``frag_a=True``
+    the cell fuses to ``Mma(c=O, a=P, b=V)`` naming ``A`` by SSA value."""
+    cell = (
+        Load(name="v_v", input="v", index=(Var("kv"), Var("d"))),
+        Assign(name="pv", op=ElementwiseImpl("multiply"), args=("p_frag", "v_v")),
+        Accum(name="O", value="pv"),
+    )
+    out = atomize_cell(cell, atom=_ATOM, k_name="kv", write=None, frag_a=True)
+    mma = _only_mma(out)
+    assert (mma.c, mma.a, mma.b) == ("O", "p_frag", "v_v")
+    assert mma.b_trans is False  # V[kv, d] — K-major B
+    assert [s.name for s in out if isinstance(s, Load)] == ["v_v"]
+
+
+def test_fragment_a_off_by_default_guards_scalar_scaled_reduce():
+    """``frag_a`` is OFF by default: a one-``Load`` ``mul`` cell — indistinguishable from a
+    scalar-scaled reduce ``acc += x·s`` — never fuses unless the caller opts in. Without
+    the flag the P@V-shaped cell passes through untouched (no spurious ``Mma``)."""
+    cell = (
+        Load(name="v_v", input="v", index=(Var("kv"), Var("d"))),
+        Assign(name="pv", op=ElementwiseImpl("multiply"), args=("p_frag", "v_v")),
+        Accum(name="O", value="pv"),
+    )
+    out = atomize_cell(cell, atom=_ATOM, k_name="kv", write=None)  # frag_a defaults False
+    assert not any(isinstance(s, Mma) for s in out)
+
+
 def test_walks_serial_tile_reduce_tower_to_cell():
     """Called with ``k_name=None`` (as ``warp_build`` does), the move recurses
     through a ``SerialTile`` reduce tower and reads the K name off the reduce axis."""
