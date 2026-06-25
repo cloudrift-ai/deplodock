@@ -263,7 +263,14 @@ mma-flash golden for the layer-0 attention shape. Fills the blog's Validation + 
   (`_Regime.inner_algebra=SEMIRING`, derived from `dag.chain`); `legal_decomps` licenses the hinge `kv` split under both
   the carrier's associative trait (serial re-bracket) and its commutative trait (the embedded P@V's THREAD partition),
   which is what makes the shared-axis tiling sound. Structural tests in `test_contraction_chain.py`.
-- **Next: Phase 1c the view layer.** Start at `iter_dag`: represent the carried contraction chain + the
-  dual-role hinge axis; then `classify` → `MONOID(SEMIRING)`; then the `INLINE` score edge + the shared-axis
-  `reduce_decomp`. Structural tests at 1a/1b, end-to-end accuracy at 1c. Phase 2 then composes `_atom.atomize_cell` with
-  no new build move — the boundary Phase 0 set up.
+- **Next: Phase 1c — the shared-axis `reduce_decomp` (the build move).** The view layer (1a `dag.chain` + 1b
+  `MONOID(SEMIRING)`) is in place; 1c consumes it. **Grounded diagnosis from the realized kernel** (`compile --ir cuda`
+  on a static SDPA): today's streaming kernel binds the head-dim `d` to **GRID** and recomputes the QK^T score
+  independently for every `d` (`O_i` is a *scalar* accumulator; the `for a4 (kv) > for a5 (dd)` nest re-runs per `d`
+  block — a `D`× redundant inner contraction). 1c's target kernel needs `O[BM, D]` as a **register accumulator vector**
+  with `d` pulled *inside* the KV stream as the **P@V cell's free output**, so the score `S[BM,BN]` is computed once per
+  KV tile and shared across `d`. That is a loop-nest **reorder** (move `d` from a free-chain axis to inside the stream) +
+  un-fusing the carrier's `O = O·α + p·v` into a separate SEMIRING P@V cell reading the `INLINE` score buffer — not a
+  local edit. The safety oracle stays `BN=1` byte-identical to the current `monoid_build` (default greedy path
+  unchanged), with end-to-end GPU accuracy the BN>1 milestone. Phase 2 then composes `_atom.atomize_cell` on the two
+  cells with no new build move — the boundary Phase 0 set up.
