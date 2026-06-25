@@ -37,8 +37,12 @@ format: setup
 	./venv/bin/ruff format
 	./venv/bin/ruff check --fix
 
+# Compile CUDA kernels at -Xcicc -O1: ~3x faster suite (dodges the cicc/LLVM unroll
+# blowup on big register-tile kernels). This is the CORRECTNESS lane — -O1 changes
+# runtime perf, not numerics, and the deployable perf tests (tests/perf, -m perf) run
+# at -O3 via `make bench-kernels`. Override with DEPLODOCK_NVCC_FLAGS= to test at -O3.
 test: setup
-	./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
+	DEPLODOCK_NVCC_FLAGS="-Xcicc -O1" ./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
 
 bench-kernels-clean: setup
 	@rm -f /tmp/deplodock-gpu.lock

@@ -44,6 +44,12 @@ layer, so programmatic callers and tests get the same precedence. The dynamic `D
 make test
 ```
 
+`make test` compiles CUDA kernels at **`-Xcicc -O1`** (the suite is `nvcc`/`cicc`-compile-bound, not GPU-bound — `-O1`
+dodges the cicc/LLVM unroll blowup on big register-tile kernels, ~3× faster wall time). This is the **correctness lane**:
+`-O1` changes runtime perf, not numerics, and the deployable perf tests (`tests/perf`, `-m perf`) are skipped here — they
+run at `-O3` via `make bench-kernels`. To re-run the suite at deployable `-O3`, prefix `DEPLODOCK_NVCC_FLAGS=` (empty) or
+run `pytest` directly.
+
 Or for a specific test file:
 
 ```bash
@@ -252,7 +258,8 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
 ## Key Make Targets
 
 - `make setup` — create venv and install dependencies (includes ruff)
-- `make test` — run `pytest` using the venv (skips `perf`-marked tests; see `tests/perf/ARCHITECTURE.md`)
+- `make test` — run `pytest` using the venv (skips `perf`-marked tests; see `tests/perf/ARCHITECTURE.md`). Compiles
+  kernels at `-Xcicc -O1` for ~3× faster nvcc (correctness lane; perf tests use `-O3` via `make bench-kernels`)
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
 - `make bench` — run benchmarks (`deplodock bench recipes/*`)
