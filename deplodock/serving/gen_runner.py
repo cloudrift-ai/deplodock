@@ -48,20 +48,40 @@ class _Program:
         return [out[n] for n in self.output_names]
 
 
+def _pad_rows(arr, bucket):
+    """Pad axis 0 from ``t`` up to ``bucket`` with zeros. The decode programs are static at
+    M=bucket; padding rows are computed then sliced away — safe because pre/post are
+    per-token-independent (pointwise + matmul over the hidden axis)."""
+    import numpy as np
+
+    t = arr.shape[0]
+    if t == bucket:
+        return arr
+    out = np.zeros((bucket, *arr.shape[1:]), dtype=arr.dtype)
+    out[:t] = arr
+    return out
+
+
 def _compile_split(wrapper, example_args, argnames, np_dtype):
-    """Trace ``wrapper`` with axis 0 of every arg bound to a shared ``num_tokens`` Dim,
-    compile, bind constants, build a :class:`_Program`."""
+    """Trace ``wrapper`` and build a :class:`_Program`. ``argnames`` (a list) ties each named
+    arg's axis-0 to a shared symbolic ``num_tokens`` Dim — the **prefill** program (one program,
+    any width). ``argnames=None`` traces a **fully static** graph at the example shapes — the
+    **decode-bucket** program (efficient at small M; the symbolic program's hint-sized M-tile is
+    pathological at decode — see ``plans/generative-decode-perf-findings.md``)."""
     import torch
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.cuda.program import CompiledProgram
     from deplodock.compiler.backend.gpu_lock import gpu_lock
     from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
     from deplodock.compiler.trace.torch import trace_module
 
-    specs = [f"num_tokens@{name}:0" for name in argnames]  # shared NAME ties all axes
-    graph = trace_module(wrapper, tuple(example_args), dynamic_shapes=build_torch_dynamic_shapes(parse_position_specs(specs)))
+    dynamic_shapes = None
+    if argnames:
+        from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+
+        dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs([f"num_tokens@{n}:0" for n in argnames]))
+    graph = trace_module(wrapper, tuple(example_args), dynamic_shapes=dynamic_shapes)
     compiled = CudaBackend(tune_db="auto").compile(graph)
 
     sources = {}
@@ -78,11 +98,14 @@ def _compile_split(wrapper, example_args, argnames, np_dtype):
 
 
 class DeplodockGenRunner:
-    def __init__(self, *, embed_weight, norm, pre, post, attn_meta, np_dtype):
+    def __init__(self, *, embed_weight, norm, pre, post, attn_meta, np_dtype, pre_decode=None, post_decode=None, decode_bucket=16):
         self._embed_weight = embed_weight  # numpy [vocab, H]
         self._norm = norm  # torch module
-        self._pre = pre  # list[_Program]
-        self._post = post  # list[_Program]
+        self._pre = pre  # list[_Program] — symbolic (prefill / any width)
+        self._post = post
+        self._pre_decode = pre_decode  # list[_Program] — static M=decode_bucket (or None → no bucket)
+        self._post_decode = post_decode
+        self._decode_bucket = decode_bucket
         self.head_dim, self.num_heads, self.num_kv_heads, self.scaling = attn_meta
         self._np_dtype = np_dtype
 
@@ -91,17 +114,17 @@ class DeplodockGenRunner:
         return len(self._pre)
 
     @classmethod
-    def create(cls, model_id, *, dtype_str="float16"):
+    def create(cls, model_id, *, dtype_str="float16", decode_bucket=16):
         import torch
         from transformers import AutoModelForCausalLM
 
         logger.info("[gen_runner] loading %s (%s, CPU trace)...", model_id, dtype_str)
         with torch.device("cpu"):
             model = AutoModelForCausalLM.from_pretrained(model_id, dtype=getattr(torch, dtype_str)).eval()
-            return cls.from_model(model, dtype_str=dtype_str)
+            return cls.from_model(model, dtype_str=dtype_str, decode_bucket=decode_bucket)
 
     @classmethod
-    def from_model(cls, model, *, dtype_str="float16"):
+    def from_model(cls, model, *, dtype_str="float16", decode_bucket=16):
         """Build from an already-loaded CausalLM module (the network-free path). ``model``
         must be on CPU for the trace."""
         import numpy as np
@@ -122,8 +145,10 @@ class DeplodockGenRunner:
         attn_width = num_heads * head_dim
 
         pre_programs, post_programs = [], []
+        pre_decode, post_decode = [], []
+        decode_ok = decode_bucket and decode_bucket > 0
         for i, block in enumerate(layers):
-            logger.info("[gen_runner] compiling layer %d/%d (pre + post)...", i + 1, len(layers))
+            logger.info("[gen_runner] compiling layer %d/%d (pre + post%s)...", i + 1, len(layers), " + decode" if decode_ok else "")
             pre_w, post_w = build_attention_split_wrapper(block)
             with torch.device("cpu"):
                 pre_programs.append(_compile_split(pre_w, [torch.zeros(8, hidden, dtype=dtype)], ["hidden"], np_dtype))
@@ -135,8 +160,26 @@ class DeplodockGenRunner:
                         np_dtype,
                     )
                 )
+                # Static M=decode_bucket twins — fast at decode (small M). If a layer's static
+                # compile fails (e.g. a demoted-matmul lowering gap at this bucket), drop the
+                # decode path entirely and fall back to the symbolic programs (slow but correct).
+                if decode_ok:
+                    try:
+                        pre_decode.append(_compile_split(pre_w, [torch.zeros(decode_bucket, hidden, dtype=dtype)], None, np_dtype))
+                        post_decode.append(
+                            _compile_split(
+                                post_w,
+                                [torch.zeros(decode_bucket, attn_width, dtype=dtype), torch.zeros(decode_bucket, hidden, dtype=dtype)],
+                                None,
+                                np_dtype,
+                            )
+                        )
+                    except Exception as ex:  # noqa: BLE001 — any lowering/compile failure → disable the bucket
+                        logger.warning("[gen_runner] decode-bucket compile failed at layer %d (%s); decode falls back to symbolic", i, ex)
+                        decode_ok = False
 
         embed_weight = trunk.embed_tokens.weight.detach().cpu().to(torch.float32).numpy().astype(np_dtype, copy=False)
+        use_decode = decode_ok and len(pre_decode) == len(layers)
         return cls(
             embed_weight=embed_weight,
             norm=trunk.norm,
@@ -144,6 +187,9 @@ class DeplodockGenRunner:
             post=post_programs,
             attn_meta=(head_dim, num_heads, num_kv, scaling),
             np_dtype=np_dtype,
+            pre_decode=pre_decode if use_decode else None,
+            post_decode=post_decode if use_decode else None,
+            decode_bucket=decode_bucket,
         )
 
     def embed(self, input_ids):
@@ -154,13 +200,26 @@ class DeplodockGenRunner:
 
     def forward_layer_pre(self, layer, hidden, positions=None):
         """``hidden[T, H]`` numpy → un-rotated ``(q[T,Hq·D], k[T,Hkv·D], v[T,Hkv·D])``.
-        ``positions`` is unused under A2 (RoPE applied downstream); kept for signature parity."""
+        ``positions`` is unused under A2 (RoPE applied downstream); kept for signature parity.
+        Uses the static decode-bucket program when ``T <= decode_bucket`` (pad → run → slice)."""
         del positions
-        return tuple(self._pre[layer].run([hidden.astype(self._np_dtype, copy=False)]))
+        h = hidden.astype(self._np_dtype, copy=False)
+        t = h.shape[0]
+        if self._pre_decode is not None and t <= self._decode_bucket:
+            q, k, v = self._pre_decode[layer].run([_pad_rows(h, self._decode_bucket)])
+            return q[:t], k[:t], v[:t]
+        return tuple(self._pre[layer].run([h]))
 
     def forward_layer_post(self, layer, attn_out, residual):
-        """``(attn_out[T,Hq·D], residual[T,H])`` numpy → ``layer_out[T, H]`` numpy."""
-        return self._post[layer].run([attn_out.astype(self._np_dtype, copy=False), residual.astype(self._np_dtype, copy=False)])[0]
+        """``(attn_out[T,Hq·D], residual[T,H])`` numpy → ``layer_out[T, H]`` numpy. Decode-bucketed
+        like ``forward_layer_pre``."""
+        a = attn_out.astype(self._np_dtype, copy=False)
+        r = residual.astype(self._np_dtype, copy=False)
+        t = a.shape[0]
+        if self._post_decode is not None and t <= self._decode_bucket:
+            out = self._post_decode[layer].run([_pad_rows(a, self._decode_bucket), _pad_rows(r, self._decode_bucket)])[0]
+            return out[:t]
+        return self._post[layer].run([a, r])[0]
 
     def final_norm(self, hidden):
         """Apply the model's final norm (held as a torch module) to ``hidden[T, H]`` numpy."""
