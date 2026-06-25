@@ -19,6 +19,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, Write
+from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
 from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
@@ -386,59 +387,6 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
 # ``MONOID(SEMIRING)`` analog of ``monoid_build``.
 
 
-def _value_dependent(merge: tuple[Assign, ...], value_name: str) -> set[str]:
-    """Fixpoint over a twisted carrier's ``merge`` program: the SSA names that
-    transitively read the value partial (``value_name`` — flash's V load). These are
-    the P@V accumulation (``O·α + p·v`` and its temps + the ``O`` state update); the
-    rest is the ``d``-invariant softmax-stats update. A fixpoint (not one pass) because
-    the state's own update (``O = om + pv``) precedes a temp that reads it (``om = O·α``)
-    in program order."""
-    dvar = {value_name}
-    changed = True
-    while changed:
-        changed = False
-        for a in merge:
-            if a.name not in dvar and any(arg in dvar for arg in a.args):
-                dvar.add(a.name)
-                changed = True
-    return dvar
-
-
-def _split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str]:
-    """Split a twisted ``MONOID(SEMIRING)`` carrier into ``(stats, accum, d_state)``:
-    the ``d``-invariant softmax-stats ``Monoid`` (state minus the accumulator, partial =
-    the score) and the ``d``-varying accumulation ``Monoid`` (the accumulator state,
-    partial = the value), which reads the stats carrier's rescale/probability temps by
-    name (they render inline, visible to the sibling carrier). ``d_state`` is the
-    accumulator state component (flash's ``O``)."""
-    dvar = _value_dependent(carrier.merge, value_name)
-    accum_merge = tuple(a for a in carrier.merge if a.name in dvar)
-    stats_merge = tuple(a for a in carrier.merge if a.name not in dvar)
-    d_states = [s for s in carrier.state if s in dvar]
-    stats_states = [s for s in carrier.state if s not in dvar]
-    if len(d_states) != 1:
-        raise ValueError(f"chain_build: expected exactly one accumulator state, got {d_states}")
-    d_state = d_states[0]
-    ident = dict(zip(carrier.state, carrier.identity, strict=True)) if carrier.identity else {}
-    stats = Monoid(
-        state=tuple(stats_states),
-        partial=(carrier.partial[0],),
-        merge=stats_merge,
-        identity=tuple(ident[s] for s in stats_states) if ident else (),
-        commutative=carrier.commutative,
-        axes=carrier.axes,
-    )
-    accum = Monoid(
-        state=(d_state,),
-        partial=(value_name,),
-        merge=accum_merge,
-        identity=(ident[d_state],) if ident else (),
-        commutative=carrier.commutative,
-        axes=carrier.axes,
-    )
-    return stats, accum, d_state
-
-
 def _chain_axes(dag: IterDag, value_load: Load) -> tuple[Axis, Axis, tuple[Loop, ...]]:
     """Classify the free axes of a chain nest off the def-use: the **P@V output ``d``**
     (a free axis in the value load's index but NOT in the inner QK^T contraction — the
@@ -495,7 +443,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     monoid = next(s for s in kv_body if isinstance(s, Monoid))
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
-    stats, accum, _d_state = _split_carrier(carrier, value_name)
+    stats, accum, _d_state = split_carrier(carrier, value_name)
     d_axis, m_axis, grid = _chain_axes(dag, value_load)
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
