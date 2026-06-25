@@ -45,8 +45,8 @@ from deplodock.compiler.ir.kernel.ir import (
     Sync,
 )
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Mma
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Mma
+from deplodock.compiler.ir.tile.ir import AtomTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, wrap_carry_tower
 
 
@@ -139,14 +139,14 @@ def build_warp_chain_tileop(
         Assign(name="mn1", op=mx, args=("m1", "r1")),
         Assign(name="dm0", op=ElementwiseImpl("subtract"), args=("m0", "mn0")),
         Assign(name="dm1", op=ElementwiseImpl("subtract"), args=("m1", "mn1")),
-        Assign(name="a0", op=ElementwiseImpl("exp"), args=("dm0",)),
-        Assign(name="a1", op=ElementwiseImpl("exp"), args=("dm1",)),
+        Assign(name="alpha0", op=ElementwiseImpl("exp"), args=("dm0",)),
+        Assign(name="alpha1", op=ElementwiseImpl("exp"), args=("dm1",)),
     ]
     merge += [FragmentExp(out=f"Pf{nt}", src=f"Sf{nt}", top_sub="mn0", bot_sub="mn1") for nt in range(2)]
     merge += [
         FragmentRowReduce(top="s0", bot="s1", frags=("Pf0", "Pf1"), op=add),
-        Assign(name="lm0", op=ElementwiseImpl("multiply"), args=("l0", "a0")),
-        Assign(name="lm1", op=ElementwiseImpl("multiply"), args=("l1", "a1")),
+        Assign(name="lm0", op=ElementwiseImpl("multiply"), args=("l0", "alpha0")),
+        Assign(name="lm1", op=ElementwiseImpl("multiply"), args=("l1", "alpha1")),
         Assign(name="ln0", op=add, args=("lm0", "s0")),
         Assign(name="ln1", op=add, args=("lm1", "s1")),
         Reassign(name="l0", value="ln0"),
@@ -154,7 +154,7 @@ def build_warp_chain_tileop(
     ]
 
     # rescale — the twist: O *= alpha before the P@V accumulation.
-    rescale: list = [FragmentScale(frag=f"Of{n}", top="a0", bot="a1") for n in range(nd)]
+    rescale: list = [FragmentScale(frag=f"Of{n}", top="alpha0", bot="alpha1") for n in range(nd)]
 
     # handoff — the C→A edge: write the P C-fragment to the smem slab, ldmatrix it back as A.
     handoff: list = [
@@ -167,12 +167,17 @@ def build_warp_chain_tileop(
     handoff.append(RegFragment(name="pa", role="a", shape=atom_shape, dtype=F16))
     handoff.append(ld("pa", "flash_pv_smem", Literal(0, "int"), "a", staged=True, ldm=16))  # ps row stride = BN = 16, not D
 
-    # consume — P@V: A = P (smem), B = V (gmem-direct), accumulate into O over the KV tile.
+    # consume — P@V: A = P (the live ``pa`` fragment), B = V (gmem-direct), accumulate into O
+    # over the KV tile. Each N-atom is a **fragment-A AtomTile** that ``kernel/005`` lowers
+    # (one gmem B Load + the live A — the C→A handoff cell): the mma codegen is the matmul's
+    # own pass, not hand-emitted here.
     consume: list = []
     for n in range(nd):
-        consume.append(RegFragment(name=f"vb{n}", role="b", shape=atom_shape, dtype=F16))
-        consume.append(ld(f"vb{n}", v, _add(kvrow, n * 8), "b", b_trans=pv.b_trans))
-        consume.append(MmaSyncPtx(c_frag=f"Of{n}", a_frag="pa", b_frag=f"vb{n}", shape=atom_shape, ab_dtype=ab_dt))
+        cell = (
+            Load(name=f"vv{n}", input=v, index=(_add(kvrow, n * 8),)),
+            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=pv.atom, b_trans=pv.b_trans),
+        )
+        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=pv.atom))
     consume.append(Sync())  # finish reading ps (the ldmatrix) before the next KV tile overwrites it
 
     # update — commit the carrier max.
