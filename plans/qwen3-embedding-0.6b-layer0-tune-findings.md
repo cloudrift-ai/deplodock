@@ -261,65 +261,55 @@ root-caused with **nsys ground truth** (the deplodock bench harness mis-attribut
 2. `kernel: cooperative WarpShuffle uses __activemask()` — a whole-CTA cooperative reduce with `BR < warp_size` launches
    a partial warp; the hard-coded `0xffffffff` mask named absent lanes (UB). Correctness hygiene.
 
-**nsys ground truth (uncaptured forward, seq=512 hint).** The deplodock `run --bench` per-kernel table is **unreliable**
-— it reported `k_mean_linear_reduce` (k-norm) at 7864 µs and the SDPA at 14 µs, but nsys shows the **opposite**: the
-k-norm is **2.4 µs** (fine — the harness mis-attributes ~the SDPA's time onto it) and the real cost is the attention:
+**nsys ground truth at the deployment seq (512).** The deplodock `run --bench` per-kernel TABLE mis-attributes (it
+blamed `k_mean_linear_reduce` / k-norm at 7864 µs and the SDPA at 14 µs) — nsys shows the opposite. The whole-program
+number is right (~8.8 ms ≈ Eager 224 µs → **0.02×**); only the per-launch "solo window" attribution is scrambled. nsys
+per-kernel (uncaptured, seq=512):
 
 ```
-k_sdpa_linear_reduce   325 µs/call (uncaptured, seq=512)  <-- 45% — the wall
-k_linear_0837e7        185 µs/call                        <-- 26%
-… all other kernels     2–30 µs each
+k_sdpa_linear_reduce   8.16 ms/call   <-- ~90% — the wall (the streaming flash)
+k_linear_0837e7        0.21 ms/call   <-- the second cost (a real linear)
+k_mean_linear_reduce   2.4 µs         <-- the "28 ms catastrophe" was pure harness mis-attribution
+… all other kernels    2–40 µs each
 ```
 
-**The SDPA at the deployment seq is the wall.** The fast 325 µs above is the *uncaptured* forward at seq=512. Under the
-bench's **CUDA-graph capture** the same kernel balloons to **~8 ms** (nsys `cuda_gpu_trace` on the captured run: grid
-1024, block 8, 168 regs, 8.0–8.1 ms/instance). So the layer's captured e2e is ~8.8 ms (≈ Eager 217 µs → **0.02×**).
-Whether you read the uncaptured (325 µs) or captured (8 ms) number, attention dominates.
+**No capture penalty — it's seq, not capture.** An earlier read suggested the SDPA ballooned 325 µs → 8 ms under
+CUDA-graph capture; that was a confound. The 325 µs was the forward at the **trace seq (32)**; the bench runs at the
+**hint (512)**. nsys of an **uncaptured** forward at seq=512 shows the SDPA at **8.16 ms** — identical captured and
+uncaptured. The SDPA is genuinely ~8 ms at the deployment length, period (O(seq²) and the wall regardless of capture).
 
 **Why it can't be cheap (yet).** The symbolic-`seq_len` streaming flash is a **scalar serial-KV** nest: each query
-thread streams all `seq` keys, **re-reading K/V from gmem with no smem tile sharing across queries**. At seq=512,
-1×16×512×128 that is a **~1.2 ms memory-bound floor** (≈2 GB of K/V re-reads / 1.8 TB/s) even at perfect occupancy —
-and the deployed config is far from perfect occupancy (block 8 / 168 regs). Eager's flash shares K/V tiles in smem and
-runs the **whole layer** in 217 µs. So eager-competitive symbolic attention needs the **smem-tiled / tensor-core
-streaming flash for a symbolic axis** — `warp_chain` / `warp_chain_eligible` is **static-only** today, and
-`chain_build` + cooperative-KV (shared score AND parallel KV) is the explicitly-"not wired yet" combination
-(`_chain_applicable` refuses `BR > 1`). This is the large remaining piece; it is real architecture work, not a config
-tweak, so it was checkpointed rather than half-built autonomously.
+thread streams all `seq` keys, **re-reading K/V from gmem with no smem tile sharing across queries**, at low occupancy
+(block 8 / 168 regs). Eager's flash shares K/V tiles in smem (and uses tensor cores) and runs the **whole layer** in
+224 µs. So eager-competitive symbolic attention needs the **smem-tiled / tensor-core streaming flash for a symbolic
+axis** — `warp_chain` / `warp_chain_eligible` is **static-only** today, and `chain_build` + cooperative-KV (shared score
+AND parallel KV) is the explicitly-"not wired yet" combination (`_chain_applicable` refuses `BR > 1`). This is the large
+remaining piece — real architecture work, checkpointed rather than half-built autonomously.
+
+**Dead end checked — the materialized SDPA is INCORRECT for dynamic seq.** The tempting shortcut is to route symbolic
+SDPA to the score-materializing decomposition (QK^T → softmax → P@V, which reaches the tensor-core matmul tier; the
+bare-SDPA bench showed 861 µs vs 6663 µs streaming). It is **wrong** at runtime `seq < hint`: the masked-N QK^T
+**zero-fills** the masked keys, but softmax needs **−inf** (`exp(0)=1` spuriously adds the masked keys to the
+denominator). It only matched torch because every bench is at `seq=hint=512` (no masked region) — a focused test at
+seq=8/16/37 fails. So `010_recognize_flash`'s forcing of flash for symbolic SDPA is a **correctness** guard (the
+streaming flash masks the score to −inf in the stream, `_mask_carrier`), not just routing; making the materialized path
+correct needs the −inf mask propagated into the score before softmax (non-trivial). **The streaming flash stays the
+only correct symbolic SDPA today** — which is exactly why its speed is the gating item.
 
 **Smaller, tractable next steps (do not reach eager parity, but real):**
 
-- **Thread-budget mis-allocation in the chain.** `070_coop_reduce._streaming_leaves` fans out `thread_offers` as a
-  balanced `(t_n, t_m)` over `(inner_n, outer_m)`, but `chain_build` forces the P@V output `d` to a REGISTER axis, so
-  the threads `thread_offers` spends on `d` are **wasted** — the query (`m`) is left under-threaded (deployed block=8,
-  even block=1 on a bare SDPA). The chain free-tile fork should put the **whole** thread budget on `m_axis`
-  (query), `d`→1. Expected ~4–8× on occupancy (8 ms → ~1–2 ms), still memory-bound until K/V smem tiling lands.
-- **Per-op tune benches symbolic kernels at the trace seq, not the hint.** The learned prior ranks the SDPA on
-  seq=32-ish numbers (cheap) while deployment is seq=512 (O(seq²)) — so the prior's SDPA pick (block=8/1) is
-  mis-ranked. Benching symbolic per-op slices at `DEFAULT_SEQ_HINT` would fix the ranking (and the misleading
-  `eval variants` SDPA latencies: tune 7726 µs vs nsys 325 µs).
-- **Bench harness per-kernel attribution is wrong** (k-norm 7864 µs vs nsys 2.4 µs). The per-launch "solo window"
-  mis-assigns the captured SDPA's time. Trust nsys, not the table, until fixed.
+- **Chain thread-budget mis-allocation.** `070_coop_reduce._streaming_leaves` fans out `thread_offers` as a balanced
+  `(t_n, t_m)` over `(inner_n, outer_m)`, but `chain_build` forces the P@V output `d` to a REGISTER axis — the threads
+  spent on `d` are **wasted**, leaving the query (`m`) under-threaded (block 8). The chain free-tile fork should put the
+  whole budget on `m_axis`. Improves occupancy; still memory-bound until K/V smem tiling lands.
+- **Per-op tune benches symbolic kernels at the trace seq, not the hint** — the prior ranks the SDPA on cheap seq≈32
+  numbers while deployment is seq=512 (O(seq²)), so its SDPA pick is mis-ranked. Bench symbolic per-op slices at
+  `DEFAULT_SEQ_HINT`.
+- **Bench-harness per-kernel attribution is wrong** (blames k-norm; nsys says SDPA). The whole-program number is fine;
+  the per-launch solo window is not. Trust nsys until fixed.
 
-**Dead end checked — the materialized SDPA is INCORRECT for dynamic seq.** The tempting shortcut is to route symbolic
-SDPA to the score-materializing decomposition (QK^T → softmax → P@V, which reaches the tensor-core matmul tier and the
-bare-SDPA bench showed 861 µs vs 6663 µs streaming). It is **wrong** at runtime `seq < hint`: the masked-N QK^T
-**zero-fills** the masked keys, but softmax needs **−inf** (`exp(0)=1` spuriously adds the masked keys to the
-denominator). It only matched torch because every bench is at `seq=hint=512` (no masked region). The
-`010_recognize_flash._composer_wants_flash` implication that FORCES flash for symbolic is therefore a **correctness**
-guard, not just routing — the streaming flash masks the score to −inf in the stream (`_mask_carrier`). So the
-materialized path is not a free win; making it correct needs the −inf mask propagated into the score before softmax
-(non-trivial). The streaming flash stays the only correct symbolic SDPA today.
-
-**Capture penalty (separate, important).** Under full-model **CUDA-graph capture** the SDPA reduce kernel is ~17–25×
-slower than uncaptured / captured-standalone (nsys: 325 µs uncaptured → 8 ms captured for the streaming flash; 220 µs →
-3.8 ms for the materialized QK^T+softmax). It is NOT flash-specific (both reduce kernels balloon) and NOT reproducible
-standalone (a single captured kernel is fine) — it appears only with the kernel embedded in the full captured graph,
-pointing at SM contention / co-scheduling of the low-occupancy (block 8) reduce against concurrent kernels under graph
-replay. If serving captures graphs (it does, for latency), this penalty is a real deployment cost on top of the
-algorithmic one — worth its own investigation (check graph-replay concurrency / raise the reduce-kernel occupancy).
-
-**Status:** model **works** (was a hard hang); the k-norm "28 ms catastrophe" was a harness artifact (real 2.4 µs).
-Reasonable (eager-class) e2e perf is gated on the **smem-tiled / tensor-core symbolic streaming flash** (shares K/V
-tiles across queries — the ~1.2 ms memory floor + the capture penalty both trace to the current scalar serial-KV nest
-re-reading K/V per query). That, plus the capture-penalty investigation, is the next major task — it is real
-architecture work and was checkpointed rather than half-built autonomously.
+**Status:** model **works** (was a hard hang); the k-norm "28 ms catastrophe" was a harness mis-attribution (real
+2.4 µs); no capture penalty (the SDPA is ~8 ms at seq=512 captured AND uncaptured). Reasonable (eager-class) e2e perf is
+gated on the **smem-tiled / tensor-core symbolic streaming flash** — sharing K/V tiles across queries (today's scalar
+serial-KV nest re-reads K/V per query, the memory-bound wall) and using tensor cores. That is the next major task: real
+architecture work, checkpointed rather than half-built autonomously.
