@@ -104,8 +104,8 @@ def test_chain_is_a_monoid_over_semiring_composition():
     # chain link), and the score edge is the inner contraction's result (the carrier's first partial).
     assert chain.inner.out_index[-1].free_vars() == {chain.hinge_name}, "the inner contraction's output column is the hinge"
     assert chain.score == chain.inner.result == chain.carrier.partial[0]
-    # Geometry is a separate, derived view (not algebra fields): query row m, head output d, grid.
-    assert chain.m_axis is chain.m.axis and chain.d_axis is chain.d.axis
+    # The chain carries NO geometry: m/d/grid are walked off the composition at build time.
+    assert not any(hasattr(chain, attr) for attr in ("m", "d", "grid", "grid_nodes", "m_axis", "d_axis"))
 
 
 def test_standalone_matmul_is_a_contraction():
@@ -132,6 +132,22 @@ def test_standalone_matmul_is_a_contraction():
     assert c.result, "the contraction's result edge (the Accum SSA) is recorded"
 
 
+def test_chain_free_axes_walks_the_composition():
+    """The build geometry is **walked off the composition** (``chain_free_axes``), not stored on the
+    chain: the query row ``m`` is the inner contraction's own free output (``out_index[-2]``), the
+    head output ``d`` is the carrier's value operand's own free output, ``grid`` the shared batch /
+    head axes — each read from the composition level that defines it."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import chain_free_axes
+
+    dag = iter_dag(_flash_loop())
+    chain = dag.chain
+    m_axis, d_axis, grid = chain_free_axes(chain, dag)
+    assert m_axis.name in chain.inner.out_index[-2].free_vars(), "m is the inner contraction's output row"
+    assert m_axis.name not in (chain.hinge_name, d_axis.name), "m is neither the hinge nor the P@V output"
+    grid_names = {lp.axis.name for lp in grid}
+    assert grid_names and m_axis.name not in grid_names and d_axis.name not in grid_names, "grid is the shared batch/head axes"
+
+
 def test_chain_post_init_enforces_the_hinge_invariant():
     """A ``ContractionChain`` whose inner output column is NOT the hinge is rejected at construction
     — the carried-chain invariant lives in the class, not in an external gate, so invalid states are
@@ -139,14 +155,15 @@ def test_chain_post_init_enforces_the_hinge_invariant():
     import pytest
 
     from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain, chain_free_axes
 
     dag = iter_dag(_flash_loop())
     good = dag.chain
+    m_axis, _d, _grid = chain_free_axes(good, dag)
     # Put a non-hinge axis (the query row) in the inner's output-column coord — must raise.
-    broken_inner = Contraction(node=good.inner.node, result=good.inner.result, out_index=(Var(good.hinge_name), Var(good.m.axis.name)))
+    broken_inner = Contraction(node=good.inner.node, result=good.inner.result, out_index=(Var(good.hinge_name), Var(m_axis.name)))
     with pytest.raises(ValueError, match="hinge"):
-        ContractionChain(carrier=good.carrier, hinge=good.hinge, inner=broken_inner, m=good.m, d=good.d, grid_nodes=good.grid_nodes)
+        ContractionChain(carrier=good.carrier, hinge=good.hinge, inner=broken_inner)
 
 
 def test_partition_free_axes_is_a_role_neutral_three_way_split():

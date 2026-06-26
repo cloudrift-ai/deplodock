@@ -39,7 +39,7 @@ from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, chain_free_axes
 
 
 def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:
@@ -449,7 +449,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
     stats, accum, _d_state = split_carrier(carrier, value_name)
-    d_axis, m_axis, grid = chain.d_axis, chain.m_axis, chain.grid
+    m_axis, d_axis, grid = chain_free_axes(chain, dag)  # walk the composition for the geometry — no stored view
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
     d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
@@ -527,7 +527,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     atom_m, atom_n, atom_k = atom.shape
 
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    d_axis, m_axis, grid = chain.d_axis, chain.m_axis, chain.grid
+    m_axis, d_axis, grid = chain_free_axes(chain, op.dag)  # walk the composition for the geometry — no stored view
 
     # σ-tile geometry. m (query row) → m_b·atom_m (GRID block, atom owns the 16 lane); kv (stream)
     # → kv_b·16 (serial-outer carry, the 16-key tile owned by atom_n/atom_k); the QK^T 16-col score

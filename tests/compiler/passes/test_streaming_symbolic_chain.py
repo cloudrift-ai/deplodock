@@ -109,7 +109,6 @@ def test_flash_cells_atomize_via_the_generic_unit():
     warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
     path that replaced the hand-assembled ``realize_flash``. CPU-only."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
     from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
@@ -124,13 +123,13 @@ def test_flash_cells_atomize_via_the_generic_unit():
 
     kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    m_axis = chain.m_axis  # the query row — a DAG invariant on the chain (derived, not hard-coded)
 
-    # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream).
+    # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream). The
+    # score coords are the inner contraction's own ``out_index`` (read off the composition).
     qkt_cell = next(s for s in kv_loop.body if isinstance(s, Loop))  # the D-reduce
     qkt = next(
         s
-        for s in atomize_cell(tuple(qkt_cell.body), atom=atom, k_name=qkt_cell.axis.name, write=None, out_index=(Var(m_axis.name), Var(kv)))
+        for s in atomize_cell(tuple(qkt_cell.body), atom=atom, k_name=qkt_cell.axis.name, write=None, out_index=chain.out_index)
         if isinstance(s, Mma)
     )
     assert qkt.b_trans is True, "Q@K^T must atomize transposed-B"

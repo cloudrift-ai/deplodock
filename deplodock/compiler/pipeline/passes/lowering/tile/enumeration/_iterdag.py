@@ -134,19 +134,17 @@ class ContractionChain:
     ``carrier`` + ``hinge``. Flash is therefore *selected structurally* — "a ``Monoid`` whose folded
     inner operand is a SEMIRING ``Contraction``" — never matched as a named shape.
 
-    **Algebra** (this composition) is kept apart from **geometry** (the free-axis roles :attr:`m` /
-    :attr:`d` / :attr:`grid`, classified once by :func:`partition_free_axes`) and from the
-    **edges** (:attr:`score` / :attr:`out_index`, derived) — geometry and edges are views over the
-    composition, never peer fields. A **derived** view (computed on demand by :attr:`IterDag.chain`,
-    like :attr:`IterDag.streaming`) — never stored, so it can't drift and doesn't enter
-    ``op_cache_key``."""
+    The chain carries **only the algebra** — ``carrier`` + ``hinge`` + ``inner`` — plus the derived
+    **edges** (:attr:`score` / :attr:`out_index`, read off the inner contraction). It carries **no
+    geometry**: the build moves derive the free-axis roles (query ``m`` / head ``d`` / ``grid``) by
+    *walking the composition* at emit time (:func:`chain_free_axes`), so the geometry is never a
+    stored view on the routing-facing algebra object. A **derived** view (computed on demand by
+    :attr:`IterDag.chain`, like :attr:`IterDag.streaming`) — never stored, so it can't drift and
+    doesn't enter ``op_cache_key``."""
 
     carrier: Monoid  # the online-softmax MONOID carrier (its twisted accumulation embeds the outer P@V SEMIRING)
     hinge: AxisNode  # the streaming reduce node — the chain's shared axis (``inner``'s output col is the hinge)
     inner: Contraction  # the QK^T inner SEMIRING contraction, composed
-    m: AxisNode  # geometry: the query-row free axis (shared free output of both contractions) — binds THREAD
-    d: AxisNode  # geometry: the P@V head-output free axis (the outer SEMIRING's col) — the register vector ``O[d]``
-    grid_nodes: tuple[AxisNode, ...]  # geometry: the shared broadcast / batch free axes — bind GRID
 
     def __post_init__(self) -> None:
         # The carried-chain invariant: the inner contraction's output column IS the reduced hinge.
@@ -165,27 +163,6 @@ class ContractionChain:
     def score(self) -> str:
         """The INLINE score edge — the inner contraction's result (the carrier's first partial)."""
         return self.inner.result
-
-    @property
-    def m_axis(self) -> Axis:
-        """The query-row free axis (geometry view) — binds THREAD."""
-        return self.m.axis
-
-    @property
-    def d_axis(self) -> Axis:
-        """The P@V head-output free axis (geometry view) — the register vector ``O[d]``."""
-        return self.d.axis
-
-    @property
-    def grid(self) -> tuple[Loop, ...]:
-        """The shared (batch / head) free loops, bound GRID."""
-        return tuple(n.loop for n in self.grid_nodes)
-
-    @property
-    def value_load(self) -> Load:
-        """The V operand ``Load`` (``carrier.partial[1]``) at the hinge body's top level —
-        the outer P@V's value operand, read off the DAG (not the lowered tile block)."""
-        return next(s for s in self.hinge.body if isinstance(s, Load) and s.name == self.carrier.partial[1])
 
     @property
     def out_index(self) -> tuple[Expr, ...] | None:
@@ -260,10 +237,10 @@ class IterDag:
         value_load = next((s for s in hinge.body if isinstance(s, Load) and s.name == hinge.carrier.partial[1]), None)
         if value_load is None:
             return None
-        # Geometry: the free axes split by the two contraction operands' footprints — query ``m``
-        # (inner-only), head ``d`` (outer/V-only), ``grid`` (shared). Role-neutral; the algebra
-        # composition below carries no attention vocabulary.
-        m_nodes, d_nodes, grid_nodes = partition_free_axes(
+        # Separability + the query row: the free axes split by the two operands' footprints — query
+        # ``m`` (inner-only), head ``d`` (V-only). The build re-walks for the geometry (no stored
+        # view); here the partition only validates separability and names ``m`` for the score coords.
+        m_nodes, d_nodes, _grid = partition_free_axes(
             self.parallel, _free_var_footprint(inner_node.body), _free_var_footprint((value_load,))
         )
         if len(m_nodes) != 1 or len(d_nodes) != 1:
@@ -273,7 +250,7 @@ class IterDag:
             return None
         # The fragment QK^T has no Write, so the score coords are synthesized: ``(query row, hinge)``.
         inner = Contraction(node=inner_node, result=hinge.carrier.partial[0], out_index=(Var(m_nodes[0].axis.name), Var(hinge.axis.name)))
-        return ContractionChain(carrier=hinge.carrier, hinge=hinge, inner=inner, m=m_nodes[0], d=d_nodes[0], grid_nodes=grid_nodes)
+        return ContractionChain(carrier=hinge.carrier, hinge=hinge, inner=inner)
 
     @property
     def contractions(self) -> tuple[Contraction, ...]:
@@ -360,6 +337,21 @@ def partition_free_axes(
         in_a, in_b = n.axis.name in footprint_a, n.axis.name in footprint_b
         (a_only if (in_a and not in_b) else b_only if (in_b and not in_a) else rest).append(n)
     return tuple(a_only), tuple(b_only), tuple(rest)
+
+
+def chain_free_axes(chain: ContractionChain, dag: IterDag) -> tuple[Axis, Axis, tuple[Loop, ...]]:
+    """**Walk** the MONOID(SEMIRING) composition to its free-axis roles — the build geometry, derived
+    at emit time, never a stored view on the chain. Reads each role off the composition level that
+    defines it: the **query row** ``m`` is the inner contraction's own free output, the **P@V output**
+    ``d`` is the carrier's value operand's own free output (in V, not the inner QK^T), the **grid** is
+    the shared batch / head axes. ``IterDag.chain`` has already validated separability, so ``m`` / ``d``
+    are each exactly one axis. The build moves (``_build.chain_build`` / ``warp_chain_build``) call this
+    while emitting, instead of consuming a precomputed geometry tuple."""
+    value_load = next(s for s in chain.hinge.body if isinstance(s, Load) and s.name == chain.carrier.partial[1])
+    m_nodes, d_nodes, grid_nodes = partition_free_axes(
+        dag.parallel, _free_var_footprint(chain.inner.body), _free_var_footprint((value_load,))
+    )
+    return m_nodes[0].axis, d_nodes[0].axis, tuple(n.loop for n in grid_nodes)
 
 
 def _carrier_of(loop: Loop) -> ReduceCarrier | None:
