@@ -32,11 +32,7 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     if kind is None or op.dag is None:
         raise RuleSkipped("warp build applies to a warp (MMA atom) variant with a dag")
     nkey = fam.split_key(op.dag.inner_n.axis.name)
-    if (
-        nkey not in op.knobs
-        or not fam.split_complete(op.knobs[nkey])
-        or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs
-    ):
+    if nkey not in op.knobs or not fam.split_complete(op.knobs[nkey]) or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs:
         raise RuleSkipped("warp build applies once, after the register tile is pinned")
     atom = ATOM_REGISTRY[kind]
     offers = warp_bk_offers(op.dag, atom)
