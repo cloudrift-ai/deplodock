@@ -123,6 +123,11 @@ class Transport(enum.Enum):
     SYNC = "sync"
     CPASYNC = "cpasync"  # sm_80+
     TMA = "tma"  # sm_90+
+    FRAG = "frag"  # register-fragment → smem → register-fragment (the flash C→A handoff): a
+    # ``RegStore`` of the producer fragment into an smem slab + a ``Sync`` + an ``Ldmatrix`` of
+    # the consumer fragment. Unlike SYNC/CPASYNC/TMA (gmem→smem cooperative loads), the source is
+    # a live register fragment, not a gmem buffer — so ``synthesize_staging`` emits the fragment
+    # round-trip rather than a cooperative slab fill.
 
 
 class Placement(enum.Enum):
@@ -448,6 +453,11 @@ class Schedule:
     binding: dict[str, Binding] = field(default_factory=dict)  # axis -> hardware role
     launch: dict[str, int] = field(default_factory=dict)  # block -> launch group (one group = one kernel)
     staged: dict[Edge, Transport] = field(default_factory=dict)  # read-site -> SMEM fill transport
+    # A SERIAL_OUTER axis that carries an online-updating (twisted-)monoid across its stream —
+    # the streaming-flash kv loop. Set ⇒ ``assemble`` realizes the block's carrier at the
+    # FRAGMENT tier (``realize_fragment_softmax``) instead of inline-rendering it, so the warp
+    # flash falls out of the generic walk. Empty ⇒ a plain reduce (carrier rendered inline).
+    carry: frozenset[str] = field(default_factory=frozenset)
 
     def with_binding(self, **kw: Binding) -> Schedule:
         return replace(self, binding={**self.binding, **kw})
