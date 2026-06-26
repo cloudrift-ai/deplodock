@@ -102,14 +102,12 @@ def test_static_stream_stays_scalar_monoid_by_default():
 
 
 def test_flash_cells_atomize_via_the_generic_unit():
-    """Capability 1 (the foundation for dissolving ``realize_flash``): the two flash cells in the
-    **logical seed** atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell``
-    — the QK^T (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V
-    (``frag_a``) to a **canonical-B** ``A=prob-fragment`` cell. This is what ``realize_flash``
-    hand-builds today; the remaining capability-1 work (the ``warp_chain_build`` move) is the
-    orchestration that walks the seed + the split carrier to assemble these into a warp-streaming
-    ``TileGraph`` (then capability 3 — the ``assemble_carry`` walk — replaces ``realize_flash``).
-    CPU-only."""
+    """The foundation of the warp-flash dissolution: the two flash cells in the **logical seed**
+    atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell`` — the QK^T
+    (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V (``frag_a``) to a
+    **canonical-B** ``A=prob-fragment`` cell. ``warp_chain_build`` σ-tiles + atomizes these into a
+    warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
+    path that replaced the hand-assembled ``realize_flash``. CPU-only."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
@@ -151,11 +149,12 @@ def test_flash_cells_atomize_via_the_generic_unit():
 
 
 def test_warp_chain_build_produces_atomized_streaming_graph():
-    """Capability 1 orchestration (WIP): ``warp_chain_build`` emits a streaming ``TileGraph`` with
-    the two atomized cells (QK^T transposed-B, P@V ``frag_a`` canonical-B) over the kv-stream
-    ``Schedule.carry`` axis + the score→A handoff as a ``Transport.FRAG`` staged edge. Not yet
-    wired into the pipeline (the ``assemble_carry`` walk that realizes the fragment-tier phases is
-    the next step); this is the structural check on the build move's output. CPU-only."""
+    """``warp_chain_build`` σ-tiles the warp-tier flash into a streaming ``TileGraph``: the two
+    atomized cells (QK^T transposed-B, P@V ``frag_a`` canonical-B) over the kv-stream
+    ``Schedule.carry`` axis (the split stream block ``<hinge>_b``) + the score→A handoff as a staged
+    ``flash_pv_smem`` edge. ``carry_scope_from_graph`` (assembly) realizes the fragment-tier phases
+    around these cells (GPU-validated by ``e2e/test_flash_tensorcore_generated.py`` under the walk).
+    This is the structural check on the build move's output. CPU-only."""
     from deplodock.compiler.dtype import F16
     from deplodock.compiler.ir.stmt import Mma
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
@@ -174,7 +173,7 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
 
     tg = warp_chain_build(op)
-    assert tg.schedule.carry == frozenset({chain.hinge_name}), "the kv stream must be marked Schedule.carry"
+    assert tg.schedule.carry == frozenset({f"{chain.hinge_name}_b"}), "the σ-tiled kv stream block must be marked Schedule.carry"
     assert any(e.buffer == "flash_pv_smem" for e in tg.schedule.staged), "the score→A handoff must be a staged smem edge"
     mmas = [s for s in tg.blocks[0].compute.iter() if isinstance(s, Mma)]
     assert any(m.b_trans for m in mmas), "QK^T (transposed-B) cell present"

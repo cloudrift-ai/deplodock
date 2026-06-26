@@ -48,17 +48,8 @@ NO_NVCC = "DEPLODOCK_NO_NVCC"
 GPU_LOCK = "DEPLODOCK_GPU_LOCK"
 NCU_CHILD = "DEPLODOCK_NCU_CHILD"
 SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
-FLASHWALK = "DEPLODOCK_FLASHWALK"
 
 _CACHE_ROOT = Path.home() / ".cache" / "deplodock"
-
-
-def flash_walk(default: bool = False) -> bool:
-    """``DEPLODOCK_FLASHWALK`` — route the warp-tier streaming flash through the generic
-    ``carry_scope_from_graph`` walk over ``warp_chain_build``'s atomized TileGraph (the
-    capability-3 dissolution of ``realize_flash``), instead of the hand-assembled
-    ``realize_flash``. Default off while the walk is GPU-validated against the reference."""
-    return _bool(FLASHWALK, default)
 
 
 def knob_var(name: str) -> str:

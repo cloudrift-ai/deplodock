@@ -1,7 +1,7 @@
 """Flash geometry — the streaming-flash parameters + addressing helpers derived from the
 logical gmem buffers, shared by the **enumeration** warp-flash build move (`warp_chain_build`)
-and the **assembly** realizer (`_assemble.realize_flash`). Lives in `lowering/` (a sibling of
-`_masking` / `_predicates`) so both layers import it without crossing the enumeration↔assembly
+and the **assembly** realizer (`_assemble.carry_scope_from_graph`). Lives in `lowering/` (a sibling
+of `_masking` / `_predicates`) so both layers import it without crossing the enumeration↔assembly
 boundary. Pure functions over `Buffer` shapes — no pass / dialect dependency.
 """
 

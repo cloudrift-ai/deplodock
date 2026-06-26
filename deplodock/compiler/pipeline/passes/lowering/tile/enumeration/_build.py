@@ -514,32 +514,31 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
 
 
-# === Warp-tier flash build move (capability 1 — atomize the two chained contractions). ===
-# WIP toward dissolving ``_assemble.realize_flash``: ``warp_chain_build`` produces the warp-tier
-# flash as an **atomized streaming TileGraph** the generic ``assemble_carry`` walk realizes (the
-# fragment-tier softmax / scale / mask / C→A handoff / epilogue), instead of ``realize_flash``
-# hand-assembling the whole ``CarryScope``. It atomizes the QK^T cell (``out_index`` fragment
-# output, transposed-B) and the P@V cell (``frag_a``, canonical-B) via the generic ``atomize_cell``
-# (capability 1, proven in ``test_streaming_symbolic_chain``), with the flat addressing from the
-# shared ``flash_params`` geometry. The kv-stream is the ``Schedule.carry`` axis; the score→P→A
-# handoff is a ``Transport.FRAG`` staged edge (capability 2). The assemble-side walk + the dispatch
-# flip + ``realize_flash`` deletion are the remaining steps — GPU-validated against the reference.
+# === Warp-tier flash build move (σ-tile + atomize the two chained contractions). ===
+# ``warp_chain_build`` produces the warp-tier flash as an **atomized streaming TileGraph** the
+# generic ``assembly._assemble.carry_scope_from_graph`` walk realizes (the fragment-tier softmax /
+# scale / mask / C→A handoff / epilogue). It σ-tiles + atomizes the QK^T cell (``out_index``
+# fragment output, transposed-B) and the P@V cell (``frag_a``, canonical-B) via the generic
+# ``atomize_cell`` — no hand-authored ``Mma``, no flat 1-D authoring (the render flattens the 4D
+# loads via the buffer strides). The kv-stream is the ``Schedule.carry`` axis; the score→P→A handoff
+# is a staged ``flash_pv_smem`` edge. This is the deployed warp-flash path (it replaced the
+# hand-assembled ``realize_flash``).
 
 
 def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
-    """Capability 1+ — σ-tile the warp-tier flash's two chained contractions into an **atomized
-    streaming** ``TileGraph`` the generic ``carry_scope_from_graph`` walk realizes.
+    """σ-tile the warp-tier flash's two chained contractions into an **atomized streaming**
+    ``TileGraph`` the generic ``carry_scope_from_graph`` walk realizes.
 
     The seed's logical 4D cells are σ-tiled to the warp geometry (16 query rows / warp, the kv
     stream a 16-key serial-outer carry, D re-bracketed at ``atom_k``) and fused via the generic
-    ``atomize_cell`` (so the render flattens the 4D loads to the same addresses ``realize_flash``
-    hand-computes — no flat 1-D authoring). The QK^T inner D-reduce → ``2`` transposed-B ``Mma``
-    cells (the 16-col score = ``16/atom_n`` N-atoms, ``out_index`` = the INLINE score ``(m, kv)``);
-    the split-carrier P@V → ``D/atom_n`` ``frag_a`` canonical-B ``Mma`` cells (``A`` = the
-    probability fragment, ``B`` = V). The kv stream is ``Schedule.carry``; the score→A handoff is a
-    staged ``flash_pv_smem`` edge. The block ``domain`` lays the warp tile (query block GRID, the
-    grid axes GRID); ``carry_scope_from_graph`` reads these AtomTiles + the carrier and assembles
-    the ``CarryScope`` (softmax / scale / mask / handoff / epilogue) — dissolving ``realize_flash``."""
+    ``atomize_cell`` (the render flattens the 4D loads via the buffer strides — no flat 1-D
+    authoring). The QK^T inner D-reduce → ``2`` transposed-B ``Mma`` cells (the 16-col score =
+    ``16/atom_n`` N-atoms, ``out_index`` = the INLINE score ``(m, kv)``); the split-carrier P@V →
+    ``D/atom_n`` ``frag_a`` canonical-B ``Mma`` cells (``A`` = the probability fragment, ``B`` = V).
+    The kv stream is ``Schedule.carry``; the score→A handoff is a staged ``flash_pv_smem`` edge. The
+    block ``domain`` lays the warp tile (query block GRID, the grid axes GRID);
+    ``carry_scope_from_graph`` reads these AtomTiles + the carrier and assembles the ``CarryScope``
+    (softmax / scale / mask / handoff / epilogue) — the path that replaced ``realize_flash``."""
     tg = op.tilegraph
     block = tg.blocks[0]
     fp = flash_params(op.buffers, block.writes[0].buffer)
@@ -574,7 +573,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         cell = tuple(s.rewrite(_identity_rename, sig) for s in qkt_body)
         fused = atomize_cell(cell, atom=atom, k_name=ko, write=None, out_index=(m_expr, n_base))
         # kt>1: a real K_o serial loop (the atom spans atom_k per step). kt==1: the whole D is one
-        # atom — strip ``ko`` to 0 and emit the cell directly (the form 005 lowers, like realize_flash).
+        # atom — strip ``ko`` to 0 and emit the cell directly (the form 005_lower_atom_tile lowers).
         if kt > 1:
             body = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
         else:

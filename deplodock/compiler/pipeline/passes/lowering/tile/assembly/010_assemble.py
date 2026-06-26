@@ -12,17 +12,11 @@ does the register/thread replication (``_wrap_tower``) + slab synthesis from the
 
 from __future__ import annotations
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import (
-    assemble_block,
-    assembly_ready,
-    carry_scope_from_graph,
-    realize_flash,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready, carry_scope_from_graph
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -45,12 +39,12 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     return."""
     op: TileGraphOp = root.op
     if op.tilegraph is not None and op.tilegraph.schedule.carry:
-        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream
-        # axis as a fragment-tier online-softmax carrier. Under ``DEPLODOCK_FLASHWALK`` the generic
-        # ``carry_scope_from_graph`` walk realizes it from the σ-tiled atomized ``warp_chain_build``
-        # graph (the capability-3 dissolution); else ``realize_flash`` hand-assembles the CarryScope
-        # from the logical seed (carrier off ``block.carrier``, geometry off ``op.buffers``).
-        return carry_scope_from_graph(op) if config.flash_walk() else realize_flash(op)
+        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream axis
+        # as a fragment-tier online-softmax carrier. The generic ``carry_scope_from_graph`` walk
+        # realizes it from the σ-tiled atomized ``warp_chain_build`` graph (the produce/consume Mma
+        # cells fused by ``atomize_cell``; only the fragment-tier softmax / scale / mask / C→A
+        # handoff / epilogue realized here) and hands it to the one ``assemble_carry``.
+        return carry_scope_from_graph(op)
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     tg = op.tilegraph

@@ -21,10 +21,12 @@ partition rides THREAD, not a cross-CTA split).
 
 A streaming flash in the **16-bit tensor-core scope** (``_is_warp_flash`` — fp16/bf16,
 ``D%16==0``, GQA-or-equal-head, static ``S%16==0`` OR symbolic ``seq_len``) instead deploys the
-**warp-tier chain**: this pass marks the kv-stream axis ``Schedule.carry`` and hands the logical
-seed to assembly, where ``_assemble.realize_flash`` realizes the fragment-tier online-softmax (the
-former ``split/005_warp_chain`` route, folded in here). Symbolic is the deployed default (the
-~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in. This single fork owns the regime end to end:
+**warp-tier chain**: this pass hands the logical seed to ``_build.warp_chain_build``, which σ-tiles
++ atomizes the two chained contractions (stamping the kv-stream ``Schedule.carry`` + the score→A
+handoff edge); assembly's generic ``_assemble.carry_scope_from_graph`` walk then realizes the
+fragment-tier online-softmax around those cells (the former ``split/005_warp_chain`` route, folded
+in here). Symbolic is the deployed default (the ~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in.
+This single fork owns the regime end to end:
 the scalar passes ``090``/``100``/``110`` and ``120_stage`` gate off ``MONOID`` (a monoid
 reduce stays smem-free — each lane reads its own ``K_c``-strided slice, no cross-thread reuse).
 """
@@ -33,7 +35,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
@@ -104,17 +105,14 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     if op.algebra is not AlgebraKind.MONOID or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs:
         raise RuleSkipped("MONOID build applies once, to a MONOID seed")
     if op.dag.streaming and _is_warp_flash(op):
-        # Warp-tier tensor-core flash: mark the kv-stream axis ``Schedule.carry`` (the
-        # fragment-tier realization) and hand the seed to assembly — no build move, no cooperative
-        # leaves (the warp chain replaces them here, matching the old ``split/005_warp_chain``
-        # route). ``assembly/010_assemble`` dispatches on ``carry``. A terminal leaf: the later
-        # scalar passes gate off MONOID. Under ``DEPLODOCK_FLASHWALK`` the seed is σ-tiled +
-        # atomized by ``warp_chain_build`` (it stamps ``carry`` itself) so assembly's generic
-        # ``carry_scope_from_graph`` walk realizes it; else the seed is marked for ``realize_flash``.
-        if config.flash_walk():
-            return [replace(op, tilegraph=warp_chain_build(op))]
-        sched = replace(op.tilegraph.schedule, carry=frozenset({op.dag.chain.hinge_name}))
-        return [replace(op, tilegraph=replace(op.tilegraph, schedule=sched))]
+        # Warp-tier tensor-core flash: ``warp_chain_build`` σ-tiles the two chained contractions to
+        # the warp geometry and fuses them via the generic ``atomize_cell`` (stamping the kv-stream
+        # ``Schedule.carry`` + the score→A handoff edge), and assembly's generic
+        # ``carry_scope_from_graph`` walk realizes the fragment-tier phases (softmax / scale / mask /
+        # handoff / epilogue) around those cells. No build move, no cooperative leaves (the warp
+        # chain replaces them here, matching the old ``split/005_warp_chain`` route). A terminal
+        # leaf: the later scalar passes gate off MONOID.
+        return [replace(op, tilegraph=warp_chain_build(op))]
     leaves = _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
     if not leaves:
         raise RuleSkipped("no legal MONOID decomposition")

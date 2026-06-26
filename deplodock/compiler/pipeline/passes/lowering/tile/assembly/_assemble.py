@@ -177,8 +177,8 @@ def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None
     """Materialize a :class:`CarryScope` into the tower — the **one** materialization every
     assembly path funnels through: the single-block kernels (``_assemble_one`` — pointwise /
     matmul / reduce), the SMEM-fused edge (``_assemble_group``), the multi-launch DAG
-    (``_assemble_multi`` → ``_assemble_one``), and flash (``_flash.realize_flash``). It is the
-    sole caller of :func:`_wrap_tower`.
+    (``_assemble_multi`` → ``_assemble_one``), and the warp-tier flash (``carry_scope_from_graph``).
+    It is the sole caller of :func:`_wrap_tower`.
 
     The per-iteration phases concatenate in carrier order
     (``produce`` → ``merge`` → ``rescale`` → ``handoff`` → ``consume`` → ``update``),
@@ -223,141 +223,6 @@ def synthesize_frag_handoff(prob_frags, *, slab: str, slab_dtype, a_frag: str, s
     return out
 
 
-def realize_flash(op: TileGraphOp) -> TileOp:
-    """The fragment-tier specialization of :func:`assemble_carry` — the warp-tier streaming
-    flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``enumeration/070_coop_reduce``)
-    marked with ``Schedule.carry``. It is NOT a separate assembler: it builds the
-    ``CarryScope`` (the produce / merge / handoff / consume / epilogue phases of the
-    online-softmax stream) and hands it to ``assemble_carry`` like every other carry.
-
-    The geometry (q/k/v/out buffers + ``(B,H,S,D)`` + GQA + causal + symbolic ``seq``) is
-    derived from the op's logical gmem ``buffers``; the twisted online-softmax ``Monoid``
-    carrier is read off ``block.carrier``; the QK^T / P@V mma cells lower via ``kernel/005``;
-    the softmax phases are ``realize_fragment_softmax(carrier)``. The C→A handoff (register
-    fragment → smem → ldmatrix) is the one irreducibly flash-specific authoring — there is no
-    matmul / reduce analog of a fragment-tier online-softmax with a register-staged handoff."""
-    block = op.tilegraph.blocks[0]
-    fp = flash_params(op.buffers, block.writes[0].buffer)  # shared geometry derivation
-    q, k, v, out = fp.q, fp.k, fp.v, fp.out
-    B, H, D, S, seq_var, group, causal = fp.B, fp.H, fp.D, fp.S, fp.seq_var, fp.group, fp.causal
-    carrier = block.carrier.carrier  # the twisted online-softmax Monoid, read off the logical block
-    atom = ATOM_REGISTRY[fp.atom_kind]
-    qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
-    atom_m, atom_n, atom_k = atom.shape
-    assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
-
-    atom_shape = atom.shape
-    ab_dt = atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16)
-    scale = f"{1.0 / math.sqrt(D)!r}f"
-    kt = D // atom_k  # QK^T K-tiles (reduce over D)
-    nd = D // atom_n  # P@V N-tiles (output over D)
-
-    symbolic = seq_var is not None
-    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(S // 16)
-    seq = Var(seq_var) if symbolic else Literal(S, "int")
-
-    bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
-    row_stride = _fmul(seq, D) if symbolic else Literal(S * D, "int")
-    base_q = BinaryExpr("*", bh, row_stride)
-    if group > 1:
-        h_kv = H // group
-        bh_kv = _fadd(
-            _fmul(BinaryExpr("//", bh, Literal(H, "int")), h_kv),
-            BinaryExpr("//", BinaryExpr("%", bh, Literal(H, "int")), Literal(group, "int")),
-        )
-        base_kv = BinaryExpr("*", bh_kv, row_stride)
-    else:
-        base_kv = base_q
-    qrow = _fadd(base_q, _fmul(qb, 16 * D))  # query-row base (q-head)
-    kvrow = _fadd(base_kv, _fmul(kv, 16 * D))  # kv-tile base (kv-head under GQA)
-
-    geom = FragGeom(
-        atom_m=atom_m,
-        atom_n=atom_n,
-        score_frags=tuple(f"Sf{nt}_frag" for nt in range(2)),
-        prob_frags=tuple(f"Pf{nt}" for nt in range(2)),
-        accum_frags=tuple(f"Of{n}" for n in range(nd)),
-    )
-    fs = realize_fragment_softmax(carrier, geom=geom)
-
-    init: list = list(fs.init)
-    init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
-    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
-
-    def _qk_guards(nt: int) -> dict:
-        if not symbolic:
-            return {}
-        return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * 8), seq)}
-
-    produce: list = []
-    for nt in range(2):
-        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=atom, b_trans=qk_bt, **_qk_guards(nt))
-        if kt > 1:
-            ko = Var(f"ko{nt}")
-            rbody = (
-                Load(name=f"qv{nt}", input=q, index=(_fadd(qrow, _fmul(ko, 16)),)),
-                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D, _fmul(ko, 16)),)),
-                qk_mma,
-            )
-            cellbody: tuple = (SerialTile(axis=Axis(f"ko{nt}", Dim(kt)), body=Body(rbody), kind="plain"),)
-        else:
-            cellbody = (
-                Load(name=f"qv{nt}", input=q, index=(qrow,)),
-                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D),)),
-                qk_mma,
-            )
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=atom))
-    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
-    kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * 8) for nt in range(2))
-    if causal:
-        produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)
-    if symbolic:
-        produce += realize_boundary_mask(geom, kv_col_bases=kv_col_bases, bound=seq)
-
-    merge: list = list(fs.merge)
-    rescale: list = list(fs.rescale)
-
-    # handoff — the C→A edge: the fragment-staged relayout (capability 2), reused by the walk.
-    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom_shape)
-
-    pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
-    consume: list = []
-    for n in range(nd):
-        cell = (
-            Load(name=f"vv{n}", input=v, index=(_fadd(kvrow, n * 8),)),
-            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=atom, b_trans=pv_bt, **pv_kzero),
-        )
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=atom))
-    consume.append(Sync())
-
-    store_mguard = (_fmul(qb, 16), seq) if symbolic else None
-    epilogue: list = []
-    for n in range(nd):
-        epilogue.append(fs.epilogue[n])
-        epilogue.append(
-            RegStore(dst_buffer=out, dst_index=(_fadd(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D, m_guard=store_mguard)
-        )
-
-    carry = CarryScope(
-        axis=Axis("kv", s_dim),
-        init=tuple(init),
-        produce=tuple(produce),
-        merge=tuple(merge),
-        rescale=tuple(rescale),
-        handoff=tuple(handoff),
-        consume=tuple(consume),
-        update=tuple(fs.update),
-        epilogue=tuple(epilogue),
-    )
-    parallel_layers = [
-        (Axis("w", Dim(1)), Role.WARP),
-        (Axis("qb", s_dim), Role.BLOCK),
-        (Axis("bh", Dim(B * H)), Role.BLOCK),
-    ]
-    name = op.name if op.name.startswith("k_") else f"k_{op.name}"
-    return TileOp(body=assemble_carry(carry, parallel_layers=parallel_layers), name=name, knobs={})
-
-
 def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, guards: dict | None = None) -> AtomTile:
     """Rename a graph-sourced flash AtomTile to the ``carry_scope_from_graph`` fragment scheme:
     suffix the cell's ``Load`` names (so sibling N-atom tiles don't collide), set the ``Mma``'s
@@ -384,13 +249,14 @@ def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, gua
 
 
 def carry_scope_from_graph(op: TileGraphOp) -> TileOp:
-    """The generic capability-3 walk — the dissolution of :func:`realize_flash`. Reads the
-    ``warp_chain_build`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by the
-    generic ``atomize_cell``, σ-tiled to the warp geometry) and assembles the SAME warp-chain
-    ``CarryScope`` ``realize_flash`` hand-builds — but the produce / consume ``Mma`` cells come from
-    the graph (no hand-authored ``Mma``), and only the fragment-tier phases (softmax / scale / mask /
-    C→A handoff / epilogue) are realized here from the carrier + geometry. Dispatched off
-    ``Schedule.carry`` under ``DEPLODOCK_FLASHWALK`` while GPU-validated against the reference."""
+    """The generic warp-tier-flash realizer — reads the ``warp_chain_build`` atomized streaming
+    ``TileGraph`` (the QK^T / P@V cells already fused by the generic ``atomize_cell``, σ-tiled to the
+    warp geometry) and assembles the warp-chain ``CarryScope``: the produce / consume ``Mma`` cells
+    come from the graph (no hand-authored ``Mma``), and only the fragment-tier phases (softmax via
+    ``realize_fragment_softmax`` / scale / causal+boundary masks / the C→A handoff / the epilogue
+    ``RegStore``) are realized here from the carrier + geometry, then handed to the one
+    ``assemble_carry``. Dispatched off ``Schedule.carry`` by ``assembly/010_assemble``. This is the
+    capability-3 graph walk that replaced the hand-assembled ``realize_flash``."""
     block = op.tilegraph.blocks[0]
     fp = flash_params(op.buffers, block.writes[0].buffer)
     out, D, S, seq_var, causal = fp.out, fp.D, fp.S, fp.seq_var, fp.causal
