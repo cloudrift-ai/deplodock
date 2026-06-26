@@ -1,0 +1,197 @@
+"""Algebra-native knob schema — one *move family* per DAG element.
+
+``plans/algebra-knob-naming-schema.md``. The tile composer dispatches on the carrier
+algebra (``MAP`` / ``SEMIRING`` / ``MONOID``) over an arbitrary-rank iteration DAG, so
+the knob vocabulary is keyed on the DAG's own elements rather than on rank-2 GEMM
+letters. Each knob is **one move applied to one DAG element**; the ``op.knobs`` key
+reads ``MOVE@element``:
+
+    SPLIT@<free-axis>     tile_axis            ``"<par>x<reg>"``
+    REDUCE@<reduce-axis>  reduce_decomp        ``"s<serial>/f<fold>/c<cta>/t<coop>"``
+    ATOM@<cell>           atomize              ``"scalar"`` | an ``ATOM_REGISTRY`` kind
+    PLACE@<edge>          placement+transport  ``"inline"`` | ``"smem[:sync|cpasync|tma]"`` | ``"gmem"``
+
+The *element* is the DAG element's own IR identity: a free / reduce axis's
+``Axis.name`` (``a0`` / ``dd`` / ``kv``), an edge's buffer name (``xn`` / ``score``), a
+cell's ``Block.name``. The schema is instantiated per kernel by walking the DAG.
+
+Two structural unlocks over the legacy rank-2 costume (``BN``/``BM``/``BK``/``WM``/…):
+
+- ``REDUCE`` is **per reduce axis**, so a streaming flash gets BOTH ``REDUCE@dd`` (the
+  QK^T inner contraction) and ``REDUCE@kv`` (the streaming axis) — two reduce axes the
+  legacy K-only ``BK``/``FK``/``SPLITK``/``BR`` cannot express.
+- ``SPLIT``'s ``par`` is tier-agnostic — its binding tier (THREAD vs WARP) is read off
+  the consuming cell's ``ATOM`` (scalar → thread, atom → warp), not from which knob was
+  set. So legacy ``BN``/``FN`` and ``WN``/``FN`` collapse to one ``SPLIT@<n-axis>``.
+
+The implementation reads these keys (or the IR directly) — **never** legacy GEMM-letter
+names. The legacy names survive only in the ingest mapper (``_knob_legacy``, Step 2) for
+backwards-compatible env pins / golden YAMLs.
+
+**Env spelling.** ``DEPLODOCK_<MOVE>_<ELEMENT>`` (element upper-cased), e.g.
+``DEPLODOCK_REDUCE_KV=s16/f1/c1/t1`` / ``DEPLODOCK_ATOM_OUT=mma_m16n8k16_f16``. A bare
+``DEPLODOCK_<MOVE>`` pins every element of that family (``DEPLODOCK_ATOM=scalar``,
+``DEPLODOCK_REDUCE=s16/f1/c1/t1``) — for coarse pins / tests. The env-var namespace is
+``config``'s (``knob_raw``), the same one ``compiler/pipeline/knob.py`` borrows.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from deplodock import config
+
+# --- Move families. Plain string tags; the op.knobs key is ``MOVE@element``. ---
+SPLIT = "SPLIT"
+REDUCE = "REDUCE"
+ATOM = "ATOM"
+PLACE = "PLACE"
+
+#: The atom value naming the scalar tier (no tensor-core atomize) — the absence of an
+#: ``ATOM_REGISTRY`` kind. Read by :func:`atom_kind` to recover ``None``.
+SCALAR = "scalar"
+
+
+def key(move: str, element: str) -> str:
+    """The ``op.knobs`` key for ``move`` applied to DAG element ``element``."""
+    return f"{move}@{element}"
+
+
+def split_key(axis: str) -> str:
+    return key(SPLIT, axis)
+
+
+def reduce_key(axis: str) -> str:
+    return key(REDUCE, axis)
+
+
+def atom_key(cell: str) -> str:
+    return key(ATOM, cell)
+
+
+def place_key(edge: str) -> str:
+    return key(PLACE, edge)
+
+
+def split_move(k: str) -> str | None:
+    """The element of a ``MOVE@element`` key, or ``None`` if ``k`` is not that move."""
+    return _element_of(SPLIT, k)
+
+
+def reduce_move(k: str) -> str | None:
+    return _element_of(REDUCE, k)
+
+
+def atom_move(k: str) -> str | None:
+    return _element_of(ATOM, k)
+
+
+def _element_of(move: str, k: str) -> str | None:
+    prefix = f"{move}@"
+    return k[len(prefix) :] if k.startswith(prefix) else None
+
+
+# --- SPLIT codec: ``"<par>x<reg>"`` — the parallel-binding factor × the register-cell
+# factor. The grid is the launch residual (extent / (par·reg)), never stamped. ---
+
+
+def enc_split(par: int, reg: int) -> str:
+    return f"{par}x{reg}"
+
+
+def dec_split(raw: object) -> tuple[int, int]:
+    par, _, reg = str(raw).partition("x")
+    return int(par), int(reg)
+
+
+# --- REDUCE codec: ``"s<serial>/f<fold>/c<cta>/t<coop>"`` — the four reduce-decomposition
+# tower components. Which fields are legal is the carrier's traits (``associative →
+# {s,f}``, ``commutative → {c,t}``); an illegal field is forced to 1 (= identity = no
+# decomposition). ---
+
+
+@dataclass(frozen=True)
+class Decomp:
+    """The four reduce-decomposition factors of one ``REDUCE@axis`` value.
+
+    - ``serial`` — intra-CTA K-loop trip (``ext/serial`` stage-inner chunk).
+    - ``fold`` — register strip-mine into independent accumulators.
+    - ``cta`` — cross-CTA split (split-K).
+    - ``coop`` — cooperative-thread partition (warp-shuffle / tree combine).
+
+    ``1`` in any field is the identity (no decomposition on that lever)."""
+
+    serial: int = 1
+    fold: int = 1
+    cta: int = 1
+    coop: int = 1
+
+
+def enc_reduce(serial: int = 1, fold: int = 1, cta: int = 1, coop: int = 1) -> str:
+    return f"s{serial}/f{fold}/c{cta}/t{coop}"
+
+
+def dec_reduce(raw: object) -> Decomp:
+    fields: dict[str, int] = {}
+    for part in str(raw).split("/"):
+        part = part.strip()
+        if part:
+            fields[part[0]] = int(part[1:])
+    return Decomp(serial=fields.get("s", 1), fold=fields.get("f", 1), cta=fields.get("c", 1), coop=fields.get("t", 1))
+
+
+# --- ATOM codec: ``"scalar"`` or an ``ATOM_REGISTRY`` kind name. ---
+
+
+def enc_atom(kind: str | None) -> str:
+    return kind if kind else SCALAR
+
+
+def atom_kind(raw: object) -> str | None:
+    """The concrete tensor-core atom kind named by ``raw``, or ``None`` for the
+    scalar tier (``"scalar"`` / empty)."""
+    s = str(raw).strip()
+    return None if not s or s.lower() == SCALAR else s
+
+
+# --- Native env pins. ``DEPLODOCK_<MOVE>_<ELEMENT>`` first, bare ``DEPLODOCK_<MOVE>``
+# as the all-elements fallback. ``config.knob_raw`` owns the ``DEPLODOCK_`` join. ---
+
+
+def pin(move: str, element: str) -> str | None:
+    """Live env pin for ``move`` on ``element`` — ``DEPLODOCK_<MOVE>_<ELEMENT>``,
+    falling back to the bare ``DEPLODOCK_<MOVE>`` family pin. ``None`` when unset."""
+    raw = config.knob_raw(f"{move}_{element}")
+    return raw if raw is not None else config.knob_raw(move)
+
+
+def pin_split(axis: str) -> tuple[int, int] | None:
+    """A pinned ``(par, reg)`` for ``SPLIT@axis``, or ``None``."""
+    raw = pin(SPLIT, axis)
+    return dec_split(raw) if raw is not None else None
+
+
+def pin_reduce(axis: str) -> Decomp | None:
+    raw = pin(REDUCE, axis)
+    return dec_reduce(raw) if raw is not None else None
+
+
+def reduce_fields(dag, axis: str) -> tuple[int | None, int | None, int | None, int | None]:
+    """The pinned ``(serial, fold, cta, coop)`` REDUCE factors for ``axis`` — each int
+    or ``None`` when unpinned (so the offer keeps its full per-field menu). A native
+    ``DEPLODOCK_REDUCE_<axis>`` pin (full spec) wins; otherwise the legacy
+    ``DEPLODOCK_BK``/``FK``/``SPLITK``/``BR`` ingest fills the primary reduce axis (the
+    deprecation ramp — see ``_knob_legacy``)."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    raw = pin(REDUCE, axis)
+    if raw is not None:
+        d = dec_reduce(raw)
+        return (d.serial, d.fold, d.cta, d.coop)
+    return _knob_legacy.reduce_fields(dag, axis)
+
+
+def pin_atom(cell: str) -> str | None:
+    """The raw ``ATOM@cell`` env pin (``"scalar"`` / a kind / ``None`` when unset).
+    Distinct from :func:`atom_kind` — a ``"scalar"`` pin is a *decision*, not unset."""
+    return pin(ATOM, cell)

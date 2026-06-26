@@ -32,20 +32,16 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     CHAIN,
-    COOP_BR,
     MAP_M_REG,
     MAP_N_REG,
     MAX_THREADS_PER_CTA,
-    RED_BK,
-    RED_FK,
-    RED_SPLITK,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
-    _pin,
     coop_free_thread_knobs,
     coop_reduce_knobs,
     coop_reduce_offers,
@@ -68,7 +64,7 @@ def _streaming_bk(dag) -> int:
     validator-collapse gap (``BK`` was legal on the MONOID tier but forced to 1 here) — and
     is the foundation for the register-score / P@V-cell surfacing the tensor-core tier needs.
     Default (unpinned) is ``1``, so greedy / the scalar tier are unchanged."""
-    bk = _pin(RED_BK)
+    bk = fam.reduce_fields(dag, dag.k_node.loop.axis.name)[0]
     if not bk or bk <= 1:
         return 1
     for n in dag.reduce:
@@ -83,7 +79,7 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.MONOID or COOP_BR.name in op.knobs:
+    if op.algebra is not AlgebraKind.MONOID or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs:
         raise RuleSkipped("MONOID build applies once, to a MONOID seed")
     leaves = _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
     if not leaves:
@@ -98,9 +94,10 @@ def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     free_knobs = coop_free_thread_knobs(op.dag)
     out: list[TileGraphOp] = []
     for r in offers:
-        # REGISTER forced to 1 (one element per cell-owner); SPLITK=1 (the cooperative
-        # partition rides THREAD, no cross-CTA split). MMA / WM / WN OFF-fill downstream.
-        knobs = {**op.knobs, **free_knobs, **coop_reduce_knobs(r), MAP_N_REG.name: 1, RED_SPLITK.name: 1}
+        # REGISTER forced to 1 (one element per cell-owner); the cooperative partition
+        # rides THREAD (``coop`` factor), no cross-CTA split (``cta=1``, the REDUCE
+        # default). MMA / WM / WN OFF-fill downstream.
+        knobs = {**op.knobs, **free_knobs, **coop_reduce_knobs(op.dag, r), MAP_N_REG.name: 1}
         if op.dag.outer_m is not None:
             knobs[MAP_M_REG.name] = 1
         tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
@@ -126,10 +123,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
                 **op.knobs,
                 **thread_knobs(op.dag, t),
                 MAP_N_REG.name: 1,
-                RED_BK.name: bk,
-                RED_FK.name: 1,
-                RED_SPLITK.name: 1,
-                COOP_BR.name: br,
+                fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=1, coop=br),
             }
             if op.dag.outer_m is not None:
                 knobs[MAP_M_REG.name] = 1

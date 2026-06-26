@@ -19,8 +19,9 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import free_tile
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, MAP_N_THREAD, RED_FK
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, map_reg_offers, reduce_reg_offers, reg_knobs
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -33,7 +34,8 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     if op.algebra is AlgebraKind.MONOID:
         raise RuleSkipped("cooperative-reduce tier (070_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING:
-        offers = reduce_reg_offers(op.dag, Budget(), op.knobs[RED_FK.name])
+        fold = fam.dec_reduce(op.knobs[fam.reduce_key(op.dag.k_node.loop.axis.name)]).fold
+        offers = reduce_reg_offers(op.dag, Budget(), fold)
     else:
         offers = map_reg_offers(op.dag, Budget())
     if not offers:

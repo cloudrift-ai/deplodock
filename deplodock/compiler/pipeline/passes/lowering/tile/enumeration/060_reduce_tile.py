@@ -21,8 +21,8 @@ from deplodock.compiler.ir.stmt import Load, Loop, Write
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import reduce_decomp
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import RED_BK, RED_FK
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import reduce_knobs, reduce_offers
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -48,15 +48,18 @@ def _is_fp16_matmul(op: TileGraphOp) -> bool:
 
 def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.SEMIRING or RED_BK.name in op.knobs or mma_atom(op.knobs) is not None:
-        raise RuleSkipped("reduce tile not applicable / already pinned / warp tier")
+    if op.algebra is not AlgebraKind.SEMIRING or mma_atom(op.knobs) is not None:
+        raise RuleSkipped("reduce tile not applicable / warp tier")  # MAP / warp: no reduce axis to key on
+    rk = fam.reduce_key(op.dag.k_node.loop.axis.name)
+    if rk in op.knobs:
+        raise RuleSkipped("reduce tile already pinned")
     offers = reduce_offers(op.dag)
     if not offers:
         raise RuleSkipped("no legal reduce tiling")
     fp16 = _is_fp16_matmul(op)
     out = []
     for bk, fk, sk in offers:
-        knobs = {**op.knobs, **reduce_knobs((bk, fk, sk))}
+        knobs = {**op.knobs, **reduce_knobs(op.dag, (bk, fk, sk))}
         # fp16 matmul + an even FK window (FK == the stage chunk bk): reinterpret FK
         # as the half2 accumulation window (``plans/fk-half2-fp16-matmul.md``) — keep
         # the FK=1 fp32 K factorization (no K_f register fold) and stamp ``FKWIN`` so
@@ -64,7 +67,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
         # register FK fold and the half2 window are mutually exclusive realizations
         # of the FK knob; for fp16 the window wins. fp32 / bf16 keep the fold.
         if fp16 and fk > 1 and fk == bk and bk % 2 == 0:
-            knobs = {**knobs, RED_FK.name: 1, "FKWIN": fk}
+            knobs = {**knobs, rk: fam.enc_reduce(serial=bk, fold=1, cta=sk), "FKWIN": fk}
         tg = reduce_decomp(op.tilegraph, op.dag, knobs, target_names=op.target_names)
         out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out

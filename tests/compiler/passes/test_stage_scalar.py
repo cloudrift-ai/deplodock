@@ -30,6 +30,7 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import Buffer, Space, StageBundle, StagePolicy, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -37,7 +38,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import 
 
 from ..conftest import requires_cuda
 
-_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, "BK": 16, "FK": 1, "SPLITK": 1}
+_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1)}
 
 
 def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:

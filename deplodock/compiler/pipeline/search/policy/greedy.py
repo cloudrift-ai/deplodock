@@ -54,8 +54,12 @@ def _tile_pipeline():
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
 # that fully determine a tile (so two leaves are "the same tile" iff these match).
 # Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
-# the greedy fork pick and differ between the leaf and the rejected node.
-_TILE_IDENTITY = ("BN", "BM", "FM", "FN", "BK", "FK", "SPLITK", "BR", "WM", "WN", "MMA")
+# the greedy fork pick and differ between the leaf and the rejected node. The native
+# per-element families (``REDUCE@<axis>``, and later ``SPLIT@``/``ATOM@``) are matched
+# by key prefix since their element names are per-kernel; the still-legacy free-axis /
+# warp knobs are matched by exact name.
+_TILE_IDENTITY = ("BN", "BM", "FM", "FN", "WM", "WN", "MMA")
+_TILE_IDENTITY_PREFIXES = ("REDUCE@", "SPLIT@", "ATOM@")
 
 # The rule whose fork prices a kernel: the prior's predicted µs for the chosen
 # complete tile row at the partition fork is the per-kernel cost the structural
@@ -69,7 +73,9 @@ def tile_identity(knobs: dict) -> frozenset:
     Computed identically for a greedy leaf's fork knobs and for a rejected node's
     realized knobs, so :func:`greedy_decide` can skip a leaf that already failed
     ``validate(ctx)`` downstream (the smem / thread-budget gate)."""
-    return frozenset((k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs)
+    exact = [(k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs]
+    native = [(k, str(v)) for k, v in knobs.items() if k.startswith(_TILE_IDENTITY_PREFIXES)]
+    return frozenset(exact + native)
 
 
 def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:

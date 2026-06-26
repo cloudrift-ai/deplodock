@@ -42,21 +42,18 @@ from deplodock.compiler.ir.tile.ir import Binding, Block, Buffer, Schedule, Seri
 _BM_RED = 16
 _BN_RED = 16
 
-# The combine kernel is fixed-schedule (no fork). Stamp every enumeration knob so
+# The combine kernel is fixed-schedule (no fork). Stamp the free-axis + tier knobs so
 # the tile-pass chain skips it wholesale (each pass gates on its own knob's presence)
 # and ``assembly/010_assemble`` materializes the already-tiled block directly. ``MMA``
-# / ``WM`` / ``WN`` / ``BR`` / ``FK`` / ``STAGE`` are OFF sentinels (scalar tier, no
-# staging); ``BN``/``BM`` = the 16×16 thread tile, ``FN``/``FM`` = 1 cell, ``SPLITK``
-# = 1 (the combine itself is not split).
+# / ``WM`` / ``WN`` / ``STAGE`` are OFF sentinels (scalar tier, no staging); ``BN``/``BM``
+# = the 16×16 thread tile, ``FN``/``FM`` = 1 cell. The combine is ``MAP`` algebra with no
+# contraction, so it carries **no** ``REDUCE@<axis>`` knob (the reduce passes gate on the
+# ``MAP`` algebra, not a sentinel).
 _COMBINE_KNOBS = {
     "BN": _BN_RED,
     "BM": _BM_RED,
     "FN": 1,
     "FM": 1,
-    "BK": 1,
-    "FK": 0,
-    "SPLITK": 1,
-    "BR": 0,
     "MMA": "0",
     "WM": 0,
     "WN": 0,

@@ -34,28 +34,25 @@ def _pin(monkeypatch, knobs: dict) -> None:
 # --- Senseless combinations: the validator must REFUSE -----------------------
 
 # Each row: (algebra, pins) where no tier the algebra resolves to can satisfy the pins.
+# NOTE: the reduce-decomposition levers (``BK``/``FK``/``SPLITK``/``BR`` → the native
+# ``REDUCE@<axis>`` family) are NO LONGER policed by tier-foreignness here — their legality
+# is the carrier-trait value-domain gate at the knob (``_families``), so a senseless reduce
+# pin is forced to identity, not hard-errored. Only the free-axis tile (``BN``/``BM``/
+# ``FM``/``FN``), the warp geometry (``WM``/``WN``/``MMA``), and the staging schedule
+# (``STAGE``/``TMA``) are still audited.
 _REFUSED = [
-    # Warp MMA forced (MMA=<kind>) + a scalar/cooperative-only knob.
+    # Warp MMA forced (MMA=<kind>) + a scalar-only free-axis knob.
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "BN": 32}, "scalar THREAD width on a warp kernel"),
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "BM": 8}, "scalar THREAD width on a warp kernel"),
-    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "BR": 4}, "cooperative lanes on a warp kernel"),
-    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "FK": 4}, "strip-mine accumulators on a warp kernel"),
     # Scalar forced (MMA=0) + a warp-only knob.
     (AlgebraKind.SEMIRING, {"MMA": 0, "WM": 2}, "warp count on a scalar kernel"),
     (AlgebraKind.SEMIRING, {"MMA": 0, "WN": 2}, "warp count on a scalar kernel"),
-    # BR>1 is cooperative/streaming only — foreign to BOTH SEMIRING tiers regardless of MMA.
-    (AlgebraKind.SEMIRING, {"BR": 4}, "cooperative lanes on a matmul"),
     # Warp geometry pin (WM) vs a scalar THREAD pin (BN) — the two forced tiers exclude.
     (AlgebraKind.SEMIRING, {"WM": 2, "BN": 32}, "warp geometry vs scalar THREAD tile"),
-    # A cooperative MONOID reduce: warp / split-K / tensor-core are all foreign.
+    # A cooperative MONOID reduce: warp / tensor-core are foreign.
     (AlgebraKind.MONOID, {"WM": 2}, "warp count on a cooperative reduce"),
     (AlgebraKind.MONOID, {"MMA": _ATOM}, "tensor-core atom on a cooperative reduce"),
-    (AlgebraKind.MONOID, {"SPLITK": 4}, "cross-CTA split-K on a cooperative reduce"),
-    # A pointwise MAP nest has no reduce / warp tier.
-    (AlgebraKind.MAP, {"BK": 32}, "K-chunk on a pointwise nest"),
-    (AlgebraKind.MAP, {"FK": 4}, "strip-mine on a pointwise nest"),
-    (AlgebraKind.MAP, {"SPLITK": 4}, "split-K on a pointwise nest"),
-    (AlgebraKind.MAP, {"BR": 4}, "cooperative lanes on a pointwise nest"),
+    # A pointwise MAP nest has no warp tier.
     (AlgebraKind.MAP, {"MMA": _ATOM}, "tensor-core atom on a pointwise nest"),
     (AlgebraKind.MAP, {"WM": 2}, "warp count on a pointwise nest"),
     # Staging / transport on a tier that never stages (smem-free reduce / no K-tower).
@@ -175,9 +172,9 @@ def test_search_path_exempt_from_validation(monkeypatch):
 def test_error_names_the_offending_pins(monkeypatch):
     """The message names the algebra, the tiers it can lower on, and each pin's legal
     tiers — enough to see which knob to drop."""
-    _pin(monkeypatch, {"MMA": _ATOM, "BR": 4})
+    _pin(monkeypatch, {"MMA": _ATOM, "BN": 32})
     with pytest.raises(KnobPinError) as exc:
         validate_pins(AlgebraKind.SEMIRING)
     msg = str(exc.value)
     assert "semiring" in msg
-    assert "MMA=" in msg and "BR=4" in msg
+    assert "MMA=" in msg and "BN=32" in msg

@@ -23,11 +23,11 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Write
 from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     BK_CHOICES,
     BR_CHOICES,
-    COOP_BR,
     FK_CHOICES,
     MAP_M_REG,
     MAP_M_THREAD,
@@ -35,13 +35,9 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     MAP_N_THREAD,
     MAX_CELLS_PER_THREAD,
     MAX_THREADS_PER_CTA,
-    RED_BK,
-    RED_FK,
-    RED_SPLITK,
     REG_CHOICES,
     SPLITK_CHOICES,
     TC_ATOM,
-    TC_BK,
     TC_REG_CHOICES,
     TC_REG_M,
     TC_REG_N,
@@ -277,7 +273,7 @@ def reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
     The legality is the carrier-trait query :func:`legal_decomps` (associative →
     split; commutative → cross-CTA combine); ranking + the split-K soundness gate
     (cost / hardware) stay here."""
-    bk_pin, fk_pin, sk_pin = _pin(RED_BK), _pin(RED_FK), _pin(RED_SPLITK)
+    bk_pin, fk_pin, sk_pin, _ = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     # Split-K atomic-adds per-CTA partials, sound only for a bare single reduce.
@@ -316,10 +312,11 @@ def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, 
     return out
 
 
-def reduce_knobs(reduce: tuple[int, int, int]) -> dict:
-    """Knob delta a reduce-tile branch pins."""
+def reduce_knobs(dag: IterDag, reduce: tuple[int, int, int]) -> dict:
+    """Knob delta a reduce-tile branch pins — the native ``REDUCE@<primary>`` value
+    ``s<serial>/f<fold>/c<cta>``."""
     bk, fk, sk = reduce
-    return {RED_BK.name: bk, RED_FK.name: fk, RED_SPLITK.name: sk}
+    return {fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=fk, cta=sk)}
 
 
 # --- Cooperative-reduce (MONOID) moves: the carrier's commutative-licensed
@@ -354,7 +351,7 @@ def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, 
     lanes must form an aligned intra-warp segment — matching
     ``cooperative_combine_geometry``), and ``bn·bm·br`` must fit the CTA thread
     budget."""
-    bk_pin, fk_pin, br_pin = _pin(RED_BK), _pin(RED_FK), _pin(COOP_BR)
+    bk_pin, fk_pin, _, br_pin = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     brs = (br_pin,) if br_pin else BR_CHOICES
@@ -398,10 +395,11 @@ def _strided_br_ok(br: int, free_threads: int, warp_size: int) -> bool:
     return br == 1 or (br <= warp_size and br & (br - 1) == 0)
 
 
-def coop_reduce_knobs(reduce: tuple[int, int, int]) -> dict:
-    """Knob delta a cooperative-reduce leaf pins."""
+def coop_reduce_knobs(dag: IterDag, reduce: tuple[int, int, int]) -> dict:
+    """Knob delta a cooperative-reduce leaf pins — ``REDUCE@<primary>`` with the
+    cooperative-lane factor in ``t<coop>``."""
     bk, fk, br = reduce
-    return {RED_BK.name: bk, RED_FK.name: fk, COOP_BR.name: br}
+    return {fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=fk, coop=br)}
 
 
 def coop_free_thread_knobs(dag: IterDag) -> dict:
@@ -423,7 +421,7 @@ def streaming_br_offers(dag: IterDag) -> list[int]:
     THREAD lanes whose per-lane online-softmax partials merge via the carrier's
     ``combine_states``. Cooperative streaming is opt-in (pin-only), not yet a default
     search dimension; a symbolic streaming axis stays serial."""
-    br = _pin(COOP_BR)
+    _, _, _, br = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
     if br is None or br <= 1:
         return [1]
     stream = dag.k_node.loop.axis
@@ -500,7 +498,7 @@ def warp_bk_offers(dag: IterDag, atom) -> list[int]:
     (``BK_CHOICES`` is descending)."""
     atom_k = atom.shape[2]
     k_atoms = max(1, dag.k_extent // atom_k)
-    bk_pin = _pin(TC_BK)
+    bk_pin, _, _, _ = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
     cands = (bk_pin,) if bk_pin else BK_CHOICES
     return [bk for bk in cands if bk >= 1 and k_atoms % bk == 0]
 
@@ -515,9 +513,9 @@ def warp_reg_knobs(fm: int, fn: int) -> dict:
     return {TC_REG_M.name: fm, TC_REG_N.name: fn}
 
 
-def warp_bk_knobs(atom, bk: int) -> dict:
-    """Knob delta the warp K-chunk branch pins: the atom-kind stamp, the K chunk,
-    and the v1 ``SPLITK = 1`` invariant (the warp tier has no cross-CTA split-K —
-    the fragment-store fold relies on it; ``SPLITK`` has no OFF sentinel, so it is
-    stamped explicitly here rather than by ``apply_off_defaults``)."""
-    return {TC_ATOM.name: atom.name, TC_BK.name: bk, RED_SPLITK.name: 1}
+def warp_bk_knobs(dag: IterDag, atom, bk: int) -> dict:
+    """Knob delta the warp K-chunk branch pins: the atom-kind stamp + the native
+    ``REDUCE@<primary>`` value carrying the K chunk in ``s<bk>``. The v1 ``cta = 1``
+    (no cross-CTA split-K — the fragment-store fold relies on it) is the
+    ``enc_reduce`` default, so it rides the value implicitly."""
+    return {TC_ATOM.name: atom.name, fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk)}

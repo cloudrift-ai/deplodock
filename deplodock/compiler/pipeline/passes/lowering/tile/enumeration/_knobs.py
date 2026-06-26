@@ -31,9 +31,6 @@ from deplodock.compiler.pipeline.knob import Knob, KnobType
 _TUNE_AXIS_CHOICES: tuple[int, ...] = (1, 8, 16, 32, 64, 128, 256)
 _TUNE_WARP_AXIS_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 _TUNE_F_CHOICES: tuple[int, ...] = (1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 26, 28, 32, 40, 48, 64, 96, 128)
-_BK_CANDIDATES: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
-_SPLITK_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
-_BR_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 
 
 def _mma_features(mma: object) -> dict[str, float]:
@@ -60,7 +57,10 @@ def _mma_features(mma: object) -> dict[str, float]:
 # Scalar-tier THREAD-binding knobs (``off=0`` = warp-tier OFF sentinel).
 BN = Knob("BN", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA innermost THREAD width (the N free-axis thread tile)", off=0)
 BM = Knob("BM", KnobType.INT, hints=_TUNE_AXIS_CHOICES, help="CTA outer THREAD width (the M free-axis thread tile)", off=0)
-BR = Knob("BR", KnobType.INT, hints=_BR_CANDIDATES, help="Cooperative-K thread count (1 = pure serial chunked reduce)", off=0)
+# The reduce-decomposition knobs ``BK``/``FK``/``SPLITK``/``BR`` are gone — folded into
+# the native ``REDUCE@<axis>`` family (``_families``), one ``"s/f/c/t"`` value per reduce
+# axis. The candidate menus below stay (the move offers enumerate them); the legacy env
+# spellings survive only through ``_knob_legacy`` ingest.
 # Warp-tier WARP-binding knobs (``off=0`` = scalar-tier OFF sentinel).
 WN = Knob("WN", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA innermost WARP count along the N output axis", off=0)
 WM = Knob("WM", KnobType.INT, hints=_TUNE_WARP_AXIS_CHOICES, help="CTA outer WARP count along the M output axis", off=0)
@@ -73,14 +73,9 @@ MMA = Knob(
     features=_mma_features,
     off="0",
 )
-# Tier-shared knobs (same arithmetic role in both tiers).
+# Tier-shared free-axis register knobs (same arithmetic role in both tiers).
 FM = Knob("FM", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the M (output) axis")
 FN = Knob("FN", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-cell-owner cells along the N (output) axis")
-FK = Knob(
-    "FK", KnobType.INT, hints=_TUNE_F_CHOICES, help="Per-thread independent accumulators along the reduce (K) axis (1 = single)", off=0
-)
-BK = Knob("BK", KnobType.INT, hints=_BK_CANDIDATES, help="Per-stage K-chunk size (intra-CTA K-loop trip count = K / BK)")
-SPLITK = Knob("SPLITK", KnobType.INT, hints=_SPLITK_CANDIDATES, help="Cross-CTA K-split factor (1 = no split)")
 # Staging knob (the ``stage`` move, ``120_stage``): a bitmask over the ranked
 # stageable read-sites (``Edge``s) of a reduce kernel — char ``i`` selects ranked
 # candidate ``i``. The fork writes the chosen ``Edge``s into ``Schedule.staged``
@@ -140,25 +135,20 @@ MAP_N_REG = FN
 MAP_M_THREAD = BM
 MAP_M_REG = FM
 
-# Reduce-tile knobs (the ``TileSerial`` move): ``BK`` is the staged K-chunk (inner
-# serial loop trip count); ``FK`` strip-mines the K axis into independent
-# accumulators (``RegisterTile(reduce=True)``); ``SPLITK`` is the cross-CTA split.
+# Reduce-decomposition candidate menus (the ``REDUCE@<axis>`` family — the ``TileSerial``
+# / cooperative / split-K levers). ``serial`` (legacy ``BK``) is the staged K-chunk,
+# ``fold`` (``FK``) the register strip-mine, ``cta`` (``SPLITK``) the cross-CTA split,
+# ``coop`` (``BR``) the cooperative-thread partition. The values now live in one
+# ``"s/f/c/t"`` ``REDUCE@<axis>`` knob per reduce axis (``_families``); these are the
+# per-field menus the move offers enumerate.
 BK_CHOICES: tuple[int, ...] = (64, 32, 16, 8, 4, 2, 1)
 FK_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 SPLITK_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
-RED_BK = BK
-RED_FK = FK
-RED_SPLITK = SPLITK
-
-# Cooperative-reduce knob (the ``SplitParallel`` thread binding): ``BR`` threads
-# cooperatively reduce one row's K, then a warp-shuffle / tree combine folds the
-# partials (emitted by kernel/100_materialize_tile from Accum.axes ∩ ThreadTile).
 BR_CHOICES: tuple[int, ...] = (256, 128, 64, 32, 16, 8, 4, 2, 1)
-COOP_BR = BR
 
 # Tensor-core (warp-tier MMA) knobs — the ``Tensorize`` move. ``MMA`` is the atom
 # kind ("0" = scalar tier, no tensorize); ``WM``/``WN`` the per-CTA warp counts;
-# ``FM``/``FN`` register cells per warp; ``BK`` the K chunk in atom-K units.
+# ``FM``/``FN`` register cells per warp; the K chunk is ``REDUCE@<axis>.serial``.
 WARP_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 TC_REG_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
 TC_ATOM = MMA
@@ -166,4 +156,3 @@ WARP_M = WM
 WARP_N = WN
 TC_REG_M = FM
 TC_REG_N = FN
-TC_BK = BK

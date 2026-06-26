@@ -15,16 +15,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
-# Knobs the thread-tier / warp-tier enumeration decides — the projection a golden
-# is matched on (STAGE / RING / WARPSPEC / NOATOMIC are stamped by later passes,
-# not chosen here). FK is omitted from the thread set: the matmul enumeration
-# always emits FK=1, so it never distinguishes a golden.
-THREAD_KNOBS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
-WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
+# Free-axis knobs the thread-tier / warp-tier enumeration decides — the projection a
+# golden is matched on (the reduce decomposition is now the native ``REDUCE@<axis>``
+# value, dynamic per kernel, so it is matched separately, not as a static column).
+THREAD_KNOBS = ("BN", "BM", "FM", "FN")
+WARP_KNOBS = ("WN", "WM", "FM", "FN", "MMA")
 
 
-def _matmul_thread_gate(r: dict) -> bool:
+def _matmul_thread_gate(r: dict, reduce_key: str) -> bool:
     """The heuristic-plausible band for thread-tier matmul tiles, distilled from
     the measured ``GOLDEN_CONFIGS`` (every recorded golden satisfies it). Used to
     prune the enumeration so the cold ``AnalyticPrior`` can't argmin onto an
@@ -36,12 +36,13 @@ def _matmul_thread_gate(r: dict) -> bool:
     bn, bm = r["BN"], r["BM"]
     threads = bn * bm
     tile_n = bn * r["FN"]
+    decomp = fam.dec_reduce(r[reduce_key])
     return (
         16 <= bn <= 64
         and 8 <= bm <= 16
         and bn >= bm
-        and r["BK"] >= 32
-        and r["SPLITK"] <= 2
+        and decomp.serial >= 32
+        and decomp.cta <= 2
         and threads in (128, 256, 512, 1024)
         and tile_n in (32, 64, 128)
     )
@@ -97,22 +98,20 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
         return [], (THREAD_KNOBS if dtype == "fp32" else WARP_KNOBS)
     budget = _moves.Budget()
 
+    rk = fam.reduce_key(dag.k_node.loop.axis.name)
     if dtype == "fp32":
         rows: list[dict] = []
         threads = _moves.thread_offers(dag, budget)
         for bk, fk, sk in _moves.reduce_offers(dag):
-            red = _moves.reduce_knobs((bk, fk, sk))
+            red = _moves.reduce_knobs(dag, (bk, fk, sk))
             regs = _moves.reduce_reg_offers(dag, budget, fk)
             for t in threads:
                 thr = _moves.thread_knobs(dag, t)
                 for r in regs:
-                    # BR=1 is the scalar-tier seal (110_seal_scalar_tier) — a SEMIRING
-                    # matmul has no cooperative-K lane; stamp it so the row carries the
-                    # complete THREAD_KNOBS projection a golden is matched on.
-                    rows.append({**red, **thr, **_moves.reg_knobs(dag, r), "BR": 1})
+                    rows.append({**red, **thr, **_moves.reg_knobs(dag, r)})
         # Narrow to the golden-plausible band so the cold prior can't argmin onto a
         # degenerate tile; fall back to the ungated set if no in-band candidate exists.
-        gated = [r for r in rows if _matmul_thread_gate(r)]
+        gated = [r for r in rows if _matmul_thread_gate(r, rk)]
         return (gated or rows), THREAD_KNOBS
 
     from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
@@ -128,7 +127,7 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
         for fm, fn in regs:
             reg = _moves.warp_reg_knobs(fm, fn)
             for bk in bks:
-                rows.append({**geom, **reg, **_moves.warp_bk_knobs(atom, bk)})
+                rows.append({**geom, **reg, **_moves.warp_bk_knobs(dag, atom, bk)})
     return rows, WARP_KNOBS
 
 

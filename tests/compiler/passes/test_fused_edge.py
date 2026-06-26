@@ -27,13 +27,14 @@ from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, is_fused_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from tests.compiler.conftest import requires_cuda
 from tests.compiler.passes.test_tile_ir_invariants import _oracle_tilegraph
 
-_KN = {"BN": 16, "FN": 2, "BM": 16, "FM": 2, "BK": 16, "FK": 1, "SPLITK": 1}
+_KN = {"BN": 16, "FN": 2, "BM": 16, "FM": 2, fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1)}
 
 
 def _mm_xn_graph(M=64, K=64, N=64) -> Graph:
@@ -374,6 +375,17 @@ def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
         monkeypatch.setenv("DEPLODOCK_BN", "16")
         monkeypatch.setenv("DEPLODOCK_BM", "16")
         monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    else:
+        # Pin a small in-budget warp tile: the cold-ranker's smart tile pick is being
+        # retired (greedy cold → emission order), so the warp tier must be pinned rather
+        # than relying on the prior to avoid the largest-BK smem-overflow emission default.
+        # Legacy env pins route through the ingest mapper (DEPLODOCK_BK → REDUCE@<axis>).
+        monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+        monkeypatch.setenv("DEPLODOCK_WM", "2")
+        monkeypatch.setenv("DEPLODOCK_WN", "2")
+        monkeypatch.setenv("DEPLODOCK_FM", "2")
+        monkeypatch.setenv("DEPLODOCK_FN", "2")
+        monkeypatch.setenv("DEPLODOCK_BK", "2")
     monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept fused edge
     ctx = Context.from_target((12, 0))
     s, h, i = 32, 1024, 3072

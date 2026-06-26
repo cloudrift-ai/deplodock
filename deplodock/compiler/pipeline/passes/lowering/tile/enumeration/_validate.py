@@ -39,16 +39,12 @@ from enum import Enum
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.pipeline.knob import mma_decode
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
-    BK,
     BM,
     BN,
-    BR,
     CHAIN,
-    FK,
     FM,
     FN,
     MMA,
-    SPLITK,
     STAGE,
     TMA,
     WM,
@@ -106,20 +102,6 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         # Register cells: coop / streaming force the free-axis register tile to 1, so a
         # cell pin > 1 is foreign to them; = 1 is the universal value.
         return frozenset({Tier.MAP, Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
-    if name == BK.name:
-        # K-chunk: the reduce tiers (scalar SEMIRING + MONOID — split-KV is legal on the
-        # nested monoid too) + warp. A pointwise MAP has no K.
-        return frozenset({Tier.SCALAR, Tier.MONOID, Tier.WARP}) if _as_int(raw) > 1 else None
-    if name == FK.name:
-        # Strip-mine accumulators: the scalar SEMIRING + MONOID reduce.
-        return frozenset({Tier.SCALAR, Tier.MONOID}) if _as_int(raw) > 1 else None
-    if name == SPLITK.name:
-        # Cross-CTA split-K: the scalar reduce AND the warp tier (the atomic-free
-        # split-K combine, ``140_atomic_free_splitk``). A non-linear epilogue downgrades
-        # it to 1 at the shape level — that is the pipeline's job, not a pin contradiction.
-        return frozenset({Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
-    if name == BR.name:
-        return frozenset({Tier.MONOID}) if _as_int(raw) > 1 else None  # cooperative lanes (flat reduce or stream)
     if name == STAGE.name:
         # Staging a read-site: only the scalar reduce / warp matmul stage (COOP / STREAMING
         # are smem-free, MAP has no K-tower). A mask with no selected bit is inert.
@@ -141,9 +123,12 @@ def _as_int(raw: str) -> int:
         return 0
 
 
-# The knobs whose env pin this validator audits — tile geometry + the staging /
-# transport schedule (STAGE / TMA), each legal only on the tiers in ``_legal_tiers``.
-_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, BK, FK, SPLITK, BR, STAGE, TMA, CHAIN)
+# The knobs whose env pin this validator audits — free-axis tile geometry + the staging
+# / transport schedule (STAGE / TMA), each legal only on the tiers in ``_legal_tiers``.
+# The reduce-decomposition levers (``REDUCE@<axis>``) are no longer policed here — their
+# legality is the carrier-trait value-domain gate at the knob (``_families``), not a
+# tier-foreignness check.
+_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, STAGE, TMA, CHAIN)
 
 
 def validate_pins(algebra: AlgebraKind) -> None:

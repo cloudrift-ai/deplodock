@@ -22,17 +22,14 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Lo
 from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
 from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, TileGraph
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
-    COOP_BR,
     MAP_M_REG,
     MAP_M_THREAD,
     MAP_N_REG,
     MAP_N_THREAD,
-    RED_BK,
-    RED_FK,
-    RED_SPLITK,
 )
 
 
@@ -125,7 +122,7 @@ def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis |
     two agree without sharing state."""
     if not target_names:
         return None
-    splitk = knobs[RED_SPLITK.name]
+    splitk = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)]).cta
     if splitk <= 1:
         return None
     kax = dag.k_node.loop.axis
@@ -162,9 +159,8 @@ def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: 
         return graph
     k_s = _k_s_axis(dag, knobs, target_names)
     block = graph.blocks[0]
-    compute = _replace_k_scalar(
-        tuple(block.compute), target_names, dag.k_extent, knobs[RED_BK.name], knobs[RED_FK.name], knobs[RED_SPLITK.name], k_s
-    )
+    d = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)])
+    compute = _replace_k_scalar(tuple(block.compute), target_names, dag.k_extent, d.serial, d.fold, d.cta, k_s)
     return replace(graph, blocks=(replace(block, compute=Body(compute)), *graph.blocks[1:]))
 
 
@@ -347,7 +343,8 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     (cooperative-KV). ``BR > 1`` lays the cooperative lane — for the flat reduce the
     carrier's commutative partition, for the stream each lane's strided slice into its own
     online-softmax partial, merged at materialize via the carrier's ``combine_states``."""
-    bk, fk, br = knobs[RED_BK.name], knobs[RED_FK.name], knobs[COOP_BR.name]
+    d = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)])
+    bk, fk, br = d.serial, d.fold, d.coop
     targets = target_names or frozenset({dag.k_node.loop.axis.name})
 
     kax = dag.k_node.loop.axis
@@ -555,12 +552,12 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
     granularity + fuse the cell into an ``Mma``, laying the domain axes + bindings.
     ``assemble`` reconstructs the AtomTile/WarpTile tower from ``domain`` + ``Mma``."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_BK, TC_REG_M, TC_REG_N, WARP_M, WARP_N
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_REG_M, TC_REG_N, WARP_M, WARP_N
 
     atom_m, atom_n, atom_k = atom.shape
     wm, wn = knobs[WARP_M.name], knobs[WARP_N.name]
     fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
-    bk = knobs[TC_BK.name]
+    bk = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)]).serial
 
     inner_n, outer_m, extra_outer = _free_axes(dag)
     n_b, n_w, n_r, n_a, n_expr, n_bound = _warp_axis(inner_n, wn, fn, atom_n)

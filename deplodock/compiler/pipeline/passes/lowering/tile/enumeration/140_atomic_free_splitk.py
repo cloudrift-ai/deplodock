@@ -36,7 +36,8 @@ from deplodock.compiler.ir.stmt import Body, Stmt, Write
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, mma_atom
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _build, _knobs
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _build
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import additive_reduce_tilegraph, reduce_tilegraphop
 from deplodock.compiler.tensor import Tensor
 
@@ -134,7 +135,8 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
         raise RuleSkipped("atomic-free split-K applies to the scalar SEMIRING matmul tier")
     if NOATOMIC.name in op.knobs:
         raise RuleSkipped("NOATOMIC already decided (idempotence)")
-    splitk = op.knobs.get(_knobs.RED_SPLITK.name, 1)
+    rk = op.knobs.get(fam.reduce_key(op.dag.k_node.loop.axis.name))
+    splitk = fam.dec_reduce(rk).cta if rk is not None else 1
     if splitk <= 1:
         raise RuleSkipped("no split-K (SPLITK = 1) — atomic-free is moot")
     k_s = _build._k_s_axis(op.dag, op.knobs, op.target_names)

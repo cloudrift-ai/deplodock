@@ -14,6 +14,7 @@ without re-running the offline weight fit (that lives in
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, pick_matmul
 from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
@@ -49,8 +50,9 @@ def test_pick_matmul_lands_in_geometry_band():
         r = pick_matmul(M, N, K, "fp32", ctx)
         assert 16 <= r["BN"] <= 64, (M, N, K, r)
         assert 8 <= r["BM"] <= 16, (M, N, K, r)
-        assert r["BK"] >= 32, (M, N, K, r)
-        assert r["SPLITK"] <= 2, (M, N, K, r)
+        decomp = fam.dec_reduce(r[next(k for k in r if k.startswith("REDUCE@"))])
+        assert decomp.serial >= 32, (M, N, K, r)  # native REDUCE serial (legacy BK)
+        assert decomp.cta <= 2, (M, N, K, r)  # native REDUCE cta (legacy SPLITK)
         assert set(THREAD_KNOBS) <= set(r)
 
 

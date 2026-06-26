@@ -210,8 +210,11 @@ def test_epilogue_warp_rows_stay_splitk_one(monkeypatch, _sm120_target):
     _pin_warp(monkeypatch)
     monkeypatch.setenv("DEPLODOCK_SPLITK", "2")
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=_residual_add()))
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+
     assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
-    assert kop.knobs.get("SPLITK") == 1
+    rk = next(k for k in kop.knobs if k.startswith("REDUCE@"))
+    assert fam.dec_reduce(kop.knobs[rk]).cta == 1  # warp v1 invariant: split-K (REDUCE cta) stays 1
 
 
 # --- blocked dependencies (compile-only, GPU-less) ----------------------------------

@@ -37,10 +37,15 @@ from deplodock.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 
-_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, "BK": 16, "FK": 1, "SPLITK": 1}
+# Native ``MOVE@element`` knobs for the matmul oracle: the free-axis SPLIT geometry
+# (still legacy ``BN``/``BM``/``FN``/``FM`` until the SPLIT family lands) + the native
+# ``REDUCE@<reduce-axis>`` value (the matmul's contraction axis is ``a2``).
+_REDUCE_AXIS = "a2"
+_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, fam.reduce_key(_REDUCE_AXIS): fam.enc_reduce(serial=16, fold=1, cta=1)}
 
 
 def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
@@ -94,7 +99,7 @@ def test_op_cache_key_is_canonical_and_knob_sensitive() -> None:
     op_b = TileGraphOp(name="k_matmul", tilegraph=_oracle_tilegraph(g, _MM_KNOBS), knobs=dict(_MM_KNOBS))
     assert op_cache_key(op_a) == op_cache_key(op_b)
 
-    other = {**_MM_KNOBS, "BK": 8}
+    other = {**_MM_KNOBS, fam.reduce_key(_REDUCE_AXIS): fam.enc_reduce(serial=8, fold=1, cta=1)}
     op_c = TileGraphOp(name="k_matmul", tilegraph=_oracle_tilegraph(g, other), knobs=other)
     assert op_cache_key(op_c) != op_cache_key(op_a)
 

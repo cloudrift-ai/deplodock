@@ -21,7 +21,8 @@ from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_THREAD, RED_BK
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, thread_knobs, thread_offers
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -33,7 +34,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
         raise RuleSkipped("thread tile already pinned / warp tier")
     if op.algebra is AlgebraKind.MONOID:
         raise RuleSkipped("cooperative-reduce tier (070_coop_reduce owns the MONOID free-axis tile)")
-    if op.algebra is AlgebraKind.SEMIRING and RED_BK.name not in op.knobs:
+    if op.algebra is AlgebraKind.SEMIRING and fam.reduce_key(op.dag.k_node.loop.axis.name) not in op.knobs:
         raise RuleSkipped("reduce tile not yet pinned")
     # A SEMIRING (matmul) 2-D output tile wants a balanced, coalesced shape; a MAP
     # (pointwise) nest stays bandwidth-bound / wide-N. (MONOID is skipped above.)
