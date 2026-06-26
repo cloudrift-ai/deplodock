@@ -40,10 +40,10 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     return."""
     op: TileGraphOp = root.op
     if op.flash is not None:
-        # Warp-tier streaming flash (the offer shim ``split/005_warp_chain`` stamped the
-        # ``FlashSpec``): realize it directly through the generic carry assembler. The
-        # enumeration forks skip a flash op (it carries no logical ``tilegraph`` to tile).
-        return realize_flash(op.flash)
+        # Warp-tier streaming flash: realize it from the logical FA-2 ``tilegraph`` the offer
+        # shim ``split/005_warp_chain`` attached (geometry from ``op.buffers``, the twisted
+        # online-softmax carrier on ``op.flash``), through the generic carry assembler.
+        return realize_flash(op)
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     tg = op.tilegraph

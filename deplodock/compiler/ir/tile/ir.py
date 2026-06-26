@@ -642,11 +642,10 @@ class TileGraphOp(Op):
     target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
     seed_key: str = ""  # the source LoopOp's body structural key
     buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
-    flash: object = None  # FlashSpec — a warp-tier streaming-flash op the assembler realizes directly (split/005_warp_chain shim)
+    flash: object = None  # the twisted online-softmax carrier Monoid — marks a warp-tier streaming-flash op the
+    # assembler realizes directly from the logical ``tilegraph`` (the ``split/005_warp_chain`` shim); ``None`` otherwise
 
     def structural_key(self) -> str:
-        if self.flash is not None:
-            return getattr(self.flash, "key", lambda: "flash")()
         return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
 
     def pretty_body(self) -> str:

@@ -175,22 +175,12 @@ def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D
     assert max_diff < 5e-3, f"generated causal TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
 
 
-def test_warp_chain_cell_layout_falls_out_of_atomize():
-    """The two cells' operand layout (``b_trans``, the atom) is DERIVED by the ``atomize``
-    move (``_classify_cell`` → ``atomize_cell`` → ``classify_matmul_operands``), not
-    hard-coded: QK^T is a transposed-B Q@K^T, P@V a canonical-B P@V. CPU-only."""
-    import importlib
-
-    from deplodock.compiler.ir.expr import Var
-
-    _classify_cell = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.split.005_warp_chain")._classify_cell
-
-    qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")))
-    pv = _classify_cell("flash_pv_smem", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None)
-    assert qk.b_trans is True, "Q@K^T must be transposed-B"
-    assert pv.b_trans is False, "P@V must be canonical-B"
-    assert (qk.a, qk.b) == ("ca", "cb") and (pv.a, pv.b) == ("ca", "cb")
-    assert qk.atom.shape == (16, 8, 16)
+# NOTE: the former ``test_warp_chain_cell_layout_falls_out_of_atomize`` (which imported the
+# split shim's ``_classify_cell`` to assert the operand ``b_trans`` was derived by ``atomize``)
+# was removed when the flash realization moved to ``_flash.realize_flash``, which sets the v1
+# m16n8k16 layout (transposed-B Q@K^T, canonical-B P@V) as a structural constant. That layout is
+# now accuracy-checked end-to-end by the dynamic / static tests in this file — a wrong ``b_trans``
+# corrupts the attention and fails them.
 
 
 @requires_cuda

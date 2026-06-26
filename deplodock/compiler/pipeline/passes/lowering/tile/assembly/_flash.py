@@ -1,4 +1,4 @@
-"""Warp-tier streaming-flash realizer — `realize_flash` turns a :class:`FlashSpec` into a
+"""Warp-tier streaming-flash realizer — `realize_flash` turns the logical flash TileGraph into a
 `TileOp` through the **generic carry assembler** (`_assemble.assemble_carry`).
 
 The fused tensor-core flash is the maximal carrier (an MMA contraction AND an online-updating
@@ -10,7 +10,7 @@ fragment-softmax realization (`_frag_softmax` over the shared `carrier_algebra` 
 all the generic shared machinery.
 
 `split/005_warp_chain` is the eligibility/offer shim: it detects an in-scope flash `LoopOp`,
-atomizes the two cells, reads the carrier, and emits a `TileGraphOp(flash=FlashSpec(...))`; the
+reads the carrier + attaches the logical FA-2 TileGraph, and emits a `TileGraphOp(tilegraph=…, flash=carrier)`; the
 assembly pass (`assembly/010_assemble`) calls :func:`realize_flash` on it. No separate assembler
 entry, no enumeration bypass at the Graph level — flash rides the standard TileGraphOp →
 assemble pass like every other kernel.
@@ -23,16 +23,15 @@ Scope (:func:`warp_chain_eligible`): fp16/bf16, causal or non-causal, `D%16==0`;
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 from deplodock.compiler.backend.cuda.dtype import cuda_name
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
+from deplodock.compiler.dtype import BF16, F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
-from deplodock.compiler.ir.stmt import Body, Load, Mma, Monoid
-from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
+from deplodock.compiler.ir.stmt import Body, Load, Mma
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, AtomTile, SerialTile, TileGraphOp, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_carry
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
@@ -43,31 +42,12 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax imp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role
 
 
-@dataclass(frozen=True)
-class FlashSpec:
-    """The warp-tier flash a `split/005_warp_chain` shim hands the assembler — the cells'
-    atomized `Mma`s, the streaming online-softmax `Monoid` carrier, the `(B,H,S,D)` geometry,
-    and the q/k/v/out buffer names. `seq_var` is the runtime symbol for a symbolic `S` (else
-    `None`); `group > 1` is GQA; `causal` masks the strict upper triangle."""
-
-    name: str
-    q: str
-    k: str
-    v: str
-    out: str
-    B: int
-    H: int
-    S: int
-    D: int
-    qk: Mma
-    pv: Mma
-    carrier: Monoid
-    causal: bool = False
-    seq_var: str | None = None
-    group: int = 1
-
-    def key(self) -> str:
-        return f"flash_{self.B}_{self.H}_{self.S}_{self.D}_{self.group}_c{int(self.causal)}_s{self.seq_var or 0}_{self.qk.atom.kind}"
+def _static(d) -> int | None:
+    """The static extent of a shape entry, or ``None`` for a symbolic dim."""
+    if isinstance(d, int):
+        return d
+    f = getattr(d, "as_static", None)
+    return f() if (f is not None and getattr(d, "is_static", True)) else None
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -99,30 +79,43 @@ def _mul(a, b: int):
     return _add() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
 
 
-def realize_flash(spec: FlashSpec) -> TileOp:
-    """The fused TC flash as a ``TileOp`` (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
-    for ``(B,H,S,D)`` 16-bit, optionally causal / symbolic / GQA — assembled through the generic
-    carry assembler (``assemble_carry``), lowered by the standard kernel passes. The QK^T / P@V
-    mma codegen is ``kernel/005``'s shared AtomTile lowering; the softmax phases are the fragment
-    realization of the streaming online-softmax ``carrier`` (``realize_fragment_softmax``)."""
-    q, k, v, out = spec.q, spec.k, spec.v, spec.out
-    B, H, D = spec.B, spec.H, spec.D
-    qk, pv, carrier, causal, seq_var, group = spec.qk, spec.pv, spec.carrier, spec.causal, spec.seq_var, spec.group
-    atom_m, atom_n, atom_k = qk.atom.shape
+def realize_flash(op: TileGraphOp) -> TileOp:
+    """The fused TC flash as a ``TileOp`` (``GridTile > WarpTile > [init] SerialTile [epilogue]``),
+    assembled through the generic carry assembler (``assemble_carry``) and lowered by the standard
+    kernel passes. Driven by the **logical flash TileGraph** the offer shim ``split/005_warp_chain``
+    attached: the geometry (q/k/v/out buffers + ``(B,H,S,D)`` + GQA + causal + symbolic ``seq``) is
+    derived from the op's logical gmem ``buffers``, and the streaming online-softmax twisted
+    ``Monoid`` carrier rides ``op.flash``. The QK^T / P@V mma codegen is ``kernel/005``'s shared
+    AtomTile lowering; the softmax phases are ``realize_fragment_softmax(carrier)``."""
+    block = op.tilegraph.blocks[0]
+    buffers = op.buffers
+    out = block.writes[0].buffer
+    rank4 = [n for n, b in buffers.items() if len(b.shape) == 4 and n != out]
+    q, k, v = rank4[0], rank4[1], rank4[2]
+    causal = any("ninf" in n for n in buffers)
+    qshape = buffers[q].shape
+    B, H, D = _static(qshape[0]), _static(qshape[1]), _static(qshape[3])
+    S = _static(qshape[2])
+    seq_var = None if S is not None else next(iter(qshape[2].expr.free_vars()))
+    group = H // _static(buffers[k].shape[1])  # GQA: q-heads / kv-heads
+    carrier = op.flash  # the twisted online-softmax Monoid (split read it off dag.chain.carrier)
+    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if buffers[q].dtype == BF16 else "mma_m16n8k16_f16"]
+    qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
+    atom_m, atom_n, atom_k = atom.shape
     assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
 
-    atom_shape = qk.atom.shape
-    ab_dt = qk.atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16)
+    atom_shape = atom.shape
+    ab_dt = atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16)
     scale = f"{1.0 / math.sqrt(D)!r}f"
     kt = D // atom_k  # QK^T K-tiles (reduce over D)
     nd = D // atom_n  # P@V N-tiles (output over D)
 
     symbolic = seq_var is not None
-    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(spec.S // 16)
-    seq = Var(seq_var) if symbolic else Literal(spec.S, "int")
+    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(S // 16)
+    seq = Var(seq_var) if symbolic else Literal(S, "int")
 
     bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
-    row_stride = _mul(seq, D) if symbolic else Literal(spec.S * D, "int")
+    row_stride = _mul(seq, D) if symbolic else Literal(S * D, "int")
     base_q = BinaryExpr("*", bh, row_stride)
     if group > 1:
         h_kv = H // group
@@ -161,7 +154,7 @@ def realize_flash(spec: FlashSpec) -> TileOp:
 
     produce: list = []
     for nt in range(2):
-        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans, **_qk_guards(nt))
+        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=atom, b_trans=qk_bt, **_qk_guards(nt))
         if kt > 1:
             ko = Var(f"ko{nt}")
             rbody = (
@@ -176,7 +169,7 @@ def realize_flash(spec: FlashSpec) -> TileOp:
                 Load(name=f"kc{nt}", input=k, index=(_add(kvrow, nt * 8 * D),)),
                 qk_mma,
             )
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=qk.atom))
+        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=atom))
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
     kv_col_bases = tuple(_add(_mul(kv, 16), nt * 8) for nt in range(2))
     if causal:
@@ -205,9 +198,9 @@ def realize_flash(spec: FlashSpec) -> TileOp:
     for n in range(nd):
         cell = (
             Load(name=f"vv{n}", input=v, index=(_add(kvrow, n * 8),)),
-            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=pv.atom, b_trans=pv.b_trans, **pv_kzero),
+            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=atom, b_trans=pv_bt, **pv_kzero),
         )
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=pv.atom))
+        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=atom))
     consume.append(Sync())
 
     update: list = list(fs.update)
@@ -238,5 +231,5 @@ def realize_flash(spec: FlashSpec) -> TileOp:
         (Axis("bh", Dim(B * H)), Role.BLOCK),
     ]
     body = assemble_carry(carry, parallel_layers=parallel_layers)
-    name = spec.name if spec.name.startswith("k_") else f"k_{spec.name}"
+    name = op.name if op.name.startswith("k_") else f"k_{op.name}"
     return TileOp(body=body, name=name, knobs={})
