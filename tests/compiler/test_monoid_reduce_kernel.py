@@ -117,6 +117,39 @@ def test_deferred_finalize_additive_carrier_sums_partitions() -> None:
 
 
 @pytest.mark.skipif(not _has_cuda(), reason="deferred finalize runs on CUDA")
+def test_deferred_finalize_flash_attention_carrier_merges_states() -> None:
+    """The flash attention ``(m, l, O)`` twisted monoid — the carrier a split-KV / flash-decoding
+    producer would emit per CTA — merges through the SAME generic selector: the cross-partition
+    ``O = Σ_s O_s·exp(m_s − max_s m_s)`` (the e^{Δm} rescale, NOT a plain sum), so the deferred
+    KERNEL finalize is correct for the attention carrier (atomic would be illegal — non-additive).
+    The kernel-level proof of "attention's cross-CTA combine"; the producer that feeds it is the
+    remaining flash split-KV work."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+
+    s, m, n = 8, 16, 32
+    rng = np.random.default_rng(13)
+    ws_m = (rng.standard_normal((s, m, n)) * 3.0).astype(np.float32)
+    ws_l = (rng.random((s, m, n)).astype(np.float32) + 0.1) * 5.0
+    ws_o = (rng.standard_normal((s, m, n)) * 2.0).astype(np.float32)
+    g = _deferred_graph(
+        flash_combine("m", "l", "o", "s", "v"),
+        workspaces=("ws_m", "ws_l", "ws_o"),
+        s=s,
+        m=m,
+        n=n,
+        init_ops=(ElementwiseImpl("maximum"), ElementwiseImpl("add"), ElementwiseImpl("add")),
+        out_value="o",  # the merged unnormalized output accumulator O
+    )
+    be = CudaBackend()
+    out = np.asarray(
+        be.run(be.compile(g), input_data={"ws_m": ws_m, "ws_l": ws_l, "ws_o": ws_o})[0].outputs["out"]
+    ).reshape(m, n)
+    o_g = (ws_o * np.exp(ws_m - ws_m.max(axis=0))).sum(axis=0)
+    np.testing.assert_allclose(out, o_g, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="deferred finalize runs on CUDA")
 def test_deferred_finalize_twisted_monoid_carrier_merges_states() -> None:
     """The SAME selector routes the twisted ``(m, l)`` online-softmax ``Monoid`` to the rescaled
     cross-partition merge — carrier-generic dispatch, not a flash special case."""
