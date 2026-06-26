@@ -177,10 +177,15 @@ def handle_eval_prior(args) -> None:
     """``eval prior`` — the learned prior on the golden configs: the greedy pick vs
     golden, the golden's rank under the prior, and (with ``--features``) the
     regressor input vector. With ``--dataset db`` instead reports the prior's pick
-    reachability over the tune DB's *measured* variants (the orthogonal view)."""
+    reachability over the tune DB's *measured* variants (the orthogonal view); with
+    ``--dataset nodes`` reports fork sibling-ranking + leaf reachability over the tune
+    DB's search-tree node store (the search-faithful, partial-config view)."""
     resolve_prior_arg(args)
     if args.dataset == "db":
         _emit_prior_db_reachability(args)
+        return
+    if args.dataset == "nodes":
+        _emit_prior_nodes(args)
         return
     if args.features:
         _emit_golden_features(args.kernel)
@@ -566,6 +571,31 @@ def _emit_prior_db_reachability(args) -> None:
     for label, best_us, pick_us, ratio, n in sorted(rr, key=lambda r: -r[3]):
         flag = "  <-- misses best" if ratio > 1.2 else ""
         logger.info("    %-26s  best %8.2fus  pick %8.2fus  (%.2fx, %d configs)%s", label, best_us, pick_us, ratio, n, flag)
+
+
+def _emit_prior_nodes(args) -> None:
+    """``eval prior --dataset nodes`` body: the prior over the tune DB's search-tree
+    ``node`` store (the value-of-position dataset). Reports the fork sibling-ranking
+    (does the prior order each fork's children — the partial configs it ranks during
+    search — by their best-reachable latency?) plus leaf reachability / calibration
+    on the persistent, deduped store. The search-faithful counterpart to
+    ``--dataset db`` (which only scores fully-decided leaf variants)."""
+    from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.prior import diagnostics, load_prior  # noqa: PLC0415
+
+    db_path = Path(args.db) if args.db else resolve_tune_db()
+    if not db_path.exists():
+        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        return
+    db = SearchDB.open_readonly(db_path)
+    try:
+        nodes = list(db.iter_nodes())
+    finally:
+        db.close()
+    # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
+    prior = load_prior()
+    logger.info("")
+    logger.info("%s", diagnostics.node_report(prior, nodes, kernel_filter=args.kernel))
 
 
 def _mean(xs: list[float]) -> float:
