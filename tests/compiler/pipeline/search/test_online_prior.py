@@ -298,15 +298,27 @@ def test_collect_node_records_skips_unbenched_and_sentinel():
 
 
 def test_node_key_excludes_s_and_h():
-    """Within one op (op_sig) + regime (context_key), node identity is the tunable
-    knob set only — two nodes differing solely in ``S_*``/``H_*`` collide, and a
+    """Within one op (op_sig) + regime (context_key) + card (gpu), node identity is the
+    tunable knob set only — two nodes differing solely in ``S_*``/``H_*`` collide, and a
     differing tunable knob splits them."""
     s = TuningSearch(tree=SearchTree())
-    base = s._node_key({"BM": 64, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx")
-    s_h_perturbed = s._node_key({"BM": 64, "S_n_mma": 9.0, "H_opt": 3.0}, "sig", "ctx")
-    tunable_perturbed = s._node_key({"BM": 32, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx")
+    base = s._node_key({"BM": 64, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx", "gpu")
+    s_h_perturbed = s._node_key({"BM": 64, "S_n_mma": 9.0, "H_opt": 3.0}, "sig", "ctx", "gpu")
+    tunable_perturbed = s._node_key({"BM": 32, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx", "gpu")
     assert base == s_h_perturbed
     assert base != tunable_perturbed
+
+
+def test_node_key_folds_gpu():
+    """Same op + knobs + regime on different cards get distinct node_keys — so same-die
+    SKUs (identical context_key) never collide and keep-min can't drop one card's data;
+    the same card is stable."""
+    s = TuningSearch(tree=SearchTree())
+    feats = {"BM": 64, "S_n_mma": 1.0, "H_opt": 1.0}
+    h100 = s._node_key(feats, "sig", "ctx", "NVIDIA H100 80GB HBM3")
+    h200 = s._node_key(feats, "sig", "ctx", "NVIDIA H200 141GB")
+    assert h100 != h200
+    assert h100 == s._node_key(feats, "sig", "ctx", "NVIDIA H100 80GB HBM3")
 
 
 def _stats(median: float):

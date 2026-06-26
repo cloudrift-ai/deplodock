@@ -348,12 +348,15 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
             # Persist every search-tree node (partial branches + leaves) to the
             # keyed/deduped ``node`` table — alongside the reservoir feed above, and
             # independent of whether a prior is attached. ``op_sig`` is the op's
-            # ``S_*`` structural signature; the walk threads parent_key/value/depth.
+            # ``S_*`` structural signature; ``gpu`` is the card identity (folded into
+            # the key so same-die SKUs don't collide); the walk threads
+            # parent_key/value/depth.
             op_sig = digest(*sorted((k, v) for k, v in op.knobs.items() if k.startswith("S_")))
+            gpu = ctx.hardware_id()
             db.record_nodes(
                 [
-                    NodeRow(node_key=nk, parent_key=pk, context_key=ctx_key, op_sig=op_sig, features=feats, value_us=v, depth=d)
-                    for nk, pk, feats, v, d in inner._collect_node_records(context_key=ctx_key, op_sig=op_sig)
+                    NodeRow(node_key=nk, parent_key=pk, context_key=ctx_key, op_sig=op_sig, features=feats, value_us=v, depth=d, gpu=gpu)
+                    for nk, pk, feats, v, d in inner._collect_node_records(context_key=ctx_key, op_sig=op_sig, gpu=gpu)
                 ]
             )
             best = db.best_per_op_time(ctx_key, key, backend=backend_name)

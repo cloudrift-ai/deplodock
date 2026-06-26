@@ -21,6 +21,7 @@ properties of the silicon; this module owns only the hardware itself.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 
 _MIB = 1024 * 1024
@@ -102,9 +103,14 @@ class GpuSpec:
         return TENSOR_CORE_GEN.get(self.compute_capability, self.compute_capability[0])
 
     def device_features(self) -> dict[str, float]:
-        """The ``sm_count`` / ``smem_*`` / ``regs`` / ``warp`` subset, matching the
-        keys :func:`probe_live_features` reads from a live device — the memorized
-        fallback. Empty when ``sm_count`` is unknown (degrades like a GPU-less host)."""
+        """The ``sm_count`` / ``smem_*`` / ``regs`` / ``warp`` / ``total_mem`` subset,
+        matching the keys :func:`probe_live_features` reads from a live device — the
+        memorized fallback. ``total_mem`` (VRAM bytes) is the one feature that
+        distinguishes same-die SKUs the prior otherwise can't tell apart (H100 80GB vs
+        H200 141GB share cc + SM count). Empty when ``sm_count`` is unknown (degrades
+        like a GPU-less host); ``total_mem`` is always present (``0.0`` when VRAM is
+        unknown) so the feature SET matches the live probe — a card featurizes the same
+        whether probed or memorized."""
         if self.sm_count is None or self.smem_per_sm is None:
             return {}
         return {
@@ -113,6 +119,7 @@ class GpuSpec:
             "smem_per_block": float(self.smem_per_block),
             "regs_per_block": float(self.regs_per_block),
             "warp_size": float(self.warp_size),
+            "total_mem": float(self.vram_bytes or 0),
         }
 
 
@@ -186,6 +193,9 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=132,
         smem_per_sm=233472,
         vram_mib=81559,
+        # ``cudaDeviceProp.name`` reports the SXM5 form, not the capacity-suffixed
+        # registry name — so a live card canonicalizes via the alias (see ``live_name``).
+        aliases=("NVIDIA H100 80GB HBM3",),
     ),
     GpuSpec(
         name="NVIDIA H200 141GB",
@@ -195,6 +205,7 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=132,
         smem_per_sm=233472,
         vram_mib=143771,
+        aliases=("NVIDIA H200",),  # bare reported name (SXM); registry name carries the capacity
     ),
     GpuSpec(
         name="NVIDIA B200",
@@ -213,6 +224,9 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=108,
         smem_per_sm=167936,
         vram_mib=40960,
+        # SXM4 / PCIe report distinct ``cudaDeviceProp.name`` forms; both 40GB A100s
+        # share this spec's SM count + VRAM, so canonicalize them to one identity.
+        aliases=("NVIDIA A100-SXM4-40GB", "NVIDIA A100-PCIE-40GB"),
     ),
     GpuSpec(
         name="NVIDIA A100 80GB",
@@ -222,6 +236,7 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=108,
         smem_per_sm=167936,
         vram_mib=81920,
+        aliases=("NVIDIA A100-SXM4-80GB", "NVIDIA A100 80GB PCIe"),
     ),
     GpuSpec(
         name="NVIDIA Tesla V100 SXM3 32GB",
@@ -286,7 +301,29 @@ def probe_live_features(fallback_name: str | None = None) -> dict[str, float]:
             "smem_per_block": float(props["sharedMemPerBlock"]),
             "regs_per_block": float(props["regsPerBlock"]),
             "warp_size": float(props["warpSize"]),
+            "total_mem": float(props["totalGlobalMem"]),
         }
     except Exception:  # noqa: BLE001 — no live device ⇒ memorized fallback
         spec = (by_name(fallback_name) if fallback_name else None) or DEFAULT_GPU
         return spec.device_features()
+
+
+@functools.cache
+def live_name() -> str | None:
+    """The live CUDA device's PCIe product name (``cudaDeviceProp.name``), canonicalized
+    to the registry name via :func:`by_name` (datacenter cards report a bare name —
+    ``"NVIDIA H200"`` — that the registry carries as an alias of the capacity-suffixed
+    ``"NVIDIA H200 141GB"``); the raw reported name when unrecognized, ``None`` when no
+    device is visible. The hardware identity that distinguishes same-die SKUs (H100 vs
+    H200) — ``compute_capability`` + SM features alone can't. Canonicalizing matters so a
+    live node-store row and a golden reconstructed from the canonical name share one
+    ``gpu`` string. Cached: physical, target-independent."""
+    try:
+        import cupy as cp  # noqa: PLC0415
+
+        raw = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)["name"]
+    except Exception:  # noqa: BLE001 — no live device
+        return None
+    name = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+    spec = by_name(name)
+    return spec.name if spec else name

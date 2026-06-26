@@ -305,17 +305,57 @@ def _node_op_label(features: dict) -> str:
     return _op_label(tuple(sorted((k, v) for k, v in features.items() if k.startswith("S_"))))
 
 
+def _node_gpu_block(prior, gpu: str, gnodes: list) -> list[str]:
+    """Per-card metrics: fork sibling-ranking + leaf reachability/calibration over ONE
+    GPU's nodes. Grouping by card is what keeps same-die SKUs (H100 vs H200) from being
+    compared against each other — their latencies differ but their ``S_*`` op signature
+    (the leaf-reachability group key) is identical."""
+    lines = [f"  [{gpu}] {len(gnodes)} nodes"]
+    sib = node_sibling_ranking(prior, gnodes)
+    if sib is None:
+        lines.append("    fork sibling-ranking: no multi-child forks")
+    else:
+        n_forks, top1, rho, n_children = sib
+        rho_txt = f"{rho:+.2f}" if rho is not None else "n/a"
+        lines.append(
+            f"    fork sibling-ranking: top-1 {top1:.2f}  median per-fork Spearman {rho_txt}  ({n_forks} forks, {n_children} children)"
+        )
+    groups = Dataset.from_node_rows(gnodes).group_by_op()
+    rr = reachability(prior, groups)
+    if rr:
+        ratios = [r[3] for r in rr]
+        agg = f"mean {statistics.mean(ratios):.2f}x  median {statistics.median(ratios):.2f}x  worst {max(ratios):.2f}x"
+        lines.append(f"    leaf reachability: {agg}  ({len(rr)} ops, 1.00 = optimum)")
+        for label, best_us, pick_us, ratio, n in sorted(rr, key=lambda r: -r[3]):
+            if ratio > 1.2:
+                lines.append(
+                    f"      {label:26}  best {best_us:8.2f}us  pick {pick_us:8.2f}us  ({ratio:.2f}x, {n} configs)  <-- misses best"
+                )
+    calib = _calibration(prior, groups)
+    if calib is not None:
+        lines.append(f"    leaf calibration (median per-op Spearman): {calib:+.2f}")
+    return lines
+
+
 def node_report(prior, nodes, *, kernel_filter: str | None = None) -> str:
-    """The ``eval prior --dataset nodes`` block: the fork sibling-ranking (the
-    metric unique to this dataset) plus leaf reachability / calibration reused on the
-    persistent, deduped node store. ``nodes`` is a list of :class:`db.NodeRow` from
+    """The ``eval prior --dataset nodes`` block. Groups the node store **by card**
+    (``NodeRow.gpu``) and, per card, reports the fork sibling-ranking (the metric unique
+    to this dataset) plus leaf reachability / calibration. Per-card grouping is what
+    makes a cross-hardware dataset (H100, H200, …) evaluate correctly — same-die SKUs
+    share an ``S_*`` op signature but not their latencies, so mixing them would corrupt
+    both metrics. ``nodes`` is a list of :class:`db.NodeRow` from
     :meth:`SearchDB.iter_nodes`; ``kernel_filter`` keeps only nodes whose op label
     contains the substring (``--kernel``)."""
+    from collections import defaultdict  # noqa: PLC0415
+
     total = len(nodes)
     if kernel_filter:
         nodes = [n for n in nodes if kernel_filter in _node_op_label(n.features)]
+    by_gpu: dict[str, list] = defaultdict(list)
+    for n in nodes:
+        by_gpu[n.gpu or "(unknown card)"].append(n)
     suffix = f" matching --kernel {kernel_filter!r}" if kernel_filter else ""
-    lines = [f"[prior] node store: {len(nodes)} nodes{suffix}, fitted={prior.fitted}"]
+    lines = [f"[prior] node store: {len(nodes)} nodes{suffix} across {len(by_gpu)} card(s), fitted={prior.fitted}"]
     if not nodes:
         if kernel_filter and total:
             lines.append(f"  no nodes match --kernel {kernel_filter!r} ({total} in store) — try an op label like 'matmul' / 'reduce'")
@@ -324,28 +364,6 @@ def node_report(prior, nodes, *, kernel_filter: str | None = None) -> str:
         return "\n".join(lines)
     if not prior.fitted:
         lines.append("  no fitted prior — the cold AnalyticPrior ranks by D_* geometry only; run `deplodock tune`")
-
-    sib = node_sibling_ranking(prior, nodes)
-    if sib is None:
-        lines.append("[prior] fork sibling-ranking: no multi-child forks recorded")
-    else:
-        n_forks, top1, rho, n_children = sib
-        rho_txt = f"{rho:+.2f}" if rho is not None else "n/a"
-        lines.append("[prior] fork sibling-ranking — does the prior rank each fork's children by value-of-position?")
-        lines.append(f"  top-1 {top1:.2f}  (predicted-best child is a true-best child)   median per-fork Spearman {rho_txt}")
-        lines.append(f"  over {n_forks} forks ({n_children} children)")
-
-    groups = Dataset.from_node_rows(nodes).group_by_op()
-    rr = reachability(prior, groups)
-    if rr:
-        ratios = [r[3] for r in rr]
-        lines.append("[prior] leaf reachability over node store — does the prior recover each op's best leaf?")
-        agg = f"mean {statistics.mean(ratios):.2f}x  median {statistics.median(ratios):.2f}x  worst {max(ratios):.2f}x"
-        lines.append(f"  {agg}   (1.00 = optimum)")
-        for label, best_us, pick_us, ratio, n in sorted(rr, key=lambda r: -r[3]):
-            flag = "  <-- misses best" if ratio > 1.2 else ""
-            lines.append(f"    {label:26}  best {best_us:8.2f}us  pick {pick_us:8.2f}us  ({ratio:.2f}x, {n} configs){flag}")
-    calib = _calibration(prior, groups)
-    if calib is not None:
-        lines.append(f"[prior] leaf ranking calibration (median per-op Spearman): {calib:+.2f}")
+    for gpu in sorted(by_gpu):
+        lines.extend(_node_gpu_block(prior, gpu, by_gpu[gpu]))
     return "\n".join(lines)

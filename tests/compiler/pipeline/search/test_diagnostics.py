@@ -185,7 +185,26 @@ def test_node_report_combines_fork_and_leaf_sections():
     text = diagnostics.node_report(_BMPrior(), nodes)
     assert "node store: 3 nodes" in text
     assert "fork sibling-ranking" in text
-    assert "leaf reachability over node store" in text
+    assert "leaf reachability" in text
+
+
+def test_node_report_separates_hardware():
+    """The report groups by card, so an H100 op and a same-die H200 op (identical S_*
+    signature, different latencies) are evaluated as separate blocks — never mixed."""
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    mm = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
+    nodes = [
+        NodeRow("Ph", None, "ctx", "mm", mm, 5.0, 1, gpu="NVIDIA H100 80GB"),
+        NodeRow("h8", "Ph", "ctx", "mm", {**mm, "BM": 8}, 5.0, 2, gpu="NVIDIA H100 80GB"),
+        NodeRow("h64", "Ph", "ctx", "mm", {**mm, "BM": 64}, 7.0, 2, gpu="NVIDIA H100 80GB"),
+        NodeRow("Pn", None, "ctx", "mm", mm, 3.0, 1, gpu="NVIDIA H200 141GB"),
+        NodeRow("n8", "Pn", "ctx", "mm", {**mm, "BM": 8}, 3.0, 2, gpu="NVIDIA H200 141GB"),
+        NodeRow("n64", "Pn", "ctx", "mm", {**mm, "BM": 64}, 4.0, 2, gpu="NVIDIA H200 141GB"),
+    ]
+    text = diagnostics.node_report(_BMPrior(), nodes)
+    assert "across 2 card(s)" in text
+    assert "[NVIDIA H100 80GB]" in text and "[NVIDIA H200 141GB]" in text
 
 
 def test_node_report_kernel_filter_selects_ops_by_label():

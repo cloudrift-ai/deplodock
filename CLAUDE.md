@@ -239,14 +239,17 @@ fails fast with a specific message.
   **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
   orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
   `--dataset nodes` instead reads the tune DB's search-tree **`node` store** (the value-of-position dataset
-  `deplodock tune` records — partial branches + leaves with a `parent_key`) and reports two things
-  (`diagnostics.node_report` over `SearchDB.iter_nodes()`): the **fork sibling-ranking** — group nodes by `parent_key`
-  and ask whether the prior orders each fork's children (the partial configs it ranks during `_select`) by their
-  best-reachable latency (top-1 hit + median per-fork Spearman), the search-faithful metric no other view measures —
-  plus **leaf reachability / calibration** reused on the deduped persistent store. `--kernel` filters the node store
-  by **op label** (the nodes carry no kernel C-identifier; `--kernel matmul` / `reduce` / `free=512` keeps whole ops
-  atomically since all of an op's nodes share one `S_*` label). Reads the prior JSON
-  (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also
+  `deplodock tune` records — partial branches + leaves with a `parent_key`, keyed/grouped by GPU) and reports, **per
+  card** (`diagnostics.node_report` over `SearchDB.iter_nodes()`): the **fork sibling-ranking** — group nodes by
+  `parent_key` and ask whether the prior orders each fork's children (the partial configs it ranks during `_select`) by
+  their best-reachable latency (top-1 hit + median per-fork Spearman), the search-faithful metric no other view
+  measures — plus **leaf reachability / calibration** reused on the deduped persistent store. The node store keys on
+  the **GPU product name** (`Context.hardware_id`) so a cross-hardware dataset (H100, H200, …) never collides — same-die
+  SKUs share cc + SM features but differ in VRAM, captured as the `H_total_mem` feature so the prior can model them —
+  and the report blocks per card so same-die SKUs are never compared against each other. `--kernel` filters by **op
+  label** (the nodes carry no kernel C-identifier; `--kernel matmul` / `reduce` / `free=512` keeps whole ops atomically
+  since all of an op's nodes share one `S_*` label). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`;
+  option-0 when none loaded). `--features` (golden mode) also
   prints the exact regressor input per golden config (`knob.knob_features`: `S_*` structural/shape + `H_*` regime +
   tuning knobs; the shape enters only as coarse `S_ext_*` products/maxes, so the occupancy/CTA/reuse terms the prior
   needs are added as engineered `D_*` features). The golden `S_*` here is the full histogram (the shape's snippet is
