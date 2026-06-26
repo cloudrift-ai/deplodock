@@ -4,7 +4,9 @@
 > (~11×) and kernel-tune (~2×) wins. Grounded in the profiling in
 > [`generative-decode-perf-findings.md`](generative-decode-perf-findings.md): the remaining gap is **overhead-bound**,
 > not kernel-bound. Status: **Phase A implemented + measured (served decode 85.5 → 178.7 tok/s, ~2×, gap to vLLM
-> ~3.2× → ~1.5×); Phase B not started.**
+> ~3.2× → ~1.5×); Phase B not started.** ⚠️ The 178.7 was measured **pre-merge**; a later `main` tile-lowering refactor
+> regressed these decode kernels ~2.4× (current main: ~91.8 re-tuned) — see **Post-merge re-bench** below. Phase A's
+> device-residency win is intact; the regression is in the kernels `main` now emits.
 
 ## Why (the measurement that motivates this)
 
@@ -102,6 +104,26 @@ and `test_vllm_plugin_gen_gpu.py` still token-for-token. Bug caught in review: `
 in-place on the **shared** norm module (broke the host path's CPU tensor) — fixed with a deep-copied device norm.
 Notably this win lands **under `--enforce-eager`**, so Phase A already captured much of the dispatch headroom previously
 attributed to Phase B — re-estimate B's remaining payoff (the ~5 ms vLLM-eager-framework slice) before committing to it.
+
+### Post-merge re-bench (main's tile-lowering refactor regressed the decode kernels)
+
+After merging `main` (the flash/monoid tile-lowering dissolution, #272–#279), a re-bench showed **two separate effects**
+— Phase A's device-residency is unaffected, but the kernels `main` now emits are slower:
+
+| runner decode step (bucket=16) | pre-merge (Phase A) | post-merge, stale prior | post-merge, **re-tuned** |
+|---|---|---|---|
+| G — GPU kernels | 4.06 ms | 37.69 ms | **9.86 ms** |
+| W − G — host+dispatch (Phase A's lever) | 2.72 ms | 3.56 ms | 3.03 ms |
+| served single-stream | 178.7 tok/s | 25.5 | **91.8 tok/s** |
+
+1. **Stale prior (recoverable, ~74% of the drop).** The refactor renamed/restructured the kernels
+   (`k_linear_mean_reduce` → `k_linear_mean_loop_reduce`), so the tuned prior's keys stopped matching → cold picks
+   (G 4.06 → 37.69 ms). **Re-tuning recovers it** (`tune <post/pre>_m16.json --bench --clean` → G 9.86 ms, 25.5 → 91.8
+   tok/s). The prior is per-user cache, so any deployment must re-tune after a compiler change.
+2. **Genuine lowering regression (residual, ~2.4×).** Even after a clean re-tune, G is **9.86 vs 4.06 ms** — same
+   shapes, same device-path code, only the compiler changed. So `main`'s refactor emits ~2.4× slower decode matmuls.
+   Host/dispatch is unchanged, so **Phase A's contribution stands** (it still removes the ~3 ms host overhead); the
+   regression is entirely in the kernels. Known issue — the tile-lowering owner is working on it.
 
 ### Phase B — drop `--enforce-eager` / whole-step capture (the big lever, higher risk)
 

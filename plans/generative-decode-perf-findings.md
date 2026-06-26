@@ -215,6 +215,11 @@ re-opened** — the profiling above shows host/dispatch is now 40% of the runner
   device-resident decode seam (captured-replay, torch↔cupy zero-copy): served decode **85.5 → 178.7 tok/s (~2×)**, gap
   to vLLM ~3.2× → **~1.5×** (still under `--enforce-eager`). Phase B (drop `--enforce-eager` for whole-step capture)
   remains, with smaller headroom than expected since A's captured-replay already removed most per-program dispatch.
+  ⚠️ **Post-merge:** the 178.7 was pre-merge; `main`'s tile-lowering refactor (#272–#279) then regressed the decode
+  kernels ~2.4× (G 4.06 → 9.86 ms re-tuned, even after `--clean` re-tuning; +9.3× before re-tuning, from stale prior
+  keys) → current main ~91.8 re-tuned / 25.5 stale. Phase A's device-residency is intact; the regression is in the
+  kernels `main` emits (known, owner working on it). Full split in `generative-device-resident-decode.md` → Post-merge
+  re-bench.
 - **Multi-bucket decode** (e.g., 8 / 32 / 128) to cover higher concurrency with tight padding, vs the single 16-bucket
   here. Memory cost: more program sets (Top risk #9).
 - **Per-`Dim` hint plumbing** → one symbolic program with a small M-tile, efficient at all widths (the cleanest
