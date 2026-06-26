@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
@@ -40,7 +41,7 @@ from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build, warp_chain_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
@@ -104,10 +105,14 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
         raise RuleSkipped("MONOID build applies once, to a MONOID seed")
     if op.dag.streaming and _is_warp_flash(op):
         # Warp-tier tensor-core flash: mark the kv-stream axis ``Schedule.carry`` (the
-        # fragment-tier realization) and hand the logical seed straight to assembly — no build
-        # move, no cooperative leaves (the warp chain replaces them here, matching the old
-        # ``split/005_warp_chain`` route). ``assembly/010_assemble`` dispatches on ``carry`` →
-        # ``realize_flash``. A terminal leaf: the later scalar passes gate off MONOID.
+        # fragment-tier realization) and hand the seed to assembly — no build move, no cooperative
+        # leaves (the warp chain replaces them here, matching the old ``split/005_warp_chain``
+        # route). ``assembly/010_assemble`` dispatches on ``carry``. A terminal leaf: the later
+        # scalar passes gate off MONOID. Under ``DEPLODOCK_FLASHWALK`` the seed is σ-tiled +
+        # atomized by ``warp_chain_build`` (it stamps ``carry`` itself) so assembly's generic
+        # ``carry_scope_from_graph`` walk realizes it; else the seed is marked for ``realize_flash``.
+        if config.flash_walk():
+            return [replace(op, tilegraph=warp_chain_build(op))]
         sched = replace(op.tilegraph.schedule, carry=frozenset({op.dag.chain.hinge_name}))
         return [replace(op, tilegraph=replace(op.tilegraph, schedule=sched))]
     leaves = _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
