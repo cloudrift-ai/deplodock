@@ -34,10 +34,7 @@ from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
-    CHAIN,
-    MAX_THREADS_PER_CTA,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
     coop_free_thread_knobs,
@@ -121,22 +118,16 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
                 **free_split_knobs(op.dag, t, (1, 1)),  # complete SPLIT, register forced to 1
                 fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=1, coop=br),
             }
-            if _chain_pinned() and _chain_applicable(op, br):
-                # Phase 1c: the FA-2 shared-score restructuring (register O[d] + INLINE
-                # score edge + the split carrier). Pin-driven opt-in for now — greedy keeps
-                # the scalar streaming nest until the search-fork integration (Phase 6).
-                knobs[CHAIN.name] = True
+            if fam.pin_inline_chain() and _chain_applicable(op, br):
+                # Phase 1c: the FA-2 shared-score restructuring (register O[d] + the score
+                # edge placed INLINE + the split carrier). Pin-driven opt-in for now —
+                # greedy keeps the scalar streaming nest until the search-fork integration.
+                knobs[fam.place_key(op.dag.chain.score)] = fam.INLINE
                 tg = chain_build(op.tilegraph, op.dag, knobs)
             else:
                 tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
             out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out
-
-
-def _chain_pinned() -> bool:
-    """The ``DEPLODOCK_CHAIN`` opt-in for the FA-2 shared-score restructuring."""
-    raw = CHAIN.raw()
-    return raw is not None and CHAIN.parse(raw)
 
 
 def _chain_applicable(op: TileGraphOp, br: int) -> bool:

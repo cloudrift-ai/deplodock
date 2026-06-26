@@ -286,6 +286,18 @@ def pin_place_mask(n: int) -> int | None:
     return _knob_legacy.stage_mask(n)
 
 
+def pin_inline_chain() -> bool:
+    """The opt-in for the FA-2 shared-score restructuring — the score edge placed
+    ``inline`` (register fragment). Native bare ``DEPLODOCK_PLACE=inline``, else the legacy
+    ``DEPLODOCK_CHAIN`` ingest."""
+    raw = pin(PLACE, "")
+    if raw is not None:
+        return place_of(raw) == INLINE
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.chain_pin()
+
+
 def pin_xport() -> bool | None:
     """Pinned transport for staged edges: native bare ``DEPLODOCK_PLACE`` carrying a
     ``:tma`` / ``:sync`` xport, else the legacy ``DEPLODOCK_TMA`` ingest. ``None`` =

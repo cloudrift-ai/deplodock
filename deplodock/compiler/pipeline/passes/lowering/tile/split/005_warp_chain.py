@@ -23,9 +23,9 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._warp_chain import assemble_warp_chain, warp_chain_eligible
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import CHAIN
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -34,8 +34,7 @@ PATTERN = [Pattern("root", LoopOp)]
 
 
 def _chain_pinned() -> bool:
-    raw = CHAIN.raw()
-    return raw is not None and CHAIN.parse(raw)
+    return fam.pin_inline_chain()
 
 
 def _static(d) -> int | None:

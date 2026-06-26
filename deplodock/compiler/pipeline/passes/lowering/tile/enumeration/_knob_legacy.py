@@ -103,6 +103,13 @@ def tma_pin() -> bool | None:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def chain_pin() -> bool:
+    """Legacy ``DEPLODOCK_CHAIN`` opt-in (ingested as ``PLACE@<score>=inline`` — the
+    FA-2 shared-score warp-chain). ``False`` when unset."""
+    raw = config.knob_raw("CHAIN")
+    return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def atom_raw() -> str | None:
     """The legacy ``DEPLODOCK_MMA`` env pin (``0``/``scalar`` / a kind / auto), ingested
     as the atom control for the matmul cell. ``None`` when unset."""
