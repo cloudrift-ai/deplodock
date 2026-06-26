@@ -75,8 +75,8 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   runner's pattern). This removed the ~40% host/dispatch overhead and ~2×'d served decode (see
   `plans/generative-device-resident-decode.md`). **Decode bucket:** it
   also compiles a **static M=`decode_bucket` (default 16)** `pre`/`post` twin per layer and uses it when
-  `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode M=1
-  (`plans/generative-decode-perf-findings.md`); falls back to symbolic above the bucket or if a static compile fails. So
+  `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode
+  M=1; falls back to symbolic above the bucket or if a static compile fails. So
   up to 4 capacity programs/layer — the memory budget the plan flags (Top risk #9).
 - `vllm_model_gen.py` — `DeplodockGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
   builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs

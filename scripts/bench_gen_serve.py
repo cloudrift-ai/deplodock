@@ -2,8 +2,7 @@
 """Bench a running generative (chat) server: single-stream decode tok/s (TTFT + steady-state)
 and concurrent system throughput. Talks to any OpenAI-compatible `/v1/chat/completions`
 endpoint — e.g. a server started by `deplodock serve <model> --generate` (the deplodock plugin)
-or `... --generate --stock` (native vLLM baseline). The reproducer behind the "End-to-end served
-validation" numbers in `plans/generative-decode-perf-findings.md`.
+or `... --generate --stock` (native vLLM baseline).
 
 Usage (start a server in one shell, bench in another):
     deplodock serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate --max-model-len 2048 \

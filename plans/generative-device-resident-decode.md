@@ -1,9 +1,9 @@
 # Device-resident generative decode + whole-step capture — scoping
 
 > Scoping doc for closing the remaining ~3× gap to native vLLM on generative (chat) serving, after the decode-bucket
-> (~11×) and kernel-tune (~2×) wins. Grounded in the profiling in
-> [`generative-decode-perf-findings.md`](generative-decode-perf-findings.md): the remaining gap is **overhead-bound**,
-> not kernel-bound. Status: **Phase A implemented + measured (served decode 85.5 → 178.7 tok/s, ~2×, gap to vLLM
+> (~11×) and kernel-tune (~2×) wins. Grounded in the runner-level profiling below (`scripts/profile_gen_decode.py`):
+> the remaining gap is **overhead-bound**, not kernel-bound. Status: **Phase A implemented + measured (served decode
+> 85.5 → 178.7 tok/s, ~2×, gap to vLLM
 > ~3.2× → ~1.5×); Phase B not started.** ⚠️ The 178.7 was measured **pre-merge**; a later `main` tile-lowering refactor
 > regressed these decode kernels ~2.4× (current main: ~91.8 re-tuned) — see **Post-merge re-bench** below. Phase A's
 > device-residency win is intact; the regression is in the kernels `main` now emits.

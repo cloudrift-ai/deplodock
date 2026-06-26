@@ -89,7 +89,7 @@ def _compile_split(wrapper, example_args, argnames, np_dtype):
     arg's axis-0 to a shared symbolic ``num_tokens`` Dim — the **prefill** program (one program,
     any width). ``argnames=None`` traces a **fully static** graph at the example shapes — the
     **decode-bucket** program (efficient at small M; the symbolic program's hint-sized M-tile is
-    pathological at decode — see ``plans/generative-decode-perf-findings.md``)."""
+    pathological at decode)."""
     import torch
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend

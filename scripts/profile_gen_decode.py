@@ -8,8 +8,8 @@ and decompose the time:
   W-G = host I/O + dispatch + Python overhead
 
 Decides whether the remaining vLLM gap is kernel-bound (-> tune / smaller bucket / M=1 lowering)
-or overhead-bound (-> device-resident interleave + whole-step CUDA-graph capture). The reproducer
-behind the "Profiling the tuned step" section of `plans/generative-decode-perf-findings.md`.
+or overhead-bound (-> device-resident interleave + whole-step CUDA-graph capture). See
+`plans/generative-device-resident-decode.md`.
 
 Usage:
     python scripts/profile_gen_decode.py --bucket 16

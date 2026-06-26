@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Bench the generative decode-bucket `post` subgraph vs cuBLAS (the reproducer behind
-`plans/generative-decode-perf-findings.md`).
+"""Bench the generative decode-bucket `post` subgraph vs cuBLAS.
 
 Times one decoder layer's carved `post` subgraph (o_proj + residual + post-norm + gated MLP)
 three ways at decode width:
