@@ -68,9 +68,11 @@ def reduce_tilegraphop(tg: TileGraph, *, extra_knobs: dict | None = None) -> Til
 
 
 def _grid_thread_axes(m_extent: int, n_extent: int) -> tuple[Axis, Axis, Axis, Axis, BinaryExpr, BinaryExpr]:
-    """The combine kernel's free-axis tower: ``GridTile(M_b, N_b) > ThreadTile(M_t,
+    """The 2-D combine kernel's free-axis tower: ``GridTile(M_b, N_b) > ThreadTile(M_t,
     N_t)`` over ``16×16`` tiles with ceil-div grid extents (a boundary ``Cond`` guards
-    a non-divisor M/N). Returns the four axes + the flattened ``(m_idx, n_idx)``."""
+    a non-divisor M/N). Returns the four axes + the flattened ``(m_idx, n_idx)``. The
+    matmul split-K combine is the rank-2 case — kept byte-identical (axis names + order)
+    by :func:`_out_axes`; a general reduction's output rank routes through the rank-N path."""
     m_blocks = -(-m_extent // _BM_RED)
     n_blocks = -(-n_extent // _BN_RED)
     M_b = Axis("M_b_red", to_dim(m_blocks))
@@ -82,11 +84,64 @@ def _grid_thread_axes(m_extent: int, n_extent: int) -> tuple[Axis, Axis, Axis, A
     return M_b, N_b, M_t, N_t, m_idx, n_idx
 
 
+def _out_axes(out_shape: tuple[int, ...]) -> tuple[tuple[Axis, ...], dict, tuple, BinaryExpr]:
+    """The combine kernel's free-axis tower for an **arbitrary output rank** — the
+    carrier-generic geometry generalization (a reduction's output is N-D: ``(M,)`` for a
+    plain ``x.sum(dim=-1)``, ``(M, N)`` for the matmul split-K, ``(B, M, N)`` for a
+    batched reduce). Returns ``(domain, binding, out_index, in_bounds)``: the THREAD-inner
+    / GRID-outer domain, the per-axis binding, the per-dim output index exprs, and the
+    boundary ``Cond`` guard.
+
+    The **innermost up-to-two** output axes get a ``16``-wide ``ThreadTile`` + ceil-div
+    ``GridTile`` (so one CTA owns a ``16×16`` output tile, one thread per cell — the
+    matmul's geometry); every leading axis is a pure ``GridTile`` (one block per
+    coordinate). The ``K_s`` partition stays the serial fold (added by the caller, not a
+    domain axis). The **rank-2** case delegates to :func:`_grid_thread_axes` so the matmul
+    split-K combine stays byte-identical (same axis names + domain order)."""
+    if len(out_shape) == 2:
+        m_extent, n_extent = out_shape
+        M_b, N_b, M_t, N_t, m_idx, n_idx = _grid_thread_axes(m_extent, n_extent)
+        domain = (M_t, N_t, M_b, N_b)
+        binding = {M_t.name: Binding.THREAD, N_t.name: Binding.THREAD, M_b.name: Binding.GRID, N_b.name: Binding.GRID}
+        in_bounds = BinaryExpr(
+            "&&", BinaryExpr("<", m_idx, Literal(m_extent, "int")), BinaryExpr("<", n_idx, Literal(n_extent, "int"))
+        )
+        return domain, binding, (m_idx, n_idx), in_bounds
+
+    r = len(out_shape)
+    tiled = set(range(max(0, r - 2), r))  # the innermost up-to-two axes get a 16-wide thread tile
+    thread_axes: list[Axis] = []
+    grid_axes: list[Axis] = []
+    binding: dict = {}
+    index: list = []
+    guards: list = []
+    for i, ext in enumerate(out_shape):
+        if i in tiled:
+            a_b = Axis(f"d{i}_b_red", to_dim(-(-ext // _BN_RED)))
+            a_t = Axis(f"d{i}_t_red", to_dim(_BN_RED))
+            idx = Var(a_b.name) * Literal(_BN_RED, "int") + Var(a_t.name)
+            thread_axes.append(a_t)
+            grid_axes.append(a_b)
+            binding[a_t.name] = Binding.THREAD
+            binding[a_b.name] = Binding.GRID
+            index.append(idx)
+            guards.append(BinaryExpr("<", idx, Literal(ext, "int")))
+        else:
+            a = Axis(f"d{i}_red", to_dim(ext))
+            grid_axes.append(a)
+            binding[a.name] = Binding.GRID
+            index.append(Var(a.name))
+    domain = (*thread_axes, *grid_axes)  # THREAD inner, GRID outer (``_free_layers`` tier order)
+    in_bounds = guards[0]
+    for g in guards[1:]:
+        in_bounds = BinaryExpr("&&", in_bounds, g)
+    return domain, binding, tuple(index), in_bounds
+
+
 def _combine_block(
     *,
     name: str,
-    m_extent: int,
-    n_extent: int,
+    out_shape: tuple[int, ...],
     inits: tuple[Stmt, ...],
     reduce_inner: tuple[Stmt, ...],
     s_axis: Axis,
@@ -95,40 +150,29 @@ def _combine_block(
     out_name: str,
     dtype: DataType,
 ) -> TileGraph:
-    """Assemble the combine ``Block`` from its per-carrier pieces.
+    """Assemble the combine ``Block`` from its per-carrier pieces, for an arbitrary
+    output rank (the geometry comes from :func:`_out_axes`).
 
-    Shape (after ``assemble``)::
+    Shape (after ``assemble``), illustrated for a 2-D output::
 
         GridTile(M_b, N_b)
           ThreadTile(M_t, N_t)
             <inits>
             SerialTile(K_s, reduce) { <reduce_inner: Load(s) + carrier fold> }
-            Cond(in-bounds) { <finalize>; Write(out[m, n], written) }
+            Cond(in-bounds) { <finalize>; Write(out[d...], written) }
 
-    ``domain`` carries the free axes (THREAD then GRID); the ``K_s`` serial reduce
-    rides ``compute`` (it is not a domain axis), exactly as the matmul's K tower does.
+    ``domain`` carries the free output axes (THREAD then GRID); the ``K_s`` serial reduce
+    rides ``compute`` (it is not a domain axis), exactly as the matmul's K tower does. The
+    ``reduce_inner`` Loads index ``workspace[s, *out_index]``, so the caller must build them
+    from the SAME :func:`_out_axes` ``out_index`` this block writes.
     """
-    M_b, N_b, M_t, N_t, m_idx, n_idx = _grid_thread_axes(m_extent, n_extent)
-    in_bounds = BinaryExpr(
-        "&&",
-        BinaryExpr("<", m_idx, Literal(m_extent, "int")),
-        BinaryExpr("<", n_idx, Literal(n_extent, "int")),
-    )
-    write = Write(output=out_name, index=(m_idx, n_idx), value=written, value_dtype=dtype)
+    domain, binding, out_index, in_bounds = _out_axes(out_shape)
+    write = Write(output=out_name, index=out_index, value=written, value_dtype=dtype)
     guarded = Cond(cond=in_bounds, body=Body((*finalize, write)))
     serial = SerialTile(axis=s_axis, body=Body(reduce_inner), kind="plain", unroll=True)
     compute = Body((*inits, serial, guarded))
-    # THREAD axes first, then GRID — ``assembly/_assemble._free_layers`` lays the tower
-    # in that tier order (THREAD inner, GRID outer).
-    domain = (M_t, N_t, M_b, N_b)
-    binding = {
-        M_t.name: Binding.THREAD,
-        N_t.name: Binding.THREAD,
-        M_b.name: Binding.GRID,
-        N_b.name: Binding.GRID,
-    }
     block = Block(name=name, domain=domain, compute=compute)
-    buffers = {out_name: Buffer(name=out_name, shape=(to_dim(m_extent), to_dim(n_extent)), dtype=dtype, space=Space.GMEM)}
+    buffers = {out_name: Buffer(name=out_name, shape=tuple(to_dim(e) for e in out_shape), dtype=dtype, space=Space.GMEM)}
     return TileGraph(name=name, buffers=buffers, blocks=(block,), schedule=Schedule(binding=binding))
 
 
