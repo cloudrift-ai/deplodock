@@ -24,12 +24,83 @@ from mistaking this for a rule.
 
 from __future__ import annotations
 
+import enum
+from dataclasses import dataclass
+
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
 from deplodock.compiler.ir.stmt import Accum, Cond, Monoid, Stmt, Write
 from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
+
+
+class Fold(enum.Enum):
+    """A combine stage's fold primitive — the hardware mechanism that merges the
+    partials at one level of the cross-execution-unit reduction hierarchy.
+
+    - ``SHFL`` — a lane-level register butterfly (``WarpShuffle`` / ``__shfl_xor_sync``).
+      The dominant intra-warp scheme (smem-within-a-warp is strictly dominated).
+    - ``SMEM`` — a cross-warp / block-wide smem tree-halve (``Smem`` slab + ``Sync`` +
+      ``TreeHalve``). Warps cannot shfl across each other, so the across-warps level is
+      always SMEM.
+    - ``ATOMIC`` — a cross-CTA in-place ``atomicAdd`` (the split-K finalize). Reserved
+      for the cross-CTA stage's finalize policy (Milestone 3); ``emit_combine`` (intra-CTA
+      only) never emits it.
+
+    The fold is **DERIVED from the execution level**, not tuned: lane → ``SHFL``,
+    across-warps → ``SMEM``, cross-CTA → ``ATOMIC``. The level is implied by the stage's
+    place in the plan."""
+
+    SHFL = "shfl"
+    SMEM = "smem"
+    ATOMIC = "atomic"
+
+
+@dataclass(frozen=True)
+class CombineStage:
+    """One level of the cross-execution-unit reduction hierarchy: a ``width`` of partials
+    folded by a ``fold`` primitive.
+
+    - ``width`` — DERIVED from the partition (the already-tuned cooperative / split-K
+      degree); the number of partials this stage merges.
+    - ``fold`` — DERIVED from the execution level (see :class:`Fold`).
+    - ``kernel_boundary`` — the cross-CTA stage's POLICY knob (Milestone 3): a deferred
+      fold in a fresh kernel vs an in-place atomic. Always ``False`` for the intra-CTA
+      stages :func:`derive_combine_plan` produces."""
+
+    width: int
+    fold: Fold
+    kernel_boundary: bool = False
+
+
+#: The combine as an ordered array of stages, outer→inner, applied after the in-thread
+#: ``(serial/fold)`` accumulation. A **derived** structure: assembled from the partition
+#: widths + the level→fold derivation, not stored as free per-cell knobs. The product of
+#: the intra-CTA widths equals the old ``coop`` thread count.
+CombinePlan = tuple[CombineStage, ...]
+
+
+def derive_combine_plan(n_threads: int, warp_size: int) -> CombinePlan:
+    """The intra-CTA :data:`CombinePlan` for an ``n_threads``-wide cooperative partition —
+    the typed representation of the geometry ``emit_combine`` used to pick by raw count.
+
+    Reproduces the three historical paths exactly:
+
+    - ``n_threads ≤ warp_size`` → one ``SHFL`` stage (the warp butterfly).
+    - ``n_threads`` a multiple of ``warp_size`` → ``SHFL`` (lanes) then ``SMEM`` (the
+      ``n_warps`` cross-warp tree) — the hierarchical scheme.
+    - otherwise (pow-of-two, not a clean warp multiple) → one ``SMEM`` stage (the
+      block-wide tree).
+
+    Requires a power-of-two ``n_threads`` (the butterfly / tree reorders)."""
+    if n_threads & (n_threads - 1):
+        raise ValueError(f"cross-thread combine needs a power-of-two thread count, got {n_threads}")
+    if n_threads <= warp_size:
+        return (CombineStage(n_threads, Fold.SHFL),)
+    if n_threads % warp_size == 0:
+        return (CombineStage(warp_size, Fold.SHFL), CombineStage(n_threads // warp_size, Fold.SMEM))
+    return (CombineStage(n_threads, Fold.SMEM),)
 
 
 def find_nested_reduce_carriers(stmts) -> dict[str, Stmt]:
@@ -106,23 +177,24 @@ def emit_combine(
     ``combine_operands()`` (the second-operand state names), ``combine_partials()``
     (the state-merges-state program). A scalar ``Accum`` is the degenerate
     1-component case; the tuple ``Monoid`` (flash online-softmax) is the general one.
-    Three paths, picked by ``n_threads`` (all require ``commutative`` — the butterfly
-    / tree reorders — checked at the carrier):
 
-    - **Warp** (``n_threads ≤ warp_size``, power of two): a single ``WarpShuffle``
-      register butterfly. No smem, no syncthreads. The XOR butterfly never crosses
-      an aligned ``n_threads``-lane group, so this is also the SEGMENTED per-row
-      combine for strided-cooperative rows (caller passes the segment size as
-      ``n_threads`` — see :func:`cooperative_combine_geometry`).
-    - **Hierarchical** (``n_threads`` a power-of-two multiple of ``warp_size``): each
-      warp first shuffle-reduces its lanes in place (broadcast within the warp);
-      lane 0 of each warp writes the per-warp state to a tiny ``smem[n_warps]`` slab
-      per component; one ``Sync`` + ``TreeHalve(length=n_warps, tid_var="warp")``
-      collapses across warps and broadcasts. The cross-warp reduce is one round of
-      compare-sync (``n_warps`` ≪ ``n_threads``) instead of ``log2(n_threads)``.
-    - **Block** (otherwise — power of two, not a clean warp multiple): each thread
-      writes its partial to a ``smem[n_threads]`` slab per component, one ``Sync``,
-      a single ``TreeHalve(length=n_threads)`` reduces + broadcasts in place.
+    The geometry is the derived intra-CTA :data:`CombinePlan`
+    (:func:`derive_combine_plan` of ``n_threads`` / ``warp_size``) — an ordered array of
+    :class:`CombineStage`s this function emits one-for-one (all require ``commutative`` —
+    the butterfly / tree reorders — checked at the carrier):
+
+    - a ``SHFL`` stage → a single ``WarpShuffle`` register butterfly (no smem, no
+      syncthreads). The XOR butterfly never crosses an aligned ``width``-lane group, so a
+      lone ``SHFL`` stage is also the SEGMENTED per-row combine for strided-cooperative
+      rows (caller passes the segment size as ``n_threads`` — see
+      :func:`cooperative_combine_geometry`).
+    - a ``SMEM`` stage **after** a ``SHFL`` stage → the *hierarchical* cross-warp slab:
+      each warp has already shuffle-reduced its lanes in place; lane 0 of each warp writes
+      the per-warp state to a tiny ``smem[width]`` slab per component; one ``Sync`` +
+      ``TreeHalve(length=width, tid_var="warp")`` collapses across warps and broadcasts.
+    - a standalone ``SMEM`` stage → the *block* slab: every thread writes its partial to a
+      ``smem[width]`` slab per component, one ``Sync``, a single ``TreeHalve`` reduces +
+      broadcasts in place.
 
     ``dtype`` flows from the carrier (``Accum.dtype``; fp32 for a ``Monoid``) so the
     smem slabs + the combine render in the accumulator's element type.
@@ -141,59 +213,45 @@ def emit_combine(
     prog = carrier.combine_partials()
     dtype = getattr(carrier, "dtype", None) or F32
 
-    if n_threads <= warp_size and (n_threads & (n_threads - 1)) == 0:
-        return [WarpShuffle(state=state, state_b=state_b, combine_states=prog, length=n_threads, dtype=dtype)]
-    if n_threads & (n_threads - 1):
-        raise ValueError(f"cross-thread combine needs a power-of-two thread count, got {n_threads}")
+    plan = derive_combine_plan(n_threads, warp_size)
 
     from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
 
     smem_c = _cuda_name(dtype)
     bufs = tuple(f"{st}_smem" for st in state)
-
-    if n_threads % warp_size == 0:
-        # Hierarchical: per-warp in-place WarpShuffle, lane-0 of each warp stages its
-        # warp's state into a tiny n_warps slab, a TreeHalve collapses + broadcasts.
-        n_warps = n_threads // warp_size
-        out: list[Stmt] = [WarpShuffle(state=state, state_b=state_b, combine_states=prog, length=warp_size, dtype=dtype)]
-        out += [Smem(name=b, extents=(n_warps,), dtype=smem_c) for b in bufs]
-        out.append(
-            Cond(
-                cond=BinaryExpr("==", Var("lane"), Literal(0, "int")),
-                body=tuple(Write(output=b, index=(Var("warp"),), value=st) for b, st in zip(bufs, state, strict=True)),
+    out: list[Stmt] = []
+    for i, stage in enumerate(plan):
+        if stage.fold is Fold.SHFL:
+            out.append(WarpShuffle(state=state, state_b=state_b, combine_states=prog, length=stage.width, dtype=dtype))
+        elif stage.fold is Fold.SMEM:
+            # Two SMEM forms, distinguished by the preceding stage: a cross-warp SMEM after
+            # a per-warp SHFL is the *hierarchical* slab — lane-0 of each warp stages its
+            # warp's broadcast state, indexed by ``warp``; a standalone SMEM is the *block*
+            # slab — every thread stages its own partial, indexed by ``t``.
+            hierarchical = i > 0 and plan[i - 1].fold is Fold.SHFL
+            tid_var = "warp" if hierarchical else t
+            out += [Smem(name=b, extents=(stage.width,), dtype=smem_c) for b in bufs]
+            if hierarchical:
+                out.append(
+                    Cond(
+                        cond=BinaryExpr("==", Var("lane"), Literal(0, "int")),
+                        body=tuple(Write(output=b, index=(Var("warp"),), value=st) for b, st in zip(bufs, state, strict=True)),
+                    )
+                )
+            else:
+                out += [Write(output=b, index=(Var(tid_var),), value=st) for b, st in zip(bufs, state, strict=True)]
+            out.append(Sync(barrier_id=barrier_id, count=barrier_count))
+            out.append(
+                TreeHalve(
+                    bufs=bufs,
+                    state=state,
+                    state_b=state_b,
+                    combine_states=prog,
+                    length=stage.width,
+                    tid_var=tid_var,
+                    dtype=dtype,
+                    barrier_id=barrier_id,
+                    barrier_count=barrier_count,
+                )
             )
-        )
-        out.append(Sync(barrier_id=barrier_id, count=barrier_count))
-        out.append(
-            TreeHalve(
-                bufs=bufs,
-                state=state,
-                state_b=state_b,
-                combine_states=prog,
-                length=n_warps,
-                tid_var="warp",
-                dtype=dtype,
-                barrier_id=barrier_id,
-                barrier_count=barrier_count,
-            )
-        )
-        return out
-
-    # Block: every thread stages its partial into a full-width slab, TreeHalve folds.
-    out = [Smem(name=b, extents=(n_threads,), dtype=smem_c) for b in bufs]
-    out += [Write(output=b, index=(Var(t),), value=st) for b, st in zip(bufs, state, strict=True)]
-    out.append(Sync(barrier_id=barrier_id, count=barrier_count))
-    out.append(
-        TreeHalve(
-            bufs=bufs,
-            state=state,
-            state_b=state_b,
-            combine_states=prog,
-            length=n_threads,
-            tid_var=t,
-            dtype=dtype,
-            barrier_id=barrier_id,
-            barrier_count=barrier_count,
-        )
-    )
     return out
