@@ -1,13 +1,18 @@
 """Pre-build pass: emit the fused tensor-core flash for an eligible streaming nest.
 
-Runs FIRST (before
-``010_split_demoted``), on the un-tiled flash ``LoopOp``: when ``DEPLODOCK_CHAIN=1`` and
-the nest is a streaming ``MONOID(SEMIRING)`` chain (``dag.chain``) in the v1 fused-TC
-scope (fp16, non-causal, equal-head, ``D%16==0``, ``S%16==0``), it replaces the LoopOp
-with a single ``TileOp`` running the warp-chain kernel (``_warp_chain.assemble_warp_chain``
-— the validated FA-2 kernel) and the engine splices it. Out of scope ⇒ ``RuleSkipped``,
-so the flash falls through to ``chain_build`` (scalar) / the materialized path — the
-deployed default is unchanged (this only fires under the explicit pin).
+Runs FIRST (before ``010_split_demoted``), on the un-tiled flash ``LoopOp``: when the nest
+is a streaming ``MONOID(SEMIRING)`` chain (``dag.chain``) in the fused-TC scope (fp16/bf16,
+causal or non-causal, equal-head or GQA, ``D%16==0``; static ``S%16==0`` OR symbolic
+``seq_len``), it replaces the LoopOp with a single ``TileOp`` running the warp-chain kernel
+(``_warp_chain.assemble_warp_chain``) and the engine splices it.
+
+**Routing (Phase 3 of ``plans/smem-tiled-symbolic-flash.md``):** a **symbolic** ``seq_len``
+flash fires the warp chain BY DEFAULT (the tensor-core / smem-shared-K/V flash is the
+deployed symbolic default — the ~100× win over the scalar streaming nest at seq=512). A
+**static** flash stays a ``DEPLODOCK_CHAIN=1`` opt-in (greedy keeps the scalar nest there
+until the static search-fork integration). Out of scope ⇒ ``RuleSkipped``, so the flash
+falls through to ``chain_build`` (scalar) / the materialized path — the correct fallback for
+the symbolic shapes the warp chain declines (fp32, odd ``D``, additive mask).
 """
 
 from __future__ import annotations
@@ -81,8 +86,6 @@ def _flash_params(op: LoopOp):
 
 def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     op: LoopOp = root.op
-    if not _chain_pinned():
-        raise RuleSkipped("warp-chain flash is CHAIN-pinned only")
     dag = iter_dag(op)
     if not dag.streaming or dag.chain is None:
         raise RuleSkipped("not a streaming-flash chain")
@@ -90,7 +93,15 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     if params is None:
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
     B, H, S, D, group, dt, causal, seq_var = params
-    if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=causal, mask=False, symbolic=seq_var is not None):
+    symbolic = seq_var is not None
+    # Phase 3 — the warp chain is the **symbolic** default (the tensor-core / smem-shared K/V
+    # flash; the scalar streaming `chain_build` stays the fallback for the non-eligible
+    # symbolic shapes `070_coop_reduce` still handles: odd D, additive mask). A **static**
+    # flash stays a `DEPLODOCK_CHAIN=1` opt-in (greedy keeps the scalar nest there — the
+    # static search-fork integration is later work).
+    if not symbolic and not _chain_pinned():
+        raise RuleSkipped("static warp-chain flash is CHAIN-pinned only")
+    if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=causal, mask=False, symbolic=symbolic):
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
     # Run the algebraic ``atomize`` move on the two cells HERE (the ``split`` phase may
     # import ``enumeration``; the ``assembly`` may not) — the operand layout (``b_trans``
