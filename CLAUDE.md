@@ -122,8 +122,9 @@ same worker.
   per-variant `perf` cache, so an identical re-run (same prior) replays every variant with no GPU bench, while the
   ever-changing global prior can steer the same-patience search down a new trajectory and bench only the genuinely-new
   variants it surfaces (the old `op_effort` skip-already-tuned gate, which suppressed that re-exploration, is gone).
-  Persists `perf` / `lowering` / inventory rows to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or
-  `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
+  Persists `perf` / `lowering` / inventory rows — plus a `node` row per search-tree node (keyed/deduped,
+  keep-min value-of-position latency, full feature dict + `parent_key`; written alongside the prior's reservoir,
+  no current reader) — to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
