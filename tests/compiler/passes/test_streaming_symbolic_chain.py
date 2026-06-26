@@ -160,12 +160,12 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import warp_chain_build
 
-    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so flash_params admits the warp scope.
+    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so warp_chain_build reads the 16-bit atom.
     shp = (Dim(1), Dim(1), Dim(64), Dim(16))
     loop = build_flash_frag("q", "k", "v", shp, shp, shp, Tensor("o", shp, F32), causal=False).nodes["o"].op
     dag = iter_dag(loop)
     # The synthetic recognizer fragment carries no input shapes (the real pipeline gets 4D shapes
-    # from the trace); supply the (B,H,S,D) fp16 buffers `flash_params` derives geometry from.
+    # from the trace); supply the (B,H,S,D) fp16 buffers `warp_chain_build` reads the operand dtype off.
     buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
     op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
     chain = dag.chain

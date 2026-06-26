@@ -30,9 +30,8 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Stmt, Write
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
-    ATOM_REGISTRY,
     AffineAddressing,
     AtomTile,
     Binding,
@@ -47,9 +46,8 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import add as _fadd
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import mul as _fmul
+from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
+from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
@@ -265,24 +263,32 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     here off ``Schedule.carry``. This is the graph walk that replaced the hand-assembled
     ``realize_flash``."""
     block = graph.blocks[0]
-    fp = flash_params(graph.buffers, block.writes[0].buffer)
-    out, D, S, seq_var, causal = fp.out, fp.D, fp.S, fp.seq_var, fp.causal
-    atom = ATOM_REGISTRY[fp.atom_kind]
-    atom_m, atom_n, _atom_k = atom.shape
-    ab_dt = atom.operand_dtype("a")
-    scale = f"{1.0 / math.sqrt(D)!r}f"
-    nd = D // atom_n
-    symbolic = seq_var is not None
-    seq = Var(seq_var) if symbolic else Literal(S, "int")
+    out = block.writes[0].buffer  # the output buffer — the RegStore target
 
     # The kv-stream serial-outer carry + its full twisted carrier (the online-softmax Monoid that
     # ``warp_chain_build`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
     kv_loop = next(s for s in block.compute if isinstance(s, SerialTile) and s.kind == "serial_outer")
     carrier = next(s for s in kv_loop.body if isinstance(s, Monoid))
+    causal = any(isinstance(s, Select) for s in kv_loop.body)  # the score-mask Select — structural, not a flag
     is_qkt = lambda t: any(isinstance(s, Mma) and s.b_trans for s in t.body.iter())  # noqa: E731
     produce_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and is_qkt(t)]
     consume_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and not is_qkt(t)]
     nt_count = len(produce_tiles)
+
+    # Geometry off the graph, no flash descriptor: the atom off the Mma cell; the head dim ``D`` off
+    # the P@V output-atom count (``nd·atom_n``); the seq extent off the kv-stream axis (its
+    # ``source_axis`` carries the un-tiled extent — static ``S`` or the symbolic ``seq_len``).
+    atom = produce_tiles[0].atom
+    atom_m, atom_n, _atom_k = atom.shape
+    ab_dt = atom.operand_dtype("a")
+    nd = len(consume_tiles)
+    D = nd * atom_n
+    scale = f"{1.0 / math.sqrt(D)!r}f"
+    seq_ext = (kv_loop.axis.source_axis or kv_loop.axis).extent
+    symbolic = not seq_ext.is_static
+    seq_var = next(iter(seq_ext.expr.free_vars())) if symbolic else None
+    S = None if symbolic else seq_ext.as_static()
+    seq = Var(seq_var) if symbolic else Literal(S, "int")
 
     qb = Var(block.domain[0].name)  # the query block axis (GRID), one warp / 16 query rows
     kv = Var(kv_loop.axis.name)  # the kv stream var
@@ -307,6 +313,10 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
             return {}
         return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * atom_n), seq)}
 
+    # Realize the score fragments + their fragment-tier transforms. The causal mask fires off the
+    # graph's ``Select`` (``causal`` above), the boundary mask off the symbolic ``seq`` — both are
+    # structural facts (a graph op / a shape extent), never an attention flag; the scale is keyed on
+    # the shape fact ``D``.
     produce: list = [_relabel_tile(t, c=f"Sf{nt}", sfx=f"q{nt}", guards=_qk_guards(nt)) for nt, t in enumerate(produce_tiles)]
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(nt_count)]
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
