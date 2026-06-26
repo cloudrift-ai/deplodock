@@ -23,10 +23,15 @@ remains.
   cta=2 and cta=4) — `tests/compiler/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure`
   (one matrix over carrier × finalize). The matmul / `sum` / flash share ONE `_build_fragment`; the additive `Accum` is
   the degenerate 1-component instantiation of the twisted state emission.
-- **M4 (partly done)** — the carrier→producer derivation is recorded in the tile-lowering ARCHITECTURE (the producer
-  mirrors the intra-CTA cooperative producer, one partition level up). Surfacing `cta` as an autonomous reduce-offer
-  search dimension (un-gating it from pin-only) still needs the `AnalyticPrior` to rank `cta = 1` first for the reduce
-  regime so greedy / cold stay split-free (the matmul already does; the reduce weights do not yet).
+- **M4 (docs done; search-surfacing deferred by design)** — the carrier→producer derivation is recorded in the
+  tile-lowering ARCHITECTURE (the cross-CTA producer mirrors the intra-CTA cooperative producer exactly — one move, two
+  partition levels: `br` on a THREAD lane, `cta` on the `K_s` GRID partition). `cta > 1` stays **pin-gated** for both the
+  additive reduce and the flash split-KV: surfacing it as an autonomous reduce-offer search dimension (un-gating it so the
+  tuner explores it) first needs the `AnalyticPrior` to rank `cta = 1` first for the reduce regime so greedy / cold stay
+  split-free — the matmul regime already does, the reduce weights favor a degenerate split, so un-gating today would flip
+  the greedy default for a plain `sum` / SDPA. That is an analytic-prior re-fit (`scripts/golden_knob_heuristics.py`),
+  orthogonal to this producer work and left as the one open follow-up; the producer + combine themselves are reachable
+  (pinned) and verified for every carrier.
 
 Closes the last asymmetry in the monoid-combine work: the cross-execution-unit reduction
 *combine* is carrier-generic at every level, but the *producer* that emits the partials is split — intra-CTA
