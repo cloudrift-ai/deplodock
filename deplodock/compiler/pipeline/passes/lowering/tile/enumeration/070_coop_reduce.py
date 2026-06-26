@@ -106,21 +106,33 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     lays the ``K_c`` lane on the streaming axis (cooperative-KV), constrained by the
     cross-lane combine geometry (whole-CTA tree vs strided intra-warp segment)."""
     bk = _streaming_bk(op.dag)  # Phase 1: KV-tile re-bracket of the streaming axis (pin-honored)
+    symbolic = op.dag.k_bound is not None
     out: list[TileGraphOp] = []
     for br in streaming_br_offers(op.dag):
-        offers = thread_offers(op.dag, Budget(max_threads=max(1, MAX_THREADS_PER_CTA // br)))
+        budget = Budget(max_threads=max(1, MAX_THREADS_PER_CTA // br))
+        offers = [t for t in thread_offers(op.dag, budget) if streaming_coop_geometry_ok(br, t[0] * t[1])]
+        # A **symbolic** streaming (KV) axis is serial-locked (``BR = BK = 1``). With a
+        # carried-contraction chain, ``chain_build`` (the FA-2 shared-score restructuring)
+        # makes it efficient — the QK^T score is computed ONCE per KV step and shared across
+        # the P@V output ``d`` (register vector ``O[d]``), not recomputed per ``d``. That is
+        # the symbolic DEFAULT: ``monoid_build`` would recompute the score per ``d`` and run
+        # unboundedly long (Finding 1, qwen3-emb-0.6b layer 0). A static stream keeps the
+        # pin-gated opt-in (greedy stays the scalar nest until the search-fork integration).
+        use_chain = _chain_applicable(op, br) and (symbolic or fam.pin_inline_chain())
+        # Without a chain (a streaming monoid with no inner contraction) a symbolic axis
+        # falls back to ``monoid_build``'s serial stream, where the free-axis tile can't move
+        # the reduce-bound kernel — so collapse the futile fork to one canonical leaf.
+        if symbolic and not use_chain:
+            offers = offers[:1]
         for t in offers:
-            if not streaming_coop_geometry_ok(br, t[0] * t[1]):
-                continue
             knobs = {
                 **op.knobs,
                 **free_split_knobs(op.dag, t, (1, 1)),  # complete SPLIT, register forced to 1
                 fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=1, coop=br),
             }
-            if fam.pin_inline_chain() and _chain_applicable(op, br):
+            if use_chain:
                 # Phase 1c: the FA-2 shared-score restructuring (register O[d] + the score
-                # edge placed INLINE + the split carrier). Pin-driven opt-in for now —
-                # greedy keeps the scalar streaming nest until the search-fork integration.
+                # edge placed INLINE + the split carrier).
                 knobs[fam.place_key(op.dag.chain.score)] = fam.INLINE
                 tg = chain_build(op.tilegraph, op.dag, knobs)
             else:
@@ -130,7 +142,13 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
 
 
 def _chain_applicable(op: TileGraphOp, br: int) -> bool:
-    """Whether ``chain_build`` covers this nest: a carried-contraction chain, a static
-    streaming axis (the symbolic-K masked stream is future work), and no cooperative-KV
-    (``BR == 1`` — the cooperative combine isn't wired through the split carrier yet)."""
-    return op.dag.chain is not None and br == 1 and all(n.loop.axis.extent.is_static for n in op.dag.reduce)
+    """Whether ``chain_build`` covers this nest: a carried-contraction chain and no
+    cooperative-KV (``BR == 1`` — the cooperative combine isn't wired through the split
+    carrier yet). The **hinge** (KV stream) axis MAY be symbolic — ``chain_build`` keeps it
+    a serial runtime-bounded loop (no tiling → no masking, every ``kv < seq_len`` is valid);
+    every OTHER contraction (the inner QK^T score reduce) must be static, since the score is
+    a register-shared reduce rather than a masked one."""
+    chain = op.dag.chain
+    if chain is None or br != 1:
+        return False
+    return all(n.loop.axis.extent.is_static for n in op.dag.reduce if n.loop.axis.name != chain.hinge_name)
