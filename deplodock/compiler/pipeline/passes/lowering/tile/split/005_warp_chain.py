@@ -30,7 +30,6 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.tile.ir import Buffer, Space, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._flash import warp_chain_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -53,6 +52,19 @@ def _static(d) -> int | None:
     if as_static is not None and getattr(d, "is_static", True):
         return as_static()
     return None
+
+
+def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
+    """The fused-TC-flash scope: 16-bit (fp16 / bf16), causal **or** non-causal (masked at the
+    score fragment), ``D % 16 == 0``. A **symbolic** ``seq_len`` is accepted (the partial final
+    tile is masked / clamped / guarded) and drops the ``S % 16 == 0`` requirement; a STATIC ``S``
+    still requires ``S % 16 == 0``. **GQA** (``group > 1``) is accepted — K/V at ``head // group``.
+    Additive-mask falls back to the scalar chain. (Dtype is gated in ``_flash_params``.)"""
+    if mask or group < 1 or H % group != 0 or D % 16 != 0 or not (16 <= D <= 256):
+        return False
+    if symbolic:
+        return True
+    return S % 16 == 0 and S >= 16
 
 
 def _flash_params(op: LoopOp):

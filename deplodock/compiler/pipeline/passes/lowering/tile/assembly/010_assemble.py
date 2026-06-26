@@ -16,8 +16,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._flash import realize_flash
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready, realize_flash
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
