@@ -37,9 +37,16 @@ class CarryScope:
     new carrier state from it, ``rescale`` the accumulator by the carrier (the twist),
     ``handoff`` the C→A edge realization, ``consume`` (accumulate the consumer cell into the
     rescaled accumulator), ``update`` (commit the carrier state). A degenerate SEMIRING
-    K-reduce populates only ``consume`` (the ``Mma`` accumulates in place)."""
+    K-reduce populates only ``consume`` (the ``Mma`` accumulates in place).
 
-    axis: Axis
+    ``axis`` is the streaming/reduce loop the phases iterate — set for a **phase-built**
+    carry (``assemble_carry`` builds the ``SERIAL_OUTER`` loop: flash's kv-stream, a monoid
+    reduce). It is ``None`` for an **embedded** carry — a matmul / scalar reduce whose K
+    serial tower the enumeration K re-bracket already embedded in ``consume`` and whose
+    per-tile work is one in-place ``Accum`` / ``Mma`` — where the phases ARE the body and no
+    loop is built at assembly time."""
+
+    axis: Axis | None = None
     init: tuple[Stmt, ...] = ()
     produce: tuple[Stmt, ...] = ()
     merge: tuple[Stmt, ...] = ()
