@@ -12,7 +12,7 @@ therefore makes ``chain_build`` the **enumeration default** for a symbolic strea
 This is the **fallback** for the symbolic shapes the tensor-core warp chain declines: as of
 Phase 3 of ``plans/smem-tiled-symbolic-flash.md``, an *eligible* symbolic flash (fp16/bf16,
 ``D%16==0``, equal-head or GQA) is intercepted **before** enumeration by
-``split/005_warp_chain`` and deployed as the smem-tiled tensor-core warp chain (the perf
+the ``070_coop_reduce`` warp-flash fork and deployed as the smem-tiled tensor-core warp chain (the perf
 win); ``chain_build`` then serves only the non-eligible symbolic flashes (fp32, odd ``D``,
 additive mask). These tests seed the enumeration directly (the buffers are **fp32**, so the
 warp chain doesn't apply) — they pin the ``chain_build`` fallback routing.

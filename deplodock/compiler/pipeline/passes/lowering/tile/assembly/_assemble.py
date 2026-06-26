@@ -228,7 +228,7 @@ def _fmul(a, b: int):
 
 def realize_flash(op: TileGraphOp) -> TileOp:
     """The fragment-tier specialization of :func:`assemble_carry` — the warp-tier streaming
-    flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``split/005_warp_chain``)
+    flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``enumeration/070_coop_reduce``)
     marked with ``Schedule.carry``. It is NOT a separate assembler: it builds the
     ``CarryScope`` (the produce / merge / handoff / consume / epilogue phases of the
     online-softmax stream) and hands it to ``assemble_carry`` like every other carry.

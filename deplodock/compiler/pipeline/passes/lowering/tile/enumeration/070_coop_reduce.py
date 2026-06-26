@@ -17,7 +17,14 @@ strided-cooperative free tile (``coop_reduce_offers``); a streaming flash search
 free-axis THREAD tile (``thread_offers``) with ``BK = FK = 1`` and ``BR`` over the **static**
 KV axis (``streaming_br_offers`` — cooperative-KV, opt-in; a symbolic streaming axis stays
 serial). Both pin ``REGISTER = 1`` (one element per cell-owner) and ``SPLITK = 1`` (the
-partition rides THREAD, not a cross-CTA split). This single fork owns the regime end to end:
+partition rides THREAD, not a cross-CTA split).
+
+A streaming flash in the **16-bit tensor-core scope** (``_is_warp_flash`` — fp16/bf16,
+``D%16==0``, GQA-or-equal-head, static ``S%16==0`` OR symbolic ``seq_len``) instead deploys the
+**warp-tier chain**: this pass marks the kv-stream axis ``Schedule.carry`` and hands the logical
+seed to assembly, where ``_assemble.realize_flash`` realizes the fragment-tier online-softmax (the
+former ``split/005_warp_chain`` route, folded in here). Symbolic is the deployed default (the
+~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in. This single fork owns the regime end to end:
 the scalar passes ``090``/``100``/``110`` and ``120_stage`` gate off ``MONOID`` (a monoid
 reduce stays smem-free — each lane reads its own ``K_c``-strided slice, no cross-thread reuse).
 """
@@ -27,6 +34,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
@@ -71,10 +79,73 @@ def _streaming_bk(dag) -> int:
 PATTERN = [Pattern("root", TileGraphOp)]
 
 
+def _static(d) -> int | None:
+    if isinstance(d, int):
+        return d
+    f = getattr(d, "as_static", None)
+    return f() if (f is not None and getattr(d, "is_static", True)) else None
+
+
+def _warp_chain_eligible(*, B, H, S, D, group, causal, symbolic) -> bool:  # noqa: ARG001 — causal/B accepted for parity
+    """The fused-TC-flash geometry scope: ``D % 16 == 0`` (16 ≤ D ≤ 256), GQA group divides H,
+    and static ``S % 16 == 0`` OR a symbolic ``seq_len`` (any runtime size). Dtype (16-bit) is
+    gated by :func:`_warp_flash_params`."""
+    if group < 1 or H % group != 0 or D % 16 != 0 or not (16 <= D <= 256):
+        return False
+    return True if symbolic else (S % 16 == 0 and S >= 16)
+
+
+def _warp_flash_params(op: TileGraphOp):
+    """``(B, H, S, D, group, causal, symbolic)`` for a streaming-flash op derived from its
+    logical gmem ``buffers``, or ``None`` when out of the 16-bit warp scope (a 4th rank-4 input
+    = additive mask, non-16-bit dtype, or non-static B/H/D). The realizer (``realize_flash``)
+    re-derives the same off the buffers — this is the enumeration-side eligibility query."""
+    buffers = op.buffers
+    out = op.tilegraph.blocks[0].writes[0].buffer
+    ins = [(n, b) for n, b in buffers.items() if len(b.shape) == 4 and n != out]
+    if len(ins) != 3:  # an additive mask adds a 4th rank-4 input — out of scope
+        return None
+    (_qn, q), (_kn, k), (_vn, _v) = ins
+    if q.dtype not in (F16, BF16):
+        return None
+    B, H, D = _static(q.shape[0]), _static(q.shape[1]), _static(q.shape[3])
+    S = _static(q.shape[2])  # None ⇒ symbolic seq_len
+    kvh = _static(k.shape[1])
+    if kvh in (None, 0) or any(x is None for x in (B, H, D)):
+        return None
+    causal = any("ninf" in n for n in buffers)
+    return B, H, S, D, H // kvh, causal, S is None
+
+
+def _is_warp_flash(op: TileGraphOp) -> bool:
+    """Whether this streaming flash deploys the **warp-tier tensor-core chain** (vs the
+    cooperative / scalar streaming nest): in the 16-bit warp scope AND either a symbolic
+    ``seq_len`` (the deployed default — the ~100× win) or a static shape under ``DEPLODOCK_CHAIN``.
+    (Folds the former ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
+    if op.dag.chain is None:
+        return False
+    params = _warp_flash_params(op)
+    if params is None:
+        return False
+    symbolic = params[-1]
+    if not symbolic and not fam.pin_inline_chain():
+        return False
+    b, h, s, d, group, causal, _ = params
+    return _warp_chain_eligible(B=b, H=h, S=s or 0, D=d, group=group, causal=causal, symbolic=symbolic)
+
+
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
     if op.algebra is not AlgebraKind.MONOID or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs:
         raise RuleSkipped("MONOID build applies once, to a MONOID seed")
+    if op.dag.streaming and _is_warp_flash(op):
+        # Warp-tier tensor-core flash: mark the kv-stream axis ``Schedule.carry`` (the
+        # fragment-tier realization) and hand the logical seed straight to assembly — no build
+        # move, no cooperative leaves (the warp chain replaces them here, matching the old
+        # ``split/005_warp_chain`` route). ``assembly/010_assemble`` dispatches on ``carry`` →
+        # ``realize_flash``. A terminal leaf: the later scalar passes gate off MONOID.
+        sched = replace(op.tilegraph.schedule, carry=frozenset({op.dag.chain.hinge_name}))
+        return [replace(op, tilegraph=replace(op.tilegraph, schedule=sched))]
     leaves = _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
     if not leaves:
         raise RuleSkipped("no legal MONOID decomposition")
