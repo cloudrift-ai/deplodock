@@ -108,37 +108,82 @@ def split_complete(raw: object) -> bool:
 # --- REDUCE codec: ``"s<serial>/f<fold>/c<cta>/t<coop>"`` — the four reduce-decomposition
 # tower components. Which fields are legal is the carrier's traits (``associative →
 # {s,f}``, ``commutative → {c,t}``); an illegal field is forced to 1 (= identity = no
-# decomposition). ---
+# decomposition). The ``c`` (cross-CTA / split-K) field additionally carries the cross-CTA
+# **combine stage**'s finalize fold as a trailing letter (``c<cta>a`` = ATOMIC in-place,
+# ``c<cta>k`` = deferred KERNEL-boundary) — the ``CombineStage(width=cta, fold, kernel_boundary)``
+# of the cross-CTA level. A bare ``c<cta>`` (no letter) is the pre-decision transient the
+# reduce-decomp emits; ``140_atomic_free_splitk`` completes it to ``a``/``k``. ``c1`` carries
+# no finalize (no cross-CTA stage). ---
+
+#: The cross-CTA finalize folds (the ``c`` field's trailing letter ↔ the policy name).
+ATOMIC = "atomic"
+KERNEL = "kernel"
+_FINALIZE_CODE = {ATOMIC: "a", KERNEL: "k"}
+_FINALIZE_NAME = {"a": ATOMIC, "k": KERNEL}
 
 
 @dataclass(frozen=True)
 class Decomp:
-    """The four reduce-decomposition factors of one ``REDUCE@axis`` value.
+    """The four reduce-decomposition factors of one ``REDUCE@axis`` value, plus the
+    cross-CTA finalize.
 
     - ``serial`` — intra-CTA K-loop trip (``ext/serial`` stage-inner chunk).
     - ``fold`` — register strip-mine into independent accumulators.
     - ``cta`` — cross-CTA split (split-K).
     - ``coop`` — cooperative-thread partition (warp-shuffle / tree combine).
+    - ``finalize`` — the cross-CTA stage's combine fold: ``"atomic"`` (in-place ``atomicAdd``)
+      or ``"kernel"`` (deferred combine kernel). Meaningful only when ``cta > 1``; defaults to
+      ``"atomic"`` (the historical split-K default).
 
-    ``1`` in any field is the identity (no decomposition on that lever)."""
+    ``1`` in any factor is the identity (no decomposition on that lever)."""
 
     serial: int = 1
     fold: int = 1
     cta: int = 1
     coop: int = 1
+    finalize: str = ATOMIC
 
 
-def enc_reduce(serial: int = 1, fold: int = 1, cta: int = 1, coop: int = 1) -> str:
-    return f"s{serial}/f{fold}/c{cta}/t{coop}"
+def enc_reduce(serial: int = 1, fold: int = 1, cta: int = 1, coop: int = 1, finalize: str | None = None) -> str:
+    """Encode a ``REDUCE@axis`` value. ``finalize`` (``"atomic"`` / ``"kernel"``) stamps the
+    cross-CTA ``c`` field's trailing letter; ``None`` (the default) emits a **bare** ``c<cta>``
+    — the pre-decision transient the reduce-decomp move emits before ``140`` picks the finalize.
+    ``cta <= 1`` never carries a letter (no cross-CTA stage)."""
+    c = f"c{cta}" if cta <= 1 or finalize is None else f"c{cta}{_FINALIZE_CODE[finalize]}"
+    return f"s{serial}/f{fold}/{c}/t{coop}"
 
 
 def dec_reduce(raw: object) -> Decomp:
+    """Decode a ``REDUCE@axis`` value, parsing the ``c`` field's optional finalize letter
+    (``a``/``k``). A bare ``c<cta>`` (no letter) decodes ``finalize="atomic"`` — the semantic
+    default — so a consumer reading a pre-decision or legacy value still gets a well-defined
+    combine (use :func:`reduce_finalize_decided` to tell bare from an explicit ``a``)."""
     fields: dict[str, int] = {}
+    finalize = ATOMIC
     for part in str(raw).split("/"):
         part = part.strip()
-        if part:
-            fields[part[0]] = int(part[1:])
-    return Decomp(serial=fields.get("s", 1), fold=fields.get("f", 1), cta=fields.get("c", 1), coop=fields.get("t", 1))
+        if not part:
+            continue
+        tag, val = part[0], part[1:]
+        if tag == "c":
+            letter = val[-1:] if val[-1:] in _FINALIZE_NAME else ""
+            num = val[: -len(letter)] if letter else val
+            fields["c"] = int(num) if num else 1
+            if letter and fields["c"] > 1:
+                finalize = _FINALIZE_NAME[letter]
+        else:
+            fields[tag] = int(val)
+    return Decomp(serial=fields.get("s", 1), fold=fields.get("f", 1), cta=fields.get("c", 1), coop=fields.get("t", 1), finalize=finalize)
+
+
+def reduce_finalize_decided(raw: object) -> bool:
+    """True once the ``c`` field carries an explicit finalize letter (``a``/``k``) — the
+    idempotence guard ``140`` reads (bare ``c<cta>`` means the finalize is still pending)."""
+    for part in str(raw).split("/"):
+        part = part.strip()
+        if part[:1] == "c":
+            return part[-1:] in _FINALIZE_NAME
+    return False
 
 
 # --- Native env pins. ``DEPLODOCK_<MOVE>_<ELEMENT>`` first, bare ``DEPLODOCK_<MOVE>``
@@ -186,9 +231,47 @@ def reduce_fields(dag, axis: str) -> tuple[int | None, int | None, int | None, i
 
     raw = pin(REDUCE, axis)
     if raw is not None:
+        # A **partial** native pin (only the fields PRESENT in the string) leaves the rest free —
+        # the native replacement for the legacy single-field ``BK``/``FK``/``SPLITK``/``BR`` pins.
+        # ``DEPLODOCK_REDUCE=t128`` pins only ``coop`` (the offer still picks ``serial`` so the
+        # reduce extent is covered); ``c2k`` pins only ``cta`` (+ the finalize, read by
+        # ``pin_finalize``). A full ``s/f/c/t`` spec pins everything (a recorded golden).
+        present = {p.strip()[0] for p in str(raw).split("/") if p.strip()}
         d = dec_reduce(raw)
-        return (d.serial, d.fold, d.cta, d.coop)
+        return (
+            d.serial if "s" in present else None,
+            d.fold if "f" in present else None,
+            d.cta if "c" in present else None,
+            d.coop if "t" in present else None,
+        )
     return _knob_legacy.reduce_fields(dag, axis)
+
+
+def pin_finalize(axis: str) -> str | None:
+    """The pinned cross-CTA finalize for ``axis`` — ``"atomic"`` / ``"kernel"``, or ``None``
+    (auto). The env override ``140`` honors when narrowing its finalize offer (the codec's
+    ``c``-suffix fork). Sourced, in order, from:
+
+    1. the native ``REDUCE@<axis>`` codec pin's ``c``-letter (``DEPLODOCK_REDUCE_<axis>`` /
+       bare ``DEPLODOCK_REDUCE`` carrying e.g. ``c2k`` / ``c2a``) — the finalize lives IN the
+       reduce codec, so one native knob owns both the split-K width and its finalize;
+    2. a standalone ``DEPLODOCK_FINALIZE_<axis>`` / bare ``DEPLODOCK_FINALIZE`` convenience pin.
+
+    Replaces the removed ``DEPLODOCK_NOATOMIC`` pin (``kernel`` ≡ the old ``NOATOMIC=1``)."""
+    rraw = pin(REDUCE, axis)
+    if rraw is not None and reduce_finalize_decided(rraw):
+        return dec_reduce(rraw).finalize
+    raw = config.knob_raw(f"FINALIZE_{axis.upper()}")
+    if raw is None:
+        raw = config.knob_raw("FINALIZE")
+    if raw is None:
+        return None
+    r = raw.strip().lower()
+    if r in ("kernel", "deferred", "k", "1", "true", "noatomic"):
+        return KERNEL
+    if r in ("atomic", "a", "0", "false"):
+        return ATOMIC
+    return None
 
 
 # --- PLACE codec: ``place[:xport]`` — the per-edge placement lattice + transport. ---

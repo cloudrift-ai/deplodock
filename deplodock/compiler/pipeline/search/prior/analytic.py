@@ -203,18 +203,17 @@ class AnalyticPrior(Prior):
         feats = knob.knob_features(knobs)
         w_set = self._w_dyn if feats.get("S_ext_n_symbolic_axis", 0.0) > 0 else self._w
         quality = sum(w * feats.get(k, 0.0) for k, w in w_set.items())
-        # Atomic-free split-K gate (local term — see __init__). ``NOATOMIC`` is the
-        # canonical knob name of ``ATOMIC_FREE_SPLITK`` (1 when the workspace fork is
-        # on). The ``af_on · (±1)`` product is the interaction a plain weight can't
-        # express: above the split threshold REWARD atomic-free (higher quality →
-        # lower latency proxy), below it PENALIZE so a narrow split keeps the cheap
-        # atomicAdd fast-path. NOATOMIC=False scores zero either way (af_on = 0), so
-        # the atomic path keeps its geometry-driven rank.
-        af_on = feats.get("NOATOMIC", 0.0)
+        # Deferred-kernel split-K finalize gate (local term — see __init__). The
+        # cross-CTA finalize is the REDUCE codec's ``c`` letter, featurized as
+        # ``D_finalize_kernel`` (1 when the deferred ``c<cta>k`` combine kernel is on).
+        # The ``af_on · (±1)`` product is the interaction a plain weight can't express:
+        # above the split threshold REWARD the deferred fold (higher quality → lower
+        # latency proxy), below it PENALIZE so a narrow split keeps the cheap atomicAdd
+        # fast-path. The atomic finalize scores zero either way (af_on = 0), so it keeps
+        # its geometry-driven rank.
+        af_on = feats.get("D_finalize_kernel", 0.0)
         if af_on:
-            # Native rows carry the split-K count as ``D_splitk`` (REDUCE@<k>.cta);
-            # a legacy row also exposes the raw ``SPLITK`` knob feature.
-            splitk = feats.get("SPLITK", feats.get("D_splitk", 1.0))
+            splitk = feats.get("D_splitk", 1.0)  # the split-K count (REDUCE@<k>.cta)
             many_splits = splitk >= self._atomic_free_split_threshold
             quality += self._atomic_free_weight * af_on * (1.0 if many_splits else -1.0)
         return math.exp(-self._scale * max(min(quality, 80.0), -80.0))
