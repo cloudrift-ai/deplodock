@@ -53,7 +53,7 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import STAGE, TMA
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -189,16 +189,17 @@ def tma_eligible(graph, sources: list[Source], ctx: Context) -> bool:  # noqa: A
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if STAGE.name not in op.knobs or TMA.name in op.knobs:
-        raise RuleSkipped("transport runs once, after stage decided the staged read-sites (idempotence via the TMA knob)")
+    smem_edges = fam.smem_edges_without_xport(op.knobs)
+    if not smem_edges:
+        raise RuleSkipped("transport runs once, after stage placed smem read-sites (idempotence via PLACE :xport)")
     if not op.tilegraph.schedule.staged:
         raise RuleSkipped("nothing staged — no read-site to promote")
 
     eligible = ctx.compute_capability >= _MIN_CAPABILITY and tma_eligible(op.tilegraph, prospective_sources(op.tilegraph), ctx)
-    pin = TMA.raw()
+    pin = fam.pin_xport()
     if pin is not None:
         # A pin is authoritative; an ineligible pinned-on shape declines gracefully to SYNC.
-        decisions = [TMA.parse(pin) and eligible]
+        decisions = [pin and eligible]
     else:
         # TMA-first when eligible (option-0 = the cold / analytic / greedy default). The
         # strict ``tma_eligible`` gate only passes tiles that benefit, and the bulk-async
@@ -216,7 +217,12 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
         if use:
             staged = {e: Transport.TMA for e in op.tilegraph.schedule.staged}
             tg = replace(op.tilegraph, schedule=replace(op.tilegraph.schedule, staged=staged))
+            xport = "tma"
         else:
             tg = op.tilegraph
-        out.append(replace(op, tilegraph=tg, knobs={**op.knobs, TMA.name: use}))
+            xport = "sync"
+        # Record the chosen transport on each staged ``PLACE@<edge>`` (``smem`` → ``smem:tma``
+        # / ``smem:sync``); ``Schedule.staged`` already carries the Transport for codegen.
+        place_updates = {k: fam.enc_place(fam.SMEM, xport) for k in smem_edges}
+        out.append(replace(op, tilegraph=tg, knobs={**op.knobs, **place_updates}))
     return out

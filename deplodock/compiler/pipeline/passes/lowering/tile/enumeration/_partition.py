@@ -46,11 +46,11 @@ _BN_RED = 16
 # ``TileGraphOp`` (``dag=None``), so the geometry passes (090 / 100 / 110) skip it on the
 # dag-None guard and ``assembly/010_assemble`` materializes the already-tiled block
 # directly. It carries no free-axis ``SPLIT@<axis>`` / ``REDUCE@<axis>`` knob (nothing to
-# enumerate); the staging / tensorize sentinels (``ATOM@out=scalar``, ``STAGE=`` unstaged)
-# stay so the PLACE-tier passes (120 / 130) skip on knob presence.
+# enumerate); the tensorize sentinel (``ATOM@out=scalar``) stays so 020/050 skip. It
+# carries no ``PLACE@<edge>``: 120 skips it on the dag-None guard and 130 on the absence of
+# any untransported smem edge (nothing staged), so the placement passes pass it through.
 _COMBINE_KNOBS = {
     "ATOM@out": "scalar",
-    "STAGE": "",
 }
 
 

@@ -234,6 +234,71 @@ def pin_atom(cell: str) -> str | None:
     return pin(ATOM, cell)
 
 
+# --- PLACE codec: ``place[:xport]`` — the per-edge placement lattice + transport. ---
+# place ∈ {inline, smem, gmem}; xport ∈ {sync, cpasync, tma} is meaningful only for smem
+# and is set at the transport fork (130) after the placement fork (120) sets the place —
+# the same two-phase staging as SPLIT's par→reg. ``Schedule.staged`` stays the codegen
+# source of truth; ``PLACE@<edge>`` is the per-edge record/fork the passes key on.
+INLINE = "inline"
+SMEM = "smem"
+GMEM = "gmem"
+
+
+def enc_place(place: str, xport: str | None = None) -> str:
+    return f"{place}:{xport}" if xport else place
+
+
+def dec_place(raw: object) -> tuple[str, str | None]:
+    place, _, xport = str(raw).partition(":")
+    return place, (xport or None)
+
+
+def place_of(raw: object) -> str:
+    return dec_place(raw)[0]
+
+
+def place_xport(raw: object) -> str | None:
+    return dec_place(raw)[1]
+
+
+def place_decided(knobs: dict) -> bool:
+    """True once the placement fork (120) has stamped a ``PLACE@<edge>`` for this op —
+    the idempotence guard so it runs once."""
+    return any(k.startswith("PLACE@") for k in knobs)
+
+
+def smem_edges_without_xport(knobs: dict) -> list[str]:
+    """The ``PLACE@<edge>`` keys placed in smem but with no transport chosen yet — the
+    read-sites the transport fork (130) promotes. Empty once transport is decided (or
+    nothing is staged)."""
+    return [k for k, v in knobs.items() if k.startswith("PLACE@") and place_of(v) == SMEM and place_xport(v) is None]
+
+
+def pin_place_mask(n: int) -> int | None:
+    """A pinned staging mask over ``n`` ranked edges, or ``None`` (auto-enumerate).
+    Native bare ``DEPLODOCK_PLACE`` (``smem`` → stage all, ``gmem``/``inline`` → none),
+    else the legacy ``DEPLODOCK_STAGE`` bitmask ingest."""
+    raw = pin(PLACE, "")  # bare DEPLODOCK_PLACE family pin
+    if raw is not None:
+        return (1 << n) - 1 if place_of(raw) == SMEM else 0
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.stage_mask(n)
+
+
+def pin_xport() -> bool | None:
+    """Pinned transport for staged edges: native bare ``DEPLODOCK_PLACE`` carrying a
+    ``:tma`` / ``:sync`` xport, else the legacy ``DEPLODOCK_TMA`` ingest. ``None`` =
+    auto."""
+    raw = pin(PLACE, "")
+    if raw is not None:
+        xport = place_xport(raw)
+        return None if xport is None else xport == "tma"
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.tma_pin()
+
+
 def atom_raw(cell: str) -> str | None:
     """The raw atom control for ``cell`` — native ``DEPLODOCK_ATOM_<cell>`` / bare
     ``DEPLODOCK_ATOM`` first, else the legacy ``DEPLODOCK_MMA`` ingest. The string

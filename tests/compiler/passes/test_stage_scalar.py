@@ -121,12 +121,13 @@ def test_assemble_synthesizes_smem_slabs() -> None:
 
 def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     """The full ``TILE_PASSES`` chain (greedy) stages a scalar matmul when
-    ``DEPLODOCK_STAGE`` pins the all-staged mask: the emitted ``TileOp`` carries the
-    ``STAGE`` knob and a ``StageBundle``."""
+    ``DEPLODOCK_STAGE`` pins the all-staged mask (ingested as ``PLACE@<edge>=smem``): the
+    emitted ``TileOp`` carries the native ``PLACE@<edge>`` placement and a ``StageBundle``."""
     monkeypatch.setenv("DEPLODOCK_STAGE", "all")
     out = Pipeline.build(TILE_PASSES).run(_matmul_graph(), ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert tile_op.knobs.get("STAGE") == "11"
+    placed = {k: v for k, v in tile_op.knobs.items() if k.startswith("PLACE@")}
+    assert placed and all(v.startswith("smem") for v in placed.values()), placed  # both operands staged
     assert any(isinstance(s, StageBundle) for s in tile_op.body.iter())
 
 

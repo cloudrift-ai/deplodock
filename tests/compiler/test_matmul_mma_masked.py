@@ -145,7 +145,8 @@ def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
-    assert kop.knobs.get("TMA") is True, "symbolic-M with static innermost dim must be TMA-eligible"
+    placed = [v for k, v in kop.knobs.items() if k.startswith("PLACE@")]
+    assert placed and any(v.endswith(":tma") for v in placed), f"symbolic-M with static innermost dim must be TMA-eligible: {placed}"
     src = kop.kernel_source
     assert "int seq_len" in src, "runtime extent must still be a kernel arg"
     assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"

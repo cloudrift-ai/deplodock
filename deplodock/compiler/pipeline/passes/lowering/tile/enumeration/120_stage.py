@@ -32,7 +32,6 @@ from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import STAGE
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -73,8 +72,8 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     op: TileGraphOp = root.op
     nkey = fam.split_key(op.dag.inner_n.axis.name) if op.dag is not None else None
     fully_tiled = nkey is not None and nkey in op.knobs and fam.split_complete(op.knobs[nkey])
-    if not fully_tiled or STAGE.name in op.knobs:
-        raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via the STAGE knob)")
+    if not fully_tiled or fam.place_decided(op.knobs):
+        raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via PLACE@<edge>)")
     if op.algebra is AlgebraKind.MONOID:
         # A cooperative reduce / flash stream (both MONOID) stays smem-free: each lane reads its own
         # K-strided slice with no cross-thread reuse (legacy coop / flash never staged).
@@ -84,13 +83,13 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     if n == 0:
         raise RuleSkipped("no stageable read-sites (pointwise / no reuse / no K-tower)")
 
-    # Env pin (``DEPLODOCK_STAGE=11`` / ``all`` / ``none``) collapses the fork to one
-    # mask and is authoritative (no budget filter); otherwise offer every subset,
-    # most-staged-first (option-0 = stage the most, best when smem fits — matches the
-    # search's prefer-deeper-first heuristic).
-    raw = STAGE.raw()
-    if raw:
-        masks = [STAGE.parse(raw, width=n)]
+    # Env pin (native bare ``DEPLODOCK_PLACE=smem`` / legacy ``DEPLODOCK_STAGE=11``)
+    # collapses the fork to one mask and is authoritative (no budget filter); otherwise
+    # offer every subset, most-staged-first (option-0 = stage the most, best when smem
+    # fits — matches the search's prefer-deeper-first heuristic).
+    pin = fam.pin_place_mask(n)
+    if pin is not None:
+        masks = [pin]
     else:
         # Budget-aware: drop any subset whose slabs exceed the smem cap so greedy's
         # option-0 deterministically picks the largest IN-BUDGET staging (mask 0 = no
@@ -112,5 +111,9 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     for mask in masks:
         staged = {e: Transport.SYNC for i, e in enumerate(ranked) if mask & (1 << i)}
         tg = replace(op.tilegraph, schedule=replace(op.tilegraph.schedule, staged=staged))
-        out.append(replace(op, tilegraph=tg, knobs={**op.knobs, STAGE.name: STAGE.pretty(mask, width=n)}))
+        # Per-edge placement record: ``smem`` for the staged read-sites (transport set at
+        # 130), ``gmem`` for the unstaged candidates. ``Schedule.staged`` is the codegen
+        # source of truth; ``PLACE@<edge>`` is the fork/record the passes key on.
+        place = {fam.place_key(e.buffer): (fam.SMEM if mask & (1 << i) else fam.GMEM) for i, e in enumerate(ranked)}
+        out.append(replace(op, tilegraph=tg, knobs={**op.knobs, **place}))
     return out

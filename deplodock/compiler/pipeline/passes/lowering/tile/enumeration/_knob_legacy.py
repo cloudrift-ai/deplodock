@@ -74,6 +74,35 @@ def split_reg(dag, axis_name: str) -> int | None:
     return None
 
 
+def stage_mask(n: int) -> int | None:
+    """Legacy ``DEPLODOCK_STAGE`` bitmask over ``n`` ranked staged read-sites
+    (``"11"`` / ``"all"`` / ``"none"`` / int), ingested as the placement pin. ``None``
+    when unset (auto-enumerate)."""
+    raw = config.knob_raw("STAGE")
+    if raw is None:
+        return None
+    s = raw.strip()
+    if s == "all":
+        return (1 << n) - 1
+    if s == "none" or s == "":
+        return 0
+    if len(s) == n and all(c in "01" for c in s):
+        return sum(int(c) << i for i, c in enumerate(s))
+    try:
+        return int(s, 0) & ((1 << n) - 1)
+    except ValueError:
+        return None
+
+
+def tma_pin() -> bool | None:
+    """Legacy ``DEPLODOCK_TMA`` transport pin (ingested as the ``:tma`` vs ``:sync``
+    xport for staged ``PLACE@<edge>``). ``None`` when unset."""
+    raw = config.knob_raw("TMA")
+    if raw is None or raw == "":
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def atom_raw() -> str | None:
     """The legacy ``DEPLODOCK_MMA`` env pin (``0``/``scalar`` / a kind / auto), ingested
     as the atom control for the matmul cell. ``None`` when unset."""
