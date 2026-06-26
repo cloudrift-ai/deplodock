@@ -16,8 +16,10 @@ the oracle.
 
 Geometry: one warp per 16 query rows; Q/K/V/O are addressed as flat ``(B·H·S·D)``
 buffers (gmem-direct mma operands — no smem staging of Q/K/V), the score ``P`` rides an
-smem slab for the C→A handoff. v1 scope: fp16, non-causal, equal-head, ``D%16==0``,
-``S%16==0`` (:func:`warp_chain_eligible`).
+smem slab for the C→A handoff. Scope (:func:`warp_chain_eligible`): fp16/bf16, causal or
+non-causal, ``D%16==0``; **static `S%16==0` OR symbolic `seq_len`** (Phase 1 — the partial
+final tile masked at the score fragment + clamped loads + guarded store); **equal-head OR
+GQA** (Phase 2 — K/V at the kv-head ``head//group``).
 """
 
 from __future__ import annotations
@@ -46,13 +48,14 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Car
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
     """The fused-TC-flash scope: 16-bit (fp16 / bf16), causal **or** non-causal (masked at
-    the score fragment), equal-head, ``D % 16 == 0``. A **symbolic** ``seq_len`` (Phase 1) is
-    accepted — the KV-stream / query-tile extents ceil-div the runtime ``seq_len``, the
-    partial final tile is masked at the score fragment + clamped loads + guarded store — and
-    drops the ``S % 16 == 0`` requirement (any runtime size). A STATIC ``S`` still requires
-    ``S % 16 == 0`` (no partial tile). Additive-mask / GQA still fall back to the scalar chain.
-    (Dtype is gated upstream in ``_flash_params``; this checks only geometry.)"""
-    if mask or group != 1 or D % 16 != 0 or not (16 <= D <= 256):
+    the score fragment), ``D % 16 == 0``. A **symbolic** ``seq_len`` (Phase 1) is accepted —
+    the KV-stream / query-tile extents ceil-div the runtime ``seq_len``, the partial final
+    tile is masked at the score fragment + clamped loads + guarded store — and drops the
+    ``S % 16 == 0`` requirement (any runtime size). A STATIC ``S`` still requires
+    ``S % 16 == 0`` (no partial tile). **GQA** (Phase 2, ``group > 1``) is accepted — K/V are
+    read at ``head // group`` (no materialized broadcast). Additive-mask still falls back to
+    the scalar chain. (Dtype is gated upstream in ``_flash_params``; this checks only geometry.)"""
+    if mask or group < 1 or H % group != 0 or D % 16 != 0 or not (16 <= D <= 256):
         return False
     if symbolic:
         return True
@@ -90,6 +93,7 @@ def build_warp_chain_tileop(
     carrier: Monoid,
     causal: bool = False,
     seq_var: str | None = None,
+    group: int = 1,
 ) -> TileOp:
     """The fused TC flash as a **TileOp** (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
     for ``(B,H,S,D)`` 16-bit, optionally causal — routed through the generic kernel passes
@@ -129,9 +133,22 @@ def build_warp_chain_tileop(
     # (b,h) offset into the flat (B·H·S·D) buffer: the per-(b,h) row stride is the RUNTIME
     # ``seq_len·D`` when symbolic (the kernel runs at the real seq, not the trace hint).
     row_stride = _mul(seq, D) if symbolic else Literal(S * D, "int")
-    base = BinaryExpr("*", bh, row_stride)
-    qrow = _add(base, _mul(qb, 16 * D))  # query-row base
-    kvrow = _add(base, _mul(kv, 16 * D))  # kv-tile base
+    # Q/O are addressed by the q-head ``bh = batch·H + head``; K/V by the **kv-head** under
+    # GQA — ``bh_kv = batch·H_kv + head // group`` (no materialized broadcast). For
+    # ``group == 1`` this collapses to ``bh`` (``H_kv == H``), so the equal-head codegen is
+    # byte-identical. ``H``/``H_kv``/``group`` are static constants; ``//`` is integer floor.
+    base_q = BinaryExpr("*", bh, row_stride)
+    if group > 1:
+        h_kv = H // group
+        bh_kv = _add(
+            _mul(BinaryExpr("//", bh, Literal(H, "int")), h_kv),
+            BinaryExpr("//", BinaryExpr("%", bh, Literal(H, "int")), Literal(group, "int")),
+        )
+        base_kv = BinaryExpr("*", bh_kv, row_stride)
+    else:
+        base_kv = base_q
+    qrow = _add(base_q, _mul(qb, 16 * D))  # query-row base (q-head)
+    kvrow = _add(base_kv, _mul(kv, 16 * D))  # kv-tile base (kv-head under GQA)
 
     def ld(frag, buf, src_index, role, *, b_trans=False, staged=False, ldm=D):
         return LdmatrixLoad(frag=frag, src_buffer=buf, src_index=(src_index,), role=role, ldm=ldm, staged=staged, b_trans=b_trans)
@@ -279,7 +296,18 @@ def build_warp_chain_tileop(
 
 
 def assemble_warp_chain(
-    loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, carrier: Monoid, causal: bool = False, seq_var: str | None = None
+    loop_op: LoopOp,
+    *,
+    B: int,
+    H: int,
+    S: int,
+    D: int,
+    qk: Mma,
+    pv: Mma,
+    carrier: Monoid,
+    causal: bool = False,
+    seq_var: str | None = None,
+    group: int = 1,
 ) -> Graph:
     """Build a single-``TileOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
     inputs + one kernel node. Spliced by the engine; the generic kernel passes lower it.
@@ -291,7 +319,21 @@ def assemble_warp_chain(
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
     kop = build_warp_chain_tileop(
-        loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, carrier=carrier, causal=causal, seq_var=seq_var
+        loop_op,
+        q=q_id,
+        k=k_id,
+        v=v_id,
+        out=out_t.name,
+        B=B,
+        H=H,
+        S=S,
+        D=D,
+        qk=qk,
+        pv=pv,
+        carrier=carrier,
+        causal=causal,
+        seq_var=seq_var,
+        group=group,
     )
 
     g = Graph()

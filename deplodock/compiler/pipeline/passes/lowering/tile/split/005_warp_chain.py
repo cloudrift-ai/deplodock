@@ -101,7 +101,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     # The streaming online-softmax Monoid (state (m,l,O), partial (score,value)) — the
     # algebraic source the fragment realizer regenerates the softmax phases from. Reading
     # it here keeps the ``enumeration`` import in ``split``, not ``assembly``.
-    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier, seq_var=seq_var)
+    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier, seq_var=seq_var, group=group)
 
 
 def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):
