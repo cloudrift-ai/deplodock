@@ -89,6 +89,56 @@ def test_chain_score_is_the_carrier_partial():
     assert chain.score == chain.carrier.partial[0]
 
 
+def test_chain_is_a_monoid_over_semiring_composition():
+    """The chain is the **MONOID(SEMIRING)** composition, not a flat parse: a ``Monoid`` carrier
+    composed over an inner SEMIRING :class:`Contraction`. The carried-chain invariant is the shared
+    hinge — the inner contraction's free-output column IS the carrier's reduced hinge — and it is
+    enforced by construction, so a malformed composition is unrepresentable."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
+
+    dag = iter_dag(_flash_loop())
+    chain = dag.chain
+    assert isinstance(chain.carrier, Monoid), "the outer algebra is a MONOID carrier"
+    assert isinstance(chain.inner, Contraction) and chain.inner.algebra is AlgebraKind.SEMIRING, "the inner operand is a SEMIRING"
+    # The composition's invariant: inner.col IS the hinge (the chain link), and the score edge is
+    # the inner contraction's result (the carrier's first partial).
+    assert chain.inner.col is chain.hinge, "the inner contraction's column is the reduced hinge"
+    assert chain.score == chain.inner.result == chain.carrier.partial[0]
+    # Geometry is a separate, derived view (not algebra fields): query row m, head output d, grid.
+    assert chain.m_axis is chain.m.axis and chain.d_axis is chain.d.axis
+
+
+def test_chain_post_init_enforces_the_hinge_invariant():
+    """A ``ContractionChain`` whose inner column is NOT the hinge is rejected at construction —
+    the carried-chain invariant lives in the class, not in an external gate, so invalid states are
+    unrepresentable."""
+    import pytest
+
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain
+
+    dag = iter_dag(_flash_loop())
+    good = dag.chain
+    # Swap the inner contraction's column to a non-hinge axis (the query row) — must raise.
+    broken_inner = Contraction(node=good.inner.node, result=good.inner.result, col=good.m)
+    with pytest.raises(ValueError, match="hinge"):
+        ContractionChain(carrier=good.carrier, hinge=good.hinge, inner=broken_inner, m=good.m, d=good.d, grid_nodes=good.grid_nodes)
+
+
+def test_partition_free_axes_is_a_role_neutral_three_way_split():
+    """The reusable partition: axes in operand A's footprint only, B's only, and the rest — in
+    BOTH or in NEITHER (the shared / broadcast axes). No attention vocabulary, so any two-operand
+    composition reuses it; the both-or-neither lumping is what the chain reads as ``grid``."""
+    from types import SimpleNamespace
+
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import partition_free_axes
+
+    nodes = tuple(SimpleNamespace(axis=SimpleNamespace(name=n)) for n in ("m", "d", "both", "neither"))
+    a_only, b_only, rest = partition_free_axes(nodes, footprint_a={"m", "both"}, footprint_b={"d", "both"})
+    assert [n.axis.name for n in a_only] == ["m"]
+    assert [n.axis.name for n in b_only] == ["d"]
+    assert [n.axis.name for n in rest] == ["both", "neither"]
+
+
 def test_causal_chain_still_exposes_the_chain():
     """A causal mask folds a masked score; the chain still reports the carrier's
     first partial (whatever the carrier folds, not a hard-coded name)."""

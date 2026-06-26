@@ -419,33 +419,6 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
 # ``MONOID(SEMIRING)`` analog of ``monoid_build``.
 
 
-def _chain_axes(dag: IterDag, value_load: Load) -> tuple[Axis, Axis, tuple[Loop, ...]]:
-    """Classify the free axes of a chain nest off the def-use: the **P@V output ``d``**
-    (a free axis in the value load's index but NOT in the inner QK^T contraction — the
-    score is independent of it), the **query row ``m``** (in the inner contraction, not
-    the value), and the shared **grid** axes (in both — batch / head). Structural, not
-    a named-shape match."""
-    parallel = {n.axis.name: n.axis for n in dag.parallel}
-    inner_free = {v for ld in dag.chain.inner.body for v in _index_vars(ld)} & parallel.keys()
-    value_free = {v for e in value_load.index for v in e.free_vars()} & parallel.keys()
-    d_names = value_free - inner_free
-    m_names = inner_free - value_free
-    if len(d_names) != 1 or len(m_names) != 1:
-        raise ValueError(f"chain_build: ambiguous chain free axes (d={d_names}, m={m_names})")
-    d_axis = parallel[next(iter(d_names))]
-    m_axis = parallel[next(iter(m_names))]
-    grid = tuple(n.loop for n in dag.parallel if n.axis.name not in d_names | m_names)
-    return d_axis, m_axis, grid
-
-
-def _index_vars(stmt: Stmt) -> set[str]:
-    """The index Vars a ``Load`` references (empty for a non-Load) — used to read a
-    cell's free-axis footprint."""
-    if isinstance(stmt, Load):
-        return {v for e in stmt.index for v in e.free_vars()}
-    return set()
-
-
 def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     """The shared-axis reduce_decomp (Phase 1c): restructure a ``MONOID(SEMIRING)``
     chain nest into the FA-2 form — the P@V output ``d`` as a register vector ``O[d]``
@@ -476,7 +449,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
     stats, accum, _d_state = split_carrier(carrier, value_name)
-    d_axis, m_axis, grid = _chain_axes(dag, value_load)
+    d_axis, m_axis, grid = chain.d_axis, chain.m_axis, chain.grid
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
     d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
@@ -554,7 +527,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     atom_m, atom_n, atom_k = atom.shape
 
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    d_axis, m_axis, grid = _chain_axes(op.dag, value_load)
+    d_axis, m_axis, grid = chain.d_axis, chain.m_axis, chain.grid
 
     # σ-tile geometry. m (query row) → m_b·atom_m (GRID block, atom owns the 16 lane); kv (stream)
     # → kv_b·16 (serial-outer carry, the 16-key tile owned by atom_n/atom_k); the QK^T 16-col score

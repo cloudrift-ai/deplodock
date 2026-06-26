@@ -114,7 +114,6 @@ def test_flash_cells_atomize_via_the_generic_unit():
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
     from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import _chain_axes
 
     op = _flash_op(Dim(64))
     dag = op.dag
@@ -125,7 +124,7 @@ def test_flash_cells_atomize_via_the_generic_unit():
 
     kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    _d_axis, m_axis, _grid = _chain_axes(dag, value_load)  # m_axis = the query row (derived, not hard-coded)
+    m_axis = chain.m_axis  # the query row — a DAG invariant on the chain (derived, not hard-coded)
 
     # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream).
     qkt_cell = next(s for s in kv_loop.body if isinstance(s, Loop))  # the D-reduce

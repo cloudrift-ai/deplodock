@@ -38,7 +38,7 @@ from deplodock.compiler.pipeline.passes.lowering._predicates import (
     is_matmul_reduce,
     segmentable_k_extent,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import ContractionChain, IterDag
 
 
 def classify_matmul_operands(loads, k_name: str, *, out_index=None):
@@ -215,6 +215,19 @@ def eligible_atoms(dag: IterDag, *, compute_capability: tuple[int, int], dtype_o
     """The atoms ``dag`` admits, in ``ATOM_REGISTRY`` priority order (f16 first).
     Empty for a non-matmul / scalar-only kernel."""
     return [a for a in ATOM_REGISTRY.values() if _atom_eligible(a, dag, compute_capability=compute_capability, dtype_of=dtype_of)]
+
+
+def chain_inner_atomizes(chain: ContractionChain, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
+    """Whether a streaming chain's inner SEMIRING contraction independently reaches the
+    warp tensor-core tier — the SAME :func:`cell_atomizes` atom-fit :func:`_atom_eligible`
+    gates a standalone SEMIRING matmul on, applied to ``chain.inner`` with the score's
+    ``(m, kv)`` out coords (``chain.out_index``). The DAG invariant behind warp-chain routing:
+    a warp chain is just a chain whose inner contraction tensorizes — named for no attention
+    concept, no flash shape match."""
+    return any(
+        cell_atomizes(chain.inner.loop, a, compute_capability=compute_capability, dtype_of=dtype_of, out_index=chain.out_index)
+        for a in ATOM_REGISTRY.values()
+    )
 
 
 # === The ``atomize`` body edit (the atom layer's move) =====================
