@@ -18,10 +18,6 @@ from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile
 # ---------------------------------------------------------------------------
 
 
-def _index_expr(*names: str) -> tuple:
-    return tuple(Var(n) for n in names)
-
-
 def _flat_index(*parts: tuple[str, int]) -> tuple:
     """Build an Add chain: ``parts[0][0]*parts[0][1] + ...``. Used to build
     the canonical matmul output index ``M_b*BM + M_t``."""

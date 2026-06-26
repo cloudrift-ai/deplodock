@@ -361,7 +361,6 @@ def test_offering_fork_keeps_fused_by_default_splits_when_pinned(monkeypatch):
     assert sum(1 for n in greedy.nodes.values() if isinstance(n.op, TileOp)) == 1
     assert _n_kernels(lower("0")) == 1  # pinned keep — same fused edge
     assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
-    assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
 
 
 @requires_cuda

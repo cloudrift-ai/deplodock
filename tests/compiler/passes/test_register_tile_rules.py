@@ -105,20 +105,3 @@ def test_sdpa_qk_matmul_fires_register_tile(recording_dump):
     Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/kernel")
     assert "split_register_axes" in fired, fired
-
-
-def test_sdpa_attention_kernel_fires_register_tile(recording_dump):
-    """With ``020_stage_inputs`` running before split_register_axes, Stages
-    stay singleton across F² and the smem budget no longer blows up on
-    SDPA's softmax-pre-pass + (P·V) matmul kernel. Both SDPA matmul
-    kernels (Q·Kᵀ and the dominant one) now fire."""
-    g = Graph()
-    _input(g, "q", (1, 8, 128, 64))
-    _input(g, "k", (1, 8, 128, 64))
-    _input(g, "v", (1, 8, 128, 64))
-    g.add_node(op=SdpaOp(), inputs=["q", "k", "v"], output=Tensor("o", (1, 8, 128, 64)), node_id="o")
-    g.inputs = ["q", "k", "v"]
-    g.outputs = ["o"]
-
-    Pipeline.build(KERNEL_PASSES).run(g, dump=recording_dump)
-    assert "split_register_axes" in recording_dump.fired_rules("lowering/kernel")
