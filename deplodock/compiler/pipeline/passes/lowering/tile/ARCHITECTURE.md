@@ -12,8 +12,15 @@
 > reads native keys / the IR, never legacy names**; the legacy `DEPLODOCK_BN`/`BK`/`MMA`/`STAGE`/… env pins + legacy
 > golden YAMLs resolve through the ingest-only mapper `_knob_legacy.py`. `Schedule.staged`/`binding` stay the codegen
 > source of truth, so the rename is byte-identical. The per-pass descriptions below still use the **legacy** names for
-> continuity — read them through that table. (The learned prior is cold — its `prior.json` is deleted — so the greedy
-> cold pick is emission-order; the `BN`/`MMA`/… `Knob` descriptors stay registered only for the legacy ingest/display.)
+> continuity — read them through that table. The **prior featurizer** `knob.knob_features` is likewise schema-agnostic:
+> it reads the native `SPLIT@`/`REDUCE@`/`ATOM@` keys via `knob._free_slots` / `_reduce_decomp` (free axes canonicalized
+> by `par` — dag-free, so the `n`/`m` role split needs no `IterDag`), falling back to the legacy `BN`/`BM`/`MMA`/… names
+> so a legacy-recorded golden YAML still featurizes identically; `knob.tile_signature` is the matching bridge that pairs
+> a legacy golden against the native enumeration candidates (`scripts/golden_knob_heuristics.py`,
+> `search/analytic.evaluate_golden`). (The learned prior is cold — its `prior.json` is deleted — so the greedy cold pick
+> is the `AnalyticPrior` argmin over those native features; before the featurizer spoke native it scored every native row
+> identically — a degenerate emission-order pick. The `BN`/`MMA`/… `Knob` descriptors stay registered for the legacy
+> ingest/display and the `MMA` atom featurizer.)
 
 The tile phase lowers each fused `LoopOp` to a kernel-ready `TileOp` in **three passes** over the block-DAG Tile IR
 (`ir/tile/ir.py`), following `plans/tile-ir-block-dag.md`:

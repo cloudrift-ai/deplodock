@@ -561,6 +561,15 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_width"] = float(len(s))
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
         # STR knobs with no custom featurizer: no generic numeric encoding.
+    # Atom (tensor-core cell) features. The legacy ``MMA`` key already routed through
+    # its ``features`` callable in the loop above; the native schema names the atom on
+    # ``ATOM@<cell>`` instead (no ``MMA`` key), so derive the same ``MMA_*`` features
+    # from the native key here. Idempotent for a legacy row (same values).
+    atom = mma_atom(knobs)
+    if atom is not None:
+        mk = get("MMA")
+        if mk is not None and mk.features is not None:
+            feats.update(mk.features(atom))
     feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
     feats.update(_tile_features(knobs))
     # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread
@@ -578,8 +587,99 @@ def knob_features(knobs: dict) -> dict[str, float]:
     return feats
 
 
+def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
+    """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes — read
+    from the native ``SPLIT@<axis>`` values (``"<par>x<reg>"``) when any are present,
+    else the legacy ``BN``/``FN`` + ``BM``/``FM`` (thread tier) / ``WN``/``FN`` +
+    ``WM``/``FM`` (warp tier) names.
+
+    The native key carries the axis's IR *name*, not the legacy n/m rank, and the
+    featurizer has no dag — so the two axes are canonicalized by ``par`` (the wider
+    parallel binding is the ``n`` / coalesced slot, the narrower the ``m`` slot). This
+    is dag-free and identical across both schemas; in the golden region (``BN ≥ BM``)
+    it reduces to the legacy labelling. A single free axis fills the ``n`` slot with a
+    degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no complete free split is
+    present (a non-tiled kernel or a par-only transitional row)."""
+    pairs: list[tuple[int, int]] = []
+    native = [k for k in knobs if k.startswith("SPLIT@")]
+    if native:
+        from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+
+        for k in native:
+            par, reg = fam.dec_split(knobs[k])
+            if reg is not None:  # skip par-only transitional values (incomplete tile)
+                pairs.append((par, reg))
+    else:
+        # Scalar ``BN``/``BM`` and warp ``WN``/``WM`` are mutually exclusive (a row is
+        # scalar XOR warp), so pick the par names by which tier has a non-zero count —
+        # not via ``is_warp`` (needs the atom key a bare ``_warp_tile_features`` unit
+        # input may omit), and not by mere presence (the off tier is present as the 0
+        # sentinel: a scalar row carries ``WN=WM=0``, a warp row ``BN=BM=0``).
+        def _nz(name: str) -> int:
+            try:
+                return int(knobs.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        n, m = ("WN", "WM") if (_nz("WN") > 0 or _nz("WM") > 0) else ("BN", "BM")
+        for par_key, reg_key in ((n, "FN"), (m, "FM")):
+            if par_key in knobs and reg_key in knobs:
+                try:
+                    pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
+                except (TypeError, ValueError):
+                    return None
+    if not pairs:
+        return None
+    pairs.sort(key=lambda pr: (pr[0], pr[1]), reverse=True)  # wider par = the n slot
+    (par_n, reg_n) = pairs[0]
+    (par_m, reg_m) = pairs[1] if len(pairs) >= 2 else (1, 1)
+    return par_n, reg_n, par_m, reg_m
+
+
+def _reduce_decomp(knobs: dict):
+    """The primary reduce axis's ``(serial, fold, cta, coop)`` factors — from the native
+    ``REDUCE@<axis>`` value (the deepest-``serial`` axis when a streaming nest has more
+    than one) when present, else the legacy ``BK``/``FK``/``SPLITK``/``BR``. Returns a
+    :class:`_families.Decomp`."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+
+    native = [knobs[k] for k in knobs if k.startswith("REDUCE@")]
+    if native:
+        return max((fam.dec_reduce(v) for v in native), key=lambda d: (d.serial, d.cta))
+    return fam.Decomp(
+        serial=int(knobs.get("BK", 1) or 1),
+        fold=int(knobs.get("FK", 1) or 1),
+        cta=int(knobs.get("SPLITK", 1) or 1),
+        coop=int(knobs.get("BR", 1) or 1),
+    )
+
+
+def tile_signature(knobs: dict) -> tuple:
+    """Schema-agnostic structural identity of a tile config: the canonical free-axis
+    slots, the primary reduce decomposition, and the atom kind — read from native
+    ``MOVE@element`` keys or legacy GEMM-letter names alike. Two configs with equal
+    signatures are the same kernel variant whichever schema spelled them, so this is
+    the bridge for matching a legacy-recorded golden YAML against the native
+    enumeration's candidate rows (``scripts/golden_knob_heuristics.py`` /
+    ``search/analytic.evaluate_golden``)."""
+    return (_free_slots(knobs), _reduce_decomp(knobs), mma_atom(knobs))
+
+
 def _geom_feats(
-    knobs: dict, *, threads: int, cells: int, tile_m: int, tile_n: int, splitk: int, free_prod, sm: float, warp: bool
+    knobs: dict,
+    *,
+    threads: int,
+    cells: int,
+    tile_m: int,
+    tile_n: int,
+    splitk: int,
+    bn: int,
+    bm: int,
+    bk: int,
+    br: int,
+    free_prod,
+    sm: float,
+    warp: bool,
 ) -> dict[str, float]:
     """The engineered ``D_*`` tile-geometry / occupancy feature family — the
     single featurization the priors rank on. It folds in everything the old
@@ -611,14 +711,10 @@ def _geom_feats(
     aspect = l2(tile_m) - l2(tile_n)
     thr_target = 7.0 if warp else 8.0  # log2 threads: 128 (4-warp) vs 256
     area_target = 12.0 if warp else 13.0  # log2 area: 64×64=4096 vs 8192
-    bn = int(knobs.get("BN", 0) or 0)
-    bm = int(knobs.get("BM", 0) or 0)
-    bk = int(knobs.get("BK", 1) or 1)
     masked_m = float(knobs.get("S_masked_m", 0.0) or 0.0)
     masked_n = float(knobs.get("S_masked_n", 0.0) or 0.0)
     masked_k = float(knobs.get("S_masked_k", 0.0) or 0.0)
     k_ext = float(knobs.get("S_ext_reduce_prod") or 0.0)
-    br = int(knobs.get("BR", 1) or 1)
     kchunks = max((k_ext / br) / bk, 1.0) if k_ext > 0 else 1.0
     out = {
         # core geometry
@@ -702,12 +798,12 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     sentinels don't feed a meaningless scalar tile."""
     if is_warp(knobs):
         return {}
-    try:
-        bn, bm, fm, fn = int(knobs["BN"]), int(knobs["BM"]), int(knobs["FM"]), int(knobs["FN"])
-    except (KeyError, TypeError, ValueError):
+    slots = _free_slots(knobs)
+    if slots is None:
         return {}
-    br = int(knobs.get("BR", 1) or 1)
-    splitk = int(knobs.get("SPLITK", 1) or 1)
+    par_n, reg_n, par_m, reg_m = slots  # (BN, FN, BM, FM)
+    d = _reduce_decomp(knobs)
+    bn, bm, fm, fn, br, bk, splitk = par_n, par_m, reg_m, reg_n, d.coop, d.serial, d.cta
     return _geom_feats(
         knobs,
         threads=bn * bm * br,
@@ -715,6 +811,10 @@ def _tile_features(knobs: dict) -> dict[str, float]:
         tile_m=bm * fm,
         tile_n=bn * fn,
         splitk=splitk,
+        bn=bn,
+        bm=bm,
+        bk=bk,
+        br=br,
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=False,
@@ -727,20 +827,28 @@ def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None)
     ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the
     MMA cell dims the featurizer already derived. Empty if the warp knobs or atom
     dims are missing (so a malformed row degrades gracefully)."""
-    try:
-        wm, wn, fm, fn = int(knobs["WM"]), int(knobs["WN"]), int(knobs["FM"]), int(knobs["FN"])
-        am, an = int(atom_m), int(atom_n)
-    except (KeyError, TypeError, ValueError):
+    slots = _free_slots(knobs)
+    if slots is None:
         return {}
+    try:
+        am, an = int(atom_m), int(atom_n)
+    except (TypeError, ValueError):
+        return {}
+    wn, fn, wm, fm = slots  # (WN, FN, WM, FM) — warp counts in the par slots
     if wm <= 0 or wn <= 0:
         return {}
+    d = _reduce_decomp(knobs)
     return _geom_feats(
         knobs,
         threads=wm * wn * 32,
         cells=fm * fn,
         tile_m=wm * fm * am,
         tile_n=wn * fn * an,
-        splitk=int(knobs.get("SPLITK", 1) or 1),
+        splitk=d.cta,
+        bn=0,  # OFF sentinels: the BN/BM bands don't fire on a warp row
+        bm=0,
+        bk=d.serial,
+        br=d.coop,
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=True,

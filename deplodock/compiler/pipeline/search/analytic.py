@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.pipeline import knob
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
 # Free-axis knobs the thread-tier / warp-tier enumeration decides — the projection a
@@ -169,13 +170,16 @@ def evaluate_golden(
     :class:`AnalyticPrior` (negated latency); the learned-prior diagnostics pass
     ``-prior.mean_score`` instead. Returns ``({}, None, 0)`` if nothing
     enumerates."""
-    rows, match_keys = _enumerate(M, N, K, dtype, ctx)
+    rows, _ = _enumerate(M, N, K, dtype, ctx)
     if not rows:
         return {}, None, 0
     if scorer is None:
         scorer = _analytic_scorer(M, N, K, ctx, dynamic=dynamic)
-    want = tuple(golden_knobs.get(k) for k in match_keys)
-    gidx = next((i for i, r in enumerate(rows) if tuple(r.get(k) for k in match_keys) == want), None)
+    # Match the legacy-recorded golden against the native candidate rows by
+    # schema-agnostic structural signature (free slots + reduce decomp + atom) — the
+    # candidates speak native ``MOVE@element``, the golden YAML legacy GEMM-letters.
+    want = knob.tile_signature(golden_knobs) if golden_knobs else None
+    gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None) if want else None
     scores = [scorer(r) for r in rows]
     best = max(range(len(rows)), key=scores.__getitem__)
     rank = sum(1 for s in scores if s > scores[gidx]) if gidx is not None else None

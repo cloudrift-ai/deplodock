@@ -56,12 +56,6 @@ from deplodock.compiler.pipeline.search.golden import (
     ReduceGoldenConfig,
 )
 
-# Reduce / pointwise knob projections a golden is matched on. The matmul thread /
-# warp projections come from ``analytic._enumerate``'s returned match keys, so the
-# fit ranks over the EXACT pool ``eval analytic`` and the greedy deploy rank over.
-_REDUCE_KEYS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR", "FK")
-_POINTWISE_KEYS = ("BN", "BM", "FM", "FN", "SPLITK")
-
 
 def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dict:
     """The shape / regime features the planner stamps and the prior featurizes —
@@ -107,34 +101,37 @@ def _dag_from_snippet(snippet: str, ctx: Context):
 def _reduce_rows(dag) -> list[dict]:
     """Cooperative-reduce candidate knob rows: the cartesian of the carrier's
     cooperative ``(bk, fk, br)`` K-partitions (``coop_reduce_offers``) × the free-row
-    register tile (``reduce_reg_offers``), with the free-axis THREAD tile
-    (``coop_free_thread_knobs``). A 1-D reduce (no outer M axis) stamps the
-    degenerate ``BM``/``FM`` = 1 the recorded golden carries, and ``SPLITK`` = 1
-    (cooperative reduces partition on the THREAD axis, not split-K's BLOCK)."""
+    register tile (``reduce_reg_offers``), over the free-axis THREAD tile
+    (``coop_free_threads``). The native rows speak ``MOVE@element`` (``SPLIT@<axis>`` +
+    ``REDUCE@<axis>``); a 1-D reduce (no outer M axis) leaves the M slot degenerate,
+    which the schema-agnostic ``tile_signature`` matches against the golden's
+    ``BM``/``FM`` = 1."""
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
 
     budget = _moves.Budget()
-    free = _moves.coop_free_thread_knobs(dag)
-    degenerate = {} if dag.outer_m is not None else {"BM": 1, "FM": 1}
+    thread = _moves.coop_free_threads(dag)  # free-axis THREAD tile (par)
     rows = []
     for bk, fk, br in _moves.coop_reduce_offers(dag):
+        red = _moves.coop_reduce_knobs(dag, (bk, fk, br))  # native REDUCE@<primary>
         for reg in _moves.reduce_reg_offers(dag, budget, fk):
-            rows.append({**free, **_moves.coop_reduce_knobs((bk, fk, br)), **_moves.reg_knobs(dag, reg), "SPLITK": 1, **degenerate})
+            rows.append({**_moves.free_split_knobs(dag, thread, reg), **red})  # par + swept reg
     return rows
 
 
 def _pointwise_rows(dag) -> list[dict]:
     """Pointwise (MAP, no reduce) candidate knob rows: the cartesian of the free
-    thread tile (``thread_offers``) × the register tile (``map_reg_offers``); the
-    reduce / split-K knobs are degenerate (``BK=FK=SPLITK=BR=1``)."""
+    thread tile (``thread_offers``) × the register tile (``map_reg_offers``). The native
+    rows carry only ``SPLIT@<axis>`` (no ``REDUCE@`` — a MAP nest has no contraction);
+    ``tile_signature``'s degenerate reduce decomposition matches the golden's
+    ``BK=FK=SPLITK=BR=1``."""
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
 
     budget = _moves.Budget()
     rows = []
     for thread in _moves.thread_offers(dag, budget):
-        thr = _moves.thread_knobs(dag, thread)
+        thr = _moves.thread_knobs(dag, thread)  # par-only SPLIT
         for reg in _moves.map_reg_offers(dag, budget):
-            rows.append({**thr, **_moves.reg_knobs(dag, reg), "BK": 1, "FK": 1, "SPLITK": 1, "BR": 1})
+            rows.append({**thr, **_moves.reg_knobs(dag, thr, reg)})  # complete SPLIT (par×reg)
     return rows
 
 
@@ -169,23 +166,27 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
             # (the tuned ``FN`` register tile sweeps it): trace E_M=1, E_N=M, E_K=K.
             base = _base(ctx, 1, g.M, g.K)
             dag = _dag_from_snippet(g.snippet(), ctx)
-            rows, keys, tier = (_reduce_rows(dag) if dag is not None else []), _REDUCE_KEYS, "reduce"
+            rows, tier = (_reduce_rows(dag) if dag is not None else []), "reduce"
         elif isinstance(g, PointwiseGoldenConfig):
             base = _base(ctx, g.M, g.N, 1)
             dag = _dag_from_snippet(g.snippet(), ctx)
-            rows, keys, tier = (_pointwise_rows(dag) if dag is not None else []), _POINTWISE_KEYS, "pointwise"
+            rows, tier = (_pointwise_rows(dag) if dag is not None else []), "pointwise"
         elif isinstance(g, MatmulGoldenConfig):
             dyn = bool(g.dynamic)
             base = _base(ctx, g.M, g.N, g.K, dynamic=dyn)
-            rows, keys = _enumerate(g.M, g.N, g.K, g.dtype, ctx)
+            rows, _ = _enumerate(g.M, g.N, g.K, g.dtype, ctx)
             tier = "dyn" if dyn else ("thread" if g.dtype == "fp32" else "warp")
         else:
             continue
         if not rows:
             print(f"  !! {g.name}: nothing enumerated — skipping")
             continue
-        want = tuple(g.knobs.get(k) for k in keys)
-        gidx = next((i for i, r in enumerate(rows) if tuple(r.get(k) for k in keys) == want), None)
+        # Match the legacy-recorded golden against the native candidate rows by
+        # schema-agnostic structural signature (free-axis slots + reduce decomp +
+        # atom) — the candidates speak native ``MOVE@element``, the golden YAML legacy
+        # GEMM-letters, so a per-key tuple compare never lines up.
+        want = knob.tile_signature(g.knobs)
+        gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None)
         if gidx is None:
             print(f"  !! {g.name}: golden not in {len(rows)} candidates — skipping")
             continue
