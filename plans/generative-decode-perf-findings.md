@@ -3,7 +3,7 @@
 > Post-merge investigation of `deplodock serve --generate` / the per-layer `DeplodockGenRunner` decode latency on
 > **TinyLlama-1.1B-Chat** (22 layers), RTX 4080, fp16. Measure-first: we profiled before optimizing, which redirected
 > the work away from two ~1% "fixes" and onto the real decode lever (the ~63× kernel). Companion to
-> [`generative-inference-support.md`](generative-inference-support.md).
+> [`generative-device-resident-decode.md`](generative-device-resident-decode.md) (the device-resident follow-on).
 
 ## TL;DR
 

@@ -145,6 +145,5 @@ Phase A is self-contained and shippable on its own; Phase B is a separate PR gat
 
 ## Out of scope
 
-Standalone serving with deplodock's own KV cache + incremental-attention kernel (the eventual Phase 7 in
-`generative-inference-support.md`) — that removes the vLLM interleave entirely and is a much larger effort. This doc
-stays within the vLLM-plugin design.
+Standalone serving with deplodock's own KV cache + incremental-attention kernel (the eventual standalone-serving phase)
+— that removes the vLLM interleave entirely and is a much larger effort. This doc stays within the vLLM-plugin design.
