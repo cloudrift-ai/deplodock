@@ -28,8 +28,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._validate impo
 PATTERN = [Pattern("root", LoopOp)]
 
 # Regimes the move set builds: MAP / SEMIRING / MONOID. Flash (R6 — the streaming
-# online-softmax nest, built by enumeration/080_streaming) is the MONOID algebra on the
-# streaming schedule, derived structurally on demand (``dag.streaming``), not a distinct kind.
+# online-softmax nest, built by enumeration/070_coop_reduce) is the MONOID algebra on the
+# streaming schedule, derived structurally on demand (``dag.reduction.nested``), not a distinct kind.
 _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 
 

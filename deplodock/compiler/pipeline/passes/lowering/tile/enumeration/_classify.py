@@ -8,10 +8,11 @@ read off the derived iteration DAG.
 The streaming-flash schedule is **not** a distinct algebra (a twisted monoid is a
 monoid — transport of structure): it is a *structural* property of a ``MONOID``
 nest — a tuple `Monoid` carrier streaming over a *nested* contraction (flash's
-QK^T reduce inside the KV stream). It is **derived on demand** (``IterDag.streaming``),
-never stored on the regime: the streaming fork (``080_streaming``) and the knob-pin
-validator query the DAG when they need the distinction; a plain `Accum` / non-nested
-`Monoid` reduce is the cooperative ``MONOID`` regime.
+QK^T reduce inside the KV stream). It is the reduction's **Axis-A** ``nested`` fact
+(``MonoidReduction.nested``, derived on demand off ``IterDag.reduction``), NOT a
+standalone ``IterDag.streaming`` routing bit: ``classify`` and the MONOID pass
+(``070_coop_reduce``) read it off the reduction; a plain `Accum` / non-nested
+`Monoid` reduce is the cooperative ``MONOID`` regime (``nested=False``).
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag impor
 class _Regime:
     """The classification handoff: the nest's algebra + the contraction-axis names
     a reduce decomposition rewrites (``target_names``). The streaming-flash schedule
-    is **not** carried here — it is a derived property of the DAG (``IterDag.streaming``)
-    queried on demand by the moves that need it.
+    is **not** carried here — it is the reduction's Axis-A ``nested`` fact
+    (``dag.reduction.nested``), queried on demand by the moves that need it.
 
     ``inner_algebra`` carries the **compositional** algebra of a twisted carrier:
     a streaming-flash
@@ -46,24 +47,27 @@ class _Regime:
 
 def classify(dag: IterDag) -> _Regime | None:
     """Tag the nest's regime off the derived DAG — the reduce axes'
-    ``Loop.algebra_kind`` (the streaming-flash schedule is derived separately via
-    ``dag.streaming``), or ``None`` for a shape the moves don't cover."""
+    ``Loop.algebra_kind`` (the streaming-flash schedule is the reduction's ``nested``
+    fact, ``dag.reduction.nested``), or ``None`` for a shape the moves don't cover."""
     if not dag.parallel:
         return None
     reduce_loops = [n.loop for n in dag.reduce]
     algebras = dag.algebras
     inner_body = dag.inner_body
 
-    if dag.streaming:
+    # The streaming-flash schedule is the reduction's Axis-A ``nested`` fact (a nested-reduce
+    # composition with a ``Monoid`` carrier), read off ``dag.reduction`` — no standalone
+    # ``IterDag.streaming`` routing bit.
+    reduction = dag.reduction
+    if reduction is not None and reduction.nested:
         if len(dag.parallel) < 2:
             return None
         if any(not n.loop.axis.extent.is_static for n in dag.reduce if not isinstance(n.carrier, Monoid)):
             return None
         # The twisted carrier is compositional: ``MONOID(SEMIRING)`` when the reduction composes an
         # inner SEMIRING contraction (the embedded P@V on the hinge ``kv``). A structural property
-        # (``dag.reduction.inner``), so this stays a derived read.
-        reduction = dag.reduction
-        inner = AlgebraKind.SEMIRING if reduction is not None and reduction.inner is not None else None
+        # (``reduction.inner``), so this stays a derived read.
+        inner = AlgebraKind.SEMIRING if reduction.inner is not None else None
         return _Regime(AlgebraKind.MONOID, frozenset(lp.axis.name for lp in reduce_loops), inner_algebra=inner)
 
     if not reduce_loops:  # no contraction — a MAP nest.

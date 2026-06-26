@@ -51,7 +51,7 @@ _S, _D = 16, 8  # the streaming KV extent (hinge) and the head-dim (inner QK^T r
 
 def test_streaming_flash_exposes_the_chain():
     dag = iter_dag(_flash_loop())
-    assert dag.streaming, "a flash nest must be streaming"
+    assert dag.reduction is not None and dag.reduction.nested, "a flash nest must be streaming"
     chain = dag.reduction
     assert chain is not None, "a streaming flash nest must expose the carried contraction chain"
 
@@ -207,7 +207,7 @@ def test_plain_reduce_is_a_reduction_with_no_inner():
     """A flat (non-streaming) reduce is the SAME ``MonoidReduction`` class as flash — just with no
     inner contraction (``inner is None``). The composition is uniform; flash is the inner-present case."""
     dag = iter_dag(_reduce_loop())
-    assert not dag.streaming
+    assert dag.reduction is not None and not dag.reduction.nested
     reduction = dag.reduction
     assert reduction is not None and reduction.inner is None, "a flat reduce is a MonoidReduction with no inner"
 

@@ -173,7 +173,7 @@ def reduction_build(ctx: Context, op: TileGraphOp) -> list[TileGraphOp]:
         # score→A handoff edge); assembly's generic ``carry_scope_from_graph`` walk realizes the
         # fragment-tier phases (softmax / scale / mask / handoff / epilogue) around those cells.
         return [replace(op, tilegraph=warp_chain_build(op))]
-    return _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
+    return _streaming_leaves(op) if reduction.nested else _coop_leaves(op)
 
 
 def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:

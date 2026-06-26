@@ -49,7 +49,9 @@ def _flash_op(s_dim: Dim) -> TileGraphOp:
     loop = build_flash_frag("q", "k", "v", shp, shp, shp, out, causal=False).nodes["o"].op
     dag = iter_dag(loop)
     regime = classify(dag)
-    assert regime is not None and regime.algebra is AlgebraKind.MONOID and dag.streaming and dag.reduction.inner is not None
+    reduction = dag.reduction
+    assert regime is not None and regime.algebra is AlgebraKind.MONOID
+    assert reduction is not None and reduction.nested and reduction.inner is not None
     buffers = {n: Buffer(name=n, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM) for n, t in loop.inputs.items()}
     for t in loop.outputs.values():
         buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
