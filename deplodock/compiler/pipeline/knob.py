@@ -680,6 +680,7 @@ def _geom_feats(
     free_prod,
     sm: float,
     warp: bool,
+    finalize: str = "atomic",
 ) -> dict[str, float]:
     """The engineered ``D_*`` tile-geometry / occupancy feature family — the
     single featurization the priors rank on. It folds in everything the old
@@ -757,6 +758,10 @@ def _geom_feats(
         "D_w_near_bk": (-abs(l2(bk) - 1.0)) if warp else 0.0,
         "D_splitk": float(splitk),
         "D_splitk_le2": 1.0 if splitk <= 2 else 0.0,
+        # Cross-CTA finalize fold (the REDUCE codec ``c`` field's letter): 1.0 = deferred
+        # KERNEL combine (``c<cta>k``), 0.0 = in-place ATOMIC (``c<cta>a`` / bare). Replaces
+        # the removed ``NOATOMIC`` knob feature; the analytic prior's split-K gate reads it.
+        "D_finalize_kernel": 1.0 if (splitk > 1 and finalize == "kernel") else 0.0,
         "D_tilen_clean": 1.0 if tile_n in (32, 64, 128) else 0.0,
         "D_near_tilen": -abs(l2(tile_n) - 6.0),
     }
@@ -818,6 +823,7 @@ def _tile_features(knobs: dict) -> dict[str, float]:
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=False,
+        finalize=d.finalize,
     )
 
 

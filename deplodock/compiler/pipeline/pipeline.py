@@ -931,17 +931,20 @@ def _concrete_option(option: object) -> object | None:
 
 def _option_decision(option: object, root_knobs: dict) -> dict | None:
     """The decision-knob delta one raw structural-fork option would stamp vs
-    the offer op: new non-``S_*`` knob keys on the option's op / fork knobs (a
-    ``Graph`` option reads the union over its nodes' op knobs — fragment
-    kernels restamp their own ``S_*``, which describe the child bodies, not
-    the decision). ``None`` when the option stamps nothing new."""
+    the offer op: non-``S_*`` knob keys the option's op / fork knobs **add or
+    change** vs the offer (a ``Graph`` option reads the union over its nodes'
+    op knobs — fragment kernels restamp their own ``S_*``, which describe the
+    child bodies, not the decision). A *changed value* on an existing key counts
+    (e.g. the cross-CTA finalize fork mutates the ``REDUCE@<axis>`` codec's ``c``
+    field from a bare ``c<cta>`` to ``c<cta>a`` / ``c<cta>k`` — same key, new
+    value), not only a brand-new key. ``None`` when the option stamps nothing new."""
     if isinstance(option, Graph):
         knobs: dict = {}
         for node in option.nodes.values():
             knobs.update(getattr(node.op, "knobs", None) or {})
     else:
         knobs = getattr(option, "knobs", None) or {}
-    delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
+    delta = {k: v for k, v in knobs.items() if root_knobs.get(k) != v and not k.startswith("S_")}
     return delta or None
 
 

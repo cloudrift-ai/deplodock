@@ -137,7 +137,14 @@ class MonoidReduction:
 
     Flash is therefore *selected structurally* — "a ``Monoid`` whose folded inner operand is a
     SEMIRING ``Contraction``" — never matched as a named shape; a flat reduce is the same class with
-    no inner. When ``inner`` is present the **carried-chain invariant** holds: the inner
+    no inner. The :attr:`nested` flag carries the **Axis-A** (what-is-folded) schedule fact — a
+    nested-reduce composition with a ``Monoid`` carrier — set even when ``inner is None`` (the
+    *non-separable* stream: nested, but its free-axis footprints don't separate into a clean QK^T /
+    P@V). It distinguishes that case from a *flat* cooperative reduce (``nested=False``, ``inner is
+    None``), the one MONOID distinction NOT subsumed by the combine array (it is Axis A, not the
+    Axis-B combine). The MONOID pass (``070_coop_reduce``) and ``_classify`` route on it instead of a
+    standalone ``IterDag.streaming`` bit. When ``inner`` is present the **carried-chain invariant**
+    holds: the inner
     contraction's output column (``inner.out_index[-1]``) IS the reduced ``axis`` (the hinge) —
     enforced in ``__post_init__``, so a malformed composition is unrepresentable.
 
@@ -150,6 +157,7 @@ class MonoidReduction:
     carrier: ReduceCarrier  # the associative carrier — a ``Monoid`` (twisted, flash / Welford) or ``Accum`` (plain)
     axis: AxisNode  # the primary reduce node (the streaming hinge when ``inner`` is present)
     inner: Contraction | None = None  # the nested SEMIRING contraction (streaming flash), or ``None`` (flat reduce)
+    nested: bool = False  # the streaming-schedule fact — a nested-reduce ∧ Monoid-carrier composition (Axis A)
 
     def __post_init__(self) -> None:
         # The carried-chain invariant (flash only): the inner contraction's output column IS ``axis`` (the hinge).
@@ -209,14 +217,13 @@ class IterDag:
         """The algebra kinds of the reduce axes (empty for a MAP nest)."""
         return {n.algebra for n in self.reduce if n.algebra is not None}
 
-    @property
-    def streaming(self) -> bool:
-        """The streaming-flash schedule — a tuple ``Monoid`` carrier streaming over a
-        *nested* contraction (flash's QK^T reduce inside the KV stream). A **derived**
-        structural property (a reduce whose parent is a reduce, with a ``Monoid``
-        carrier), computed on demand exactly like ``algebras`` — never stored, so it
-        can't drift and doesn't enter ``op_cache_key``. A move that needs the
-        distinction (the streaming fork, the knob-pin validator) queries this."""
+    def _nested_monoid(self) -> bool:
+        """The streaming-schedule structural fact (Axis A) — a tuple ``Monoid`` carrier
+        streaming over a *nested* contraction (a reduce whose parent is a reduce, with a
+        ``Monoid`` carrier somewhere in the nest). Folded onto :attr:`MonoidReduction.nested`
+        (replacing the former standalone ``IterDag.streaming`` routing property): the MONOID
+        pass and ``_classify`` read it off the reduction. Derived on demand, never stored, so
+        it can't drift and doesn't enter ``op_cache_key``."""
         nested_reduce = any(n.parent is not None and n.parent.role is AxisRole.REDUCE for n in self.reduce)
         has_monoid = any(isinstance(n.carrier, Monoid) for n in self.reduce)
         return nested_reduce and has_monoid
@@ -231,19 +238,20 @@ class IterDag:
         (``070_coop_reduce``) dispatches on."""
         if not self.reduce or self.reduce[0].algebra is not AlgebraKind.MONOID:
             return None  # not a MONOID nest (a SEMIRING matmul / MAP has no monoid reduction)
-        inner, hinge = self._flash_inner()
+        nested = self._nested_monoid()
+        inner, hinge = self._flash_inner(nested)
         if inner is not None:
-            return MonoidReduction(carrier=hinge.carrier, axis=hinge, inner=inner)
+            return MonoidReduction(carrier=hinge.carrier, axis=hinge, inner=inner, nested=True)
         primary = self.reduce[0]
-        return MonoidReduction(carrier=primary.carrier, axis=primary, inner=None)
+        return MonoidReduction(carrier=primary.carrier, axis=primary, inner=None, nested=nested)
 
-    def _flash_inner(self) -> tuple[Contraction, AxisNode] | tuple[None, None]:
+    def _flash_inner(self, nested: bool) -> tuple[Contraction, AxisNode] | tuple[None, None]:
         """The separable streaming flash's inner SEMIRING :class:`Contraction` + its hinge node, or
         ``(None, None)`` for a flat reduce / a non-separable stream. The ``MONOID(SEMIRING)``
         recognizer: a ``Monoid``-carrier hinge with a nested SEMIRING contraction whose free-axis
         footprints separate (exactly one query ``m`` / head ``d``). The fragment QK^T has no
         ``Write``, so the score coords are synthesized ``(query row, hinge)``."""
-        if not self.streaming:
+        if not nested:
             return None, None
         hinge = next((n for n in self.reduce if isinstance(n.carrier, Monoid)), None)
         if hinge is None or not hinge.carrier.partial:

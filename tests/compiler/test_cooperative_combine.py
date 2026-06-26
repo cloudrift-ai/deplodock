@@ -118,11 +118,11 @@ def _ref_softmax(x: np.ndarray) -> np.ndarray:
 @pytest.mark.skipif(not _has_cuda(), reason="cooperative monoid combine runs on CUDA")
 @pytest.mark.parametrize("br", [32, 128])
 def test_cooperative_combine_softmax_matches_numpy(monkeypatch, br: int) -> None:
-    """A cooperative-K ``Monoid`` reduce (BR>1) matches numpy softmax — warp-
-    shuffle path at BR=32, smem-tree path at BR=128."""
-    monkeypatch.setenv("DEPLODOCK_BR", str(br))
-    monkeypatch.setenv("DEPLODOCK_BN", "1")
-    monkeypatch.setenv("DEPLODOCK_BM", "1")
+    """A cooperative-K ``Monoid`` reduce (coop>1) matches numpy softmax — warp-
+    shuffle path at coop=32, smem-tree path at coop=128. Native pins: the REDUCE
+    coop field ``t<br>`` + a whole-CTA free tile (``SPLIT=1`` ⇒ BN=BM=1)."""
+    monkeypatch.setenv("DEPLODOCK_REDUCE", f"t{br}")
+    monkeypatch.setenv("DEPLODOCK_SPLIT", "1")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     rows, k = 8, 256
@@ -136,11 +136,10 @@ def test_cooperative_combine_softmax_matches_numpy(monkeypatch, br: int) -> None
 
 @pytest.mark.skipif(not _has_cuda(), reason="cooperative monoid combine runs on CUDA")
 def test_cooperative_combine_emits_monoid_combine(monkeypatch) -> None:
-    """With BR pinned, the kernel carries the cross-thread monoid combine
-    (``__shfl_xor_sync`` butterfly over the full state) — not a serial reduce."""
-    monkeypatch.setenv("DEPLODOCK_BR", "32")
-    monkeypatch.setenv("DEPLODOCK_BN", "1")
-    monkeypatch.setenv("DEPLODOCK_BM", "1")
+    """With the REDUCE coop field pinned, the kernel carries the cross-thread monoid
+    combine (``__shfl_xor_sync`` butterfly over the full state) — not a serial reduce."""
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "t32")
+    monkeypatch.setenv("DEPLODOCK_SPLIT", "1")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     compiled = CudaBackend().compile(_softmax_combine_graph(8, 256))
