@@ -29,10 +29,11 @@ PATTERN = [Pattern("root", TileGraphOp)]
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
     kind = mma_atom(op.knobs)
+    if kind is None or op.dag is None:
+        raise RuleSkipped("warp build applies to a warp (MMA atom) variant with a dag")
     nkey = fam.split_key(op.dag.inner_n.axis.name)
     if (
-        kind is None
-        or nkey not in op.knobs
+        nkey not in op.knobs
         or not fam.split_complete(op.knobs[nkey])
         or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs
     ):

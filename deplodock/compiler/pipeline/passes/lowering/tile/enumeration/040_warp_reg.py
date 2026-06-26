@@ -25,8 +25,10 @@ PATTERN = [Pattern("root", TileGraphOp)]
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
     kind = mma_atom(op.knobs)
+    if kind is None or op.dag is None:
+        raise RuleSkipped("warp reg tile applies to a warp (MMA atom) variant with a dag")
     nkey = fam.split_key(op.dag.inner_n.axis.name)
-    if kind is None or nkey not in op.knobs or fam.split_complete(op.knobs[nkey]):
+    if nkey not in op.knobs or fam.split_complete(op.knobs[nkey]):
         raise RuleSkipped("warp reg tile applies once, after the geometry is pinned")
     offers = warp_reg_offers(op.dag, ATOM_REGISTRY[kind])
     if not offers:
