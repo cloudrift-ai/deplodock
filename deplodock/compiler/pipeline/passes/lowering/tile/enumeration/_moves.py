@@ -390,11 +390,16 @@ def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, 
         allow_split=True,
     )
     # The cross-CTA split-K menu — additive Accum + static K + no epilogue / multi-accum.
+    # **Pin-gated** in M1 (offered only when ``REDUCE`` carries an explicit ``c<cta>``): the
+    # cold ``AnalyticPrior`` would otherwise rank a degenerate split-K reduce above the
+    # cooperative one, changing the greedy default (a plain ``sum`` is cooperative-reduced, not
+    # split). M4 surfaces ``cta`` as a real search dimension; until then greedy / cold stay
+    # cta=1 and only a pin (or, at M4, the tuner) reaches the cross-CTA producer.
     additive = isinstance(carrier, Accum) and carrier.op.name == "add"
     has_epilogue = any(not isinstance(s, (Loop, Write)) for s in dag.inner_body)
     n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
     allow_cta = additive and not masked and not (has_epilogue or n_reduce > 1)
-    sks = ((sk_pin,) if sk_pin else SPLITK_CHOICES) if allow_cta else (1,)
+    sks = (sk_pin,) if (allow_cta and sk_pin) else (1,)
     out: list[tuple[int, int, int, int]] = []
     for d in decomps:
         br, bk, fk = d.factors

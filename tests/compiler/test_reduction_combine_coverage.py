@@ -63,6 +63,10 @@ def _ref_matmul(xs):
     return xs[0] @ xs[1]
 
 
+def _ref_sum(xs):
+    return xs[0].sum(axis=1, keepdims=True)
+
+
 # (label, code, ref_fn). The reduce axis is sized 1024 (reduction/softmax) so coop=128 reaches
 # the 4-warp hierarchical smem combine; attention's KV is 64 (coop ≤ 64).
 _OPS = {
@@ -74,6 +78,7 @@ _OPS = {
         _ref_attention,
     ),
     "matmul": ("torch.matmul(torch.randn(8, 1024), torch.randn(1024, 16))", _ref_matmul),
+    "sum": ("torch.randn(4, 1024).sum(dim=1, keepdim=True)", _ref_sum),
 }
 
 
@@ -151,6 +156,30 @@ def test_cross_cta_finalize_accuracy_and_structure(finalize, monkeypatch):
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
     assert diff < 1e-2, f"matmul/{finalize}: split-K mismatch (max abs err {diff})"
+    n_global = src.count("__global__")
+    if finalize == "atomic":
+        assert "atomicAdd" in src, "the atomic finalize must emit atomicAdd"
+        assert n_global == 1, f"atomic finalize is one kernel, got {n_global}"
+    else:
+        assert "atomicAdd" not in src, "the deferred kernel finalize must not emit atomicAdd"
+        assert n_global == 2, f"deferred finalize splices a second combine kernel, got {n_global}"
+
+
+@pytest.mark.parametrize("finalize", ["atomic", "kernel"])
+def test_cross_cta_reduce_finalize_accuracy_and_structure(finalize, monkeypatch):
+    """The **carrier-generic cross-CTA producer**: a plain additive ``Accum`` reduce
+    (``x.sum(dim)``) splits its reduce axis across CTAs (``c<cta>``) exactly like the
+    matmul split-K, writing each CTA's partial to a workspace and folding it through the
+    SAME finalize fork — the 1-component instantiation of the producer a twisted flash
+    ``(m, l, O)`` carrier takes. Accurate under BOTH finalize folds, with the matching
+    kernel set: ATOMIC = one kernel + ``atomicAdd``; deferred KERNEL = a second
+    ``__global__`` combine kernel, no ``atomicAdd``."""
+    code, ref_fn = _OPS["sum"]
+    reduce_pin = "c2a" if finalize == "atomic" else "c2k"
+    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": reduce_pin}, monkeypatch)
+    want = ref_fn(xs).reshape(got.shape)
+    diff = float(np.abs(got - want).max())
+    assert diff < 1e-2, f"sum/{finalize}: cross-CTA reduce mismatch (max abs err {diff})"
     n_global = src.count("__global__")
     if finalize == "atomic":
         assert "atomicAdd" in src, "the atomic finalize must emit atomicAdd"
