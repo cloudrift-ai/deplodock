@@ -142,9 +142,7 @@ def test_deferred_finalize_flash_attention_carrier_merges_states() -> None:
         out_value="o",  # the merged unnormalized output accumulator O
     )
     be = CudaBackend()
-    out = np.asarray(
-        be.run(be.compile(g), input_data={"ws_m": ws_m, "ws_l": ws_l, "ws_o": ws_o})[0].outputs["out"]
-    ).reshape(m, n)
+    out = np.asarray(be.run(be.compile(g), input_data={"ws_m": ws_m, "ws_l": ws_l, "ws_o": ws_o})[0].outputs["out"]).reshape(m, n)
     o_g = (ws_o * np.exp(ws_m - ws_m.max(axis=0))).sum(axis=0)
     np.testing.assert_allclose(out, o_g, rtol=1e-5, atol=1e-5)
 
