@@ -32,19 +32,24 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Body, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Stmt, Write
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType, mma_atom
+from deplodock.compiler.pipeline.passes.lowering._predicates import atomic_finalize_legal
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import additive_reduce_tilegraph, reduce_tilegraphop
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
 from deplodock.compiler.tensor import Tensor
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
-# BOOL knob: the autotuner forks between the legacy atomicAdd path (False) and the
-# two-kernel atomic-free path (True). Per-shape pin via ``DEPLODOCK_NOATOMIC=1``.
+# BOOL knob — the cross-CTA stage's **finalize policy** (the one tunable cell of the combine
+# array; the intra-CTA folds are derived, the widths already tuned). False = the in-place
+# ``Fold.ATOMIC`` finalize (codegen atomicAdd); True = the deferred ``kernel_boundary`` fold (a
+# fresh combine kernel). ATOMIC's legality (additive ``Accum`` + atomicAdd dtype) is checked via
+# ``_combine.atomic_finalize_legal`` in ``rewrite``; deferred is always legal. Per-shape pin via
+# ``DEPLODOCK_NOATOMIC=1``.
 NOATOMIC = Knob(
     "NOATOMIC",
     KnobType.BOOL,
@@ -77,9 +82,12 @@ def _rewrite_writes_to_workspace(stmts: tuple[Stmt, ...], *, out_name: str, work
     return tuple(new_stmts)
 
 
-def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: int) -> Graph:
+def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: int, carrier: Accum) -> Graph:
     """The ``NOATOMIC=True`` fragment: the matmul writing to ``partial[K_s, M, N]`` +
-    the sibling additive reduce kernel folding ``K_s`` into the output."""
+    the sibling deferred-finalize combine kernel folding ``K_s`` into the output. The combine
+    is built carrier-generically (``_partition.deferred_combine_tilegraph``) — for the additive
+    matmul ``carrier`` the 1-component ``Accum`` sum, the trivial instantiation of the same
+    cross-partition fold a twisted ``Monoid`` (online-softmax / flash) would take."""
     out_shape = root.output.shape
     if len(out_shape) != 2 or not all(d.is_static for d in out_shape):
         raise RuleSkipped(f"atomic-free split-K expects a 2D static matmul output, got shape={out_shape}")
@@ -99,8 +107,9 @@ def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: i
     matmul_variant = replace(op, tilegraph=new_tg, knobs={**op.knobs, NOATOMIC.name: True})
 
     reduce_op = reduce_tilegraphop(
-        additive_reduce_tilegraph(
-            workspace_name=workspace_name,
+        deferred_combine_tilegraph(
+            carrier,
+            workspaces=(workspace_name,),
             out_name=out_name,
             s_extent=splitk,
             m_extent=m_extent,
@@ -143,13 +152,26 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     if k_s is None:
         raise RuleSkipped("no split-K partition axis")
 
+    # The cross-CTA stage's finalize policy: NOATOMIC=False is the in-place ``Fold.ATOMIC``
+    # finalize, NOATOMIC=True the deferred ``kernel_boundary`` (workspace + sibling reduce kernel).
+    # ATOMIC is legal only for an additive ``Accum`` over an atomicAdd-capable dtype
+    # (``_predicates.atomic_finalize_legal``) — always true here (the SEMIRING matmul's combine is a
+    # plain sum), but the gate is the explicit legality M5's twisted (non-additive ``Monoid``)
+    # split-KV finalize will fail, falling back to deferred.
+    accums = tuple(Body.coerce(op.tilegraph.blocks[0].compute).iter_of_type(Accum))
+    if not accums:
+        raise RuleSkipped("no reduce carrier — nothing to finalize across the split-K partitions")
+    atomic_legal = atomic_finalize_legal(accums[0], root.output.dtype)
+
     candidates = NOATOMIC.narrow(NOATOMIC.hints)
+    if not atomic_legal:
+        candidates = [c for c in candidates if c is True]  # ATOMIC illegal ⇒ deferred-only (always legal)
     if not candidates:
-        raise RuleSkipped("NOATOMIC pin doesn't match any candidate")
+        raise RuleSkipped("NOATOMIC pin doesn't match any candidate (or pins the illegal ATOMIC finalize)")
     variants: list = []
     for use_atomic_free in candidates:
         if use_atomic_free:
-            variants.append(_build_fragment(match, root, op, k_s.name, splitk))
+            variants.append(_build_fragment(match, root, op, k_s.name, splitk, accums[0]))
         else:
             variants.append(replace(op, knobs={**op.knobs, NOATOMIC.name: False}))
     return variants

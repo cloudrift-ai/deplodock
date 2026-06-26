@@ -204,3 +204,66 @@ def monoid_reduce_tilegraph(
         out_name=out_name,
         dtype=dtype,
     )
+
+
+def deferred_combine_tilegraph(
+    carrier,
+    *,
+    workspaces: tuple[str, ...],
+    out_name: str,
+    s_extent: int,
+    m_extent: int,
+    n_extent: int,
+    dtype: DataType,
+    name: str,
+    init_ops: tuple[ElementwiseImpl, ...] = (),
+    finalize: tuple[Assign, ...] = (),
+    out_value: str | None = None,
+) -> TileGraph:
+    """Carrier-generic cross-partition (split-K / split-KV) **deferred finalize** — ONE combine
+    kernel for ANY associative carrier, dispatched on its state. The schedule never changes (one
+    CTA per ``16×16`` output tile, a serial fold over the ``S`` partitions); only the carrier's
+    combine does. This is the algebraic thesis made concrete: a regular sum, online softmax
+    ``(m, d)``, Welford ``(n, μ, M₂)``, and flash attention ``(m, d, o)`` are the SAME reduction,
+    differing only in carrier state — so the deferred finalize is one entry point, not a flash
+    special case.
+
+    - an **additive 1-component ``Accum``** with no finalize (the matmul split-K, ``state =
+      (acc,)``) → :func:`additive_reduce_tilegraph` (the bit-identical ``+`` fold — the trivial
+      carrier).
+    - a tuple **``Monoid``** (online-softmax / flash) or any multi-component carrier →
+      :func:`monoid_reduce_tilegraph`, seeding each state component from ``init_ops`` (the
+      carrier's per-component identity) and folding via the carrier's ``combine_states``, with the
+      op's ``finalize`` (e.g. flash's ``o / d``) read off at the end.
+
+    The producer (the cross-CTA split) writes one workspace ``partial_i[S, M, N]`` per state
+    component (``workspaces`` aligned to the carrier's state); an additive carrier has a single
+    component, so ``workspaces`` is length 1."""
+    if isinstance(carrier, Accum) and carrier.op.name == "add" and len(workspaces) == 1 and not finalize:
+        return additive_reduce_tilegraph(
+            workspace_name=workspaces[0],
+            out_name=out_name,
+            s_extent=s_extent,
+            m_extent=m_extent,
+            n_extent=n_extent,
+            dtype=dtype,
+            name=name,
+        )
+    if not isinstance(carrier, Monoid):
+        raise ValueError(
+            f"deferred_combine_tilegraph: a non-additive {type(carrier).__name__} carrier needs the "
+            "Monoid (state, combine_states) form for the cross-partition fold"
+        )
+    return monoid_reduce_tilegraph(
+        carrier=carrier,
+        init_ops=init_ops,
+        workspaces=workspaces,
+        out_name=out_name,
+        s_extent=s_extent,
+        m_extent=m_extent,
+        n_extent=n_extent,
+        dtype=dtype,
+        finalize=finalize,
+        out_value=out_value,
+        name=name,
+    )
