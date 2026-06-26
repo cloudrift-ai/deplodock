@@ -184,4 +184,4 @@ def test_structural_replay_consulted() -> None:
     assert sum(1 for n in terminal.nodes.values() if isinstance(n.op, LoopOp)) == 4, "both sites must take the split side"
     split = next(d for d in trace if d.rule_name == "010_split_demoted")
     assert split.chosen_kind == "graph"
-    assert split.knob_delta.get("CUT") == "1"
+    assert split.knob_delta.get("PLACE@cone") == "cut"  # the structural materialize decision (legacy CUT="1")

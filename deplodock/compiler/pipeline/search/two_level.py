@@ -199,7 +199,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
     informed instead of uniform. They are estimates for *search ordering*; greedy's
     deploy decision keeps the sharper compositional probe
     (``policy/greedy._pick_structural``)."""
-    from deplodock.compiler.pipeline.search.keys import STRUCTURAL_DECISION_KNOBS, dialect_of, source_chain  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain, structural_decision_delta  # noqa: PLC0415
 
     best = {r.op_key: r.best_us for r in per_op}
     unique: dict[str, object] = {}
@@ -209,7 +209,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
             unique[key] = op
     groups: dict[tuple, tuple[dict, list[float | None]]] = {}
     for key, op in unique.items():
-        delta = {k: op.knobs[k] for k in STRUCTURAL_DECISION_KNOBS if k in op.knobs}
+        delta = structural_decision_delta(op.knobs)
         if not delta:
             continue  # a kernel from no structural decision (no offer fired)
         site = None

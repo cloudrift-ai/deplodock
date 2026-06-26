@@ -73,6 +73,7 @@ from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._cut import cut_offers
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import extract_block, seed_fused
 
@@ -93,23 +94,25 @@ PATTERN = [Pattern("root", LoopOp)]
 # DELIBERATELY no ``off=``: ``_off_fill_pass`` would stamp an off-default onto
 # every knob-bearing TileOp at the pass boundary, erasing the absent-vs-declined
 # distinction the prior trains on. ``SPLIT_CONE`` alias keeps ``DEPLODOCK_SPLIT_CONE``
-# pinning the width-1 mask (``1`` ↔ old ``True``, ``0`` ↔ old ``False``).
+# pinning the cut. The native decision is the ``PLACE@cone`` placement
+# (``inline`` keep / ``cut`` materialize — ``_families``); this ``CUT`` ``Knob`` stays
+# registered only so the legacy ``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE`` env namespace
+# + display resolve (ingested via ``_knob_legacy.cut_pin``).
 CUT = Knob(
     "CUT",
     KnobType.BINMASK,
     aliases=("SPLIT_CONE",),
-    help="BINMASK over ranked cuttable edges (bit i = cut ranked offer i) of a demoted matmul's "
-    "computed / K-folded operand cone(s) into producer kernel(s) (xn producer(s) + clean gemm; "
-    "multi-accum also extracts one gemm per accum + the pointwise combine) vs keep them fused on-chip. "
-    "Width-1 today (the whole-cone cut is all-or-nothing); DEPLODOCK_SPLIT_CONE=1/0 pins it.",
+    help="(legacy spelling of PLACE@cone) cut a demoted matmul's computed / K-folded operand "
+    "cone(s) into producer kernel(s) (xn producer(s) + clean gemm) vs keep them fused on-chip. "
+    "DEPLODOCK_SPLIT_CONE=1/0 pins it; the native key is PLACE@cone=cut/inline.",
 )
 
 
-def _stamp(split: Graph, mask_str: str) -> Graph:
-    """Stamp the cut ``CUT`` mask onto every split kernel's ``op.knobs``."""
+def _stamp(split: Graph, place: str) -> Graph:
+    """Stamp the cone placement (``cut``) onto every split kernel's ``PLACE@cone``."""
     for node in split.nodes.values():
         if isinstance(node.op, LoopOp):
-            node.op.knobs = {**node.op.knobs, CUT.name: mask_str}
+            node.op.knobs = {**node.op.knobs, fam.cone_key(): place}
     return split
 
 
@@ -130,40 +133,34 @@ def _dtype_of(loop_op: LoopOp, graph: Graph):
 
 
 def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
-    if CUT.name in root.op.knobs:
+    if fam.cone_key() in root.op.knobs:
         raise RuleSkipped("split fork already considered for this kernel")
     split = extract_block(root.op, graph=match.graph, node_id=root.id, out_tensor=root.output)
     if split is None:
         raise RuleSkipped("not a cuttable demoted matmul")
     # The offer policy (enumeration/_cut.cut_offers): a demoted cone whose operand keeps
     # the matmul below any buildable tier (the gated-MLP RMSNorm, the SDPA softmax-
-    # prologue) offers a cut that restores it. ``decision.width`` is the number of ranked
-    # cuttable edges = the ``CUT`` mask width (1 today, the all-or-nothing whole-cone cut;
-    # ``or 1`` keeps the fork width-1 even in the unreached cuttable-but-not-offered case).
+    # prologue) offers a cut that restores it.
     cc = ctx.compute_capability if ctx is not None else target_mod.compute_capability()
     fused = seed_fused(root.op, graph=match.graph, node_id=root.id, out_tensor=root.output)
     smem_fusible = fused is not None
     decision = cut_offers(root.op, compute_capability=cc, dtype_of=_dtype_of(root.op, match.graph), smem_fusible=smem_fusible)
-    n = decision.width or 1
-    keep_mask = CUT.pretty(0, width=n)  # "0" — cut nothing (keep the cone fused)
-    cut_mask = CUT.pretty((1 << n) - 1, width=n)  # "1" — cut every ranked edge
-    # The "keep" option: the SMEM fused edge (the producer cone on-chip, one kernel) when
-    # expressible, else the un-tiled fused LoopOp (a buildable-fused operand index). Only
-    # genuine offer sites carry the decision knob — never-offered kernels stay knob-free
-    # (the prior's "not considered" NaN state).
+    # The "keep" option places the cone ``inline`` (it rides inside the consumer — the SMEM
+    # fused edge when expressible, else the un-tiled fused LoopOp); the "cut" option places
+    # it ``cut`` (materialized to a gmem intermediate kernel). Only genuine offer sites
+    # carry the ``PLACE@cone`` decision — never-offered kernels stay knob-free.
     if smem_fusible:
-        fused.knobs = {**root.op.knobs, CUT.name: keep_mask}
+        fused.knobs = {**root.op.knobs, fam.cone_key(): fam.INLINE}
         keep = fused
     else:
-        keep = replace(root.op, knobs={**root.op.knobs, CUT.name: keep_mask})
-    # Env pin (``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE`` = ``1`` / ``0`` / ``all`` /
-    # ``none``) collapses the fork to one mask, mirroring ``STAGE`` — ``narrow`` rejects
-    # BINMASK, so pin via ``raw()`` + ``parse(width=n)``. Any non-zero mask = cut.
-    raw = CUT.raw()
-    if raw:
-        return keep if CUT.parse(raw, width=n) == 0 else _stamp(split, cut_mask)
+        keep = replace(root.op, knobs={**root.op.knobs, fam.cone_key(): fam.INLINE})
+    # Env pin (native ``DEPLODOCK_PLACE_CONE=cut`` / legacy ``DEPLODOCK_CUT`` /
+    # ``DEPLODOCK_SPLIT_CONE``) collapses the fork — True = cut, False = keep.
+    pin = fam.pin_cut()
+    if pin is not None:
+        return _stamp(split, fam.CUT) if pin else keep
     if decision.force:
-        return _stamp(split, cut_mask)
+        return _stamp(split, fam.CUT)
     # Offered-not-forced (``smem_fusible``): a real keep(SMEM)-vs-cut(GMEM) fork. Greedy's
     # "a cold compile never changes kernel sets" rule (search/policy/greedy._pick_structural
     # filters the structural cut when the prior is cold) deploys the kernel-set-PRESERVING
@@ -171,4 +168,4 @@ def rewrite(ctx: Context | None, match: Match, root: Node) -> Graph | Op | list:
     # prices the cut's GMEM Σ vs keep's SMEM Σ and deploys the cut when it predicts faster;
     # ``tune``'s MCTS walks both. Keep first = the documented no-prior emission-order
     # fallback (the SMEM fused edge — no gmem round-trip). ``DEPLODOCK_SPLIT_CONE=1/0`` pins.
-    return [keep, _stamp(split, cut_mask)]
+    return [keep, _stamp(split, fam.CUT)]

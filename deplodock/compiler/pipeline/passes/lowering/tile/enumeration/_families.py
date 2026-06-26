@@ -242,6 +242,16 @@ def pin_atom(cell: str) -> str | None:
 INLINE = "inline"
 SMEM = "smem"
 GMEM = "gmem"
+#: The structural materialize-to-gmem placement of a demoted-matmul cone — distinct from
+#: ``gmem`` (an operand read uncached, op-variant) so the value self-describes the
+#: kernel-set-changing decision: ``gmem`` on an operand read-site is "read direct", ``cut``
+#: on the cone is "materialize to a gmem intermediate kernel".
+CUT = "cut"
+#: The canonical structural element of the demoted-cone cut decision (like ``ATOM@out``'s
+#: ``out`` — one cut per demoted matmul today, width-1; per-cone-edge is the additive
+#: follow-up). Distinct from any operand / score element, so the structural recognizer keys
+#: on ``PLACE@cone`` unambiguously.
+CONE = "cone"
 
 
 def enc_place(place: str, xport: str | None = None) -> str:
@@ -284,6 +294,29 @@ def pin_place_mask(n: int) -> int | None:
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.stage_mask(n)
+
+
+def cone_key() -> str:
+    """The ``PLACE@cone`` key — the demoted-cone keep-vs-cut decision."""
+    return place_key(CONE)
+
+
+def place_is_cut(raw: object) -> bool:
+    """True when a ``PLACE@<edge>`` value is the structural ``cut`` (materialize to a gmem
+    intermediate), as opposed to ``gmem`` (operand read-direct) / ``smem`` / ``inline``."""
+    return place_of(raw) == CUT
+
+
+def pin_cut() -> bool | None:
+    """Pinned keep-vs-cut for the demoted cone: native ``DEPLODOCK_PLACE_CONE`` (``cut`` /
+    ``inline``), else legacy ``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE``. ``True`` = cut,
+    ``False`` = keep, ``None`` = auto."""
+    raw = pin(PLACE, CONE)
+    if raw is not None:
+        return place_of(raw) == CUT
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.cut_pin()
 
 
 def pin_inline_chain() -> bool:

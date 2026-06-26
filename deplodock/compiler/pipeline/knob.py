@@ -516,7 +516,7 @@ def _cut_features(knobs: dict) -> dict[str, float]:
     ``S_ext_*`` skeleton lacks — the deferred §3 follow-up."""
     import math  # noqa: PLC0415
 
-    cut = str(knobs.get("CUT", "")).count("1")
+    cut = 1 if str(knobs.get("PLACE@cone", "")) == "cut" else 0  # the materialize-to-gmem decision
     free = float(knobs.get("S_ext_free_prod", 0.0) or 0.0)
     return {"D_cut_roundtrip": math.log2(free) if (cut and free > 1.0) else 0.0}
 
@@ -573,7 +573,7 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # ``plans/golden-sweep-report.md``).
     if is_warp(knobs):
         feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
-    if "CUT" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
+    if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
         feats.update(_cut_features(knobs))
     return feats
 

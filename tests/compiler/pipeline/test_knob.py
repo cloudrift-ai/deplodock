@@ -381,14 +381,14 @@ def test_knob_features_differs_by_one_knob():
 def test_knob_features_cut_roundtrip():
     import math
 
-    # A cut fragment (CUT mask cuts) carries the materialized round-trip volume,
-    # sized from the coarse S_ext_free_prod product; the fused keep (CUT="0")
+    # A cut fragment (PLACE@cone=cut) carries the materialized round-trip volume,
+    # sized from the coarse S_ext_free_prod product; the fused keep (PLACE@cone=inline)
     # carries it as 0.0 — the cost axis that discriminates the two realizations.
-    cut = knob_features({"CUT": "1", "S_ext_free_prod": 4096.0})
+    cut = knob_features({"PLACE@cone": "cut", "S_ext_free_prod": 4096.0})
     assert cut["D_cut_roundtrip"] == math.log2(4096.0)
-    keep = knob_features({"CUT": "0", "S_ext_free_prod": 4096.0})
+    keep = knob_features({"PLACE@cone": "inline", "S_ext_free_prod": 4096.0})
     assert keep["D_cut_roundtrip"] == 0.0
-    # Never-offered kernels (no CUT key) stay free of the feature — the prior's
+    # Never-offered kernels (no PLACE@cone key) stay free of the feature — the prior's
     # "not considered" NaN state, never a spurious 0.
     assert "D_cut_roundtrip" not in knob_features({"S_ext_free_prod": 4096.0})
 

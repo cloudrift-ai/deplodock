@@ -1,12 +1,14 @@
 # Tile lowering — enumeration + assembly over the block-DAG IR
 
 > **Knob schema — algebra-native `MOVE@element` (`_families.py`).** The composer keys each knob on a *move applied to a
-> DAG element*, not on a rank-2 GEMM letter (`plans/algebra-knob-naming-schema.md`). `op.knobs` speaks:
+> DAG element*, not on a rank-2 GEMM letter (the grammar + codecs live in `enumeration/_families.py`). `op.knobs` speaks:
 > `SPLIT@<free-axis>` = `"par×reg"` (the legacy `BN`/`FN` thread tile **and** `WN`/`FN` warp tile — the tier is read off
 > the cell's `ATOM`, not the value; `BM`/`FM`/`WM` are the outer axis); `REDUCE@<reduce-axis>` = `"s/f/c/t"` (legacy
 > `BK`/`FK`/`SPLITK`/`BR`, **per reduce axis** — flash's two reduce axes become first-class); `ATOM@<cell>` (legacy
 > `MMA`; the matmul's single cell is the structural constant `out`); `PLACE@<edge>` = `place[:xport]` (the legacy
-> `STAGE`→`smem`, `TMA`→`:tma`/`:sync`, `CHAIN`→`inline` — `CUT`→`gmem` is the one deferred fold). The **implementation
+> `STAGE`→`smem`, `TMA`→`:tma`/`:sync`, `CHAIN`→`PLACE@score=inline`, and `CUT`→`PLACE@cone=cut` — a demoted cone
+> materialized to a gmem intermediate; `cut` is distinct from an operand `gmem`-direct read so the structural recognizer
+> keys on the value). The **implementation
 > reads native keys / the IR, never legacy names**; the legacy `DEPLODOCK_BN`/`BK`/`MMA`/`STAGE`/… env pins + legacy
 > golden YAMLs resolve through the ingest-only mapper `_knob_legacy.py`. `Schedule.staged`/`binding` stay the codegen
 > source of truth, so the rename is byte-identical. The per-pass descriptions below still use the **legacy** names for

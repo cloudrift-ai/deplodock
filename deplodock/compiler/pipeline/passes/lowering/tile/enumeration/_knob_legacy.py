@@ -103,6 +103,27 @@ def tma_pin() -> bool | None:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def cut_pin() -> bool | None:
+    """Legacy ``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE`` (a width-1 bitmask; any non-zero
+    bit = cut), ingested as the demoted-cone keep-vs-cut decision. ``None`` when unset."""
+    raw = config.knob_raw("CUT")
+    if raw is None:
+        raw = config.knob_raw("SPLIT_CONE")
+    if raw is None or raw == "":
+        return None
+    s = raw.strip().lower()
+    if s == "all":
+        return True
+    if s == "none":
+        return False
+    if s and all(c in "01" for c in s):
+        return "1" in s
+    try:
+        return int(s, 0) != 0
+    except ValueError:
+        return None
+
+
 def chain_pin() -> bool:
     """Legacy ``DEPLODOCK_CHAIN`` opt-in (ingested as ``PLACE@<score>=inline`` — the
     FA-2 shared-score warp-chain). ``False`` when unset."""

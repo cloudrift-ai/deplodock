@@ -357,15 +357,14 @@ class LazyCandidate:
 
 
 def _graph_decision_knobs(graph: Graph) -> dict:
-    """The structural-decision knobs (``CUT``) carried by a ``Graph`` option's
+    """The structural-decision knobs (``PLACE@cone``) carried by a ``Graph`` option's
     kernels — the cut's producer/consumer stamp the decision; the graph itself
     has none. Lets the outer prior rank a structural decomposition option (else
     it scores as a knob-less generic row, never preferred)."""
-    from deplodock.compiler.pipeline.search.keys import STRUCTURAL_DECISION_KNOBS  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.keys import structural_decision_delta  # noqa: PLC0415
 
     for node in graph.nodes.values():
-        kn = getattr(node.op, "knobs", None) or {}
-        hit = {k: kn[k] for k in STRUCTURAL_DECISION_KNOBS if k in kn}
+        hit = structural_decision_delta(getattr(node.op, "knobs", None) or {})
         if hit:
             return hit
     return {}
