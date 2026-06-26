@@ -426,17 +426,24 @@ apply_knobs_env()
 
 # --- Rendering -------------------------------------------------------------
 
-# Canonical display order for tuning knobs — tile geometry first (block / register
-# tile, split, pipeline), then everything else alphabetically. Shared by the
-# ``run --bench`` kernel table and the ``deplodock eval`` golden tables so knob
-# columns read in a stable, comparable order everywhere.
+# Canonical display order for tuning knobs. The native ``MOVE@element`` families lead —
+# ``SPLIT@`` (free-axis tiles), then ``REDUCE@`` (contraction tower), then ``ATOM@``
+# (atomize), then ``PLACE@`` (placement) — each family's keys sorted by element; the
+# legacy exact-name knobs (``STAGE``/``TMA``/``CUT``/… still un-folded, plus any legacy
+# golden/DB row) follow in the historical order, unknown knobs last (alpha). Shared by the
+# ``run --bench`` kernel table and the ``deplodock eval`` tables so columns read stably.
+_FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
 KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 
 def knob_sort_key(name: str) -> tuple[int, str]:
-    """Sort key placing knobs in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
-    return (_KNOB_RANK.get(name, len(KNOB_ORDER)), name)
+    """Sort key: native ``MOVE@element`` families first (by :data:`_FAMILY_ORDER`, then
+    element), then the legacy names in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
+    for i, prefix in enumerate(_FAMILY_ORDER):
+        if name.startswith(prefix):
+            return (i, name[len(prefix) :])
+    return (len(_FAMILY_ORDER) + _KNOB_RANK.get(name, len(KNOB_ORDER)), name)
 
 
 def format_tuning_knobs(knobs: dict) -> str:
