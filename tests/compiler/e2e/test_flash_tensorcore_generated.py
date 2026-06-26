@@ -242,6 +242,57 @@ def test_warp_chain_dynamic_matches_torch(monkeypatch, seq):
     assert max_diff < 5e-3, f"symbolic warp-chain flash seq={seq} max_diff={max_diff:.2e}"
 
 
+@requires_cuda
+@pytest.mark.parametrize("seq", [8, 16, 37, 64])
+def test_warp_chain_causal_dynamic_matches_torch(monkeypatch, seq):
+    """Phase 4 — symbolic ``seq_len`` warp-chain flash with **causal** masking (equal-head).
+    The causal score-fragment mask (``kv_col > q_row`` → ``-1e30``) composes with the
+    symbolic boundary mask (``kv_col >= seq_len`` → ``-1e30``): both write the soft −inf
+    before the rowmax, so emitting them in sequence is the AND of the keep predicates.
+    Matches torch ``is_causal=True`` SDPA at seq ∈ {8, 16, 37, 64}."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    B, H, D = 1, 2, 32
+    sd = torch.export.Dim("seq_len", min=4, max=4096)
+    graph = trace_module(
+        _CausalSdpa().cpu(),
+        (
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+        ),
+        dynamic_shapes={"q": {2: sd}, "k": {2: sd}, "v": {2: sd}},
+    )
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    kernels = [nid for nid in compiled.nodes if getattr(compiled.nodes[nid].op, "kernel_source", None)]
+    assert len(kernels) == 1, f"dynamic causal warp-chain flash should fuse to one kernel, got {len(kernels)}"
+    assert "flash_pv_smem" in compiled.nodes[kernels[0]].op.kernel_source, "must be the fused warp-chain"
+
+    torch.manual_seed(seq)
+    q, k, v = (torch.randn(B, H, seq, D, dtype=torch.float16) for _ in range(3))
+
+    def ref():
+        with torch.no_grad():
+            return (
+                torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda(), is_causal=True)
+                .cpu()
+                .flatten()
+                .float()
+                .numpy()
+            )
+
+    data = {n: t for n, t in zip(graph.inputs, (q.numpy(), k.numpy(), v.numpy()), strict=True)}
+    run_result, eager = backend.run(compiled, input_data=data, pre_run=ref)
+    got = list(run_result.outputs.values())[0].flatten().astype(np.float32)
+    assert not np.any(np.isnan(got)), f"causal symbolic warp-chain flash seq={seq} produced NaN"
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 5e-3, f"causal symbolic warp-chain flash seq={seq} max_diff={max_diff:.2e}"
+
+
 class _GqaSdpa(torch.nn.Module):
     """GQA SDPA. ``enable_gqa=True`` is grabbed by the tracer's is_causal scan (the default
     ``is_causal=False`` is dropped by dynamo), so this traces as GQA **and** causal — the
