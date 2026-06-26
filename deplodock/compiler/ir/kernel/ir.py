@@ -742,6 +742,51 @@ class FragmentCausalMask(Stmt):
         return lines
 
 
+@dataclass(frozen=True)
+class FragmentBoundaryMask(Stmt):
+    """Per-element **symbolic-boundary** ``-inf`` mask over an ``mma.sync`` ``m16n8`` score
+    C-fragment — the symbolic-``seq_len`` sibling of :class:`FragmentCausalMask`. The final
+    KV tile of a symbolic streaming flash straddles the runtime extent: its columns
+    ``kv_col >= seq_len`` are padding keys whose scaled QK^T score must be neutralized to the
+    softmax max-identity (``-1e30``) BEFORE the rowmax / exp, so the online-softmax
+    denominator excludes them (``exp(0) = 1`` would corrupt it — the same −inf-vs-0 trap the
+    materialized decomposition fell into). Column-only (no ``q_row`` term), so it composes
+    with the causal mask by ANDing the keep predicates — both just write ``-1e30``, so
+    emitting both in sequence is the AND.
+
+    ``kv_col_base`` is the absolute col of element ``(0,0)`` (``kv*16 + nt*8``); ``bound`` is
+    the runtime extent ``Var("seq_len")``. The fragment's 4 elements are cols ``(lane%4)*2 +
+    {0,1}`` (rows are irrelevant to a column predicate)."""
+
+    frag: str
+    kv_col_base: Expr
+    bound: Expr
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.kv_col_base, self.bound)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentBoundaryMask({self.frag} where col {self.kv_col_base.pretty()} >= {self.bound.pretty()})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        lane = "(threadIdx.x & 31)"
+        kb, bd = self.kv_col_base.render(ctx), self.bound.render(ctx)
+        ninf = ctx.identity_literal(-1e30, "f32")
+        lines = [f"{pad}{{ const int _t = {lane} & 3;"]
+        for i in range(4):
+            col = f"(_t * 2 + {i & 1})"
+            lines.append(f"{pad}  if (({kb}) + {col} >= ({bd})) {self.frag}[{i}] = {ninf};")
+        lines.append(f"{pad}}}")
+        return lines
+
+
 # ---------------------------------------------------------------------------
 # Warp-level MMA: ``mma.sync.aligned`` + ``ldmatrix`` (the ``s16816`` path
 # cuBLAS / CUTLASS use) — the sole tensor-core Stmt family. Operands are
@@ -1776,3 +1821,11 @@ def _(s: FragmentCausalMask, rename, sigma, axis_fn):
     # ``frag`` is SSA (the score fragment); the base coords σ-substitute so the
     # canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``).
     return FragmentCausalMask(frag=rename(s.frag), q_row_base=sigma.apply(s.q_row_base), kv_col_base=sigma.apply(s.kv_col_base))
+
+
+@_rewrite.register
+def _(s: FragmentBoundaryMask, rename, sigma, axis_fn):
+    # ``frag`` is SSA (the score fragment); the kv-col base + runtime bound σ-substitute
+    # so the canonicalizer renames the kv axis var (the ``seq_len`` bound is a free runtime
+    # symbol — untouched by σ over the local axes).
+    return FragmentBoundaryMask(frag=rename(s.frag), kv_col_base=sigma.apply(s.kv_col_base), bound=sigma.apply(s.bound))

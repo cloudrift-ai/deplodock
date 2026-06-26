@@ -597,6 +597,17 @@ class Mma(ReduceCarrier):
     atom: Atom
     axes: tuple[str, ...] = ()
     b_trans: bool = False
+    # Explicit masked-tile guards for a HAND-BUILT cell (the symbolic warp-chain flash),
+    # where ``kernel/005_lower_atom_tile`` can't derive them from a Write boundary ``Cond``
+    # (a fragment-output / fragment-A cell has no Write) or the operand tensor shape (the
+    # flash uses flat single-index Loads). Each is ``(base Expr, bound Expr)`` on the named
+    # axis; ``005`` routes them to the operand ``LdmatrixLoad``s — ``m_guard`` clamps the A
+    # rows (masked query), ``n_guard`` clamps the B cols (masked key, transposed-B), ``k_zero``
+    # zero-fills the B reduce rows past ``bound`` (masked-K P@V). ``None`` = the enumeration
+    # σ-split path, where ``005`` derives guards as before.
+    m_guard: tuple[Expr, Expr] | None = None
+    n_guard: tuple[Expr, Expr] | None = None
+    k_zero: tuple[Expr, Expr] | None = None
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum``: the accumulator read is implicit (loop-carried),

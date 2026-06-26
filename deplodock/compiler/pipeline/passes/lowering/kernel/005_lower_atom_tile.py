@@ -59,6 +59,14 @@ detects this and :func:`_emit_chain` raises ``LoweringError`` to drop the
 candidate, so the search uses the staged (zero-filling) transport or the scalar
 path instead.
 
+EXPLICIT GUARDS — a HAND-BUILT cell (the symbolic-``seq_len`` warp-chain flash)
+carries its masked-tile guards on the ``Mma`` (``m_guard`` / ``n_guard`` /
+``k_zero``), because a fragment-output / fragment-A cell has no Write boundary
+``Cond`` to classify and the flash's flat single-index Loads don't match the
+operand-shape masked-K detection. When the ``Mma`` carries any guard,
+:func:`_emit_chain` uses them verbatim (A row clamp / B col clamp / B reduce-row
+zero-fill) and skips the auto masked-K detection (the ``explicit_guards`` param).
+
 Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
 ``rewrite`` entry point and its lowering helpers all live in this one module.
@@ -205,6 +213,17 @@ def _lower_cell(
     write_stmt, a_seed, b_seed, c_seed, has_reduce, spec = _scan_cell(atom_body)
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
+    # Explicit masked-tile guards stamped on a HAND-BUILT cell (the symbolic warp-chain
+    # flash) — the Mma carries them because no Write boundary Cond / operand shape is
+    # available to derive them from (``_boundary_guards`` / ``_masked_k_zero`` are the
+    # enumeration-σ path). When present, ``_emit_chain`` uses them verbatim and skips the
+    # auto masked-K detection (the flash's flat single-index Loads don't match it).
+    mma0 = next(iter(atom_body.iter_of_type(Mma)), None)
+    explicit_guards: tuple | None = (
+        (mma0.m_guard, mma0.n_guard, mma0.k_zero)
+        if mma0 is not None and (mma0.m_guard is not None or mma0.n_guard is not None or mma0.k_zero is not None)
+        else None
+    )
     # A **fragment-output** cell (no ``Write``) keeps its C-fragment in registers for a
     # downstream consumer instead of storing it — the flash QK^T score (the INLINE
     # score edge, no gmem round-trip). The same lowering (operand fragments + ldmatrix + mma) minus the
@@ -251,6 +270,7 @@ def _lower_cell(
                     m_guard=m_guard,
                     n_guard=n_guard,
                     graph=graph,
+                    explicit_guards=explicit_guards,
                 )
                 return (s.with_bodies((Body(chain),)),)
             return None
@@ -285,6 +305,7 @@ def _lower_cell(
             n_guard=n_guard,
             b_trans=b_trans,
             graph=graph,
+            explicit_guards=explicit_guards,
         )
         return (decl_b, *chain)
     if a_load is None or b_load is None:
@@ -301,6 +322,7 @@ def _lower_cell(
         n_guard=n_guard,
         b_trans=b_trans,
         graph=graph,
+        explicit_guards=explicit_guards,
     )
     if fragment_output:  # the score edge stays in the C-fragment — no store
         return (*fragments, *chain)
@@ -500,6 +522,7 @@ def _build_chain(
     m_guard: tuple[Expr, Expr] | None = None,
     n_guard: tuple[Expr, Expr] | None = None,
     graph: Graph | None = None,
+    explicit_guards: tuple | None = None,
 ) -> tuple[Stmt, ...]:
     """Build the ``ldmatrix a + ldmatrix b + mma.sync`` chain that replaces a
     reduce SerialTile's ``[Load a, Load b, Mma]`` body — operands matched via
@@ -519,6 +542,7 @@ def _build_chain(
         n_guard=n_guard,
         b_trans=b_trans,
         graph=graph,
+        explicit_guards=explicit_guards,
     )
 
 
@@ -604,23 +628,34 @@ def _emit_chain(
     n_guard: tuple[Expr, Expr] | None = None,
     b_trans: bool = False,
     graph: Graph | None = None,
+    explicit_guards: tuple | None = None,
 ) -> tuple[Stmt, ...]:
     """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step.
 
     ``a_load`` is ``None`` for a **fragment-A** cell (the flash P@V C→A handoff): the A
     operand is a pre-existing live register fragment (``a_frag``, the softmax-derived ``P``),
     so no ``ldmatrix`` loads it — the chain is just ``ldmatrix b + mma`` accumulating into
-    the live C fragment. Everything A-side (staging / masked-K / guard) is skipped."""
+    the live C fragment. Everything A-side (staging / masked-K / guard) is skipped.
+
+    ``explicit_guards`` (the hand-built symbolic warp-chain) is ``(m_guard, n_guard,
+    k_zero)`` read off the cell's ``Mma``: when set, the operand guards come straight from it
+    (A's M-clamp, B's N-clamp / K zero-fill) and the auto masked-K detection — which keys on
+    the operand tensor shape vs the flat single-index Loads the flash uses — is skipped."""
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
+    em, en, ekz = explicit_guards if explicit_guards is not None else (None, None, None)
     if a_load is None:
         # Fragment-A: B-only load + mma into the live A / C fragments.
         b_staged = b_load.input in smem_sources
-        b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
-        if not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph):
-            from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+        if explicit_guards is not None:
+            b_kz = ekz if (ekz is not None and not b_staged and not b_trans) else None
+            b_guard = en if (en is not None and not b_staged) else None
+        else:
+            b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
+            if not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph):
+                from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
-            raise LoweringError("masked-K (symbolic reduce) fragment-A mma operand can't lower gmem-direct — needs staging")
-        b_guard = n_guard if (n_guard is not None and not b_staged) else None
+                raise LoweringError("masked-K (symbolic reduce) fragment-A mma operand can't lower gmem-direct — needs staging")
+            b_guard = n_guard if (n_guard is not None and not b_staged) else None
         b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
         return (
             LdmatrixLoad(
@@ -655,30 +690,46 @@ def _emit_chain(
     # unstaged transport, so a masked-K mma lowers gmem-direct (slower than staged
     # — no smem reuse — but correct) instead of bailing. A transposed-B operand
     # keeps the clamp path (its K is the contiguous dim).
-    a_kz = _masked_k_zero(a_load, a_src_index, "a", graph) if not a_staged else None
-    b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
-    if (not a_staged and a_kz is None and _unstaged_masked_k(a_load, "a", graph)) or (
-        not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph)
-    ):
-        # The masked-K extent isn't a single symbol → can't build the ``*_kzero``
-        # bound. Bail (LoweringError) so greedy retries / the search picks a staged
-        # or scalar variant rather than emit an un-zero-filled gmem-direct read.
-        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+    if explicit_guards is not None:
+        # Hand-built warp-chain cell: guards come straight off the Mma (A's M-clamp, B's
+        # N-clamp). The flash QK^T reduces over a STATIC K (D), so no K zero-fill; the
+        # auto masked-K detection (operand shape vs flat single-index Loads) is skipped.
+        a_kz = None
+        b_kz = ekz if (ekz is not None and not b_staged and not b_trans) else None
+        a_guard = em if (em is not None and not a_staged) else None
+        b_guard = en if (en is not None and not b_staged) else None
+    else:
+        # Masked-K (symbolic reduce): an unstaged operand whose reduce (K) gmem dim is
+        # symbolic takes the gmem-direct ``*_kzero`` helper, which ZERO-FILLS the
+        # partial final K tile past ``seq_len`` (a clamp would duplicate and corrupt
+        # the accumulation). Mirrors the staged ``_stage_expand`` zero-fill for the
+        # unstaged transport, so a masked-K mma lowers gmem-direct (slower than staged
+        # — no smem reuse — but correct) instead of bailing. A transposed-B operand
+        # keeps the clamp path (its K is the contiguous dim).
+        a_kz = _masked_k_zero(a_load, a_src_index, "a", graph) if not a_staged else None
+        b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
+        if (not a_staged and a_kz is None and _unstaged_masked_k(a_load, "a", graph)) or (
+            not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph)
+        ):
+            # The masked-K extent isn't a single symbol → can't build the ``*_kzero``
+            # bound. Bail (LoweringError) so greedy retries / the search picks a staged
+            # or scalar variant rather than emit an un-zero-filled gmem-direct read.
+            from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
-        raise LoweringError(
-            "masked-K (symbolic reduce) mma operand can't lower gmem-direct — reduce extent "
-            "is not a single symbol, so the *_kzero bound can't be built; needs staging"
-        )
-    # Masked cells with an UNSTAGED gated-axis operand take the clamped
-    # gmem-direct helper: the staged slab is in-bounds by construction (its
-    # gmem fill is clamped — 021 + _stage_expand), but a plain gmem-direct
-    # fragment load at straddling-tile coords would read past the
-    # runtime-sized buffer, so the lane coordinate clamps to the boundary
-    # instead (``LdmatrixLoad.gmem_guard``). Keeps every enumerated variant
-    # lowerable — the staging passes legitimately decline (smem budget), and
-    # a greedy pick must not crash on the fallback.
-    a_guard = m_guard if (m_guard is not None and not a_staged) else None
-    b_guard = n_guard if (n_guard is not None and not b_staged) else None
+            raise LoweringError(
+                "masked-K (symbolic reduce) mma operand can't lower gmem-direct — reduce extent "
+                "is not a single symbol, so the *_kzero bound can't be built; needs staging"
+            )
+        # Masked cells with an UNSTAGED gated-axis operand take the clamped
+        # gmem-direct helper: the staged slab is in-bounds by construction (its
+        # gmem fill is clamped — 021 + _stage_expand), but a plain gmem-direct
+        # fragment load at straddling-tile coords would read past the
+        # runtime-sized buffer, so the lane coordinate clamps to the boundary
+        # instead (``LdmatrixLoad.gmem_guard``). Keeps every enumerated variant
+        # lowerable — the staging passes legitimately decline (smem budget), and
+        # a greedy pick must not crash on the fallback.
+        a_guard = m_guard if (m_guard is not None and not a_staged) else None
+        b_guard = n_guard if (n_guard is not None and not b_staged) else None
     a_swz = smem_sources[a_load.input].swizzle.value if a_staged else "NONE"
     b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
     return (

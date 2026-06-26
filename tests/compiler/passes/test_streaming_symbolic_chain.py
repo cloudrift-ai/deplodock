@@ -7,8 +7,15 @@ slow (Finding 1, ``plans/qwen3-embedding-0.6b-layer0-tune-findings.md``). ``chai
 restructures it: ``d`` rides a REGISTER vector ``O[d]`` and the score is computed ONCE per
 KV step and shared across ``d``. The KV stream stays a serial runtime-bounded loop (no
 tiling → no masking), so ``chain_build`` covers a symbolic hinge. ``070_coop_reduce``
-therefore makes ``chain_build`` the **default** for a symbolic streaming flash (it stays a
-pin-gated opt-in for a static stream — greedy keeps the scalar nest there).
+therefore makes ``chain_build`` the **enumeration default** for a symbolic streaming flash
+(it stays a pin-gated opt-in for a static stream — greedy keeps the scalar nest there).
+This is the **fallback** for the symbolic shapes the tensor-core warp chain declines: as of
+Phase 3 of ``plans/smem-tiled-symbolic-flash.md``, an *eligible* symbolic flash (fp16/bf16,
+``D%16==0``, equal-head or GQA) is intercepted **before** enumeration by
+``split/005_warp_chain`` and deployed as the smem-tiled tensor-core warp chain (the perf
+win); ``chain_build`` then serves only the non-eligible symbolic flashes (fp32, odd ``D``,
+additive mask). These tests seed the enumeration directly (the buffers are **fp32**, so the
+warp chain doesn't apply) — they pin the ``chain_build`` fallback routing.
 
 Accuracy of the symbolic chain path is guarded end-to-end by the ``*_dynamic_matches_torch``
 flash tests in ``tests/compiler/e2e/test_flash_attention.py`` (SDPA / GQA+causal / additive
