@@ -16,7 +16,7 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready, carry_scope_from_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -38,16 +38,12 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     engine splices, the same shape the structural forks (``140_atomic_free_splitk``)
     return."""
     op: TileGraphOp = root.op
-    if op.tilegraph is not None and op.tilegraph.schedule.carry:
-        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream axis
-        # as a fragment-tier online-softmax carrier. The generic ``carry_scope_from_graph`` walk
-        # realizes it from the σ-tiled atomized ``warp_chain_build`` graph (the produce/consume Mma
-        # cells fused by ``atomize_cell``; only the fragment-tier softmax / scale / mask / C→A
-        # handoff / epilogue realized here) and hands it to the one ``assemble_carry``.
-        return carry_scope_from_graph(op)
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     tg = op.tilegraph
-    if not assembly_ready(tg):
+    # ``Schedule.carry`` (the warp-tier streaming flash) is ready by construction — ``warp_chain_build``
+    # σ-tiled it; ``assemble_block`` dispatches it to the fragment-tier carrier branch. Every other
+    # graph must have a populated ``domain`` (``assembly_ready``) before materializing.
+    if not tg.schedule.carry and not assembly_ready(tg):
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     return assemble_block(tg, knobs=op.knobs, base_knobs={}, kernel_name=op.name, leading=op.leading)

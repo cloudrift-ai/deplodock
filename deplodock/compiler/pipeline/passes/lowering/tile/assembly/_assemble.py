@@ -44,7 +44,6 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     TileGraph,
-    TileGraphOp,
     TileOp,
     Transport,
 )
@@ -125,6 +124,12 @@ def assemble_block(
     tensor (shape/dtype derived from the producer ``Write``). The partition is
     **deterministic** — same ``TileGraph`` → byte-identical kernel set — per the RF
     invariant-guard discipline."""
+    if graph.schedule.carry:
+        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream axis a
+        # fragment-tier online-softmax carrier. The same single-block path, with the carrier realized
+        # at the fragment tier (the produce/consume cells read off the graph) — funnels through the
+        # one ``assemble_carry`` like every other kernel.
+        return carry_scope_from_graph(graph, kernel_name=kernel_name)
     if is_fused_graph(graph):
         return _assemble_group(graph, knobs=knobs, base_knobs=base_knobs, kernel_name=kernel_name, leading=leading)
     if len(graph.blocks) == 1:
@@ -248,17 +253,19 @@ def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, gua
     return replace(tile, body=Body(walk(tuple(tile.body), {})))
 
 
-def carry_scope_from_graph(op: TileGraphOp) -> TileOp:
-    """The generic warp-tier-flash realizer — reads the ``warp_chain_build`` atomized streaming
-    ``TileGraph`` (the QK^T / P@V cells already fused by the generic ``atomize_cell``, σ-tiled to the
-    warp geometry) and assembles the warp-chain ``CarryScope``: the produce / consume ``Mma`` cells
-    come from the graph (no hand-authored ``Mma``), and only the fragment-tier phases (softmax via
-    ``realize_fragment_softmax`` / scale / causal+boundary masks / the C→A handoff / the epilogue
-    ``RegStore``) are realized here from the carrier + geometry, then handed to the one
-    ``assemble_carry``. Dispatched off ``Schedule.carry`` by ``assembly/010_assemble``. This is the
-    capability-3 graph walk that replaced the hand-assembled ``realize_flash``."""
-    block = op.tilegraph.blocks[0]
-    fp = flash_params(op.buffers, block.writes[0].buffer)
+def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
+    """The warp-tier-flash branch of :func:`assemble_block` — NOT a separate assembly entry. Reads
+    the ``warp_chain_build`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
+    the generic ``atomize_cell``, σ-tiled to the warp geometry) and assembles the warp-chain
+    ``CarryScope``: the produce / consume ``Mma`` cells come from the graph (no hand-authored
+    ``Mma``), and only the fragment-tier phases (softmax via ``realize_fragment_softmax`` / scale /
+    causal+boundary masks / the C→A handoff / the epilogue ``RegStore``) are realized here from the
+    carrier + the geometry read off the ``TileGraph`` (``graph.buffers`` / ``block.domain``), then
+    handed to the one ``assemble_carry`` every kernel funnels through. ``assemble_block`` dispatches
+    here off ``Schedule.carry``. This is the graph walk that replaced the hand-assembled
+    ``realize_flash``."""
+    block = graph.blocks[0]
+    fp = flash_params(graph.buffers, block.writes[0].buffer)
     out, D, S, seq_var, causal = fp.out, fp.D, fp.S, fp.seq_var, fp.causal
     atom = ATOM_REGISTRY[fp.atom_kind]
     atom_m, atom_n, _atom_k = atom.shape
@@ -335,7 +342,7 @@ def carry_scope_from_graph(op: TileGraphOp) -> TileOp:
         epilogue=tuple(epilogue),
     )
     parallel_layers = [(Axis("w", Dim(1)), Role.WARP)] + [(a, Role.BLOCK) for a in block.domain]
-    name = op.name if op.name.startswith("k_") else f"k_{op.name}"
+    name = kernel_name if kernel_name.startswith("k_") else f"k_{kernel_name}"
     return TileOp(body=assemble_carry(carry, parallel_layers=parallel_layers), name=name, knobs={})
 
 

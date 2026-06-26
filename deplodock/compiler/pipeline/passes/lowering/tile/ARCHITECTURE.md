@@ -142,6 +142,42 @@ bandwidth-biased for a `MAP` nest (`map_reg_offers`) and compute/ILP-biased for 
 This is the tile-phase instance of the global rule in [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) — *No
 shape-specific pattern matching.*
 
+## INVARIANT: one IR, one build shape, one assembly entry — no side channels
+
+Three structural laws complement the algebraic-moveset law above. They are what keep "adding a kernel" from ever
+meaning "adding a path":
+
+1. **Everything flows through the `TileGraph`.** Every kernel is `IterDag` → a **build move** (`seed_graph` then the
+   σ-moves `reduce_decomp` / `free_tile`, or the regime composers `monoid_build` / `chain_build` / `warp_chain_build` /
+   `warp_build`) — each typed `… -> TileGraph` — → the **single assembly entry** `assembly/_assemble.assemble_block`
+   → `TileOp`. The fused tensor-core flash is **not** an exception: `warp_chain_build` is an ordinary build move (it
+   σ-tiles + atomizes the two chained contractions and returns a `TileGraph`), and `assemble_block` dispatches its
+   `Schedule.carry` branch (`carry_scope_from_graph`) — there is no second assembler entry, no pre-build interception
+   (the former `split/005_warp_chain` is gone), no hand-written kernel.
+
+2. **No side-channel descriptors — all scheduling + geometry live ON the graph.** There is no `FlashDesc` (or any
+   `*Desc`) struct threaded alongside the `TileGraph`. The algorithm is `Block.compute` + `block.carrier`; the schedule
+   is `Schedule.binding` / `staged` / `carry`; the shapes are `TileGraph.buffers`. Flash geometry (`B,H,S,D`, GQA
+   `group`, `causal`, symbolic `seq`) is **derived** from `TileGraph.buffers` by `lowering/_flash_geom.flash_params` —
+   a read of graph state, not a stored parallel description. The C→A handoff is a `Schedule.staged` edge
+   (`flash_pv_smem`), not a flag.
+
+3. **No hand-authored backend ops.** Every `Mma` is produced by the generic `enumeration/_atom.atomize_cell` — the
+   flash's QK^T (transposed-B) and P@V (`frag_a` canonical-B) cells included. Every kernel materializes its tower
+   through the single `assemble_carry` (the sole `_wrap_tower` caller); a matmul / reduce / pointwise is the *embedded*
+   carrier, the warp flash the *phase-built* `SERIAL_OUTER` carrier — same path, different carrier.
+
+**Where the flash still differs (the tracked next unification, not an IR gap).** `carry_scope_from_graph` reads the
+produce / consume `Mma` cells off the graph, but the fragment-tier phases (the online-softmax `realize_fragment_softmax`,
+the `1/√D` scale, the causal / boundary masks, the epilogue `RegStore`) are still **realized at assembly** from the
+carrier + geometry rather than present as `TileGraph` nodes. The DAG IR already carries every op needed to represent
+them as graph nodes — `FragmentRowReduce` / `FragmentExp` / `FragmentScale` / `FragmentCausalMask` /
+`FragmentBoundaryMask` / `RegStore`, plus the handoff as a `Schedule.staged` edge — so moving their construction
+build-side (into `warp_chain_build`, leaving `assemble_block` fully generic) is a code-location change, **not** a DAG IR
+extension. Until then the carry branch is the one place a single algebra (the twisted `MONOID`) is realized by
+algebra-driven emitters rather than read verbatim from the graph; it dispatches on the `Schedule.carry` *representation*
+(never a shape), so it stays within the algebraic-moveset law.
+
 ## `split/` — pre-build structural forks
 
 | Module | Role |
