@@ -50,7 +50,7 @@ def _streaming_bk(dag) -> int:
     """The KV-tile factor ``BK`` re-bracketing the streaming reduce,
     ``S_k → S_k/BK · BK``. Honored from a
     ``DEPLODOCK_BK`` pin only when it divides EVERY reduce extent the move tiles (the KV
-    stream + the nested QK^T), since ``_replace_k_monoid`` applies it uniformly; else ``1``
+    stream + the nested QK^T), since ``_rebracket_k`` applies it uniformly; else ``1``
     (the serial-stream default). A symbolic axis (no static extent) stays ``1``.
 
     This is the **serial** re-bracket (each ``K_i`` step still folds one key through the

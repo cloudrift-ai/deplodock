@@ -61,39 +61,101 @@ def _split_free_axis(axis: Axis, thread: int, reg: int, *, interleave_when_maske
     return a_b, a_t, a_r, expr, bound
 
 
-def _replace_k_scalar(
-    stmts: tuple[Stmt, ...], target_names: frozenset[str], k_extent: int, bk: int, fk: int, splitk: int, k_s: Axis | None
+def _ki_term(k_i: Axis, unit: int):
+    """The stage-inner ``K_i`` σ term: a bare ``Var`` at unit stride 1 (scalar tier),
+    scaled by the inner ``unit`` (``br`` cooperative lane / ``atom_k`` cell) otherwise."""
+    return Var(k_i.name) if unit == 1 else Var(k_i.name) * Literal(unit, "int")
+
+
+def _rebracket_k(
+    stmts: tuple[Stmt, ...],
+    target_names: frozenset[str],
+    *,
+    bk: int,
+    fk: int = 1,
+    unit: int = 1,
+    coop_axis: str | None = None,
+    grid: tuple[Axis, int] | None = None,
+    thread: Axis | None = None,
+    masking: str = "none",
 ) -> tuple[Stmt, ...]:
-    """Replace every contraction loop named in ``target_names`` with a ``K_o``
-    (serial-outer) / ``K_i`` (stage-inner) tower, σ-mapping
-    ``K → K_s·(K_o_ext·bk·fk) + K_o·(bk·fk) + K_f·bk + K_i`` (``K_f`` only when
-    ``fk > 1``, ``K_s`` only when ``splitk > 1``). The ``K_s`` grid axis is added to
-    the outer BLOCK layers by the caller."""
+    """Re-bracket every contraction loop named in ``target_names`` into the ``K_o``
+    (serial-outer) / ``K_i`` (stage-inner) tower — the ONE K decomposition behind the
+    scalar, MONOID, and warp tiers. **Recursive**: a nested contraction is towered
+    before its enclosing loop. The σ-map is
+
+        K → K_o·(u·bk·fk) + K_f·(u·bk) + K_i·u + K_c     ( + K_s·(k_o_ext·u·bk·fk) )
+
+    where ``u`` is the inner ``unit`` on the PRIMARY axis (``coop_axis``) and ``1``
+    elsewhere; ``K_f`` only when ``fk > 1``; the thread partition lane ``K_c`` only on
+    ``coop_axis`` when ``thread`` is set; the grid split-K axis ``K_s`` prepended when
+    ``grid`` is set. Params select the tier:
+
+    - **scalar** (matmul / flat SEMIRING): ``unit=1``, ``grid=(K_s, splitk)`` for
+      split-K, ``thread=None``, ``masking="carrier"`` (a no-op on the static path — it
+      only fires on a symbolic axis, closing the latent symbolic-scalar gap the legacy
+      ``_replace_k_scalar`` left: a plain ``//`` with no mask).
+    - **MONOID** (cooperative reduce / streaming flash): ``unit=br`` on ``coop_axis``,
+      ``thread=K_c`` (the ``br``-lane cooperative partition), ``masking="carrier"``.
+    - **warp** (tensor-core): ``unit=atom_k``, ``fk=1``, no partition,
+      ``masking="downstream"`` (a symbolic K ceil-divides but is NOT body-masked —
+      ``kernel/005`` / ``_stage_expand`` zero-fill the partial slab instead).
+
+    ``masking``: ``"carrier"`` clamps a symbolic reduce's load index for a safe read and
+    folds the carrier identity past the bound (``_mask_carrier``), and guards a symbolic
+    map loop's store with a boundary ``Cond``; ``"downstream"`` ceil-divides ``K_o`` but
+    leaves the body unmasked; ``"none"`` is the static-only ``//`` (no ceil-div)."""
     out: list[Stmt] = []
     for s in stmts:
-        if isinstance(s, Loop) and s.axis.name in target_names:
-            kn = s.axis.name
-            src = s.axis.source_axis or s.axis
-            this_extent = s.axis.extent.as_static() if s.axis.extent.is_static else k_extent
-            k_o_ext = this_extent // (splitk * bk * fk)
-            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
-            k_i = Axis(f"{kn}_i", bk, source_axis=src)
-            expr = Var(k_o.name) * Literal(bk * fk, "int")
-            k_f = None
-            if fk > 1:
-                k_f = Axis(f"{kn}_f", fk, source_axis=src)
-                expr = expr + Var(k_f.name) * Literal(bk, "int")
-            expr = expr + Var(k_i.name)
-            if k_s is not None:
-                expr = Var(k_s.name) * Literal(k_o_ext * bk * fk, "int") + expr
-            sigma_k = Sigma({kn: expr})
-            inner = _replace_k_scalar(tuple(s.body), target_names, k_extent, bk, fk, splitk, k_s)
-            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
-            if k_f is not None:
-                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
-            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
-        else:
+        if not (isinstance(s, Loop) and s.axis.name in target_names):
             out.append(s)
+            continue
+        kn = s.axis.name
+        src = s.axis.source_axis or s.axis
+        is_primary = coop_axis is None or kn == coop_axis
+        u = unit if is_primary else 1
+        kc = thread if (thread is not None and is_primary) else None
+        stride = u * bk * fk
+        ext = s.axis.extent
+        symbolic = not ext.is_static
+        if symbolic:
+            k_o_ext = ext.ceil_div(stride)
+        elif grid is not None:
+            k_o_ext = ext.as_static() // (grid[1] * stride)
+        else:
+            k_o_ext = ext.as_static() // stride
+        k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
+        k_i = Axis(f"{kn}_i", bk, source_axis=src)
+        expr = Var(k_o.name) * Literal(stride, "int")
+        k_f = None
+        if fk > 1:
+            k_f = Axis(f"{kn}_f", fk, source_axis=src)
+            expr = expr + Var(k_f.name) * Literal(u * bk, "int")
+        expr = expr + _ki_term(k_i, u)
+        if kc is not None:
+            expr = expr + Var(kc.name)
+        if grid is not None:
+            expr = Var(grid[0].name) * Literal(k_o_ext * stride, "int") + expr
+        sigma_k = Sigma({kn: expr})
+        inner = _rebracket_k(
+            tuple(s.body), target_names, bk=bk, fk=fk, unit=unit, coop_axis=coop_axis, grid=grid, thread=thread, masking=masking
+        )
+        if symbolic and masking == "carrier":
+            bound = ext.expr
+            decoded_k = sigma_k.apply(Var(kn))
+            pred = BinaryExpr("<", decoded_k, bound)
+            if s.is_reduce:
+                clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", bound, Literal(1, "int")))
+                body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in inner)
+                new_body = _mask_carrier(body_c, pred)
+            else:
+                body_u = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+                new_body = (Cond(cond=pred, body=Body(body_u)),)
+        else:
+            new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
+        if k_f is not None:
+            new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
+        out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
     return tuple(out)
 
 
@@ -154,7 +216,15 @@ def reduce_decomp(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: 
     k_s = _k_s_axis(dag, knobs, target_names)
     block = graph.blocks[0]
     d = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)])
-    compute = _replace_k_scalar(tuple(block.compute), target_names, dag.k_extent, d.serial, d.fold, d.cta, k_s)
+    compute = _rebracket_k(
+        tuple(block.compute),
+        target_names,
+        bk=d.serial,
+        fk=d.fold,
+        unit=1,
+        grid=(k_s, d.cta) if k_s is not None else None,
+        masking="carrier",
+    )
     return replace(graph, blocks=(replace(block, compute=Body(compute)), *graph.blocks[1:]))
 
 
@@ -258,75 +328,11 @@ def _mask_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
     return tuple(out)
 
 
-def _replace_k_monoid(
-    stmts: tuple[Stmt, ...], target_names: frozenset[str], *, bk: int, fk: int, br: int, k_c: Axis | None, coop_axis: str
-) -> tuple[Stmt, ...]:
-    """Re-bracket each contraction loop named in ``target_names`` into the reduce
-    tower — the one move serving both the flat cooperative reduce and the nested
-    streaming flash. **Recursive**: a nested contraction (flash's QK^T reduce inside
-    the KV stream) is towered before its enclosing loop. The cooperative ``K_c``
-    THREAD lane (``br`` lanes per row) rides only the PRIMARY axis ``coop_axis``
-    (``dag.k_node``); every other contraction is serial (``br = 1``). σ-mapping
-    ``K → K_o·(br·bk·fk) + K_f·(br·bk) + K_i·br + K_c`` (``K_f`` only when ``fk > 1``;
-    ``K_c`` only on ``coop_axis`` when ``br > 1``); the carrier's ``axes`` propagate
-    ``K_c`` through σ → ``kernel/100`` emits the combine.
-
-    A **symbolic** loop (dynamic ``seq_len`` KV) ceil-divides ``K_o`` and masks the
-    final partial tile: a reduce clamps its load index for a safe read and folds the
-    carrier identity past the bound (``_mask_carrier`` — ``Monoid`` score → ``-inf``,
-    ``Accum`` → op identity); a second-pass map loop guards its store with
-    ``Cond(decoded_k < bound)``."""
-    out: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Loop) and s.axis.name in target_names:
-            kn = s.axis.name
-            src = s.axis.source_axis or s.axis
-            this_br = br if kn == coop_axis else 1
-            this_kc = k_c if kn == coop_axis else None
-            ext = s.axis.extent
-            symbolic = not ext.is_static
-            bound = ext.expr if symbolic else None
-            inner = _replace_k_monoid(tuple(s.body), target_names, bk=bk, fk=fk, br=br, k_c=k_c, coop_axis=coop_axis)
-            stride = this_br * bk * fk
-            k_o_ext = ext.ceil_div(stride) if symbolic else ext // stride
-            k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
-            k_i = Axis(f"{kn}_i", bk, source_axis=src)
-            expr = Var(k_o.name) * Literal(stride, "int")
-            k_f = None
-            if fk > 1:
-                k_f = Axis(f"{kn}_f", fk, source_axis=src)
-                expr = expr + Var(k_f.name) * Literal(this_br * bk, "int")
-            expr = expr + Var(k_i.name) * Literal(this_br, "int")
-            if this_kc is not None:
-                expr = expr + Var(this_kc.name)
-            sigma_k = Sigma({kn: expr})
-            if symbolic:
-                decoded_k = sigma_k.apply(Var(kn))
-                pred = BinaryExpr("<", decoded_k, bound)
-                if s.is_reduce:
-                    clamp = TernaryExpr(cond=pred, if_true=decoded_k, if_false=BinaryExpr("-", bound, Literal(1, "int")))
-                    body_c = tuple(c.rewrite(_identity_rename, Sigma({kn: clamp})) for c in inner)
-                    new_body = _mask_carrier(body_c, pred)
-                else:
-                    body_u = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
-                    new_body = (Cond(cond=pred, body=Body(body_u)),)
-            else:
-                new_body = tuple(c.rewrite(_identity_rename, sigma_k) for c in inner)
-            if k_f is not None:
-                # ``reduce`` follows the loop: the reduce loops accumulate (FK
-                # multiple-accumulator), a second-pass map loop only writes.
-                new_body = (RegisterTile(axes=(k_f,), body=Body(new_body), reduce=s.is_reduce),)
-            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
-        else:
-            out.append(s)
-    return tuple(out)
-
-
 def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
     """The MONOID build move — one move for the cooperative reduce (softmax / rmsnorm
     / mean / max) AND the streaming flash (online-softmax over a nested QK^T). Apply
     the reduce-decomposition tower to **each** contraction axis the DAG exposes
-    (``_replace_k_monoid``, recursive for a nested stream) with the cooperative ``K_c``
+    (``_rebracket_k`` with ``masking="carrier"``, recursive for a nested stream) with the cooperative ``K_c``
     THREAD lane on the primary axis, then σ-split the free axes (``free_tile``, register
     forced to 1 by the caller). The ``K_c`` axis is laid FIRST in ``Block.domain`` so it
     sits innermost in the THREAD tier (fastest threadIdx bits); ``assemble`` reconstructs
@@ -349,7 +355,7 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     k_c = Axis(f"{kax.name}_c", br, source_axis=kax.source_axis or kax) if br > 1 else None
 
     block = graph.blocks[0]
-    compute = _replace_k_monoid(tuple(block.compute), targets, bk=bk, fk=fk, br=br, k_c=k_c, coop_axis=kax.name)
+    compute = _rebracket_k(tuple(block.compute), targets, bk=bk, fk=fk, unit=br, coop_axis=kax.name, thread=k_c, masking="carrier")
     g = free_tile(replace(graph, blocks=(replace(block, compute=Body(compute)),)), dag, knobs, target_names=target_names)
     if k_c is not None:
         # Lay K_c FIRST in domain (innermost THREAD bits), so the segmented cross-lane
@@ -515,34 +521,6 @@ def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
     return a_b, a_w, a_r, a_a, expr, bound
 
 
-def _replace_k_warp(stmts: tuple[Stmt, ...], k_name: str, k_dim, bk: int, atom_k: int, k_bound=None) -> tuple[Stmt, ...]:
-    """Replace the K reduce loop with the ``atom_k``-strided ``K_o`` / ``K_i``
-    tower: ``σ(K) = K_o·(bk·atom_k) + K_i·atom_k`` (each ``K_i`` step is one
-    ``mma.sync`` over ``atom_k`` K-elements). No split-K / strip-mine (v1).
-
-    For a **symbolic (masked) K** (``k_bound`` set — SDPA P@V over ``seq_len``),
-    ``K_o`` ceil-divides the runtime extent (``ceil(seq_len/(bk·atom_k))`` serial
-    steps, so the loop bound — and thus ``seq_len`` — enters the kernel signature
-    and seq > hint is covered); the partial final tile past ``k_bound`` is
-    ZERO-filled in smem / by the ``dpl_mma_load_*_kzero`` gmem-direct helper
-    (``kernel/005_lower_atom_tile`` + ``_stage_expand``), so the mma accumulates 0
-    past the runtime extent (a clamped duplicate would corrupt the reduction)."""
-    out: list[Stmt] = []
-    stride = bk * atom_k
-    for s in stmts:
-        if isinstance(s, Loop) and s.axis.name == k_name:
-            src = s.axis.source_axis or s.axis
-            k_o_ext = k_dim.ceil_div(stride) if k_bound is not None else k_dim // stride
-            k_o = Axis(f"{k_name}_o", k_o_ext, source_axis=src)
-            k_i = Axis(f"{k_name}_i", bk, source_axis=src)
-            expr = Var(k_o.name) * Literal(bk * atom_k, "int") + Var(k_i.name) * Literal(atom_k, "int")
-            new_body = tuple(c.rewrite(_identity_rename, Sigma({k_name: expr})) for c in s.body)
-            out.extend(_wrap_tower([(k_i, Role.STAGE_INNER), (k_o, Role.SERIAL_OUTER)], new_body))
-        else:
-            out.append(s)
-    return tuple(out)
-
-
 def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> TileGraph:
     """The warp-tier ``atomize`` build move: take the logical seed graph and σ-split
     the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
@@ -560,7 +538,8 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
 
     block = graph.blocks[0]
     new_inner = tuple(s.rewrite(_identity_rename, sigma_outer) for s in block.compute)
-    new_inner = _replace_k_warp(new_inner, dag.k_node.loop.axis.name, dag.k_node.loop.axis.extent, bk, atom_k, dag.k_bound)
+    kn = dag.k_node.loop.axis.name
+    new_inner = _rebracket_k(new_inner, frozenset({kn}), bk=bk, fk=1, unit=atom_k, coop_axis=kn, masking="downstream")
     new_inner = atomize_cell(new_inner, atom=atom, k_name=None, write=None)
     bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
     new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)
