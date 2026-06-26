@@ -211,8 +211,10 @@ re-opened** — the profiling above shows host/dispatch is now 40% of the runner
   golden entry would harden it. The leftover ~3× gap is now the architectural levers below.
 - **CUDA-graph capture over the deplodock decode step + kill the per-layer host round-trip** — the now-dominant lever
   after tuning. deplodock runs `--enforce-eager` with per-layer numpy↔torch hops; native vLLM captures the whole step.
-  **Scoped** in [`generative-device-resident-decode.md`](generative-device-resident-decode.md): Phase A makes the seam
-  device-resident (removes the 40%), Phase B drops `--enforce-eager` for whole-step capture.
+  Scoped in [`generative-device-resident-decode.md`](generative-device-resident-decode.md). **Phase A ✅ applied** —
+  device-resident decode seam (captured-replay, torch↔cupy zero-copy): served decode **85.5 → 178.7 tok/s (~2×)**, gap
+  to vLLM ~3.2× → **~1.5×** (still under `--enforce-eager`). Phase B (drop `--enforce-eager` for whole-step capture)
+  remains, with smaller headroom than expected since A's captured-replay already removed most per-program dispatch.
 - **Multi-bucket decode** (e.g., 8 / 32 / 128) to cover higher concurrency with tight padding, vs the single 16-bucket
   here. Memory cost: more program sets (Top risk #9).
 - **Per-`Dim` hint plumbing** → one symbolic program with a small M-tile, efficient at all widths (the cleanest

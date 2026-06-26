@@ -120,7 +120,13 @@ class DeplodockGenModel(nn.Module):
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kwargs):
         device = positions.device
         # clamp guards vLLM's _dummy_run garbage-id profiling batches (out-of-vocab → IndexError).
-        ids_np = input_ids.clamp(0, self.config.vocab_size - 1).cpu().numpy()
+        ids = input_ids.clamp(0, self.config.vocab_size - 1)
+        t = int(ids.shape[0])
+        # Decode hot path (T <= bucket): device-resident, no host numpy round-trip (Phase A,
+        # plans/generative-device-resident-decode.md). Prefill / larger T keeps the host path.
+        if self.runner.has_device_decode and 0 < t <= self.runner.decode_bucket:
+            return self._forward_device(ids, positions)
+        ids_np = ids.cpu().numpy()
         hidden_np = self.runner.embed(ids_np)  # [T, H] numpy
         for layer in range(self.runner.num_layers):
             residual_np = hidden_np
@@ -134,13 +140,24 @@ class DeplodockGenModel(nn.Module):
         hidden_np = self.runner.final_norm(hidden_np)
         return torch.from_numpy(np.ascontiguousarray(hidden_np)).to(device)
 
+    def _forward_device(self, ids, positions):
+        """Device-resident decode forward (T <= decode_bucket): q/k/v and attn_out stay CUDA
+        tensors through RoPE + vLLM attention — no per-layer numpy↔torch host hop."""
+        hidden = self.runner.embed_device(ids)  # [T, H] CUDA
+        for layer in range(self.runner.num_layers):
+            residual = hidden
+            q, k, v = self.runner.forward_layer_pre_device(layer, hidden)
+            q, k = self.rotary_emb(positions, q, k)  # A2: vLLM applies RoPE
+            attn_out = self.attn[layer](q, k, v)  # vLLM paged attention
+            hidden = self.runner.forward_layer_post_device(layer, attn_out, residual)
+        return self.runner.final_norm_device(hidden)
+
     def compute_logits(self, hidden_states, *args):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def embed_input_ids(self, input_ids):
-        # vLLM embedding hook → the runner owns embedding; return its lookup as a GPU tensor.
-        out = self.runner.embed(input_ids.clamp(0, self.config.vocab_size - 1).cpu().numpy())
-        return torch.from_numpy(np.ascontiguousarray(out)).to(input_ids.device)
+        # vLLM embedding hook → the runner owns embedding; on-device gather (no host hop).
+        return self.runner.embed_device(input_ids.clamp(0, self.config.vocab_size - 1))
 
     def load_weights(self, weights):
         """vLLM owns ONLY ``lm_head`` (the runner already loaded embed + trunk). Load

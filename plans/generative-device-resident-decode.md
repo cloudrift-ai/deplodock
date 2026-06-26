@@ -3,7 +3,8 @@
 > Scoping doc for closing the remaining ~3× gap to native vLLM on generative (chat) serving, after the decode-bucket
 > (~11×) and kernel-tune (~2×) wins. Grounded in the profiling in
 > [`generative-decode-perf-findings.md`](generative-decode-perf-findings.md): the remaining gap is **overhead-bound**,
-> not kernel-bound. Status: **design only — not started.**
+> not kernel-bound. Status: **Phase A implemented + measured (served decode 85.5 → 178.7 tok/s, ~2×, gap to vLLM
+> ~3.2× → ~1.5×); Phase B not started.**
 
 ## Why (the measurement that motivates this)
 
@@ -68,21 +69,39 @@ so device-resident "pad" is just "upload `T` rows into the prefix" — no zero-f
 
 ### Phase A — device-resident seam (captures the 40%, lower risk)
 
-Change the runner seam ABI from numpy to **torch CUDA tensors**, and run each `pre`/`post` decode program via the
-device path under the external-stream context.
+Scope: make the **decode hot path** (`T ≤ decode_bucket`, where the profiled 40% lives) device-resident. Prefill /
+`T > bucket` **keeps the existing host `rebind` path** — it's one-shot per request, not the hot loop, and the symbolic
+program already serves it correctly. This sidesteps the per-seq-len capture + capacity-buffer work for now.
 
-- `gen_runner.py`: add a device-resident `_Program.run_device(arrays_cupy) -> list[cupy]` mirroring the embedding
-  runner (set_sym_values trivial for static, upload_prefix_device, capture_program_graph once, replay_program_graph,
-  output_prefix_device). `forward_layer_pre/post`, `embed`, `final_norm` take/return torch CUDA tensors;
-  `cp.from_dlpack` / `torch.from_dlpack` bridge at the boundary. Keep the numpy path for the standalone
-  `deplodock generate` oracle / tests.
-- `vllm_model_gen.py::forward`: drop every `.cpu().numpy()` / `torch.from_numpy().to(device)`; pass q/k/v and attn_out
-  as device tensors straight through RoPE + `attn[layer]`. Wrap the per-token forward in the external-stream context so
-  deplodock replays and vLLM's attention enqueue in order on `torch.cuda.current_stream()`.
-- `final_norm` already a torch module → run it on CUDA (drop the numpy hop).
+Change the decode seam ABI from numpy to **torch CUDA tensors**, running each static M=`bucket` `pre`/`post` program via
+the device path under the external-stream context. Concrete work (the items below are *not* free ports — Codex review
+flagged each):
 
-Expected: removes the 2.72 ms host/dispatch from the runner step (6.79 → ~4.3 ms) and, captured-replayed, trims
+- **`_Program.run_device(arrays) -> list[torch]`** (new, gen_runner.py): mirrors the embedding runner — under
+  `cp.cuda.Stream.from_external(torch.cuda.current_stream())`, `upload_prefix_device` the `T` real rows into the static
+  M=bucket buffer prefix, `capture_program_graph` (cached once, empty `sym_values`), `replay_program_graph`,
+  `output_prefix_device`. `cp.from_dlpack` / `torch.from_dlpack` bridge. **Slice each output to `T`** before returning
+  (the static program returns M=bucket rows; `output_prefix_device` can't infer `T` — preserve the host path's `q[:t]`).
+- **Device `embed`** (gen_runner.py:181,195 is a CPU numpy lookup): hold `_embed_weight` as a CUDA torch tensor and
+  gather on device (`embed_weight[input_ids]`), matching `vllm_model_gen.py::embed_input_ids`. Returns `[T, H]` CUDA.
+- **Device `final_norm`** (gen_runner.py:101,224 is a CPU-built torch module): move the norm module to CUDA in
+  `from_model`/serving init (`.to(device)`), run it on the CUDA hidden tensor. Keep the CPU module for the oracle.
+- **`vllm_model_gen.py::forward`**: branch on `T = input_ids.shape[0]`. `T ≤ bucket` → device path end-to-end (no
+  `.cpu().numpy()`): q/k/v and attn_out stay CUDA tensors through RoPE + `attn[layer]`, wrapped in the external-stream
+  context so deplodock replays and vLLM's attention enqueue in order. `T > bucket` → the existing host path, unchanged.
+- Keep all numpy methods for the `deplodock generate` oracle / CPU tests.
+
+Expected: removes the 2.72 ms host/dispatch from the decode step (6.79 → ~4.3 ms runner) and, captured-replayed, trims
 per-program dispatch. Served single-stream target ~**100–120 tok/s** (gap ~2.3–2.7×). `--enforce-eager` stays.
+
+**Result (implemented).** Served single-stream **85.5 → 178.7 tok/s (~2.09×)**, concurrency 1007 → 2367 tok/s (~2.35×),
+TTFT 29 → 17 ms — gap to native vLLM **~3.2× → ~1.5×**. Beat the projection because the **captured-replay** also removed
+the per-program launch dispatch (each program's ~10 kernel launches → one `graph.launch`, ~44 program-calls/step), which
+the `run_once`-based profile lumped into "dispatch" but didn't eliminate. Bit-identical to the host path (`max|Δ|=0`),
+and `test_vllm_plugin_gen_gpu.py` still token-for-token. Bug caught in review: `final_norm`'s `.to("cuda")` was
+in-place on the **shared** norm module (broke the host path's CPU tensor) — fixed with a deep-copied device norm.
+Notably this win lands **under `--enforce-eager`**, so Phase A already captured much of the dispatch headroom previously
+attributed to Phase B — re-estimate B's remaining payoff (the ~5 ms vLLM-eager-framework slice) before committing to it.
 
 ### Phase B — drop `--enforce-eager` / whole-step capture (the big lever, higher risk)
 

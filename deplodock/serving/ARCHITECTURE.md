@@ -68,8 +68,12 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   decoder layer (`build_attention_split_wrapper`), compiles **two dynamic-`num_tokens` programs per layer** (`pre` +
   `post`) over the flattened `[num_tokens, H]` layout, and exposes `embed` / `forward_layer_pre(L,…)→(q,k,v)`
   (un-rotated 2-D seam) / `forward_layer_post(L, attn_out, residual)→hidden` / `final_norm`. The caller stitches between
-  `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention` in Phase 3). Host numpy
-  `rebind` I/O for now (the device zero-copy + captured-replay path is the Phase-3/4 perf step). **Decode bucket:** it
+  `pre` and `post` (a reference torch SDPA in the Phase-2 host stitch; vLLM paged `Attention` in Phase 3). **I/O:**
+  prefill / `num_tokens > bucket` use the host numpy `rebind` path; the **decode hot path** (`num_tokens ≤ bucket`)
+  is **device-resident** (Phase A — `run_device` / `embed_device` / `forward_layer_*_device` / `final_norm_device`:
+  captured-replay over the static program with torch↔cupy DLPack zero-copy, no host hop; reuses the embedding
+  runner's pattern). This removed the ~40% host/dispatch overhead and ~2×'d served decode (see
+  `plans/generative-device-resident-decode.md`). **Decode bucket:** it
   also compiles a **static M=`decode_bucket` (default 16)** `pre`/`post` twin per layer and uses it when
   `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode M=1
   (`plans/generative-decode-perf-findings.md`); falls back to symbolic above the bucket or if a static compile fails. So
@@ -79,10 +83,12 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.
   The trunk compute (embed + per-layer pre/post + final norm) is the `DeplodockGenRunner`; vLLM owns only `lm_head`
   (`load_weights` claims `lm_head.weight`, or the tied embed alias). `forward` brackets each `self.attn[L](q,k,v)` with
-  two deplodock replays (pre/post), applying RoPE in between (A2). Select via `--runner generate` +
+  two deplodock replays (pre/post), applying RoPE in between (A2). `forward` branches on `num_tokens`: the decode hot
+  path (`≤ bucket`) runs `_forward_device` (q/k/v + attn_out stay CUDA tensors through RoPE + attention, no host
+  hop); prefill keeps the numpy path. Select via `--runner generate` +
   `--hf-overrides '{"architectures":["DeplodockGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
-  this for seam coherence). Registered in `__init__.py`. Decode-shaped tuning + the device-path interleave are
-  later-phase work.
+  this for seam coherence). Registered in `__init__.py`. Whole-step CUDA-graph capture (drop `--enforce-eager`) is
+  Phase B (`plans/generative-device-resident-decode.md`).
 
 ## Static mode (`DEPLODOCK_SERVING_STATIC=1`) — static extents for both batch and seq
 
