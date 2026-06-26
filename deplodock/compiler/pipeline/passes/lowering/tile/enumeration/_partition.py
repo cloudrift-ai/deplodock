@@ -103,9 +103,7 @@ def _out_axes(out_shape: tuple[int, ...]) -> tuple[tuple[Axis, ...], dict, tuple
         M_b, N_b, M_t, N_t, m_idx, n_idx = _grid_thread_axes(m_extent, n_extent)
         domain = (M_t, N_t, M_b, N_b)
         binding = {M_t.name: Binding.THREAD, N_t.name: Binding.THREAD, M_b.name: Binding.GRID, N_b.name: Binding.GRID}
-        in_bounds = BinaryExpr(
-            "&&", BinaryExpr("<", m_idx, Literal(m_extent, "int")), BinaryExpr("<", n_idx, Literal(n_extent, "int"))
-        )
+        in_bounds = BinaryExpr("&&", BinaryExpr("<", m_idx, Literal(m_extent, "int")), BinaryExpr("<", n_idx, Literal(n_extent, "int")))
         return domain, binding, (m_idx, n_idx), in_bounds
 
     r = len(out_shape)

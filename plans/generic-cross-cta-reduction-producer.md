@@ -1,6 +1,28 @@
 # Generic cross-CTA reduction producer (carrier-agnostic split-K / split-KV)
 
-**Status:** planned (design). Closes the last asymmetry in the monoid-combine work: the cross-execution-unit reduction
+**Status:** M1 + M2 landed (`make test` green after each). M3 (flash split-KV — the twisted-`Monoid` producer) and M4's
+search-surfacing remain.
+
+- **M1 (done)** — additive cross-CTA reduce. `coop_reduce_offers` returns `(bk, fk, br, cta)` and offers `cta > 1` for an
+  additive `Accum` carrier (static K, no epilogue / multi-accum); `monoid_build` threads the `K_s` split-K GRID partition
+  through `_rebracket_k`; `150_cross_cta_finalize`'s gate accepts a `MONOID` reduce; the `_partition` combine geometry is
+  generalized to the op's N-D output rank (`_out_axes` — the rank-2 matmul combine kept byte-identical). A plain
+  `x.sum(dim)` with `cta=2` now splices a deferred combine kernel (`c2k`) or `atomicAdd`s (`c2a`) and matches eager for
+  rank-1/2/3 outputs (`tests/compiler/test_reduction_combine_coverage.py::test_cross_cta_reduce_finalize_*`). **cta > 1 is
+  pin-gated** (an explicit `REDUCE` `c<cta>`): the cold `AnalyticPrior` would otherwise rank a degenerate split-K reduce
+  above the cooperative one, changing the greedy default — so greedy / cold stay cta=1 and only a pin reaches the producer.
+- **M2 (done)** — `140_atomic_free_splitk` → `150_cross_cta_finalize`, carrier-driven framing (the SEMIRING matmul is the
+  1-component instantiation). Matmul deferred output unchanged.
+- **M3 (remaining — the payload)** — the twisted-`Monoid` (flash `(m, l, O)`) cross-CTA producer. All the generic
+  plumbing M1/M2 landed is reused; the remaining work is the producer's **state emission** (write the partial `(m, l, O)`
+  to 3 workspaces via `split_carrier`, deferring the `O / l` finalize) inside the streaming-flash build — the flash-geometry
+  "hard part" this plan flags. The combine half (`monoid_reduce_tilegraph`) is already GPU-verified for this carrier.
+- **M4 (partly done)** — the carrier→producer derivation is recorded in the tile-lowering ARCHITECTURE (the producer
+  mirrors the intra-CTA cooperative producer, one partition level up). Surfacing `cta` as an autonomous reduce-offer
+  search dimension (un-gating it from pin-only) still needs the `AnalyticPrior` to rank `cta = 1` first for the reduce
+  regime so greedy / cold stay split-free (the matmul already does; the reduce weights do not yet).
+
+Closes the last asymmetry in the monoid-combine work: the cross-execution-unit reduction
 *combine* is carrier-generic at every level, but the *producer* that emits the partials is split — intra-CTA
 (cooperative) is carrier-generic, cross-CTA (split-K) exists **only** for the additive matmul. This plan makes the
 cross-CTA producer carrier-generic too, so any reduction — plain sum, online softmax, Welford, flash attention — can
