@@ -48,13 +48,13 @@ def _static(d) -> int | None:
 
 
 def _flash_params(op: LoopOp):
-    """``(B, H, S, D, group, dtype, causal)`` for an eligible flash LoopOp, or ``None``
-    (out of scope: GQA / additive mask / symbolic / non-16-bit). The 3 rank-4 inputs in
+    """``(B, H, S, D, group, dtype, causal, seq_var)`` for an eligible flash LoopOp, or
+    ``None`` (out of scope: GQA / additive mask / non-16-bit). The 3 rank-4 inputs in
     declared order are Q/K/V; a 4th rank-4 input is an additive mask (out of scope), a
     ``*ninf*`` input is the **causal** bias (the ``kv ≤ m`` Select — Phase 5, masked at
     the score fragment). The 16-bit operand dtype (``F16`` / ``BF16``) selects the mma
-    atom kind (Phase 4) — f16 and bf16 share the fragment layout, differ only in the mma
-    dtype."""
+    atom kind (Phase 4). A **symbolic** ``S`` (Q/K/V dim -2) is in scope (Phase 1): ``seq_var``
+    is its runtime symbol name (``None`` for a static ``S``); B/H/D must stay static."""
     rank4 = [(n, t) for n, t in op.inputs.items() if len(t.shape) == 4]
     if len(rank4) != 3:  # an additive mask adds a 4th rank-4 input — out of scope
         return None
@@ -62,13 +62,21 @@ def _flash_params(op: LoopOp):
     (qn, q), (_kn, k), (_vn, _v) = rank4
     if q.dtype not in (F16, BF16):
         return None
-    dims = [_static(d) for d in q.shape]
-    kdims = [_static(d) for d in k.shape]
-    if any(d is None for d in dims) or kdims[1] is None or kdims[1] == 0:
+    B, H, S, D = (_static(q.shape[0]), _static(q.shape[1]), _static(q.shape[2]), _static(q.shape[3]))
+    # The seq axis (dim -2) may be symbolic; B/H/D must be static (the fragment geometry).
+    seq_var = None
+    if S is None:
+        fvs = q.shape[2].expr.free_vars()
+        if len(fvs) != 1:  # a single runtime symbol drives the ceil-div extents
+            return None
+        seq_var = next(iter(fvs))
+    if any(d is None for d in (B, H, D)):
         return None
-    B, H, S, D = dims
-    group = H // kdims[1]
-    return B, H, S, D, group, q.dtype, causal
+    kdim1 = _static(k.shape[1])  # the kv-head count (static — GQA group ratio)
+    if kdim1 is None or kdim1 == 0:
+        return None
+    group = H // kdim1
+    return B, H, S, D, group, q.dtype, causal, seq_var
 
 
 def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
@@ -81,8 +89,8 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     params = _flash_params(op)
     if params is None:
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
-    B, H, S, D, group, dt, causal = params
-    if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=causal, mask=False, symbolic=False):
+    B, H, S, D, group, dt, causal, seq_var = params
+    if not warp_chain_eligible(B=B, H=H, S=S, D=D, group=group, causal=causal, mask=False, symbolic=seq_var is not None):
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
     # Run the algebraic ``atomize`` move on the two cells HERE (the ``split`` phase may
     # import ``enumeration``; the ``assembly`` may not) — the operand layout (``b_trans``
@@ -93,7 +101,7 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     # The streaming online-softmax Monoid (state (m,l,O), partial (score,value)) — the
     # algebraic source the fragment realizer regenerates the softmax phases from. Reading
     # it here keeps the ``enumeration`` import in ``split``, not ``assembly``.
-    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier)
+    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier, seq_var=seq_var)
 
 
 def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):

@@ -27,7 +27,14 @@ from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.kernel.ir import FragmentCausalMask, FragmentExp, FragmentRowReduce, FragmentScale, Reassign
+from deplodock.compiler.ir.kernel.ir import (
+    FragmentBoundaryMask,
+    FragmentCausalMask,
+    FragmentExp,
+    FragmentRowReduce,
+    FragmentScale,
+    Reassign,
+)
 from deplodock.compiler.ir.stmt import Assign, Init, Monoid, Stmt
 from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
 
@@ -187,3 +194,14 @@ def realize_score_mask(geom: FragGeom, *, q_row_base: Expr, kv_col_bases: tuple[
     return [
         FragmentCausalMask(frag=sf, q_row_base=q_row_base, kv_col_base=cb) for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
     ]
+
+
+def realize_boundary_mask(geom: FragGeom, *, kv_col_bases: tuple[Expr, ...], bound: Expr) -> list[Stmt]:
+    """The fragment-tier symbolic-``seq_len`` boundary mask — the column-only sibling of
+    :func:`realize_score_mask`. Masks each score C-fragment to ``-1e30`` (the carrier's ``m``
+    identity) where the element's absolute key column ``>= bound`` (the partial final KV
+    tile's padding keys), before the rowmax fold — so the online-softmax denominator excludes
+    them (``exp(0) = 1`` would corrupt it). Composes with the causal mask by sequencing both
+    (each writes ``-1e30``, the AND of the keep predicates). ``kv_col_bases`` is the absolute
+    column origin per N-atom."""
+    return [FragmentBoundaryMask(frag=sf, kv_col_base=cb, bound=bound) for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)]

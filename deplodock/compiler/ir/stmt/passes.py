@@ -135,7 +135,21 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 @rewrite.register
 def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
-    return Mma(c=rename(s.c), a=rename(s.a), b=rename(s.b), atom=s.atom, axes=new_axes, b_trans=s.b_trans)
+
+    def _g(guard):  # σ-substitute a (base, bound) guard's exprs so axis vars canonicalize
+        return None if guard is None else (sigma.apply(guard[0]), sigma.apply(guard[1]))
+
+    return Mma(
+        c=rename(s.c),
+        a=rename(s.a),
+        b=rename(s.b),
+        atom=s.atom,
+        axes=new_axes,
+        b_trans=s.b_trans,
+        m_guard=_g(s.m_guard),
+        n_guard=_g(s.n_guard),
+        k_zero=_g(s.k_zero),
+    )
 
 
 @rewrite.register

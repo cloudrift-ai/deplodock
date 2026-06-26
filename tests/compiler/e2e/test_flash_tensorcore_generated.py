@@ -194,6 +194,55 @@ def test_warp_chain_cell_layout_falls_out_of_atomize():
 
 
 @requires_cuda
+@pytest.mark.parametrize("seq", [8, 16, 37, 64])
+def test_warp_chain_dynamic_matches_torch(monkeypatch, seq):
+    """Phase 1 — symbolic ``seq_len`` warp-chain flash. ONE cached fused-TC kernel
+    carrying ``int seq_len`` serves every runtime size: the partial final KV / query
+    tile (``seq=37`` straddles both) is masked at the score fragment (``kv_col >=
+    seq_len`` → ``-1e30`` before the rowmax), its K/V gmem loads clamped, and its
+    output store guarded. Non-causal, equal-head, ``D % 16 == 0``. Matches torch SDPA
+    at seq ∈ {8, 16, 37, 64} (37 is the partial-tile oracle that caught the
+    materialized-path −inf bug)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    B, H, D = 1, 2, 32
+    sd = torch.export.Dim("seq_len", min=4, max=4096)
+    graph = trace_module(
+        _Sdpa().cpu(),
+        (
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+            torch.randn(B, H, 16, D, dtype=torch.float16),
+        ),
+        dynamic_shapes={"q": {2: sd}, "k": {2: sd}, "v": {2: sd}},
+    )
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+    kernels = [nid for nid in compiled.nodes if getattr(compiled.nodes[nid].op, "kernel_source", None)]
+    assert len(kernels) == 1, f"dynamic warp-chain flash should fuse to one kernel, got {len(kernels)}"
+    src = compiled.nodes[kernels[0]].op.kernel_source
+    assert "flash_pv_smem" in src, "the symbolic flash must be the fused warp-chain (C->A smem handoff)"
+    assert "int seq_len" in src, "the symbolic warp-chain must carry the runtime seq_len arg"
+
+    torch.manual_seed(seq)
+    q, k, v = (torch.randn(B, H, seq, D, dtype=torch.float16) for _ in range(3))
+
+    def ref():
+        with torch.no_grad():
+            return torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda()).cpu().flatten().float().numpy()
+
+    data = {n: t for n, t in zip(graph.inputs, (q.numpy(), k.numpy(), v.numpy()), strict=True)}
+    run_result, eager = backend.run(compiled, input_data=data, pre_run=ref)
+    got = list(run_result.outputs.values())[0].flatten().astype(np.float32)
+    assert not np.any(np.isnan(got)), f"symbolic warp-chain flash seq={seq} produced NaN"
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 5e-3, f"symbolic warp-chain flash seq={seq} max_diff={max_diff:.2e}"
+
+
+@requires_cuda
 def test_default_path_is_not_the_warp_chain(monkeypatch):
     """Without the ``CHAIN`` pin, a fp16 SDPA does NOT take the warp-chain — the deployed
     default (scalar streaming flash / materialized) is unchanged."""

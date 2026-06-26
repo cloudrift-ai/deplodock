@@ -409,6 +409,15 @@ source. Downstream consumer plans (MMA fragment
 factorization, warp-specialize refactor) emit `WarpTile` to drive
 warp-cooperative codegen.
 
+The `Mma` also carries optional **explicit masked-tile guards** (`m_guard` /
+`n_guard` / `k_zero`, each `(base, bound)` or `None`) for a HAND-BUILT cell — the
+symbolic-`seq_len` warp-chain flash, where `kernel/005` can't derive guards from a
+Write boundary `Cond` (a fragment-output / fragment-A cell has no Write) or the
+operand tensor shape (the flash uses flat single-index Loads). When set, `005`
+routes them straight to the operand `LdmatrixLoad`s (A row clamp / B col clamp / B
+reduce-row zero-fill); `None` (the default, the enumeration-σ path) keeps `005`
+deriving guards from the Write `Cond` + operand shape as before.
+
 **Stage + StageBundle:** `Stage` is a sources-only group of gmem
 transport operands behind one barrier — it carries no body. The
 producer (cooperative `Load+Write` per source) is synthesized at

@@ -37,6 +37,7 @@ from deplodock.compiler.ir.stmt import Body, Load, Mma, Monoid
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
+    realize_boundary_mask,
     realize_fragment_softmax,
     realize_score_mask,
 )
@@ -44,12 +45,18 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Car
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
-    """The fused-TC-flash scope: static 16-bit (fp16 / bf16 — Phase 4), causal **or**
-    non-causal (Phase 5 masks the upper triangle at the score fragment), equal-head, both
-    extents a multiple of 16. Additive-mask / GQA / symbolic still fall back to the scalar
-    chain. (Dtype is gated upstream in ``_flash_params``; this checks only geometry —
-    ``causal`` is accepted, the parameter is kept so the gate reads explicitly.)"""
-    return not symbolic and not mask and group == 1 and D % 16 == 0 and S % 16 == 0 and 16 <= D <= 256 and S >= 16
+    """The fused-TC-flash scope: 16-bit (fp16 / bf16), causal **or** non-causal (masked at
+    the score fragment), equal-head, ``D % 16 == 0``. A **symbolic** ``seq_len`` (Phase 1) is
+    accepted — the KV-stream / query-tile extents ceil-div the runtime ``seq_len``, the
+    partial final tile is masked at the score fragment + clamped loads + guarded store — and
+    drops the ``S % 16 == 0`` requirement (any runtime size). A STATIC ``S`` still requires
+    ``S % 16 == 0`` (no partial tile). Additive-mask / GQA still fall back to the scalar chain.
+    (Dtype is gated upstream in ``_flash_params``; this checks only geometry.)"""
+    if mask or group != 1 or D % 16 != 0 or not (16 <= D <= 256):
+        return False
+    if symbolic:
+        return True
+    return S % 16 == 0 and S >= 16
 
 
 def _add(*terms):
@@ -82,12 +89,21 @@ def build_warp_chain_tileop(
     pv: Mma,
     carrier: Monoid,
     causal: bool = False,
+    seq_var: str | None = None,
 ) -> TileOp:
     """The fused TC flash as a **TileOp** (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
     for ``(B,H,S,D)`` 16-bit, optionally causal — routed through the generic kernel passes
     (``kernel/005``…``100`` → ``cuda``), NOT a KernelOp bypassing them. ``causal`` inserts a
     per-element ``FragmentCausalMask`` on the score fragment (the strict upper triangle
     ``kv_col > q_row`` masked to ``-1e30`` before the rowmax — Phase 5).
+
+    ``seq_var`` (Phase 1) makes the ``S`` axis **symbolic**: the KV-stream / query-tile
+    extents ceil-div the runtime ``Var(seq_var)`` (so it enters the kernel signature and any
+    runtime size is covered), the (b,h) row stride uses ``seq_var·D``, the partial final tile
+    is masked at the score fragment (``kv_col >= seq_len`` → ``-1e30`` before the rowmax via
+    :func:`realize_boundary_mask`), its Q/K/V gmem loads are clamped / zero-filled (the
+    ``Mma`` carries the operand guards ``kernel/005`` routes to the ``LdmatrixLoad``s), and
+    the partial query-row store is guarded (``RegStore.m_guard``). ``None`` = static ``S``.
 
     ``qk`` / ``pv`` are the two cells' atomized ``Mma``s (built by the ``split`` pass via
     the ``atomize`` move — the layering keeps the ``enumeration`` ``atomize`` import out of
@@ -103,8 +119,17 @@ def build_warp_chain_tileop(
     kt = D // atom_k  # QK^T K-tiles (reduce over D)
     nd = D // atom_n  # P@V N-tiles (output over D)
 
+    symbolic = seq_var is not None
+    # The streaming-axis extents: ceil(seq_len/16) symbolic, S//16 static. ``seq`` is the
+    # runtime row-bound (Var) the score-boundary mask / store guard / load clamps compare to.
+    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(S // 16)
+    seq = Var(seq_var) if symbolic else Literal(S, "int")
+
     bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
-    base = _mul(bh, S * D)  # (b,h) offset into the flat buffer
+    # (b,h) offset into the flat (B·H·S·D) buffer: the per-(b,h) row stride is the RUNTIME
+    # ``seq_len·D`` when symbolic (the kernel runs at the real seq, not the trace hint).
+    row_stride = _mul(seq, D) if symbolic else Literal(S * D, "int")
+    base = BinaryExpr("*", bh, row_stride)
     qrow = _add(base, _mul(qb, 16 * D))  # query-row base
     kvrow = _add(base, _mul(kv, 16 * D))  # kv-tile base
 
@@ -142,31 +167,49 @@ def build_warp_chain_tileop(
     # AtomTile** (transposed-B Q@K^T, no ``Write`` → the C-fragment stays live) that
     # ``kernel/005`` lowers — the mma codegen is the matmul's own pass, not hand-emitted.
     # ``005`` names the live C-fragment ``Sf{nt}_frag`` (the softmax below reads that).
+    # Symbolic masked-tile guards (Phase 1) for the partial final query / KV tile, stamped on
+    # the QK^T ``Mma`` so ``kernel/005`` routes them to the operand loads: A=Q clamps the
+    # query rows past ``seq_len`` (``m_guard``), B=K (transposed) clamps the key cols
+    # (``n_guard``, per N-atom origin ``kv*16 + nt*8``). The clamped lanes read in-bounds
+    # duplicates — harmless: the score boundary mask sets those columns to ``-1e30``.
+    def _qk_guards(nt: int) -> dict:
+        if not symbolic:
+            return {}
+        return {"m_guard": (_mul(qb, 16), seq), "n_guard": (_add(_mul(kv, 16), nt * 8), seq)}
+
     produce: list = []
     for nt in range(2):
+        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans, **_qk_guards(nt))
         if kt > 1:
             ko = Var(f"ko{nt}")
             rbody = (
                 Load(name=f"qv{nt}", input=q, index=(_add(qrow, _mul(ko, 16)),)),
                 Load(name=f"kc{nt}", input=k, index=(_add(kvrow, nt * 8 * D, _mul(ko, 16)),)),
-                Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans),
+                qk_mma,
             )
             cellbody: tuple = (SerialTile(axis=Axis(f"ko{nt}", Dim(kt)), body=Body(rbody), kind="plain"),)
         else:
             cellbody = (
                 Load(name=f"qv{nt}", input=q, index=(qrow,)),
                 Load(name=f"kc{nt}", input=k, index=(_add(kvrow, nt * 8 * D),)),
-                Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=qk.atom, b_trans=qk.b_trans),
+                qk_mma,
             )
         produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=qk.atom))
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
+    # kv_col_base per N-atom: kv-tile + N-atom origin (kv*16 + nt*8) — shared by the causal
+    # and symbolic-boundary score masks.
+    kv_col_bases = tuple(_add(_mul(kv, 16), nt * 8) for nt in range(2))
     if causal:
         # The fragment-tier score-partial mask (the realizer owns the FragmentCausalMask
         # fan-out + the -1e30 identity): strict upper triangle (absolute key col > absolute
-        # query row) masked before the rowmax. q_row_base = qb*16 (query-tile origin);
-        # kv_col_base = kv*16 + nt*8 (kv-tile + N-atom origin) per score frag.
-        kv_col_bases = tuple(_add(_mul(kv, 16), nt * 8) for nt in range(2))
+        # query row) masked before the rowmax. q_row_base = qb*16 (query-tile origin).
         produce += realize_score_mask(geom, q_row_base=_mul(qb, 16), kv_col_bases=kv_col_bases)
+    if symbolic:
+        # The symbolic-``seq_len`` boundary mask (the crux): the partial final KV tile's
+        # padding columns ``kv_col >= seq_len`` masked to ``-1e30`` BEFORE the rowmax so the
+        # online-softmax denominator excludes them (``exp(0) = 1`` would corrupt it). Composes
+        # with the causal mask above (both write ``-1e30`` — the AND of the keep predicates).
+        produce += realize_boundary_mask(geom, kv_col_bases=kv_col_bases, bound=seq)
 
     # merge — the carrier's new state from this tile (rowmax → m_new / alpha; P = exp(S - m_new);
     # rowsum → l); rescale — the twist O *= alpha. Both generated by the fragment realizer.
@@ -188,11 +231,17 @@ def build_warp_chain_tileop(
     # over the KV tile. Each N-atom is a **fragment-A AtomTile** that ``kernel/005`` lowers
     # (one gmem B Load + the live A — the C→A handoff cell): the mma codegen is the matmul's
     # own pass, not hand-emitted here.
+    # P@V's B=V reduce axis is the kv tile (the 16 key rows). For the partial final tile the
+    # rows ``kv*16 + r >= seq_len`` must contribute 0 to the accumulation — ``k_zero``
+    # zero-fills them (a clamp would corrupt the sum; the masked P column is already ~0, but a
+    # zero V also fences an OOB-garbage read). Stamped on the P@V ``Mma`` so ``kernel/005``
+    # routes it to V's gmem load.
+    pv_kzero = {"k_zero": (_mul(kv, 16), seq)} if symbolic else {}
     consume: list = []
     for n in range(nd):
         cell = (
             Load(name=f"vv{n}", input=v, index=(_add(kvrow, n * 8),)),
-            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=pv.atom, b_trans=pv.b_trans),
+            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=pv.atom, b_trans=pv.b_trans, **pv_kzero),
         )
         consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=pv.atom))
     consume.append(Sync())  # finish reading ps (the ldmatrix) before the next KV tile overwrites it
@@ -201,14 +250,20 @@ def build_warp_chain_tileop(
     # (after every read of their old value), so nothing is deferred to the post-consume slot.
     update: list = list(fs.update)
 
-    # epilogue — O /= l (the realizer's normalize FragmentScale per D-atom), then store.
+    # epilogue — O /= l (the realizer's normalize FragmentScale per D-atom), then store. The
+    # partial final query tile's rows ``qb*16 + r >= seq_len`` must NOT write (OOB output) —
+    # the ``RegStore.m_guard`` predicates each element store on the runtime row bound (and
+    # fences a fully-out-of-range row's never-normalized garbage / NaN from reaching gmem).
+    store_mguard = (_mul(qb, 16), seq) if symbolic else None
     epilogue: list = []
     for n in range(nd):
         epilogue.append(fs.epilogue[n])
-        epilogue.append(RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D))
+        epilogue.append(
+            RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D, m_guard=store_mguard)
+        )
 
     carry = CarryScope(
-        axis=Axis("kv", Dim(S // 16)),
+        axis=Axis("kv", s_dim),
         init=tuple(init),
         produce=tuple(produce),
         merge=tuple(merge),
@@ -218,25 +273,25 @@ def build_warp_chain_tileop(
         update=tuple(update),
         epilogue=tuple(epilogue),
     )
-    body = wrap_carry_tower(carry, warp_axes=(Axis("w", Dim(1)),), grid_axes=(Axis("bh", Dim(B * H)), Axis("qb", Dim(S // 16))))
+    body = wrap_carry_tower(carry, warp_axes=(Axis("w", Dim(1)),), grid_axes=(Axis("bh", Dim(B * H)), Axis("qb", s_dim)))
     name = loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}"
     return TileOp(body=body, name=name, knobs={})
 
 
 def assemble_warp_chain(
-    loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, carrier: Monoid, causal: bool = False
+    loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, carrier: Monoid, causal: bool = False, seq_var: str | None = None
 ) -> Graph:
     """Build a single-``TileOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
     inputs + one kernel node. Spliced by the engine; the generic kernel passes lower it.
     ``qk`` / ``pv`` are the cells' atomized ``Mma``s (the ``split`` pass ran the ``atomize``
     move); ``carrier`` is the streaming online-softmax ``Monoid`` the fragment realizer
     regenerates the softmax phases from. ``causal`` masks the strict upper triangle at the
-    score fragment (Phase 5)."""
+    score fragment (Phase 5); ``seq_var`` makes the ``S`` axis symbolic (Phase 1)."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
     kop = build_warp_chain_tileop(
-        loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, carrier=carrier, causal=causal
+        loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, carrier=carrier, causal=causal, seq_var=seq_var
     )
 
     g = Graph()
