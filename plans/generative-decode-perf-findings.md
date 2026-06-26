@@ -167,11 +167,41 @@ deplodock step, killing the per-layer host round-trip, and batched concurrent de
 drift after re-lowering — so the per-kernel before/after table was unusable; the prior update itself is unaffected, and
 the served re-bench is the proof.)
 
+### Profiling the tuned step — the remaining gap is overhead-bound
+
+Profiled a tuned decode step at the **runner level** (T=1, all 22 layers, vLLM attention excluded), split into pure GPU
+kernel time vs host I/O + dispatch (`scripts/profile_gen_decode.py`, each program's GPU time CUDA-graph-captured):
+
+| bucket=16 (tuned) decode step | ms/step | share |
+|---|---|---|
+| W — wall | 6.79 | 100% (→ 147 tok/s runner-only) |
+| G — GPU kernels | 4.06 | 60% |
+| W−G — host numpy↔torch + Python/dispatch | 2.72 | 40% |
+
+- **Kernels are no longer the lopsided cost.** Tuning brought pre+post to ~0.18 ms/layer (was ~0.53 ms/layer for post
+  alone, cold). Host/dispatch is now **40%** of the runner step.
+- **The host I/O forces `--enforce-eager`**, disabling vLLM's whole-step CUDA graph — so the *served* step (11.7 ms) is
+  ~5 ms above the runner step (6.79 ms), most of it vLLM's attention + framework running eager. Device-resident
+  interleave doesn't just save the 2.72 ms; it **unblocks capturing the whole step**.
+- **Bucket-8 is not a free win.** Re-profiled at bucket=8 → 12.5 ms/step (slower!) because the prior was tuned for the
+  M=16 shapes; the M=8 kernels fall back to untuned configs (0.41 vs 0.18 ms/layer). A smaller bucket needs its
+  own tune, with uncertain payoff now that M=16 is tuned. Dropped.
+
+**Conclusion:** the gap is now **overhead-bound**. Next lever is device-resident interleave + whole-step CUDA-graph
+capture (removes the 40% and unblocks capture); kernel tuning / the M=1 lowering fix is secondary.
+
 ## Ruled out / deferred
 
-- **Device zero-copy interleave** — ~1% (host transfers are 1.3%). Not worth doing for latency.
-- **Captured-graph replay** — ~0% on the slow kernel (not dispatch-bound).
-- **Generic autotuning of the symbolic kernel** — benches at the hint, so it can't pick a decode-friendly M-tile.
+These were ruled out **pre-tune** (at ~46 tok/s, where kernels were 95%+ of the step). **Post-tune the first two are
+re-opened** — the profiling above shows host/dispatch is now 40% of the runner step, so they became the dominant lever
+(see Follow-ups). Kept here as a record of how the proportions shifted, not as current guidance.
+
+- **Device zero-copy interleave** — *was* ~1% (host transfers 1.3% of the cold step); **now ~40%** of the tuned runner
+  step and it unblocks whole-step capture. Re-opened as the #1 lever.
+- **Captured-graph replay** — *was* ~0% on the isolated post kernel (not dispatch-bound at M=1); **re-opened** for the
+  whole 22-layer step, where per-launch dispatch + Python orchestration is part of that 40%.
+- **Generic autotuning of the symbolic kernel** — benches at the hint, so it can't pick a decode-friendly M-tile (still
+  true; the static bucket is the answer, and tuning it is what gave the ~2×).
 
 ## Follow-ups
 
