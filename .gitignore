@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 *.pyo
 
+# CUDA
+*.cubin
+
 # Python egg-info
 deplodock.egg-info/
 
