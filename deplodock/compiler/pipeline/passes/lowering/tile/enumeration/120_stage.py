@@ -14,7 +14,7 @@ the stage *mask*, writing the chosen ``Edge``s straight into ``Schedule.staged``
 the source of truth ``assemble`` reads. The mask string is the variant identity the
 perf DB / learned prior key on; ordering is decision order (``stage`` reads derived
 projections of the fully-tiled algorithm, so it runs once every free-axis tile is
-pinned: ``MAP_N_REG``).
+pinned — the ``FN``/``FM`` register-cell factors).
 
 R1 scope: scalar (no-MMA) reduce regimes. ``stage_candidates`` returns nothing for
 pointwise (no K-tower) / no-reuse kernels, so this pass is a no-op there

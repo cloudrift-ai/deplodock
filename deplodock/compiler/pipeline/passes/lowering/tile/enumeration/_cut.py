@@ -132,12 +132,6 @@ class CutDecision:
         """A tier-monotonic ``GMEM`` cut is available (at least one ranked offer)."""
         return bool(self.offers)
 
-    @property
-    def width(self) -> int:
-        """The ``CUT`` BINMASK width — the number of independent cut decisions (1 today,
-        the all-or-nothing whole-cone cut)."""
-        return len(self.offers)
-
 
 def cut_offers(loop_op: LoopOp, *, compute_capability: tuple[int, int], dtype_of, smem_fusible: bool = False) -> CutDecision:
     """The cut-offer verdict for a (still-un-tiled) fused ``LoopOp`` — read off the

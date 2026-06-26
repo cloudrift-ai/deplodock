@@ -48,7 +48,7 @@ ATOM = "ATOM"
 PLACE = "PLACE"
 
 #: The atom value naming the scalar tier (no tensor-core atomize) — the absence of an
-#: ``ATOM_REGISTRY`` kind. Read by :func:`atom_kind` to recover ``None``.
+#: ``ATOM_REGISTRY`` kind.
 SCALAR = "scalar"
 
 #: The canonical cell name of a matmul's single atomizable output cell. A STRUCTURAL
@@ -77,24 +77,6 @@ def atom_key(cell: str) -> str:
 
 def place_key(edge: str) -> str:
     return key(PLACE, edge)
-
-
-def split_move(k: str) -> str | None:
-    """The element of a ``MOVE@element`` key, or ``None`` if ``k`` is not that move."""
-    return _element_of(SPLIT, k)
-
-
-def reduce_move(k: str) -> str | None:
-    return _element_of(REDUCE, k)
-
-
-def atom_move(k: str) -> str | None:
-    return _element_of(ATOM, k)
-
-
-def _element_of(move: str, k: str) -> str | None:
-    prefix = f"{move}@"
-    return k[len(prefix) :] if k.startswith(prefix) else None
 
 
 # --- SPLIT codec: ``"<par>x<reg>"`` — the parallel-binding factor × the register-cell
@@ -159,20 +141,6 @@ def dec_reduce(raw: object) -> Decomp:
     return Decomp(serial=fields.get("s", 1), fold=fields.get("f", 1), cta=fields.get("c", 1), coop=fields.get("t", 1))
 
 
-# --- ATOM codec: ``"scalar"`` or an ``ATOM_REGISTRY`` kind name. ---
-
-
-def enc_atom(kind: str | None) -> str:
-    return kind if kind else SCALAR
-
-
-def atom_kind(raw: object) -> str | None:
-    """The concrete tensor-core atom kind named by ``raw``, or ``None`` for the
-    scalar tier (``"scalar"`` / empty)."""
-    s = str(raw).strip()
-    return None if not s or s.lower() == SCALAR else s
-
-
 # --- Native env pins. ``DEPLODOCK_<MOVE>_<ELEMENT>`` first, bare ``DEPLODOCK_<MOVE>``
 # as the all-elements fallback. ``config.knob_raw`` owns the ``DEPLODOCK_`` join. ---
 
@@ -208,11 +176,6 @@ def split_reg(dag, axis: str) -> int | None:
     return _knob_legacy.split_reg(dag, axis)
 
 
-def pin_reduce(axis: str) -> Decomp | None:
-    raw = pin(REDUCE, axis)
-    return dec_reduce(raw) if raw is not None else None
-
-
 def reduce_fields(dag, axis: str) -> tuple[int | None, int | None, int | None, int | None]:
     """The pinned ``(serial, fold, cta, coop)`` REDUCE factors for ``axis`` — each int
     or ``None`` when unpinned (so the offer keeps its full per-field menu). A native
@@ -226,12 +189,6 @@ def reduce_fields(dag, axis: str) -> tuple[int | None, int | None, int | None, i
         d = dec_reduce(raw)
         return (d.serial, d.fold, d.cta, d.coop)
     return _knob_legacy.reduce_fields(dag, axis)
-
-
-def pin_atom(cell: str) -> str | None:
-    """The raw ``ATOM@cell`` env pin (``"scalar"`` / a kind / ``None`` when unset).
-    Distinct from :func:`atom_kind` — a ``"scalar"`` pin is a *decision*, not unset."""
-    return pin(ATOM, cell)
 
 
 # --- PLACE codec: ``place[:xport]`` — the per-edge placement lattice + transport. ---
@@ -299,12 +256,6 @@ def pin_place_mask(n: int) -> int | None:
 def cone_key() -> str:
     """The ``PLACE@cone`` key — the demoted-cone keep-vs-cut decision."""
     return place_key(CONE)
-
-
-def place_is_cut(raw: object) -> bool:
-    """True when a ``PLACE@<edge>`` value is the structural ``cut`` (materialize to a gmem
-    intermediate), as opposed to ``gmem`` (operand read-direct) / ``smem`` / ``inline``."""
-    return place_of(raw) == CUT
 
 
 def pin_cut() -> bool | None:

@@ -10,7 +10,7 @@ reduce axis, the carrier whose algebra a decomposition move queries
 This is **the one structure the partition consumes** — the typed regime skeletons
 are gone (phase 6). ``tree.classify(dag)`` tags the regime off this view and
 ``tree.build_partition(dag)`` factors its axes; the free-axis / K-info accessors
-(``inner_n`` / ``outer_m`` / ``extra_outer`` / ``k_node`` / ``k_extent`` /
+(``inner_n`` / ``outer_m`` / ``k_node`` / ``k_extent`` /
 ``k_bound``) replace the skeletons' fields.
 """
 
@@ -169,7 +169,7 @@ class IterDag:
         return ContractionChain(hinge=hinge, carrier=hinge.carrier, inner=inner, score=hinge.carrier.partial[0])
 
     # --- Free-axis accessors (the tiled output axes). Replace the skeleton's
-    # ``inner_n`` / ``outer_m`` / ``extra_outer`` fields — the partition consumes
+    # ``inner_n`` / ``outer_m`` fields — the partition consumes
     # these straight off the DAG. ---
 
     @property
@@ -182,11 +182,6 @@ class IterDag:
         """The next-out free axis — the ``M`` tile axis, or ``None`` for a 1-D
         (single free axis) nest."""
         return self.parallel[-2] if len(self.parallel) >= 2 else None
-
-    @property
-    def extra_outer(self) -> tuple[Loop, ...]:
-        """Free loops outside ``M`` / ``N`` (extra outer BLOCK axes)."""
-        return tuple(n.loop for n in self.parallel[:-2])
 
     # --- Reduce-axis (K) accessors. Replace the skeleton's ``k_loop`` / ``k_name``
     # / ``k_extent`` / ``k_bound`` fields. ``k_node`` is the primary reduce. ---

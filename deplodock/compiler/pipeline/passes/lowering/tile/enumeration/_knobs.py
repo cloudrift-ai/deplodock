@@ -130,9 +130,7 @@ MAX_CELLS_PER_THREAD = 128
 # the next-out one. Legacy ``BN``/``BM`` ARE the per-CTA THREAD widths; ``FN``/``FM``
 # the register cells per thread.
 MAP_N_THREAD = BN
-MAP_N_REG = FN
 MAP_M_THREAD = BM
-MAP_M_REG = FM
 
 # Reduce-decomposition candidate menus (the ``REDUCE@<axis>`` family — the ``TileSerial``
 # / cooperative / split-K levers). ``serial`` (legacy ``BK``) is the staged K-chunk,
@@ -150,8 +148,3 @@ BR_CHOICES: tuple[int, ...] = (256, 128, 64, 32, 16, 8, 4, 2, 1)
 # ``FM``/``FN`` register cells per warp; the K chunk is ``REDUCE@<axis>.serial``.
 WARP_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 TC_REG_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
-TC_ATOM = MMA
-WARP_M = WM
-WARP_N = WN
-TC_REG_M = FM
-TC_REG_N = FN
