@@ -595,7 +595,7 @@ def _emit_prior_nodes(args) -> None:
     # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
     prior = load_prior()
     logger.info("")
-    logger.info("%s", diagnostics.node_report(prior, nodes))
+    logger.info("%s", diagnostics.node_report(prior, nodes, kernel_filter=args.kernel))
 
 
 def _mean(xs: list[float]) -> float:

@@ -37,7 +37,11 @@ def add_dataset_args(parser, *, default: str, with_min_variants: bool = False) -
         f"(tune DB search-tree node store, for `eval prior`). Default: {default}.",
     )
     parser.add_argument("--db", help="Tune DB path for --dataset db/nodes. Default: DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db.")
-    parser.add_argument("--kernel", help="Filter by name substring (golden name, or kernel C identifier for --dataset db).")
+    parser.add_argument(
+        "--kernel",
+        help="Filter by substring: golden name; kernel C identifier for --dataset db; op label (e.g. 'matmul', "
+        "'reduce', 'free=512') for --dataset nodes.",
+    )
     if with_min_variants:
         parser.add_argument(
             "--min-variants", type=int, default=8, help="Skip kernels with fewer than this many measured variants (default: 8)."

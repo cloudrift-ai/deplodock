@@ -296,14 +296,31 @@ def node_sibling_ranking(prior, nodes) -> tuple | None:
     return (n_forks, top1 / n_forks, statistics.median(rhos) if rhos else None, n_children)
 
 
-def node_report(prior, nodes) -> str:
+def _node_op_label(features: dict) -> str:
+    """The op label for a single ``node`` row — derived from its ``S_*`` features, the
+    same labels :func:`reachability` rows carry, so ``--kernel`` filters the node store
+    by op kind/shape (e.g. ``matmul`` / ``reduce`` / ``free=512``). All nodes of one op
+    share these features, so filtering keeps/drops a whole op atomically — parent and
+    children never split."""
+    return _op_label(tuple(sorted((k, v) for k, v in features.items() if k.startswith("S_"))))
+
+
+def node_report(prior, nodes, *, kernel_filter: str | None = None) -> str:
     """The ``eval prior --dataset nodes`` block: the fork sibling-ranking (the
     metric unique to this dataset) plus leaf reachability / calibration reused on the
     persistent, deduped node store. ``nodes`` is a list of :class:`db.NodeRow` from
-    :meth:`SearchDB.iter_nodes`."""
-    lines = [f"[prior] node store: {len(nodes)} nodes, fitted={prior.fitted}"]
+    :meth:`SearchDB.iter_nodes`; ``kernel_filter`` keeps only nodes whose op label
+    contains the substring (``--kernel``)."""
+    total = len(nodes)
+    if kernel_filter:
+        nodes = [n for n in nodes if kernel_filter in _node_op_label(n.features)]
+    suffix = f" matching --kernel {kernel_filter!r}" if kernel_filter else ""
+    lines = [f"[prior] node store: {len(nodes)} nodes{suffix}, fitted={prior.fitted}"]
     if not nodes:
-        lines.append("  empty — run `deplodock tune <model>` to populate the node table")
+        if kernel_filter and total:
+            lines.append(f"  no nodes match --kernel {kernel_filter!r} ({total} in store) — try an op label like 'matmul' / 'reduce'")
+        else:
+            lines.append("  empty — run `deplodock tune <model>` to populate the node table")
         return "\n".join(lines)
     if not prior.fitted:
         lines.append("  no fitted prior — the cold AnalyticPrior ranks by D_* geometry only; run `deplodock tune`")

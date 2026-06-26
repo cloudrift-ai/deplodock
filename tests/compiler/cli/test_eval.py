@@ -344,6 +344,29 @@ def test_prior_nodes_smoke(run_cli, tmp_path):
     assert "traceback" not in (stdout + stderr).lower()
 
 
+def test_prior_nodes_kernel_filter(run_cli, tmp_path):
+    """``eval prior --dataset nodes --kernel`` scopes the node store by op label."""
+    from deplodock.compiler.pipeline.search.db import NodeRow, SearchDB
+
+    db_path = tmp_path / "n.db"
+    db = SearchDB(db_path)
+    s = {"S_ext_free_prod": 1024.0, "S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0}
+    db.record_nodes(
+        [
+            NodeRow("P", None, "ctx", "mm", s, 1.0, 1),
+            NodeRow("c8", "P", "ctx", "mm", {**s, "BN": 32, "BM": 8}, 1.0, 2),
+        ]
+    )
+    db.close()
+    prior = str(tmp_path / "missing.json")
+    rc, stdout, stderr = run_cli("eval", "prior", "--dataset", "nodes", "--db", str(db_path), "--kernel", "matmul", "--prior", prior)
+    assert rc == 0, f"stderr: {stderr}"
+    assert "matching --kernel 'matmul'" in stdout
+    rc2, stdout2, _ = run_cli("eval", "prior", "--dataset", "nodes", "--db", str(db_path), "--kernel", "reduce", "--prior", prior)
+    assert rc2 == 0
+    assert "no nodes match --kernel 'reduce'" in stdout2
+
+
 def test_nodes_dataset_rejected_by_db_only_subcommand(run_cli, tmp_path):
     """Widening the ``--dataset`` vocabulary with ``nodes`` must not leak into the
     db-only subcommands — ``eval variants`` still exits 2 on it."""

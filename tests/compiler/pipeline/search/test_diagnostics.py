@@ -186,3 +186,25 @@ def test_node_report_combines_fork_and_leaf_sections():
     assert "node store: 3 nodes" in text
     assert "fork sibling-ranking" in text
     assert "leaf reachability over node store" in text
+
+
+def test_node_report_kernel_filter_selects_ops_by_label():
+    """``--kernel`` filters the node store by op label (derived from each node's
+    ``S_*`` features) — whole ops drop atomically, and a non-matching filter prints
+    an explanatory message, not the empty-store one."""
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    mm = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
+    rd = {"S_reduce_add": 1.0, "S_ext_reduce_max": 64.0}  # a reduce op: no pw-multiply / 2nd input
+    nodes = [
+        NodeRow("Pm", None, "ctx", "mm", mm, 1.0, 1),
+        NodeRow("m8", "Pm", "ctx", "mm", {**mm, "BM": 8}, 1.0, 2),
+        NodeRow("m64", "Pm", "ctx", "mm", {**mm, "BM": 64}, 3.0, 2),
+        NodeRow("Pr", None, "ctx", "rd", rd, 2.0, 1),
+        NodeRow("r1", "Pr", "ctx", "rd", {**rd, "FK": 1}, 2.0, 2),
+    ]
+    out = diagnostics.node_report(_BMPrior(), nodes, kernel_filter="matmul")
+    assert "3 nodes matching --kernel 'matmul'" in out  # only the matmul op's nodes survive
+    assert "fork sibling-ranking" in out
+    miss = diagnostics.node_report(_BMPrior(), nodes, kernel_filter="zzz")
+    assert "no nodes match --kernel 'zzz'" in miss

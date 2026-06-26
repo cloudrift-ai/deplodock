@@ -243,7 +243,9 @@ fails fast with a specific message.
   (`diagnostics.node_report` over `SearchDB.iter_nodes()`): the **fork sibling-ranking** — group nodes by `parent_key`
   and ask whether the prior orders each fork's children (the partial configs it ranks during `_select`) by their
   best-reachable latency (top-1 hit + median per-fork Spearman), the search-faithful metric no other view measures —
-  plus **leaf reachability / calibration** reused on the deduped persistent store. Reads the prior JSON
+  plus **leaf reachability / calibration** reused on the deduped persistent store. `--kernel` filters the node store
+  by **op label** (the nodes carry no kernel C-identifier; `--kernel matmul` / `reduce` / `free=512` keeps whole ops
+  atomically since all of an op's nodes share one `S_*` label). Reads the prior JSON
   (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also
   prints the exact regressor input per golden config (`knob.knob_features`: `S_*` structural/shape + `H_*` regime +
   tuning knobs; the shape enters only as coarse `S_ext_*` products/maxes, so the occupancy/CTA/reuse terms the prior
