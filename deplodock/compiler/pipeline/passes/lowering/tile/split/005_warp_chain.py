@@ -28,11 +28,12 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Buffer, Space, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._flash import FlashSpec, warp_chain_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
 if TYPE_CHECKING:
@@ -137,7 +138,20 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
         seq_var=seq_var,
         group=group,
     )
-    return TileGraphOp(name=op.name, flash=spec)
+    # Step 1 of the ``_flash.py`` removal: also carry the **logical FA-2 TileGraph** (the same
+    # ``chain_build`` restructure the cooperative tier assembles generically) — the streaming
+    # online-softmax algorithm over the q/k/v/o buffers, with the kv stream the serial-carry
+    # axis. The assembler will walk THIS (not the flat spec) to realize the warp tier; for now
+    # ``flash=spec`` still drives ``assembly/010_assemble`` so behavior is unchanged. ``dag`` is
+    # left unset so the enumeration forks skip the flash op (the ``flash`` marker routes it
+    # straight to assembly).
+    buffers: dict[str, Buffer] = {}
+    for name, t in op.inputs.items():
+        buffers[name] = Buffer(name=name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
+    for t in op.outputs.values():
+        buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
+    tg = chain_build(seed_graph(dag, kernel_name=op.name, buffers=buffers), dag, dict(op.knobs))
+    return TileGraphOp(name=op.name, tilegraph=tg, flash=spec)
 
 
 def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):
