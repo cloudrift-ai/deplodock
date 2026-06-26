@@ -36,6 +36,7 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import mma_atom
 
 from .conftest import requires_sm90
 
@@ -94,7 +95,7 @@ def test_symbolic_m_masked_mma_kernel_structure(monkeypatch):
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
     assert kop.knobs.get("S_ext_n_symbolic_axis"), "symbolic-M warp row must carry a symbolic axis"
     src = kop.kernel_source
     assert "int seq_len" in src, "runtime extent must be a kernel arg"
@@ -378,7 +379,7 @@ def test_batched_symbolic_mk_reaches_warp(monkeypatch):
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_batched_symbolic_mk_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "batched symbolic M+K matmul must reach the warp tier"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "batched symbolic M+K matmul must reach the warp tier"
     src = kop.kernel_source
     assert "mma.sync.aligned.m16n8k16" in src and "ldmatrix" in src
     assert "int seq_len" in src, "runtime extent must be a kernel arg"

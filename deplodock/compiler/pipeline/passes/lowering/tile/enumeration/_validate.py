@@ -38,6 +38,7 @@ from enum import Enum
 
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.pipeline.knob import mma_decode
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     CHAIN,
     MMA,
@@ -133,7 +134,10 @@ def validate_pins(algebra: AlgebraKind) -> None:
     feasible = candidates
     pinned: list[tuple[str, str, frozenset[Tier]]] = []
     for knob in _AUDITED:
-        raw = knob.raw()
+        # The atom selector is the native ``ATOM@<cell>`` family now — audit its pin
+        # (``DEPLODOCK_ATOM`` / legacy ``DEPLODOCK_MMA`` via ingest); the message keeps the
+        # ``MMA`` label for continuity.
+        raw = fam.atom_raw(fam.MATMUL_CELL) if knob is MMA else knob.raw()
         if raw is None or raw == "":
             continue
         tiers = _legal_tiers(knob.name, raw)

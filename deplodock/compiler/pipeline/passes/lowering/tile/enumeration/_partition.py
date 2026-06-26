@@ -46,10 +46,10 @@ _BN_RED = 16
 # ``TileGraphOp`` (``dag=None``), so the geometry passes (090 / 100 / 110) skip it on the
 # dag-None guard and ``assembly/010_assemble`` materializes the already-tiled block
 # directly. It carries no free-axis ``SPLIT@<axis>`` / ``REDUCE@<axis>`` knob (nothing to
-# enumerate); the staging / tensorize sentinels (``MMA=0`` scalar, ``STAGE=`` unstaged)
+# enumerate); the staging / tensorize sentinels (``ATOM@out=scalar``, ``STAGE=`` unstaged)
 # stay so the PLACE-tier passes (120 / 130) skip on knob presence.
 _COMBINE_KNOBS = {
-    "MMA": "0",
+    "ATOM@out": "scalar",
     "STAGE": "",
 }
 

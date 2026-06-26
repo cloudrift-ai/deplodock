@@ -114,12 +114,19 @@ def mma_decode(raw: str | None) -> tuple[bool, str | None]:
 
 def mma_atom(knobs: dict) -> str | None:
     """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None``
-    for the scalar tier (``MMA`` absent, the ``"0"`` OFF sentinel, any falsy
-    value, or the pre-enumeration ``1``/auto control — none of which name an
-    atom). Value-based, so it is safe once scalar variants carry ``MMA="0"`` (a
-    truthy *string* that the old ``knobs.get("MMA")`` presence/​truthiness checks
-    misread)."""
-    v = knobs.get("MMA")
+    for the scalar tier (no atom / the ``"scalar"`` decision / the pre-enumeration
+    auto control — none of which name an atom).
+
+    Native schema: scan the per-cell ``ATOM@<cell>`` keys and return the first that
+    names a real atom kind (``"scalar"`` is the scalar decision, not a kind). A
+    legacy ``MMA`` key (golden YAML / pre-migration DB row) is honored as a fallback
+    — the one legacy spelling read here, an ingest convenience, not impl vocabulary."""
+    for k, v in knobs.items():
+        if k.startswith("ATOM@"):
+            s = str(v).strip()
+            if s and s.lower() != "scalar":
+                return s
+    v = knobs.get("MMA")  # legacy ingest fallback
     if v is None:
         return None
     s = str(v).strip()

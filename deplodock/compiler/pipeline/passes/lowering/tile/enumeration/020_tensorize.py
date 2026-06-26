@@ -26,17 +26,18 @@ from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom, mma_decode
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import eligible_atoms
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_ATOM
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.SEMIRING or TC_ATOM.name in op.knobs or mma_atom(op.knobs) is not None:
+    cell = fam.atom_key(fam.MATMUL_CELL)
+    if op.algebra is not AlgebraKind.SEMIRING or cell in op.knobs or mma_atom(op.knobs) is not None:
         raise RuleSkipped("tensorize applies once, to a SEMIRING seed (warp tier not yet decided)")
-    enabled, pinned = mma_decode(TC_ATOM.raw())
+    enabled, pinned = mma_decode(fam.atom_raw(fam.MATMUL_CELL))
     if not enabled:
         raise RuleSkipped("DEPLODOCK_MMA disabled — scalar tier only")
     # An explicit *legacy* scalar-tier THREAD pin (``DEPLODOCK_BN`` / ``DEPLODOCK_BM``)
@@ -59,7 +60,7 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
 
     # Warp branches first (option-0 = the fastest eligible atom), then the scalar
     # fallback — unless ``DEPLODOCK_MMA=<kind>`` pinned a single atom (no fallback).
-    out = [replace(op, knobs={**op.knobs, TC_ATOM.name: a.name}) for a in atoms]
+    out = [replace(op, knobs={**op.knobs, cell: a.name}) for a in atoms]
     if pinned is None:
-        out.append(op)  # the scalar tier (no MMA key — the scalar chain + 040 seal it)
+        out.append(op)  # the scalar tier (no ATOM@out key yet — the scalar chain + 110 seal it)
     return out

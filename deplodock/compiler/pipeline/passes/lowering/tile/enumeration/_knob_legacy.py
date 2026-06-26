@@ -74,6 +74,12 @@ def split_reg(dag, axis_name: str) -> int | None:
     return None
 
 
+def atom_raw() -> str | None:
+    """The legacy ``DEPLODOCK_MMA`` env pin (``0``/``scalar`` / a kind / auto), ingested
+    as the atom control for the matmul cell. ``None`` when unset."""
+    return config.knob_raw("MMA")
+
+
 def reduce_fields(dag, axis_name: str) -> tuple[int | None, int | None, int | None, int | None]:
     """Legacy ``DEPLODOCK_BK`` / ``FK`` / ``SPLITK`` / ``BR`` → the native
     ``(serial, fold, cta, coop)`` REDUCE factors, applied to the **primary** reduce

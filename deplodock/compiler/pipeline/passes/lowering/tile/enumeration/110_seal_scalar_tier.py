@@ -30,9 +30,10 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if op.algebra is not AlgebraKind.SEMIRING or op.dag is None or "MMA" in op.knobs:
+    cell = fam.atom_key(fam.MATMUL_CELL)
+    if op.algebra is not AlgebraKind.SEMIRING or op.dag is None or cell in op.knobs:
         raise RuleSkipped("not a scalar SEMIRING reduce / already sealed / warp tier / no dag")
     nkey = fam.split_key(op.dag.inner_n.axis.name)
     if nkey not in op.knobs or not fam.split_complete(op.knobs[nkey]):
         raise RuleSkipped("scalar SEMIRING reduce not fully tiled yet")
-    return replace(op, knobs={**op.knobs, "MMA": "0"})
+    return replace(op, knobs={**op.knobs, cell: fam.SCALAR})

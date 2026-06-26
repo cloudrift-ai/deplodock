@@ -16,7 +16,14 @@ families have landed:
   the canonical free/reduce-axis ranking. The cold ranker (`AnalyticPrior`) is left to degrade per "break it, delete
   legacy" — tests that relied on its smart tile pick now pin the tile (legacy env pins route through ingest).
 
-The **ATOM@\<cell\>** family (replacing `MMA`), **PLACE@\<edge\>** (step 5), and the golden YAML cutover (step 4) remain. No DB-compat constraint (clean-slate the storage) and **the learned prior is
+- `ATOM@<cell>` (`"scalar"` | a kind) replaces the global `MMA` knob — keyed on a **structural** cell constant
+  (`ATOM@out` for the matmul's single output cell, not the per-op kernel name, so `op_cache_key` stays
+  name-independent). `mma_atom` / `is_warp` scan the `ATOM@<cell>` keys (with a legacy `MMA` fallback for golden / DB
+  ingest); `020_tensorize` reads the atom control via `atom_raw` (native `DEPLODOCK_ATOM` / legacy `DEPLODOCK_MMA`).
+
+The **PLACE@\<edge\>** family (step 5 — folding `STAGE`/`TMA`/`CUT`/`CHAIN`) and the golden YAML cutover (step 4) remain.
+The `MMA`/`BN`/`BM`/… `Knob` descriptors stay registered (legacy `knob_features` / display / env-pin ingest); the
+implementation no longer reads them. No DB-compat constraint (clean-slate the storage) and **the learned prior is
 assumed deleted** — so this plan designs no featurization and owes nothing to prior compatibility; greedy fork-picking
 is whatever replaces the prior (out of scope here). Everything *native-facing* — `op.knobs` storage, `eval` display, new
 goldens, new tests — speaks the new schema. A **legacy mapper** is **ingest-only** (legacy → new) and exists for one

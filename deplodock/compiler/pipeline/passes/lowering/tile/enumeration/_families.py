@@ -51,6 +51,12 @@ PLACE = "PLACE"
 #: ``ATOM_REGISTRY`` kind. Read by :func:`atom_kind` to recover ``None``.
 SCALAR = "scalar"
 
+#: The canonical cell name of a matmul's single atomizable output cell. A STRUCTURAL
+#: constant (NOT the per-op kernel name), so ``ATOM@out`` keys identically across
+#: structurally-identical matmul ops and ``op_cache_key`` stays name-independent. (Flash's
+#: two cells — ``score`` / ``out`` — are named structurally by the contraction chain.)
+MATMUL_CELL = "out"
+
 
 def key(move: str, element: str) -> str:
     """The ``op.knobs`` key for ``move`` applied to DAG element ``element``."""
@@ -226,3 +232,15 @@ def pin_atom(cell: str) -> str | None:
     """The raw ``ATOM@cell`` env pin (``"scalar"`` / a kind / ``None`` when unset).
     Distinct from :func:`atom_kind` — a ``"scalar"`` pin is a *decision*, not unset."""
     return pin(ATOM, cell)
+
+
+def atom_raw(cell: str) -> str | None:
+    """The raw atom control for ``cell`` — native ``DEPLODOCK_ATOM_<cell>`` / bare
+    ``DEPLODOCK_ATOM`` first, else the legacy ``DEPLODOCK_MMA`` ingest. The string
+    ``mma_decode`` interprets (``scalar`` / auto / a kind name)."""
+    raw = pin(ATOM, cell)
+    if raw is not None:
+        return raw
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.atom_raw()

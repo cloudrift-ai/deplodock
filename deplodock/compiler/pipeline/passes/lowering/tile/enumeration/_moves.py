@@ -31,7 +31,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     MAX_THREADS_PER_CTA,
     REG_CHOICES,
     SPLITK_CHOICES,
-    TC_ATOM,
     TC_REG_CHOICES,
     THREAD_CHOICES,
     WARP_CHOICES,
@@ -533,4 +532,4 @@ def warp_bk_knobs(dag: IterDag, atom, bk: int) -> dict:
     ``REDUCE@<primary>`` value carrying the K chunk in ``s<bk>``. The v1 ``cta = 1``
     (no cross-CTA split-K — the fragment-store fold relies on it) is the
     ``enc_reduce`` default, so it rides the value implicitly."""
-    return {TC_ATOM.name: atom.name, fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk)}
+    return {fam.atom_key(fam.MATMUL_CELL): atom.name, fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk)}

@@ -54,11 +54,11 @@ def _tile_pipeline():
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
 # that fully determine a tile (so two leaves are "the same tile" iff these match).
 # Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
-# the greedy fork pick and differ between the leaf and the rejected node. The native
-# per-element families (``REDUCE@<axis>``, and later ``SPLIT@``/``ATOM@``) are matched
-# by key prefix since their element names are per-kernel; the still-legacy free-axis /
-# warp knobs are matched by exact name.
-_TILE_IDENTITY = ("MMA",)
+# the greedy fork pick and differ between the leaf and the rejected node. Every
+# tile-geometry family is now native (``SPLIT@``/``REDUCE@``/``ATOM@`` per-element keys),
+# matched by key prefix since the element names are per-kernel; no legacy exact-name
+# knob remains.
+_TILE_IDENTITY: tuple[str, ...] = ()
 _TILE_IDENTITY_PREFIXES = ("REDUCE@", "SPLIT@", "ATOM@")
 
 # The rule whose fork prices a kernel: the prior's predicted µs for the chosen
