@@ -1,6 +1,6 @@
-"""MMA staging by default — M6 of ``plans/mma-smem-staging.md``.
+"""MMA staging by default.
 
-After M6 the ``ATOM_KIND`` skip in ``020_stage_inputs`` is gone and
+The ``ATOM_KIND`` skip in ``020_stage_inputs`` is gone and
 MMA matmuls stage through smem unconditionally. This test pins that
 invariant: a small MMA matmul produces at least one ``StageBundle``
 post-tile-lowering. End-to-end correctness is covered by

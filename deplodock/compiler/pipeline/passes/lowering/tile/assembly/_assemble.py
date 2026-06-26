@@ -1,6 +1,6 @@
 """``assemble`` — the one deterministic step (block-DAG ``TileGraph`` → tower).
 
-``plans/tile-ir-block-dag.md`` makes staging / pipelining / warp-spec / register
+The block-DAG ``TileGraph`` makes staging / pipelining / warp-spec / register
 tiling / split-K / placement all the same kind of operation: a :class:`Schedule`
 annotation over an invariant algorithm. By the time a ``TileGraph`` reaches here the
 enumeration body moves have already σ-split it (F3-b: ``reduce_decomp`` re-bracketed
@@ -99,7 +99,7 @@ def assemble_block(
 
     For a single-block graph the return is the byte-identical ``TileOp`` the
     pipeline has always emitted. For a multi-block DAG ``assemble_block`` is the single
-    entry that **realizes the placement lattice** (``plans/dag-edge-placement-split-as-enumeration.md``):
+    entry that **realizes the placement lattice**:
     a same-launch-group multi-block graph (the ``SMEM``/``INLINE`` fused edge) assembles
     to **one** fused ``TileOp`` (``_assemble_group`` — the producer folds into the
     consumer's slab ``compute`` phase); a multi-launch DAG (``Schedule.launch`` partitions
@@ -199,8 +199,7 @@ def _assemble_multi(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_n
     """Assemble a multi-block DAG into a ``Graph`` of ``TileOp`` kernels — one per
     launch group, cross-group edges materialized as intermediate graph tensors.
 
-    v1 scope (``plans/dag-edge-placement-split-as-enumeration.md`` → "Sync scope vs.
-    barrier mechanism"): every launch group is a single block (the two-launch cut —
+    v1 scope: every launch group is a single block (the two-launch cut —
     the kernel boundary is the grid barrier). A group with more than one block would
     be the cooperative ``grid.sync`` mechanism, a later enumeration field."""
     for gid, blocks in _launch_groups(graph).items():
@@ -241,7 +240,7 @@ def _assemble_multi(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_n
 
 
 # ---------------------------------------------------------------------------
-# The SMEM/INLINE fused edge (``plans/dag-edge-placement-split-as-enumeration.md``).
+# The SMEM/INLINE fused edge.
 #
 # A MONOID/MAP producer ``--xn-->`` SEMIRING consumer kept in **one kernel**, the ``xn``
 # intermediate riding an smem slab (the producer fills it, the consumer

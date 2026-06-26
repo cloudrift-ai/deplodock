@@ -1,6 +1,6 @@
 """Warp-build pass (fork) — pins the K chunk ``BK`` + applies the ``atomize`` move.
 
-``plans/tile-ir-block-dag.md`` R4: the last warp-tier enumeration fork. With the
+The last warp-tier enumeration fork. With the
 atom + geometry + register cells already pinned, this offers the legal ``BK``
 K-chunks (``_moves.warp_bk_offers``, in atom-K units) and, for each, **applies the
 warp build body move** (``_build.warp_build``: σ-split each output axis four ways

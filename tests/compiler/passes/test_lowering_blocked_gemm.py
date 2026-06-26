@@ -1,8 +1,7 @@
 """CUDA accuracy regressions for matmul shapes with FN > 1.
 
 Each test pins the autotune knob bundle that used to fault on the
-register-blocked GEMM builder's path (deleted in
-``plans/obsolete-blocked-gemm-builder.md`` phase 5) and confirms the
+register-blocked GEMM builder's path (deleted) and confirms the
 per-cell shape + Kernel-IR replicator + ``dedup_replicated`` pipeline
 reproduces the same accuracy. The pinned shapes exercise the smem
 vectorize / fp16 pack / fused-prologue intersections that produced CUDA

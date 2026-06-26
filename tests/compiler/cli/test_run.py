@@ -85,8 +85,7 @@ def _symbolic_input_graph():
 
 def test_hint_sized_inputs_tiles_symbolic_axes():
     """A symbolic input axis grows to its Dim hint (DEFAULT_SEQ_HINT) by tiling
-    the trace-time values; static inputs pass through untouched (finding 4 of
-    plans/qwen3-embedding-layer0-dynamic-tune-findings.md: the full-model table
+    the trace-time values; static inputs pass through untouched (the full-model table
     must bench torch at the same hint shape deplodock benches at)."""
     from deplodock.commands.run import _hint_sized_inputs
     from deplodock.compiler.dim import DEFAULT_SEQ_HINT
@@ -367,7 +366,7 @@ def test_run_code_matmul_blockify(run_cli, dtype):
 @pytest.mark.parametrize("br", [None, 1])
 def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
     """FK register-tiles the reduce axis into ``fk`` independent accumulators +
-    a cross-accumulator fold (``plans/fk-register-tile-reductions.md``). Pin FK
+    a cross-accumulator fold. Pin FK
     (and optionally BR=1 for the pure-serial scope) and confirm the folded
     reduction still matches eager — ``rc == 0`` is the accuracy assertion."""
     monkeypatch.setenv("DEPLODOCK_FK", str(fk))
@@ -407,7 +406,7 @@ def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
 @requires_cuda
 @pytest.mark.parametrize("fk", [2, 4, 8])
 def test_run_code_fp16_matmul_window_accuracy(run_cli, monkeypatch, fk):
-    """fp16 scalar matmul half2 accumulation window (``plans/fk-half2-fp16-matmul.md``):
+    """fp16 scalar matmul half2 accumulation window:
     pin MMA off + an even FK window and confirm the windowed half2 accumulate +
     fp32 flush matches eager within fp16 tolerance — ``rc == 0`` asserts it."""
     monkeypatch.setenv("DEPLODOCK_MMA", "0")

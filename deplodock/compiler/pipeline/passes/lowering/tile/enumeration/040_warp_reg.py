@@ -1,6 +1,6 @@
 """Warp register-tile pass (fork) — pins the per-warp register cells ``(FM, FN)``.
 
-``plans/tile-ir-block-dag.md`` R4: the third warp-tier fork (after the geometry
+The third warp-tier fork (after the geometry
 is pinned). Offers the legal ``(fm, fn)`` cells under the register-file budget
 (``_moves.warp_reg_offers``) and forks — still knob-only; the warp build (the
 ``atomize`` body move) lands at ``050_warp_build`` once the K chunk is pinned

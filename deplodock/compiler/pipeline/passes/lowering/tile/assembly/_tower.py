@@ -28,8 +28,7 @@ from deplodock.compiler.ir.tile.ir import (
 @dataclass(frozen=True)
 class CarryScope:
     """A reduce axis that carries accumulator state ACROSS its serial loop — the
-    re-bracketable reduction the generalized ``_tower`` is built on
-    (``plans/tensor-core-streaming-flash-mma.md`` → "Generalized ``_tower``"). State is
+    re-bracketable reduction the generalized ``_tower`` is built on. State is
     declared ABOVE the loop (``init``), combined per-iteration, and normalized AFTER
     (``epilogue``); a matmul's K-reduce and flash's kv-stream are both ``CarryScope``s —
     they differ ONLY in which phase slots are populated (the carrier algebra). The

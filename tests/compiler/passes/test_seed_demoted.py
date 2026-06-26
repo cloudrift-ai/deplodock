@@ -1,6 +1,6 @@
-"""The block-DAG seed of the demoted-matmul cut (``seed_demoted``, R7 step 2.5).
+"""The block-DAG seed of the demoted-matmul cut (``seed_demoted``).
 
-``plans/dag-edge-placement-split-as-enumeration.md``: a demoted matmul is not one
+A demoted matmul is not one
 "unbuildable" block — it is two clean blocks fusion glued together (a MONOID/MAP
 producer ``--xn-->`` a SEMIRING matmul consumer), and "fused vs split" is the
 **placement** of that ``xn`` edge. ``seed_demoted`` builds exactly that block-DAG seed.

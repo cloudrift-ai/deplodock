@@ -10,11 +10,10 @@ non-causal SDPA fuses to one kernel matching torch on the GPU (static + dynamic
 symbolic ``seq_len``); (2) with ``FLASH`` off, the score-materializing
 decomposition is untouched (default unchanged); (3) causal, explicit additive
 mask, and GQA (``head // group``) are recognized structurally from the fused body
-and fuse to one masked nest, static and dynamic — the scalar-tier masked/GQA flash
-from ``plans/masked-gqa-mma-flash-attention.md``. The score producer must be a
-clean scaled-QK (RoPE-fused producers — real decoder layers — are a follow-up; see
-the plan). The MMA tensor-core tier remains future work
-(``plans/online-softmax-flash-attention.md``).
+and fuse to one masked nest, static and dynamic — the scalar-tier masked/GQA flash.
+The score producer must be a
+clean scaled-QK (RoPE-fused producers — real decoder layers — are a follow-up).
+The MMA tensor-core tier remains future work.
 """
 
 from __future__ import annotations
@@ -72,7 +71,7 @@ def test_flash_sdpa_matches_torch(monkeypatch, B, H, S, D):
 @requires_cuda
 @pytest.mark.parametrize("bk", [2, 4])
 def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
-    """Phase 1 KV tiling (``plans/tensor-core-streaming-flash-mma.md``): a ``DEPLODOCK_BK``
+    """KV tiling: a ``DEPLODOCK_BK``
     pin re-brackets the streaming reduce ``S_k → S_k/BK · BK`` (serial within the tile). The
     fused flash kernel must still match torch — BN=1 is degenerate-identical, BN>1 the
     re-bracketed serial fold. ``S=32`` / ``D=16`` are divisible by both 2 and 4, so the pin
@@ -99,7 +98,7 @@ def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
 @requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
 def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
-    """Phase 1c (``plans/tensor-core-streaming-flash-mma.md``): ``DEPLODOCK_CHAIN=1``
+    """``DEPLODOCK_CHAIN=1``
     restructures the streaming flash into the FA-2 **shared-score** form — the P@V output
     ``d`` rides a register vector ``O[BM, D]``, the QK^T score is computed once per KV step
     and shared across ``d`` (the INLINE score edge), the twisted carrier splits into a

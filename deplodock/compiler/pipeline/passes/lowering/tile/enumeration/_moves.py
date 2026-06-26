@@ -448,8 +448,8 @@ def streaming_coop_geometry_ok(br: int, free_threads: int, warp_size: int = 32) 
 
 
 # --- Warp-tier (tensor-core ``atomize``) moves: the warp count, the per-warp
-# register cells, and the K chunk in atom-K units (``plans/tile-ir-block-dag.md``
-# R4). Legality is the per-CTA resource budget (threads / cells) + the atom-K
+# register cells, and the K chunk in atom-K units. Legality is the per-CTA resource
+# budget (threads / cells) + the atom-K
 # divisibility; the atom eligibility itself is the gate in ``enumeration/_atom``. ---
 
 _MAX_WARP_CELLS = 64  # cells (atom tiles) per warp — the register-file ceiling

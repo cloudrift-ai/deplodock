@@ -1,6 +1,6 @@
 """Algebra-native knob schema — one *move family* per DAG element.
 
-``plans/algebra-knob-naming-schema.md``. The tile composer dispatches on the carrier
+The tile composer dispatches on the carrier
 algebra (``MAP`` / ``SEMIRING`` / ``MONOID``) over an arbitrary-rank iteration DAG, so
 the knob vocabulary is keyed on the DAG's own elements rather than on rank-2 GEMM
 letters. Each knob is **one move applied to one DAG element**; the ``op.knobs`` key

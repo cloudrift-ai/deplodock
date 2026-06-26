@@ -1,6 +1,5 @@
 """Validated reference kernel for the **fused tensor-core flash** — the executable
-target the warp-chain codegen must generate (Phase 2.3 + Phase 3 of
-``plans/tensor-core-streaming-flash-mma.md``).
+target the warp-chain codegen must generate.
 
 This is NOT the compiler's output: it is a hand-written FA-2 kernel that proves the
 whole design works end-to-end on real hardware, and pins the lane-layout contracts the

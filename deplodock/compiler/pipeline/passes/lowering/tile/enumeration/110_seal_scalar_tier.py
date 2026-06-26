@@ -1,6 +1,6 @@
 """Seal-scalar-tier pass (deterministic) — stamp the scalar-tier OFF sentinels.
 
-``plans/tile-ir-block-dag.md`` F3-b: this pass is **knob-only** — it does not touch
+This pass is **knob-only** — it does not touch
 the stored algorithm (the body moves run in ``060_reduce_tile`` / ``100_register_tile``).
 It seals the scalar ``SEMIRING`` reduce's warp-tier atom knob to its OFF sentinel
 (``MMA=0``) so every reduce variant carries the warp-tier marker the perf DB / learned

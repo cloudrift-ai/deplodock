@@ -1,7 +1,7 @@
 """The atom layer's ``atomize_cell`` move in isolation — the fixed contract.
 
-``plans/tensor-core-streaming-flash-mma.md`` Phase 0 factored the ``atomize`` body
-edit out of ``_build.warp_build``'s matmul-staging geometry into ``_atom`` so it is
+The ``atomize`` body
+edit was factored out of ``_build.warp_build``'s matmul-staging geometry into ``_atom`` so it is
 an independently-testable unit, callable with operands of **any provenance** (it
 names A / B by SSA value). These tests pin that contract — a canonical matmul cell
 ``[Load, Load, Assign(mul), Accum]`` fuses to one ``Mma`` with the right A / B / C

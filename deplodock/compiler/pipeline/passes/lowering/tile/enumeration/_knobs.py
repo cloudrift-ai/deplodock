@@ -99,8 +99,7 @@ TMA = Knob(
     off=False,
 )
 
-# Chain knob (the shared-axis reduce_decomp, ``_build.chain_build``,
-# ``plans/tensor-core-streaming-flash-mma.md`` Phase 1c): a BOOL over a streaming
+# Chain knob (the shared-axis reduce_decomp, ``_build.chain_build``): a BOOL over a streaming
 # ``MONOID(SEMIRING)`` flash nest. ``True`` restructures it into the FA-2 shared-score
 # form — the P@V output ``d`` rides a register vector ``O[d]`` inside the stream, the
 # score is computed once per KV step (the INLINE score edge, shared across ``d``), and

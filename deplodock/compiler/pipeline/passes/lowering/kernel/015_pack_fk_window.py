@@ -4,7 +4,7 @@ The fp16 scalar matmul accumulates every product into an fp32 register master
 (``__half2float(a) * __half2float(b)`` summed in f32). That leaves the GPU's 2×
 packed-fp16 throughput on the table — ``__hfma2`` does two fp16 MACs per
 instruction, but pure fp16 accumulation over a full K loop loses too much
-precision. The ``FK`` window (``plans/fk-half2-fp16-matmul.md``) bounds the
+precision. The ``FK`` window bounds the
 rounding error: accumulate one **stage chunk** of K (the window, length
 ``FK = bk``, even) in a ``__half2`` register, then widen + horizontal-sum +
 flush into the persistent fp32 master once per window.

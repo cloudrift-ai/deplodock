@@ -1,6 +1,6 @@
 """Intra-CTA cooperative combine over a general monoid (``Monoid``) carrier.
 
-Step 2 of ``plans/atomic-free-monoid-combine.md``: a cooperative-K reduce whose
+A cooperative-K reduce whose
 carrier is a tuple-valued ``Monoid`` (online-softmax ``(m, l)``) — not an
 ``Accum`` — splits across the CTA's threads and merges the per-thread partial
 states via the carrier's ``combine_states`` (the materializer's ``emit_combine`` →

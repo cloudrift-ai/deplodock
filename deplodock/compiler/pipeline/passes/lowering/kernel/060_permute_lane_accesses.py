@@ -137,8 +137,7 @@ def rewrite(ctx: Context, root: Node) -> Graph | None:
         return _off()
     if is_warp(knobs):
         # MMA path: the s16816 ``ldmatrix`` consumer applies its own per-lane
-        # swizzle XOR — the per-thread LDS.128 permute doesn't apply. Skip per
-        # plans/mma-fragment-factorization.md M7.
+        # swizzle XOR — the per-thread LDS.128 permute doesn't apply. Skip.
         return _off()
     if "FN" not in knobs:
         return _off()

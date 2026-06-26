@@ -1,6 +1,6 @@
 """stage pass (enumeration fork) — the first ``Schedule``-move pass.
 
-``plans/tile-ir-block-dag.md`` R1: ``stage(read)`` writes
+``stage(read)`` writes
 ``Schedule.staged[edge] = SYNC`` for a reused gmem read; it inserts **no block**
 and edits **no body** — the smem slab + cooperative producer are synthesized later
 by ``assembly/_slab`` from the annotation.

@@ -8,7 +8,7 @@ so the TMA issues sat behind a ``threadIdx.x == 0`` guard no consumer-branch thr
 satisfy, and every consumer ``mbarrier.wait`` spun forever — a deterministic device hang.
 The fix made the producer pass's ``_eligible`` run the same split the transform used and
 raise ``"not reachable by the producer split"`` when no TMA depth-2 bundle landed
-producer-side. See ``plans/qwen3-embedding-tune-hung-kernel.md``.
+producer-side.
 
 The block-DAG rewrite **removed** the ``085_warp_specialize`` producer pass and its
 ``DEPLODOCK_WARP_SPECIALIZE`` knob entirely, so that producer-side guard is no longer

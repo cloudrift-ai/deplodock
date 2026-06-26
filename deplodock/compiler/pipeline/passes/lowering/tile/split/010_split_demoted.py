@@ -6,7 +6,7 @@ piece of a split can re-enter planning with its own tiling), and the demoted mat
 builds a seed anyway (``classify`` returns ``None`` for a cone-operand cell, so
 ``010_build`` would ``RuleSkip`` it) — which is why the cut stays a pre-build operation
 and ``split/`` survives rather than folding into ``enumeration/`` as an edge-placement
-move (``plans/dag-edge-placement-split-as-enumeration.md`` → "Status / step 2.5").
+move.
 
 This rule holds **no** decision logic — it is the thin fork the plan calls for, pairing
 three relocated pieces:

@@ -1,6 +1,6 @@
-"""RF hardening guards for the block-DAG tile IR (``plans/tile-ir-block-dag.md``).
+"""RF hardening guards for the block-DAG tile IR.
 
-These lock the load-bearing invariants the F3-b refactor rests on — the ones a future
+These lock the load-bearing invariants the refactor rests on — the ones a future
 change could silently break and that the perf DB / learned prior can't migrate around:
 
 - **derived-view discipline** — ``Block`` stores *only* ``name`` / ``domain`` /

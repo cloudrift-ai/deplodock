@@ -1,6 +1,6 @@
 """``partition_reduce`` — the split-K combine block, rebuilt against the block-DAG IR.
 
-R3 of ``plans/tile-ir-block-dag.md``. A cross-CTA split-K matmul partitions its
+A cross-CTA split-K matmul partitions its
 contraction axis ``K`` across ``SPLITK`` CTAs (the ``K_s`` GRID axis the reduce-decomp
 body move already binds); the per-partition partials must then be combined. Two
 realizations:

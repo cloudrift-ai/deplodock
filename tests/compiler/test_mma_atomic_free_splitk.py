@@ -1,5 +1,4 @@
-"""Atomic-free split-K on the warp / MMA tensor-core tier (Step 3b of
-``plans/atomic-free-monoid-combine.md``).
+"""Atomic-free split-K on the warp / MMA tensor-core tier.
 
 Dropping ``017``'s ``is_warp`` early-out lets an MMA matmul's split-K route its
 C-fragment store into ``workspace[K_s, M, N]`` (the same Write-retarget the scalar

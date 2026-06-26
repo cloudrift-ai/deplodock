@@ -1,6 +1,6 @@
 """Tensorize pass (fork) — the warp-tier ``atomize`` atom-vs-scalar choice.
 
-``plans/tile-ir-block-dag.md`` R4: the first warp-tier fork. It offers each
+The first warp-tier fork. It offers each
 :class:`~deplodock.compiler.ir.tile.ir.Atom` the kernel admits (the gate in
 ``enumeration/_atom.eligible_atoms``) **plus the scalar tier** — warp variants
 ranked first (``ldmatrix``/``mma.sync`` outrank scalar register tiles), scalar

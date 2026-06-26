@@ -240,7 +240,7 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-# Staged MMA regression for ``plans/mma-smem-staging.md`` M5. These
+# Staged MMA regression. These
 # shapes pick a K-split (K_o > 1) under the planner's natural priors,
 # placing a SerialTile(K_o) between the AtomTile and the StageBundle
 # (which wraps SerialTile(K_i) > loads). The buggy pre-fix shape
@@ -297,8 +297,7 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-# Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM, see
-# plans/make-a-plan-for-sparkling-hamster.md). On cc>=9.0 the F16 atom is
+# Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM). On cc>=9.0 the F16 atom is
 # eligible whenever the K-loads are F16, so at >=512^3 the greedy compile
 # *prefers* the tensor-core variant; ``DEPLODOCK_MMA=0`` is what forces the
 # scalar register-tile FMA path (fp16 in -> fp32 accumulate -> fp16 out). The

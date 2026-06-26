@@ -17,7 +17,7 @@ When no REGISTER tags are present (non-matmul kernels), the pass
 skips. Stamps ``FM`` / ``FN`` so the planner-stamped values persist
 and the rule is idempotent on a second visit.
 
-For MMA kernels (``plans/mma-fragment-factorization.md``), the sibling
+For MMA kernels, the sibling
 ``005_lower_atom_tile`` pass has already replaced the AtomTile-wrapped
 matmul body with an Mma* fragment chain by the time this pass runs.
 This pass then sees the same ``RegisterTile`` wrapper as in the scalar

@@ -1,6 +1,6 @@
 """Warp-geometry pass (fork) — pins the per-CTA warp counts ``(WM, WN)``.
 
-``plans/tile-ir-block-dag.md`` R4: the second warp-tier fork (after
+The second warp-tier fork (after
 ``020_tensorize`` chose the atom). Offers the legal ``(wm, wn)`` warp tilings
 (``_moves.warp_offers``) and forks — knob-only, no body move (the warp build
 needs the register + K-chunk knobs too, applied at ``050_warp_build``). Fires

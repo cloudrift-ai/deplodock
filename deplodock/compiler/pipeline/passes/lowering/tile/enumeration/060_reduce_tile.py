@@ -61,7 +61,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     for bk, fk, sk in offers:
         knobs = {**op.knobs, **reduce_knobs(op.dag, (bk, fk, sk))}
         # fp16 matmul + an even FK window (FK == the stage chunk bk): reinterpret FK
-        # as the half2 accumulation window (``plans/fk-half2-fp16-matmul.md``) — keep
+        # as the half2 accumulation window — keep
         # the FK=1 fp32 K factorization (no K_f register fold) and stamp ``FKWIN`` so
         # kernel/015_pack_fk_window packs the even bk inner loop into __hfma2. The
         # register FK fold and the half2 window are mutually exclusive realizations

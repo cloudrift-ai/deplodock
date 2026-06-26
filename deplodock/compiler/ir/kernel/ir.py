@@ -572,7 +572,7 @@ class Reassign(Stmt):
 @dataclass(frozen=True)
 class FragmentExp(Stmt):
     """Per-element ``exp(in − row_sub)`` over an ``mma.sync`` ``m16n8`` C-fragment — the
-    flash ``P = exp(S − m)`` (Phase 3 of ``plans/tensor-core-streaming-flash-mma.md``).
+    flash ``P = exp(S − m)``.
 
     The fragment's 4 elements are rows ``g`` / ``g+8`` (``g=lane/4``): elements ``[0,1]``
     are row ``g`` (subtract ``top_sub``), ``[2,3]`` are row ``g+8`` (subtract ``bot_sub``)
@@ -629,8 +629,7 @@ class FragmentScale(Stmt):
 @dataclass(frozen=True)
 class FragmentRowReduce(Stmt):
     """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
-    flash fragment-softmax ``rowmax`` / ``rowsum`` (Phase 3 of
-    ``plans/tensor-core-streaming-flash-mma.md``, validated in
+    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated in
     ``tests/compiler/e2e/test_flash_tensorcore_reference.py``).
 
     Each lane of an ``m16n8`` C-fragment owns 4 f32 elements: rows ``g`` / ``g+8``
@@ -689,8 +688,8 @@ class FragmentRowReduce(Stmt):
 
 @dataclass(frozen=True)
 class FragmentCausalMask(Stmt):
-    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment
-    (Phase 5 of ``plans/tensor-core-streaming-flash-mma.md``). Sets ``frag[i]`` to the
+    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment.
+    Sets ``frag[i]`` to the
     softmax max-identity (``-1e30``, the same soft ``-inf`` the carrier's ``m`` is seeded
     with — avoids ``-inf − -inf = nan`` when a whole row is masked) wherever the element's
     absolute key column exceeds its absolute query row (the strict upper triangle), so the

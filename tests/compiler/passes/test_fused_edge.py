@@ -1,4 +1,4 @@
-"""The SMEM fused-edge assemble (``plans/dag-edge-placement-split-as-enumeration.md``).
+"""The SMEM fused-edge assemble.
 
 The fused realization of an ``SMEM``-placed edge: a MAP producer ``--xn-->`` SEMIRING
 matmul consumer kept in **one kernel**, the ``xn`` intermediate riding an smem slab the
@@ -318,8 +318,8 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     x, nw, wg = data["x"].astype(np.float32), data["nw"].astype(np.float32), data["wg"].astype(np.float32)
     xn_ref = x[0] * (1.0 / np.sqrt((x[0] ** 2).mean(axis=-1, keepdims=True) + 1e-6)) * nw
     # The MONOID fused-prologue path (cooperative rms-scale reduce + fp16 matmul accumulate
-    # at K=1024) carries ~7% relative error on the large elements — a known-fragile path, see
-    # plans/tile-ir-block-dag-branch-review-2026-06-23.md P1. rtol=0.1 reflects that real
+    # at K=1024) carries ~7% relative error on the large elements — a known-fragile path.
+    # rtol=0.1 reflects that real
     # precision (tighter than the old blanket rtol=0.5) so a regression is still caught;
     # atol=0.5 absorbs the near-zero elements where relative error is meaningless.
     np.testing.assert_allclose(got, xn_ref @ wg.T, atol=0.5, rtol=0.1)

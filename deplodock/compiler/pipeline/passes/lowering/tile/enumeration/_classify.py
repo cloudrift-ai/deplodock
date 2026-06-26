@@ -11,8 +11,7 @@ nest — a tuple `Monoid` carrier streaming over a *nested* contraction (flash's
 QK^T reduce inside the KV stream). It is **derived on demand** (``IterDag.streaming``),
 never stored on the regime: the streaming fork (``080_streaming``) and the knob-pin
 validator query the DAG when they need the distinction; a plain `Accum` / non-nested
-`Monoid` reduce is the cooperative ``MONOID`` regime. See
-``plans/twisted-monoid-carrier-design.md``.
+`Monoid` reduce is the cooperative ``MONOID`` regime.
 """
 
 from __future__ import annotations
@@ -31,8 +30,8 @@ class _Regime:
     is **not** carried here — it is a derived property of the DAG (``IterDag.streaming``)
     queried on demand by the moves that need it.
 
-    ``inner_algebra`` carries the **compositional** algebra of a twisted carrier
-    (``plans/tensor-core-streaming-flash-mma.md`` Unification 2): a streaming-flash
+    ``inner_algebra`` carries the **compositional** algebra of a twisted carrier:
+    a streaming-flash
     ``Monoid`` carrier is ``MONOID(SEMIRING)`` — its online-softmax combine is a
     SEMIRING accumulation (the embedded P@V ``O += p·v`` over the hinge ``kv``) twisted
     by the MONOID rescale (``α``). ``inner_algebra = SEMIRING`` surfaces that embedded

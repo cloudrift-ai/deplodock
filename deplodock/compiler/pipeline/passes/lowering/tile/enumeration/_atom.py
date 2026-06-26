@@ -1,6 +1,6 @@
 """The atom layer — the warp-tier MMA *eligibility gate* + the ``atomize`` body edit.
 
-``plans/tile-ir-block-dag.md`` R4 (``atomize``): the warp-tier MMA fork
+``atomize``: the warp-tier MMA fork
 (``020_tensorize``) offers each :class:`~deplodock.compiler.ir.tile.ir.Atom`
 the kernel admits, and ``050_warp_build`` fuses the matmul cell into one
 :class:`~deplodock.compiler.ir.stmt.Mma`. Both concerns live here, the

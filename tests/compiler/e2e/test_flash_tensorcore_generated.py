@@ -1,5 +1,4 @@
-"""The compiler GENERATES the fused tensor-core flash (Phase 2.3 + Phase 3 of
-``plans/tensor-core-streaming-flash-mma.md``).
+"""The compiler GENERATES the fused tensor-core flash.
 
 End-to-end: a fp16 SDPA traced + compiled with ``DEPLODOCK_CHAIN=1`` lowers — via the
 ``split/005_warp_chain`` pass — to a single ``mma.sync`` kernel (the warp-chain build

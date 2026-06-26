@@ -5,8 +5,7 @@ demand, exactly like ``Loop.algebra_kind`` — zero serialization, zero
 ``op_cache_key`` surface, always consistent with the body). It tags every index
 axis by role (``PARALLEL`` free axis / ``REDUCE`` contraction axis) and, for a
 reduce axis, the carrier whose algebra a decomposition move queries
-(``associative`` / ``commutative`` / ``has_identity``). See
-``plans/algebra-licensed-decomposition-moves.md`` (phase 2).
+(``associative`` / ``commutative`` / ``has_identity``).
 
 This is **the one structure the partition consumes** — the typed regime skeletons
 are gone (phase 6). ``tree.classify(dag)`` tags the regime off this view and
@@ -74,8 +73,8 @@ class AxisNode:
 
 @dataclass(frozen=True)
 class ContractionChain:
-    """The **carried contraction chain** of a streaming-flash nest — Unification 3 of
-    ``plans/tensor-core-streaming-flash-mma.md``. Two SEMIRING contractions share a
+    """The **carried contraction chain** of a streaming-flash nest. Two SEMIRING
+    contractions share a
     *dual-role* hinge axis ``kv``, recombined by the ``Monoid`` carrier folding over it::
 
         S[m,kv] = Σ_e Q[m,e]·K[kv,e]     # inner: reduce ``e``,  free-output ``kv``

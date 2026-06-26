@@ -1,5 +1,4 @@
-"""Flash attention with a COOPERATIVE-K (KV split across threads) reduce — Step 4
-of ``plans/atomic-free-monoid-combine.md``.
+"""Flash attention with a COOPERATIVE-K (KV split across threads) reduce.
 
 The deployed scalar flash kernel kept its KV (online-softmax ``Monoid``) reduce
 serial — one thread per output element, the KV axis unparallelized. Step 4 routes

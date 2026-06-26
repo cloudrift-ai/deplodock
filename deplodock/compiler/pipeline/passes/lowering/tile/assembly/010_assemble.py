@@ -1,6 +1,6 @@
 """Assembly pass — the one deterministic ``TileGraph`` → ``TileOp`` step.
 
-The second half of the block-DAG tile phase (``plans/tile-ir-block-dag.md``):
+The second half of the block-DAG tile phase:
 ``enumeration/`` refines a stored, knob-invariant ``TileGraph`` in place — the body
 moves (``reduce_decomp`` / ``free_tile``) σ-split the algorithm and the ``stage`` move
 annotates ``Schedule.staged`` — and hands the fully-tiled ``TileGraphOp`` here. This

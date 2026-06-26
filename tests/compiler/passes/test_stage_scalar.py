@@ -1,6 +1,6 @@
-"""R1 (Staging) — the ``stage`` move on the scalar reduce tier.
+"""Staging — the ``stage`` move on the scalar reduce tier.
 
-``plans/tile-ir-block-dag.md`` R1: ``stage(read)`` writes ``Schedule.staged[edge] =
+``stage(read)`` writes ``Schedule.staged[edge] =
 SYNC`` for a reused gmem read (the enumeration fork ``120_stage``); ``assemble``
 synthesizes the smem slab + cooperative producer from that annotation
 (``assembly/_slab``). These tests pin the new architecture end to end on a scalar

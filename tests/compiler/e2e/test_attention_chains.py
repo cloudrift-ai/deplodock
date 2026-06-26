@@ -42,7 +42,7 @@ def _seed(monkeypatch):
     # with the prior retired (algebra-knob-schema "break it"), the cold emission-order pick
     # can choose an over-budget tile (deep BK staging slab / wide MONOID-combine smem) and
     # hard-fail. The tile is irrelevant to these accuracy checks, so pin a fitting one
-    # (legacy env pins route through the ingest mapper). See plans/algebra-knob-naming-schema.md.
+    # (legacy env pins route through the ingest mapper).
     for k, v in (("BN", "16"), ("BM", "8"), ("FN", "2"), ("FM", "2"), ("BK", "8"), ("BR", "4")):
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
 

@@ -1,5 +1,4 @@
-"""The carried contraction chain — Phase 1a of the tensor-core streaming flash
-(``plans/tensor-core-streaming-flash-mma.md``).
+"""The carried contraction chain of the tensor-core streaming flash.
 
 A streaming-flash nest is a ``Monoid`` carrier streaming over a *nested* QK^T
 contraction. Unification 3 reads it as a **chain on a shared axis**: ``kv`` is the

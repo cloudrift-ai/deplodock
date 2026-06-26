@@ -1,6 +1,6 @@
 """Pre-build pass: emit the fused tensor-core flash for an eligible streaming nest.
 
-``plans/tensor-core-streaming-flash-mma.md`` Phase 2.3 + Phase 3. Runs FIRST (before
+Runs FIRST (before
 ``010_split_demoted``), on the un-tiled flash ``LoopOp``: when ``DEPLODOCK_CHAIN=1`` and
 the nest is a streaming ``MONOID(SEMIRING)`` chain (``dag.chain``) in the v1 fused-TC
 scope (fp16, non-causal, equal-head, ``D%16==0``, ``S%16==0``), it replaces the LoopOp

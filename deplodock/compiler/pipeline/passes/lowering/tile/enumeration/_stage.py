@@ -2,7 +2,7 @@
 
 A pure function over a built :class:`TileGraph`'s DERIVED projections
 (``Block.reads`` + ``Schedule.binding`` + the K-tower in ``Block.compute``),
-never tower shape — the ``plans/tile-ir-block-dag.md`` discipline. A gmem input
+never tower shape — the block-DAG discipline. A gmem input
 read is **stageable** iff:
 
 - it indexes its buffer AFFINELY (a ``TEMPLATE`` collapsed-reshape declines — the

@@ -1,6 +1,6 @@
 """Atomic-free split-K — the ``partition_reduce`` combine, as a structural fork.
 
-R3 of ``plans/tile-ir-block-dag.md``. A cross-CTA split-K matmul (the ``K_s`` GRID
+A cross-CTA split-K matmul (the ``K_s`` GRID
 partition the reduce-decomp body move binds when ``SPLITK > 1``) combines its
 per-partition partials one of two ways; this pass forks between them:
 

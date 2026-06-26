@@ -1,4 +1,4 @@
-"""Carrier-general cross-partition reduce kernel (R3 of ``plans/tile-ir-block-dag.md``).
+"""Carrier-general cross-partition reduce kernel.
 
 The atomic-free split-K combine block, rebuilt against the block-DAG Tile IR:
 ``enumeration/_partition.monoid_reduce_tilegraph`` builds a combine kernel driven by a

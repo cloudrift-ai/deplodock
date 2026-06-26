@@ -1,6 +1,4 @@
-"""The warp-chain assembler — build the fused tensor-core flash as a **TileOp**
-(``plans/tensor-core-streaming-flash-mma.md`` Phase 2.3 + Phase 3, step 2 of the
-"Generalized ``_tower``" migration).
+"""The warp-chain assembler — build the fused tensor-core flash as a **TileOp**.
 
 Produces a :class:`TileOp` (``GridTile > WarpTile > [init] SerialTile [epilogue]``) that
 flows through the **generic kernel passes** (``kernel/005``…``100`` → ``cuda``), NOT a

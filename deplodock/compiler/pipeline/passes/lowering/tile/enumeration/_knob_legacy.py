@@ -1,5 +1,5 @@
 """Legacy knob ingest (read-only) — the deprecation ramp for the rank-2 GEMM-letter
-schema (``plans/algebra-knob-naming-schema.md`` Step 2).
+schema.
 
 The native ``MOVE@element`` schema (``_families``) is the source of truth everywhere
 the pipeline faces inward — storage, ``eval`` display, new goldens, new tests all speak

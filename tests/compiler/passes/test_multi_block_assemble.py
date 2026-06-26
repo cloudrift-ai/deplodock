@@ -1,4 +1,4 @@
-"""General multi-block / multi-launch ``assemble`` (``plans/dag-edge-placement-split-as-enumeration.md`` → step 1).
+"""General multi-block / multi-launch ``assemble``.
 
 The single-block restriction in ``assemble_block`` is the coexistence stopgap the
 edge-placement plan lifts first: a ``GMEM`` cut yields a multi-block ``TileGraph``

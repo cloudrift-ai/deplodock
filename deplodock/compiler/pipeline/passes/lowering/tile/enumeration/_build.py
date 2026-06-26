@@ -1,6 +1,6 @@
 """Build the block-DAG ``TileGraph`` from the iteration DAG + a move choice.
 
-The composer's front half (``plans/tile-ir-block-dag.md``): instead of
+The composer's front half: instead of
 materializing the ``TileOp`` tower, ``build_dag`` emits the invariant algorithm (a
 :class:`Block`) + a reference :class:`Schedule` (the binding), and ``lower`` wraps
 it in the ``TileGraphOp`` the enumeration pass returns. One ``build_dag`` serves
@@ -99,7 +99,7 @@ def _replace_k_scalar(
 
 def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple:
     """Wrap ``body`` in a boundary ``Cond`` per masked free axis — the derived
-    store guard (``plans/tile-ir-block-dag.md``: masked-ness is ``real_extent`` vs
+    store guard (masked-ness is ``real_extent`` vs
     tile, a derived ``Cond``). Mirrors ``materialize._assemble`` exactly, so the
     σ-split + guarded body stays byte-identical."""
     for name, bound in bounds:
@@ -123,7 +123,7 @@ def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis |
     return Axis(f"{kax.name}_s", splitk, source_axis=kax.source_axis or kax)
 
 
-# === The per-pass body moves (``plans/tile-ir-block-dag.md`` F3-b). ===
+# === The per-pass body moves. ===
 # ``build_dag`` is no longer a monolith called at one site: it is the COMPOSITION of
 # the incremental moves the enumeration passes apply one at a time to the stored,
 # knob-invariant algorithm. ``010_build`` seeds the logical block; ``060_reduce_tile``
@@ -207,7 +207,6 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
 
 
 # === MONOID build move — one move for the cooperative reduce AND the streaming flash ===
-# (``plans/tile-ir-block-dag.md`` R2/R6, ``plans/tensor-core-streaming-flash-mma.md`` Phase 0).
 # A ``MONOID`` nest — a plain reduce (softmax LSE / rmsnorm stat / mean / max) **or** a
 # streaming-flash nest (online-softmax over a nested QK^T contraction) — lowers through
 # the SAME body move: σ-split the free axes (``free_tile``, register forced to 1) + apply
@@ -365,7 +364,7 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
 
 
 # === The carried-contraction-chain build move (the shared-axis reduce_decomp) ===
-# (``plans/tensor-core-streaming-flash-mma.md`` Phase 1c). A ``MONOID(SEMIRING)``
+# A ``MONOID(SEMIRING)``
 # nest — a twisted carrier streaming over a nested contraction whose combine embeds a
 # SECOND contraction (flash: online softmax over QK^T, with P@V embedded in
 # ``O = O·α + p·v``) — is restructured so the **P@V free output ``d``** rides a register
@@ -474,7 +473,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
 
 
-# === Warp-tier (tensor-core ``atomize``) build move (``plans/tile-ir-block-dag.md`` R4). ===
+# === Warp-tier (tensor-core ``atomize``) build move. ===
 # The warp tower is the same kind of body move as the scalar ``free_tile`` /
 # ``reduce_decomp``, but it splits each output axis FOUR ways
 # (``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom``, bound GRID/WARP/REGISTER/ATOM)

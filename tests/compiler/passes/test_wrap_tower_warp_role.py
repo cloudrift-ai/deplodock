@@ -1,8 +1,8 @@
 """Tests for ``Role.WARP`` wiring in the partition planner's
-``_wrap_tower`` (M3 of ``plans/warptile-primitive.md``).
+``_wrap_tower``.
 
 No planner branch emits ``Role.WARP`` yet — the MMA fragment
-factorization consumer plan does. M3's job is to wire
+factorization consumer plan does. The job here is to wire
 ``_layer_kind_for`` / ``_wrap_tower`` so downstream plans can flip a
 tier without revisiting the tower mechanics. These tests poke
 ``_wrap_tower`` directly with a synthetic ``layers`` list.

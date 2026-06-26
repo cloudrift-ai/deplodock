@@ -6,10 +6,9 @@ independent cells that originally referenced the same axis-invariant
 value end up structurally identical at the same scope. Folding them
 to a single occurrence is content-agnostic CSE — what the deleted
 register-blocked GEMM builder used to get by hand-partitioning
-N-invariant cones (see ``plans/obsolete-blocked-gemm-builder.md``).
+N-invariant cones.
 
-Empirically (sweep over the compiler test suite; see
-``plans/post-blocked-builder-cleanup.md`` step 8) most FN > 1 matmul
+Empirically (sweep over the compiler test suite) most FN > 1 matmul
 kernels fold nothing — 020_stage_inputs
 already deduplicates N-invariant Loads upstream. The pass earns its
 keep on reduce/norm kernels: RMSNorm's mean reduce, softmax's

@@ -1,8 +1,8 @@
 """Slab synthesis — ``assemble`` materializes ``Schedule.staged`` into smem.
 
-``plans/tile-ir-block-dag.md``: "Slabs, cooperative producers ... are all
+Slabs, cooperative producers ... are all
 assemble OUTPUTS — synthesized from the algorithm + Schedule, never stored in the
-IR." This module is that synthesis for the ``stage`` move (R1, scalar tier): for
+IR. This module is that synthesis for the ``stage`` move (R1, scalar tier): for
 each ``Schedule.staged`` read-site it derives a :class:`Source` (the smem slab's
 cache axes + per-CTA-per-stage origin + affine addressing) and wraps the K-tower
 in one ``StageBundle(policy=SYNC)``, rewriting the staged consumer ``Load``s to

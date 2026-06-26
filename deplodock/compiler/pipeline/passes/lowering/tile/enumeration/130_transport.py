@@ -1,6 +1,6 @@
-"""transport pass (enumeration fork) — ``promote_transport`` (R5).
+"""transport pass (enumeration fork) — ``promote_transport``.
 
-``plans/tile-ir-block-dag.md`` R5: ``promote_transport(read, →TMA)`` writes the
+``promote_transport(read, →TMA)`` writes the
 ``Schedule.staged[edge]`` value (``SYNC`` → ``TMA``); it edits **no body**. The smem
 slab's swizzle + the double-buffered ``cp.async.bulk.tensor`` ring are synthesized later
 by ``assembly/_slab`` from the annotation, and ``assembly/020_peel`` software-pipelines

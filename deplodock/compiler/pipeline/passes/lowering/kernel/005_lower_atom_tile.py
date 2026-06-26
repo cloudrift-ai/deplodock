@@ -206,9 +206,8 @@ def _lower_cell(
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
     # A **fragment-output** cell (no ``Write``) keeps its C-fragment in registers for a
-    # downstream consumer instead of storing it — the flash QK^T score (Phase 3 of
-    # ``plans/tensor-core-streaming-flash-mma.md``: the INLINE score edge, no gmem
-    # round-trip). The same lowering (operand fragments + ldmatrix + mma) minus the
+    # downstream consumer instead of storing it — the flash QK^T score (the INLINE
+    # score edge, no gmem round-trip). The same lowering (operand fragments + ldmatrix + mma) minus the
     # ``RegStore`` epilogue; the ``Mma``'s ``c`` (``<c>_frag``) is the live result.
     fragment_output = write_stmt is None
     if fragment_output:
@@ -742,8 +741,7 @@ def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
     threads ``Var(cache_ax) * block`` per cache axis, relative to a zero
     origin.
 
-    Staged double-buffered (``buffer_count >= 2``, M2 of
-    plans/mma-perf-closures.md): the slab is allocated as ``[phase,
+    Staged double-buffered (``buffer_count >= 2``): the slab is allocated as ``[phase,
     *cache_axes]`` (rank-prepended); ``Load.index`` carries the leading
     phase Expr followed by the cache vars. Detect via
     ``len(load.index) > len(cache_axes)`` and splice the leading prefix
@@ -776,7 +774,7 @@ def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
             cache_coords.append(Var(ax.name))
         else:
             cache_coords.append(Var(ax.name) * Literal(b, "int"))
-    # M2 of plans/mma-perf-closures.md (Bug B): a buffered slab is allocated as
+    # A buffered slab is allocated as
     # ``[phase, *cache_axes]``. ``020_stage_inputs`` / ``040_use_ring_buffers``
     # rewrites the consumer Load index to ``(phase_expr, *cache_vars)`` — phase
     # is the leading dim. Splice the leading prefix in front of the computed

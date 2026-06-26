@@ -1,7 +1,6 @@
 """MONOID pass (fork) — the one pass for the cooperative reduce AND the streaming flash.
 
-``plans/tile-ir-block-dag.md`` R2/R6 + ``plans/tensor-core-streaming-flash-mma.md`` Phase 0:
-a ``MONOID`` nest lowers through ONE build move (``_build.monoid_build``) regardless of
+A ``MONOID`` nest lowers through ONE build move (``_build.monoid_build``) regardless of
 whether it is a **flat** reduce (softmax LSE / rmsnorm stat / mean / max) or a **nested**
 streaming flash (online-softmax over a nested QK^T contraction — a twisted monoid is a
 monoid, selected structurally not as a distinct kind). The move applies the
@@ -48,8 +47,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import 
 
 
 def _streaming_bk(dag) -> int:
-    """The KV-tile factor ``BK`` re-bracketing the streaming reduce — Phase 1's
-    ``S_k → S_k/BK · BK`` (``plans/tensor-core-streaming-flash-mma.md``). Honored from a
+    """The KV-tile factor ``BK`` re-bracketing the streaming reduce,
+    ``S_k → S_k/BK · BK``. Honored from a
     ``DEPLODOCK_BK`` pin only when it divides EVERY reduce extent the move tiles (the KV
     stream + the nested QK^T), since ``_replace_k_monoid`` applies it uniformly; else ``1``
     (the serial-stream default). A symbolic axis (no static extent) stays ``1``.

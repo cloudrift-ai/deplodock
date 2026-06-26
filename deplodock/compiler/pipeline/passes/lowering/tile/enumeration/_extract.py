@@ -1,10 +1,10 @@
 """The demoted-matmul fission — the cut's body surgery (R7 edge placement).
 
-``plans/dag-edge-placement-split-as-enumeration.md`` → "``extract_block(cone)`` — the
+``extract_block(cone)`` is the
 body move that fission realizes a ``GMEM``/cut placement with: lift an inline
 sub-computation into a new ``Block``, rewrite the consumer ``Load`` to the new
 intermediate ``Buffer``, choose the intermediate's layout from the consumer's
-``atom``/``AccessMap``." This module is that fission. ``enumeration/_cut.py`` owns the
+``atom``/``AccessMap``. This module is that fission. ``enumeration/_cut.py`` owns the
 *offer* decision (whether a cut is worth it), and ``split/010_split_demoted`` is the
 thin fork that pairs them.
 
@@ -24,7 +24,7 @@ Loop fusion can merge a producer chain INTO a matmul's reduce body (the gated-ML
 an elementwise scale, softmax stats, rotary): a multiply operand feeding the ``Accum``
 then reads a computed SSA cone instead of a plain ``Load``, and the warp tier dies —
 ``ldmatrix`` feeds MMA fragments from staged smem, and a computed operand has no buffer
-to stage (``plans/gated-mlp-tensor-cores.md``). By partition time the fused body is
+to stage. By partition time the fused body is
 final, so the demotion is visible order-independently — which is why this lives here
 and not as a fusion guard: only this tier knows whether the clean matmul would actually
 reach the warp tier.
@@ -470,7 +470,7 @@ def _assemble_fragment(graph: Graph, *, producers, consumer_op: LoopOp, cons_id:
 
 def seed_demoted(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> TileGraph | None:
     """The **block-DAG seed** of the cut: a demoted matmul ``LoopOp`` → one multi-block
-    ``TileGraph`` (``plans/dag-edge-placement-split-as-enumeration.md`` → step 2.5).
+    ``TileGraph``.
 
     The same fission as :func:`extract_block`, but each producer/consumer piece is
     seeded as a logical :class:`Block` (``seed_graph(iter_dag(piece))``) and the pieces
@@ -514,7 +514,7 @@ def seed_demoted(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Ten
 def seed_fused(loop_op: LoopOp, *, graph: Graph, node_id: str, out_tensor: Tensor) -> TileGraphOp | None:
     """The **SMEM fused-edge seed** of the cut: a single-cone demoted matmul ``LoopOp`` →
     a fused 2-block ``TileGraphOp`` the enumeration tiles into one kernel
-    (``plans/dag-edge-placement-split-as-enumeration.md`` → the keep(SMEM)-vs-cut fork).
+    (the keep(SMEM)-vs-cut fork).
 
     The same fission as :func:`extract_block` / :func:`seed_demoted`, but laid out for the
     *fused* assemble: the clean matmul **consumer is ``blocks[0]``** (a logical seed the

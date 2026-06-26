@@ -13,7 +13,7 @@ This pass restores the read-side clamp the staged path already has: each gmem-di
 ``Load`` index dim that EQUALS a masked output coord ``coord`` becomes
 ``(coord < bound) ? coord : bound-1`` — a harmless in-bounds duplicate (the masked
 output cell it feeds is never written, so the wrong value is dropped; the "M/N
-edge-clamp" the ``plans/tile-ir-block-dag.md`` IR describes as ``AccessMap.clamp``).
+edge-clamp" the IR describes as ``AccessMap.clamp``).
 A masked *reduce* (symbolic-K) axis is NOT an output mask — its overhang must be
 zero-filled, not edge-clamped (a duplicate would corrupt the sum) — so only Conds whose
 body stores a ``Write`` indexing ``coord`` are treated as output masks. The atom / MMA

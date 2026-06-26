@@ -1,5 +1,4 @@
-"""End-to-end MMA matmul correctness — M8 of
-``plans/mma-fragment-factorization.md``.
+"""End-to-end MMA matmul correctness.
 
 Verifies the s16816 ``mma.sync`` F16 path produces correct output across
 realistic shapes + both output dtypes (F32 accumulator-direct-store, F16
@@ -105,8 +104,7 @@ def _np_dtype(dt: DataType):
     return {F16: np.float16, F32: np.float32}[dt]
 
 
-# Default-on MMA matches the `MMA` knob's unset default (`mma_mode()`; per
-# `plans/mma-fragment-factorization.md` post-M5). The pin is still set
+# Default-on MMA matches the `MMA` knob's unset default (`mma_mode()`). The pin is still set
 # in tests so the fixture is robust against env-var clobbering during
 # parallel pytest runs (xdist).
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")

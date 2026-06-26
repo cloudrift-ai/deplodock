@@ -1,5 +1,5 @@
 """The fragment row-reduction kernel-IR op (``FragmentRowReduce``) — the flash
-fragment-softmax primitive (Phase 3 of ``plans/tensor-core-streaming-flash-mma.md``).
+fragment-softmax primitive.
 
 The op renders the ``rowmax`` / ``rowsum`` over an ``mma.sync`` ``m16n8`` C-fragment's
 N (kv) lanes — the same logic the validated reference kernel

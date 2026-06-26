@@ -1,7 +1,6 @@
 """Build pass (deterministic) — seed the enumeration: ``LoopOp → TileGraphOp``.
 
-The first half of the per-family enumeration split (``plans/tile-ir-block-dag.md``,
-RF/F3-b). Derives the iteration DAG (``iter_dag``) and classifies the regime
+The first half of the per-family enumeration split. Derives the iteration DAG (``iter_dag``) and classifies the regime
 (``_tree.classify``), then emits a seed ``TileGraphOp`` carrying the **logical
 (un-tiled) algorithm** (``_build.seed_graph`` — one ``Block`` whose ``compute`` is
 the DAG's inner body, empty ``domain`` / ``Schedule``) plus the ``dag`` + regime the

@@ -3,7 +3,7 @@
 A matmul fused with a pointwise epilogue (``out = f(a @ b, ...)`` — residual adds, bias / scale broadcasts,
 activations) used to be locked out of the tensor-core tier: the mma path stores the accumulator *fragment*
 (``RegStore``), so scalar epilogue Assigns have no accumulator SSA name to read (0 of 74 tuned Qwen3 down_proj
-variants on tensor cores; 29 us vs 8 us cuBLAS — ``plans/qwen3-embedding-layer0-tune-findings.md`` finding 3).
+variants on tensor cores; 29 us vs 8 us cuBLAS).
 
 The fold (CUTLASS epilogue-visitor pattern): each lane knows the (row, col) of its 4 C-fragment elements, so
 ``RegStore`` evaluates the whole chain per element in f32 — leaf operands load at the element's own coordinates

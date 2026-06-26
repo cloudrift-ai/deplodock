@@ -1,6 +1,6 @@
 """peel — deterministic post-``assemble`` software-pipelining of TMA K loops (R5).
 
-``plans/tile-ir-block-dag.md``: the ``peel`` post-pass expands a ring-staged
+The ``peel`` post-pass expands a ring-staged
 ``serial_outer`` K loop into prologue / main / epilogue, deterministically, from the
 already-chosen ``ring_depth`` (``StageBundle.buffer_count``) — **no fork** (the transport
 decision was the fork upstream; the peel has exactly one output for a given ring depth).
