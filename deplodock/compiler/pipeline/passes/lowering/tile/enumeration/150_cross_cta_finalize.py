@@ -1,26 +1,33 @@
-"""Cross-CTA split-K finalize — the ``partition_reduce`` combine, as a structural fork.
+"""Cross-CTA finalize — the carrier-generic ``partition_reduce`` combine, as a structural fork.
 
-A cross-CTA split-K matmul (the ``K_s`` GRID partition the reduce-decomp body move binds
-when ``cta > 1``) combines its per-partition partials one of two ways; this pass picks the
-cross-CTA combine stage's **finalize fold**, encoded in the ``REDUCE@<axis>`` codec's ``c``
-field (``c<cta>a`` = ATOMIC, ``c<cta>k`` = deferred KERNEL — see ``_families``):
+Any reduction that splits its contraction axis across CTAs (the ``K_s`` GRID partition the
+reduce-decomp / ``monoid_build`` body move binds when ``cta > 1``) combines its per-partition
+partials one of two ways; this pass picks the cross-CTA combine stage's **finalize fold**,
+encoded in the ``REDUCE@<axis>`` codec's ``c`` field (``c<cta>a`` = ATOMIC, ``c<cta>k`` =
+deferred KERNEL — see ``_families``). The fork fires on ANY fully-tiled scalar op with
+``cta > 1`` — a SEMIRING matmul (the additive 1-component carrier) OR a MONOID reduce (a plain
+``Accum`` sum today; a twisted ``(m, l, O)`` flash carrier at the split-KV milestone). The
+matmul is no longer special — it is the degenerate 1-component instantiation of the same
+carrier-generic producer + combine:
 
 - **ATOMIC** (``c<cta>a``, the default) — each CTA ``atomicAdd``s its partial into the
   output (``K_s`` stays out of the Write index ⇒ ``escape_analysis`` emits the atomic). The
   op is left unchanged, only the codec's finalize letter is stamped.
-- **KERNEL** (``c<cta>k``) — a **structural** split (a kernel-set change): the matmul writes
-  its partial into a workspace ``partial[K_s, M, N]`` (``K_s`` prepended to the Write index ⇒
+- **KERNEL** (``c<cta>k``) — a **structural** split (a kernel-set change): the op writes its
+  partial *state* into a workspace ``partial[K_s, …]`` (``K_s`` prepended to the Write index ⇒
   a plain store), and a sibling **combine kernel** (``_partition.deferred_combine_tilegraph``,
   carrier-generic — additive ``Accum`` here) folds the ``K_s`` axis into the original output.
-  Returned as a two-node ``Graph`` fragment (matmul → workspace → reduce) the engine splices;
-  ``_is_structural_option`` classifies it structural.
+  Returned as a two-node ``Graph`` fragment (producer → workspace → reduce) the engine splices;
+  ``_is_structural_option`` classifies it structural (by Graph-fragment type, not rule name).
 
-The reduce-decomp move emits a **bare** ``c<cta>`` (finalize pending); this pass completes it
-to ``a``/``k`` (idempotent: ``fam.reduce_finalize_decided`` guards re-entry). ATOMIC's legality
-(additive ``Accum`` + atomicAdd dtype, ``_predicates.atomic_finalize_legal``) narrows the offer
-to KERNEL-only when illegal; a ``DEPLODOCK_FINALIZE`` pin narrows it explicitly (replacing the
+The reduce-decomp / ``monoid_build`` move emits a **bare** ``c<cta>`` (finalize pending); this
+pass completes it to ``a``/``k`` (idempotent: ``fam.reduce_finalize_decided`` guards re-entry).
+ATOMIC's legality (additive ``Accum`` + atomicAdd dtype, ``_predicates.atomic_finalize_legal``)
+narrows the offer to KERNEL-only when illegal — the gate the twisted (non-additive ``Monoid``)
+split-KV finalize trips (its ``e^{Δm}`` rescale can't be an ``atomicAdd``, so attention has only
+a kernel arm by construction). A ``DEPLODOCK_FINALIZE`` pin narrows it explicitly (replacing the
 removed ``NOATOMIC`` knob — ``kernel`` ≡ old ``NOATOMIC=1``). The warp / MMA tier is ``cta=1``
-today (R4), so this fires only on the scalar ``SEMIRING`` matmul.
+today (R4), so this fires only on the scalar tier.
 """
 
 from __future__ import annotations

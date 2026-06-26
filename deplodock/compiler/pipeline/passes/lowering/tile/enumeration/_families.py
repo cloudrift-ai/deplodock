@@ -112,7 +112,7 @@ def split_complete(raw: object) -> bool:
 # **combine stage**'s finalize fold as a trailing letter (``c<cta>a`` = ATOMIC in-place,
 # ``c<cta>k`` = deferred KERNEL-boundary) — the ``CombineStage(width=cta, fold, kernel_boundary)``
 # of the cross-CTA level. A bare ``c<cta>`` (no letter) is the pre-decision transient the
-# reduce-decomp emits; ``140_atomic_free_splitk`` completes it to ``a``/``k``. ``c1`` carries
+# reduce-decomp emits; ``150_cross_cta_finalize`` completes it to ``a``/``k``. ``c1`` carries
 # no finalize (no cross-CTA stage). ---
 
 #: The cross-CTA finalize folds (the ``c`` field's trailing letter ↔ the policy name).
