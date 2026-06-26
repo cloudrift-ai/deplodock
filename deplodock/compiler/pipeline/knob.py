@@ -45,6 +45,34 @@ STRUCT_PREFIX = "S_"
 CTX_PREFIX = "H_"
 
 
+def masked_axis_features(*, m: bool = False, n: bool = False, k: bool = False) -> dict[str, float]:
+    """The per-role boundary-masked structural features (``S_masked_m/n/k``).
+
+    A tile boundary-masks an output / reduce axis when the extent is symbolic or a
+    static non-divisor of the chosen tile — a *consequence* of the shape/tile
+    pairing, not a tunable choice — so it belongs with the ``S_`` structural
+    identity, not a tuning knob. Masking is only known once the tile geometry is
+    chosen, so the producers stamp it at materialize / enumeration time; the
+    feature definition lives here, beside ``STRUCT_PREFIX`` and the featurizer that
+    reads it (``_geom_feats`` → ``D_neg_masked_*``).
+
+    Replaces the legacy flat ``OVERHANG`` tuple knob, split per role so the prior
+    can learn that K-masking (SYNC-pinned, ring-declined) prices differently from
+    M / N output masking. Only the masked roles are emitted — an unmasked kernel
+    carries none, so its structural identity is unchanged and the featurizer
+    defaults a missing flag to ``0.0`` (matching the old ``OVERHANG`` conditional
+    stamp). ``S_masked_*`` pass through :func:`knob_features` as raw floats via the
+    ``STRUCT_PREFIX`` branch automatically."""
+    feats: dict[str, float] = {}
+    if m:
+        feats[f"{STRUCT_PREFIX}masked_m"] = 1.0
+    if n:
+        feats[f"{STRUCT_PREFIX}masked_n"] = 1.0
+    if k:
+        feats[f"{STRUCT_PREFIX}masked_k"] = 1.0
+    return feats
+
+
 class _Unset:
     """Sentinel for ``Knob.off`` meaning "no OFF value declared" — the knob is
     expected to always be stamped by its owning pass (universal knobs like
@@ -86,12 +114,19 @@ def mma_decode(raw: str | None) -> tuple[bool, str | None]:
 
 def mma_atom(knobs: dict) -> str | None:
     """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None``
-    for the scalar tier (``MMA`` absent, the ``"0"`` OFF sentinel, any falsy
-    value, or the pre-enumeration ``1``/auto control — none of which name an
-    atom). Value-based, so it is safe once scalar variants carry ``MMA="0"`` (a
-    truthy *string* that the old ``knobs.get("MMA")`` presence/​truthiness checks
-    misread)."""
-    v = knobs.get("MMA")
+    for the scalar tier (no atom / the ``"scalar"`` decision / the pre-enumeration
+    auto control — none of which name an atom).
+
+    Native schema: scan the per-cell ``ATOM@<cell>`` keys and return the first that
+    names a real atom kind (``"scalar"`` is the scalar decision, not a kind). A
+    legacy ``MMA`` key (golden YAML / pre-migration DB row) is honored as a fallback
+    — the one legacy spelling read here, an ingest convenience, not impl vocabulary."""
+    for k, v in knobs.items():
+        if k.startswith("ATOM@"):
+            s = str(v).strip()
+            if s and s.lower() != "scalar":
+                return s
+    v = knobs.get("MMA")  # legacy ingest fallback
     if v is None:
         return None
     s = str(v).strip()
@@ -391,17 +426,24 @@ apply_knobs_env()
 
 # --- Rendering -------------------------------------------------------------
 
-# Canonical display order for tuning knobs — tile geometry first (block / register
-# tile, split, pipeline), then everything else alphabetically. Shared by the
-# ``run --bench`` kernel table and the ``deplodock eval`` golden tables so knob
-# columns read in a stable, comparable order everywhere.
+# Canonical display order for tuning knobs. The native ``MOVE@element`` families lead —
+# ``SPLIT@`` (free-axis tiles), then ``REDUCE@`` (contraction tower), then ``ATOM@``
+# (atomize), then ``PLACE@`` (placement) — each family's keys sorted by element; the
+# legacy exact-name knobs (``STAGE``/``TMA``/``CUT``/… still un-folded, plus any legacy
+# golden/DB row) follow in the historical order, unknown knobs last (alpha). Shared by the
+# ``run --bench`` kernel table and the ``deplodock eval`` tables so columns read stably.
+_FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
 KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 
 def knob_sort_key(name: str) -> tuple[int, str]:
-    """Sort key placing knobs in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
-    return (_KNOB_RANK.get(name, len(KNOB_ORDER)), name)
+    """Sort key: native ``MOVE@element`` families first (by :data:`_FAMILY_ORDER`, then
+    element), then the legacy names in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
+    for i, prefix in enumerate(_FAMILY_ORDER):
+        if name.startswith(prefix):
+            return (i, name[len(prefix) :])
+    return (len(_FAMILY_ORDER) + _KNOB_RANK.get(name, len(KNOB_ORDER)), name)
 
 
 def format_tuning_knobs(knobs: dict) -> str:
@@ -456,6 +498,29 @@ def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
 # --- Feature vector ---------------------------------------------------------
 
 
+def _cut_features(knobs: dict) -> dict[str, float]:
+    """The engineered ``D_*`` edge-cost feature for the demoted-matmul cut (the
+    ``CUT`` knob — ``plans/split-cone-to-cut-knob.md`` §3). A cut materializes the
+    demoted operand cone to a **gmem intermediate** — a round-trip the fused keep
+    avoids — so the prior needs the materialized volume to price the cut's Σ vs.
+    keep's. ``D_cut_roundtrip`` is the cost axis that discriminates the two
+    realizations of one decision: positive on a cut fragment (``CUT`` mask
+    popcount > 0), **zero on the fused keep** (``CUT="0"``) and absent on a
+    never-offered kernel (no ``CUT`` key → the prior's NaN "not considered").
+
+    Coarse like the rest of the ``D_*`` family — sized from the ``S_ext_free_prod``
+    product the structural vocabulary carries (a cut producer's free output IS the
+    materialized intermediate). Precise per-operand intermediate bytes (split from
+    the consumer's own M·N output) and the cross-kernel ``D_cone_fanout`` /
+    ``D_recompute_flops`` terms need per-operand shape stamping the coarse
+    ``S_ext_*`` skeleton lacks — the deferred §3 follow-up."""
+    import math  # noqa: PLC0415
+
+    cut = 1 if str(knobs.get("PLACE@cone", "")) == "cut" else 0  # the materialize-to-gmem decision
+    free = float(knobs.get("S_ext_free_prod", 0.0) or 0.0)
+    return {"D_cut_roundtrip": math.log2(free) if (cut and free > 1.0) else 0.0}
+
+
 def knob_features(knobs: dict) -> dict[str, float]:
     """Convert a knob dict into a flat numeric feature vector for the (future)
     learned planner prior — the single featurizer over the whole dict.
@@ -496,6 +561,15 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_width"] = float(len(s))
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
         # STR knobs with no custom featurizer: no generic numeric encoding.
+    # Atom (tensor-core cell) features. The legacy ``MMA`` key already routed through
+    # its ``features`` callable in the loop above; the native schema names the atom on
+    # ``ATOM@<cell>`` instead (no ``MMA`` key), so derive the same ``MMA_*`` features
+    # from the native key here. Idempotent for a legacy row (same values).
+    atom = mma_atom(knobs)
+    if atom is not None:
+        mk = get("MMA")
+        if mk is not None and mk.features is not None:
+            feats.update(mk.features(atom))
     feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
     feats.update(_tile_features(knobs))
     # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread
@@ -508,11 +582,104 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # ``plans/golden-sweep-report.md``).
     if is_warp(knobs):
         feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
+    if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
+        feats.update(_cut_features(knobs))
     return feats
 
 
+def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
+    """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes — read
+    from the native ``SPLIT@<axis>`` values (``"<par>x<reg>"``) when any are present,
+    else the legacy ``BN``/``FN`` + ``BM``/``FM`` (thread tier) / ``WN``/``FN`` +
+    ``WM``/``FM`` (warp tier) names.
+
+    The native key carries the axis's IR *name*, not the legacy n/m rank, and the
+    featurizer has no dag — so the two axes are canonicalized by ``par`` (the wider
+    parallel binding is the ``n`` / coalesced slot, the narrower the ``m`` slot). This
+    is dag-free and identical across both schemas; in the golden region (``BN ≥ BM``)
+    it reduces to the legacy labelling. A single free axis fills the ``n`` slot with a
+    degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no complete free split is
+    present (a non-tiled kernel or a par-only transitional row)."""
+    pairs: list[tuple[int, int]] = []
+    native = [k for k in knobs if k.startswith("SPLIT@")]
+    if native:
+        from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+
+        for k in native:
+            par, reg = fam.dec_split(knobs[k])
+            if reg is not None:  # skip par-only transitional values (incomplete tile)
+                pairs.append((par, reg))
+    else:
+        # Scalar ``BN``/``BM`` and warp ``WN``/``WM`` are mutually exclusive (a row is
+        # scalar XOR warp), so pick the par names by which tier has a non-zero count —
+        # not via ``is_warp`` (needs the atom key a bare ``_warp_tile_features`` unit
+        # input may omit), and not by mere presence (the off tier is present as the 0
+        # sentinel: a scalar row carries ``WN=WM=0``, a warp row ``BN=BM=0``).
+        def _nz(name: str) -> int:
+            try:
+                return int(knobs.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        n, m = ("WN", "WM") if (_nz("WN") > 0 or _nz("WM") > 0) else ("BN", "BM")
+        for par_key, reg_key in ((n, "FN"), (m, "FM")):
+            if par_key in knobs and reg_key in knobs:
+                try:
+                    pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
+                except (TypeError, ValueError):
+                    return None
+    if not pairs:
+        return None
+    pairs.sort(key=lambda pr: (pr[0], pr[1]), reverse=True)  # wider par = the n slot
+    (par_n, reg_n) = pairs[0]
+    (par_m, reg_m) = pairs[1] if len(pairs) >= 2 else (1, 1)
+    return par_n, reg_n, par_m, reg_m
+
+
+def _reduce_decomp(knobs: dict):
+    """The primary reduce axis's ``(serial, fold, cta, coop)`` factors — from the native
+    ``REDUCE@<axis>`` value (the deepest-``serial`` axis when a streaming nest has more
+    than one) when present, else the legacy ``BK``/``FK``/``SPLITK``/``BR``. Returns a
+    :class:`_families.Decomp`."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+
+    native = [knobs[k] for k in knobs if k.startswith("REDUCE@")]
+    if native:
+        return max((fam.dec_reduce(v) for v in native), key=lambda d: (d.serial, d.cta))
+    return fam.Decomp(
+        serial=int(knobs.get("BK", 1) or 1),
+        fold=int(knobs.get("FK", 1) or 1),
+        cta=int(knobs.get("SPLITK", 1) or 1),
+        coop=int(knobs.get("BR", 1) or 1),
+    )
+
+
+def tile_signature(knobs: dict) -> tuple:
+    """Schema-agnostic structural identity of a tile config: the canonical free-axis
+    slots, the primary reduce decomposition, and the atom kind — read from native
+    ``MOVE@element`` keys or legacy GEMM-letter names alike. Two configs with equal
+    signatures are the same kernel variant whichever schema spelled them, so this is
+    the bridge for matching a legacy-recorded golden YAML against the native
+    enumeration's candidate rows (``scripts/golden_knob_heuristics.py`` /
+    ``search/analytic.evaluate_golden``)."""
+    return (_free_slots(knobs), _reduce_decomp(knobs), mma_atom(knobs))
+
+
 def _geom_feats(
-    knobs: dict, *, threads: int, cells: int, tile_m: int, tile_n: int, splitk: int, free_prod, sm: float, warp: bool
+    knobs: dict,
+    *,
+    threads: int,
+    cells: int,
+    tile_m: int,
+    tile_n: int,
+    splitk: int,
+    bn: int,
+    bm: int,
+    bk: int,
+    br: int,
+    free_prod,
+    sm: float,
+    warp: bool,
 ) -> dict[str, float]:
     """The engineered ``D_*`` tile-geometry / occupancy feature family — the
     single featurization the priors rank on. It folds in everything the old
@@ -544,12 +711,10 @@ def _geom_feats(
     aspect = l2(tile_m) - l2(tile_n)
     thr_target = 7.0 if warp else 8.0  # log2 threads: 128 (4-warp) vs 256
     area_target = 12.0 if warp else 13.0  # log2 area: 64×64=4096 vs 8192
-    bn = int(knobs.get("BN", 0) or 0)
-    bm = int(knobs.get("BM", 0) or 0)
-    bk = int(knobs.get("BK", 1) or 1)
-    overhang = len(knobs.get("OVERHANG", ()) or ())
+    masked_m = float(knobs.get("S_masked_m", 0.0) or 0.0)
+    masked_n = float(knobs.get("S_masked_n", 0.0) or 0.0)
+    masked_k = float(knobs.get("S_masked_k", 0.0) or 0.0)
     k_ext = float(knobs.get("S_ext_reduce_prod") or 0.0)
-    br = int(knobs.get("BR", 1) or 1)
     kchunks = max((k_ext / br) / bk, 1.0) if k_ext > 0 else 1.0
     out = {
         # core geometry
@@ -571,7 +736,12 @@ def _geom_feats(
         "D_l2_reuse": l2(reuse),
         "D_near_intensity": -abs(l2(reuse) - 5.0),
         "D_near_kchunks": -abs(l2(kchunks) - 5.0),
-        "D_neg_overhang": float(-overhang),
+        # Per-role masked-tile penalties (was the single ``D_neg_overhang`` count):
+        # split M / N / K so the prior can weight K-masking distinctly. Negative =
+        # penalty, preserving the old sign convention.
+        "D_neg_masked_m": -masked_m,
+        "D_neg_masked_n": -masked_n,
+        "D_neg_masked_k": -masked_k,
         # thread-tier geometry bands (raw BN/BM/BK/SPLITK; 0 on a warp row)
         "D_l2_bn": l2(bn),
         "D_l2_bm": l2(bm),
@@ -597,6 +767,18 @@ def _geom_feats(
         out["D_log2_waves"] = waves  # CTAs relative to SM count
         out["D_near_waves"] = -abs(waves - 1.0)  # target ~2 waves
         out["D_ctas_ge_sm"] = 1.0 if ctas >= sm else 0.0
+        # Split-K beyond what occupancy needs is pure atomic/combine waste. The free
+        # axes alone give ``free_ctas = free_prod/area`` CTAs; split-K is justified
+        # only to lift that toward the ~2·SM ``D_near_waves`` target. The terms above
+        # fold ``splitk`` straight into ``ctas``, so they CANNOT tell "≈2 waves via a
+        # small tile" (golden, free) from "≈2 waves via heavy split-K on a big tile"
+        # (atomic-bound) — both score the same waves / ctas≥sm. This credits split-K
+        # up to the need and penalizes the excess, the engineered signal the learned
+        # prior needs to separate the SPLITK=1/2 goldens from the SPLITK=8/16 tiles
+        # the -O1 sweep over-ranks (the analytic prior already gets it via D_splitk_le2).
+        free_ctas = float(free_prod) / area
+        needed = max(2.0 * sm / max(free_ctas, 1.0), 1.0)
+        out["D_splitk_excess"] = math.log2(max(splitk / needed, 1.0))
         # Register-tile intensity × occupancy interaction: a wide per-thread
         # register tile (big FM·FN) is a win only while the grid still covers
         # the SMs — the flat D_cells* terms can't express that, so the big-FM
@@ -616,12 +798,12 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     sentinels don't feed a meaningless scalar tile."""
     if is_warp(knobs):
         return {}
-    try:
-        bn, bm, fm, fn = int(knobs["BN"]), int(knobs["BM"]), int(knobs["FM"]), int(knobs["FN"])
-    except (KeyError, TypeError, ValueError):
+    slots = _free_slots(knobs)
+    if slots is None:
         return {}
-    br = int(knobs.get("BR", 1) or 1)
-    splitk = int(knobs.get("SPLITK", 1) or 1)
+    par_n, reg_n, par_m, reg_m = slots  # (BN, FN, BM, FM)
+    d = _reduce_decomp(knobs)
+    bn, bm, fm, fn, br, bk, splitk = par_n, par_m, reg_m, reg_n, d.coop, d.serial, d.cta
     return _geom_feats(
         knobs,
         threads=bn * bm * br,
@@ -629,6 +811,10 @@ def _tile_features(knobs: dict) -> dict[str, float]:
         tile_m=bm * fm,
         tile_n=bn * fn,
         splitk=splitk,
+        bn=bn,
+        bm=bm,
+        bk=bk,
+        br=br,
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=False,
@@ -641,20 +827,28 @@ def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None)
     ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the
     MMA cell dims the featurizer already derived. Empty if the warp knobs or atom
     dims are missing (so a malformed row degrades gracefully)."""
-    try:
-        wm, wn, fm, fn = int(knobs["WM"]), int(knobs["WN"]), int(knobs["FM"]), int(knobs["FN"])
-        am, an = int(atom_m), int(atom_n)
-    except (KeyError, TypeError, ValueError):
+    slots = _free_slots(knobs)
+    if slots is None:
         return {}
+    try:
+        am, an = int(atom_m), int(atom_n)
+    except (TypeError, ValueError):
+        return {}
+    wn, fn, wm, fm = slots  # (WN, FN, WM, FM) — warp counts in the par slots
     if wm <= 0 or wn <= 0:
         return {}
+    d = _reduce_decomp(knobs)
     return _geom_feats(
         knobs,
         threads=wm * wn * 32,
         cells=fm * fn,
         tile_m=wm * fm * am,
         tile_n=wn * fn * an,
-        splitk=int(knobs.get("SPLITK", 1) or 1),
+        splitk=d.cta,
+        bn=0,  # OFF sentinels: the BN/BM bands don't fire on a warp row
+        bm=0,
+        bk=d.serial,
+        br=d.coop,
         free_prod=knobs.get("S_ext_free_prod"),
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=True,

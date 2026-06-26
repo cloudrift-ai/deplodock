@@ -23,7 +23,7 @@ Tile IR and are materialized away before reaching this layer. A
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
@@ -45,13 +45,11 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
-    Pack,
     RenderCtx,
     Select,
     SelectBranch,
     Stmt,
     StridedLoop,
-    Unpack,
     Write,
     _pad,
 )
@@ -312,17 +310,6 @@ class TmaLoad(Stmt):
         ]
 
 
-def _mbar_addr_expr(mbar: str, slot: Expr | None) -> str:
-    """``__cvta_generic_to_shared(&<mbar>[<slot>])`` — one mbarrier per slot
-    of a ring buffer is the only correct pattern for pipelined TMA, since
-    multiple ``arrive.expect_tx`` calls on the *same* mbarrier within one
-    phase accumulate into one phase rather than queueing per-slot phases.
-    ``slot=None`` means scalar mbar (single-slot, no ring buffering)."""
-    if slot is None:
-        return f"__cvta_generic_to_shared(&{mbar})"
-    return f"__cvta_generic_to_shared(&{mbar}[{{slot_expr}}])".replace("{slot_expr}", "%(slot)s")
-
-
 @dataclass(frozen=True)
 class MbarrierInit(Stmt):
     """``mbarrier.init.shared.b64 [&mbar[slot]], count;`` — one-shot init.
@@ -436,166 +423,24 @@ class MbarrierWait(Stmt):
 
 @dataclass(frozen=True)
 class TreeHalve(Stmt):
-    """Cooperative power-of-two tree reduction over a 1D smem buffer.
+    """Cross-thread combine of a (possibly multi-component) monoid state over a
+    PRE-POPULATED power-of-two smem tree — the > warp_size fallback for
+    :class:`WarpShuffle`.
 
-    Reduces ``buf[0..length)`` into ``buf[0]`` using ``op`` as the combine.
-    ``tid_var`` names the cooperative thread axis. ``length`` must be a
-    power of two and ``≤ blockDim.x``. ``dtype`` is the element type of
-    the smem buffer and the dtype the combine operates in — the renderer
-    picks the right intrinsic spelling (``fmaxf`` vs ``__hmax``, etc.)
-    via the target.
-    """
+    Each state component has its own smem slab ``bufs[i][0..length)``, populated by
+    the caller (``emit_combine`` writes the per-thread partials, or the
+    hierarchical path writes one per-warp partial per slot). This stmt tree-reduces
+    each slab into ``bufs[i][0]`` applying the carrier's ``combine_states`` at every
+    halving step (rendered at ``dtype``), then broadcast-reassigns every
+    ``state[i]`` from ``bufs[i][0]`` **in place** (no ``_b`` rename — every thread
+    ends holding the full reduction in the carried SSA names). ``length`` is a power
+    of two ≤ ``blockDim.x``. A scalar reduce is the 1-component case
+    (``state=("acc",)``, ``combine_states=(Assign("acc", op, ("acc","acc__o")),)``).
 
-    buf: str
-    op: ElementwiseImpl
-    length: int
-    tid_var: str
-    dtype: DataType = F32
-    # Named-barrier support: when ``barrier_id > 0`` the per-iter sync
-    # renders as ``bar.sync <id>, <count>;`` instead of ``__syncthreads()``.
-    # Required when this TreeHalve sits inside a warp-specialized consumer
-    # branch — __syncthreads on a warp-divergent condition is UB.
-    barrier_id: int = 0
-    barrier_count: int | None = None
-
-    def pretty(self, indent: str = "") -> list[str]:
-        bar = "" if self.barrier_id == 0 else f", bar={self.barrier_id}/{self.barrier_count}"
-        return [f"{indent}TreeHalve({self.dtype.name} {self.buf}, op={self.op.name}, length={self.length}, tid={self.tid_var}{bar})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        """Power-of-two tree reduction over ``buf[0..length)`` into ``buf[0]``."""
-        pad = _pad(ctx.indent)
-        inner_pad = _pad(ctx.indent + 1)
-        halve_pad = _pad(ctx.indent + 2)
-        op_expr = _binary_combine_expr(
-            self.op, f"{self.buf}[{self.tid_var}]", f"{self.buf}[{self.tid_var} + s]", ctx.target, self.dtype.name
-        )
-        half = int(self.length) // 2
-        if self.barrier_id == 0:
-            sync_line = f"{inner_pad}__syncthreads();"
-        else:
-            if self.barrier_count is None:
-                raise ValueError(f"TreeHalve(barrier_id={self.barrier_id}) requires barrier_count")
-            sync_line = f'{inner_pad}asm volatile("bar.sync {self.barrier_id}, {self.barrier_count};\\n" ::: "memory");'
-        return [
-            f"{pad}for (int s = {half}; s > 0; s >>= 1) {{",
-            f"{inner_pad}if ({self.tid_var} < s) {{",
-            f"{halve_pad}{self.buf}[{self.tid_var}] = {op_expr};",
-            f"{inner_pad}}}",
-            sync_line,
-            f"{pad}}}",
-        ]
-
-
-@dataclass(frozen=True)
-class WarpShuffle(Stmt):
-    """Warp-shuffle reduction: combine ``value`` across ``length`` lanes
-    via ``__shfl_xor_sync`` and bind the broadcast result to ``name``.
-
-    Renders as a register-only butterfly (no smem, no syncthreads):
-
-        <type> <name> = <value>;
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/2));
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, length/4));
-        ...
-        <name> = <op>(<name>, __shfl_xor_sync(0xffffffff, <name>, 1));
-
-    Used by ``materialize_tile._emit_combine`` when the cooperative
-    thread count fits in a single warp (``length ≤ 32``, power of two).
-    Replaces the ``Smem`` + ``Sync`` + ``TreeHalve`` + ``Sync`` + ``Load``
-    sequence — kills the smem alloc, the two block barriers, and the
-    smem-staged broadcast load. ``dtype`` is the parent accumulator's
-    dtype; the renderer declares the local + picks the combine intrinsic
-    at that dtype via the target.
-    """
-
-    name: str
-    value: str
-    op: ElementwiseImpl
-    length: int
-    dtype: DataType = F32
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}WarpShuffle({self.dtype.name} {self.name} <- {self.value}, op={self.op.name}, length={self.length})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        acc_dt = self.dtype.name
-        value_dt = ctx.ssa_dtypes.get(self.value, acc_dt)
-        src_expr = ctx.target.convert(self.value, value_dt, acc_dt)
-        ctx.ssa_dtypes[self.name] = acc_dt
-        out = [f"{pad}{ctx.type_name(acc_dt)} {self.name} = {src_expr};"]
-        s = int(self.length) // 2
-        while s > 0:
-            shfl = f"__shfl_xor_sync(0xffffffff, {self.name}, {s})"
-            combined = _binary_combine_expr(self.op, self.name, shfl, ctx.target, acc_dt)
-            out.append(f"{pad}{self.name} = {combined};")
-            s >>= 1
-        return out
-
-
-@dataclass(frozen=True)
-class MonoidWarpShuffle(Stmt):
-    """Cross-thread combine of a multi-component **monoid** state (a ``Monoid``
-    carrier) over ``length`` lanes via ``__shfl_xor_sync``.
-
-    The tuple-valued generalization of :class:`WarpShuffle`: each lane holds a
-    full per-thread partial ``state`` tuple (seeded from the carrier's identity,
-    reduced over the lane's strided K slice by the streaming ``merge``). Each
-    butterfly step shuffles **every** state component down and applies the
-    carrier's ``combine_states`` (the state-merges-state monoid op) to fold the
-    shuffled neighbor state into this lane's. After the last step every lane holds
-    the full reduction in the SAME ``state`` SSA names — reassigned **in place**,
-    so the post-reduce epilogue reads them with no rename (unlike ``WarpShuffle``'s
-    ``<name>_b`` broadcast).
-
-    ``length`` must be a power of two ≤ ``warp_size``; the XOR butterfly never
-    crosses an aligned ``length``-lane group, so this is also the SEGMENTED
-    per-row combine for strided-cooperative rows. ``commutative`` (required — the
-    butterfly reorders) is checked at the carrier; the partials reduce in fp32.
-    """
-
-    state: tuple[str, ...]
-    state_b: tuple[str, ...]
-    combine_states: tuple[Assign, ...]
-    length: int
-    dtype: DataType = F32
-
-    def deps(self) -> tuple[str, ...]:
-        return tuple(self.state)
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        inner = _pad(ctx.indent + 1)
-        f32 = ctx.type_name("f32")
-        out: list[str] = []
-        s = int(self.length) // 2
-        while s > 0:
-            # Block-scope each step so the shuffled state_b + merge temps redeclare
-            # cleanly per round (the carried state is declared by an enclosing Init).
-            out.append(f"{pad}{{")
-            for st, sb in zip(self.state, self.state_b, strict=True):
-                out.append(f"{inner}{f32} {sb} = __shfl_xor_sync(0xffffffff, {st}, {s});")
-                ctx.ssa_dtypes[sb] = "f32"
-            out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=inner))
-            out.append(f"{pad}}}")
-            s >>= 1
-        return out
-
-
-@dataclass(frozen=True)
-class MonoidTreeHalve(Stmt):
-    """Cross-thread combine of a multi-component monoid state over ``length``
-    threads via a power-of-two smem tree (the >warp_size fallback for
-    :class:`MonoidWarpShuffle`).
-
-    Each component gets its own smem slab ``bufs[i][length]`` (declared
-    separately, before this stmt). This stmt: (1) writes each thread's partial
-    ``state[i]`` to ``bufs[i][tid]``; (2) ``__syncthreads``; (3) a tree reduces
-    ``bufs[i][0..length)`` into ``bufs[i][0]`` applying ``combine_states`` at each
-    halving step; (4) broadcast-reassigns every ``state[i]`` from ``bufs[i][0]``,
-    in place (like :class:`MonoidWarpShuffle`). ``length`` must be a power of two
-    ≤ ``blockDim.x``. The reduction runs in fp32.
+    Named-barrier support: ``barrier_id > 0`` routes the per-iter sync to
+    ``bar.sync <id>, <count>`` instead of ``__syncthreads()`` — required inside a
+    warp-specialized consumer branch (a __syncthreads on a warp-divergent cond is
+    UB).
     """
 
     bufs: tuple[str, ...]
@@ -605,41 +450,296 @@ class MonoidTreeHalve(Stmt):
     length: int
     tid_var: str
     dtype: DataType = F32
+    barrier_id: int = 0
+    barrier_count: int | None = None
 
     def deps(self) -> tuple[str, ...]:
         return tuple(self.state)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        bar = "" if self.barrier_id == 0 else f", bar={self.barrier_id}/{self.barrier_count}"
+        return [f"{indent}TreeHalve({', '.join(self.state)}, length={self.length}, tid={self.tid_var}{bar})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         in1 = _pad(ctx.indent + 1)
         in2 = _pad(ctx.indent + 2)
         t = self.tid_var
-        f32 = ctx.type_name("f32")
-        out: list[str] = []
-        # (1) write each thread's partial state to its slab.
-        for buf, st in zip(self.bufs, self.state, strict=True):
-            out.append(f"{pad}{buf}[{t}] = {st};")
-        out.append(f"{pad}__syncthreads();")
-        # (3) tree reduce: each active thread folds buf[t+s] into buf[t].
+        ty = ctx.type_name(self.dtype.name)
+        if self.barrier_id == 0:
+            sync_line = f"{in1}__syncthreads();"
+        else:
+            if self.barrier_count is None:
+                raise ValueError(f"TreeHalve(barrier_id={self.barrier_id}) requires barrier_count")
+            sync_line = f'{in1}asm volatile("bar.sync {self.barrier_id}, {self.barrier_count};\\n" ::: "memory");'
         half = int(self.length) // 2
-        out.append(f"{pad}for (int s = {half}; s > 0; s >>= 1) {{")
-        out.append(f"{in1}if ({t} < s) {{")
+        out: list[str] = [f"{pad}for (int s = {half}; s > 0; s >>= 1) {{", f"{in1}if ({t} < s) {{"]
+        # Shadow temps named after the carried state so ``combine_states`` (which
+        # reassigns ``state``) folds ``buf[t+s]`` into ``buf[t]`` per component.
         for buf, st, sb in zip(self.bufs, self.state, self.state_b, strict=True):
-            out.append(f"{in2}{f32} {st} = {buf}[{t}];")
-            out.append(f"{in2}{f32} {sb} = {buf}[{t} + s];")
-            ctx.ssa_dtypes[st] = "f32"
-            ctx.ssa_dtypes[sb] = "f32"
-        out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=in2))
+            out.append(f"{in2}{ty} {st} = {buf}[{t}];")
+            out.append(f"{in2}{ty} {sb} = {buf}[{t} + s];")
+            ctx.ssa_dtypes[st] = self.dtype.name
+            ctx.ssa_dtypes[sb] = self.dtype.name
+        out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=in2, dtype=self.dtype))
         for buf, st in zip(self.bufs, self.state, strict=True):
             out.append(f"{in2}{buf}[{t}] = {st};")
         out.append(f"{in1}}}")
-        out.append(f"{in1}__syncthreads();")
+        out.append(sync_line)
         out.append(f"{pad}}}")
-        # (4) broadcast the reduced state back into the carried SSA names.
+        # Broadcast the reduced state back into the carried SSA names (in place).
         for buf, st in zip(self.bufs, self.state, strict=True):
             out.append(f"{pad}{st} = {buf}[0];")
-            ctx.ssa_dtypes[st] = "f32"
+            ctx.ssa_dtypes[st] = self.dtype.name
         return out
+
+
+@dataclass(frozen=True)
+class WarpShuffle(Stmt):
+    """Cross-thread combine of a (possibly multi-component) monoid state over
+    ``length`` lanes via ``__shfl_xor_sync`` — a register-only butterfly (no smem,
+    no syncthreads).
+
+    Each lane holds a full per-thread partial ``state`` tuple (a scalar reduce is
+    the 1-component case ``state=("acc",)``). Each butterfly step shuffles **every**
+    component down into ``state_b`` and applies the carrier's ``combine_states``
+    (the state-merges-state monoid op, rendered at ``dtype``) to fold the shuffled
+    neighbor into this lane's state, reassigning ``state`` **in place**. After the
+    last step every lane holds the full reduction in the SAME SSA names — so the
+    post-reduce epilogue reads them with no rename (kills the old scalar ``<name>_b``
+    broadcast).
+
+    ``length`` must be a power of two ≤ ``warp_size``; the XOR butterfly never
+    crosses an aligned ``length``-lane group, so this is also the SEGMENTED per-row
+    combine for strided-cooperative rows. ``commutative`` (required — the butterfly
+    reorders) is checked at the carrier.
+
+    The shuffle mask is ``__activemask()``, NOT a hard-coded ``0xffffffff``: a
+    whole-CTA cooperative reduce with ``BR < warp_size`` launches a **partial warp**
+    (e.g. ``block=8``), and naming the absent lanes ``8..31`` in the mask is undefined
+    behavior — on the e2e captured-graph path it manifested as a multi-millisecond
+    stall (a per-token×head RMSNorm went 28 ms instead of µs). The combine is reached
+    with the warp converged (the per-CTA reduce has no data-dependent divergence and
+    the only enclosing guard is warp-uniform), so ``__activemask()`` returns exactly
+    the participating lanes — correct for a partial warp, a full warp, AND a
+    non-warp-multiple block's partial final warp (where no single static literal mask
+    is correct per warp).
+    """
+
+    state: tuple[str, ...]
+    state_b: tuple[str, ...]
+    combine_states: tuple[Assign, ...]
+    length: int
+    dtype: DataType = F32
+
+    def deps(self) -> tuple[str, ...]:
+        return tuple(self.state)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}WarpShuffle({', '.join(self.state)}, length={self.length})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        inner = _pad(ctx.indent + 1)
+        ty = ctx.type_name(self.dtype.name)
+        out: list[str] = []
+        s = int(self.length) // 2
+        while s > 0:
+            # Block-scope each step so the shuffled state_b + merge temps redeclare
+            # cleanly per round (the carried state is declared by an enclosing Init).
+            out.append(f"{pad}{{")
+            for st, sb in zip(self.state, self.state_b, strict=True):
+                out.append(f"{inner}{ty} {sb} = __shfl_xor_sync(__activemask(), {st}, {s});")
+                ctx.ssa_dtypes[sb] = self.dtype.name
+            out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=inner, dtype=self.dtype))
+            out.append(f"{pad}}}")
+            s >>= 1
+        return out
+
+
+@dataclass(frozen=True)
+class Reassign(Stmt):
+    """Reassign an already-declared carried scalar — ``name = value;`` (no ``float``
+    decl). The streaming-flash online-softmax stats (``m`` / ``l``) are carried across
+    the KV-tile loop: an enclosing ``Init`` declares them, the per-tile recurrence
+    computes fresh SSA temps, and this rebinds the carried name to the new value
+    (``Assign`` always *declares*, which would shadow the carried value)."""
+
+    name: str
+    value: str
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.value,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{self.name} := {self.value}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return [f"{_pad(ctx.indent)}{self.name} = {self.value};"]
+
+
+@dataclass(frozen=True)
+class FragmentExp(Stmt):
+    """Per-element ``exp(in − row_sub)`` over an ``mma.sync`` ``m16n8`` C-fragment — the
+    flash ``P = exp(S − m)``.
+
+    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g=lane/4``): elements ``[0,1]``
+    are row ``g`` (subtract ``top_sub``), ``[2,3]`` are row ``g+8`` (subtract ``bot_sub``)
+    — the per-row online-softmax max in fragment-distributed form. Writes the result to
+    ``out`` (declared as ``float out[4]``)."""
+
+    out: str
+    src: str
+    top_sub: str  # the per-row max for rows g (an SSA scalar)
+    bot_sub: str  # the per-row max for rows g+8
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.src, self.top_sub, self.bot_sub)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.out,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentExp({self.out} <- exp({self.src} - [{self.top_sub},{self.bot_sub}]))"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        exp = ctx.target.intrinsic("exp", "f32")
+        subs = (self.top_sub, self.top_sub, self.bot_sub, self.bot_sub)
+        return [f"{pad}float {self.out}[4];"] + [f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)]
+
+
+@dataclass(frozen=True)
+class FragmentScale(Stmt):
+    """Per-row in-place scale of an ``mma.sync`` ``m16n8`` C-fragment — the flash
+    accumulator rescale ``O *= α`` and the epilogue ``O /= l`` (Phase 3). Elements
+    ``[0,1]`` (rows ``g``) scale by ``top``, ``[2,3]`` (rows ``g+8``) by ``bot`` (SSA
+    scalars or literals). A uniform scale (``top == bot``) is the score ``S *= scale``."""
+
+    frag: str
+    top: str
+    bot: str
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag, self.top, self.bot)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentScale({self.frag} *= [{self.top},{self.bot}])"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        scales = (self.top, self.top, self.bot, self.bot)
+        return [f"{pad}{self.frag}[{i}] *= {scales[i]};" for i in range(4)]
+
+
+@dataclass(frozen=True)
+class FragmentRowReduce(Stmt):
+    """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
+    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated in
+    ``tests/compiler/e2e/test_flash_tensorcore_reference.py``).
+
+    Each lane of an ``m16n8`` C-fragment owns 4 f32 elements: rows ``g`` / ``g+8``
+    (``g = lane/4``), cols ``(lane%4)*2 + {0,1}``. A ``BN``-wide score tile is
+    ``len(frags)`` such fragments (one per N-atom). Reducing over N (the kv columns)
+    is: combine each fragment's in-lane col pair (``frag[0]∘frag[1]`` for row ``g``,
+    ``frag[2]∘frag[3]`` for row ``g+8``) across all N-atoms, then a ``__shfl_xor``
+    butterfly over the ``group``-lane column set (``group=4`` for ``m16n8`` — lanes
+    differing in ``lane%4`` hold the 8 distinct cols of a row). After the butterfly
+    every lane in a column group holds the full per-row reduction, so the two outputs
+    ``top`` (rows ``g``) / ``bot`` (rows ``g+8``) are correct on every lane — the
+    fragment-distributed (2 rows/lane) form the online-softmax stats need.
+
+    Distinct from :class:`WarpShuffle` (which reduces a whole per-thread monoid state
+    over a cooperative-K lane set): this reduces *within* one warp's C-fragment over
+    the atom's N direction, keyed on the PTX C-layout."""
+
+    top: str  # the per-row reduction for rows g (broadcast across the column group)
+    bot: str  # the per-row reduction for rows g+8
+    frags: tuple[str, ...]  # the C-fragment arrays (float[4] each), one per N-atom of the BN tile
+    op: ElementwiseImpl  # the reduce op (maximum for rowmax, add for rowsum)
+    group: int = 4  # column-group lane span (m16n8: 4 lanes hold a row's 8 cols)
+    dtype: DataType = F32
+
+    def deps(self) -> tuple[str, ...]:
+        return self.frags
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.top, self.bot)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentRowReduce({self.top}, {self.bot} <- {', '.join(self.frags)}, op={self.op.name})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        f32 = ctx.type_name("f32")
+
+        def combine(parts: list[str]) -> str:
+            e = parts[0]
+            for p in parts[1:]:
+                e = _binary_combine_expr(self.op, e, p, ctx.target, "f32")
+            return e
+
+        top_parts = [f"{f}[{i}]" for f in self.frags for i in (0, 1)]
+        bot_parts = [f"{f}[{i}]" for f in self.frags for i in (2, 3)]
+        out = [f"{pad}{f32} {self.top} = {combine(top_parts)};", f"{pad}{f32} {self.bot} = {combine(bot_parts)};"]
+        ctx.ssa_dtypes[self.top] = ctx.ssa_dtypes[self.bot] = "f32"
+        s = int(self.group) // 2
+        while s > 0:
+            for nm in (self.top, self.bot):
+                shfl = f"__shfl_xor_sync(0xffffffff, {nm}, {s})"
+                out.append(f"{pad}{nm} = {_binary_combine_expr(self.op, nm, shfl, ctx.target, 'f32')};")
+            s >>= 1
+        return out
+
+
+@dataclass(frozen=True)
+class FragmentCausalMask(Stmt):
+    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment.
+    Sets ``frag[i]`` to the
+    softmax max-identity (``-1e30``, the same soft ``-inf`` the carrier's ``m`` is seeded
+    with — avoids ``-inf − -inf = nan`` when a whole row is masked) wherever the element's
+    absolute key column exceeds its absolute query row (the strict upper triangle), so the
+    masked key contributes nothing to the online-softmax (``max(m, -1e30) = m``,
+    ``exp(-1e30 − m) = 0``). Applied to the scaled score before the rowmax.
+
+    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g = lane/4``), cols
+    ``(lane%4)*2 + {0,1}`` within the N-atom. ``q_row_base`` is the absolute row of element
+    ``(0,0)`` (the query-tile origin ``qb*16``); ``kv_col_base`` the absolute col of
+    element ``(0,0)`` (the kv-tile + N-atom origin ``kv*16 + nt*8``). Because the predicate
+    is over absolute coordinates, the same op is a no-op on fully-below-diagonal tiles and
+    masks everything on fully-above-diagonal tiles — correct on every kv tile."""
+
+    frag: str
+    q_row_base: Expr
+    kv_col_base: Expr
+
+    def deps(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.frag,)
+
+    def exprs(self) -> tuple[Expr, ...]:
+        return (self.q_row_base, self.kv_col_base)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}FragmentCausalMask({self.frag} where col {self.kv_col_base.pretty()} > row {self.q_row_base.pretty()})"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        lane = "(threadIdx.x & 31)"
+        qb, kb = self.q_row_base.render(ctx), self.kv_col_base.render(ctx)
+        ninf = ctx.identity_literal(-1e30, "f32")
+        lines = [f"{pad}{{ const int _g = {lane} >> 2, _t = {lane} & 3;"]
+        for i in range(4):
+            row = "_g" if i < 2 else "(_g + 8)"
+            col = f"(_t * 2 + {i & 1})"
+            lines.append(f"{pad}  if (({kb}) + {col} > ({qb}) + {row}) {self.frag}[{i}] = {ninf};")
+        lines.append(f"{pad}}}")
+        return lines
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +782,7 @@ class RegFragment(Stmt):
     cell ``(M, N, K)``; the count
     derives from ``shape`` + ``role`` via :func:`_mma_sync_nregs`. The
     ``c`` array is zero-initialised at declaration, so the mma.sync path
-    needs no separate ``MmaFill``."""
+    needs no separate fill node."""
 
     name: str
     role: str  # "a" / "b" / "c"
@@ -884,7 +984,7 @@ class MmaSyncPtx(Stmt):
         return (self.c_frag, self.a_frag, self.b_frag)
 
     def defines(self) -> tuple[str, ...]:
-        # Accumulates into c_frag in place — a definition, like MmaSync.
+        # Accumulates into c_frag in place — a definition, like MmaSyncPtx.
         return (self.c_frag,)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -950,8 +1050,7 @@ class RegStore(Stmt):
     the M×N=16×8 C tile (rows ``g`` / ``g+8`` with ``g = lane/4``, cols
     ``(lane%4)*2 + {0,1}``) and writes them directly. ``frag`` is the f32
     ``float c[4]``; when the destination buffer is narrower (``__half*``)
-    each value is converted via ``__float2half`` (mirrors
-    :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
+    each value is converted via ``__float2half``. ``ldm`` is the output row stride
     (N) — ``0`` auto-resolves from the buffer's inner extent.
 
     ``epilogue`` optionally carries a fused pointwise chain
@@ -1222,7 +1321,7 @@ def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int | str:
 def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     """Look up the row-major leading-dimension stride (= inner extent)
     for ``buffer`` from the kernel render context. Used by
-    :class:`MmaLoad` / :class:`MmaStore` when ``ldm == 0`` (auto).
+    :class:`LdmatrixLoad` / :class:`RegStore` when ``ldm == 0`` (auto).
     Accepts both raw int extents and :class:`Dim` extents (Tensor.shape) —
     a symbolic inner extent (e.g. QK^T's ``(seq, seq)`` output) resolves to
     a C expression over the runtime kernel arg (the M9 runtime-ldm path);
@@ -1230,7 +1329,7 @@ def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     int/str split is transparent."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
-        raise ValueError(f"MmaLoad/MmaStore: buffer {buffer!r} not in ctx.shapes (no shape registered)")
+        raise ValueError(f"_resolve_ldm: buffer {buffer!r} not in ctx.shapes (no shape registered)")
     return _ext_to_c(shape[-1], ctx)
 
 
@@ -1373,12 +1472,6 @@ class KernelOp(BodyOp):
             return False
         return True
 
-    @property
-    def smem_names(self) -> frozenset[str]:
-        """Names of all ``__shared__`` buffers declared in the body — these
-        are render-internal and are excluded from kernel-parameter inference."""
-        return frozenset(self.smem_buffers)
-
 
 # ---------------------------------------------------------------------------
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
@@ -1397,8 +1490,6 @@ __all__ = [
     "Expr",
     # Loop-IR leaves + control flow (reused)
     "Load",
-    "Pack",
-    "Unpack",
     "Assign",
     "Select",
     "SelectBranch",
@@ -1435,9 +1526,6 @@ __all__ = [
     "Axis",
     "ElementwiseImpl",
 ]
-
-
-_ = field  # silence ruff
 
 
 # ---------------------------------------------------------------------------
@@ -1547,14 +1635,32 @@ def _(s: SetMaxNReg, rename, sigma, axis_fn):
 
 @_rewrite.register
 def _(s: TreeHalve, rename, sigma, axis_fn):
-    return s
+    # The carried state, the second-operand state, and the combine_states program
+    # all reference SSA names — thread them through ``rename`` so the canonicalizer
+    # can renumber. ``bufs`` are smem slab names (absent from the rename map → no-op)
+    # and ``tid_var`` is a loop var, left untouched.
+    return TreeHalve(
+        bufs=tuple(rename(b) for b in s.bufs),
+        state=tuple(rename(n) for n in s.state),
+        state_b=tuple(rename(n) for n in s.state_b),
+        combine_states=tuple(_rewrite(a, rename, sigma, axis_fn) for a in s.combine_states),
+        length=s.length,
+        tid_var=s.tid_var,
+        dtype=s.dtype,
+        barrier_id=s.barrier_id,
+        barrier_count=s.barrier_count,
+    )
 
 
 @_rewrite.register
 def _(s: WarpShuffle, rename, sigma, axis_fn):
-    # ``name`` is the SSA output; ``value`` is the SSA input — both pass
-    # through ``rename`` so the SSA canonicalizer can renumber them.
-    return WarpShuffle(name=rename(s.name), value=rename(s.value), op=s.op, length=s.length)
+    return WarpShuffle(
+        state=tuple(rename(n) for n in s.state),
+        state_b=tuple(rename(n) for n in s.state_b),
+        combine_states=tuple(_rewrite(a, rename, sigma, axis_fn) for a in s.combine_states),
+        length=s.length,
+        dtype=s.dtype,
+    )
 
 
 # --- MMA fragment rewrites -------------------------------------------------
@@ -1632,3 +1738,41 @@ def _(s: RegStore, rename, sigma, axis_fn):
         m_guard=_sub_guard(s.m_guard),
         n_guard=_sub_guard(s.n_guard),
     )
+
+
+# --- flash fragment-softmax rewrites ---------------------------------------
+#
+# The online-softmax ops carried INSIDE a streaming-flash ``TileOp`` (so they flow
+# through the kernel passes, not only KernelOp→render). Each routes its SSA names
+# through ``rename`` (the SSA canonicalizer / per-cell replicator); ``rename`` is
+# identity on non-SSA strings, so a literal scale (``"0.25f"``) passes through
+# unchanged while an SSA scalar (``"a0"``) renames.
+
+
+@_rewrite.register
+def _(s: Reassign, rename, sigma, axis_fn):
+    return Reassign(name=rename(s.name), value=rename(s.value))
+
+
+@_rewrite.register
+def _(s: FragmentExp, rename, sigma, axis_fn):
+    return FragmentExp(out=rename(s.out), src=rename(s.src), top_sub=rename(s.top_sub), bot_sub=rename(s.bot_sub))
+
+
+@_rewrite.register
+def _(s: FragmentScale, rename, sigma, axis_fn):
+    return FragmentScale(frag=rename(s.frag), top=rename(s.top), bot=rename(s.bot))
+
+
+@_rewrite.register
+def _(s: FragmentRowReduce, rename, sigma, axis_fn):
+    return FragmentRowReduce(
+        top=rename(s.top), bot=rename(s.bot), frags=tuple(rename(f) for f in s.frags), op=s.op, group=s.group, dtype=s.dtype
+    )
+
+
+@_rewrite.register
+def _(s: FragmentCausalMask, rename, sigma, axis_fn):
+    # ``frag`` is SSA (the score fragment); the base coords σ-substitute so the
+    # canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``).
+    return FragmentCausalMask(frag=rename(s.frag), q_row_base=sigma.apply(s.q_row_base), kv_col_base=sigma.apply(s.kv_col_base))

@@ -50,29 +50,39 @@ _W_A: dict[str, float] = {
     "D_splitk_le2": 8.407426536981845,
     "D_ctas_ge_sm": -7.948709567336204,
     "D_bn_band": -7.821722985417555,
-    "D_tilen_clean": 6.416225259656883,
-    "D_w_near_bk": 6.211004717311999,
+    "D_w_near_bk": 6.921170033543419,
     "MMA_tier": 5.106063905982595,
     "D_bm_band": 4.79269048276045,
     "D_bn_ge_bm": 4.1047225430800305,
-    "D_w_l2_bk": 3.6467210113988764,
+    "D_w_l2_bk": 3.8318001959254397,
     "D_near_waves": 3.3396197822131195,
     "D_square": 3.0592744803555165,
-    "D_near_area": 2.5706036479303176,
+    "D_near_area": 2.570603647930318,
     "D_bk_ge32": -2.250612760379462,
     "D_near_intensity": -2.040435217053873,
     "D_near_tilen": -1.8722293684790128,
     "D_log2_area": -1.5867630330619453,
     "D_l2_reuse": 1.2797850818471639,
+    "D_l2_bm": -1.011700520817604,
+    "D_l2_bn": -1.0011925751885005,
     "D_l2_bk": 0.9757523358723075,
-    "D_neg_overhang": -0.8646029028646691,
-    "D_l2_bm": -0.8611753178680309,
+    # Per-role split of the former ``D_neg_overhang`` (the fit kept the three roles at
+    # one shared weight here; the dynamic set below separates them).
+    # See plans/drop-overhang-knob-structural-masked-feature.md.
+    "D_neg_masked_k": -0.8646029028646691,
+    "D_neg_masked_m": -0.8646029028646691,
+    "D_neg_masked_n": -0.8646029028646691,
     "D_aspect": -0.700694025296909,
-    "D_l2_bn": -0.6882108423260582,
     "D_splitk": -0.5742697587615958,
     "D_pow2_threads": -0.4401714077219094,
+    # Pinned positive (not the fit's small negative): a clean coalesced ``tile_n`` ∈
+    # {32,64,128} is genuinely good, but the gate fixes ``tile_n`` inside that set for
+    # every thread-tier candidate, so the feature is ~constant in-pool and the fit
+    # can't identify its sign — the negative it drifts to stops penalizing the
+    # out-of-pool degenerate tiles the geometry prior must still reject.
+    "D_tilen_clean": 6.416225259656883,
+    "D_near_kchunks": -0.42097617675856036,
     "D_log2_waves": -0.3096053721652958,
-    "D_near_kchunks": -0.24376538495140618,
     "D_log2_ctas": 0.23685242485122074,
     "D_l2_threads": -0.15663789439639914,
     "D_near_threads": 0.10459439545995662,
@@ -80,7 +90,7 @@ _W_A: dict[str, float] = {
     "D_reuse": -0.056740960131700914,
     "D_near_cells": -0.03521970822845533,
     "D_cells": -0.007608072063392554,
-    "D_tile_n": -0.005719609457676535,
+    "D_tile_n": -0.00653684883131978,
     "D_threads": -0.004295893049161819,
     "D_tile_m": -0.003968686543542194,
 }
@@ -95,43 +105,46 @@ _W_A: dict[str, float] = {
 # ``SPLITK 1/2`` — the dynM seed report's finding 4). Selected at score time on
 # the stamped ``S_ext_n_symbolic_axis`` flag.
 _W_A_DYN: dict[str, float] = {
-    "D_splitk_le2": 2.335205221027407,
-    "D_near_kchunks": 2.0411714964370526,
-    "D_l2_bn": -1.9721307282729108,
-    "D_l2_bk": -1.9378821830668715,
-    "D_ctas_ge_sm": -1.6368130082756995,
-    "D_splitk": 1.506972617874152,
-    "D_near_waves": -1.4885713149137085,
-    "D_neg_overhang": 1.4232013571064015,
-    "D_bm_band": -1.328509340005289,
-    "D_l2_threads": -1.3114718972707482,
-    "MMA_tier": 1.1625757242541237,
-    "D_l2_bm": -1.1044983303644318,
-    "D_near_intensity": -1.0373173103115754,
-    "D_pow2_threads": 0.9477121154344588,
-    "D_bn_ge_bm": -0.7675791001039283,
-    "D_log2_area": 0.7283876807192595,
-    "D_bn_band": -0.7001195998838845,
-    "D_w_near_bk": -0.6919543937787341,
-    "D_square": 0.6742826935596792,
-    "D_near_area": 0.664416975841559,
-    "D_near_tilen": 0.6216444551999621,
-    "D_w_l2_bk": 0.47136282725736045,
-    "D_tilen_clean": 0.461865876692245,
-    "D_bk_ge32": -0.3082928739467462,
-    "D_near_threads": -0.2164612881543422,
-    "D_l2_cells_occ": 0.17912858998990044,
-    "D_log2_ctas": 0.1586980948517343,
-    "D_log2_waves": 0.12902916253215332,
-    "D_near_cells": 0.09205423871906947,
-    "D_l2_reuse": -0.08454193988132098,
-    "D_cells": -0.05183793166434414,
-    "D_reuse": 0.040639341150390126,
-    "D_cells_cap": -0.026621293900614396,
-    "D_tile_n": 0.0025264619706496572,
-    "D_tile_m": -0.0024300935430789845,
-    "D_threads": -0.00089339705959862,
-    "D_aspect": 0.000349748592144826,
+    "D_tilen_clean": 10.363634177205995,
+    "D_near_intensity": 3.09585000821334,
+    "D_neg_masked_k": -2.408294505214342,
+    "D_splitk_excess": 2.236560261975075,
+    "MMA_tier": -1.9996703527801165,
+    "D_near_area": 1.9510266862031242,
+    "D_neg_masked_m": -1.722865029661352,
+    "D_pow2_threads": 1.6440224154568588,
+    "D_bk_ge32": 1.5892280540195423,
+    "D_bn_band": 1.5086869426362757,
+    "D_near_kchunks": 1.4505052863521672,
+    "D_square": 1.438076875853351,
+    "D_aspect": -1.3341905081108296,
+    "D_splitk_le2": -1.3014214723301045,
+    "D_neg_masked_n": -1.2811932144523817,
+    "D_near_threads": 1.0880770996884204,
+    "D_l2_bn": -0.9187480426321503,
+    "D_l2_bm": -0.8970572684808231,
+    "D_bm_band": -0.8778374540375237,
+    "D_w_near_bk": -0.7969716930759126,
+    "D_l2_bk": -0.7809453874933684,
+    "D_splitk": 0.7629320265655761,
+    "D_l2_reuse": -0.6541889260273863,
+    "D_log2_area": -0.48773112125719426,
+    "D_bn_ge_bm": 0.45582853484702923,
+    "D_w_l2_bk": -0.39622597910562535,
+    "D_log2_waves": 0.35143754110462044,
+    "D_near_tilen": 0.23048989068226083,
+    "D_near_waves": -0.1884370133305674,
+    "D_ctas_ge_sm": 0.18711232101396888,
+    "D_log2_ctas": 0.16701343971466798,
+    "D_l2_threads": -0.15145005431309883,
+    "D_reuse": 0.09057112060934554,
+    "D_cells_cap": 0.0770135861998017,
+    "D_l2_cells_occ": 0.06394837142353067,
+    "D_cells": -0.05085462688421328,
+    "D_near_cells": 0.04398218666306179,
+    "D_tile_m": -0.004569744643930981,
+    "D_threads": -0.0034359526994655843,
+    "D_tile_n": 0.0014055838910050466,
 }
 
 
@@ -199,7 +212,10 @@ class AnalyticPrior(Prior):
         # the atomic path keeps its geometry-driven rank.
         af_on = feats.get("NOATOMIC", 0.0)
         if af_on:
-            many_splits = feats.get("SPLITK", 1.0) >= self._atomic_free_split_threshold
+            # Native rows carry the split-K count as ``D_splitk`` (REDUCE@<k>.cta);
+            # a legacy row also exposes the raw ``SPLITK`` knob feature.
+            splitk = feats.get("SPLITK", feats.get("D_splitk", 1.0))
+            many_splits = splitk >= self._atomic_free_split_threshold
             quality += self._atomic_free_weight * af_on * (1.0 if many_splits else -1.0)
         return math.exp(-self._scale * max(min(quality, 80.0), -80.0))
 

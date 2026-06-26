@@ -170,7 +170,7 @@ class _Tree[P]:
         if depth == len(self.levels):
             # One leaf per row, carrying the COMPLETE row as its knobs —
             # the DB-matchable variant identity (levels may not cover
-            # every knob, e.g. FK / OVERHANG).
+            # every knob, e.g. FK).
             return [_Leaf(tree=self, knobs=dict(row)) for row in group]
         level = self.levels[depth]
         keyed: dict[tuple, list[dict]] = {}

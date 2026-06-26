@@ -4,7 +4,7 @@ The fp16 scalar matmul accumulates every product into an fp32 register master
 (``__half2float(a) * __half2float(b)`` summed in f32). That leaves the GPU's 2×
 packed-fp16 throughput on the table — ``__hfma2`` does two fp16 MACs per
 instruction, but pure fp16 accumulation over a full K loop loses too much
-precision. The ``FK`` window (``plans/fk-half2-fp16-matmul.md``) bounds the
+precision. The ``FK`` window bounds the
 rounding error: accumulate one **stage chunk** of K (the window, length
 ``FK = bk``, even) in a ``__half2`` register, then widen + horizontal-sum +
 flush into the persistent fp32 master once per window.
@@ -45,7 +45,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Pack, Stmt, Unpack
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
+from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -77,6 +77,16 @@ def _walk(body: Body, counter: list[int]) -> tuple[Body, bool]:
         if isinstance(s, SerialTile) and _is_window_loop(s):
             out.extend(_pack_window(s, counter))
             did = True
+        elif isinstance(s, StageBundle):
+            # The window K loop (the staged smem→register reduce) lives inside the
+            # bundle's ``body`` at this stage — the bundle is only expanded to inline
+            # Sync + cooperative loads later (kernel/100_materialize_tile). Recurse
+            # into both bundle bodies so the window fires on a staged fp16 matmul.
+            nb, db = _walk(s.body, counter)
+            comp = s.compute if s.compute is not None else None
+            nc, dc = _walk(comp, counter) if comp is not None else (comp, False)
+            out.append(s.with_bodies((nc if comp is not None else Body(()), nb)))
+            did = did or db or dc
         elif isinstance(s, (SerialTile, StridedTile, RegisterTile, GridTile, ThreadTile, WarpTile)):
             nb, d = _walk(s.body, counter)
             out.append(s.with_bodies((nb,)))

@@ -1,5 +1,4 @@
-"""End-to-end MMA matmul correctness — M8 of
-``plans/mma-fragment-factorization.md``.
+"""End-to-end MMA matmul correctness.
 
 Verifies the s16816 ``mma.sync`` F16 path produces correct output across
 realistic shapes + both output dtypes (F32 accumulator-direct-store, F16
@@ -22,7 +21,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import is_warp
+from deplodock.compiler.pipeline.knob import is_warp, mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -105,8 +104,7 @@ def _np_dtype(dt: DataType):
     return {F16: np.float16, F32: np.float32}[dt]
 
 
-# Default-on MMA matches the `MMA` knob's unset default (`mma_mode()`; per
-# `plans/mma-fragment-factorization.md` post-M5). The pin is still set
+# Default-on MMA matches the `MMA` knob's unset default (`mma_mode()`). The pin is still set
 # in tests so the fixture is robust against env-var clobbering during
 # parallel pytest runs (xdist).
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
@@ -147,7 +145,7 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     g = _matmul_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "expected warp-tier mma.sync variant"
 
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -202,7 +200,7 @@ def test_mma_default_on_picks_warp_variant(monkeypatch):
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "MMA should be on by default"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "MMA should be on by default"
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
@@ -216,9 +214,9 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     kop = g.nodes["c"].op
     # Scalar fallback: the leaf carries the MMA OFF sentinel ("0"), not a real
     # atom kind — ``is_warp`` is False (no warp-tier variant emitted).
-    assert not is_warp(kop.knobs) and kop.knobs.get("MMA") == "0", "warp variant should not be emitted when DEPLODOCK_MMA=0"
-    # Scalar path should stamp BN/BM.
-    assert "BN" in kop.knobs and "BM" in kop.knobs
+    assert not is_warp(kop.knobs) and mma_atom(kop.knobs) is None, "warp variant should not be emitted when DEPLODOCK_MMA=0"
+    # Scalar path should stamp the native free-axis SPLIT@<axis> tiles (par×reg) for both axes.
+    assert sum(1 for k in kop.knobs if k.startswith("SPLIT@")) >= 2, kop.knobs
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")

@@ -48,20 +48,24 @@ def _tile_pipeline():
     frozen and shareable, so one load serves every nested descent."""
     from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
 
-    return Pipeline.build(["lowering/tile"])
+    return Pipeline.build(["lowering/tile/enumeration"])
 
 
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
 # that fully determine a tile (so two leaves are "the same tile" iff these match).
 # Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
-# the greedy fork pick and differ between the leaf and the rejected node.
-_TILE_IDENTITY = ("BN", "BM", "FM", "FN", "BK", "FK", "SPLITK", "BR", "WM", "WN", "MMA")
+# the greedy fork pick and differ between the leaf and the rejected node. Every
+# tile-geometry family is now native (``SPLIT@``/``REDUCE@``/``ATOM@`` per-element keys),
+# matched by key prefix since the element names are per-kernel; no legacy exact-name
+# knob remains.
+_TILE_IDENTITY: tuple[str, ...] = ()
+_TILE_IDENTITY_PREFIXES = ("REDUCE@", "SPLIT@", "ATOM@")
 
 # The rule whose fork prices a kernel: the prior's predicted µs for the chosen
 # complete tile row at the partition fork is the per-kernel cost the structural
 # pricing sums (defined here, not in ``two_level``, because that module imports
 # this package at module scope — the reverse would cycle).
-PARTITION_RULE = "010_partition_loops"
+PARTITION_RULE = "100_register_tile"
 
 
 def tile_identity(knobs: dict) -> frozenset:
@@ -69,7 +73,9 @@ def tile_identity(knobs: dict) -> frozenset:
     Computed identically for a greedy leaf's fork knobs and for a rejected node's
     realized knobs, so :func:`greedy_decide` can skip a leaf that already failed
     ``validate(ctx)`` downstream (the smem / thread-budget gate)."""
-    return frozenset((k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs)
+    exact = [(k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs]
+    native = [(k, str(v)) for k, v in knobs.items() if k.startswith(_TILE_IDENTITY_PREFIXES)]
+    return frozenset(exact + native)
 
 
 def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:

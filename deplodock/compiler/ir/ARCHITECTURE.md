@@ -144,17 +144,20 @@ constants; `Monoid` reports `associative` / `has_identity` `True` by constructio
 with a per-instance `commutative` field).
 
 **Bottom-up algebra analysis** (`ir/algebra.py`). `Loop.algebra_kind` derives
-each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (a plain
-associative `Accum`) / `SEMIRING` (a matmul-shaped reduce whose product
-distributes over its reduce — `Mma`, or an `Accum` fed by a distributing
-product) / `TWISTED_MONOID` (a recognized `Monoid`, e.g. flash's online softmax)
-— by *reading back* the carrier already in the body. It is a **derived cache,
-not a second source of truth**: computed on demand, so it can never contradict
-the carrier's traits and never enters equality / `op_cache_key`. The expensive
-match (raw coupled-accumulator → verified twisted monoid) is done once by
-`loop/recognize` (which emits the `Monoid`); this is a cheap read of that
-carrier. The structural matmul predicate `matmul_reduce` lives here too — the
-single source `lowering/tile/_helpers.is_matmul_reduce` delegates to (adding only
+each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (an associative
+reduce: a scalar `Accum`, OR a recognized tuple `Monoid` such as flash's online
+softmax — a twisted monoid **is** a monoid, transport of structure) / `SEMIRING`
+(a matmul-shaped reduce whose product distributes over its reduce — `Mma`, or an
+`Accum` fed by a distributing product) — by *reading back* the carrier already in
+the body. It is a **derived cache, not a second source of truth**: computed on
+demand, so it can never contradict the carrier's traits and never enters equality
+/ `op_cache_key`. The expensive match (raw coupled-accumulator → verified twisted
+monoid) is done once by `loop/recognize` (which emits the `Monoid`); this is a
+cheap read of that carrier. The streaming-flash *schedule* (a `Monoid` carrier
+streaming over a nested contraction) is selected structurally by the tile
+classifier (`lowering/tile/enumeration/_classify`), one layer below the algebra —
+see [`plans/twisted-monoid-carrier-design.md`](../../../plans/twisted-monoid-carrier-design.md). The structural matmul predicate `matmul_reduce` lives here too — the
+single source `lowering/_predicates.is_matmul_reduce` delegates to (adding only
 its tile-layer type guard).
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
@@ -225,7 +228,7 @@ axes excluded), plus `external_reads`, the names read from outside (axis vars an
 Construction never fails: unresolved names are data, and chaining scope levels means seeding the next level's
 `backward_cone` with the previous one's `external_reads`. `Body.defs_die_at(members, roots=…, allowed=…)` is the
 matching escape check (may the cone be cut out, with only the designated consumers reading its roots?). This is
-the shared substrate behind the rules that slice cones (`_split_demoted`'s producer cut, `021`'s masked-load
+the shared substrate behind the rules that slice cones (`010_split_demoted`'s producer cut, `assembly/_slab._hoist_masked`'s masked-load
 guard) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. Two dataflow walks
 deliberately do NOT use it: `classify_fragment_epilogue` (single pass interleaving reduce-scope flags with its
 negative-form blocker reporting) and `030_hoist_invariant_compute` (all-deps saturation under an axis-invariance
@@ -351,13 +354,17 @@ the body at materialize / render time via ``ir/tile/escape_analysis.py``:
 cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
 atomic-write classification from enclosing ``GridTile.axes`` vs
 ``Write.index``, broadcast-write guards from cooperative thread axes vs
-``Write.index``. The same cooperative analysis covers the general monoid
-carrier: a ``Monoid``'s cooperative axes are keyed by each of its ``state``
-component names, and the materializer emits a **multi-component** cross-thread
-combine — ``MonoidWarpShuffle`` (register ``__shfl_xor_sync`` butterfly over the
-full state tuple, ≤ warp) or ``MonoidTreeHalve`` (per-component smem tree, >
-warp), both folding via the carrier's ``combine_states`` and reassigning the
-state in place (no ``_b`` rename). No explicit coordination stmt or per-tile tag
+``Write.index``. One cooperative analysis covers every reduce carrier — a scalar
+``Accum`` is the degenerate 1-component monoid (its ``combine_partials`` is the
+one-``Assign`` op-fold), the general ``Monoid`` (flash online-softmax) the
+multi-component case — keyed by the carrier's first carried name. The
+materializer's single ``emit_combine`` emits the cross-thread fold off the
+carrier's ``carried_names`` / ``combine_operands`` / ``combine_partials``:
+``WarpShuffle`` (register ``__shfl_xor_sync`` butterfly, ≤ warp), a hierarchical
+per-warp ``WarpShuffle`` + ``n_warps``-wide ``TreeHalve`` (power-of-two warp
+multiple), or a block-wide per-component ``TreeHalve`` (> warp) — all folding via
+the carrier's ``combine_states`` and reassigning the state in place (no ``_b``
+rename). No explicit coordination stmt or per-tile tag
 carries this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
 and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
 ``Accum.axes`` carries the names of the loops being reduced over and is
@@ -384,7 +391,7 @@ wraps `Accum`s — the flag also routes `FK`-vs-`FM`/`FN` knob stamping. `partit
 shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
 itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.
-Right after, `tile/011_lower_atom_cell` reads `.atom` off the tile and
+Right after, `tile/enumeration/050_warp_build` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
 (`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
 `ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,
@@ -446,7 +453,7 @@ directly (no separate AST class).
 | `RegFragment`      | mma.sync (s16816) per-thread register array decl (one per operand role `"a"`/`"b"`/`"c"`): `unsigned a[4]`/`b[2]` (16-bit operands, 2 elems/reg) or `float c[4]` (f32 acc, zero-init at decl — no separate fill). Carries the cell shape `(M, N, K)` + dtype. Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). The sole tensor-core fragment family (the opaque `nvcuda::wmma` nodes were removed). |
 | `LdmatrixLoad`     | Load one operand into a `RegFragment`. `staged=True` (default): `ldmatrix.sync.aligned.m8n8.x{4,trans}.b16` from smem (`role="a"` → x4; `role="b"` → x2.trans; each lane derives its row address from `threadIdx.x & 31`; `swizzle` applies the per-lane chunk XOR for a TMA-swizzled slab). `staged=False`: operand not staged into smem (ldmatrix is smem-only) → renders a **gmem-direct fragment load** (`dpl_mma_load_{a,b}_gmem`) reading the fragment straight from gmem with the same m16n8k16 lane→element map — slower (no smem reuse) but lets an unstageable MMA tile compile instead of crashing. `b_trans=True` (role "b" only) marks a transposed-B operand stored `[N, K]` (the native `mma.row.col` col-major B — a Q@K^T cell): gmem-direct via `dpl_mma_load_b_gmem_trans` (k contiguous; masked → `_trans_nclamp`). |
 | `MmaSyncPtx`       | `mma.sync.aligned.m16n8k16.row.col.f32.{f16,bf16}.{f16,bf16}.f32` — one s16816 MMA via inline PTX (`c += a @ b`). `ab_dtype` (`"f16"`/`"bf16"`) picks the `dpl_mma_…` wrapper. |
-| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order, plus `selects` — coord-predicated causal-mask ternaries) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations, the causal attention mask — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by `kernel/005_lower_atom_tile._scan_epilogue` after the shared negative-form gate `tile/_atom.classify_fragment_epilogue` admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). Each `selects` entry `(name, ((cond|None, value), …))` renders as a per-element ternary, its `__M__`/`__N__` placeholder coords substituted with the element's absolute (row, col). |
+| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order, plus `selects` — coord-predicated causal-mask ternaries) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations, the causal attention mask — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by `kernel/005_lower_atom_tile._scan_epilogue` after the shared negative-form gate `lowering/_predicates.classify_fragment_epilogue` admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). Each `selects` entry `(name, ((cond|None, value), …))` renders as a per-element ternary, its `__M__`/`__N__` placeholder coords substituted with the element's absolute (row, col). |
 | Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`

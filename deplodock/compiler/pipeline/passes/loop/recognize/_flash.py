@@ -118,12 +118,17 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
 
 
 # Structural fork: deploy the fused streaming nest, or fall through to the
-# score-materializing 010_sdpa path. Declared like 005_split_demoted's SPLIT_CONE;
-# auto-registered by knob.registry()'s module walk.
+# score-materializing 010_sdpa path. A structural-decision BOOL like the cut fork's
+# CUT mask; auto-registered by knob.registry()'s module walk.
 FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into the streaming online-softmax flash nest")
 
 
 def flash_enabled() -> bool:
+    """The explicit ``FLASH`` knob. The move composer ALSO implies flash, but only
+    for symbolic-seq SDPA (static SDPA decomposes — the composer covers the static
+    QK^T / softmax / P@V kernels, and the loop reference backend can run those but
+    can't render the streaming flash carrier). That conditional implication lives
+    at the recognizer (`_composer_wants_flash`), which has the shape."""
     raw = FLASH.raw()
     return raw is not None and FLASH.parse(raw)
 

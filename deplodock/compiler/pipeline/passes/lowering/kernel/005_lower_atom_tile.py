@@ -1,6 +1,6 @@
 """Lower the tensor-core matmul cell to the kernel-IR MMA fragment chain.
 
-The matmul cell arrives in tensor-core form: ``tile/011_lower_atom_cell`` fused
+The matmul cell arrives in tensor-core form: ``tile/enumeration/050_warp_build`` fused
 the compute into an :class:`~deplodock.compiler.ir.stmt.Mma` (which names its A
 / B operands by SSA value and carries the ``Atom`` spec) and left the operand
 ``Load``s **plain**, and the staging passes carried both through (the loads
@@ -69,6 +69,8 @@ nothing and the pass skips.
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
+
 from deplodock.compiler.dtype import DataType
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
@@ -85,8 +87,32 @@ from deplodock.compiler.ir.tile.ir import (
     map_staged,
 )
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
 
 PATTERN = [Pattern("root", TileOp)]
+
+
+def _compute_output_source(bundle: StageBundle) -> tuple[str, Source] | None:
+    """A ``Source`` for a ``StageBundle.compute`` phase's **output** slab (the SMEM
+    fused edge's ``xn``): the consumer reads it as a *staged* operand (``ldmatrix``),
+    but it is the compute output — not in ``bundle.sources`` — so the cell lowering
+    would otherwise treat it as un-staged and read the wrong layout. It shares the
+    physical layout of the input slabs the compute reads (``assembly/_fused`` builds
+    them from one operand ``Source``), so give it the matching input ``Source``'s
+    addressing under the output slab's name. ``None`` if the compute reads no
+    registered source (nothing to mirror)."""
+    if bundle.compute is None:
+        return None
+    out_name, out_axes, _ = compute_phase_info(bundle.compute, bundle.sources)
+    out_names = [ax.name for ax in out_axes]
+    by_name = {src.name: src for src in bundle.sources}
+    for ld in bundle.compute.iter_of_type(Load):
+        src = by_name.get(ld.input)
+        # Mirror the FULL operand (cache axes == the output's), not a broadcast
+        # sub-slab (``rs[m]`` / ``nw[k]``) — the consumer reads the full xn layout.
+        if src is not None and [ax.name for ax in src.cache_axes] == out_names:
+            return out_name, dc_replace(src, name=out_name, buf=out_name)
+    return None
 
 
 def rewrite(match: Match, root: Node) -> Graph | None:
@@ -169,17 +195,26 @@ def _lower_cell(
         if isinstance(s, StageBundle):
             for src in s.sources:
                 bundle_sources[src.name] = src
+            out = _compute_output_source(s)
+            if out is not None:  # the SMEM fused edge's compute-output slab, read staged
+                bundle_sources[out[0]] = out[1]
         return None
 
     map_staged(atom_body, _gather)
 
     write_stmt, a_seed, b_seed, c_seed, has_reduce, spec = _scan_cell(atom_body)
-    if write_stmt is None:
-        raise RuleSkipped("AtomTile body unrecognised — no Write")
     if spec is None or a_seed is None or b_seed is None or c_seed is None:
         raise RuleSkipped(f"AtomTile body unrecognised — expected operand Loads + Mma (got a={a_seed!r}, b={b_seed!r}, c={c_seed!r})")
-    m_guard, n_guard = _boundary_guards(atom_body, write_stmt)
-    epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph, outer_loads=outer_loads)
+    # A **fragment-output** cell (no ``Write``) keeps its C-fragment in registers for a
+    # downstream consumer instead of storing it — the flash QK^T score (the INLINE
+    # score edge, no gmem round-trip). The same lowering (operand fragments + ldmatrix + mma) minus the
+    # ``RegStore`` epilogue; the ``Mma``'s ``c`` (``<c>_frag``) is the live result.
+    fragment_output = write_stmt is None
+    if fragment_output:
+        m_guard, n_guard, epilogue, strip_ids = None, None, None, set()
+    else:
+        m_guard, n_guard = _boundary_guards(atom_body, write_stmt)
+        epilogue, strip_ids = _scan_epilogue(atom_body, acc_name=c_seed, graph=graph, outer_loads=outer_loads)
 
     c_frag, a_frag, b_frag = f"{c_seed}_frag", f"{a_seed}_frag", f"{b_seed}_frag"
     fragments = _emit_fragments(spec, c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, c_dtype=spec.operand_dtype("c"))
@@ -192,6 +227,13 @@ def _lower_cell(
             # accumulator SSA name the fragment path never defines — drop them.
             if id(s) in strip_ids:
                 return ()
+            if isinstance(s, StageBundle) and s.compute is not None:
+                # The producer slab-fill compute phase (the SMEM fused edge) is opaque
+                # to the cell lowering — its Write fills an smem slab, NOT the mma
+                # accumulator, so it must NOT become a RegStore. Rewrite only the
+                # consumer body; 100_materialize lowers the compute phase.
+                inner = {**sources, **{src.name: src for src in s.sources}}
+                return (s.with_bodies((s.compute, map_staged(s.body, handler, sources=inner))),)
             if isinstance(s, Write):
                 return (
                     _emit_store(
@@ -222,6 +264,29 @@ def _lower_cell(
     # via ``gmem_guard``, staged loads read the in-bounds slab, and the store
     # carries the per-element guards. The Cond was only a whole-tile skip.
     a_load, b_load, b_trans = _find_role_loads(atom_body)
+    # Fragment-A cell (the flash P@V C→A handoff): the A operand is a pre-existing register
+    # fragment (the softmax-derived ``P`` — no Load, named by the Mma's ``a`` SSA) and the C
+    # accumulator is carried from an enclosing ``init`` (the streaming ``O``). Neither is
+    # declared/reset here — only B is loaded; the mma accumulates into the live C using the
+    # live A. (The atom layer marks this shape with ``frag_a`` — ``_atom.atomize_cell``; here
+    # the signal is simply that the Mma's A operand has no co-located Load.)
+    if a_load is None and b_load is not None:
+        b_frag = f"{b_seed}_frag"
+        decl_b = RegFragment(name=b_frag, role="b", shape=spec.shape, dtype=spec.operand_dtype("b"))
+        chain = _emit_chain(
+            spec,
+            a_load=None,
+            b_load=b_load,
+            a_frag=a_seed,
+            b_frag=b_frag,
+            c_frag=c_seed,
+            smem_sources=bundle_sources,
+            m_guard=m_guard,
+            n_guard=n_guard,
+            b_trans=b_trans,
+            graph=graph,
+        )
+        return (decl_b, *chain)
     if a_load is None or b_load is None:
         raise RuleSkipped("Atom body (shape C) missing its Mma / A/B loads")
     chain = _emit_chain(
@@ -237,6 +302,8 @@ def _lower_cell(
         b_trans=b_trans,
         graph=graph,
     )
+    if fragment_output:  # the score edge stays in the C-fragment — no store
+        return (*fragments, *chain)
     store = _emit_store(
         spec, dst_buffer=write_stmt.output, dst_index=write_stmt.index, c_frag=c_frag, epilogue=epilogue, m_guard=m_guard, n_guard=n_guard
     )
@@ -312,6 +379,13 @@ def _scan_cell(body: Body) -> tuple[Write | None, str | None, str | None, str | 
                 has_reduce = True
                 _walk(s.body)
                 continue
+            if isinstance(s, StageBundle):
+                # The producer slab-fill ``compute`` phase (the SMEM fused edge) is
+                # opaque to the cell scan — its Write targets an smem slab, not the
+                # mma output. Walk only the consumer body so ``write_stmt`` is the
+                # real cell output (``100_materialize`` lowers the compute phase).
+                _walk(s.body)
+                continue
             if s.nested():
                 for sub in s.nested():
                     _walk(sub)
@@ -351,7 +425,7 @@ def _scan_epilogue(
     blocker here means the gate and this fold disagree — fail loud rather than
     emit a kernel referencing the undefined scalar accumulator."""
     from deplodock.compiler.ir.stmt import Write  # noqa: PLC0415
-    from deplodock.compiler.pipeline.passes.lowering.tile._atom import classify_fragment_epilogue  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering._predicates import classify_fragment_epilogue  # noqa: PLC0415
 
     produced = {w.output for w in body.iter_of_type(Write)}
 
@@ -520,7 +594,7 @@ def _masked_k_zero(load: Load, src_index: tuple, role: str, graph: Graph | None)
 def _emit_chain(
     spec: Atom,
     *,
-    a_load: Load,
+    a_load: Load | None,
     b_load: Load,
     a_frag: str,
     b_frag: str,
@@ -531,9 +605,39 @@ def _emit_chain(
     b_trans: bool = False,
     graph: Graph | None = None,
 ) -> tuple[Stmt, ...]:
-    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step."""
-    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
+    """The per-reduce ``ldmatrix a + ldmatrix b + mma.sync`` chain for one K-step.
+
+    ``a_load`` is ``None`` for a **fragment-A** cell (the flash P@V C→A handoff): the A
+    operand is a pre-existing live register fragment (``a_frag``, the softmax-derived ``P``),
+    so no ``ldmatrix`` loads it — the chain is just ``ldmatrix b + mma`` accumulating into
+    the live C fragment. Everything A-side (staging / masked-K / guard) is skipped."""
     b_src_index, b_ldm = _mma_src_index(b_load, smem_sources)
+    if a_load is None:
+        # Fragment-A: B-only load + mma into the live A / C fragments.
+        b_staged = b_load.input in smem_sources
+        b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
+        if not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph):
+            from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+            raise LoweringError("masked-K (symbolic reduce) fragment-A mma operand can't lower gmem-direct — needs staging")
+        b_guard = n_guard if (n_guard is not None and not b_staged) else None
+        b_swz = smem_sources[b_load.input].swizzle.value if b_staged else "NONE"
+        return (
+            LdmatrixLoad(
+                frag=b_frag,
+                src_buffer=b_load.input,
+                src_index=b_src_index,
+                role="b",
+                ldm=b_ldm,
+                swizzle=b_swz,
+                staged=b_staged,
+                gmem_guard=b_guard,
+                b_trans=b_trans,
+                k_zero=b_kz,
+            ),
+            MmaSyncPtx(c_frag=c_frag, a_frag=a_frag, b_frag=b_frag, shape=spec.shape, ab_dtype=spec.operand_dtype("a").name),
+        )
+    a_src_index, a_ldm = _mma_src_index(a_load, smem_sources)
     # ldmatrix is smem→register only, so each operand's transport depends on
     # whether an enclosing StageBundle staged it. Staged → ldmatrix (with the
     # Source's TMA swizzle); unstaged → a gmem-direct fragment load (the staging
@@ -637,8 +741,7 @@ def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
     threads ``Var(cache_ax) * block`` per cache axis, relative to a zero
     origin.
 
-    Staged double-buffered (``buffer_count >= 2``, M2 of
-    plans/mma-perf-closures.md): the slab is allocated as ``[phase,
+    Staged double-buffered (``buffer_count >= 2``): the slab is allocated as ``[phase,
     *cache_axes]`` (rank-prepended); ``Load.index`` carries the leading
     phase Expr followed by the cache vars. Detect via
     ``len(load.index) > len(cache_axes)`` and splice the leading prefix
@@ -671,7 +774,7 @@ def _mma_src_index(load: Load, smem_sources: dict[str, Source]) -> tuple:
             cache_coords.append(Var(ax.name))
         else:
             cache_coords.append(Var(ax.name) * Literal(b, "int"))
-    # M2 of plans/mma-perf-closures.md (Bug B): a buffered slab is allocated as
+    # A buffered slab is allocated as
     # ``[phase, *cache_axes]``. ``020_stage_inputs`` / ``040_use_ring_buffers``
     # rewrites the consumer Load index to ``(phase_expr, *cache_vars)`` — phase
     # is the leading dim. Splice the leading prefix in front of the computed

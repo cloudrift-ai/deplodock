@@ -966,10 +966,13 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     The pass walks ``stmts`` with :meth:`Body.map` and uses
     ``dataclasses.fields`` to locate any field currently holding an
     ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
-    ``Accum.op`` / Kernel-IR's ``TreeHalve.op`` /
-    ``WarpShuffle.op`` without coupling this module to those IR
-    dialects). The replacement is destructive — the resulting body is
-    only safe to consume from :attr:`Body.structural_key()`.
+    ``Accum.op`` without coupling this module to those IR dialects). A
+    monoid carrier (``Monoid``) and the kernel-IR cross-thread combine
+    stmts (``WarpShuffle`` / ``TreeHalve``) carry their op inside an
+    ``Assign`` program (``merge`` / ``combine_states``), already
+    canonicalized at the carrier before lowering. The replacement is
+    destructive — the resulting body is only safe to consume from
+    :attr:`Body.structural_key()`.
     """
     from dataclasses import fields, is_dataclass  # noqa: PLC0415
 

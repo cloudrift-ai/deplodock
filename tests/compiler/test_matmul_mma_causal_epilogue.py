@@ -25,6 +25,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign, Select, SelectBranch
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -128,7 +129,7 @@ def test_causal_mask_epilogue_mma(M: int, out_dtype: DataType, shape_mode, monke
     g = _causal_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "causal-mask matmul must reach the warp tier"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "causal-mask matmul must reach the warp tier"
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
     assert "mma.sync.aligned.m16n8k16" in src

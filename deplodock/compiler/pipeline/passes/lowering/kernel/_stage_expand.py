@@ -13,10 +13,11 @@ The leading-underscore module name keeps the pass loader (which globs
 
 from __future__ import annotations
 
+from deplodock.compiler.dim import to_dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
-from deplodock.compiler.ir.stmt import Assign, Load, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Assign, Body, Load, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
 
 
@@ -395,39 +396,98 @@ def compute_phase_info(compute, sources):  # noqa: ANN001 — Body, tuple[Source
     for src in sources:
         for ax in src.cache_axes:
             axis_map[ax.name] = ax
-    # Each index entry must be a bare ``Var`` naming one of the sibling cone's
-    # cache axes. A sibling-cell fusion (``012_fuse_sibling_register_cells``)
-    # can σ-collapse a cache-axis ``Var`` to a constant ``Literal`` in this
-    # self-describing Write (the compute body is exposed via
-    # ``StageBundle.nested()``, so generic index substitution reaches it) —
-    # the slab is then co-filled by N sibling bundles, each writing one pinned
-    # cell. The hoisted-compute materializer derives ONE iteration domain /
-    # slab shape from a single Write, so it can't represent that multi-bundle
-    # fill; flag it as un-lowerable. Under ``tune`` this prunes the offending
-    # search branch (``Run.drive`` containment); the deployable greedy pick
-    # never reaches this fork.
-    bad = [v for v in write.index if not (isinstance(v, Var) and v.name in axis_map)]
-    if bad:
-        from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
-
-        raise LoweringError(
-            f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
-            f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} (axes {tuple(axis_map)!r}) — a sibling-cell-fused "
-            f"slab fill the single-Write materializer can't represent"
-        )
-    cache_axes = tuple(axis_map[v.name] for v in write.index)
+    # Each index entry is normally a bare ``Var`` naming one of the sibling
+    # cone's cache axes. Two ways a ``Literal`` shows up instead:
+    #
+    #   1. **Degenerate (extent-1) cache axis.** A thread/cell-binding σ pins an
+    #      extent-1 cache axis to its only coord — e.g. ``BM=1`` literalizes the
+    #      M cache axis to ``0`` in both the read and the Write. The axis is still
+    #      a legitimate cache dim (extent 1); recover it positionally from the
+    #      input ``Source`` whose cache_axes align (Var positions match by name),
+    #      so the single-Write materializer iterates the correct domain.
+    #   2. **Sibling-cell fusion** (``012_fuse_sibling_register_cells``) pinning a
+    #      genuine (extent > 1) cache axis to one cell ``i`` — the slab is co-filled
+    #      by N sibling bundles, which the single-Write materializer can't represent.
+    #      Flag un-lowerable. Under ``tune`` this prunes the branch; greedy avoids it.
+    #
+    # Distinguish by the pinned axis's extent: extent-1 → case 1 (lowerable),
+    # extent > 1 → case 2 (raise).
+    if all(isinstance(v, Var) and v.name in axis_map for v in write.index):
+        cache_axes = tuple(axis_map[v.name] for v in write.index)
+    else:
+        cache_axes = _recover_degenerate_cache_axes(write, sources)
     if not cache_axes:
         raise ValueError(f"compute phase {write.output!r}: needs at least one cache axis")
     return write.output, cache_axes, write.value_dtype
 
 
+def _recover_degenerate_cache_axes(write, sources):  # noqa: ANN001 — Write, tuple[Source, ...]
+    """Recover the Write's per-position cache axes when a ``Literal`` index entry
+    pins a degenerate (extent-1) axis. Aligns the Write index against an input
+    ``Source`` whose cache_axes match at the ``Var`` positions; a ``Literal`` then
+    resolves to that source's same-position cache axis, accepted only when its
+    extent is 1. Raises :class:`LoweringError` (the sibling-cell-fused multi-bundle
+    fill) when no source aligns with every ``Literal`` over an extent-1 axis."""
+    for src in sources:
+        if len(src.cache_axes) != len(write.index):
+            continue
+        ok = True
+        for entry, ax in zip(write.index, src.cache_axes, strict=True):
+            if isinstance(entry, Var):
+                if entry.name != ax.name:  # this source doesn't define the Write's axis order
+                    ok = False
+                    break
+            elif not (ax.extent.is_static and ax.extent.as_static() == 1):
+                ok = False  # a Literal pinning a real (extent > 1) axis — case 2, not this source
+                break
+        if ok:
+            return tuple(src.cache_axes)
+    from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+
+    bad = [v for v in write.index if not isinstance(v, Var)]
+    raise LoweringError(
+        f"compute phase {write.output!r}: hoisted-compute Write index {write.index!r} has non-cache-axis "
+        f"entr{'ies' if len(bad) > 1 else 'y'} {bad!r} pinning a non-degenerate axis — a sibling-cell-fused "
+        f"slab fill the single-Write materializer can't represent"
+    )
+
+
+def compute_phase_extents(compute, sources) -> tuple[int, ...]:  # noqa: ANN001
+    """The fused slab's **physical** per-dim extents — the input slabs' ``alloc_extents``
+    (cache extent × atom-stride ``block``) when the compute reads a block-multiplied
+    (warp-tier) operand slab, else the bare cache extents (scalar tier, ``block=()``).
+
+    The SMEM fused edge (``assembly/_fused``) builds every input slab by projecting one
+    operand ``Source``, so the **full** operand's slab shares the output slab's physical
+    layout; iterating that full physical slab (not the logical cache cell) makes the
+    producer a layout-agnostic element-wise smem→smem transform — correct for a 32×32
+    warp micro-tile where the bare cache cell is only 2×2. The match is by the output
+    cache axes (the full operand, not a broadcast sub-slab like ``rs[m]``/``nw[k]``). For
+    the scalar tier ``alloc_extents == cache extents``, so it is a no-op there."""
+    _name, out_axes, _dtype = compute_phase_info(compute, sources)
+    out_names = [ax.name for ax in out_axes]
+    by_name = {s.name: s for s in sources}
+    for ld in compute.iter_of_type(Load):
+        src = by_name.get(ld.input)
+        if (
+            src is not None
+            and isinstance(src.addressing, AffineAddressing)
+            and src.addressing.block
+            and [ax.name for ax in src.cache_axes] == out_names
+        ):
+            return tuple(src.alloc_extents)
+    return tuple(ax.extent.as_static() for ax in out_axes)
+
+
 def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_count: int) -> list[Stmt]:  # noqa: ANN001
     """Emit producer scaffolding for a ``StageBundle.compute`` phase.
 
-    Wraps the compute body in a cooperative ``StridedLoop`` over the fused
-    cache axes — each thread executes the compute template once per cell it
-    owns, σ-substituting cache-axis Vars with row-major flat-iter decoded
-    coords. The fused slab name / cache axes are recovered from the body via
+    Wraps the compute body in a cooperative ``StridedLoop`` over the fused slab's
+    **physical** extents (:func:`compute_phase_extents` — the full warp micro-tile, not
+    the logical cache cell), σ-substituting the cache-axis Vars with row-major flat-iter
+    decoded coords. Because the fused edge's input and output slabs share one physical
+    layout, the same physical coords index every slab → a correct element-wise fill.
+    The fused slab name / cache axes are recovered from the body via
     :func:`compute_phase_info` (no output ``Source`` is carried).
 
     The fused slab's smem decl is hoisted to kernel scope by
@@ -439,14 +499,18 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
     from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
     name, cache_axes, _dtype = compute_phase_info(compute, sources)
+    extents = compute_phase_extents(compute, sources)
+    # Re-stamp the cache axes with the physical extents for the decode + iteration
+    # (same names, so the σ-substitution still reaches the compute body's index Vars).
+    axes = tuple(Axis(name=ax.name, extent=to_dim(e)) for ax, e in zip(cache_axes, extents, strict=True))
     total = 1
-    for ax in cache_axes:
-        total *= ax.extent.as_static()
+    for e in extents:
+        total *= e
     iter_axis = Axis(name=f"{name}_flat", extent=total)
-    if len(cache_axes) == 1:
-        coord_for = {cache_axes[0].name: Var(iter_axis.name)}
+    if len(axes) == 1:
+        coord_for = {axes[0].name: Var(iter_axis.name)}
     else:
-        coord_for = flat_decode(cache_axes, iter_axis.name)
+        coord_for = flat_decode(axes, iter_axis.name)
     sigma = Sigma(coord_for)
 
     # σ-substitute cache vars in every stmt of the compute body. Loads /
@@ -457,7 +521,6 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
     for s in compute:
         new_stmts.append(s.rewrite(lambda n: n, sigma))
 
-    extents = tuple(ax.extent.as_static() for ax in cache_axes)
     full_extents = (buffer_count, *extents) if buffer_count > 1 else extents
     body_out: list[Stmt] = [
         Sync(),
@@ -471,6 +534,36 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
         Sync(),
     ]
     return body_out
+
+
+def emit_reduce_phase(cr, tid_expr, n_threads: int) -> list[Stmt]:  # noqa: ANN001 — CoopReduce
+    """Expand a :class:`~deplodock.compiler.ir.tile.ir.CoopReduce` prologue (the SMEM
+    fused edge's rmsnorm reduce) into the cooperative ``StridedLoop`` reduce.
+
+    Emits the per-CTA ``leading`` constants once, declares the per-row ``out_slab``, then
+    a ``tid``-strided loop over the M ``cells`` — each iteration σ-substitutes the cell
+    coord into the per-cell reduce body (a serial reduce over the full row + the
+    ``rsqrt`` scalar chain + the ``Write out_slab[cell]``). A trailing ``Sync`` makes the
+    freshly computed slab CTA-visible to the matmul's scale-application compute phase."""
+    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+    from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+
+    extents = tuple(ax.extent.as_static() for ax in cr.cells)
+    total = 1
+    for e in extents:
+        total *= e
+    iter_axis = Axis(name=f"{cr.out_slab}_flat", extent=total)
+    coord_for = {cr.cells[0].name: Var(iter_axis.name)} if len(cr.cells) == 1 else flat_decode(cr.cells, iter_axis.name)
+    sigma = Sigma(coord_for)
+    cell_body = tuple(s.rewrite(lambda n: n, sigma) for s in cr.body)
+    dtype = cuda_name(cr.out_dtype) if cr.out_dtype is not None else "float"
+    align = 16 if dtype == "__half" else 0
+    return [
+        *cr.leading,
+        Smem(name=cr.out_slab, extents=extents, dtype=dtype, align=align),
+        StridedLoop(axis=iter_axis, start=tid_expr, step=Literal(n_threads, "int"), body=Body(cell_body)),
+        Sync(),
+    ]
 
 
 def flat_decode(cache_axes: tuple[Axis, ...], flat_name: str) -> dict:

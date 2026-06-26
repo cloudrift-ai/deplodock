@@ -64,6 +64,19 @@ def test_accum_traits_forward_to_op():
     assert not a.associative and not a.has_identity
 
 
+def test_accum_combine_partials_is_scalar_op_fold():
+    # The uniform recombine: fold the carried acc with a second partial named
+    # "<acc>__o" via the carrier's own op (here `maximum`).
+    a = Accum(name="acc", value="v", op=ElementwiseImpl("maximum"))
+    assert a.combine_operands() == ("acc__o",)
+    fold = a.combine_partials()
+    assert len(fold) == 1
+    step = fold[0]
+    assert isinstance(step, Assign)
+    assert step.name == "acc" and step.op.name == "maximum"
+    assert step.args == ("acc", "acc__o")
+
+
 # --------------------------------------------------------------------------- #
 # ReduceCarrier protocol — Mma
 # --------------------------------------------------------------------------- #
@@ -81,6 +94,16 @@ def test_mma_is_reduce_carrier():
     # The tensor-core accumulation is an additive fold — its traits match a
     # scalar sum Accum so split-K reassociation gates see the same algebra.
     assert m.associative and m.commutative and m.has_identity
+
+
+def test_mma_combine_partials_is_additive_fold():
+    # The cross-CTA split-K combine: c = c + c__o, regardless of the cell op.
+    m = _mma()
+    assert m.combine_operands() == ("acc__o",)
+    fold = m.combine_partials()
+    assert len(fold) == 1 and isinstance(fold[0], Assign)
+    assert fold[0].name == "acc" and fold[0].op.name == "add"
+    assert fold[0].args == ("acc", "acc__o")
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +140,17 @@ def test_combine_is_reduce_carrier():
     assert c.partial_deps() == ("s",)
     # A monoid: associative + identity by construction; commutative is the field.
     assert c.associative and c.commutative and c.has_identity
+
+
+def test_combine_partials_returns_combine_states():
+    # The Monoid's uniform recombine IS its authored state-merges-state program,
+    # folding the carried state with the second operand named by state_b.
+    c = _combine()
+    assert c.combine_operands() == c.state_b
+    assert c.combine_partials() == c.combine_states
+    # Symmetric additive monoid: combine_states is auto-derived, so the merge's
+    # partial read ("s") is replaced by the second-state operand.
+    assert all(isinstance(step, Assign) for step in c.combine_partials())
 
 
 def test_combine_rewrite_renames_state_partial_and_merge():

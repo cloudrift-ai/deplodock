@@ -69,7 +69,7 @@ def test_compile_passes_shorthand(run_cli, tmp_path):
     rc, stdout, stderr = run_cli("compile", "-c", "F.relu(torch.randn(8))", "--passes", "dolft", "-o", str(out), "-vv")
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
-    for name in ("frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion", "lowering/tile"):
+    for name in ("frontend/decomposition", "frontend/optimization", "loop/lifting", "loop/fusion", "lowering/tile/enumeration"):
         assert name in log, f"missing pass {name!r} in log"
     assert "lowering/cuda" not in log
 

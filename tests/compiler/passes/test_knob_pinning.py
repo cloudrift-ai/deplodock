@@ -38,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ..conftest import device_compute_capability, dyn_M, requires_cuda
+from ..conftest import dyn_M, requires_cuda
 
 # Shapes match the user's offline scan.
 _MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}
@@ -223,6 +223,10 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
     ``cp.async.bulk.tensor`` store and hung (``HungKernelError``); this test would
     time out. The numpy reference is the static graph; the forced CUDA run uses
     the mode's graph."""
+    # This pins a scalar cooperative-reduce config for the demoted matmul's CUT producer
+    # kernel (the #244 TMA wedge); SPLIT_CONE=1 forces that GMEM cut (the default is now the
+    # keep(SMEM) fused edge, which has no separate norm-reduce producer to wedge).
+    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
     static_graph, input_shapes, (out_name, _) = _build_norm_linear_graph(_NORM_DIMS)
     forced_graph, _, _ = _build_norm_linear_graph(_NORM_DIMS, mode=shape_mode)
     rng = np.random.default_rng(0)
@@ -236,7 +240,7 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-# Staged MMA regression for ``plans/mma-smem-staging.md`` M5. These
+# Staged MMA regression. These
 # shapes pick a K-split (K_o > 1) under the planner's natural priors,
 # placing a SerialTile(K_o) between the AtomTile and the StageBundle
 # (which wraps SerialTile(K_i) > loads). The buggy pre-fix shape
@@ -293,8 +297,7 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-# Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM, see
-# plans/make-a-plan-for-sparkling-hamster.md). On cc>=9.0 the F16 atom is
+# Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM). On cc>=9.0 the F16 atom is
 # eligible whenever the K-loads are F16, so at >=512^3 the greedy compile
 # *prefers* the tensor-core variant; ``DEPLODOCK_MMA=0`` is what forces the
 # scalar register-tile FMA path (fp16 in -> fp32 accumulate -> fp16 out). The
@@ -340,22 +343,84 @@ def test_scalar_matmul_f16(monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
+def test_article_tma_sgemm_reproduction(monkeypatch):
+    """The matmul-optimization blogs' hero kernel is a SCALAR fp32 SGEMM whose staged
+    operands ride the **TMA** transport (``cp.async.bulk.tensor.2d`` double buffer) —
+    the ``TM=26`` tile (``BM=8 BN=32 FM=26 FN=4 BK=32``) reaching ~106 % of cuBLAS at
+    2048³. ``130_transport`` promotes any staged matmul with a ringable K loop, scalar
+    as well as warp-tier; the scalar tier's plain-``Load`` consumer reads an unswizzled
+    (``SwizzleMode.NONE``) deposit (``_slab._make_bundle``, keyed on ``Block.atom``)
+    where the warp tier's ``ldmatrix`` reads a swizzled one. This asserts both that the
+    staged bundles flip to ``StagePolicy.TMA`` and that the lowered kernel emits the
+    ``cp.async.bulk.tensor`` box copy. Tile-level (inspects the staging policy + source).
+    No CUDA needed."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+    from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
+
+    g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
+    bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
+    assert bundles, "the staged scalar tile must synthesize at least one StageBundle"
+    assert any(b.policy is StagePolicy.TMA for b in bundles), "scalar-tile TMA transport engaged"
+
+    g2, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    cuda = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g2, ctx=Context.from_target((12, 0)))
+    src = "\n".join(n.op.kernel_source for n in cuda.nodes.values() if isinstance(n.op, CudaOp))
+    assert "cp.async.bulk.tensor" in src, "scalar-tile TMA box copy emitted"
+
+
+def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
+    """``assembly/030_mark_unroll`` flags the small FMA inner reduce (the ``BK=32`` K
+    loop, ≤ 64 trips) for ``#pragma unroll``, giving ptxas the register-resident
+    operand reuse + ILP the hand-tuned SGEMM relies on (the ``TM=26`` hero tile runs
+    at 255 regs / ~293 µs with the unroll, ~126 regs / ~384 µs without — the lever for
+    the article's ~96 %-of-cuBLAS number). The K-outer pipeline loop (> 64 unrolled
+    trips) stays rolled. Compile-only (inspects the kernel source). No CUDA needed."""
+    from deplodock.compiler.context import Context
+    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+
+    g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
+    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+    res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
+    src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
+    assert "#pragma unroll" in src, "the small FMA inner reduce must be marked for #pragma unroll"
+
+
 @requires_cuda
 def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     """When the greedy compile picks the tensor-core atom variant but its operands
-    aren't staged for ``ldmatrix`` (``TMA=0`` + scalar-tile geometry), ``005_lower_atom_tile``
-    now lowers them to a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``)
-    instead of raising — ldmatrix is smem-only, so the gmem path lets an unstageable
-    MMA tile compile rather than crash. Compile-only (inspects the kernel source)."""
+    aren't staged for ``ldmatrix`` (``TMA=0`` + a deliberately-large warp register
+    tile whose slabs don't fit the smem budget), ``005_lower_atom_tile`` lowers them
+    to a **gmem-direct fragment load** (``dpl_mma_load_{a,b}_gmem``) instead of
+    raising — ldmatrix is smem-only, so the gmem path lets an unstageable MMA tile
+    compile rather than crash. Compile-only (inspects the kernel source).
+
+    Two facts make this fire: (1) the over-ceiling ``FM=26`` warp register pin is
+    authoritative (``warp_reg_offers`` bypasses the ``_MAX_WARP_CELLS`` search
+    ceiling for a full pin), so the warp build proceeds; (2) with **no** ``STAGE``
+    pin the budget-aware ``120_stage`` filter prunes every over-budget staging subset
+    to the empty one (``FM=26`` slabs blow the smem cap), so greedy's option-0 stages
+    nothing and the operands lower gmem-direct."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
-    for k, v in _SCALAR_F16_KNOBS.items():
+    # Pin only the WARP-tier geometry (the over-ceiling register tile + atom-K chunk)
+    # and leave STAGE unpinned — an explicit STAGE pin is authoritative (no budget
+    # filter), but here we want the budget-aware filter to decline the over-budget
+    # staging so the operands fall to the gmem-direct path. Scalar-tier knobs (BN/BM)
+    # are deliberately NOT pinned: they are foreign to the warp tier and the strict
+    # knob-pin validator (``_validate``) rejects them alongside a ``MMA=<kind>`` pin.
+    for k, v in {"FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
-    # tier), so greedy MUST take the atom variant — and with TMA=0 + this geometry
-    # the staging passes decline, so the operands hit the gmem-direct path.
+    # tier), so greedy MUST take the atom variant.
     monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
     compiled = CudaBackend().compile(g)  # no longer raises
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
@@ -375,39 +440,34 @@ def test_unstaged_atom_mma_accuracy(monkeypatch):
     _assert_match(forced.astype(np.float32), ref.astype(np.float32))
 
 
-# Regressions for the article-reproduction work (see plans + git log
-# for ``cab3c83e``, ``8940dc25``, the affine-collapse commit). Each row
-# pins a configuration that used to fail before a specific fix:
+# Accuracy regressions for the fp32 SGEMM tile shapes from the matmul-optimization
+# blog posts ("Modern GPU Matmul Optimization" and "Surfacing a 60% performance bug
+# in cuBLAS" — both a scalar SIMT fp32 SGEMM on the RTX 5090, the ``TM=26`` register
+# tile at 2048³ reaching ~106 % of cuBLAS). Each row pins a tile geometry that once
+# emitted a wrong-output kernel and asserts the lowered kernel still matches the numpy
+# reference:
 #
-# - ``BM=8``: out-of-set BM. ``_TUNE_AXIS_CHOICES = (1, 16, 32, 64,
-#   128, 256)`` excludes 8, so the legacy ``Knob.narrow`` silently
-#   dropped the pin and re-enumerated with defaults (``BM=1, BN=256``).
-#   Fixed in ``cab3c83e``: pin authoritative regardless of hint
-#   membership.
-# - ``FM=26`` on ``BM=8, M=2048`` (208-row overhang): non-divisor FM
-#   with overhang. ``_enumerate_cartesian`` skipped non-divisor FM
-#   when ``m_overhang`` was off; same commit added per-(fm,fn)
-#   overhang flip + masked-tile codegen.
-# - ``TMA=1`` + multi-source A+B (matmul): ``050_use_tma``
-#   rejected multi-source bundles. Fixed in ``8940dc25``: pre-
-#   eligibility split of multi-source Stages into N single-source
-#   Stages so the materializer's N-stages-per-bundle TMA emit path
-#   handles them.
-# - ``FN=4`` (multi-axis composite): the cache decomposition
-#   ``(BN_thread × FN_register)`` used to mark B's addressing
-#   ``TemplateAddressing``, ineligible for TMA's affine box copy.
-#   Fixed via the composite-stride check in
-#   ``020_stage_inputs._derive_slab`` (admits multi-axis-per-
-#   source-dim as ``AffineAddressing``) + the shared
-#   ``affine_decode_per_dim`` helper used by every post-staging
-#   consumer (``_stage_expand``, ``025_unify_sibling_stages``,
-#   ``_source_decl_line``) so the composite stride round-trips
-#   through smem-stage → revert-to-gmem → cuda emission.
+# - ``BM=8``: an out-of-hint THREAD width. ``_TUNE_AXIS_CHOICES`` excludes 8, so a
+#   non-authoritative ``Knob.narrow`` would drop the pin and re-enumerate the default
+#   geometry. The pin must be honored regardless of hint membership.
+# - ``FM=26`` on ``BM=8, M=2048``: a non-divisor register tile → a 208-row masked-M
+#   tile (ceil-div grid + per-row boundary ``Cond`` on the Write). The article's hero
+#   tile (``TM=26``); ``FN=26`` is the symmetric masked-N case.
+# - ``FN=4`` / ``FM=4``: a multi-axis composite register tile (``BN_thread ×
+#   FN_register`` on one source dim) — its strided addressing must round-trip through
+#   the smem stage.
+# - ``INTERLEAVE_LOADS=0``: the ``kernel/095_interleave_loads`` opt-out (flat-LDS
+#   layout) must still produce correct output.
+#
+# NOTE: the article's defining optimization — **TMA** (``cp.async.bulk.tensor``) on
+# the scalar SGEMM tile — is covered separately by ``test_article_tma_sgemm_reproduction``
+# (the ``*_tma`` rows below also pin ``TMA=1``): ``130_transport`` promotes the scalar
+# fp32 tier as well as the warp-tier MMA atom, depositing the slab unswizzled for the
+# plain-``Load`` consumer.
 
-# 2048×2048 matmul = the article's hero shape. We compare against a
-# numpy reference at this size rather than the smaller (32, 128, 64)
-# above so the per-tile-shape configurations actually exercise the
-# multi-stage TMA/cp.async pipeline and the 128 B alignment math.
+# 2048×2048 fp32 matmul = the blogs' hero shape. The configs are benched against a
+# numpy reference at this size so the masked-tile (FM=26) overhang math + the
+# composite-stride staging are actually exercised on the full tile.
 _ARTICLE_DIMS = {"M": 2048, "K": 2048, "N": 2048}
 
 
@@ -427,190 +487,48 @@ def _build_2d_matmul_graph(dims: dict):
     return g, {"a": (M, K), "b": (K, N)}, ("c", (M, N))
 
 
-# (label, dims, knobs, env extras). The label is what shows up in
-# the test id; ``dims`` is the M/K/N for the matmul; ``knobs`` is the
-# per-knob ``DEPLODOCK_<K>`` pin set; ``env`` carries non-knob
-# ``DEPLODOCK_*`` vars (today: the ``INTERLEAVE_LOADS`` opt-out).
+# (label, dims, knobs, env extras). ``dims`` is the M/K/N; ``knobs`` is the per-knob
+# ``DEPLODOCK_<K>`` pin set; ``env`` carries non-knob ``DEPLODOCK_*`` vars (today only
+# the ``INTERLEAVE_LOADS`` opt-out). Masked-N (FN=26) uses a smaller 512³ shape — the
+# per-launch watchdog in ``program.py`` is 1 s and the masked kernels are scalar
+# (SYNC) here, so the small shape keeps comfortably inside it under parallel xdist.
 #
-# **Default dims.** ``_ARTICLE_DIMS`` (2048³) is the article's hero
-# shape. Variants that exercise the cp.async + masked path use a
-# smaller ``_CPASYNC_DIMS`` (512³) — the per-launch wall-clock
-# watchdog in ``program.py`` is 1 s, and the 2048³ cp.async masked-M
-# kernel hovers around that threshold under parallel-xdist
-# contention. 512³ still triggers masked-M with FM=26 (208 × 2 cells
-# leaves 96-row overhang) and is well inside the watchdog.
-#
-# **Staging-mode coverage.** Each masked-tile config (FM=26 → 208-row
-# overhang, FN=26 → 832-col overhang) runs through every staging
-# transport × pipelining combination that the article-tile knobs can
-# select, so a regression in any of them trips a test:
-#
-#   - TMA pipelined (``TMA=1 PIPELINE_STAGES=1``)
-#   - TMA depth-1 (``TMA=1 PIPELINE_STAGES=0``)
-#   - cp.async pipelined (``TMA=0 ASYNC_COPY=1 PIPELINE_STAGES=1``)
-#   - cp.async depth-1 (``TMA=0 ASYNC_COPY=1 PIPELINE_STAGES=0``)
-#   - sync double-buffered (``TMA=0 ASYNC_COPY=0 PIPELINE_STAGES=1``)
-#   - sync depth-1 (``TMA=0 ASYNC_COPY=0 PIPELINE_STAGES=0``)
-#
-# The B2 per-Load guard (``021_hoist_staged_loads_above_mask._guard_unsafe_loads``)
-# handles the masked-tile branch on the TMA + cp.async + sync paths.
-# The depth-1 / sync variants additionally exercise:
-#
-#   - ``050_vectorize_loads``' padded-stride alignment check (using
-#     ``Source.alloc_extents[-1]`` so ``070_pad_smem``'s +1 pad
-#     doesn't slip a misaligned ``float4`` reinterpret_cast past).
-#   - ``100_materialize_tile.emit_bundle_producer``'s single
-#     trailing wait on unpipelined multi-stage TMA bundles (mbarrier
-#     ``arrive_count = len(stages)`` requires waiting once after ALL
-#     stages arrive, not once per stage).
-_CPASYNC_DIMS = {"M": 512, "K": 512, "N": 512}
-_ARTICLE_REPRODUCTION: tuple[tuple[str, dict, dict, dict], ...] = (
-    # cab3c83e: BM=8 outside _TUNE_AXIS_CHOICES — pin must be honored.
+# Every row is the SCALAR fp32 tier (no MMA atom is eligible for fp32). Most rows stage
+# via plain SYNC cooperative loads; the ``*_tma`` rows pin ``TMA=1`` so the staged
+# operands ride the ``cp.async.bulk.tensor`` double-buffer ring (the article's hero
+# transport — ``130_transport`` now promotes the scalar tier, depositing the slab
+# unswizzled for the plain-``Load`` consumer; see ``test_article_tma_sgemm_reproduction``
+# for the tile-level check). The dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose
+# passes were removed in the block-DAG rewrite) were dropped here.
+_SMALL_DIMS = {"M": 512, "K": 512, "N": 512}
+_MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
+    # BM=8 outside _TUNE_AXIS_CHOICES — the pin must be honored authoritatively.
     ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # cab3c83e: FM=26 non-divisor of E_M/BM=256 — overhang/masked tile.
-    ("fm26_overhang_masked", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # 8940dc25: TMA=1 forces TMA on the matmul A+B bundle that the
-    # eligibility check used to reject as multi-source. Tile sized so
-    # ``KernelOp.validate``'s smem cap (~99 KB on sm_120) is honored.
-    ("multisrc_tma_fm1_fn1", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
-    # FN=4 multi-axis cache on N. Multi-axis-per-source-dim is now
-    # admitted as ``AffineAddressing`` unconditionally (the old
-    # ``DEPLODOCK_AFFINE_COLLAPSE`` opt-in was retired once the unify-
-    # pass revert path was fixed to round-trip composite strides).
-    (
-        "multi_axis_affine_fn4",
-        _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
-        {},
-    ),
-    # Multi-axis collapse on BOTH axes: FM=4 and FN=4 — the article's
-    # FM×FN > 1 register tile, with multi-source TMA on A and B.
-    (
-        "multi_axis_affine_fm4_fn4",
-        _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
-        {},
-    ),
-    # 095_interleave_loads opt-out — flat-LDS layout (every Load at
-    # the top of the cluster). Locks in that disabling the pass via
-    # env still produces correct output, so a future re-enabling of
-    # the legacy path stays safe.
+    # FM=26 non-divisor of M/BM → a 208-row masked-M tile (ceil-div grid + per-row
+    # boundary Cond on the Write).
+    ("fm26_masked_m", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # FN=4 multi-axis composite cache on N (BN_thread × FN_register on one source dim) —
+    # the composite stride must round-trip through smem stage → revert-to-gmem.
+    ("multi_axis_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # Multi-axis composite on BOTH axes: FM=4 and FN=4 (the FM×FN > 1 register tile).
+    ("multi_axis_fm4_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # kernel/095_interleave_loads opt-out (flat-LDS layout) must still be correct.
     (
         "interleave_loads_disabled",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
+        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
-    # Article's EXACT tile: ``BM=8 BN=32 FM=26 FN=4 BK=32`` produces a
-    # 208×128 masked-M tile (M=2048 not a multiple of 208 → ceil-div
-    # grid + per-row boundary Cond on the Write). Exercises the
-    # masked-tile boundary Cond hoist in ``021_hoist_staged_loads_above_mask``:
-    # every masked cell's K-pipeline runs (TMA elects a single issuer
-    # thread; cp.async needs all threads to fetch their lane) and the
-    # B2 per-Load guard (``_guard_unsafe_loads``) wraps the still-
-    # un-staged gmem Loads that depend on the gated coord so masked
-    # threads skip the OOB read. With multi-source TMA + multi-axis
-    # composite (default on), this config lowers to a kernel
-    # structurally byte-equivalent to ``_lower_matmul_tma_db``'s
-    # TM=26 emit (104 cells/thread, 255 registers, 17 % occupancy)
-    # and benches at ~97 % of cuBLAS on RTX 5090.
-    (
-        "article_exact_fm26_masked_tma",
-        _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1},
-        {},
-    ),
-    # Same masked-M tile (FM=26 overhang) but routed through the
-    # cp.async path (``TMA=0`` skips 050_use_tma; ``ASYNC_COPY=1``
-    # promotes the BUFFERED bundle to ASYNC; ``PIPELINE_STAGES=1``
-    # software-pipelines into prologue/main/epilogue). Verifies the
-    # hoist's per-Load guard interacts correctly with cp.async's
-    # cooperative-load semantics (all threads issue gmem reads via
-    # cp.async.ca, then mbarrier waits on commit) — TMA's
-    # OOB_FILL_NAN_REQUEST_ZERO_FMA fills OOB rows with zeros, while
-    # cp.async has no equivalent hardware OOB handling, so the
-    # per-Load Cond is the only thing keeping masked threads from
-    # faulting at the overhang. 512³ shape: smaller dims keep the
-    # kernel comfortably inside ``program.py``'s 1 s per-launch
-    # watchdog under parallel-xdist contention; 208 × 2 cells +
-    # 96-row overhang still exercises the masked-M code path.
-    (
-        "fm26_masked_cpasync",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
-        {},
-    ),
-    # Symmetric coverage: ``FN=26 FM=4`` → masked-N overhang on
-    # 512³ (832-col tile, N=512 < 832 → 1 cell with 320-col
-    # overhang). Boundary Cond gates the N coord. cp.async path
-    # only — TMA is not eligible for masked-N at this shape
-    # (multi-axis cache on N collides with the TMA box-copy gating).
-    (
-        "fn26_masked_cpasync",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
-        {},
-    ),
-    # Non-masked baseline on the cp.async path (FM=4 FN=4 divides
-    # both 2048 and 512). Anchors that the cp.async lowering
-    # produces correct results on the un-gated path too, so a
-    # regression isolated to masked-tile codegen versus a regression
-    # in cp.async in general can be told apart.
-    (
-        "fm4_fn4_cpasync",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 1},
-        {},
-    ),
-    # Depth-1 staging coverage (``PIPELINE_STAGES=0`` keeps the bundle
-    # at ``pipeline_depth=1``, skipping ``080_pipeline_stages``'s
-    # prologue/main/epilogue peel). These three configs previously hung
-    # with ``CUDA_ERROR_MISALIGNED_ADDRESS`` on the article tile due to
-    # two bugs:
-    #
-    # 1. ``050_vectorize_loads`` collapsed 4 consecutive smem reads into
-    #    a ``float4 reinterpret_cast`` based on the unpadded inner
-    #    extent (FN=4 → 4-aligned), missing that ``070_pad_smem``'s
-    #    bank-conflict ``pad=1`` makes the per-thread stride 5 floats =
-    #    20 bytes — misaligned for any thread with ``a3 % 4 != 0``.
-    #    Fix: check ``Source.alloc_extents[-1]`` (padded), not
-    #    ``cache_axes[-1].extent``.
-    #
-    # 2. The unpipelined TMA emit (``100_materialize_tile.emit_tma_stage``)
-    #    placed a trailing ``MbarrierWait`` after EVERY stage in a
-    #    multi-source bundle. Mbarrier ``arrive_count`` is ``len(stages)
-    #    = 2`` so the wait between stage 1 (arrived) and stage 2 (not
-    #    yet arrived) blocks forever. Fix: move the wait+sync out of
-    #    ``emit_tma_stage`` and emit it ONCE in ``emit_bundle_producer``
-    #    after every member has issued its arrive.
-    #
-    # The cp.async/sync depth-1 paths hit bug 1; TMA depth-1 hits both.
-    # Smaller dims (``_CPASYNC_DIMS``) match the cp.async tests' watchdog
-    # margin.
-    (
-        "fm26_masked_tma_no_pipe",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1, "ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
-        {},
-    ),
-    (
-        "fm26_masked_cpasync_no_pipe",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 1, "PIPELINE_STAGES": 0},
-        {},
-    ),
-    (
-        "fm26_masked_sync_db",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 0, "PIPELINE_STAGES": 1},
-        {},
-    ),
-    (
-        "fm26_masked_sync_no_pipe",
-        _CPASYNC_DIMS,
-        {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 0, "ASYNC_COPY": 0, "PIPELINE_STAGES": 0},
-        {},
-    ),
+    # The blogs' hero register tile: BM=8 BN=32 FM=26 FN=4 BK=32 → a 208×128 masked-M
+    # tile (TM=26 ≈ 106 % of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
+    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # Symmetric masked-N: FN=26 FM=4 on 512³ → a 320-col overhang (boundary Cond on N).
+    ("fn26_masked_n", _SMALL_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # Scalar-tile TMA: the staged operands ride the cp.async.bulk.tensor ring (unswizzled
+    # deposit, plain-Load consumer). A clean (FM=4 FN=4) tile and the masked-M hero tile
+    # (FM=26 FN=4 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
+    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
+    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
 )
 
 
@@ -625,27 +543,19 @@ def _run_with_knobs_and_env(graph, inputs, out_name: str, knobs: dict, env: dict
 @requires_cuda
 @pytest.mark.parametrize(
     ("label", "dims", "knobs", "env"),
-    _ARTICLE_REPRODUCTION,
+    _MASKED_TILE_CONFIGS,
     ids=lambda v: v if isinstance(v, str) else "",
 )
-def test_article_reproduction_configs(label: str, dims: dict, knobs: dict, env: dict, monkeypatch):  # noqa: ARG001 — ``label`` is the test id
-    """End-to-end accuracy regression for the configurations surfaced
-    while reproducing the article's TMA SGEMM kernel via knob pinning.
-    Each row exercises one previously-broken code path; a failure here
-    indicates a regression in: (a) ``Knob.narrow`` authoritative pin
-    semantics, (b) ``_enumerate_cartesian``'s per-(fm,fn) overhang
-    handling, (c) ``050_use_tma`` multi-source-split + 128 B inner
-    alignment, (d) ``020_stage_inputs._derive_slab`` composite-stride
-    affine collapse + ``_stage_expand`` decode, or (e) the masked-tile
-    boundary-Cond hoist (``021_hoist_staged_loads_above_mask``) + B2
-    per-Load guard (``_guard_unsafe_loads``) interaction with the
-    selected transport (TMA / cp.async)."""
-    # The TMA transport emits the ``sm_NNa`` arch-accelerated target, which only
-    # exists for sm_90a+; on sm_80-89 nvcc rejects it (``Unsupported gpu
-    # architecture 'sm_89a'``). Skip the TMA-pinned rows below sm_90 — the
-    # cp.async / sync rows still cover the masked-tile paths here.
-    if knobs.get("TMA") == 1 and (device_compute_capability() or (0, 0)) < (9, 0):
-        pytest.skip("TMA transport needs sm_90+ (sm_NNa unsupported on sm_80-89)")
+def test_masked_tile_accuracy_configs(label: str, dims: dict, knobs: dict, env: dict, monkeypatch):  # noqa: ARG001 — ``label`` is the test id
+    """End-to-end accuracy regression for the scalar fp32 SGEMM tile geometries from
+    the matmul-optimization blog posts. Each row pins a tile that once emitted a
+    wrong-output kernel; a failure flags a regression in (a) ``Knob.narrow``
+    authoritative pin semantics, (b) the masked-tile (FM=26 / FN=26) ceil-div grid +
+    boundary-Cond codegen, (c) the multi-axis composite-stride staging round-trip,
+    (d) the ``095_interleave_loads`` opt-out, or (e) the scalar-tile TMA transport
+    (``*_tma`` rows — the unswizzled ``cp.async.bulk.tensor`` deposit + plain-``Load``
+    consumer). ``test_article_tma_sgemm_reproduction`` covers the same TMA tile at the
+    tile/kernel level (no CUDA)."""
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)

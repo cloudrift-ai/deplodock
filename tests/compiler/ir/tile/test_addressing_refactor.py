@@ -1,4 +1,4 @@
-"""M2 of ``plans/mma-smem-staging.md`` — addressing-mode refactor.
+"""Addressing-mode refactor.
 
 Pure structural change: ``Source.addressing`` is now a stored field of
 type ``AffineAddressing | TemplateAddressing`` instead of a property

@@ -58,14 +58,6 @@ static __device__ __forceinline__ void mbarrier_arrive(unsigned long long* mbar)
                  : "=l"(state) : "r"(addr) : "memory");
 }
 
-static __device__ __forceinline__ bool mbarrier_try_wait_parity(unsigned long long* mbar, int phase) {
-    unsigned int addr = __cvta_generic_to_shared(mbar);
-    int ready;
-    asm volatile("{.reg .pred P; mbarrier.try_wait.parity.shared.b64 P, [%1], %2; selp.b32 %0, 1, 0, P;}\\n"
-                 : "=r"(ready) : "r"(addr), "r"(phase) : "memory");
-    return ready != 0;
-}
-
 static __device__ __forceinline__ void mbarrier_wait_parity(unsigned long long* mbar, int phase) {
     // Issue one ``mbarrier.try_wait`` first — its hint timeout makes the
     // warp suspend rather than spin while the TMA tx drains, freeing the

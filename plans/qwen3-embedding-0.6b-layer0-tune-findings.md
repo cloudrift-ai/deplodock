@@ -1,459 +1,315 @@
-# Qwen3-Embedding-0.6B — layer-0 tune findings (static + dynamic, e2e + per-kernel + serve A/B)
+# Qwen3-Embedding-0.6B layer-0 tune findings — analytic-prior → CatBoost guidance
 
-**Status:** complete. Clean autotune of layer 0 in both static (shape-specialised) and dynamic (symbolic `seq_len`,
-masked-tile) modes on an RTX 5090, with per-kernel triage, a whole-model serve A/B vs vanilla vLLM, and a direct
-static-vs-dynamic softmax comparison. **Headline: the dynamic layer-0 forward is ~par with eager (1.03×) but 1.4×
-behind torch.compile, and the gap is concentrated entirely in the SDPA softmax reduce (`k_sdpa_reduce`). At A/B time the
-serve test was a hard negative: the tuned plugin **crashed at compile** and the cold-prior plugin ran 34× slower than
-vanilla vLLM, so the per-kernel wins did not reach serving. A follow-up whole-model tune (12 terminals, ~4.5 h)
-confirmed *tuning* doesn't fix the crash — the deployed kernel (an MMA-tier masked-K P@V) is an unfinished lowering
-path the tuner never benches. **UPDATE: that crash was a real compiler bug, fixed in
-[PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)** (four root causes — xn operand dtype, `Source.dtype`
-validate-sizing, `_is_transposed_b` collapsed-reshape, `k_zero` replication; `tests/compiler/` stays green). The tuned
-plugin now **compiles and serves at 97.53 req/s** (14.3× the cold fallback, the number the bug had blocked), but the
-masked-K P@V MMA is **not yet bit-correct** (cosine 0.23 vs torch — PR #260 is WIP), so that throughput is a perf
-ceiling, not a deployable result. See the Serve A/B table and Finding 1.**
+**Status:** complete (single-layer, dynamic). Run on an **RTX 5090** (`sm_120`, driver 580.159.03) on 2026-06-25,
+immediately after the `prior: featurizer reads native MOVE@element knobs + refit _W_A/_W_A_DYN` commit (`a4bff929`) —
+the point of this run is to watch the **refit cold `AnalyticPrior`** guide the learned `CatBoostPrior` on a real model.
 
-**Date:** 2026-06-18. **GPU:** NVIDIA GeForce RTX 5090 (sm_120), driver 580.159.03. **ncu:** 2025.3.1 (worked; no
-permission gate). **vLLM:** 0.22.1.
-
-**Run commands**
+**Run command**
 
 ```bash
-# dynamic (deployable: symbolic seq_len, masked-tile kernels)
 deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --dynamic seq_len@x:1 --clean --bench \
-    --dump-dir _tune/tune-model-qwen3-emb-l0-report/dump-dynamic     # DEPLODOCK_TUNE_DB/PRIOR_FILE → dynamic.{db,prior}
-# static (contrast: shape-specialised at trace-default seq=32)
-deplodock tune Qwen/Qwen3-Embedding-0.6B --layer 0 --clean --bench \
-    --dump-dir _tune/tune-model-qwen3-emb-l0-report/dump-static       # …→ static.{db,prior}
-# serve A/B (200 reqs, conc 32, random-input-len 512, seed 0)
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --num-prompts 200 --random-input-len 512 \
-    --max-concurrency 32 --bench-seed 0 -- --gpu-memory-utilization 0.8           # plugin (dynamic prior) → CRASHES
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --stock --num-prompts 200 --random-input-len 512 \
-    --max-concurrency 32 --bench-seed 0 -- --gpu-memory-utilization 0.8           # vanilla vLLM baseline
+  --dump-dir _tune/tune-qwen3-emb-06b/dump 2>&1 | tee _tune/tune-qwen3-emb-06b/tune.log
 ```
 
-**Run stats**
+**Run stats:** 1 fused terminal, inner search **1010.9 s** (~17 min). Prior trained on **972 benches** (warmup 76 /
+post 896), reservoir dataset 22 263 rows. **802 ok / 33 bench_fail** measured configs. Post-training calibration
+(Spearman, predicted vs latency) **+0.51**; best inner latency 2.533 µs @ bench #885.
 
-| run                   | search wall           | variants  | terminals       | notes                                                                                                                                            |
-|-----------------------|-----------------------|-----------|-----------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
-| dynamic, layer 0      | 6276.5 s (~104.6 min) | 6611      | 8 fused         | 5 bench_fail; prior 7798 benches, Spearman +0.99                                                                                                 |
-| static, layer 0       | 3948.7 s (~65.8 min)  | 5655      | 8 fused         | 0 bench_fail; prior 6485 benches, Spearman +0.99                                                                                                 |
-| dynamic, whole model  | ~4.5 h (interrupted)  | 14686     | 12 (no `done`)  | accumulated into `dynamic.db` (→10335 perf rows); 18 unique kernels / 422 positions; stopped after 12 terminals — see Finding 1 / workflow notes |
-
-**Number-family disclaimer (do not mix).** Every latency below that comes from a `--bench` table or an `eval` `-O3 us`
-column is **-O3, deployable, CUDA-graph captured**. Tune-DB latencies quoted for ranking context (e.g. `eval variants`
-`us` column, `pick: rank R/N`) are **-Xcicc -O1** — a ranking signal only; reduction/attention kernels run 1.5–3×
-slower at -O1 than -O3.
-
-**Mode note.** The dynamic run is the deployable artifact: symbolic `seq_len`, masked-tile kernels, all tune/bench
-measurements taken at the `Dim` hint **seq_len = 512** (`DEFAULT_SEQ_HINT`; `--seq-len` only sizes trace tensors). The
-static run is shape-specialised at the **trace-default seq_len = 32** — fast, no masked-tile guards, **not** the
-deployable configuration, and not the same shape as the dynamic run (see the seq-confound caveat in Finding 5).
+**Measurement semantics.** `--clean` reset the tune DB + prior + cubin caches, so this is a genuine cold start: the
+**refit `AnalyticPrior` drove the warmup picks**, `CatBoostPrior` took over post-training. Dynamic (`--dynamic
+seq_len@x:1`): all kernels are symbolic-`seq_len` masked tiles **benched at the `Dim` hint `seq_len=512`**; the boundary
+guards (`if (coord < seq_len)`) are part of the measured cost. **Number families:** the per-kernel `--bench` table below
+is **-O3, deployable, CUDA-graph captured**; tune-DB `us` columns quoted for ranking context are **-O1** (1.5–3× slower
+on reduction/attention kernels) and the `-O3 us` column is the in-band -O3 re-bench. Never compare across the two.
 
 ---
 
 ## Bench results
 
-### Dynamic layer-0 end-to-end (seq_len = 512 hint; torch inputs tiled to match)
+**Full-model end-to-end bench did not complete** — it aborted with
+`HungKernelError("kernel 'k_sdpa_linear_reduce_5d67bc' did not complete within 1000 ms")` (Finding 1), so there is no
+eager / torch.compile / deplodock e2e row for the layer. The per-kernel -O3 table is the deployable result; the
+attention kernel is the reason the model-level number is missing — itself the top finding.
 
-| Backend       | Latency (µs) | vs Eager  |
-|---------------|--------------|-----------|
-| Eager PyTorch | 222          | 1.00×     |
-| torch.compile | 151          | 1.47×     |
-| **Deplodock** | **216**      | **1.03×** |
+**Per-kernel -O3 `--bench` table** (deplodock vs eager / torch.compile, µs; `vs eager` = eager/deplodock, >1 = win):
 
-Deplodock is ~par with eager and **1.4× behind torch.compile**. (A single layer's e2e, not the whole model — see the
-serve A/B for the deployable whole-model answer.)
+| Kernel                      | Layer op (provenance)                  | eager | tcompile | deplodock | vs eager |
+|-----------------------------|----------------------------------------|------:|---------:|----------:|---------:|
+| k_sdpa_linear_reduce        | SDPA (attn) 14/15 + linear_2           |    31 |       30 |       216 |  0.14x   |
+| k_linear_mean_loop_reduce   | linear + mean-pool loop reduce         |   119 |       57 |       176 |  0.68x   |
+| k_mean_linear_reduce        | mean-pool + linear reduce              |   104 |       20 |        43 |  2.43x   |
+| k_linear                    | linear_6 (proj) + add_7                |    23 |       23 |        41 |  0.56x   |
+| k_linear_reduce             | linear (q/k/v proj, partial)           |    14 |       14 |        35 |  0.41x   |
+| k_mean_linear_reduce        | mean-pool + linear reduce              |    76 |       14 |        29 |  2.64x   |
+| k_linear_reduce             | linear (proj, partial)                 |    10 |       10 |        24 |  0.43x   |
+| k_mean                      | mean-pool reduce                       |    72 |        6 |        14 |  5.12x   |
 
-### Dynamic per-kernel (-O3 reproducer table), sorted by deplodock µs
+(`k_linear_sdpa_reduce` was skipped — its reproducer bench exceeded the 60 s GPU-time cap.)
 
-> **POST-FIX re-bench ([PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)).** Re-run with the masked-K
-> MMA fixes applied. The non-SDPA rows are unchanged (within run-to-run noise); the two **SDPA matmul** reproducers
-> got **slower** — QK^T 80→**96 µs**, P@V 58→**74 µs**. That regression is the fix *working*: the `Source.dtype`
-> validate-sizing bug previously rejected every masked-K MMA config, so the greedy prior fell back to scalar; with
-> the slab now sized at fp16 the masked-K MMA split-consumer is enumerable and the prior deploys it — but at the
-> seq=512 hint for these GQA shapes it is **not** faster than the scalar fallback it replaced (P@V re-lowers to
-> softmax 50 µs + xn 11 µs + MMA consumer 11 µs + proj 11 µs). And it is still numerically WIP (the served P@V is
-> cosine 0.23, Finding 1). So the fix **unblocks the deployment path** (which is what serving needed) but does not
-> by itself make these reproducers a win. Pre-fix numbers in parentheses.
-
-| kernel                        | layer op                           | eager | tcompile | deplodock     | vs eager                              |
-|-------------------------------|------------------------------------|-------|----------|---------------|---------------------------------------|
-| `k_linear_sdpa_reduce_6bb11e` | q_proj + QK^T scores (Linear+Sdpa) | 39    | 37       | **96** (←80)  | 0.41× ✗                               |
-| `k_sdpa_linear_reduce_0045cd` | P@V + proj (Sdpa+Linear)           | 30    | 30       | **74** (←58)  | 0.40× ✗                               |
-| `k_linear_mean_reduce_05d34c` | q/k-norm: 2×Linear + Mean          | 122   | 57       | 47            | 2.58× ✓                               |
-| `k_sdpa_reduce_042770`        | rotary+mask+softmax (Sdpa reduce)  | 152   | 25       | **45**        | 3.36× vs eager, **loses to tcompile** |
-| `k_linear_0837e7`             | linear + activation                | 23    | 23       | 23            | 1.00× ≈                               |
-| `k_mean_linear_reduce_34d0f3` | RMSNorm + proj                     | 105   | 20       | 18            | 5.68× ✓                               |
-| `k_linear_reduce_f94dd0`      | linear (o_proj/down)               | 14    | 14       | 15            | 0.94× ≈                               |
-| `k_mean_linear_reduce_ca9764` | RMSNorm + proj                     | 76    | 14       | 12            | 6.17× ✓                               |
-| `k_linear_reduce_716194`      | linear (o_proj/down)               | 10    | 10       | 9             | 1.09× ✓                               |
-| `k_mean_d65726`               | RMSNorm (Mean)                     | 66    | 4        | 2             | 34.68× ✓                              |
-
-The fused RMSNorm+matmul and pure-matmul kernels win or tie; the three SDPA-bearing rows lose. **The "96/74/45 µs"
-SDPA numbers are multi-kernel re-lowering totals, not single kernels** — see Finding 2, which is essential to reading
-this table correctly. The reproducer solo-sum over-counts vs the whole-program e2e (the SDPA reproducers re-lower the
-softmax + projections alongside the matmul).
-
-### Static per-kernel (-O3, seq_len = 32 — shape-specialised), sorted by deplodock µs
-
-| kernel                        | eager | tcompile | deplodock | vs eager                  |
-|-------------------------------|-------|----------|-----------|---------------------------|
-| `k_linear_sdpa_reduce` (QK^T) | 14    | 12       | 12        | 1.17× ✓ (ties tcompile)   |
-| `k_linear_mean_reduce`        | 65    | 14       | 12        | 5.25× ✓                   |
-| `k_sdpa_linear_reduce` (P@V)  | 10    | 10       | 8         | 1.25× ✓                   |
-| `k_linear`                    | 8     | 8        | 7         | 1.17× ✓                   |
-| `k_sdpa_reduce` (softmax)     | 86    | 8        | 7         | 12.31× ✓ (beats tcompile) |
-| `k_mean_linear_reduce` ×2     | 57/59 | 8/8      | 6/6       | ~9.5× ✓                   |
-| `k_linear_reduce` ×2          | 6/6   | 6/6      | 4/3       | 1.68×/2.10× ✓             |
-| `k_mean`                      | 52    | 4        | 1         | 40.18× ✓                  |
-
-At seq=32 the specialised kernels meet or beat eager **and** torch.compile across the board — including the SDPA
-kernels that lose in the dynamic run. The regression is the masked-tile path, not the kernels' fundamentals (Finding 5).
-
-**Post-fix:** unchanged. PR #260 only touches the **masked-K** (symbolic reduce axis) path; static specialised kernels
-have a concrete K and no masking, so re-benching them with the fix reproduces these numbers exactly (QK^T 12.2 µs, P@V
-7.9 µs, softmax 5.4 µs — within noise).
-
-### Serve A/B vs vanilla vLLM (200 reqs, concurrency 32, random-input-len 512, seed 0, enforce-eager)
-
-| serve config                                  | req/s       | tok/s    | mean E2EL (ms)  | median   | P99      | outcome                                                                             |
-|-----------------------------------------------|-------------|----------|-----------------|----------|----------|-------------------------------------------------------------------------------------|
-| **vanilla vLLM** (`--stock`)                  | **229.05**  | 117,273  | 129.85          | 128.15   | 196.75   | baseline ✓                                                                          |
-| deplodock **tuned** prior — at A/B time       | —           | —        | —               | —        | —        | **CRASHED** (Finding 1)                                                             |
-| deplodock **tuned** prior — PR #260 (fixed)   | 97.53       | 49,935   | 307.89          | 317.72   | 382.73   | compiles + serves; **NUMERICALLY WRONG** (cosine 0.23 vs torch) — perf ceiling only |
-| deplodock **cold** AnalyticPrior              | 6.81        | 3,489    | 4410.92         | 4674.76  | 4952.87  | compiles, correct, **~34× slower**                                                  |
-
-**At A/B time the deplodock-tuned plugin could not be benched — it crashed at compile** (masked-K `LoweringError`,
-Finding 1), so the only producible deplodock serving number was the cold/scalar fallback (6.81 req/s, ~34× slower than
-vanilla vLLM). **The crash was a real compiler bug, fixed in [PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)**
-(four root causes: xn operand dtype, `Source.dtype` validate-sizing, `_is_transposed_b` collapsed-reshape, `k_zero`
-replication). With those fixes the tuned plugin **compiles and serves at 97.53 req/s** — **14.3× the cold fallback** and
-the throughput the bug had blocked — but the masked-K P@V MMA kernel is **not yet bit-correct** (cosine 0.23 vs torch;
-PR #260 is WIP), so this row is a **perf ceiling, not a deployable quality result**. A valid quality A/B awaits the
-P@V bit-correctness fix; even then it is ~2.35× behind vanilla vLLM, so the layer-0 per-kernel wins still do not (yet)
-translate into a served win on this model.
+**Dominating slices.** deplodock **wins the reduction-shaped kernels** — `k_mean` 5.12×, the two `k_mean_linear_reduce`
+2.43–2.64× — the mean-pool reductions the carrier-algebra reduce tier handles well. It **loses the matmul-shaped and
+attention kernels**: `k_sdpa_linear_reduce` (0.14×, 216 µs) alone dwarfs the rest and is bench-failure-dominated; the
+`k_linear`/`k_linear_reduce` projections sit at 0.41–0.56× of cuBLAS on tiny (M=512-hint) GEMMs.
 
 ---
 
-## Finding 1 — the tuned plugin can't compile: the masked-K MMA P@V was rejected at smem-validate (RESOLVED, [PR #260](https://github.com/cloudrift-ai/deplodock/pull/260))
+## Prior guidance — does the refit `AnalyticPrior` steer `CatBoost` onto the best configs?
 
-> **RESOLUTION ([PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)).** This was a **real compiler bug**, not
-> the "unfinished MMA path" the original analysis below concluded. Four root causes, all fixed; `tests/compiler/` stays
-> green (1629 passed); the tuned plugin now compiles and **serves at 97.53 req/s** (Serve A/B table):
-> 1. **`020_stage_inputs` didn't stamp `Source.dtype` at creation** — so the post-`020` `TileOp.validate` smem-budget
->    gate sized the fp16 masked-K slab at the fp32 `BYTES_PER_ELEM` fallback (132 KB vs the real 66 KB) and rejected it
->    against the 99 KB cap. **This is why the tune showed "0 MMA configs" — every masked-K MMA variant failed validate,
->    not because the path is unfinished.** With the operand un-stageable AND un-lowerable gmem-direct, the `005` gate
->    crashed greedy deploy.
-> 2. **`_split_demoted` materialized the `xn` intermediate at the fp32 softmax-cone dtype**, not the matmul operand
->    dtype (V = fp16) — 2× oversizing the slab and mis-typing the `ldmatrix.b16` read.
-> 3. **`011_lower_atom_cell._is_transposed_b`** mis-flagged the collapsed-reshape V (`[seq, kv*hd]`) as transposed.
-> 4. **`LdmatrixLoad.k_zero`** was dropped through register-tile replication.
->
-> So "tuning can't fix it" was *correct* (the whole-model tune confirmed it — the fix is in the compiler, not the
-> search), but "no MMA config exists / the path is unfinished" was **wrong**: the MMA configs were being silently
-> rejected at validate. **Caveat — PR #260 is WIP:** the deployed masked-K P@V MMA is **not yet bit-correct** (cosine
-> 0.23 vs torch; a residual fragment-layout bug, see the PR), so the 97.53 req/s is a *perf ceiling*, not deployable
-> quality. The original analysis is kept below for the record.
+This is the headline question. Three views, and they tell a layered story.
 
-**Symptom.** `deplodock serve … --bench` with the tuned dynamic prior fails vLLM EngineCore init during the plugin's
-model compile (`serving/runner.py:130` → `backend.compile` → `Pipeline.run`):
+**1. Aggregate pick reachability over the measured DB** (`deplodock eval prior --dataset db`): the prior's *model*
+*argmin* recovers each op's measured-best to **mean 2.52× / median 1.06× / worst 12.05×**. The median is the story — for
+the typical op the prior lands within **6 %** of the measured best. The tail is a handful of matmuls:
 
 ```
-LoweringError: masked-K (symbolic reduce) mma operand can't lower gmem-direct — no K zero-fill
-(only the staged _stage_expand path zero-fills the partial slab); needs staging
+matmul free=1024 red=1024  best  57.38us  pick 691.36us  (12.05x, 32 configs)  <-- model argmin misses
+matmul free=1024 red=2048  best  73.35us  pick 196.78us  (2.68x, 31 configs)
+matmul free=3072 red=1024  best 106.39us  pick 171.18us  (1.61x, 23 configs)
 ```
 
-**Root cause (`compiler/pipeline/passes/lowering/kernel/005_lower_atom_tile.py:519-530`).** The gate is **by design** a
-search-time signal:
-
-```python
-# Masked-K (symbolic reduce) correctness gate: the gmem-direct fragment load has no K zero-fill, so an unstaged
-# masked-K operand reads past the padded extent ... Bail so the search stages it or falls to the scalar path.
-if (not a_staged and _unstaged_masked_k(a_load, "a", graph)) or (
-    not b_staged and not b_trans and _unstaged_masked_k(b_load, "b", graph)):
-    # LoweringError (not RuleSkipped): drop this candidate so the search falls back to a staged-mma or scalar variant.
-    raise LoweringError("masked-K (symbolic reduce) mma operand can't lower gmem-direct …")
-```
-
-During **tuning** the SP-MCTS catches this `LoweringError` and drops the candidate. During **greedy deployment** (serve
-plugin / `compile` / `run`) there is no search and no fallback — the error propagates and crashes the engine. This is
-the hard-error twin of the QK^T `dpl_mma_load_b_gmem` perf smell (Finding 3): an unstaged MMA B-operand is a
-slow-but-correct fallback for non-masked-K, but a **correctness crash** for masked-K.
-
-**The deeper cause — and why tuning cannot fix it (verified).** It is tempting to call this prior-dependent and
-fixable by tuning the deployed graph. It is not. The fused masked-K P@V is an **unfinished MMA path**: CLAUDE.md states
-"flash-style fused symbolic-K attention remains future work," and the tuner deliberately keeps the fused masked-K P@V
-**degenerate scalar-tier**. Direct evidence from the tune DB: the whole-model P@V `k_sdpa_linear_reduce_95f2c6` has
-**857 measured configs and 0 of them are MMA** (`eval variants --kernel k_sdpa_linear_reduce_95f2c6 | grep -c
-mma_m16n8k16` → 0) — all scalar, ~1055 µs, and the prior's pick (rank 5) is scalar too. The **serving** greedy compile,
-on its own graph (`serving/runner.py` traces the `AutoModel` trunk), reaches the **MMA-tier** masked-K P@V — the
-unfinished path the tuner never takes — and hits the unguarded `LoweringError`.
-
-**Experiment that proves it (the key result of this run).** I ran a full **whole-model dynamic tune accumulating into
-the same `dynamic.db`/prior** (12 terminals, ~4.5 h, the served kernels benched directly — e.g. 857 P@V configs,
-`k_linear_sdpa_reduce_6db6c8` 193, `k_sdpa_reduce_5661da` 89), then re-ran `serve` with that whole-model-trained prior.
-**It crashes with the byte-identical masked-K `LoweringError`.** So no amount of tuning helps: the kernel serving
-deploys (MMA masked-K fused P@V) is one the tuner *never produces* (it stays scalar) — tuning the deployment graph
-gives the prior evidence for the *scalar* P@V, not the *MMA* one the serving lowering reaches. The cold `AnalyticPrior`
-"compiles" only because it stays conservative scalar (→ Finding 1b's 34× slowdown), not because it found a good masked-K
-MMA config — there isn't one.
-
-**Repro (compile-only, no bench — fails once weights load; identical under the layer-0 or whole-model prior):**
-
-```bash
-DEPLODOCK_PRIOR_FILE=…/dynamic-prior.json deplodock serve Qwen/Qwen3-Embedding-0.6B --dry-run
-DEPLODOCK_TUNE_DB=…/dynamic.db deplodock eval variants --kernel k_sdpa_linear_reduce_95f2c6 | grep -c mma   # → 0
-```
-
-**Fix (priority: HIGH — this blocks the deployable artifact; tuning is NOT the fix).** Two real options, neither of
-which is "tune more": (1) **guard the deployment path** — when `005_lower_atom_tile` would raise `LoweringError` for an
-unstaged masked-K MMA operand, the greedy compile must force-stage it or fall to the (lowerable) scalar/split variant
-the tuner uses, instead of propagating; equivalently, `Prior.pick`/enumeration eligibility must exclude unstageable
-masked-K MMA configs for symbolic-K ops so they can never be deployed. (2) **finish the fused masked-K MMA path**
-(flash-style fused symbolic-K attention) so it lowers and is fast — the real performance fix. Until one of these lands,
-the embedding plugin cannot serve any model whose whole-graph attention reaches a masked-K MMA, regardless of tuning.
-
-## Finding 1b — cold-prior serving is 34× slower than vanilla vLLM
-
-**Symptom.** The cold-`AnalyticPrior` plugin serves correctly but at **6.81 req/s vs vanilla vLLM's 229.05 req/s**
-(mean E2EL 4411 ms vs 130 ms). Both run under `enforce-eager` (CUDA graphs off on both sides — apples-to-apples on that
-axis).
-
-**Root cause.** The cold prior deploys un-tuned kernels, and for the masked-K attention it stays scalar-tier (the
-conservative pick), i.e. scalar attention against vLLM's flash kernels — ~1 ms per P@V × 28 layers, no CUDA graphs.
-
-> **UPDATE ([PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)).** The original claim "there is no fast
-> masked-K MMA config to deploy" was wrong — the MMA configs were rejected at smem-validate (Finding 1's resolution).
-> With the fix the **tuned** plugin deploys the masked-K MMA P@V and serves at **97.53 req/s — 14.3× this cold
-> fallback** (Serve A/B table). It is still ~2.35× behind vanilla vLLM (229 req/s) and **not yet bit-correct** (cosine
-> 0.23), so it is not a deployable win — but the *deployment* path the cold prior worked around is no longer a wall.
-
-**Fix (priority: HIGH).** ~~Blocked on finishing the fused masked-K MMA attention.~~ The compiler crash is fixed
-([PR #260](https://github.com/cloudrift-ai/deplodock/pull/260)); what remains is (a) the P@V MMA's bit-correctness
-(WIP in the PR) and (b) the perf gap to vLLM's fused flash attention — the per-kernel layer wins (RMSNorm/matmul
-fusions) only translate to a served win once both land.
-
-## Finding 2 — per-kernel reproducer totals over-count SDPA kernels (the matmuls are fast; the softmax is the cost)
-
-**Symptom.** The per-kernel table attributes 80 µs to `k_linear_sdpa_reduce` and 58 µs to `k_sdpa_linear_reduce`
-(both 0.49× eager), which reads as "the attention matmuls are slow." They are not.
-
-**Evidence.** Re-lowering each SDPA reproducer standalone (`run --ir … --bench`) decomposes it into several kernels,
-because the sliced reproducer re-lowers the full SDPA (QK^T + softmax + P@V) with no surrounding graph to fuse into:
-
-- **QK^T reproducer (80 µs total) = 4 kernels:** the QK^T matmul `k_linear_sdpa_reduce_6bb11e` is **6.5 µs (8.3%)**;
-  two softmax reduces `k_sdpa_reduce_*` are 31.3 + 30.6 = **61.9 µs (79%)**; split producer 10.1 µs.
-- **P@V reproducer (58 µs total) = 4 kernels:** softmax `k_sdpa_reduce_6874a2` **31.3 µs (55%)**; P@V matmul
-  `k_sdpa_linear_reduce_2fafc0` 10.0 µs; V-proj `k_linear_reduce` 8.9 µs; split producer 6.5 µs.
-- **softmax reproducer (48 µs total) = 5 kernels:** two MMA reduces 13.8 + 10.1 µs + three scalar `_xn/_xna/_xnb`
-  split producers 8.2 + 7.8 + 6.9 µs.
-
-**Conclusion.** Every matmul is fast and competitive (QK^T 6.5 µs, P@V 10 µs, V-proj 8.9 µs). The recurring softmax
-reduce `k_sdpa_reduce` (the [16, 512, 512] rotary+mask+softmax) is the real bottleneck and the entire gap to
-torch.compile. This is also why solo-sum (313 µs) ≫ whole-program (216 µs): the SDPA reproducers re-decompose without
-fusion. **Read the whole-program e2e and the named-kernel solo µs, never the reproducer total attributed to one name.**
-
-**Fix (priority: MEDIUM — a reporting/tooling fix).** The per-kernel `--bench` table should label multi-kernel
-re-lowerings as such (it already prints the sub-kernel breakdown in the `run --ir` knob table, but
-`62_kernel_bench.json` and `kernels.html` collapse it to one row keyed by the reproducer name). See workflow notes.
-
-## Finding 3 — the SDPA softmax reduce is bank-conflict- and occupancy-bound, and the conflict-breaking knobs are no-ops
-
-**Symptom.** Standalone, deplodock's softmax is 48 µs vs torch.compile's 25 µs (1.9× behind). It is MMA-tier (so not a
-tier lockout) and the prior's pick is rank 2/275 — so neither a search shortfall nor a tier problem (`eval variants
---kernel k_sdpa_reduce`).
-
-**Evidence (NCU, `ncu-softmax/61_ncu_metrics.json`).**
-
-| kernel                                                 | dur     | occ%     | sm%  | dram% | fma% | ld.cnflct   | regs   |
-|--------------------------------------------------------|---------|----------|------|-------|------|-------------|--------|
-| `k_sdpa_reduce_77b0f0` (main MMA reduce)               | 20.7 µs | 45.6     | 26.5 | 23.1  | 5.2  | **107,480** | 56     |
-| `k_sdpa_reduce_6e4bd6` (2nd MMA reduce)                | 18.6 µs | **24.1** | 25.5 | 37.6  | 0.2  | 0           | **72** |
-| torch ref `flash_fwd_splitkv_kernel` (whole attention) | 25.3 µs | 8.4      | 16.0 | 19.8  | 2.9  | 0           | 206    |
-
-The main reduce is stalled on **107,480 shared-load bank conflicts** (SM 26.5%, FMA 5.2% — not compute-bound); the
-second reduce is **occupancy-limited at 24.1% by 72 regs/thread** (DRAM 37.6%, FMA 0.2% — latency-bound). torch.compile
-fuses the whole attention into **one** flash kernel; deplodock spreads it across 5 masked split kernels.
-
-**The standard fix knobs do not reach this kernel.** A/B of `PAD_SMEM=1` and `PAD_SMEM=1,PERMUTE_LANES=1` on the
-softmax reproducer (`run --ir … --ab …`) is a **no-op**: smem stays 32 K and the main reduce stays 13.8 µs. The pad
-fork only emits "when at least one Source actually benefits" (`tile/070_pad_smem`), and the conflicts here come from the
-MMA reduce's fixed `ldmatrix` smem staging, which the `+1` pad does not touch.
-
-**Repro:**
-
-```bash
-deplodock run --ir dump-dynamic/07_lowering_cuda.kernels/k_sdpa_reduce_042770.torch.json --bench --profile \
-    --bench-backends eager,deplodock                                   # NCU compare table
-deplodock run --ir …/k_sdpa_reduce_042770.torch.json --bench --ab "PAD_SMEM=1" --ab "PAD_SMEM=1,PERMUTE_LANES=1"
-```
-
-**Fix (priority: HIGH — this is the entire e2e gap to tcompile).** A conflict-free smem layout for the MMA softmax
-reduce (swizzle the score-tile staging so the `ldmatrix` reads don't collide), and/or a fused flash-style attention so
-the scores never round-trip through gmem across 5 kernels (CLAUDE.md: "flash-style fused symbolic-K attention remains
-future work"). Lower the second reduce's register pressure (72 → occupancy is 24%).
-
-## Finding 4 — prior pick-reachability shortfall on the large (gated-MLP) matmuls
-
-**Symptom.** `eval prior --dataset db` reachability: mean 1.27×, median 1.16×, **worst 2.13×**. The misses are the big
-matmuls:
+**2. But the *deployed* pick is rescued by the -O3 evidence reservoir.** `eval prior --dataset db` scores the learned
+model's raw argmin over **-O1** rows; the actual `Prior.pick` consults the **-O3 reservoir first**. `eval variants`
+shows the deployed pick (◄) is frequently a poor -O1 rank yet the **-O3-deployable best**:
 
 ```
-matmul free=3072 red=1024  best 31.05us  pick 66.16us  (2.13x, 141 configs)  <-- misses best
-matmul free=3072 red=1024  best 33.71us  pick 56.94us  (1.69x, 123 configs)  <-- misses best
-matmul free=1024 red=2048  best 46.17us  pick 67.77us  (1.47x,  79 configs)  <-- misses best
+k_linear_reduce_716194  pick rank 3/32 (1.25x -O1)  ── but pick -O3 = 48.9us is the LOWEST -O3 of any config
+k_mean_linear_reduce    pick rank 13/45 (1.32x -O1) ── but pick -O3 = 2.5us  beats the -O1-fastest (2.6us -O3)
+k_mean_linear_reduce_mm1 pick rank 17/23 (1.61x -O1)── but pick -O3 = 100.7us beats rank-3's -O3 (102.6us)
 ```
 
-**Evidence.** `eval knobs --dataset db` ranks **`FM`** (per-thread M cells) as the highest-leverage tunable
-(geomean regret 12.63×, p90 71×), then `SPLITK` 12.25×, `MMA` 11.61×, `BR` 9.74×, `FK` 8.93×, `WM`/`WN` ~8.6×. The
-learned prior is mis-ordering `FM`/`SPLITK` on the large reduce shapes — the deployed config is a tensor-core tile but
-not the fastest one.
+So the same matmuls that look like a 12× "miss" under the -O1 model argmin are, after the -O3 re-bench of the
+tolerance-band contenders, deployed at their **-O3 optimum**. The refit `AnalyticPrior`'s job in this loop is exactly
+that: its -O1 ranking surfaces the right configs into the `DEPLODOCK_O3_TOL` band, they get -O3-sampled, and the
+evidence-first `Prior.pick` then deploys the -O3 winner regardless of its noisy -O1 rank. The 12× model-argmin gap is a
+**learned-model calibration** limitation (Spearman +0.51 — moderate), not a deployment regression, *as long as the
+reservoir has an -O3 sample*. Where it has none (small static-K projections with `-O3 us = —`), the pick falls back to
+the -O1 rank and the 1.21–1.25× shortfalls are real (Finding 5).
 
-**Fix (priority: MEDIUM).** More patience on the gated-MLP shapes, or better `FM`/`SPLITK` features in the prior.
-Confirm by re-tuning the offending reproducer with 2–4× patience (no `--clean`); if the rank-1 config becomes the pick,
-it's prior/patience, not codegen.
-
-## Finding 5 — the masked-tile tax: dynamic vs static softmax (user-requested comparison)
-
-**Caveat first:** static is seq=32, dynamic is seq=512 (16× more data) — compare the **deplodock-vs-tcompile ratio at
-each shape**, not absolute µs.
-
-| aspect                             | static @ seq=32                                  | dynamic @ seq=512                                                                                 |
-|------------------------------------|--------------------------------------------------|---------------------------------------------------------------------------------------------------|
-| reproducer decomposition           | 4 kernels                                        | 5 kernels (extra split producer)                                                                  |
-| emitted CUDA (`compile --ir cuda`) | 383 lines, **3** if-guards, **no `seq_len` arg** | 1093 lines (**2.9×**), **54** if-guards, `int seq_len` in every signature                         |
-| deplodock total                    | 5.4 µs (wp 6.4)                                  | 46.7 µs (wp 48.5)                                                                                 |
-| eager / tcompile / **deplodock**   | 84 / 8 / **6** → **beats tcompile**              | 151 / 25 / **48** → **1.9× behind tcompile**                                                      |
-| main MMA reduce                    | `k_sdpa_reduce_39b7dc` 2.2 µs, occ 50%, 32 regs  | `k_sdpa_reduce_77b0f0` 13.8 µs, occ 45.6%, **107 K conflicts** + a second reduce occ 24%, 72 regs |
-
-The masking tax is concrete in the dynamic CUDA (absent in static, which bakes every shape as a constant): runtime
-ceil-div grid decode `blockIdx.x / (((seq_len+31)/32)*16)`; nested boundary guards on **both** axes of the [seq×seq]
-scores `if (a1*64+a4*64 < seq_len) { if (a2*64+a5*8 < seq_len) { if (…+_g < seq_len && …< seq_len) … } }`; a
-padded-to-64 output slab `((seq_len+63)/64*64)`; TMA descriptors. The softmax's **posture flips** from beating
-torch.compile (specialised) to 1.9× behind it (masked). The masking guards and the MMA-reduce codegen limits (Finding 3)
-compound.
-
-**Repro:**
-
-```bash
-deplodock compile dump-static/07_lowering_cuda.kernels/k_sdpa_reduce_39b7dc.torch.json  --ir cuda   # 3 guards, no seq_len
-deplodock compile dump-dynamic/07_lowering_cuda.kernels/k_sdpa_reduce_042770.torch.json --ir cuda   # 54 guards, seq_len
-```
-
-**Known-limitation / future work (priority: MEDIUM).** A clean same-shape comparison (static **at seq=512** vs dynamic
-at 512) would isolate masking from data-size; I skipped that 70-min re-tune because the dynamic-vs-tcompile@512 gap
-(48 vs 25 µs) already isolates the regression without the seq confound. The real fix is the same as Finding 3 (fused
-flash-style masked attention).
-
-## Finding 6 — compile-budget bench failures (wasted search slots)
-
-**Symptom.** `eval failures` (dynamic.db): 5 `bench_fail` rows, **all** "compile stage exceeded 2.0s budget" nvcc
-timeouts (3.96 s–5.76 s); 4 of 5 are on `k_sdpa_linear_reduce_0045cd_xn` (the split P@V producer) with `SPLIT_CONE=True`
-and large `FK`. Static.db had **0** bench_fail.
-
-**Root cause.** The split-producer's large `FK` unroll blows past the tuner's 2 s per-variant compile budget
-(`_tune_backend`'s `bench_wall_timeout`). These are wasted search slots, not deployment problems (the final pick is
-fine). The dynamic graph hits them because the masked split producers carry more unrolled code than the static ones.
-
-**Fix (priority: LOW).** Cap `FK` for split-producer enumeration, or raise the compile budget for the `_xn` family.
-
-## Finding 7 — TMA transport declines the symbolic SDPA split producer (known limitation)
-
-**Symptom.** The dynamic tune log repeats: "dropped un-lowerable candidate (StageBundle TMA: source
-`scaled_dot_product_attention_reduce__xn_smem` pad must be empty, got (0, 0, 8)) — pruning branch, continuing search."
-
-**Root cause.** The TMA staging pass (`tile/050_use_tma`) can't promote the masked SDPA split producer's padded smem
-slab, so it correctly prunes those candidates. Search-time only (pruned, not crashed) — recorded because it narrows the
-transport options for exactly the SDPA kernels that are already the bottleneck.
-
-**Fix (priority: LOW, correct-by-design).** Noted for context; folds into the flash-attention work (Finding 3).
+**3. Cold-start sanity.** The warmup 76 benches were driven by the refit `AnalyticPrior` alone (no `prior.json` after
+`--clean`). The post-training "silly (≥2× best)" rate is 783/846 = 93 % — high, but expected for a single-layer cold
+tune whose enumeration is dominated by the attention kernel's failing configs (Finding 1); the reduction kernels the
+prior is well-calibrated on (the golden regimes) are the ones that deploy at ≤1.06×.
 
 ---
+
+## Finding 1 — `k_sdpa_linear_reduce` attention: 26/27 configs bench_fail, blocks the e2e bench (priority: high)
+
+**Symptom.** The attention kernel is 0.14× eager (216 µs vs 31) and its tune enumeration is almost entirely dead: `eval
+variants --kernel k_sdpa_linear_reduce` shows **1 measured config / 26 bench_fail**, the lone survivor at a catastrophic
+334 712 µs (-O1). It hangs the GPU past the 1 s watchdog, which is what aborted the **full-model e2e bench**.
+
+**Evidence.** `eval failures` clusters all 26 under `k_sdpa_linear_reduce_5d67bc`:
+
+```
+14 rows  RuntimeError 'benchmark run stage exceeded 2.0s of GPU time'   shared: REDUCE@a3=s1/f1/c1/t1, SPLIT@a1=…
+ 6 rows  HungKernelError 'did not complete within 1000 ms'              shared: REDUCE@a3=s1/f1/c1/t1, SPLIT@a1=1x1
+ …       bench worker EOF (timeout 1.0s)
+```
+
+Every failing config shares `REDUCE@a3=s1/f1/c1/t1` (a degenerate reduce on the attention reduce axis) and small
+`SPLIT@a1`. Provenance: `scaled_dot_product_attention (SdpaOp): 14/15 — partial` — this is the **non-flash** SDPA reduce
+path (the `FLASH` knob fuses SDPA into the streaming online-softmax MONOID nest; this kernel is the un-fused reduce).
+
+**Root cause (hypothesis).** The symbolic-`seq_len` masked SDPA reduce, on the non-flash path, generates kernels that
+loop the full hint-K with a degenerate per-row reduce and no convergent tiling — they run unboundedly long at small
+`SPLIT@a1`. The dominant question is whether `FLASH=True` (the streaming flash nest) was enumerated for this symbolic-K
+SDPA at all; CLAUDE.md notes flash-style **fused symbolic-K attention remains future work** and the prologue P@V stays
+degenerate at `FM=FN=1`. If the flash fork is gated off for symbolic K, the search is stuck on the slow reduce path —
+a **class-2 (tier/structural lockout)** on top of the **class-4 (bench failures)**.
+
+**Next diagnostic.** `DEPLODOCK_KNOBS="FLASH=True" deplodock compile <k_sdpa_linear_reduce>.torch.json --ir cuda`
+(compile only, no GPU) to see whether the flash nest is even reachable for this op, then find the gate in
+`passes/lowering/tile/` that declines it on symbolic K. **Do not** re-bench this kernel live without the 1 s watchdog.
+
+**Fix.** Gate the degenerate `REDUCE@a3=s1/...` + tiny-`SPLIT@a1` SDPA-reduce configs out of enumeration (they only ever
+hang), and/or unlock the symbolic-K flash fork. Until then the watchdog correctly fences them, but they burn 26 search
+slots and block the e2e bench.
+
+**Resolution (the class-2 lockout — landed).** Root cause: a **symbolic** streaming-flash KV axis is serial-locked
+(`streaming_br_offers` → `BR=1`, `_streaming_bk` → `BK=1`), so `enumeration/070_coop_reduce._streaming_leaves` fell to
+`monoid_build` — the scalar streaming nest that recomputes the QK^T score **per P@V output `d`** (the `d` loop wraps the
+KV stream), O(`d_v`=64) redundant, so every config ran unboundedly long (the 26 dead leaves were that one
+per-`d`-recompute kernel under different free tiles). The fix is the **FA-2 shared-score restructuring**: route the
+symbolic streaming flash through **`chain_build`** by default — the score is computed ONCE per KV step and shared across
+`d` (the P@V output rides a register vector `O[d]`, the score edge placed INLINE). `_chain_applicable` was relaxed to
+admit a **symbolic hinge** (only the inner QK^T must be static — the KV stream stays a serial runtime-bounded loop, no
+tiling → no masking, every `kv < seq_len` valid); `_streaming_leaves` makes `chain_build` the symbolic default
+(`monoid_build` + the one-leaf collapse remains the fallback for a chainless symbolic stream). A static stream keeps
+`chain_build` a `DEPLODOCK_CHAIN=1` opt-in (unchanged).
+
+**Measured (RTX 5090, symbolic SDPA `1×8×512×64` at the hint, `run --bench`, -O3 captured):** **334 712 µs (-O1 hang) →
+515 µs** cold-analytic default (correct to max_diff 1e-6 vs eager) — a ~650× kernel-level improvement; the cold pick
+threads the query (`block=32`, 25 % occ) with `d` in registers (`FM=64`, `PLACE@v1=inline`). The remaining gap to eager
+(53 µs cuBLAS/flash) is the scalar-FMA P@V + serial KV stream + 167 regs (25 % occ ceiling) — closing it needs the
+**tensor-core warp chain for symbolic streaming** (`warp_chain_eligible` is static-only today), the genuine follow-up.
+NOTE the **learned prior** carried from this run is stale for the new chain regime (it was trained on the old
+all-failing `monoid_build` kernels) and mis-ranks the chain leaves to `block=1` (1203 µs); a re-tune relearns it — the
+cold `AnalyticPrior` already picks the 515 µs config. Accuracy is guarded e2e by the `*_dynamic_matches_torch` flash
+tests (SDPA / GQA+causal / additive-mask over symbolic `seq_len`, now exercising the chain path); routing by
+`tests/compiler/passes/test_streaming_symbolic_chain.py`. The **e2e-abort retry** (workflow note) is the only Finding-1
+follow-up left.
+
+## Finding 2 — learned-model argmin misranks small matmuls 2.7–12× (rescued by -O3 evidence) (priority: medium)
+
+**Symptom / evidence.** See the Prior-guidance section: `eval prior --dataset db` worst 12.05× on `matmul free=1024
+red=1024`, yet `eval variants` shows the deployed pick is the -O3-best for those same kernels. **Root cause:** the
+`CatBoostPrior` Spearman is +0.51 — it ranks the broad strokes but not the fine -O1 ordering of near-best matmul
+configs, so its argmin drifts onto a slow tile. The evidence-first `Prior.pick` corrects this **only where an -O3
+reservoir sample exists** for a tolerance-band config.
+
+**Fix / watch.** This is acceptable by design (the -O3 band is the safety net) but argues for (a) more tune patience on
+the matmul ops so more contenders enter the -O3 band, and (b) feeding the -O3 rows back as `H_opt=3` training rows to
+lift the model's matmul calibration over successive tunes. Re-running `tune` without `--clean` (accumulate) should
+tighten the 12× tail — worth a follow-up measurement.
+
+## Finding 3 — bf16 MMA codegen emits an unused helper → nvcc compile failure (priority: medium)
+
+**Symptom.** `eval failures` cluster on `k_linear_reduce_716194` (3 rows):
+
+```
+nvcc compile failed: a_m16n8k16_bf16" was declared but never referenced
+  static __attribute__((device)) … void dpl_mma_m16n8k16_bf16(float* d, const unsigned* a, …)
+shared knobs: ATOM@out=mma_m16n8k16_f16, FM=2, SPLIT@a0=4x1, SPLIT@a1=8x2, REDUCE@a2=s1/f1/c1/t1
+```
+
+**Root cause.** With `ATOM@out=mma_m16n8k16_f16` selected, codegen still **emits the `dpl_mma_m16n8k16_bf16` helper**
+(and a `a_m16n8k16_bf16` operand decl) that nothing references → the compile fails under the strict diagnostic. A
+dead-helper emission in the warp-tier CUDA lowering — the f16 and bf16 atom paths aren't cleanly separated. **Class 4**
+(bench failure): these are pure wasted search slots.
+
+**Repro (no GPU).** `DEPLODOCK_KNOBS="ATOM@out=mma_m16n8k16_f16,FM=2,SPLIT@a0=4x1,SPLIT@a1=8x2"
+deplodock compile <k_linear_reduce_716194>.torch.json --ir cuda` and grep for `bf16` in the emitted source.
+
+**Fix.** Emit the atom helper for the *selected* kind only (gate the bf16 helper on `ATOM@out` being a bf16 atom).
+
+## Finding 4 — `KeyError('mul_N_smem')` when staging a pointwise `mul` edge in smem (priority: medium)
+
+**Symptom.** `eval failures` clusters `k_linear_0837e7` (`KeyError('mul_16_smem')`, 3 rows) and `k_linear_reduce_716194`
+(`KeyError('mul_1_smem')`, 1 row), each sharing `PLACE@mul_N=smem:sync` (+ `PLACE@linear_N_wt=smem:sync`).
+
+**Root cause.** When the placement fork stages the activation `mul_N` edge into smem, assembly looks up a `mul_N_smem`
+buffer key that was never created — an assembly/schedule gap for staging a **pointwise (non-weight) edge** in smem.
+**Class 4.** The weight edge (`linear_N_wt`) stages fine; the `mul` edge is the one missing its smem buffer.
+
+**Repro (no GPU).** `DEPLODOCK_KNOBS="PLACE@mul_16=smem:sync,PLACE@linear_6_wt=smem:sync,ATOM@out=mma_m16n8k16_f16"
+deplodock compile <k_linear_0837e7>.torch.json --ir cuda`.
+
+**Fix.** Register the smem buffer for a staged pointwise edge in the assembly pass (or decline `PLACE@<pointwise>=smem`
+in the offer if it's not meant to be stageable).
+
+## Finding 5 — small-K projection GEMMs trail cuBLAS 2–2.5× (priority: low)
+
+**Symptom.** `k_linear` 0.56×, `k_linear_reduce` 0.41×/0.43× vs eager (= cuBLAS) on tiny (M=512-hint, K=1024–3072)
+projections. The deployed picks are reasonable (warp-tier `mma_m16n8k16_f16`, `smem:tma`/`smem:sync`) but these are
+small GEMMs where cuBLAS's hand-tuned kernels dominate and some picks have **no -O3 reservoir sample** (`-O3 us =`
+`—`), so they deploy on the -O1 rank (1.21–1.25× of -O1-best). **Class 3** + the Finding-2 reservoir gap.
+
+**Next step.** NCU compare (`run --ir <k>.torch.json --bench --profile`) to quantify the cuBLAS gap (occupancy / fma% /
+dram%); not done here to keep this run focused on the prior-guidance question and avoid the hanging attention kernel.
+
+---
+
+## What deplodock already wins
+
+`k_mean` (5.12×), both `k_mean_linear_reduce` (2.43×, 2.64×) — the mean-pool reduction kernels, the regime the refit
+prior is best calibrated on (the reduce goldens). These deploy at ≤1.06× of their measured best per `eval prior`. The
+embedding model's pooling tail is deplodock's strength; the projections and attention are the gap.
 
 ## Repro / artifacts
 
-Work dir: `_tune/tune-model-qwen3-emb-l0-report/` (2.0 G, under gitignored `_tune/`).
-
-- Tune logs: `tune-dynamic.log`, `tune-static.log`. Dumps: `dump-dynamic/`, `dump-static/` (each has the
-  `*_lowering_cuda.kernels/*.torch.json` reproducers, `62_kernel_bench.json`, `kernels.html`).
-- Tune DBs / priors: `dynamic.{db,prior.json}`, `static.{db,prior.json}` (point `DEPLODOCK_TUNE_DB` /
-  `DEPLODOCK_PRIOR_FILE` at these to re-read).
-- Triage: `triage/{variants_qkt,variants_pv,variants_softmax,prior_reach_db,knobs,failures}.txt`,
-  `triage/{qkt_ab,pv_bench,softmax_bench,softmax_ncu,softmax_pad_ab,softmax_static_bench}.log`,
-  `triage/softmax_{static,dynamic}.cu`. NCU CSV/JSON: `ncu-softmax/61_ncu_metrics.{csv,json}`.
-- Serve logs: `serve-stock.log` (works), `serve-deplodock.log` (layer-0-prior crash),
-  `serve-deplodock-wholemodel.log` (whole-model-prior crash — identical error), `serve-deplodock-coldprior.log`
-  (34× slower). Whole-model tune: `tune-wholemodel-dynamic.log`, `dump-wholemodel-dynamic/`.
-
-Compile-only repros (no GPU):
-
-```bash
-DEPLODOCK_PRIOR_FILE=…/dynamic-prior.json deplodock serve Qwen/Qwen3-Embedding-0.6B --dry-run     # Finding 1 crash
-deplodock compile dump-dynamic/…/k_sdpa_reduce_042770.torch.json --ir cuda                        # Finding 5 guards
-DEPLODOCK_TUNE_DB=…/dynamic.db deplodock eval variants --kernel k_sdpa_reduce                     # Finding 3 rank
-DEPLODOCK_TUNE_DB=…/dynamic.db deplodock eval prior --dataset db                                  # Finding 4 reachability
-```
-
-GPU repros:
-
-```bash
-deplodock run --ir dump-dynamic/…/k_sdpa_reduce_042770.torch.json --bench --profile               # Finding 3 NCU
-deplodock run --ir dump-dynamic/…/k_linear_sdpa_reduce_6bb11e.torch.json --bench                  # Finding 2 decomposition
-deplodock compare _tune/.../dump-static _tune/.../dump-dynamic                                     # cross-mode diff
-```
-
----
+- Tune log: `_tune/tune-qwen3-emb-06b/tune.log`
+- Dump dir: `_tune/tune-qwen3-emb-06b/dump/` (per-kernel `.torch.json` reproducers, `kernels.html` / `.png`,
+  `62_kernel_bench.json`)
+- Tune DB: `~/.cache/deplodock/autotune.db`; prior: `~/.cache/deplodock/prior.json`
+- Prior reachability: `deplodock eval prior --dataset db`
+- Failures: `deplodock eval failures`
+- Per-kernel leaderboards: `deplodock eval variants --kernel <k_sdpa_linear_reduce|k_linear_reduce|k_linear>`
+- Compile-only repros (no GPU) for Findings 3/4: pin the cluster's shared knobs via `DEPLODOCK_KNOBS` and
+  `deplodock compile <reproducer>.torch.json --ir cuda`.
 
 ## Workflow notes
 
-**Slow steps.**
-- The two-level tune is **far** past the skill's "~10–20 min single-layer" estimate: **104.6 min dynamic, 65.8 min
-  static** (6611 / 5655 variants). The cost is the SP-MCTS exploring structural forks — each terminal re-runs the full
-  per-kernel inner search, and the SDPA split forks (`005_split_demoted` + `_xn` producers) multiply the kernel set
-  (8 fused terminals, 10→13 kernels). *Proposal:* document a realistic per-layer wall on a transformer block (~1–2 h),
-  and consider an outer-tree iteration cap or a `--max-terminals` flag so a "quick look" tune is possible. The 5-min
-  estimate in the skill is wrong for any real decoder layer.
-- The **whole-model** tune is worse: it ran **~4.5 h to 12 terminals without reaching `done`** and I stopped it with
-  SIGINT (it checkpoints the prior incrementally + writes per-op rows on interrupt, so the accumulated evidence is
-  intact). The whole model has more structural-fork sites than one layer, so the outer SP-MCTS tree is far larger (8
-  terminals for layer-0 vs 12-and-counting whole-model). A `--max-terminals` / wall-clock cap is effectively mandatory
-  for whole-model tuning; without it the run does not terminate in a practical window. (op-key dedup *does* work — 18
-  unique kernels cover 422 positions — so the cost is outer-tree breadth, not 28× the kernels.)
-- The whole-model dynamic `run --bench` (for the e2e headline) **failed**: "benchmark run stage exceeded 10.0s of GPU
-  time — variant marked bench_fail", almost certainly the dispatch-bound op-by-op torch *reference* replay for the full
-  310-weight model, not a deplodock blow-up. *Proposal:* skip / time-cap the torch reference for whole-model `--bench`,
-  or bench deplodock-only with a note, so a whole-model e2e number is obtainable. (We fell back to the serve A/B + the
-  layer-0 e2e.)
+- **Slow / blocked step — the hanging attention kernel.** `k_sdpa_linear_reduce`'s 26 hanging variants cost ~minutes of
+  watchdog timeouts during the inner search and **aborted the full-model e2e bench entirely**, so this run has no
+  model-level eager/tcompile/deplodock number. Proposal: when the full-model bench aborts on a `HungKernelError`, retry
+  it once with the offending kernel pinned to its fastest *measured* config (skip the greedy re-pick that may re-hang),
+  so a single bad kernel doesn't cost the whole e2e table.
+- **Two-number-family cross-referencing was manual.** Answering "is the pick actually good?" needed reading the `-O3 us`
+  column in `eval variants` against the `eval prior --dataset db` -O1 reachability by hand — the 12× "miss" is benign
+  once you see the -O3 column, but nothing says so. Proposal: have `eval prior --dataset db` annotate each miss with
+  "(deployed -O3 = X, rank R)" so the evidence-first rescue is visible in the same view, not two commands apart.
+- **`eval failures` was excellent** — the `(kernel, error) + shared knobs` clustering pinned Findings 3 and 4 to exact
+  knob sets with zero log grepping; this is the view that made the codegen bugs actionable. No change needed.
+- **`pgrep -f` self-matched the monitor.** A polling loop containing the tune command string matched its own argv, so
+  "is the tune still running?" falsely reported YES after exit; had to cross-check with `ps -C python`. Minor, but worth
+  a note for anyone scripting around `deplodock tune`.
+- **No NCU this run** — deliberately skipped to avoid re-launching the hanging attention kernel under `ncu` and to keep
+  the run focused on prior guidance. The codegen findings (3–5) would each benefit from an `ncu compare` follow-up.
 
-**Many-step detours.**
-- **Reproducer attribution is misleading for SDPA (Finding 2).** It took a `run --ir … --bench` per kernel to discover
-  the "80 µs" rows are 4–5-kernel re-lowerings whose matmul is 6.5 µs. *Proposal:* `62_kernel_bench.json` and
-  `kernels.html` should carry the sub-kernel breakdown the `run --ir` knob table already prints, or flag rows where the
-  reproducer re-lowers to >1 kernel. This is the single biggest "data existed only after manual drilling" item.
-- **Reservoir -O3 vs reproducer -O3 looked like a 2–6× contradiction** until the decomposition explained it. An
-  `eval variants` note like "reproducer re-lowers to N kernels; this -O3 row is the named kernel only" would have saved
-  the confusion.
+---
 
-**Flakiness / environment.**
-- The serve A/B needed `-- --gpu-memory-utilization 0.8`: vLLM's default 0.9 util wanted 28.19 GiB but only ~27 GiB was
-  free (the ~3.7 GiB display baseline on a workstation 5090, plus a leaked ~4 GiB CUDA context from an earlier drill).
-  *Proposal:* `deplodock serve` could default `gpu_memory_utilization` lower, or surface a clear "free X, need Y" hint
-  instead of a raw vLLM `RuntimeError`. Also: the per-kernel drills leak GPU memory (orphan contexts) — worth a cleanup
-  between GPU steps.
+## Autonomous e2e-perf session (2026-06-26, RTX 5090) — model now runs; SDPA is the wall
 
-**Output friction.**
-- `--ab` **silently skips un-promotable pins**: pinning the reservoir's `RING=2` configs printed "compile/bench of the
-  pinned config failed (DEPLODOCK_RING=2 pinned but cannot fire: BUFFER_COUNT=2 not promotable …) — skipping its row"
-  and continued. Easy to miss in a long table; the skip should be louder (or surfaced in a summary line).
-- The plugin compile crash (Finding 1) only shows the real cause in the *separate* vLLM server log
-  (`/tmp/deplodock-serve-*.log`), not in the `deplodock serve` stdout (which shows only "Engine core initialization
-  failed"). *Proposal:* `deplodock serve` should tail the root-cause exception (it already prints "Log tail" but
-  truncates above the `LoweringError`).
+Goal: get the layer-0 e2e to run and perform reasonably. Two fixes landed (committed) and the bottleneck was
+root-caused with **nsys ground truth** (the deplodock bench harness mis-attributes per-kernel time — see below).
 
-**Prior reports.** None existed (the reference `plans/qwen3-embedding-layer0-*-tune-findings.md` the skill cites were
-deleted in `8727fbb5 delete executed plans`); this report was written fresh. The analysis CLI the skill leans on
-(`eval variants/failures/prior/knobs`, `run --ab`, the `ncu compare` table, `compare`) all worked and carried the
-triage — the main gap is the SDPA per-kernel attribution above.
+**Fixes committed**
+
+1. `tile: symbolic streaming flash deploys FA-2 shared-score (chain_build) by default` — the symbolic SDPA no longer
+   hangs the watchdog / aborts the e2e bench (Finding 1's real fix); the model now runs end to end with correct output
+   (`max_diff 0.0039` vs eager at the hint).
+2. `kernel: cooperative WarpShuffle uses __activemask()` — a whole-CTA cooperative reduce with `BR < warp_size` launches
+   a partial warp; the hard-coded `0xffffffff` mask named absent lanes (UB). Correctness hygiene.
+
+**nsys ground truth at the deployment seq (512).** The deplodock `run --bench` per-kernel TABLE mis-attributes (it
+blamed `k_mean_linear_reduce` / k-norm at 7864 µs and the SDPA at 14 µs) — nsys shows the opposite. The whole-program
+number is right (~8.8 ms ≈ Eager 224 µs → **0.02×**); only the per-launch "solo window" attribution is scrambled. nsys
+per-kernel (uncaptured, seq=512):
+
+```
+k_sdpa_linear_reduce   8.16 ms/call   <-- ~90% — the wall (the streaming flash)
+k_linear_0837e7        0.21 ms/call   <-- the second cost (a real linear)
+k_mean_linear_reduce   2.4 µs         <-- the "28 ms catastrophe" was pure harness mis-attribution
+… all other kernels    2–40 µs each
+```
+
+**No capture penalty — it's seq, not capture.** An earlier read suggested the SDPA ballooned 325 µs → 8 ms under
+CUDA-graph capture; that was a confound. The 325 µs was the forward at the **trace seq (32)**; the bench runs at the
+**hint (512)**. nsys of an **uncaptured** forward at seq=512 shows the SDPA at **8.16 ms** — identical captured and
+uncaptured. The SDPA is genuinely ~8 ms at the deployment length, period (O(seq²) and the wall regardless of capture).
+
+**Why it can't be cheap (yet).** The symbolic-`seq_len` streaming flash is a **scalar serial-KV** nest: each query
+thread streams all `seq` keys, **re-reading K/V from gmem with no smem tile sharing across queries**, at low occupancy
+(block 8 / 168 regs). Eager's flash shares K/V tiles in smem (and uses tensor cores) and runs the **whole layer** in
+224 µs. So eager-competitive symbolic attention needs the **smem-tiled / tensor-core streaming flash for a symbolic
+axis** — `warp_chain` / `warp_chain_eligible` is **static-only** today, and `chain_build` + cooperative-KV (shared score
+AND parallel KV) is the explicitly-"not wired yet" combination (`_chain_applicable` refuses `BR > 1`). This is the large
+remaining piece — real architecture work, checkpointed rather than half-built autonomously.
+
+**Dead end checked — the materialized SDPA is INCORRECT for dynamic seq.** The tempting shortcut is to route symbolic
+SDPA to the score-materializing decomposition (QK^T → softmax → P@V, which reaches the tensor-core matmul tier; the
+bare-SDPA bench showed 861 µs vs 6663 µs streaming). It is **wrong** at runtime `seq < hint`: the masked-N QK^T
+**zero-fills** the masked keys, but softmax needs **−inf** (`exp(0)=1` spuriously adds the masked keys to the
+denominator). It only matched torch because every bench is at `seq=hint=512` (no masked region) — a focused test at
+seq=8/16/37 fails. So `010_recognize_flash`'s forcing of flash for symbolic SDPA is a **correctness** guard (the
+streaming flash masks the score to −inf in the stream, `_mask_carrier`), not just routing; making the materialized path
+correct needs the −inf mask propagated into the score before softmax (non-trivial). **The streaming flash stays the
+only correct symbolic SDPA today** — which is exactly why its speed is the gating item.
+
+**Smaller, tractable next steps (do not reach eager parity, but real):**
+
+- **Chain thread-budget mis-allocation.** `070_coop_reduce._streaming_leaves` fans out `thread_offers` as a balanced
+  `(t_n, t_m)` over `(inner_n, outer_m)`, but `chain_build` forces the P@V output `d` to a REGISTER axis — the threads
+  spent on `d` are **wasted**, leaving the query (`m`) under-threaded (block 8). The chain free-tile fork should put the
+  whole budget on `m_axis`. Improves occupancy; still memory-bound until K/V smem tiling lands.
+- **Per-op tune benches symbolic kernels at the trace seq, not the hint** — the prior ranks the SDPA on cheap seq≈32
+  numbers while deployment is seq=512 (O(seq²)), so its SDPA pick is mis-ranked. Bench symbolic per-op slices at
+  `DEFAULT_SEQ_HINT`.
+- **Bench-harness per-kernel attribution is wrong** (blames k-norm; nsys says SDPA). The whole-program number is fine;
+  the per-launch solo window is not. Trust nsys until fixed.
+
+**Status:** model **works** (was a hard hang); the k-norm "28 ms catastrophe" was a harness mis-attribution (real
+2.4 µs); no capture penalty (the SDPA is ~8 ms at seq=512 captured AND uncaptured). Reasonable (eager-class) e2e perf is
+gated on the **smem-tiled / tensor-core symbolic streaming flash** — sharing K/V tiles across queries (today's scalar
+serial-KV nest re-reads K/V per query, the memory-bound wall) and using tensor cores. That is the next major task: real
+architecture work, checkpointed rather than half-built autonomously.

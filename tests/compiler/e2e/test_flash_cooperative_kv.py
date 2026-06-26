@@ -1,5 +1,4 @@
-"""Flash attention with a COOPERATIVE-K (KV split across threads) reduce — Step 4
-of ``plans/atomic-free-monoid-combine.md``.
+"""Flash attention with a COOPERATIVE-K (KV split across threads) reduce.
 
 The deployed scalar flash kernel kept its KV (online-softmax ``Monoid``) reduce
 serial — one thread per output element, the KV axis unparallelized. Step 4 routes
@@ -51,7 +50,7 @@ def test_cooperative_flash_matches_torch(monkeypatch, br, B, H, S, D):
     assert len(kernels) == 1, f"flash should fuse to one kernel, got {len(kernels)}"
     src = compiled.nodes[kernels[0]].op.kernel_source
     # The cross-thread monoid combine: __shfl_xor_sync (warp path, BR<=32) or a
-    # per-component smem tree (MonoidTreeHalve, BR>32). Scalar flash has no other
+    # per-component smem tree (TreeHalve, BR>32). Scalar flash has no other
     # smem, so either marker confirms the KV reduce went cooperative.
     assert "__shfl_xor_sync" in src or "_smem" in src, "cooperative-KV flash must carry the cross-thread monoid combine"
 

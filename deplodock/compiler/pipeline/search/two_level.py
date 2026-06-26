@@ -21,7 +21,7 @@ pass index:
 - **Outer** (:func:`run_two_level_tune`) drives the graph-changing passes —
   ``frontend`` + ``loop`` plus the pre-partition head of ``lowering/tile``
   (:func:`outer_pipeline`), where the structural fork emitters live (today
-  ``005_split_demoted``'s keep-vs-split offer). A terminal is the state where
+  ``010_split_demoted``'s keep-vs-split offer). A terminal is the state where
   the cursor reaches ``partition_loops`` with every structural fork resolved —
   every op post-fusion and structurally final, split producers/consumers
   included as real ``LoopOp`` nodes. Each terminal is a candidate fused graph;
@@ -64,7 +64,6 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
 from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.policy.greedy import PARTITION_RULE
 from deplodock.compiler.pipeline.search.slice import single_node_graph
 
 if TYPE_CHECKING:
@@ -73,11 +72,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ``PARTITION_RULE`` (imported from the greedy policy, which prices kernels at
-# that fork) is the rule that finalizes the kernel set: everything in
-# ``lowering/tile`` *before* it is a structural (kernel-set-changing) decision
-# the outer search owns; everything from it on is op-variant lowering the
-# inner search tunes.
+# The structural / op-variant boundary is the ``split`` phase: the keep-vs-cut
+# ``CUT`` offer is the only kernel-set-changing decision, so the outer search owns
+# ``frontend`` + ``loop`` + ``split`` and the inner tunes everything from
+# ``enumeration`` (tiling) on — see :func:`outer_pipeline`.
 
 # Lowering-only passes (post-fusion): ``tile → kernel → cuda``. The inner
 # per-op search runs these on a single-node slice so the finalized LoopOp body
@@ -92,30 +90,28 @@ LOWERING_PASSES = CUDA_PASSES[len(LOOP_PASSES) :]
 
 
 def outer_pipeline() -> Pipeline:
-    """The graph-changing passes the outer search drives: ``frontend`` +
-    ``loop`` (any fusion forks) **plus the pre-partition head of
-    ``lowering/tile``** — the structural fork emitters that change which
-    kernels exist before partition finalizes them (today ``005_split_demoted``;
-    the boundary is the *effect*, not the pass index — see
-    ``plans/structural-forks-in-two-level.md`` step 2). An outer terminal is a
-    fused graph whose kernel set is final: the cursor reached
-    :data:`PARTITION_RULE` with every structural fork resolved, so split
-    producers/consumers are real ``LoopOp`` nodes picked up by
-    :func:`_inner_reward_async` like any kernel — own slice, own patience, own
-    progress leaf, deduped by ``op_cache_key`` across layers and terminals.
+    """The graph-changing passes the outer search drives: ``frontend`` + ``loop``
+    (any fusion forks) **plus the ``split`` phase** — the structural fork emitter
+    (``010_split_demoted``'s keep-vs-cut ``CUT`` offer), the only move that changes
+    *which kernels exist*. An outer terminal is a graph whose kernel set is final:
+    the keep(SMEM) side is one fused ``TileGraphOp`` (``seed_fused``), the cut side
+    its producer + consumer; :func:`_inner_reward_async` picks each up as its own
+    slice (own patience, own progress leaf, deduped by ``op_cache_key``) and tunes
+    its tiling via :data:`LOWERING_PASSES`.
 
-    Sub-partition splices (``017_atomic_free_splitk``'s combine) stay on the
-    inner slice-sum path — their trigger knob (``SPLITK``) doesn't exist until
-    partition runs."""
+    Tiling (``enumeration``/partition) is **inner**, deliberately NOT driven here:
+    a tile-knob fork (``MMA`` / ``BN`` / …) does not change the kernel set, so
+    branching the OUTER tree on it would explode the tree (every tile combination ×
+    every structural choice) with no kernel-set distinction. The split boundary is
+    exactly where the kernel set is fixed but tiling is not — the right outer/inner
+    seam (``plans/structural-forks-in-two-level.md`` step 2). Sub-partition splices
+    (``140_atomic_free_splitk``'s combine) likewise stay inner — their trigger knob
+    (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
-    tile_rules = [r.name for r in Pass.load("lowering/tile", index=len(passes)).rules]
-    head = tile_rules[: tile_rules.index(PARTITION_RULE)]
-    # Re-load with ``select`` (rather than slicing the loaded rules) so the
-    # partial pass's ``declared_knobs`` covers only the pre-partition rule
-    # modules — the pass-boundary OFF-fill must not stamp post-partition
-    # lowering knobs onto fused LoopOps (that would churn every op_cache_key
-    # away from what the assembled greedy run derives).
-    passes.append(Pass.load("lowering/tile", index=len(passes), select=set(head)))
+    # ``010_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary
+    # OFF-fill stamps nothing onto the fused/cut ops (their ``op_cache_key`` stays what
+    # the assembled greedy run derives).
+    passes.append(Pass.load("lowering/tile/split", index=len(passes)))
     return Pipeline(passes=passes)
 
 
@@ -173,28 +169,37 @@ def _point_stats(us: float) -> PerfStats:
 
 
 def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
-    """Post-fusion kernel nodes — ``(node_id, op)`` for every ``LoopOp``."""
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    """Post-fusion kernel nodes — ``(node_id, op)`` for every kernel-bearing op.
 
-    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)]
+    An outer terminal sits at the ``split`` boundary (:func:`outer_pipeline`): the
+    keep(SMEM) side is a fused ``TileGraphOp`` (``seed_fused``), the cut side its
+    producer + consumer ``LoopOp``s (un-built — the inner tiles them). Count both
+    ``LoopOp`` and ``TileGraphOp`` so every kernel of either side gets its own inner
+    slice."""
+    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+
+    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, (LoopOp, TileGraphOp))]
 
 
 def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
     """Composed value-of-position training rows for structural decompositions.
 
-    A terminal's kernels attribute back to the op a structural decision was
-    taken on via ``Op.source`` (``Candidate.apply`` stamps loop→loop splice
-    hops; the keep-side ``Op`` rebind stamps as always). Group the terminal's
-    unique kernels by that pre-decision ancestor + the decision-knob delta the
-    hop stamped (``SPLIT_CONE: True/False``, never the per-body ``S_*``
-    restamps), and label each group with the **Σ of its kernels' tuned bests**
-    — the kernel-set cost of taking that side. The row's features
-    (``{ctx, pre-decision op knobs, decision delta}``) are exactly what the
-    outer MCTS's PUCT queries at the structural fork's siblings, so these rows
-    are what make that selection informed instead of uniform. They are
-    estimates for *search ordering*; greedy's deploy decision keeps the sharper
-    compositional probe (``policy/greedy._pick_structural``)."""
-    from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+    A terminal's kernels (post-build ``TileGraphOp``s) attribute back through
+    ``Op.source`` to the op the structural decision was offered on. Group the
+    terminal's unique kernels by that **pre-decision site** — the deepest
+    ``S_*``-stamped *loop* ancestor (the original demoted matmul, before the
+    fission re-stamped each fragment's own shallower ``S_*``) — plus the decision
+    delta (the ``CUT`` mask ``"1"``/``"0"``, read off the kernel), and label each
+    group with the **Σ of its kernels' tuned bests** — the kernel-set cost of that
+    side. Both cut fragments + the keep kernel converge on the one site, so the
+    cut's producer+consumer sum into a single kernel-set Σ. The row's features
+    (``{ctx, site S_*, decision delta}``) are exactly what the outer MCTS's PUCT
+    queries at the structural fork's siblings, so these rows make that selection
+    informed instead of uniform. They are estimates for *search ordering*; greedy's
+    deploy decision keeps the sharper compositional probe
+    (``policy/greedy._pick_structural``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain, structural_decision_delta  # noqa: PLC0415
 
     best = {r.op_key: r.best_us for r in per_op}
     unique: dict[str, object] = {}
@@ -204,20 +209,21 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
             unique[key] = op
     groups: dict[tuple, tuple[dict, list[float | None]]] = {}
     for key, op in unique.items():
-        site = op.source
-        if site is None or dialect_of(site) != "loop":
+        delta = structural_decision_delta(op.knobs)
+        if not delta:
+            continue  # a kernel from no structural decision (no offer fired)
+        site = None
+        for anc in source_chain(op):
+            if dialect_of(anc) == "loop" and any(k.startswith("S_") for k in getattr(anc, "knobs", {})):
+                site = anc  # keep the LAST (deepest) — the pre-decision offer op
+        if site is None:
             continue
         site_key = op_cache_key(site)
         if site_key is None:
             continue
-        # The decision delta: knobs this hop introduced. ``S_*`` keys are
-        # excluded — fragment kernels restamp their own structural features,
-        # which describe the child body, not the decision.
-        delta = {k: v for k, v in op.knobs.items() if k not in site.knobs and not k.startswith("S_")}
-        if not delta:
-            continue  # not a decision hop (e.g. a name-only rebind ancestor)
         gkey = (site_key, tuple(sorted((k, str(v)) for k, v in delta.items())))
-        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site.knobs, **delta}, []))
+        site_s = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
+        feats, labels = groups.setdefault(gkey, ({**ctx.features(), **site_s, **delta}, []))
         labels.append(best.get(key))
     return [(feats, float(sum(labels))) for feats, labels in groups.values() if labels and all(us is not None for us in labels)]
 
@@ -400,7 +406,7 @@ async def run_two_level_tune(
     because its terminal reward comes from the inner tuning, not
     ``_bench_terminal_async``. The outer pipeline (:func:`outer_pipeline`) runs
     through the pre-partition tile rules, so each structural fork (the
-    keep-vs-split offer of ``005_split_demoted``) branches the outer tree —
+    keep-vs-split offer of ``010_split_demoted``) branches the outer tree —
     one terminal per kernel-set, compared by Σ-per-op cost. A graph with no
     structural offers yields a single terminal and this reduces to "tune each
     op once, sum, assemble". Identical offer sites within one trajectory
@@ -420,7 +426,7 @@ async def run_two_level_tune(
 
     prior = load_prior(seed=prior_seed)
     # The global prior drives the outer PUCT too: at a structural fork the
-    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, decision
+    # siblings' ``_node_knobs`` are ``{ctx, pre-decision op knobs, CUT decision
     # knob}`` — the exact feature shape :func:`_decomposition_rows` trains on
     # below — so once composed Σ rows accumulate, the outer descends the
     # predicted-cheaper kernel set first instead of emission order.

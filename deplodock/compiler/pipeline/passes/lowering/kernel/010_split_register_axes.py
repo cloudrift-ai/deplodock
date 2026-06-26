@@ -17,7 +17,7 @@ When no REGISTER tags are present (non-matmul kernels), the pass
 skips. Stamps ``FM`` / ``FN`` so the planner-stamped values persist
 and the rule is idempotent on a second visit.
 
-For MMA kernels (``plans/mma-fragment-factorization.md``), the sibling
+For MMA kernels, the sibling
 ``005_lower_atom_tile`` pass has already replaced the AtomTile-wrapped
 matmul body with an Mma* fragment chain by the time this pass runs.
 This pass then sees the same ``RegisterTile`` wrapper as in the scalar
@@ -37,7 +37,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Stmt
 from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
+from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -129,7 +129,19 @@ def _replicate_register_tiles(body: Body, *, in_k_serial: bool = False) -> tuple
             # independently and re-attached via ``with_bodies``. A K serial
             # loop body propagates ``in_k_serial=True`` so any reduce fold from
             # below keeps bubbling until the loop closes.
-            child_in_k = isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner")
+            #
+            # A ``StageBundle`` is **transparent** to the K-serial nesting: it
+            # wraps the staged K_i loop *inside* K_o (gmem→smem cooperative load +
+            # the inner reduce loop), so a reduce fold generated under it must keep
+            # bubbling past K_o, not stop at the bundle scope. Propagate the
+            # current ``in_k_serial`` through it rather than resetting to False
+            # (without this, a multi-stage fp16 matmul drops the FK cross-accumulator
+            # fold inside K_o — its master accumulators are then out of scope at the
+            # post-K_o store).
+            if isinstance(s, StageBundle):
+                child_in_k = in_k_serial
+            else:
+                child_in_k = isinstance(s, SerialTile) and s.kind in ("serial_outer", "stage_inner")
             new_bodies: list[Body] = []
             child_folds: list[Stmt] = []
             for sub in s.nested():
@@ -307,7 +319,16 @@ def _replicate_along_axis(
             else:
                 wrapper_bound = frozenset()
             own_refs_axis = axis not in wrapper_bound and any(axis in e.free_vars() for e in s.exprs())
-            if nested and not own_refs_axis:
+            if isinstance(s, StageBundle) and nested and not own_refs_axis:
+                # A StageBundle's COMPUTE phase is a cooperative slab fill (the
+                # SMEM fused edge's producer — it writes the WHOLE slab, every
+                # register cell; ``emit_compute_phase`` re-iterates its cache
+                # axes), so it must NOT be register-replicated. Only the consumer
+                # BODY descends — its Loads read the cell's own slab position and
+                # so replicate across the REGISTER axis. (Source-side state stays
+                # untouched: the cache-axis Vars are smem-local, masked above.)
+                out.append(s.with_bodies((s.compute if s.compute is not None else Body(()), go(s.body))))
+            elif nested and not own_refs_axis:
                 # Wrap-body Stage's consumer body must be descended so the
                 # consumer Loads inside the staged scope replicate across the
                 # REGISTER axis. Stage's source-side state (cache_axes, origin)

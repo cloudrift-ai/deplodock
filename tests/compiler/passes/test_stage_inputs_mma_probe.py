@@ -1,6 +1,6 @@
-"""MMA staging by default — M6 of ``plans/mma-smem-staging.md``.
+"""MMA staging by default.
 
-After M6 the ``ATOM_KIND`` skip in ``020_stage_inputs`` is gone and
+The ``ATOM_KIND`` skip in ``020_stage_inputs`` is gone and
 MMA matmuls stage through smem unconditionally. This test pins that
 invariant: a small MMA matmul produces at least one ``StageBundle``
 post-tile-lowering. End-to-end correctness is covered by
@@ -23,6 +23,7 @@ from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.tile.ir import StageBundle
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import mma_atom
 
 
 def _mma_matmul_graph(*, M: int = 64, N: int = 64, K: int = 64) -> Graph:
@@ -96,5 +97,5 @@ def test_mma_matmul_stages_through_smem(monkeypatch):
     g = _mma_matmul_graph()
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
     assert _has_stage_bundle(out)

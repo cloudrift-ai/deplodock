@@ -392,12 +392,14 @@ def test_evidence_skipped_off_o3_regime():
     assert p.evidence_pick([{"S_sig": 7.0, "H_opt": 1.0, "FM": 6}]) is None
 
 
-def test_evidence_normalizes_sequence_knobs():
-    """OVERHANG recorded as a list (YAML) matches a tuple-valued candidate (the
-    seed-report ``_knob_eq`` lesson)."""
+def test_evidence_matches_masked_structural_feature():
+    """``S_masked_*`` (the per-role structural feature that replaced the OVERHANG
+    knob) joins the ``S_*`` evidence signature: a masked candidate matches a
+    masked -O3 row, and the scalar float hashes cleanly into the frozenset
+    signature (the whole point of moving it off the sequence-valued knob)."""
     p = CatBoostPrior(seed=0)
-    p.add_rows([_o3_row({"OVERHANG": ["a0"], "FM": 6}, 24.0)])
-    ev = p.evidence_pick([_cand({"OVERHANG": ("a0",), "FM": 6})])
+    p.add_rows([_o3_row({"S_masked_m": 1.0, "FM": 6}, 24.0)])
+    ev = p.evidence_pick([_cand({"S_masked_m": 1.0, "FM": 6})])
     assert ev == (0, 24.0)
 
 

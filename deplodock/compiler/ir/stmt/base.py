@@ -237,32 +237,35 @@ def op_to_expr(fn: str, inputs: list[Expr]) -> Expr:
     raise NotImplementedError(f"render: elementwise fn={fn!r} not supported")
 
 
-def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None = None) -> list[str]:
+def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None = None, *, dtype=None) -> list[str]:
     """Render a monoid ``merge`` / ``combine_states`` program (a tuple of
-    ``Assign``) in fp32. An ``Assign`` whose target is in ``state_names`` is a
-    reassignment of an already-declared carried value (``name = …;``); every
-    other ``Assign`` declares a local fp32 temp (``float t = …;``). Statement
-    order is load-bearing — a state update must follow every read of that state's
-    old value (the carrier builder guarantees it).
+    ``Assign``) at ``dtype`` (a :class:`DataType`; ``None`` → fp32). An ``Assign``
+    whose target is in ``state_names`` is a reassignment of an already-declared
+    carried value (``name = …;``); every other ``Assign`` declares a local temp
+    (``<ty> t = …;``). Statement order is load-bearing — a state update must follow
+    every read of that state's old value (the carrier builder guarantees it).
 
-    Shared by ``Monoid.render`` (the streaming step) and the kernel-IR
-    cross-thread monoid combine primitives (the state-merges-state step), so both
-    spell the carrier's algebra identically."""
+    Shared by ``Monoid.render`` (the streaming step, fp32) and the kernel-IR
+    cross-thread combine primitives ``WarpShuffle`` / ``TreeHalve`` (the
+    state-merges-state step, at the carrier's dtype — fp32 for monoids, the
+    accumulator dtype for a degenerate scalar reduce), so all spell the carrier's
+    algebra identically."""
     if pad is None:
         pad = _pad(ctx.indent)
-    ty = ctx.type_name("f32")
+    dt = "f32" if dtype is None else dtype.name
+    ty = ctx.type_name(dt)
     sset = set(state_names)
     out: list[str] = []
     for a in program:
-        # The merge runs in fp32 — cast any non-f32 arg (e.g. a raw ``__half``
-        # value loaded into the partial, as in fp16 flash's ``p · v``) so the
-        # operator isn't ambiguous. The cast is a no-op for f32 args.
-        arg_exprs = [Var(x) if ctx.ssa_dtypes.get(x, "f32") == "f32" else CastExpr("float", Var(x)) for x in a.args]
+        # The merge runs at ``dt`` — cast any arg with a different dtype (e.g. a raw
+        # ``__half`` value loaded into the partial, as in fp16 flash's ``p · v``) so
+        # the operator isn't ambiguous. The cast is a no-op for matching args.
+        arg_exprs = [Var(x) if ctx.ssa_dtypes.get(x, dt) == dt else CastExpr(ty, Var(x)) for x in a.args]
         rhs = op_to_expr(a.op.name, arg_exprs).render(ctx)
         if a.name in sset:
             out.append(f"{pad}{a.name} = {rhs};")  # reassign carried state
         else:
-            ctx.ssa_dtypes[a.name] = "f32"
+            ctx.ssa_dtypes[a.name] = dt
             out.append(f"{pad}{ty} {a.name} = {rhs};")  # local temp
     return out
 
@@ -576,6 +579,27 @@ class ReduceCarrier(Stmt):
 
     def partial_deps(self) -> tuple[str, ...]:
         return self.deps()
+
+    def combine_partials(self) -> tuple:
+        """The operator that folds two FULLY-reduced partial states — the ONE
+        recombine a decomposition move (split-K / split-KV / cooperative-tree)
+        reads, independent of how it is realized (atomic / warp-shuffle / smem
+        tree / mma). Returned **as data**: a tuple of :class:`Assign` steps that
+        read the carried state plus a second state operand named by
+        :meth:`combine_operands` and reassign the merged state.
+
+        ``Monoid`` returns its authored ``combine_states``; the additive carriers
+        (``Accum`` scalar fold, ``Mma`` fragment add) return a one-``Assign``
+        op-fold. This is the carrier-side half of
+        ``plans/algebra-licensed-decomposition-moves.md`` (phase 1)."""
+        raise NotImplementedError(f"{type(self).__name__}.combine_partials")
+
+    def combine_operands(self) -> tuple[str, ...]:
+        """The SSA names of the SECOND state operand :meth:`combine_partials`
+        folds in (the first is the carried state itself). ``Monoid``'s is its
+        ``state_b`` (``"<s>__o"`` by default); the additive carriers name theirs
+        ``"<carried>__o"`` to match."""
+        raise NotImplementedError(f"{type(self).__name__}.combine_operands")
 
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:

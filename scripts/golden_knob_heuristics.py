@@ -15,12 +15,14 @@ It treats the problem as offline learning-to-rank, over the SINGLE featurization
 (``knob.knob_features`` — no parallel feature set), covering **every kernel
 regime**: fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise.
 
-  1. For every golden (matmul thread / warp, reduce, pointwise), reconstruct the
-     planner's exact candidate enumeration for that mode and locate the golden row.
-     fp16/bf16 (warp) goldens enumerate BOTH tiers — scalar + warp — since a real
-     fp16 matmul does, so the fit ranks the warp golden against the scalar tile it
-     competes with (the warp-first default greedy's flatten no longer gets from
-     enumeration order).
+  1. For every golden (matmul thread / warp / dyn, reduce, pointwise), reconstruct
+     the planner's exact candidate enumeration for that mode and locate the golden
+     row. Matmul goldens reuse ``analytic._enumerate`` — the SAME gate-narrowed pool
+     ``eval analytic`` and the greedy deploy rank over (fp32 → thread tier, fp16/bf16
+     → the warp tier alone; the block-DAG rework moved the scalar↔warp choice to a
+     structural fork, so a warp golden ranks within the warp tier, not against
+     scalar rows). Reduce / pointwise trace the snippet to an ``IterDag`` and compose
+     the cooperative-reduce / MAP ``_moves`` offers.
   2. Featurize every candidate via ``knob.knob_features`` (the ``D_*`` engineered
      features plus ``MMA_tier``, the warp/scalar tier discriminator — the ``S_*`` /
      ``H_*`` shape/regime features are constant within a shape, so they drop out of
@@ -45,24 +47,14 @@ import math
 import numpy as np
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
 from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import (
-    _enumerate_warp_matmul_impl,
-    enumerate_cartesian,
-)
+from deplodock.compiler.pipeline.search.analytic import _enumerate
 from deplodock.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
     MatmulGoldenConfig,
     PointwiseGoldenConfig,
     ReduceGoldenConfig,
 )
-
-# Knobs each enumeration mode assigns — the projection a golden is matched on.
-_THREAD_KEYS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
-_WARP_KEYS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
-_REDUCE_KEYS = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR", "FK")
-_POINTWISE_KEYS = ("BN", "BM", "FM", "FN", "SPLITK")
 
 
 def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dict:
@@ -80,11 +72,83 @@ def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dic
     return base
 
 
+def _dag_from_snippet(snippet: str, ctx: Context):
+    """Trace a golden's torch snippet and lower it through ``LOOP_PASSES`` (option-0
+    greedy resolve, no GPU) to the first ``LoopOp``'s ``IterDag`` — the shape the
+    reduce / pointwise enumeration offers are composed over. Mirrors
+    ``analytic._matmul_dag`` but regime-agnostic: ``torch.sum`` / ``torch.relu`` have
+    no dedicated frontend op, so the dag comes from the real trace, not a hand-built
+    graph. Returns ``None`` if nothing lowers."""
+    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
+    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline.fork import Fork  # noqa: PLC0415
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
+    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+
+    def _option0(fp):
+        o = fp.options[0]
+        while isinstance(o, Fork) and not o.is_leaf:
+            o = o.expand()[0]
+        return o
+
+    graph = graph_from_code(snippet)[0]
+    terminal, _ = Run(pipeline=Pipeline.build(LOOP_PASSES), ctx=ctx).resolve(graph, _option0)
+    loops = [n.op for n in terminal.nodes.values() if isinstance(n.op, LoopOp)]
+    return iter_dag(loops[0]) if loops else None
+
+
+def _reduce_rows(dag) -> list[dict]:
+    """Cooperative-reduce candidate knob rows: the cartesian of the carrier's
+    cooperative ``(bk, fk, br)`` K-partitions (``coop_reduce_offers``) × the free-row
+    register tile (``reduce_reg_offers``), over the free-axis THREAD tile
+    (``coop_free_threads``). The native rows speak ``MOVE@element`` (``SPLIT@<axis>`` +
+    ``REDUCE@<axis>``); a 1-D reduce (no outer M axis) leaves the M slot degenerate,
+    which the schema-agnostic ``tile_signature`` matches against the golden's
+    ``BM``/``FM`` = 1."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+
+    budget = _moves.Budget()
+    thread = _moves.coop_free_threads(dag)  # free-axis THREAD tile (par)
+    rows = []
+    for bk, fk, br in _moves.coop_reduce_offers(dag):
+        red = _moves.coop_reduce_knobs(dag, (bk, fk, br))  # native REDUCE@<primary>
+        for reg in _moves.reduce_reg_offers(dag, budget, fk):
+            rows.append({**_moves.free_split_knobs(dag, thread, reg), **red})  # par + swept reg
+    return rows
+
+
+def _pointwise_rows(dag) -> list[dict]:
+    """Pointwise (MAP, no reduce) candidate knob rows: the cartesian of the free
+    thread tile (``thread_offers``) × the register tile (``map_reg_offers``). The native
+    rows carry only ``SPLIT@<axis>`` (no ``REDUCE@`` — a MAP nest has no contraction);
+    ``tile_signature``'s degenerate reduce decomposition matches the golden's
+    ``BK=FK=SPLITK=BR=1``."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+
+    budget = _moves.Budget()
+    rows = []
+    for thread in _moves.thread_offers(dag, budget):
+        thr = _moves.thread_knobs(dag, thread)  # par-only SPLIT
+        for reg in _moves.map_reg_offers(dag, budget):
+            rows.append({**thr, **_moves.reg_knobs(dag, thr, reg)})  # complete SPLIT (par×reg)
+    return rows
+
+
 def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
-    """Reconstruct each matmul golden's candidate enumeration (both tiers), pin the
-    golden's index, and featurize every row. Returns ``(name, tier, golden_idx,
-    feats)`` where ``tier`` is ``"thread"``/``"warp"`` and ``feats`` is the per-row
-    ``D_*`` (+ ``MMA_tier``) feature dict.
+    """Reconstruct each golden's candidate enumeration, pin the golden's index, and
+    featurize every row. Returns ``(name, tier, golden_idx, feats)`` where ``tier``
+    is ``"thread"`` / ``"warp"`` / ``"dyn"`` / ``"reduce"`` / ``"pointwise"`` and
+    ``feats`` is the per-row ``D_*`` (+ ``MMA_tier``) feature dict.
+
+    Matmul goldens enumerate via ``analytic._enumerate`` — the SAME gate-narrowed
+    pool ``eval analytic`` and the greedy deploy rank over (fp32 → thread tier,
+    fp16/bf16 → warp tier; the block-DAG rework moved the scalar↔warp choice to a
+    structural fork, so a real fp16 matmul ranks within the warp tier alone, no
+    scalar rows in the pool). A dynamic (``.dynM``) golden enumerates its hint-sized
+    static twin's pool and featurizes with the symbolic-axis stamp (its own weight
+    set). Reduce / pointwise goldens trace their snippet to an ``IterDag`` and
+    compose the cooperative-reduce / MAP ``_moves`` offers.
 
     Each golden is reconstructed under its OWN card's context
     (``Context.from_target(cap, gpu_name=…)``, mirroring ``Sample.from_golden``):
@@ -99,51 +163,37 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
         ctx = Context.from_target(tuple(g.compute_cap), gpu_name=g.gpu_name)
         if isinstance(g, ReduceGoldenConfig):
             # The reduce's free axis (the ``M`` rows) maps to the planner's N axis
-            # (the tuned ``FN`` register tile sweeps it), so enumerate E_M=1, E_N=M.
+            # (the tuned ``FN`` register tile sweeps it): trace E_M=1, E_N=M, E_K=K.
             base = _base(ctx, 1, g.M, g.K)
-            rows = enumerate_cartesian(E_M=1, E_N=g.M, E_K=g.K, ctx=ctx, priority_mode="reduce", n_axis_name="n")
-            keys, tier = _REDUCE_KEYS, "reduce"
+            dag = _dag_from_snippet(g.snippet(), ctx)
+            rows, tier = (_reduce_rows(dag) if dag is not None else []), "reduce"
         elif isinstance(g, PointwiseGoldenConfig):
             base = _base(ctx, g.M, g.N, 1)
-            rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=1, ctx=ctx, priority_mode="pointwise", m_axis_name="m", n_axis_name="n")
-            keys, tier = _POINTWISE_KEYS, "pointwise"
-        elif isinstance(g, MatmulGoldenConfig) and g.dtype == "fp32":
-            base = _base(ctx, g.M, g.N, g.K, dynamic=bool(g.dynamic))
-            rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, priority_mode="matmul", m_axis_name="m", n_axis_name="n")
-            keys, tier = _THREAD_KEYS, ("dyn" if g.dynamic else "thread")
+            dag = _dag_from_snippet(g.snippet(), ctx)
+            rows, tier = (_pointwise_rows(dag) if dag is not None else []), "pointwise"
         elif isinstance(g, MatmulGoldenConfig):
-            base = _base(ctx, g.M, g.N, g.K)
-            atom = ATOM_REGISTRY.get(g.knobs.get("MMA", ""))
-            if atom is None:
-                continue
-            warp_rows = _enumerate_warp_matmul_impl(
-                E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, force_splitk_one=False,
-                atoms=(atom,), m_axis_name="m", n_axis_name="n", m_forced_mask=False, n_forced_mask=False,
-            )  # fmt: skip
-            warp_rows = [r for r in warp_rows if r["WM"] * r["WN"] != 1]
-            # Include the SCALAR tier in the candidate pool: a real fp16 matmul
-            # enumerates both tiers as leaves under one fork tree, so greedy's
-            # flattened pick ranks warp vs scalar directly. Enumerating warp-only
-            # here hid that competition, so the fit never learned to prefer tensor
-            # cores — the cold analytic ranked the scalar tile first for fp16. With
-            # both tiers in the pool the rank objective penalizes "scalar outranks
-            # the warp golden", so the joint fit learns the warp preference (via
-            # ``MMA_tier``, kept below).
-            scalar_rows = enumerate_cartesian(E_M=g.M, E_N=g.N, E_K=g.K, ctx=ctx, priority_mode="matmul", m_axis_name="m", n_axis_name="n")
-            rows = list(scalar_rows) + warp_rows
-            keys, tier = _WARP_KEYS, "warp"
+            dyn = bool(g.dynamic)
+            base = _base(ctx, g.M, g.N, g.K, dynamic=dyn)
+            rows, _ = _enumerate(g.M, g.N, g.K, g.dtype, ctx)
+            tier = "dyn" if dyn else ("thread" if g.dtype == "fp32" else "warp")
         else:
             continue
-        want = tuple(g.knobs.get(k) for k in keys)
-        gidx = next((i for i, r in enumerate(rows) if tuple(r.get(k) for k in keys) == want), None)
+        if not rows:
+            print(f"  !! {g.name}: nothing enumerated — skipping")
+            continue
+        # Match the legacy-recorded golden against the native candidate rows by
+        # schema-agnostic structural signature (free-axis slots + reduce decomp +
+        # atom) — the candidates speak native ``MOVE@element``, the golden YAML legacy
+        # GEMM-letters, so a per-key tuple compare never lines up.
+        want = knob.tile_signature(g.knobs)
+        gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None)
         if gidx is None:
             print(f"  !! {g.name}: golden not in {len(rows)} candidates — skipping")
             continue
         # Keep ``D_*`` geometry/occupancy plus ``MMA_tier`` (the warp/scalar tier
-        # discriminator) — the only non-``D_`` feature the tier choice rides on.
-        # It's constant 0 within a scalar-only shape (fp32 / reduce / pointwise),
-        # so it drops out of those within-shape rankings and only fires where both
-        # tiers compete (fp16 / bf16).
+        # discriminator, where the featurization still emits it) — the ``S_*`` /
+        # ``H_*`` shape/regime features are constant within a shape, so they drop out
+        # of a within-shape ranking.
         feats = [{k: v for k, v in knob.knob_features({**base, **r}).items() if k.startswith("D_") or k == "MMA_tier"} for r in rows]
         cases.append((g.name, tier, gidx, feats))
     return cases

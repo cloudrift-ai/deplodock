@@ -16,6 +16,15 @@ twisted monoid — is done ONCE by the recognizer (``loop/recognize``, which
 emits a `Monoid` carrier); this classification is then a cheap read of that
 carrier.
 
+A twisted monoid **is** a monoid (transport of structure — the rescale-by-max
+bijection conjugates a plain direct-product monoid), so a `Monoid` carrier
+classifies as ``MONOID`` here, the same kind as a scalar `Accum` reduce. The
+``MONOID`` algebra is not where flash's streaming schedule is chosen: that is a
+*structural* property (a tuple `Monoid` carrier streaming over a nested
+contraction), read off the iteration DAG by the tile classifier
+(``lowering/tile/enumeration/_classify``), one layer below the algebra. See
+``plans/twisted-monoid-carrier-design.md``.
+
 The kind is well-defined where the **carrier is present** — i.e. on a `LoopOp`
 body's reduce loops, before the partition planner tiles the carrier away (a
 matmul becomes `Mma`/`ldmatrix` fragments; a `Monoid` combine becomes an
@@ -28,7 +37,7 @@ from enum import Enum
 
 from deplodock.compiler.ir.stmt.base import ReduceCarrier
 from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma, Monoid
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma
 
 
 class AlgebraKind(Enum):
@@ -39,9 +48,8 @@ class AlgebraKind(Enum):
     """
 
     MAP = "map"  # pointwise / functor — a non-reduce scope (the default)
-    MONOID = "monoid"  # a plain associative reduce        (carrier: Accum)
+    MONOID = "monoid"  # an associative reduce (carrier: Accum, or a tuple `Monoid` — flash / Welford)
     SEMIRING = "semiring"  # a contraction / matmul           (carrier: Mma, or matmul-shaped Accum)
-    TWISTED_MONOID = "twisted_monoid"  # an online / coupled reduce        (carrier: Monoid — flash, Welford, …)
     SCAN = "scan"  # prefix / causal — reserved, out of scope v1
 
 
@@ -98,22 +106,20 @@ def classify_algebra(loop) -> AlgebraKind:
     """Classify a loop scope by its carrier — the cheap bottom-up read.
 
     - ``MAP`` — a non-reduce scope (no `ReduceCarrier` in the immediate body).
-    - ``TWISTED_MONOID`` — a recognized `Monoid` carrier (flash's online softmax
-      and any future Welford / argmax catalog entry); its catalog identity is the
-      carrier's own (`FlashCombine` ⟺ ``lse``).
     - ``SEMIRING`` — a matmul-shaped reduce whose product distributes over its
       reduce (`Mma`, or an `Accum` fed by a distributing product).
-    - ``MONOID`` — a plain associative reduce (an `Accum` whose combine is
-      associative — `has_identity` makes it maskable).
+    - ``MONOID`` — an associative reduce: a scalar `Accum` (a plain reduce), OR a
+      recognized tuple `Monoid` carrier (flash's online softmax / Welford). A
+      twisted monoid is a monoid (transport of structure), so both land here;
+      `has_identity` makes either maskable. The streaming-flash *schedule* is
+      selected structurally one layer below, not by a distinct algebra kind.
     - ``MAP`` (fallback) — a reduce the analysis doesn't recognize (no
       regression: callers keep their current path)."""
     if not getattr(loop, "is_reduce", False):
         return AlgebraKind.MAP
-    body = loop.body
-    if any(isinstance(s, Monoid) for s in body):
-        return AlgebraKind.TWISTED_MONOID
     if _is_semiring_contraction(loop):
         return AlgebraKind.SEMIRING
+    body = loop.body
     carriers = [s for s in body if isinstance(s, ReduceCarrier)]
     if carriers and all(c.associative for c in carriers):
         return AlgebraKind.MONOID

@@ -22,13 +22,13 @@ Tile body, post-order):
    destination-buffer dtype, replace the run with one widened ``Write``.
 3. Otherwise advance one stmt.
 
-## Why this lives at the Kernel-IR boundary
+## Why this runs at the TileOp level
 
 Same reason as ``050_vectorize_loads``: the decision needs the
-destination-buffer dtype, which comes from graph node dtypes for ``KernelOp.outputs`` keys
-or the graph node's dtype. Running here keeps both pieces of context in
-one place and ensures the IR-visible form (``--ir kernel``) reflects
-the optimization.
+destination-buffer dtype (from ``top.outputs`` / ``top.inputs``), which
+Body alone doesn't carry. This pass matches ``TileOp`` and runs before
+``100_materialize_tile``, so the IR-visible form (``--ir kernel``)
+reflects the optimization.
 """
 
 from __future__ import annotations

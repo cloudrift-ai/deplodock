@@ -1,13 +1,14 @@
-"""Carrier-general cross-partition reduce kernel (Step 3a of
-``plans/atomic-free-monoid-combine.md``).
+"""Carrier-general cross-partition reduce kernel.
 
-``017``'s ``build_monoid_reduce_tileop`` builds an atomic-free reduce kernel
-driven by a ``Monoid`` carrier: per-partition state slabs in a
-``workspace[S, M, N]``, ``identity``-seeded, folded along ``S`` via the carrier's
-``combine_states``. The additive matmul split-K still rides the bit-identical
-``Accum`` sum (``_build_reduce_tileop``); this test exercises the NON-additive
-``(m, l)`` online-softmax monoid through the new builder directly — a hand-built
-scalar monoid split that merges S partition states and matches numpy.
+The atomic-free split-K combine block, rebuilt against the block-DAG Tile IR:
+``enumeration/_partition.monoid_reduce_tilegraph`` builds a combine kernel driven by a
+``Monoid`` carrier — per-partition state slabs in a ``workspace[S, M, N]``,
+``identity``-seeded, folded along ``S`` via the carrier's ``combine_states`` (the new-IR
+successor of the deleted ``017``'s ``build_monoid_reduce_tileop``). The additive matmul
+split-K rides the bit-identical ``Accum`` sum (:func:`additive_reduce_tilegraph`); this
+test exercises the NON-additive ``(m, l)`` online-softmax monoid through the builder
+directly — a hand-built scalar monoid split that merges S partition states and matches
+numpy.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import monoid_reduce_tilegraph, reduce_tilegraphop
 
 
 def _has_cuda() -> bool:
@@ -31,13 +33,6 @@ def _has_cuda() -> bool:
         return False
 
 
-def _load_builder():
-    import importlib
-
-    mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.017_atomic_free_splitk")
-    return mod.build_monoid_reduce_tileop
-
-
 def _ml_carrier():
     from tests.compiler.test_cooperative_combine import _ml_combine
 
@@ -45,9 +40,8 @@ def _ml_carrier():
 
 
 def _reduce_graph(s: int, m: int, n: int) -> Graph:
-    build = _load_builder()
     carrier = _ml_carrier()
-    reduce_op = build(
+    tg = monoid_reduce_tilegraph(
         carrier=carrier,
         init_ops=(ElementwiseImpl("maximum"), ElementwiseImpl("add")),
         workspaces=("ws_m", "ws_l"),
@@ -59,6 +53,7 @@ def _reduce_graph(s: int, m: int, n: int) -> Graph:
         out_value="l",  # the merged denominator l_global
         name="monoid_ml__reduce",
     )
+    reduce_op = reduce_tilegraphop(tg)
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("ws_m", (Dim(s), Dim(m), Dim(n))), node_id="ws_m")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("ws_l", (Dim(s), Dim(m), Dim(n))), node_id="ws_l")

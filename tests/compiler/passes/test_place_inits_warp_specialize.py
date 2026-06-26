@@ -1,18 +1,20 @@
 """Regression test for ``020_place_inits`` on a warp-specialized body.
 
-The warp-specialize materializer wraps a ``WarpSpecialize`` inside a
-``WarpTile(role)``; the consumer half owns the reduce loop and its
-``Accum``. ``020_place_inits`` must descend into ``WarpSpecialize`` and
-place the accumulator ``Init`` at the **consumer_body head** (the
-per-consumer-thread scope just above the K loop).
+A ``WarpSpecialize`` is wrapped inside a ``WarpTile(role)``; the consumer half owns the
+reduce loop and its ``Accum``. ``020_place_inits`` must descend into ``WarpSpecialize`` and
+place the accumulator ``Init`` at the **consumer_body head** (the per-consumer-thread scope
+just above the K loop).
 
-The bug this guards against: before the fix, ``_open_scope`` recursed
-into the ``WarpTile`` but ``_place_inits_in_scope`` /
-``_accums_under_reduces_only`` didn't understand ``WarpSpecialize``, so
-**no explicit Init was placed at all**. The renderer then fell back to
-its default per-reduce-loop init, which lands *inside* the consumer K
-loop — resetting the accumulators every K chunk and corrupting the
-result (the WS=1 ``max_diff ~228`` accuracy failure).
+The bug this guards against: before the fix, ``_open_scope`` recursed into the ``WarpTile``
+but ``_place_inits_in_scope`` / ``_accums_under_reduces_only`` didn't understand
+``WarpSpecialize``, so **no explicit Init was placed at all**. The renderer then fell back to
+its default per-reduce-loop init, which lands *inside* the consumer K loop — resetting the
+accumulators every K chunk and corrupting the result (the WS=1 ``max_diff ~228`` accuracy
+failure).
+
+No live pass constructs a ``WarpSpecialize`` today (the ``tile/085_warp_specialize.py``
+producer pass was removed), but the consumer-head Init placement in ``020_place_inits`` is
+still live; we build the node directly and run the pass over it.
 """
 
 from __future__ import annotations

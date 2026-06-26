@@ -264,11 +264,11 @@ def handle_eval_failures(args) -> None:
 
 def _variant_key(s) -> tuple:
     """Hashable identity of one measured config: the full ``S_*`` signature plus
-    the tunable-knob dict (sorted items, lists coerced via :func:`_hashable`) —
-    the join key between a DB row and its -O3 reservoir sibling."""
+    the tunable-knob dict (sorted items) — the join key between a DB row and its
+    -O3 reservoir sibling."""
     return (
-        tuple(sorted((k, _hashable(v)) for k, v in s.s_features().items())),
-        tuple(sorted((k, _hashable(v)) for k, v in s.knobs.items())),
+        tuple(sorted((k, v) for k, v in s.s_features().items())),
+        tuple(sorted((k, v) for k, v in s.knobs.items())),
     )
 
 
@@ -383,16 +383,6 @@ def _ratio_color(matched: int, total: int) -> str:
     return _GREEN if matched == total else (_YELLOW if frac > 0.8 else _RED)
 
 
-def _knob_eq(a, b) -> bool:
-    """Knob value equality across representations: the pipeline stamps sequence
-    knobs as tuples (``OVERHANG=('a0',)``) while the golden YAML records lists
-    (``['a0']``) — a raw ``==`` false-flags every OVERHANG-carrying golden as a
-    mismatch."""
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return list(a) == list(b)
-    return a == b
-
-
 def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     """``{knob: (value_text, red?)}`` for one renderable entry (no ``NAME=`` prefix —
     :func:`~deplodock.commands.table.knob_columns` puts the name in the column header).
@@ -401,7 +391,7 @@ def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     if entry[0] == "total":
         return entry[2]
     _, _, gold, got = entry
-    return {k: (f"{got.get(k, '-')}/{gold[k]}", not _knob_eq(got.get(k), gold[k])) for k in gold}
+    return {k: (f"{got.get(k, '-')}/{gold[k]}", got.get(k) != gold[k]) for k in gold}
 
 
 def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str) -> None:
@@ -508,7 +498,7 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
         except Exception as e:  # noqa: BLE001 — one shape's error shouldn't abort the report
             entries.append(("err", g.name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
             continue
-        matched = sum(1 for k in gold if _knob_eq(got.get(k), gold[k]))
+        matched = sum(1 for k in gold if (got.get(k) == gold[k]))
         lead = [g.name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold))), str(rank) if rank is not None else "?", str(pool)]
         entries.append(("row", lead, gold, got))
         if rank is not None:
@@ -674,13 +664,13 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
                 entries.append(("err", name, " ".join(f"{type(e).__name__}: {e}".split())[:100]))
                 continue
             # Closest golden: most knobs reproduced, tie-broken by match fraction.
-            scored = [(sum(1 for k in gd if _knob_eq(got.get(k), gd[k])), gd) for gd in (tunable(c.knobs) for c in group)]
+            scored = [(sum(1 for k in gd if (got.get(k) == gd[k])), gd) for gd in (tunable(c.knobs) for c in group)]
             matched, gold = max(scored, key=lambda t: (t[0], t[0] / len(t[1]) if t[1] else 1.0))
             n_match += matched == len(gold)
             n_rows += 1
             for k in gold:
                 knob_total[k] = knob_total.get(k, 0) + 1
-                knob_match[k] = knob_match.get(k, 0) + _knob_eq(got.get(k), gold[k])
+                knob_match[k] = knob_match.get(k, 0) + (got.get(k) == gold[k])
             lead = [name, (f"{matched}/{len(gold)}", _ratio_color(matched, len(gold)))]
             pc = _perf_cell(perf, name)
             if pc is not None:
@@ -717,14 +707,6 @@ class KnobRow:
     geomean_regret: float
 
 
-def _hashable(v: object) -> object:
-    """Coerce a knob value to a hashable form so it can key a dict / join a set.
-    Most knob values are already scalars (int / bool / str), but some carry a
-    list (e.g. ``OVERHANG=['a0']``) which would raise ``TypeError: unhashable
-    type: 'list'`` when used as a grouping key. Lists become tuples (recursively)."""
-    return tuple(_hashable(x) for x in v) if isinstance(v, list) else v
-
-
 def _compute_knob_regret(kernels: dict[str, list[tuple[dict, float]]]) -> list[KnobRow]:
     per_knob_regret: dict[str, list[float]] = defaultdict(list)
     per_knob_n_values: dict[str, list[int]] = defaultdict(list)
@@ -738,7 +720,6 @@ def _compute_knob_regret(kernels: dict[str, list[tuple[dict, float]]]) -> list[K
                 v = knobs.get(K)
                 if v is None:
                     continue
-                v = _hashable(v)
                 if v not in best_by_value or us < best_by_value[v]:
                     best_by_value[v] = us
             if len(best_by_value) < 2:
@@ -784,7 +765,7 @@ def _compute_interactions(
                     v2 = knobs_dict.get(K2)
                     if v1 is None or v2 is None:
                         continue
-                    v1, v2 = _hashable(v1), _hashable(v2)
+                    v1, v2 = v1, v2
                     prev = argmin_by_v1.get(v1)
                     if prev is None or us < prev[1]:
                         argmin_by_v1[v1] = (v2, us)
