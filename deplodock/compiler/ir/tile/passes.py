@@ -27,6 +27,7 @@ from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rew
 from deplodock.compiler.ir.tile.ir import (
     AsyncWait,
     AtomTile,
+    CoopReduce,
     GridTile,
     ParallelTile,
     RegisterTile,
@@ -57,6 +58,28 @@ def _(s: StageBundle, ctx: SimplifyCtx) -> Stmt:
     if s.compute is not None:
         kwargs["compute"] = tuple(simplify(c, ctx) for c in s.compute)
     return type(s)(**kwargs)
+
+
+@rewrite.register
+def _(s: CoopReduce, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    return CoopReduce(
+        cells=tuple(axis_fn(a) for a in s.cells),
+        leading=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.leading),
+        body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
+        out_slab=s.out_slab,
+        out_dtype=s.out_dtype,
+    )
+
+
+@simplify.register
+def _(s: CoopReduce, ctx: SimplifyCtx) -> Stmt:
+    return CoopReduce(
+        cells=s.cells,
+        leading=tuple(simplify(c, ctx) for c in s.leading),
+        body=tuple(simplify(c, ctx) for c in s.body),
+        out_slab=s.out_slab,
+        out_dtype=s.out_dtype,
+    )
 
 
 @rewrite.register

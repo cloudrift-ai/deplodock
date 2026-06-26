@@ -38,6 +38,7 @@ from deplodock import config
 from deplodock.compiler.pipeline.search.candidate import LazyCandidate
 from deplodock.compiler.pipeline.search.db import PerfStats
 from deplodock.compiler.pipeline.search.policy.base import Search
+from deplodock.compiler.structural import digest
 
 if TYPE_CHECKING:
     from deplodock.compiler.pipeline.search.prior import Prior
@@ -216,9 +217,8 @@ class TuningSearch(Search):
     @staticmethod
     def _o3_sig(knobs: dict | None) -> tuple:
         """A hashable signature of a realized knob set for -O3 dedup. Values are
-        ``str()``-ified (some knobs — ``OVERHANG`` — carry list values that aren't
-        hashable), and the ``H_opt`` regime tag is excluded so the -O1 row and its
-        -O3 re-bench share one signature."""
+        ``str()``-ified for a uniform hashable key, and the ``H_opt`` regime tag is
+        excluded so the -O1 row and its -O3 re-bench share one signature."""
         if not knobs:
             return ()
         return tuple(sorted((k, str(v)) for k, v in knobs.items() if k != "H_opt"))
@@ -361,6 +361,54 @@ class TuningSearch(Search):
             knobs = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
             rows.append((knobs, 1.0 / node.best_reward))
         return rows
+
+    def _node_key(self, feats: dict, op_sig: str, context_key: str) -> str:
+        """Identity of a node within its operation: a digest over the deploy
+        regime (``context_key``), the op's ``S_*`` signature (``op_sig``), and the
+        canonical tunable-knob set. ``S_*`` / ``H_*`` features are excluded from the
+        set — they are already folded via ``op_sig`` / ``context_key`` — so the key
+        is the "within-op node identity". ``str()``-ified values mirror
+        :meth:`_o3_sig` so list-valued knobs (``OVERHANG``) stay stable, and the
+        sorted tuple keeps :func:`digest` (order-sensitive) deterministic."""
+        tun = tuple(sorted((k, str(v)) for k, v in feats.items() if not k.startswith(("S_", "H_"))))
+        return digest(context_key, op_sig, tun)
+
+    def _collect_node_records(self, *, context_key: str, op_sig: str) -> list[tuple]:
+        """Post-search tree walk producing keyed, parent-linked node records for
+        :meth:`SearchDB.record_nodes` — the persistent/keyed/deduped sibling of
+        :meth:`_collect_rows` (which feeds the prior's in-memory reservoir).
+
+        Pre-order descent from the top forks (the sentinel root is skipped); each
+        node passing the same ``visits > 0 and best_reward > 0`` guard as
+        ``_collect_rows`` emits ``(node_key, parent_key, features, value_us, depth)``:
+        ``features`` is the full dict the prior sees (``realized_knobs`` on a benched
+        leaf — incl. deterministically-stamped knobs — else the partial fork-prefix
+        from ``_node_knobs``), ``value_us`` is the value-of-position ``1/best_reward``.
+
+        ``parent_key`` is the *nearest emitted ancestor*'s ``node_key`` (a skipped
+        intermediate node passes its own inherited parent down), so it always
+        references a recorded row — true ancestry from the live ``parent`` edge,
+        not knob-subset inference (which a leaf's extra stamped knobs would break).
+        Asserts the monotone ``parent.value_us <= child.value_us`` invariant — it
+        holds because ``record_terminal`` max-propagates ``best_reward`` up the
+        chain, transitively across skipped nodes."""
+        out: list[tuple] = []
+
+        def visit(node: SearchNode, parent_key: str | None, parent_value: float | None, depth: int) -> None:
+            nk = parent_key
+            if node.candidate is not None and node.visits > 0 and node.best_reward > 0:
+                feats = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
+                value_us = 1.0 / node.best_reward
+                assert parent_value is None or value_us >= parent_value - 1e-9, "value-of-position not monotone up the tree"
+                nk = self._node_key(feats, op_sig, context_key)
+                out.append((nk, parent_key, feats, value_us, depth))
+                parent_value = value_us
+            for child in node.children:
+                visit(child, nk, parent_value, depth + 1)
+
+        for child in self.tree.root.children:
+            visit(child, None, None, 1)
+        return out
 
     def _should_stop(self) -> bool:
         if self.stop_reason is not None:

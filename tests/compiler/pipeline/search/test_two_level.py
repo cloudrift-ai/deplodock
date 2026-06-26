@@ -171,6 +171,24 @@ def test_inner_reward_is_separable_not_a_product() -> None:
     assert reward.total_us == pytest.approx(sum(r.best_us for r in reward.per_op))
 
 
+def test_inner_reward_records_nodes() -> None:
+    """The post-search walk persists tree nodes to the ``node`` table — keyed by
+    the run's context, one op_sig group per distinct kernel, with every non-null
+    parent_key referencing a recorded node (valid ancestry edges)."""
+    fused = _fuse(_two_distinct_matmuls())
+    ctx = Context.from_target((8, 0))
+    db = SearchDB()
+    run_inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=_PATIENCE)
+
+    rows = db._conn.execute("SELECT node_key, parent_key, context_key, op_sig, value_us FROM node").fetchall()
+    assert rows, "expected node rows recorded from the finished search trees"
+    assert {r[2] for r in rows} == {ctx.structural_key()}  # all under the run's regime
+    assert all(r[4] > 0 for r in rows)  # positive value-of-position
+    assert len({r[3] for r in rows}) >= 2  # two distinct matmuls → ≥2 op_sig groups
+    keys = {r[0] for r in rows}
+    assert all(r[1] in keys for r in rows if r[1] is not None)  # parents reference recorded nodes
+
+
 def test_inner_reward_rerun_is_replay_dominated() -> None:
     """A second pass at the same patience is replay-dominated and never regresses:
     the warm perf cache serves almost every terminal, so the rerun benches far
@@ -266,7 +284,7 @@ def test_inner_reward_parallel_matches_serial() -> None:
 
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
     """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
     f16 = _dt.get("f16")
     g = g if g is not None else Graph()
     x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
@@ -337,9 +355,9 @@ class _RecordingPrior:
 
 
 def _is_decomposition_row(knobs: dict) -> bool:
-    """Composed Σ rows carry the decision knob but no tile-level knobs — every
-    inner per-kernel / branch row carries at least one partition-level knob."""
-    return "SPLIT_CONE" in knobs and not any(k in knobs for k in ("BM", "BN", "BR", "MMA", "WM", "FM"))
+    """Composed Σ rows carry the structural decision knob (PLACE@cone) but no tile-level
+    knobs — every inner per-kernel / branch row carries at least one native geometry knob."""
+    return "PLACE@cone" in knobs and not any(k.startswith(("SPLIT@", "REDUCE@", "ATOM@")) for k in knobs)
 
 
 def test_outer_branches_on_structural_fork(monkeypatch) -> None:
@@ -372,15 +390,15 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     # producer + consumer (2 op leaves) — the denominators the progress bar sees.
     assert sorted(progress.terminal_sizes) == [1, 2]
     assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
-    # Both sides' composed rows reached the prior: SPLIT_CONE=False labeled
-    # with the fused best, SPLIT_CONE=True with the split kernels' Σ.
+    # Both sides' composed rows reached the prior: PLACE@cone=inline (keep) labeled
+    # with the fused best, PLACE@cone=cut (cut) with the split kernels' Σ.
     decomp = [(k, us) for k, us in rec.rows if _is_decomposition_row(k)]
-    assert {k["SPLIT_CONE"] for k, _ in decomp} == {False, True}
+    assert {k["PLACE@cone"] for k, _ in decomp} == {"inline", "cut"}
     assert all(us > 0 for _, us in decomp)
     # The decision hop never enters the ``lowering`` table (one best child per
     # parent — a multi-kernel decomposition's parent must not resolve through
     # ONE fragment kernel's median): the pre-decision op has no lowering row.
-    site = next(n.op.source for n in result.best_fused.nodes.values() if isinstance(n.op, LoopOp) and n.op.source is not None)
+    site = next(_site(n.op) for n in result.best_fused.nodes.values() if _site(n.op) is not None)
     assert db.lookup_lowering(op_cache_key(site)) is None
 
 
@@ -390,8 +408,26 @@ def _outer_terminals(graph: Graph) -> list[Graph]:
     return [cand.graph for cand in drained]
 
 
-def _loops(graph: Graph) -> list:
-    return [n.op for n in graph.nodes.values() if isinstance(n.op, LoopOp)]
+def _kernels(graph: Graph) -> list:
+    """Outer-terminal kernel ops. A terminal sits past ``010_build``, so its
+    kernels are ``TileGraphOp`` seeds (the keep(SMEM) fused kernel + the cut's
+    producer/consumer); a ``LoopOp`` survives only when ``010_build`` skipped it."""
+    from deplodock.compiler.ir.tile.ir import TileGraphOp
+
+    return [n.op for n in graph.nodes.values() if isinstance(n.op, (LoopOp, TileGraphOp))]
+
+
+def _site(op):
+    """The pre-decision offer site — the deepest ``S_*``-stamped loop ancestor,
+    mirroring ``two_level._decomposition_rows`` (the original demoted matmul,
+    before the fission re-stamped each fragment's own shallower ``S_*``)."""
+    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain
+
+    site = None
+    for anc in source_chain(op):
+        if dialect_of(anc) == "loop" and any(k.startswith("S_") for k in getattr(anc, "knobs", {})):
+            site = anc
+    return site
 
 
 def test_split_kernels_attribute_to_pre_decision_op() -> None:
@@ -403,19 +439,19 @@ def test_split_kernels_attribute_to_pre_decision_op() -> None:
     into ``source`` — honoring the copy used to point the link past the offer
     site)."""
     terminals = _outer_terminals(_norm_linear("a"))
-    split = next(t for t in terminals if len(_loops(t)) == 2)
-    kernels = _loops(split)
-    assert all(k.knobs.get("SPLIT_CONE") is True for k in kernels)
-    assert all(k.source is not None for k in kernels)
-    assert len({id(k.source) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
-    site = kernels[0].source
-    assert "SPLIT_CONE" not in site.knobs
+    split = next(t for t in terminals if len(_kernels(t)) == 2)
+    kernels = _kernels(split)
+    assert all(k.knobs.get("PLACE@cone") == "cut" for k in kernels)
+    assert all(_site(k) is not None for k in kernels)
+    assert len({op_cache_key(_site(k)) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
+    site = _site(kernels[0])
+    assert "PLACE@cone" not in site.knobs
     assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
 
-    fused = next(t for t in terminals if len(_loops(t)) == 1)
-    keep = _loops(fused)[0]
-    assert keep.knobs.get("SPLIT_CONE") is False
-    assert keep.source is not None and op_cache_key(keep.source) == op_cache_key(site), (
+    fused = next(t for t in terminals if len(_kernels(t)) == 1)
+    keep = _kernels(fused)[0]
+    assert keep.knobs.get("PLACE@cone") == "inline"
+    assert _site(keep) is not None and op_cache_key(_site(keep)) == op_cache_key(site), (
         "the keep side must attribute to the SAME offer-site op as the split side"
     )
 
@@ -423,21 +459,21 @@ def test_split_kernels_attribute_to_pre_decision_op() -> None:
 def test_outer_descends_prior_preferred_branch_first() -> None:
     """With a prior ranking the split side cheaper, the outer PUCT explores it
     FIRST — including past the fork's resolve: the resolved branch's
-    continuation keeps its ``SPLIT_CONE`` delta (``LazyCandidate.resolved_knobs``),
+    continuation keeps its ``PLACE@cone`` delta (``LazyCandidate.resolved_knobs``),
     so it isn't out-scored by the unresolved keep-fused sibling as a knob-less
     generic row (the regression this test pins)."""
 
     class _SplitCheapPrior(_RecordingPrior):
         def score(self, knobs) -> float:
-            if knobs.get("SPLIT_CONE") is True:
+            if knobs.get("PLACE@cone") == "cut":
                 return 1.0
-            return 2.0 if "SPLIT_CONE" in knobs else 3.0
+            return 2.0 if "PLACE@cone" in knobs else 3.0
 
     ctx = Context.from_target((12, 0))
     search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
     drained = drain_tune(outer_pipeline(), _norm_linear("a"), search=search, ctx=ctx, db=SearchDB(), on=lambda c: True)
     first = drained[0]
-    assert len(_loops(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
+    assert len(_kernels(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
 
 
 def test_decomposition_rows_sum_kernel_set_costs() -> None:
@@ -445,27 +481,27 @@ def test_decomposition_rows_sum_kernel_set_costs() -> None:
     knobs + the decision delta (never the kids' restamped ``S_*``), label =
     the Σ of the side's per-kernel bests."""
     terminals = _outer_terminals(_norm_linear("a"))
-    by_size = {len(_loops(t)): t for t in terminals}
+    by_size = {len(_kernels(t)): t for t in terminals}
     ctx = Context.from_target((12, 0))
 
     split = by_size[2]
-    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_loops(split), (7.0, 13.0), strict=True)]
+    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_kernels(split), (7.0, 13.0), strict=True)]
     rows = _decomposition_rows(split, per_op, ctx)
     assert len(rows) == 1
     feats, label = rows[0]
     assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
-    assert feats["SPLIT_CONE"] is True
-    site = _loops(split)[0].source
+    assert feats["PLACE@cone"] == "cut"
+    site = _site(_kernels(split)[0])
     site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
     assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
 
     fused = by_size[1]
-    fop = _loops(fused)[0]
+    fop = _kernels(fused)[0]
     rows = _decomposition_rows(fused, [OpResult(name="k", op_key=op_cache_key(fop), best_us=42.0)], ctx)
     assert len(rows) == 1
     feats, label = rows[0]
     assert label == pytest.approx(42.0)
-    assert feats["SPLIT_CONE"] is False
+    assert feats["PLACE@cone"] == "inline"
 
 
 def test_identical_offer_sites_take_the_same_side() -> None:
@@ -479,7 +515,7 @@ def test_identical_offer_sites_take_the_same_side() -> None:
         cand.graph
         for cand in drain_tune(outer_pipeline(), g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
     ]
-    sizes = sorted(sum(1 for n in t.nodes.values() if isinstance(n.op, LoopOp)) for t in terminals)
+    sizes = sorted(len(_kernels(t)) for t in terminals)
     assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
 
 

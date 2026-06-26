@@ -17,7 +17,7 @@ from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 
 def _row(a: int, b: int, c: int) -> dict:
     """Synthetic variant knob row — two branch-level knobs (A, B) plus a
-    knob no level covers (C), mirroring the planner's FK/OVERHANG."""
+    knob no level covers (C), mirroring the planner's FK."""
     return {"A": a, "B": b, "C": c}
 
 

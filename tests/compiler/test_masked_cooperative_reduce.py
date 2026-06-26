@@ -53,7 +53,7 @@ def test_masked_cooperative_softmax_structure(monkeypatch):
     cooperative combine (``__shfl_xor_sync``) over a hint-tiled, boundary-masked
     K — the runtime ``seq_len`` arg, the per-tile mask, and the clamped read are
     all present (vs the old degenerate per-thread serial reduce)."""
-    monkeypatch.setenv("DEPLODOCK_BR", "64")
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "t64")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     compiled = CudaBackend().compile(_dynamic_softmax_graph())
@@ -72,7 +72,7 @@ def test_masked_cooperative_softmax_accuracy(monkeypatch, seq):
     below / at / above the 512 hint — the off-hint sizes (1, 31, 513, 700)
     straddle the BR·BK = 512-element tile, exercising the boundary mask (the
     overhang must fold the reduce identity, not garbage past ``seq_len``)."""
-    monkeypatch.setenv("DEPLODOCK_BR", "64")
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "t64")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     graph = _dynamic_softmax_graph()

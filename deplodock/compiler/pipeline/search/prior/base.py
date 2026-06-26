@@ -47,12 +47,6 @@ MAX_ROWS = 100_000
 _O3_OPT = 3.0
 
 
-def _norm_knob(v):
-    """Normalize a knob value for evidence matching — sequence knobs (OVERHANG)
-    are recorded as YAML lists in some sources and tuples in the pipeline."""
-    return tuple(v) if isinstance(v, (list, tuple)) else v
-
-
 class Prior(ABC):
     """Abstract global tuning prior over a bounded, reservoir-sampled dataset.
 
@@ -122,8 +116,8 @@ class Prior(ABC):
             for knobs, us in self._dataset:
                 if float(knobs.get("H_opt", 0.0)) != _O3_OPT or us <= 0:
                     continue
-                sig = frozenset((k, _norm_knob(v)) for k, v in knobs.items() if k.startswith("S_"))
-                tun = {k: _norm_knob(v) for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
+                sig = frozenset((k, v) for k, v in knobs.items() if k.startswith("S_"))
+                tun = {k: v for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
                 index.setdefault(sig, []).append((tun, float(us)))
             self._ev_index = index
             self._ev_fp = fp
@@ -150,11 +144,11 @@ class Prior(ABC):
             return None
         best: tuple[int, float] | None = None
         for i, cand in enumerate(rows):
-            sig = frozenset((k, _norm_knob(v)) for k, v in cand.items() if k.startswith("S_"))
+            sig = frozenset((k, v) for k, v in cand.items() if k.startswith("S_"))
             measured = index.get(sig)
             if not measured:
                 continue
-            cand_tun = {k: _norm_knob(v) for k, v in cand.items() if not k.startswith(("S_", "H_"))}
+            cand_tun = {k: v for k, v in cand.items() if not k.startswith(("S_", "H_"))}
             for row_tun, us in measured:
                 if any(k in row_tun and row_tun[k] != v for k, v in cand_tun.items()):
                     continue

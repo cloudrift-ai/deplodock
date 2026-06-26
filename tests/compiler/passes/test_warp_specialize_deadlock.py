@@ -1,63 +1,56 @@
 """Regression tests for the WS=1 stranded-TMA deadlock (Qwen3 ``k_linear_mean_reduce``).
 
-The fused RMSNorm + gate/up-linear + SwiGLU kernel of a Qwen3-class decoder MLP wraps its whole body in a
-``SerialTile(kind='plain')`` per-thread M-fragment loop. ``085_warp_specialize._split_by_role`` only recurses through
-``serial_outer`` / ``RegisterTile`` / ``AtomTile``, so on this shape the WS=1 rewrite used to strand every TMA
-``StageBundle`` in the **consumer** branch: the producer branch came out empty, the TMA issues sat behind a
-``threadIdx.x == 0`` guard that no consumer-branch thread can satisfy (thread 0 is a producer-warp thread), and every
-consumer ``mbarrier.wait`` spun forever — a deterministic device hang at any nvcc opt level. ``_eligible`` had used a
-*deep* body walk to find the bundle, so it declared the shape WS-eligible even though the *shallow* split could never
-reach it; the learned prior then deployed WS=1 for this op (generalizing from warp-tier MMA rows where WS wins) and
-every ``run`` / ``compile`` of Qwen3-Embedding-0.6B layer 0 hung. See
-``plans/qwen3-embedding-tune-hung-kernel.md``.
+The fused RMSNorm + gate/up-linear + SwiGLU kernel of a Qwen3-class decoder MLP wraps its
+whole body in a per-thread M-fragment loop. The original deadlock came from the
+``tile/085_warp_specialize`` producer pass: its shallow producer/consumer split stranded
+every TMA ``StageBundle`` in the **consumer** branch (the producer branch came out empty),
+so the TMA issues sat behind a ``threadIdx.x == 0`` guard no consumer-branch thread can
+satisfy, and every consumer ``mbarrier.wait`` spun forever — a deterministic device hang.
+The fix made the producer pass's ``_eligible`` run the same split the transform used and
+raise ``"not reachable by the producer split"`` when no TMA depth-2 bundle landed
+producer-side.
 
-The fix makes ``_eligible`` run the same producer/consumer split the transform uses and reject when no TMA depth-2
-bundle lands producer-side. The compile-only tests below lock that in GPU-less CI (``set_target`` pins the TMA path);
-the CUDA test confirms the shape's pinned knob family lowers to a kernel that actually completes under the watchdog.
+The block-DAG rewrite **removed** the ``085_warp_specialize`` producer pass and its
+``DEPLODOCK_WARP_SPECIALIZE`` knob entirely, so that producer-side guard is no longer
+reachable (the regression of pinning WS=1 onto this shape simply cannot be expressed). The
+old WS=1-pinning test is gone (no code path left to exercise); ``test_mlp_slice_never_offers_ws1``
+below is its present-day replacement — see the note there.
 
-The knob pins mirror the deployed greedy pick for the hanging op (BM=8 BN=32 BK=64 RING=2 STAGE=100 on the
-(1, 32, 1024) → (1, 32, 3072) fp16 slice) so the partition planner reproduces the exact tile structure.
+What is still live is (a) the present-day invariant that this shape never lowers to a
+``WarpSpecialize`` node at all — no path can deploy WS=1 here — and (b) the materializer's
+own stranding guard: ``emit_warp_specialize`` rejects a ``WarpSpecialize`` with empty
+``consumer_thread_axes`` (the shape that would emit a consumer branch with no thread-axis
+decode). Those two are tested directly.
+
+The slice is the (1, 32, 1024) → (1, 32, 3072) fp16 MLP that hung Qwen3-Embedding-0.6B
+layer 0; it is lowered under the default greedy pick (the brittle knob pins that reproduced
+the old 085 tile family are no longer expressible under the block-DAG tier validation).
 """
 
 from __future__ import annotations
+
+import importlib
 
 import numpy as np
 import pytest
 
 from deplodock.compiler import dtype as _dt
 from deplodock.compiler import target as target_mod
+from deplodock.compiler.context import Context
+from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Tensor
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from deplodock.compiler.ir.tile.ir import SerialTile, TileOp, WarpSpecialize, WarpTile
 
 from ..conftest import requires_cuda, requires_sm90
 
-# The hanging op's tile family (the greedy pick deployed for Qwen3-Embedding-0.6B layer 0's
-# k_linear_mean_reduce), plus the transport pins that force the TMA depth-2 pipelined path
-# the WS rule matches on.
-_KNOBS = {
-    "BM": 8,
-    "BN": 32,
-    "BK": 64,
-    "BR": 1,
-    "FM": 1,
-    "FN": 1,
-    "FK": 1,
-    "SPLITK": 1,
-    "RING": 2,
-    "STAGE": 100,
-    "GROUP_M": 8,
-    "TMA": 1,
-    "PIPELINE_STAGES": 1,
-}
+_mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
 
 _S, _H, _I = 32, 1024, 3072  # seq, hidden, intermediate — the Qwen3-Embedding-0.6B MLP slice
-
-
-def _pin_knobs(monkeypatch) -> None:
-    for key, value in _KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", str(value))
 
 
 def _build_mlp_slice() -> Graph:
@@ -88,41 +81,82 @@ def _sm120_target():
         target_mod.set_target(None)
 
 
-def test_pinned_ws1_on_mlp_slice_raises(monkeypatch, _sm120_target):
-    """Pinned WS=1 on the fused linear+mean shape must raise the loud unhonorable-pin
-    error, not lower into the empty-producer kernel (the pre-fix behavior, which
-    deadlocked the device on first launch)."""
+# ---------------------------------------------------------------------------
+# Present-day invariant: the shape never lowers to a WarpSpecialize node, so
+# WS=1 can never deploy on it (neither the tuner nor the learned prior can
+# reach a code path that emits the producer/consumer split).
+# ---------------------------------------------------------------------------
+
+
+def test_mlp_slice_never_offers_ws1(_sm120_target):
+    """The fused linear+mean shape lowers with no ``WarpSpecialize`` node and no
+    ``WARPSPEC=True`` knob — WS=1 is not in the enumeration, so the deadlock can never
+    deploy. Run unpinned: the partition planner's free greedy pick must not surface WS."""
     from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 
-    _pin_knobs(monkeypatch)
-    monkeypatch.setenv("DEPLODOCK_WARP_SPECIALIZE", "1")
-    with pytest.raises(ValueError, match="not reachable by the producer split"):
-        Pipeline.build(TILE_PASSES).run(_build_mlp_slice())
-
-
-def test_mlp_slice_never_offers_ws1(monkeypatch, _sm120_target):
-    """Without a WS pin the shape lowers with WARPSPEC stamped False — WS=1 is not in
-    the enumeration, so neither the tuner nor the learned prior can ever deploy it."""
-    from deplodock.compiler.ir.tile.ir import TileOp, WarpSpecialize
-    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-
-    _pin_knobs(monkeypatch)
     g2 = Pipeline.build(TILE_PASSES).run(_build_mlp_slice())
-    op = g2.nodes["o"].op
-    assert isinstance(op, TileOp)
-    assert op.knobs.get("WARPSPEC") is False
-    assert not any(isinstance(s, WarpSpecialize) for s in op.body.iter())
+    tile_ops = [n.op for n in g2.nodes.values() if isinstance(n.op, TileOp)]
+    assert tile_ops, "expected at least one lowered TileOp"
+    for op in tile_ops:
+        assert op.knobs.get("WARPSPEC") is not True, f"{op.name} stamped WARPSPEC=True"
+        assert not any(isinstance(s, WarpSpecialize) for s in op.body.iter()), f"{op.name} emitted a WarpSpecialize node"
+
+
+# ---------------------------------------------------------------------------
+# Live stranding guard: emit_warp_specialize rejects an empty consumer-axis WS
+# (the materializer-side equivalent of the removed producer-split guard — a
+# consumer branch with no thread-axis decode is the stranded shape).
+# ---------------------------------------------------------------------------
+
+
+def test_materializer_rejects_empty_consumer_axes():
+    """A ``WarpSpecialize`` with empty ``consumer_thread_axes`` raises the loud guard
+    rather than emitting a consumer branch that no thread can decode (the present-day
+    stranding guard, replacing the removed 085 producer-split check)."""
+    k = Axis("k_outer", 8)
+    ws = WarpSpecialize(
+        producer_body=Body((SerialTile(axis=k, body=Body(()), kind="serial_outer"),)),
+        consumer_body=Body((SerialTile(axis=k, body=Body(()), kind="serial_outer"),)),
+        ring_depth=2,
+        n_producer_threads=32,
+        consumer_thread_axes=(),
+    )
+    op = TileOp(body=Body((WarpTile(axes=(Axis("ws_role", Dim(2)),), body=Body((ws,))),)), name="k_strand")
+    g = Graph()
+    g.add_node(op=op, inputs=[], output=Tensor(op.name, ()), node_id="op")
+    ctx = Context(compute_capability=(9, 0))
+    with pytest.raises(ValueError, match="consumer_thread_axes must be non-empty"):
+        _mat.rewrite(ctx, g.nodes["op"])
+
+
+# ---------------------------------------------------------------------------
+# Deleted producer-pass guard.
+# ---------------------------------------------------------------------------
+#
+# The original suite had a ``test_pinned_ws1_on_mlp_slice_raises`` that pinned
+# ``DEPLODOCK_WARP_SPECIALIZE=1`` and asserted the 085 producer pass raised
+# "not reachable by the producer split". Both the pass and the knob were removed in the
+# block-DAG rewrite, so there is no code path left to exercise — pinning WS=1 onto this
+# shape can no longer be expressed at all. ``test_mlp_slice_never_offers_ws1`` above is the
+# present-day replacement (the shape simply never produces a WarpSpecialize node). No xfail
+# stub is kept here because the only exception the old invocation now raises is an unrelated
+# tier-pin error, which would make a strict xfail "pass" for the wrong reason.
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: the shape compiles and runs to completion (no device hang).
+# ---------------------------------------------------------------------------
 
 
 @requires_cuda
 @requires_sm90
-def test_mlp_slice_completes_and_matches(monkeypatch):
-    """The pinned knob family compiles and runs to completion (a regression would
-    trip the per-launch watchdog's HungKernelError) and matches the numpy reference."""
+def test_mlp_slice_completes_and_matches():
+    """The fused linear+mean shape compiles and runs to completion under the default greedy
+    pick (a WS=1 regression would trip the per-launch watchdog's HungKernelError) and matches
+    the numpy reference."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.backend.numpy import NumpyBackend
 
-    _pin_knobs(monkeypatch)
     g = _build_mlp_slice()
     rng = np.random.default_rng(0)
     f16 = np.dtype(np.float16)

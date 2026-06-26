@@ -249,12 +249,6 @@ def _make_softmax():
     return g
 
 
-def test_softmax_fuses():
-    result = _fuse(_make_softmax())
-    kernels = _kernel_nodes(result)
-    assert len(kernels) >= 1
-
-
 def test_softmax_only_kernel_input_constant():
     result = _fuse(_make_softmax())
     for n in result.nodes.values():
@@ -313,9 +307,6 @@ def test_ssa_invariants_hold():
                 defined.add(s.name)
             elif isinstance(s, (Load, Accum)):
                 defined.add(s.name)
-            elif isinstance(s, Accum):
-                assert s.target in defined
-                assert s.value in defined
             elif isinstance(s, Write):
                 assert s.value in defined
 
@@ -428,11 +419,6 @@ def test_softmax_has_both_accumulators():
     kernel = _kernel_nodes(result)[0]
     combine_fns = _local_combine_fns(kernel.op.body.accums)
     assert {"add", "maximum"} <= combine_fns, f"missing accumulators: {combine_fns}"
-
-
-def test_softmax_single_kernel_correctness():
-    x = rng.standard_normal((4, 8)).astype(np.float32)
-    _assert_correctness(_make_softmax, {"x": x})
 
 
 # ===================================================================

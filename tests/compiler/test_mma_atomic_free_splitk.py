@@ -1,12 +1,13 @@
-"""Atomic-free split-K on the warp / MMA tensor-core tier (Step 3b of
-``plans/atomic-free-monoid-combine.md``).
+"""Atomic-free split-K on the warp / MMA tensor-core tier.
 
 Dropping ``017``'s ``is_warp`` early-out lets an MMA matmul's split-K route its
 C-fragment store into ``workspace[K_s, M, N]`` (the same Write-retarget the scalar
 path uses — the fragment ``RegStore`` is lowered later from that Write) and reuse
-the additive ``Accum``-sum reduce kernel, instead of the codegen ``atomicAdd``.
-With ``NOATOMIC=1`` pinned the fp16 MMA split-K is accurate vs numpy and emits no
-``atomicAdd``; with ``NOATOMIC=0`` the legacy atomic path stays available.
+the additive ``Accum``-sum reduce kernel, instead of the codegen ``atomicAdd``. The cross-CTA
+finalize is the native ``REDUCE`` codec's ``c``-letter: ``c2k`` (the deferred combine kernel) is
+accurate vs numpy and emits no ``atomicAdd``; ``c2a`` (the in-place atomic finalize) stays
+available. Pinned entirely through the native move-knob set (``ATOM`` / ``SPLIT`` / ``REDUCE``) —
+no legacy ``MMA`` / ``WM`` / ``SPLITK`` / ``NOATOMIC`` spellings.
 """
 
 from __future__ import annotations
@@ -19,7 +20,16 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 
-_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2", "SPLITK": "2"}
+# Native move-knob set: the warp MMA atom on the output cell + a 2×2 warp/register tile on every
+# free axis (WM=WN=FM=FN=2). The reduce decomposition (BK=2 + split-K 2 + the finalize letter) is
+# the per-arm ``DEPLODOCK_REDUCE`` codec value ``s2/c2{a,k}``.
+_WARP_NATIVE = {"DEPLODOCK_ATOM": "mma_m16n8k16_f16", "DEPLODOCK_SPLIT": "2x2"}
+
+
+def _set_warp(monkeypatch, reduce_spec: str) -> None:
+    for k, v in _WARP_NATIVE.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DEPLODOCK_REDUCE", reduce_spec)
 
 
 def _has_cuda() -> bool:
@@ -50,10 +60,8 @@ def _mma_graph(m: int, k: int, n: int) -> Graph:
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync split-K needs sm_80+")
 def test_mma_atomic_free_splitk_accurate_and_no_atomic(monkeypatch) -> None:
-    """fp16 MMA split-K with NOATOMIC=1: bit-correct vs numpy and no atomicAdd."""
-    for kk, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{kk}", v)
-    monkeypatch.setenv("DEPLODOCK_NOATOMIC", "1")
+    """fp16 MMA split-K with the deferred ``c2k`` finalize: bit-correct vs numpy and no atomicAdd."""
+    _set_warp(monkeypatch, "s2/c2k")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     m, k, n = 128, 512, 128
@@ -72,10 +80,8 @@ def test_mma_atomic_free_splitk_accurate_and_no_atomic(monkeypatch) -> None:
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync split-K needs sm_80+")
 def test_mma_atomic_splitk_still_available(monkeypatch) -> None:
-    """The legacy atomic arm stays selectable (NOATOMIC=0) and is also accurate."""
-    for kk, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{kk}", v)
-    monkeypatch.setenv("DEPLODOCK_NOATOMIC", "0")
+    """The atomic finalize arm (``c2a``) stays selectable and is also accurate."""
+    _set_warp(monkeypatch, "s2/c2a")
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     m, k, n = 128, 512, 128

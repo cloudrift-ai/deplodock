@@ -86,8 +86,9 @@ class Loop(Stmt):
     @property
     def algebra_kind(self):
         """The loop's algebraic kind (``AlgebraKind``), derived bottom-up from
-        its carrier — ``MAP`` (non-reduce) / ``MONOID`` / ``SEMIRING`` /
-        ``TWISTED_MONOID``. A computed read (never stored, never in
+        its carrier — ``MAP`` (non-reduce) / ``MONOID`` / ``SEMIRING``. A tuple
+        `Monoid` carrier (flash) is a monoid (transport of structure), so it
+        reads as ``MONOID``. A computed read (never stored, never in
         ``op_cache_key``), so it can never contradict the body's algebra. See
         ``ir/algebra.py``."""
         from deplodock.compiler.ir.algebra import classify_algebra  # noqa: PLC0415 — break blocks↔algebra cycle

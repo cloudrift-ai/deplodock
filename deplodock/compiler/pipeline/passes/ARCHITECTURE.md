@@ -1,7 +1,11 @@
 # Pass-authoring invariants
 
 Rules that apply to EVERY pass in this tree (`frontend/`, `loop/`, `lowering/`). Per-dialect details live in
-[`../ARCHITECTURE.md`](../ARCHITECTURE.md) (pass order, knob table, fork semantics).
+[`../ARCHITECTURE.md`](../ARCHITECTURE.md) (pass order, knob table, fork semantics). The **tile-lowering** phase
+([`lowering/tile/ARCHITECTURE.md`](lowering/tile/ARCHITECTURE.md)) is the canonical instance of the invariant below —
+a **purely algebraic moveset, no specializations**: it dispatches on the carrier algebra (`MAP` / `SEMIRING` /
+`MONOID`), never on a named shape (matmul / pointwise / attention) — flash attention is the `MONOID` algebra on the
+streaming schedule (a twisted monoid is a monoid), selected structurally, not a distinct kind.
 
 ## No shape-specific pattern matching
 
@@ -14,13 +18,13 @@ layout rules that drift apart) and silently narrows coverage to the shapes someo
 
 How to comply:
 
-- **Write the rule per element, not per shape.** Example: `lowering/tile/_split_demoted.try_split_demoted`
+- **Write the rule per element, not per shape.** Example: `lowering/tile/split/010_split_demoted.try_split_demoted`
   classifies each multiply operand independently (plain `Load` stays put; computed cone becomes a producer
   materialized over exactly the axes it reads). Norm→linear, scale→matmul, SDPA P@V, and rotary QK^T are
   *instances* of that one rule, not branches — and a shape nobody designed for (a weight-side dequant cone) is
   covered for free.
 - **Gate in the negative.** Enumerating admissible shapes is shape matching by another name. Walk the body and
-  report the first thing the transform *fundamentally cannot do*, like `tile/_atom.classify_fragment_epilogue`
+  report the first thing the transform *fundamentally cannot do*, like `lowering/_predicates.classify_fragment_epilogue`
   (the epilogue folds unless it has an ineligible op/dependency) — the eligible set then grows with the renderer
   instead of with a hand-maintained list.
 - **Bail conservatively on well-formedness, never on shape identity.** `return None` / `RuleSkipped` for a body

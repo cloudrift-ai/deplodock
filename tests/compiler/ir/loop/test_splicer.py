@@ -26,16 +26,6 @@ from deplodock.compiler.ir.loop import (
 # ---------------------------------------------------------------------------
 
 
-def _ops_by_name(op: LoopOp) -> dict[str, object]:
-    """Flatten body, index Assigns/Loads/Accums by their SSA name."""
-    out: dict[str, object] = {}
-    for s in op.body.iter():
-        name = getattr(s, "name", None)
-        if name is not None:
-            out[name] = s
-    return out
-
-
 def _count_kind(op: LoopOp, cls: type) -> int:
     return sum(1 for s in op.body.iter() if isinstance(s, cls))
 

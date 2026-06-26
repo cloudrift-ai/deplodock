@@ -167,7 +167,7 @@ class Candidate:
         knob merge, which is idempotent for rules that already merged
         manually). A
         lowering-tier ``Graph`` splice of a loop-dialect kernel (a
-        structural decomposition — ``tile/005_split_demoted``'s split)
+        structural decomposition — ``tile/010_split_demoted``'s split)
         stamps the consumed root op as each fragment kernel's
         ``source``, so the chain also records *which op a decomposition
         came from*: the two-level tuner groups a terminal's kernels by
@@ -259,7 +259,7 @@ class LazyCandidate:
     # down the tree to featurize a node for the prior — without this, a
     # RESOLVED ancestor's delta would vanish from every descendant's feature
     # vector, so e.g. the structural branch's continuation would be scored
-    # without its ``SPLIT_CONE`` (an off-distribution generic row) while the
+    # without its ``CUT`` (an off-distribution generic row) while the
     # unresolved keep-fused sibling keeps full knobs — an asymmetric, noisy
     # PUCT comparison.
     resolved_knobs: dict | None = None
@@ -272,7 +272,15 @@ class LazyCandidate:
         ``try_rewrite``'s filter) is lifted into an :class:`OptionFork`
         leaf — an ``Op``'s knob delta rides along as the fork's ``knobs``."""
         if not isinstance(option, Fork):
-            knobs = dict(getattr(option, "knobs", None) or {}) if isinstance(option, Op) else {}
+            if isinstance(option, Op):
+                knobs = dict(getattr(option, "knobs", None) or {})
+            else:
+                # A ``Graph`` option is a structural decomposition (the cut's
+                # producer+consumer): the graph itself has no knobs, but its
+                # kernels carry the ``CUT`` decision. Surface it so the prior can
+                # rank the split branch — without this the cut scores as a
+                # knob-less generic row and the outer PUCT never prefers it.
+                knobs = _graph_decision_knobs(option)
             option = OptionFork(option=option, knobs=knobs)
         return cls(inner=inner, cursor=cursor, pending=(match, option))
 
@@ -346,6 +354,20 @@ class LazyCandidate:
 # routed to ``pipeline.dump.on_rule`` when a dump sink is set).
 # Module-private helpers used only by :meth:`Candidate._log_apply`.
 # ---------------------------------------------------------------------------
+
+
+def _graph_decision_knobs(graph: Graph) -> dict:
+    """The structural-decision knobs (``PLACE@cone``) carried by a ``Graph`` option's
+    kernels — the cut's producer/consumer stamp the decision; the graph itself
+    has none. Lets the outer prior rank a structural decomposition option (else
+    it scores as a knob-less generic row, never preferred)."""
+    from deplodock.compiler.pipeline.search.keys import structural_decision_delta  # noqa: PLC0415
+
+    for node in graph.nodes.values():
+        hit = structural_decision_delta(getattr(node.op, "knobs", None) or {})
+        if hit:
+            return hit
+    return {}
 
 
 def _format_rule_application(name: str, graph: Graph, match: Match, fragment: Graph, *, pass_name: str | None = None) -> str:

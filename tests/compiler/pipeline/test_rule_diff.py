@@ -58,7 +58,7 @@ def test_format_skipped_uses_dashed_marker():
 
 
 def test_display_name_prefixes_known_pass():
-    assert display_name("lowering/tile", "005_launch_geometry") == "t:005_launch_geometry"
+    assert display_name("lowering/tile/enumeration", "005_launch_geometry") == "t:005_launch_geometry"
     assert display_name("loop/fusion", "010_merge_loop_ops") == "f:010_merge_loop_ops"
     # Unknown / missing pass falls back to the bare rule name.
     assert display_name(None, "001_x") == "001_x"

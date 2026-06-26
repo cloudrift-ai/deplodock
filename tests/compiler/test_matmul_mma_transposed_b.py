@@ -25,6 +25,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -125,7 +126,7 @@ def test_transposed_b_mma_matches_reference(M: int, N: int, K: int, out_dtype: D
     g = _qkt_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "transposed-B Q@K^T must reach the warp-tier mma.sync variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "transposed-B Q@K^T must reach the warp-tier mma.sync variant"
 
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
@@ -173,7 +174,7 @@ def test_transposed_b_mma_symbolic_mn(seq: int, out_dtype: DataType, monkeypatch
     g = _qkt_graph(M=s, N=s, K=K, out_dtype=out_dtype)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "symbolic-MN Q@K^T must reach the warp-tier mma.sync variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "symbolic-MN Q@K^T must reach the warp-tier mma.sync variant"
     tensors = {nid: n.output for nid, n in g.nodes.items() if hasattr(n.output, "shape")}
     src = render_kernelop(kop, tensors=tensors)
     assert "dpl_mma_load_b_gmem_trans" in src, "transposed-B must use the gmem-direct trans helper"

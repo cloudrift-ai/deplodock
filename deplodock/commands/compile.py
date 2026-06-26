@@ -68,9 +68,11 @@ def add_input_args(parser) -> None:
         "--code",
         "-c",
         help=(
-            "Inline Python expression whose last statement is a call. "
-            "The callable may be an nn.Module (e.g. 'nn.RMSNorm(2048)(torch.randn(1,32,2048))') "
-            "or a torch function (e.g. 'F.silu(torch.randn(1,32,2048))'). "
+            "Inline Python expression whose last statement is a call. 'torch', 'nn' and 'F' "
+            "(torch.nn.functional) are already in scope — no import needed. The callable may be an "
+            "nn.Module or a torch function. Full runnable example (SDPA): "
+            'deplodock compile -c "F.scaled_dot_product_attention('
+            'torch.randn(1,8,128,64), torch.randn(1,8,128,64), torch.randn(1,8,128,64), is_causal=True)". '
             "Traces the expression and compiles it in one step. Mutually exclusive with the positional input."
         ),
     )

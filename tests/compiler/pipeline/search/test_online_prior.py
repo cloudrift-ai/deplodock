@@ -239,6 +239,76 @@ def test_collect_rows_skips_unbenched_nodes():
     assert (("BM", 64), ("BR", 2)) not in knob_sets
 
 
+# --- node store extraction (_collect_node_records) -------------------------
+
+
+def test_collect_node_records_parent_linkage():
+    """A leaf points at its branch via parent_key (the real tree edge), and the
+    leaf's full ``realized_knobs`` — incl. a deterministically-stamped knob the
+    branch never saw — is what gets stored, proving parentage is taken from the
+    ``parent`` pointer, not inferred from knob-subset containment."""
+    tree = SearchTree()
+    branch = _node({"BR": 1}, tree.root)
+    leaf = _node({"BR": 1, "BM": 64}, branch)
+    leaf.realized_knobs = {"S_n_mma": 1.0, "H_opt": 1.0, "BR": 1, "BM": 64, "FK": 2}
+    tree.root.children = [branch]
+    branch.children = [leaf]
+    tree.record_terminal(leaf, 2.0)
+    recs = TuningSearch(tree=tree)._collect_node_records(context_key="ctx", op_sig="sig")
+    by_depth = {d: (nk, pk, feats) for nk, pk, feats, _, d in recs}
+    branch_key, branch_parent, branch_feats = by_depth[1]
+    leaf_key, leaf_parent, leaf_feats = by_depth[2]
+    assert branch_parent is None  # top fork → no recorded parent
+    assert leaf_parent == branch_key  # leaf → branch edge from node.parent
+    assert "FK" in leaf_feats and "FK" not in branch_feats  # stamped knob only on the leaf
+
+
+def test_collect_node_records_value_min_invariant():
+    """Each node's value-of-position (1/best_reward) is >= its parent's — the
+    max-propagation invariant the walk asserts."""
+    tree = SearchTree()
+    branch = _node({"BR": 1}, tree.root)
+    leaf_slow = _node({"BR": 1, "BM": 32}, branch)
+    leaf_fast = _node({"BR": 1, "BM": 64}, branch)
+    tree.root.children = [branch]
+    branch.children = [leaf_slow, leaf_fast]
+    tree.record_terminal(leaf_slow, 1.0)
+    tree.record_terminal(leaf_fast, 2.0)
+    recs = TuningSearch(tree=tree)._collect_node_records(context_key="ctx", op_sig="sig")
+    by_key = {nk: (pk, v) for nk, pk, _, v, _ in recs}
+    assert any(pk is not None for pk, _ in by_key.values())  # at least one real edge exercised
+    for pk, v in by_key.values():
+        if pk is not None:
+            assert v >= by_key[pk][1] - 1e-12  # child never labeled faster than its parent
+
+
+def test_collect_node_records_skips_unbenched_and_sentinel():
+    """An unbenched frontier yields no row, and the sentinel root is never emitted
+    (its benched child is depth 1 with ``parent_key`` None)."""
+    tree = SearchTree()
+    visited = _node({"BR": 1, "BM": 64}, tree.root)
+    frontier = _node({"BR": 2, "BM": 64}, tree.root)
+    tree.root.children = [visited, frontier]
+    tree.record_terminal(visited, 1.5)
+    recs = TuningSearch(tree=tree)._collect_node_records(context_key="ctx", op_sig="sig")
+    assert len(recs) == 1
+    nk, pk, _, v, d = recs[0]
+    assert pk is None and d == 1
+    assert abs(v - 1 / 1.5) < 1e-12
+
+
+def test_node_key_excludes_s_and_h():
+    """Within one op (op_sig) + regime (context_key), node identity is the tunable
+    knob set only — two nodes differing solely in ``S_*``/``H_*`` collide, and a
+    differing tunable knob splits them."""
+    s = TuningSearch(tree=SearchTree())
+    base = s._node_key({"BM": 64, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx")
+    s_h_perturbed = s._node_key({"BM": 64, "S_n_mma": 9.0, "H_opt": 3.0}, "sig", "ctx")
+    tunable_perturbed = s._node_key({"BM": 32, "S_n_mma": 1.0, "H_opt": 1.0}, "sig", "ctx")
+    assert base == s_h_perturbed
+    assert base != tunable_perturbed
+
+
 def _stats(median: float):
     from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
 
@@ -392,12 +462,14 @@ def test_evidence_skipped_off_o3_regime():
     assert p.evidence_pick([{"S_sig": 7.0, "H_opt": 1.0, "FM": 6}]) is None
 
 
-def test_evidence_normalizes_sequence_knobs():
-    """OVERHANG recorded as a list (YAML) matches a tuple-valued candidate (the
-    seed-report ``_knob_eq`` lesson)."""
+def test_evidence_matches_masked_structural_feature():
+    """``S_masked_*`` (the per-role structural feature that replaced the OVERHANG
+    knob) joins the ``S_*`` evidence signature: a masked candidate matches a
+    masked -O3 row, and the scalar float hashes cleanly into the frozenset
+    signature (the whole point of moving it off the sequence-valued knob)."""
     p = CatBoostPrior(seed=0)
-    p.add_rows([_o3_row({"OVERHANG": ["a0"], "FM": 6}, 24.0)])
-    ev = p.evidence_pick([_cand({"OVERHANG": ("a0",), "FM": 6})])
+    p.add_rows([_o3_row({"S_masked_m": 1.0, "FM": 6}, 24.0)])
+    ev = p.evidence_pick([_cand({"S_masked_m": 1.0, "FM": 6})])
     assert ev == (0, 24.0)
 
 

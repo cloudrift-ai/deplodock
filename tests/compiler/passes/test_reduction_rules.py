@@ -18,8 +18,8 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Load
 from deplodock.compiler.ir.tensor.ir import ReduceOp
 from deplodock.compiler.ir.tile.ir import StageBundle, ThreadTile
 from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import accums_independent as _accums_independent
-from deplodock.compiler.pipeline.passes.lowering.tile._helpers import reduce_body_has_coupled_accum
+from deplodock.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
+from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import accums_independent as _accums_independent
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -73,7 +73,7 @@ def test_long_axis_sum_fires_cooperative_reduce(recording_dump):
     g.outputs = ["o"]
 
     out = Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    fired = recording_dump.fired_rules("lowering/tile")
+    fired = recording_dump.fired_rules("lowering/tile/enumeration")
     assert _tile_has_combine(out)
     assert "chunk_matmul_k" not in fired
 

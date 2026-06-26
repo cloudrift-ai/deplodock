@@ -43,13 +43,10 @@ from deplodock.compiler.ir.stmt import (
     Accum,
     Assign,
     Body,
-    Cond,
     Init,
     Load,
-    Loop,
     Pack,
     Stmt,
-    StridedLoop,
     Unpack,
     Write,
 )
@@ -218,8 +215,3 @@ def _stamp_write(s: Write, ctx: _StampCtx) -> Write:
         values=s.values,
         value_dtype=dt,
     )
-
-
-# Silence unused-import warnings — these symbols are referenced via
-# isinstance only and not all imports are exercised on every IR.
-_ = (Loop, StridedLoop, Cond)

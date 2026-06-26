@@ -515,6 +515,16 @@ class Accum(ReduceCarrier):
     def carried_names(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def combine_operands(self) -> tuple[str, ...]:
+        return (f"{self.name}__o",)
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The scalar op-fold of two partials: ``name = op(name, name__o)`` — the
+        same combine the cooperative / split-K realizations apply, reified as a
+        one-``Assign`` program so the decomposition move reads it uniformly with
+        ``Monoid.combine_states``."""
+        return (Assign(name=self.name, op=self.op, args=(self.name, f"{self.name}__o"), dtype=self.dtype),)
+
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
     # ``sum`` Accum differ, and ``self.op`` is the source of truth.
     @property
@@ -555,7 +565,7 @@ class Mma(ReduceCarrier):
     """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
-    cell on the tensor-core path. Emitted by ``tile/011_lower_atom_cell``
+    cell on the tensor-core path. Emitted by ``tile/enumeration/050_warp_build``
     alongside its two operand ``Load``s — which stay **plain** (no tensor-core
     tag): the ``Mma`` is the sole carrier of the cell's :class:`Atom` spec +
     operand identity, naming its A/B operands by SSA value, so
@@ -578,7 +588,7 @@ class Mma(ReduceCarrier):
       transposed-B ``Q @ K^T`` cell. This is the native ``mma.row.col`` B layout
       (col-major K×N), so ``kernel/005_lower_atom_tile`` loads it via ``ldmatrix``
       WITHOUT ``.trans`` (the default canonical B[k,n] uses ``.trans``). Set by
-      ``tile/011_lower_atom_cell`` from the classified B Load's K position.
+      ``tile/enumeration/050_warp_build`` from the classified B Load's K position.
     """
 
     c: str
@@ -587,6 +597,17 @@ class Mma(ReduceCarrier):
     atom: Atom
     axes: tuple[str, ...] = ()
     b_trans: bool = False
+    # Explicit masked-tile guards for a HAND-BUILT cell (the symbolic warp-chain flash),
+    # where ``kernel/005_lower_atom_tile`` can't derive them from a Write boundary ``Cond``
+    # (a fragment-output / fragment-A cell has no Write) or the operand tensor shape (the
+    # flash uses flat single-index Loads). Each is ``(base Expr, bound Expr)`` on the named
+    # axis; ``005`` routes them to the operand ``LdmatrixLoad``s — ``m_guard`` clamps the A
+    # rows (masked query), ``n_guard`` clamps the B cols (masked key, transposed-B), ``k_zero``
+    # zero-fills the B reduce rows past ``bound`` (masked-K P@V). ``None`` = the enumeration
+    # σ-split path, where ``005`` derives guards as before.
+    m_guard: tuple[Expr, Expr] | None = None
+    n_guard: tuple[Expr, Expr] | None = None
+    k_zero: tuple[Expr, Expr] | None = None
 
     def deps(self) -> tuple[str, ...]:
         # Mirror ``Accum``: the accumulator read is implicit (loop-carried),
@@ -599,6 +620,16 @@ class Mma(ReduceCarrier):
 
     def carried_names(self) -> tuple[str, ...]:
         return (self.c,)
+
+    def combine_operands(self) -> tuple[str, ...]:
+        return (f"{self.c}__o",)
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The fragment add of two partial accumulators: ``c = c + c__o`` — the
+        cross-CTA split-K combine, reified as a one-``Assign`` program (the
+        accumulation is additive, so the fold op is ``add`` regardless of the
+        original scalar cell)."""
+        return (Assign(name=self.c, op=ElementwiseImpl("add"), args=(self.c, f"{self.c}__o")),)
 
     # The tensor-core accumulation ``c += a @ b`` is an additive fold —
     # associative + commutative with identity 0. That is what tells
@@ -751,6 +782,15 @@ class Monoid(ReduceCarrier):
 
     def carried_names(self) -> tuple[str, ...]:
         return self.state
+
+    def combine_operands(self) -> tuple[str, ...]:
+        return self.state_b
+
+    def combine_partials(self) -> tuple[Assign, ...]:
+        """The state-merges-state monoid op (``combine_states``) — already the
+        realization-agnostic cross-partition combine the cooperative-tree /
+        split-KV / split-K reductions fold through."""
+        return self.combine_states
 
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.

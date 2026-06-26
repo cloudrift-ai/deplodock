@@ -20,7 +20,7 @@ def _minimal_compiled(**kw) -> _Compiled:
 class TestSymbolicCapacityGuard:
     """``symbolic_caps`` makes the launch resolver hard-error when a runtime
     extent exceeds a capacity-capped kernel's baked hint (the smem-staged fused
-    symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)."""
+    symbolic-K SDPA P@V)."""
 
     def test_extent_over_cap_raises(self):
         compiled = _minimal_compiled(

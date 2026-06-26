@@ -1,28 +1,28 @@
 """Materializer integration tests for ``WarpSpecialize``.
 
-Build a minimal TileOp that holds a ``WarpSpecialize`` directly (skip
-the 085 pass) and run the materializer. Check that:
+No live pass constructs a ``WarpSpecialize`` today (the ``tile/085_warp_specialize.py``
+producer pass was removed in the block-DAG rewrite), but the consumer-side codegen in
+``100_materialize_tile.py::emit_warp_specialize`` is still live and reachable: a
+hand-built ``WarpSpecialize`` node fed through the materializer lowers into the full
+mbarrier handshake. These tests build that node directly and check the emitted Stmt
+tree, exactly as the original suite did.
 
-- the prologue has ``Smem("tma_mbar_empty", ...) + Cond(tid==0, [MbarrierInit
-  per slot]) + Sync()``;
-- producer / consumer subtrees are wrapped in
-  ``Cond(role < N_producer_warps, [SetMaxNReg(24,"dec"), ...],
-        [SetMaxNReg(240,"inc"), ThreadTile(tid_offset=n_producer, ...)])``;
-- producer-side ``SerialTile(serial_outer)`` matching ``serial_axis_name``
-  gets a ``MbarrierWait`` prepended inside a ``Cond(K_o >= bc-1)`` guard;
-- consumer-side ``SerialTile(serial_outer)`` matching ``serial_axis_name``
-  gets a trailing ``Sync(barrier_id=1, count=n_consumer_threads)`` +
-  single-thread ``MbarrierArrive``;
-- ``AsyncWait`` inside the consumer lowers with a named
-  ``Sync(barrier_id=1, count=n_cons)`` trailing fence;
-- ``AsyncWait`` outside any ``WarpSpecialize`` lowers with default
-  ``Sync(barrier_id=0)``.
+We assert that:
 
-Post-M6 (``plans/warptile-primitive.md``): the input TileOp now wraps
-``WarpSpecialize`` in a ``WarpTile(role)`` rather than the pre-refactor
-extended ``ThreadTile``; the σ-shift on the consumer subtree is gone; a
-nested ``ThreadTile(tid_offset=n_producer_threads, …)`` is what the
-materializer emits inside the consumer ``Cond.else_body``.
+- the prologue is ``Smem("tma_mbar_empty", ...) + Cond(tid==0, [MbarrierInit per slot]) + Sync()``;
+- producer / consumer subtrees are wrapped in a role-split ``Cond(role < n_producer_warps,
+  [SetMaxNReg(24,"dec"), ...], [SetMaxNReg(240,"inc"), ThreadTile(tid_offset=n_producer, ...)])``;
+- producer-side ``SerialTile(serial_outer)`` matching the K_o axis gets a ``MbarrierWait``
+  prepended inside a ``Cond(K_o >= bc-1)`` guard;
+- consumer-side ``SerialTile(serial_outer)`` gets a trailing ``Sync(barrier_id=1,
+  count=n_consumer_threads)`` + single-thread ``MbarrierArrive``;
+- ``AsyncWait`` inside the consumer lowers with a named ``Sync(barrier_id=1, count=n_cons)``
+  trailing fence;
+- ``AsyncWait`` outside any ``WarpSpecialize`` lowers with the default ``Sync(barrier_id=0)``.
+
+The input TileOp wraps ``WarpSpecialize`` in a ``WarpTile(role)``; the materializer reads
+the role axis off the WarpTile and emits a nested ``ThreadTile(tid_offset=n_producer_threads,
+…)`` inside the consumer ``Cond.else_body``.
 """
 
 from __future__ import annotations
@@ -131,9 +131,8 @@ def _tile_op_with_ws(
 
 
 def test_materializer_emits_empty_mbar_prologue():
-    """The first three stmts of the materialized WarpTile body are the
-    empty-mbarrier Smem decl, an init Cond gated on ``threadIdx.x==0``,
-    and a CTA-wide Sync."""
+    """The materialized WarpTile body holds the empty-mbarrier Smem decl,
+    an init Cond gated on ``threadIdx.x==0``, and a CTA-wide Sync."""
     kernel = _materialize(_tile_op_with_ws(ring_depth=2))
     # Outer is a WarpTile; descend to its body.
     top = kernel.body[0]
@@ -196,9 +195,9 @@ def test_producer_serial_outer_gets_mbarrier_wait():
     """Inside the producer branch's ``SerialTile(serial_outer)``, the
     head stmt is a ``Cond(K_o >= bc-1, [MbarrierWait(...)])``.
 
-    Producer branch is NOT wrapped in a consumer-decode ThreadTile —
+    The producer branch is NOT wrapped in a consumer-decode ThreadTile —
     producer warps don't need the inner-thread-axis decode (they only
-    use ``threadIdx.x`` directly for the TMA issuer cond and
+    use ``threadIdx.x`` directly for the TMA issuer cond and the
     ``lane`` / ``warp_id`` exposed by the enclosing WarpTile)."""
     kernel = _materialize(_tile_op_with_ws(ring_depth=2))
     top = kernel.body[0]

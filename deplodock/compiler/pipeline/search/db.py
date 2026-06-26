@@ -21,6 +21,16 @@ Pure persistence layer — no MCTS state, no propagation walks. Tables:
   terminal op the backend measured (today: a CudaOp; tomorrow whatever
   other backends lower to). ``backend`` partitions the table so the
   loop interpreter and the CUDA backend can coexist in the same DB.
+- ``node`` — one row per search-tree node (every partial branch + leaf of a
+  per-kernel autotune search), keyed by ``digest(context_key, op_sig,
+  tunable-knob set)``. Each row carries the full feature dict passed to the
+  prior (``H_*`` + ``S_*`` + knobs), a keep-the-minimum value-of-position
+  latency (``1/best_reward`` — the best latency reachable below the node), and
+  a ``parent_key`` pointer so ancestry between rows is recoverable. Content-keyed
+  (parent-tree-independent), so it survives schema-version drops like ``perf``.
+  Written once per finished search by :meth:`SearchDB.record_nodes`, fed by the
+  post-order tree walk ``TuningSearch._collect_node_records`` — alongside (not
+  replacing) the learned prior's reservoir feed.
 
 Concurrency: opened in WAL mode so parallel benches can read while one
 writes. The connection is kept open for the DB's lifetime; callers can
@@ -119,6 +129,27 @@ class LoweringRow:
     best_median_us: float | None
 
 
+@dataclass(frozen=True)
+class NodeRow:
+    """One ``node`` row — a single node of a per-kernel autotune search tree.
+
+    ``node_key`` is ``digest(context_key, op_sig, tunable-knob set)`` — the node's
+    identity within its operation; ``parent_key`` is the parent node's ``node_key``
+    (``None`` at the operation's top forks). ``features`` is the full feature dict
+    the prior sees (``H_*`` regime + ``S_*`` structure + tunable knobs).
+    ``value_us`` is the value-of-position latency (best reachable below the node);
+    :meth:`SearchDB.record_nodes` keeps the minimum on re-encounter. ``depth`` is
+    the node's distance from the sentinel root (top forks = 1)."""
+
+    node_key: str
+    parent_key: str | None
+    context_key: str
+    op_sig: str
+    features: dict
+    value_us: float
+    depth: int
+
+
 # The ``perf`` SELECT column list — order must match ``_row_to_perf``.
 _PERF_COLS = (
     "context_key, op_key, backend, status, latency_us_median, latency_us_min, latency_us_max, "
@@ -213,6 +244,25 @@ class SearchDB:
             PRIMARY KEY (context_key, op_key, backend)
         )
         """,
+        # Content-keyed (``node_key`` folds context + op_sig + knob set), so —
+        # unlike ``lowering`` — it is parent-tree-independent and survives a
+        # ``_SCHEMA_VERSION`` bump. ``CREATE … IF NOT EXISTS`` auto-creates it on
+        # the next open of a pre-``node`` DB; no version bump / ALTER needed.
+        """
+        CREATE TABLE IF NOT EXISTS node (
+            node_key     TEXT PRIMARY KEY,
+            parent_key   TEXT,
+            context_key  TEXT NOT NULL,
+            op_sig       TEXT NOT NULL,
+            features     TEXT NOT NULL DEFAULT '{}',
+            value_us     REAL NOT NULL,
+            depth        INTEGER NOT NULL,
+            n_updates    INTEGER NOT NULL DEFAULT 1,
+            updated_at   TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS node_parent ON node (parent_key)",
+        "CREATE INDEX IF NOT EXISTS node_op ON node (context_key, op_sig)",
     ]
 
     def __init__(self, path: Path | str | None = None) -> None:
@@ -239,6 +289,11 @@ class SearchDB:
 
     def _has_perf_error_column(self) -> bool:
         return any(r[1] == "error" for r in self._conn.execute("PRAGMA table_info(perf)"))
+
+    def _has_node_table(self) -> bool:
+        # A read-only open of a pre-``node`` DB never ran ``CREATE TABLE IF NOT
+        # EXISTS``, so ``SELECT … FROM node`` would raise; readers gate on this.
+        return self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node'").fetchone() is not None
 
     @classmethod
     def open_readonly(cls, path: Path | str) -> SearchDB:
@@ -410,6 +465,83 @@ class SearchDB:
                 error,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Search-tree nodes — write
+    # ------------------------------------------------------------------
+
+    def record_nodes(self, rows: list[NodeRow]) -> None:
+        """Keep-the-minimum upsert a batch of search-tree node rows (one finished
+        per-kernel search's worth). ``value_us`` is a value-of-position label that
+        only falls on re-encounter, so a worse-or-equal value never overwrites a
+        known one; ``context_key`` / ``op_sig`` / ``parent_key`` are functions of
+        ``node_key`` and re-stamp identically. ``n_updates`` counts writes (incl.
+        non-improving re-encounters) and ``updated_at`` refreshes each time.
+
+        Manual lookup-guard + INSERT/UPDATE (the ``record_perf`` / ``record_lowering``
+        idiom) rather than ``INSERT OR REPLACE`` — the latter would reset
+        ``n_updates`` and drop the old value. Row-at-a-time autocommit like the rest
+        of the file; a finished search is a few-hundred-row batch at most."""
+        now = datetime.now(UTC).isoformat()
+        for r in rows:
+            feats_json = json.dumps(r.features, sort_keys=True, default=str)
+            existing = self._conn.execute("SELECT value_us, n_updates FROM node WHERE node_key = ?", (r.node_key,)).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO node "
+                    "(node_key, parent_key, context_key, op_sig, features, value_us, depth, n_updates, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r.node_key, r.parent_key, r.context_key, r.op_sig, feats_json, r.value_us, r.depth, 1, now),
+                )
+            elif r.value_us < existing[0]:
+                self._conn.execute(
+                    "UPDATE node SET value_us = ?, features = ?, parent_key = ?, n_updates = ?, updated_at = ? WHERE node_key = ?",
+                    (r.value_us, feats_json, r.parent_key, existing[1] + 1, now, r.node_key),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE node SET n_updates = ?, updated_at = ? WHERE node_key = ?",
+                    (existing[1] + 1, now, r.node_key),
+                )
+
+    # ------------------------------------------------------------------
+    # Search-tree nodes — read
+    # ------------------------------------------------------------------
+
+    def iter_nodes(self, *, context_key: str | None = None, op_sig: str | None = None) -> Iterator[NodeRow]:
+        """Yield one :class:`NodeRow` per stored search-tree node (the value-of-position
+        dataset backing ``eval prior --dataset nodes``). Self-contained — no join.
+        A read-only open of a pre-``node`` DB has no such table, so this degrades to
+        yielding nothing instead of raising (mirrors ``iter_perf_samples``'
+        missing-column degrade). Optional ``context_key`` / ``op_sig`` scope to one
+        regime / operation."""
+        if not self._has_node_table():
+            return
+        sql = "SELECT node_key, parent_key, context_key, op_sig, features, value_us, depth FROM node"
+        clauses: list[str] = []
+        params: list = []
+        if context_key is not None:
+            clauses.append("context_key = ?")
+            params.append(context_key)
+        if op_sig is not None:
+            clauses.append("op_sig = ?")
+            params.append(op_sig)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        for node_key, parent_key, ck, sig, feats_json, value_us, depth in self._conn.execute(sql, params):
+            try:
+                features = json.loads(feats_json) if feats_json else {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            yield NodeRow(
+                node_key=node_key,
+                parent_key=parent_key,
+                context_key=ck,
+                op_sig=sig,
+                features=features,
+                value_us=value_us,
+                depth=depth,
+            )
 
     # ------------------------------------------------------------------
     # Perf — read

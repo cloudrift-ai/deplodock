@@ -29,9 +29,12 @@ def _kernel_compute_types() -> tuple[type, ...]:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
-    return (LoopOp, TileOp, KernelOp, CudaOp)
+    # ``TileGraphOp`` is a kernel-bearing op too: an outer two-level terminal slices
+    # partially-tiled ``TileGraphOp`` seeds (the structural-fork producer/consumer), so a
+    # ``TileGraphOp`` ancestor must become a synthetic ``InputOp`` boundary like any kernel.
+    return (LoopOp, TileOp, TileGraphOp, KernelOp, CudaOp)
 
 
 def collect_kernel_ancestors(graph: Graph, root_id: str, compute_types: tuple[type, ...]) -> tuple[set[str], set[str]]:

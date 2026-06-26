@@ -42,7 +42,7 @@ from deplodock.compiler.pipeline.search import (
 # and tests should reference these rather than re-listing pass names.
 TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
 LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion", "loop/recognize", "loop/stamp"]
-TILE_PASSES = [*LOOP_PASSES, "lowering/tile"]
+TILE_PASSES = [*LOOP_PASSES, "lowering/tile/split", "lowering/tile/enumeration", "lowering/tile/assembly"]
 KERNEL_PASSES = [*TILE_PASSES, "lowering/kernel"]
 CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
 

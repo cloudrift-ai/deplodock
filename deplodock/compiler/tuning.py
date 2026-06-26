@@ -46,7 +46,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline.passes.lowering.tile._enumeration import BK, BM, BN, FM, FN, SPLITK
+from deplodock import config
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import BM, BN, FM, FN
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.stmt.body import Body
@@ -386,7 +387,7 @@ def forced_bk(
     smem cap at the active tile shape.
 
     ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB)."""
-    forced = BK.read_int(0)
+    forced = config.int_env(config.knob_var("BK"), 0)  # legacy DEPLODOCK_BK pin (heuristic-defaults UI)
     if forced > 0:
         return forced
     if not body_info.has_matmul:
@@ -433,7 +434,7 @@ def auto_splitk(
     ``waves_target * num_sms`` total CTAs, divide by the current
     M-N grid count, clamp to the largest divisor of ``k_o_extent``
     that is ≤ the target. Returns 1 when no useful split exists."""
-    forced = SPLITK.read_int(0)
+    forced = config.int_env(config.knob_var("SPLITK"), 0)  # legacy DEPLODOCK_SPLITK pin (heuristic-defaults UI)
     if forced > 0:
         return forced
     if not body_info.has_matmul:

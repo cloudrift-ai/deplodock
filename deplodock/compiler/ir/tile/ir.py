@@ -51,7 +51,9 @@ from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
 from deplodock.compiler.dtype import BF16, F16, F32, DataType
+from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import (
     BinaryExpr,
@@ -91,6 +93,596 @@ from deplodock.compiler.ir.stmt.blocks import (
     _render_thread_axis_decode,
 )
 from deplodock.compiler.ir.stmt.ir import BodyOp
+from deplodock.compiler.ir.stmt.leaves import Mma
+
+# ===========================================================================
+# ENUMERATION — the block-DAG Tile IR (algorithm + Schedule)
+# ===========================================================================
+# The invariant algorithm (a DAG of Blocks) + the Schedule the move composer
+# searches. Derived projections (reads/writes/carrier/atom/edges) are computed
+# on demand, never stored. ``assemble(TileGraph)`` lowers this to the
+# MATERIALIZED tower below. See plans/tile-ir-block-dag.md.
+
+
+class Space(enum.Enum):
+    GMEM = "gmem"
+    SMEM = "smem"  # only ever an assemble artifact (a staged slab); never a stored Buffer
+    REG = "reg"
+
+
+class Binding(enum.Enum):
+    GRID = "grid"  # blockIdx        — scope-creating
+    SERIAL = "serial"  # for-loop     — scope-creating
+    WARP = "warp"  # warp_id          — replication
+    THREAD = "thread"  # threadIdx    — replication
+    REGISTER = "register"  # unrolled cell — replication
+    ATOM = "atom"  # one tensor-core cell — non-addressable (excluded from AccessMap)
+
+
+class Transport(enum.Enum):
+    SYNC = "sync"
+    CPASYNC = "cpasync"  # sm_80+
+    TMA = "tma"  # sm_90+
+
+
+class Placement(enum.Enum):
+    """Where a DAG edge's producer→consumer value is materialized — the unifying
+    edge-placement annotation (``plans/dag-edge-placement-split-as-enumeration.md``).
+    DERIVED from the ``Schedule`` (``staged`` + ``launch``), never stored: every
+    scheduling choice already lives in those fields, so placement is a projection
+    of them the same way ``Block.atom`` / ``TileGraph.edges`` are projections of the
+    body — see :meth:`TileGraph.placement`.
+
+    - ``INLINE`` — the value rides registers inside the consumer block (a fused
+      cone or a plain gmem-direct read); the default, no annotation.
+    - ``SMEM`` — a staged smem slab (``Schedule.staged[edge]``); today's ``stage``
+      move.
+    - ``GMEM`` — a global intermediate buffer; the producer and consumer live in
+      different launch groups (a grid barrier — the ``GMEM`` cut). Says *where the
+      buffer lives*, not *how many kernels*: v1 realizes every grid-crossing edge
+      as two launches, so a ``GMEM`` edge is exactly a cross-launch-group edge."""
+
+    INLINE = "inline"
+    SMEM = "smem"
+    GMEM = "gmem"
+
+
+class AddrKind(enum.Enum):
+    AFFINE = "affine"  # source_index[d] = offset[d] + Σ_{i: dims[i]==d} block[i]·Var(axes[i])
+    TEMPLATE = "template"  # verbatim coords, domain vars symbolic (collapsed reshape `/`,`%`)
+
+
+# ---------------------------------------------------------------------------
+# AccessMap — the derived index-classification of one Load / Write
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AccessMap:
+    """A DERIVED value: how one ``Load`` / ``Write`` in a body indexes one
+    buffer. Produced by classifying the leaf's index ``Expr`` (the legacy
+    ``020_stage_inputs._classify``); not stored on blocks. AFFINE carries the
+    structure ``assemble`` needs to size slabs, decide TMA box-eligibility, pick
+    a swizzle, and clamp."""
+
+    kind: AddrKind
+    axes: tuple[str, ...] = ()  # domain axes indexing this buffer (AFFINE)
+    dims: tuple[int, ...] = ()  # axes[i] -> source dim
+    block: tuple[int, ...] = ()  # per-axis atom-cell stride multiplier
+    offset: tuple[Expr, ...] = ()  # per-source-dim CTA-uniform anchor
+    template: tuple[Expr, ...] = ()  # TEMPLATE: verbatim source coords
+    clamp: tuple[Expr | None, ...] = ()  # per-source-dim safe-read bound (from the gmem Buffer.shape)
+
+    def free_axes(self) -> frozenset[str]:
+        """The domain axes this access depends on (drives hoist legality)."""
+        if self.kind is AddrKind.AFFINE:
+            return frozenset(self.axes)
+        out: set[str] = set()
+        for e in self.template:
+            out |= e.free_vars()
+        return frozenset(out)
+
+    @property
+    def rank(self) -> int:
+        """Number of source dims indexed."""
+        if self.kind is AddrKind.AFFINE:
+            return len(self.offset)
+        return len(self.template)
+
+
+def _affine_terms(expr: Expr) -> tuple[dict[str, int], Expr] | None:
+    """Decompose ``expr`` into ``({var: int_coeff}, const_expr)`` where the
+    coefficients are integer literals over distinct vars and ``const_expr`` is
+    the variable-free / CTA-uniform remainder. Returns ``None`` when the
+    expression is not affine in its vars (``//`` / ``%`` / non-literal product)."""
+    if isinstance(expr, Literal):
+        return {}, expr
+    if isinstance(expr, Var):
+        return {expr.name: 1}, Literal(0, "int")
+    if isinstance(expr, BinaryExpr):
+        op = expr.op
+        if op in ("+", "-"):
+            lhs = _affine_terms(expr.left)
+            rhs = _affine_terms(expr.right)
+            if lhs is None or rhs is None:
+                return None
+            lc, lk = lhs
+            rc, rk = rhs
+            terms = dict(lc)
+            sign = 1 if op == "+" else -1
+            for v, c in rc.items():
+                terms[v] = terms.get(v, 0) + sign * c
+            const = _add(lk, rk) if op == "+" else _add(lk, _mul_const(rk, -1))
+            return {v: c for v, c in terms.items() if c != 0}, const
+        if op == "*":
+            lhs = _affine_terms(expr.left)
+            rhs = _affine_terms(expr.right)
+            if lhs is None or rhs is None:
+                return None
+            lc, lk = lhs
+            rc, rk = rhs
+            # One side must be a pure constant for the product to stay affine.
+            if not lc and isinstance(lk, Literal):
+                k = int(lk.value)
+                return {v: k * c for v, c in rc.items()}, _mul_const(rk, k)
+            if not rc and isinstance(rk, Literal):
+                k = int(rk.value)
+                return {v: k * c for v, c in lc.items()}, _mul_const(lk, k)
+            return None
+        return None
+    return None
+
+
+def _is_zero(e: Expr) -> bool:
+    return isinstance(e, Literal) and e.value == 0
+
+
+def _add(a: Expr, b: Expr) -> Expr:
+    if _is_zero(a):
+        return b
+    if _is_zero(b):
+        return a
+    if isinstance(a, Literal) and isinstance(b, Literal):
+        return Literal(a.value + b.value, "int")
+    return BinaryExpr("+", a, b)
+
+
+def _mul_const(e: Expr, k: int) -> Expr:
+    if k == 0 or _is_zero(e):
+        return Literal(0, "int")
+    if k == 1:
+        return e
+    if isinstance(e, Literal):
+        return Literal(e.value * k, "int")
+    return BinaryExpr("*", e, Literal(k, "int"))
+
+
+def classify_access(index: tuple[Expr, ...], domain: frozenset[str]) -> AccessMap:
+    """Classify one ``Load`` / ``Write`` index tuple against the iteration
+    ``domain`` (the set of axis names the block iterates). AFFINE when every
+    source dim is affine in the domain axes; TEMPLATE (verbatim, domain vars
+    symbolic) otherwise — matching the legacy ``AffineAddressing`` /
+    ``TemplateAddressing`` split."""
+    axes: list[str] = []
+    dims: list[int] = []
+    block: list[int] = []
+    offset: list[Expr] = []
+    for d, e in enumerate(index):
+        terms = _affine_terms(e)
+        if terms is None:
+            return AccessMap(kind=AddrKind.TEMPLATE, template=tuple(index), clamp=(None,) * len(index))
+        coeffs, const = terms
+        anchor = const
+        for v, c in coeffs.items():
+            if v in domain:
+                axes.append(v)
+                dims.append(d)
+                block.append(c)
+            else:
+                # A non-domain (CTA-uniform / outer) var folds into the anchor.
+                anchor = _add(anchor, _mul_const(Var(v), c))
+        offset.append(anchor)
+    return AccessMap(
+        kind=AddrKind.AFFINE,
+        axes=tuple(axes),
+        dims=tuple(dims),
+        block=tuple(block),
+        offset=tuple(offset),
+        clamp=(None,) * len(index),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Port / Carrier — derived dataflow + reduce-algebra views
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Port:
+    """A DERIVED dataflow endpoint: ``(buffer, AccessMap)`` read off one body
+    leaf (``Load`` for a read, ``Write`` for a write)."""
+
+    buffer: str
+    access: AccessMap
+
+
+@dataclass(frozen=True)
+class Carrier:
+    """A DERIVED view of a folding block's reduce algebra — the legality oracle
+    for the reduce-restructuring moves. ``kind`` / traits come from
+    ``classify_algebra``; ``mask`` (the symbolic-K identity-fill bound) is read
+    off the block's domain. Nothing here is stored: recomputed from the body +
+    domain, like ``Loop.algebra_kind``."""
+
+    carrier: ReduceCarrier
+    kind: AlgebraKind | None = None  # set by Block.carrier (needs the enclosing loop)
+    mask: tuple[str, Expr] | None = None  # (reduce-axis, runtime bound) — symbolic reduce axis
+
+    @property
+    def associative(self) -> bool:
+        return self.carrier.associative
+
+    @property
+    def commutative(self) -> bool:
+        return self.carrier.commutative
+
+    @property
+    def has_identity(self) -> bool:
+        return self.carrier.has_identity
+
+
+# ---------------------------------------------------------------------------
+# Block — a DAG node: the algorithm at one compute site
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Block:
+    """A DAG node: the algorithm at one compute site. STORED state is only
+    ``name``, ``domain``, ``compute``. Everything else is a projection of
+    ``compute`` (+ ``domain``), computed on demand — so it can never drift and
+    never enters ``op_cache_key``."""
+
+    name: str
+    domain: tuple[Axis, ...]  # iteration axes (extent / real_extent / symbolic) the body references
+    compute: Body  # the scalar algorithm over logical buffers — THE source of truth
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.compute, Body):
+            object.__setattr__(self, "compute", Body.coerce(self.compute))
+
+    @property
+    def domain_names(self) -> frozenset[str]:
+        return frozenset(a.name for a in self.domain)
+
+    @property
+    def reads(self) -> tuple[Port, ...]:
+        """``Load`` leaves of ``compute`` → ``(buffer, AccessMap)`` (recursing
+        through nested reduce loops)."""
+        dom = self.domain_names
+        return tuple(Port(ld.input, classify_access(ld.index, dom)) for ld in self.compute.iter_of_type(Load))
+
+    @property
+    def writes(self) -> tuple[Port, ...]:
+        """``Write`` leaves of ``compute`` → ``(buffer, AccessMap)``."""
+        dom = self.domain_names
+        return tuple(Port(w.output, classify_access(w.index, dom)) for w in self.compute.iter_of_type(Write))
+
+    @property
+    def carrier(self) -> Carrier | None:
+        """The ``ReduceCarrier`` in ``compute`` (+ derived ``kind`` / ``mask``),
+        else ``None``. The reduce axis (and any symbolic ``mask`` bound) is read
+        off the enclosing reduce ``Loop`` in the body."""
+        from deplodock.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
+
+        for lp in self.compute.iter_of_type(Loop):
+            if not lp.is_reduce:
+                continue
+            inner = [s for s in lp.body if isinstance(s, ReduceCarrier)]
+            if not inner:
+                continue
+            ext = lp.axis.extent
+            mask = None if ext.is_static else (lp.axis.name, ext.expr)
+            return Carrier(carrier=inner[0], kind=classify_algebra(lp), mask=mask)
+        # A carrier directly at the block's top level (already-bracketed body).
+        for s in self.compute:
+            if isinstance(s, ReduceCarrier):
+                return Carrier(carrier=s)
+        return None
+
+    @property
+    def atom(self) -> Atom | None:
+        """The ``Mma``'s atom once atomized, else ``None``."""
+        for m in self.compute.iter_of_type(Mma):
+            return m.atom
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Buffer / Edge — logical value-stores + derived def-use topology
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Buffer:
+    """A LOGICAL value-store: a kernel input/output or an inter-block
+    intermediate. SMEM slabs are not Buffers — they are assemble artifacts of a
+    ``staged`` annotation. ``pad`` is a schedule property of the slab, not
+    here."""
+
+    name: str
+    shape: tuple[Expr, ...]
+    dtype: DataType
+    space: Space = Space.GMEM
+
+
+@dataclass(frozen=True)
+class Edge:
+    """A DERIVED value (not stored): one per ``(producer-or-input, consumer,
+    buffer)`` from the body's buffer def-use."""
+
+    src: str  # producer block name, or an input Buffer name
+    dst: str  # consumer block name
+    buffer: str
+
+
+# ---------------------------------------------------------------------------
+# Schedule — the variant: every scheduling choice
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """The variant — every scheduling choice the moves search, exactly the
+    **hardware overlay** over the invariant algorithm (the tiled iteration
+    structure lives in ``Block.compute``, never here): how each axis binds
+    (``binding``), where each edge's value is placed (``staged``), and how blocks
+    partition into kernels (``launch``). One move co-writes the body (the σ-split
+    that creates an axis) and this overlay (that axis's binding), keyed by name;
+    ``assemble`` composes the two into the materialized ``TileOp``. Staging keys
+    are read-sites (the derived ``Edge``); a read absent from ``staged`` is
+    gmem-direct. Fields are added back here only when a move actually writes one
+    (a fact decided at assemble — ring depth, slab pad — rides the materialized
+    node, not a never-populated slot here)."""
+
+    binding: dict[str, Binding] = field(default_factory=dict)  # axis -> hardware role
+    launch: dict[str, int] = field(default_factory=dict)  # block -> launch group (one group = one kernel)
+    staged: dict[Edge, Transport] = field(default_factory=dict)  # read-site -> SMEM fill transport
+    # A SERIAL_OUTER axis that carries an online-updating (twisted-)monoid across its stream —
+    # the streaming-flash kv loop. Set ⇒ ``assemble`` realizes the block's carrier at the
+    # FRAGMENT tier (``realize_fragment_softmax``) instead of inline-rendering it, so the warp
+    # flash falls out of the generic walk. Empty ⇒ a plain reduce (carrier rendered inline).
+    carry: frozenset[str] = field(default_factory=frozenset)
+
+    def with_binding(self, **kw: Binding) -> Schedule:
+        return replace(self, binding={**self.binding, **kw})
+
+    def pretty(self, indent: str = "") -> list[str]:
+        """Readable listing of the non-empty scheduling decisions (for
+        ``compile -vv`` / kernel dumps). ``binding`` is rendered on the
+        block domain axes by :meth:`TileGraph.pretty`, so it is omitted
+        here; ``launch`` / ``staged`` each get one line. The ``staged``
+        edge-keyed map keys on ``buffer:src->dst``."""
+
+        def edge_key(e: Edge) -> str:
+            return f"{e.buffer}:{e.src}->{e.dst}"
+
+        lines: list[str] = []
+        if self.launch:
+            lines.append(f"{indent}launch: " + ", ".join(f"{b}={g}" for b, g in self.launch.items()))
+        if self.staged:
+            lines.append(f"{indent}staged: " + ", ".join(f"{edge_key(e)}={t.value}" for e, t in self.staged.items()))
+        return lines
+
+
+# ---------------------------------------------------------------------------
+# TileGraph — the new Tile IR
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TileGraph:
+    """The new Tile IR. ``assemble(TileGraph) -> KernelOp | Graph[KernelOp]``
+    (one kernel per launch group). The edge topology is derived."""
+
+    name: str
+    buffers: dict[str, Buffer]  # logical only (inputs / outputs / intermediates)
+    blocks: tuple[Block, ...]
+    schedule: Schedule
+
+    def block(self, name: str) -> Block:
+        for b in self.blocks:
+            if b.name == name:
+                return b
+        raise KeyError(name)
+
+    @property
+    def edges(self) -> tuple[Edge, ...]:
+        """Buffer def-use across blocks (+ input-source edges), deduplicated.
+
+        For each buffer a block reads, the edge's ``src`` is the (unique) block
+        that writes it, or — when no block writes it — the input ``Buffer``
+        name itself."""
+        writer: dict[str, str] = {}
+        for b in self.blocks:
+            for p in b.writes:
+                writer[p.buffer] = b.name
+        out: list[Edge] = []
+        seen: set[Edge] = set()
+        for b in self.blocks:
+            for p in b.reads:
+                src = writer.get(p.buffer, p.buffer)
+                if src == b.name:
+                    continue  # a block reading its own intermediate (accumulator) is not a DAG edge
+                e = Edge(src=src, dst=b.name, buffer=p.buffer)
+                if e not in seen:
+                    seen.add(e)
+                    out.append(e)
+        return tuple(out)
+
+    def placement(self, edge: Edge) -> Placement:
+        """The DERIVED :class:`Placement` of one edge — read off ``Schedule.staged``
+        + ``Schedule.launch`` (``plans/dag-edge-placement-split-as-enumeration.md``).
+        ``stage`` and the ``GMEM`` cut become two values of one query, with ``INLINE``
+        the default. A cross-launch-group edge is ``GMEM`` regardless of whether the
+        consumer also stages its read of the materialized buffer (the buffer lives in
+        gmem either way), so ``GMEM`` is checked first."""
+        sched = self.schedule
+        block_names = {b.name for b in self.blocks}
+        if edge.src in block_names and sched.launch.get(edge.src, edge.src) != sched.launch.get(edge.dst, edge.dst):
+            return Placement.GMEM
+        if edge in sched.staged:
+            return Placement.SMEM
+        return Placement.INLINE
+
+    def place_edge(self, edge: Edge, placement: Placement, *, transport: Transport = Transport.SYNC) -> TileGraph:
+        """Return a copy of this ``TileGraph`` with ``edge`` placed — the unifying
+        edge-placement **move** (``plans/dag-edge-placement-split-as-enumeration.md``).
+        The inverse of :meth:`placement`: it writes the ``Schedule`` fields a placement
+        implies, so ``stage``/``split``/fuse become one operation over the block-DAG.
+
+        - ``GMEM`` (the cut) — put the producer and consumer in **different** launch
+          groups (a grid barrier — the multi-launch ``assemble`` then emits separate
+          kernels with a gmem intermediate). Drops any stale staging of the edge.
+        - ``SMEM`` (the fused edge) — put both in the **same** launch group and stage
+          the edge (``staged[edge] = transport``); the intermediate rides an smem slab
+          inside one kernel (the producer fills it, the consumer reads it).
+        - ``INLINE`` — same launch group, no staging (the value rides registers).
+
+        Only meaningful for a block→block edge (``edge.src`` is a producer block); an
+        input-source edge has no producer to co-place, so only ``SMEM``/``INLINE``
+        (its staging) apply and the launch keys are left untouched."""
+        sched = self.schedule
+        block_names = {b.name for b in self.blocks}
+        launch = dict(sched.launch)
+        staged = {e: t for e, t in sched.staged.items() if e != edge}
+        if edge.src in block_names:
+            if placement is Placement.GMEM:
+                launch[edge.src] = launch.get(edge.src, 0)
+                launch[edge.dst] = launch[edge.src] + 1  # a distinct group → the cut
+            else:
+                launch[edge.dst] = launch[edge.src] = launch.get(edge.src, 0)  # one kernel
+        if placement is Placement.SMEM:
+            staged[edge] = transport
+        return replace(self, schedule=replace(sched, launch=launch, staged=staged))
+
+    def structural_key(self) -> str:
+        """A canonical identity over the algorithm + Schedule, for ``op_cache_key``
+        (``plans/tile-ir-block-dag.md``: the key is ``canonical(compute bodies +
+        edge topology) + Schedule``). The derived projections never enter it."""
+        blocks = tuple((b.name, b.compute.structural_key()) for b in self.blocks)
+        binding = tuple(sorted((a, v.value) for a, v in self.schedule.binding.items()))
+        edges = tuple(sorted((e.src, e.dst, e.buffer) for e in self.edges))
+        return repr((blocks, binding, edges))
+
+    def pretty(self, indent: str = "") -> list[str]:
+        """Readable multi-line listing of the block-DAG (for ``compile -vv``
+        and kernel dumps): the logical buffers, each block's domain (axis +
+        binding) and compute body, the non-empty schedule decisions, and the
+        derived def-use edges. The verbose nested-dataclass ``repr`` is what
+        this replaces."""
+        lines: list[str] = [f"{indent}buffers:"]
+        for buf in self.buffers.values():
+            shape = ", ".join(d.pretty() if hasattr(d, "pretty") else str(d) for d in buf.shape)
+            space = "" if buf.space is Space.GMEM else f" {buf.space.value}"
+            lines.append(f"{indent}{INDENT}{buf.name}: {buf.dtype.name}[{shape}]{space}")
+        for b in self.blocks:
+            dom = ", ".join(_fmt_domain_axis(ax, self.schedule.binding.get(ax.name)) for ax in b.domain)
+            lines.append(f"{indent}block {b.name} [{dom}]")
+            lines.extend(pretty_body(b.compute, indent + INDENT))
+        sched = self.schedule.pretty(indent + INDENT)
+        if sched:
+            lines.append(f"{indent}schedule:")
+            lines.extend(sched)
+        edges = self.edges
+        if edges:
+            lines.append(f"{indent}edges:")
+            for e in edges:
+                lines.append(f"{indent}{INDENT}{e.buffer}: {e.src} -> {e.dst}")
+        return lines
+
+
+def _fmt_domain_axis(ax: Axis, binding: Binding | None) -> str:
+    """``name:extent`` plus ``=binding`` when the axis is bound — the compact
+    per-axis label in :meth:`TileGraph.pretty`'s block header."""
+    label = f"{ax.name}:{ax.extent}"
+    return f"{label}={binding.value}" if binding is not None else label
+
+
+@dataclass
+class TileGraphOp(Op):
+    """The node the ENUMERATION passes pass between themselves and hand to
+    ASSEMBLY. It carries the **stored algorithm being refined in place** by the F3-b
+    incremental body moves (``plans/tile-ir-block-dag.md``): ``010_build`` seeds the
+    **logical** (un-tiled) ``TileGraph`` (``_build.seed_graph``), then the tile passes
+    rewrite it move by move — the algorithm is a first-class structure refined as the
+    search descends, never a function re-derived from a stored knob dict (that is the
+    "knob-invariant algorithm" the model calls for).
+
+    - **logical seed → tiled** (``tilegraph`` set throughout) — ``010_build`` emits the
+      logical block; ``060_reduce_tile`` applies the reduce-decomposition body move
+      (``reduce_decomp``); ``090_thread_tile`` pins the thread knob (no body move);
+      ``100_register_tile`` applies the free-axis σ-split body move (``free_tile``),
+      after which the algorithm is fully tiled; ``110_seal_scalar_tier`` stamps the
+      reduce regime's scalar-tier OFF sentinels; ``120_stage`` annotates
+      ``Schedule.staged``. It also carries the derived ``dag`` + regime (``algebra`` /
+      ``target_names``) the offer fns read. Each fork pins one more knob group onto
+      ``knobs``; the carry-forward ``LoopOp`` knobs ride ``knobs`` automatically (the
+      engine merges a predecessor's knobs forward on every rebind).
+    - **assembly** consumes the fully-tiled ``tilegraph`` directly
+      (``assembly/010_assemble`` → ``assemble_block``): no build there, only the tower
+      materialization + slab synthesis from the ``Schedule``.
+
+    ``op_cache_key`` keys on :meth:`structural_key` (the stored ``TileGraph``'s
+    canonical algorithm + ``Schedule``) + ``knobs`` — distinct per variant, so the
+    search tree never self-parents."""
+
+    name: str = ""
+    tilegraph: TileGraph | None = None
+    leading: tuple = ()
+    # --- enumeration state carried alongside the stored algorithm (untyped to keep
+    # the ir layer free of a passes-layer import — set/read by the tile passes) ---
+    dag: object = None  # the IterDag the offer fns tile
+    algebra: object = None  # AlgebraKind — the regime the passes dispatch on
+    target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
+    seed_key: str = ""  # the source LoopOp's body structural key
+    buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
+
+    def structural_key(self) -> str:
+        return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
+
+    def pretty_body(self) -> str:
+        """Readable rendering of the stored algorithm for ``compile -vv`` /
+        kernel dumps — the regime header (``algebra`` / reduce ``targets``),
+        the leading hoisted stmts, then the ``TileGraph`` block-DAG. Replaces
+        the unreadable nested-dataclass ``repr`` the diff renderer fell back
+        to. The caller (``Candidate._format_nodes``) emits the surrounding
+        ``<out> = TileGraphOp(<inputs>)`` label, so none is prepended here."""
+        lines: list[str] = []
+        algebra = getattr(self.algebra, "value", self.algebra)
+        head = f"algebra={algebra}" if algebra is not None else "algebra=?"
+        # Streaming-flash is a derived property of the carried dag (never stored).
+        if getattr(self.dag, "streaming", False):
+            head += " (streaming)"
+        if self.target_names:
+            head += f"  targets={{{', '.join(sorted(self.target_names))}}}"
+        lines.append(head)
+        if self.leading:
+            lines.append("leading:")
+            lines.extend(pretty_body(Body.coerce(self.leading), INDENT))
+        if self.tilegraph is not None:
+            lines.extend(self.tilegraph.pretty())
+        return "\n".join(lines)
+
+
+# ===========================================================================
+# MATERIALIZED — the assemble output: the tower IR
+# ===========================================================================
+# What ``assemble`` emits and the kernel passes lower to ``KernelOp``: ``TileOp``
+# + the typed tile flavors + ``StageBundle`` / ``Source`` / ``WarpSpecialize`` /
+# ``AsyncWait`` + ``Atom`` / ``ATOM_REGISTRY``. Slated for removal once
+# ``assemble`` emits ``KernelOp`` directly.
+
 
 SerialKind = _Lit["plain", "stage_inner", "serial_outer", "pipeline"]
 
@@ -229,6 +821,65 @@ class AsyncWait(Stmt):
 
 
 # ---------------------------------------------------------------------------
+# CoopReduce — cooperative per-row reduce prologue (SMEM fused edge, R7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CoopReduce(Stmt):
+    """A cooperative per-row reduce **prologue** for the SMEM fused edge (the rmsnorm
+    producer). All CTA threads stride over the ``cells`` (the M cache axes), each
+    reducing the producer's contraction over the **full** row and writing a per-row
+    scalar slab (``out_slab``); the matmul's scale-application compute phase then reads
+    that slab as a broadcast operand. Emitted as a ``GridTile``-level sibling **before**
+    the matmul tower — no second ``ThreadTile``, the cooperative ``StridedLoop`` uses the
+    kernel's own thread count. ``100_materialize`` expands it via ``emit_reduce_phase``.
+
+    - ``cells`` — the M cache axes: the cooperative iteration domain + the ``out_slab``
+      index. (Materialize flat-decodes a ``tid``-strided index into these.)
+    - ``leading`` — per-CTA constants, emitted **once** before the cooperative loop (the
+      rmsnorm ``1/H`` reciprocal + ``eps`` loads).
+    - ``body`` — the per-cell reduce: a serial reduce loop over the contraction axis + the
+      scalar chain (``rsqrt(acc·(1/H)+eps)``) + the ``Write out_slab[cells]``.
+    - ``out_slab`` / ``out_dtype`` — the produced per-row smem slab + its element dtype.
+
+    The bodies ARE exposed via :meth:`nested` so ``020_place_inits`` seeds the reduce
+    ``Accum`` and ``030_stamp_types`` stamps dtypes; ``010_split_register_axes`` skips it
+    (the cooperative fill must not be register-replicated, like ``StageBundle.compute``)."""
+
+    cells: tuple[Axis, ...]
+    leading: Body
+    body: Body
+    out_slab: str
+    out_dtype: DataType
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.leading, Body):
+            object.__setattr__(self, "leading", Body.coerce(self.leading))
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body.coerce(self.body))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.leading, self.body)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        return replace(self, leading=bodies[0], body=bodies[1])
+
+    def external_reads(self) -> tuple[str, ...]:
+        return tuple(ld.input for b in (self.leading, self.body) for ld in b.iter_of_type(Load))
+
+    def local_decls(self) -> tuple[str, ...]:
+        return (self.out_slab,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        cells = ", ".join(f"{a.name}:{a.extent}" for a in self.cells)
+        lines = [f"{indent}coop_reduce[{cells}] -> {self.out_slab}:"]
+        lines.extend(pretty_body(self.leading, indent + INDENT))
+        lines.extend(pretty_body(self.body, indent + INDENT))
+        return lines
+
+
+# ---------------------------------------------------------------------------
 # WarpSpecialize — producer/consumer split for TMA-pipelined kernels
 # ---------------------------------------------------------------------------
 #
@@ -270,9 +921,8 @@ class WarpSpecialize(Stmt):
       ``consumer_is_warp``). The materializer feeds these into a nested
       ``ThreadTile`` / ``WarpTile`` carrying ``tid_offset=n_producer_threads``
       so consumer threads decode ``threadIdx.x - n_producer_threads`` back into
-      these axis names. ``()`` is the legacy / pre-refactor shape, kept for
-      back-compat with any caller that doesn't track the axes yet — the new
-      materializer arm raises if it's empty when expected.
+      these axis names. Required (no default) — the WarpTile-based materializer
+      arm raises on empty axes (the stranded-consumer deadlock guard).
 
     The K_o axis the WS pass aligned scheduling against is identified by
     the materializer structurally — the (single) ``SerialTile(serial_outer)``
@@ -292,7 +942,7 @@ class WarpSpecialize(Stmt):
     consumer_body: Body
     ring_depth: int
     n_producer_threads: int
-    consumer_thread_axes: tuple[Axis, ...] = ()
+    consumer_thread_axes: tuple[Axis, ...]
     # When True the consumer axes are *warp*-granularity (the warp-tier MMA
     # tower: ``consumer_thread_axes`` are the WM×WN warp axes, 32 lanes each),
     # so the materializer wraps the consumer body in
@@ -649,51 +1299,6 @@ def affine_decode_per_dim(
     return out
 
 
-def trivial_stage_body(
-    name: str,
-    buf: str,
-    origin: tuple[Expr, ...],
-    axes: tuple[Axis, ...],
-    addressing: AffineAddressing | TemplateAddressing,
-) -> Body:
-    """**Deprecated** — kept for import compatibility during stage-wrap-body refactor.
-
-    Pre-refactor: built the canonical ``Load + Write`` cooperative-load body
-    for a Stage. Post-refactor: producer body is reconstructed at materialize
-    time from ``Source`` entries; no caller should need this helper. Phase C
-    bucket 12 (swizzle split) removes the last reference.
-    """
-    cache_index = tuple(Var(ax.name) for ax in axes)
-    if isinstance(addressing, AffineAddressing):
-        coord_for = {ax.name: cache_index[i] for i, ax in enumerate(axes)}
-        src_index = addressing.source_index(axes, coord_for, origin)
-    else:
-        src_index = addressing.exprs
-    load_name = f"{name}__src"
-    return Body(
-        (
-            Load(name=load_name, input=buf, index=src_index),
-            Write(output=name, index=cache_index, value=load_name),
-        )
-    )
-
-
-def _source_pretty(src: Source) -> str:
-    """Legacy single-line source description — kept for debugging / dump
-    output. New consumer-facing pretty-print uses ``_source_decl_line``
-    which formats each source as ``shared name[...] = buf[...]`` at the
-    Stage's indent.
-    """
-    dims = src.addressing.dims if isinstance(src.addressing, AffineAddressing) else tuple(range(len(src.cache_axes)))
-    cache = ", ".join(f"{ax.name}:{ax.extent}@{d}" for ax, d in zip(src.cache_axes, dims, strict=True))
-    origin = ", ".join(e.pretty() for e in src.origin)
-    pad = f" pad=({', '.join(str(p) for p in src.pad)})" if src.pad and any(src.pad) else ""
-    tpl = ""
-    if isinstance(src.addressing, TemplateAddressing):
-        tpl = " template=[" + ", ".join(e.pretty() for e in src.addressing.exprs) + "]"
-    return f"{src.name}<-{src.buf}(origin=({origin}), slab=({cache})){pad}{tpl}"
-
-
 def _source_decl_line(src: Source) -> str:
     """Render one ``Source`` as ``shared <name>[<cache_axes>] = <buf>[<source_index>];``.
 
@@ -1016,12 +1621,12 @@ class AtomTile(ParallelTile):
     Marker for the per-cell hardware-atomic extent on a matmul-reduce kernel
     (see ``plans/mma-fragment-factorization.md``). The axes carry the cell
     shape (e.g. ``(M=16, N=8)``); the body inside is the per-cell compute that
-    ``011_lower_atom_cell`` turns into an ``Mma`` + the lowering replaces with
+    ``050_warp_build`` turns into an ``Mma`` + the lowering replaces with
     the fragment chain.
 
     ``atom`` is the :class:`Atom` this cell realises, carried **structurally**
     on the tile — its presence (and this field) is the "this kernel factorizes
-    through tensor cores" signal, and ``011_lower_atom_cell`` reads ``.atom``
+    through tensor cores" signal, and ``050_warp_build`` reads ``.atom``
     off it to build the ``Mma`` (no ``ATOM_KIND`` knob lookup; the knob is the
     tuning shadow of the same choice, not the semantic source). Scalar matmul
     kernels never emit an ``AtomTile``.
@@ -1036,7 +1641,7 @@ class AtomTile(ParallelTile):
         raise NotImplementedError(
             "AtomTile must be consumed by the MMA materializer "
             "(kernel/005_lower_atom_tile) before render — an AtomTile here "
-            "usually means tile/011_lower_atom_cell could not tag the cell "
+            "usually means tile/enumeration/050_warp_build could not tag the cell "
             "(operand A/B classification failed) — "
             f"reached render with axes={tuple(ax.name for ax in self.axes)!r}"
         )
@@ -1685,7 +2290,6 @@ __all__ = [
     # Source-aware traversal (transformer / visitor over staged bodies)
     "map_staged",
     "StagedHandler",
-    "trivial_stage_body",  # deprecated stub during refactor
     "BYTES_PER_ELEM",
     "Stmt",
     # Top-level

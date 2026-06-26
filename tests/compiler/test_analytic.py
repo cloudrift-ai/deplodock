@@ -14,7 +14,8 @@ without re-running the offline weight fit (that lives in
 from __future__ import annotations
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, pick_matmul
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from deplodock.compiler.pipeline.search.analytic import pick_matmul
 from deplodock.compiler.pipeline.search.prior import AnalyticPrior
 
 
@@ -47,20 +48,25 @@ def test_pick_matmul_lands_in_geometry_band():
     ctx = _ctx()
     for M, N, K in [(64, 64, 64), (128, 256, 128), (512, 1024, 1024)]:
         r = pick_matmul(M, N, K, "fp32", ctx)
-        assert 16 <= r["BN"] <= 64, (M, N, K, r)
-        assert 8 <= r["BM"] <= 16, (M, N, K, r)
-        assert r["BK"] >= 32, (M, N, K, r)
-        assert r["SPLITK"] <= 2, (M, N, K, r)
-        assert set(THREAD_KNOBS) <= set(r)
+        # Native SPLIT@<axis>: the matmul free axes are a1 (inner N) and a0 (outer M).
+        n_par, _ = fam.dec_split(r[fam.split_key("a1")])
+        m_par, _ = fam.dec_split(r[fam.split_key("a0")])
+        assert 16 <= n_par <= 64, (M, N, K, r)
+        assert 8 <= m_par <= 16, (M, N, K, r)
+        decomp = fam.dec_reduce(r[next(k for k in r if k.startswith("REDUCE@"))])
+        assert decomp.serial >= 32, (M, N, K, r)  # native REDUCE serial (legacy BK)
+        assert decomp.cta <= 2, (M, N, K, r)  # native REDUCE cta (legacy SPLITK)
 
 
 def test_pick_matmul_warp_dispatch_by_dtype():
     ctx = _ctx()
     r16 = pick_matmul(256, 256, 256, "fp16", ctx)
-    assert r16.get("MMA") == "mma_m16n8k16_f16"
-    assert r16["WM"] * r16["WN"] != 1  # single-warp tiles are pruned
+    assert r16.get(fam.atom_key(fam.MATMUL_CELL)) == "mma_m16n8k16_f16"
+    wn = fam.dec_split(r16[fam.split_key("a1")])[0]
+    wm = fam.dec_split(r16[fam.split_key("a0")])[0]
+    assert wm * wn != 1  # single-warp tiles are pruned
     r_bf = pick_matmul(256, 256, 256, "bf16", ctx)
-    assert r_bf.get("MMA") == "mma_m16n8k16_bf16"
+    assert r_bf.get(fam.atom_key(fam.MATMUL_CELL)) == "mma_m16n8k16_bf16"
 
 
 def test_dynamic_weight_set_selected_on_symbolic_flag():
@@ -81,22 +87,27 @@ def test_dynamic_weight_set_selected_on_symbolic_flag():
 
 
 def test_atomic_free_split_preference_above_threshold():
-    """The atomic-free split-K gate (plans/atomic-free-monoid-combine.md): a wide
-    split (SPLITK >= threshold) should prefer NOATOMIC=True (workspace + reduce);
-    a narrow split should keep the atomicAdd fast-path. The two variants share
-    identical matmul geometry — the NOATOMIC term is the sole differentiator."""
+    """The cross-CTA finalize gate: a wide split (cta >= threshold) should prefer the
+    deferred KERNEL finalize (``c<cta>k`` — workspace + reduce); a narrow split should
+    keep the atomicAdd fast-path (``c<cta>a``). The two variants share identical matmul
+    geometry — the finalize letter (featurized as ``D_finalize_kernel``) is the sole
+    differentiator."""
     p = AnalyticPrior(atomic_free_split_threshold=4.0, atomic_free_weight=5.0)
-    base = {"BN": 32, "BM": 8, "FM": 26, "FN": 4, "FK": 1, "BK": 32, "BR": 1, "S_ext_free_prod": 4.0e6}
-    # Wide split: atomic-free wins (lower latency proxy).
-    wide_atomic = {**base, "SPLITK": 8, "NOATOMIC": False}
-    wide_free = {**base, "SPLITK": 8, "NOATOMIC": True}
+    base = {"BN": 32, "BM": 8, "FM": 26, "FN": 4, "S_ext_free_prod": 4.0e6}
+
+    def reduce(cta: int, finalize: str) -> dict:  # the native REDUCE codec, finalize in the c field
+        return {"REDUCE@k": f"s32/f1/c{cta}{finalize}/t1"}
+
+    # Wide split: the deferred kernel fold wins (lower latency proxy).
+    wide_atomic = {**base, **reduce(8, "a")}
+    wide_free = {**base, **reduce(8, "k")}
     assert p.score(wide_free) < p.score(wide_atomic)
     # Narrow split: the atomic fast-path wins.
-    narrow_atomic = {**base, "SPLITK": 2, "NOATOMIC": False}
-    narrow_free = {**base, "SPLITK": 2, "NOATOMIC": True}
+    narrow_atomic = {**base, **reduce(2, "a")}
+    narrow_free = {**base, **reduce(2, "k")}
     assert p.score(narrow_atomic) < p.score(narrow_free)
-    # The term is gated off for NOATOMIC=False: its score matches a weight-0 prior;
-    # NOATOMIC=True diverges (the term fires).
+    # The term is gated off for the atomic finalize: its score matches a weight-0 prior;
+    # the kernel finalize diverges (the term fires).
     p0 = AnalyticPrior(atomic_free_weight=0.0)
     assert p.score(wide_atomic) == p0.score(wide_atomic)
     assert p.score(wide_free) != p0.score(wide_free)

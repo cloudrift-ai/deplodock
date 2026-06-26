@@ -25,6 +25,7 @@ def _ws(**overrides):
         consumer_body=Body((AsyncWait(keep=1),)),
         ring_depth=2,
         n_producer_threads=32,
+        consumer_thread_axes=(),
     )
     kwargs.update(overrides)
     return WarpSpecialize(**kwargs)
@@ -48,6 +49,7 @@ def test_body_coercion_from_tuple():
         consumer_body=(AsyncWait(keep=1),),  # type: ignore[arg-type]
         ring_depth=2,
         n_producer_threads=32,
+        consumer_thread_axes=(),
     )
     assert isinstance(ws.producer_body, Body)
     assert isinstance(ws.consumer_body, Body)
@@ -143,6 +145,7 @@ def test_rewrite_substitutes_into_both_bodies():
         consumer_body=Body((AsyncWait(keep=1, phase=Var("x")),)),
         ring_depth=2,
         n_producer_threads=32,
+        consumer_thread_axes=(),
     )
     sigma = Sigma({"x": Literal(7, "int")})
     out = ws.rewrite(lambda n: n, sigma)

@@ -46,7 +46,7 @@ def _f32_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
 
 def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
     """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/005_split_demoted``) is a structural fork."""
+    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
     f16 = _dt.get("f16")
     g = g if g is not None else Graph()
     x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
@@ -112,20 +112,34 @@ def test_option0_decide_matches_no_prior_greedy() -> None:
 
 
 def test_trace_records_partition_fork() -> None:
-    """The partition fork traces under its rule name with the kernel's node id,
-    a complete tile knob row, and the decide's score annotation (None for the
-    unranked option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds."""
+    """The inner partition forks trace under their per-family rule names with the
+    kernel's node id and the decide's score annotation (None for the unranked
+    option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds. The block-DAG
+    Tile IR splits the old monolithic ``010_enumerate`` into the per-family
+    chain (``060_reduce_tile`` → ``090_thread_tile`` → ``100_register_tile`` →
+    ``120_stage``), so one kernel records that chain rather than one fork, and
+    the cumulative knob row carries the complete tile (``{BM, BN}``) by the
+    thread-tile fork."""
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     terminal, trace = run.resolve(g, _option0)
-    part = [d for d in trace if d.rule_name == "010_partition_loops"]
-    assert len(part) == 1, f"one partition fork for one kernel, got {[d.rule_name for d in trace]}"
-    d = part[0]
-    assert d.node_id in terminal.nodes
-    assert d.chosen_kind == "op"
-    assert d.score is None
-    assert d.n_options == 1, "the planner emits ONE lazy fork tree as its raw option"
-    assert {"BM", "BN"} <= set(d.knob_delta), f"a leaf decision carries the complete tile row, got {d.knob_delta}"
+    part = [d for d in trace if d.rule_name in {"060_reduce_tile", "090_thread_tile", "100_register_tile"}]
+    assert [d.rule_name for d in part] == ["060_reduce_tile", "090_thread_tile", "100_register_tile"], (
+        f"the inner tile-fork chain for one kernel, got {[d.rule_name for d in trace]}"
+    )
+    for d in part:
+        assert d.node_id in terminal.nodes
+        assert d.chosen_kind == "op"
+        assert d.score is None
+        assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+
+    thread = next(d for d in part if d.rule_name == "090_thread_tile")
+    # The matmul free axes are a0 (M, outer) and a1 (N, inner); the thread fork stamps the
+    # par-only ``SPLIT@<axis>`` for both (the register fork completes par×reg).
+    assert {fam.split_key("a1"), fam.split_key("a0")} <= set(thread.knob_delta), (
+        f"the thread-tile decision carries the free-axis SPLIT row, got {thread.knob_delta}"
+    )
 
 
 def test_decide_score_lands_on_trace() -> None:
@@ -165,9 +179,9 @@ def test_structural_replay_consulted() -> None:
         return _option0(fp)
 
     terminal, trace = Run(pipeline=outer_pipeline(), ctx=Context.from_target((12, 0))).resolve(g, split_first)
-    assert seen.count("005_split_demoted") == 1, f"the second offer site must replay, decide saw {seen}"
-    assert sum(1 for d in trace if d.rule_name == "005_split_demoted") == 1
+    assert seen.count("010_split_demoted") == 1, f"the second offer site must replay, decide saw {seen}"
+    assert sum(1 for d in trace if d.rule_name == "010_split_demoted") == 1
     assert sum(1 for n in terminal.nodes.values() if isinstance(n.op, LoopOp)) == 4, "both sites must take the split side"
-    split = next(d for d in trace if d.rule_name == "005_split_demoted")
+    split = next(d for d in trace if d.rule_name == "010_split_demoted")
     assert split.chosen_kind == "graph"
-    assert split.knob_delta.get("SPLIT_CONE") is True
+    assert split.knob_delta.get("PLACE@cone") == "cut"  # the structural materialize decision (legacy CUT="1")

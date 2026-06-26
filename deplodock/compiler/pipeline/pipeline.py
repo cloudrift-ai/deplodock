@@ -852,6 +852,12 @@ class Run:
 
         search = self.search
         assert search is not None, "Run.drive needs a search policy; use Run.resolve for deterministic resolution"
+        # The tune search is exempt from the strict knob-pin validator: it explores
+        # tier-foreign forks and steers heterogeneous multi-op graphs with a union pin
+        # vector (each op takes its tier's subset). A per-op contradiction is a pruned
+        # branch here, not the loud user error the greedy compile wants (``_validate``).
+        if self.ctx.validate_pins:
+            self.ctx = replace(self.ctx, validate_pins=False)
         # Seed candidate: no parent token — the policy roots it itself.
         search.push(Candidate(run=self, graph=graph, cursor=Cursor(run=self)).lazy())
 
@@ -904,7 +910,7 @@ def _is_structural_option(option: object) -> bool:
     ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
     changes which ops exist — **structural**; an ``Op`` rebind is in-place —
     **op-variant**. The Op/Graph return type IS the classification; rules wrap
-    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/005_split_demoted``),
+    a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/010_split_demoted``),
     whose ``option`` is readable without firing any thunk. A *branch* ``Fork``
     reads op-variant: the sole branch-Fork emitter today is the partition
     planner (all ``TileOp`` leaves), and typing it would require ``expand()`` —
@@ -925,17 +931,20 @@ def _concrete_option(option: object) -> object | None:
 
 def _option_decision(option: object, root_knobs: dict) -> dict | None:
     """The decision-knob delta one raw structural-fork option would stamp vs
-    the offer op: new non-``S_*`` knob keys on the option's op / fork knobs (a
-    ``Graph`` option reads the union over its nodes' op knobs — fragment
-    kernels restamp their own ``S_*``, which describe the child bodies, not
-    the decision). ``None`` when the option stamps nothing new."""
+    the offer op: non-``S_*`` knob keys the option's op / fork knobs **add or
+    change** vs the offer (a ``Graph`` option reads the union over its nodes'
+    op knobs — fragment kernels restamp their own ``S_*``, which describe the
+    child bodies, not the decision). A *changed value* on an existing key counts
+    (e.g. the cross-CTA finalize fork mutates the ``REDUCE@<axis>`` codec's ``c``
+    field from a bare ``c<cta>`` to ``c<cta>a`` / ``c<cta>k`` — same key, new
+    value), not only a brand-new key. ``None`` when the option stamps nothing new."""
     if isinstance(option, Graph):
         knobs: dict = {}
         for node in option.nodes.values():
             knobs.update(getattr(node.op, "knobs", None) or {})
     else:
         knobs = getattr(option, "knobs", None) or {}
-    delta = {k: v for k, v in knobs.items() if k not in root_knobs and not k.startswith("S_")}
+    delta = {k: v for k, v in knobs.items() if root_knobs.get(k) != v and not k.startswith("S_")}
     return delta or None
 
 
@@ -960,7 +969,7 @@ def _replay_structural_decision(graph: Graph, root_op, options: list) -> object 
     The earlier decision is read off the candidate's own graph, not a
     side-table: a decided site leaves its evidence in the IR by contract —
     every structural rule stamps its decision knob onto the surviving ops
-    (the ``SPLIT_CONE`` considered-vs-declined idiom), and those ops chain to
+    (the ``CUT`` considered-vs-declined idiom), and those ops chain to
     the pre-decision offer op via the engine-owned ``Op.source`` (stamped
     unconditionally on rebinds, stamped across loop-dialect splices,
     preserved by ``_rename_buf_in_op``). So: find any op carrying every
@@ -1191,6 +1200,7 @@ class _TerminalBench:
         from deplodock.compiler.pipeline.search.keys import (  # noqa: PLC0415
             _is_kernel_bearing,
             dialect_of,
+            introduces_structural_decision,
             op_cache_key,
             source_chain,
         )
@@ -1217,6 +1227,14 @@ class _TerminalBench:
                 # op to a single fragment kernel's median — half the work
                 # masquerading as the whole op. The decomposition's cost
                 # is a Σ, owned by the two-level tuner, never this table.
+                continue
+            if introduces_structural_decision(parent_op, child_op):
+                # The keep(SMEM) side of 005's fork is a loop→tile hop
+                # (``seed_fused`` jumps straight to a ``TileGraphOp``) that
+                # introduces ``CUT`` — a structural decision, not a lowering
+                # rewrite, so it must be skipped like the loop→loop cut hops
+                # above (else the pre-decision site gets a ``lowering`` row and
+                # greedy resolves it bypassing ``_pick_structural``'s Σ).
                 continue
             p_key = op_cache_key(parent_op)
             c_key = op_cache_key(child_op)

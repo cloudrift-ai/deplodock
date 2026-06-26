@@ -47,7 +47,7 @@ tests/
 │   ├── cases.py                   # curated (op, shape) cases + torch/deplodock builders
 │   ├── conftest.py                # `bench_pair` fixture, session summary, JSON dump
 │   ├── test_primitives.py         # matmul / rmsnorm / softmax / silu_mul
-│   └── test_fused.py              # SDPA (xfail until fusion lands)
+│   └── test_fused.py              # SDPA fused-kernel perf comparison
 ├── compiler/                       # mirrors deplodock/compiler/
 │   ├── conftest.py                     # requires_cuda / requires_sm90 markers, run_graph fixture,
 │   │                                   # device_compute_capability(), matmul_graph(m,k,n) shared builder
@@ -79,7 +79,6 @@ tests/
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
 │   │   ├── test_lowering_blocked_gemm.py       # FN > 1 matmul accuracy (per-cell + replicator)
 │   │   ├── test_knob_pinning.py                # DEPLODOCK_KNOBS regression configs
-│   │   ├── test_split_demoted.py               # demoted-matmul split (SPLIT_CONE fork) + accuracy
 │   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
 │   │   └── test_pipeline_semantics.py          # full pass chain vs numpy
 │   ├── pipeline/                       # pipeline-level tests (knob, dump, rule_diff)
@@ -202,6 +201,6 @@ context and cascades `cudaErrorIllegalAddress` into every later test on the work
 (`test_matmul_mma.py`, `test_matmul_mma_tma.py`, `test_matmul_mma_staged_pipelined.py`,
 `test_matmul_mma_causal_epilogue.py`, `test_matmul_mma_transposed_b.py`) gate at module scope; mixed files that also
 hold GPU-less structure / compile-only tests (`test_matmul_mma_masked.py`, `test_matmul_mma_parity.py`,
-`test_matmul_mma_residual.py`, `test_split_demoted.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
+`test_matmul_mma_residual.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
 tests, and `test_knob_pinning.py` skips its `TMA=1` rows in-body. `_supports_mma_sync()` (≥ sm_80, the
 instruction-availability check) and `_supports_tma()` (≥ sm_90) still gate on top.

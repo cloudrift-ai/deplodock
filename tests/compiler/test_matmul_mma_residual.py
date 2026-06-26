@@ -3,14 +3,14 @@
 A matmul fused with a pointwise epilogue (``out = f(a @ b, ...)`` — residual adds, bias / scale broadcasts,
 activations) used to be locked out of the tensor-core tier: the mma path stores the accumulator *fragment*
 (``RegStore``), so scalar epilogue Assigns have no accumulator SSA name to read (0 of 74 tuned Qwen3 down_proj
-variants on tensor cores; 29 us vs 8 us cuBLAS — ``plans/qwen3-embedding-layer0-tune-findings.md`` finding 3).
+variants on tensor cores; 29 us vs 8 us cuBLAS).
 
 The fold (CUTLASS epilogue-visitor pattern): each lane knows the (row, col) of its 4 C-fragment elements, so
 ``RegStore`` evaluates the whole chain per element in f32 — leaf operands load at the element's own coordinates
 (per-dim ``m``/``n``/``fixed`` roles at each buffer's own stride, so transposed / broadcast operands read
 correctly) and the ops render via the scalar ``op_to_expr`` translation.
 
-Eligibility is the NEGATIVE rule (``tile/_atom.classify_fragment_epilogue``): the backward slice from the Write
+Eligibility is the NEGATIVE rule (``lowering/_predicates.classify_fragment_epilogue``): the backward slice from the Write
 to the accumulator is foldable unless it contains an ineligible operation / dependency — accumulator consumed
 inside a reduce loop, multiple accumulators, multiple / vector Writes, escaping slice values, non-Load leaves,
 in-kernel-produced leaf buffers, unconvertible dtypes, ops without a rendering, or leaf index dims the lane
@@ -37,6 +37,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Var
 from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
 from deplodock.compiler.ir.stmt import Accum, Assign, Stmt
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+from deplodock.compiler.pipeline.knob import mma_atom
 
 from .conftest import requires_cuda, requires_sm90
 
@@ -152,7 +153,7 @@ def test_residual_epilogue_admits_warp_tier(monkeypatch, _sm120_target):
     into the fragment store and the scalar epilogue stripped."""
     _pin_warp(monkeypatch)
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=_residual_add()))
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
     src = _render(kop)
     assert "mma.sync.aligned.m16n8k16" in src
     assert "__half2float(r[" in src, "residual leaf must be loaded in the fragment store"
@@ -173,7 +174,7 @@ def test_pointwise_chain_with_broadcast_admits_warp_tier(monkeypatch, _sm120_tar
     )
     _pin_warp(monkeypatch)
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=epilogue, extra_inputs={"s": (1024,)}))
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
     src = _render(kop)
     assert "__half2float(s[" in src, "broadcast leaf must load in the fragment store"
     assert "fmaxf(0.0f" in src, "relu must render through op_to_expr"
@@ -185,7 +186,7 @@ def test_transposed_residual_admits_warp_tier(monkeypatch, _sm120_target):
     apply at the residual's own strides."""
     _pin_warp(monkeypatch)
     kop = _compile(_epilogue_graph(M=128, N=128, K=128, epilogue=_residual_add(res_index=(Var("j"), Var("i")))))
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
 
 
 def test_multiply_epilogue_admits_warp_tier(monkeypatch, _sm120_target):
@@ -199,7 +200,7 @@ def test_multiply_epilogue_admits_warp_tier(monkeypatch, _sm120_target):
     )
     _pin_warp(monkeypatch)
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=epilogue))
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
 
 
 def test_epilogue_warp_rows_stay_splitk_one(monkeypatch, _sm120_target):
@@ -210,8 +211,11 @@ def test_epilogue_warp_rows_stay_splitk_one(monkeypatch, _sm120_target):
     _pin_warp(monkeypatch)
     monkeypatch.setenv("DEPLODOCK_SPLITK", "2")
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=_residual_add()))
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16"
-    assert kop.knobs.get("SPLITK") == 1
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
+    rk = next(k for k in kop.knobs if k.startswith("REDUCE@"))
+    assert fam.dec_reduce(kop.knobs[rk]).cta == 1  # warp v1 invariant: split-K (REDUCE cta) stays 1
 
 
 # --- blocked dependencies (compile-only, GPU-less) ----------------------------------
@@ -227,7 +231,7 @@ def test_mixed_cell_axis_index_blocks_fold(monkeypatch, _sm120_target):
     )
     _pin_warp(monkeypatch)
     kop = _compile(_epilogue_graph(M=128, N=128, K=128, epilogue=epilogue, extra_inputs={"r2": (256,)}))
-    assert kop.knobs.get("MMA") != "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) != "mma_m16n8k16_f16"
 
 
 def test_multi_accumulator_epilogue_blocks_fold(monkeypatch, _sm120_target):
@@ -277,7 +281,7 @@ def test_multi_accumulator_epilogue_blocks_fold(monkeypatch, _sm120_target):
     g.outputs = ["c"]
     _pin_warp(monkeypatch)
     kop = _compile(g)
-    assert kop.knobs.get("MMA") != "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) != "mma_m16n8k16_f16"
 
 
 def test_escaping_epilogue_value_blocks_fold(monkeypatch, _sm120_target):
@@ -293,7 +297,7 @@ def test_escaping_epilogue_value_blocks_fold(monkeypatch, _sm120_target):
     g.add_node(op=InputOp(), inputs=[], output=Tensor("c2", (128, 128), dtype=F16), node_id="c2")
     _pin_warp(monkeypatch)
     kop = _compile(g)
-    assert kop.knobs.get("MMA") != "mma_m16n8k16_f16"
+    assert mma_atom(kop.knobs) != "mma_m16n8k16_f16"
 
 
 # --- device ------------------------------------------------------------------------
@@ -325,7 +329,7 @@ def test_residual_mma_matches_reference(M: int, N: int, K: int, FM: int, out_dty
     be = CudaBackend()
     compiled = be.compile(_epilogue_graph(M=M, N=N, K=K, out_dtype=out_dtype, epilogue=_residual_add()))
     kop = compiled.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected the warp-tier variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "expected the warp-tier variant"
     out, _ = be.run(compiled, input_data={"a": a, "b": b, "r": r})
 
     expected = a.astype(np.float32) @ b.astype(np.float32) + r.astype(np.float32)
@@ -363,7 +367,7 @@ def test_chain_epilogue_mma_matches_reference(FM: int, monkeypatch):
     be = CudaBackend()
     compiled = be.compile(_epilogue_graph(M=M, N=N, K=K, epilogue=epilogue, extra_inputs={"s": (N,)}))
     kop = compiled.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected the warp-tier variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "expected the warp-tier variant"
     out, _ = be.run(compiled, input_data={"a": a, "b": b, "r": r, "s": s})
 
     acc = a.astype(np.float32) @ b.astype(np.float32)
@@ -391,7 +395,7 @@ def test_transposed_residual_mma_matches_reference(monkeypatch):
     be = CudaBackend()
     compiled = be.compile(_epilogue_graph(M=M, N=N, K=K, epilogue=_residual_add(res_index=(Var("j"), Var("i")))))
     kop = compiled.nodes["c"].op
-    assert kop.knobs.get("MMA") == "mma_m16n8k16_f16", "expected the warp-tier variant"
+    assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "expected the warp-tier variant"
     out, _ = be.run(compiled, input_data={"a": a, "b": b, "r": r})
 
     expected = a.astype(np.float32) @ b.astype(np.float32) + r.astype(np.float32).T

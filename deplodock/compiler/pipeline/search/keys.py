@@ -27,13 +27,42 @@ from deplodock.compiler.structural import digest
 
 Dialect = Literal["loop", "tile", "kernel", "cuda"]
 
+# The native ``PLACE@cone`` placement records the demoted-cone keep-vs-cut **structural**
+# (kernel-set-changing) decision — ``inline`` keep / ``cut`` materialize-to-gmem
+# (``enumeration/_families``). Its canonical ``cone`` element is distinct from any
+# operand-staging ``PLACE@<buffer>`` or score ``PLACE@<edge>``, so a hop that introduces it
+# is unambiguously the structural fork (the `cut` value also self-describes the
+# materialization vs an operand `gmem`-direct read). A source-chain hop that introduces it
+# is a decomposition hop whose cost is a Σ owned by the two-level tuner, NOT a ``lowering``
+# row. The literal is kept here (search/ shouldn't import a lowering pass) — it mirrors
+# ``_families.cone_key()``.
+_CONE_PLACE = "PLACE@cone"
+
+
+def structural_decision_delta(knobs: dict) -> dict:
+    """The structural-decision knobs ``knobs`` carries — today the single ``PLACE@cone``
+    placement (keep ``inline`` / cut ``cut``); ``{}`` when the op carries no cone decision.
+    Read by the candidate replay (``search/candidate``) and the decomposition-row featurizer
+    (``two_level._decomposition_rows``) to attribute each side's Σ cost."""
+    return {_CONE_PLACE: knobs[_CONE_PLACE]} if _CONE_PLACE in knobs else {}
+
+
+def introduces_structural_decision(parent_op: object, child_op: object) -> bool:
+    """True when ``child_op`` carries the ``PLACE@cone`` structural decision the
+    ``parent_op`` lacks — the keep-vs-cut fork hop. Covers both the cut (loop→loop fragment
+    splice) and the keep (loop→tile ``seed_fused`` jump), so the recorder skips the decision
+    hop regardless of dialect crossing."""
+    p = getattr(parent_op, "knobs", None) or {}
+    c = getattr(child_op, "knobs", None) or {}
+    return _CONE_PLACE in c and _CONE_PLACE not in p
+
 
 def op_cache_key(op: object) -> str | None:
     """Cache key for any kernel-bearing op, or ``None`` if not cacheable."""
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -52,6 +81,11 @@ def op_cache_key(op: object) -> str | None:
         # ``_propagate_expected`` walks the parent chain forever.
         knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
         return digest(type(op).__name__, op.body.structural_key(), knob_key)
+    if isinstance(op, TileGraphOp):
+        # The enumeration-pass output (a chosen Schedule's TileGraph, pre-assembly):
+        # key on the TileGraph's canonical algorithm + Schedule identity + knobs.
+        knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
+        return digest("TileGraphOp", op.structural_key(), knob_key)
     return None
 
 
@@ -70,6 +104,10 @@ def dialect_of(op: object) -> Dialect | None:
         return "tile"
     if isinstance(op, LoopOp):
         return "loop"
+    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+
+    if isinstance(op, TileGraphOp):
+        return "tile"  # the enumeration output, still the tile dialect (pre-assembly)
     return None
 
 
