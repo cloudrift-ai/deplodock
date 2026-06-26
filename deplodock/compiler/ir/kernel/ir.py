@@ -513,6 +513,17 @@ class WarpShuffle(Stmt):
     crosses an aligned ``length``-lane group, so this is also the SEGMENTED per-row
     combine for strided-cooperative rows. ``commutative`` (required — the butterfly
     reorders) is checked at the carrier.
+
+    The shuffle mask is ``__activemask()``, NOT a hard-coded ``0xffffffff``: a
+    whole-CTA cooperative reduce with ``BR < warp_size`` launches a **partial warp**
+    (e.g. ``block=8``), and naming the absent lanes ``8..31`` in the mask is undefined
+    behavior — on the e2e captured-graph path it manifested as a multi-millisecond
+    stall (a per-token×head RMSNorm went 28 ms instead of µs). The combine is reached
+    with the warp converged (the per-CTA reduce has no data-dependent divergence and
+    the only enclosing guard is warp-uniform), so ``__activemask()`` returns exactly
+    the participating lanes — correct for a partial warp, a full warp, AND a
+    non-warp-multiple block's partial final warp (where no single static literal mask
+    is correct per warp).
     """
 
     state: tuple[str, ...]
@@ -538,7 +549,7 @@ class WarpShuffle(Stmt):
             # cleanly per round (the carried state is declared by an enclosing Init).
             out.append(f"{pad}{{")
             for st, sb in zip(self.state, self.state_b, strict=True):
-                out.append(f"{inner}{ty} {sb} = __shfl_xor_sync(0xffffffff, {st}, {s});")
+                out.append(f"{inner}{ty} {sb} = __shfl_xor_sync(__activemask(), {st}, {s});")
                 ctx.ssa_dtypes[sb] = self.dtype.name
             out.extend(render_merge_program(self.combine_states, self.state, ctx, pad=inner, dtype=self.dtype))
             out.append(f"{pad}}}")
