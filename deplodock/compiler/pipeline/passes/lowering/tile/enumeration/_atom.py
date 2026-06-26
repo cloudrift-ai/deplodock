@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma, Stmt, Write
 from deplodock.compiler.ir.stmt.blocks import Body
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom, SerialTile
 from deplodock.compiler.pipeline.passes.lowering._predicates import (
@@ -127,16 +127,54 @@ def _matmul_out_index(dag: IterDag):
     return None
 
 
+def cell_atomizes(
+    k_loop: Loop, atom: Atom, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object], out_index, produced=frozenset()
+) -> bool:
+    """The shared atom-fit core — does the single contraction cell under ``k_loop`` fuse to ``atom``
+    on this device? cc ≥ (8,0); ``K extent % cell_k == 0``; each K-indexed operand a single-K-dim
+    (or segmentable) gmem input (not a computed ``produced`` buffer) of the atom's operand dtype; the
+    canonical ``[Load, Load, Assign(mul), Accum]`` shape with ``mul.distributes_over(accum)``; A/B
+    classifiable via ``out_index``. The SAME predicate the SEMIRING warp matmul (``_atom_eligible``,
+    per matmul-reduce) and the streaming-flash fork (``070_coop_reduce`` on the chain's inner QK^T
+    contraction) gate on — no shape / dialect specialization, just the atom fit."""
+    cell_k = atom.shape[2]
+    operand_dtype = atom.operand_dtype("a")
+    if compute_capability < (8, 0):
+        return False
+    k_name = k_loop.axis.name
+    if k_loop.axis.extent.is_static and k_loop.axis.extent.as_static() % cell_k != 0:
+        return False
+    for load in Body.coerce(k_loop.body).iter_of_type(Load):
+        k_dims = [d for d, e in enumerate(load.index) if k_name in e.free_vars()]
+        if not k_dims:
+            continue
+        seg_c = segmentable_k_extent(load, k_name)
+        segmentable = seg_c is not None and seg_c % cell_k == 0
+        if (len(k_dims) > 1 and not segmentable) or load.input in produced:
+            return False
+        if dtype_of(load.input) != operand_dtype:
+            return False
+    top_level = list(k_loop.body)
+    loads = [s for s in top_level if isinstance(s, Load)]
+    assigns = [s for s in top_level if isinstance(s, Assign)]
+    accums = [s for s in top_level if isinstance(s, Accum)]
+    if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
+        return False
+    multiply, accum = assigns[0], accums[0]
+    load_names = {ld.names[0] for ld in loads if ld.names}
+    if set(multiply.args) != load_names or accum.value != multiply.name or not multiply.op.distributes_over(accum.op):
+        return False
+    a_ld, b_ld = classify_matmul_operands(loads, k_name, out_index=out_index)
+    return a_ld is not None and b_ld is not None
+
+
 def _atom_eligible(atom: Atom, dag: IterDag, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
     """True iff ``dag`` admits ``atom`` on this device — the warp-tier gate.
 
     Checks (mirroring the legacy ``_mma_eligible_factory``): cc ≥ (8,0); ≥1
-    matmul-reduce; K extent % cell_k == 0; each K-indexed operand a single-K-dim
-    (or segmentable) gmem input of the atom's operand dtype; the canonical
-    ``[Load,Load,Assign(mul),Accum]`` cell with ``mul.distributes_over(accum)``
-    and A/B classifiable; a foldable pointwise epilogue; output extents % cell."""
-    cell_m, cell_n, cell_k = atom.shape
-    operand_dtype = atom.operand_dtype("a")
+    matmul-reduce; the shared :func:`cell_atomizes` per reduce (K divisibility, operand dtype,
+    canonical cell, A/B classify); a foldable pointwise epilogue; output extents % cell."""
+    cell_m, cell_n, _cell_k = atom.shape
     if compute_capability < (8, 0):
         return False
     matmul_reduces = [n.loop for n in dag.reduce if is_matmul_reduce(n.loop)]
@@ -145,37 +183,11 @@ def _atom_eligible(atom: Atom, dag: IterDag, *, compute_capability: tuple[int, i
     out_index = _matmul_out_index(dag)
     produced = {w.output for w in Body.coerce(dag.inner_body).iter_of_type(Write)}
     accum_names: set[str] = set()
+    fit = {"compute_capability": compute_capability, "dtype_of": dtype_of, "out_index": out_index, "produced": produced}
     for k_loop in matmul_reduces:
-        k_name = k_loop.axis.name
-        if k_loop.axis.extent.is_static and k_loop.axis.extent.as_static() % cell_k != 0:
+        if not cell_atomizes(k_loop, atom, **fit):
             return False
-        for load in Body.coerce(k_loop.body).iter_of_type(Load):
-            k_dims = [d for d, e in enumerate(load.index) if k_name in e.free_vars()]
-            if not k_dims:
-                continue
-            seg_c = segmentable_k_extent(load, k_name)
-            segmentable = seg_c is not None and seg_c % cell_k == 0
-            if (len(k_dims) > 1 and not segmentable) or load.input in produced:
-                return False
-            dt = dtype_of(load.input)
-            if dt != operand_dtype:
-                return False
-        top_level = list(k_loop.body)
-        loads = [s for s in top_level if isinstance(s, Load)]
-        assigns = [s for s in top_level if isinstance(s, Assign)]
-        accums = [s for s in top_level if isinstance(s, Accum)]
-        if not (len(loads) == 2 and len(assigns) == 1 and len(accums) == 1):
-            return False
-        multiply, accum = assigns[0], accums[0]
-        load_names = {ld.names[0] for ld in loads if ld.names}
-        if set(multiply.args) != load_names or accum.value != multiply.name:
-            return False
-        if not multiply.op.distributes_over(accum.op):
-            return False
-        a_ld, b_ld = classify_matmul_operands(loads, k_name, out_index=out_index)
-        if a_ld is None or b_ld is None:
-            return False
-        accum_names.add(accum.name)
+        accum_names.add(next(s.name for s in k_loop.body if isinstance(s, Accum)))
     # Loop-invariant leaf Loads (a fused per-CTA / per-row scale / mask) the
     # frontend hoisted above the free chain land in ``dag.leading`` / ``dag.mid``,
     # not ``inner_body`` — pass them as ``outer_loads`` so the fold can resolve an
