@@ -59,10 +59,11 @@ def classify(dag: IterDag) -> _Regime | None:
             return None
         if any(not n.loop.axis.extent.is_static for n in dag.reduce if not isinstance(n.carrier, Monoid)):
             return None
-        # The twisted carrier is compositional: ``MONOID(SEMIRING)`` when the DAG exposes
-        # the carried contraction chain (the embedded P@V on the hinge ``kv``). The chain
-        # is a structural property (``dag.chain``), so this stays a derived read.
-        inner = AlgebraKind.SEMIRING if dag.chain is not None else None
+        # The twisted carrier is compositional: ``MONOID(SEMIRING)`` when the reduction composes an
+        # inner SEMIRING contraction (the embedded P@V on the hinge ``kv``). A structural property
+        # (``dag.reduction.inner``), so this stays a derived read.
+        reduction = dag.reduction
+        inner = AlgebraKind.SEMIRING if reduction is not None and reduction.inner is not None else None
         return _Regime(AlgebraKind.MONOID, frozenset(lp.axis.name for lp in reduce_loops), inner_algebra=inner)
 
     if not reduce_loops:  # no contraction — a MAP nest.

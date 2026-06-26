@@ -35,10 +35,9 @@ from deplodock.compiler.ir.stmt.blocks import Body
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom, SerialTile
 from deplodock.compiler.pipeline.passes.lowering._predicates import (
     classify_fragment_epilogue,
-    is_matmul_reduce,
     segmentable_k_extent,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, IterDag
 
 
 def classify_matmul_operands(loads, k_name: str, *, out_index=None):
@@ -118,15 +117,6 @@ def _classify_transposed_b(loads, k_name: str, out_index):
     return a_load, b_load
 
 
-def _matmul_out_index(dag: IterDag):
-    """The matmul output ``Write``'s index (≥2 var-bearing dims) — the M / N
-    coordinates the transposed-B A/B disambiguation reads."""
-    for w in Body.coerce(dag.inner_body).iter_of_type(Write):
-        if sum(1 for e in w.index if e.free_vars()) >= 2:
-            return w.index
-    return None
-
-
 def cell_atomizes(
     k_loop: Loop, atom: Atom, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object], out_index, produced=frozenset()
 ) -> bool:
@@ -171,23 +161,21 @@ def cell_atomizes(
 def _atom_eligible(atom: Atom, dag: IterDag, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
     """True iff ``dag`` admits ``atom`` on this device — the warp-tier gate.
 
-    Checks (mirroring the legacy ``_mma_eligible_factory``): cc ≥ (8,0); ≥1
-    matmul-reduce; the shared :func:`cell_atomizes` per reduce (K divisibility, operand dtype,
-    canonical cell, A/B classify); a foldable pointwise epilogue; output extents % cell."""
+    Checks (mirroring the legacy ``_mma_eligible_factory``): cc ≥ (8,0); ≥1 SEMIRING
+    :class:`~...Contraction`; the shared :func:`contraction_atomizes` per contraction (K
+    divisibility, operand dtype, canonical cell, A/B classify off the contraction's ``out_index``);
+    a foldable pointwise epilogue; output extents % cell."""
     cell_m, cell_n, _cell_k = atom.shape
     if compute_capability < (8, 0):
         return False
-    matmul_reduces = [n.loop for n in dag.reduce if is_matmul_reduce(n.loop)]
-    if not matmul_reduces:
+    contractions = dag.contractions
+    if not contractions:
         return False
-    out_index = _matmul_out_index(dag)
     produced = {w.output for w in Body.coerce(dag.inner_body).iter_of_type(Write)}
-    accum_names: set[str] = set()
-    fit = {"compute_capability": compute_capability, "dtype_of": dtype_of, "out_index": out_index, "produced": produced}
-    for k_loop in matmul_reduces:
-        if not cell_atomizes(k_loop, atom, **fit):
+    for c in contractions:
+        if not contraction_atomizes(c, atom, compute_capability=compute_capability, dtype_of=dtype_of, produced=produced):
             return False
-        accum_names.add(next(s.name for s in k_loop.body if isinstance(s, Accum)))
+    accum_names = {c.result for c in contractions}
     # Loop-invariant leaf Loads (a fused per-CTA / per-row scale / mask) the
     # frontend hoisted above the free chain land in ``dag.leading`` / ``dag.mid``,
     # not ``inner_body`` — pass them as ``outer_loads`` so the fold can resolve an
@@ -215,6 +203,28 @@ def eligible_atoms(dag: IterDag, *, compute_capability: tuple[int, int], dtype_o
     """The atoms ``dag`` admits, in ``ATOM_REGISTRY`` priority order (f16 first).
     Empty for a non-matmul / scalar-only kernel."""
     return [a for a in ATOM_REGISTRY.values() if _atom_eligible(a, dag, compute_capability=compute_capability, dtype_of=dtype_of)]
+
+
+def contraction_atomizes(
+    c: Contraction, atom: Atom, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object], produced=frozenset()
+) -> bool:
+    """Does the SEMIRING :class:`~...Contraction` ``c`` fuse to ``atom`` on this device? The shared
+    atom-fit over its reduce cell + its own ``out_index`` (the K divisibility / operand dtype /
+    canonical-cell / A/B-classify core, :func:`cell_atomizes`). The **ONE** predicate both the
+    standalone matmul tier (:func:`_atom_eligible`, per contraction) and the streaming flash
+    (:func:`inner_atomizes`, on ``reduction.inner``) gate on — a matmul and a flash QK^T reach the
+    warp tier through one representation and one question, named for no attention concept."""
+    return cell_atomizes(
+        c.node.loop, atom, compute_capability=compute_capability, dtype_of=dtype_of, out_index=c.out_index, produced=produced
+    )
+
+
+def inner_atomizes(inner: Contraction, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
+    """Whether a streaming reduction's inner SEMIRING :class:`Contraction` independently reaches the
+    warp tensor-core tier — :func:`contraction_atomizes` for any atom, the SAME call the standalone
+    matmul tier makes per contraction. The DAG invariant behind warp-chain routing: a warp chain is
+    just a ``MonoidReduction`` whose inner contraction tensorizes — no attention concept, no shape match."""
+    return any(contraction_atomizes(inner, a, compute_capability=compute_capability, dtype_of=dtype_of) for a in ATOM_REGISTRY.values())
 
 
 # === The ``atomize`` body edit (the atom layer's move) =====================

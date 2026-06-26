@@ -49,7 +49,7 @@ def _flash_op(s_dim: Dim) -> TileGraphOp:
     loop = build_flash_frag("q", "k", "v", shp, shp, shp, out, causal=False).nodes["o"].op
     dag = iter_dag(loop)
     regime = classify(dag)
-    assert regime is not None and regime.algebra is AlgebraKind.MONOID and dag.streaming and dag.chain is not None
+    assert regime is not None and regime.algebra is AlgebraKind.MONOID and dag.streaming and dag.reduction.inner is not None
     buffers = {n: Buffer(name=n, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM) for n, t in loop.inputs.items()}
     for t in loop.outputs.values():
         buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
@@ -83,7 +83,7 @@ def test_symbolic_stream_routes_to_chain_build():
     assert op.dag.k_bound is not None, "the streaming axis must be symbolic for this case"
     leaves = _coop._streaming_leaves(op)
     assert leaves, "symbolic streaming flash produced no leaves"
-    score_key = fam.place_key(op.dag.chain.score)
+    score_key = fam.place_key(op.dag.reduction.score)
     for leaf in leaves:
         assert leaf.knobs.get(score_key) == fam.INLINE, "symbolic chain leaf must place the score INLINE"
         assert _has_shared_score_register(leaf), "symbolic chain leaf must carry the O[d] register vector"
@@ -95,7 +95,7 @@ def test_static_stream_stays_scalar_monoid_by_default():
     unchanged."""
     op = _flash_op(Dim(64))
     assert op.dag.k_bound is None, "the streaming axis must be static for this case"
-    score_key = fam.place_key(op.dag.chain.score)
+    score_key = fam.place_key(op.dag.reduction.score)
     for leaf in _coop._streaming_leaves(op):
         assert score_key not in leaf.knobs, "static default must not place the score INLINE (no chain)"
         assert not _has_shared_score_register(leaf), "static default must stay the scalar monoid stream"
@@ -109,29 +109,27 @@ def test_flash_cells_atomize_via_the_generic_unit():
     warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
     path that replaced the hand-assembled ``realize_flash``. CPU-only."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
     from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import _chain_axes
 
     op = _flash_op(Dim(64))
     dag = op.dag
     block = op.tilegraph.blocks[0]
-    chain = dag.chain
+    chain = dag.reduction
     kv = chain.hinge_name
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
 
     kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    _d_axis, m_axis, _grid = _chain_axes(dag, value_load)  # m_axis = the query row (derived, not hard-coded)
 
-    # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream).
+    # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream). The
+    # score coords are the inner contraction's own ``out_index`` (read off the composition).
     qkt_cell = next(s for s in kv_loop.body if isinstance(s, Loop))  # the D-reduce
     qkt = next(
         s
-        for s in atomize_cell(tuple(qkt_cell.body), atom=atom, k_name=qkt_cell.axis.name, write=None, out_index=(Var(m_axis.name), Var(kv)))
+        for s in atomize_cell(tuple(qkt_cell.body), atom=atom, k_name=qkt_cell.axis.name, write=None, out_index=chain.out_index)
         if isinstance(s, Mma)
     )
     assert qkt.b_trans is True, "Q@K^T must atomize transposed-B"
@@ -168,7 +166,7 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     # from the trace); supply the (B,H,S,D) fp16 buffers `warp_chain_build` reads the operand dtype off.
     buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
     op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
-    chain = dag.chain
+    chain = dag.reduction
     _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
     prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
 

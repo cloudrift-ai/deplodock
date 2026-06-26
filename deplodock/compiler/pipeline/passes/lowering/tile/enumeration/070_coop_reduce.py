@@ -19,15 +19,28 @@ KV axis (``streaming_br_offers`` — cooperative-KV, opt-in; a symbolic streamin
 serial). Both pin ``REGISTER = 1`` (one element per cell-owner) and ``SPLITK = 1`` (the
 partition rides THREAD, not a cross-CTA split).
 
-A streaming flash deploys the **warp-tier chain** when ``_is_warp_flash`` holds — expressed as
-**general DAG properties**, not a flash shape match: a carried-contraction chain (``dag.chain``)
-whose **inner contraction atomizes** to the tensor-core tier (the SAME ``_atom.cell_atomizes``
-atom-fit the SEMIRING warp matmul gates on, applied to ``chain.inner`` — so the 16-bit-operand /
-``D%cell_k`` / classifiable-cell facts live in one shared predicate). The v1 realizer's scope
-ceilings (``_warp_chain_buildable`` — no additive mask, ``D≤256``) and the deployment policy
-(symbolic-default; static under ``DEPLODOCK_CHAIN``) are separate, orthogonal to eligibility. This
-pass then hands the logical seed to ``_build.warp_chain_build``, which σ-tiles + atomizes the two
-chained contractions (stamping the kv-stream ``Schedule.carry`` + the score→A handoff edge);
+Both regimes are **one** :class:`MonoidReduction` composition (``op.dag.reduction`` — an associative
+carrier folding a primary reduce axis, optionally composed over an inner SEMIRING ``Contraction``),
+and ``reduction_build`` is the **one dispatch** that routes it: ``inner is None`` → the cooperative
+leaves; a streaming reduction → the streaming leaves; an eligible streaming reduction → the
+warp-tier flash. The three emit bodies (``monoid_build`` / ``chain_build`` / ``warp_chain_build``)
+stay specialized behind it.
+
+A streaming flash deploys the **warp-tier chain** off **general DAG invariants**, never a flash
+shape match — the dispatch reads three orthogonal facts: (1) the reduction composes an inner
+contraction (``reduction.inner``), (2) it **tensorizes** (``_atom.inner_atomizes`` — the SAME
+``cell_atomizes`` atom-fit the standalone SEMIRING warp matmul gates on, applied to
+``reduction.inner`` with its own score coords, so the 16-bit-operand / ``D%cell_k`` /
+classifiable-cell facts live in one shared predicate; a warp chain is just a ``MonoidReduction``
+whose inner contraction tensorizes), AND (3) the realizer can build it and policy deploys it. The
+score coords are a DAG invariant on the inner ``Contraction`` (``out_index``); the free-axis
+geometry is walked off the composition at emit time (``_iterdag.chain_free_axes``), so neither
+routing nor the build moves walk the lowered tile to recover them. The v1 realizer's scope ceilings
+(``_warp_chain_buildable`` — no additive mask, ``D≤256``) and the deployment policy
+(``_deploy_warp_chain`` — symbolic-default, static under ``DEPLODOCK_CHAIN``) are named, orthogonal
+guards: what the realizer can build today + an env/extent policy, not graph facts.
+This pass then hands the logical seed to ``_build.warp_chain_build``, which σ-tiles + atomizes the
+two chained contractions (stamping the kv-stream ``Schedule.carry`` + the score→A handoff edge);
 assembly's generic ``_assemble.carry_scope_from_graph`` walk then realizes the fragment-tier
 online-softmax around those cells (the former ``split/005_warp_chain`` route, folded in here).
 Symbolic is the deployed default (the ~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in.
@@ -43,13 +56,11 @@ from dataclasses import replace
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Load, Loop
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
+from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import cell_atomizes
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import _chain_axes, chain_build, monoid_build, warp_chain_build
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import inner_atomizes
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build, warp_chain_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
@@ -88,53 +99,34 @@ def _streaming_bk(dag) -> int:
 PATTERN = [Pattern("root", TileGraphOp)]
 
 
+def _dtype_of(op: TileGraphOp):
+    """A buffer-name → dtype lookup over the op's buffers (the atom-fit gate reads operand
+    dtypes), ``None`` for an unknown name."""
+    return lambda n: op.buffers[n].dtype if n in op.buffers else None
+
+
 def _warp_chain_buildable(op: TileGraphOp) -> bool:
-    """The v1 fragment-softmax realizer's scope **ceilings** — kept SEPARATE from the general
-    eligibility (``_is_warp_flash``) because they are "what the realizer can build today", not "is
-    this a warp-flash". The realizer folds no **additive mask** (a 4th rank-4 input — itself a
-    structural ``Add``, so a later realizer could handle it like the causal ``Select`` rather than
-    decline), and bounds the head dim at ``256`` (register / smem pressure). Shrinks toward empty as
-    the realizer generalizes."""
+    """The v1 fragment-softmax realizer's scope **ceilings** — kept SEPARATE from the eligibility
+    invariant (``reduction.inner`` + ``inner_atomizes``) because they are "what the realizer can
+    build today", not "is this a warp chain". The realizer folds no **additive mask** (a 4th rank-4
+    input — itself a structural ``Add``, so a later realizer could handle it like the causal
+    ``Select`` rather than decline), and bounds the head dim at ``256`` (register / smem pressure).
+    Shrinks toward empty as the realizer generalizes."""
     block = op.tilegraph.blocks[0]
     ins = [b for n, b in op.buffers.items() if len(b.shape) == 4 and n != block.writes[0].buffer]
     if len(ins) != 3:  # a 4th rank-4 input is an additive mask
         return False
-    d = op.dag.chain.inner.loop.axis.extent
+    d = op.dag.reduction.inner.loop.axis.extent
     return d.is_static and d.as_static() <= 256
 
 
-def _is_warp_flash(op: TileGraphOp, compute_capability: tuple[int, int]) -> bool:
-    """Whether this streaming flash deploys the **warp-tier tensor-core chain** — expressed as
-    **general DAG properties**, not a flash shape match: (1) a carried-contraction chain
-    (``dag.chain`` — a tuple ``Monoid`` carrier streaming over a nested SEMIRING contraction, the
-    algebra-derived FA-2 structure), AND (2) that chain's **inner contraction atomizes** to the
-    tensor-core tier — the SAME :func:`cell_atomizes` atom-fit the SEMIRING warp matmul gates on
-    (``020_tensorize``), applied to ``chain.inner`` with the score's ``(m, kv)`` output coords. The
-    16-bit-operand / ``D%cell_k`` / classifiable-cell facts all live in that shared predicate, named
-    for no attention concept. The v1 realizer's scope ceilings (``_warp_chain_buildable``) and the
-    deployment policy (symbolic-default; static under ``DEPLODOCK_CHAIN``) are orthogonal to
-    eligibility. (Folds the former ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
-    ch = op.dag.chain
-    if ch is None:
-        return False
-    block = op.tilegraph.blocks[0]
-    kv_loop = next((s for s in block.compute if isinstance(s, Loop) and s.axis.name == ch.hinge_name), None)
-    value_load = next((s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == ch.carrier.partial[1]), None) if kv_loop else None
-    if value_load is None:
-        return False
-    _d_axis, m_axis, _grid = _chain_axes(op.dag, value_load)
-    out_index = (Var(m_axis.name), Var(ch.hinge_name))  # the QK^T score coords (M = query row, N = kv)
-
-    def dtype_of(n: str):
-        return op.buffers[n].dtype if n in op.buffers else None
-
-    eligible = any(
-        cell_atomizes(ch.inner.loop, a, compute_capability=compute_capability, dtype_of=dtype_of, out_index=out_index)
-        for a in ATOM_REGISTRY.values()
-    )
-    if not eligible or not _warp_chain_buildable(op):
-        return False
-    seq = kv_loop.axis.extent  # deployment policy: symbolic-default; static under DEPLODOCK_CHAIN
+def _deploy_warp_chain(op: TileGraphOp, reduction) -> bool:
+    """The warp-tier chain's **deployment policy** — orthogonal to eligibility (it gates on env +
+    the runtime extent, not the graph). A **symbolic** KV stream deploys by default (the ~100×
+    win); a **static** stream stays the scalar nest unless ``DEPLODOCK_CHAIN`` opts in, and then
+    only when it is 16-aligned (the warp tile owns a 16-key slab). The hinge (KV stream) extent IS
+    the deployment axis."""
+    seq = reduction.hinge.axis.extent
     if seq.is_static:
         return fam.pin_inline_chain() and seq.as_static() % 16 == 0 and seq.as_static() >= 16
     return True
@@ -144,19 +136,44 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     op: TileGraphOp = root.op
     if op.algebra is not AlgebraKind.MONOID or fam.reduce_key(op.dag.k_node.loop.axis.name) in op.knobs:
         raise RuleSkipped("MONOID build applies once, to a MONOID seed")
-    if op.dag.streaming and _is_warp_flash(op, ctx.compute_capability):
-        # Warp-tier tensor-core flash: ``warp_chain_build`` σ-tiles the two chained contractions to
-        # the warp geometry and fuses them via the generic ``atomize_cell`` (stamping the kv-stream
-        # ``Schedule.carry`` + the score→A handoff edge), and assembly's generic
-        # ``carry_scope_from_graph`` walk realizes the fragment-tier phases (softmax / scale / mask /
-        # handoff / epilogue) around those cells. No build move, no cooperative leaves (the warp
-        # chain replaces them here, matching the old ``split/005_warp_chain`` route). A terminal
-        # leaf: the later scalar passes gate off MONOID.
-        return [replace(op, tilegraph=warp_chain_build(op))]
-    leaves = _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
+    leaves = reduction_build(ctx, op)
     if not leaves:
         raise RuleSkipped("no legal MONOID decomposition")
     return leaves
+
+
+def reduction_build(ctx: Context, op: TileGraphOp) -> list[TileGraphOp]:
+    """The **unified MONOID codegen dispatch** — read the one :class:`MonoidReduction` and route to
+    the right specialized emit body (``op.dag.reduction``):
+
+    - ``inner`` present + tensorizes + buildable + deployable → the **warp-tier tensor-core flash**
+      (``warp_chain_build`` — a terminal leaf; the later scalar passes gate off MONOID).
+    - a **streaming** reduction → the streaming leaves (scalar FA-2 ``chain_build`` when the inner
+      chain applies, else the serial-stream ``monoid_build``).
+    - a **flat** reduction (``inner is None``, not streaming) → the cooperative leaves
+      (``monoid_build``).
+
+    Warp-tier flash routes off **general DAG invariants**, never a flash shape match: a composed
+    inner contraction (``reduction.inner``) that independently tensorizes (``inner_atomizes`` — the
+    SAME atom-fit the standalone SEMIRING matmul gates on). The realizer scope ceiling
+    (``_warp_chain_buildable``) and the deployment policy (``_deploy_warp_chain`` — symbolic-default,
+    static under ``DEPLODOCK_CHAIN``) are explicit, orthogonal guards: what the v1 realizer can build
+    today + an env/extent policy, not graph facts. The three emit bodies stay specialized behind this
+    one dispatch (they produce genuinely different kernels — a cooperative tree-reduce, a scalar FA-2
+    stream, a tensor-core flash)."""
+    reduction = op.dag.reduction
+    if (
+        reduction.inner is not None
+        and inner_atomizes(reduction.inner, compute_capability=ctx.compute_capability, dtype_of=_dtype_of(op))
+        and _warp_chain_buildable(op)
+        and _deploy_warp_chain(op, reduction)
+    ):
+        # ``warp_chain_build`` σ-tiles the two chained contractions to the warp geometry and fuses
+        # them via the generic ``atomize_cell`` (stamping the kv-stream ``Schedule.carry`` + the
+        # score→A handoff edge); assembly's generic ``carry_scope_from_graph`` walk realizes the
+        # fragment-tier phases (softmax / scale / mask / handoff / epilogue) around those cells.
+        return [replace(op, tilegraph=warp_chain_build(op))]
+    return _streaming_leaves(op) if op.dag.streaming else _coop_leaves(op)
 
 
 def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:
@@ -211,7 +228,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
             if use_chain:
                 # Phase 1c: the FA-2 shared-score restructuring (register O[d] + the score
                 # edge placed INLINE + the split carrier).
-                knobs[fam.place_key(op.dag.chain.score)] = fam.INLINE
+                knobs[fam.place_key(op.dag.reduction.score)] = fam.INLINE
                 tg = chain_build(op.tilegraph, op.dag, knobs)
             else:
                 tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
@@ -220,13 +237,13 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
 
 
 def _chain_applicable(op: TileGraphOp, br: int) -> bool:
-    """Whether ``chain_build`` covers this nest: a carried-contraction chain and no
-    cooperative-KV (``BR == 1`` — the cooperative combine isn't wired through the split
-    carrier yet). The **hinge** (KV stream) axis MAY be symbolic — ``chain_build`` keeps it
-    a serial runtime-bounded loop (no tiling → no masking, every ``kv < seq_len`` is valid);
-    every OTHER contraction (the inner QK^T score reduce) must be static, since the score is
-    a register-shared reduce rather than a masked one."""
-    chain = op.dag.chain
-    if chain is None or br != 1:
+    """Whether ``chain_build`` covers this nest: a streaming reduction with a composed inner
+    contraction (``reduction.inner``) and no cooperative-KV (``BR == 1`` — the cooperative combine
+    isn't wired through the split carrier yet). The **hinge** (KV stream) axis MAY be symbolic —
+    ``chain_build`` keeps it a serial runtime-bounded loop (no tiling → no masking, every
+    ``kv < seq_len`` is valid); every OTHER contraction (the inner QK^T score reduce) must be static,
+    since the score is a register-shared reduce rather than a masked one."""
+    reduction = op.dag.reduction
+    if reduction is None or reduction.inner is None or br != 1:
         return False
-    return all(n.loop.axis.extent.is_static for n in op.dag.reduce if n.loop.axis.name != chain.hinge_name)
+    return all(n.loop.axis.extent.is_static for n in op.dag.reduce if n.loop.axis.name != reduction.hinge_name)

@@ -21,8 +21,10 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.expr import Expr, Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Loop, Monoid, ReduceCarrier, Stmt
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Monoid, ReduceCarrier, Stmt, Write
+from deplodock.compiler.pipeline.passes.lowering._predicates import is_matmul_reduce
 
 
 def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -72,36 +74,112 @@ class AxisNode:
 
 
 @dataclass(frozen=True)
-class ContractionChain:
-    """The **carried contraction chain** of a streaming-flash nest. Two SEMIRING
-    contractions share a
-    *dual-role* hinge axis ``kv``, recombined by the ``Monoid`` carrier folding over it::
+class Contraction:
+    """A **SEMIRING contraction** read off the DAG — the single representation shared by the
+    standalone-matmul warp tier (:func:`IterDag.contractions`) and the flash chain's inner QK^T
+    (:attr:`MonoidReduction.inner`). A reduce-axis node folding a product of operands into a
+    result edge, plus the output ``(…, M, N)`` coordinates the atom-fit reads. Algebra-generic, no
+    attention vocabulary: a matmul (``out_index`` = its output ``Write`` index) or flash's QK^T
+    (``out_index`` = the synthesized INLINE score coords ``(m, kv)``, since the fragment has no
+    ``Write``). The atom-fit (:func:`_atom.contraction_atomizes`) gates on exactly these fields, so
+    "does this contraction reach the warp tier?" is one call for the matmul and the flash inner.
 
-        S[m,kv] = Σ_e Q[m,e]·K[kv,e]     # inner: reduce ``e``,  free-output ``kv``
-        P[m,kv] = softmax_kv(S)           # the ``Monoid`` carrier, over ``kv``
-        O[m,n]  = Σ_kv P[m,kv]·V[kv,n]    # outer: reduce ``kv``, free-output ``n``
+    Wraps the reduce :class:`AxisNode`, delegating the node reads its consumers use
+    (``loop`` / ``body`` / ``axis`` / ``algebra`` / ``parent`` / ``extent``) so a contraction *is*
+    its node from the outside, while adding the contraction-level facts (``result`` / ``out_index``)."""
 
-    ``kv`` is the **hinge**: free-output of the inner contraction, reduce of BOTH the
-    outer contraction and the carrier. The outer P@V contraction is not a distinct
-    ``Loop`` — it lives inside the carrier's ``O = O·α + p·v`` accumulation (a SEMIRING
-    accumulation twisted by the online-softmax rescale: ``MONOID(SEMIRING)``), so it is
-    characterized by ``carrier`` + ``hinge`` rather than by its own node. A **derived**
-    view (computed on demand, like :attr:`IterDag.streaming`) — never stored, so it can't
-    drift and doesn't enter ``op_cache_key``. The shared-axis ``reduce_decomp`` (Phase 1c)
-    tiles ``hinge`` by ``BN``, materializing :attr:`score` as the INLINE register edge."""
+    node: AxisNode  # the SEMIRING reduce node (the contraction axis; ``algebra`` is SEMIRING)
+    result: str  # the SSA name of the contraction's output edge (QK^T: the score; matmul: the Accum)
+    out_index: tuple[Expr, ...] | None  # the output ``(…, M, N)`` coords (matmul: the Write index; QK^T fragment: ``(m, kv)``)
 
-    hinge: AxisNode  # ``kv`` — the dual-role hinge (the streaming ``Monoid`` reduce)
-    carrier: Monoid  # the online-softmax carrier folding over the hinge (its embedded P@V is the outer contraction)
-    inner: AxisNode  # the QK^T inner SEMIRING contraction, nested inside the hinge
-    score: str  # the inner contraction's result SSA name (the carrier's first partial) — the INLINE score edge
+    @property
+    def axis(self) -> Axis:
+        return self.node.axis
+
+    @property
+    def loop(self) -> Loop:
+        return self.node.loop
+
+    @property
+    def body(self) -> tuple[Stmt, ...]:
+        return self.node.body
+
+    @property
+    def algebra(self) -> AlgebraKind | None:
+        return self.node.algebra
+
+    @property
+    def parent(self) -> AxisNode | None:
+        return self.node.parent
+
+    @property
+    def extent(self) -> int:
+        return self.node.extent
+
+
+@dataclass(frozen=True)
+class MonoidReduction:
+    """A **MONOID reduction**, *as a composition* — the one class for the flat cooperative reduce
+    AND the streaming flash. An associative ``carrier`` folding over a primary reduce ``axis``,
+    **optionally composed over an inner SEMIRING** :class:`Contraction`::
+
+        inner is None         →  a flat reduce  (softmax LSE / RMSNorm stat / mean / max / sum):
+                                  ``s = ⊕_k f(x[…,k])`` — the carrier folds a pointwise leaf, no
+                                  nested contraction.
+        inner is Contraction  →  the streaming flash (``MONOID(SEMIRING)``): the carrier (online
+                                  softmax) folds the inner QK^T contraction's score over the shared
+                                  hinge ``kv``, its twisted ``O = O·α + p·v`` accumulation embedding
+                                  the outer P@V::
+
+            S[m,kv] = Σ_e Q[m,e]·K[kv,e]   # inner SEMIRING Contraction: reduce ``e``, output col ``kv``
+            P[m,kv] = softmax_kv(S)         # the MONOID carrier, over the hinge ``kv`` (= ``axis``)
+            O[m,d]  = Σ_kv P[m,kv]·V[kv,d]  # outer SEMIRING (the carrier's twisted P@V): reduce ``kv``
+
+    Flash is therefore *selected structurally* — "a ``Monoid`` whose folded inner operand is a
+    SEMIRING ``Contraction``" — never matched as a named shape; a flat reduce is the same class with
+    no inner. When ``inner`` is present the **carried-chain invariant** holds: the inner
+    contraction's output column (``inner.out_index[-1]``) IS the reduced ``axis`` (the hinge) —
+    enforced in ``__post_init__``, so a malformed composition is unrepresentable.
+
+    Carries **only the algebra** (``carrier`` + ``axis`` + ``inner``) plus the derived **edges**
+    (:attr:`score` / :attr:`out_index`, read off the inner contraction). It carries **no geometry**:
+    the build moves derive the free-axis roles (query ``m`` / head ``d`` / ``grid``) by *walking the
+    composition* at emit time (:func:`chain_free_axes`). A **derived** view (computed on demand by
+    :attr:`IterDag.reduction`) — never stored, so it can't drift and doesn't enter ``op_cache_key``."""
+
+    carrier: ReduceCarrier  # the associative carrier — a ``Monoid`` (twisted, flash / Welford) or ``Accum`` (plain)
+    axis: AxisNode  # the primary reduce node (the streaming hinge when ``inner`` is present)
+    inner: Contraction | None = None  # the nested SEMIRING contraction (streaming flash), or ``None`` (flat reduce)
+
+    def __post_init__(self) -> None:
+        # The carried-chain invariant (flash only): the inner contraction's output column IS ``axis`` (the hinge).
+        if self.inner is not None and (not self.inner.out_index or self.inner.out_index[-1].free_vars() != {self.axis.axis.name}):
+            raise ValueError("MonoidReduction: inner contraction's output column must be the reduced axis / hinge (chain invariant)")
+
+    @property
+    def hinge(self) -> AxisNode:
+        """The streaming hinge — the flash name for the shared reduce :attr:`axis`."""
+        return self.axis
 
     @property
     def hinge_name(self) -> str:
-        return self.hinge.axis.name
+        return self.axis.axis.name
 
     @property
     def inner_name(self) -> str:
         return self.inner.axis.name
+
+    @property
+    def score(self) -> str:
+        """The INLINE score edge — the inner contraction's result (the carrier's first partial)."""
+        return self.inner.result
+
+    @property
+    def out_index(self) -> tuple[Expr, ...] | None:
+        """The inner QK^T contraction's score output coords ``(m, kv)`` — read off the composed
+        inner :class:`Contraction` (the M=query-row / N=kv-hinge coordinates the transposed-B A/B
+        classification reads)."""
+        return self.inner.out_index
 
 
 @dataclass(frozen=True)
@@ -144,19 +222,33 @@ class IterDag:
         return nested_reduce and has_monoid
 
     @property
-    def chain(self) -> ContractionChain | None:
-        """The carried contraction chain (Unification 3) for a streaming-flash nest, else
-        ``None``. Derived on demand: the ``Monoid``-carrier hinge axis ``kv``, the SEMIRING
-        contraction (QK^T) nested inside it that produces the score, and the carrier whose
-        embedded P@V is a SEMIRING accumulation over the hinge. The view the score INLINE
-        edge + the shared-axis ``reduce_decomp`` (Phase 1c) tile — see
-        :class:`ContractionChain`."""
+    def reduction(self) -> MonoidReduction | None:
+        """This nest's **MONOID reduction** composition (:class:`MonoidReduction`), else ``None`` for
+        a non-MONOID nest. The primary reduce's carrier + axis, composed over an inner SEMIRING
+        :class:`Contraction` when the nest is a separable streaming flash (``inner`` set), else a
+        flat reduce (``inner is None`` — softmax / RMSNorm / mean / sum, or a non-separable stream).
+        Derived on demand, self-validating, never stored — the one structure the MONOID pass
+        (``070_coop_reduce``) dispatches on."""
+        if not self.reduce or self.reduce[0].algebra is not AlgebraKind.MONOID:
+            return None  # not a MONOID nest (a SEMIRING matmul / MAP has no monoid reduction)
+        inner, hinge = self._flash_inner()
+        if inner is not None:
+            return MonoidReduction(carrier=hinge.carrier, axis=hinge, inner=inner)
+        primary = self.reduce[0]
+        return MonoidReduction(carrier=primary.carrier, axis=primary, inner=None)
+
+    def _flash_inner(self) -> tuple[Contraction, AxisNode] | tuple[None, None]:
+        """The separable streaming flash's inner SEMIRING :class:`Contraction` + its hinge node, or
+        ``(None, None)`` for a flat reduce / a non-separable stream. The ``MONOID(SEMIRING)``
+        recognizer: a ``Monoid``-carrier hinge with a nested SEMIRING contraction whose free-axis
+        footprints separate (exactly one query ``m`` / head ``d``). The fragment QK^T has no
+        ``Write``, so the score coords are synthesized ``(query row, hinge)``."""
         if not self.streaming:
-            return None
+            return None, None
         hinge = next((n for n in self.reduce if isinstance(n.carrier, Monoid)), None)
         if hinge is None or not hinge.carrier.partial:
-            return None
-        inner = next(
+            return None, None
+        inner_node = next(
             (
                 n
                 for n in self.reduce
@@ -164,9 +256,35 @@ class IterDag:
             ),
             None,
         )
-        if inner is None:
-            return None
-        return ContractionChain(hinge=hinge, carrier=hinge.carrier, inner=inner, score=hinge.carrier.partial[0])
+        if inner_node is None:
+            return None, None
+        value_load = next((s for s in hinge.body if isinstance(s, Load) and s.name == hinge.carrier.partial[1]), None)
+        if value_load is None:
+            return None, None
+        m_nodes, d_nodes, _grid = partition_free_axes(
+            self.parallel, _free_var_footprint(inner_node.body), _free_var_footprint((value_load,))
+        )
+        if len(m_nodes) != 1 or len(d_nodes) != 1:
+            return None, None  # not separable — routed as a plain (serial-stream) monoid, not the chain
+        inner = Contraction(node=inner_node, result=hinge.carrier.partial[0], out_index=(Var(m_nodes[0].axis.name), Var(hinge.axis.name)))
+        return inner, hinge
+
+    @property
+    def contractions(self) -> tuple[Contraction, ...]:
+        """The nest's SEMIRING contractions as :class:`Contraction` units — one per matmul-reduce
+        loop, each carrying the nest's output ``(…, M, N)`` coordinates (the ``Write`` index). The
+        standalone-matmul analog of the chain's inner contraction: the warp-tier gate
+        (``_atom._atom_eligible``) reads these instead of re-deriving the output coords by walking
+        the body, so the matmul tier and the flash inner share one SEMIRING-contraction
+        representation and one atom-fit (``_atom.contraction_atomizes``). Empty for a non-matmul
+        nest. Derived on demand, never stored."""
+        out_index = _matmul_out_index(self)
+        cs: list[Contraction] = []
+        for n in self.reduce:
+            if is_matmul_reduce(n.loop):
+                result = next((s.name for s in n.body if isinstance(s, Accum)), "")
+                cs.append(Contraction(node=n, result=result, out_index=out_index))
+        return tuple(cs)
 
     # --- Free-axis accessors (the tiled output axes). Replace the skeleton's
     # ``inner_n`` / ``outer_m`` fields — the partition consumes
@@ -202,6 +320,56 @@ class IterDag:
         """The symbolic-K runtime boundary ``Expr`` (``None`` for a static K)."""
         ext = self.k_node.loop.axis.extent
         return None if ext.is_static else ext.expr
+
+
+def _free_var_footprint(stmts: tuple[Stmt, ...]) -> set[str]:
+    """The union of index ``Var`` names every ``Load`` in ``stmts`` references — an operand's
+    free-axis footprint (non-Load statements contribute nothing)."""
+    return {v for s in stmts if isinstance(s, Load) for e in s.index for v in e.free_vars()}
+
+
+def _matmul_out_index(dag: IterDag) -> tuple[Expr, ...] | None:
+    """The matmul output ``Write``'s index (≥2 var-bearing dims) — the ``(…, M, N)`` coordinates the
+    transposed-B A/B disambiguation reads. ``None`` when no output ``Write`` carries two free dims
+    (a collapsed / 1-D output that can't supply M/N — which keeps that matmul off the warp tier)."""
+    for w in Body.coerce(dag.inner_body).iter_of_type(Write):
+        if sum(1 for e in w.index if e.free_vars()) >= 2:
+            return w.index
+    return None
+
+
+def partition_free_axes(
+    free_nodes: tuple[AxisNode, ...], footprint_a: set[str], footprint_b: set[str]
+) -> tuple[tuple[AxisNode, ...], tuple[AxisNode, ...], tuple[AxisNode, ...]]:
+    """Split free-axis nodes by two operand footprints (sets of axis names): those whose axis is in
+    A's footprint only, in B's only, and the rest (in both, or in neither — the broadcast / batch
+    axes a two-operand composition shares). A **role-neutral** classification off the def-use, no
+    shape or attention vocabulary — the carried-contraction chain reads ``(a_only, b_only, rest)``
+    as ``(query rows m, value output d, grid)``, but any two-operand composition can reuse it.
+    Preserves ``free_nodes`` order within each group."""
+    a_only: list[AxisNode] = []
+    b_only: list[AxisNode] = []
+    rest: list[AxisNode] = []
+    for n in free_nodes:
+        in_a, in_b = n.axis.name in footprint_a, n.axis.name in footprint_b
+        (a_only if (in_a and not in_b) else b_only if (in_b and not in_a) else rest).append(n)
+    return tuple(a_only), tuple(b_only), tuple(rest)
+
+
+def chain_free_axes(reduction: MonoidReduction, dag: IterDag) -> tuple[Axis, Axis, tuple[Loop, ...]]:
+    """**Walk** the ``MONOID(SEMIRING)`` composition (a flash :class:`MonoidReduction`, ``inner`` set)
+    to its free-axis roles — the build geometry, derived at emit time, never a stored view. Reads each
+    role off the composition level that defines it: the **query row** ``m`` is the inner contraction's
+    own free output, the **P@V output** ``d`` is the carrier's value operand's own free output (in V,
+    not the inner QK^T), the **grid** is the shared batch / head axes. ``IterDag.reduction`` has already
+    validated separability, so ``m`` / ``d`` are each exactly one axis. The build moves
+    (``_build.chain_build`` / ``warp_chain_build``) call this while emitting, instead of consuming a
+    precomputed geometry tuple."""
+    value_load = next(s for s in reduction.hinge.body if isinstance(s, Load) and s.name == reduction.carrier.partial[1])
+    m_nodes, d_nodes, grid_nodes = partition_free_axes(
+        dag.parallel, _free_var_footprint(reduction.inner.body), _free_var_footprint((value_load,))
+    )
+    return m_nodes[0].axis, d_nodes[0].axis, tuple(n.loop for n in grid_nodes)
 
 
 def _carrier_of(loop: Loop) -> ReduceCarrier | None:
