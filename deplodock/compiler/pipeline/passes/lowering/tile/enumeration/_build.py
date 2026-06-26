@@ -560,6 +560,11 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     nt_count, nd, kt = 16 // atom_n, D // atom_n, D // atom_k
     qkt_body = tuple(next(s for s in kv_loop.body if isinstance(s, Loop)).body)  # the QK^T D-reduce cell
     a3_name = next(s for s in kv_loop.body if isinstance(s, Loop)).axis.name
+    # The score-masking ``Select`` the recognizer placed (``v2 = select(col<=row, score, -inf)``) —
+    # the causal mask's structural representation. Carried THROUGH to the graph (below) so assembly
+    # reads causality off it, not off a flag (there is no ``causal`` in FlashParams). It is the score
+    # mask's analog of the carrier ``Monoid`` (the softmax's structural representation).
+    score_mask = next((s for s in kv_loop.body if isinstance(s, Select)), None)
 
     # produce — the QK^T D-reduce, σ-tiled per N-atom (nt) → a transposed-B Mma over the INLINE
     # score (m, kv·16 + nt·atom_n). The D reduce becomes a ``ko`` K-tile loop (the load's K base is
@@ -575,7 +580,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         # kt>1: a real K_o serial loop (the atom spans atom_k per step). kt==1: the whole D is one
         # atom — strip ``ko`` to 0 and emit the cell directly (the form 005_lower_atom_tile lowers).
         if kt > 1:
-            body = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
+            body: tuple[Stmt, ...] = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
         else:
             body = tuple(s.rewrite(_identity_rename, Sigma({ko: Literal(0, "int")})) for s in fused)
         produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(body), atom=atom))
@@ -597,11 +602,13 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         body = tuple(s.rewrite(_identity_rename, Sigma({kpv: Literal(0, "int")})) for s in fused)
         consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(body), atom=atom))
 
-    # The streaming carry body: produce QK^T cells → the full twisted carrier (the online-softmax
-    # Monoid — the walk splits it via realize_fragment_softmax) → consume P@V cells, wrapped in the
-    # kv-stream serial-outer carry. carry_scope_from_graph realizes the fragment phases (softmax /
-    # scale / mask / C→A handoff / epilogue) around these AtomTiles.
-    new_kv = SerialTile(axis=kv_b, body=Body((*produce, chain.carrier, *consume)), kind="serial_outer")
+    # The streaming carry body: produce QK^T cells → (the score-mask ``Select``, when causal) → the
+    # full twisted carrier (the online-softmax Monoid — the walk splits it via
+    # realize_fragment_softmax) → consume P@V cells, wrapped in the kv-stream serial-outer carry.
+    # carry_scope_from_graph realizes the fragment phases (softmax / scale / mask / C→A handoff /
+    # epilogue) around these AtomTiles, reading causality off the ``Select``'s presence.
+    mask = (score_mask,) if score_mask is not None else ()
+    new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, chain.carrier, *consume)), kind="serial_outer")
     head_inits = tuple(s for s in block.compute if isinstance(s, Init))
     epilogue = tuple(s for s in block.compute if isinstance(s, (Assign, Write)))
     compute = (*head_inits, new_kv, *epilogue)

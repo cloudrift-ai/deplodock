@@ -30,7 +30,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Stmt, Write
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     AffineAddressing,
@@ -266,7 +266,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     ``realize_flash``."""
     block = graph.blocks[0]
     fp = flash_params(graph.buffers, block.writes[0].buffer)
-    out, D, S, seq_var, causal = fp.out, fp.D, fp.S, fp.seq_var, fp.causal
+    out, D, S, seq_var = fp.out, fp.D, fp.S, fp.seq_var
     atom = ATOM_REGISTRY[fp.atom_kind]
     atom_m, atom_n, _atom_k = atom.shape
     ab_dt = atom.operand_dtype("a")
@@ -279,6 +279,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     # ``warp_chain_build`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
     kv_loop = next(s for s in block.compute if isinstance(s, SerialTile) and s.kind == "serial_outer")
     carrier = next(s for s in kv_loop.body if isinstance(s, Monoid))
+    causal = any(isinstance(s, Select) for s in kv_loop.body)  # the score-mask Select — structural, not a flag
     is_qkt = lambda t: any(isinstance(s, Mma) and s.b_trans for s in t.body.iter())  # noqa: E731
     produce_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and is_qkt(t)]
     consume_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and not is_qkt(t)]
@@ -307,6 +308,10 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
             return {}
         return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * atom_n), seq)}
 
+    # Realize the score fragments + their fragment-tier transforms. The causal mask fires off the
+    # graph's ``Select`` (``causal`` above), the boundary mask off the symbolic ``seq`` — both are
+    # structural facts (a graph op / a shape extent), never an attention flag; the scale is keyed on
+    # the shape fact ``D``.
     produce: list = [_relabel_tile(t, c=f"Sf{nt}", sfx=f"q{nt}", guards=_qk_guards(nt)) for nt, t in enumerate(produce_tiles)]
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(nt_count)]
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))

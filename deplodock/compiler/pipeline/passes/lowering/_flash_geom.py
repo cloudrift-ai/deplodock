@@ -39,20 +39,17 @@ def mul(a, b: int) -> Expr:
 
 @dataclass(frozen=True)
 class FlashParams:
-    """The streaming-flash shape derived from the logical gmem ``buffers``: the q/k/v/out buffer
-    names, ``(B, H, S, D)`` (``S`` is ``None`` for a symbolic ``seq_len``, ``seq_var`` its runtime
-    symbol), the GQA ``group`` (q-heads / kv-heads), ``causal``, and the 16-bit operand dtype."""
+    """The streaming-flash **shape + dtype** read off the logical gmem buffers — the generic facts
+    any tiled kernel needs, named for **no** attention concept: the output buffer ``out`` (the query
+    rows + head dim live on its shape), the head dim ``D`` (the QK^T reduce / P@V output extent), the
+    query/kv seq extent ``S`` (``None`` ⇒ symbolic ``seq_len``, ``seq_var`` its runtime symbol), and
+    the 16-bit operand ``dtype`` (which ``mma`` atom). The attention-domain facts (which input is q /
+    k / v, GQA grouping, causality) are NOT here — they are read structurally off the seed (the σ-tiled
+    cells / the carrier / the score ``Select``), never named in a side helper."""
 
-    q: str
-    k: str
-    v: str
     out: str
-    B: int
-    H: int
     S: int | None
     D: int
-    group: int
-    causal: bool
     seq_var: str | None
     dtype: DataType
 
@@ -66,20 +63,20 @@ class FlashParams:
 
 
 def flash_params(buffers: dict, out: str) -> FlashParams | None:
-    """Derive :class:`FlashParams` from the logical gmem ``buffers`` (+ the written ``out``
-    buffer), or ``None`` when out of the 16-bit warp scope (a 4th rank-4 input = additive mask,
-    non-16-bit dtype, or non-static B/H/D). ``causal`` is detected by a ``*ninf*`` input."""
-    ins = [(n, b) for n, b in buffers.items() if len(b.shape) == 4 and n != out]
-    if len(ins) != 3:  # an additive mask adds a 4th rank-4 input — out of scope
+    """Derive the :class:`FlashParams` shape/dtype off the logical gmem buffers, or ``None`` when out
+    of the 16-bit warp scope (a 4th rank-4 input = additive mask, a non-16-bit operand dtype, or a
+    non-static head dim). ``D`` / ``S`` come from the rank-4 **output** shape (the query rows + head
+    dim); the operand ``dtype`` from a rank-4 16-bit input. No q/k/v identification, no GQA group, no
+    causal flag — those are structural facts read off the seed where they are needed."""
+    ob = buffers.get(out)
+    if ob is None or len(ob.shape) != 4:
         return None
-    (qn, q), (kn, k), (vn, _v) = ins
-    if q.dtype not in (F16, BF16):
+    ins = [b for n, b in buffers.items() if len(b.shape) == 4 and n != out]
+    if len(ins) != 3 or ins[0].dtype not in (F16, BF16):  # a 4th rank-4 input = additive mask — out of scope
         return None
-    B, H, D = static_extent(q.shape[0]), static_extent(q.shape[1]), static_extent(q.shape[3])
-    S = static_extent(q.shape[2])  # None ⇒ symbolic seq_len
-    kvh = static_extent(k.shape[1])
-    if kvh in (None, 0) or any(x is None for x in (B, H, D)):
+    D = static_extent(ob.shape[3])  # head dim — the QK^T reduce / P@V output extent
+    S = static_extent(ob.shape[2])  # query rows; None ⇒ symbolic seq_len
+    if D is None:
         return None
-    seq_var = None if S is not None else next(iter(q.shape[2].expr.free_vars()))
-    causal = any("ninf" in n for n in buffers)
-    return FlashParams(q=qn, k=kn, v=vn, out=out, B=B, H=H, S=S, D=D, group=H // kvh, causal=causal, seq_var=seq_var, dtype=q.dtype)
+    seq_var = None if S is not None else next(iter(ob.shape[2].expr.free_vars()))
+    return FlashParams(out=out, S=S, D=D, seq_var=seq_var, dtype=ins[0].dtype)

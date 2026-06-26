@@ -83,11 +83,12 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def _is_warp_flash(op: TileGraphOp) -> bool:
     """Whether this streaming flash deploys the **warp-tier tensor-core chain** (vs the
-    cooperative / scalar streaming nest): a carried-contraction chain in the 16-bit warp scope
-    (the shared ``flash_params`` — fp16/bf16, ``D%16==0`` with ``16 ≤ D ≤ 256``, GQA group
-    dividing H, static ``S%16==0`` OR symbolic) AND either a symbolic ``seq_len`` (the deployed
-    default — the ~100× win) or a static shape under ``DEPLODOCK_CHAIN``. (Folds the former
-    ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
+    cooperative / scalar streaming nest): a carried-contraction chain (``dag.chain`` — the structural
+    flash recognition, which already guarantees a well-formed GQA/equal-head nest) in the 16-bit warp
+    scope (``flash_params`` is non-``None`` — fp16/bf16, exactly the 3 rank-4 inputs) with the head
+    dim atom-eligible (``D%16==0``, ``16 ≤ D ≤ 256``) AND either a symbolic ``seq_len`` (the deployed
+    default — the ~100× win) or a static ``S%16==0`` shape under ``DEPLODOCK_CHAIN``. (Folds the
+    former ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
     if op.dag.chain is None:
         return False
     fp = flash_params(op.buffers, op.tilegraph.blocks[0].writes[0].buffer)
@@ -95,7 +96,7 @@ def _is_warp_flash(op: TileGraphOp) -> bool:
         return False
     if not fp.symbolic and not fam.pin_inline_chain():
         return False
-    if fp.group < 1 or fp.H % fp.group != 0 or fp.D % 16 != 0 or not (16 <= fp.D <= 256):
+    if fp.D % 16 != 0 or not (16 <= fp.D <= 256):
         return False
     return True if fp.symbolic else (fp.S % 16 == 0 and fp.S >= 16)
 
