@@ -56,6 +56,30 @@ def test_probe_falls_back_to_memorized(monkeypatch):
     assert gpu.probe_live_features("NVIDIA GeForce RTX 4090")["total_mem"] == gpu.by_name("NVIDIA GeForce RTX 4090").vram_bytes
 
 
+def test_by_name_canonicalizes_reported_aliases():
+    """Live datacenter cards report bare ``cudaDeviceProp.name`` strings that differ from
+    the capacity-suffixed registry names; the registry aliases canonicalize them (so a
+    live node-store row and a golden built from the canonical name share one gpu string).
+    Without these, ``live_name`` canonicalization was a no-op for the exact cards it
+    targets."""
+    assert gpu.by_name("NVIDIA H200").name == "NVIDIA H200 141GB"
+    assert gpu.by_name("NVIDIA H100 80GB HBM3").name == "NVIDIA H100 80GB"
+    assert gpu.by_name("NVIDIA A100-SXM4-80GB").name == "NVIDIA A100 80GB"
+    assert gpu.by_name("NVIDIA H200 141GB").name == "NVIDIA H200 141GB"  # canonical resolves to itself
+    assert gpu.by_name("NVIDIA Totally Made Up") is None  # unknown → None (live_name keeps the raw string)
+
+
+def test_registry_names_and_aliases_are_unique():
+    """No string maps to two specs — every canonical name / alias is unique across the
+    registry, so a typo'd alias is caught here instead of being silently shadowed by the
+    ``setdefault`` in the ``_BY_NAME`` build (or mis-canonicalizing a card)."""
+    seen: dict[str, str] = {}
+    for g in gpu.KNOWN_GPUS:
+        for label in (g.name, *g.aliases):
+            assert label not in seen, f"{label!r} claimed by both {seen[label]!r} and {g.name!r}"
+            seen[label] = g.name
+
+
 def test_hardware_id_distinguishes_same_die_skus(monkeypatch):
     """``Context.hardware_id`` keys on the product name when known — so H100 and H200
     (identical cc + SM features) get distinct identities; an unnamed context falls back

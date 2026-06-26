@@ -193,6 +193,9 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=132,
         smem_per_sm=233472,
         vram_mib=81559,
+        # ``cudaDeviceProp.name`` reports the SXM5 form, not the capacity-suffixed
+        # registry name — so a live card canonicalizes via the alias (see ``live_name``).
+        aliases=("NVIDIA H100 80GB HBM3",),
     ),
     GpuSpec(
         name="NVIDIA H200 141GB",
@@ -202,6 +205,7 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=132,
         smem_per_sm=233472,
         vram_mib=143771,
+        aliases=("NVIDIA H200",),  # bare reported name (SXM); registry name carries the capacity
     ),
     GpuSpec(
         name="NVIDIA B200",
@@ -220,6 +224,9 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=108,
         smem_per_sm=167936,
         vram_mib=40960,
+        # SXM4 / PCIe report distinct ``cudaDeviceProp.name`` forms; both 40GB A100s
+        # share this spec's SM count + VRAM, so canonicalize them to one identity.
+        aliases=("NVIDIA A100-SXM4-40GB", "NVIDIA A100-PCIE-40GB"),
     ),
     GpuSpec(
         name="NVIDIA A100 80GB",
@@ -229,6 +236,7 @@ KNOWN_GPUS: tuple[GpuSpec, ...] = (
         sm_count=108,
         smem_per_sm=167936,
         vram_mib=81920,
+        aliases=("NVIDIA A100-SXM4-80GB", "NVIDIA A100 80GB PCIe"),
     ),
     GpuSpec(
         name="NVIDIA Tesla V100 SXM3 32GB",
@@ -303,10 +311,13 @@ def probe_live_features(fallback_name: str | None = None) -> dict[str, float]:
 @functools.cache
 def live_name() -> str | None:
     """The live CUDA device's PCIe product name (``cudaDeviceProp.name``), canonicalized
-    through the registry (:func:`by_name`) when recognized, else the raw reported name;
-    ``None`` when no device is visible. The hardware identity that distinguishes same-die
-    SKUs (H100 vs H200) — ``compute_capability`` + SM features alone can't. Cached:
-    physical, target-independent."""
+    to the registry name via :func:`by_name` (datacenter cards report a bare name —
+    ``"NVIDIA H200"`` — that the registry carries as an alias of the capacity-suffixed
+    ``"NVIDIA H200 141GB"``); the raw reported name when unrecognized, ``None`` when no
+    device is visible. The hardware identity that distinguishes same-die SKUs (H100 vs
+    H200) — ``compute_capability`` + SM features alone can't. Canonicalizing matters so a
+    live node-store row and a golden reconstructed from the canonical name share one
+    ``gpu`` string. Cached: physical, target-independent."""
     try:
         import cupy as cp  # noqa: PLC0415
 
