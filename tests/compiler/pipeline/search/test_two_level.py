@@ -171,6 +171,24 @@ def test_inner_reward_is_separable_not_a_product() -> None:
     assert reward.total_us == pytest.approx(sum(r.best_us for r in reward.per_op))
 
 
+def test_inner_reward_records_nodes() -> None:
+    """The post-search walk persists tree nodes to the ``node`` table — keyed by
+    the run's context, one op_sig group per distinct kernel, with every non-null
+    parent_key referencing a recorded node (valid ancestry edges)."""
+    fused = _fuse(_two_distinct_matmuls())
+    ctx = Context.from_target((8, 0))
+    db = SearchDB()
+    run_inner_reward(fused, ctx=ctx, db=db, backend=_CountingBackend(), patience=_PATIENCE)
+
+    rows = db._conn.execute("SELECT node_key, parent_key, context_key, op_sig, value_us FROM node").fetchall()
+    assert rows, "expected node rows recorded from the finished search trees"
+    assert {r[2] for r in rows} == {ctx.structural_key()}  # all under the run's regime
+    assert all(r[4] > 0 for r in rows)  # positive value-of-position
+    assert len({r[3] for r in rows}) >= 2  # two distinct matmuls → ≥2 op_sig groups
+    keys = {r[0] for r in rows}
+    assert all(r[1] in keys for r in rows if r[1] is not None)  # parents reference recorded nodes
+
+
 def test_inner_reward_rerun_is_replay_dominated() -> None:
     """A second pass at the same patience is replay-dominated and never regresses:
     the warm perf cache serves almost every terminal, so the rerun benches far

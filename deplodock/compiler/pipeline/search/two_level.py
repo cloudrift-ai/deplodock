@@ -62,9 +62,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
+from deplodock.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 from deplodock.compiler.pipeline.search.slice import single_node_graph
+from deplodock.compiler.structural import digest
 
 if TYPE_CHECKING:
     from deplodock.compiler.context import Context
@@ -344,6 +345,17 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
                 prior.add_rows(inner._collect_rows() + inner.o3_rows)
                 if prior.maybe_refit():
                     prior.checkpoint()
+            # Persist every search-tree node (partial branches + leaves) to the
+            # keyed/deduped ``node`` table — alongside the reservoir feed above, and
+            # independent of whether a prior is attached. ``op_sig`` is the op's
+            # ``S_*`` structural signature; the walk threads parent_key/value/depth.
+            op_sig = digest(*sorted((k, v) for k, v in op.knobs.items() if k.startswith("S_")))
+            db.record_nodes(
+                [
+                    NodeRow(node_key=nk, parent_key=pk, context_key=ctx_key, op_sig=op_sig, features=feats, value_us=v, depth=d)
+                    for nk, pk, feats, v, d in inner._collect_node_records(context_key=ctx_key, op_sig=op_sig)
+                ]
+            )
             best = db.best_per_op_time(ctx_key, key, backend=backend_name)
             results[op_idx] = OpResult(name=name, op_key=key, best_us=best, multiplicity=count)
             if progress is not None:

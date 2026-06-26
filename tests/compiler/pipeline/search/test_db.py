@@ -7,11 +7,12 @@ Loop→Tile), and a backend-partitioned generic ``perf`` table.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
 
-from deplodock.compiler.pipeline.search.db import PerfStats, SearchDB
+from deplodock.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
 
 
 def _stats(median: float) -> PerfStats:
@@ -216,6 +217,96 @@ def test_open_readonly_reads_without_mutating(tmp_path) -> None:
 def test_open_readonly_missing_file_raises(tmp_path) -> None:
     with pytest.raises(sqlite3.OperationalError):
         SearchDB.open_readonly(tmp_path / "nope.db")
+
+
+# ---------------------------------------------------------------------------
+# node — search-tree node store
+# ---------------------------------------------------------------------------
+
+
+def _node_row(node_key: str, value_us: float, *, parent_key=None, op_sig="sig", features=None, depth=1) -> NodeRow:
+    return NodeRow(
+        node_key=node_key,
+        parent_key=parent_key,
+        context_key="ctx",
+        op_sig=op_sig,
+        features=features or {},
+        value_us=value_us,
+        depth=depth,
+    )
+
+
+def test_record_nodes_then_read() -> None:
+    db = SearchDB()
+    db.record_nodes([_node_row("n1", 5.0, features={"BM": 8, "S_n_mma": 1.0}, depth=2)])
+    row = db._conn.execute(
+        "SELECT parent_key, context_key, op_sig, features, value_us, depth, n_updates FROM node WHERE node_key = ?",
+        ("n1",),
+    ).fetchone()
+    assert row[0] is None
+    assert (row[1], row[2]) == ("ctx", "sig")
+    assert json.loads(row[3]) == {"BM": 8, "S_n_mma": 1.0}  # full feature dict round-trips
+    assert (row[4], row[5], row[6]) == (5.0, 2, 1)
+
+
+def test_record_nodes_keeps_min() -> None:
+    db = SearchDB()
+    db.record_nodes([_node_row("n1", 5.0)])
+    db.record_nodes([_node_row("n1", 2.0)])  # improves → kept
+    db.record_nodes([_node_row("n1", 9.0)])  # worse → value untouched, n_updates still bumps
+    val, n = db._conn.execute("SELECT value_us, n_updates FROM node WHERE node_key = ?", ("n1",)).fetchone()
+    assert val == 2.0
+    assert n == 3
+
+
+def test_record_nodes_parent_link() -> None:
+    db = SearchDB()
+    db.record_nodes([_node_row("parent", 2.0, depth=1), _node_row("child", 4.0, parent_key="parent", depth=2)])
+    (parent_value,) = db._conn.execute(
+        "SELECT p.value_us FROM node c JOIN node p ON c.parent_key = p.node_key WHERE c.node_key = ?",
+        ("child",),
+    ).fetchone()
+    assert parent_value == 2.0
+
+
+def test_node_table_autocreated_on_pre_node_db(tmp_path) -> None:
+    """A DB written before the ``node`` table existed gains it on the next writer
+    open — ``CREATE TABLE IF NOT EXISTS`` auto-creates it, no ALTER needed."""
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE perf (context_key TEXT NOT NULL, op_key TEXT NOT NULL, backend TEXT NOT NULL,
+            status TEXT NOT NULL, latency_us_median REAL NOT NULL, latency_us_min REAL NOT NULL,
+            latency_us_max REAL NOT NULL, latency_us_mean REAL NOT NULL, latency_us_variance REAL NOT NULL,
+            n_samples INTEGER NOT NULL, measured_at TEXT NOT NULL, knobs TEXT NOT NULL DEFAULT '{}',
+            captured INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (context_key, op_key, backend));
+        """
+    )
+    con.commit()
+    con.close()
+
+    db = SearchDB(path)  # writer open creates the absent ``node`` table
+    db.record_nodes([_node_row("n1", 3.0)])
+    (val,) = db._conn.execute("SELECT value_us FROM node WHERE node_key = 'n1'").fetchone()
+    assert val == 3.0
+
+
+def test_node_survives_version_bump_that_drops_lowering(tmp_path) -> None:
+    """``node`` is content-keyed like ``perf`` (not topology-keyed like
+    ``lowering``), so a schema-version mismatch — which wipes ``lowering`` — leaves
+    ``node`` rows intact."""
+    path = tmp_path / "t.db"
+    db = SearchDB(path)
+    db.record_lowering("p", "loop", "c", "tile", knobs={"BN": 64}, measured_median_us=1.0)
+    db.record_nodes([_node_row("n1", 3.0)])
+    db._conn.execute("PRAGMA user_version = 0")  # simulate an older on-disk schema
+    db.close()
+
+    reopened = SearchDB(path)  # version mismatch → drops+recreates ``lowering``; ``node`` survives
+    assert reopened.lookup_lowering("p") is None
+    (val,) = reopened._conn.execute("SELECT value_us FROM node WHERE node_key = 'n1'").fetchone()
+    assert val == 3.0
 
 
 # ---------------------------------------------------------------------------
