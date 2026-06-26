@@ -50,20 +50,6 @@ class CarryScope:
     epilogue: tuple[Stmt, ...] = ()
 
 
-def wrap_carry_tower(carry: CarryScope, *, warp_axes: tuple[Axis, ...], grid_axes: tuple[Axis, ...]) -> Body:
-    """Wrap a :class:`CarryScope` into the ``GridTile > WarpTile > [init] SerialTile [epilogue]``
-    nest. The per-iteration phases are spliced in carrier order inside the serial loop; the
-    carry's ``init`` state is hoisted above the loop and its ``epilogue`` (normalize + store)
-    trails it — so the accumulator persists across the serial axis instead of resetting per
-    tile (the streaming accumulator the generic single-cell assembly can't express)."""
-    loop_body = carry.produce + carry.merge + carry.rescale + carry.handoff + carry.consume + carry.update
-    serial = SerialTile(axis=carry.axis, body=Body(loop_body), kind="serial_outer")
-    warp_body = carry.init + (serial,) + carry.epilogue
-    warp = WarpTile(axes=warp_axes, body=Body(warp_body))
-    grid = GridTile(axes=grid_axes, body=Body((warp,)))
-    return Body((grid,))
-
-
 class Role(enum.Enum):
     """Planner-internal label for ``_wrap_tower`` layers.
 

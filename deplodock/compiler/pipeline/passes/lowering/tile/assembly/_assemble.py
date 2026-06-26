@@ -34,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     CoopReduce,
     Edge,
     Schedule,
+    SerialTile,
     Source,
     StageBundle,
     TileGraph,
@@ -42,7 +43,7 @@ from deplodock.compiler.ir.tile.ir import (
 )
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _wrap_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
 
 # Schedule ``Binding`` → tower ``Role``. SERIAL has no free-axis use yet (the K
@@ -150,6 +151,31 @@ def _assemble_one(
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in leading if not (set(s.defines()) & inner_defs))
     return TileOp(body=kept_leading + chain_body, name=kernel_name, knobs=knobs_full)
+
+
+def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None) -> Body:
+    """Materialize a :class:`CarryScope` into the tower — the **generalized carry
+    assembler**, the one materialization for every accumulator-bearing reduction.
+
+    The streaming / reduce axis is a ``SERIAL_OUTER`` loop carrying accumulator state:
+    ``init`` is hoisted ABOVE the loop, the per-iteration phases
+    (``produce`` → ``merge`` → ``rescale`` → ``handoff`` → ``consume`` → ``update``)
+    splice in carrier order INSIDE it, and ``epilogue`` (normalize + store) trails it,
+    so the accumulator persists across the serial axis. The parallel tower
+    (GRID / WARP / THREAD / REGISTER) wraps that via the shared :func:`_wrap_tower`
+    — the SAME tower builder ``_assemble_one`` uses for the implicit-carry matmul /
+    reduce / pointwise bodies.
+
+    The carrier algebra is what differs across regimes, not the materialization: a
+    matmul's K-reduce is the degenerate carrier (only ``consume`` — the ``Mma``
+    accumulates in place), a flat reduction the monoid carrier (``merge`` / ``update``,
+    no ``Mma``), and flash the full streaming carrier (every phase). ``parallel_layers``
+    is the innermost-first ``(axis, Role)`` tower (WARP cells inside, GRID outside),
+    the carry-axis analogue of :func:`_free_layers`."""
+    loop_body = carry.produce + carry.merge + carry.rescale + carry.handoff + carry.consume + carry.update
+    serial = SerialTile(axis=carry.axis, body=Body(loop_body), kind="serial_outer")
+    inner = carry.init + (serial,) + carry.epilogue
+    return Body(_wrap_tower(parallel_layers, inner, atom=atom))
 
 
 def _restrict_schedule(sched: Schedule, block_name: str) -> Schedule:

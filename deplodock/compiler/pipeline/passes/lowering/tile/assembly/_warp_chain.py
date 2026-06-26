@@ -37,13 +37,14 @@ from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFrag
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Body, Load, Mma, Monoid
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_carry
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
     realize_boundary_mask,
     realize_fragment_softmax,
     realize_score_mask,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, wrap_carry_tower
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role
 
 
 def warp_chain_eligible(*, B: int, H: int, S: int, D: int, group: int, causal: bool, mask: bool, symbolic: bool) -> bool:
@@ -156,8 +157,8 @@ def build_warp_chain_tileop(
     # The flash kv-stream is a MONOID(SEMIRING) ``CarryScope`` over ``kv`` (the streaming
     # accumulator ``O`` + the online-softmax stats ``m``/``l``): the two SEMIRING cells
     # (QK^T ``produce``, P@V ``consume``) bracket the carrier's ``merge``/``rescale``/
-    # ``update``. ``wrap_carry_tower`` does the GridTile>WarpTile>[init]SerialTile[epilogue]
-    # nesting — the streaming accumulator the generic single-cell assembly can't model.
+    # ``update``. ``assemble_carry`` (the generic carry assembler) does the
+    # GridTile>WarpTile>[init]SerialTile[epilogue] nesting — the streaming accumulator.
 
     # The softmax phases (init stats / merge / rescale / update / epilogue scales) are the
     # **fragment realization** of the streaming online-softmax ``carrier`` — generated from
@@ -290,7 +291,17 @@ def build_warp_chain_tileop(
         update=tuple(update),
         epilogue=tuple(epilogue),
     )
-    body = wrap_carry_tower(carry, warp_axes=(Axis("w", Dim(1)),), grid_axes=(Axis("bh", Dim(B * H)), Axis("qb", s_dim)))
+    # The flash kv-stream materializes through the generic carry assembler
+    # (``_assemble.assemble_carry`` — the SAME tower path matmul / reduce use): the
+    # parallel tower is the per-warp (16 query rows) WarpTile under the (bh, qb) GridTile,
+    # innermost-first (WARP inside, GRID outside; grid axes reversed so the tower nests
+    # ``GridTile(bh, qb) > WarpTile(w)``).
+    parallel_layers = [
+        (Axis("w", Dim(1)), Role.WARP),
+        (Axis("qb", s_dim), Role.BLOCK),
+        (Axis("bh", Dim(B * H)), Role.BLOCK),
+    ]
+    body = assemble_carry(carry, parallel_layers=parallel_layers)
     name = loop_op.name if loop_op.name.startswith("k_") else f"k_{loop_op.name}"
     return TileOp(body=body, name=name, knobs={})
 
