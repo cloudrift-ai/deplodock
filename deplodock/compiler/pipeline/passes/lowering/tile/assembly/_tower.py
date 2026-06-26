@@ -1,9 +1,9 @@
 """Tower-building primitives for the assembly phase: the internal :class:`Role`
 label and :func:`_wrap_tower`, which wraps a body in the nested typed tile
 flavors (``GridTile`` / ``ThreadTile`` / ``RegisterTile`` / ``WarpTile`` /
-``AtomTile`` / ``SerialTile``). Called by ``assembly/_assemble`` (``assemble_carry`` for every
-single-block kernel — pointwise / matmul / reduce / flash — and ``_assemble_group`` /
-``_assemble_multi`` for the fused / multi-launch DAGs) to materialize the binding tower.
+``AtomTile`` / ``SerialTile``). Called only by ``assembly/_assemble.assemble_carry`` — the one
+carry materializer EVERY assembly path funnels through (single-block / fused-edge /
+multi-launch / flash) — to materialize the binding tower from a chosen ``Schedule``.
 """
 
 from __future__ import annotations

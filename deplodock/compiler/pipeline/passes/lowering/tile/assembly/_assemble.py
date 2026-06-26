@@ -158,8 +158,11 @@ def _assemble_one(
 
 
 def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None) -> tuple[Stmt, ...]:
-    """Materialize a :class:`CarryScope` into the tower — the **one** assembly path for
-    every single-block kernel: pointwise, matmul, reduction, and flash.
+    """Materialize a :class:`CarryScope` into the tower — the **one** materialization every
+    assembly path funnels through: the single-block kernels (``_assemble_one`` — pointwise /
+    matmul / reduce), the SMEM-fused edge (``_assemble_group``), the multi-launch DAG
+    (``_assemble_multi`` → ``_assemble_one``), and flash (``_flash.realize_flash``). It is the
+    sole caller of :func:`_wrap_tower`.
 
     The per-iteration phases concatenate in carrier order
     (``produce`` → ``merge`` → ``rescale`` → ``handoff`` → ``consume`` → ``update``),
@@ -453,15 +456,18 @@ def _assemble_group(graph: TileGraph, *, knobs: dict, base_knobs: dict, kernel_n
     fused_body = _fuse_producers(staged_body, producer_of, graph)
 
     layers = _free_layers(consumer, graph.schedule)
+    # Materialize through the generalized carry assembler (embedded carrier — the fused
+    # consumer's K tower is already in the body), the SAME path the single-block kernels and
+    # flash use.
     if prologues:
         # Emit the prologue(s) as GridTile-level siblings before the matmul tower: build
         # the inner (sub-grid) tower, then wrap [CoopReduce…, inner] in the GRID layer.
         grid = [ll for ll in layers if ll[1] is Role.BLOCK]
         inner = [ll for ll in layers if ll[1] is not Role.BLOCK]
-        inner_chain = _wrap_tower(inner, tuple(fused_body), atom=consumer.atom)
-        chain_body = _wrap_tower(grid, (*prologues, *inner_chain))
+        inner_chain = assemble_carry(CarryScope(consume=tuple(fused_body)), parallel_layers=inner, atom=consumer.atom)
+        chain_body = assemble_carry(CarryScope(consume=(*prologues, *inner_chain)), parallel_layers=grid)
     else:
-        chain_body = _wrap_tower(layers, tuple(fused_body), atom=consumer.atom)
+        chain_body = assemble_carry(CarryScope(consume=tuple(fused_body)), parallel_layers=layers, atom=consumer.atom)
     knobs_full = {**base_knobs, **knobs}
     inner_defs = {n for s in Body.coerce(chain_body).iter() for n in s.defines()}
     kept_leading = tuple(s for s in leading if not (set(s.defines()) & inner_defs))
