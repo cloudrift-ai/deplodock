@@ -15,10 +15,11 @@ from __future__ import annotations
 
 from deplodock.compiler.dim import to_dim
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Select, SelectBranch, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
+from deplodock.compiler.pipeline.passes.lowering._masking import in_bounds, mask_index
 
 
 def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | Expr | None) -> int:
@@ -61,17 +62,6 @@ def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing,
     return 1 if elem_size == 4 else 0
 
 
-def _ext_expr(ext: int | Expr) -> Expr:
-    """An extent as an ``Expr``: static ints become ``Literal``s, symbolic
-    extents (e.g. ``Var('seq_len')``) pass through and render against the
-    runtime kernel arg."""
-    return Literal(ext, "int") if isinstance(ext, int) else ext
-
-
-def _ext_minus_one(ext: int | Expr) -> Expr:
-    return Literal(ext - 1, "int") if isinstance(ext, int) else BinaryExpr("-", ext, Literal(1, "int"))
-
-
 def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int | Expr, ...] | None) -> tuple[Expr, ...]:
     """Clamp each cooperative-load gmem index dim to ``[0, extent)``.
 
@@ -108,11 +98,7 @@ def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int 
     if gmem_extents is None:
         return source_index
     if len(source_index) == len(gmem_extents):
-        out: list[Expr] = []
-        for idx, ext in zip(source_index, gmem_extents, strict=True):
-            cond = BinaryExpr("<", idx, _ext_expr(ext))
-            out.append(TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(ext)))
-        return tuple(out)
+        return tuple(mask_index(idx, ext, mode="clamp") for idx, ext in zip(source_index, gmem_extents, strict=True))
     if len(source_index) == 1:
         # ∏ extents, folding the static factors into one Literal so the common
         # all-static case keeps its single-literal bound.
@@ -129,9 +115,7 @@ def _clamp_source_index(source_index: tuple[Expr, ...], gmem_extents: tuple[int 
             bound = total_sym
         else:
             bound = BinaryExpr("*", total_sym, Literal(total_static, "int"))
-        idx = source_index[0]
-        cond = BinaryExpr("<", idx, _ext_expr(bound))
-        return (TernaryExpr(cond=cond, if_true=idx, if_false=_ext_minus_one(bound)),)
+        return (mask_index(source_index[0], bound, mode="clamp"),)
     # Unexpected rank shape (multi-dim source_index that doesn't match the
     # buffer rank) — leave untouched rather than mis-clamp.
     return source_index
@@ -264,21 +248,16 @@ def emit_stage(
         # fails so the mma accumulates zero past seq_len.
         kmask = getattr(src, "kmask", None)
         k_inbounds: Expr | None = None
-        k_bound_e: Expr | None = None
         k_dim_idx = -1
         if kmask is not None:
             k_dim_idx, k_bound = kmask
             if k_dim_idx < len(source_index):
-                k_bound_e = _ext_expr(k_bound)
-                k_inbounds = BinaryExpr("<", source_index[k_dim_idx], k_bound_e)
+                k_inbounds = in_bounds(source_index[k_dim_idx], k_bound)
         source_index = _clamp_source_index(source_index, getattr(src, "gmem_extents", None))
         if k_inbounds is not None and getattr(src, "gmem_extents", None) is None:
             # masked-K only (static M/N → no 021 clamp): clamp the K dim for a
             # safe in-bounds read ourselves (the value is zeroed below anyway).
-            source_index = tuple(
-                TernaryExpr(cond=BinaryExpr("<", e, k_bound_e), if_true=e, if_false=_ext_minus_one(kmask[1])) if d == k_dim_idx else e
-                for d, e in enumerate(source_index)
-            )
+            source_index = tuple(mask_index(e, kmask[1], mode="zero") if d == k_dim_idx else e for d, e in enumerate(source_index))
         # Buffered: prepend phase dim to write index (writes the current
         # ring slot).
         if is_buffered:

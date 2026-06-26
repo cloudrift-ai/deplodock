@@ -127,6 +127,16 @@ Every move is gated by a **carrier trait**, not a shape (`_moves.legal_decomps`)
   read-side edge-clamp the staged path gets from `_stage_expand`).
   `assemble` synthesizes the smem slab + cooperative producer; nothing is stored in the algorithm.
 
+> **Masked-tile index arithmetic lives in one module — `lowering/_masking.py`.** The edge-clamp
+> (`mask_index(coord, bound)` → `coord<bound ? coord : bound-1`, a harmless in-bounds duplicate the gated `Write`
+> drops), the zero-fill predicate (`in_bounds(coord, bound)` → `coord<bound`, gating the masked-K value→0 `Select`),
+> the extent helpers (`ext_expr`/`ext_minus_one`), and the symbolic-K locator (`locate_symbolic_k` — which staged
+> source dim carries the symbolic contraction extent) are defined once and consumed by `kernel/009` (gmem-direct
+> clamp), `kernel/_stage_expand` (cooperative-load clamp + masked-K zero-fill), and `assembly/_slab` (`Source.kmask`
+> stamp). The warp/MMA tier (`kernel/005`) renders its own M/N clamp + K zero-fill directly in CUDA C from
+> `(coord, bound)` tuples on the `Mma`, so it builds no `Expr` clamps and does not route through `_masking` — it
+> shares the *concept*, not the construction.
+
 The only algebra-*conditioned* heuristic is a **ranking** cost model, not a code path: the free-axis register menu is
 bandwidth-biased for a `MAP` nest (`map_reg_offers`) and compute/ILP-biased for a reduce regime (`reduce_reg_offers`).
 This is the tile-phase instance of the global rule in [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) — *No

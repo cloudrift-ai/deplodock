@@ -45,6 +45,7 @@ from deplodock.compiler.ir.tile.ir import (
     _mul_const,
     pick_swizzle_atom,
 )
+from deplodock.compiler.pipeline.passes.lowering._masking import locate_symbolic_k
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _identity_rename
 
 # Double-buffer ring depth for TMA-staged K loops. R5 fixes the depth at 2 (the
@@ -394,13 +395,8 @@ def _kmask_source(src: Source, reduce_names: frozenset[str], input_extents: dict
     exts = input_extents.get(src.buf)
     if exts is None:
         return src
-    for i, ax in enumerate(src.cache_axes):
-        if ax.name not in reduce_names:
-            continue
-        k_dim = src.addressing.dims[i]
-        if k_dim < len(exts) and not isinstance(exts[k_dim], int):  # a symbolic K gmem dim
-            return replace(src, kmask=(k_dim, exts[k_dim]))
-    return src
+    kmask = locate_symbolic_k(src.cache_axes, src.addressing.dims, exts, reduce_names)
+    return replace(src, kmask=kmask) if kmask is not None else src
 
 
 def _stamp_kmask(stmt: Stmt, reduce_names: frozenset[str], input_extents: dict) -> Stmt:
