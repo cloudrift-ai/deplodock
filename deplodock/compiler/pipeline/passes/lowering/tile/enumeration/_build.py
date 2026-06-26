@@ -37,34 +37,53 @@ def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:
     return inner_n, outer_m, extra_outer
 
 
-def _split_free_axis(axis: Axis, thread: int, reg: int, *, interleave_when_masked: bool):
-    """Build the block/thread/register axes + σ entry + optional store-guard bound
-    for one free axis (``A → A_b·(T·R) + A_t·R + A_r``; interleaved on a masked
-    inner axis)."""
-    tr = thread * reg
-    masked = (not axis.extent.is_static) or (axis.extent.as_static() % tr != 0)
+def _scaled(name: str, weight: int):
+    """A σ term ``Var·weight`` — a bare ``Var`` at unit weight 1, scaled otherwise.
+    The least-significant axis in a mixed-radix split (weight 1) renders bare; an
+    inner lane / cell axis (``br`` / ``atom_k`` / ``reg``·… stride) renders scaled."""
+    return Var(name) if weight == 1 else Var(name) * Literal(weight, "int")
+
+
+def _split_axis(axis: Axis, specs: list[tuple[str, int, bool]], *, interleave_when_masked: bool = False):
+    """σ-split one axis into an outer block axis + the inner factor axes in ``specs``
+    (``(suffix, extent, emit_sigma)``, most-significant-first) — the ONE free-axis split
+    behind the scalar thread tile (``A → A_b·(T·R) + A_t·R + A_r``) and the warp tile
+    (``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom``, the ``A_a`` ATOM lane carrying the
+    cell extent but emitting NO σ term — its per-lane offset is owned by ``mma.sync``).
+
+    ``per_block = ∏ extent``; the block axis ``A_b`` ceil-divides + carries ``real_extent``
+    + returns the boundary ``bound`` when masked (non-divisible / symbolic), else ``//``.
+    σ is the mixed-radix sum ``A_b·per_block + Σ A_i·(∏ extents to its right)`` over the
+    ``emit_sigma`` axes (ATOM extents still count toward the other axes' weights). A masked
+    inner axis may **interleave** — reverse the inner significance order so the thread lane
+    varies fastest (the masked-tile store-coalescing layout). Returns
+    ``(a_b, inner_axes, expr, bound)``; the caller lays the domain + bindings."""
     src = axis.source_axis or axis
+    per_block = 1
+    for _, ext, _ in specs:
+        per_block *= ext
+    masked = (not axis.extent.is_static) or (axis.extent.as_static() % per_block != 0)
     a_b = Axis(
         f"{axis.name}_b",
-        axis.extent.ceil_div(tr) if masked else axis.extent // tr,
+        axis.extent.ceil_div(per_block) if masked else axis.extent // per_block,
         source_axis=src,
-        real_extent=axis.extent.as_static() if masked and axis.extent.is_static else None,
+        real_extent=axis.extent.as_static() if (masked and axis.extent.is_static) else None,
     )
-    a_t = Axis(f"{axis.name}_t", thread, source_axis=src)
-    a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
-    block = Var(a_b.name) * Literal(tr, "int")
+    inner = tuple(Axis(f"{axis.name}_{sfx}", ext, source_axis=src) for sfx, ext, _ in specs)
+    order = list(range(len(specs)))
     if masked and interleave_when_masked:
-        expr = block + Var(a_r.name) * Literal(thread, "int") + Var(a_t.name)
-    else:
-        expr = block + Var(a_t.name) * Literal(reg, "int") + Var(a_r.name)
+        order = order[::-1]
+    weight: dict[int, int] = {}
+    suffix = 1
+    for i in reversed(order):
+        weight[i] = suffix
+        suffix *= specs[i][1]
+    expr = Var(a_b.name) * Literal(per_block, "int")
+    for i in order:
+        if specs[i][2]:  # emit_sigma (ATOM lanes excluded)
+            expr = expr + _scaled(inner[i].name, weight[i])
     bound = axis.extent.expr if masked else None
-    return a_b, a_t, a_r, expr, bound
-
-
-def _ki_term(k_i: Axis, unit: int):
-    """The stage-inner ``K_i`` σ term: a bare ``Var`` at unit stride 1 (scalar tier),
-    scaled by the inner ``unit`` (``br`` cooperative lane / ``atom_k`` cell) otherwise."""
-    return Var(k_i.name) if unit == 1 else Var(k_i.name) * Literal(unit, "int")
+    return a_b, inner, expr, bound
 
 
 def _rebracket_k(
@@ -131,7 +150,7 @@ def _rebracket_k(
         if fk > 1:
             k_f = Axis(f"{kn}_f", fk, source_axis=src)
             expr = expr + Var(k_f.name) * Literal(u * bk, "int")
-        expr = expr + _ki_term(k_i, u)
+        expr = expr + _scaled(k_i.name, u)
         if kc is not None:
             expr = expr + Var(kc.name)
         if grid is not None:
@@ -249,7 +268,7 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
     domain: list = []
     binding: dict[str, Binding] = {}
     for axis, thread, reg, interleave in free_specs:
-        a_b, a_t, a_r, expr, bound = _split_free_axis(axis, thread, reg, interleave_when_masked=interleave)
+        a_b, (a_t, a_r), expr, bound = _split_axis(axis, [("t", thread, True), ("r", reg, True)], interleave_when_masked=interleave)
         sigma_map[axis.name] = expr
         if bound is not None:
             bounds.append((axis.name, bound))
@@ -448,7 +467,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
     m_split = knobs.get(fam.split_key(m_axis.name))
     m_thread = fam.dec_split(m_split)[0] if m_split is not None else 1
-    m_b, m_t, m_r, m_expr, m_bound = _split_free_axis(m_axis, m_thread, 1, interleave_when_masked=True)
+    m_b, (m_t, m_r), m_expr, m_bound = _split_axis(m_axis, [("t", m_thread, True), ("r", 1, True)], interleave_when_masked=True)
 
     # The carrier-state Inits + epilogue stay where they are; the register-replication
     # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
@@ -492,35 +511,6 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
 # via the shared ``_free_layers`` + ``_wrap_tower``.
 
 
-def _warp_axis(axis: Axis, warp: int, reg: int, atom_cell: int):
-    """4-level output-axis split for the warp tier:
-    ``A → A_b·(W·R·atom) + A_w·(R·atom) + A_r·atom`` (the per-lane ``A_a`` offset
-    is owned by ``mma.sync``, so it is NOT in σ — the ``A_a`` ATOM axis carries
-    the cell extent but binds no σ term). A symbolic / non-divisible axis is
-    masked: ``A_b`` ceil-divides and carries ``real_extent``; the boundary ``Expr``
-    is returned for the per-cell store ``Cond``."""
-    src = axis.source_axis or axis
-    per_block = warp * reg * atom_cell
-    masked = (not axis.extent.is_static) or (axis.extent.as_static() % per_block != 0)
-    b_ext = axis.extent.ceil_div(per_block) if masked else axis.extent // per_block
-    a_b = Axis(
-        f"{axis.name}_b",
-        b_ext,
-        source_axis=src,
-        real_extent=axis.extent.as_static() if (masked and axis.extent.is_static) else None,
-    )
-    a_w = Axis(f"{axis.name}_w", warp, source_axis=src)
-    a_r = Axis(f"{axis.name}_r", reg, source_axis=src)
-    a_a = Axis(f"{axis.name}_a", atom_cell, source_axis=src)
-    expr = (
-        Var(a_b.name) * Literal(per_block, "int")
-        + Var(a_w.name) * Literal(reg * atom_cell, "int")
-        + Var(a_r.name) * Literal(atom_cell, "int")
-    )
-    bound = axis.extent.expr if masked else None
-    return a_b, a_w, a_r, a_a, expr, bound
-
-
 def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> TileGraph:
     """The warp-tier ``atomize`` build move: take the logical seed graph and σ-split
     the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
@@ -532,8 +522,9 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     inner_n, outer_m, extra_outer = _free_axes(dag)
     wn, fn = fam.dec_split(knobs[fam.split_key(inner_n.name)])
     wm, fm = fam.dec_split(knobs[fam.split_key(outer_m.name)])
-    n_b, n_w, n_r, n_a, n_expr, n_bound = _warp_axis(inner_n, wn, fn, atom_n)
-    m_b, m_w, m_r, m_a, m_expr, m_bound = _warp_axis(outer_m, wm, fm, atom_m)
+    # Four-way warp split: the ATOM lane carries the cell extent but emits no σ term.
+    n_b, (n_w, n_r, n_a), n_expr, n_bound = _split_axis(inner_n, [("w", wn, True), ("r", fn, True), ("a", atom_n, False)])
+    m_b, (m_w, m_r, m_a), m_expr, m_bound = _split_axis(outer_m, [("w", wm, True), ("r", fm, True), ("a", atom_m, False)])
     sigma_outer = Sigma({inner_n.name: n_expr, outer_m.name: m_expr})
 
     block = graph.blocks[0]
