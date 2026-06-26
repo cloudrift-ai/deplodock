@@ -100,26 +100,51 @@ def test_chain_is_a_monoid_over_semiring_composition():
     chain = dag.chain
     assert isinstance(chain.carrier, Monoid), "the outer algebra is a MONOID carrier"
     assert isinstance(chain.inner, Contraction) and chain.inner.algebra is AlgebraKind.SEMIRING, "the inner operand is a SEMIRING"
-    # The composition's invariant: inner.col IS the hinge (the chain link), and the score edge is
-    # the inner contraction's result (the carrier's first partial).
-    assert chain.inner.col is chain.hinge, "the inner contraction's column is the reduced hinge"
+    # The composition's invariant: the inner contraction's output column coord IS the hinge (the
+    # chain link), and the score edge is the inner contraction's result (the carrier's first partial).
+    assert chain.inner.out_index[-1].free_vars() == {chain.hinge_name}, "the inner contraction's output column is the hinge"
     assert chain.score == chain.inner.result == chain.carrier.partial[0]
     # Geometry is a separate, derived view (not algebra fields): query row m, head output d, grid.
     assert chain.m_axis is chain.m.axis and chain.d_axis is chain.d.axis
 
 
+def test_standalone_matmul_is_a_contraction():
+    """The unification: a standalone matmul is the SAME ``Contraction`` representation as the flash
+    inner. ``IterDag.contractions`` yields it — one per matmul-reduce, SEMIRING, carrying the output
+    ``(M, N)`` coords off the ``Write`` (not re-derived in the atom gate) — so the matmul tier and
+    the flash chain share one SEMIRING-contraction abstraction and one ``contraction_atomizes`` call
+    (the warp-tier behavior itself is covered end to end by the GPU matmul/flash e2e suites)."""
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (128, 64), F16), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (64, 128), F16), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("o", (128, 128), F16), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+    lowered = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((8, 0)))
+    lo = next(n.op for n in lowered.nodes.values() if type(n.op).__name__ == "LoopOp")
+
+    (c,) = iter_dag(lo).contractions
+    assert isinstance(c, Contraction) and c.algebra is AlgebraKind.SEMIRING, "a matmul reduce is a SEMIRING Contraction"
+    assert c.out_index is not None and sum(1 for e in c.out_index if e.free_vars()) >= 2, "out_index carries the matmul's (M, N)"
+    assert c.result, "the contraction's result edge (the Accum SSA) is recorded"
+
+
 def test_chain_post_init_enforces_the_hinge_invariant():
-    """A ``ContractionChain`` whose inner column is NOT the hinge is rejected at construction —
-    the carried-chain invariant lives in the class, not in an external gate, so invalid states are
+    """A ``ContractionChain`` whose inner output column is NOT the hinge is rejected at construction
+    — the carried-chain invariant lives in the class, not in an external gate, so invalid states are
     unrepresentable."""
     import pytest
 
+    from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain
 
     dag = iter_dag(_flash_loop())
     good = dag.chain
-    # Swap the inner contraction's column to a non-hinge axis (the query row) — must raise.
-    broken_inner = Contraction(node=good.inner.node, result=good.inner.result, col=good.m)
+    # Put a non-hinge axis (the query row) in the inner's output-column coord — must raise.
+    broken_inner = Contraction(node=good.inner.node, result=good.inner.result, out_index=(Var(good.hinge_name), Var(good.m.axis.name)))
     with pytest.raises(ValueError, match="hinge"):
         ContractionChain(carrier=good.carrier, hinge=good.hinge, inner=broken_inner, m=good.m, d=good.d, grid_nodes=good.grid_nodes)
 
