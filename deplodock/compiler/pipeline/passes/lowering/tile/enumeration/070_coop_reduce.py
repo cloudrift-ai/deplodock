@@ -36,11 +36,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.context import Context
+from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
+from deplodock.compiler.ir.stmt import Loop
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build, warp_chain_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
@@ -82,23 +83,31 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 
 def _is_warp_flash(op: TileGraphOp) -> bool:
-    """Whether this streaming flash deploys the **warp-tier tensor-core chain** (vs the
-    cooperative / scalar streaming nest): a carried-contraction chain (``dag.chain`` — the structural
-    flash recognition, which already guarantees a well-formed GQA/equal-head nest) in the 16-bit warp
-    scope (``flash_params`` is non-``None`` — fp16/bf16, exactly the 3 rank-4 inputs) with the head
-    dim atom-eligible (``D%16==0``, ``16 ≤ D ≤ 256``) AND either a symbolic ``seq_len`` (the deployed
-    default — the ~100× win) or a static ``S%16==0`` shape under ``DEPLODOCK_CHAIN``. (Folds the
-    former ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
+    """Whether this streaming flash deploys the **warp-tier tensor-core chain** (vs the cooperative /
+    scalar streaming nest) — read STRUCTURALLY off the seed, no geometry descriptor: a
+    carried-contraction chain (``dag.chain`` — the recognition, which already guarantees a well-formed
+    GQA/equal-head nest) over **16-bit operands** (exactly the 3 rank-4 inputs — a 4th is an additive
+    mask, out of scope), with the **head dim atom-eligible** (the QK^T reduce extent ``D%16==0``,
+    ``16 ≤ D ≤ 256``) AND either a symbolic ``seq_len`` (the deployed default — the ~100× win) or a
+    static ``S%16==0`` stream under ``DEPLODOCK_CHAIN``. (Folds the former ``split/005_warp_chain``
+    routing shim into this MONOID fork.)"""
     if op.dag.chain is None:
         return False
-    fp = flash_params(op.buffers, op.tilegraph.blocks[0].writes[0].buffer)
-    if fp is None:
+    block = op.tilegraph.blocks[0]
+    ins = [b for n, b in op.buffers.items() if len(b.shape) == 4 and n != block.writes[0].buffer]
+    if len(ins) != 3 or ins[0].dtype not in (F16, BF16):
         return False
-    if not fp.symbolic and not fam.pin_inline_chain():
+    kv_loop = next((s for s in block.compute if isinstance(s, Loop) and s.axis.name == op.dag.chain.hinge_name), None)
+    qkt_loop = next((s for s in kv_loop.body if isinstance(s, Loop)), None) if kv_loop is not None else None
+    if qkt_loop is None:
         return False
-    if fp.D % 16 != 0 or not (16 <= fp.D <= 256):
+    d = qkt_loop.axis.extent  # the QK^T reduce extent = the head dim
+    if not d.is_static or d.as_static() % 16 != 0 or not (16 <= d.as_static() <= 256):
         return False
-    return True if fp.symbolic else (fp.S % 16 == 0 and fp.S >= 16)
+    seq = kv_loop.axis.extent
+    if seq.is_static:
+        return fam.pin_inline_chain() and seq.as_static() % 16 == 0 and seq.as_static() >= 16
+    return True  # symbolic seq_len — the deployed default
 
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001

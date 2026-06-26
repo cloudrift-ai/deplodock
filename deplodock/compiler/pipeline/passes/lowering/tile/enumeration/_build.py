@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32, DataType
+from deplodock.compiler.dtype import BF16, F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
@@ -34,9 +34,8 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraph,
     Transport,
 )
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import add as _fadd
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
-from deplodock.compiler.pipeline.passes.lowering._flash_geom import mul as _fmul
+from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
+from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
@@ -541,14 +540,19 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     (softmax / scale / mask / handoff / epilogue) — the path that replaced ``realize_flash``."""
     tg = op.tilegraph
     block = tg.blocks[0]
-    fp = flash_params(op.buffers, block.writes[0].buffer)
-    atom = ATOM_REGISTRY[fp.atom_kind]
-    atom_m, atom_n, atom_k = atom.shape
-    D = fp.D
     chain = op.dag.chain
     kv = chain.hinge_name
-
     kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
+    qkt_loop = next(s for s in kv_loop.body if isinstance(s, Loop))  # the QK^T D-reduce loop
+    qkt_body, a3_name = tuple(qkt_loop.body), qkt_loop.axis.name
+
+    # Geometry off the graph, no flash descriptor: the head dim ``D`` is the QK^T reduce extent; the
+    # operand dtype (→ which 16-bit mma atom) is read off a QK^T load's gmem buffer.
+    D = qkt_loop.axis.extent.as_static()
+    dtype = op.buffers[next(s for s in qkt_body if isinstance(s, Load)).input].dtype
+    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if dtype == BF16 else "mma_m16n8k16_f16"]
+    atom_m, atom_n, atom_k = atom.shape
+
     value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
     d_axis, m_axis, grid = _chain_axes(op.dag, value_load)
 
@@ -558,12 +562,10 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     m_b, _m_a, m_expr, m_bound = _split_axis(m_axis, [("a", atom_m, False)])
     kv_b, _kv_a, kv_expr, kv_bound = _split_axis(kv_loop.axis, [("a", 16, False)])
     nt_count, nd, kt = 16 // atom_n, D // atom_n, D // atom_k
-    qkt_body = tuple(next(s for s in kv_loop.body if isinstance(s, Loop)).body)  # the QK^T D-reduce cell
-    a3_name = next(s for s in kv_loop.body if isinstance(s, Loop)).axis.name
     # The score-masking ``Select`` the recognizer placed (``v2 = select(col<=row, score, -inf)``) —
     # the causal mask's structural representation. Carried THROUGH to the graph (below) so assembly
-    # reads causality off it, not off a flag (there is no ``causal`` in FlashParams). It is the score
-    # mask's analog of the carrier ``Monoid`` (the softmax's structural representation).
+    # reads causality off its presence, not off a flag. It is the score mask's analog of the carrier
+    # ``Monoid`` (the softmax's structural representation).
     score_mask = next((s for s in kv_loop.body if isinstance(s, Select)), None)
 
     # produce — the QK^T D-reduce, σ-tiled per N-atom (nt) → a transposed-B Mma over the INLINE
