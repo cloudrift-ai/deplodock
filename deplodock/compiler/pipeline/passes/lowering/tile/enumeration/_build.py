@@ -149,13 +149,18 @@ def _rebracket_k(
         is_primary = coop_axis is None or kn == coop_axis
         u = unit if is_primary else 1
         kc = thread if (thread is not None and is_primary) else None
+        # The cross-CTA split-K ``K_s`` GRID partition rides the PRIMARY axis only — the
+        # one cross-execution-unit partition (the matmul's single K, the flash KV stream),
+        # never an inner contraction (the QK^T D-reduce of a streaming flash, which is the
+        # carrier's hinge, not a partitionable axis).
+        kg = grid if (grid is not None and is_primary) else None
         stride = u * bk * fk
         ext = s.axis.extent
         symbolic = not ext.is_static
         if symbolic:
             k_o_ext = ext.ceil_div(stride)
-        elif grid is not None:
-            k_o_ext = ext.as_static() // (grid[1] * stride)
+        elif kg is not None:
+            k_o_ext = ext.as_static() // (kg[1] * stride)
         else:
             k_o_ext = ext.as_static() // stride
         k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
@@ -168,8 +173,8 @@ def _rebracket_k(
         expr = expr + _scaled(k_i.name, u)
         if kc is not None:
             expr = expr + Var(kc.name)
-        if grid is not None:
-            expr = Var(grid[0].name) * Literal(k_o_ext * stride, "int") + expr
+        if kg is not None:
+            expr = Var(kg[0].name) * Literal(k_o_ext * stride, "int") + expr
         sigma_k = Sigma({kn: expr})
         inner = _rebracket_k(
             tuple(s.body), target_names, bk=bk, fk=fk, unit=unit, coop_axis=coop_axis, grid=grid, thread=thread, masking=masking

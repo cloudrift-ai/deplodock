@@ -202,6 +202,15 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     cross-lane combine geometry (whole-CTA tree vs strided intra-warp segment)."""
     bk = _streaming_bk(op.dag)  # Phase 1: KV-tile re-bracket of the streaming axis (pin-honored)
     symbolic = op.dag.k_bound is not None
+    # Cross-CTA split-KV (Flash-Decoding) of the streaming flash — **pin-gated** (an explicit
+    # ``REDUCE`` ``c<cta>`` on the KV stream): each CTA folds a slice of the KV stream into its
+    # own partial ``(m, l, O)`` state, ``150_cross_cta_finalize`` writes the 3 state workspaces
+    # and the carrier-generic combine merges them (``monoid_reduce_tilegraph``). Static KV only
+    # (the slice must divide); the serial-stream ``monoid_build`` carries the split-K grid (the
+    # FA-2 ``chain_build`` doesn't thread it yet), so cta>1 forces the ``monoid_build`` path.
+    _, _, sk_pin, _ = fam.reduce_fields(op.dag, op.dag.k_node.loop.axis.name)
+    stream_ext = op.dag.k_node.loop.axis.extent
+    cta = sk_pin if (sk_pin and sk_pin > 1 and stream_ext.is_static and stream_ext.as_static() % sk_pin == 0) else 1
     out: list[TileGraphOp] = []
     for br in streaming_br_offers(op.dag):
         budget = Budget(max_threads=max(1, MAX_THREADS_PER_CTA // br))
@@ -213,7 +222,9 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
         # the symbolic DEFAULT: ``monoid_build`` would recompute the score per ``d`` and run
         # unboundedly long (Finding 1, qwen3-emb-0.6b layer 0). A static stream keeps the
         # pin-gated opt-in (greedy stays the scalar nest until the search-fork integration).
-        use_chain = _chain_applicable(op, br) and (symbolic or fam.pin_inline_chain())
+        # Split-KV (cta>1) rides the serial-stream ``monoid_build`` — force it (the FA-2 chain
+        # doesn't thread the split-K grid yet) and stamp the bare ``c<cta>`` finalize-pending.
+        use_chain = cta == 1 and _chain_applicable(op, br) and (symbolic or fam.pin_inline_chain())
         # Without a chain (a streaming monoid with no inner contraction) a symbolic axis
         # falls back to ``monoid_build``'s serial stream, where the free-axis tile can't move
         # the reduce-bound kernel — so collapse the futile fork to one canonical leaf.
@@ -223,7 +234,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
             knobs = {
                 **op.knobs,
                 **free_split_knobs(op.dag, t, (1, 1)),  # complete SPLIT, register forced to 1
-                fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=1, coop=br),
+                fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=cta, coop=br),
             }
             if use_chain:
                 # Phase 1c: the FA-2 shared-score restructuring (register O[d] + the score

@@ -1,7 +1,7 @@
 # Generic cross-CTA reduction producer (carrier-agnostic split-K / split-KV)
 
-**Status:** M1 + M2 landed (`make test` green after each). M3 (flash split-KV — the twisted-`Monoid` producer) and M4's
-search-surfacing remain.
+**Status:** M1 + M2 + M3 landed (`make test` green after each). M4's search-surfacing (un-gating `cta` from pin-only)
+remains.
 
 - **M1 (done)** — additive cross-CTA reduce. `coop_reduce_offers` returns `(bk, fk, br, cta)` and offers `cta > 1` for an
   additive `Accum` carrier (static K, no epilogue / multi-accum); `monoid_build` threads the `K_s` split-K GRID partition
@@ -13,10 +13,16 @@ search-surfacing remain.
   above the cooperative one, changing the greedy default — so greedy / cold stay cta=1 and only a pin reaches the producer.
 - **M2 (done)** — `140_atomic_free_splitk` → `150_cross_cta_finalize`, carrier-driven framing (the SEMIRING matmul is the
   1-component instantiation). Matmul deferred output unchanged.
-- **M3 (remaining — the payload)** — the twisted-`Monoid` (flash `(m, l, O)`) cross-CTA producer. All the generic
-  plumbing M1/M2 landed is reused; the remaining work is the producer's **state emission** (write the partial `(m, l, O)`
-  to 3 workspaces via `split_carrier`, deferring the `O / l` finalize) inside the streaming-flash build — the flash-geometry
-  "hard part" this plan flags. The combine half (`monoid_reduce_tilegraph`) is already GPU-verified for this carrier.
+- **M3 (done — the payload)** — the twisted-`Monoid` (flash `(m, l, O)`) cross-CTA producer (Flash-Decoding / split-KV).
+  `070_coop_reduce::_streaming_leaves` offers `cta > 1` (pin-gated, static KV) via the serial-stream `monoid_build`;
+  `_rebracket_k` threads the `K_s` split-K grid on the **primary** axis only (so it never partitions the inner QK^T
+  reduce); `150_cross_cta_finalize`'s unified `_build_fragment` writes the partial `(m, l, O)` state to one **packed**
+  workspace `partial[K_s, c, …]` (a graph `Node` is single-output, so the N state components ride a component axis `c`
+  rather than N buffers) and the carrier-generic combine (`monoid_reduce_tilegraph`, reading the packed buffer) merges via
+  the twisted `combine_states` + defers the `O / l` finalize. Accuracy vs eager verified on SDPA (plain / causal / GQA,
+  cta=2 and cta=4) — `tests/compiler/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure`
+  (one matrix over carrier × finalize). The matmul / `sum` / flash share ONE `_build_fragment`; the additive `Accum` is
+  the degenerate 1-component instantiation of the twisted state emission.
 - **M4 (partly done)** — the carrier→producer derivation is recorded in the tile-lowering ARCHITECTURE (the producer
   mirrors the intra-CTA cooperative producer, one partition level up). Surfacing `cta` as an autonomous reduce-offer
   search dimension (un-gating it from pin-only) still needs the `AnalyticPrior` to rank `cta = 1` first for the reduce

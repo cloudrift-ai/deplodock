@@ -40,7 +40,7 @@ from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Accum, Body, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Monoid, Stmt, Write
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom
@@ -84,39 +84,124 @@ def _rewrite_writes_to_workspace(stmts: tuple[Stmt, ...], *, out_name: str, work
     return tuple(new_stmts)
 
 
-def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: int, carrier: Accum) -> Graph:
-    """The deferred-KERNEL (``c<cta>k``) fragment: the matmul writing to ``partial[K_s, M, N]`` +
-    the sibling deferred-finalize combine kernel folding ``K_s`` into the output. The combine
-    is built carrier-generically (``_partition.deferred_combine_tilegraph``) — for the additive
-    matmul ``carrier`` the 1-component ``Accum`` sum, the trivial instantiation of the same
-    cross-partition fold a twisted ``Monoid`` (online-softmax / flash) would take."""
+# --- Twisted Monoid (flash split-KV) producer: emit the partial STATE, defer the finalize ---
+
+
+def _state_init_ops(compute: Body, state: tuple[str, ...]) -> tuple:
+    """The per-state-component identity op (``maximum`` → −inf seed, ``add`` → 0 seed),
+    read off the producer body's ``Init`` stmts (one per carried state component). The
+    combine seeds each merged-state accumulator from these so the cross-partition fold
+    starts at the carrier identity."""
+    inits = {s.name: s.op for s in Body.coerce(compute).iter_of_type(Init)}
+    missing = [st for st in state if st not in inits]
+    if missing:
+        raise RuleSkipped(f"cross-CTA Monoid finalize: no Init for carried state {missing}")
+    return tuple(inits[st] for st in state)
+
+
+def _state_finalize(compute: Body, out_name: str, state: tuple[str, ...]) -> tuple[tuple[Assign, ...], str]:
+    """The producer's **finalize** — the (single) Assign feeding the output ``Write`` (flash's
+    ``res = O_i / l_i``), to be DEFERRED into the combine kernel. Returns ``(finalize, out_value)``:
+    the finalize Assigns (over the merged state names — they read the carrier state directly, which
+    the combine reproduces) and the value the combine writes. When the output is a bare state
+    component (no epilogue), ``finalize`` is empty and ``out_value`` is that component."""
+    stmts = list(Body.coerce(compute).iter())
+    write = next((s for s in stmts if isinstance(s, Write) and s.output == out_name), None)
+    if write is None:
+        raise RuleSkipped("cross-CTA Monoid finalize: no output Write to defer")
+    val = write.value
+    if val in state:
+        return (), val
+    assigns = {s.name: s for s in stmts if isinstance(s, Assign)}
+    fin = assigns.get(val)
+    if fin is None or any(a not in state for a in fin.args):
+        raise RuleSkipped(f"cross-CTA Monoid finalize: output {val!r} is not a single Assign over the carrier state")
+    return (fin,), val
+
+
+def _rewrite_writes_to_state_workspaces(
+    stmts: tuple[Stmt, ...], *, out_name: str, workspace: str, state: tuple[str, ...], k_s_name: str
+) -> tuple[Stmt, ...]:
+    """Recurse and replace every output ``Write`` with **one ``Write`` per carried state
+    component** into a single **packed** workspace ``partial[K_s, c, …]`` (``K_s`` prepended and
+    the component index ``c`` next ⇒ a plain store; one kernel can't write N graph buffers, so the
+    state rides a component axis). The producer no longer finalizes (``O / l``) — it writes the raw
+    ``(m, l, O)`` partial state, and the deferred combine folds + finalizes. The original finalize
+    Assign is left dead (no consumer)."""
+    new_stmts: list[Stmt] = []
+    for s in stmts:
+        bodies = s.nested()
+        if bodies:
+            new_bodies = tuple(
+                Body(_rewrite_writes_to_state_workspaces(tuple(b), out_name=out_name, workspace=workspace, state=state, k_s_name=k_s_name))
+                for b in bodies
+            )
+            if new_bodies != bodies:
+                s = s.with_bodies(new_bodies)
+        if isinstance(s, Write) and s.output == out_name:
+            from deplodock.compiler.ir.expr import Literal  # noqa: PLC0415
+
+            new_stmts.extend(
+                replace(s, output=workspace, index=(Var(k_s_name), Literal(c, "int"), *s.index), values=(st,)) for c, st in enumerate(state)
+            )
+            continue
+        new_stmts.append(s)
+    return tuple(new_stmts)
+
+
+def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: int, carrier) -> Graph:
+    """The deferred-KERNEL (``c<cta>k``) fragment — **carrier-generic**, one builder for every
+    carrier: the producer writes its partial **state** to a workspace ``partial[K_s, …]`` (``K_s``
+    prepended ⇒ a plain store), and the sibling combine kernel
+    (``_partition.deferred_combine_tilegraph``) folds ``K_s`` into the output.
+
+    - **additive ``Accum``** (matmul split-K / ``sum`` split-reduce) — the 1-component carrier: the
+      output Write is retargeted to ``partial[K_s, *out]`` (the ``acc`` value IS the output), the
+      combine is the bit-identical ``Σ_s`` fold.
+    - **twisted ``Monoid``** (flash split-KV / Flash-Decoding) — the N-component carrier: the
+      finalized-output Write is replaced by N writes of the carrier's ``(m, l, O)`` state into one
+      packed workspace ``partial[K_s, c, *out]`` (one kernel can't write N graph buffers), and the
+      combine merges via the twisted ``combine_states`` (the ``e^{Δm}`` rescale, not a sum) and
+      applies the deferred ``O / l`` finalize. The combine half is GPU-verified
+      (``test_deferred_finalize_flash_attention_carrier_merges_states``)."""
     out_shape = root.output.shape
     if not out_shape or not all(d.is_static for d in out_shape):
         raise RuleSkipped(f"cross-CTA finalize expects a fully-static output shape, got shape={out_shape}")
     out_extents = tuple(d.as_static() for d in out_shape)
     dtype = root.output.dtype
     out_name = root.output.name
-
-    # Rewire the matmul body's output Writes to the workspace.
+    workspace = f"{root.id}__partial"
     block = op.tilegraph.blocks[0]
-    new_compute = _rewrite_writes_to_workspace(
-        tuple(block.compute), out_name=out_name, workspace_name=f"{root.id}__partial", k_s_name=k_s_name
-    )
-    if tuple(new_compute) == tuple(block.compute):
-        raise RuleSkipped("no matmul output Write found to rewire")
-    workspace_name = f"{root.id}__partial"
-    new_tg = replace(op.tilegraph, blocks=(replace(block, compute=Body(new_compute)),))
-    matmul_variant = replace(op, tilegraph=new_tg, knobs=_with_finalize(op.knobs, op.dag.k_node.loop.axis.name, fam.KERNEL))
 
-    reduce_op = reduce_tilegraphop(
+    # Per-carrier: how the producer writes its partial state + the combine's finalize args. The
+    # additive ``Accum`` is the degenerate 1-component case of the twisted ``Monoid`` state emission.
+    if isinstance(carrier, Monoid):
+        state = carrier.state
+        new_compute = _rewrite_writes_to_state_workspaces(
+            tuple(block.compute), out_name=out_name, workspace=workspace, state=state, k_s_name=k_s_name
+        )
+        ws_shape = (to_dim(splitk), to_dim(len(state)), *out_shape)  # one packed buffer [K_s, n_state, *out]
+        finalize, out_value = _state_finalize(block.compute, out_name, state)
+        combine_kw = {"init_ops": _state_init_ops(block.compute, state), "finalize": finalize, "out_value": out_value}
+    else:  # additive Accum — the single-Write retarget, no init/finalize
+        new_compute = _rewrite_writes_to_workspace(tuple(block.compute), out_name=out_name, workspace_name=workspace, k_s_name=k_s_name)
+        ws_shape = (to_dim(splitk), *out_shape)
+        combine_kw = {}
+    if tuple(new_compute) == tuple(block.compute):
+        raise RuleSkipped("no output Write found to rewire to the workspace")
+
+    new_tg = replace(op.tilegraph, blocks=(replace(block, compute=Body(new_compute)),))
+    producer = replace(op, tilegraph=new_tg, knobs=_with_finalize(op.knobs, op.dag.k_node.loop.axis.name, fam.KERNEL))
+    combine = reduce_tilegraphop(
         deferred_combine_tilegraph(
             carrier,
-            workspaces=(workspace_name,),
+            workspaces=(workspace,),
             out_name=out_name,
             s_extent=splitk,
             out_shape=out_extents,
             dtype=dtype,
             name=f"{out_name}__reduce",
+            **combine_kw,
         )
     )
 
@@ -128,10 +213,8 @@ def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: i
         shape = inp.output.shape if inp is not None else ()
         in_dtype = inp.output.dtype if inp is not None else dtype
         frag.add_node(InputOp(), [], Tensor(inp_id, shape, in_dtype), node_id=inp_id)
-    workspace_id = frag.add_node(
-        matmul_variant, list(root.inputs), Tensor(workspace_name, (to_dim(splitk), *out_shape), dtype), node_id=workspace_name
-    )
-    reduce_id = frag.add_node(reduce_op, [workspace_id], Tensor(out_name, out_shape, dtype), node_id=root.id)
+    ws_id = frag.add_node(producer, list(root.inputs), Tensor(workspace, ws_shape, dtype), node_id=workspace)
+    reduce_id = frag.add_node(combine, [ws_id], Tensor(out_name, out_shape, dtype), node_id=root.id)
     frag.outputs = [reduce_id]
     return frag
 
@@ -162,10 +245,19 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     # — always true here (the SEMIRING matmul's combine is a plain sum), but the gate is the
     # explicit legality the twisted (non-additive ``Monoid``) split-KV finalize will trip. A
     # ``DEPLODOCK_FINALIZE`` pin narrows the offer (the removed ``NOATOMIC`` env pin's successor).
-    accums = tuple(Body.coerce(op.tilegraph.blocks[0].compute).iter_of_type(Accum))
-    if not accums:
-        raise RuleSkipped("no reduce carrier — nothing to finalize across the split-K partitions")
-    atomic_legal = atomic_finalize_legal(accums[0], root.output.dtype)
+    # The cross-partition **carrier** drives the combine (carrier-generic): a SEMIRING matmul's
+    # additive ``Accum`` (read off the body), or a MONOID reduce's carrier off ``dag.reduction``
+    # (an additive ``Accum`` for a plain ``sum``, a twisted ``Monoid`` for the flash ``(m, l, O)``
+    # — the body ``Accum`` would be the inner QK^T score, not the carrier, so the reduction view
+    # is the correct source).
+    if op.algebra is AlgebraKind.MONOID and op.dag.reduction is not None:
+        carrier = op.dag.reduction.carrier
+    else:
+        accums = tuple(Body.coerce(op.tilegraph.blocks[0].compute).iter_of_type(Accum))
+        if not accums:
+            raise RuleSkipped("no reduce carrier — nothing to finalize across the split-K partitions")
+        carrier = accums[0]
+    atomic_legal = atomic_finalize_legal(carrier, root.output.dtype)
 
     choices = [fam.ATOMIC, fam.KERNEL] if atomic_legal else [fam.KERNEL]
     pin = fam.pin_finalize(reduce_axis)
@@ -176,7 +268,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     variants: list = []
     for finalize in choices:
         if finalize is fam.KERNEL:
-            variants.append(_build_fragment(match, root, op, k_s.name, splitk, accums[0]))
+            variants.append(_build_fragment(match, root, op, k_s.name, splitk, carrier))
         else:
             variants.append(replace(op, knobs=_with_finalize(op.knobs, reduce_axis, fam.ATOMIC)))
     return variants

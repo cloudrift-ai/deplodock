@@ -216,19 +216,30 @@ def monoid_reduce_tilegraph(
     """Carrier-general cross-partition combine — the monoid sibling of
     :func:`additive_reduce_tilegraph`.
 
-    Each of the carrier's ``state`` components has its own workspace ``workspaces[i]``
-    (shaped ``[S, *out_shape]``). One thread per output cell seeds its state from the
-    op-identity (``init_ops[i]``: ``maximum`` → −inf, ``add`` → 0) and serially folds
-    each ``S`` slice via the carrier's ``combine_states`` (the state-merges-state monoid
-    op). An optional ``finalize`` (Assigns over the merged state) produces the single
-    output value ``out_value`` (default the first state component), written to
-    ``out_name``. The non-additive path a flash split-KV's online ``(m, l)`` LSE takes.
-    """
+    Each of the carrier's ``state`` components is read from a workspace and seeded from the
+    op-identity (``init_ops[i]``: ``maximum`` → −inf, ``add`` → 0); one thread per output cell
+    serially folds each ``S`` slice via the carrier's ``combine_states`` (the state-merges-state
+    monoid op). An optional ``finalize`` (Assigns over the merged state) produces the single
+    output value ``out_value`` (default the first state component), written to ``out_name``. The
+    non-additive path a flash split-KV's online ``(m, l, O)`` carrier takes.
+
+    Two workspace layouts (both ``[…, *out_shape]``): **separate** buffers (``workspaces[i]`` per
+    component, read ``workspaces[i][s, *out]``) or, when ``len(workspaces) == 1`` for a multi-state
+    carrier, a single **packed** buffer ``partial[S, n_state, *out_shape]`` (read ``partial[s, i,
+    *out]``) — the form a single-output producer kernel emits (one kernel can't write N graph
+    buffers, so the flash split-KV producer packs its ``(m, l, O)`` state on a component axis)."""
     s_axis = Axis("K_s_red", to_dim(s_extent))
     _, _, out_index, _ = _out_axes(out_shape)
     others = tuple(f"o_{i}" for i in range(len(carrier.state)))
+    packed = len(workspaces) == 1 and len(carrier.state) > 1
     loads: tuple[Stmt, ...] = tuple(
-        Load(name=others[i], input=workspaces[i], index=(Var(s_axis.name), *out_index), dtype=dtype) for i in range(len(workspaces))
+        Load(
+            name=others[i],
+            input=workspaces[0] if packed else workspaces[i],
+            index=(Var(s_axis.name), Literal(i, "int"), *out_index) if packed else (Var(s_axis.name), *out_index),
+            dtype=dtype,
+        )
+        for i in range(len(carrier.state))
     )
     fold = replace(carrier.as_state_merge(others), axes=(s_axis.name,))
     inits: tuple[Stmt, ...] = tuple(Init(name=st, op=init_ops[i], dtype=F32) for i, st in enumerate(carrier.state))
