@@ -23,7 +23,7 @@ Tile IR and are materialized away before reaching this layer. A
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 
 from deplodock.compiler.dtype import F32, DataType
@@ -45,13 +45,11 @@ from deplodock.compiler.ir.stmt import (
     Cond,
     Load,
     Loop,
-    Pack,
     RenderCtx,
     Select,
     SelectBranch,
     Stmt,
     StridedLoop,
-    Unpack,
     Write,
     _pad,
 )
@@ -1464,12 +1462,6 @@ class KernelOp(BodyOp):
             return False
         return True
 
-    @property
-    def smem_names(self) -> frozenset[str]:
-        """Names of all ``__shared__`` buffers declared in the body — these
-        are render-internal and are excluded from kernel-parameter inference."""
-        return frozenset(self.smem_buffers)
-
 
 # ---------------------------------------------------------------------------
 # Tree walk — shared with Loop IR (drives off ``Stmt.nested``)
@@ -1488,8 +1480,6 @@ __all__ = [
     "Expr",
     # Loop-IR leaves + control flow (reused)
     "Load",
-    "Pack",
-    "Unpack",
     "Assign",
     "Select",
     "SelectBranch",
@@ -1526,9 +1516,6 @@ __all__ = [
     "Axis",
     "ElementwiseImpl",
 ]
-
-
-_ = field  # silence ruff
 
 
 # ---------------------------------------------------------------------------

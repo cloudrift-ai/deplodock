@@ -8,9 +8,6 @@
 - :func:`parallel_tile_of` — return the per-binding-tier inner scope
   (ThreadTile or WarpTile) for an outer ``GridTile`` / ``ThreadTile`` /
   ``WarpTile`` (renamed from the pre-WarpTile ``thread_tile_of``).
-- :func:`compute_capability` — re-exported from
-  :mod:`deplodock.compiler.target` so passes can import it locally.
-  Honors the ``--target sm_NN`` CLI override.
 - :func:`loads_reading` — collect every body Load reading a Stage by
   name. Bank-conflict analysis itself lives in
   :mod:`deplodock.compiler.diagnostics.bank_conflicts` and is shared
@@ -39,9 +36,6 @@ def accums_independent(body: Body) -> bool:
     body = Body.coerce(body)
     accum_names = {s.name for s in body if isinstance(s, Accum)}
     return not any(body.depends_on(s.value, accum_names - {s.name}) for s in body if isinstance(s, Accum))
-
-
-from deplodock.compiler.target import compute_capability  # noqa: E402,F401
 
 
 def parallel_tile_of(outer: ParallelTile) -> ThreadTile | WarpTile:

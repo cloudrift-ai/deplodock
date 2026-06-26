@@ -882,21 +882,6 @@ def _build_linear_tid(thread_axes: tuple[Axis, ...]):
     return expr
 
 
-def _build_warp_id_expr(warp_axes: tuple[Axis, ...]):
-    """Linear row-major warp index from the WARP axes — the warp granularity
-    counterpart of :func:`_build_linear_tid`.
-
-    Single-axis → ``Var(name)``; multi-axis → ``m_w * N_w + n_w`` (row-
-    major). Lane is implicit — the renderer emits ``int lane = threadIdx.x &
-    31;`` unconditionally inside ``WarpTile.render``. Callers that need
-    a single linear *thread* id keep using ``threadIdx.x`` directly (it's
-    a builtin).
-    """
-    # Same row-major flatten as _build_linear_tid; share the implementation
-    # to keep the warp-axis decode and thread-axis decode shapes aligned.
-    return _build_linear_tid(warp_axes)
-
-
 # ---------------------------------------------------------------------------
 # TMA mbarrier phase
 # ---------------------------------------------------------------------------
