@@ -34,11 +34,24 @@ budget filter now sizes symbolic staging slabs at the hint (a genuine fix), and 
 MONOID-combine smem is still unbudgeted so a few unpinned attention e2e tests pin a
 budget-safe tile (the maintainer chose to accept this rather than re-point featurization).
 
-**Remaining:** the **PLACE@\<edge\>** family (step 5 — folding `STAGE`/`TMA`/`CUT`/`CHAIN`
-into one per-edge lattice coordinate over the `Schedule.staged` source-of-truth). This is
-the largest, most cross-cutting family (4 passes + the split phase + assembly); its headline
-payoff (the clean one-fork flash deploy) needs a picker, which is out of scope here and
-currently degraded, so its near-term impact is schema consistency rather than behavior. No DB-compat constraint (clean-slate the storage) and **the learned prior is
+**Step 5 (PLACE) — 3 of the 4 lattice points landed.** `STAGE`→`PLACE@<edge>=smem`,
+`TMA`→the `:tma`/`:sync` xport, and `CHAIN`→`PLACE@<score>=inline` are folded: `120_stage`
+stamps `smem`/`gmem` per ranked read-site, `130_transport` appends the transport, and the
+streaming/warp-chain passes place the score `inline`. `Schedule.staged` stays the codegen
+source of truth (the assembly reads it, not the knob), so kernels are byte-identical; the
+`STAGE`/`TMA`/`CHAIN` `Knob` descriptors stay registered for the legacy env-pin ingest +
+`_validate`'s staged/streaming-tier audit.
+
+**The 4th lattice point — `CUT`→`PLACE@<edge>=gmem` — is deferred** (a genuine design
+wrinkle, not just effort). `CUT` is the **structural-fork decision** knob
+(`STRUCTURAL_DECISION_KNOBS`, the two-level-tune replay / pricing in
+`pipeline._replay_structural_decision` + `two_level._decomposition_rows`). But `gmem`
+already denotes "unstaged operand (gmem-direct read)" in the staging record `120_stage`
+stamps, so folding `CUT` to `gmem` needs the structural recognizer to **distinguish a
+gmem-materialization decision (kernel-set change) from a gmem-direct read** — a redesign of
+the structural-decision machinery, not a mechanical fold, with nil functional impact while
+the greedy fork-picker is out of scope here. Worth doing alongside the post-prior picking
+policy; tracked here as the one remaining fold. No DB-compat constraint (clean-slate the storage) and **the learned prior is
 assumed deleted** — so this plan designs no featurization and owes nothing to prior compatibility; greedy fork-picking
 is whatever replaces the prior (out of scope here). Everything *native-facing* — `op.knobs` storage, `eval` display, new
 goldens, new tests — speaks the new schema. A **legacy mapper** is **ingest-only** (legacy → new) and exists for one
