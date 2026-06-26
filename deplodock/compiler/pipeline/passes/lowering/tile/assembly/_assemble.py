@@ -23,7 +23,7 @@ from dataclasses import replace
 
 from deplodock.compiler.backend.cuda.dtype import cuda_name
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import BF16, F32
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
@@ -48,6 +48,9 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import add as _fadd
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
@@ -220,29 +223,6 @@ def synthesize_frag_handoff(prob_frags, *, slab: str, slab_dtype, a_frag: str, s
     return out
 
 
-def _static(d) -> int | None:
-    """The static extent of a shape entry, or ``None`` for a symbolic dim."""
-    if isinstance(d, int):
-        return d
-    f = getattr(d, "as_static", None)
-    return f() if (f is not None and getattr(d, "is_static", True)) else None
-
-
-def _fadd(*terms):
-    """Sum int / Expr terms into one Expr (dropping literal zeros) — flash addressing."""
-    out = None
-    for t in terms:
-        e = Literal(t, "int") if isinstance(t, int) else t
-        if isinstance(e, Literal) and e.value == 0:
-            continue
-        out = e if out is None else BinaryExpr("+", out, e)
-    return out if out is not None else Literal(0, "int")
-
-
-def _fmul(a, b: int):
-    return _fadd() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
-
-
 def realize_flash(op: TileGraphOp) -> TileOp:
     """The fragment-tier specialization of :func:`assemble_carry` — the warp-tier streaming
     flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``enumeration/070_coop_reduce``)
@@ -257,18 +237,11 @@ def realize_flash(op: TileGraphOp) -> TileOp:
     fragment → smem → ldmatrix) is the one irreducibly flash-specific authoring — there is no
     matmul / reduce analog of a fragment-tier online-softmax with a register-staged handoff."""
     block = op.tilegraph.blocks[0]
-    buffers = op.buffers
-    out = block.writes[0].buffer
-    rank4 = [n for n, b in buffers.items() if len(b.shape) == 4 and n != out]
-    q, k, v = rank4[0], rank4[1], rank4[2]
-    causal = any("ninf" in n for n in buffers)
-    qshape = buffers[q].shape
-    B, H, D = _static(qshape[0]), _static(qshape[1]), _static(qshape[3])
-    S = _static(qshape[2])
-    seq_var = None if S is not None else next(iter(qshape[2].expr.free_vars()))
-    group = H // _static(buffers[k].shape[1])  # GQA: q-heads / kv-heads
+    fp = flash_params(op.buffers, block.writes[0].buffer)  # shared geometry derivation
+    q, k, v, out = fp.q, fp.k, fp.v, fp.out
+    B, H, D, S, seq_var, group, causal = fp.B, fp.H, fp.D, fp.S, fp.seq_var, fp.group, fp.causal
     carrier = block.carrier.carrier  # the twisted online-softmax Monoid, read off the logical block
-    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if buffers[q].dtype == BF16 else "mma_m16n8k16_f16"]
+    atom = ATOM_REGISTRY[fp.atom_kind]
     qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
     atom_m, atom_n, atom_k = atom.shape
     assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"

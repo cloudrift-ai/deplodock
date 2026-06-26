@@ -34,11 +34,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
@@ -79,59 +79,23 @@ def _streaming_bk(dag) -> int:
 PATTERN = [Pattern("root", TileGraphOp)]
 
 
-def _static(d) -> int | None:
-    if isinstance(d, int):
-        return d
-    f = getattr(d, "as_static", None)
-    return f() if (f is not None and getattr(d, "is_static", True)) else None
-
-
-def _warp_chain_eligible(*, B, H, S, D, group, causal, symbolic) -> bool:  # noqa: ARG001 — causal/B accepted for parity
-    """The fused-TC-flash geometry scope: ``D % 16 == 0`` (16 ≤ D ≤ 256), GQA group divides H,
-    and static ``S % 16 == 0`` OR a symbolic ``seq_len`` (any runtime size). Dtype (16-bit) is
-    gated by :func:`_warp_flash_params`."""
-    if group < 1 or H % group != 0 or D % 16 != 0 or not (16 <= D <= 256):
-        return False
-    return True if symbolic else (S % 16 == 0 and S >= 16)
-
-
-def _warp_flash_params(op: TileGraphOp):
-    """``(B, H, S, D, group, causal, symbolic)`` for a streaming-flash op derived from its
-    logical gmem ``buffers``, or ``None`` when out of the 16-bit warp scope (a 4th rank-4 input
-    = additive mask, non-16-bit dtype, or non-static B/H/D). The realizer (``realize_flash``)
-    re-derives the same off the buffers — this is the enumeration-side eligibility query."""
-    buffers = op.buffers
-    out = op.tilegraph.blocks[0].writes[0].buffer
-    ins = [(n, b) for n, b in buffers.items() if len(b.shape) == 4 and n != out]
-    if len(ins) != 3:  # an additive mask adds a 4th rank-4 input — out of scope
-        return None
-    (_qn, q), (_kn, k), (_vn, _v) = ins
-    if q.dtype not in (F16, BF16):
-        return None
-    B, H, D = _static(q.shape[0]), _static(q.shape[1]), _static(q.shape[3])
-    S = _static(q.shape[2])  # None ⇒ symbolic seq_len
-    kvh = _static(k.shape[1])
-    if kvh in (None, 0) or any(x is None for x in (B, H, D)):
-        return None
-    causal = any("ninf" in n for n in buffers)
-    return B, H, S, D, H // kvh, causal, S is None
-
-
 def _is_warp_flash(op: TileGraphOp) -> bool:
     """Whether this streaming flash deploys the **warp-tier tensor-core chain** (vs the
-    cooperative / scalar streaming nest): in the 16-bit warp scope AND either a symbolic
-    ``seq_len`` (the deployed default — the ~100× win) or a static shape under ``DEPLODOCK_CHAIN``.
-    (Folds the former ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
+    cooperative / scalar streaming nest): a carried-contraction chain in the 16-bit warp scope
+    (the shared ``flash_params`` — fp16/bf16, ``D%16==0`` with ``16 ≤ D ≤ 256``, GQA group
+    dividing H, static ``S%16==0`` OR symbolic) AND either a symbolic ``seq_len`` (the deployed
+    default — the ~100× win) or a static shape under ``DEPLODOCK_CHAIN``. (Folds the former
+    ``split/005_warp_chain`` routing shim into this MONOID fork.)"""
     if op.dag.chain is None:
         return False
-    params = _warp_flash_params(op)
-    if params is None:
+    fp = flash_params(op.buffers, op.tilegraph.blocks[0].writes[0].buffer)
+    if fp is None:
         return False
-    symbolic = params[-1]
-    if not symbolic and not fam.pin_inline_chain():
+    if not fp.symbolic and not fam.pin_inline_chain():
         return False
-    b, h, s, d, group, causal, _ = params
-    return _warp_chain_eligible(B=b, H=h, S=s or 0, D=d, group=group, causal=causal, symbolic=symbolic)
+    if fp.group < 1 or fp.H % fp.group != 0 or fp.D % 16 != 0 or not (16 <= fp.D <= 256):
+        return False
+    return True if fp.symbolic else (fp.S % 16 == 0 and fp.S >= 16)
 
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
