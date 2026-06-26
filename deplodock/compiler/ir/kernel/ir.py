@@ -771,7 +771,7 @@ class RegFragment(Stmt):
     cell ``(M, N, K)``; the count
     derives from ``shape`` + ``role`` via :func:`_mma_sync_nregs`. The
     ``c`` array is zero-initialised at declaration, so the mma.sync path
-    needs no separate ``MmaFill``."""
+    needs no separate fill node."""
 
     name: str
     role: str  # "a" / "b" / "c"
@@ -973,7 +973,7 @@ class MmaSyncPtx(Stmt):
         return (self.c_frag, self.a_frag, self.b_frag)
 
     def defines(self) -> tuple[str, ...]:
-        # Accumulates into c_frag in place — a definition, like MmaSync.
+        # Accumulates into c_frag in place — a definition, like MmaSyncPtx.
         return (self.c_frag,)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -1039,8 +1039,7 @@ class RegStore(Stmt):
     the M×N=16×8 C tile (rows ``g`` / ``g+8`` with ``g = lane/4``, cols
     ``(lane%4)*2 + {0,1}``) and writes them directly. ``frag`` is the f32
     ``float c[4]``; when the destination buffer is narrower (``__half*``)
-    each value is converted via ``__float2half`` (mirrors
-    :class:`MmaStore`'s downconvert). ``ldm`` is the output row stride
+    each value is converted via ``__float2half``. ``ldm`` is the output row stride
     (N) — ``0`` auto-resolves from the buffer's inner extent.
 
     ``epilogue`` optionally carries a fused pointwise chain
@@ -1311,7 +1310,7 @@ def _dim_stride(buffer: str, dim: int, ctx: RenderCtx) -> int | str:
 def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     """Look up the row-major leading-dimension stride (= inner extent)
     for ``buffer`` from the kernel render context. Used by
-    :class:`MmaLoad` / :class:`MmaStore` when ``ldm == 0`` (auto).
+    :class:`LdmatrixLoad` / :class:`RegStore` when ``ldm == 0`` (auto).
     Accepts both raw int extents and :class:`Dim` extents (Tensor.shape) —
     a symbolic inner extent (e.g. QK^T's ``(seq, seq)`` output) resolves to
     a C expression over the runtime kernel arg (the M9 runtime-ldm path);
@@ -1319,7 +1318,7 @@ def _resolve_ldm(buffer: str, ctx: RenderCtx) -> int | str:
     int/str split is transparent."""
     shape = ctx.shapes.get(buffer)
     if shape is None:
-        raise ValueError(f"MmaLoad/MmaStore: buffer {buffer!r} not in ctx.shapes (no shape registered)")
+        raise ValueError(f"_resolve_ldm: buffer {buffer!r} not in ctx.shapes (no shape registered)")
     return _ext_to_c(shape[-1], ctx)
 
 

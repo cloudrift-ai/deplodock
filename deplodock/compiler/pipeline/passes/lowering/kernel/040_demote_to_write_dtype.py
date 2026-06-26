@@ -23,7 +23,7 @@ half`` sequences and demotes the float-compute middle to half.
 
 ## Algorithm
 
-Backward dataflow over the KernelOp body:
+Backward dataflow over the TileOp body:
 
 1. Build a def map ``name → defining_stmt`` from a deep ``Body.iter()``.
 2. Seed a worklist with the ``value`` of every ``Write`` whose output

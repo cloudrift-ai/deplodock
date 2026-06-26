@@ -3,8 +3,8 @@
 Each composer knob is a *move parameter* (the ``TileMap`` move on a map axis
 contributes a thread-tile factor + a register-tile factor; ``TileSerial`` a
 K-chunk; ``Tensorize`` a warp/atom geometry). Rather than mint a fresh schema,
-the composer **reuses the legacy ``BM/BN/BK/...`` knob objects** (defined in
-``_enumeration.py``): the move parameters have the SAME arithmetic role as the
+the composer **reuses the legacy ``BM/BN/BK/...`` knob objects** (defined
+below): the move parameters have the SAME arithmetic role as the
 legacy tile dimensions (legacy ``BN`` IS "CTA thread width along N" = the
 composer's N thread-tile extent; ``FM/FN`` the register cells; ``WM/WN`` the warp
 counts; ``BK/SPLITK/BR/FK/MMA`` identical), so aliasing keeps the tune DB / learned
@@ -12,7 +12,7 @@ prior / golden YAMLs / pinned-knob tests (``DEPLODOCK_BK=…`` etc.) valid acros
 cutover. The greenfield Python names are retained as aliases so the move code
 reads in move terms; the stamped ``op.knobs`` key is the legacy string name.
 
-Legacy tier schema (``_enumeration.py``): scalar ``{BN,BM,FM,FN,FK,BK,SPLITK,BR}``,
+Legacy tier schema: scalar ``{BN,BM,FM,FN,FK,BK,SPLITK,BR}``,
 warp ``{WN,WM,FM,FN,BK,SPLITK,MMA}`` — the composer stamps the same per tier. The
 register knobs ``FM/FN`` and ``BK`` are tier-shared (a kernel is scalar XOR warp),
 so the scalar map-reg and warp-reg aliases point at the one ``FM``/``FN``/``BK``.

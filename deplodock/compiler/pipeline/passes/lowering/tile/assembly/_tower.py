@@ -1,7 +1,7 @@
 """Tower-building primitives for the assembly phase: the internal :class:`Role`
 label and :func:`_wrap_tower`, which wraps a body in the nested typed tile
 flavors (``GridTile`` / ``ThreadTile`` / ``RegisterTile`` / ``WarpTile`` /
-``AtomTile`` / ``SerialTile``). Used by ``assembly/_assemble`` + ``assembly/_fused``
+``AtomTile`` / ``SerialTile``). Used by ``assembly/_assemble`` + ``assembly/_warp_chain``
 to materialize the binding tower from a chosen ``Schedule``.
 """
 
@@ -114,8 +114,8 @@ def _wrap_tower(layers: list[tuple[Axis, Role | None]], inner: tuple[Stmt, ...],
       recovered at materialize time from ``Accum.axes ∩ ThreadTile.axes``
       (see ``escape_analysis``).
     - ``REGISTER`` → ``RegisterTile.axes``.
-    - ``WARP`` → ``WarpTile.axes``. Reserved for the MMA / WS-refactor
-      consumer plans; no rule in this pass emits it today.
+    - ``WARP`` → ``WarpTile.axes``. Emitted for warp-tier matmul rows
+      (``_assemble._free_layers`` maps ``Binding.WARP`` here).
     - ``SERIAL_OUTER`` / ``STAGE_INNER`` / ``PIPELINE`` → ``SerialTile(kind=…)``.
     - Untagged (``None``) → ``SerialTile(kind="plain")``.
 

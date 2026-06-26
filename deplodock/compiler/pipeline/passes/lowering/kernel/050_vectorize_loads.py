@@ -26,15 +26,13 @@ Tile body, post-order):
    the run with one widened ``Load``.
 3. Otherwise advance one stmt.
 
-## Why this lives at the Kernel-IR boundary
+## Why this runs at the TileOp level
 
-The decision needs the source-buffer dtype (graph node dtypes for
-graph dtypes via ``KernelOp.inputs`` keys + ``Smem.dtype`` for smem buffers). Body alone doesn't carry that
-info, so ``normalize_body`` (which runs on every Body construction)
-can't make the call without external context. Running the pass here —
-after ``100_materialize_tile`` has placed the Smem decls and before
-the CUDA-source rendering in ``lowering/cuda`` — keeps both pieces of
-context available in one place.
+The decision needs the source-buffer dtype, which Body alone doesn't
+carry, so ``normalize_body`` (which runs on every Body construction)
+can't make the call without external context. This pass matches
+``TileOp`` and runs before ``100_materialize_tile`` lowers to Kernel-IR,
+reading the dtype off the staged ``Source`` / ``TileOp.inputs``.
 
 ## Composition with the demote pass
 

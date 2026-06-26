@@ -6,7 +6,6 @@
   the typed tile flavors (``GridTile``, ``ThreadTile``, etc.) come from
   ``ir.tile.ir``.
 - :mod:`.render` — ``render_kernelop`` emitting CUDA source.
-- :mod:`.pretty` — structural pretty-printer.
 """
 
 from deplodock.compiler.ir.axis import Axis

@@ -4,7 +4,7 @@ Runs FIRST (before
 ``010_split_demoted``), on the un-tiled flash ``LoopOp``: when ``DEPLODOCK_CHAIN=1`` and
 the nest is a streaming ``MONOID(SEMIRING)`` chain (``dag.chain``) in the v1 fused-TC
 scope (fp16, non-causal, equal-head, ``D%16==0``, ``S%16==0``), it replaces the LoopOp
-with a single ``CudaOp`` running the warp-chain kernel (``_warp_chain.assemble_warp_chain``
+with a single ``TileOp`` running the warp-chain kernel (``_warp_chain.assemble_warp_chain``
 — the validated FA-2 kernel) and the engine splices it. Out of scope ⇒ ``RuleSkipped``,
 so the flash falls through to ``chain_build`` (scalar) / the materialized path — the
 deployed default is unchanged (this only fires under the explicit pin).
