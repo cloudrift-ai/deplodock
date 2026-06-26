@@ -21,9 +21,24 @@ families have landed:
   name-independent). `mma_atom` / `is_warp` scan the `ATOM@<cell>` keys (with a legacy `MMA` fallback for golden / DB
   ingest); `020_tensorize` reads the atom control via `atom_raw` (native `DEPLODOCK_ATOM` / legacy `DEPLODOCK_MMA`).
 
-The **PLACE@\<edge\>** family (step 5 — folding `STAGE`/`TMA`/`CUT`/`CHAIN`) and the golden YAML cutover (step 4) remain.
-The `MMA`/`BN`/`BM`/… `Knob` descriptors stay registered (legacy `knob_features` / display / env-pin ingest); the
-implementation no longer reads them. No DB-compat constraint (clean-slate the storage) and **the learned prior is
+Steps 1–4 have landed (full suite green: 2218 passed). The three geometry families
+(`SPLIT`/`REDUCE`/`ATOM`) are native; the legacy ingest (step 2) and the `_validate`
+retirement (step 3) folded in as the rename forced them; native display ordering (step 4)
+is done, and new recordings are native automatically (existing legacy goldens keep working
+via env-pin ingest, so a re-record cutover needs tuning, out of scope here). The
+`MMA`/`BN`/`BM`/… `Knob` descriptors stay registered (legacy `knob_features` / display /
+env-pin ingest); the implementation no longer reads them.
+
+Two consequences of retiring the cold ranker were handled along the way: the `120_stage`
+budget filter now sizes symbolic staging slabs at the hint (a genuine fix), and the
+MONOID-combine smem is still unbudgeted so a few unpinned attention e2e tests pin a
+budget-safe tile (the maintainer chose to accept this rather than re-point featurization).
+
+**Remaining:** the **PLACE@\<edge\>** family (step 5 — folding `STAGE`/`TMA`/`CUT`/`CHAIN`
+into one per-edge lattice coordinate over the `Schedule.staged` source-of-truth). This is
+the largest, most cross-cutting family (4 passes + the split phase + assembly); its headline
+payoff (the clean one-fork flash deploy) needs a picker, which is out of scope here and
+currently degraded, so its near-term impact is schema consistency rather than behavior. No DB-compat constraint (clean-slate the storage) and **the learned prior is
 assumed deleted** — so this plan designs no featurization and owes nothing to prior compatibility; greedy fork-picking
 is whatever replaces the prior (out of scope here). Everything *native-facing* — `op.knobs` storage, `eval` display, new
 goldens, new tests — speaks the new schema. A **legacy mapper** is **ingest-only** (legacy → new) and exists for one
