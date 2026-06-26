@@ -114,6 +114,59 @@ host 2.9 ≈ 22 ms ⇒ ~46 tok/s** — the realized **~10×** over the ~4.5 tok/
 tok/s (the earlier "~100–140 tok/s" projection over-extrapolated from the M=8 floor; the shipped M=16 is the real
 number).
 
+## End-to-end served validation (post-merge)
+
+The numbers above are layer-0 micro-benchmarks. To confirm the win holds for the **real served path**, we benched
+`deplodock serve --generate` (the vLLM in-process plugin, `DeplodockGenModel` → `DeplodockGenRunner`) against **stock
+vLLM** (`vllm serve`, native — CUDA graphs + cuBLAS + paged attention), same model, on the same GPU. Client: a streaming
+`/v1/chat/completions` bench — single-stream decode (median of 3, 128 output tokens) and 16-way concurrency (64
+requests). Reproduce: start a server (`deplodock serve <model> --generate …` or `… --generate --stock`), then
+`python scripts/bench_gen_serve.py --port <P> --model <model>`.
+
+| TinyLlama-1.1B, fp16, RTX 4080 | deplodock plugin | stock vLLM | gap |
+|---|---|---|---|
+| **single-stream decode** | **46.5 tok/s** | 273.1 tok/s | ~5.9× slower |
+| TTFT | 50 ms | 10 ms | ~5× |
+| system throughput (16-way) | 446 tok/s | 3862 tok/s | ~8.7× slower |
+
+**Win confirmed:** served single-stream **46.5 tok/s matches the reconciled ~46 tok/s projection** above — the
+decode-bucket makes generative serving usable (was ~4.5 tok/s). The layer-0 micro-projection was right end-to-end.
+
+**Next bottleneck = our kernels, not the seam.** deplodock single-stream is 21.5 ms/token, matching the compute budget
+(post 11.7 + pre 7.1 + host 2.9 ≈ 21.7 ms) — so the deplodock-owned kernels dominate; vLLM-side overhead and TTFT are
+small. Native vLLM runs the *entire* step in 3.66 ms/token, so deplodock's kernels alone are ~5× vLLM's whole optimized
+step. The concurrency gap (8.7×) is *worse* than single-stream (5.9×): the bucket pads every step to M=16 and the
+per-layer host round-trip serializes, while vLLM batches concurrent decode into one step.
+
+**Memory constraint surfaced.** The decode-bucket roughly doubled the runner's cupy footprint (up to 4 programs/layer),
+so the server needed `--max-num-batched-tokens 1024` + a tuned `--gpu-memory-utilization` to fit TinyLlama on 16 GB
+(default 0.9 OOMs — vLLM's KV cache had no room after weights + the deplodock workspaces). This is Top-risk #9, now
+concrete; it bites harder on bigger models.
+
+**Takeaway:** generative serving is viable but ~6× off native vLLM, dominated by the decode kernels. The most direct
+next lever is tuning the **static** decode-bucket kernels (they're tunable, unlike the symbolic one) — see Follow-ups.
+
+### Update — tuning the decode kernels (the #1 follow-up, applied)
+
+Tuned the static M=16 `post` + `pre` subgraphs (`deplodock tune <subgraph>.json --bench`), which **built the learned
+prior from scratch** — the first server run above used the cold `AnalyticPrior` (no `prior.json` existed). Re-benching
+the served model with the trained prior:
+
+| TinyLlama-1.1B, fp16, RTX 4080 | cold prior | **tuned prior** | stock vLLM |
+|---|---|---|---|
+| single-stream decode | 46.5 tok/s | **85.5 tok/s** (1.84×) | 273.1 tok/s |
+| TTFT | 50 ms | 29 ms | 10 ms |
+| system throughput (16-way) | 446 tok/s | **1007 tok/s** (2.26×) | 3862 tok/s |
+
+Kernel config alone **nearly doubled** single-stream decode and **halved the gap to native vLLM** (5.9× → ~3.2×
+single-stream; 8.7× → ~3.8× concurrency). The "~6× gap is mostly architectural" read was **wrong** — the cold prior was
+leaving ~2× on the table. The remaining ~3× is the harder, partly-architectural part: CUDA-graph capture over the
+deplodock step, killing the per-layer host round-trip, and batched concurrent decode.
+
+(Tooling note: the per-kernel `tune --ir <graph>.json --bench` display couldn't locate most reproducers — content-hash
+drift after re-lowering — so the per-kernel before/after table was unusable; the prior update itself is unaffected, and
+the served re-bench is the proof.)
+
 ## Ruled out / deferred
 
 - **Device zero-copy interleave** — ~1% (host transfers are 1.3%). Not worth doing for latency.
@@ -122,6 +175,14 @@ number).
 
 ## Follow-ups
 
+- **Tune the static decode-bucket kernels** — ✅ **applied** (see the Update above): tuning the M=16 `post`/`pre`
+  subgraphs nearly doubled served single-stream decode (46.5 → 85.5 tok/s) and halved the gap to native vLLM. Remaining:
+  the prior was built from layer-0's two subgraphs only — a fuller sweep (more layers/shapes, other models) + a proper
+  golden entry would harden it. The leftover ~3× gap is now the architectural levers below.
+- **CUDA-graph capture over the deplodock decode step + kill the per-layer host round-trip** — the now-dominant lever
+  after tuning. deplodock runs `--enforce-eager` with per-layer numpy↔torch hops; native vLLM captures the whole step.
+  Re-test whether whole-step capture helps at full-model scale (the isolated-post finding said ×1.0, but 22 layers ×
+  many small kernels + host hops may differ).
 - **Multi-bucket decode** (e.g., 8 / 32 / 128) to cover higher concurrency with tight padding, vs the single 16-bucket
   here. Memory cost: more program sets (Top risk #9).
 - **Per-`Dim` hint plumbing** → one symbolic program with a small M-tile, efficient at all widths (the cleanest
