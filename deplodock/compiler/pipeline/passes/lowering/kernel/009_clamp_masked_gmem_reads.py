@@ -31,10 +31,11 @@ from __future__ import annotations
 from dataclasses import replace as dc_replace
 
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, TernaryExpr
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from deplodock.compiler.pipeline.passes.lowering._masking import mask_index
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -84,11 +85,7 @@ def _clamp_load(load: Load, pairs: list[tuple[Expr, Expr]]) -> Load:
         repl = dim
         for coord, bound in pairs:
             if dim == coord:
-                repl = TernaryExpr(
-                    cond=BinaryExpr("<", coord, bound),
-                    if_true=coord,
-                    if_false=BinaryExpr("-", bound, Literal(1, "int")),
-                )
+                repl = mask_index(coord, bound, mode="clamp")
                 changed = True
                 break
         new_index.append(repl)

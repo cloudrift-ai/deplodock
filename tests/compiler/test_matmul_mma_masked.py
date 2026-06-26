@@ -312,7 +312,7 @@ def test_demoted_symbolic_n_accuracy(monkeypatch, seq):
 # The masked-K mma tier (a symbolic ``seq_len`` reduce on the tensor-core path) now
 # lowers + runs correctly through these SYNTHETIC standalone graphs. Four fixes
 # landed: (1) ``_classify`` admits a symbolic-K SEMIRING (tiles K at the ``Dim``
-# hint); (2) ``_build._replace_k_warp`` ceil-divides ``K_o`` so the loop bound is the
+# hint); (2) ``_build._rebracket_k`` (warp tier) ceil-divides ``K_o`` so the loop bound is the
 # runtime ``ceil(seq_len/(BK·atom_k))`` (covers seq > hint) and ``seq_len`` enters the
 # kernel signature; (3) ``assembly/_slab._stamp_kmask`` stamps ``Source.kmask`` on the
 # staged operands so ``_stage_expand`` ZERO-fills the partial-final-K smem overhang

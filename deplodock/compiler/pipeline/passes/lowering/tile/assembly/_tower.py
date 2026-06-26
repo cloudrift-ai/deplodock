@@ -1,8 +1,9 @@
 """Tower-building primitives for the assembly phase: the internal :class:`Role`
 label and :func:`_wrap_tower`, which wraps a body in the nested typed tile
 flavors (``GridTile`` / ``ThreadTile`` / ``RegisterTile`` / ``WarpTile`` /
-``AtomTile`` / ``SerialTile``). Used by ``assembly/_assemble`` + ``assembly/_warp_chain``
-to materialize the binding tower from a chosen ``Schedule``.
+``AtomTile`` / ``SerialTile``). Called only by ``assembly/_assemble.assemble_carry`` — the one
+carry materializer EVERY assembly path funnels through (single-block / fused-edge /
+multi-launch / flash) — to materialize the binding tower from a chosen ``Schedule``.
 """
 
 from __future__ import annotations
@@ -37,9 +38,16 @@ class CarryScope:
     new carrier state from it, ``rescale`` the accumulator by the carrier (the twist),
     ``handoff`` the C→A edge realization, ``consume`` (accumulate the consumer cell into the
     rescaled accumulator), ``update`` (commit the carrier state). A degenerate SEMIRING
-    K-reduce populates only ``consume`` (the ``Mma`` accumulates in place)."""
+    K-reduce populates only ``consume`` (the ``Mma`` accumulates in place).
 
-    axis: Axis
+    ``axis`` is the streaming/reduce loop the phases iterate — set for a **phase-built**
+    carry (``assemble_carry`` builds the ``SERIAL_OUTER`` loop: flash's kv-stream, a monoid
+    reduce). It is ``None`` for an **embedded** carry — a matmul / scalar reduce whose K
+    serial tower the enumeration K re-bracket already embedded in ``consume`` and whose
+    per-tile work is one in-place ``Accum`` / ``Mma`` — where the phases ARE the body and no
+    loop is built at assembly time."""
+
+    axis: Axis | None = None
     init: tuple[Stmt, ...] = ()
     produce: tuple[Stmt, ...] = ()
     merge: tuple[Stmt, ...] = ()
@@ -48,20 +56,6 @@ class CarryScope:
     consume: tuple[Stmt, ...] = ()
     update: tuple[Stmt, ...] = ()
     epilogue: tuple[Stmt, ...] = ()
-
-
-def wrap_carry_tower(carry: CarryScope, *, warp_axes: tuple[Axis, ...], grid_axes: tuple[Axis, ...]) -> Body:
-    """Wrap a :class:`CarryScope` into the ``GridTile > WarpTile > [init] SerialTile [epilogue]``
-    nest. The per-iteration phases are spliced in carrier order inside the serial loop; the
-    carry's ``init`` state is hoisted above the loop and its ``epilogue`` (normalize + store)
-    trails it — so the accumulator persists across the serial axis instead of resetting per
-    tile (the streaming accumulator the generic single-cell assembly can't express)."""
-    loop_body = carry.produce + carry.merge + carry.rescale + carry.handoff + carry.consume + carry.update
-    serial = SerialTile(axis=carry.axis, body=Body(loop_body), kind="serial_outer")
-    warp_body = carry.init + (serial,) + carry.epilogue
-    warp = WarpTile(axes=warp_axes, body=Body(warp_body))
-    grid = GridTile(axes=grid_axes, body=Body((warp,)))
-    return Body((grid,))
 
 
 class Role(enum.Enum):

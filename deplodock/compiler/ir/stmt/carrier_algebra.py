@@ -20,11 +20,107 @@ how state and partials are distributed):
 
 The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
 structure — not two hand-authored transcriptions.
+
+The per-key online-softmax ``merge`` program is classified ONCE here — :func:`classify_merge_program`
+(over :func:`fragment_taint`) tags each ``Assign`` with its geometry-independent carrier role
+(``fold`` / ``exp`` / ``state_copy`` / ``state_scalar`` / ``scalar``, as :class:`MergeStep`s) — and the
+fragment realizer consumes that classification as a thin geometry emitter (the streaming + cross-thread
+realizers consume the carrier's ``merge`` / ``combine_states`` surface directly via
+``render_merge_program``, so they need no role split). One analysis, geometry per realizer.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from deplodock.compiler.ir.stmt.leaves import Assign, Monoid
+
+# Associative+commutative ops whose presence over a fragment operand marks a reduction
+# (rowmax / rowsum). Disambiguates ``max(m, s)`` (a FOLD, ``s`` fragment) from a purely
+# scalar ``max(m, r)`` — only a fragment operand under one of these is a fold.
+_REDUCE_OPS = frozenset({"add", "maximum", "minimum"})
+
+
+def fragment_taint(merge: tuple[Assign, ...], score_partial: str) -> set[str]:
+    """SSA names that are fragment-valued: those transitively derived from the score
+    partial via NON-reducing ops. A reduce-eligible op (``add``/``maximum``/``minimum``)
+    with exactly one fragment operand is a FOLD — its result is a per-row SCALAR, so it
+    stops the taint. Geometry-independent — the analysis half of the fragment / cooperative
+    realizers (the realizer supplies how the tainted values are distributed)."""
+    frag = {score_partial}
+    changed = True
+    while changed:
+        changed = False
+        for a in merge:
+            if a.name in frag:
+                continue
+            frag_args = [x for x in a.args if x in frag]
+            if not frag_args:
+                continue
+            is_fold = a.op.name in _REDUCE_OPS and len(frag_args) == 1 and len(a.args) == 2
+            if not is_fold:
+                frag.add(a.name)
+                changed = True
+    return frag
+
+
+@dataclass(frozen=True)
+class MergeStep:
+    """One classified ``Assign`` of an online-softmax ``merge`` program, tagged with its
+    carrier role (geometry-independent). A realizer maps each role onto its distribution:
+
+    - ``"fold"`` — a reduction of a fragment operand to a per-row scalar (rowmax / rowsum);
+      ``frag_src`` is the reduced fragment SSA, ``scalar`` the running scalar operand,
+      ``is_state`` whether the result updates a carried state (``l``) vs a temp (``mx``).
+    - ``"exp"`` — a fused ``exp(frag_src − scalar)`` producing a new fragment (the
+      probabilities ``p``); ``frag_src`` the source fragment, ``scalar`` the subtracted row scalar.
+    - ``"state_copy"`` — a carried-state reassign from a single source (``m = copy(mx)``);
+      ``args = (src,)``.
+    - ``"state_scalar"`` / ``"scalar"`` — a scalar state reassign / a pure scalar temp;
+      ``op`` + ``args`` are the source program's."""
+
+    role: str
+    name: str
+    op: object = None
+    args: tuple = ()
+    frag_src: str | None = None
+    scalar: str | None = None
+    is_state: bool = False
+
+
+def classify_merge_program(merge: tuple[Assign, ...], score_partial: str, state_names) -> tuple[list[MergeStep], set[str]]:
+    """Classify an online-softmax stats ``merge`` program into role-tagged :class:`MergeStep`s
+    (the analysis the fragment realizer ``assembly/_frag_softmax`` consumes), returning
+    ``(steps, frag)`` where ``frag`` is the :func:`fragment_taint` set. The ``subtract`` feeding
+    an ``exp`` is fused into the ``exp`` step (it emits no step of its own). Pure carrier algebra:
+    no IR-dialect / geometry dependency — the realizer supplies the fragment / lane distribution."""
+    frag = fragment_taint(merge, score_partial)
+    states = set(state_names)
+    sub_fuse: dict[str, tuple[str, str]] = {}  # subtract name -> (src fragment, sub scalar)
+    steps: list[MergeStep] = []
+    for a in merge:
+        frag_args = [x for x in a.args if x in frag]
+        is_fold = a.op.name in _REDUCE_OPS and len(frag_args) == 1 and len(a.args) == 2
+        if is_fold:
+            fragnm = frag_args[0]
+            scalarnm = a.args[0] if a.args[1] == fragnm else a.args[1]
+            steps.append(MergeStep("fold", a.name, op=a.op, frag_src=fragnm, scalar=scalarnm, is_state=a.name in states))
+        elif frag_args:
+            if a.op.name == "subtract" and len(a.args) == 2 and a.args[0] in frag and a.args[1] not in frag:
+                sub_fuse[a.name] = (a.args[0], a.args[1])  # `src - scalar`, fused into the next exp
+            elif a.op.name == "exp" and len(a.args) == 1 and a.args[0] in sub_fuse:
+                src, sub = sub_fuse[a.args[0]]
+                steps.append(MergeStep("exp", a.name, frag_src=src, scalar=sub))
+            else:
+                raise NotImplementedError(f"v1 fragment softmax: unhandled fragment op {a.op.name!r} on {a.name!r}")
+        elif a.name in states:
+            if a.op.name == "copy" and len(a.args) == 1:
+                steps.append(MergeStep("state_copy", a.name, args=(a.args[0],)))
+            else:
+                steps.append(MergeStep("state_scalar", a.name, op=a.op, args=a.args))
+        else:
+            steps.append(MergeStep("scalar", a.name, op=a.op, args=a.args))
+    return steps, frag
 
 
 def value_dependent(merge: tuple[Assign, ...], value_name: str) -> set[str]:
