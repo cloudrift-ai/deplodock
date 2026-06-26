@@ -1,10 +1,13 @@
-"""Pre-build pass: emit the fused tensor-core flash for an eligible streaming nest.
+"""Pre-build pass: the **eligibility / offer SHIM** for the fused tensor-core flash.
 
 Runs FIRST (before ``010_split_demoted``), on the un-tiled flash ``LoopOp``: when the nest
 is a streaming ``MONOID(SEMIRING)`` chain (``dag.chain``) in the fused-TC scope (fp16/bf16,
 causal or non-causal, equal-head or GQA, ``D%16==0``; static ``S%16==0`` OR symbolic
-``seq_len``), it replaces the LoopOp with a single ``TileOp`` running the warp-chain kernel
-(``_warp_chain.assemble_warp_chain``) and the engine splices it.
+``seq_len``), it atomizes the two cells + reads the carrier and replaces the LoopOp with a
+``TileGraphOp(flash=FlashSpec(...))``. It holds NO assembly logic — the assembly pass
+(``assembly/010_assemble``) realizes the spec via ``assembly/_flash.realize_flash`` through the
+**generic carry assembler** (``assemble_carry``, the same tower path matmul / reduce use), so
+flash rides the standard TileGraphOp → assemble pipeline like every other kernel.
 
 **Routing (Phase 3 of ``plans/smem-tiled-symbolic-flash.md``):** a **symbolic** ``seq_len``
 flash fires the warp chain BY DEFAULT (the tensor-core / smem-shared-K/V flash is the
@@ -20,14 +23,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import BF16, F16
-from deplodock.compiler.graph import Graph, Node
+from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Mma
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
+from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._warp_chain import assemble_warp_chain, warp_chain_eligible
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._flash import FlashSpec, warp_chain_eligible
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
@@ -84,7 +87,7 @@ def _flash_params(op: LoopOp):
     return B, H, S, D, group, q.dtype, causal, seq_var
 
 
-def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
+def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
     op: LoopOp = root.op
     dag = iter_dag(op)
     if not dag.streaming or dag.chain is None:
@@ -109,10 +112,32 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     kind = "mma_m16n8k16_bf16" if dt == BF16 else "mma_m16n8k16_f16"
     qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")), kind=kind)
     pv = _classify_cell("P", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None, kind=kind)
-    # The streaming online-softmax Monoid (state (m,l,O), partial (score,value)) — the
-    # algebraic source the fragment realizer regenerates the softmax phases from. Reading
-    # it here keeps the ``enumeration`` import in ``split``, not ``assembly``.
-    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier, seq_var=seq_var, group=group)
+    # Emit a flash-spec ``TileGraphOp`` (this pass is the eligibility/offer SHIM): the assembly
+    # pass ``assembly/010_assemble`` realizes it via ``_flash.realize_flash`` through the generic
+    # carry assembler — no separate assembler entry. The streaming online-softmax ``Monoid``
+    # (state (m,l,O), partial (score,value)) is the algebraic source the fragment realizer
+    # regenerates the softmax phases from; reading it here keeps the ``enumeration`` import in
+    # ``split``, not ``assembly``.
+    rank4 = [n for n, t in op.inputs.items() if len(t.shape) == 4]
+    out_t = next(iter(op.outputs.values()))
+    spec = FlashSpec(
+        name=op.name,
+        q=rank4[0],
+        k=rank4[1],
+        v=rank4[2],
+        out=out_t.name,
+        B=B,
+        H=H,
+        S=S,
+        D=D,
+        qk=qk,
+        pv=pv,
+        carrier=dag.chain.carrier,
+        causal=causal,
+        seq_var=seq_var,
+        group=group,
+    )
+    return TileGraphOp(name=op.name, flash=spec)
 
 
 def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):
