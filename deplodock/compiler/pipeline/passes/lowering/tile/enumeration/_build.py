@@ -388,8 +388,24 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     # tiles the masked K at the hint and may carry ``br`` (ceil-div, masked fill).
     k_c = Axis(f"{kax.name}_c", br, source_axis=kax.source_axis or kax) if br > 1 else None
 
+    # Cross-CTA split-K of the cooperative reduce: thread the ``K_s`` GRID partition through
+    # the K re-bracket when ``cta > 1`` (the additive ``Accum`` carrier — the offer set gates
+    # the legality). The same ``grid=(K_s, cta)`` the matmul ``reduce_decomp`` uses; ``free_tile``
+    # binds the ``K_s`` GRID axis (it reads ``cta`` off the same knobs). The cross-CTA producer
+    # mirrors the intra-CTA cooperative ``K_c`` lane one partition level up.
+    k_s = _k_s_axis(dag, knobs, targets)
     block = graph.blocks[0]
-    compute = _rebracket_k(tuple(block.compute), targets, bk=bk, fk=fk, unit=br, coop_axis=kax.name, thread=k_c, masking="carrier")
+    compute = _rebracket_k(
+        tuple(block.compute),
+        targets,
+        bk=bk,
+        fk=fk,
+        unit=br,
+        coop_axis=kax.name,
+        thread=k_c,
+        grid=(k_s, d.cta) if k_s is not None else None,
+        masking="carrier",
+    )
     g = free_tile(replace(graph, blocks=(replace(block, compute=Body(compute)),)), dag, knobs, target_names=target_names)
     if k_c is not None:
         # Lay K_c FIRST in domain (innermost THREAD bits), so the segmented cross-lane

@@ -84,9 +84,9 @@ def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: i
     matmul ``carrier`` the 1-component ``Accum`` sum, the trivial instantiation of the same
     cross-partition fold a twisted ``Monoid`` (online-softmax / flash) would take."""
     out_shape = root.output.shape
-    if len(out_shape) != 2 or not all(d.is_static for d in out_shape):
-        raise RuleSkipped(f"atomic-free split-K expects a 2D static matmul output, got shape={out_shape}")
-    m_extent, n_extent = out_shape[0].as_static(), out_shape[1].as_static()
+    if not out_shape or not all(d.is_static for d in out_shape):
+        raise RuleSkipped(f"cross-CTA finalize expects a fully-static output shape, got shape={out_shape}")
+    out_extents = tuple(d.as_static() for d in out_shape)
     dtype = root.output.dtype
     out_name = root.output.name
 
@@ -107,8 +107,7 @@ def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: i
             workspaces=(workspace_name,),
             out_name=out_name,
             s_extent=splitk,
-            m_extent=m_extent,
-            n_extent=n_extent,
+            out_shape=out_extents,
             dtype=dtype,
             name=f"{out_name}__reduce",
         )
@@ -133,9 +132,11 @@ def _build_fragment(match, root: Node, op: TileGraphOp, k_s_name: str, splitk: i
 def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
     if op.tilegraph is None or not op.tilegraph.blocks[0].domain:
-        raise RuleSkipped("atomic-free split-K runs on a fully-tiled matmul (still a logical seed)")
-    if op.algebra is not AlgebraKind.SEMIRING or mma_atom(op.knobs) is not None:
-        raise RuleSkipped("cross-CTA finalize applies to the scalar SEMIRING matmul tier")
+        raise RuleSkipped("cross-CTA finalize runs on a fully-tiled op (still a logical seed)")
+    if mma_atom(op.knobs) is not None:
+        raise RuleSkipped("cross-CTA finalize is scalar-tier today (the warp / MMA tier is cta = 1)")
+    if op.algebra not in (AlgebraKind.SEMIRING, AlgebraKind.MONOID):
+        raise RuleSkipped("cross-CTA finalize applies to a SEMIRING matmul or a MONOID reduce")
     reduce_axis = op.dag.k_node.loop.axis.name
     rk = op.knobs.get(fam.reduce_key(reduce_axis))
     if rk is not None and fam.reduce_finalize_decided(rk):

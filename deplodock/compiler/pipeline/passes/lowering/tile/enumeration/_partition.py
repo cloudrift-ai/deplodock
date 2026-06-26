@@ -177,21 +177,21 @@ def _combine_block(
 
 
 def additive_reduce_tilegraph(
-    *, workspace_name: str, out_name: str, s_extent: int, m_extent: int, n_extent: int, dtype: DataType, name: str
+    *, workspace_name: str, out_name: str, s_extent: int, out_shape: tuple[int, ...], dtype: DataType, name: str
 ) -> TileGraph:
-    """The additive split-K combine: ``out[m, n] = Σ_s partial[s, m, n]`` via an
-    ``Accum`` sum (bit-identical to the matmul's own ``+`` reduce). One thread per
-    output cell serially folds the ``S`` partition slabs."""
+    """The additive split-K / split-reduce combine: ``out[d...] = Σ_s partial[s, d...]``
+    via an ``Accum`` sum (bit-identical to the matmul's own ``+`` reduce). One thread per
+    output cell serially folds the ``S`` partition slabs. ``out_shape`` is the (static)
+    output extent per dim — ``(M, N)`` for the matmul, ``(M,)`` for a plain ``sum(dim)``."""
     s_axis = Axis("K_s_red", to_dim(s_extent))
-    _, _, _, _, m_idx, n_idx = _grid_thread_axes(m_extent, n_extent)
+    _, _, out_index, _ = _out_axes(out_shape)
     reduce_inner = (
-        Load(name="p", input=workspace_name, index=(Var(s_axis.name), m_idx, n_idx), dtype=dtype),
+        Load(name="p", input=workspace_name, index=(Var(s_axis.name), *out_index), dtype=dtype),
         Accum(name="acc", value="p", dtype=F32, axes=(s_axis.name,)),
     )
     return _combine_block(
         name=name,
-        m_extent=m_extent,
-        n_extent=n_extent,
+        out_shape=out_shape,
         inits=(),
         reduce_inner=reduce_inner,
         s_axis=s_axis,
@@ -209,8 +209,7 @@ def monoid_reduce_tilegraph(
     workspaces: tuple[str, ...],
     out_name: str,
     s_extent: int,
-    m_extent: int,
-    n_extent: int,
+    out_shape: tuple[int, ...],
     dtype: DataType,
     finalize: tuple[Assign, ...] = (),
     out_value: str | None = None,
@@ -220,7 +219,7 @@ def monoid_reduce_tilegraph(
     :func:`additive_reduce_tilegraph`.
 
     Each of the carrier's ``state`` components has its own workspace ``workspaces[i]``
-    (shaped ``[S, M, N]``). One thread per output cell seeds its state from the
+    (shaped ``[S, *out_shape]``). One thread per output cell seeds its state from the
     op-identity (``init_ops[i]``: ``maximum`` → −inf, ``add`` → 0) and serially folds
     each ``S`` slice via the carrier's ``combine_states`` (the state-merges-state monoid
     op). An optional ``finalize`` (Assigns over the merged state) produces the single
@@ -228,18 +227,17 @@ def monoid_reduce_tilegraph(
     ``out_name``. The non-additive path a flash split-KV's online ``(m, l)`` LSE takes.
     """
     s_axis = Axis("K_s_red", to_dim(s_extent))
-    _, _, _, _, m_idx, n_idx = _grid_thread_axes(m_extent, n_extent)
+    _, _, out_index, _ = _out_axes(out_shape)
     others = tuple(f"o_{i}" for i in range(len(carrier.state)))
     loads: tuple[Stmt, ...] = tuple(
-        Load(name=others[i], input=workspaces[i], index=(Var(s_axis.name), m_idx, n_idx), dtype=dtype) for i in range(len(workspaces))
+        Load(name=others[i], input=workspaces[i], index=(Var(s_axis.name), *out_index), dtype=dtype) for i in range(len(workspaces))
     )
     fold = replace(carrier.as_state_merge(others), axes=(s_axis.name,))
     inits: tuple[Stmt, ...] = tuple(Init(name=st, op=init_ops[i], dtype=F32) for i, st in enumerate(carrier.state))
     written = out_value if out_value is not None else carrier.state[0]
     return _combine_block(
         name=name,
-        m_extent=m_extent,
-        n_extent=n_extent,
+        out_shape=out_shape,
         inits=inits,
         reduce_inner=(*loads, fold),
         s_axis=s_axis,
@@ -256,8 +254,7 @@ def deferred_combine_tilegraph(
     workspaces: tuple[str, ...],
     out_name: str,
     s_extent: int,
-    m_extent: int,
-    n_extent: int,
+    out_shape: tuple[int, ...],
     dtype: DataType,
     name: str,
     init_ops: tuple[ElementwiseImpl, ...] = (),
@@ -288,8 +285,7 @@ def deferred_combine_tilegraph(
             workspace_name=workspaces[0],
             out_name=out_name,
             s_extent=s_extent,
-            m_extent=m_extent,
-            n_extent=n_extent,
+            out_shape=out_shape,
             dtype=dtype,
             name=name,
         )
@@ -304,8 +300,7 @@ def deferred_combine_tilegraph(
         workspaces=workspaces,
         out_name=out_name,
         s_extent=s_extent,
-        m_extent=m_extent,
-        n_extent=n_extent,
+        out_shape=out_shape,
         dtype=dtype,
         finalize=finalize,
         out_value=out_value,
