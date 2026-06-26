@@ -8,10 +8,6 @@
 - :func:`parallel_tile_of` — return the per-binding-tier inner scope
   (ThreadTile or WarpTile) for an outer ``GridTile`` / ``ThreadTile`` /
   ``WarpTile`` (renamed from the pre-WarpTile ``thread_tile_of``).
-- :func:`loads_reading` — collect every body Load reading a Stage by
-  name. Bank-conflict analysis itself lives in
-  :mod:`deplodock.compiler.diagnostics.bank_conflicts` and is shared
-  with the visualizer.
 
 The file is prefixed ``_`` so the engine's rule loader skips it
 (``engine._load_rules`` filters ``startswith("_")``).
@@ -21,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body, Load
+from deplodock.compiler.ir.stmt import Accum, Body
 from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, ThreadTile, WarpTile
 from deplodock.compiler.pipeline import RuleSkipped
 
@@ -111,13 +107,3 @@ def single_tile(body: Body) -> tuple[int, ParallelTile]:
         if isinstance(s, (GridTile, ThreadTile, WarpTile)):
             return (i, s)
     raise RuleSkipped("TileOp has no outer ParallelTile (degenerate single-thread body)")
-
-
-# ---------------------------------------------------------------------------
-# Stage / Load helpers
-# ---------------------------------------------------------------------------
-
-
-def loads_reading(body: Body, stage_name: str) -> list[Load]:
-    """Collect every Load anywhere in ``body`` reading from ``stage_name``."""
-    return [s for s in body.iter() if isinstance(s, Load) and s.input == stage_name]
