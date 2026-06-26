@@ -203,6 +203,23 @@ def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None
     return _wrap_tower(parallel_layers, inner, atom=atom)
 
 
+def synthesize_frag_handoff(prob_frags, *, slab: str, slab_dtype, a_frag: str, shape) -> list[Stmt]:
+    """A **register-fragment → smem → register-fragment** staged edge (capability 2) — the
+    fragment-source analog of the gmem cooperative stage (``_slab``). Stores each producer
+    fragment (``prob_frags``, the m16n8 C-fragments) into ``slab`` at its column offset, a
+    ``Sync``, then ``ldmatrix``-loads it back as the consumer A fragment ``a_frag`` in the A
+    layout — a relayout-through-smem (what CUTLASS does between fused-GEMM stages). Reused by
+    the flash C→A handoff; the eventual ``Schedule.staged`` ``FRAG`` transport will call it."""
+    out: list[Stmt] = [
+        RegStore(dst_buffer=slab, dst_index=(Literal(0, "int"), Literal(i * 8, "int")), frag=pf, shape=shape, ldm=16)
+        for i, pf in enumerate(prob_frags)
+    ]
+    out.append(Sync())
+    out.append(RegFragment(name=a_frag, role="a", shape=shape, dtype=slab_dtype))
+    out.append(LdmatrixLoad(frag=a_frag, src_buffer=slab, src_index=(Literal(0, "int"),), role="a", ldm=16, staged=True, b_trans=False))
+    return out
+
+
 def _static(d) -> int | None:
     """The static extent of a shape entry, or ``None`` for a symbolic dim."""
     if isinstance(d, int):
@@ -281,9 +298,6 @@ def realize_flash(op: TileGraphOp) -> TileOp:
     qrow = _fadd(base_q, _fmul(qb, 16 * D))  # query-row base (q-head)
     kvrow = _fadd(base_kv, _fmul(kv, 16 * D))  # kv-tile base (kv-head under GQA)
 
-    def ld(frag, buf, src_index, role, *, b_trans=False, staged=False, ldm=D):
-        return LdmatrixLoad(frag=frag, src_buffer=buf, src_index=(src_index,), role=role, ldm=ldm, staged=staged, b_trans=b_trans)
-
     geom = FragGeom(
         atom_m=atom_m,
         atom_n=atom_n,
@@ -330,17 +344,8 @@ def realize_flash(op: TileGraphOp) -> TileOp:
     merge: list = list(fs.merge)
     rescale: list = list(fs.rescale)
 
-    # handoff — the C→A edge: write P to the smem slab, ldmatrix it back as A (the one
-    # irreducibly flash-specific authoring: a register-fragment → smem → register-fragment edge).
-    handoff: list = [
-        RegStore(
-            dst_buffer="flash_pv_smem", dst_index=(Literal(0, "int"), Literal(nt * 8, "int")), frag=f"Pf{nt}", shape=atom_shape, ldm=16
-        )
-        for nt in range(2)
-    ]
-    handoff.append(Sync())
-    handoff.append(RegFragment(name="pa", role="a", shape=atom_shape, dtype=ab_dt))
-    handoff.append(ld("pa", "flash_pv_smem", Literal(0, "int"), "a", staged=True, ldm=16))
+    # handoff — the C→A edge: the fragment-staged relayout (capability 2), reused by the walk.
+    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom_shape)
 
     pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
     consume: list = []
