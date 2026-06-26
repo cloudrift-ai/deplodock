@@ -1,9 +1,9 @@
 """The compiler GENERATES the fused tensor-core flash.
 
 End-to-end: a fp16 SDPA traced + compiled with ``DEPLODOCK_CHAIN=1`` lowers — via the
-``070_coop_reduce`` warp-flash fork — to a single ``mma.sync`` kernel (the warp-chain build
-``_assemble.realize_flash``, the validated FA-2 kernel generalized over ``(B,H,S,D)``, reusing
-the ``FragmentRowReduce`` op for the fragment softmax), and matches torch SDPA. The
+``070_coop_reduce`` warp-flash fork — to a single ``mma.sync`` kernel (``_build.warp_chain_build``
+σ-tiles + atomizes the two contractions, ``_assemble.carry_scope_from_graph`` realizes the
+fragment softmax via ``FragmentRowReduce``, generalized over ``(B,H,S,D)``), and matches torch SDPA. The
 default path (no ``CHAIN`` pin) is unchanged — the scalar streaming flash / materialized
 path still deploys, so this only fires under the explicit opt-in.
 

@@ -102,14 +102,12 @@ def test_static_stream_stays_scalar_monoid_by_default():
 
 
 def test_flash_cells_atomize_via_the_generic_unit():
-    """Capability 1 (the foundation for dissolving ``realize_flash``): the two flash cells in the
-    **logical seed** atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell``
-    — the QK^T (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V
-    (``frag_a``) to a **canonical-B** ``A=prob-fragment`` cell. This is what ``realize_flash``
-    hand-builds today; the remaining capability-1 work (the ``warp_chain_build`` move) is the
-    orchestration that walks the seed + the split carrier to assemble these into a warp-streaming
-    ``TileGraph`` (then capability 3 — the ``assemble_carry`` walk — replaces ``realize_flash``).
-    CPU-only."""
+    """The foundation of the warp-flash dissolution: the two flash cells in the **logical seed**
+    atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell`` — the QK^T
+    (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V (``frag_a``) to a
+    **canonical-B** ``A=prob-fragment`` cell. ``warp_chain_build`` σ-tiles + atomizes these into a
+    warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
+    path that replaced the hand-assembled ``realize_flash``. CPU-only."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.expr import Var
     from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
@@ -148,3 +146,36 @@ def test_flash_cells_atomize_via_the_generic_unit():
     )
     pv = next(s for s in atomize_cell(pv_cell, atom=atom, k_name=kv, write=None, frag_a=True) if isinstance(s, Mma))
     assert pv.b_trans is False and pv.a == prob, "P@V must atomize canonical-B with A = the probability fragment"
+
+
+def test_warp_chain_build_produces_atomized_streaming_graph():
+    """``warp_chain_build`` σ-tiles the warp-tier flash into a streaming ``TileGraph``: the two
+    atomized cells (QK^T transposed-B, P@V ``frag_a`` canonical-B) over the kv-stream
+    ``Schedule.carry`` axis (the split stream block ``<hinge>_b``) + the score→A handoff as a staged
+    ``flash_pv_smem`` edge. ``carry_scope_from_graph`` (assembly) realizes the fragment-tier phases
+    around these cells (GPU-validated by ``e2e/test_flash_tensorcore_generated.py`` under the walk).
+    This is the structural check on the build move's output. CPU-only."""
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.ir.stmt import Mma
+    from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import warp_chain_build
+
+    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so flash_params admits the warp scope.
+    shp = (Dim(1), Dim(1), Dim(64), Dim(16))
+    loop = build_flash_frag("q", "k", "v", shp, shp, shp, Tensor("o", shp, F32), causal=False).nodes["o"].op
+    dag = iter_dag(loop)
+    # The synthetic recognizer fragment carries no input shapes (the real pipeline gets 4D shapes
+    # from the trace); supply the (B,H,S,D) fp16 buffers `flash_params` derives geometry from.
+    buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
+    op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
+    chain = dag.chain
+    _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
+    prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
+
+    tg = warp_chain_build(op)
+    assert tg.schedule.carry == frozenset({f"{chain.hinge_name}_b"}), "the σ-tiled kv stream block must be marked Schedule.carry"
+    assert any(e.buffer == "flash_pv_smem" for e in tg.schedule.staged), "the score→A handoff must be a staged smem edge"
+    mmas = [s for s in tg.blocks[0].compute.iter() if isinstance(s, Mma)]
+    assert any(m.b_trans for m in mmas), "QK^T (transposed-B) cell present"
+    assert any(not m.b_trans for m in mmas), "P@V (canonical-B) cell present"
+    assert any(m.a == prob for m in mmas if not m.b_trans), "P@V reads the probability fragment as its A operand"

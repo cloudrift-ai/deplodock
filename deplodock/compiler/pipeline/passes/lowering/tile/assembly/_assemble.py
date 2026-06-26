@@ -23,14 +23,14 @@ from dataclasses import replace
 
 from deplodock.compiler.backend.cuda.dtype import cuda_name
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import BF16, F32
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Stmt, Write
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     AffineAddressing,
@@ -44,10 +44,12 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     TileGraph,
-    TileGraphOp,
     TileOp,
     Transport,
 )
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import add as _fadd
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
@@ -122,6 +124,12 @@ def assemble_block(
     tensor (shape/dtype derived from the producer ``Write``). The partition is
     **deterministic** — same ``TileGraph`` → byte-identical kernel set — per the RF
     invariant-guard discipline."""
+    if graph.schedule.carry:
+        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream axis a
+        # fragment-tier online-softmax carrier. The same single-block path, with the carrier realized
+        # at the fragment tier (the produce/consume cells read off the graph) — funnels through the
+        # one ``assemble_carry`` like every other kernel.
+        return carry_scope_from_graph(graph, kernel_name=kernel_name)
     if is_fused_graph(graph):
         return _assemble_group(graph, knobs=knobs, base_knobs=base_knobs, kernel_name=kernel_name, leading=leading)
     if len(graph.blocks) == 1:
@@ -174,8 +182,8 @@ def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None
     """Materialize a :class:`CarryScope` into the tower — the **one** materialization every
     assembly path funnels through: the single-block kernels (``_assemble_one`` — pointwise /
     matmul / reduce), the SMEM-fused edge (``_assemble_group``), the multi-launch DAG
-    (``_assemble_multi`` → ``_assemble_one``), and flash (``_flash.realize_flash``). It is the
-    sole caller of :func:`_wrap_tower`.
+    (``_assemble_multi`` → ``_assemble_one``), and the warp-tier flash (``carry_scope_from_graph``).
+    It is the sole caller of :func:`_wrap_tower`.
 
     The per-iteration phases concatenate in carrier order
     (``produce`` → ``merge`` → ``rescale`` → ``handoff`` → ``consume`` → ``update``),
@@ -220,122 +228,88 @@ def synthesize_frag_handoff(prob_frags, *, slab: str, slab_dtype, a_frag: str, s
     return out
 
 
-def _static(d) -> int | None:
-    """The static extent of a shape entry, or ``None`` for a symbolic dim."""
-    if isinstance(d, int):
-        return d
-    f = getattr(d, "as_static", None)
-    return f() if (f is not None and getattr(d, "is_static", True)) else None
+def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, guards: dict | None = None) -> AtomTile:
+    """Rename a graph-sourced flash AtomTile to the ``carry_scope_from_graph`` fragment scheme:
+    suffix the cell's ``Load`` names (so sibling N-atom tiles don't collide), set the ``Mma``'s
+    output fragment ``c`` (→ ``Sf{nt}`` / ``Of{n}``), optionally pin ``a`` (the P@V A = the handoff
+    ``pa``) and merge symbolic edge guards. Recurses through the ``D>atom_k`` re-bracket SerialTile."""
+
+    def walk(stmts: tuple[Stmt, ...], rename: dict[str, str]) -> tuple[Stmt, ...]:
+        out: list[Stmt] = []
+        for s in stmts:
+            if isinstance(s, Load):
+                nn = f"{s.names[0]}_{sfx}"
+                rename[s.names[0]] = nn
+                out.append(replace(s, names=(nn,)))
+            elif isinstance(s, SerialTile):
+                out.append(replace(s, body=Body(walk(tuple(s.body), rename))))
+            elif isinstance(s, Mma):
+                m = replace(s, c=c, a=(a if a is not None else rename.get(s.a, s.a)), b=rename.get(s.b, s.b))
+                out.append(replace(m, **guards) if guards else m)
+            else:
+                out.append(s)
+        return tuple(out)
+
+    return replace(tile, body=Body(walk(tuple(tile.body), {})))
 
 
-def _fadd(*terms):
-    """Sum int / Expr terms into one Expr (dropping literal zeros) — flash addressing."""
-    out = None
-    for t in terms:
-        e = Literal(t, "int") if isinstance(t, int) else t
-        if isinstance(e, Literal) and e.value == 0:
-            continue
-        out = e if out is None else BinaryExpr("+", out, e)
-    return out if out is not None else Literal(0, "int")
-
-
-def _fmul(a, b: int):
-    return _fadd() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
-
-
-def realize_flash(op: TileGraphOp) -> TileOp:
-    """The fragment-tier specialization of :func:`assemble_carry` — the warp-tier streaming
-    flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``enumeration/070_coop_reduce``)
-    marked with ``Schedule.carry``. It is NOT a separate assembler: it builds the
-    ``CarryScope`` (the produce / merge / handoff / consume / epilogue phases of the
-    online-softmax stream) and hands it to ``assemble_carry`` like every other carry.
-
-    The geometry (q/k/v/out buffers + ``(B,H,S,D)`` + GQA + causal + symbolic ``seq``) is
-    derived from the op's logical gmem ``buffers``; the twisted online-softmax ``Monoid``
-    carrier is read off ``block.carrier``; the QK^T / P@V mma cells lower via ``kernel/005``;
-    the softmax phases are ``realize_fragment_softmax(carrier)``. The C→A handoff (register
-    fragment → smem → ldmatrix) is the one irreducibly flash-specific authoring — there is no
-    matmul / reduce analog of a fragment-tier online-softmax with a register-staged handoff."""
-    block = op.tilegraph.blocks[0]
-    buffers = op.buffers
-    out = block.writes[0].buffer
-    rank4 = [n for n, b in buffers.items() if len(b.shape) == 4 and n != out]
-    q, k, v = rank4[0], rank4[1], rank4[2]
-    causal = any("ninf" in n for n in buffers)
-    qshape = buffers[q].shape
-    B, H, D = _static(qshape[0]), _static(qshape[1]), _static(qshape[3])
-    S = _static(qshape[2])
-    seq_var = None if S is not None else next(iter(qshape[2].expr.free_vars()))
-    group = H // _static(buffers[k].shape[1])  # GQA: q-heads / kv-heads
-    carrier = block.carrier.carrier  # the twisted online-softmax Monoid, read off the logical block
-    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if buffers[q].dtype == BF16 else "mma_m16n8k16_f16"]
-    qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
-    atom_m, atom_n, atom_k = atom.shape
-    assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
-
-    atom_shape = atom.shape
-    ab_dt = atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16)
+def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
+    """The warp-tier-flash branch of :func:`assemble_block` — NOT a separate assembly entry. Reads
+    the ``warp_chain_build`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
+    the generic ``atomize_cell``, σ-tiled to the warp geometry) and assembles the warp-chain
+    ``CarryScope``: the produce / consume ``Mma`` cells come from the graph (no hand-authored
+    ``Mma``), and only the fragment-tier phases (softmax via ``realize_fragment_softmax`` / scale /
+    causal+boundary masks / the C→A handoff / the epilogue ``RegStore``) are realized here from the
+    carrier + the geometry read off the ``TileGraph`` (``graph.buffers`` / ``block.domain``), then
+    handed to the one ``assemble_carry`` every kernel funnels through. ``assemble_block`` dispatches
+    here off ``Schedule.carry``. This is the graph walk that replaced the hand-assembled
+    ``realize_flash``."""
+    block = graph.blocks[0]
+    fp = flash_params(graph.buffers, block.writes[0].buffer)
+    out, D, S, seq_var, causal = fp.out, fp.D, fp.S, fp.seq_var, fp.causal
+    atom = ATOM_REGISTRY[fp.atom_kind]
+    atom_m, atom_n, _atom_k = atom.shape
+    ab_dt = atom.operand_dtype("a")
     scale = f"{1.0 / math.sqrt(D)!r}f"
-    kt = D // atom_k  # QK^T K-tiles (reduce over D)
-    nd = D // atom_n  # P@V N-tiles (output over D)
-
+    nd = D // atom_n
     symbolic = seq_var is not None
-    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(S // 16)
     seq = Var(seq_var) if symbolic else Literal(S, "int")
 
-    bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
-    row_stride = _fmul(seq, D) if symbolic else Literal(S * D, "int")
-    base_q = BinaryExpr("*", bh, row_stride)
-    if group > 1:
-        h_kv = H // group
-        bh_kv = _fadd(
-            _fmul(BinaryExpr("//", bh, Literal(H, "int")), h_kv),
-            BinaryExpr("//", BinaryExpr("%", bh, Literal(H, "int")), Literal(group, "int")),
-        )
-        base_kv = BinaryExpr("*", bh_kv, row_stride)
-    else:
-        base_kv = base_q
-    qrow = _fadd(base_q, _fmul(qb, 16 * D))  # query-row base (q-head)
-    kvrow = _fadd(base_kv, _fmul(kv, 16 * D))  # kv-tile base (kv-head under GQA)
+    # The kv-stream serial-outer carry + its full twisted carrier (the online-softmax Monoid that
+    # ``warp_chain_build`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
+    kv_loop = next(s for s in block.compute if isinstance(s, SerialTile) and s.kind == "serial_outer")
+    carrier = next(s for s in kv_loop.body if isinstance(s, Monoid))
+    is_qkt = lambda t: any(isinstance(s, Mma) and s.b_trans for s in t.body.iter())  # noqa: E731
+    produce_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and is_qkt(t)]
+    consume_tiles = [t for t in kv_loop.body if isinstance(t, AtomTile) and not is_qkt(t)]
+    nt_count = len(produce_tiles)
+
+    qb = Var(block.domain[0].name)  # the query block axis (GRID), one warp / 16 query rows
+    kv = Var(kv_loop.axis.name)  # the kv stream var
+    qload = next(s for s in produce_tiles[0].body.iter() if isinstance(s, Load))
+    bh_dims = tuple(qload.index[:2])  # (batch, head) — the leading 4D dims, shared with the output
 
     geom = FragGeom(
         atom_m=atom_m,
         atom_n=atom_n,
-        score_frags=tuple(f"Sf{nt}_frag" for nt in range(2)),
-        prob_frags=tuple(f"Pf{nt}" for nt in range(2)),
+        score_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
+        prob_frags=tuple(f"Pf{nt}" for nt in range(nt_count)),
         accum_frags=tuple(f"Of{n}" for n in range(nd)),
     )
     fs = realize_fragment_softmax(carrier, geom=geom)
 
     init: list = list(fs.init)
-    init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
+    init += [RegFragment(name=f"Of{n}", role="c", shape=atom.shape, dtype=F32) for n in range(nd)]
     init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
 
     def _qk_guards(nt: int) -> dict:
         if not symbolic:
             return {}
-        return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * 8), seq)}
+        return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * atom_n), seq)}
 
-    produce: list = []
-    for nt in range(2):
-        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=atom, b_trans=qk_bt, **_qk_guards(nt))
-        if kt > 1:
-            ko = Var(f"ko{nt}")
-            rbody = (
-                Load(name=f"qv{nt}", input=q, index=(_fadd(qrow, _fmul(ko, 16)),)),
-                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D, _fmul(ko, 16)),)),
-                qk_mma,
-            )
-            cellbody: tuple = (SerialTile(axis=Axis(f"ko{nt}", Dim(kt)), body=Body(rbody), kind="plain"),)
-        else:
-            cellbody = (
-                Load(name=f"qv{nt}", input=q, index=(qrow,)),
-                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D),)),
-                qk_mma,
-            )
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=atom))
-    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
-    kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * 8) for nt in range(2))
+    produce: list = [_relabel_tile(t, c=f"Sf{nt}", sfx=f"q{nt}", guards=_qk_guards(nt)) for nt, t in enumerate(produce_tiles)]
+    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(nt_count)]
+    kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
     if causal:
         produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)
     if symbolic:
@@ -343,30 +317,21 @@ def realize_flash(op: TileGraphOp) -> TileOp:
 
     merge: list = list(fs.merge)
     rescale: list = list(fs.rescale)
-
-    # handoff — the C→A edge: the fragment-staged relayout (capability 2), reused by the walk.
-    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom_shape)
+    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
 
     pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
-    consume: list = []
-    for n in range(nd):
-        cell = (
-            Load(name=f"vv{n}", input=v, index=(_fadd(kvrow, n * 8),)),
-            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=atom, b_trans=pv_bt, **pv_kzero),
-        )
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=atom))
+    consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]
     consume.append(Sync())
 
     store_mguard = (_fmul(qb, 16), seq) if symbolic else None
     epilogue: list = []
     for n in range(nd):
         epilogue.append(fs.epilogue[n])
-        epilogue.append(
-            RegStore(dst_buffer=out, dst_index=(_fadd(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D, m_guard=store_mguard)
-        )
+        out_idx = (*bh_dims, _fmul(qb, 16), Literal(n * atom_n, "int"))
+        epilogue.append(RegStore(dst_buffer=out, dst_index=out_idx, frag=f"Of{n}", shape=atom.shape, ldm=D, m_guard=store_mguard))
 
     carry = CarryScope(
-        axis=Axis("kv", s_dim),
+        axis=kv_loop.axis,
         init=tuple(init),
         produce=tuple(produce),
         merge=tuple(merge),
@@ -376,12 +341,8 @@ def realize_flash(op: TileGraphOp) -> TileOp:
         update=tuple(fs.update),
         epilogue=tuple(epilogue),
     )
-    parallel_layers = [
-        (Axis("w", Dim(1)), Role.WARP),
-        (Axis("qb", s_dim), Role.BLOCK),
-        (Axis("bh", Dim(B * H)), Role.BLOCK),
-    ]
-    name = op.name if op.name.startswith("k_") else f"k_{op.name}"
+    parallel_layers = [(Axis("w", Dim(1)), Role.WARP)] + [(a, Role.BLOCK) for a in block.domain]
+    name = kernel_name if kernel_name.startswith("k_") else f"k_{kernel_name}"
     return TileOp(body=assemble_carry(carry, parallel_layers=parallel_layers), name=name, knobs={})
 
 
