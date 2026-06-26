@@ -18,17 +18,23 @@ innermost, then THREAD, then GRID, extra-outer GRID axes last) via the shared
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
+from deplodock.compiler.backend.cuda.dtype import cuda_name
+from deplodock.compiler.dim import Dim
+from deplodock.compiler.dtype import BF16, F32
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
+    ATOM_REGISTRY,
     AffineAddressing,
+    AtomTile,
     Binding,
     Block,
     CoopReduce,
@@ -38,10 +44,17 @@ from deplodock.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     TileGraph,
+    TileGraphOp,
     TileOp,
     Transport,
 )
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
+    FragGeom,
+    realize_boundary_mask,
+    realize_fragment_softmax,
+    realize_score_mask,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
@@ -188,6 +201,188 @@ def assemble_carry(carry: CarryScope, *, parallel_layers: list[tuple], atom=None
         phases = (SerialTile(axis=carry.axis, body=Body(phases), kind="serial_outer"),)
     inner = carry.init + phases + carry.epilogue
     return _wrap_tower(parallel_layers, inner, atom=atom)
+
+
+def synthesize_frag_handoff(prob_frags, *, slab: str, slab_dtype, a_frag: str, shape) -> list[Stmt]:
+    """A **register-fragment → smem → register-fragment** staged edge (capability 2) — the
+    fragment-source analog of the gmem cooperative stage (``_slab``). Stores each producer
+    fragment (``prob_frags``, the m16n8 C-fragments) into ``slab`` at its column offset, a
+    ``Sync``, then ``ldmatrix``-loads it back as the consumer A fragment ``a_frag`` in the A
+    layout — a relayout-through-smem (what CUTLASS does between fused-GEMM stages). Reused by
+    the flash C→A handoff; the eventual ``Schedule.staged`` ``FRAG`` transport will call it."""
+    out: list[Stmt] = [
+        RegStore(dst_buffer=slab, dst_index=(Literal(0, "int"), Literal(i * 8, "int")), frag=pf, shape=shape, ldm=16)
+        for i, pf in enumerate(prob_frags)
+    ]
+    out.append(Sync())
+    out.append(RegFragment(name=a_frag, role="a", shape=shape, dtype=slab_dtype))
+    out.append(LdmatrixLoad(frag=a_frag, src_buffer=slab, src_index=(Literal(0, "int"),), role="a", ldm=16, staged=True, b_trans=False))
+    return out
+
+
+def _static(d) -> int | None:
+    """The static extent of a shape entry, or ``None`` for a symbolic dim."""
+    if isinstance(d, int):
+        return d
+    f = getattr(d, "as_static", None)
+    return f() if (f is not None and getattr(d, "is_static", True)) else None
+
+
+def _fadd(*terms):
+    """Sum int / Expr terms into one Expr (dropping literal zeros) — flash addressing."""
+    out = None
+    for t in terms:
+        e = Literal(t, "int") if isinstance(t, int) else t
+        if isinstance(e, Literal) and e.value == 0:
+            continue
+        out = e if out is None else BinaryExpr("+", out, e)
+    return out if out is not None else Literal(0, "int")
+
+
+def _fmul(a, b: int):
+    return _fadd() if b == 0 else (a if b == 1 else BinaryExpr("*", a if not isinstance(a, int) else Literal(a, "int"), Literal(b, "int")))
+
+
+def realize_flash(op: TileGraphOp) -> TileOp:
+    """The fragment-tier specialization of :func:`assemble_carry` — the warp-tier streaming
+    flash, realized from the logical FA-2 ``TileGraph`` an offer shim (``enumeration/070_coop_reduce``)
+    marked with ``Schedule.carry``. It is NOT a separate assembler: it builds the
+    ``CarryScope`` (the produce / merge / handoff / consume / epilogue phases of the
+    online-softmax stream) and hands it to ``assemble_carry`` like every other carry.
+
+    The geometry (q/k/v/out buffers + ``(B,H,S,D)`` + GQA + causal + symbolic ``seq``) is
+    derived from the op's logical gmem ``buffers``; the twisted online-softmax ``Monoid``
+    carrier is read off ``block.carrier``; the QK^T / P@V mma cells lower via ``kernel/005``;
+    the softmax phases are ``realize_fragment_softmax(carrier)``. The C→A handoff (register
+    fragment → smem → ldmatrix) is the one irreducibly flash-specific authoring — there is no
+    matmul / reduce analog of a fragment-tier online-softmax with a register-staged handoff."""
+    block = op.tilegraph.blocks[0]
+    buffers = op.buffers
+    out = block.writes[0].buffer
+    rank4 = [n for n, b in buffers.items() if len(b.shape) == 4 and n != out]
+    q, k, v = rank4[0], rank4[1], rank4[2]
+    causal = any("ninf" in n for n in buffers)
+    qshape = buffers[q].shape
+    B, H, D = _static(qshape[0]), _static(qshape[1]), _static(qshape[3])
+    S = _static(qshape[2])
+    seq_var = None if S is not None else next(iter(qshape[2].expr.free_vars()))
+    group = H // _static(buffers[k].shape[1])  # GQA: q-heads / kv-heads
+    carrier = block.carrier.carrier  # the twisted online-softmax Monoid, read off the logical block
+    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if buffers[q].dtype == BF16 else "mma_m16n8k16_f16"]
+    qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
+    atom_m, atom_n, atom_k = atom.shape
+    assert (atom_m, atom_n, atom_k) == (16, 8, 16), "v1 warp-chain fragment layout assumes m16n8k16"
+
+    atom_shape = atom.shape
+    ab_dt = atom.operand_dtype("a")  # the 16-bit operand dtype (F16 / BF16)
+    scale = f"{1.0 / math.sqrt(D)!r}f"
+    kt = D // atom_k  # QK^T K-tiles (reduce over D)
+    nd = D // atom_n  # P@V N-tiles (output over D)
+
+    symbolic = seq_var is not None
+    s_dim = Dim(seq_var).ceil_div(16) if symbolic else Dim(S // 16)
+    seq = Var(seq_var) if symbolic else Literal(S, "int")
+
+    bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
+    row_stride = _fmul(seq, D) if symbolic else Literal(S * D, "int")
+    base_q = BinaryExpr("*", bh, row_stride)
+    if group > 1:
+        h_kv = H // group
+        bh_kv = _fadd(
+            _fmul(BinaryExpr("//", bh, Literal(H, "int")), h_kv),
+            BinaryExpr("//", BinaryExpr("%", bh, Literal(H, "int")), Literal(group, "int")),
+        )
+        base_kv = BinaryExpr("*", bh_kv, row_stride)
+    else:
+        base_kv = base_q
+    qrow = _fadd(base_q, _fmul(qb, 16 * D))  # query-row base (q-head)
+    kvrow = _fadd(base_kv, _fmul(kv, 16 * D))  # kv-tile base (kv-head under GQA)
+
+    geom = FragGeom(
+        atom_m=atom_m,
+        atom_n=atom_n,
+        score_frags=tuple(f"Sf{nt}_frag" for nt in range(2)),
+        prob_frags=tuple(f"Pf{nt}" for nt in range(2)),
+        accum_frags=tuple(f"Of{n}" for n in range(nd)),
+    )
+    fs = realize_fragment_softmax(carrier, geom=geom)
+
+    init: list = list(fs.init)
+    init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
+    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
+
+    def _qk_guards(nt: int) -> dict:
+        if not symbolic:
+            return {}
+        return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * 8), seq)}
+
+    produce: list = []
+    for nt in range(2):
+        qk_mma = Mma(c=f"Sf{nt}", a=f"qv{nt}", b=f"kc{nt}", atom=atom, b_trans=qk_bt, **_qk_guards(nt))
+        if kt > 1:
+            ko = Var(f"ko{nt}")
+            rbody = (
+                Load(name=f"qv{nt}", input=q, index=(_fadd(qrow, _fmul(ko, 16)),)),
+                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D, _fmul(ko, 16)),)),
+                qk_mma,
+            )
+            cellbody: tuple = (SerialTile(axis=Axis(f"ko{nt}", Dim(kt)), body=Body(rbody), kind="plain"),)
+        else:
+            cellbody = (
+                Load(name=f"qv{nt}", input=q, index=(qrow,)),
+                Load(name=f"kc{nt}", input=k, index=(_fadd(kvrow, nt * 8 * D),)),
+                qk_mma,
+            )
+        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=atom))
+    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
+    kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * 8) for nt in range(2))
+    if causal:
+        produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)
+    if symbolic:
+        produce += realize_boundary_mask(geom, kv_col_bases=kv_col_bases, bound=seq)
+
+    merge: list = list(fs.merge)
+    rescale: list = list(fs.rescale)
+
+    # handoff — the C→A edge: the fragment-staged relayout (capability 2), reused by the walk.
+    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom_shape)
+
+    pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
+    consume: list = []
+    for n in range(nd):
+        cell = (
+            Load(name=f"vv{n}", input=v, index=(_fadd(kvrow, n * 8),)),
+            Mma(c=f"Of{n}", a="pa", b=f"vv{n}", atom=atom, b_trans=pv_bt, **pv_kzero),
+        )
+        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=atom))
+    consume.append(Sync())
+
+    store_mguard = (_fmul(qb, 16), seq) if symbolic else None
+    epilogue: list = []
+    for n in range(nd):
+        epilogue.append(fs.epilogue[n])
+        epilogue.append(
+            RegStore(dst_buffer=out, dst_index=(_fadd(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D, m_guard=store_mguard)
+        )
+
+    carry = CarryScope(
+        axis=Axis("kv", s_dim),
+        init=tuple(init),
+        produce=tuple(produce),
+        merge=tuple(merge),
+        rescale=tuple(rescale),
+        handoff=tuple(handoff),
+        consume=tuple(consume),
+        update=tuple(fs.update),
+        epilogue=tuple(epilogue),
+    )
+    parallel_layers = [
+        (Axis("w", Dim(1)), Role.WARP),
+        (Axis("qb", s_dim), Role.BLOCK),
+        (Axis("bh", Dim(B * H)), Role.BLOCK),
+    ]
+    name = op.name if op.name.startswith("k_") else f"k_{op.name}"
+    return TileOp(body=assemble_carry(carry, parallel_layers=parallel_layers), name=name, knobs={})
 
 
 def _restrict_schedule(sched: Schedule, block_name: str) -> Schedule:

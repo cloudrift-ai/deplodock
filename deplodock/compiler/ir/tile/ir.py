@@ -448,6 +448,11 @@ class Schedule:
     binding: dict[str, Binding] = field(default_factory=dict)  # axis -> hardware role
     launch: dict[str, int] = field(default_factory=dict)  # block -> launch group (one group = one kernel)
     staged: dict[Edge, Transport] = field(default_factory=dict)  # read-site -> SMEM fill transport
+    # A SERIAL_OUTER axis that carries an online-updating (twisted-)monoid across its stream —
+    # the streaming-flash kv loop. Set ⇒ ``assemble`` realizes the block's carrier at the
+    # FRAGMENT tier (``realize_fragment_softmax``) instead of inline-rendering it, so the warp
+    # flash falls out of the generic walk. Empty ⇒ a plain reduce (carrier rendered inline).
+    carry: frozenset[str] = field(default_factory=frozenset)
 
     def with_binding(self, **kw: Binding) -> Schedule:
         return replace(self, binding={**self.binding, **kw})
@@ -642,8 +647,6 @@ class TileGraphOp(Op):
     target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
     seed_key: str = ""  # the source LoopOp's body structural key
     buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
-    flash: object = None  # the twisted online-softmax carrier Monoid — marks a warp-tier streaming-flash op the
-    # assembler realizes directly from the logical ``tilegraph`` (the ``split/005_warp_chain`` shim); ``None`` otherwise
 
     def structural_key(self) -> str:
         return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
