@@ -43,9 +43,13 @@ def _slab_bytes(graph, ranked) -> dict[str, int]:
     the auto-enumerated fork ranks against. Each buffer's slab is independent of which
     others stage, so size them once from the all-staged ``prospective_sources``
     (the byte count matches ``KernelOp.smem_bytes`` exactly — the slab is
-    ``∏(cache_extent · block) · dtype.nbytes``, pre-padding). A buffer whose source
-    can't be sized (an exotic non-affine layout) is omitted ⇒ treated as free, so the
-    filter never removes a staging it can't price (preserves the legacy offer)."""
+    ``∏(cache_extent · block) · dtype.nbytes``, pre-padding). A **symbolic** cache axis is
+    sized at its ``Dim`` hint — the same extent the masked-tile path actually allocates the
+    slab at — so a symbolic-seq operand (SDPA over ``seq_len``) is priced, not omitted (else
+    the filter under-counts it as free and lets an over-budget stage-all slab through). A
+    buffer whose source genuinely can't be sized (no static extent and no hint — an exotic
+    non-affine layout) is still omitted ⇒ treated as free, so the filter never removes a
+    staging it can't price."""
     full = replace(graph, schedule=replace(graph.schedule, staged={e: Transport.SYNC for e in ranked}))
     try:
         sources = prospective_sources(full)
@@ -56,9 +60,10 @@ def _slab_bytes(graph, ranked) -> dict[str, int]:
         block = getattr(s.addressing, "block", ()) or ()
         elems = 1
         for i, ax in enumerate(s.cache_axes):
-            if not ax.extent.is_static:
-                break
-            elems *= ax.extent.as_static() * (block[i] if block else 1)
+            ext = ax.extent.as_static() if ax.extent.is_static else (ax.extent.hint or 0)
+            if ext <= 0:
+                break  # no static extent and no hint — genuinely unsizable
+            elems *= ext * (block[i] if block else 1)
         else:
             out[s.buf] = elems * (s.dtype.nbytes if s.dtype else 4)
     return out
