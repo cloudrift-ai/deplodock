@@ -133,13 +133,17 @@ class LoweringRow:
 class NodeRow:
     """One ``node`` row — a single node of a per-kernel autotune search tree.
 
-    ``node_key`` is ``digest(context_key, op_sig, tunable-knob set)`` — the node's
-    identity within its operation; ``parent_key`` is the parent node's ``node_key``
-    (``None`` at the operation's top forks). ``features`` is the full feature dict
-    the prior sees (``H_*`` regime + ``S_*`` structure + tunable knobs).
-    ``value_us`` is the value-of-position latency (best reachable below the node);
-    :meth:`SearchDB.record_nodes` keeps the minimum on re-encounter. ``depth`` is
-    the node's distance from the sentinel root (top forks = 1)."""
+    ``node_key`` is ``digest(context_key, gpu, op_sig, tunable-knob set)`` — the
+    node's identity within its operation *on its hardware*; ``parent_key`` is the
+    parent node's ``node_key`` (``None`` at the operation's top forks). ``gpu`` is the
+    card's identity (``Context.hardware_id`` — the PCIe product name, or a device
+    digest when unknown): folded into the key so same-die SKUs (H100 vs H200) never
+    collide, and kept as a column so the dataset groups/filters by hardware.
+    ``features`` is the full feature dict the prior sees (``H_*`` regime + ``S_*``
+    structure + tunable knobs). ``value_us`` is the value-of-position latency (best
+    reachable below the node); :meth:`SearchDB.record_nodes` keeps the minimum on
+    re-encounter. ``depth`` is the node's distance from the sentinel root (top
+    forks = 1)."""
 
     node_key: str
     parent_key: str | None
@@ -148,6 +152,7 @@ class NodeRow:
     features: dict
     value_us: float
     depth: int
+    gpu: str = ""
 
 
 # The ``perf`` SELECT column list — order must match ``_row_to_perf``.
@@ -254,6 +259,7 @@ class SearchDB:
             parent_key   TEXT,
             context_key  TEXT NOT NULL,
             op_sig       TEXT NOT NULL,
+            gpu          TEXT NOT NULL DEFAULT '',
             features     TEXT NOT NULL DEFAULT '{}',
             value_us     REAL NOT NULL,
             depth        INTEGER NOT NULL,
@@ -263,6 +269,7 @@ class SearchDB:
         """,
         "CREATE INDEX IF NOT EXISTS node_parent ON node (parent_key)",
         "CREATE INDEX IF NOT EXISTS node_op ON node (context_key, op_sig)",
+        "CREATE INDEX IF NOT EXISTS node_gpu ON node (gpu)",
     ]
 
     def __init__(self, path: Path | str | None = None) -> None:
@@ -279,16 +286,27 @@ class SearchDB:
         if cur_version != self._SCHEMA_VERSION:
             self._conn.execute("DROP TABLE IF EXISTS lowering")
             self._conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
+        # Additive ``node.gpu`` migration must run BEFORE the schema loop — the
+        # ``node_gpu`` index in ``_SCHEMA`` references the column, so it has to exist
+        # first. A brand-new DB has no ``node`` table yet (the loop's CREATE includes
+        # ``gpu``), so this only fires for a pre-``gpu``-column table; old rows default
+        # to '' (unknown card).
+        if self._has_node_table() and not self._has_node_gpu_column():
+            self._conn.execute("ALTER TABLE node ADD COLUMN gpu TEXT NOT NULL DEFAULT ''")
         for stmt in self._SCHEMA:
             self._conn.execute(stmt)
         # Additive migration: pre-existing DBs lack the ``error`` column
         # (``CREATE TABLE IF NOT EXISTS`` never alters). Writer-side only —
-        # read-only consumers tolerate its absence instead.
+        # read-only consumers tolerate its absence instead. (``perf`` has no index on
+        # ``error``, so unlike ``node.gpu`` this can run after the schema loop.)
         if not self._has_perf_error_column():
             self._conn.execute("ALTER TABLE perf ADD COLUMN error TEXT")
 
     def _has_perf_error_column(self) -> bool:
         return any(r[1] == "error" for r in self._conn.execute("PRAGMA table_info(perf)"))
+
+    def _has_node_gpu_column(self) -> bool:
+        return any(r[1] == "gpu" for r in self._conn.execute("PRAGMA table_info(node)"))
 
     def _has_node_table(self) -> bool:
         # A read-only open of a pre-``node`` DB never ran ``CREATE TABLE IF NOT
@@ -489,9 +507,9 @@ class SearchDB:
             if existing is None:
                 self._conn.execute(
                     "INSERT INTO node "
-                    "(node_key, parent_key, context_key, op_sig, features, value_us, depth, n_updates, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (r.node_key, r.parent_key, r.context_key, r.op_sig, feats_json, r.value_us, r.depth, 1, now),
+                    "(node_key, parent_key, context_key, op_sig, gpu, features, value_us, depth, n_updates, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r.node_key, r.parent_key, r.context_key, r.op_sig, r.gpu, feats_json, r.value_us, r.depth, 1, now),
                 )
             elif r.value_us < existing[0]:
                 self._conn.execute(
@@ -517,7 +535,10 @@ class SearchDB:
         regime / operation."""
         if not self._has_node_table():
             return
-        sql = "SELECT node_key, parent_key, context_key, op_sig, features, value_us, depth FROM node"
+        # ``gpu`` degrades to '' on a pre-``gpu``-column DB opened read-only (the
+        # additive migration runs writer-side only) — same pattern as perf.error.
+        gpu_col = "gpu" if self._has_node_gpu_column() else "''"
+        sql = f"SELECT node_key, parent_key, context_key, op_sig, {gpu_col}, features, value_us, depth FROM node"  # noqa: S608
         clauses: list[str] = []
         params: list = []
         if context_key is not None:
@@ -528,7 +549,7 @@ class SearchDB:
             params.append(op_sig)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        for node_key, parent_key, ck, sig, feats_json, value_us, depth in self._conn.execute(sql, params):
+        for node_key, parent_key, ck, sig, gpu, feats_json, value_us, depth in self._conn.execute(sql, params):
             try:
                 features = json.loads(feats_json) if feats_json else {}
             except (TypeError, json.JSONDecodeError):
@@ -541,6 +562,7 @@ class SearchDB:
                 features=features,
                 value_us=value_us,
                 depth=depth,
+                gpu=gpu,
             )
 
     # ------------------------------------------------------------------

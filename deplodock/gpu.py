@@ -21,6 +21,7 @@ properties of the silicon; this module owns only the hardware itself.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 
 _MIB = 1024 * 1024
@@ -102,18 +103,24 @@ class GpuSpec:
         return TENSOR_CORE_GEN.get(self.compute_capability, self.compute_capability[0])
 
     def device_features(self) -> dict[str, float]:
-        """The ``sm_count`` / ``smem_*`` / ``regs`` / ``warp`` subset, matching the
-        keys :func:`probe_live_features` reads from a live device — the memorized
-        fallback. Empty when ``sm_count`` is unknown (degrades like a GPU-less host)."""
+        """The ``sm_count`` / ``smem_*`` / ``regs`` / ``warp`` / ``total_mem`` subset,
+        matching the keys :func:`probe_live_features` reads from a live device — the
+        memorized fallback. ``total_mem`` (VRAM bytes) is the one feature that
+        distinguishes same-die SKUs the prior otherwise can't tell apart (H100 80GB vs
+        H200 141GB share cc + SM count). Empty when ``sm_count`` is unknown (degrades
+        like a GPU-less host); ``total_mem`` is omitted when VRAM is unknown."""
         if self.sm_count is None or self.smem_per_sm is None:
             return {}
-        return {
+        feats = {
             "sm_count": float(self.sm_count),
             "smem_per_sm": float(self.smem_per_sm),
             "smem_per_block": float(self.smem_per_block),
             "regs_per_block": float(self.regs_per_block),
             "warp_size": float(self.warp_size),
         }
+        if self.vram_bytes is not None:
+            feats["total_mem"] = float(self.vram_bytes)
+        return feats
 
 
 # Specs marked "measured" are exact values probed off the live card (recorded in
@@ -286,7 +293,26 @@ def probe_live_features(fallback_name: str | None = None) -> dict[str, float]:
             "smem_per_block": float(props["sharedMemPerBlock"]),
             "regs_per_block": float(props["regsPerBlock"]),
             "warp_size": float(props["warpSize"]),
+            "total_mem": float(props["totalGlobalMem"]),
         }
     except Exception:  # noqa: BLE001 — no live device ⇒ memorized fallback
         spec = (by_name(fallback_name) if fallback_name else None) or DEFAULT_GPU
         return spec.device_features()
+
+
+@functools.cache
+def live_name() -> str | None:
+    """The live CUDA device's PCIe product name (``cudaDeviceProp.name``), canonicalized
+    through the registry (:func:`by_name`) when recognized, else the raw reported name;
+    ``None`` when no device is visible. The hardware identity that distinguishes same-die
+    SKUs (H100 vs H200) — ``compute_capability`` + SM features alone can't. Cached:
+    physical, target-independent."""
+    try:
+        import cupy as cp  # noqa: PLC0415
+
+        raw = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)["name"]
+    except Exception:  # noqa: BLE001 — no live device
+        return None
+    name = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+    spec = by_name(name)
+    return spec.name if spec else name

@@ -340,7 +340,7 @@ def test_prior_nodes_smoke(run_cli, tmp_path):
     assert rc == 0, f"stderr: {stderr}"
     assert "node store: 3 nodes" in stdout
     assert "fork sibling-ranking" in stdout
-    assert "leaf reachability over node store" in stdout
+    assert "leaf reachability" in stdout
     assert "traceback" not in (stdout + stderr).lower()
 
 

@@ -362,18 +362,22 @@ class TuningSearch(Search):
             rows.append((knobs, 1.0 / node.best_reward))
         return rows
 
-    def _node_key(self, feats: dict, op_sig: str, context_key: str) -> str:
-        """Identity of a node within its operation: a digest over the deploy
-        regime (``context_key``), the op's ``S_*`` signature (``op_sig``), and the
-        canonical tunable-knob set. ``S_*`` / ``H_*`` features are excluded from the
-        set — they are already folded via ``op_sig`` / ``context_key`` — so the key
-        is the "within-op node identity". ``str()``-ified values mirror
-        :meth:`_o3_sig` so list-valued knobs (``OVERHANG``) stay stable, and the
-        sorted tuple keeps :func:`digest` (order-sensitive) deterministic."""
+    def _node_key(self, feats: dict, op_sig: str, context_key: str, gpu: str) -> str:
+        """Identity of a node within its operation *on its hardware*: a digest over the
+        deploy regime (``context_key``), the card identity (``gpu`` —
+        ``Context.hardware_id``), the op's ``S_*`` signature (``op_sig``), and the
+        canonical tunable-knob set. ``gpu`` is folded in because ``context_key`` (cc +
+        opt only) can't tell same-die SKUs apart (H100 vs H200), so without it their
+        rows would collide and keep-min would silently drop one card's data. ``S_*`` /
+        ``H_*`` features are excluded from the set — already folded via ``op_sig`` /
+        ``context_key`` (and ``gpu``) — so the key is the within-op node identity.
+        ``str()``-ified values mirror :meth:`_o3_sig` so list-valued knobs
+        (``OVERHANG``) stay stable, and the sorted tuple keeps :func:`digest`
+        (order-sensitive) deterministic."""
         tun = tuple(sorted((k, str(v)) for k, v in feats.items() if not k.startswith(("S_", "H_"))))
-        return digest(context_key, op_sig, tun)
+        return digest(context_key, gpu, op_sig, tun)
 
-    def _collect_node_records(self, *, context_key: str, op_sig: str) -> list[tuple]:
+    def _collect_node_records(self, *, context_key: str, op_sig: str, gpu: str = "") -> list[tuple]:
         """Post-search tree walk producing keyed, parent-linked node records for
         :meth:`SearchDB.record_nodes` — the persistent/keyed/deduped sibling of
         :meth:`_collect_rows` (which feeds the prior's in-memory reservoir).
@@ -400,7 +404,7 @@ class TuningSearch(Search):
                 feats = node.realized_knobs if node.realized_knobs is not None else self._node_knobs(node)
                 value_us = 1.0 / node.best_reward
                 assert parent_value is None or value_us >= parent_value - 1e-9, "value-of-position not monotone up the tree"
-                nk = self._node_key(feats, op_sig, context_key)
+                nk = self._node_key(feats, op_sig, context_key, gpu)
                 out.append((nk, parent_key, feats, value_us, depth))
                 parent_value = value_us
             for child in node.children:

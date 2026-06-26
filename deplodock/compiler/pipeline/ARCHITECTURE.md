@@ -378,11 +378,17 @@ The autotune state is split across two cooperating modules:
   full stats (`latency_us_{median,min,max,mean,variance}`,
   `n_samples`, `backend`, `status`, `knobs`), and a `node` table — one
   row per **search-tree node** (every partial branch + leaf of a per-kernel
-  search), keyed by `digest(context_key, op_sig, tunable-knob set)`, carrying
+  search), keyed by `digest(context_key, gpu, op_sig, tunable-knob set)`, carrying
   the full feature dict the prior sees (`H_*` + `S_*` + knobs), a keep-the-minimum
   value-of-position latency (`1/best_reward`), a `parent_key` pointer (ancestry
-  is the live tree edge, not knob-subset inference), and `depth`/`n_updates`
-  bookkeeping (written by `record_nodes`, fed by `TuningSearch._collect_node_records`).
+  is the live tree edge, not knob-subset inference), a `gpu` column, and
+  `depth`/`n_updates` bookkeeping (written by `record_nodes`, fed by
+  `TuningSearch._collect_node_records`). The `gpu` identity (`Context.hardware_id` —
+  the PCIe product name) is folded into the key so a **cross-hardware** dataset
+  never collides: `context_key` (cc + opt only) can't separate same-die SKUs (H100
+  vs H200 share cc + SM count), so without `gpu` their rows would merge and keep-min
+  would silently drop one card's data (the `H_total_mem` VRAM feature is what then
+  lets the prior model the difference).
   `node` is content-keyed like `perf` (parent-tree-independent) and survives a
   `_SCHEMA_VERSION` bump; only the topology-keyed `lowering` table is dropped on
   mismatch. Selection statistic is the median.
@@ -571,10 +577,13 @@ deduplicated, parent-linked counterpart to the unkeyed/sampled reservoir. Each n
 `digest(context_key, op_sig, tunable-knob set)`, so the same position re-encountered across runs collapses to one row with a
 keep-the-minimum value-of-position latency; it carries the full `knob_features` input dict, and stores `parent_key` from the
 live `node.parent` edge so ancestry is recoverable. The prior still *trains* from the in-memory reservoir, but the `node`
-store is *read back* by `eval prior --dataset nodes` (`SearchDB.iter_nodes` → `diagnostics.node_report`): it groups nodes by
-`parent_key` and scores the **fork sibling-ranking** — does the prior order each fork's children (the partial configs it
-ranks during `_select`) by their best-reachable latency (top-1 hit + per-fork Spearman)? — the search-faithful evaluation
-no leaf-only view can give, alongside leaf reachability/calibration reused on the deduped store.
+store is *read back* by `eval prior --dataset nodes` (`SearchDB.iter_nodes` → `diagnostics.node_report`): **per card**,
+it groups nodes by `parent_key` and scores the **fork sibling-ranking** — does the prior order each fork's children (the
+partial configs it ranks during `_select`) by their best-reachable latency (top-1 hit + per-fork Spearman)? — the
+search-faithful evaluation no leaf-only view can give, alongside leaf reachability/calibration reused on the deduped
+store. The per-card grouping matters for a cross-hardware dataset: same-die SKUs (H100/H200) share an `S_*` op signature
+(the leaf-reachability group key) but not their latencies, so mixing them would corrupt both metrics — the `gpu` key
+keeps their rows distinct and `node_report` reports them in separate blocks.
 
 Why CatBoost (chosen by `scripts/prior_bakeoff.py` over a multi-op tuning dataset): the model's greedy pick must not run
 off to a degenerate corner. A linear model (the former `BayesianRidgePrior`) is monotone in every knob, so its optimum is

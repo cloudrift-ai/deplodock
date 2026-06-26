@@ -31,8 +31,9 @@ def test_derived_cc_facts():
 
 def test_device_features_shape():
     feats = gpu.by_name("NVIDIA GeForce RTX 5090").device_features()
-    assert set(feats) == {"sm_count", "smem_per_sm", "smem_per_block", "regs_per_block", "warp_size"}
+    assert set(feats) == {"sm_count", "smem_per_sm", "smem_per_block", "regs_per_block", "warp_size", "total_mem"}
     assert feats["sm_count"] == 170.0
+    assert feats["total_mem"] == gpu.by_name("NVIDIA GeForce RTX 5090").vram_bytes  # distinguishes same-die SKUs
     # AMD card has no CUDA specs → empty feature dict (degrades like a GPU-less host).
     assert gpu.by_name("AMD Instinct MI350X").device_features() == {}
 
@@ -51,6 +52,23 @@ def test_probe_falls_back_to_memorized(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", no_cupy)
     assert gpu.probe_live_features() == gpu.DEFAULT_GPU.device_features()
     assert gpu.probe_live_features("NVIDIA GeForce RTX 4090")["sm_count"] == 128.0
+    # total_mem (the same-die SKU discriminator) rides the fallback too.
+    assert gpu.probe_live_features("NVIDIA GeForce RTX 4090")["total_mem"] == gpu.by_name("NVIDIA GeForce RTX 4090").vram_bytes
+
+
+def test_hardware_id_distinguishes_same_die_skus(monkeypatch):
+    """``Context.hardware_id`` keys on the product name when known — so H100 and H200
+    (identical cc + SM features) get distinct identities; an unnamed context falls back
+    to a device-regime digest. And ``features()`` carries ``H_total_mem``."""
+    from deplodock.compiler.context import Context
+
+    h100 = Context.from_target((9, 0), gpu_name="NVIDIA H100 80GB")
+    h200 = Context.from_target((9, 0), gpu_name="NVIDIA H200 141GB")
+    assert h100.hardware_id() != h200.hardware_id()  # same cc, distinct product → distinct id
+    assert h100.features()["H_total_mem"] != h200.features()["H_total_mem"]  # the distinguishing feature
+    # No product name → a stable digest, not a crash.
+    anon = Context(compute_capability=(9, 0))
+    assert isinstance(anon.hardware_id(), str) and anon.hardware_id()
 
 
 def test_back_compat_maps_match_registry():

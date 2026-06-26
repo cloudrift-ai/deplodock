@@ -224,7 +224,7 @@ def test_open_readonly_missing_file_raises(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _node_row(node_key: str, value_us: float, *, parent_key=None, op_sig="sig", features=None, depth=1) -> NodeRow:
+def _node_row(node_key: str, value_us: float, *, parent_key=None, op_sig="sig", features=None, depth=1, gpu="") -> NodeRow:
     return NodeRow(
         node_key=node_key,
         parent_key=parent_key,
@@ -233,6 +233,7 @@ def _node_row(node_key: str, value_us: float, *, parent_key=None, op_sig="sig", 
         features=features or {},
         value_us=value_us,
         depth=depth,
+        gpu=gpu,
     )
 
 
@@ -339,6 +340,51 @@ def test_iter_nodes_missing_table_degrades(tmp_path) -> None:
     ro = SearchDB.open_readonly(path)
     assert not ro._has_node_table()
     assert list(ro.iter_nodes()) == []
+    ro.close()
+
+
+def test_record_nodes_gpu_column_roundtrips(tmp_path) -> None:
+    db = SearchDB(tmp_path / "t.db")
+    db.record_nodes([_node_row("n1", 5.0, features={"BM": 8}, gpu="NVIDIA H200 141GB")])
+    (n,) = list(db.iter_nodes())
+    assert n.gpu == "NVIDIA H200 141GB"
+
+
+_PRE_GPU_NODE_SCHEMA = (
+    "CREATE TABLE node (node_key TEXT PRIMARY KEY, parent_key TEXT, context_key TEXT NOT NULL, "
+    "op_sig TEXT NOT NULL, features TEXT NOT NULL DEFAULT '{}', value_us REAL NOT NULL, "
+    "depth INTEGER NOT NULL, n_updates INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL); "
+    "INSERT INTO node VALUES ('old', NULL, 'ctx', 'mm', '{}', 3.0, 1, 1, 'now');"
+)
+
+
+def test_node_gpu_column_added_to_pre_gpu_db(tmp_path) -> None:
+    """A ``node`` table from the first node-store version (no ``gpu`` column) gains it
+    on the next writer open — the ALTER runs *before* the schema loop so the
+    ``node_gpu`` index builds; old rows default to ''."""
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(_PRE_GPU_NODE_SCHEMA)
+    con.commit()
+    con.close()
+    db = SearchDB(path)  # writer migrates: ALTER adds gpu, then node_gpu index builds
+    assert db._has_node_gpu_column()
+    assert list(db.iter_nodes())[0].gpu == ""  # pre-existing row defaults
+    db.record_nodes([_node_row("new", 2.0, gpu="NVIDIA H100 80GB")])
+    assert {n.node_key: n.gpu for n in db.iter_nodes()}["new"] == "NVIDIA H100 80GB"
+
+
+def test_iter_nodes_pre_gpu_column_readonly_degrades(tmp_path) -> None:
+    """A read-only open of a pre-``gpu``-column DB degrades ``gpu`` to '' rather than
+    raising (the additive ALTER is writer-side only)."""
+    path = tmp_path / "ro.db"
+    con = sqlite3.connect(path)
+    con.executescript(_PRE_GPU_NODE_SCHEMA)
+    con.commit()
+    con.close()
+    ro = SearchDB.open_readonly(path)
+    assert not ro._has_node_gpu_column()
+    assert list(ro.iter_nodes())[0].gpu == ""
     ro.close()
 
 

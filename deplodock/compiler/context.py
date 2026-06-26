@@ -113,6 +113,13 @@ class Context:
     # which would mis-model an RTX PRO 6000 golden ranked on an RTX 5090 (both
     # cc 12.0 but 188 vs 170 SMs). NOT in ``structural_key`` (device-physical).
     device_props: dict = field(default_factory=dict)
+    # PCIe product name of the card this context is for (e.g. "NVIDIA H200 141GB"),
+    # set by ``from_target(gpu_name=…)`` or probed live (``gpu.live_name``). The one
+    # identity that separates same-die SKUs (H100 vs H200: identical cc + SM features,
+    # different VRAM) — used by the node-store key + ``gpu`` column so cross-hardware
+    # tuning data never collides. NOT in ``structural_key`` (the perf cache stays
+    # SKU-coarse on purpose; only the node *dataset* keys on it). ``None`` ⇒ unknown.
+    gpu_name: str | None = None
     # Identifies which backend's perf rows this compile reads/writes — the
     # tune DB keys ``perf`` by ``(context_key, op_key, backend)``. Defaults to
     # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
@@ -152,6 +159,7 @@ class Context:
             max_dynamic_smem=_max_dynamic_smem_for(cap),
             sm_count=sm,
             device_props=props,
+            gpu_name=spec.name if spec else gpu_name,
             compile_flags=_env_compile_flags(),
         )
 
@@ -171,6 +179,19 @@ class Context:
 
         return digest("Context", self.compute_capability, self.compile_flags)
 
+    def hardware_id(self) -> str:
+        """A stable per-card identity for the node-store key + ``gpu`` column: the PCIe
+        product name when known, else a digest of the device-physical regime (``H_*``
+        features + capability). Separates same-die SKUs (H100 vs H200) that
+        ``structural_key`` (cc + opt only) and the SM-only ``H_*`` features can't, so a
+        cross-hardware node dataset never collides."""
+        if self.gpu_name:
+            return self.gpu_name
+        from deplodock.compiler.structural import digest  # noqa: PLC0415
+
+        regime = sorted((k, v) for k, v in self.features().items() if k.startswith("H_"))
+        return digest("hw", self.compute_capability, regime)
+
     def features(self) -> dict[str, float]:
         """Host/hardware regime as ``H_*`` features for the learned prior, so a
         SINGLE global prior spans every GPU and nvcc opt level (these are
@@ -185,8 +206,10 @@ class Context:
         - ``H_opt`` — nvcc cicc opt level from ``compile_flags`` (tune's
           ``-Xcicc -O1`` → 1; compile/run's default → 3)
         - ``H_sm_count`` / ``H_smem_per_sm`` / ``H_smem_per_block`` /
-          ``H_regs_per_block`` / ``H_warp_size`` — live device props
-          (:func:`target.live_device_features`; absent on GPU-less hosts)
+          ``H_regs_per_block`` / ``H_warp_size`` / ``H_total_mem`` — live device props
+          (:func:`target.live_device_features`; absent on GPU-less hosts). ``H_total_mem``
+          (VRAM bytes) is the one feature that distinguishes same-die SKUs the SM-only
+          features can't — H100 80GB vs H200 141GB share cc + SM count.
         """
         import re  # noqa: PLC0415
 
@@ -220,6 +243,7 @@ class Context:
         the launch. Without this distinction, ``--target sm_90`` on an
         sm_86 box would request 227 KB on a 99 KB device.
         """
+        from deplodock import gpu  # noqa: PLC0415
         from deplodock.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
 
         cap = compute_capability()
@@ -230,4 +254,10 @@ class Context:
             smem = _max_dynamic_smem_for(cap)
         else:
             smem = min(_max_dynamic_smem_for(cap), _max_dynamic_smem_for(live))
-        return cls(compute_capability=cap, max_dynamic_smem=smem, sm_count=_live_sm_count(), compile_flags=_env_compile_flags())
+        return cls(
+            compute_capability=cap,
+            max_dynamic_smem=smem,
+            sm_count=_live_sm_count(),
+            gpu_name=gpu.live_name(),
+            compile_flags=_env_compile_flags(),
+        )
