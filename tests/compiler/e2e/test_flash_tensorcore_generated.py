@@ -8,8 +8,10 @@ the ``FragmentRowReduce`` op for the fragment softmax), and matches torch SDPA. 
 default path (no ``CHAIN`` pin) is unchanged — the scalar streaming flash / materialized
 path still deploys, so this only fires under the explicit opt-in.
 
-v1 scope: fp16, non-causal, equal-head, ``D % 16 == 0``, ``S % 16 == 0`` — the reference
-kernel's scope (``test_flash_tensorcore_reference.py``). Out of scope falls back cleanly.
+v1 scope: fp16 / bf16, causal or non-causal, equal-head, ``D % 16 == 0``, ``S % 16 == 0``.
+The softmax is generated from the carrier by the fragment realizer (``_frag_softmax``), so
+dtype (f32 algebra) and causal (a score-partial mask) are orthogonal — this file covers
+their cross-product. Out of scope falls back cleanly.
 """
 
 from __future__ import annotations
@@ -90,6 +92,46 @@ def test_generated_tensorcore_flash_bf16_matches_torch(monkeypatch, B, H, S, D):
     got = torch.from_numpy(got_bits).view(torch.bfloat16).float().numpy()
     max_diff = float(np.max(np.abs(got - eager)))
     assert max_diff < 5e-2, f"generated bf16 TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
+
+
+@requires_cuda
+@pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (1, 4, 128, 64)])
+def test_generated_tensorcore_flash_causal_bf16_matches_torch(monkeypatch, B, H, S, D):
+    """The cross-product: bf16 operands AND the fragment causal mask, together. The
+    softmax realizer is dtype-agnostic (f32 algebra) and causal is a score-partial mask,
+    so the two compose with no special-casing — validated vs torch's bf16 is_causal SDPA."""
+    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    torch.manual_seed(S + D + 2)
+    q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
+    graph = _CausalSdpa().cpu()
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from deplodock.compiler.trace.torch import trace_module
+
+    g = trace_module(graph, (q, k, v))
+    backend = CudaBackend()
+    compiled = backend.compile(g)
+    kernels = [nid for nid in compiled.nodes if getattr(compiled.nodes[nid].op, "kernel_source", None)]
+    assert len(kernels) == 1, f"fused causal bf16 TC flash should be one kernel, got {len(kernels)}"
+    src = compiled.nodes[kernels[0]].op.kernel_source
+    assert "dpl_mma_m16n8k16_bf16" in src and "flash_pv_smem" in src
+
+    def ref():
+        with torch.no_grad():
+            return (
+                torch.nn.functional.scaled_dot_product_attention(q.cuda(), k.cuda(), v.cuda(), is_causal=True)
+                .cpu()
+                .flatten()
+                .float()
+                .numpy()
+            )
+
+    data = {n: t.view(torch.uint16).numpy() for n, t in zip(g.inputs, (q, k, v), strict=True)}
+    run_result, eager = backend.run(compiled, input_data=data, pre_run=ref)
+    got_bits = list(run_result.outputs.values())[0].flatten().astype(np.uint16)
+    got = torch.from_numpy(got_bits).view(torch.bfloat16).float().numpy()
+    max_diff = float(np.max(np.abs(got - eager)))
+    assert max_diff < 5e-2, f"generated causal bf16 TC flash {(B, H, S, D)} max_diff={max_diff:.2e}"
 
 
 class _CausalSdpa(torch.nn.Module):

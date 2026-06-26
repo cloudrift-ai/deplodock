@@ -6,6 +6,20 @@ A twisted ``MONOID(SEMIRING)`` carrier (flash attention's online softmax: ``stat
 program (a fixpoint over SSA reads), so it lives here — next to ``Monoid`` in ``ir/stmt`` — rather
 than inside any one pass, and is shared by the enumeration ``chain_build`` (the cooperative /
 cross-thread realization) and the assembly fragment realizer (the m16n8 tensor-core realization).
+
+One carrier algebra, three **realizations** (each consumes the same ``Monoid`` surface — the
+``merge`` / ``combine_states`` programs over ``carried_names`` / ``partial`` — and differs only in
+how state and partials are distributed):
+
+- **streaming** (one thread, serial) — ``Monoid.render`` → ``render_merge_program`` (the per-KV-tile
+  fold, inline in the loop body).
+- **cross-thread** (lanes / smem) — ``lowering/kernel/_combine.emit_combine`` → ``WarpShuffle`` /
+  ``TreeHalve`` (the cooperative reduce of a partial split across the CTA's threads).
+- **fragment** (m16n8 tensor-core registers) — ``assembly/_frag_softmax.realize_fragment_softmax``
+  → ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` (the warp-chain flash softmax).
+
+The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
+structure — not two hand-authored transcriptions.
 """
 
 from __future__ import annotations

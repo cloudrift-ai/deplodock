@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from deplodock.compiler.ir.kernel.ir import FragmentCausalMask, FragmentExp, FragmentRowReduce, FragmentScale, Reassign
 from deplodock.compiler.ir.stmt import Assign, Init
+from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragGeom,
     realize_fragment_softmax,
     realize_score_mask,
 )
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
 def _geom(nd: int = 4) -> FragGeom:
