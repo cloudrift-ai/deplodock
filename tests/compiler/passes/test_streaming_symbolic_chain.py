@@ -99,3 +99,52 @@ def test_static_stream_stays_scalar_monoid_by_default():
     for leaf in _coop._streaming_leaves(op):
         assert score_key not in leaf.knobs, "static default must not place the score INLINE (no chain)"
         assert not _has_shared_score_register(leaf), "static default must stay the scalar monoid stream"
+
+
+def test_flash_cells_atomize_via_the_generic_unit():
+    """Capability 1 (the foundation for dissolving ``realize_flash``): the two flash cells in the
+    **logical seed** atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell``
+    — the QK^T (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V
+    (``frag_a``) to a **canonical-B** ``A=prob-fragment`` cell. This is what ``realize_flash``
+    hand-builds today; the remaining capability-1 work (the ``warp_chain_build`` move) is the
+    orchestration that walks the seed + the split carrier to assemble these into a warp-streaming
+    ``TileGraph`` (then capability 3 — the ``assemble_carry`` walk — replaces ``realize_flash``).
+    CPU-only."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.expr import Var
+    from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
+    from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
+    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import _chain_axes
+
+    op = _flash_op(Dim(64))
+    dag = op.dag
+    block = op.tilegraph.blocks[0]
+    chain = dag.chain
+    kv = chain.hinge_name
+    atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
+
+    kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
+    value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
+    _d_axis, m_axis, _grid = _chain_axes(dag, value_load)  # m_axis = the query row (derived, not hard-coded)
+
+    # QK^T: the inner reduce cell of the kv loop → the INLINE score (M=query row, N=kv stream).
+    qkt_cell = next(s for s in kv_loop.body if isinstance(s, Loop))  # the D-reduce
+    qkt = next(
+        s
+        for s in atomize_cell(tuple(qkt_cell.body), atom=atom, k_name=qkt_cell.axis.name, write=None, out_index=(Var(m_axis.name), Var(kv)))
+        if isinstance(s, Mma)
+    )
+    assert qkt.b_trans is True, "Q@K^T must atomize transposed-B"
+
+    # P@V: the split-carrier accumulation as a fragment-A cell (A = the probability fragment, B = V).
+    _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
+    prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
+    pv_cell = (
+        Load(name="vv", input="v", index=value_load.index),
+        Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")),
+        Accum(name=d_state, value="pv"),
+    )
+    pv = next(s for s in atomize_cell(pv_cell, atom=atom, k_name=kv, write=None, frag_a=True) if isinstance(s, Mma))
+    assert pv.b_trans is False and pv.a == prob, "P@V must atomize canonical-B with A = the probability fragment"
