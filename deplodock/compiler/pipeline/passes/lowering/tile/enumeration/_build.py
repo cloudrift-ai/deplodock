@@ -433,23 +433,23 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     ``d``-independent) pass through shared, once per KV step. ``m`` binds THREAD, the
     shared axes GRID. The reduce axes stay serial (``BN=1`` per step — the per-KV online
     fold)."""
-    chain = dag.chain
-    if chain is None:
-        raise ValueError("chain_build requires a carried-contraction-chain (streaming MONOID(SEMIRING)) nest")
+    reduction = dag.reduction
+    if reduction is None or reduction.inner is None:
+        raise ValueError("chain_build requires a streaming MONOID(SEMIRING) reduction (inner contraction present)")
     block = graph.blocks[0]
     body = tuple(block.compute)
-    carrier = chain.carrier
+    carrier = reduction.carrier
     value_name = carrier.partial[1]
 
     # Locate the KV stream loop + its carrier / value load.
-    kv_loop = next(s for s in body if isinstance(s, Loop) and s.axis.name == chain.hinge_name)
+    kv_loop = next(s for s in body if isinstance(s, Loop) and s.axis.name == reduction.hinge_name)
     kv_body = tuple(kv_loop.body)
     value_load = next(s for s in kv_body if isinstance(s, Load) and s.name == value_name)
     monoid = next(s for s in kv_body if isinstance(s, Monoid))
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
     stats, accum, _d_state = split_carrier(carrier, value_name)
-    m_axis, d_axis, grid = chain_free_axes(chain, dag)  # walk the composition for the geometry — no stored view
+    m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry — no stored view
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
     d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
@@ -513,8 +513,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     (softmax / scale / mask / handoff / epilogue) — the path that replaced ``realize_flash``."""
     tg = op.tilegraph
     block = tg.blocks[0]
-    chain = op.dag.chain
-    kv = chain.hinge_name
+    reduction = op.dag.reduction
+    kv = reduction.hinge_name
     kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
     qkt_loop = next(s for s in kv_loop.body if isinstance(s, Loop))  # the QK^T D-reduce loop
     qkt_body, a3_name = tuple(qkt_loop.body), qkt_loop.axis.name
@@ -526,8 +526,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if dtype == BF16 else "mma_m16n8k16_f16"]
     atom_m, atom_n, atom_k = atom.shape
 
-    value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
-    m_axis, d_axis, grid = chain_free_axes(chain, op.dag)  # walk the composition for the geometry — no stored view
+    value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == reduction.carrier.partial[1])
+    m_axis, d_axis, grid = chain_free_axes(reduction, op.dag)  # walk the composition for the geometry — no stored view
 
     # σ-tile geometry. m (query row) → m_b·atom_m (GRID block, atom owns the 16 lane); kv (stream)
     # → kv_b·16 (serial-outer carry, the 16-key tile owned by atom_n/atom_k); the QK^T 16-col score
@@ -563,7 +563,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     # consume — the split-carrier P@V cell, σ-tiled per output N-atom (n) → a frag_a canonical-B Mma
     # (A = the probability fragment, B = V), accumulating O[d]. The kv tile (16 keys) is one atom_k:
     # a 1-trip ``kpv`` K loop (load K base ``a3_b·16 + kpv·atom_k``, the atom spans the 16 keys).
-    _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
+    _stats, accum, d_state = split_carrier(reduction.carrier, reduction.carrier.partial[1])
     prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
     kpv = "kpv"
     consume: list[Stmt] = []
@@ -583,7 +583,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     # carry_scope_from_graph realizes the fragment phases (softmax / scale / mask / C→A handoff /
     # epilogue) around these AtomTiles, reading causality off the ``Select``'s presence.
     mask = (score_mask,) if score_mask is not None else ()
-    new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, chain.carrier, *consume)), kind="serial_outer")
+    new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, reduction.carrier, *consume)), kind="serial_outer")
     head_inits = tuple(s for s in block.compute if isinstance(s, Init))
     epilogue = tuple(s for s in block.compute if isinstance(s, (Assign, Write)))
     compute = (*head_inits, new_kv, *epilogue)

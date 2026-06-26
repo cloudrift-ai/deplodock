@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering._predicates import (
     classify_fragment_epilogue,
     segmentable_k_extent,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain, IterDag
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, IterDag
 
 
 def classify_matmul_operands(loads, k_name: str, *, out_index=None):
@@ -211,22 +211,20 @@ def contraction_atomizes(
     """Does the SEMIRING :class:`~...Contraction` ``c`` fuse to ``atom`` on this device? The shared
     atom-fit over its reduce cell + its own ``out_index`` (the K divisibility / operand dtype /
     canonical-cell / A/B-classify core, :func:`cell_atomizes`). The **ONE** predicate both the
-    standalone matmul tier (:func:`_atom_eligible`, per contraction) and the flash chain
-    (:func:`chain_inner_atomizes`, on ``chain.inner``) gate on — a matmul and a flash QK^T reach
-    the warp tier through one representation and one question, named for no attention concept."""
+    standalone matmul tier (:func:`_atom_eligible`, per contraction) and the streaming flash
+    (:func:`inner_atomizes`, on ``reduction.inner``) gate on — a matmul and a flash QK^T reach the
+    warp tier through one representation and one question, named for no attention concept."""
     return cell_atomizes(
         c.node.loop, atom, compute_capability=compute_capability, dtype_of=dtype_of, out_index=c.out_index, produced=produced
     )
 
 
-def chain_inner_atomizes(chain: ContractionChain, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
-    """Whether a streaming chain's inner SEMIRING contraction independently reaches the warp
-    tensor-core tier — :func:`contraction_atomizes` on ``chain.inner``, the SAME call the standalone
+def inner_atomizes(inner: Contraction, *, compute_capability: tuple[int, int], dtype_of: Callable[[str], object]) -> bool:
+    """Whether a streaming reduction's inner SEMIRING :class:`Contraction` independently reaches the
+    warp tensor-core tier — :func:`contraction_atomizes` for any atom, the SAME call the standalone
     matmul tier makes per contraction. The DAG invariant behind warp-chain routing: a warp chain is
-    just a chain whose inner contraction tensorizes — no attention concept, no flash shape match."""
-    return any(
-        contraction_atomizes(chain.inner, a, compute_capability=compute_capability, dtype_of=dtype_of) for a in ATOM_REGISTRY.values()
-    )
+    just a ``MonoidReduction`` whose inner contraction tensorizes — no attention concept, no shape match."""
+    return any(contraction_atomizes(inner, a, compute_capability=compute_capability, dtype_of=dtype_of) for a in ATOM_REGISTRY.values())
 
 
 # === The ``atomize`` body edit (the atom layer's move) =====================

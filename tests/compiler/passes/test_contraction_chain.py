@@ -4,7 +4,7 @@ A streaming-flash nest is a ``Monoid`` carrier streaming over a *nested* QK^T
 contraction. Unification 3 reads it as a **chain on a shared axis**: ``kv`` is the
 dual-role hinge — free-output of the inner QK^T contraction, reduce of the outer P@V
 contraction (embedded in the carrier's ``O = O·α + p·v``) and of the carrier. These
-tests pin the **derived view** ``IterDag.chain`` exposing that structure; it is a
+tests pin the **derived view** ``IterDag.reduction`` exposing that structure; it is a
 projection of the body (computed on demand), so a non-streaming nest yields ``None``
 and a flash nest yields the hinge + the inner SEMIRING contraction + the carrier.
 
@@ -52,7 +52,7 @@ _S, _D = 16, 8  # the streaming KV extent (hinge) and the head-dim (inner QK^T r
 def test_streaming_flash_exposes_the_chain():
     dag = iter_dag(_flash_loop())
     assert dag.streaming, "a flash nest must be streaming"
-    chain = dag.chain
+    chain = dag.reduction
     assert chain is not None, "a streaming flash nest must expose the carried contraction chain"
 
     # The hinge carries the online-softmax Monoid (the streaming reduce + the outer P@V
@@ -71,7 +71,7 @@ def test_chain_hinge_is_dual_role():
     of the inner QK^T contraction (it indexes K inside the QK^T body but is not the QK^T
     reduce axis)."""
     dag = iter_dag(_flash_loop())
-    chain = dag.chain
+    chain = dag.reduction
     hinge, inner = chain.hinge_name, chain.inner.loop
 
     # The inner contraction reduces the head-dim, not the hinge.
@@ -85,7 +85,7 @@ def test_chain_score_is_the_carrier_partial():
     """The score edge is the inner contraction's result the carrier folds — the
     carrier's first partial (the INLINE edge value 1c materializes)."""
     dag = iter_dag(_flash_loop())
-    chain = dag.chain
+    chain = dag.reduction
     assert chain.score == chain.carrier.partial[0]
 
 
@@ -97,7 +97,7 @@ def test_chain_is_a_monoid_over_semiring_composition():
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
 
     dag = iter_dag(_flash_loop())
-    chain = dag.chain
+    chain = dag.reduction
     assert isinstance(chain.carrier, Monoid), "the outer algebra is a MONOID carrier"
     assert isinstance(chain.inner, Contraction) and chain.inner.algebra is AlgebraKind.SEMIRING, "the inner operand is a SEMIRING"
     # The composition's invariant: the inner contraction's output column coord IS the hinge (the
@@ -140,7 +140,7 @@ def test_chain_free_axes_walks_the_composition():
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import chain_free_axes
 
     dag = iter_dag(_flash_loop())
-    chain = dag.chain
+    chain = dag.reduction
     m_axis, d_axis, grid = chain_free_axes(chain, dag)
     assert m_axis.name in chain.inner.out_index[-2].free_vars(), "m is the inner contraction's output row"
     assert m_axis.name not in (chain.hinge_name, d_axis.name), "m is neither the hinge nor the P@V output"
@@ -149,21 +149,21 @@ def test_chain_free_axes_walks_the_composition():
 
 
 def test_chain_post_init_enforces_the_hinge_invariant():
-    """A ``ContractionChain`` whose inner output column is NOT the hinge is rejected at construction
+    """A ``MonoidReduction`` whose inner output column is NOT the hinge is rejected at construction
     — the carried-chain invariant lives in the class, not in an external gate, so invalid states are
     unrepresentable."""
     import pytest
 
     from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, ContractionChain, chain_free_axes
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, MonoidReduction, chain_free_axes
 
     dag = iter_dag(_flash_loop())
-    good = dag.chain
+    good = dag.reduction
     m_axis, _d, _grid = chain_free_axes(good, dag)
     # Put a non-hinge axis (the query row) in the inner's output-column coord — must raise.
     broken_inner = Contraction(node=good.inner.node, result=good.inner.result, out_index=(Var(good.hinge_name), Var(m_axis.name)))
     with pytest.raises(ValueError, match="hinge"):
-        ContractionChain(carrier=good.carrier, hinge=good.hinge, inner=broken_inner)
+        MonoidReduction(carrier=good.carrier, axis=good.hinge, inner=broken_inner)
 
 
 def test_partition_free_axes_is_a_role_neutral_three_way_split():
@@ -185,7 +185,7 @@ def test_causal_chain_still_exposes_the_chain():
     """A causal mask folds a masked score; the chain still reports the carrier's
     first partial (whatever the carrier folds, not a hard-coded name)."""
     dag = iter_dag(_flash_loop(causal=True))
-    chain = dag.chain
+    chain = dag.reduction
     assert chain is not None
     assert chain.score == chain.carrier.partial[0]
     assert chain.hinge.algebra is AlgebraKind.MONOID
@@ -203,12 +203,13 @@ def _reduce_loop() -> LoopOp:
     return next(n.op for n in out.nodes.values() if type(n.op).__name__ == "LoopOp")
 
 
-def test_plain_reduce_has_no_chain():
-    """A flat (non-streaming) reduce is not a chain — ``chain`` is ``None`` there,
-    so the view stays specific to the carried-contraction shape."""
+def test_plain_reduce_is_a_reduction_with_no_inner():
+    """A flat (non-streaming) reduce is the SAME ``MonoidReduction`` class as flash — just with no
+    inner contraction (``inner is None``). The composition is uniform; flash is the inner-present case."""
     dag = iter_dag(_reduce_loop())
     assert not dag.streaming
-    assert dag.chain is None
+    reduction = dag.reduction
+    assert reduction is not None and reduction.inner is None, "a flat reduce is a MonoidReduction with no inner"
 
 
 # --- 1b: classify recognizes MONOID(SEMIRING) -------------------------------------
@@ -224,7 +225,7 @@ def test_classify_streaming_is_compositional():
     assert regime.algebra is AlgebraKind.MONOID
     assert regime.inner_algebra is AlgebraKind.SEMIRING
     # Both contraction axes (the hinge kv stream + the inner QK^T reduce) are rewritten.
-    assert {dag.chain.hinge_name, dag.chain.inner_name} <= regime.target_names
+    assert {dag.reduction.hinge_name, dag.reduction.inner_name} <= regime.target_names
 
 
 def test_classify_flat_monoid_is_not_compositional():
@@ -243,7 +244,7 @@ def test_legal_decomps_splits_the_hinge_under_both_traits():
     recombine is the Monoid's ``combine_states``). One ``Monoid`` carrier carries both,
     which is exactly why the shared-axis tiling (1c) is sound."""
     dag = iter_dag(_flash_loop())
-    chain = dag.chain
+    chain = dag.reduction
     carrier, kv, ext = chain.carrier, chain.hinge.loop.axis, chain.hinge.extent
     bn = 4
     placement = [Role.THREAD, Role.STAGE_INNER, Role.REGISTER]
@@ -290,8 +291,8 @@ def test_chain_build_splits_the_carrier_into_two_cells():
     accum, stats = by_state[0], by_state[1]
     assert len(accum.state) == 1 and len(stats.state) == 2
     # The accumulation carrier folds the value partial; the stats carrier folds the score.
-    assert accum.partial[0] == dag.chain.carrier.partial[1]  # the value (V)
-    assert stats.partial[0] == dag.chain.carrier.partial[0]  # the score
+    assert accum.partial[0] == dag.reduction.carrier.partial[1]  # the value (V)
+    assert stats.partial[0] == dag.reduction.carrier.partial[0]  # the score
 
 
 def test_chain_build_puts_the_pv_output_in_registers():
@@ -324,5 +325,5 @@ def test_chain_build_degenerates_to_torch_oracle_offline():
     import pytest  # noqa: PLC0415
 
     dag = iter_dag(_reduce_loop())
-    with pytest.raises(ValueError, match="carried-contraction-chain"):
+    with pytest.raises(ValueError, match="inner contraction present"):
         chain_build(seed_graph(dag, kernel_name="r"), dag, {})

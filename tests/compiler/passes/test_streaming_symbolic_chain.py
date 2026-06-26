@@ -49,7 +49,7 @@ def _flash_op(s_dim: Dim) -> TileGraphOp:
     loop = build_flash_frag("q", "k", "v", shp, shp, shp, out, causal=False).nodes["o"].op
     dag = iter_dag(loop)
     regime = classify(dag)
-    assert regime is not None and regime.algebra is AlgebraKind.MONOID and dag.streaming and dag.chain is not None
+    assert regime is not None and regime.algebra is AlgebraKind.MONOID and dag.streaming and dag.reduction.inner is not None
     buffers = {n: Buffer(name=n, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM) for n, t in loop.inputs.items()}
     for t in loop.outputs.values():
         buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
@@ -83,7 +83,7 @@ def test_symbolic_stream_routes_to_chain_build():
     assert op.dag.k_bound is not None, "the streaming axis must be symbolic for this case"
     leaves = _coop._streaming_leaves(op)
     assert leaves, "symbolic streaming flash produced no leaves"
-    score_key = fam.place_key(op.dag.chain.score)
+    score_key = fam.place_key(op.dag.reduction.score)
     for leaf in leaves:
         assert leaf.knobs.get(score_key) == fam.INLINE, "symbolic chain leaf must place the score INLINE"
         assert _has_shared_score_register(leaf), "symbolic chain leaf must carry the O[d] register vector"
@@ -95,7 +95,7 @@ def test_static_stream_stays_scalar_monoid_by_default():
     unchanged."""
     op = _flash_op(Dim(64))
     assert op.dag.k_bound is None, "the streaming axis must be static for this case"
-    score_key = fam.place_key(op.dag.chain.score)
+    score_key = fam.place_key(op.dag.reduction.score)
     for leaf in _coop._streaming_leaves(op):
         assert score_key not in leaf.knobs, "static default must not place the score INLINE (no chain)"
         assert not _has_shared_score_register(leaf), "static default must stay the scalar monoid stream"
@@ -117,7 +117,7 @@ def test_flash_cells_atomize_via_the_generic_unit():
     op = _flash_op(Dim(64))
     dag = op.dag
     block = op.tilegraph.blocks[0]
-    chain = dag.chain
+    chain = dag.reduction
     kv = chain.hinge_name
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
 
@@ -166,7 +166,7 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     # from the trace); supply the (B,H,S,D) fp16 buffers `warp_chain_build` reads the operand dtype off.
     buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
     op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
-    chain = dag.chain
+    chain = dag.reduction
     _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
     prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
 
