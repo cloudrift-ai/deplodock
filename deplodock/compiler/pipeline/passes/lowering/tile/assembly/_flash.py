@@ -10,7 +10,7 @@ fragment-softmax realization (`_frag_softmax` over the shared `carrier_algebra` 
 all the generic shared machinery.
 
 `split/005_warp_chain` is the eligibility/offer shim: it detects an in-scope flash `LoopOp`,
-reads the carrier + attaches the logical FA-2 TileGraph, and emits a `TileGraphOp(tilegraph=…, flash=carrier)`; the
+attaches the logical FA-2 TileGraph and marks the kv axis `Schedule.carry`; the
 assembly pass (`assembly/010_assemble`) calls :func:`realize_flash` on it. No separate assembler
 entry, no enumeration bypass at the Graph level — flash rides the standard TileGraphOp →
 assemble pass like every other kernel.
@@ -85,7 +85,7 @@ def realize_flash(op: TileGraphOp) -> TileOp:
     kernel passes. Driven by the **logical flash TileGraph** the offer shim ``split/005_warp_chain``
     attached: the geometry (q/k/v/out buffers + ``(B,H,S,D)`` + GQA + causal + symbolic ``seq``) is
     derived from the op's logical gmem ``buffers``, and the streaming online-softmax twisted
-    ``Monoid`` carrier rides ``op.flash``. The QK^T / P@V mma codegen is ``kernel/005``'s shared
+    ``Monoid`` carrier is read off ``block.carrier``. The QK^T / P@V mma codegen is ``kernel/005``'s shared
     AtomTile lowering; the softmax phases are ``realize_fragment_softmax(carrier)``."""
     block = op.tilegraph.blocks[0]
     buffers = op.buffers
@@ -98,7 +98,7 @@ def realize_flash(op: TileGraphOp) -> TileOp:
     S = _static(qshape[2])
     seq_var = None if S is not None else next(iter(qshape[2].expr.free_vars()))
     group = H // _static(buffers[k].shape[1])  # GQA: q-heads / kv-heads
-    carrier = op.flash  # the twisted online-softmax Monoid (split read it off dag.chain.carrier)
+    carrier = block.carrier.carrier  # the twisted online-softmax Monoid, read off the logical block
     atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if buffers[q].dtype == BF16 else "mma_m16n8k16_f16"]
     qk_bt, pv_bt = True, False  # QK^T transposed-B; P@V canonical-B (v1 m16n8k16)
     atom_m, atom_n, atom_k = atom.shape

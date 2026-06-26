@@ -39,10 +39,11 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     engine splices, the same shape the structural forks (``140_atomic_free_splitk``)
     return."""
     op: TileGraphOp = root.op
-    if op.flash is not None:
-        # Warp-tier streaming flash: realize it from the logical FA-2 ``tilegraph`` the offer
-        # shim ``split/005_warp_chain`` attached (geometry from ``op.buffers``, the twisted
-        # online-softmax carrier on ``op.flash``), through the generic carry assembler.
+    if op.tilegraph is not None and op.tilegraph.schedule.carry:
+        # Warp-tier streaming flash: the ``Schedule.carry`` representation marks the kv-stream
+        # axis as a fragment-tier online-softmax carrier. Realize it from the logical FA-2
+        # ``tilegraph`` (carrier read off ``block.carrier``, geometry off ``op.buffers``) through
+        # the generic carry assembler — dispatched purely off the schedule, no ``flash`` marker.
         return realize_flash(op)
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")

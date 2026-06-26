@@ -22,6 +22,7 @@ the symbolic shapes the warp chain declines (fp32, odd ``D``, additive mask).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import BF16, F16
@@ -107,17 +108,16 @@ def rewrite(ctx: Context, root: Node, match) -> TileGraphOp:  # noqa: ARG001
         raise RuleSkipped("flash shape out of the v1 warp-chain scope")
     # This pass is the eligibility/offer SHIM: emit a ``TileGraphOp`` carrying the **logical
     # flash TileGraph** (``seed_graph`` — the un-restructured FA-2 algorithm over q/k/v/o, the
-    # twisted online-softmax ``Monoid`` carrier intact) + the carrier on ``flash`` (the algebraic
-    # source the fragment realizer regenerates the softmax from; the assembler can't re-derive the
-    # *twisted* carrier from ``chain_build``'s split output). The assembly pass
-    # ``assembly/010_assemble`` realizes it via ``_flash.realize_flash`` through the generic carry
-    # assembler — geometry derived from ``buffers``, no flat spec, no separate assembler entry.
-    # ``dag`` is left unset so the enumeration forks skip the flash op (the ``flash`` marker
-    # routes it straight to assembly).
+    # twisted online-softmax ``Monoid`` carrier intact at ``block.carrier``) with the kv stream
+    # axis marked ``Schedule.carry`` — the representation that tells ``assembly/010_assemble`` to
+    # realize this carrier at the FRAGMENT tier (the warp chain). Geometry is derived from the
+    # logical ``buffers``; no flat spec, no ``flash`` marker, no separate assembler entry. ``dag``
+    # is left unset so the enumeration forks skip the op (it flows straight to assembly).
     buffers: dict[str, Buffer] = {}
     for name, t in op.inputs.items():
         buffers[name] = Buffer(name=name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
     for t in op.outputs.values():
         buffers[t.name] = Buffer(name=t.name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM)
     tg = seed_graph(dag, kernel_name=op.name, buffers=buffers)
-    return TileGraphOp(name=op.name, tilegraph=tg, buffers=buffers, flash=dag.chain.carrier)
+    tg = replace(tg, schedule=replace(tg.schedule, carry=frozenset({dag.chain.hinge_name})))
+    return TileGraphOp(name=op.name, tilegraph=tg, buffers=buffers)

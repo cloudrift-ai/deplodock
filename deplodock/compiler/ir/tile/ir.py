@@ -123,11 +123,6 @@ class Transport(enum.Enum):
     SYNC = "sync"
     CPASYNC = "cpasync"  # sm_80+
     TMA = "tma"  # sm_90+
-    FRAG = "frag"  # register-fragment → smem → register-fragment (the flash C→A handoff): a
-    # ``RegStore`` of the producer fragment into an smem slab + a ``Sync`` + an ``Ldmatrix`` of
-    # the consumer fragment. Unlike SYNC/CPASYNC/TMA (gmem→smem cooperative loads), the source is
-    # a live register fragment, not a gmem buffer — so ``synthesize_staging`` emits the fragment
-    # round-trip rather than a cooperative slab fill.
 
 
 class Placement(enum.Enum):
@@ -652,8 +647,6 @@ class TileGraphOp(Op):
     target_names: frozenset = frozenset()  # contraction-axis names a reduce move rewrites
     seed_key: str = ""  # the source LoopOp's body structural key
     buffers: dict = field(default_factory=dict)  # logical gmem Buffers (name -> Buffer) from the source LoopOp's I/O
-    flash: object = None  # the twisted online-softmax carrier Monoid — marks a warp-tier streaming-flash op the
-    # assembler realizes directly from the logical ``tilegraph`` (the ``split/005_warp_chain`` shim); ``None`` otherwise
 
     def structural_key(self) -> str:
         return self.tilegraph.structural_key() if self.tilegraph is not None else self.seed_key
