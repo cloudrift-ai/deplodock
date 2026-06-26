@@ -91,7 +91,10 @@ def rewrite(ctx: Context, root: Node, match) -> Graph:  # noqa: ARG001
     kind = "mma_m16n8k16_bf16" if dt == BF16 else "mma_m16n8k16_f16"
     qk = _classify_cell("Q", (Var("m"), Var("dd")), "K", (Var("kv"), Var("dd")), "dd", (Var("m"), Var("kv")), kind=kind)
     pv = _classify_cell("P", (Var("m"), Var("kv")), "V", (Var("kv"), Var("d")), "kv", None, kind=kind)
-    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal)
+    # The streaming online-softmax Monoid (state (m,l,O), partial (score,value)) — the
+    # algebraic source the fragment realizer regenerates the softmax phases from. Reading
+    # it here keeps the ``enumeration`` import in ``split``, not ``assembly``.
+    return assemble_warp_chain(op, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal, carrier=dag.chain.carrier)
 
 
 def _classify_cell(a_buf, a_idx, b_buf, b_idx, k_name, out_index, *, kind="mma_m16n8k16_f16"):

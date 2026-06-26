@@ -32,23 +32,16 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import (
-    FragmentCausalMask,
-    FragmentExp,
-    FragmentRowReduce,
-    FragmentScale,
-    LdmatrixLoad,
-    Reassign,
-    RegFragment,
-    RegStore,
-    Smem,
-    Sync,
-)
+from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Mma
+from deplodock.compiler.ir.stmt import Body, Load, Mma, Monoid
 from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, TileOp
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
+    FragGeom,
+    realize_fragment_softmax,
+    realize_score_mask,
+)
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, wrap_carry_tower
 
 
@@ -77,7 +70,20 @@ def _mul(a, b: int):
 
 
 def build_warp_chain_tileop(
-    loop_op: LoopOp, *, q: str, k: str, v: str, out: str, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, causal: bool = False
+    loop_op: LoopOp,
+    *,
+    q: str,
+    k: str,
+    v: str,
+    out: str,
+    B: int,
+    H: int,
+    S: int,
+    D: int,
+    qk: Mma,
+    pv: Mma,
+    carrier: Monoid,
+    causal: bool = False,
 ) -> TileOp:
     """The fused TC flash as a **TileOp** (``GridTile > WarpTile > [init] SerialTile [epilogue]``)
     for ``(B,H,S,D)`` 16-bit, optionally causal — routed through the generic kernel passes
@@ -98,8 +104,6 @@ def build_warp_chain_tileop(
     scale = f"{1.0 / math.sqrt(D)!r}f"
     kt = D // atom_k  # QK^T K-tiles (reduce over D)
     nd = D // atom_n  # P@V N-tiles (output over D)
-    add = ElementwiseImpl("add")
-    mx = ElementwiseImpl("maximum")
 
     bh, qb, kv = Var("bh"), Var("qb"), Var("kv")
     base = _mul(bh, S * D)  # (b,h) offset into the flat buffer
@@ -115,13 +119,23 @@ def build_warp_chain_tileop(
     # ``update``. ``wrap_carry_tower`` does the GridTile>WarpTile>[init]SerialTile[epilogue]
     # nesting — the streaming accumulator the generic single-cell assembly can't model.
 
-    # carried state + the Q A-fragments (loaded once, reused across the KV stream).
-    init: list = [
-        Init(name="m0", op=mx, dtype=F32),
-        Init(name="m1", op=mx, dtype=F32),
-        Init(name="l0", op=add, dtype=F32),
-        Init(name="l1", op=add, dtype=F32),
-    ]
+    # The softmax phases (init stats / merge / rescale / update / epilogue scales) are the
+    # **fragment realization** of the streaming online-softmax ``carrier`` — generated from
+    # its algebra, the m16n8 sibling of the cooperative ``emit_combine``. The fragment
+    # geometry (the N-atom score/prob frags, the D-atom O accumulators) is the contract with
+    # the hand-built scaffolding below (produce names ``Sf{nt}_frag``; the realizer's
+    # ``FragmentExp`` produces ``Pf{nt}`` the handoff stores; ``Of{n}`` are declared here).
+    geom = FragGeom(
+        atom_m=atom_m,
+        atom_n=atom_n,
+        score_frags=tuple(f"Sf{nt}_frag" for nt in range(2)),
+        prob_frags=tuple(f"Pf{nt}" for nt in range(2)),
+        accum_frags=tuple(f"Of{n}" for n in range(nd)),
+    )
+    fs = realize_fragment_softmax(carrier, geom=geom)
+
+    # carried state (the realizer's m/l Inits) + the O accumulators + the C→A smem slab.
+    init: list = list(fs.init)
     init += [RegFragment(name=f"Of{n}", role="c", shape=atom_shape, dtype=F32) for n in range(nd)]
     init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
 
@@ -149,37 +163,17 @@ def build_warp_chain_tileop(
         produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(cellbody), atom=qk.atom))
     produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(2)]
     if causal:
-        # The strict upper triangle (absolute key col > absolute query row) masked to
-        # -1e30 before the rowmax. q_row_base = qb*16 (the query-tile origin); kv_col_base
-        # = kv*16 + nt*8 (the kv-tile + N-atom origin). Same predicate on every tile —
-        # a no-op below the diagonal, all-masked above it.
-        produce += [
-            FragmentCausalMask(frag=f"Sf{nt}_frag", q_row_base=_mul(qb, 16), kv_col_base=_add(_mul(kv, 16), nt * 8)) for nt in range(2)
-        ]
+        # The fragment-tier score-partial mask (the realizer owns the FragmentCausalMask
+        # fan-out + the -1e30 identity): strict upper triangle (absolute key col > absolute
+        # query row) masked before the rowmax. q_row_base = qb*16 (query-tile origin);
+        # kv_col_base = kv*16 + nt*8 (kv-tile + N-atom origin) per score frag.
+        kv_col_bases = tuple(_add(_mul(kv, 16), nt * 8) for nt in range(2))
+        produce += realize_score_mask(geom, q_row_base=_mul(qb, 16), kv_col_bases=kv_col_bases)
 
-    # merge — the carrier's new state from this tile: rowmax → m_new / alpha; P = exp(S - m_new); rowsum → l.
-    merge: list = [
-        FragmentRowReduce(top="r0", bot="r1", frags=("Sf0_frag", "Sf1_frag"), op=mx),
-        Assign(name="mn0", op=mx, args=("m0", "r0")),
-        Assign(name="mn1", op=mx, args=("m1", "r1")),
-        Assign(name="dm0", op=ElementwiseImpl("subtract"), args=("m0", "mn0")),
-        Assign(name="dm1", op=ElementwiseImpl("subtract"), args=("m1", "mn1")),
-        Assign(name="alpha0", op=ElementwiseImpl("exp"), args=("dm0",)),
-        Assign(name="alpha1", op=ElementwiseImpl("exp"), args=("dm1",)),
-    ]
-    merge += [FragmentExp(out=f"Pf{nt}", src=f"Sf{nt}_frag", top_sub="mn0", bot_sub="mn1") for nt in range(2)]
-    merge += [
-        FragmentRowReduce(top="s0", bot="s1", frags=("Pf0", "Pf1"), op=add),
-        Assign(name="lm0", op=ElementwiseImpl("multiply"), args=("l0", "alpha0")),
-        Assign(name="lm1", op=ElementwiseImpl("multiply"), args=("l1", "alpha1")),
-        Assign(name="ln0", op=add, args=("lm0", "s0")),
-        Assign(name="ln1", op=add, args=("lm1", "s1")),
-        Reassign(name="l0", value="ln0"),
-        Reassign(name="l1", value="ln1"),
-    ]
-
-    # rescale — the twist: O *= alpha before the P@V accumulation.
-    rescale: list = [FragmentScale(frag=f"Of{n}", top="alpha0", bot="alpha1") for n in range(nd)]
+    # merge — the carrier's new state from this tile (rowmax → m_new / alpha; P = exp(S - m_new);
+    # rowsum → l); rescale — the twist O *= alpha. Both generated by the fragment realizer.
+    merge: list = list(fs.merge)
+    rescale: list = list(fs.rescale)
 
     # handoff — the C→A edge: write the P C-fragment to the smem slab, ldmatrix it back as A.
     handoff: list = [
@@ -205,13 +199,14 @@ def build_warp_chain_tileop(
         consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(cell), atom=pv.atom))
     consume.append(Sync())  # finish reading ps (the ldmatrix) before the next KV tile overwrites it
 
-    # update — commit the carrier max.
-    update: list = [Reassign(name="m0", value="mn0"), Reassign(name="m1", value="mn1")]
+    # update — empty: the realizer reassigns the carried m/l in place at the end of merge
+    # (after every read of their old value), so nothing is deferred to the post-consume slot.
+    update: list = list(fs.update)
 
-    # epilogue — O /= l, store.
+    # epilogue — O /= l (the realizer's normalize FragmentScale per D-atom), then store.
     epilogue: list = []
     for n in range(nd):
-        epilogue.append(FragmentScale(frag=f"Of{n}", top="(1.0f/l0)", bot="(1.0f/l1)"))
+        epilogue.append(fs.epilogue[n])
         epilogue.append(RegStore(dst_buffer=out, dst_index=(_add(qrow, n * 8),), frag=f"Of{n}", shape=atom_shape, ldm=D))
 
     carry = CarryScope(
@@ -230,15 +225,21 @@ def build_warp_chain_tileop(
     return TileOp(body=body, name=name, knobs={})
 
 
-def assemble_warp_chain(loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, causal: bool = False) -> Graph:
+def assemble_warp_chain(
+    loop_op: LoopOp, *, B: int, H: int, S: int, D: int, qk: Mma, pv: Mma, carrier: Monoid, causal: bool = False
+) -> Graph:
     """Build a single-``TileOp`` ``Graph`` fragment for the fused TC flash — the q/k/v
     inputs + one kernel node. Spliced by the engine; the generic kernel passes lower it.
     ``qk`` / ``pv`` are the cells' atomized ``Mma``s (the ``split`` pass ran the ``atomize``
-    move). ``causal`` masks the strict upper triangle at the score fragment (Phase 5)."""
+    move); ``carrier`` is the streaming online-softmax ``Monoid`` the fragment realizer
+    regenerates the softmax phases from. ``causal`` masks the strict upper triangle at the
+    score fragment (Phase 5)."""
     rank4 = [n for n, t in loop_op.inputs.items() if len(t.shape) == 4]
     q_id, k_id, v_id = rank4[0], rank4[1], rank4[2]
     out_t = next(iter(loop_op.outputs.values()))
-    kop = build_warp_chain_tileop(loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, causal=causal)
+    kop = build_warp_chain_tileop(
+        loop_op, q=q_id, k=k_id, v=v_id, out=out_t.name, B=B, H=H, S=S, D=D, qk=qk, pv=pv, carrier=carrier, causal=causal
+    )
 
     g = Graph()
     for nid in (q_id, k_id, v_id):
