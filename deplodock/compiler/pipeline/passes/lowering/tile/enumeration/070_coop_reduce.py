@@ -36,8 +36,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _famili
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     CHAIN,
-    MAP_M_REG,
-    MAP_N_REG,
     MAX_THREADS_PER_CTA,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
@@ -45,9 +43,9 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import 
     coop_free_thread_knobs,
     coop_reduce_knobs,
     coop_reduce_offers,
+    free_split_knobs,
     streaming_br_offers,
     streaming_coop_geometry_ok,
-    thread_knobs,
     thread_offers,
 )
 
@@ -94,12 +92,11 @@ def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     free_knobs = coop_free_thread_knobs(op.dag)
     out: list[TileGraphOp] = []
     for r in offers:
-        # REGISTER forced to 1 (one element per cell-owner); the cooperative partition
+        # ``free_knobs`` already completes SPLIT@<axis> with reg=1 (one element per
+        # cell-owner — the MONOID tier has no register fork); the cooperative partition
         # rides THREAD (``coop`` factor), no cross-CTA split (``cta=1``, the REDUCE
         # default). MMA / WM / WN OFF-fill downstream.
-        knobs = {**op.knobs, **free_knobs, **coop_reduce_knobs(op.dag, r), MAP_N_REG.name: 1}
-        if op.dag.outer_m is not None:
-            knobs[MAP_M_REG.name] = 1
+        knobs = {**op.knobs, **free_knobs, **coop_reduce_knobs(op.dag, r)}
         tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
         out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out
@@ -121,12 +118,9 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
                 continue
             knobs = {
                 **op.knobs,
-                **thread_knobs(op.dag, t),
-                MAP_N_REG.name: 1,
+                **free_split_knobs(op.dag, t, (1, 1)),  # complete SPLIT, register forced to 1
                 fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=1, coop=br),
             }
-            if op.dag.outer_m is not None:
-                knobs[MAP_M_REG.name] = 1
             if _chain_pinned() and _chain_applicable(op, br):
                 # Phase 1c: the FA-2 shared-score restructuring (register O[d] + INLINE
                 # score edge + the split carrier). Pin-driven opt-in for now — greedy keeps

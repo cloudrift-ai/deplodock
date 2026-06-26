@@ -31,7 +31,8 @@ from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_REG, STAGE
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import STAGE
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -65,7 +66,9 @@ def _slab_bytes(graph, ranked) -> dict[str, int]:
 
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if MAP_N_REG.name not in op.knobs or STAGE.name in op.knobs:
+    nkey = fam.split_key(op.dag.inner_n.axis.name) if op.dag is not None else None
+    fully_tiled = nkey is not None and nkey in op.knobs and fam.split_complete(op.knobs[nkey])
+    if not fully_tiled or STAGE.name in op.knobs:
         raise RuleSkipped("stage runs once the algorithm is fully tiled (idempotence via the STAGE knob)")
     if op.algebra is AlgebraKind.MONOID:
         # A cooperative reduce / flash stream (both MONOID) stays smem-free: each lane reads its own

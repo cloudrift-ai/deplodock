@@ -1,9 +1,22 @@
 # Algebra-native knob naming schema — knobs per DAG element, not per GEMM letter
 
-**Status:** in progress. Step 1 underway — the `_families` grammar + the **REDUCE@\<axis\>** family have landed (moves
-stamp native, `_build` decodes native, the enumeration passes gate on the native key, `_validate` no longer polices the
-reduce levers, the `_knob_legacy` ingest maps legacy `DEPLODOCK_BK`/`FK`/`SPLITK`/`BR` → the primary reduce axis). The
-SPLIT / ATOM / PLACE families and the golden/test cutover remain. No DB-compat constraint (clean-slate the storage) and **the learned prior is
+**Status:** in progress. Step 1 underway — the `_families` grammar + the **REDUCE@\<axis\>** and **SPLIT@\<axis\>**
+families have landed:
+
+- `REDUCE@<axis>` (`"s/f/c/t"`) replaces `BK`/`FK`/`SPLITK`/`BR`; the moves stamp it, `_build` decodes it, the
+  enumeration passes gate on it.
+- `SPLIT@<axis>` (`"par×reg"`) replaces `BN`/`BM`/`FN`/`FM`/`WN`/`WM`; the par (thread width / warp count) is stamped at
+  the thread/warp-geometry fork as a par-only transitional and **completed** to `par×reg` at the register fork. The tier
+  is read off the cell's `ATOM` (still `MMA` until the ATOM family lands), not the SPLIT value. The MONOID tier stamps
+  the complete `SPLIT` (reg=1) in one leaf. The split-K combine is a dag-less, already-tiled op the geometry passes skip
+  on a dag-None guard.
+- `_validate`'s tier-foreignness policing of **both** geometry families is retired (plan step 3); only `MMA` / `STAGE` /
+  `TMA` / `CHAIN` are still audited.
+- `_knob_legacy` ingests legacy `DEPLODOCK_BN`/`BM`/`FN`/`FM`/`WN`/`WM` / `BK`/`FK`/`SPLITK`/`BR` to the native keys via
+  the canonical free/reduce-axis ranking. The cold ranker (`AnalyticPrior`) is left to degrade per "break it, delete
+  legacy" — tests that relied on its smart tile pick now pin the tile (legacy env pins route through ingest).
+
+The **ATOM@\<cell\>** family (replacing `MMA`), **PLACE@\<edge\>** (step 5), and the golden YAML cutover (step 4) remain. No DB-compat constraint (clean-slate the storage) and **the learned prior is
 assumed deleted** — so this plan designs no featurization and owes nothing to prior compatibility; greedy fork-picking
 is whatever replaces the prior (out of scope here). Everything *native-facing* — `op.knobs` storage, `eval` display, new
 goldens, new tests — speaks the new schema. A **legacy mapper** is **ingest-only** (legacy → new) and exists for one

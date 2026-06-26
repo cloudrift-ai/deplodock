@@ -34,27 +34,19 @@ def _pin(monkeypatch, knobs: dict) -> None:
 # --- Senseless combinations: the validator must REFUSE -----------------------
 
 # Each row: (algebra, pins) where no tier the algebra resolves to can satisfy the pins.
-# NOTE: the reduce-decomposition levers (``BK``/``FK``/``SPLITK``/``BR`` → the native
-# ``REDUCE@<axis>`` family) are NO LONGER policed by tier-foreignness here — their legality
-# is the carrier-trait value-domain gate at the knob (``_families``), so a senseless reduce
-# pin is forced to identity, not hard-errored. Only the free-axis tile (``BN``/``BM``/
-# ``FM``/``FN``), the warp geometry (``WM``/``WN``/``MMA``), and the staging schedule
-# (``STAGE``/``TMA``) are still audited.
+# NOTE: the geometry families (``SPLIT@<axis>`` ← BN/BM/FM/FN/WM/WN, ``REDUCE@<axis>`` ←
+# BK/FK/SPLITK/BR) are NO LONGER policed by tier-foreignness — a ``SPLIT`` value carries no
+# tier (it is the cell's ``ATOM``) and the reduce levers' legality is the carrier-trait
+# value-domain gate. Only the atom-tier selector (``MMA``), the staging schedule
+# (``STAGE``/``TMA``), and the streaming restructure (``CHAIN``) are still audited (the
+# plan's step-3 retirement, completed as the SPLIT family landed).
 _REFUSED = [
-    # Warp MMA forced (MMA=<kind>) + a scalar-only free-axis knob.
-    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "BN": 32}, "scalar THREAD width on a warp kernel"),
-    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "BM": 8}, "scalar THREAD width on a warp kernel"),
-    # Scalar forced (MMA=0) + a warp-only knob.
-    (AlgebraKind.SEMIRING, {"MMA": 0, "WM": 2}, "warp count on a scalar kernel"),
-    (AlgebraKind.SEMIRING, {"MMA": 0, "WN": 2}, "warp count on a scalar kernel"),
-    # Warp geometry pin (WM) vs a scalar THREAD pin (BN) — the two forced tiers exclude.
-    (AlgebraKind.SEMIRING, {"WM": 2, "BN": 32}, "warp geometry vs scalar THREAD tile"),
-    # A cooperative MONOID reduce: warp / tensor-core are foreign.
-    (AlgebraKind.MONOID, {"WM": 2}, "warp count on a cooperative reduce"),
+    # A tensor-core atom forces the WARP tier — foreign to the MONOID / MAP algebras.
     (AlgebraKind.MONOID, {"MMA": _ATOM}, "tensor-core atom on a cooperative reduce"),
-    # A pointwise MAP nest has no warp tier.
     (AlgebraKind.MAP, {"MMA": _ATOM}, "tensor-core atom on a pointwise nest"),
-    (AlgebraKind.MAP, {"WM": 2}, "warp count on a pointwise nest"),
+    # A warp atom (WARP) beside the FA-2 streaming restructure (CHAIN → MONOID) — the two
+    # forced tiers exclude each other.
+    (AlgebraKind.SEMIRING, {"MMA": _ATOM, "CHAIN": 1}, "warp atom vs streaming-flash restructure"),
     # Staging / transport on a tier that never stages (smem-free reduce / no K-tower).
     (AlgebraKind.MONOID, {"STAGE": 11}, "STAGE on an smem-free cooperative reduce"),
     (AlgebraKind.MONOID, {"TMA": 1}, "TMA on an smem-free cooperative reduce"),
@@ -137,7 +129,7 @@ def test_greedy_pipeline_refuses_end_to_end(monkeypatch):
     g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (128, 128)), node_id="c")
     g.inputs, g.outputs = ["a", "b"], ["c"]
     monkeypatch.setenv("DEPLODOCK_MMA", _ATOM)
-    monkeypatch.setenv("DEPLODOCK_BN", "32")
+    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")  # warp atom (WARP) vs streaming restructure (MONOID)
     with pytest.raises(KnobPinError):
         Pipeline.build(TILE_PASSES).run(g)
 
@@ -172,9 +164,9 @@ def test_search_path_exempt_from_validation(monkeypatch):
 def test_error_names_the_offending_pins(monkeypatch):
     """The message names the algebra, the tiers it can lower on, and each pin's legal
     tiers — enough to see which knob to drop."""
-    _pin(monkeypatch, {"MMA": _ATOM, "BN": 32})
+    _pin(monkeypatch, {"MMA": _ATOM, "CHAIN": 1})
     with pytest.raises(KnobPinError) as exc:
         validate_pins(AlgebraKind.SEMIRING)
     msg = str(exc.value)
     assert "semiring" in msg
-    assert "MMA=" in msg and "BN=32" in msg
+    assert "MMA=" in msg and "CHAIN=1" in msg

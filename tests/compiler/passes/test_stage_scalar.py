@@ -38,7 +38,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import 
 
 from ..conftest import requires_cuda
 
-_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1)}
+_MM_KNOBS = {
+    fam.split_key("a1"): fam.enc_split(8, 2),
+    fam.split_key("a0"): fam.enc_split(8, 2),
+    fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1),
+}
 
 
 def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
@@ -80,7 +84,8 @@ def test_stage_candidates_empty_for_pointwise() -> None:
     g.inputs, g.outputs = ["x"], ["y"]
     loop = next(n.op for n in Pipeline.build(LOOP_PASSES).run(g).nodes.values() if type(n.op).__name__ == "LoopOp")
     dag = iter_dag(loop)
-    tg = build_dag(dag, {"BN": 8, "FN": 1, "BM": 8, "FM": 1}, kernel_name="k_relu", target_names=classify(dag).target_names)
+    relu_knobs = {fam.split_key("a1"): fam.enc_split(8, 1), fam.split_key("a0"): fam.enc_split(8, 1)}
+    tg = build_dag(dag, relu_knobs, kernel_name="k_relu", target_names=classify(dag).target_names)
     assert stage_candidates(tg) == []
 
 
@@ -134,6 +139,11 @@ def test_staged_scalar_matmul_matches_reference(monkeypatch, stage_mask, shape) 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
     monkeypatch.setenv("DEPLODOCK_STAGE", stage_mask)
+    # Pin a small in-budget scalar tile: the cold ranker's smart tile pick is retired
+    # (greedy cold → emission order), so the deep-BK emission default can overflow the
+    # staged smem slab on the larger shape. Legacy env pins route through the ingest mapper.
+    for k, v in (("BN", "16"), ("BM", "16"), ("FN", "2"), ("FM", "2"), ("BK", "16")):
+        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     M, N, K = shape
     rng = np.random.default_rng(0)
     a = rng.standard_normal((M, K), dtype=np.float32)

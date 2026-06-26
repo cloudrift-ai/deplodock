@@ -132,8 +132,14 @@ def test_trace_records_partition_fork() -> None:
         assert d.chosen_kind == "op"
         assert d.score is None
         assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+
     thread = next(d for d in part if d.rule_name == "090_thread_tile")
-    assert {"BM", "BN"} <= set(thread.knob_delta), f"the thread-tile decision carries the complete free tile row, got {thread.knob_delta}"
+    # The matmul free axes are a0 (M, outer) and a1 (N, inner); the thread fork stamps the
+    # par-only ``SPLIT@<axis>`` for both (the register fork completes par×reg).
+    assert {fam.split_key("a1"), fam.split_key("a0")} <= set(thread.knob_delta), (
+        f"the thread-tile decision carries the free-axis SPLIT row, got {thread.knob_delta}"
+    )
 
 
 def test_decide_score_lands_on_trace() -> None:

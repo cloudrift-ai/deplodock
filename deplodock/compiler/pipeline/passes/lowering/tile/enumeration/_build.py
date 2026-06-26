@@ -25,12 +25,6 @@ from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Rol
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
-    MAP_M_REG,
-    MAP_M_THREAD,
-    MAP_N_REG,
-    MAP_N_THREAD,
-)
 
 
 def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:
@@ -174,9 +168,11 @@ def free_tile(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: froz
     ``090_thread_tile`` just pins the thread knob (the layout needs the register knob
     too, so a byte-identical split can't be staged across the two forks)."""
     inner_n, outer_m, extra_outer = _free_axes(dag)
-    free_specs = [(inner_n, knobs[MAP_N_THREAD.name], knobs[MAP_N_REG.name], True)]
+    n_par, n_reg = fam.dec_split(knobs[fam.split_key(inner_n.name)])
+    free_specs = [(inner_n, n_par, n_reg, True)]
     if outer_m is not None:
-        free_specs.append((outer_m, knobs[MAP_M_THREAD.name], knobs[MAP_M_REG.name], False))
+        m_par, m_reg = fam.dec_split(knobs[fam.split_key(outer_m.name)])
+        free_specs.append((outer_m, m_par, m_reg, False))
 
     sigma_map: dict = {}
     bounds: list = []
@@ -445,7 +441,8 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
     d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
-    m_thread = knobs.get(MAP_N_THREAD.name, 1) if m_axis.name == dag.inner_n.axis.name else knobs.get(MAP_M_THREAD.name, 1)
+    m_split = knobs.get(fam.split_key(m_axis.name))
+    m_thread = fam.dec_split(m_split)[0] if m_split is not None else 1
     m_b, m_t, m_r, m_expr, m_bound = _split_free_axis(m_axis, m_thread, 1, interleave_when_masked=True)
 
     # The carrier-state Inits + epilogue stay where they are; the register-replication
@@ -552,14 +549,12 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     the free axes four ways (GRID/WARP/REGISTER/ATOM) + re-bracket K at ``atom_k``
     granularity + fuse the cell into an ``Mma``, laying the domain axes + bindings.
     ``assemble`` reconstructs the AtomTile/WarpTile tower from ``domain`` + ``Mma``."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_REG_M, TC_REG_N, WARP_M, WARP_N
-
     atom_m, atom_n, atom_k = atom.shape
-    wm, wn = knobs[WARP_M.name], knobs[WARP_N.name]
-    fm, fn = knobs[TC_REG_M.name], knobs[TC_REG_N.name]
     bk = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)]).serial
 
     inner_n, outer_m, extra_outer = _free_axes(dag)
+    wn, fn = fam.dec_split(knobs[fam.split_key(inner_n.name)])
+    wm, fm = fam.dec_split(knobs[fam.split_key(outer_m.name)])
     n_b, n_w, n_r, n_a, n_expr, n_bound = _warp_axis(inner_n, wn, fn, atom_n)
     m_b, m_w, m_r, m_a, m_expr, m_bound = _warp_axis(outer_m, wm, fm, atom_m)
     sigma_outer = Sigma({inner_n.name: n_expr, outer_m.name: m_expr})

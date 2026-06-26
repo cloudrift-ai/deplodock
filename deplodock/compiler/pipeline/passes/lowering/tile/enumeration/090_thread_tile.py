@@ -22,7 +22,6 @@ from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_N_THREAD
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, thread_knobs, thread_offers
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -30,8 +29,10 @@ PATTERN = [Pattern("root", TileGraphOp)]
 
 def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     op: TileGraphOp = root.op
-    if MAP_N_THREAD.name in op.knobs or mma_atom(op.knobs) is not None:
-        raise RuleSkipped("thread tile already pinned / warp tier")
+    if op.dag is None or mma_atom(op.knobs) is not None:
+        raise RuleSkipped("warp tier / already-built kernel (no dag — e.g. the split-K combine)")
+    if fam.split_key(op.dag.inner_n.axis.name) in op.knobs:
+        raise RuleSkipped("thread tile already pinned")
     if op.algebra is AlgebraKind.MONOID:
         raise RuleSkipped("cooperative-reduce tier (070_coop_reduce owns the MONOID free-axis tile)")
     if op.algebra is AlgebraKind.SEMIRING and fam.reduce_key(op.dag.k_node.loop.axis.name) not in op.knobs:

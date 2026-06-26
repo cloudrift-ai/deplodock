@@ -95,13 +95,26 @@ def _element_of(move: str, k: str) -> str | None:
 # factor. The grid is the launch residual (extent / (par·reg)), never stamped. ---
 
 
-def enc_split(par: int, reg: int) -> str:
-    return f"{par}x{reg}"
+def enc_split(par: int, reg: int | None = None) -> str:
+    """``"<par>x<reg>"`` once both factors are chosen, or a par-only ``"<par>"``
+    transitional (the thread / warp-geometry fork sets ``par``; the register fork
+    completes ``reg`` — the build only reads the value once complete)."""
+    return f"{par}x{reg}" if reg is not None else f"{par}"
 
 
-def dec_split(raw: object) -> tuple[int, int]:
-    par, _, reg = str(raw).partition("x")
-    return int(par), int(reg)
+def dec_split(raw: object) -> tuple[int, int | None]:
+    """``(par, reg)`` — ``reg`` is ``None`` for a par-only transitional value."""
+    s = str(raw)
+    if "x" in s:
+        par, _, reg = s.partition("x")
+        return int(par), int(reg)
+    return int(s), None
+
+
+def split_complete(raw: object) -> bool:
+    """True once a ``SPLIT@<axis>`` value carries its register factor (the register
+    fork has run) — i.e. ``"PxR"``, not the par-only ``"P"`` transitional."""
+    return "x" in str(raw)
 
 
 # --- REDUCE codec: ``"s<serial>/f<fold>/c<cta>/t<coop>"`` — the four reduce-decomposition
@@ -165,10 +178,28 @@ def pin(move: str, element: str) -> str | None:
     return raw if raw is not None else config.knob_raw(move)
 
 
-def pin_split(axis: str) -> tuple[int, int] | None:
-    """A pinned ``(par, reg)`` for ``SPLIT@axis``, or ``None``."""
+def split_par(dag, axis: str) -> int | None:
+    """The pinned parallel-binding factor for ``SPLIT@axis`` (thread width or warp
+    count — the tier is the consuming cell's ``ATOM``, not this value). Native
+    ``DEPLODOCK_SPLIT_<axis>`` first, else the legacy ``BN``/``WN`` (innermost free) /
+    ``BM``/``WM`` (next-out) ingest."""
     raw = pin(SPLIT, axis)
-    return dec_split(raw) if raw is not None else None
+    if raw is not None:
+        return dec_split(raw)[0]
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.split_par(dag, axis)
+
+
+def split_reg(dag, axis: str) -> int | None:
+    """The pinned register-cell factor for ``SPLIT@axis``. Native first, else the
+    legacy ``FN`` (innermost free) / ``FM`` (next-out) ingest."""
+    raw = pin(SPLIT, axis)
+    if raw is not None:
+        return dec_split(raw)[1]
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+
+    return _knob_legacy.split_reg(dag, axis)
 
 
 def pin_reduce(axis: str) -> Decomp | None:

@@ -16,7 +16,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_REG_M, WARP_M
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import warp_reg_knobs, warp_reg_offers
 
 PATTERN = [Pattern("root", TileGraphOp)]
@@ -25,9 +25,10 @@ PATTERN = [Pattern("root", TileGraphOp)]
 def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG001
     op: TileGraphOp = root.op
     kind = mma_atom(op.knobs)
-    if kind is None or WARP_M.name not in op.knobs or TC_REG_M.name in op.knobs:
+    nkey = fam.split_key(op.dag.inner_n.axis.name)
+    if kind is None or nkey not in op.knobs or fam.split_complete(op.knobs[nkey]):
         raise RuleSkipped("warp reg tile applies once, after the geometry is pinned")
-    offers = warp_reg_offers(ATOM_REGISTRY[kind])
+    offers = warp_reg_offers(op.dag, ATOM_REGISTRY[kind])
     if not offers:
         raise RuleSkipped("no legal warp register tile")
-    return [replace(op, knobs={**op.knobs, **warp_reg_knobs(fm, fn)}) for fm, fn in offers]
+    return [replace(op, knobs={**op.knobs, **warp_reg_knobs(op.dag, op.knobs, fm, fn)}) for fm, fn in offers]

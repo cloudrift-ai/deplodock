@@ -39,6 +39,41 @@ def _int_pin(name: str) -> int | None:
         return None
 
 
+def _free_rank(dag, axis_name: str) -> int | None:
+    """The canonical free-axis rank of ``axis_name`` — ``0`` for the innermost free
+    axis (``dag.inner_n``, legacy "N"), ``1`` for the next-out (``dag.outer_m``,
+    legacy "M"), else ``None`` (a 3rd+ free axis has no legacy name)."""
+    if axis_name == dag.inner_n.axis.name:
+        return 0
+    if dag.outer_m is not None and axis_name == dag.outer_m.axis.name:
+        return 1
+    return None
+
+
+def split_par(dag, axis_name: str) -> int | None:
+    """Legacy parallel-binding pin for a free axis: rank-0 (innermost N) takes
+    ``BN`` (thread) or ``WN`` (warp), rank-1 (outer M) takes ``BM`` / ``WM`` — the
+    tier is mutually exclusive (a kernel is scalar XOR warp), so whichever is set
+    wins. A 3rd+ free axis has no legacy name → ``None``."""
+    rank = _free_rank(dag, axis_name)
+    if rank == 0:
+        return _int_pin("BN") or _int_pin("WN")
+    if rank == 1:
+        return _int_pin("BM") or _int_pin("WM")
+    return None
+
+
+def split_reg(dag, axis_name: str) -> int | None:
+    """Legacy register-cell pin for a free axis: rank-0 (innermost N) takes ``FN``,
+    rank-1 (outer M) takes ``FM``."""
+    rank = _free_rank(dag, axis_name)
+    if rank == 0:
+        return _int_pin("FN")
+    if rank == 1:
+        return _int_pin("FM")
+    return None
+
+
 def reduce_fields(dag, axis_name: str) -> tuple[int | None, int | None, int | None, int | None]:
     """Legacy ``DEPLODOCK_BK`` / ``FK`` / ``SPLITK`` / ``BR`` → the native
     ``(serial, fold, cta, coop)`` REDUCE factors, applied to the **primary** reduce

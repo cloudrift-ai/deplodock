@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock import config
 from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
@@ -26,7 +27,7 @@ from deplodock.compiler.ir.tile.ir import TileGraphOp
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import mma_atom, mma_decode
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import eligible_atoms
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_M_THREAD, MAP_N_THREAD, TC_ATOM
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import TC_ATOM
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -38,12 +39,13 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     enabled, pinned = mma_decode(TC_ATOM.raw())
     if not enabled:
         raise RuleSkipped("DEPLODOCK_MMA disabled — scalar tier only")
-    # An explicit scalar-tier THREAD-knob pin (``DEPLODOCK_BN`` / ``DEPLODOCK_BM``) is
-    # warp-foreign — it signals scalar-tier intent — so it suppresses the
-    # default-on warp offer (the user is pinning the scalar register-tile geometry).
+    # An explicit *legacy* scalar-tier THREAD pin (``DEPLODOCK_BN`` / ``DEPLODOCK_BM``)
+    # signals scalar-tier intent — so it suppresses the default-on warp offer (the user
+    # is pinning the scalar register-tile geometry). A native ``SPLIT@<axis>`` pin does
+    # NOT (its tier is the cell's ``ATOM`` — pin ``ATOM=scalar`` / ``MMA=0`` for scalar).
     # An explicit ``DEPLODOCK_MMA=<kind>`` pin still wins (handled below).
-    if pinned is None and (MAP_N_THREAD.raw() or MAP_M_THREAD.raw()):
-        raise RuleSkipped("scalar THREAD knob pinned — scalar tier only")
+    if pinned is None and (config.knob_raw("BN") or config.knob_raw("BM")):
+        raise RuleSkipped("legacy scalar THREAD knob pinned — scalar tier only")
 
     def dtype_of(buf: str):
         b = op.buffers.get(buf)

@@ -35,17 +35,21 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.ir.tile.ir import Block, Buffer, Space, TileGraphOp, TileOp
 from deplodock.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from deplodock.compiler.pipeline.search.keys import op_cache_key
 
-# Native ``MOVE@element`` knobs for the matmul oracle: the free-axis SPLIT geometry
-# (still legacy ``BN``/``BM``/``FN``/``FM`` until the SPLIT family lands) + the native
-# ``REDUCE@<reduce-axis>`` value (the matmul's contraction axis is ``a2``).
+# Native ``MOVE@element`` knobs for the matmul oracle: the free axes are ``a0`` (M, outer)
+# and ``a1`` (N, inner), the contraction axis ``a2``. ``SPLIT@<axis>`` packs par×reg
+# (BN/FN on the inner N axis, BM/FM on the outer M); ``REDUCE@a2`` the contraction tower.
 _REDUCE_AXIS = "a2"
-_MM_KNOBS = {"BN": 8, "FN": 2, "BM": 8, "FM": 2, fam.reduce_key(_REDUCE_AXIS): fam.enc_reduce(serial=16, fold=1, cta=1)}
+_MM_KNOBS = {
+    fam.split_key("a1"): fam.enc_split(8, 2),
+    fam.split_key("a0"): fam.enc_split(8, 2),
+    fam.reduce_key(_REDUCE_AXIS): fam.enc_reduce(serial=16, fold=1, cta=1),
+}
 
 
 def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:

@@ -34,7 +34,11 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag impor
 from tests.compiler.conftest import requires_cuda
 from tests.compiler.passes.test_tile_ir_invariants import _oracle_tilegraph
 
-_KN = {"BN": 16, "FN": 2, "BM": 16, "FM": 2, fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1)}
+_KN = {
+    fam.split_key("a1"): fam.enc_split(16, 2),
+    fam.split_key("a0"): fam.enc_split(16, 2),
+    fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1),
+}
 
 
 def _mm_xn_graph(M=64, K=64, N=64) -> Graph:

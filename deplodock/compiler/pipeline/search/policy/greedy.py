@@ -58,7 +58,7 @@ def _tile_pipeline():
 # per-element families (``REDUCE@<axis>``, and later ``SPLIT@``/``ATOM@``) are matched
 # by key prefix since their element names are per-kernel; the still-legacy free-axis /
 # warp knobs are matched by exact name.
-_TILE_IDENTITY = ("BN", "BM", "FM", "FN", "WM", "WN", "MMA")
+_TILE_IDENTITY = ("MMA",)
 _TILE_IDENTITY_PREFIXES = ("REDUCE@", "SPLIT@", "ATOM@")
 
 # The rule whose fork prices a kernel: the prior's predicted µs for the chosen

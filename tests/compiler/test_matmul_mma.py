@@ -217,8 +217,8 @@ def test_mma_disabled_falls_back_to_scalar(monkeypatch):
     # Scalar fallback: the leaf carries the MMA OFF sentinel ("0"), not a real
     # atom kind — ``is_warp`` is False (no warp-tier variant emitted).
     assert not is_warp(kop.knobs) and kop.knobs.get("MMA") == "0", "warp variant should not be emitted when DEPLODOCK_MMA=0"
-    # Scalar path should stamp BN/BM.
-    assert "BN" in kop.knobs and "BM" in kop.knobs
+    # Scalar path should stamp the native free-axis SPLIT@<axis> tiles (par×reg) for both axes.
+    assert sum(1 for k in kop.knobs if k.startswith("SPLIT@")) >= 2, kop.knobs
 
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")

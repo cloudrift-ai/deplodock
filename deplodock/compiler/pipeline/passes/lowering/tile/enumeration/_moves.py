@@ -15,13 +15,11 @@ param dicts; ``materialize.py`` realizes a complete choice into the tower.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Write
-from deplodock.compiler.pipeline.knob import Knob
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
@@ -29,22 +27,14 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
     BK_CHOICES,
     BR_CHOICES,
     FK_CHOICES,
-    MAP_M_REG,
-    MAP_M_THREAD,
-    MAP_N_REG,
-    MAP_N_THREAD,
     MAX_CELLS_PER_THREAD,
     MAX_THREADS_PER_CTA,
     REG_CHOICES,
     SPLITK_CHOICES,
     TC_ATOM,
     TC_REG_CHOICES,
-    TC_REG_M,
-    TC_REG_N,
     THREAD_CHOICES,
     WARP_CHOICES,
-    WARP_M,
-    WARP_N,
 )
 
 # --- Resource budget (merged from _budget.py) ---
@@ -157,13 +147,6 @@ def _enumerate(menus: Sequence[Sequence[int]], prefix: tuple[int, ...], emit) ->
         _enumerate(menus[1:], (*prefix, v), emit)
 
 
-def _pin(knob: Knob) -> int | None:
-    """Env override for one search dimension (``DEPLODOCK_<NAME>``) — lets a
-    user / test pin a greenfield knob the way the legacy enumerator does."""
-    raw = os.environ.get(knob.env)
-    return int(raw) if raw not in (None, "") else None
-
-
 # Pointwise is memory-bandwidth bound, so a conservative register-tile menu
 # keeps the generative tree small without losing the configs that matter
 # (richer reduce-regime reg menus arrive with their regimes).
@@ -206,7 +189,8 @@ def thread_offers(dag: IterDag, budget: Budget, *, balanced: bool = False) -> li
     band. Only matmul wants this: a MAP (pointwise) nest is bandwidth-bound and keeps
     the wide-N order (``balanced=False``), and a genuinely 1-wide axis (gemv) falls
     back to the bare order so it is never stranded."""
-    bn_pin, bm_pin = _pin(MAP_N_THREAD), _pin(MAP_M_THREAD)
+    bn_pin = fam.split_par(dag, dag.inner_n.axis.name)
+    bm_pin = fam.split_par(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
     n_choices = (bn_pin,) if bn_pin else _axis_thread_choices(dag.inner_n.extent)
     if dag.outer_m is None:
         m_choices: tuple[int, ...] = (1,)
@@ -229,7 +213,8 @@ def map_reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     (fewest cells — a MAP nest is bandwidth bound; prefer tiling the contiguous N
     axis on ties). A pinned ``DEPLODOCK_FN``/``FM`` narrows its axis (see
     :func:`thread_offers`)."""
-    fn_pin, fm_pin = _pin(MAP_N_REG), _pin(MAP_M_REG)
+    fn_pin = fam.split_reg(dag, dag.inner_n.axis.name)
+    fm_pin = fam.split_reg(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
     n_choices = (fn_pin,) if fn_pin else _MAP_REG_CHOICES
     if dag.outer_m is None:
         m_choices: tuple[int, ...] = (1,)
@@ -241,21 +226,38 @@ def map_reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
 
 
 def thread_knobs(dag: IterDag, thread: tuple[int, int]) -> dict:
-    """Knob delta a thread-tile branch pins."""
+    """Knob delta the thread-tile branch pins — the par-only ``SPLIT@<axis>``
+    transitional (the register fork completes ``reg`` at :func:`reg_knobs`)."""
     t_n, t_m = thread
-    knobs = {MAP_N_THREAD.name: t_n}
+    knobs = {fam.split_key(dag.inner_n.axis.name): fam.enc_split(t_n)}
     if dag.outer_m is not None:
-        knobs[MAP_M_THREAD.name] = t_m
+        knobs[fam.split_key(dag.outer_m.axis.name)] = fam.enc_split(t_m)
     return knobs
 
 
-def reg_knobs(dag: IterDag, reg: tuple[int, int]) -> dict:
-    """Knob delta a register-tile leaf adds on top of its thread branch."""
+def reg_knobs(dag: IterDag, knobs: dict, reg: tuple[int, int]) -> dict:
+    """Knob delta the register-tile leaf adds — it **completes** each free axis's
+    ``SPLIT@<axis>`` by reading the par the thread branch stamped and appending the
+    register factor (``"P"`` → ``"PxR"``)."""
     r_n, r_m = reg
-    knobs = {MAP_N_REG.name: r_n}
+    par_n = fam.dec_split(knobs[fam.split_key(dag.inner_n.axis.name)])[0]
+    out = {fam.split_key(dag.inner_n.axis.name): fam.enc_split(par_n, r_n)}
     if dag.outer_m is not None:
-        knobs[MAP_M_REG.name] = r_m
-    return knobs
+        par_m = fam.dec_split(knobs[fam.split_key(dag.outer_m.axis.name)])[0]
+        out[fam.split_key(dag.outer_m.axis.name)] = fam.enc_split(par_m, r_m)
+    return out
+
+
+def free_split_knobs(dag: IterDag, thread: tuple[int, int], reg: tuple[int, int]) -> dict:
+    """Complete ``SPLIT@<axis>`` for both free axes at once (par + reg) — the MONOID
+    path (cooperative reduce / streaming flash) pins the register factor (1) in the
+    same leaf as the thread tile, so there is no separate register fork to complete."""
+    t_n, t_m = thread
+    r_n, r_m = reg
+    out = {fam.split_key(dag.inner_n.axis.name): fam.enc_split(t_n, r_n)}
+    if dag.outer_m is not None:
+        out[fam.split_key(dag.outer_m.axis.name)] = fam.enc_split(t_m, r_m)
+    return out
 
 
 # --- Reduce decomposition move (SEMIRING / MONOID): the carrier-licensed
@@ -304,7 +306,8 @@ def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, 
     """Legal ``(reg_n, reg_m)`` register tiles for a reduce regime under the cell budget
     (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells). A pinned
     ``DEPLODOCK_FN``/``FM`` narrows its axis (see :func:`thread_offers`)."""
-    fn_pin, fm_pin = _pin(MAP_N_REG), _pin(MAP_M_REG)
+    fn_pin = fam.split_reg(dag, dag.inner_n.axis.name)
+    fm_pin = fam.split_reg(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
     n_choices = (fn_pin,) if fn_pin else REG_CHOICES
     m_choices = (fm_pin,) if fm_pin else REG_CHOICES
     out = [(r_n, r_m) for r_n in n_choices for r_m in m_choices if budget.cells_ok(fk * r_n * r_m)]
@@ -333,8 +336,8 @@ def coop_free_threads(dag: IterDag) -> tuple[int, int]:
     A pinned ``BN``/``BM`` > 1 thread-binds the free rows ALONGSIDE the ``BR``
     cooperative lanes — the **strided-cooperative rows** form (e.g. a per-head
     q/k-norm deploys a ``BN×BR`` CTA instead of a degenerate one)."""
-    bn = _pin(MAP_N_THREAD) or 1
-    bm = (_pin(MAP_M_THREAD) or 1) if dag.outer_m is not None else 1
+    bn = fam.split_par(dag, dag.inner_n.axis.name) or 1
+    bm = (fam.split_par(dag, dag.outer_m.axis.name) or 1) if dag.outer_m is not None else 1
     return bn, bm
 
 
@@ -403,14 +406,11 @@ def coop_reduce_knobs(dag: IterDag, reduce: tuple[int, int, int]) -> dict:
 
 
 def coop_free_thread_knobs(dag: IterDag) -> dict:
-    """Knob delta for the free-axis THREAD tiles (``BN``/``BM``) a cooperative
-    reduce binds — default ``1`` (whole-CTA), or the pinned strided-cooperative
-    value. ``BM`` only when an outer free axis exists."""
-    bn, bm = coop_free_threads(dag)
-    knobs = {MAP_N_THREAD.name: bn}
-    if dag.outer_m is not None:
-        knobs[MAP_M_THREAD.name] = bm
-    return knobs
+    """Knob delta for the free-axis tiles a cooperative reduce binds — the complete
+    ``SPLIT@<axis>`` with par = the thread tile (default ``1`` whole-CTA, or the
+    pinned strided-cooperative value) and reg forced to ``1`` (one element per
+    cell-owner; the MONOID tier has no register fork)."""
+    return free_split_knobs(dag, coop_free_threads(dag), (1, 1))
 
 
 def streaming_br_offers(dag: IterDag) -> list[int]:
@@ -457,11 +457,13 @@ _MAX_WARP_CELLS = 64  # cells (atom tiles) per warp — the register-file ceilin
 _WARP_CELL_TARGET = 16  # a warp wants a register tile big enough for ILP, small enough for occupancy
 
 
-def warp_offers(atom) -> list[tuple[int, int]]:
+def warp_offers(dag: IterDag, atom) -> list[tuple[int, int]]:
     """Legal ``(wm, wn)`` warp counts: ``wm·wn ≥ 2`` (single-warp mma.sync is
     pruned — ``ldmatrix`` is smem→register only) and ``wm·wn·group_size`` within
-    the CTA thread budget. Best-first: fewest warps, square-ish."""
-    wm_pin, wn_pin = _pin(WARP_M), _pin(WARP_N)
+    the CTA thread budget. Best-first: fewest warps, square-ish. ``wm``/``wn`` are
+    the par factors of ``SPLIT@<outer_m>`` / ``SPLIT@<inner_n>`` (warp-tier par)."""
+    wm_pin = fam.split_par(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
+    wn_pin = fam.split_par(dag, dag.inner_n.axis.name)
     wms = (wm_pin,) if wm_pin else WARP_CHOICES
     wns = (wn_pin,) if wn_pin else WARP_CHOICES
     out = [(wm, wn) for wm in wms for wn in wns if wm * wn >= 2 and wm * wn * atom.group_size <= MAX_THREADS_PER_CTA]
@@ -469,7 +471,7 @@ def warp_offers(atom) -> list[tuple[int, int]]:
     return out
 
 
-def warp_reg_offers(atom) -> list[tuple[int, int]]:  # noqa: ARG001
+def warp_reg_offers(dag: IterDag, atom) -> list[tuple[int, int]]:  # noqa: ARG001
     """Legal ``(fm, fn)`` per-warp register cells under the cell ceiling
     (``fm·fn ≤ _MAX_WARP_CELLS``), best-first (≈``_WARP_CELL_TARGET`` cells).
 
@@ -482,7 +484,8 @@ def warp_reg_offers(atom) -> list[tuple[int, int]]:  # noqa: ARG001
     the smem budget, so the budget-aware ``120_stage`` filter declines staging and
     the operands lower gmem-direct — instead of vanishing into ``no legal warp
     register tile``. The ceiling still prunes the auto-enumerated candidates."""
-    fm_pin, fn_pin = _pin(TC_REG_M), _pin(TC_REG_N)
+    fm_pin = fam.split_reg(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
+    fn_pin = fam.split_reg(dag, dag.inner_n.axis.name)
     if fm_pin and fn_pin:
         return [(fm_pin, fn_pin)]
     fms = (fm_pin,) if fm_pin else TC_REG_CHOICES
@@ -503,14 +506,26 @@ def warp_bk_offers(dag: IterDag, atom) -> list[int]:
     return [bk for bk in cands if bk >= 1 and k_atoms % bk == 0]
 
 
-def warp_geom_knobs(wm: int, wn: int) -> dict:
-    """Knob delta the warp-geometry branch pins."""
-    return {WARP_M.name: wm, WARP_N.name: wn}
+def warp_geom_knobs(dag: IterDag, wm: int, wn: int) -> dict:
+    """Knob delta the warp-geometry branch pins — the par-only ``SPLIT@<axis>``
+    transitional with the warp counts (``wn`` on the inner N axis, ``wm`` on the
+    outer M); the register fork completes ``reg`` at :func:`warp_reg_knobs`."""
+    out = {fam.split_key(dag.inner_n.axis.name): fam.enc_split(wn)}
+    if dag.outer_m is not None:
+        out[fam.split_key(dag.outer_m.axis.name)] = fam.enc_split(wm)
+    return out
 
 
-def warp_reg_knobs(fm: int, fn: int) -> dict:
-    """Knob delta a warp register-tile branch pins."""
-    return {TC_REG_M.name: fm, TC_REG_N.name: fn}
+def warp_reg_knobs(dag: IterDag, knobs: dict, fm: int, fn: int) -> dict:
+    """Knob delta the warp register-tile branch pins — **completes** each free
+    axis's ``SPLIT@<axis>`` by appending the per-warp register cells to the warp
+    count the geometry branch stamped."""
+    par_n = fam.dec_split(knobs[fam.split_key(dag.inner_n.axis.name)])[0]
+    out = {fam.split_key(dag.inner_n.axis.name): fam.enc_split(par_n, fn)}
+    if dag.outer_m is not None:
+        par_m = fam.dec_split(knobs[fam.split_key(dag.outer_m.axis.name)])[0]
+        out[fam.split_key(dag.outer_m.axis.name)] = fam.enc_split(par_m, fm)
+    return out
 
 
 def warp_bk_knobs(dag: IterDag, atom, bk: int) -> dict:

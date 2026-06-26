@@ -24,18 +24,18 @@ THREAD_KNOBS = ("BN", "BM", "FM", "FN")
 WARP_KNOBS = ("WN", "WM", "FM", "FN", "MMA")
 
 
-def _matmul_thread_gate(r: dict, reduce_key: str) -> bool:
+def _matmul_thread_gate(r: dict, dag, reduce_key: str) -> bool:
     """The heuristic-plausible band for thread-tier matmul tiles, distilled from
     the measured ``GOLDEN_CONFIGS`` (every recorded golden satisfies it). Used to
     prune the enumeration so the cold ``AnalyticPrior`` can't argmin onto an
-    *unbenched* degenerate tile (e.g. ``BN=8`` from the now-default wide candidate
-    menu) and override the golden-shaped option. Coalesced wide inner axis, short
-    outer axis, large K-chunk, light split-K, clean output-column width. The caller
-    falls back to the ungated set when this empties (tiny / unusual shapes with no
-    in-band candidate), so it only ever *narrows*, never strands a shape."""
-    bn, bm = r["BN"], r["BM"]
+    *unbenched* degenerate tile and override the golden-shaped option. Coalesced
+    wide inner axis, short outer axis, large K-chunk, light split-K, clean
+    output-column width. The caller falls back to the ungated set when this empties
+    (tiny / unusual shapes with no in-band candidate), so it only ever *narrows*."""
+    bn, fn = fam.dec_split(r[fam.split_key(dag.inner_n.axis.name)])
+    bm, _ = fam.dec_split(r[fam.split_key(dag.outer_m.axis.name)])
     threads = bn * bm
-    tile_n = bn * r["FN"]
+    tile_n = bn * fn
     decomp = fam.dec_reduce(r[reduce_key])
     return (
         16 <= bn <= 64
@@ -106,12 +106,12 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
             red = _moves.reduce_knobs(dag, (bk, fk, sk))
             regs = _moves.reduce_reg_offers(dag, budget, fk)
             for t in threads:
-                thr = _moves.thread_knobs(dag, t)
+                base = {**red, **_moves.thread_knobs(dag, t)}  # par-only SPLIT
                 for r in regs:
-                    rows.append({**red, **thr, **_moves.reg_knobs(dag, r)})
+                    rows.append({**base, **_moves.reg_knobs(dag, base, r)})  # complete SPLIT
         # Narrow to the golden-plausible band so the cold prior can't argmin onto a
         # degenerate tile; fall back to the ungated set if no in-band candidate exists.
-        gated = [r for r in rows if _matmul_thread_gate(r, rk)]
+        gated = [r for r in rows if _matmul_thread_gate(r, dag, rk)]
         return (gated or rows), THREAD_KNOBS
 
     from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
@@ -121,13 +121,13 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
         return [], WARP_KNOBS
     rows = []
     bks = _moves.warp_bk_offers(dag, atom)
-    regs = _moves.warp_reg_offers(atom)
-    for wm, wn in _moves.warp_offers(atom):  # wm·wn ≥ 2 already (single-warp mma pruned)
-        geom = _moves.warp_geom_knobs(wm, wn)
+    regs = _moves.warp_reg_offers(dag, atom)
+    for wm, wn in _moves.warp_offers(dag, atom):  # wm·wn ≥ 2 already (single-warp mma pruned)
+        geom = _moves.warp_geom_knobs(dag, wm, wn)  # par-only SPLIT
         for fm, fn in regs:
-            reg = _moves.warp_reg_knobs(fm, fn)
+            row = {**geom, **_moves.warp_reg_knobs(dag, geom, fm, fn)}  # complete SPLIT
             for bk in bks:
-                rows.append({**geom, **reg, **_moves.warp_bk_knobs(dag, atom, bk)})
+                rows.append({**row, **_moves.warp_bk_knobs(dag, atom, bk)})
     return rows, WARP_KNOBS
 
 

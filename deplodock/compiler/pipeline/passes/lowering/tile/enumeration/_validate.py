@@ -39,16 +39,10 @@ from enum import Enum
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.pipeline.knob import mma_decode
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
-    BM,
-    BN,
     CHAIN,
-    FM,
-    FN,
     MMA,
     STAGE,
     TMA,
-    WM,
-    WN,
 )
 
 
@@ -94,14 +88,6 @@ def _legal_tiers(name: str, raw: str) -> frozenset[Tier] | None:
         if not enabled:
             return _NON_WARP  # MMA=0 — scalar/coop/streaming/map, never warp
         return None  # truthy / auto — no constraint
-    if name in (WM.name, WN.name):
-        return frozenset({Tier.WARP}) if _as_int(raw) >= 1 else None
-    if name in (BN.name, BM.name):
-        return _NON_WARP if _as_int(raw) >= 1 else None  # THREAD width — every tier but warp
-    if name in (FM.name, FN.name):
-        # Register cells: coop / streaming force the free-axis register tile to 1, so a
-        # cell pin > 1 is foreign to them; = 1 is the universal value.
-        return frozenset({Tier.MAP, Tier.SCALAR, Tier.WARP}) if _as_int(raw) > 1 else None
     if name == STAGE.name:
         # Staging a read-site: only the scalar reduce / warp matmul stage (COOP / STREAMING
         # are smem-free, MAP has no K-tower). A mask with no selected bit is inert.
@@ -123,12 +109,12 @@ def _as_int(raw: str) -> int:
         return 0
 
 
-# The knobs whose env pin this validator audits — free-axis tile geometry + the staging
-# / transport schedule (STAGE / TMA), each legal only on the tiers in ``_legal_tiers``.
-# The reduce-decomposition levers (``REDUCE@<axis>``) are no longer policed here — their
-# legality is the carrier-trait value-domain gate at the knob (``_families``), not a
-# tier-foreignness check.
-_AUDITED = (MMA, WM, WN, BN, BM, FM, FN, STAGE, TMA, CHAIN)
+# The knobs whose env pin this validator still audits — the atom-tier selector (MMA) and
+# the staging / transport schedule (STAGE / TMA / CHAIN). The geometry families
+# (``SPLIT@<axis>`` / ``REDUCE@<axis>``) are NO LONGER policed by tier-foreignness — a
+# ``SPLIT`` value carries no tier (it is the cell's ``ATOM``), and the reduce levers'
+# legality is the carrier-trait value-domain gate. This is the plan's step-3 retirement.
+_AUDITED = (MMA, STAGE, TMA, CHAIN)
 
 
 def validate_pins(algebra: AlgebraKind) -> None:
