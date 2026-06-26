@@ -13,7 +13,7 @@ pipeline/
 │   ├── candidate.py  # Candidate / LazyCandidate / Cursor data classes
 │   ├── policy/       # Search ABC (base.py) + TuningSearch (mcts.py, tune) + greedy_decide (greedy.py, the Run.resolve pick for compile/run); both rank via the Prior
 │   ├── db.py         # SearchDB SQLite store: op inventory + lowering edges + perf (per-variant replay cache) + node (keyed/deduped/parent-linked search-tree nodes via record_nodes); open_readonly + iter_perf_samples (perf ⋈ cuda_op) back the data layer
-│   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path; golden rows carry the config's `--dynamic` specs in `.dynamic`), Dataset (from_golden/from_db/from_prior + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity AND the single golden↔measured join key: `from_matmul` / `MatmulGoldenConfig.shape_key()` build the golden side, `from_s_features` the stamped-op side — dtype flag from `S_dtype_f32`, never `S_n_mma`, which is 0 on every stamped row; `is_dyn` splits a symbolic-axis golden from its static twin, mirroring the 992 stamp's symbolic-excluded extent products + `S_ext_n_symbolic_axis` flag; all diagnostics joins + run's golden A/B kernel matching key through it)
+│   ├── data/         # harmonized read-view over the 3 sources (golden / DB perf / prior reservoir): Sample (one normalized row + the single knob_features path; golden rows carry the config's `--dynamic` specs in `.dynamic`), Dataset (from_golden/from_db/from_prior/from_node_rows + group_by_op/group_by_kernel_name), ShapeKey (arithmetic S_* identity AND the single golden↔measured join key: `from_matmul` / `MatmulGoldenConfig.shape_key()` build the golden side, `from_s_features` the stamped-op side — dtype flag from `S_dtype_f32`, never `S_n_mma`, which is 0 on every stamped row; `is_dyn` splits a symbolic-axis golden from its static twin, mirroring the 992 stamp's symbolic-excluded extent products + `S_ext_n_symbolic_axis` flag; all diagnostics joins + run's golden A/B kernel matching key through it)
 │   ├── keys.py       # op_cache_key / dialect_of / source_chain
 │   ├── slice.py      # single_node_graph: isolate one finalized kernel into a standalone graph
 │   ├── two_level.py  # two-level tuner: outer structural MCTS + inner separable per-op reward
@@ -570,8 +570,11 @@ Alongside that reservoir feed (not replacing it), the same finished tree is walk
 deduplicated, parent-linked counterpart to the unkeyed/sampled reservoir. Each node keys on
 `digest(context_key, op_sig, tunable-knob set)`, so the same position re-encountered across runs collapses to one row with a
 keep-the-minimum value-of-position latency; it carries the full `knob_features` input dict, and stores `parent_key` from the
-live `node.parent` edge so ancestry is recoverable. Persistent record only — no current consumer reads it back (the prior
-still trains from the in-memory reservoir).
+live `node.parent` edge so ancestry is recoverable. The prior still *trains* from the in-memory reservoir, but the `node`
+store is *read back* by `eval prior --dataset nodes` (`SearchDB.iter_nodes` → `diagnostics.node_report`): it groups nodes by
+`parent_key` and scores the **fork sibling-ranking** — does the prior order each fork's children (the partial configs it
+ranks during `_select`) by their best-reachable latency (top-1 hit + per-fork Spearman)? — the search-faithful evaluation
+no leaf-only view can give, alongside leaf reachability/calibration reused on the deduped store.
 
 Why CatBoost (chosen by `scripts/prior_bakeoff.py` over a multi-op tuning dataset): the model's greedy pick must not run
 off to a degenerate corner. A linear model (the former `BayesianRidgePrior`) is monotone in every knob, so its optimum is

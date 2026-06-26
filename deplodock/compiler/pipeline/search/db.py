@@ -290,6 +290,11 @@ class SearchDB:
     def _has_perf_error_column(self) -> bool:
         return any(r[1] == "error" for r in self._conn.execute("PRAGMA table_info(perf)"))
 
+    def _has_node_table(self) -> bool:
+        # A read-only open of a pre-``node`` DB never ran ``CREATE TABLE IF NOT
+        # EXISTS``, so ``SELECT … FROM node`` would raise; readers gate on this.
+        return self._conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node'").fetchone() is not None
+
     @classmethod
     def open_readonly(cls, path: Path | str) -> SearchDB:
         """Open an existing DB **read-only** — no schema creation, no version
@@ -498,6 +503,45 @@ class SearchDB:
                     "UPDATE node SET n_updates = ?, updated_at = ? WHERE node_key = ?",
                     (existing[1] + 1, now, r.node_key),
                 )
+
+    # ------------------------------------------------------------------
+    # Search-tree nodes — read
+    # ------------------------------------------------------------------
+
+    def iter_nodes(self, *, context_key: str | None = None, op_sig: str | None = None) -> Iterator[NodeRow]:
+        """Yield one :class:`NodeRow` per stored search-tree node (the value-of-position
+        dataset backing ``eval prior --dataset nodes``). Self-contained — no join.
+        A read-only open of a pre-``node`` DB has no such table, so this degrades to
+        yielding nothing instead of raising (mirrors ``iter_perf_samples``'
+        missing-column degrade). Optional ``context_key`` / ``op_sig`` scope to one
+        regime / operation."""
+        if not self._has_node_table():
+            return
+        sql = "SELECT node_key, parent_key, context_key, op_sig, features, value_us, depth FROM node"
+        clauses: list[str] = []
+        params: list = []
+        if context_key is not None:
+            clauses.append("context_key = ?")
+            params.append(context_key)
+        if op_sig is not None:
+            clauses.append("op_sig = ?")
+            params.append(op_sig)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        for node_key, parent_key, ck, sig, feats_json, value_us, depth in self._conn.execute(sql, params):
+            try:
+                features = json.loads(feats_json) if feats_json else {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            yield NodeRow(
+                node_key=node_key,
+                parent_key=parent_key,
+                context_key=ck,
+                op_sig=sig,
+                features=features,
+                value_us=value_us,
+                depth=depth,
+            )
 
     # ------------------------------------------------------------------
     # Perf — read

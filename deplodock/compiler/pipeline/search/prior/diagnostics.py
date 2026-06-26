@@ -252,3 +252,83 @@ def report(prior) -> str:
     if covered == 0:
         lines.append("  none yet — tune the golden shapes (`deplodock tune --golden NAME`) to validate against them")
     return "\n".join(lines)
+
+
+def node_sibling_ranking(prior, nodes) -> tuple | None:
+    """Fork-level ranking over the autotune ``node`` store — the search-faithful
+    metric: group nodes by ``parent_key`` (each group = one fork's children, the
+    partial configs the prior actually ranks during ``_select``) and measure whether
+    the prior orders them by predicted latency the way their value-of-position labels
+    (``value_us`` = best latency reachable below) imply.
+
+    Returns ``(n_forks, top1_rate, median_spearman, n_children)`` — ``top1_rate`` is
+    the fraction of forks whose predicted-best child is a true-best child (its
+    ``value_us`` equals the fork's minimum); ``median_spearman`` is over forks with
+    ≥3 children (``None`` if none). Returns ``None`` when there are no multi-child
+    forks. Unlike :func:`reachability` it does NOT leaf-filter — siblings are already
+    one fork level (branches and leaves alike), and the prior is scored on each
+    node's full feature dict, exactly as ``mcts._select`` queries it."""
+    from collections import defaultdict  # noqa: PLC0415
+
+    from scipy.stats import spearmanr  # noqa: PLC0415
+
+    by_parent: dict = defaultdict(list)
+    for n in nodes:
+        if n.parent_key is not None:
+            by_parent[n.parent_key].append(n)
+
+    top1, rhos, n_forks, n_children = 0, [], 0, 0
+    for sibs in by_parent.values():
+        if len(sibs) < 2:
+            continue
+        n_forks += 1
+        n_children += len(sibs)
+        scored = [(prior.mean_score(s.features), s.value_us) for s in sibs]  # (predicted, measured)
+        pred_best_value = min(scored, key=lambda t: t[0])[1]  # value_us of the predicted-fastest child
+        if pred_best_value <= min(v for _, v in scored) + 1e-12:  # is it a true-best child? (measured ties OK)
+            top1 += 1
+        if len(sibs) >= 3:
+            rho = spearmanr([p for p, _ in scored], [v for _, v in scored]).statistic
+            if not math.isnan(rho):
+                rhos.append(rho)
+    if n_forks == 0:
+        return None
+    return (n_forks, top1 / n_forks, statistics.median(rhos) if rhos else None, n_children)
+
+
+def node_report(prior, nodes) -> str:
+    """The ``eval prior --dataset nodes`` block: the fork sibling-ranking (the
+    metric unique to this dataset) plus leaf reachability / calibration reused on the
+    persistent, deduped node store. ``nodes`` is a list of :class:`db.NodeRow` from
+    :meth:`SearchDB.iter_nodes`."""
+    lines = [f"[prior] node store: {len(nodes)} nodes, fitted={prior.fitted}"]
+    if not nodes:
+        lines.append("  empty — run `deplodock tune <model>` to populate the node table")
+        return "\n".join(lines)
+    if not prior.fitted:
+        lines.append("  no fitted prior — the cold AnalyticPrior ranks by D_* geometry only; run `deplodock tune`")
+
+    sib = node_sibling_ranking(prior, nodes)
+    if sib is None:
+        lines.append("[prior] fork sibling-ranking: no multi-child forks recorded")
+    else:
+        n_forks, top1, rho, n_children = sib
+        rho_txt = f"{rho:+.2f}" if rho is not None else "n/a"
+        lines.append("[prior] fork sibling-ranking — does the prior rank each fork's children by value-of-position?")
+        lines.append(f"  top-1 {top1:.2f}  (predicted-best child is a true-best child)   median per-fork Spearman {rho_txt}")
+        lines.append(f"  over {n_forks} forks ({n_children} children)")
+
+    groups = Dataset.from_node_rows(nodes).group_by_op()
+    rr = reachability(prior, groups)
+    if rr:
+        ratios = [r[3] for r in rr]
+        lines.append("[prior] leaf reachability over node store — does the prior recover each op's best leaf?")
+        agg = f"mean {statistics.mean(ratios):.2f}x  median {statistics.median(ratios):.2f}x  worst {max(ratios):.2f}x"
+        lines.append(f"  {agg}   (1.00 = optimum)")
+        for label, best_us, pick_us, ratio, n in sorted(rr, key=lambda r: -r[3]):
+            flag = "  <-- misses best" if ratio > 1.2 else ""
+            lines.append(f"    {label:26}  best {best_us:8.2f}us  pick {pick_us:8.2f}us  ({ratio:.2f}x, {n} configs){flag}")
+    calib = _calibration(prior, groups)
+    if calib is not None:
+        lines.append(f"[prior] leaf ranking calibration (median per-op Spearman): {calib:+.2f}")
+    return "\n".join(lines)

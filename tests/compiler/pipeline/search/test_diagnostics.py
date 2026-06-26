@@ -114,3 +114,75 @@ def test_golden_prior_eval_warns_per_unjoinable_shape():
     skip_lines = [line for line in out.splitlines() if "SKIPPED" in line and "no tuned rows" in line]
     # square.512 and its .fp16 twin (one line per recorded config name, deduped by name set)
     assert {line.split()[0] for line in skip_lines} >= {"square.512", "square.512.fp16"}
+
+
+# ---------------------------------------------------------------------------
+# node-store fork sibling-ranking
+# ---------------------------------------------------------------------------
+
+
+class _BMPrior:
+    """A prior whose predicted latency is ``sign * features['BM']`` — so ``sign=+1``
+    predicts smaller BM as faster, ``sign=-1`` reverses the order."""
+
+    fitted = True
+
+    def __init__(self, sign: float = 1.0):
+        self._sign = sign
+
+    def mean_score(self, feats) -> float:
+        return self._sign * float(feats.get("BM", 0.0))
+
+
+def _child(node_key, bm, value_us, *, parent="P"):
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    return NodeRow(node_key, parent, "ctx", "mm", {"BM": bm}, value_us, 2)
+
+
+def _fork_nodes():
+    """A root P with three children whose value-of-position falls as BM falls."""
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    return [NodeRow("P", None, "ctx", "mm", {}, 1.0, 1), _child("c8", 8, 1.0), _child("c32", 32, 2.0), _child("c64", 64, 3.0)]
+
+
+def test_node_sibling_ranking_recovers_best_and_order():
+    """The prior orders the fork's children by value-of-position: top-1 hit (its
+    predicted-best child IS the true-best) and Spearman +1."""
+    n_forks, top1, rho, n_children = diagnostics.node_sibling_ranking(_BMPrior(), _fork_nodes())
+    assert (n_forks, n_children) == (1, 3)
+    assert top1 == 1.0 and rho == 1.0
+
+
+def test_node_sibling_ranking_penalizes_reversed_order():
+    """A prior that ranks the children backwards misses top-1 and scores Spearman -1."""
+    _, top1, rho, _ = diagnostics.node_sibling_ranking(_BMPrior(sign=-1.0), _fork_nodes())
+    assert top1 == 0.0  # predicted-best (BM=64) is the slowest child
+    assert rho == -1.0
+
+
+def test_node_sibling_ranking_ignores_singletons_and_top_forks():
+    """A top fork (parent None) and a single-child parent are not multi-child forks,
+    so there is nothing to rank."""
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    nodes = [NodeRow("P", None, "ctx", "mm", {}, 1.0, 1), _child("only", 8, 1.0)]
+    assert diagnostics.node_sibling_ranking(_BMPrior(), nodes) is None
+
+
+def test_node_report_combines_fork_and_leaf_sections():
+    """``node_report`` renders both the fork sibling-ranking and the leaf reachability
+    over the node store."""
+    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+
+    s = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
+    nodes = [
+        NodeRow("P", None, "ctx", "mm", s, 1.0, 1),
+        NodeRow("c8", "P", "ctx", "mm", {**s, "BM": 8}, 1.0, 2),
+        NodeRow("c64", "P", "ctx", "mm", {**s, "BM": 64}, 3.0, 2),
+    ]
+    text = diagnostics.node_report(_BMPrior(), nodes)
+    assert "node store: 3 nodes" in text
+    assert "fork sibling-ranking" in text
+    assert "leaf reachability over node store" in text

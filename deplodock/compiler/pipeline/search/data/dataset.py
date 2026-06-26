@@ -92,6 +92,15 @@ class Dataset:
         ``FallbackPrior`` (it delegates ``_dataset`` to the learned half)."""
         return cls([Sample.from_prior_row(k, v) for k, v in prior._dataset])
 
+    @classmethod
+    def from_node_rows(cls, rows) -> Dataset:
+        """Search-tree ``node`` rows (:meth:`SearchDB.iter_nodes`) as samples — each
+        node's full feature dict + value-of-position latency, split into
+        tunable/``H_*``/``S_*`` exactly like a reservoir row. Pure transform (no
+        I/O), so the caller reads the rows once and can also group them by
+        ``parent_key`` for the fork-ranking diagnostic."""
+        return cls([Sample.from_prior_row(r.features, r.value_us) for r in rows])
+
     # --- grouping ----------------------------------------------------------
 
     def group_by_op(self) -> dict[tuple, list[Sample]]:

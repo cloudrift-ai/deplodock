@@ -309,6 +309,39 @@ def test_node_survives_version_bump_that_drops_lowering(tmp_path) -> None:
     assert val == 3.0
 
 
+def test_iter_nodes_roundtrips_features_and_parent(tmp_path) -> None:
+    """``iter_nodes`` yields a NodeRow per stored node with the JSON feature dict
+    parsed back and the parent pointer intact."""
+    db = SearchDB(tmp_path / "t.db")
+    db.record_nodes(
+        [
+            _node_row("p", 2.0, op_sig="mm", features={"S_n_mma": 1.0}, depth=1),
+            _node_row("c", 4.0, parent_key="p", op_sig="mm", features={"S_n_mma": 1.0, "BM": 8}, depth=2),
+        ]
+    )
+    by_key = {n.node_key: n for n in db.iter_nodes()}
+    assert set(by_key) == {"p", "c"}
+    assert by_key["c"].parent_key == "p" and by_key["p"].parent_key is None
+    assert by_key["c"].features == {"S_n_mma": 1.0, "BM": 8}  # JSON round-trips
+    assert (by_key["c"].value_us, by_key["c"].depth, by_key["c"].op_sig) == (4.0, 2, "mm")
+    # op_sig scoping filters
+    assert [n.node_key for n in db.iter_nodes(op_sig="other")] == []
+
+
+def test_iter_nodes_missing_table_degrades(tmp_path) -> None:
+    """A read-only open of a DB that predates the ``node`` table yields nothing
+    instead of raising ``no such table`` (mirrors the perf error-column degrade)."""
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript("CREATE TABLE perf (context_key TEXT);")  # a node-less DB
+    con.commit()
+    con.close()
+    ro = SearchDB.open_readonly(path)
+    assert not ro._has_node_table()
+    assert list(ro.iter_nodes()) == []
+    ro.close()
+
+
 # ---------------------------------------------------------------------------
 # op inventory
 # ---------------------------------------------------------------------------

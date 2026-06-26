@@ -135,7 +135,7 @@ same worker.
   variants it surfaces (the old `op_effort` skip-already-tuned gate, which suppressed that re-exploration, is gone).
   Persists `perf` / `lowering` / inventory rows — plus a `node` row per search-tree node (keyed/deduped,
   keep-min value-of-position latency, full feature dict + `parent_key`; written alongside the prior's reservoir,
-  no current reader) — to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
+  read by `eval prior --dataset nodes`) — to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
@@ -205,11 +205,13 @@ same worker.
   appearance), so a re-tuned kernel whose hash moved still pairs and prints as `old -> new`; one-side-only kernels are
   listed as kernel-set changes (structural fork / fusion differences). Ratios outside `--tol` color green/red. The
   before/after view for compiler changes — per-kernel rows, not the full-model total, are the stable cross-tune signal.
-The `eval` subcommands share a `--dataset {golden,db}` vocabulary (`commands/dataset_args.py`): `golden` reads the
-recorded `GOLDEN_CONFIGS`, `db` reads the tune DB's measured `perf` rows. Both flow through one read-view —
-`compiler/pipeline/search/data/` (`Sample` / `Dataset` / `ShapeKey`) — which also backs the prior `fit` featurization
-and the diagnostics grouping, so golden filtering, the DB join, and `knob_features` live in one place. Source is
-orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) fails fast with a specific message.
+The `eval` subcommands share a `--dataset {golden,db,nodes}` vocabulary (`commands/dataset_args.py`): `golden` reads the
+recorded `GOLDEN_CONFIGS`, `db` reads the tune DB's measured `perf` rows, `nodes` reads the tune DB's search-tree `node`
+store (`eval prior` only). Both `golden`/`db` flow through one read-view — `compiler/pipeline/search/data/` (`Sample` /
+`Dataset` / `ShapeKey`) — which also backs the prior `fit` featurization and the diagnostics grouping, so golden
+filtering, the DB join, and `knob_features` live in one place (`Dataset.from_node_rows` adapts node rows into the same
+`Sample`s for the leaf metrics). Source is orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`)
+fails fast with a specific message.
 
 - `deplodock eval knobs [--dataset db] [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the
   autotune DB (`--dataset db`, the default; `--dataset golden` is rejected — goldens carry no kernel C identity): the
@@ -224,7 +226,7 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   `search/analytic.py` module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior
   (`eval analytic` shows the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit
   offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
-- `deplodock eval prior [--prior PATH] [--dataset {golden,db}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
+- `deplodock eval prior [--prior PATH] [--dataset {golden,db,nodes}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
   learned `CatBoostPrior`. Default `--dataset golden`: the golden's rank under the prior over the full enumeration, then
   the greedy pipeline pick vs golden (per-knob `found/golden`) with a **`vs gold`** perf column — the deployable (-O3)
   latency of the prior's predicted-best **measured** config over the golden's recorded `deplodock_us`, read from the
@@ -236,7 +238,13 @@ orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`) 
   mirrors the 992 stamp: symbolic axes are excluded from the extent products). `--dataset db` instead reports the prior's pick
   **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
   orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
-  Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also
+  `--dataset nodes` instead reads the tune DB's search-tree **`node` store** (the value-of-position dataset
+  `deplodock tune` records — partial branches + leaves with a `parent_key`) and reports two things
+  (`diagnostics.node_report` over `SearchDB.iter_nodes()`): the **fork sibling-ranking** — group nodes by `parent_key`
+  and ask whether the prior orders each fork's children (the partial configs it ranks during `_select`) by their
+  best-reachable latency (top-1 hit + median per-fork Spearman), the search-faithful metric no other view measures —
+  plus **leaf reachability / calibration** reused on the deduped persistent store. Reads the prior JSON
+  (`DEPLODOCK_PRIOR_FILE` or `--prior`; option-0 when none loaded). `--features` (golden mode) also
   prints the exact regressor input per golden config (`knob.knob_features`: `S_*` structural/shape + `H_*` regime +
   tuning knobs; the shape enters only as coarse `S_ext_*` products/maxes, so the occupancy/CTA/reuse terms the prior
   needs are added as engineered `D_*` features). The golden `S_*` here is the full histogram (the shape's snippet is

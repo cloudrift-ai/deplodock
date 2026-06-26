@@ -31,11 +31,12 @@ def add_dataset_args(parser, *, default: str, with_min_variants: bool = False) -
     threshold."""
     parser.add_argument(
         "--dataset",
-        choices=["golden", "db"],
+        choices=["golden", "db", "nodes"],
         default=default,
-        help=f"Measurement-data source: 'golden' (recorded golden configs) or 'db' (tune DB perf rows). Default: {default}.",
+        help="Measurement-data source: 'golden' (recorded golden configs), 'db' (tune DB perf rows), or 'nodes' "
+        f"(tune DB search-tree node store, for `eval prior`). Default: {default}.",
     )
-    parser.add_argument("--db", help="Tune DB path for --dataset db. Default: DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db.")
+    parser.add_argument("--db", help="Tune DB path for --dataset db/nodes. Default: DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db.")
     parser.add_argument("--kernel", help="Filter by name substring (golden name, or kernel C identifier for --dataset db).")
     if with_min_variants:
         parser.add_argument(
