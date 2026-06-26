@@ -20,7 +20,18 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Ternary
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, Write
 from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
-from deplodock.compiler.ir.tile.ir import Atom, Binding, Block, RegisterTile, Schedule, TileGraph
+from deplodock.compiler.ir.tile.ir import (
+    ATOM_REGISTRY,
+    Atom,
+    Binding,
+    Block,
+    Edge,
+    RegisterTile,
+    Schedule,
+    TileGraph,
+    Transport,
+)
+from deplodock.compiler.pipeline.passes.lowering._flash_geom import flash_params
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
@@ -496,6 +507,76 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
         binding[lp.axis.name] = Binding.GRID
     new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
     return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
+
+
+# === Warp-tier flash build move (capability 1 — atomize the two chained contractions). ===
+# WIP toward dissolving ``_assemble.realize_flash``: ``warp_chain_build`` produces the warp-tier
+# flash as an **atomized streaming TileGraph** the generic ``assemble_carry`` walk realizes (the
+# fragment-tier softmax / scale / mask / C→A handoff / epilogue), instead of ``realize_flash``
+# hand-assembling the whole ``CarryScope``. It atomizes the QK^T cell (``out_index`` fragment
+# output, transposed-B) and the P@V cell (``frag_a``, canonical-B) via the generic ``atomize_cell``
+# (capability 1, proven in ``test_streaming_symbolic_chain``), with the flat addressing from the
+# shared ``flash_params`` geometry. The kv-stream is the ``Schedule.carry`` axis; the score→P→A
+# handoff is a ``Transport.FRAG`` staged edge (capability 2). The assemble-side walk + the dispatch
+# flip + ``realize_flash`` deletion are the remaining steps — GPU-validated against the reference.
+
+
+def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
+    """Capability 1 — atomize the warp-tier flash's two chained contractions into a streaming
+    ``TileGraph`` (WIP).
+
+    Reuses the generic ``atomize_cell`` on the **seed's logical 4D cells** (the proven cap-1
+    mechanism — ``atomize_cell`` keys on the K *dim* of a multi-dim load, so the loads stay 4D and
+    the render flattens them via the buffer strides; a flat 1-D address can't be classified). The
+    QK^T inner D-reduce → a transposed-B ``Mma`` (``out_index`` = the INLINE score ``(m, kv)``); the
+    split-carrier P@V → a ``frag_a`` canonical-B ``Mma`` (``A`` = the probability fragment, ``B`` =
+    V). The kv stream is marked ``Schedule.carry``; the score→A handoff is a ``Transport.FRAG``
+    staged edge (capability 2).
+
+    REMAINING (WIP, not yet wired — ``realize_flash`` still drives): the **warp σ-tiling** (the
+    16-query-rows-per-warp geometry on the 4D loads), the ``assemble_carry`` walk that realizes the
+    fragment-tier softmax / scale / mask / handoff / epilogue around these cells (capability 3), and
+    the dispatch flip + ``realize_flash`` deletion — each GPU-validated against the reference."""
+    tg = op.tilegraph
+    block = tg.blocks[0]
+    atom = ATOM_REGISTRY[flash_params(op.buffers, block.writes[0].buffer).atom_kind]
+    chain = op.dag.chain
+    kv = chain.hinge_name
+
+    kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
+    value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == chain.carrier.partial[1])
+    _d_axis, m_axis, _grid = _chain_axes(op.dag, value_load)
+
+    # QK^T: atomize the inner D-reduce cell (4D loads) → transposed-B, the INLINE score (m, kv).
+    qkt_loop = next(s for s in kv_loop.body if isinstance(s, Loop))
+    qkt_cell = atomize_cell(tuple(qkt_loop.body), atom=atom, k_name=qkt_loop.axis.name, write=None, out_index=(Var(m_axis.name), Var(kv)))
+    qkt = replace(qkt_loop, body=Body(qkt_cell))
+
+    # P@V: atomize the split-carrier accumulation (frag_a) — A = the probability fragment, B = V.
+    stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
+    prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
+    pv_cell = (
+        replace(value_load, names=("vv",)),
+        Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")),
+        Accum(name=d_state, value="pv"),
+    )
+    pv = atomize_cell(pv_cell, atom=atom, k_name=kv, write=None, frag_a=True)
+
+    # The streaming carry body: QK^T cell → the stats carrier (softmax) → P@V cell. The fragment
+    # realization (carrier → FragmentRowReduce/Exp/Scale; score→prob→A via the FRAG handoff) is the
+    # assemble_carry walk's job (capability 3).
+    new_kv = replace(kv_loop, body=Body((qkt, stats, *pv)))
+    head_inits = tuple(s for s in block.compute if isinstance(s, Init))
+    epilogue = tuple(s for s in block.compute if isinstance(s, (Assign, Write)))
+    compute = (*head_inits, new_kv, *epilogue)
+
+    # The score→A handoff: the probability fragment relayed register→smem→ldmatrix into the P@V A
+    # fragment (``synthesize_frag_handoff``) — an SMEM-placed edge on the SYNC transport (cp.async
+    # can't relayout a register value). ``carry`` is what dispatches the fragment-tier realization.
+    handoff_edge = Edge(src=block.name, dst=block.name, buffer="flash_pv_smem")
+    schedule = replace(tg.schedule, carry=frozenset({kv}), staged={**tg.schedule.staged, handoff_edge: Transport.SYNC})
+    new_block = Block(name=block.name, domain=block.domain, compute=Body(compute))
+    return replace(tg, blocks=(new_block, *tg.blocks[1:]), schedule=schedule)
 
 
 # === Warp-tier (tensor-core ``atomize``) build move. ===

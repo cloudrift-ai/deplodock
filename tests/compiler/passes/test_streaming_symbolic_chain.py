@@ -148,3 +148,35 @@ def test_flash_cells_atomize_via_the_generic_unit():
     )
     pv = next(s for s in atomize_cell(pv_cell, atom=atom, k_name=kv, write=None, frag_a=True) if isinstance(s, Mma))
     assert pv.b_trans is False and pv.a == prob, "P@V must atomize canonical-B with A = the probability fragment"
+
+
+def test_warp_chain_build_produces_atomized_streaming_graph():
+    """Capability 1 orchestration (WIP): ``warp_chain_build`` emits a streaming ``TileGraph`` with
+    the two atomized cells (QK^T transposed-B, P@V ``frag_a`` canonical-B) over the kv-stream
+    ``Schedule.carry`` axis + the score→A handoff as a ``Transport.FRAG`` staged edge. Not yet
+    wired into the pipeline (the ``assemble_carry`` walk that realizes the fragment-tier phases is
+    the next step); this is the structural check on the build move's output. CPU-only."""
+    from deplodock.compiler.dtype import F16
+    from deplodock.compiler.ir.stmt import Mma
+    from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import warp_chain_build
+
+    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so flash_params admits the warp scope.
+    shp = (Dim(1), Dim(1), Dim(64), Dim(16))
+    loop = build_flash_frag("q", "k", "v", shp, shp, shp, Tensor("o", shp, F32), causal=False).nodes["o"].op
+    dag = iter_dag(loop)
+    # The synthetic recognizer fragment carries no input shapes (the real pipeline gets 4D shapes
+    # from the trace); supply the (B,H,S,D) fp16 buffers `flash_params` derives geometry from.
+    buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
+    op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
+    chain = dag.chain
+    _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
+    prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
+
+    tg = warp_chain_build(op)
+    assert tg.schedule.carry == frozenset({chain.hinge_name}), "the kv stream must be marked Schedule.carry"
+    assert any(e.buffer == "flash_pv_smem" for e in tg.schedule.staged), "the score→A handoff must be a staged smem edge"
+    mmas = [s for s in tg.blocks[0].compute.iter() if isinstance(s, Mma)]
+    assert any(m.b_trans for m in mmas), "QK^T (transposed-B) cell present"
+    assert any(not m.b_trans for m in mmas), "P@V (canonical-B) cell present"
+    assert any(m.a == prob for m in mmas if not m.b_trans), "P@V reads the probability fragment as its A operand"
