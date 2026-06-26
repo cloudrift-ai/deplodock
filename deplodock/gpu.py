@@ -108,19 +108,19 @@ class GpuSpec:
         memorized fallback. ``total_mem`` (VRAM bytes) is the one feature that
         distinguishes same-die SKUs the prior otherwise can't tell apart (H100 80GB vs
         H200 141GB share cc + SM count). Empty when ``sm_count`` is unknown (degrades
-        like a GPU-less host); ``total_mem`` is omitted when VRAM is unknown."""
+        like a GPU-less host); ``total_mem`` is always present (``0.0`` when VRAM is
+        unknown) so the feature SET matches the live probe — a card featurizes the same
+        whether probed or memorized."""
         if self.sm_count is None or self.smem_per_sm is None:
             return {}
-        feats = {
+        return {
             "sm_count": float(self.sm_count),
             "smem_per_sm": float(self.smem_per_sm),
             "smem_per_block": float(self.smem_per_block),
             "regs_per_block": float(self.regs_per_block),
             "warp_size": float(self.warp_size),
+            "total_mem": float(self.vram_bytes or 0),
         }
-        if self.vram_bytes is not None:
-            feats["total_mem"] = float(self.vram_bytes)
-        return feats
 
 
 # Specs marked "measured" are exact values probed off the live card (recorded in

@@ -38,6 +38,15 @@ def test_device_features_shape():
     assert gpu.by_name("AMD Instinct MI350X").device_features() == {}
 
 
+def test_device_features_total_mem_present_when_vram_unknown():
+    """``total_mem`` is always emitted (``0.0`` when VRAM is unknown) so a card's feature
+    SET matches the live probe — it featurizes the same whether probed or memorized."""
+    spec = gpu.GpuSpec(name="Synthetic SM-known/VRAM-unknown", compute_capability=(9, 0), sm_count=132, smem_per_sm=233472)
+    feats = spec.device_features()
+    assert "total_mem" in feats and feats["total_mem"] == 0.0
+    assert set(feats) == {"sm_count", "smem_per_sm", "smem_per_block", "regs_per_block", "warp_size", "total_mem"}
+
+
 def test_probe_falls_back_to_memorized(monkeypatch):
     # Force the cupy probe to fail → memorized fallback of the named card / default.
     import builtins
