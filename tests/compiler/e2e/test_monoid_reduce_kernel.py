@@ -1,14 +1,17 @@
-"""Carrier-general cross-partition reduce kernel.
+"""Carrier-general cross-partition reduce kernel (BACKEND-ACCURACY).
 
-The atomic-free split-K combine block, rebuilt against the block-DAG Tile IR:
+The atomic-free split-K combine block, run on ``CudaBackend`` and asserted against numpy:
 ``enumeration/_partition.deferred_combine_tilegraph`` builds a combine kernel for any carrier
 (the additive ``Accum`` lowered as a degenerate ``Monoid`` via ``Accum.as_monoid``, folded by
-``deferred_combine_tilegraph``) — for a
-``Monoid`` carrier, per-partition state slabs in a ``workspace[S, M, N]``, ``identity``-seeded,
-folded along ``S`` via the carrier's ``combine_states`` (the new-IR successor of the deleted
-``017``'s ``build_monoid_reduce_tileop``). This test exercises the NON-additive ``(m, l)``
-online-softmax monoid through the builder directly — a hand-built scalar monoid split that
-merges S partition states and matches numpy.
+``deferred_combine_tilegraph``) — for a ``Monoid`` carrier, per-partition state slabs in a
+``workspace[S, M, N]``, ``identity``-seeded, folded along ``S`` via the carrier's ``combine_states``.
+Exercises the NON-additive ``(m, l)`` online-softmax monoid, the additive ``Accum`` (matmul
+split-K), the flash ``(m, l, O)`` twisted monoid, and the twisted ``(m, l)`` monoid through the
+builder directly.
+
+NOTE: every test here builds its reference graph through the tile-internal
+``deferred_combine_tilegraph`` / ``reduce_tilegraphop`` helpers, so they are tile-entangled — they
+will break when the tile IR is rebuilt and are expected to be xfailed at that point.
 """
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import Literal
+from deplodock.compiler.ir.stmt import Assign, Monoid
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
 
 
@@ -33,9 +38,45 @@ def _has_cuda() -> bool:
         return False
 
 
-def _ml_carrier():
-    from tests.compiler.test_cooperative_combine import _ml_combine
+def _ml_combine(m: str, ll: str, s: str) -> Monoid:
+    """The online-softmax ``(m, l)`` monoid: state max + denominator, folding one
+    score ``s``. Authors both ``merge`` (fold a partial) and ``combine_states``
+    (merge two partition states) — the asymmetric monoid can't auto-derive."""
+    merge = (
+        Assign(f"{m}_mx", "maximum", (m, s)),
+        Assign(f"{m}_dm", "subtract", (m, f"{m}_mx")),
+        Assign(f"{m}_al", "exp", (f"{m}_dm",)),
+        Assign(f"{m}_ds", "subtract", (s, f"{m}_mx")),
+        Assign(f"{m}_p", "exp", (f"{m}_ds",)),
+        Assign(f"{m}_lm", "multiply", (ll, f"{m}_al")),
+        Assign(ll, "add", (f"{m}_lm", f"{m}_p")),
+        Assign(m, "copy", (f"{m}_mx",)),
+    )
+    mb, lb = f"{m}__o", f"{ll}__o"
+    combine_states = (
+        Assign(f"{m}_cmx", "maximum", (m, mb)),
+        Assign(f"{m}_cda", "subtract", (m, f"{m}_cmx")),
+        Assign(f"{m}_ca", "exp", (f"{m}_cda",)),
+        Assign(f"{m}_cdb", "subtract", (mb, f"{m}_cmx")),
+        Assign(f"{m}_cb", "exp", (f"{m}_cdb",)),
+        Assign(f"{m}_cla", "multiply", (ll, f"{m}_ca")),
+        Assign(f"{m}_clb", "multiply", (lb, f"{m}_cb")),
+        Assign(ll, "add", (f"{m}_cla", f"{m}_clb")),
+        Assign(m, "copy", (f"{m}_cmx",)),
+    )
+    return Monoid(
+        state=(m, ll),
+        partial=(s,),
+        merge=merge,
+        identity=(Literal(-1e30), Literal(0.0)),
+        commutative=True,
+        axes=("k",),
+        state_b=(mb, lb),
+        combine_states=combine_states,
+    )
 
+
+def _ml_carrier():
     return _ml_combine("m", "l", "s")
 
 
@@ -86,8 +127,6 @@ def test_monoid_reduce_merges_partition_states(s: int, m: int, n: int) -> None:
 
 
 def _deferred_graph(carrier, *, workspaces, s, m, n, **kw) -> Graph:
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph
-
     tg = deferred_combine_tilegraph(
         carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, out_shape=(m, n), dtype=F32, name="deferred__reduce", **kw
     )

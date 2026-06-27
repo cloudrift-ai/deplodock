@@ -30,7 +30,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 
-from .conftest import dyn_M, requires_sm90
+from ..conftest import dyn_M, requires_sm90
 
 # Static matmul N / K (only M flips static<->dynamic). K static so the source
 # innermost dim stays static — TMA-eligible (a symbolic innermost dim would

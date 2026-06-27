@@ -23,7 +23,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import is_warp, mma_atom
 
-from .conftest import dyn_M, requires_cuda, requires_sm90
+from ..conftest import dyn_M, requires_cuda, requires_sm90
 
 # Route every test in this module to the single ``cuda`` xdist_group
 # (``tests/conftest.py::_is_cuda_item`` detects the ``"CUDA not available"``

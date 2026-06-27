@@ -38,7 +38,7 @@ from deplodock.compiler.ir.frontend.ir import MatmulOp
 from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import mma_atom
 
-from .conftest import requires_sm90
+from ..conftest import requires_sm90
 
 # ``TMA=0`` pins the cp.async masked path: these tests assert cp.async-specific
 # codegen (the clamped A-slab fill, the double-buffered pipeline). Symbolic-M with

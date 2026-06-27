@@ -27,7 +27,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import mma_atom
 
-from .conftest import dyn_M, requires_cuda, requires_sm90
+from ..conftest import dyn_M, requires_cuda, requires_sm90
 
 # ``requires_sm90`` skips below sm_90: this suite forces the mma.sync warp tier
 # (ldmatrix), which is non-functional on sm_80-89 (host ldmatrix fault). It

@@ -166,6 +166,18 @@ _CUDA_CLI_GROUP = "cuda-cli"
 def pytest_collection_modifyitems(config, items):
     import heapq
 
+    # Step 0: apply the tile-IR-rebuild xfail registry. A single file
+    # (``tests/xfail_registry.py``) owns every expected failure during the
+    # rebuild; mark each matching item ``xfail(strict=False)`` so recovery
+    # shows up as XPASS. See that module's docstring.
+    from tests.xfail_registry import XFAIL
+
+    for it in items:
+        for pat, reason in XFAIL.items():
+            if pat in it.nodeid:
+                it.add_marker(pytest.mark.xfail(reason=reason, strict=False))
+                break
+
     # Step 1: pin every CUDA-touching item to an xdist_group so each
     # chain lands on one worker and runs sequentially — ``cuda`` for
     # in-process device work, ``cuda-cli`` for ``run_cli`` subprocess

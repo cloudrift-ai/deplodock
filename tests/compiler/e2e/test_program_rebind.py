@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from .conftest import requires_cuda
+from ..conftest import requires_cuda
 
 pytestmark = [requires_cuda]
 

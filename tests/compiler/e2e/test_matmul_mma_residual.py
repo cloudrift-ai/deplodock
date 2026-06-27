@@ -39,7 +39,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Stmt
 from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 from deplodock.compiler.pipeline.knob import mma_atom
 
-from .conftest import requires_cuda, requires_sm90
+from ..conftest import requires_cuda, requires_sm90
 
 
 def _has_cuda() -> bool:

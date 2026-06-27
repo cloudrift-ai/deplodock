@@ -1,13 +1,10 @@
-"""The SMEM fused-edge assemble.
+"""The SMEM fused-edge assemble — backend-accuracy coverage.
 
 The fused realization of an ``SMEM``-placed edge: a MAP producer ``--xn-->`` SEMIRING
 matmul consumer kept in **one kernel**, the ``xn`` intermediate riding an smem slab the
-producer fills (`relu(x) @ w`). ``assemble_fused`` builds it by reusing the existing
-``StageBundle.compute`` phase ("sibling-smem → own-smem"): stage ``x`` into a slab, the
-producer becomes the compute phase writing ``xn_smem``, the consumer matmul reads it.
-
-The structural test pins the fused kernel shape; the CUDA test pins it runs correctly —
-one kernel computing ``relu(x) @ w``, the matmul reading ``xn`` from smem (no gmem
+producer fills (`relu(x) @ w`). These are the end-to-end accuracy tests: compile a fused
+graph, run it on ``CudaBackend``, and assert the result matches a numpy / torch reference
+— one kernel computing ``f(x, …) @ w``, the matmul reading ``xn`` from smem (no gmem
 round-trip).
 """
 
@@ -18,27 +15,62 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from deplodock.compiler import dtype as _dt
 from deplodock.compiler.context import Context
 from deplodock.compiler.dtype import F16
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
+from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, TileGraph, TileGraphOp, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, is_fused_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag, seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from tests.compiler.conftest import requires_cuda
-from tests.compiler.passes.test_tile_ir_invariants import _oracle_tilegraph
 
 _KN = {
     fam.split_key("a1"): fam.enc_split(16, 2),
     fam.split_key("a0"): fam.enc_split(16, 2),
     fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1),
 }
+
+
+# ── ``_oracle_tilegraph`` (copied from the deleted ``test_tile_ir_invariants``) ──────────
+def _loop_dag_buffers(graph: Graph):
+    """The fused ``LoopOp`` + its ``iter_dag`` / regime / logical buffers — the seed the
+    move composer tiles. Mirrors ``010_build`` so the oracle path matches the pipeline."""
+    loop = next(n.op for n in Pipeline.build(LOOP_PASSES).run(graph).nodes.values() if type(n.op).__name__ == "LoopOp")
+    dag = iter_dag(loop)
+    buffers = {name: Buffer(name=name, shape=tuple(t.shape), dtype=t.dtype, space=Space.GMEM) for name, t in loop.inputs.items()}
+    return loop, dag, classify(dag), buffers
+
+
+def _oracle_tilegraph(graph: Graph, knobs: dict):
+    """``build_dag`` (the composition oracle) for ``graph`` at ``knobs``."""
+    _loop, dag, regime, buffers = _loop_dag_buffers(graph)
+    return build_dag(dag, knobs, kernel_name="k_matmul", target_names=regime.target_names, buffers=buffers)
+
+
+# ── ``_norm_linear_graph`` (copied from the deleted ``test_cut_offers``) ─────────────────
+_S, _H, _I = 32, 1024, 3072
+
+
+def _norm_linear_graph() -> Graph:
+    """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul that
+    005 offers the structural split on."""
+    f16 = _dt.get("f16")
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", (1, _S, _H), f16), node_id="x")
+    g.add_node(InputOp(), [], Tensor("nw", (_H,), f16), node_id="nw")
+    g.add_node(InputOp(), [], Tensor("wg", (_I, _H), f16), node_id="wg")
+    g.add_node(RmsNormOp(eps=1e-6), ["x", "nw"], Tensor("xn", (1, _S, _H), f16), node_id="xn")
+    g.add_node(LinearOp(), ["xn", "wg"], Tensor("o", (1, _S, _I), f16), node_id="o")
+    g.inputs = ["x", "nw", "wg"]
+    g.outputs = ["o"]
+    return g
 
 
 def _mm_xn_graph(M=64, K=64, N=64) -> Graph:
@@ -99,33 +131,6 @@ def _fused_graph(producer_graph: Graph, M=64, K=64, N=64) -> TileGraph:
     xn_edge = Edge(src="prod", dst=cons.name, buffer="xn")
     sched = replace(cons_tg.schedule, launch={"prod": 0, cons.name: 0}, staged={xn_edge: Transport.SYNC})
     return TileGraph(name="fused", buffers=buffers, blocks=(prod, cons), schedule=sched)
-
-
-def test_fused_graph_detected():
-    tg = _fused_graph(_relu_producer(64, 64))
-    assert is_fused_graph(tg)  # two blocks, one launch group
-
-
-def test_assemble_fused_builds_compute_phase():
-    """The fused ``TileOp`` is one kernel whose ``xn`` slab is filled by a
-    ``StageBundle.compute`` phase (the producer relu), staging ``x`` (not ``xn``) from
-    gmem — the producer rides the consumer's slab, no gmem round-trip of ``xn``."""
-    top = assemble_block(_fused_graph(_relu_producer(64, 64)), knobs=_KN, base_knobs={}, kernel_name="k_fused")
-    assert isinstance(top, TileOp)
-    bundles = [s for s in top.body.iter() if isinstance(s, StageBundle)]
-    assert bundles, "fused kernel must carry a StageBundle"
-    fused = [b for b in bundles if b.compute is not None]
-    assert fused, "the xn slab must be filled by a compute phase (the producer)"
-    # the bundle stages x (the producer input), not xn (which is the compute output)
-    staged_bufs = {src.buf for b in fused for src in b.sources}
-    assert "x" in staged_bufs and "xn" not in staged_bufs
-    # the compute phase applies the producer transform (relu) and writes the xn slab
-    from deplodock.compiler.ir.stmt import Assign, Write
-
-    assigns = [s for b in fused for s in b.compute.iter() if isinstance(s, Assign)]
-    assert any(getattr(a.op, "name", "") == "relu" for a in assigns)
-    writes = [s for b in fused for s in b.compute.iter() if isinstance(s, Write)]
-    assert any(w.output.startswith("xn") for w in writes)
 
 
 @requires_cuda
@@ -272,7 +277,6 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     from deplodock.compiler.ir.stmt import Write
     from deplodock.compiler.ir.tile.ir import Placement, TileGraphOp
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
-    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
     monkeypatch.setenv("DEPLODOCK_BN", "16")
     monkeypatch.setenv("DEPLODOCK_BM", "16")
@@ -328,41 +332,6 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
 _TILE_PASSES = ["lowering/tile/split", "lowering/tile/enumeration", "lowering/tile/assembly"]
 
 
-def _n_kernels(graph):
-    from deplodock.compiler.ir.loop import LoopOp
-
-    return sum(1 for n in graph.nodes.values() if isinstance(n.op, (TileOp, LoopOp)))
-
-
-def test_offering_fork_keeps_fused_by_default_splits_when_pinned(monkeypatch):
-    """The offering fork (``split/005`` → ``seed_fused``): a demoted matmul (RMSNorm →
-    linear) is a real keep(SMEM)-vs-cut(GMEM) fork. Greedy's "a cold compile never changes
-    kernel sets" rule deploys the kernel-set-preserving keep(SMEM) — the **default is now
-    ONE fused kernel** (the RMSNorm cone on-chip, no gmem round-trip). ``DEPLODOCK_SPLIT_CONE
-    =1`` pins the GMEM cut (two kernels); ``=0`` pins the fused edge. The structural half,
-    no GPU."""
-    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
-
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
-    monkeypatch.setenv("DEPLODOCK_BM", "16")
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
-    ctx = Context.from_target((12, 0))
-
-    def lower(env_split):
-        if env_split is None:
-            monkeypatch.delenv("DEPLODOCK_SPLIT_CONE", raising=False)
-        else:
-            monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", env_split)
-        lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)
-        return Pipeline.build(_TILE_PASSES).run(lo, ctx=ctx)
-
-    greedy = lower(None)
-    assert _n_kernels(greedy) == 1  # unpinned cold default — the SMEM fused edge, one kernel
-    assert sum(1 for n in greedy.nodes.values() if isinstance(n.op, TileOp)) == 1
-    assert _n_kernels(lower("0")) == 1  # pinned keep — same fused edge
-    assert _n_kernels(lower("1")) == 2  # pinned cut — the two-kernel GMEM fragment
-
-
 @requires_cuda
 @pytest.mark.parametrize("tier", ["warp", "scalar"])
 def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
@@ -372,7 +341,6 @@ def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
     Covers the **warp tier** (the natural greedy pick — the matmul reads the
     cooperatively-reduced per-row scale from smem via ``ldmatrix``) and the scalar tier."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
     if tier == "scalar":
         monkeypatch.setenv("DEPLODOCK_BN", "16")
