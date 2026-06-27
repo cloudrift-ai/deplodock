@@ -1,11 +1,13 @@
 """The scalar combiner (``ir/twist.ScalarCombiner``) — CPU-only, the structural oracle for
 "realize the carrier merge at the scalar (undistributed) tier".
 
-Asserts that ``ScalarCombiner.combine`` projects the ``flash_combine`` online-softmax ``Monoid``
-onto plain scalar ``Assign``s — the identity projection — so the emitted phases reproduce the
-carrier's ``merge`` algebra exactly (the same faithfulness ``render_merge_program`` has, but as IR
-split into the carrier-generic ``CombinePhases`` it shares with the fragment ``MmaTwist``). No GPU,
-no fragment ops.
+Asserts that ``ScalarCombiner.combine`` projects the ``flash_combine`` online-softmax ``Monoid`` onto
+loose scalar statements — the identity projection — reproducing the carrier's ``merge`` algebra (the
+same faithfulness ``render_merge_program`` has, but as IR split into the carrier-generic
+``CombinePhases`` it shares with the fragment ``MmaTwist``). Because these are loose statements (not a
+``Monoid`` rendered via ``render_merge_program``'s ``state_names``), a carried-state update is a
+``Reassign`` (``Assign`` always declares, which would shadow the ``Init``'d carried value). No GPU, no
+fragment ops.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 from collections import Counter
 
 from deplodock.compiler.ir.expr import Literal
+from deplodock.compiler.ir.kernel.ir import Reassign
 from deplodock.compiler.ir.stmt import Assign, Init, Monoid
 from deplodock.compiler.ir.twist import ScalarCombiner
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
@@ -53,55 +56,87 @@ def _sig(a: Assign) -> tuple:
     return (a.name, a.op.name, tuple(a.args))
 
 
-def test_scalar_phases_are_all_scalar_assigns() -> None:
-    # No fragment / row-distributed nodes: every emitted stmt is a plain Assign or an Init seed.
+def _normalized(stmts) -> list[tuple]:
+    """Inline the temp + ``Reassign`` carried-state rebinds back to ``(state, op, args)`` so the
+    realized scalar phases compare against the carrier's ``merge`` algebra: a ``Reassign(state, tmp)``
+    over a ``__sc`` rebind temp becomes the temp's ``(op, args)``; a ``Reassign(state, src)`` copy
+    becomes ``("copy", (src,))``; the ``__sc`` temps drop; every other ``Assign`` passes through."""
+    by_name = {s.name: s for s in stmts if isinstance(s, Assign)}
+    out: list[tuple] = []
+    for s in stmts:
+        if isinstance(s, Reassign):
+            if s.value.endswith("__sc"):
+                src = by_name[s.value]
+                out.append((s.name, src.op.name, tuple(src.args)))
+            else:
+                out.append((s.name, "copy", (s.value,)))
+        elif isinstance(s, Assign) and not s.name.endswith("__sc"):
+            out.append(_sig(s))
+    return out
+
+
+def test_scalar_phases_are_scalar_only() -> None:
+    # No fragment / row-distributed nodes: every emitted stmt is a plain Assign / Reassign / Init.
     fs = ScalarCombiner().combine(_carrier())
     assert all(isinstance(s, Init) for s in fs.init)
     for phase in (fs.merge, fs.rescale, fs.consume, fs.epilogue):
-        assert all(isinstance(s, Assign) for s in phase)
+        assert all(isinstance(s, (Assign, Reassign)) for s in phase)
     assert fs.update == ()
 
 
 def test_projection_is_faithful_to_the_merge_program() -> None:
-    # The identity projection: merge + rescale + consume together reproduce the carrier's merge
-    # assignments exactly (same name / op / args multiset) — the scalar tier neither drops nor
-    # invents work relative to render_merge_program(merge).
+    # The identity projection: merge + rescale + consume (with the Reassign rebinds inlined) reproduce
+    # the carrier's merge assignments exactly — the scalar tier neither drops nor invents work.
     carrier = _carrier()
     fs = ScalarCombiner().combine(carrier)
-    realized = Counter(_sig(a) for a in (*fs.merge, *fs.rescale, *fs.consume))
+    realized = Counter(_normalized([*fs.merge, *fs.rescale, *fs.consume]))
     expected = Counter(_sig(a) for a in carrier.merge)
     assert realized == expected
+
+
+def test_carried_states_are_init_then_reassigned_never_declared() -> None:
+    # The correctness invariant (guards the loose-Assign shadowing bug): every carried state is
+    # declared once by an Init and rebound by a Reassign — never the target of an Assign (which would
+    # declare a fresh local, shadowing the Init'd carried value and leaving O / l at their identity).
+    carrier = _carrier()
+    fs = ScalarCombiner().combine(carrier)
+    states = set(carrier.state)  # m_i, l_i, O_i
+    body = [*fs.merge, *fs.rescale, *fs.consume]
+    assert states <= {s.name for s in fs.init if isinstance(s, Init)}
+    assert states <= {s.name for s in body if isinstance(s, Reassign)}
+    assert not (states & {s.name for s in body if isinstance(s, Assign)})
 
 
 def test_init_seeds_states_and_declares_accumulator() -> None:
     # init declares all three carried states with their fold-identity op: m (max → −inf),
     # l (add → 0), O (add → 0). The accumulator O is the last (declare_accum after the seeds).
-    fs = _carrier_combine_init()
+    fs = ScalarCombiner().combine(_carrier())
     seeds = {s.name: s.op.name for s in fs.init}
     assert seeds == {"m_i": "maximum", "l_i": "add", "O_i": "add"}
     assert fs.init[-1].name == "O_i"  # the accumulator declared after the stats-state seeds
 
 
-def _carrier_combine_init():
-    return ScalarCombiner().combine(_carrier())
-
-
 def test_epilogue_normalizes_accumulator_by_denominator() -> None:
-    # O / l — the add-fold stats state l is the denominator.
+    # O / l — the add-fold stats state l is the denominator (a Reassign rebind, inlined here).
     fs = ScalarCombiner().combine(_carrier())
-    assert len(fs.epilogue) == 1
-    assert _sig(fs.epilogue[0]) == ("O_i", "divide", ("O_i", "l_i"))
+    assert _normalized(list(fs.epilogue)) == [("O_i", "divide", ("O_i", "l_i"))]
 
 
 def test_statement_order_is_dependency_valid() -> None:
-    # Walking init → merge → rescale → consume in order, every arg is already defined (a prior
+    # Walking init → merge → rescale → consume in order, every read is already defined (a prior
     # stmt, a carried state, or a partial input) — the emitted order is a valid schedule.
     carrier = _carrier()
     fs = ScalarCombiner().combine(carrier)
     defined = set(carrier.partial)  # s, v arrive as the per-step partial
     for s in (*fs.init, *fs.merge, *fs.rescale, *fs.consume):
-        for arg in s.args if isinstance(s, Assign) else ():
-            assert arg in defined, f"{arg} used before definition in {_sig(s) if isinstance(s, Assign) else s}"
+        if isinstance(s, Assign):
+            reads = s.args
+        elif isinstance(s, Reassign):
+            reads = (s.value,)
+        else:
+            reads = ()
+        for arg in reads:
+            assert arg in defined, f"{arg} used before definition in {s}"
         defined.add(s.name)
 
 
@@ -118,12 +153,12 @@ def test_online_softmax_carrier_folds_without_accumulator() -> None:
     # init seeds both states with their fold identity: m (max → −inf), d (add → 0).
     assert {s.name: s.op.name for s in fs.init} == {"m": "maximum", "d": "add"}
     # merge reproduces the carrier's fold algebra exactly (identity projection at the scalar tier).
-    assert Counter(_sig(a) for a in fs.merge) == Counter(_sig(a) for a in carrier.merge)
+    assert Counter(_normalized(list(fs.merge))) == Counter(_sig(a) for a in carrier.merge)
 
 
 def test_pure_reduction_carrier_is_a_single_fold() -> None:
     # The simplest non-twisted carrier: acc += x. One seed (add → 0), one fold, nothing else.
     fs = ScalarCombiner().combine(_sum_carrier())
     assert fs.rescale == () and fs.consume == () and fs.epilogue == ()
-    assert [_sig(a) for a in fs.merge] == [("acc", "add", ("acc", "x"))]
+    assert _normalized(list(fs.merge)) == [("acc", "add", ("acc", "x"))]
     assert [(s.name, s.op.name) for s in fs.init] == [("acc", "add")]

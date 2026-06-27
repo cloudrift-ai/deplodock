@@ -348,23 +348,35 @@ class ScalarCombiner(Combiner):
     (which leaves the embedded ``p·v`` contraction to the assembler's ``Mma`` cells), the scalar tier
     has no separate consume cell — it realizes the ``p·v`` accumulation itself in :meth:`consume_accum`.
 
-    The emitted phases mirror the streaming ``render_merge_program`` semantics exactly (a state-named
-    ``Assign`` reassigns the carried value; every other ``Assign`` is an fp32 temp), but as IR
-    statements split into the carrier-generic :class:`CombinePhases` so the scalar streaming reduce and
-    the fragment flash share one ``combine`` orchestration."""
+    The emitted phases mirror the streaming ``render_merge_program`` semantics exactly, but as loose
+    IR statements split into the carrier-generic :class:`CombinePhases` so the scalar streaming reduce
+    and the fragment flash share one ``combine`` orchestration. Because these are loose statements (not
+    a ``Monoid`` rendered through ``render_merge_program``, which keys reassign-vs-declare off
+    ``state_names``), a carried-state update must be a :class:`~deplodock.compiler.ir.kernel.ir.Reassign`
+    (``Assign`` always *declares*, which would shadow the enclosing ``Init``'s carried value): every
+    carried state is declared once by an ``Init`` (``seed_state`` / ``declare_accum``) and rebound by a
+    ``Reassign`` (via a fresh temp for op-valued updates), never re-``Assign``ed."""
 
     def __init__(self) -> None:
         self._reset()
+
+    def _state_update(self, name: str, op, args) -> list[Stmt]:
+        # An op-valued carried-state rebind: compute into a fresh temp, then Reassign the state from it
+        # (Reassign carries a single value name, and Assign-ing the state directly would shadow it).
+        tmp = f"{name}__sc"
+        return [Assign(name=tmp, op=op, args=tuple(args)), Reassign(name=name, value=tmp)]
 
     # --- Distribution protocol: identity projection (one scalar per logical value) ---
 
     def fold(self, name, op, src, scalar, *, is_state) -> None:
         # A fold over a one-element partition: the reduce of ``src`` is ``src`` itself, so the step is
-        # ``name = op(scalar, src)`` — a state reassign (name is the carried state) or a temp.
-        self.out.append(Assign(name=name, op=op, args=(scalar, src)))
+        # ``name = op(scalar, src)`` — a carried-state rebind (via temp + Reassign) or a plain temp.
         self.fold_op_of[name] = op
         if is_state:
             self.state_fold_op[name] = op
+            self.out.extend(self._state_update(name, op, (scalar, src)))
+        else:
+            self.out.append(Assign(name=name, op=op, args=(scalar, src)))
 
     def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — undistributed at the scalar tier
         self.out.append(Assign(name=name, op=op, args=tuple(args)))
@@ -373,9 +385,12 @@ class ScalarCombiner(Combiner):
         self.out.append(Assign(name=name, op=op, args=tuple(args)))
 
     def state(self, name, op, args) -> None:
-        self.out.append(Assign(name=name, op=op, args=tuple(args)))
-        if op.name == "copy" and len(args) == 1 and args[0] in self.fold_op_of:
-            self.state_fold_op[name] = self.fold_op_of[args[0]]
+        if op.name == "copy" and len(args) == 1:  # a carried-state copy (m = m_new) — a direct Reassign
+            self.out.append(Reassign(name=name, value=args[0]))
+            if args[0] in self.fold_op_of:
+                self.state_fold_op[name] = self.fold_op_of[args[0]]
+        else:
+            self.out.extend(self._state_update(name, op, args))
 
     # --- phase hooks (scalar emission) ---
 
@@ -393,10 +408,17 @@ class ScalarCombiner(Combiner):
         return [Init(name=self.d_state, op=self.accum_op, dtype=F32)]
 
     def rescale_accum(self, a: Assign) -> list[Stmt]:
-        return [Assign(name=a.name, op=a.op, args=a.args)]  # om = O · α, verbatim
+        return [Assign(name=a.name, op=a.op, args=a.args)]  # om = O · α (a temp, not the carried state)
 
     def consume_accum(self, assigns: tuple[Assign, ...]) -> list[Stmt]:
-        return [Assign(name=a.name, op=a.op, args=a.args) for a in assigns]  # p·v + O = om + p·v
+        # p·v temps are plain Assigns; the accumulator state (O = om + p·v) rebinds via Reassign.
+        out: list[Stmt] = []
+        for a in assigns:
+            if a.name == self.d_state:
+                out.extend(self._state_update(a.name, a.op, a.args))
+            else:
+                out.append(Assign(name=a.name, op=a.op, args=a.args))
+        return out
 
     def normalize_accum(self, denom: str) -> list[Stmt]:
-        return [Assign(name=self.d_state, op=_DIVIDE, args=(self.d_state, denom))]
+        return self._state_update(self.d_state, _DIVIDE, (self.d_state, denom))

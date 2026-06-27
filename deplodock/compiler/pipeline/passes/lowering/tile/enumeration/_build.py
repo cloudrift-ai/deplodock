@@ -34,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraph,
     Transport,
 )
+from deplodock.compiler.ir.twist import ScalarCombiner
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
@@ -469,7 +470,15 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     monoid = next(s for s in kv_body if isinstance(s, Monoid))
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
-    stats, accum, _d_state = split_carrier(carrier, value_name)
+    # Realize the carrier's online-softmax combine at the scalar tier through the shared
+    # ``ScalarCombiner`` — the same ``combine()`` orchestration ``MmaTwist`` drives at the fragment
+    # tier (``carry_scope_from_graph``) — instead of leaving raw split stats/accum ``Monoid``s for
+    # ``render_merge_program``. The FA-2 scalar flash and the warp flash now share one carrier-combine
+    # realizer (the user-visible split: stats fold → rescale ``O·α`` → consume ``p·v`` → normalize
+    # ``O/l`` is generated once, in the combiner). The kv reduce stays serial (no cross-thread
+    # combine), and ``010_split_register_axes`` replicates the d-dependent rescale/consume ``Assign``s
+    # over ``O[d]`` exactly as it did the accum ``Monoid`` (generic ``rewrite`` replication).
+    fs = ScalarCombiner().combine(carrier)
     m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry — no stored view
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
@@ -482,7 +491,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
     head_inits = tuple(s for s in body if isinstance(s, Init))
     epilogue = tuple(s for s in body if isinstance(s, (Assign, Write)))
-    new_kv = replace(kv_loop, body=Body((*prefix, stats, value_load, accum)))
+    new_kv = replace(kv_loop, body=Body((*prefix, *fs.merge, value_load, *fs.rescale, *fs.consume)))
     compute: tuple[Stmt, ...] = (*head_inits, new_kv, *epilogue)
 
     # σ-rewrite: ``d`` -> the register axis var; ``m`` -> its block/thread split.

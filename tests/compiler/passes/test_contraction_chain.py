@@ -275,24 +275,27 @@ def _monoids(body):
     return [s for s in body.iter() if isinstance(s, _M)]
 
 
-def test_chain_build_splits_the_carrier_into_two_cells():
-    """The shared-axis reduce_decomp splits the twisted carrier into TWO cells: a
-    scalar **stats** carrier (row max / denom — the carrier's non-accumulator state,
-    folding the score) and a **register-tiled accumulation** carrier (``O[d]``, folding
-    the value). The accumulation rides a ``RegisterTile`` over the P@V output ``d``; the
-    stats stay scalar — that split is what shares the score across ``d``."""
+def test_chain_build_realizes_the_split_carrier_as_scalar_phases():
+    """The shared-axis reduce_decomp realizes the twisted carrier through the scalar
+    ``ScalarCombiner`` — the same ``combine()`` the warp flash drives at the fragment tier (the split
+    into a scalar **stats** fold over the score + a **register-tiled accumulation** ``O[d]`` over the
+    value is generated once, inside the combiner). No ``Monoid`` survives in the block: each carried
+    state (the 2 stats + the 1 accumulator) is declared once by an ``Init`` and rebound by a
+    ``Reassign`` — never re-``Assign``ed (which would shadow the carried value)."""
+    from deplodock.compiler.ir.kernel.ir import Reassign  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt import Assign, Init  # noqa: PLC0415
+
     tg, dag = _build_chain()
     block = tg.blocks[0]
-    carriers = _monoids(block.compute)
-    assert len(carriers) == 2, "the twisted carrier must split into a stats + an accumulation cell"
-    # The accumulation carrier folds ONE state (the d-indexed accumulator); the stats
-    # carrier folds the rest (the row max + denom).
-    by_state = sorted(carriers, key=lambda m: len(m.state))
-    accum, stats = by_state[0], by_state[1]
-    assert len(accum.state) == 1 and len(stats.state) == 2
-    # The accumulation carrier folds the value partial; the stats carrier folds the score.
-    assert accum.partial[0] == dag.reduction.carrier.partial[1]  # the value (V)
-    assert stats.partial[0] == dag.reduction.carrier.partial[0]  # the score
+    assert not _monoids(block.compute), "the carrier must be realized to scalar phases, not left as Monoids"
+    states = set(dag.reduction.carrier.state)  # the 2 stats states (row max / denom) + the 1 accumulator (O)
+    assert len(states) == 3
+    inits = {s.name for s in block.compute.iter() if isinstance(s, Init)}
+    reassigns = {s.name for s in block.compute.iter() if isinstance(s, Reassign)}
+    assigns = {s.name for s in block.compute.iter() if isinstance(s, Assign)}
+    assert states <= inits, "each carried state is declared once by an Init"
+    assert states <= reassigns, "each carried state is rebound by a Reassign"
+    assert not (states & assigns), "no carried state is re-Assigned (that would shadow the Init'd value)"
 
 
 def test_chain_build_puts_the_pv_output_in_registers():
