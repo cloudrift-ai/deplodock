@@ -13,9 +13,9 @@ unified twisted ``Monoid`` representation. Three recognitions, tried in order
    input fuses into one streaming online-softmax ``Monoid`` (the ``(m, d)`` twist).
 3. **Normalize** — any remaining scalar ``Accum`` (a plain sum / max / mean) becomes
    its **degenerate** monoid (``Accum.as_monoid`` — the identity twist, no rescale),
-   seeded by an enclosing :class:`Init`. A ``SEMIRING`` contraction (matmul) keeps
-   its ``Accum`` (a different algebra; converting would flip ``classify_algebra`` to
-   ``MONOID`` and mis-schedule it as a naive serial reduce).
+   seeded by an enclosing :class:`Init`. A matmul contraction (``matmul_reduce``)
+   keeps its ``Accum`` — degenerate-monoidizing it would lose the contraction
+   structure the matmul tier reads off the body.
 
 Flash must precede online-softmax which must precede normalize: each later step
 consumes the ``Accum``\\ s an earlier one pattern-matches. After this pass a plain
@@ -30,7 +30,7 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra
+from deplodock.compiler.ir.algebra import matmul_reduce
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
@@ -310,12 +310,14 @@ def _try_online_softmax(root: Node) -> LoopOp | None:
 
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
-    """Rewrite each ``MONOID`` reduce ``Loop``'s ``Accum``\\ s to ``Init`` +
-    degenerate ``Monoid`` (deep). Returns ``(stmts, changed)``."""
+    """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to ``Init`` + degenerate
+    ``Monoid`` (deep). A matmul contraction (``matmul_reduce``) keeps its ``Accum``
+    — degenerate-monoidizing it would lose the contraction structure the matmul
+    tier reads. Returns ``(stmts, changed)``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
-        if isinstance(s, Loop) and s.is_reduce and classify_algebra(s) is AlgebraKind.MONOID:
+        if isinstance(s, Loop) and s.is_reduce and not matmul_reduce(s):
             accums = [x for x in s.body if isinstance(x, Accum)]
             if accums:
                 for acc in accums:

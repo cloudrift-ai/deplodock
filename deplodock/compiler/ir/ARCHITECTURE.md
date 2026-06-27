@@ -143,22 +143,18 @@ directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
 constants; `Monoid` reports `associative` / `has_identity` `True` by construction
 with a per-instance `commutative` field).
 
-**Bottom-up algebra analysis** (`ir/algebra.py`). `Loop.algebra_kind` derives
-each reduce loop's `AlgebraKind` — `MAP` (non-reduce) / `MONOID` (an associative
-reduce: a scalar `Accum`, OR a recognized tuple `Monoid` such as flash's online
-softmax — a twisted monoid **is** a monoid, transport of structure) / `SEMIRING`
-(a matmul-shaped reduce whose product distributes over its reduce — `Mma`, or an
-`Accum` fed by a distributing product) — by *reading back* the carrier already in
-the body. It is a **derived cache, not a second source of truth**: computed on
-demand, so it can never contradict the carrier's traits and never enters equality
-/ `op_cache_key`. The expensive match (raw coupled-accumulator → verified twisted
-monoid) is done once by `loop/recognize` (which emits the `Monoid`); this is a
-cheap read of that carrier. The streaming-flash *schedule* (a `Monoid` carrier
-streaming over a nested contraction) is selected structurally by the tile
-classifier (`lowering/tile/enumeration/_classify`), one layer below the algebra —
-see [`plans/twisted-monoid-carrier-design.md`](../../../plans/twisted-monoid-carrier-design.md). The structural matmul predicate `matmul_reduce` lives here too — the
-single source `lowering/_predicates.is_matmul_reduce` delegates to (adding only
-its tile-layer type guard).
+**The algebra is in the body, not a tag** (`ir/algebra.py`). There is no stored /
+derived `AlgebraKind`: a kernel's algebra is read directly off its carriers and
+partial structure where a pass needs it. The fold ⊕ is the carrier (`Accum`
+scalar fold, or `Monoid` + `Twist`); the lift is the partial — a unary value
+(`MONOID`: sum / max / online softmax) or a ⊗-product over several contraction
+operands (`SEMIRING`: matmul). A non-reduce scope is the pointwise `MAP`. The one
+structural question the schedule still asks lives here: `matmul_reduce(loop)` —
+"is this reduce a contraction (≥ 2 K-indexed operands folded by a carrier)?"
+`lowering/tile/010_recognize` uses it to keep a matmul's `Accum` an `Accum`
+(rather than degenerate-monoidizing it like a plain reduce); `020_schedule`
+gates flash structurally (a reduce loop nested inside a reduce loop); the mma
+atom tier reads `matmul_reduce` to pick the tensor-core cell.
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (the carried SSA
