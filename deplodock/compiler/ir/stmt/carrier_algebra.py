@@ -4,7 +4,7 @@ A twisted ``MONOID(SEMIRING)`` carrier (flash attention's online softmax: ``stat
 ``partial=(score, value)``) splits into a ``d``-invariant softmax-stats monoid ``(m, l)`` and a
 ``d``-varying accumulation monoid ``(O)``. The split is plain algebra over the carrier's ``merge``
 program (a fixpoint over SSA reads), so it lives here — next to ``Monoid`` in ``ir/stmt`` — rather
-than inside any one pass, and is shared by the enumeration ``chain_build`` (the cooperative /
+than inside any one pass, and is shared by the enumeration ``build_monoid`` (the cooperative /
 cross-thread realization) and the assembly fragment realizer (the m16n8 tensor-core realization).
 
 One carrier algebra, three **realizations** (each consumes the same ``Monoid`` surface — the
@@ -23,17 +23,20 @@ how state and partials are distributed):
 The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
 structure — not two hand-authored transcriptions.
 
-Projection is the carrier-generic driver: :meth:`Monoid.project` (this module's :func:`interpret`)
-abstract-interprets a merge program over a :class:`Distribution` **backend**, taking the carrier
-algebra to a target distribution by the distribution law — a reduce over the distributed axis
-becomes the backend's cross-partition combine (``Distribution.fold``), and an elementwise op the
-backend's per-element map (``Distribution.pointwise``); scalars / carried-state reassigns stay
-replicated. The fragment realizer (``ir/twist.MmaTwist``) is one backend — its
-``fold`` is a ``FragmentRowReduce`` over the C-fragment columns, its ``pointwise`` a
-``FragmentApply`` over the registers. No softmax knowledge in the driver: it dispatches by the
-op's *role under the distribution*, not by name. (The cross-thread ``emit_combine`` is a different
-combinator — a tree of the whole ``combine_states`` over per-thread *states*, not an op-by-op
-interpretation of a partial-absorbing merge — so it stays its own realizer.)
+**The combiner does ALGEBRA; the distribution is geometry.** A reduce **carrier** (``Accum`` —
+the degenerate 1-component ``Monoid`` — or a tuple ``Monoid``) exposes ONE combine surface
+(``merge`` / ``combine_states`` over ``carried_names`` / ``partial``). That surface is realized by the
+ONE combiner, ``ScalarCombiner`` (``ir/twist`` — fragment registers are the ``MmaTwist`` sibling),
+which projects it op-by-op via :meth:`Monoid.project` (this module's :func:`interpret`) over a
+:class:`Distribution` backend — a reduce over the distributed axis → the backend's ``fold``
+(``_reduce``), an elementwise op → ``pointwise``. **The distribution tier — cross-thread / cross-CTA —
+is NOT a combiner**: ``emit_combine`` (lanes/smem ``WarpShuffle`` / ``TreeHalve``) and
+``_partition.deferred_combine_tilegraph`` (the cross-CTA workspace fold) are pure *geometry* that carry
+the carrier's ``combine_states`` straight onto their nodes, which realize the algebra via the SAME
+``render_merge_program`` ``ScalarCombiner`` / ``Monoid.render`` use. So a regular reduction lowers
+through ``ScalarCombiner`` at any tier; ``dist`` is orthogonal to the carrier (Bird's Third
+Homomorphism Theorem keeps ``◁``/``⊙`` distinct operators — ``Monoid`` carries both). No softmax
+knowledge in any driver: each dispatches by the op's *role under the distribution*.
 """
 
 from __future__ import annotations

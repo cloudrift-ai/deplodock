@@ -146,7 +146,7 @@ def _kernel_body_stmts(g: Graph):
 
 
 def test_warp_cooperative_emits_warpshuffle(recording_dump):
-    """K=32 cooperative tile → ``materialize_tile._emit_combine`` picks
+    """K=32 cooperative tile → ``emit_combine`` picks
     the warp path: ``WarpShuffle`` Stmt appears, no ``TreeHalve``."""
     g = Graph()
     _input(g, "x", (4, 32))
@@ -161,7 +161,7 @@ def test_warp_cooperative_emits_warpshuffle(recording_dump):
 
 
 def test_block_cooperative_emits_hierarchical_reduce(recording_dump, monkeypatch):
-    """A 2-warp (BR=64) cooperative K=256 tile → ``materialize_tile._emit_combine``
+    """A 2-warp (BR=64) cooperative K=256 tile → ``emit_combine``
     picks the hierarchical path: ``WarpShuffle`` reduces lanes within each warp,
     then a tiny ``TreeHalve(length=n_warps)`` collapses across warps. Both Stmts
     are present; the TreeHalve's length is far smaller than the legacy

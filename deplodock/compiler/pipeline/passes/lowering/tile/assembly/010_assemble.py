@@ -41,7 +41,7 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     tg = op.tilegraph
-    # ``Schedule.carry`` (the warp-tier streaming flash) is ready by construction — ``warp_chain_build``
+    # ``Schedule.carry`` (the warp-tier streaming flash) is ready by construction — ``build_monoid``
     # σ-tiled it; ``assemble_block`` dispatches it to the fragment-tier carrier branch. Every other
     # graph must have a populated ``domain`` (``assembly_ready``) before materializing.
     if not tg.schedule.carry and not assembly_ready(tg):

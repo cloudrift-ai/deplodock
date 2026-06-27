@@ -1,6 +1,6 @@
 """MONOID pass (fork) — the one pass for the cooperative reduce AND the streaming flash.
 
-A ``MONOID`` nest lowers through ONE build move (``_build.monoid_build``) regardless of
+A ``MONOID`` nest lowers through ONE build move (``_build.build_monoid``) regardless of
 whether it is a **flat** reduce (softmax LSE / rmsnorm stat / mean / max) or a **nested**
 streaming flash (online-softmax over a nested QK^T contraction — a twisted monoid is a
 monoid, selected structurally not as a distinct kind). The move applies the
@@ -23,8 +23,9 @@ Both regimes are **one** :class:`MonoidReduction` composition (``op.dag.reductio
 carrier folding a primary reduce axis, optionally composed over an inner SEMIRING ``Contraction``),
 and ``reduction_build`` is the **one dispatch** that routes it: ``inner is None`` → the cooperative
 leaves; a streaming reduction → the streaming leaves; an eligible streaming reduction → the
-warp-tier flash. The three emit bodies (``monoid_build`` / ``chain_build`` / ``warp_chain_build``)
-stay specialized behind it.
+warp-tier flash. The three regimes are branches of the ONE ``build_monoid``, selected by the carrier
+``Combiner`` it is handed (``ScalarCombiner`` / ``MmaTwist``) + the score-placement knob — not three
+functions.
 
 A streaming flash deploys the **warp-tier chain** off **general DAG invariants**, never a flash
 shape match — the dispatch reads three orthogonal facts: (1) the reduction composes an inner
@@ -39,8 +40,9 @@ routing nor the build moves walk the lowered tile to recover them. The v1 realiz
 (``_warp_chain_buildable`` — no additive mask, ``D≤256``) and the deployment policy
 (``_deploy_warp_chain`` — symbolic-default, static under ``DEPLODOCK_CHAIN``) are named, orthogonal
 guards: what the realizer can build today + an env/extent policy, not graph facts.
-This pass then hands the logical seed to ``_build.warp_chain_build``, which σ-tiles + atomizes the
-two chained contractions (stamping the kv-stream ``Schedule.carry`` + the score→A handoff edge);
+This pass then hands the logical seed to ``_build.build_monoid`` (with ``combiner=MmaTwist``), which
+σ-tiles + atomizes the two chained contractions (stamping the kv-stream ``Schedule.carry`` + the
+score→A handoff edge);
 assembly's generic ``_assemble.carry_scope_from_graph`` walk then realizes the fragment-tier
 online-softmax around those cells (the former ``split/005_warp_chain`` route, folded in here).
 Symbolic is the deployed default (the ~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in.
@@ -57,10 +59,11 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.tile.ir import TileGraphOp
+from deplodock.compiler.ir.twist import MmaTwist, ScalarCombiner
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import inner_atomizes
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, monoid_build, warp_chain_build
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
@@ -143,24 +146,27 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
 
 
 def reduction_build(ctx: Context, op: TileGraphOp) -> list[TileGraphOp]:
-    """The **unified MONOID codegen dispatch** — read the one :class:`MonoidReduction` and route to
-    the right specialized emit body (``op.dag.reduction``):
+    """The **unified MONOID codegen dispatch** — read the one :class:`MonoidReduction` and route it to
+    the ONE build move ``_build.build_monoid``, varying only the carrier ``Combiner`` it is handed
+    (and the score-placement knob), never the function (``op.dag.reduction``):
 
     - ``inner`` present + tensorizes + buildable + deployable → the **warp-tier tensor-core flash**
-      (``warp_chain_build`` — a terminal leaf; the later scalar passes gate off MONOID).
-    - a **streaming** reduction → the streaming leaves (scalar FA-2 ``chain_build`` when the inner
-      chain applies, else the serial-stream ``monoid_build``).
+      (``build_monoid(combiner=MmaTwist)`` — a terminal leaf; the later scalar passes gate off MONOID).
+    - a **streaming** reduction → the streaming leaves (``build_monoid(combiner=ScalarCombiner)``; the
+      scalar FA-2 geometry when the inner chain applies — signalled by the ``INLINE`` score knob — else
+      the serial-stream tower).
     - a **flat** reduction (``inner is None``, not streaming) → the cooperative leaves
-      (``monoid_build``).
+      (``build_monoid(combiner=ScalarCombiner)``).
 
     Warp-tier flash routes off **general DAG invariants**, never a flash shape match: a composed
     inner contraction (``reduction.inner``) that independently tensorizes (``inner_atomizes`` — the
     SAME atom-fit the standalone SEMIRING matmul gates on). The realizer scope ceiling
     (``_warp_chain_buildable``) and the deployment policy (``_deploy_warp_chain`` — symbolic-default,
     static under ``DEPLODOCK_CHAIN``) are explicit, orthogonal guards: what the v1 realizer can build
-    today + an env/extent policy, not graph facts. The three emit bodies stay specialized behind this
-    one dispatch (they produce genuinely different kernels — a cooperative tree-reduce, a scalar FA-2
-    stream, a tensor-core flash)."""
+    today + an env/extent policy, not graph facts. The three regimes are the honest 2×2 of (chained
+    pair vs single contraction) × (scalar vs warp) — branches of ONE ``build_monoid``, parametrized by
+    the combiner, not three functions (they still produce genuinely different kernels — a cooperative
+    tree-reduce, a scalar FA-2 stream, a tensor-core flash)."""
     reduction = op.dag.reduction
     if (
         reduction.inner is not None
@@ -168,11 +174,11 @@ def reduction_build(ctx: Context, op: TileGraphOp) -> list[TileGraphOp]:
         and _warp_chain_buildable(op)
         and _deploy_warp_chain(op, reduction)
     ):
-        # ``warp_chain_build`` σ-tiles the two chained contractions to the warp geometry and fuses
-        # them via the generic ``atomize_cell`` (stamping the kv-stream ``Schedule.carry`` + the
-        # score→A handoff edge); assembly's generic ``carry_scope_from_graph`` walk realizes the
+        # ``build_monoid(combiner=MmaTwist)`` σ-tiles the two chained contractions to the warp geometry
+        # and fuses them via the generic ``atomize_cell`` (stamping the kv-stream ``Schedule.carry`` +
+        # the score→A handoff edge); assembly's generic ``carry_scope_from_graph`` walk realizes the
         # fragment-tier phases (softmax / scale / mask / handoff / epilogue) around those cells.
-        return [replace(op, tilegraph=warp_chain_build(op))]
+        return [replace(op, tilegraph=build_monoid(op, op.knobs, combiner=MmaTwist))]
     return _streaming_leaves(op) if reduction.nested else _coop_leaves(op)
 
 
@@ -188,7 +194,7 @@ def _coop_leaves(op: TileGraphOp) -> list[TileGraphOp]:
         # rides THREAD (``coop`` factor), no cross-CTA split (``cta=1``, the REDUCE
         # default). MMA / WM / WN OFF-fill downstream.
         knobs = {**op.knobs, **free_knobs, **coop_reduce_knobs(op.dag, r)}
-        tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
+        tg = build_monoid(op, knobs, combiner=ScalarCombiner)
         out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out
 
@@ -205,9 +211,10 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     # Cross-CTA split-KV (Flash-Decoding) of the streaming flash — **pin-gated** (an explicit
     # ``REDUCE`` ``c<cta>`` on the KV stream): each CTA folds a slice of the KV stream into its
     # own partial ``(m, l, O)`` state, ``150_cross_cta_finalize`` writes the 3 state workspaces
-    # and the carrier-generic combine merges them (``monoid_reduce_tilegraph``). Static KV only
-    # (the slice must divide); the serial-stream ``monoid_build`` carries the split-K grid (the
-    # FA-2 ``chain_build`` doesn't thread it yet), so cta>1 forces the ``monoid_build`` path.
+    # and the carrier-generic combine merges them (``deferred_combine_tilegraph``). Static KV only
+    # (the slice must divide); the serial-stream geometry carries the split-K grid (the FA-2
+    # shared-score geometry doesn't thread it yet), so cta>1 forces the serial-stream path (no
+    # INLINE score knob).
     _, _, sk_pin, _ = fam.reduce_fields(op.dag, op.dag.k_node.loop.axis.name)
     stream_ext = op.dag.k_node.loop.axis.extent
     cta = sk_pin if (sk_pin and sk_pin > 1 and stream_ext.is_static and stream_ext.as_static() % sk_pin == 0) else 1
@@ -216,17 +223,17 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
         budget = Budget(max_threads=max(1, MAX_THREADS_PER_CTA // br))
         offers = [t for t in thread_offers(op.dag, budget) if streaming_coop_geometry_ok(br, t[0] * t[1])]
         # A **symbolic** streaming (KV) axis is serial-locked (``BR = BK = 1``). With a
-        # carried-contraction chain, ``chain_build`` (the FA-2 shared-score restructuring)
-        # makes it efficient — the QK^T score is computed ONCE per KV step and shared across
-        # the P@V output ``d`` (register vector ``O[d]``), not recomputed per ``d``. That is
-        # the symbolic DEFAULT: ``monoid_build`` would recompute the score per ``d`` and run
+        # carried-contraction chain, the FA-2 shared-score geometry (``build_monoid`` with the score
+        # placed INLINE) makes it efficient — the QK^T score is computed ONCE per KV step and shared
+        # across the P@V output ``d`` (register vector ``O[d]``), not recomputed per ``d``. That is
+        # the symbolic DEFAULT: the serial-stream geometry would recompute the score per ``d`` and run
         # unboundedly long (Finding 1, qwen3-emb-0.6b layer 0). A static stream keeps the
         # pin-gated opt-in (greedy stays the scalar nest until the search-fork integration).
-        # Split-KV (cta>1) rides the serial-stream ``monoid_build`` — force it (the FA-2 chain
-        # doesn't thread the split-K grid yet) and stamp the bare ``c<cta>`` finalize-pending.
+        # Split-KV (cta>1) rides the serial-stream geometry — force it (the FA-2 chain doesn't thread
+        # the split-K grid yet) and stamp the bare ``c<cta>`` finalize-pending.
         use_chain = cta == 1 and _chain_applicable(op, br) and (symbolic or fam.pin_inline_chain())
         # Without a chain (a streaming monoid with no inner contraction) a symbolic axis
-        # falls back to ``monoid_build``'s serial stream, where the free-axis tile can't move
+        # falls back to the serial-stream geometry, where the free-axis tile can't move
         # the reduce-bound kernel — so collapse the futile fork to one canonical leaf.
         if symbolic and not use_chain:
             offers = offers[:1]
@@ -237,21 +244,20 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
                 fam.reduce_key(op.dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=1, cta=cta, coop=br),
             }
             if use_chain:
-                # Phase 1c: the FA-2 shared-score restructuring (register O[d] + the score
-                # edge placed INLINE + the split carrier).
+                # Phase 1c: the FA-2 shared-score restructuring — placing the score INLINE is the only
+                # signal ``build_monoid`` needs to pick the register-``O[d]`` shared-score geometry over
+                # the serial-stream tower (same combiner, same call; the knob drives the geometry).
                 knobs[fam.place_key(op.dag.reduction.score)] = fam.INLINE
-                tg = chain_build(op.tilegraph, op.dag, knobs)
-            else:
-                tg = monoid_build(op.tilegraph, op.dag, knobs, target_names=op.target_names)
+            tg = build_monoid(op, knobs, combiner=ScalarCombiner)
             out.append(replace(op, tilegraph=tg, knobs=knobs))
     return out
 
 
 def _chain_applicable(op: TileGraphOp, br: int) -> bool:
-    """Whether ``chain_build`` covers this nest: a streaming reduction with a composed inner
-    contraction (``reduction.inner``) and no cooperative-KV (``BR == 1`` — the cooperative combine
-    isn't wired through the split carrier yet). The **hinge** (KV stream) axis MAY be symbolic —
-    ``chain_build`` keeps it a serial runtime-bounded loop (no tiling → no masking, every
+    """Whether the FA-2 shared-score geometry covers this nest: a streaming reduction with a composed
+    inner contraction (``reduction.inner``) and no cooperative-KV (``BR == 1`` — the cooperative combine
+    isn't wired through the split carrier yet). The **hinge** (KV stream) axis MAY be symbolic — the
+    FA-2 geometry keeps it a serial runtime-bounded loop (no tiling → no masking, every
     ``kv < seq_len`` is valid); every OTHER contraction (the inner QK^T score reduce) must be static,
     since the score is a register-shared reduce rather than a masked one."""
     reduction = op.dag.reduction

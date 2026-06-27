@@ -15,11 +15,12 @@ realizations:
 
 The combine kernel is built here as a **fully-tiled** single-``Block`` ``TileGraph``
 (``assembly/010_assemble`` materializes it directly): one CTA per ``16×16`` output
-tile, one thread per output cell, the partition axis ``K_s`` a serial reduce loop. The
-additive matmul case folds with a bit-identical ``Accum`` sum
-(:func:`additive_reduce_tilegraph`); a non-additive carrier (flash split-KV's online
-``(m, l)`` monoid) folds via the carrier's ``combine_states``
-(:func:`monoid_reduce_tilegraph`). This mirrors the deleted
+tile, one thread per output cell, the partition axis ``K_s`` a serial reduce loop. ONE
+builder — :func:`deferred_combine_tilegraph` — serves every carrier: the additive matmul
+case folds with a bit-identical ``Accum`` sum, a non-additive carrier (flash split-KV's
+online ``(m, l)`` monoid) folds via the carrier's ``combine_states``; the carrier dispatch
+is the carrier's ``combine_states`` (an ``Accum`` folded as a degenerate ``Monoid`` via
+``Accum.as_monoid``), realized by ``render_merge_program`` — no cross-CTA "combiner" class. This mirrors the deleted
 ``017_atomic_free_splitk``'s ``_build_reduce_tileop`` / ``build_monoid_reduce_tileop``,
 now emitting the block-DAG IR instead of a pre-tiled ``TileOp`` tower.
 """
@@ -174,62 +175,45 @@ def _combine_block(
     return TileGraph(name=name, buffers=buffers, blocks=(block,), schedule=Schedule(binding=binding))
 
 
-def additive_reduce_tilegraph(
-    *, workspace_name: str, out_name: str, s_extent: int, out_shape: tuple[int, ...], dtype: DataType, name: str
-) -> TileGraph:
-    """The additive split-K / split-reduce combine: ``out[d...] = Σ_s partial[s, d...]``
-    via an ``Accum`` sum (bit-identical to the matmul's own ``+`` reduce). One thread per
-    output cell serially folds the ``S`` partition slabs. ``out_shape`` is the (static)
-    output extent per dim — ``(M, N)`` for the matmul, ``(M,)`` for a plain ``sum(dim)``."""
-    s_axis = Axis("K_s_red", to_dim(s_extent))
-    _, _, out_index, _ = _out_axes(out_shape)
-    reduce_inner = (
-        Load(name="p", input=workspace_name, index=(Var(s_axis.name), *out_index), dtype=dtype),
-        Accum(name="acc", value="p", dtype=F32, axes=(s_axis.name,)),
-    )
-    return _combine_block(
-        name=name,
-        out_shape=out_shape,
-        inits=(),
-        reduce_inner=reduce_inner,
-        s_axis=s_axis,
-        finalize=(),
-        written="acc",
-        out_name=out_name,
-        dtype=dtype,
-    )
-
-
-def monoid_reduce_tilegraph(
+def deferred_combine_tilegraph(
+    carrier,
     *,
-    carrier: Monoid,
-    init_ops: tuple[ElementwiseImpl, ...],
     workspaces: tuple[str, ...],
     out_name: str,
     s_extent: int,
     out_shape: tuple[int, ...],
     dtype: DataType,
+    name: str,
+    init_ops: tuple[ElementwiseImpl, ...] = (),
     finalize: tuple[Assign, ...] = (),
     out_value: str | None = None,
-    name: str = "monoid__reduce",
 ) -> TileGraph:
-    """Carrier-general cross-partition combine — the monoid sibling of
-    :func:`additive_reduce_tilegraph`.
+    """Carrier-generic cross-partition (split-K / split-KV) combine — **ONE** combine kernel for
+    ANY associative carrier. The schedule + scaffolding (``_combine_block`` / ``_out_axes``: one CTA
+    per ``16×16`` output tile, a serial fold over the ``S`` partitions) never change; only the
+    carrier fold does. The fold is the **cross-CTA distribution** of the carrier's combine — pure
+    geometry (load each partition's state from the workspace(s), then the carrier's ``combine_states``
+    via ``as_state_merge``); the combine ALGEBRA is realized by ``Monoid.render`` /
+    ``render_merge_program`` (the SAME realizer the scalar combine uses), so there is no separate
+    cross-CTA "combiner". A regular sum, online softmax ``(m, d)``, Welford ``(n, μ, M₂)``, and flash
+    attention ``(m, d, o)`` are the SAME reduction, differing only in carrier state.
 
-    Each of the carrier's ``state`` components is read from a workspace and seeded from the
-    op-identity (``init_ops[i]``: ``maximum`` → −inf, ``add`` → 0); one thread per output cell
-    serially folds each ``S`` slice via the carrier's ``combine_states`` (the state-merges-state
-    monoid op). An optional ``finalize`` (Assigns over the merged state) produces the single
-    output value ``out_value`` (default the first state component), written to ``out_name``. The
-    non-additive path a flash split-KV's online ``(m, l, O)`` carrier takes.
-
-    Two workspace layouts (both ``[…, *out_shape]``): **separate** buffers (``workspaces[i]`` per
-    component, read ``workspaces[i][s, *out]``) or, when ``len(workspaces) == 1`` for a multi-state
-    carrier, a single **packed** buffer ``partial[S, n_state, *out_shape]`` (read ``partial[s, i,
-    *out]``) — the form a single-output producer kernel emits (one kernel can't write N graph
-    buffers, so the flash split-KV producer packs its ``(m, l, O)`` state on a component axis)."""
+    **ONE carrier path** (no additive special-case): an additive ``Accum`` lowers as the degenerate
+    1-component ``Monoid`` it is (``Accum.as_monoid``), folded exactly like a flash ``(m, l, O)``. The
+    producer writes one workspace per state component (``workspaces`` aligned to the carrier's state;
+    an additive carrier is length 1; or one **packed** ``partial[S, n_state, *out]`` for a multi-state
+    carrier a single producer kernel emits). An optional ``finalize`` (e.g. flash's ``O / l``) yields
+    ``out_value`` (default ``state[0]``)."""
+    if isinstance(carrier, Accum):
+        init_ops, carrier = (carrier.op,), carrier.as_monoid()  # the degenerate 1-component monoid — one path
+    elif not isinstance(carrier, Monoid):
+        raise ValueError(
+            f"deferred_combine_tilegraph: a {type(carrier).__name__} carrier needs the Accum (additive) "
+            "or Monoid (state, combine_states) form for the cross-partition fold"
+        )
     s_axis = Axis("K_s_red", to_dim(s_extent))
     _, _, out_index, _ = _out_axes(out_shape)
+    # The cross-CTA distribution: load each partition's state, fold via the carrier's combine_states.
     others = tuple(f"o_{i}" for i in range(len(carrier.state)))
     packed = len(workspaces) == 1 and len(carrier.state) > 1
     loads: tuple[Stmt, ...] = tuple(
@@ -244,74 +228,15 @@ def monoid_reduce_tilegraph(
     fold = replace(carrier.as_state_merge(others), axes=(s_axis.name,))
     inits: tuple[Stmt, ...] = tuple(Init(name=st, op=init_ops[i], dtype=F32) for i, st in enumerate(carrier.state))
     written = out_value if out_value is not None else carrier.state[0]
+    reduce_inner = (*loads, fold)
     return _combine_block(
         name=name,
         out_shape=out_shape,
         inits=inits,
-        reduce_inner=(*loads, fold),
+        reduce_inner=reduce_inner,
         s_axis=s_axis,
         finalize=finalize,
         written=written,
         out_name=out_name,
         dtype=dtype,
-    )
-
-
-def deferred_combine_tilegraph(
-    carrier,
-    *,
-    workspaces: tuple[str, ...],
-    out_name: str,
-    s_extent: int,
-    out_shape: tuple[int, ...],
-    dtype: DataType,
-    name: str,
-    init_ops: tuple[ElementwiseImpl, ...] = (),
-    finalize: tuple[Assign, ...] = (),
-    out_value: str | None = None,
-) -> TileGraph:
-    """Carrier-generic cross-partition (split-K / split-KV) **deferred finalize** — ONE combine
-    kernel for ANY associative carrier, dispatched on its state. The schedule never changes (one
-    CTA per ``16×16`` output tile, a serial fold over the ``S`` partitions); only the carrier's
-    combine does. This is the algebraic thesis made concrete: a regular sum, online softmax
-    ``(m, d)``, Welford ``(n, μ, M₂)``, and flash attention ``(m, d, o)`` are the SAME reduction,
-    differing only in carrier state — so the deferred finalize is one entry point, not a flash
-    special case.
-
-    - an **additive 1-component ``Accum``** with no finalize (the matmul split-K, ``state =
-      (acc,)``) → :func:`additive_reduce_tilegraph` (the bit-identical ``+`` fold — the trivial
-      carrier).
-    - a tuple **``Monoid``** (online-softmax / flash) or any multi-component carrier →
-      :func:`monoid_reduce_tilegraph`, seeding each state component from ``init_ops`` (the
-      carrier's per-component identity) and folding via the carrier's ``combine_states``, with the
-      op's ``finalize`` (e.g. flash's ``o / d``) read off at the end.
-
-    The producer (the cross-CTA split) writes one workspace ``partial_i[S, M, N]`` per state
-    component (``workspaces`` aligned to the carrier's state); an additive carrier has a single
-    component, so ``workspaces`` is length 1."""
-    if isinstance(carrier, Accum) and carrier.op.name == "add" and len(workspaces) == 1 and not finalize:
-        return additive_reduce_tilegraph(
-            workspace_name=workspaces[0],
-            out_name=out_name,
-            s_extent=s_extent,
-            out_shape=out_shape,
-            dtype=dtype,
-            name=name,
-        )
-    if not isinstance(carrier, Monoid):
-        raise ValueError(
-            f"deferred_combine_tilegraph: a non-additive {type(carrier).__name__} carrier needs the "
-            "Monoid (state, combine_states) form for the cross-partition fold"
-        )
-    return monoid_reduce_tilegraph(
-        carrier=carrier,
-        init_ops=init_ops,
-        workspaces=workspaces,
-        out_name=out_name,
-        s_extent=s_extent,
-        out_shape=out_shape,
-        dtype=dtype,
-        finalize=finalize,
-        out_value=out_value,
-        name=name,
     )
