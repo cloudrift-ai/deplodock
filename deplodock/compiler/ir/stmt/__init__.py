@@ -26,10 +26,8 @@ Defined here rather than under any one IR package because all three IRs
 Each IR layer adds its own scheduling-specific Stmts on top:
 
 - Loop IR: nothing extra — its bodies are exactly Loop / leaves.
-- Tile IR: ``StageBundle``, plus the shared ``Loop`` / ``StridedLoop``
-  constructs from this module and the typed tile flavors (``GridTile``,
-  ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) from
-  :mod:`deplodock.compiler.ir.tile.ir`.
+- Tile IR: the typed tile flavors and staging constructs — DEMOLISHED,
+  pending rebuild.
 - Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
   constructs.
 
@@ -51,7 +49,7 @@ from deplodock.compiler.ir.stmt.base import (
     select_to_ternary,
 )
 from deplodock.compiler.ir.stmt.base import (
-    _axis_identity as _axis_identity,  # re-export for ir.tile.ir / ir.kernel.ir
+    _axis_identity as _axis_identity,  # re-export for downstream IR layers
 )
 from deplodock.compiler.ir.stmt.base import (
     _pad as _pad,  # re-export for ir.kernel.ir

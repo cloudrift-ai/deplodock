@@ -659,7 +659,6 @@ class Body(tuple[Stmt, ...]):
         # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
         # import is needed.
         from deplodock.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()
@@ -670,11 +669,7 @@ class Body(tuple[Stmt, ...]):
 
         for s in self.iter():
             staging_buffers.update(s.local_decls())
-            if isinstance(s, GridTile):
-                block_axes.update(ax.name for ax in s.axes)
-            elif isinstance(s, ThreadTile):
-                thread_axes.update(ax.name for ax in s.axes)
-            elif isinstance(s, Accum):
+            if isinstance(s, Accum):
                 accums.append(s)
             elif isinstance(s, Monoid):
                 combines.append(s)

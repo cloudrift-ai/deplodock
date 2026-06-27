@@ -8,7 +8,6 @@ Tile / Cond) live in ``blocks``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
@@ -24,13 +23,6 @@ from deplodock.compiler.ir.stmt.base import (
     render_merge_program,
     select_to_ternary,
 )
-
-if TYPE_CHECKING:
-    # ``Mma.atom`` holds an ``Atom`` (defined in the tile-IR layer, which builds
-    # on this stmt layer). The annotation is lazy (``from __future__ import
-    # annotations``) and ``Mma`` never calls the class at runtime — it just
-    # holds an instance — so this stays a type-only import, no stmt↔tile cycle.
-    from deplodock.compiler.ir.tile.ir import Atom
 
 
 def _resolve_value(name: str, ctx: RenderCtx) -> str:
@@ -594,9 +586,10 @@ class Mma(ReduceCarrier):
       fragment at lowering); read-and-written, like ``Accum.name``.
     - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
       B = K×N); the lowering matches each Load by these names.
-    - ``atom`` — the :class:`~deplodock.compiler.ir.tile.ir.Atom` spec itself
-      (cell shape + per-operand dtypes + group size); a hashable frozen record,
-      so it rides on this frozen ``Mma`` Stmt.
+    - ``atom`` — the ``Atom`` spec itself (cell shape + per-operand dtypes +
+      group size); a hashable frozen record, so it rides on this frozen ``Mma``
+      Stmt. NOTE: the tile-IR ``Atom`` type was demolished — the annotation is a
+      bare ``object`` placeholder pending the tile-IR rebuild.
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
       cooperative-K info the escape analysis reads). Threaded through
       ``rewrite`` like ``Accum.axes``.
@@ -610,7 +603,7 @@ class Mma(ReduceCarrier):
     c: str
     a: str
     b: str
-    atom: Atom
+    atom: object
     axes: tuple[str, ...] = ()
     b_trans: bool = False
     # Explicit masked-tile guards for a HAND-BUILT cell (the symbolic warp-chain flash),

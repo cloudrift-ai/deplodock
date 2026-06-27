@@ -319,7 +319,5 @@ def _(s: Cond, ctx: SimplifyCtx) -> Stmt:
     )
 
 
-# Tile-IR Stmt registrations (Stage / AsyncWait / Monoid) live in
-# ``deplodock.compiler.ir.tile.passes`` — that module is imported from the
-# bottom of ``tile/ir.py`` so loading any Tile-IR symbol auto-registers the
-# handlers without a circular import.
+# Tile-IR Stmt registrations were DEMOLISHED along with the tile IR; pending
+# rebuild.

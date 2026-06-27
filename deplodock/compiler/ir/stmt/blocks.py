@@ -3,8 +3,8 @@
 Each carries a child body (or two, for ``Cond``) and overrides
 ``Stmt.nested`` so :func:`iter_body` can recurse uniformly. Tile-axis
 decode helpers (``_render_grid_axis_decode``, ``_render_thread_axis_decode``,
-``_body_uses_lane_warp``) live alongside and are consumed by the typed
-tile flavors in :mod:`deplodock.compiler.ir.tile.ir`.
+``_body_uses_lane_warp``) live alongside and were consumed by the typed
+tile flavors of the (now demolished) tile IR.
 """
 
 from __future__ import annotations

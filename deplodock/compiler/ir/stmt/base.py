@@ -424,9 +424,7 @@ class Stmt:
         Per-stmt logic lives in :mod:`.passes` (singledispatch over Stmt
         type + introspection walker for the Stage hierarchy). This method
         is a thin shim so existing call sites (``s.rewrite(...)``) keep
-        working. Tile-IR Stmt registrations are loaded by importing
-        ``deplodock.compiler.ir.tile.ir`` (which any caller passing a
-        Tile-IR Stmt has done already).
+        working.
         """
         from deplodock.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
 
