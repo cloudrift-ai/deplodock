@@ -18,7 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
+from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Twist, Write
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
@@ -49,7 +49,13 @@ def _softmax_loopop(n: int) -> LoopOp:
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
-                    Monoid(state=("m", "l"), partial=("s",), merge=merge, identity=(Literal(-1e30), Literal(0.0)), axes=("j",)),
+                    Monoid(
+                        state=("m", "l"),
+                        partial=("s",),
+                        twist=Twist(merge=merge),
+                        identity=(Literal(-1e30), Literal(0.0)),
+                        axes=("j",),
+                    ),
                 ),
             ),
             Loop(
@@ -89,7 +95,7 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
                     Monoid(
                         state=("m", "l", "acc"),
                         partial=("s", "vj"),
-                        merge=merge,
+                        twist=Twist(merge=merge),
                         identity=(Literal(-1e30), Literal(0.0), Literal(0.0)),
                         axes=("j",),
                     ),
@@ -158,7 +164,7 @@ def test_combine_states_default_derived_for_additive() -> None:
     c = Monoid(
         state=("acc",),
         partial=("p",),
-        merge=(Assign("acc", "add", ("acc", "p")),),
+        twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
         identity=(Literal(0.0),),
     )
     assert c.state_b == ("acc__o",)

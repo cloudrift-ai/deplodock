@@ -66,6 +66,7 @@ from deplodock.compiler.ir.stmt.leaves import (
     Pack,
     Select,
     SelectBranch,
+    Twist,
     Unpack,
     Write,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "SelectBranch",
     "Stmt",
     "StridedLoop",
+    "Twist",
     "Unpack",
     "Write",
     "canonicalize_buffer_names",

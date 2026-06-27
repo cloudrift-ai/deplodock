@@ -1,8 +1,9 @@
 # Tile IR rebuild
 
-Status: **rebuild in progress — Phase 1a (the no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` →
-`CudaOp`) has landed; every elementwise + index-only `e2e/` kernel is recovered and un-xfailed. The fold kinds
-(reduce / matmul / attention) remain registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phase 1a (no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` → `CudaOp`) and
+Phase 1b (the per-cell reduce, normal reduction + online softmax unified by the twist) have landed; every elementwise,
+index-only, and reduction `e2e/` kernel is recovered and un-xfailed. The remaining tiers (cooperative / cross-CTA reduce
+schedules, matmul, flash attention) stay registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -123,9 +124,38 @@ Recovered `e2e/` capability: every elementwise + index-only (broadcast / reshape
 gather / embedding / index-select / pow) kernel, fp32 and fp16. Their `XFAIL` entries are removed; the matmul / reduce /
 softmax / attention kernels remain registered, waiting on their schedules.
 
-### Phase 1b+ — the fold kinds — not started
+### Phase 1b — the per-cell reduce (`MONOID`), unified by the twist — done
 
-Add a schedule per remaining `AlgebraKind`: the serial / cooperative reduce (`MONOID`), the contraction (`SEMIRING`),
-and the streaming monoid (flash). Each supplies a combine to the same `TileOp` / `Tile` skeleton — the reduce `Loop` +
-`ReduceCarrier` already render through the carrier — plus its own launch geometry (cooperative threads, split-K, mma).
-To be scoped here as each lands.
+The fold kinds enter on the same skeleton: the article's framing is that a plain reduction and online softmax differ
+**only by the twist** ψ (the rescale-by-max bijection), so both must share one representation and one lowering. The slice
+makes that literal — normal reduction uses the *degenerate* (identity) twist, online softmax the max twist, and nothing
+in the schedule or the materializer branches on which.
+
+- **Representation — one carrier, twist extracted.** The combine is split out of the algebra: `Monoid` (`ir/stmt`) holds
+  the algebra (`state` / `partial` / `identity` / `commutative`), and a separate **`Twist`** holds the ψ-conjugated
+  combine as data (`merge` / `combine_states` / `state_b` + a `kind`). The monoid is shared; the twist is the only thing
+  that varies — `Twist.DEGENERATE` (ψ = id, a plain reduction's componentwise fold, `Twist.degenerate`), `Twist.SCALAR`
+  (the max-rescale on a scalar tuple — online softmax), `Twist.FRAGMENT` (the same ψ on mma fragments — attention,
+  reserved). Every reduce carrier is normalized to a `Monoid`: a scalar `Accum` → degenerate-twist monoid
+  (`Accum.as_monoid`), an already-twisted `Monoid` (the online-softmax recognizer) is kept. `merge` / `combine_states` /
+  `state_b` stay readable as `Monoid` properties, so render / rewrite / cross-partition combine are untouched.
+- **Recognize then schedule (two passes in `lowering/tile/enumeration/`).** `010_recognize` does the algebra:
+  `Accum → Init + degenerate Monoid` for every `MONOID` reduce loop (a `SEMIRING` contraction keeps its `Accum` — its
+  `classify_algebra` would otherwise flip to `MONOID`). `020_schedule` does the geometry: `_peel` maps the free axes
+  *enclosing* the reduce onto `grid_axes` (one thread per output row) and leaves the reduce `Loop` — plus any epilogue /
+  output sweep sharing its accumulator — serial in the per-cell body. `MAP` and `MONOID` schedule identically; `SEMIRING`
+  is skipped.
+- **Materialize / cuda — unchanged.** The `Monoid` renders through `render_merge_program`, the reduce `Loop` through
+  `Loop.render`, the seed through `Init`; the per-cell body (fold + epilogue + normalize sweep) sits inside the same
+  `Tile` thread-decode the no-fold kind already used. So a plain `reduce_sum` emits `acc = acc + x` and online softmax
+  emits the rescale-and-add merge through the **same** path.
+
+Recovered `e2e/` capability: `reduce_sum` / `reduce_max` / `mean` / `keepdim`, `rmsnorm`, `softmax`, online softmax, and
+the "cooperative" K=512/2048 variants (correct via the serial per-thread fold — the cooperative *schedule* is a perf
+tier, added later). Registry residuals: flash attention, cross-CTA split-reduce, and the matmul/sdpa tune cases.
+
+### Phase 1c+ — the remaining tiers — not started
+
+Add the cooperative / cross-CTA reduce *schedules* (warp-shuffle / smem-tree combine, split-reduce, flash-decoding —
+perf, not correctness), the contraction (`SEMIRING` — mma / split-K), and streaming-monoid flash attention. Each supplies
+its combine + launch geometry to the same `TileOp` / `Tile` skeleton. To be scoped here as each lands.

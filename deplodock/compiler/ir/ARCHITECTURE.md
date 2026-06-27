@@ -162,29 +162,37 @@ its tile-layer type guard).
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (the carried SSA
-names), `partial` (this step's contribution), `merge` (the associative operation
-**as data** — a short `Assign` program that reads old state + partial and
-reassigns the new state; state-targeting Assigns are updates, the rest are local
-temps), `identity` (one `Expr` per state component, seeded by the enclosing
-`Init`), and a `commutative` flag. The whole operation lives inside the carrier,
+names), `partial` (this step's contribution), `identity` (one `Expr` per state
+component, seeded by the enclosing `Init`), a `commutative` flag, and a `twist`
+(below) that holds the operation. The whole operation lives inside the carrier,
 not as loose body statements, so the online-algorithm gates (`accums_independent`,
 `classify_fragment_epilogue`) never see the cross-state coupling. `carried_names()`
 / `defines()` return `state`; `deps()` / `partial_deps()` return `partial` (the
 carried read is implicit, like `Accum` / `Mma`).
 
-Two extra fields carry the **state-merges-state** form the cross-partition combine
-needs (cooperative-tree / split-KV / split-K cross-CTA reduce, where each partition
-holds a complete state rather than a raw partial — see
-`plans/atomic-free-monoid-combine.md`): `state_b` (the second-operand state names,
-defaulting to `"<s>__o"` per component) and `combine_states` (an `Assign` program
-that reads the old `state` + the `state_b` state and reassigns the merged state).
-For an **additive** carrier whose partial lifts to a state (`len(partial) ==
-len(state)`) the two coincide, so `__post_init__` auto-derives `combine_states`
-from `merge` (partial reads swapped for `state_b`); an asymmetric monoid (flash's
-LSE) authors both (`flash_combine`). `as_state_merge(other)` returns a one-shot
-`Monoid` whose `merge` IS `combine_states` with `state_b` renamed to `other`, so a
-two-partition merge renders through the same machinery as a streaming step (see
-`tests/compiler/ir/test_combine_forward.py::test_combine_states_two_partition_matches_numpy`).
+**The `Twist` — the part that varies, extracted from the algebra.** Transport of
+structure: a monoid `(·, e)` conjugated by a bijection ψ gives the twisted combine
+`x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))`. The monoid algebra above is shared; ψ is the twist.
+`Monoid.twist` is a `Twist` holding the operation **as data** — `merge` (a short
+`Assign` program that reads old state + partial and reassigns the new state;
+state-targeting Assigns are updates, the rest local temps) and `combine_states`
+(the **state-merges-state** form the cross-partition combine needs —
+cooperative-tree / split-KV / split-K cross-CTA reduce, where each partition holds
+a complete state, reading the second operand `state_b`, default `"<s>__o"`). The
+`Twist.kind` names the realization, all over the *same* monoid: `DEGENERATE`
+(ψ = id — a plain reduction's componentwise fold, built by `Twist.degenerate`, used
+by `Accum.as_monoid`), `SCALAR` (the max-rescale on a scalar tuple — online
+softmax), `FRAGMENT` (the same ψ on mma C-fragments — tensor-core attention,
+reserved). `Monoid` exposes `merge` / `combine_states` / `state_b` as read-through
+properties, so every reader (render, rewrite, cross-partition combine,
+carrier-algebra split) is unchanged. `Monoid.__post_init__` completes the twist
+against the state: defaults `state_b` and, for an **additive** carrier whose
+partial lifts to a state (`len(partial) == len(state)`), auto-derives
+`combine_states` from `merge` (partial reads swapped for `state_b`); an asymmetric
+monoid (flash's LSE) authors both on the twist (`flash_combine`).
+`as_state_merge(other)` returns a one-shot `Monoid` whose `merge` IS
+`combine_states` with `state_b` renamed to `other`, so a two-partition merge
+renders through the same machinery as a streaming step.
 
 `Monoid.render` emits the `merge` program in fp32: each `Assign` targeting a
 `state` name is a reassignment of the carried value (declared by an enclosing

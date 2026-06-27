@@ -7,7 +7,8 @@ Tile / Cond) live in ``blocks``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import ClassVar
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
@@ -527,7 +528,7 @@ class Accum(ReduceCarrier):
         return Monoid(
             state=(self.name,),
             partial=(self.value,),
-            merge=(Assign(name=self.name, op=self.op, args=(self.name, self.value), dtype=self.dtype),),
+            twist=Twist.degenerate((self.name,), (self.value,), (self.op,), self.dtype),
             identity=(self.init,),
             commutative=self.op.commutative,
             axes=self.axes,
@@ -675,6 +676,49 @@ def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
 
 
 @dataclass(frozen=True)
+class Twist:
+    """The ψ-conjugated combine of a :class:`Monoid` — the part that VARIES while
+    the monoid algebra (carried state + neutral element) stays the same.
+
+    Transport of structure (the article): a monoid ``(·, e)`` conjugated by a
+    bijection ψ gives the twisted combine ``x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))``. The
+    monoid is shared; ψ is the twist. The combine is carried **as data** — the
+    same programs the carrier held before the extraction:
+
+    - ``merge`` — fold one partial into the state (the streaming reduce step);
+    - ``combine_states`` — merge two fully-reduced states (the cross-partition
+      step), reading the second operand named by ``state_b``.
+
+    ``kind`` names the realization, all over the *same* monoid:
+
+    - :attr:`DEGENERATE` — ψ = identity: the plain componentwise fold (normal
+      reduction — sum / max / mean). Built by :meth:`degenerate`.
+    - :attr:`SCALAR` — ψ realized on a scalar register tuple (online softmax's
+      max-rescale on ``(m, d, o)``).
+    - :attr:`FRAGMENT` — the same ψ realized on mma C-fragments (tensor-core
+      attention). Reserved; its realizer lands with the matmul / attention tier.
+    """
+
+    DEGENERATE: ClassVar[str] = "degenerate"
+    SCALAR: ClassVar[str] = "scalar"
+    FRAGMENT: ClassVar[str] = "fragment"
+
+    merge: tuple[Assign, ...]
+    combine_states: tuple[Assign, ...] = ()
+    state_b: tuple[str, ...] = ()
+    kind: str = SCALAR
+
+    @staticmethod
+    def degenerate(state: tuple[str, ...], partial: tuple[str, ...], ops: tuple[ElementwiseImpl, ...], dtype=None) -> Twist:
+        """The identity twist: componentwise ``state_i = op_i(state_i, partial_i)``
+        — a plain reduction is a monoid with no rescale (ψ = id). ``combine_states``
+        / ``state_b`` are left empty; :class:`Monoid` auto-derives them (the additive
+        carrier's partial lifts to a state)."""
+        merge = tuple(Assign(name=s, op=op, args=(s, p), dtype=dtype) for s, p, op in zip(state, partial, ops, strict=True))
+        return Twist(merge=merge, kind=Twist.DEGENERATE)
+
+
+@dataclass(frozen=True)
 class Monoid(ReduceCarrier):
     """A loop-carried **monoid** combine — a general associative reduce over
     internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
@@ -689,28 +733,22 @@ class Monoid(ReduceCarrier):
       ``Mma.c``), and the defs visible after the loop.
     - ``partial`` — this iteration's contribution SSA names (the right operand the
       step folds into the state).
-    - ``merge`` — the associative operation, **as data**: a short program of
-      ``Assign`` steps that reads the OLD state + the partial and reassigns the new
-      state. An ``Assign`` whose target is a ``state`` name is a state update
-      (rendered ``name = …;`` — the carried name is already declared by an
-      enclosing ``Init``); every other ``Assign`` is a local fp32 temp (declared
-      ``float t = …;``). Statement ORDER is load-bearing — a state update must come
-      after every read of that state's old value.
     - ``identity`` — the monoid's neutral element, one ``Expr`` per state
       component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
       cooperative-combine reductions read it to seed their partial accumulators).
-    - ``combine_states`` — the **state-merges-state** form of the monoid op: a
-      program (like ``merge``) that reads the OLD state + a SECOND full state
-      (named by ``state_b``) and reassigns the merged state. ``merge`` folds a
-      *partial* into the state (the streaming reduce); ``combine_states`` merges
-      two *fully-reduced* partition states — the form the cross-partition combine
-      needs (cooperative-tree / split-KV / split-K cross-CTA reduce), where each
-      partition holds a complete state, not a raw partial. For an **additive**
-      carrier whose partial lifts to a state (``len(partial) == len(state)``) the
-      two coincide, so ``combine_states`` is auto-derived from ``merge`` by
-      substituting the partial reads with ``state_b``; an asymmetric monoid
-      (flash's LSE) must author both. ``state_b`` defaults to ``"<s>__o"`` per
-      state component when not given.
+    - ``twist`` — the :class:`Twist`: the ψ-conjugated combine, **as data**, the
+      one part that varies (degenerate / scalar / fragment) while the algebra above
+      stays the same. It carries the ``merge`` program (fold a partial into the
+      state — each ``Assign`` targeting a ``state`` name is a state update,
+      ``name = …;``, every other a local fp32 temp; statement ORDER is
+      load-bearing) and the ``combine_states`` program (merge two fully-reduced
+      partition states, reading the second operand ``state_b`` — the form the
+      cross-partition combine needs). ``merge`` / ``combine_states`` / ``state_b``
+      are exposed as read-through properties. ``__post_init__`` completes the twist
+      against this state: defaults ``state_b`` to ``"<s>__o"`` and, for an
+      **additive** carrier whose partial lifts to a state, auto-derives
+      ``combine_states`` from ``merge``; an asymmetric monoid (flash's LSE) authors
+      both on the twist.
     - ``commutative`` — whether the operation also commutes (split-KV legality);
       ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
       monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
@@ -734,30 +772,43 @@ class Monoid(ReduceCarrier):
 
     state: tuple[str, ...]
     partial: tuple[str, ...]
-    merge: tuple[Assign, ...] = ()
+    twist: Twist
     identity: tuple[Expr, ...] = ()
     commutative: bool = True
     axes: tuple[str, ...] = ()
-    state_b: tuple[str, ...] = ()
-    combine_states: tuple[Assign, ...] = ()
 
     def __post_init__(self) -> None:
-        # Default the second-operand state names ("<s>__o") so a carrier built
-        # with only ``state`` / ``partial`` / ``merge`` still has a complete
-        # cross-partition surface. ``object.__setattr__`` — the dataclass is frozen.
-        if not self.state_b:
-            object.__setattr__(self, "state_b", tuple(f"{s}__o" for s in self.state))
+        # Complete the twist's cross-partition surface against this monoid's state.
+        # ``object.__setattr__`` — the dataclass is frozen.
+        tw = self.twist
+        # Default the second-operand state names ("<s>__o") so a twist built with
+        # only ``merge`` still has a complete cross-partition surface.
+        state_b = tw.state_b or tuple(f"{s}__o" for s in self.state)
+        combine_states = tw.combine_states
         # Auto-derive ``combine_states`` from ``merge`` for an additive carrier
         # (the partial lifts to a state, one component each): substitute the
         # partial reads with the second-operand state names. An asymmetric monoid
         # (different partial / state arity, e.g. flash LSE) must author it.
-        if not self.combine_states and len(self.partial) == len(self.state):
-            sub = dict(zip(self.partial, self.state_b, strict=True))
-            object.__setattr__(
-                self,
-                "combine_states",
-                tuple(_rename_assign_args(a, sub) for a in self.merge),
-            )
+        if not combine_states and len(self.partial) == len(self.state):
+            sub = dict(zip(self.partial, state_b, strict=True))
+            combine_states = tuple(_rename_assign_args(a, sub) for a in tw.merge)
+        if state_b != tw.state_b or combine_states != tw.combine_states:
+            object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
+
+    # The combine lives in ``twist`` (extracted); these read-throughs keep the
+    # carrier's surface (``merge`` / ``combine_states`` / ``state_b``) stable for
+    # every reader — render, rewrite, cross-partition combine, carrier-algebra split.
+    @property
+    def merge(self) -> tuple[Assign, ...]:
+        return self.twist.merge
+
+    @property
+    def combine_states(self) -> tuple[Assign, ...]:
+        return self.twist.combine_states
+
+    @property
+    def state_b(self) -> tuple[str, ...]:
+        return self.twist.state_b
 
     def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
         """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
@@ -772,12 +823,10 @@ class Monoid(ReduceCarrier):
         return Monoid(
             state=self.state,
             partial=other,
-            merge=merged,
+            twist=Twist(merge=merged, combine_states=merged, state_b=other, kind=self.twist.kind),
             identity=self.identity,
             commutative=self.commutative,
             axes=self.axes,
-            state_b=other,
-            combine_states=merged,
         )
 
     def deps(self) -> tuple[str, ...]:

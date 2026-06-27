@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from deplodock.compiler.ir.stmt.leaves import Assign, Monoid
+from deplodock.compiler.ir.stmt.leaves import Assign, Monoid, Twist
 
 # Associative+commutative ops whose presence over a distributed operand marks a reduction
 # (rowmax / rowsum). Disambiguates ``max(m, s)`` (a FOLD, ``s`` distributed) from a purely
@@ -156,7 +156,7 @@ def split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str
     stats = Monoid(
         state=tuple(stats_states),
         partial=(carrier.partial[0],),
-        merge=stats_merge,
+        twist=Twist(merge=stats_merge, kind=carrier.twist.kind),
         identity=tuple(ident[s] for s in stats_states) if ident else (),
         commutative=carrier.commutative,
         axes=carrier.axes,
@@ -164,7 +164,7 @@ def split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str
     accum = Monoid(
         state=(d_state,),
         partial=(value_name,),
-        merge=accum_merge,
+        twist=Twist(merge=accum_merge, kind=carrier.twist.kind),
         identity=(ident[d_state],) if ident else (),
         commutative=carrier.commutative,
         axes=carrier.axes,

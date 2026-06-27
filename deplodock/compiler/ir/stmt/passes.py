@@ -29,6 +29,7 @@ from deplodock.compiler.ir.stmt.leaves import (
     Pack,
     Select,
     SelectBranch,
+    Twist,
     Unpack,
     Write,
 )
@@ -181,12 +182,15 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Monoid(
         state=tuple(rn(n) for n in s.state),
         partial=tuple(rn(n) for n in s.partial),
-        merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
+        twist=Twist(
+            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
+            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.combine_states),
+            state_b=tuple(rn(n) for n in s.state_b),
+            kind=s.twist.kind,
+        ),
         identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,
         axes=new_axes,
-        state_b=tuple(rn(n) for n in s.state_b),
-        combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.combine_states),
     )
 
 

@@ -47,7 +47,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -108,12 +108,10 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     return Monoid(
         state=(m, ll, o),
         partial=(s, v),
-        merge=merge,
+        twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b, kind=Twist.SCALAR),
         identity=identity,
         commutative=True,
         axes=("kv",),
-        state_b=state_b,
-        combine_states=combine_states,
     )
 
 
@@ -161,12 +159,10 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
     return Monoid(
         state=(m, d),
         partial=(s,),
-        merge=merge,
+        twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db), kind=Twist.SCALAR),
         identity=(Literal(-1e30), Literal(0.0)),  # (−inf, 0)
         commutative=True,
         axes=(axis,),
-        state_b=(mb, db),
-        combine_states=combine_states,
     )
 
 

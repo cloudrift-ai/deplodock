@@ -1,8 +1,16 @@
-"""Tile-IR enumeration: ``LoopOp`` → ``TileOp`` (schedule selection).
+"""Tile-IR enumeration: ``LoopOp`` → ``TileOp``, in two steps.
 
-Reads each loop kernel's algebraic kind (``Loop.algebra_kind``) and chooses a
-schedule for it. The skeleton currently schedules the no-fold kind — onto the
-thread grid, one thread per output cell. Kernels carrying a combine are left
-un-lowered until their schedule is built; they reuse the same op by supplying the
-combine, per ``plans/tile-ir-rebuild.md``.
+1. **Recognize** (``010_recognize``) — read the reduce carrier's algebra and
+   normalize it to the unified twisted ``Monoid`` (a scalar ``Accum`` becomes its
+   degenerate, identity-twist monoid; an online-softmax ``Monoid`` is kept;
+   a ``SEMIRING`` contraction is left alone). After this, a plain reduction and
+   online softmax share one representation.
+2. **Schedule** (``020_schedule``) — choose the per-cell schedule: map the free
+   (output) axes onto the thread grid and keep any fold serial in the per-cell
+   body.
+
+Recognition is purely about algebraic structure; scheduling is purely geometry —
+so neither, nor the downstream lowering, branches on reduction-vs-softmax. The
+contraction (``SEMIRING``) schedule and the cooperative / cross-CTA reduce
+schedules arrive later, per ``plans/tile-ir-rebuild.md``.
 """
