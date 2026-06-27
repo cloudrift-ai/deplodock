@@ -8,7 +8,6 @@ Tile / Cond) live in ``blocks``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import ClassVar
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
@@ -682,31 +681,20 @@ class Twist:
 
     Transport of structure (the article): a monoid ``(·, e)`` conjugated by a
     bijection ψ gives the twisted combine ``x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))``. The
-    monoid is shared; ψ is the twist. The combine is carried **as data** — the
-    same programs the carrier held before the extraction:
+    monoid is shared; ψ is the twist, and ψ lives entirely in the combine programs
+    carried here **as data** — a plain reduction's identity twist
+    (``Twist.degenerate``: componentwise ``state_i = op_i(state_i, partial_i)``),
+    online softmax's max-rescale, a future mma-fragment realization — all the same
+    monoid, differing only in these programs:
 
     - ``merge`` — fold one partial into the state (the streaming reduce step);
     - ``combine_states`` — merge two fully-reduced states (the cross-partition
       step), reading the second operand named by ``state_b``.
-
-    ``kind`` names the realization, all over the *same* monoid:
-
-    - :attr:`DEGENERATE` — ψ = identity: the plain componentwise fold (normal
-      reduction — sum / max / mean). Built by :meth:`degenerate`.
-    - :attr:`SCALAR` — ψ realized on a scalar register tuple (online softmax's
-      max-rescale on ``(m, d, o)``).
-    - :attr:`FRAGMENT` — the same ψ realized on mma C-fragments (tensor-core
-      attention). Reserved; its realizer lands with the matmul / attention tier.
     """
-
-    DEGENERATE: ClassVar[str] = "degenerate"
-    SCALAR: ClassVar[str] = "scalar"
-    FRAGMENT: ClassVar[str] = "fragment"
 
     merge: tuple[Assign, ...]
     combine_states: tuple[Assign, ...] = ()
     state_b: tuple[str, ...] = ()
-    kind: str = SCALAR
 
     @staticmethod
     def degenerate(state: tuple[str, ...], partial: tuple[str, ...], ops: tuple[ElementwiseImpl, ...], dtype=None) -> Twist:
@@ -715,7 +703,7 @@ class Twist:
         / ``state_b`` are left empty; :class:`Monoid` auto-derives them (the additive
         carrier's partial lifts to a state)."""
         merge = tuple(Assign(name=s, op=op, args=(s, p), dtype=dtype) for s, p, op in zip(state, partial, ops, strict=True))
-        return Twist(merge=merge, kind=Twist.DEGENERATE)
+        return Twist(merge=merge)
 
 
 @dataclass(frozen=True)
@@ -809,7 +797,7 @@ class Monoid(ReduceCarrier):
         return Monoid(
             state=self.state,
             partial=other,
-            twist=Twist(merge=merged, combine_states=merged, state_b=other, kind=self.twist.kind),
+            twist=Twist(merge=merged, combine_states=merged, state_b=other),
             identity=self.identity,
             commutative=self.commutative,
             axes=self.axes,

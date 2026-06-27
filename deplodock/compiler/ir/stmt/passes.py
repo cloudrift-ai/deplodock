@@ -186,7 +186,6 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
             merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
             combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
             state_b=tuple(rn(n) for n in s.twist.state_b),
-            kind=s.twist.kind,
         ),
         identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,

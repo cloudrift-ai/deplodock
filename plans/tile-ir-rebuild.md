@@ -133,12 +133,12 @@ in the schedule or the materializer branches on which.
 
 - **Representation — one carrier, twist extracted.** The combine is split out of the algebra: `Monoid` (`ir/stmt`) holds
   the algebra (`state` / `partial` / `identity` / `commutative`), and a separate **`Twist`** holds the ψ-conjugated
-  combine as data (`merge` / `combine_states` / `state_b` + a `kind`). The monoid is shared; the twist is the only thing
-  that varies — `Twist.DEGENERATE` (ψ = id, a plain reduction's componentwise fold, `Twist.degenerate`), `Twist.SCALAR`
-  (the max-rescale on a scalar tuple — online softmax), `Twist.FRAGMENT` (the same ψ on mma fragments — attention,
-  reserved). Every reduce carrier is normalized to a `Monoid`: a scalar `Accum` → degenerate-twist monoid
-  (`Accum.as_monoid`), an already-twisted `Monoid` (online softmax / flash) is kept. The combine is read off the twist
-  directly (`monoid.twist.merge` / `.combine_states` / `.state_b`).
+  combine as data (`merge` / `combine_states` / `state_b`). The monoid is shared; ψ lives entirely in those programs and
+  is the only thing that varies — a plain reduction's identity twist (`Twist.degenerate`: componentwise
+  `state_i = op_i(state_i, partial_i)`), online softmax's max-rescale, a future mma-fragment realization. Every reduce
+  carrier is normalized to a `Monoid`: a scalar `Accum` → degenerate-twist monoid (`Accum.as_monoid`), an
+  already-twisted `Monoid` (online softmax / flash) is kept. The combine is read off the twist directly
+  (`monoid.twist.merge` / `.combine_states` / `.state_b`).
 - **Recognize then schedule (two passes in `lowering/tile/`).** `010_recognize` does ALL algebra recognition, in order:
   (1) **flash attention** — a softmax-then-P@V kernel + its scaled-QK producer fuse to one flash `LoopOp` (the
   `(m, l, O)` twisted monoid); (2) **online softmax** — an adjacent `(rowmax, Σ exp)` reduce pair fuses to one

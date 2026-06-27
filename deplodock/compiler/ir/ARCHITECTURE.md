@@ -178,14 +178,13 @@ structure: a monoid `(·, e)` conjugated by a bijection ψ gives the twisted com
 state-targeting Assigns are updates, the rest local temps) and `combine_states`
 (the **state-merges-state** form the cross-partition combine needs —
 cooperative-tree / split-KV / split-K cross-CTA reduce, where each partition holds
-a complete state, reading the second operand `state_b`, default `"<s>__o"`). The
-`Twist.kind` names the realization, all over the *same* monoid: `DEGENERATE`
-(ψ = id — a plain reduction's componentwise fold, built by `Twist.degenerate`, used
-by `Accum.as_monoid`), `SCALAR` (the max-rescale on a scalar tuple — online
-softmax), `FRAGMENT` (the same ψ on mma C-fragments — tensor-core attention,
-reserved). `Monoid` exposes `merge` / `combine_states` / `state_b` as read-through
-properties, so every reader (render, rewrite, cross-partition combine,
-carrier-algebra split) is unchanged. `Monoid.__post_init__` completes the twist
+a complete state, reading the second operand `state_b`, default `"<s>__o"`). ψ
+lives entirely in those programs — a plain reduction's identity twist
+(`Twist.degenerate`: componentwise `state_i = op_i(state_i, partial_i)`, used by
+`Accum.as_monoid`), online softmax's max-rescale, a future mma-fragment
+realization — all the *same* monoid, differing only in the combine. Readers reach
+it directly off the carrier (`monoid.twist.merge` / `.combine_states` /
+`.state_b`). `Monoid.__post_init__` completes the twist
 against the state: defaults `state_b` and, for an **additive** carrier whose
 partial lifts to a state (`len(partial) == len(state)`), auto-derives
 `combine_states` from `merge` (partial reads swapped for `state_b`); an asymmetric

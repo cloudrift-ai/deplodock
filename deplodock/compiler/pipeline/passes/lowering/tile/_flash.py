@@ -104,7 +104,7 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     return Monoid(
         state=(m, ll, o),
         partial=(s, v),
-        twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b, kind=Twist.SCALAR),
+        twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
         identity=identity,
         commutative=True,
         axes=("kv",),
@@ -155,7 +155,7 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
     return Monoid(
         state=(m, d),
         partial=(s,),
-        twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db), kind=Twist.SCALAR),
+        twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
         identity=(Literal(-1e30), Literal(0.0)),  # (−inf, 0)
         commutative=True,
         axes=(axis,),

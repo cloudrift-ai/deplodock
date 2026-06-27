@@ -156,7 +156,7 @@ def split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str
     stats = Monoid(
         state=tuple(stats_states),
         partial=(carrier.partial[0],),
-        twist=Twist(merge=stats_merge, kind=carrier.twist.kind),
+        twist=Twist(merge=stats_merge),
         identity=tuple(ident[s] for s in stats_states) if ident else (),
         commutative=carrier.commutative,
         axes=carrier.axes,
@@ -164,7 +164,7 @@ def split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str
     accum = Monoid(
         state=(d_state,),
         partial=(value_name,),
-        twist=Twist(merge=accum_merge, kind=carrier.twist.kind),
+        twist=Twist(merge=accum_merge),
         identity=(ident[d_state],) if ident else (),
         commutative=carrier.commutative,
         axes=carrier.axes,
