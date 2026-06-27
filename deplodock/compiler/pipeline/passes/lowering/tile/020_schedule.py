@@ -13,18 +13,21 @@ map onto the per-cell (one-thread-per-output-cell) tier:
 
 Both peel the same way (``_peel``): a leading loop-invariant prefix plus the
 outer chain of single-child free loops, stopping at the first reduce loop or
-branch — exactly where the per-cell body begins. Because the carrier is already
-the unified ``Monoid`` (degenerate twist for a plain reduction, the max twist for
-online softmax), the schedule and the downstream lowering never branch on which.
+branch — exactly where the per-cell body begins. The fold itself is the carrier in
+the per-cell body — a ``Monoid`` (degenerate twist for a plain reduction, the max
+twist for online softmax) or an ``Accum`` (a ``SEMIRING`` contraction's `+` fold,
+the matmul ``acc += a·b``) — so the schedule and the downstream lowering never
+branch on which: one thread per output cell, the fold serial.
 
-A contraction (``SEMIRING`` — matmul) is left un-lowered for now; its schedule
-arrives with the matmul tier (see ``plans/tile-ir-rebuild.md``).
+The ONE thing the scalar tier can't schedule yet is a **nested** contraction — a
+reduce loop whose body holds another reduce loop (flash attention: the ``kv``
+monoid stream wrapping the ``Q·K`` dot product). That's left un-lowered until the
+streaming/attention tier (see ``plans/tile-ir-rebuild.md``).
 """
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Body, Loop
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -70,10 +73,18 @@ def _reduce_loops(stmts) -> list[Loop]:
 
 def rewrite(match: Match, root: Node) -> TileOp | None:
     loop: LoopOp = root.op
+    # The scalar tier materializes a static thread grid (``Tile`` decodes literal
+    # extents). A symbolic axis (dynamic ``seq_len``) needs the runtime-arg decode
+    # — left un-lowered until the dynamic-shape tier.
+    if any(not a.extent.is_static for a in loop.axes):
+        raise RuleSkipped("symbolic axis — scalar tier needs static extents (dynamic tier not built)")
     axes, cell = _peel(loop.body)
     folds = _reduce_loops(cell)
-    if AlgebraKind.SEMIRING in {f.algebra_kind for f in folds}:
-        raise RuleSkipped("contraction (semiring) — its schedule is not built yet")
+    # A reduce loop whose body contains a further reduce loop is a nested
+    # contraction (flash: kv-monoid over the Q·K dot product) — the scalar tier
+    # schedules flat reductions / contractions only; nested awaits the streaming tier.
+    if any(_reduce_loops(list(f.body)) for f in folds):
+        raise RuleSkipped("nested contraction (flash attention) — streaming tier not built yet")
     if not axes and not folds:
         raise RuleSkipped("no work to schedule")
     return TileOp(body=Body(tuple(cell)), name=loop.name, grid_axes=tuple(axes))

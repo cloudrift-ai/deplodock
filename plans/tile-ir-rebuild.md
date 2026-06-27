@@ -1,9 +1,10 @@
 # Tile IR rebuild
 
-Status: **rebuild in progress — Phase 1a (no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` → `CudaOp`) and
-Phase 1b (the per-cell reduce, normal reduction + online softmax unified by the twist) have landed; every elementwise,
-index-only, and reduction `e2e/` kernel is recovered and un-xfailed. The remaining tiers (cooperative / cross-CTA reduce
-schedules, matmul, flash attention) stay registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phase 1a (no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` → `CudaOp`),
+1b (the per-cell reduce, normal reduction + online softmax unified by the twist), and 1c (scalar-tier matmul /
+`SEMIRING`) have landed; every elementwise, index-only, reduction, and static-matmul `e2e/` kernel is recovered and
+un-xfailed. The remaining tiers (the mma/blocked/split-K Atom, cooperative / cross-CTA reduce schedules, dynamic shapes,
+flash attention) stay registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -160,8 +161,28 @@ Recovered `e2e/` capability: `reduce_sum` / `reduce_max` / `mean` / `keepdim`, `
 the "cooperative" K=512/2048 variants (correct via the serial per-thread fold — the cooperative *schedule* is a perf
 tier, added later). Registry residuals: flash attention, cross-CTA split-reduce, and the matmul/sdpa tune cases.
 
-### Phase 1c+ — the remaining tiers — not started
+### Phase 1c — scalar-tier matmul (`SEMIRING`) — done
+
+A contraction is the `SEMIRING` reduce — `reduce(+) ∘ map(⊗)` — and at the scalar tier it schedules *exactly* like a
+reduction: one thread per output cell, the K axis a serial fold (`acc += a·b`). So `020_schedule` just stops skipping
+`SEMIRING` — `_peel` already keeps the reduce loop serial in the per-cell body, and `Loop.render` already emits the
+`Accum` fold. The `Accum` is kept (not degenerate-monoidized) so the kind stays `SEMIRING` for the future mma Atom.
+
+Two guards added to `020_schedule`:
+- **nested contraction** (a reduce loop whose body holds another reduce loop — flash's `kv` monoid over the `Q·K` dot
+  product) is skipped: the streaming/attention tier isn't built. So matmul (flat) lowers; flash stays gated.
+- **symbolic axis** is skipped: the scalar `Tile` decode needs static extents (a dynamic `seq_len` matmul previously hit
+  the SEMIRING skip first; now it's skipped explicitly, staying un-lowered for the dynamic tier).
+
+Recovered: static `matmul` / `linear` (+bias), fp16 matmul, and the many tier-pinned matmul *accuracy* tests
+(`test_lowering_blocked_gemm`, `test_stage_scalar`, `test_matmul_mma_parity[static]`, `test_knob_pinning` matmul/gated-MLP,
+the matmul `tune`/`two_level` cases) — the pinned tile/mma/staging/split-K knobs are no-ops at the scalar tier but the
+output is correct, so they pass on accuracy now and will *guard* their tier once it's built. Registry residuals in those
+files are the genuinely tier-needing cases (mma codegen, dynamic, split-K, attention).
+
+### Phase 1d+ — the remaining tiers — not started
 
 Add the cooperative / cross-CTA reduce *schedules* (warp-shuffle / smem-tree combine, split-reduce, flash-decoding —
-perf, not correctness), the contraction (`SEMIRING` — mma / split-K), and streaming-monoid flash attention. Each supplies
-its combine + launch geometry to the same `TileOp` / `Tile` skeleton. To be scoped here as each lands.
+perf, not correctness), the contraction **Atom** (`SEMIRING` → mma.sync / blocked register tiles / split-K — perf), and
+streaming-monoid flash attention (the nested contraction `020` currently gates). Each supplies its combine + launch
+geometry to the same `TileOp` / `Tile` skeleton. To be scoped here as each lands.
