@@ -61,7 +61,7 @@ def test_whole_cta_form_keeps_wide_br():
     CTA-wide ``BR > warp_size`` candidates — the combine spans the whole CTA."""
     offers = coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP)
     assert offers, "whole-CTA cooperative reduce produced no offers"
-    assert max(br for _, _, br in offers) > _WARP, "BN=BM=1 form must keep CTA-wide BR > warp_size"
+    assert max(br for _, _, br, _ in offers) > _WARP, "BN=BM=1 form must keep CTA-wide BR > warp_size"
 
 
 def test_strided_rows_clip_br_to_segmented_shuffle(monkeypatch):
@@ -71,7 +71,7 @@ def test_strided_rows_clip_br_to_segmented_shuffle(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_BN", "8")
     offers = coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP)
     assert offers, "strided-cooperative reduce produced no offers"
-    for _, _, br in offers:
+    for _, _, br, _ in offers:
         assert br <= _WARP, f"strided row with BR > warp_size: {br}"
         assert br & (br - 1) == 0, f"strided row with non-pow2 BR: {br}"
 
@@ -79,7 +79,7 @@ def test_strided_rows_clip_br_to_segmented_shuffle(monkeypatch):
 def test_strided_rows_respect_thread_cap(monkeypatch):
     """``bn·br`` stays within the CTA thread budget (1024) on strided rows."""
     monkeypatch.setenv("DEPLODOCK_BN", "8")
-    for _, _, br in coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP):
+    for _, _, br, _ in coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP):
         assert 8 * br <= 1024, f"bn·br exceeds CTA thread budget: 8·{br}"
 
 
@@ -137,7 +137,7 @@ def test_symbolic_row_strided_offers(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_BN", "8")
     offers = coop_reduce_offers(_reduce_dag((Dim("seq_len"), 8, 128)), warp_size=_WARP)
     assert offers, "symbolic-row strided cooperative reduce produced no offers"
-    for _, _, br in offers:
+    for _, _, br, _ in offers:
         assert br <= _WARP and br & (br - 1) == 0, f"symbolic-row strided BR not pow2<=warp: {br}"
 
 

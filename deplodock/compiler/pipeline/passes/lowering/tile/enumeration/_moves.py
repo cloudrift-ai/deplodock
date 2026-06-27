@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.stmt import Loop, ReduceCarrier, Write
+from deplodock.compiler.ir.stmt import Accum, Loop, ReduceCarrier, Write
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
@@ -340,11 +340,14 @@ def coop_free_threads(dag: IterDag) -> tuple[int, int]:
     return bn, bm
 
 
-def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, int, int]]:
-    """Legal ``(bk, fk, br)`` for a cooperative reduce: ``br`` (the cooperative
-    thread count) ≤ 1024. For a static K, ``br·bk·fk`` must divide K; a symbolic
-    (masked) K only needs ``br·bk·fk ≤`` the hint — the final partial tile is
-    masked (ceil-div). Best-first: ≈``_BR_TARGET`` threads, no chunk / strip-mine.
+def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, int, int, int]]:
+    """Legal ``(bk, fk, br, cta)`` for a cooperative reduce. ``br`` (the cooperative
+    thread count) ≤ 1024; ``cta`` is the **cross-CTA split-K** degree (each CTA owns a
+    chunk, writes its partial state to a workspace, a sibling combine kernel folds them —
+    the cross-CTA producer mirroring the intra-CTA ``br`` partition one level up). For a
+    static K, ``br·bk·fk·cta`` must divide K; a symbolic (masked) K only needs
+    ``br·bk·fk ≤`` the hint — the final partial tile is masked (ceil-div). Best-first:
+    ``cta = 1`` first (no split), then ≈``_BR_TARGET`` threads, no chunk / strip-mine.
     Env-pinnable for tests.
 
     With **strided-cooperative rows** (a pinned ``BN·BM > 1`` free-axis thread
@@ -352,8 +355,16 @@ def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, 
     ``BR`` lanes, so ``BR`` clips to a power of two ≤ ``warp_size`` (each row's
     lanes must form an aligned intra-warp segment — matching
     ``cooperative_combine_geometry``), and ``bn·bm·br`` must fit the CTA thread
-    budget."""
-    bk_pin, fk_pin, _, br_pin = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
+    budget.
+
+    **Cross-CTA split-K** (``cta > 1``) is offered ONLY for an **additive ``Accum``**
+    carrier over a **static** K with no non-linear epilogue / multi-accumulator reduce
+    (the same soundness gate :func:`reduce_offers` applies to the matmul split-K: a
+    non-linear epilogue or a coupled multi-accum over a partial would corrupt the
+    cross-CTA sum). A non-additive ``Monoid`` carrier (online softmax / flash split-KV)
+    opts in separately (the twisted finalize is kernel-only). Cooperative ``br`` and
+    cross-CTA ``cta`` compose — K is partitioned across BOTH CTAs and the CTA's threads."""
+    bk_pin, fk_pin, sk_pin, br_pin = fam.reduce_fields(dag, dag.k_node.loop.axis.name)
     bks = (bk_pin,) if bk_pin else BK_CHOICES
     fks = (fk_pin,) if fk_pin else FK_CHOICES
     brs = (br_pin,) if br_pin else BR_CHOICES
@@ -368,8 +379,9 @@ def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, 
     # Same decomposition move as split-K: factor [br (cooperative THREAD), bk
     # (STAGE_INNER), fk (REGISTER)] — the masked-K fill is licensed by the
     # carrier's identity (has_identity), the cooperative partition by commutative.
+    carrier = _carrier_of(dag.k_node.loop)
     decomps = legal_decomps(
-        _carrier_of(dag.k_node.loop),
+        carrier,
         dag.k_node.loop.axis,
         dag.k_extent,
         factor_menus=[brs, bks, fks],
@@ -377,14 +389,26 @@ def coop_reduce_offers(dag: IterDag, *, warp_size: int = 32) -> list[tuple[int, 
         masked=masked,
         allow_split=True,
     )
-    out = [
-        (d.factors[1], d.factors[2], d.factors[0])
-        for d in decomps
-        if 1 <= d.factors[0] <= 1024
-        and (d.factors[0] == 1 or not br_floor_serial)
-        and (not strided or _strided_br_ok(d.factors[0], bn * bm, warp_size))
-    ]
-    out.sort(key=lambda t: (abs(t[2] - _BR_TARGET), t[0], t[1]))
+    # The cross-CTA split-K menu — additive Accum + static K + no epilogue / multi-accum.
+    # **Pin-gated** in M1 (offered only when ``REDUCE`` carries an explicit ``c<cta>``): the
+    # cold ``AnalyticPrior`` would otherwise rank a degenerate split-K reduce above the
+    # cooperative one, changing the greedy default (a plain ``sum`` is cooperative-reduced, not
+    # split). M4 surfaces ``cta`` as a real search dimension; until then greedy / cold stay
+    # cta=1 and only a pin (or, at M4, the tuner) reaches the cross-CTA producer.
+    additive = isinstance(carrier, Accum) and carrier.op.name == "add"
+    has_epilogue = any(not isinstance(s, (Loop, Write)) for s in dag.inner_body)
+    n_reduce = sum(1 for s in dag.inner_body if isinstance(s, Loop) and s.is_reduce)
+    allow_cta = additive and not masked and not (has_epilogue or n_reduce > 1)
+    sks = (sk_pin,) if (allow_cta and sk_pin) else (1,)
+    out: list[tuple[int, int, int, int]] = []
+    for d in decomps:
+        br, bk, fk = d.factors
+        if not (1 <= br <= 1024 and (br == 1 or not br_floor_serial) and (not strided or _strided_br_ok(br, bn * bm, warp_size))):
+            continue
+        for cta in sks:
+            if cta == 1 or (not masked and dag.k_extent % (cta * br * bk * fk) == 0):
+                out.append((bk, fk, br, cta))
+    out.sort(key=lambda t: (t[3] != 1, abs(t[2] - _BR_TARGET), t[0], t[1]))
     return out
 
 
@@ -397,11 +421,13 @@ def _strided_br_ok(br: int, free_threads: int, warp_size: int) -> bool:
     return br == 1 or (br <= warp_size and br & (br - 1) == 0)
 
 
-def coop_reduce_knobs(dag: IterDag, reduce: tuple[int, int, int]) -> dict:
+def coop_reduce_knobs(dag: IterDag, reduce: tuple[int, int, int, int]) -> dict:
     """Knob delta a cooperative-reduce leaf pins — ``REDUCE@<primary>`` with the
-    cooperative-lane factor in ``t<coop>``."""
-    bk, fk, br = reduce
-    return {fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=fk, coop=br)}
+    cooperative-lane factor in ``t<coop>`` and the cross-CTA split-K degree in ``c<cta>``.
+    A ``cta > 1`` emits a **bare** ``c<cta>`` (finalize pending) — the cross-CTA finalize
+    fork (``150_cross_cta_finalize``) completes it to ``a`` (atomic) / ``k`` (deferred)."""
+    bk, fk, br, cta = reduce
+    return {fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=bk, fold=fk, cta=cta, coop=br)}
 
 
 def coop_free_thread_knobs(dag: IterDag) -> dict:

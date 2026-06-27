@@ -47,8 +47,7 @@ def _reduce_graph(s: int, m: int, n: int) -> Graph:
         workspaces=("ws_m", "ws_l"),
         out_name="out",
         s_extent=s,
-        m_extent=m,
-        n_extent=n,
+        out_shape=(m, n),
         dtype=F32,
         out_value="l",  # the merged denominator l_global
         name="monoid_ml__reduce",
@@ -90,7 +89,7 @@ def _deferred_graph(carrier, *, workspaces, s, m, n, **kw) -> Graph:
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph
 
     tg = deferred_combine_tilegraph(
-        carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, m_extent=m, n_extent=n, dtype=F32, name="deferred__reduce", **kw
+        carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, out_shape=(m, n), dtype=F32, name="deferred__reduce", **kw
     )
     g = Graph()
     for w in workspaces:

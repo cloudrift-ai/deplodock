@@ -74,7 +74,7 @@ _ALLOWED = [
     (AlgebraKind.SEMIRING, {"MMA": 0, "BN": 16, "BM": 16, "SPLITK": 4}),
     # A full warp matmul pin (atom + warp counts + register cells + atom-K chunk).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2}),
-    # Warp-tier split-K (the atomic-free combine, 140_atomic_free_splitk) is supported.
+    # Warp-tier split-K (the atomic-free combine, 150_cross_cta_finalize) is supported.
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2, "SPLITK": 2}),
     # Universal / OFF values are inert next to a warp pin (the value-aware table).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "SPLITK": 1, "FK": 1, "BR": 1, "FM": 1, "FN": 1}),

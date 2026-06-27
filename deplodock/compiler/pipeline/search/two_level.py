@@ -106,7 +106,7 @@ def outer_pipeline() -> Pipeline:
     every structural choice) with no kernel-set distinction. The split boundary is
     exactly where the kernel set is fixed but tiling is not — the right outer/inner
     seam (``plans/structural-forks-in-two-level.md`` step 2). Sub-partition splices
-    (``140_atomic_free_splitk``'s combine) likewise stay inner — their trigger knob
+    (``150_cross_cta_finalize``'s combine) likewise stay inner — their trigger knob
     (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
     # ``010_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary

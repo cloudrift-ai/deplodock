@@ -15,39 +15,46 @@ how state and partials are distributed):
   fold, inline in the loop body).
 - **cross-thread** (lanes / smem) — ``lowering/kernel/_combine.emit_combine`` → ``WarpShuffle`` /
   ``TreeHalve`` (the cooperative reduce of a partial split across the CTA's threads).
-- **fragment** (m16n8 tensor-core registers) — ``assembly/_frag_softmax.realize_fragment_softmax``
-  → ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` (the warp-chain flash softmax).
+- **fragment** (m16n8 tensor-core registers) — ``ir/twist.Twist.combine``
+  → ``FragmentRowReduce`` (the cross-column fold) + the carrier-generic ``FragmentApply`` (every
+  pointwise step — ``exp`` / scale / any op, the warp-chain flash softmax and beyond).
 
 The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
 structure — not two hand-authored transcriptions.
 
-The per-key online-softmax ``merge`` program is classified ONCE here — :func:`classify_merge_program`
-(over :func:`fragment_taint`) tags each ``Assign`` with its geometry-independent carrier role
-(``fold`` / ``exp`` / ``state_copy`` / ``state_scalar`` / ``scalar``, as :class:`MergeStep`s) — and the
-fragment realizer consumes that classification as a thin geometry emitter (the streaming + cross-thread
-realizers consume the carrier's ``merge`` / ``combine_states`` surface directly via
-``render_merge_program``, so they need no role split). One analysis, geometry per realizer.
+Projection is the carrier-generic driver: :meth:`Monoid.project` (this module's :func:`interpret`)
+abstract-interprets a merge program over a :class:`Distribution` **backend**, taking the carrier
+algebra to a target distribution by the distribution law — a reduce over the distributed axis
+becomes the backend's cross-partition combine (``Distribution.fold``), and an elementwise op the
+backend's per-element map (``Distribution.pointwise``); scalars / carried-state reassigns stay
+replicated. The fragment realizer (``ir/twist.Twist``) is one backend — its
+``fold`` is a ``FragmentRowReduce`` over the C-fragment columns, its ``pointwise`` a
+``FragmentApply`` over the registers. No softmax knowledge in the driver: it dispatches by the
+op's *role under the distribution*, not by name. (The cross-thread ``emit_combine`` is a different
+combinator — a tree of the whole ``combine_states`` over per-thread *states*, not an op-by-op
+interpretation of a partial-absorbing merge — so it stays its own realizer.)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import Protocol
 
 from deplodock.compiler.ir.stmt.leaves import Assign, Monoid
 
-# Associative+commutative ops whose presence over a fragment operand marks a reduction
-# (rowmax / rowsum). Disambiguates ``max(m, s)`` (a FOLD, ``s`` fragment) from a purely
-# scalar ``max(m, r)`` — only a fragment operand under one of these is a fold.
+# Associative+commutative ops whose presence over a distributed operand marks a reduction
+# (rowmax / rowsum). Disambiguates ``max(m, s)`` (a FOLD, ``s`` distributed) from a purely
+# scalar ``max(m, r)`` — only a distributed operand under one of these is a fold.
 _REDUCE_OPS = frozenset({"add", "maximum", "minimum"})
 
 
-def fragment_taint(merge: tuple[Assign, ...], score_partial: str) -> set[str]:
-    """SSA names that are fragment-valued: those transitively derived from the score
-    partial via NON-reducing ops. A reduce-eligible op (``add``/``maximum``/``minimum``)
-    with exactly one fragment operand is a FOLD — its result is a per-row SCALAR, so it
-    stops the taint. Geometry-independent — the analysis half of the fragment / cooperative
-    realizers (the realizer supplies how the tainted values are distributed)."""
-    frag = {score_partial}
+def distributed_taint(merge: tuple[Assign, ...], seeds) -> set[str]:
+    """SSA names that are **distributed** (e.g. fragment-valued): those transitively derived from
+    ``seeds`` (the distributed inputs — flash's score partial) via NON-reducing ops. A
+    reduce-eligible op (``add``/``maximum``/``minimum``) with exactly one distributed operand is a
+    FOLD — its result is a per-row SCALAR, so it stops the taint. Geometry-independent — the
+    analysis half of every distribution backend (the backend supplies how the tainted values are
+    distributed). ``seeds`` is a single name or an iterable."""
+    frag = {seeds} if isinstance(seeds, str) else set(seeds)
     changed = True
     while changed:
         changed = False
@@ -64,63 +71,48 @@ def fragment_taint(merge: tuple[Assign, ...], score_partial: str) -> set[str]:
     return frag
 
 
-@dataclass(frozen=True)
-class MergeStep:
-    """One classified ``Assign`` of an online-softmax ``merge`` program, tagged with its
-    carrier role (geometry-independent). A realizer maps each role onto its distribution:
+class Distribution(Protocol):
+    """A **projection target** — how a carrier's program realizes once its partials are
+    distributed along some axis (across lanes, across C-fragment registers, …). The generic
+    driver :func:`interpret` (a.k.a. :meth:`Monoid.project`) walks a merge program and calls
+    exactly one method per ``Assign`` by its *role under the distribution*:
 
-    - ``"fold"`` — a reduction of a fragment operand to a per-row scalar (rowmax / rowsum);
-      ``frag_src`` is the reduced fragment SSA, ``scalar`` the running scalar operand,
-      ``is_state`` whether the result updates a carried state (``l``) vs a temp (``mx``).
-    - ``"exp"`` — a fused ``exp(frag_src − scalar)`` producing a new fragment (the
-      probabilities ``p``); ``frag_src`` the source fragment, ``scalar`` the subtracted row scalar.
-    - ``"state_copy"`` — a carried-state reassign from a single source (``m = copy(mx)``);
-      ``args = (src,)``.
-    - ``"state_scalar"`` / ``"scalar"`` — a scalar state reassign / a pure scalar temp;
-      ``op`` + ``args`` are the source program's."""
+    - :meth:`fold` — a reduce over the distributed axis (a reduce-op with one distributed operand) →
+      the backend's cross-partition combine (a butterfly / tree / ``FragmentRowReduce``), producing
+      a per-partition scalar; ``is_state`` marks a carried-state update (``l``) vs a temp (``mx``).
+    - :meth:`pointwise` — an elementwise op producing a distributed value → a per-element map
+      (``FragmentApply`` …); ``distributed`` is the taint set so the backend tags each operand.
+    - :meth:`scalar` — a pure replicated scalar temp.
+    - :meth:`state` — a carried-state reassign that isn't a fold (a copy or a scalar update).
 
-    role: str
-    name: str
-    op: object = None
-    args: tuple = ()
-    frag_src: str | None = None
-    scalar: str | None = None
-    is_state: bool = False
+    A backend is stateful (it accumulates the emitted stmts + its name bindings); ``interpret``
+    is the pure control flow. No softmax / shape knowledge in the driver."""
+
+    def fold(self, name: str, op, src: str, scalar: str, *, is_state: bool) -> None: ...
+    def pointwise(self, name: str, op, args: tuple[str, ...], distributed: set[str]) -> None: ...
+    def scalar(self, name: str, op, args: tuple[str, ...]) -> None: ...
+    def state(self, name: str, op, args: tuple[str, ...]) -> None: ...
 
 
-def classify_merge_program(merge: tuple[Assign, ...], score_partial: str, state_names) -> tuple[list[MergeStep], set[str]]:
-    """Classify an online-softmax stats ``merge`` program into role-tagged :class:`MergeStep`s
-    (the analysis the fragment realizer ``assembly/_frag_softmax`` consumes), returning
-    ``(steps, frag)`` where ``frag`` is the :func:`fragment_taint` set. The ``subtract`` feeding
-    an ``exp`` is fused into the ``exp`` step (it emits no step of its own). Pure carrier algebra:
-    no IR-dialect / geometry dependency — the realizer supplies the fragment / lane distribution."""
-    frag = fragment_taint(merge, score_partial)
+def interpret(merge: tuple[Assign, ...], *, distributed_inputs, state_names, dist: Distribution) -> None:
+    """The carrier-generic projection driver behind :meth:`Monoid.project`: taint the distributed
+    values (seeded by ``distributed_inputs``), then dispatch each ``Assign`` to ``dist``'s
+    fold / pointwise / scalar / state by its role under the distribution — the distribution law
+    applied uniformly, no op cap, no shape knowledge. Mutates ``dist`` (the stateful backend);
+    returns nothing."""
+    frag = distributed_taint(merge, distributed_inputs)
     states = set(state_names)
-    sub_fuse: dict[str, tuple[str, str]] = {}  # subtract name -> (src fragment, sub scalar)
-    steps: list[MergeStep] = []
     for a in merge:
-        frag_args = [x for x in a.args if x in frag]
-        is_fold = a.op.name in _REDUCE_OPS and len(frag_args) == 1 and len(a.args) == 2
-        if is_fold:
-            fragnm = frag_args[0]
-            scalarnm = a.args[0] if a.args[1] == fragnm else a.args[1]
-            steps.append(MergeStep("fold", a.name, op=a.op, frag_src=fragnm, scalar=scalarnm, is_state=a.name in states))
-        elif frag_args:
-            if a.op.name == "subtract" and len(a.args) == 2 and a.args[0] in frag and a.args[1] not in frag:
-                sub_fuse[a.name] = (a.args[0], a.args[1])  # `src - scalar`, fused into the next exp
-            elif a.op.name == "exp" and len(a.args) == 1 and a.args[0] in sub_fuse:
-                src, sub = sub_fuse[a.args[0]]
-                steps.append(MergeStep("exp", a.name, frag_src=src, scalar=sub))
-            else:
-                raise NotImplementedError(f"v1 fragment softmax: unhandled fragment op {a.op.name!r} on {a.name!r}")
-        elif a.name in states:
-            if a.op.name == "copy" and len(a.args) == 1:
-                steps.append(MergeStep("state_copy", a.name, args=(a.args[0],)))
-            else:
-                steps.append(MergeStep("state_scalar", a.name, op=a.op, args=a.args))
-        else:
-            steps.append(MergeStep("scalar", a.name, op=a.op, args=a.args))
-    return steps, frag
+        dargs = [x for x in a.args if x in frag]
+        if a.op.name in _REDUCE_OPS and len(dargs) == 1 and len(a.args) == 2:
+            scalarnm = a.args[0] if a.args[1] == dargs[0] else a.args[1]
+            dist.fold(a.name, a.op, dargs[0], scalarnm, is_state=a.name in states)
+        elif a.name in frag:  # a distributed-producing elementwise op
+            dist.pointwise(a.name, a.op, a.args, frag)
+        elif a.name in states:  # a carried-state reassign (copy / scalar)
+            dist.state(a.name, a.op, a.args)
+        else:  # a replicated scalar temp
+            dist.scalar(a.name, a.op, a.args)
 
 
 def value_dependent(merge: tuple[Assign, ...], value_name: str) -> set[str]:

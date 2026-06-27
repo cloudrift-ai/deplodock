@@ -112,21 +112,22 @@ def test_reduce_reg_offers_respect_cell_budget():
 
 
 def test_coop_reduce_offers_divide_static_k():
-    """Cooperative ``(bk, fk, br)`` offers: ``br·bk·fk`` divides the static K
+    """Cooperative ``(bk, fk, br, cta)`` offers: ``br·bk·fk·cta`` divides the static K
     extent, and the cooperative thread count is in range (1 ≤ br ≤ 1024)."""
     offers = coop_reduce_offers(_reduce_dag((128, 2048)))
     assert offers, "coop_reduce_offers produced no cooperative K-tiling"
-    for bk, fk, br in offers:
-        assert 2048 % (bk * fk * br) == 0, f"bk·fk·br={bk}·{fk}·{br} does not divide K=2048"
+    for bk, fk, br, cta in offers:
+        assert 2048 % (bk * fk * br * cta) == 0, f"bk·fk·br·cta={bk}·{fk}·{br}·{cta} does not divide K=2048"
         assert 1 <= br <= 1024, f"cooperative BR out of range: {br}"
 
 
 def test_coop_reduce_offers_fk_one_ranks_first_per_group():
-    """The greedy cooperative default leads with FK=1 per (bk, br) group."""
-    seen: set[tuple[int, int]] = set()
-    for bk, fk, br in coop_reduce_offers(_reduce_dag((128, 2048))):
-        key = (bk, br)
+    """The greedy cooperative default leads with FK=1 per (bk, br, cta) group, and cta=1 first."""
+    assert coop_reduce_offers(_reduce_dag((128, 2048)))[0][3] == 1, "greedy default must lead with cta=1 (no split-K)"
+    seen: set[tuple[int, int, int]] = set()
+    for bk, fk, br, cta in coop_reduce_offers(_reduce_dag((128, 2048))):
+        key = (bk, br, cta)
         if key in seen:
             continue
         seen.add(key)
-        assert fk == 1, f"FK={fk} outranked FK=1 for (bk={bk}, br={br})"
+        assert fk == 1, f"FK={fk} outranked FK=1 for (bk={bk}, br={br}, cta={cta})"
