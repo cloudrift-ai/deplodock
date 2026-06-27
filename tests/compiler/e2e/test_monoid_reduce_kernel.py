@@ -26,6 +26,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.stmt import Assign, Monoid
+
 # tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md); guarded so the
 # module collects and its tests register as xfail rather than a collection error.
 try:
