@@ -8,18 +8,18 @@ path's ``emit_combine``), without any GPU compile.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentCausalMask, FragmentRowReduce, Reassign
+from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign
 from deplodock.compiler.ir.stmt import Assign, Init
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
-    FragGeom,
+    FragmentGeom,
     realize_fragment_softmax,
     realize_score_mask,
 )
 
 
-def _geom(nd: int = 4) -> FragGeom:
-    return FragGeom(
+def _geom(nd: int = 4) -> FragmentGeom:
+    return FragmentGeom(
         atom_m=16,
         atom_n=8,
         score_frags=("Sf0_frag", "Sf1_frag"),
@@ -114,7 +114,25 @@ def test_score_mask_is_one_causal_mask_per_score_frag():
 
     masks = realize_score_mask(fs_geom, q_row_base=Var("qb"), kv_col_bases=(Literal(0, "int"), Literal(8, "int")))
     assert [m.frag for m in masks] == ["Sf0_frag", "Sf1_frag"]
-    assert all(isinstance(m, FragmentCausalMask) for m in masks)
+    assert all(isinstance(m, FragmentMask) for m in masks)
+
+
+def test_fragment_mask_is_one_generic_node_for_causal_and_boundary():
+    """The generic ``FragmentMask`` covers causal + boundary (and any coordinate predicate): the
+    render substitutes each element's absolute (row, col) into ``mask_when`` and guards the fill —
+    ONE node, not two (the former FragmentCausalMask / FragmentBoundaryMask)."""
+    from deplodock.compiler.ir.expr import BinaryExpr, Var
+    from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW, FragmentMask
+    from deplodock.compiler.ir.stmt.base import RenderCtx
+
+    causal = FragmentMask(frag="S", mask_when=BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW)), col_base=Var("kb"), row_base=Var("qb"))
+    src = "\n".join(causal.render(RenderCtx(indent=1)))
+    assert "if (kb + (_t * 2 + 0) > qb + _g) S[0]" in src  # elem 0: row _g, col _t*2+0
+    assert "if (kb + (_t * 2 + 1) > qb + (_g + 8)) S[3]" in src  # elem 3: row _g+8, col _t*2+1
+
+    boundary = FragmentMask(frag="S", mask_when=BinaryExpr(">=", Var(FRAG_COL), Var("seq_len")), col_base=Var("kb"))
+    src2 = "\n".join(boundary.render(RenderCtx(indent=1)))
+    assert "if (kb + (_t * 2 + 0) >= seq_len) S[0]" in src2  # column-only — no row term
 
 
 # --- FragmentApply: the one generic pointwise node (subsumes the former FragmentExp/Scale) ---

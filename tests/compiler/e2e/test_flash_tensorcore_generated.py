@@ -142,7 +142,7 @@ class _CausalSdpa(torch.nn.Module):
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (2, 3, 64, 32), (1, 4, 128, 64), (1, 1, 16, 16)])
 def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D):
     """Phase 5 — causal masking at the fragment tier. The fused warp-chain inserts a
-    per-element ``FragmentCausalMask`` on the score fragment (strict upper triangle →
+    per-element ``FragmentMask`` (causal) on the score fragment (strict upper triangle →
     ``-1e30`` before the rowmax), matching torch's ``is_causal=True`` SDPA."""
     monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     monkeypatch.setenv("DEPLODOCK_CHAIN", "1")

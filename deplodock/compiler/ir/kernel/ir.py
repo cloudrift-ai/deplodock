@@ -595,9 +595,11 @@ class FragLayout:
     - ``elem_row`` — the row index (``0 .. rows_per_lane-1``) each element belongs to; ``rows_per_lane``
       derives from it.
     - ``reduce_group`` — the row-reduce ``__shfl_xor`` butterfly lane span.
-    - ``lane_decl`` / ``row_expr`` / ``col_expr`` — the CUDA coordinate codegen the coord-predicated
-      masks use: a per-kernel lane preamble, the absolute row expr per row-index, and the
-      col-within-N-atom expr per element.
+    - ``lane_decl`` — the per-kernel lane preamble the coordinate ``Expr``s below reference.
+    - ``row_off`` / ``col_off`` — the per-element coordinate **offsets as ``Expr``s** (over the
+      ``lane_decl`` locals): ``row_off[r]`` the in-tile row of row-index ``r``, ``col_off[i]`` the
+      in-N-atom column of element ``i``. :class:`FragmentMask` adds the tile origin and substitutes
+      these into its coordinate predicate (so the mask is a generic ``Expr``, not hard-coded CUDA).
 
     Only m16n8 is modeled today (both the QK^T and P@V atoms); ``frag_layout`` raises for any other,
     so an unmodeled atom fails loudly rather than miscompiling."""
@@ -606,12 +608,17 @@ class FragLayout:
     elem_row: tuple[int, ...]
     reduce_group: int
     lane_decl: str
-    row_expr: tuple[str, ...]
-    col_expr: tuple[str, ...]
+    row_off: tuple[Expr, ...]
+    col_off: tuple[Expr, ...]
 
     @property
     def rows_per_lane(self) -> int:
         return max(self.elem_row) + 1
+
+
+def _m16n8_col(b: int) -> Expr:
+    """The in-N-atom column of an m16n8 C-fragment element with col-bit ``b``: ``_t * 2 + b``."""
+    return BinaryExpr("+", BinaryExpr("*", Var("_t"), Literal(2, "int")), Literal(b, "int"))
 
 
 #: The standard ``mma.sync.m16n8`` D/C-fragment layout — 4 f32 / lane: elements ``[0,1]`` are row
@@ -622,8 +629,8 @@ M16N8 = FragLayout(
     elem_row=(0, 0, 1, 1),
     reduce_group=4,
     lane_decl="const int _g = (threadIdx.x & 31) >> 2, _t = (threadIdx.x & 31) & 3;",
-    row_expr=("_g", "(_g + 8)"),
-    col_expr=("(_t * 2 + 0)", "(_t * 2 + 1)", "(_t * 2 + 0)", "(_t * 2 + 1)"),
+    row_off=(Var("_g"), BinaryExpr("+", Var("_g"), Literal(8, "int"))),
+    col_off=(_m16n8_col(0), _m16n8_col(1), _m16n8_col(0), _m16n8_col(1)),
 )
 
 
@@ -762,27 +769,36 @@ class FragmentRowReduce(Stmt):
         return out
 
 
-@dataclass(frozen=True)
-class FragmentCausalMask(Stmt):
-    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment.
-    Sets ``frag[i]`` to the
-    softmax max-identity (``-1e30``, the same soft ``-inf`` the carrier's ``m`` is seeded
-    with — avoids ``-inf − -inf = nan`` when a whole row is masked) wherever the element's
-    absolute key column exceeds its absolute query row (the strict upper triangle), so the
-    masked key contributes nothing to the online-softmax (``max(m, -1e30) = m``,
-    ``exp(-1e30 − m) = 0``). Applied to the scaled score before the rowmax.
+#: The reserved coordinate Vars a :class:`FragmentMask` predicate is written over — the element's
+#: ABSOLUTE query row / key column; the render substitutes each element's coords (tile origin +
+#: layout offset) for these.
+FRAG_ROW = "__frow"
+FRAG_COL = "__fcol"
 
-    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g = lane/4``), cols
-    ``(lane%4)*2 + {0,1}`` within the N-atom. ``q_row_base`` is the absolute row of element
-    ``(0,0)`` (the query-tile origin ``qb*16``); ``kv_col_base`` the absolute col of
-    element ``(0,0)`` (the kv-tile + N-atom origin ``kv*16 + nt*8``). Because the predicate
-    is over absolute coordinates, the same op is a no-op on fully-below-diagonal tiles and
-    masks everything on fully-above-diagonal tiles — correct on every kv tile."""
+
+@dataclass(frozen=True)
+class FragmentMask(Stmt):
+    """Generic per-element **coordinate-predicated fill** over an mma C-fragment — the ONE fragment
+    mask node (it subsumes the former ``FragmentCausalMask`` / ``FragmentBoundaryMask``). Writes
+    ``fill`` (the carrier's fold identity — the soft ``-1e30`` so ``max(m, fill) = m`` and
+    ``exp(fill − m) = 0``) to every element whose absolute coordinates satisfy ``mask_when``, a
+    predicate ``Expr`` over the reserved coordinate vars :data:`FRAG_ROW` (``__frow``, absolute
+    query row) / :data:`FRAG_COL` (``__fcol``, absolute key column).
+
+    The render adds the tile origin (``row_base`` / ``col_base``) to the layout's per-element offset
+    and substitutes the result for ``__frow`` / ``__fcol``, then emits a guarded write — so the
+    predicate is a generic ``Expr``, not hard-coded CUDA. Causal = ``__fcol > __frow``; symbolic
+    boundary = ``__fcol >= seq_len``; any coordinate predicate (windowed, banded, …) is a different
+    ``mask_when`` over the same node. Applied to the scaled score before the rowmax; emitting two
+    masks in sequence ANDs their keep-predicates (both write ``fill``). ``row_base`` is required iff
+    ``mask_when`` references ``__frow``."""
 
     frag: str
-    q_row_base: Expr
-    kv_col_base: Expr
-    layout: FragLayout = M16N8  # the per-atom C-fragment coordinate codegen
+    mask_when: Expr
+    col_base: Expr
+    row_base: Expr | None = None
+    fill: float = -1e30
+    layout: FragLayout = M16N8
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -791,66 +807,23 @@ class FragmentCausalMask(Stmt):
         return (self.frag,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return (self.q_row_base, self.kv_col_base)
+        base = (self.mask_when, self.col_base)
+        return base + ((self.row_base,) if self.row_base is not None else ())
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentCausalMask({self.frag} where col {self.kv_col_base.pretty()} > row {self.q_row_base.pretty()})"]
+        return [f"{indent}FragmentMask({self.frag} where {self.mask_when.pretty()})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
         lay = self.layout
-        qb, kb = self.q_row_base.render(ctx), self.kv_col_base.render(ctx)
-        ninf = ctx.identity_literal(-1e30, "f32")
+        fill = ctx.identity_literal(self.fill, "f32")
         lines = [f"{pad}{{ {lay.lane_decl}"]
         for i in range(lay.n_elems):
-            row, col = lay.row_expr[lay.elem_row[i]], lay.col_expr[i]
-            lines.append(f"{pad}  if (({kb}) + {col} > ({qb}) + {row}) {self.frag}[{i}] = {ninf};")
-        lines.append(f"{pad}}}")
-        return lines
-
-
-@dataclass(frozen=True)
-class FragmentBoundaryMask(Stmt):
-    """Per-element **symbolic-boundary** ``-inf`` mask over an ``mma.sync`` ``m16n8`` score
-    C-fragment — the symbolic-``seq_len`` sibling of :class:`FragmentCausalMask`. The final
-    KV tile of a symbolic streaming flash straddles the runtime extent: its columns
-    ``kv_col >= seq_len`` are padding keys whose scaled QK^T score must be neutralized to the
-    softmax max-identity (``-1e30``) BEFORE the rowmax / exp, so the online-softmax
-    denominator excludes them (``exp(0) = 1`` would corrupt it — the same −inf-vs-0 trap the
-    materialized decomposition fell into). Column-only (no ``q_row`` term), so it composes
-    with the causal mask by ANDing the keep predicates — both just write ``-1e30``, so
-    emitting both in sequence is the AND.
-
-    ``kv_col_base`` is the absolute col of element ``(0,0)`` (``kv*16 + nt*8``); ``bound`` is
-    the runtime extent ``Var("seq_len")``. The fragment's 4 elements are cols ``(lane%4)*2 +
-    {0,1}`` (rows are irrelevant to a column predicate)."""
-
-    frag: str
-    kv_col_base: Expr
-    bound: Expr
-    layout: FragLayout = M16N8  # the per-atom C-fragment coordinate codegen
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def exprs(self) -> tuple[Expr, ...]:
-        return (self.kv_col_base, self.bound)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentBoundaryMask({self.frag} where col {self.kv_col_base.pretty()} >= {self.bound.pretty()})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        lane = "(threadIdx.x & 31)"
-        kb, bd = self.kv_col_base.render(ctx), self.bound.render(ctx)
-        ninf = ctx.identity_literal(-1e30, "f32")
-        # Column-only predicate — only the in-N-atom col matters (``_t``), rows are irrelevant.
-        lines = [f"{pad}{{ const int _t = {lane} & 3;"]
-        for i in range(self.layout.n_elems):
-            lines.append(f"{pad}  if (({kb}) + {self.layout.col_expr[i]} >= ({bd})) {self.frag}[{i}] = {ninf};")
+            sub: dict[str, Expr] = {FRAG_COL: BinaryExpr("+", self.col_base, lay.col_off[i])}
+            if self.row_base is not None:
+                sub[FRAG_ROW] = BinaryExpr("+", self.row_base, lay.row_off[lay.elem_row[i]])
+            pred = self.mask_when.substitute(sub).render(ctx)
+            lines.append(f"{pad}  if ({pred}) {self.frag}[{i}] = {fill};")
         lines.append(f"{pad}}}")
         return lines
 
@@ -1881,17 +1854,16 @@ def _(s: FragmentRowReduce, rename, sigma, axis_fn):
 
 
 @_rewrite.register
-def _(s: FragmentCausalMask, rename, sigma, axis_fn):
-    # ``frag`` is SSA (the score fragment); the base coords σ-substitute so the
-    # canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``).
-    return FragmentCausalMask(
-        frag=rename(s.frag), q_row_base=sigma.apply(s.q_row_base), kv_col_base=sigma.apply(s.kv_col_base), layout=s.layout
+def _(s: FragmentMask, rename, sigma, axis_fn):
+    # ``frag`` is SSA (the score fragment); the tile-origin bases + the predicate σ-substitute so
+    # the canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``). The
+    # reserved ``__frow`` / ``__fcol`` coordinate vars + any free runtime symbol (``seq_len``) are
+    # untouched by σ over the local axes.
+    return FragmentMask(
+        frag=rename(s.frag),
+        mask_when=sigma.apply(s.mask_when),
+        col_base=sigma.apply(s.col_base),
+        row_base=sigma.apply(s.row_base) if s.row_base is not None else None,
+        fill=s.fill,
+        layout=s.layout,
     )
-
-
-@_rewrite.register
-def _(s: FragmentBoundaryMask, rename, sigma, axis_fn):
-    # ``frag`` is SSA (the score fragment); the kv-col base + runtime bound σ-substitute
-    # so the canonicalizer renames the kv axis var (the ``seq_len`` bound is a free runtime
-    # symbol — untouched by σ over the local axes).
-    return FragmentBoundaryMask(frag=rename(s.frag), kv_col_base=sigma.apply(s.kv_col_base), bound=sigma.apply(s.bound), layout=s.layout)

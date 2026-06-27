@@ -51,7 +51,7 @@ from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
-    FragGeom,
+    FragmentGeom,
     realize_boundary_mask,
     realize_fragment_softmax,
     realize_score_mask,
@@ -296,7 +296,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     qload = next(s for s in produce_tiles[0].body.iter() if isinstance(s, Load))
     bh_dims = tuple(qload.index[:2])  # (batch, head) — the leading 4D dims, shared with the output
 
-    geom = FragGeom(
+    geom = FragmentGeom(
         atom_m=atom_m,
         atom_n=atom_n,
         score_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
