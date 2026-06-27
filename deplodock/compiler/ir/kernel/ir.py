@@ -55,7 +55,6 @@ from deplodock.compiler.ir.stmt import (
 )
 from deplodock.compiler.ir.stmt.base import render_merge_program
 from deplodock.compiler.ir.stmt.ir import BodyOp
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -1534,26 +1533,11 @@ class KernelOp(BodyOp):
           variants with tens of thousands of light CTAs slot into the
           GPU command processor so slowly that the per-launch
           ``_KERNEL_TIMEOUT_MS`` watchdog stops being a useful escape
-          hatch; better to drop them at the rule level before benching)."""
-        from math import prod  # noqa: PLC0415
+          hatch; better to drop them at the rule level before benching).
 
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
-
-        for s in self.body:
-            if isinstance(s, GridTile):
-                ctas = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-                if ctas > _MAX_CTAS:
-                    return False
-                # ThreadTile lives inside the GridTile's body.
-                for child in s.body:
-                    if isinstance(child, ThreadTile):
-                        threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in child.axes)
-                        if threads > ctx.max_threads_per_cta:
-                            return False
-            elif isinstance(s, ThreadTile):
-                threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-                if threads > ctx.max_threads_per_cta:
-                    return False
+        NOTE: the per-CTA thread / grid-CTA checks walked the now-demolished
+        tile-flavor wrappers (``GridTile`` / ``ThreadTile``); they are pending
+        rebuild. Only the smem-footprint check survives."""
         if self.smem_bytes() > ctx.max_dynamic_smem:
             return False
         return True
@@ -1583,13 +1567,7 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Kernel-IR statements — typed tile flavor hierarchy (kernel-IR
-    # materialization preserves the wrappers Tile IR emits)
-    "GridTile",
-    "ThreadTile",
-    "RegisterTile",
-    "SerialTile",
-    "StridedTile",
+    # Kernel-IR statements
     "Smem",
     "Sync",
     "TreeHalve",

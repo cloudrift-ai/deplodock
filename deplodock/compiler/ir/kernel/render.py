@@ -505,30 +505,10 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:
     """Derive ``__launch_bounds__`` from the outermost tile flavor.
 
-    - ``GridTile`` (cooperative): launch bounds = product of inner
-      ``ThreadTile`` axis extents (per-CTA thread count), or — for a
-      ``WarpTile`` inner — ``prod(warp_extents) * 32`` (32 lanes per warp).
-    - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
-      since launch is flattened across blockIdx + threadIdx.
+    NOTE: the tile-flavor walk (``GridTile`` / ``ThreadTile`` / ``WarpTile``)
+    that derived the per-CTA thread count was demolished with the tile IR and
+    is pending rebuild. Falls back to the default ``_BLOCK_SIZE``.
     """
-    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
-
-    for s in kernel_op.body:
-        if isinstance(s, GridTile):
-            for child in s.body:
-                if isinstance(child, ThreadTile):
-                    bsize = 1
-                    for ax in child.axes:
-                        bsize *= ax.extent.as_static()
-                    return max(bsize, 1)
-                if isinstance(child, WarpTile):
-                    bsize = 32
-                    for ax in child.axes:
-                        bsize *= ax.extent.as_static()
-                    return max(bsize, 32)
-            return _BLOCK_SIZE
-        if isinstance(s, ThreadTile):
-            return _BLOCK_SIZE
     return _BLOCK_SIZE
 
 
