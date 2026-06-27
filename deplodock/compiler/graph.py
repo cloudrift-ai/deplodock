@@ -132,9 +132,8 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     from deplodock.compiler.ir.kernel import ir as _kernel
     from deplodock.compiler.ir.loop import ir as _loop
     from deplodock.compiler.ir.tensor import ir as _tensor
-    from deplodock.compiler.ir.tile import ir as _tile
 
-    for module in (_base, _tensor, _frontend, _loop, _tile, _kernel, _cuda):
+    for module in (_base, _tensor, _frontend, _loop, _kernel, _cuda):
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls
@@ -270,19 +269,6 @@ def _stmt_eval_scope() -> dict:
         Write,
     )
     from deplodock.compiler.ir.tensor.ir import IndexSource
-    from deplodock.compiler.ir.tile.ir import (
-        AffineAddressing,
-        AsyncWait,
-        GridTile,
-        RegisterTile,
-        SerialTile,
-        StageBundle,
-        StagePolicy,
-        StridedTile,
-        SwizzleMode,
-        TemplateAddressing,
-        ThreadTile,
-    )
 
     _STMT_EVAL_SCOPE = {
         "Dim": Dim,
@@ -306,17 +292,6 @@ def _stmt_eval_scope() -> dict:
         "Loop": Loop,
         "StridedLoop": StridedLoop,
         "Cond": Cond,
-        "GridTile": GridTile,
-        "ThreadTile": ThreadTile,
-        "RegisterTile": RegisterTile,
-        "SerialTile": SerialTile,
-        "StridedTile": StridedTile,
-        "StageBundle": StageBundle,
-        "StagePolicy": StagePolicy,
-        "SwizzleMode": SwizzleMode,
-        "AffineAddressing": AffineAddressing,
-        "TemplateAddressing": TemplateAddressing,
-        "AsyncWait": AsyncWait,
         "Smem": Smem,
         "Sync": Sync,
         "TreeHalve": TreeHalve,
