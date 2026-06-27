@@ -1,17 +1,21 @@
-"""``Twist`` — the MONOID twist between two SEMIRING contractions, realized at the mma fragment tier.
+"""Carrier **combiners** — the realizers that project a streaming ``Monoid`` carrier's combine onto a
+concrete tier (fragment registers, scalars, …) as a set of per-iteration :class:`CombinePhases`.
 
-A twisted ``MONOID(SEMIRING)`` carrier (flash attention's online softmax) is a MONOID fold over the
-fragments an embedded SEMIRING contraction produces. ``Twist`` is that fold's realizer at the
-tensor-core register tier: built FROM the two ``Mma`` cells (the QK^T *produce* + the P@V *consume*),
-it derives the C-fragment register roles off them and **generates the combine + mask ops** for a
-``Monoid`` carrier (it IS the ``Distribution`` backend ``Monoid.project`` drives — see
-``ir/stmt/carrier_algebra``).
+One carrier algebra, many realizations (see ``ir/stmt/carrier_algebra``). A combiner is the
+``Distribution`` backend ``Monoid.project`` drives PLUS the surrounding phase orchestration (the
+carried-state seeds, the accumulator rescale ``O·α`` / declare / normalize ``O/l``). The orchestration
+is carrier-generic and lives once, in :meth:`Combiner.combine`; only the tier-specific *emission*
+(which IR nodes a fold / pointwise / rescale becomes) differs per backend:
 
-It lives at ``ir/`` rather than under a single IR layer because it spans them: it consumes the
-``Monoid`` carrier (``ir/stmt``) and emits the fragment ops + storage nodes (``ir/kernel/ir``:
-``FragmentApply`` / ``FragmentRowReduce`` / ``FragmentMask`` / ``RegFragment``). ``Mma`` owns the
-contraction; ``Twist`` owns the twist over the fragments it produces — so the geometry/registers are
-derived off the cells, never duplicated.
+- :class:`MmaTwist` — the genuine **twist** between two SEMIRING contractions (flash's online softmax
+  between the QK^T *produce* and P@V *consume* ``Mma`` cells), realized at the tensor-core register
+  tier: folds → ``FragmentRowReduce``, pointwise → ``FragmentApply``, accum → ``RegFragment``. Built
+  FROM the two ``Mma`` cells so the geometry/registers are derived off them, never duplicated.
+
+``Combiner`` lives at ``ir/`` rather than under a single IR layer because it spans them: it consumes
+the ``Monoid`` carrier (``ir/stmt``) and (for :class:`MmaTwist`) emits the fragment ops + storage
+nodes (``ir/kernel/ir``: ``FragmentApply`` / ``FragmentRowReduce`` / ``FragmentMask`` /
+``RegFragment``).
 
 Carrier-generic — no softmax / causal / boundary knowledge: the carrier supplies the merge, the
 caller (the attention assembler) supplies the mask predicate. The only attention name that survives
@@ -20,6 +24,7 @@ is in the *caller*, not here.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32
@@ -44,13 +49,13 @@ _DIVIDE = ElementwiseImpl("divide")
 
 
 @dataclass(frozen=True)
-class FragmentPhases:
-    """The realized per-iteration carrier phases for the warp-chain ``CarryScope`` (the fragment-tier
-    analog of the streaming ``CarryScope``'s phases) — what :meth:`Twist.combine` produces. ``init``
-    seeds the carried-state identities + declares the accum ``RegFragment``s; ``epilogue`` is the
-    per-output-atom normalize (in-place ``FragmentApply`` divides); the caller interleaves the
-    ``RegStore``s. ``update`` is empty (state reassigned in ``merge``). Not softmax-specific — any
-    streaming carrier projected onto the fragment tier yields these phases."""
+class CombinePhases:
+    """The realized per-iteration carrier phases for a streaming ``CarryScope`` — what
+    :meth:`Combiner.combine` produces, at whatever tier the backend realizes. ``init`` seeds the
+    carried-state identities + declares the accumulators; ``epilogue`` is the per-output normalize
+    (``O / l``); the caller interleaves the stores. ``update`` is empty (state reassigned in
+    ``merge``). Not softmax- or tier-specific — any streaming carrier projected onto any backend
+    yields these phases."""
 
     init: tuple[Stmt, ...]
     merge: tuple[Stmt, ...]
@@ -60,30 +65,129 @@ class FragmentPhases:
 
 
 def _weight_name(accum_merge: tuple, value: str) -> str | None:
-    """The distributed SSA the embedded consume contraction multiplies the value by — the fragment
-    operand of the accum merge's value-multiply (``coeff · value``). It must land in ``weight_frags``
-    (the registers the consume ``Mma``'s A operand reads). Read structurally off the carrier — no
-    softmax / ``exp`` knowledge (flash's ``p`` is one instance)."""
+    """The distributed SSA the embedded consume contraction multiplies the value by — the operand of
+    the accum merge's value-multiply (``coeff · value``). For :class:`MmaTwist` it must land in
+    ``weight_frags`` (the registers the consume ``Mma``'s A operand reads). Read structurally off the
+    carrier — no softmax / ``exp`` knowledge (flash's ``p`` is one instance)."""
     for a in accum_merge:
         if a.op.name == "multiply" and value in a.args and len(a.args) == 2:
             return a.args[0] if a.args[1] == value else a.args[1]
     return None
 
 
-class Twist:
-    """The MONOID **twist** between two SEMIRING contractions — flash's online softmax sitting between
-    the QK^T (produce) and P@V (consume) ``Mma`` cells. Built FROM those cells: the geometry (the atom
-    + the C-fragment register roles) is **derived** off them, not re-specified, so ``Twist`` and
-    ``Mma`` don't duplicate the register/atom info (``Mma`` owns the contraction, ``Twist`` the twist
-    over the fragments it produces).
+class Combiner(ABC):
+    """A carrier **combiner** — the ``Distribution`` backend ``Monoid.project`` drives plus the
+    phase orchestration that wraps it. :meth:`combine` is the one carrier-generic driver shared by
+    every tier; subclasses supply only the tier-specific emission:
 
-    - :meth:`combine` projects the carrier's merge onto the fragment tier and assembles the
-      per-iteration :class:`FragmentPhases`. ``Twist`` IS the
-      :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` backend ``Monoid.project``
-      drives — fold → ``FragmentRowReduce`` (cross-column reduce) + the per-row scalar update;
-      pointwise → one ``FragmentApply`` per N-atom (landing in ``weight_frags`` when it's the consume
-      contraction's value-coefficient, else a fresh fragment); scalar / carried-state →
-      row-distributed ``Assign`` / ``Reassign``. It also declares the accum ``RegFragment``s.
+    - the ``Distribution`` protocol (:meth:`fold` / :meth:`pointwise` / :meth:`scalar` /
+      :meth:`state`) — how a fold / elementwise / replicated-scalar / carried-state step is emitted,
+    - the phase hooks (:meth:`bind_score` / :meth:`seed_state` / :meth:`declare_accum` /
+      :meth:`rescale_accum` / :meth:`normalize_accum`) — how the accumulator is seeded, declared,
+      rescaled by the twist, and normalized.
+
+    The scratch fields (``out`` / ``frag_binding`` / ``state_fold_op`` / ``fold_op_of`` /
+    ``weight_name``) are populated during projection and read by :meth:`combine`; :meth:`_reset` is
+    called at the top of every :meth:`combine` so a combiner is reusable across calls."""
+
+    def _reset(self) -> None:
+        # Per-``combine`` projection scratch (so a combiner is reusable across calls).
+        self.out: list[Stmt] = []  # the emitted merge stmts
+        self.frag_binding: dict[str, tuple[str, ...]] = {}  # distributed SSA -> backend value(s)
+        self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
+        self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
+        self.weight_name: str | None = None  # the distributed SSA bound to the consume contraction's value coeff
+
+    # --- Distribution protocol (driven by Monoid.project) — tier-specific emission ---
+
+    @abstractmethod
+    def fold(self, name, op, src, scalar, *, is_state) -> None: ...
+
+    @abstractmethod
+    def pointwise(self, name, op, args, distributed) -> None: ...
+
+    @abstractmethod
+    def scalar(self, name, op, args) -> None: ...
+
+    @abstractmethod
+    def state(self, name, op, args) -> None: ...
+
+    # --- phase hooks — tier-specific accumulator handling ---
+
+    @abstractmethod
+    def bind_score(self, score: str) -> None:
+        """Bind the distributed input (the score partial) to this backend's representation, before
+        projection — for :class:`MmaTwist` the per-N-atom score fragments."""
+
+    @abstractmethod
+    def seed_state(self, name: str, op) -> list[Stmt]:
+        """The carried-state identity seed(s) for state ``name`` folded by ``op`` (e.g. an ``Init``
+        per distributed row)."""
+
+    @abstractmethod
+    def declare_accum(self) -> list[Stmt]:
+        """Declare the output accumulator(s) (e.g. the accum C ``RegFragment``s)."""
+
+    @abstractmethod
+    def rescale_accum(self, scalar: str) -> list[Stmt]:
+        """Rescale each accumulator by the per-row carrier scalar ``scalar`` (the twist's ``O·α``)."""
+
+    @abstractmethod
+    def normalize_accum(self, denom: str) -> list[Stmt]:
+        """Normalize each accumulator by the per-row denominator state ``denom`` (``O / l``)."""
+
+    # --- the one carrier-generic combine driver ---
+
+    def combine(self, carrier: Monoid) -> CombinePhases:
+        """Generate the per-iteration phases for a streaming ``Monoid``: split the twisted carrier
+        (``split_carrier``), **project** the stats merge onto this backend (``stats.project`` →
+        ``Monoid.project``), then add the accum rescale (``O·α``), the per-state seeds + the accum
+        declarations, and the normalize epilogue (``O / l``). The merge body is pure carrier
+        projection (no softmax knowledge); only the tier-specific emission lives in the backend
+        hooks. ``combine(carrier, backend)`` is spelled ``backend.combine(carrier)``."""
+        from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier  # noqa: PLC0415
+
+        self._reset()
+        stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
+        score = stats.partial[0]
+        self.weight_name = _weight_name(accum.merge, carrier.partial[1])
+        self.bind_score(score)
+        stats.project(stats.merge, distributed_inputs={score}, dist=self)
+
+        # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
+        # O = O·α + p·v are the SEMIRING consume contraction, accumulated into the accumulators.
+        rescale_out: list[Stmt] = []
+        for a in accum.merge:
+            if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
+                scalar = a.args[0] if a.args[1] == d_state else a.args[1]
+                rescale_out += self.rescale_accum(scalar)
+
+        # init: the carried-state identity seeds, then the accumulator declarations.
+        init_out: list[Stmt] = []
+        for st in stats.state:
+            init_out += self.seed_state(st, self.state_fold_op[st])
+        init_out += self.declare_accum()
+
+        # The denominator is the add-fold stats state (flash's l); normalize each accum by it per row.
+        denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
+        epilogue_out = self.normalize_accum(denom)
+        return CombinePhases(
+            init=tuple(init_out), merge=tuple(self.out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
+        )
+
+
+class MmaTwist(Combiner):
+    """The MONOID **twist** between two SEMIRING contractions — flash's online softmax sitting between
+    the QK^T (produce) and P@V (consume) ``Mma`` cells, realized at the tensor-core register tier.
+    Built FROM those cells: the geometry (the atom + the C-fragment register roles) is **derived** off
+    them, not re-specified, so ``MmaTwist`` and ``Mma`` don't duplicate the register/atom info
+    (``Mma`` owns the contraction, ``MmaTwist`` the twist over the fragments it produces).
+
+    - :meth:`combine` (inherited) projects the carrier's merge onto the fragment tier: fold →
+      ``FragmentRowReduce`` (cross-column reduce) + the per-row scalar update; pointwise → one
+      ``FragmentApply`` per N-atom (landing in ``weight_frags`` when it's the consume contraction's
+      value-coefficient, else a fresh fragment); scalar / carried-state → row-distributed ``Assign``
+      / ``Reassign``. It also declares the accum ``RegFragment``s.
     - :meth:`mask` neutralizes each distributed partial fragment to the carrier fold identity where a
       coordinate predicate holds (one ``FragmentMask`` per fragment).
 
@@ -103,14 +207,6 @@ class Twist:
         self.accum_frags = tuple(m.c for m in consume)  # consume cells' C = the output accumulators
         self.weight_frags = tuple(f"Pf{j}" for j in range(len(produce)))  # the probability — minted (not a cell field)
         self._reset()
-
-    def _reset(self) -> None:
-        # Per-``combine`` projection scratch (so a Twist is reusable across calls).
-        self.out: list[Stmt] = []  # the emitted merge stmts
-        self.frag_binding: dict[str, tuple[str, ...]] = {}  # distributed SSA -> per-N-atom fragment arrays
-        self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
-        self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
-        self.weight_name: str | None = None  # the distributed SSA bound to weight_frags (feeds the consume Mma)
 
     # --- Distribution protocol (driven by Monoid.project) ---
 
@@ -155,53 +251,32 @@ class Twist:
             self.out += [Assign(n0, op, tuple(f"{x}0" for x in args)), Assign(n1, op, tuple(f"{x}1" for x in args))]
             self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
 
-    # --- generators (combine + mask) given the carrier ---
+    # --- phase hooks (fragment-tier emission) ---
 
-    def combine(self, carrier: Monoid) -> FragmentPhases:
-        """Generate the per-iteration fragment phases for a streaming ``Monoid``: split the twisted
-        carrier (``split_carrier``), **project** the stats merge onto this Twist (``stats.project`` →
-        ``Monoid.project``), then add the accum rescale (``O·α``), the per-state ``Init`` seeds + the
-        accum ``RegFragment`` decls, and the normalize epilogue (``O / l``). The merge body is pure
-        carrier projection (no softmax knowledge); only the Mma coupling (the weight/accum fragment
-        bindings) lives here."""
-        from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier  # noqa: PLC0415
-
-        self._reset()
-        stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
-        score = stats.partial[0]
-        self.weight_name = _weight_name(accum.merge, carrier.partial[1])
+    def bind_score(self, score: str) -> None:
         self.frag_binding = {score: self.partial_frags}
-        stats.project(stats.merge, distributed_inputs={score}, dist=self)
 
-        # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
-        # O = O·α + p·v are the SEMIRING consume Mma, accumulated into the accum fragments.
-        rescale_out: list[Stmt] = []
-        for a in accum.merge:
-            if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
-                scalar = a.args[0] if a.args[1] == d_state else a.args[1]
-                alpha = (f"{scalar}0", f"{scalar}1")
-                rescale_out += [
-                    FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
-                    for fr in self.accum_frags
-                ]
+    def seed_state(self, name: str, op) -> list[Stmt]:
+        return [Init(name=f"{name}0", op=op, dtype=F32), Init(name=f"{name}1", op=op, dtype=F32)]
 
-        # init: the carried-state identity seeds, then the accum C-fragment declarations.
-        init_out: list[Stmt] = []
-        for st in stats.state:
-            op = self.state_fold_op[st]
-            init_out += [Init(name=f"{st}0", op=op, dtype=F32), Init(name=f"{st}1", op=op, dtype=F32)]
-        init_out += [RegFragment(name=fr, role="c", shape=self.atom.shape, dtype=F32) for fr in self.accum_frags]
+    def declare_accum(self) -> list[Stmt]:
+        return [RegFragment(name=fr, role="c", shape=self.atom.shape, dtype=F32) for fr in self.accum_frags]
 
-        # The denominator is the add-fold stats state (flash's l); normalize each accum by it per row.
-        denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
+    def rescale_accum(self, scalar: str) -> list[Stmt]:
+        alpha = (f"{scalar}0", f"{scalar}1")
+        return [
+            FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
+            for fr in self.accum_frags
+        ]
+
+    def normalize_accum(self, denom: str) -> list[Stmt]:
         denom_pair = (f"{denom}0", f"{denom}1")
-        epilogue_out: list[Stmt] = [
+        return [
             FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
             for fr in self.accum_frags
         ]
-        return FragmentPhases(
-            init=tuple(init_out), merge=tuple(self.out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
-        )
+
+    # --- mask generator (given the carrier) ---
 
     def mask(self, *, mask_when: Expr, col_bases: tuple[Expr, ...], row_base: Expr | None = None) -> list[Stmt]:
         """Generate the fragment mask — neutralize each distributed partial fragment to the carrier

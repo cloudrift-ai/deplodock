@@ -1,11 +1,11 @@
-"""The fragment-tier combiner (``ir/twist.Twist``) — CPU-only, the structural oracle for
+"""The fragment-tier combiner (``ir/twist.MmaTwist``) — CPU-only, the structural oracle for
 "generate the m16n8 phases + masks from the carrier algebra".
 
-Asserts that ``Twist.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
+Asserts that ``MmaTwist.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
 right fragment ops + row-distributed scalars (the analog of the cooperative path's ``emit_combine``)
-and ``Twist.mask`` builds the coordinate-predicated masks, without any GPU compile. The ``Twist`` is
-built from the produce / consume ``Mma`` cells — it derives the fragment register roles + layout off
-them (``partial_frags`` = ``<c>_frag``, ``accum_frags`` = ``c``).
+and ``MmaTwist.mask`` builds the coordinate-predicated masks, without any GPU compile. The
+``MmaTwist`` is built from the produce / consume ``Mma`` cells — it derives the fragment register
+roles + layout off them (``partial_frags`` = ``<c>_frag``, ``accum_frags`` = ``c``).
 """
 
 from __future__ import annotations
@@ -14,19 +14,19 @@ from deplodock.compiler.dtype import F16, F32
 from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign, RegFragment
 from deplodock.compiler.ir.stmt import Assign, Init, Mma
 from deplodock.compiler.ir.tile.ir import Atom
-from deplodock.compiler.ir.twist import Twist
+from deplodock.compiler.ir.twist import MmaTwist
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 _ATOM = Atom(name="mma_m16n8k16_f16", shape=(16, 8, 16), operand_dtypes=(("a", F16), ("b", F16), ("c", F32)), group_size=32)
 
 
-def _twist(nd: int = 4) -> Twist:
+def _twist(nd: int = 4) -> MmaTwist:
     produce = (
         Mma(c="Sf0", a="qa0", b="kb0", atom=_ATOM, b_trans=True),
         Mma(c="Sf1", a="qa1", b="kb1", atom=_ATOM, b_trans=True),
     )
     consume = tuple(Mma(c=f"Of{n}", a="pa", b=f"vb{n}", atom=_ATOM) for n in range(nd))
-    return Twist(produce=produce, consume=consume)
+    return MmaTwist(produce=produce, consume=consume)
 
 
 def _carrier():

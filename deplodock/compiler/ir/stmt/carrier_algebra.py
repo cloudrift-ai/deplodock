@@ -15,9 +15,10 @@ how state and partials are distributed):
   fold, inline in the loop body).
 - **cross-thread** (lanes / smem) — ``lowering/kernel/_combine.emit_combine`` → ``WarpShuffle`` /
   ``TreeHalve`` (the cooperative reduce of a partial split across the CTA's threads).
-- **fragment** (m16n8 tensor-core registers) — ``ir/twist.Twist.combine``
-  → ``FragmentRowReduce`` (the cross-column fold) + the carrier-generic ``FragmentApply`` (every
-  pointwise step — ``exp`` / scale / any op, the warp-chain flash softmax and beyond).
+- **fragment** (m16n8 tensor-core registers) — ``ir/twist.MmaTwist.combine`` (the ``Combiner`` base's
+  generic ``combine`` over the fragment backend) → ``FragmentRowReduce`` (the cross-column fold) + the
+  carrier-generic ``FragmentApply`` (every pointwise step — ``exp`` / scale / any op, the warp-chain
+  flash softmax and beyond).
 
 The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
 structure — not two hand-authored transcriptions.
@@ -27,7 +28,7 @@ abstract-interprets a merge program over a :class:`Distribution` **backend**, ta
 algebra to a target distribution by the distribution law — a reduce over the distributed axis
 becomes the backend's cross-partition combine (``Distribution.fold``), and an elementwise op the
 backend's per-element map (``Distribution.pointwise``); scalars / carried-state reassigns stay
-replicated. The fragment realizer (``ir/twist.Twist``) is one backend — its
+replicated. The fragment realizer (``ir/twist.MmaTwist``) is one backend — its
 ``fold`` is a ``FragmentRowReduce`` over the C-fragment columns, its ``pointwise`` a
 ``FragmentApply`` over the registers. No softmax knowledge in the driver: it dispatches by the
 op's *role under the distribution*, not by name. (The cross-thread ``emit_combine`` is a different
