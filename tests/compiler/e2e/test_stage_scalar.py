@@ -17,8 +17,14 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import StageBundle, TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+
+# tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md); guarded so the
+# module collects and its tests register as xfail rather than a collection error.
+try:
+    from deplodock.compiler.ir.tile.ir import StageBundle, TileOp
+except ModuleNotFoundError:
+    StageBundle = TileOp = None
 
 from ..conftest import requires_cuda
 

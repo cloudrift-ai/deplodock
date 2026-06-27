@@ -30,8 +30,14 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile.ir import TileOp
 from deplodock.compiler.pipeline import LoweringError
+
+# tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md); guarded so the
+# module collects and its tests register as xfail rather than a collection error.
+try:
+    from deplodock.compiler.ir.tile.ir import TileOp
+except ModuleNotFoundError:
+    TileOp = None
 from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
 from tests.compiler.conftest import drain_tune
 

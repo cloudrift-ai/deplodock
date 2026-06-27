@@ -22,20 +22,32 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, TileGraph, TileGraphOp, TileOp, Transport
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag, seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+
+# tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md). The imports are
+# guarded so the module still collects; its tests then fail at runtime and are caught by
+# the xfail registry (a hard collection error could not be).
+try:
+    from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, TileGraph, TileGraphOp, TileOp, Transport
+    from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag, seed_graph
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+except ModuleNotFoundError:
+    Buffer = Edge = Placement = Space = TileGraph = TileGraphOp = TileOp = Transport = None
+    assemble_block = fam = build_dag = seed_graph = classify = iter_dag = None
 from tests.compiler.conftest import requires_cuda
 
-_KN = {
-    fam.split_key("a1"): fam.enc_split(16, 2),
-    fam.split_key("a0"): fam.enc_split(16, 2),
-    fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1),
-}
+_KN = (
+    {
+        fam.split_key("a1"): fam.enc_split(16, 2),
+        fam.split_key("a0"): fam.enc_split(16, 2),
+        fam.reduce_key("a2"): fam.enc_reduce(serial=16, fold=1, cta=1),
+    }
+    if fam is not None
+    else {}
+)
 
 
 # ── ``_oracle_tilegraph`` (copied from the deleted ``test_tile_ir_invariants``) ──────────

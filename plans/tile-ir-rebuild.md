@@ -1,6 +1,7 @@
 # Tile IR rebuild
 
-Status: **demolition done, rebuild not started.** Branch `refactoring/tile-ir-rebuild`.
+Status: **demolition landed — tile IR + tile/kernel lowering passes removed, the codebase imports clean, the
+test suite is green through the xfail registry below. Rebuild not started.** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -16,6 +17,34 @@ they survive any internal redesign. The rebuild is "done" when the whole `e2e/` 
 registry (below).
 
 ## Phase 0 — Demolition (done)
+
+### What was demolished — functionality
+
+The lowering tier that turned a fused loop kernel into executable GPU code was removed wholesale. Everything from the
+loop IR onward through code generation is gone, so today nothing compiles past the loop IR; the surviving passes import
+cleanly but the lowering stage is an empty hole. The specific capabilities that no longer exist:
+
+- **Tiling of pointwise and reduce kernels** — mapping iteration axes onto grid blocks, threads, and register/serial
+  loops; the per-kernel schedule search that picked those tile shapes.
+- **Reductions** — re-bracketing a contraction across a serial inner loop and a cooperative thread fan-in, with the
+  cross-thread combine (warp-shuffle / tree) and masked tails filled by the carrier identity.
+- **Tensor-core matmul** — folding a contraction cell onto `mma.sync`, including transposed operands, masked and
+  symbolic-shape edges, and fused residual / pointwise / causal-mask epilogues.
+- **Attention** — streaming online-softmax (flash) attention in both a scalar and a tensor-core form; causal masking,
+  grouped-query heads, and symbolic sequence length.
+- **Shared-memory operand staging** — cooperative smem slabs for reused operands, plus the bulk-async (TMA / cp.async)
+  double-buffered transport and its software-pipelined prologue/main/epilogue.
+- **Cross-CTA partitioning** — split-K matmul, split-reduce, and split-KV (flash-decoding) across thread blocks, with
+  either an atomic finalize or a deferred combine kernel.
+- **Kernel fusion across the producer/consumer seam** — keeping a producer and its matmul consumer in one kernel via a
+  shared smem buffer, and the alternative of cutting a demoted operand out to a gmem intermediate.
+- **Autotuning of the above** — the two-level search over scheduling forks, the per-kernel structural slicing it tunes
+  in, the analytic + learned priors that rank tile configurations, and the heuristic tile-shape planner.
+- **Supporting lowering services** — generating CUDA source from a tiled kernel, deriving launch bounds and CTA/thread
+  coordination from a kernel's placement, shared-memory bank-conflict diagnostics, the tile/kernel IR dump stages, and
+  round-tripping tiled kernels through the serialized-IR format.
+
+### Tests
 
 Tile-IR **unit** tests — the ones that imported tile datatypes / pass internals and asserted on their structure — were
 deleted outright. They are gone for good; they tested an implementation that no longer exists, and the rebuild gets a
@@ -51,13 +80,15 @@ A single registry drives expected failures during the rebuild — no scattered `
   `nodeid` contains a registered substring with `xfail(strict=False)`.
 - **Recovery semantics:** `strict=False` means a test that starts passing again reports as **XPASS**, not a failure —
   that is the signal a capability came back. Delete its entry and it reverts to a required test. **An empty `XFAIL` dict
-  means the rebuild is fully recovered.** The dict is empty today (tile IR is still intact, so nothing fails yet); it
-  gets populated as the rebuild tears things out and emptied as each piece is restored.
+  means the rebuild is fully recovered.** The dict is **populated today** — the demolition registered every test that
+  exercised the removed lowering tier (whole-file entries where a file fails entirely, single-nodeid entries where a
+  file still has passing tests). It shrinks as the rebuild restores each capability and the tests flip to XPASS.
 - **Collection-time caveat:** a file whose *module-level* import of a tile symbol breaks fails at collection, before any
-  item exists to mark — pytest reports that as an error, which xfail cannot catch. The files that keep a load-bearing
-  tile import (their accuracy tests build references through tile-internal helpers) are listed in
-  `TILE_ENTANGLED_FILES` in the registry for visibility. When the rebuild removes/renames those symbols, make the import
-  lazy (so the file still collects and the failure becomes a markable item) and add the nodeid to `XFAIL`.
+  item exists to mark — pytest reports that as an error, which xfail cannot catch. The demolition handled this so
+  `TILE_ENTANGLED_FILES` is **empty**: pure tile-IR unit-test files were deleted, and the integration/accuracy files
+  whose imports were load-bearing had those imports guarded (`try/except ModuleNotFoundError`) so they still collect and
+  their now-failing cases are registered in `XFAIL` above. A rebuild that reintroduces and then renames a tile symbol
+  should repeat that pattern — guard the import, register the nodeid — rather than letting a collection error return.
 
 ## Phase 1+ — Rebuild (not started)
 
