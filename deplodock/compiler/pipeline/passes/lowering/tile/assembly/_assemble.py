@@ -260,7 +260,7 @@ def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, gua
 
 def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     """The warp-tier-flash branch of :func:`assemble_block` — NOT a separate assembly entry. Reads
-    the ``warp_chain_build`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
+    the ``build_monoid`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
     the generic ``atomize_cell``, σ-tiled to the warp geometry) and assembles the warp-chain
     ``CarryScope``: the produce / consume ``Mma`` cells come from the graph (no hand-authored
     ``Mma``), and only the fragment-tier phases (softmax via ``realize_fragment_softmax`` / scale /
@@ -273,7 +273,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     out = block.writes[0].buffer  # the output buffer — the RegStore target
 
     # The kv-stream serial-outer carry + its full twisted carrier (the online-softmax Monoid that
-    # ``warp_chain_build`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
+    # ``build_monoid`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
     kv_loop = next(s for s in block.compute if isinstance(s, SerialTile) and s.kind == "serial_outer")
     carrier = next(s for s in kv_loop.body if isinstance(s, Monoid))
     causal = any(isinstance(s, Select) for s in kv_loop.body)  # the score-mask Select — structural, not a flag

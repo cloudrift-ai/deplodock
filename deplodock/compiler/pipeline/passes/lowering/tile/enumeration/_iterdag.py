@@ -371,7 +371,7 @@ def chain_free_axes(reduction: MonoidReduction, dag: IterDag) -> tuple[Axis, Axi
     own free output, the **P@V output** ``d`` is the carrier's value operand's own free output (in V,
     not the inner QK^T), the **grid** is the shared batch / head axes. ``IterDag.reduction`` has already
     validated separability, so ``m`` / ``d`` are each exactly one axis. The build moves
-    (``_build.chain_build`` / ``warp_chain_build``) call this while emitting, instead of consuming a
+    (``_build.chain_build`` / ``build_monoid``) call this while emitting, instead of consuming a
     precomputed geometry tuple."""
     value_load = next(s for s in reduction.hinge.body if isinstance(s, Load) and s.name == reduction.carrier.partial[1])
     m_nodes, d_nodes, grid_nodes = partition_free_axes(

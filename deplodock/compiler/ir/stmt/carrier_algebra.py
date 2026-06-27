@@ -4,7 +4,7 @@ A twisted ``MONOID(SEMIRING)`` carrier (flash attention's online softmax: ``stat
 ``partial=(score, value)``) splits into a ``d``-invariant softmax-stats monoid ``(m, l)`` and a
 ``d``-varying accumulation monoid ``(O)``. The split is plain algebra over the carrier's ``merge``
 program (a fixpoint over SSA reads), so it lives here — next to ``Monoid`` in ``ir/stmt`` — rather
-than inside any one pass, and is shared by the enumeration ``chain_build`` (the cooperative /
+than inside any one pass, and is shared by the enumeration ``build_monoid`` (the cooperative /
 cross-thread realization) and the assembly fragment realizer (the m16n8 tensor-core realization).
 
 One carrier algebra, three **realizations** (each consumes the same ``Monoid`` surface — the

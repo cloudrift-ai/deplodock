@@ -4,7 +4,7 @@ A ``DEPLODOCK_<KNOB>`` env pin is global, but every kernel is lowered on exactly
 ONE *tier* (the codegen regime its body + pins resolve to): a pointwise ``MAP``, a
 scalar ``SEMIRING`` reduce, a tensor-core ``WARP`` matmul, or a ``MONOID`` reduce (the
 flat cooperative reduce **and** the streaming flash — one tier, since both share the
-``monoid_build`` move and knob slice; the streaming schedule is a derived structural
+``build_monoid`` move and knob slice; the streaming schedule is a derived structural
 property, not a separate tier). Each tier owns a disjoint slice of the knob schema (a
 warp tile has no ``BN``/``BM`` THREAD width; a ``MONOID`` reduce has no ``WM``/``WN``
 warp count; a pointwise nest has no ``BK`` K-chunk). Pinning a knob the resolved tier
@@ -67,7 +67,7 @@ _STAGED = frozenset({Tier.SCALAR, Tier.WARP})  # the tiers that synthesize an sm
 
 # The tiers an op's algebra can resolve to (before any pin narrows further). SEMIRING
 # is the only fork — scalar register-tile FMA vs the tensor-core warp atom. MONOID is one
-# tier: the cooperative reduce and the streaming flash share the same ``monoid_build`` move
+# tier: the cooperative reduce and the streaming flash share the same ``build_monoid`` move
 # and knob slice (a twisted monoid is a monoid — the streaming schedule is derived, not a
 # separate tier), so the K-chunk knobs (``BK``/``FK``) are legal on it (split-KV / serial
 # re-bracketing is associativity-licensed on the nested monoid too).
@@ -125,7 +125,7 @@ def validate_pins(algebra: AlgebraKind) -> None:
 
     A ``MONOID`` nest — the flat cooperative reduce **and** the streaming flash — resolves
     to the single ``MONOID`` tier (the streaming schedule is a derived structural property,
-    not a separate tier; both share ``monoid_build``), so ``BK``/``FK``/``BR`` are legal on
+    not a separate tier; both share ``build_monoid``), so ``BK``/``FK``/``BR`` are legal on
     it. Whether a particular shape realizes a pinned ``BK`` is the pipeline's job (like a
     non-linear matmul downgrading ``SPLITK``), not a pin contradiction."""
     candidates = _CANDIDATES.get(algebra)

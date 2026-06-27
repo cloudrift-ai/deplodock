@@ -1,7 +1,7 @@
 """Cross-CTA finalize — the carrier-generic ``partition_reduce`` combine, as a structural fork.
 
 Any reduction that splits its contraction axis across CTAs (the ``K_s`` GRID partition the
-reduce-decomp / ``monoid_build`` body move binds when ``cta > 1``) combines its per-partition
+reduce-decomp / ``build_monoid`` body move binds when ``cta > 1``) combines its per-partition
 partials one of two ways; this pass picks the cross-CTA combine stage's **finalize fold**,
 encoded in the ``REDUCE@<axis>`` codec's ``c`` field (``c<cta>a`` = ATOMIC, ``c<cta>k`` =
 deferred KERNEL — see ``_families``). The fork fires on ANY fully-tiled scalar op with
@@ -20,7 +20,7 @@ carrier-generic producer + combine:
   Returned as a two-node ``Graph`` fragment (producer → workspace → reduce) the engine splices;
   ``_is_structural_option`` classifies it structural (by Graph-fragment type, not rule name).
 
-The reduce-decomp / ``monoid_build`` move emits a **bare** ``c<cta>`` (finalize pending); this
+The reduce-decomp / ``build_monoid`` move emits a **bare** ``c<cta>`` (finalize pending); this
 pass completes it to ``a``/``k`` (idempotent: ``fam.reduce_finalize_decided`` guards re-entry).
 ATOMIC's legality (additive ``Accum`` + atomicAdd dtype, ``_predicates.atomic_finalize_legal``)
 narrows the offer to KERNEL-only when illegal — the gate the twisted (non-additive ``Monoid``)

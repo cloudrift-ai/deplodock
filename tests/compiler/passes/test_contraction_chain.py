@@ -22,11 +22,13 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Load, Monoid
 from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.ir.tile.ir import Binding, RegisterTile
+from deplodock.compiler.ir.tile.ir import Binding, RegisterTile, TileGraphOp
+from deplodock.compiler.ir.twist import ScalarCombiner
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import chain_build, seed_graph
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid, seed_graph
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_M_THREAD, MAP_N_THREAD
@@ -260,13 +262,16 @@ def test_legal_decomps_splits_the_hinge_under_both_traits():
     assert any(d.factors == (bn, 1, 1) for d in partition)
 
 
-# --- 1c: chain_build — the shared-axis reduce_decomp (the FA-2 restructuring) --------
+# --- 1c: the scalar FA-2 chain geometry of build_monoid (the shared-axis reduce_decomp) --------
 
 
 def _build_chain(causal: bool = False):
+    # The unified ``build_monoid`` picks the FA-2 shared-score geometry when the score is placed INLINE
+    # over a real carried-contraction chain — the same signal ``070_coop_reduce._streaming_leaves`` sets.
     dag = iter_dag(_flash_loop(causal=causal))
-    knobs = {MAP_N_THREAD.name: _S, MAP_M_THREAD.name: 1}
-    return chain_build(seed_graph(dag, kernel_name="flash"), dag, knobs), dag
+    knobs = {MAP_N_THREAD.name: _S, MAP_M_THREAD.name: 1, fam.place_key(dag.reduction.score): fam.INLINE}
+    op = TileGraphOp(name="flash", tilegraph=seed_graph(dag, kernel_name="flash"), dag=dag)
+    return build_monoid(op, knobs, combiner=ScalarCombiner), dag
 
 
 def _monoids(body):
@@ -322,11 +327,24 @@ def test_chain_build_shares_the_score_across_d():
         assert not any(getattr(s, "is_reduce", False) for s in rt.body.iter()), "the QK^T reduce must not ride the d register tile"
 
 
-def test_chain_build_degenerates_to_torch_oracle_offline():
-    """``chain_build`` only fires for a real carried-contraction chain; a non-chain seed
-    raises rather than silently mis-lowering."""
-    import pytest  # noqa: PLC0415
-
-    dag = iter_dag(_reduce_loop())
-    with pytest.raises(ValueError, match="inner contraction present"):
-        chain_build(seed_graph(dag, kernel_name="r"), dag, {})
+def test_build_monoid_fa2_geometry_requires_the_inline_score():
+    """The FA-2 shared-score geometry fires ONLY when the score is placed INLINE: same flash chain,
+    same ``ScalarCombiner`` tier, but without the INLINE knob ``build_monoid`` takes the serial-stream
+    cooperative path instead — no register-``O[d]`` vector, the score left in the carrier ``Monoid``.
+    The knob (not a separate build function) is what selects the geometry."""
+    dag = iter_dag(_flash_loop())
+    # The serial-stream path needs the reduce knob (bk/fk/br) + the free split the dispatch pins; omit
+    # the INLINE score so the FA-2 branch declines and the cooperative tower is taken.
+    knobs = {
+        MAP_N_THREAD.name: _S,
+        MAP_M_THREAD.name: 1,
+        fam.reduce_key(dag.k_node.loop.axis.name): fam.enc_reduce(serial=1, fold=1, cta=1, coop=1),
+        fam.split_key(dag.parallel[-1].loop.axis.name): fam.enc_split(_S, 1),
+        fam.split_key(dag.parallel[-2].loop.axis.name): fam.enc_split(1, 1),
+    }
+    op = TileGraphOp(name="flash", tilegraph=seed_graph(dag, kernel_name="flash"), dag=dag)
+    tg = build_monoid(op, knobs, combiner=ScalarCombiner)
+    binding = tg.schedule.binding
+    reg = [a for a in tg.blocks[0].domain if binding.get(a.name) is Binding.REGISTER and a.extent.as_static() > 1]
+    assert not reg, "without the INLINE score the FA-2 register-O[d] geometry must NOT fire"
+    assert _monoids(tg.blocks[0].compute), "the serial-stream path leaves the carrier as a Monoid"
