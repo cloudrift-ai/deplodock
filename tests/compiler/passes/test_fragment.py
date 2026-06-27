@@ -1,26 +1,32 @@
-"""The fragment-tier combiner (``ir/kernel/ir.Fragment``) — CPU-only, the structural oracle for
+"""The fragment-tier combiner (``ir/twist.Twist``) — CPU-only, the structural oracle for
 "generate the m16n8 phases + masks from the carrier algebra".
 
-Asserts that ``Fragment.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
+Asserts that ``Twist.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
 right fragment ops + row-distributed scalars (the analog of the cooperative path's ``emit_combine``)
-and ``Fragment.mask`` builds the coordinate-predicated masks, without any GPU compile.
+and ``Twist.mask`` builds the coordinate-predicated masks, without any GPU compile. The ``Twist`` is
+built from the produce / consume ``Mma`` cells — it derives the fragment register roles + layout off
+them (``partial_frags`` = ``<c>_frag``, ``accum_frags`` = ``c``).
 """
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, Fragment, FragmentApply, FragmentMask, FragmentRowReduce, Reassign
-from deplodock.compiler.ir.stmt import Assign, Init
+from deplodock.compiler.dtype import F16, F32
+from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign, RegFragment
+from deplodock.compiler.ir.stmt import Assign, Init, Mma
+from deplodock.compiler.ir.tile.ir import Atom
+from deplodock.compiler.ir.twist import Twist
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
+_ATOM = Atom(name="mma_m16n8k16_f16", shape=(16, 8, 16), operand_dtypes=(("a", F16), ("b", F16), ("c", F32)), group_size=32)
 
-def _frag(nd: int = 4) -> Fragment:
-    return Fragment(
-        atom_m=16,
-        atom_n=8,
-        partial_frags=("Sf0_frag", "Sf1_frag"),
-        weight_frags=("Pf0", "Pf1"),
-        accum_frags=tuple(f"Of{n}" for n in range(nd)),
+
+def _twist(nd: int = 4) -> Twist:
+    produce = (
+        Mma(c="Sf0", a="qa0", b="kb0", atom=_ATOM, b_trans=True),
+        Mma(c="Sf1", a="qa1", b="kb1", atom=_ATOM, b_trans=True),
     )
+    consume = tuple(Mma(c=f"Of{n}", a="pa", b=f"vb{n}", atom=_ATOM) for n in range(nd))
+    return Twist(produce=produce, consume=consume)
 
 
 def _carrier():
@@ -29,11 +35,14 @@ def _carrier():
 
 def test_init_seeds_the_fold_identities():
     """Two stats states × 2 rows: m is a max-fold (-inf identity), l an add-fold (0)."""
-    fs = _frag().combine(_carrier())
+    fs = _twist().combine(_carrier())
     inits = [s for s in fs.init if isinstance(s, Init)]
     assert len(inits) == 4, [s.pretty()[0] for s in fs.init]
     by_op = {s.name: s.op.name for s in inits}
     assert by_op == {"m_i0": "maximum", "m_i1": "maximum", "l_i0": "add", "l_i1": "add"}
+    # combine also declares the accum C fragments (the consume Mma cells) in init.
+    accum_decls = [s for s in fs.init if isinstance(s, RegFragment)]
+    assert [r.name for r in accum_decls] == ["Of0", "Of1", "Of2", "Of3"]
 
 
 def test_merge_emits_two_rowreduces_then_the_exp_map():
@@ -41,7 +50,7 @@ def test_merge_emits_two_rowreduces_then_the_exp_map():
     (add) — the fragment-distributed online-softmax, recovered from the scalar program. The exp
     map is now two generic ``FragmentApply``s per N-atom (subtract then exp), not the former fused
     ``FragmentExp``."""
-    fs = _frag().combine(_carrier())
+    fs = _twist().combine(_carrier())
     reduces = [s for s in fs.merge if isinstance(s, FragmentRowReduce)]
     applies = [s for s in fs.merge if isinstance(s, FragmentApply)]
 
@@ -65,7 +74,7 @@ def test_merge_emits_two_rowreduces_then_the_exp_map():
 def test_state_is_reassigned_in_merge_update_is_empty():
     """m and l are loop-carried: reassigned in-place at the end of merge (after every read of
     their old value), so the update phase is empty."""
-    fs = _frag().combine(_carrier())
+    fs = _twist().combine(_carrier())
     assert fs.update == ()
     reassigned = {s.name for s in fs.merge if isinstance(s, Reassign)}
     assert reassigned == {"m_i0", "m_i1", "l_i0", "l_i1"}
@@ -76,7 +85,7 @@ def test_rescale_scales_every_accumulator_by_alpha():
     (ROW) alpha is shared across accumulators (the rescale is the accum carrier's only realized
     step — p·v + O += … are the P@V Mma)."""
     for nd in (2, 4, 8):
-        fs = _frag(nd).combine(_carrier())
+        fs = _twist(nd).combine(_carrier())
         scales = [s for s in fs.rescale if isinstance(s, FragmentApply)]
         assert len(scales) == nd
         assert all(s.op.name == "multiply" and s.in_place and s.kinds == (FRAG, ROW) for s in scales)
@@ -88,7 +97,7 @@ def test_rescale_scales_every_accumulator_by_alpha():
 def test_epilogue_normalizes_every_accumulator_by_the_denominator():
     """O /= l per D-atom — the add-fold state (l) is the denominator; an in-place ``FragmentApply``
     divide by the per-row denom (the former FragmentScale-by-1/l)."""
-    fs = _frag(nd=4).combine(_carrier())
+    fs = _twist(nd=4).combine(_carrier())
     scales = [s for s in fs.epilogue if isinstance(s, FragmentApply)]
     assert len(scales) == 4
     assert all(s.op.name == "divide" and s.in_place and s.kinds == (FRAG, ROW) and s.args[1] == ("l_i0", "l_i1") for s in scales)
@@ -96,21 +105,21 @@ def test_epilogue_normalizes_every_accumulator_by_the_denominator():
 
 def test_scalar_updates_are_row_distributed():
     """Every per-row scalar stat is two scalars (rows g / g+8) — the 0/1 suffixing."""
-    fs = _frag().combine(_carrier())
+    fs = _twist().combine(_carrier())
     scalar_names = {s.name for s in fs.merge if isinstance(s, Assign)}
     # the subtract (m - m_new) and the exp (alpha) both appear suffixed 0 and 1
     assert any(n.endswith("0") for n in scalar_names) and any(n.endswith("1") for n in scalar_names)
     assert all(n.endswith("0") or n.endswith("1") for n in scalar_names), scalar_names
 
 
-def test_fragment_mask_builder_masks_each_partial_frag():
+def test_fragment_mask_builder_masks_each_partial_twist():
     """The generic ``fragment_mask`` builder emits one ``FragmentMask`` per distributed partial
     fragment for an arbitrary coordinate predicate — no causal / boundary / softmax naming."""
     from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
     from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
 
     causal = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
-    masks = _frag().mask(mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
+    masks = _twist().mask(mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
     assert [m.frag for m in masks] == ["Sf0_frag", "Sf1_frag"]
     assert all(isinstance(m, FragmentMask) and m.mask_when is causal for m in masks)
 
@@ -232,7 +241,7 @@ def test_realizer_emits_frag_apply_for_a_generic_carrier_op():
     """The realizer turns a generic stats-merge fragment op (``relu`` of the score, one per N-atom)
     into a ``FragmentApply`` — carrier-vocabulary generality reaching the tensor-core tier, the
     same realizer that handles softmax's exp/fold."""
-    fs = _frag().combine(_carrier_with_generic_op())
+    fs = _twist().combine(_carrier_with_generic_op())
     relus = [s for s in fs.merge if isinstance(s, FragmentApply) and s.op.name == "relu"]
     assert [r.out for r in relus] == ["sq_0", "sq_1"]  # one per N-atom (the 2 score frags)
     assert [r.args for r in relus] == [("Sf0_frag",), ("Sf1_frag",)]
