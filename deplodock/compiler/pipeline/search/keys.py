@@ -62,7 +62,6 @@ def op_cache_key(op: object) -> str | None:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -72,20 +71,13 @@ def op_cache_key(op: object) -> str | None:
         # whole-model compile.
         src = op.kernel_source.replace(op.kernel_name, "_K_") if op.kernel_name else op.kernel_source
         return digest("CudaOp", src, op.arg_order, op.grid, op.block, op.smem_bytes)
-    if isinstance(op, (LoopOp, TileOp, KernelOp)):
-        # Knobs are part of the key: same-body / different-knobs variants
-        # (e.g. ``020_stage_inputs`` emits a no-op TileOp with a
-        # ``STAGE="0..0"`` knob to mark "considered, declined" decisions)
-        # must not collide with their parent in the search tree, or
+    if isinstance(op, (LoopOp, KernelOp)):
+        # Knobs are part of the key: same-body / different-knobs variants must
+        # not collide with their parent in the search tree, or
         # ``SearchTree.expand`` self-parents the node and
         # ``_propagate_expected`` walks the parent chain forever.
         knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
         return digest(type(op).__name__, op.body.structural_key(), knob_key)
-    if isinstance(op, TileGraphOp):
-        # The enumeration-pass output (a chosen Schedule's TileGraph, pre-assembly):
-        # key on the TileGraph's canonical algorithm + Schedule identity + knobs.
-        knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
-        return digest("TileGraphOp", op.structural_key(), knob_key)
     return None
 
 
@@ -94,20 +86,13 @@ def dialect_of(op: object) -> Dialect | None:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         return "cuda"
     if isinstance(op, KernelOp):
         return "kernel"
-    if isinstance(op, TileOp):
-        return "tile"
     if isinstance(op, LoopOp):
         return "loop"
-    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
-
-    if isinstance(op, TileGraphOp):
-        return "tile"  # the enumeration output, still the tile dialect (pre-assembly)
     return None
 
 

@@ -499,29 +499,12 @@ def _validate_reason(op: Op, ctx: Context) -> str:
     # Best-effort: keep the import local so a missing kernel-IR module
     # (e.g. minimal harness in tests) doesn't break the engine itself.
     try:
-        from math import prod  # noqa: PLC0415
-
         from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
     except ImportError:
         return ""
     if not isinstance(op, KernelOp):
         return ""
     reasons: list[str] = []
-    for s in op.body:
-        if isinstance(s, GridTile):
-            ctas = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-            # _MAX_CTAS lives next to KernelOp.validate; keep the compare local.
-            for child in s.body:
-                if isinstance(child, ThreadTile):
-                    threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in child.axes)
-                    if threads > ctx.max_threads_per_cta:
-                        reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
-            _ = ctas  # _MAX_CTAS comparison kept inside validate
-        elif isinstance(s, ThreadTile):
-            threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-            if threads > ctx.max_threads_per_cta:
-                reasons.append(f"threads {threads} > max_threads_per_cta {ctx.max_threads_per_cta}")
     try:
         smem = op.smem_bytes()
         if smem > ctx.max_dynamic_smem:

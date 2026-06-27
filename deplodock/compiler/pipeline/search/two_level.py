@@ -109,10 +109,6 @@ def outer_pipeline() -> Pipeline:
     (``150_cross_cta_finalize``'s combine) likewise stay inner — their trigger knob
     (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]
-    # ``010_split_demoted`` declares only ``CUT`` (no ``off=``), so the pass-boundary
-    # OFF-fill stamps nothing onto the fused/cut ops (their ``op_cache_key`` stays what
-    # the assembled greedy run derives).
-    passes.append(Pass.load("lowering/tile/split", index=len(passes)))
     return Pipeline(passes=passes)
 
 
@@ -178,9 +174,8 @@ def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
     ``LoopOp`` and ``TileGraphOp`` so every kernel of either side gets its own inner
     slice."""
     from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
 
-    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, (LoopOp, TileGraphOp))]
+    return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, LoopOp)]
 
 
 def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> list[tuple[dict, float]]:
