@@ -117,10 +117,66 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     )
 
 
+def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoid:
+    """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the P@V
+    accumulator. State ``(m, d)`` (running row max / exp-sum denominator) folds this element's score
+    partial ``s`` in ONE streaming pass (vs the classic two: a row-max reduce then a
+    ``Σ exp(x − max)`` reduce)::
+
+        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
+        d = d·alpha + p;     m = m_new   (last)
+
+    A non-twisted carrier (no value partial) — :meth:`ScalarCombiner.combine` realizes it at the
+    scalar tier; the downstream normalize pass reads the final ``m`` and ``1/d``. Temps are namespaced
+    by ``m`` so they stay unique per kernel."""
+
+    def t(suf: str) -> str:
+        return f"{m}__{suf}"
+
+    merge = (
+        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)
+        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new
+        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)  (reads OLD m)
+        Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
+        Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
+        Assign(t("dl"), "multiply", (d, t("al"))),  # d·alpha
+        Assign(d, "add", (t("dl"), t("p"))),  # d = d·alpha + p          [state]
+        Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
+    )
+    # The LSE monoid is asymmetric (partial arity ≠ state arity), so the state-merges-state form the
+    # cross-partition combine (cooperative-tree / split-KV) needs is authored explicitly (not derivable
+    # from ``merge``): merge this partition's (m, d) with a second's (m_o, d_o).
+    mb, db = f"{m}__o", f"{d}__o"
+    combine_states = (
+        Assign(t("cmx"), "maximum", (m, mb)),  # m_new = max(m, m_o)
+        Assign(t("cda"), "subtract", (m, t("cmx"))),  # m − m_new
+        Assign(t("ca"), "exp", (t("cda"),)),  # a = exp(m − m_new)   (reads OLD m)
+        Assign(t("cdb"), "subtract", (mb, t("cmx"))),  # m_o − m_new
+        Assign(t("cb"), "exp", (t("cdb"),)),  # b = exp(m_o − m_new)
+        Assign(t("cda2"), "multiply", (d, t("ca"))),  # d·a
+        Assign(t("cdb2"), "multiply", (db, t("cb"))),  # d_o·b
+        Assign(d, "add", (t("cda2"), t("cdb2"))),  # d = d·a + d_o·b           [state]
+        Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
+    )
+    return Monoid(
+        state=(m, d),
+        partial=(s,),
+        merge=merge,
+        identity=(Literal(-1e30), Literal(0.0)),  # (−inf, 0)
+        commutative=True,
+        axes=(axis,),
+        state_b=(mb, db),
+        combine_states=combine_states,
+    )
+
+
 # Structural fork: deploy the fused streaming nest, or fall through to the
 # score-materializing 010_sdpa path. A structural-decision BOOL like the cut fork's
 # CUT mask; auto-registered by knob.registry()'s module walk.
 FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into the streaming online-softmax flash nest")
+# Standalone-softmax online fusion (the row-max + exp-sum two-pass reduce → one streaming
+# online-softmax monoid pass). Off by default; auto-registered by knob.registry()'s module walk.
+ONLINE_SOFTMAX = Knob("ONLINE_SOFTMAX", KnobType.BOOL, hints=(False, True), help="Fuse a 2-pass softmax into one online-softmax pass")
 
 
 def flash_enabled() -> bool:

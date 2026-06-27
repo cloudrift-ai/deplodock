@@ -58,7 +58,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
-from deplodock.compiler.ir.twist import Twist
+from deplodock.compiler.ir.twist import MmaTwist
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
@@ -317,7 +317,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]
     produce_mmas = tuple(next(s for s in t.body.iter() if isinstance(s, Mma)) for t in produce)
     consume_mmas = tuple(next(s for s in t.body.iter() if isinstance(s, Mma)) for t in consume)
-    twist = Twist(produce=produce_mmas, consume=consume_mmas)
+    twist = MmaTwist(produce=produce_mmas, consume=consume_mmas)
     fs = twist.combine(carrier)  # ``fs.init`` carries the carried-state seeds + the accum RegFragment decls
 
     init: list = list(fs.init)

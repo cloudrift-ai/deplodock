@@ -34,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraph,
     Transport,
 )
+from deplodock.compiler.ir.twist import ScalarCombiner
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
@@ -367,6 +368,27 @@ def _mask_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
     return tuple(out)
 
 
+def _realize_serial_monoid(stmts: tuple[Stmt, ...], carrier: Monoid) -> tuple[Stmt, ...]:
+    """Replace the ``carrier`` ``Monoid`` (matched by its carried state) wherever it sits in ``stmts``
+    — recursing into ``Loop`` bodies — with the ``ScalarCombiner``-projected serial merge (the fold as
+    ``Assign`` / ``Reassign`` statements). The carried-state ``Init`` seeds live above the reduce loop
+    already (the recognizer placed them), so only the per-iteration merge is realized here."""
+    merge = ScalarCombiner().combine(carrier).merge
+
+    def walk(body: tuple[Stmt, ...]) -> list[Stmt]:
+        out: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Monoid) and s.state == carrier.state:
+                out.extend(merge)
+            elif isinstance(s, Loop):
+                out.append(replace(s, body=Body(tuple(walk(tuple(s.body))))))
+            else:
+                out.append(s)
+        return out
+
+    return tuple(walk(stmts))
+
+
 def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
     """The MONOID build move — one move for the cooperative reduce (softmax / rmsnorm
     / mean / max) AND the streaming flash (online-softmax over a nested QK^T). Apply
@@ -400,8 +422,21 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     # mirrors the intra-CTA cooperative ``K_c`` lane one partition level up.
     k_s = _k_s_axis(dag, knobs, targets)
     block = graph.blocks[0]
+    compute_in = tuple(block.compute)
+
+    # A serial (br=1, single-CTA), non-twisted ``Monoid`` reduce — the fused online-softmax ``(m, d)``
+    # carrier — is realized through the carrier-generic ``ScalarCombiner`` (the scalar tier of the
+    # combiner, sibling of the fragment ``MmaTwist``), the SAME ``combine()`` the flash tiers drive,
+    # instead of being left a ``Monoid`` for ``render_merge_program``. Its ``Init`` seeds are already
+    # placed (the recognizer emits them) and a serial reduce has no cross-thread combine. Cooperative
+    # (``br > 1``) / split-K ``Monoid``s keep the carrier for ``emit_combine``; flat ``Accum`` reduces
+    # and twisted carriers (flash → ``chain_build`` / ``warp_chain_build``) are untouched.
+    carrier = dag.reduction.carrier if dag.reduction is not None else None
+    if br == 1 and k_s is None and isinstance(carrier, Monoid) and len(carrier.partial) == 1:
+        compute_in = _realize_serial_monoid(compute_in, carrier)
+
     compute = _rebracket_k(
-        tuple(block.compute),
+        compute_in,
         targets,
         bk=bk,
         fk=fk,
@@ -469,7 +504,15 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     monoid = next(s for s in kv_body if isinstance(s, Monoid))
     prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
 
-    stats, accum, _d_state = split_carrier(carrier, value_name)
+    # Realize the carrier's online-softmax combine at the scalar tier through the shared
+    # ``ScalarCombiner`` — the same ``combine()`` orchestration ``MmaTwist`` drives at the fragment
+    # tier (``carry_scope_from_graph``) — instead of leaving raw split stats/accum ``Monoid``s for
+    # ``render_merge_program``. The FA-2 scalar flash and the warp flash now share one carrier-combine
+    # realizer (the user-visible split: stats fold → rescale ``O·α`` → consume ``p·v`` → normalize
+    # ``O/l`` is generated once, in the combiner). The kv reduce stays serial (no cross-thread
+    # combine), and ``010_split_register_axes`` replicates the d-dependent rescale/consume ``Assign``s
+    # over ``O[d]`` exactly as it did the accum ``Monoid`` (generic ``rewrite`` replication).
+    fs = ScalarCombiner().combine(carrier)
     m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry — no stored view
 
     # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
@@ -482,7 +525,7 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
     head_inits = tuple(s for s in body if isinstance(s, Init))
     epilogue = tuple(s for s in body if isinstance(s, (Assign, Write)))
-    new_kv = replace(kv_loop, body=Body((*prefix, stats, value_load, accum)))
+    new_kv = replace(kv_loop, body=Body((*prefix, *fs.merge, value_load, *fs.rescale, *fs.consume)))
     compute: tuple[Stmt, ...] = (*head_inits, new_kv, *epilogue)
 
     # σ-rewrite: ``d`` -> the register axis var; ``m`` -> its block/thread split.
@@ -516,6 +559,22 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
 # loads via the buffer strides). The kv-stream is the ``Schedule.carry`` axis; the score→P→A handoff
 # is a staged ``flash_pv_smem`` edge. This is the deployed warp-flash path (it replaced the
 # hand-assembled ``realize_flash``).
+
+
+def _atom_cell(cell, *, atom, k_name, kt, axes, out_index=None, frag_a=False) -> AtomTile:
+    """Build ONE warp-tier contraction cell — the shared per-cell atomization the flash produce
+    (QK^T) and consume (P@V) both perform: fuse the σ-tiled ``cell`` into an ``Mma`` via the generic
+    ``atomize_cell``, then wrap its K in a ``ko`` serial loop (``kt`` atom_k steps) or, at ``kt == 1``
+    (the whole reduce is one atom), strip the K var to 0 so ``005_lower_atom_tile`` lowers the bare
+    ``Mma``. ``out_index`` (the produce's INLINE score coords) / ``frag_a`` (the consume's
+    probability-fragment A operand) select the produce vs consume shape; the cell is wrapped in an
+    ``AtomTile`` over ``axes``."""
+    fused = atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index, frag_a=frag_a)
+    if kt > 1:
+        body: tuple[Stmt, ...] = (SerialTile(axis=Axis(k_name, Dim(kt)), body=Body(fused), kind="plain"),)
+    else:
+        body = tuple(s.rewrite(_identity_rename, Sigma({k_name: Literal(0, "int")})) for s in fused)
+    return AtomTile(axes=axes, body=Body(body), atom=atom)
 
 
 def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
@@ -572,14 +631,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         n_base = _fadd(kv_expr, nt * atom_n)
         sig = Sigma({m_axis.name: m_expr, kv: n_base, a3_name: _fmul(Var(ko), atom_k)})
         cell = tuple(s.rewrite(_identity_rename, sig) for s in qkt_body)
-        fused = atomize_cell(cell, atom=atom, k_name=ko, write=None, out_index=(m_expr, n_base))
-        # kt>1: a real K_o serial loop (the atom spans atom_k per step). kt==1: the whole D is one
-        # atom — strip ``ko`` to 0 and emit the cell directly (the form 005_lower_atom_tile lowers).
-        if kt > 1:
-            body: tuple[Stmt, ...] = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
-        else:
-            body = tuple(s.rewrite(_identity_rename, Sigma({ko: Literal(0, "int")})) for s in fused)
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(body), atom=atom))
+        axes = (Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n)))
+        produce.append(_atom_cell(cell, atom=atom, k_name=ko, kt=kt, axes=axes, out_index=(m_expr, n_base)))
 
     # consume — the split-carrier P@V cell, σ-tiled per output N-atom (n) → a frag_a canonical-B Mma
     # (A = the probability fragment, B = V), accumulating O[d]. The kv tile (16 keys) is one atom_k:
@@ -594,9 +647,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         sig = Sigma({d_axis.name: Literal(n * atom_n, "int"), kv: _fadd(kv_expr, _fmul(Var(kpv), atom_k))})
         vload = replace(value_load.rewrite(_identity_rename, sig), names=("vv",))
         cell = (vload, Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")), Accum(name=d_state, value="pv"))
-        fused = atomize_cell(cell, atom=atom, k_name=kpv, write=None, frag_a=True)
-        body = tuple(s.rewrite(_identity_rename, Sigma({kpv: Literal(0, "int")})) for s in fused)
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(body), atom=atom))
+        axes = (Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n)))
+        consume.append(_atom_cell(cell, atom=atom, k_name=kpv, kt=1, axes=axes, frag_a=True))
 
     # The streaming carry body: produce QK^T cells → (the score-mask ``Select``, when causal) → the
     # full twisted carrier (the online-softmax Monoid — the walk splits it via
