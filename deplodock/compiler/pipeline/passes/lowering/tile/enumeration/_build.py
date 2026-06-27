@@ -561,6 +561,22 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
 # hand-assembled ``realize_flash``).
 
 
+def _atom_cell(cell, *, atom, k_name, kt, axes, out_index=None, frag_a=False) -> AtomTile:
+    """Build ONE warp-tier contraction cell — the shared per-cell atomization the flash produce
+    (QK^T) and consume (P@V) both perform: fuse the σ-tiled ``cell`` into an ``Mma`` via the generic
+    ``atomize_cell``, then wrap its K in a ``ko`` serial loop (``kt`` atom_k steps) or, at ``kt == 1``
+    (the whole reduce is one atom), strip the K var to 0 so ``005_lower_atom_tile`` lowers the bare
+    ``Mma``. ``out_index`` (the produce's INLINE score coords) / ``frag_a`` (the consume's
+    probability-fragment A operand) select the produce vs consume shape; the cell is wrapped in an
+    ``AtomTile`` over ``axes``."""
+    fused = atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index, frag_a=frag_a)
+    if kt > 1:
+        body: tuple[Stmt, ...] = (SerialTile(axis=Axis(k_name, Dim(kt)), body=Body(fused), kind="plain"),)
+    else:
+        body = tuple(s.rewrite(_identity_rename, Sigma({k_name: Literal(0, "int")})) for s in fused)
+    return AtomTile(axes=axes, body=Body(body), atom=atom)
+
+
 def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
     """σ-tile the warp-tier flash's two chained contractions into an **atomized streaming**
     ``TileGraph`` the generic ``carry_scope_from_graph`` walk realizes.
@@ -615,14 +631,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         n_base = _fadd(kv_expr, nt * atom_n)
         sig = Sigma({m_axis.name: m_expr, kv: n_base, a3_name: _fmul(Var(ko), atom_k)})
         cell = tuple(s.rewrite(_identity_rename, sig) for s in qkt_body)
-        fused = atomize_cell(cell, atom=atom, k_name=ko, write=None, out_index=(m_expr, n_base))
-        # kt>1: a real K_o serial loop (the atom spans atom_k per step). kt==1: the whole D is one
-        # atom — strip ``ko`` to 0 and emit the cell directly (the form 005_lower_atom_tile lowers).
-        if kt > 1:
-            body: tuple[Stmt, ...] = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
-        else:
-            body = tuple(s.rewrite(_identity_rename, Sigma({ko: Literal(0, "int")})) for s in fused)
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(body), atom=atom))
+        axes = (Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n)))
+        produce.append(_atom_cell(cell, atom=atom, k_name=ko, kt=kt, axes=axes, out_index=(m_expr, n_base)))
 
     # consume — the split-carrier P@V cell, σ-tiled per output N-atom (n) → a frag_a canonical-B Mma
     # (A = the probability fragment, B = V), accumulating O[d]. The kv tile (16 keys) is one atom_k:
@@ -637,9 +647,8 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         sig = Sigma({d_axis.name: Literal(n * atom_n, "int"), kv: _fadd(kv_expr, _fmul(Var(kpv), atom_k))})
         vload = replace(value_load.rewrite(_identity_rename, sig), names=("vv",))
         cell = (vload, Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")), Accum(name=d_state, value="pv"))
-        fused = atomize_cell(cell, atom=atom, k_name=kpv, write=None, frag_a=True)
-        body = tuple(s.rewrite(_identity_rename, Sigma({kpv: Literal(0, "int")})) for s in fused)
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(body), atom=atom))
+        axes = (Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n)))
+        consume.append(_atom_cell(cell, atom=atom, k_name=kpv, kt=1, axes=axes, frag_a=True))
 
     # The streaming carry body: produce QK^T cells → (the score-mask ``Select``, when causal) → the
     # full twisted carrier (the online-softmax Monoid — the walk splits it via
