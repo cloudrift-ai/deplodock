@@ -388,6 +388,48 @@ def test_iter_nodes_pre_gpu_column_readonly_degrades(tmp_path) -> None:
     ro.close()
 
 
+def test_merge_nodes_keeps_min_and_coexists_across_cards(tmp_path) -> None:
+    """``merge_nodes`` upserts another DB's ``node`` rows with keep-min semantics: a
+    shared ``node_key`` keeps the faster ``value_us``, while a different card's rows
+    (distinct ``gpu`` ⇒ distinct ``node_key``) merge in alongside without clobbering —
+    the cross-hardware accumulation that backs ``scripts/merge_node_db.py``."""
+    dst = SearchDB(tmp_path / "dst.db")
+    dst.record_nodes(
+        [
+            _node_row("shared", 5.0, gpu="NVIDIA H100 80GB"),  # same key as src, slower here
+            _node_row("dst_only", 7.0, gpu="NVIDIA H100 80GB"),  # untouched by the merge
+        ]
+    )
+    src = SearchDB(tmp_path / "src.db")
+    src.record_nodes(
+        [
+            _node_row("shared", 2.0, gpu="NVIDIA H100 80GB"),  # improves the shared node
+            _node_row("h200_only", 3.0, gpu="NVIDIA H200 141GB"),  # a different card's row
+        ]
+    )
+    src.close()  # flush the on-disk file before the read-only open inside merge
+
+    merged = dst.merge_nodes(tmp_path / "src.db")
+    assert merged == 2  # source rows processed
+    by_key = {n.node_key: n for n in dst.iter_nodes()}
+    assert set(by_key) == {"shared", "dst_only", "h200_only"}  # both cards coexist
+    assert by_key["shared"].value_us == 2.0  # keep-min took the faster source row
+    assert by_key["dst_only"].value_us == 7.0  # other rows untouched
+    assert by_key["h200_only"].gpu == "NVIDIA H200 141GB"  # cross-card row carried its gpu
+
+
+def test_merge_nodes_into_pre_node_dest_autocreates(tmp_path) -> None:
+    """Merging into a freshly-opened DB (no node rows yet) just inserts the source
+    rows — the dest's ``node`` table is created by ``SearchDB.__init__``."""
+    src = SearchDB(tmp_path / "src.db")
+    src.record_nodes([_node_row("n1", 4.0, gpu="NVIDIA H200 141GB")])
+    src.close()
+    dst = SearchDB(tmp_path / "dst.db")
+    assert dst.merge_nodes(tmp_path / "src.db") == 1
+    (n,) = list(dst.iter_nodes())
+    assert (n.node_key, n.value_us, n.gpu) == ("n1", 4.0, "NVIDIA H200 141GB")
+
+
 # ---------------------------------------------------------------------------
 # op inventory
 # ---------------------------------------------------------------------------

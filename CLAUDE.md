@@ -281,6 +281,12 @@ fails fast with a specific message.
 - Generative decode-bucket post-subgraph bench (vs cuBLAS): `python scripts/bench_gen_post.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` — the reproducer behind `plans/generative-decode-perf-findings.md` (symbolic@1 vs static decode-bucket M=16 vs eager, CUDA-graph-captured)
 - Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-runnable — including linear/attention, whose transposed weights are matched via `load_ops`-replayed constants), and renders a per-kernel latency bar chart via `deplodock.visualize`. `--tune` autotunes each kernel first.
 - New-model discovery: `python scripts/new_models.py [--since YYYY-MM-DD] [--text-only] [--include-supported] [--arena] [--json]` — lists open-weight models OpenRouter hosts (catalog entries with a `hugging_face_id`), verifies each on HuggingFace, and ranks the unsupported, recently-released ones by HF `trendingScore`/downloads/likes. Keyless + read-only (OpenRouter `/api/v1/models` + HF `/api/models/{id}`); excludes families already in `recipes/` (base-model match) and models older than `--since` (default ~90 days) by default. `--arena` adds LMArena Elo/rank from the `lmarena-ai/leaderboard-dataset` HF dataset (`text`/`latest`/`overall`, ~360 models, keyless) by fuzzy name-match, and lists the open arena models it couldn't link (fuzzy misses / outside the window). Triage feed for the `benchmark-new-model` flow.
+- Cross-hardware node-store merge: `python scripts/merge_node_db.py {--src DB | --remote user@host [--ssh-key PATH]
+  [--port N] [--remote-db PATH]} [--db DEST]` — merge the `node` table from another autotune DB (a local snapshot, or a
+  WAL-safe `VACUUM INTO` snapshot fetched from a remote host over SSH) into the local canonical DB via the tested
+  `SearchDB.merge_nodes` (keep-min per `node_key`; the GPU-folded key means other cards' rows are never clobbered).
+  Prints a per-card row-count receipt. The copy-back step of the `collect-node-data` skill (rent a GPU → `tune --dataset
+  golden` there → merge its node rows home).
 
 ## Key Make Targets
 
