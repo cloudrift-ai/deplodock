@@ -133,7 +133,7 @@ class Context:
     # stale -O1 number. Populated from the env by :meth:`probe` /
     # :meth:`from_target`.
     compile_flags: str = ""
-    # Whether the strict knob-pin validator (``lowering/tile/enumeration/_validate``)
+    # Whether the strict knob-pin validator (``lowering/tile/_validate``)
     # is active. ``True`` on the deterministic greedy compile (``compile`` / ``run``),
     # where a force-pinned env knob foreign to the kernel's resolved tier is a user
     # error that should fail loudly instead of silently mis-compiling. ``False`` under

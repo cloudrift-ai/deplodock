@@ -743,8 +743,9 @@ class Monoid(ReduceCarrier):
       ``name = …;``, every other a local fp32 temp; statement ORDER is
       load-bearing) and the ``combine_states`` program (merge two fully-reduced
       partition states, reading the second operand ``state_b`` — the form the
-      cross-partition combine needs). ``merge`` / ``combine_states`` / ``state_b``
-      are exposed as read-through properties. ``__post_init__`` completes the twist
+      cross-partition combine needs). Read the combine off the twist directly
+      (``monoid.twist.merge`` / ``.combine_states`` / ``.state_b``).
+      ``__post_init__`` completes the twist
       against this state: defaults ``state_b`` to ``"<s>__o"`` and, for an
       **additive** carrier whose partial lifts to a state, auto-derives
       ``combine_states`` from ``merge``; an asymmetric monoid (flash's LSE) authors
@@ -767,7 +768,7 @@ class Monoid(ReduceCarrier):
 
     associative + commutative — which is what makes split-KV (flash-decoding) and
     cooperative-combine legal. The flash instance is built by
-    ``loop/recognize/_flash.flash_combine``.
+    ``lowering/tile/_flash.flash_combine``.
     """
 
     state: tuple[str, ...]
@@ -795,21 +796,6 @@ class Monoid(ReduceCarrier):
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
 
-    # The combine lives in ``twist`` (extracted); these read-throughs keep the
-    # carrier's surface (``merge`` / ``combine_states`` / ``state_b``) stable for
-    # every reader — render, rewrite, cross-partition combine, carrier-algebra split.
-    @property
-    def merge(self) -> tuple[Assign, ...]:
-        return self.twist.merge
-
-    @property
-    def combine_states(self) -> tuple[Assign, ...]:
-        return self.twist.combine_states
-
-    @property
-    def state_b(self) -> tuple[str, ...]:
-        return self.twist.state_b
-
     def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
         """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
         a second fully-reduced state named ``other`` (the cross-partition
@@ -818,8 +804,8 @@ class Monoid(ReduceCarrier):
         ``partial`` set to ``other`` — so the cooperative-tree / cross-CTA reduce
         renders the state-merge through the same machinery as a streaming step.
         """
-        sub = dict(zip(self.state_b, other, strict=True))
-        merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
+        sub = dict(zip(self.twist.state_b, other, strict=True))
+        merged = tuple(_rename_assign_args(a, sub) for a in self.twist.combine_states)
         return Monoid(
             state=self.state,
             partial=other,
@@ -842,13 +828,13 @@ class Monoid(ReduceCarrier):
         return self.state
 
     def combine_operands(self) -> tuple[str, ...]:
-        return self.state_b
+        return self.twist.state_b
 
     def combine_partials(self) -> tuple[Assign, ...]:
-        """The state-merges-state monoid op (``combine_states``) — already the
-        realization-agnostic cross-partition combine the cooperative-tree /
-        split-KV / split-K reductions fold through."""
-        return self.combine_states
+        """The state-merges-state monoid op (the twist's ``combine_states``) —
+        already the realization-agnostic cross-partition combine the
+        cooperative-tree / split-KV / split-K reductions fold through."""
+        return self.twist.combine_states
 
     # ``project`` is the shared ``ReduceCarrier`` default (keyed off ``carried_names()`` ==
     # ``state``) — the one magic method every carrier inherits; no Monoid-specific override.
@@ -875,7 +861,7 @@ class Monoid(ReduceCarrier):
         builder orders the program so each old-state read precedes that state's
         update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
         """
-        return render_merge_program(self.merge, self.state, ctx)
+        return render_merge_program(self.twist.merge, self.state, ctx)
 
 
 @dataclass(frozen=True)

@@ -35,11 +35,8 @@ PASS_SHORTHAND = {
     "frontend/optimization": "o",
     "loop/lifting": "l",
     "loop/fusion": "f",
-    "loop/recognize": "r",
     "loop/stamp": "s",
-    "lowering/tile/split": "x",
-    "lowering/tile/enumeration": "t",
-    "lowering/tile/assembly": "a",
+    "lowering/tile": "t",
     "lowering/kernel": "k",
     "lowering/cuda": "c",
 }

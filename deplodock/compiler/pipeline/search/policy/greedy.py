@@ -48,7 +48,7 @@ def _tile_pipeline():
     frozen and shareable, so one load serves every nested descent."""
     from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
 
-    return Pipeline.build(["lowering/tile/enumeration"])
+    return Pipeline.build(["lowering/tile"])
 
 
 # Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices

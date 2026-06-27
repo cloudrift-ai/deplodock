@@ -1,4 +1,4 @@
-"""Tile-IR enumeration: ``LoopOp`` → ``TileOp``, in two steps.
+"""Tile-IR lowering: ``LoopOp`` → ``TileOp``, in two steps.
 
 1. **Recognize** (``010_recognize``) — read the reduce carrier's algebra and
    normalize it to the unified twisted ``Monoid`` (a scalar ``Accum`` becomes its

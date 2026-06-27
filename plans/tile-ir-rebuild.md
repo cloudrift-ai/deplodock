@@ -112,7 +112,7 @@ skeleton by supplying a combine rather than adding lowering code.
 - **`ir/kernel/` — `Tile`** (kernel-IR stmt): the hardware realization of the schedule — one thread per output cell. It
   emits the linear-thread decode (`_gid = blockIdx.x·blockDim.x + threadIdx.x`, the `_gid < N` guard, the per-axis index
   decode) around the body. Geometry only; static extents for now.
-- **`lowering/tile/enumeration/010_schedule.py`** — `LoopOp → TileOp`: dispatches on `Loop.algebra_kind`; schedules the
+- **`lowering/tile/020_schedule.py`** — `LoopOp → TileOp`: dispatches on `Loop.algebra_kind`; schedules the
   no-fold kind by flattening the free-loop nest into `grid_axes` + a per-cell body. A kernel that carries a combine
   (`reduce_axis_names` non-empty) is left un-lowered (still xfailed) until its schedule is built.
 - **`lowering/kernel/010_materialize.py`** — `TileOp → KernelOp`: wraps the per-cell body in `Tile`. Algebra-generic — a
@@ -137,14 +137,20 @@ in the schedule or the materializer branches on which.
   that varies — `Twist.DEGENERATE` (ψ = id, a plain reduction's componentwise fold, `Twist.degenerate`), `Twist.SCALAR`
   (the max-rescale on a scalar tuple — online softmax), `Twist.FRAGMENT` (the same ψ on mma fragments — attention,
   reserved). Every reduce carrier is normalized to a `Monoid`: a scalar `Accum` → degenerate-twist monoid
-  (`Accum.as_monoid`), an already-twisted `Monoid` (the online-softmax recognizer) is kept. `merge` / `combine_states` /
-  `state_b` stay readable as `Monoid` properties, so render / rewrite / cross-partition combine are untouched.
-- **Recognize then schedule (two passes in `lowering/tile/enumeration/`).** `010_recognize` does the algebra:
-  `Accum → Init + degenerate Monoid` for every `MONOID` reduce loop (a `SEMIRING` contraction keeps its `Accum` — its
-  `classify_algebra` would otherwise flip to `MONOID`). `020_schedule` does the geometry: `_peel` maps the free axes
+  (`Accum.as_monoid`), an already-twisted `Monoid` (online softmax / flash) is kept. The combine is read off the twist
+  directly (`monoid.twist.merge` / `.combine_states` / `.state_b`).
+- **Recognize then schedule (two passes in `lowering/tile/`).** `010_recognize` does ALL algebra recognition, in order:
+  (1) **flash attention** — a softmax-then-P@V kernel + its scaled-QK producer fuse to one flash `LoopOp` (the
+  `(m, l, O)` twisted monoid); (2) **online softmax** — an adjacent `(rowmax, Σ exp)` reduce pair fuses to one
+  `(m, d)` `Monoid`; (3) **normalize** — every remaining `MONOID` reduce loop's `Accum` → `Init + degenerate Monoid`
+  (a `SEMIRING` contraction keeps its `Accum`, else `classify_algebra` would flip to `MONOID`). Flash precedes
+  online-softmax precedes normalize — each later step consumes the `Accum`s an earlier one matches. Recognition is
+  **always on** (the `FLASH` / `ONLINE_SOFTMAX` knobs were dropped); the flash builders live in `lowering/tile/_flash.py`
+  (the demolished `loop/recognize/` pass is gone). `020_schedule` does the geometry: `_peel` maps the free axes
   *enclosing* the reduce onto `grid_axes` (one thread per output row) and leaves the reduce `Loop` — plus any epilogue /
   output sweep sharing its accumulator — serial in the per-cell body. `MAP` and `MONOID` schedule identically; `SEMIRING`
-  is skipped.
+  is skipped (so a recognized flash kernel, whose inner Q·K dot product is a `SEMIRING` reduce, stays un-lowered until
+  the matmul/attention tier — attention remains xfailed, no regression).
 - **Materialize / cuda — unchanged.** The `Monoid` renders through `render_merge_program`, the reduce `Loop` through
   `Loop.render`, the seed through `Init`; the per-cell body (fold + epilogue + normalize sweep) sits inside the same
   `Tile` thread-decode the no-fold kind already used. So a plain `reduce_sum` emits `acc = acc + x` and online softmax

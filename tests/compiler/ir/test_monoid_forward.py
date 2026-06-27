@@ -19,7 +19,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Twist, Write
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 
 def _online_softmax_steps(m: str, ll: str, s: str) -> tuple:
@@ -167,10 +167,10 @@ def test_combine_states_default_derived_for_additive() -> None:
         twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
         identity=(Literal(0.0),),
     )
-    assert c.state_b == ("acc__o",)
-    assert len(c.combine_states) == 1
-    assert c.combine_states[0].name == "acc"
-    assert c.combine_states[0].args == ("acc", "acc__o")  # partial p → state_b acc__o
+    assert c.twist.state_b == ("acc__o",)
+    assert len(c.twist.combine_states) == 1
+    assert c.twist.combine_states[0].name == "acc"
+    assert c.twist.combine_states[0].args == ("acc", "acc__o")  # partial p → state_b acc__o
 
 
 @pytest.mark.parametrize("n", [1, 4, 8, 33])

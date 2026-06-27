@@ -41,8 +41,8 @@ from deplodock.compiler.pipeline.search import (
 # Canonical pass lists, indexed by the --ir stage they produce. Backends
 # and tests should reference these rather than re-listing pass names.
 TENSOR_PASSES = ["frontend/decomposition", "frontend/optimization"]
-LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion", "loop/recognize", "loop/stamp"]
-TILE_PASSES = [*LOOP_PASSES, "lowering/tile/split", "lowering/tile/enumeration", "lowering/tile/assembly"]
+LOOP_PASSES = [*TENSOR_PASSES, "loop/lifting", "loop/fusion", "loop/stamp"]
+TILE_PASSES = [*LOOP_PASSES, "lowering/tile"]
 KERNEL_PASSES = [*TILE_PASSES, "lowering/kernel"]
 CUDA_PASSES = [*KERNEL_PASSES, "lowering/cuda"]
 

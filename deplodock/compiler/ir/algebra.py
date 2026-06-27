@@ -1,7 +1,7 @@
 """Bottom-up algebra analysis — derive each reduce loop's algebraic *kind*
 from its carrier and loads (Part B of ``plans/algebraic-carrier-analysis.md``).
 
-This is the inverse of the bespoke top-down recognizers (``loop/recognize``):
+This is the inverse of the bespoke top-down recognizers (``lowering/tile/010_recognize``):
 rather than hand-match a known pattern, *read back* the algebra that already
 lives in the loop body and expose a uniform tag the scheduler can dispatch on.
 
@@ -12,8 +12,8 @@ property), so it can never contradict the carrier's own traits — the
 computed, not stored, it never enters equality / `op_cache_key`, and it is
 always consistent with the current body (re-derived after every rewrite). The
 *expensive* match — turning a raw coupled-accumulator cluster into a verified
-twisted monoid — is done ONCE by the recognizer (``loop/recognize``, which
-emits a `Monoid` carrier); this classification is then a cheap read of that
+twisted monoid — is done ONCE by the recognizer (``lowering/tile/010_recognize``,
+which emits a `Monoid` carrier); this classification is then a cheap read of that
 carrier.
 
 A twisted monoid **is** a monoid (transport of structure — the rescale-by-max

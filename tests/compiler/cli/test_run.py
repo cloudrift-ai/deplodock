@@ -547,7 +547,7 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded loop IR" in log
-    assert "lowering/tile/enumeration" in log
+    assert "lowering/tile" in log
 
 
 @requires_cuda

@@ -169,7 +169,7 @@ def test_deferred_finalize_flash_attention_carrier_merges_states() -> None:
     The kernel-level proof of "attention's cross-CTA combine"; the producer that feeds it is the
     remaining flash split-KV work."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+    from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
     s, m, n = 8, 16, 32
     rng = np.random.default_rng(13)

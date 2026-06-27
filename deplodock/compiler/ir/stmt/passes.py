@@ -164,8 +164,8 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     # moves (identity rename / pure σ-split leaves them untouched, preserving the
     # streaming-form SSA).
     new_state0 = rename(s.state[0]) if s.state else None
-    carried = set(s.state) | set(s.state_b)
-    temps = {a.name for a in (*s.merge, *s.combine_states)} - carried
+    carried = set(s.state) | set(s.twist.state_b)
+    temps = {a.name for a in (*s.twist.merge, *s.twist.combine_states)} - carried
     overlay: dict[str, str] = {}
     if new_state0 is not None and new_state0 != s.state[0]:
         overlay = {t: f"{t}__{new_state0}" for t in temps}
@@ -183,9 +183,9 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         state=tuple(rn(n) for n in s.state),
         partial=tuple(rn(n) for n in s.partial),
         twist=Twist(
-            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
-            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.combine_states),
-            state_b=tuple(rn(n) for n in s.state_b),
+            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
+            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
+            state_b=tuple(rn(n) for n in s.twist.state_b),
             kind=s.twist.kind,
         ),
         identity=s.identity,  # constant Exprs — no SSA names to rename

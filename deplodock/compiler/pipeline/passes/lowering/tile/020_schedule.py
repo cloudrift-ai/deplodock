@@ -1,6 +1,6 @@
 """Schedule a ``LoopOp`` onto a tile grid → ``TileOp``.
 
-Second of the two enumeration steps — recognition (``010_recognize``) normalized
+Second of the two tile-lowering steps — recognition (``010_recognize``) normalized
 the reduce carriers to ``Monoid``s; this only chooses the *schedule*. Two kinds
 map onto the per-cell (one-thread-per-output-cell) tier:
 

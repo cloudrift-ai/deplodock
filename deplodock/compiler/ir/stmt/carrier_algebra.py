@@ -144,9 +144,9 @@ def split_carrier(carrier: Monoid, value_name: str) -> tuple[Monoid, Monoid, str
     partial = the value), which reads the stats carrier's rescale/probability temps by
     name (they render inline, visible to the sibling carrier). ``d_state`` is the
     accumulator state component (flash's ``O``)."""
-    dvar = value_dependent(carrier.merge, value_name)
-    accum_merge = tuple(a for a in carrier.merge if a.name in dvar)
-    stats_merge = tuple(a for a in carrier.merge if a.name not in dvar)
+    dvar = value_dependent(carrier.twist.merge, value_name)
+    accum_merge = tuple(a for a in carrier.twist.merge if a.name in dvar)
+    stats_merge = tuple(a for a in carrier.twist.merge if a.name not in dvar)
     d_states = [s for s in carrier.state if s in dvar]
     stats_states = [s for s in carrier.state if s not in dvar]
     if len(d_states) != 1:

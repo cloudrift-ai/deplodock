@@ -1,13 +1,10 @@
-"""Flash-attention shared helper — the ``FLASH`` knob, eligibility predicate, and
-the streaming online-softmax ``LoopOp`` nest builder.
+"""Flash-attention shared helper — the carrier builders, eligibility predicate,
+and the streaming online-softmax ``LoopOp`` nest builder.
 
-Flash recognition is a **Loop-IR** pass (``loop/fusion/025_recognize_flash``) that
-runs AFTER the generic fuser: a non-causal SDPA fuses to two ``LoopOp``s — the
-scaled scores and the softmax-then-P@V kernel — and the pass pattern-matches that
-consolidated softmax-attention kernel and rewrites it into one fused streaming
-kernel, with NO modification to the decomposition stage. This module is the sole
-owner of the ``FLASH`` knob, the ``flash_shape_eligible`` predicate, and the nest
-builder ``build_flash_frag``.
+Recognition itself lives in ``lowering/tile/010_recognize`` (which calls these
+builders); this module owns the *construction* side: the ``flash_combine`` /
+``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
+predicates, and the nest builders ``build_flash_frag`` / ``build_flash_recovered``.
 
 The nest fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
@@ -49,7 +46,6 @@ from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
-from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -164,25 +160,6 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
         commutative=True,
         axes=(axis,),
     )
-
-
-# Structural fork: deploy the fused streaming nest, or fall through to the
-# score-materializing 010_sdpa path. A structural-decision BOOL like the cut fork's
-# CUT mask; auto-registered by knob.registry()'s module walk.
-FLASH = Knob("FLASH", KnobType.BOOL, hints=(True, False), help="Fuse SDPA into the streaming online-softmax flash nest")
-# Standalone-softmax online fusion (the row-max + exp-sum two-pass reduce → one streaming
-# online-softmax monoid pass). Off by default; auto-registered by knob.registry()'s module walk.
-ONLINE_SOFTMAX = Knob("ONLINE_SOFTMAX", KnobType.BOOL, hints=(False, True), help="Fuse a 2-pass softmax into one online-softmax pass")
-
-
-def flash_enabled() -> bool:
-    """The explicit ``FLASH`` knob. The move composer ALSO implies flash, but only
-    for symbolic-seq SDPA (static SDPA decomposes — the composer covers the static
-    QK^T / softmax / P@V kernels, and the loop reference backend can run those but
-    can't render the streaming flash carrier). That conditional implication lives
-    at the recognizer (`_composer_wants_flash`), which has the shape."""
-    raw = FLASH.raw()
-    return raw is not None and FLASH.parse(raw)
 
 
 def _static(d) -> int | None:

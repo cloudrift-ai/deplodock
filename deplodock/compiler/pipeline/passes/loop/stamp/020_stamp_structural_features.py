@@ -1,9 +1,8 @@
 """Stamp ``LoopOp.knobs`` with the kernel's structural features.
 
 Runs LAST in the loop dialect — in the ``loop/stamp`` pass, after ``loop/fusion``
-and ``loop/recognize`` have settled the body (and after ``010_stamp_loop_names``) —
-the same rationale as the name stamp: the features must reflect the final fused /
-recognized form. Stamping here, rather than at the head of
+has settled the body (and after ``010_stamp_loop_names``) — the same rationale as
+the name stamp: the features must reflect the final fused form. Stamping here, rather than at the head of
 Tile-IR lowering, matters for consistency: the loop-dialect ``op_cache_key``
 includes knobs, so a mid-lowering stamp would give the same logical kernel two
 identities (pre- and post-stamp), splitting the tune DB's effort / perf keyings
