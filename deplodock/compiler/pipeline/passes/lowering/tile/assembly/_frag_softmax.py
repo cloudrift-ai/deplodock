@@ -8,24 +8,20 @@ the per-row stats ``(m, l)`` are 2 scalars per lane (rows ``g`` / ``g+8`` → su
 the score partial lives fragment-distributed in the C-fragment, and the reduction over the
 tile's columns is a :class:`FragmentRowReduce` (the fragment-tier analog of the lane reduce).
 
-The split (``ir/stmt/carrier_algebra.split_carrier``) separates the ``d``-invariant stats
-monoid from the ``d``-varying accumulation monoid; the stats ``merge`` program is then
-classified by the shared carrier algebra (``carrier_algebra.classify_merge_program`` →
-role-tagged ``MergeStep``s, via the fragment/scalar **taint** analysis: the score partial is
-fragment-valued; a reduce-eligible op consuming it is a FOLD whose result is a per-row scalar).
-This module is a **thin geometry emitter** over that classification: the carrier supplies the
-*algebra* (which ops, what order, which reductions, the normalizer); the caller supplies the
-*fragment geometry* (N-atom / D-atom frag names) via :class:`FragGeom` — that geometry is a
-tiling decision, not recoverable from the scalar program. The **per-atom C-fragment layout** (how
-many registers / lane, which element is which row, the reduce butterfly span, the coord codegen) is
-the :class:`~deplodock.compiler.ir.kernel.ir.FragLayout` descriptor (``frag_layout(atom_m, atom_n)``)
-the emitted nodes carry — so a second atom plugs in by adding a descriptor, not by editing the
-nodes. Only m16n8 is modeled today; the realizer's per-row scalar distribution (the ``0`` / ``1``
-suffixes) is still its 2-rows/lane form (generalizing it to ``rows_per_lane > 2`` is the part that
-needs a real second atom to design + test against).
+The split (``ir/stmt/carrier_algebra.split_carrier``) separates the ``d``-invariant stats monoid
+from the ``d``-varying accumulation monoid; :class:`FragmentDist` is then a
+:class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` **backend** that ``Monoid.project``
+drives over the stats ``merge`` — each ``Assign`` dispatches by its role under the distribution
+(fold → ``FragmentRowReduce``, pointwise → ``FragmentApply``, scalar / carried-state → row
+``Assign`` / ``Reassign``). No softmax knowledge in the driver; this module supplies only the
+*geometry* (which fragment registers, the Mma coupling) — the ``FragGeom`` register names + the
+**per-atom C-fragment layout** ``FragLayout`` (``frag_layout(atom_m, atom_n)``) the emitted nodes
+carry, so a second atom plugs in by adding a descriptor, not editing the nodes. Only m16n8 is
+modeled today; the per-row scalar distribution (the ``0`` / ``1`` suffixes) is still its 2-rows/lane
+form (generalizing it to ``rows_per_lane > 2`` needs a real second atom to design + test against).
 
-Pure functions; leading-underscore module name keeps the pass loader from treating it as a
-rule. Imports only ``ir.*`` + the shared carrier algebra — never ``enumeration``.
+Leading-underscore module name keeps the pass loader from treating it as a rule. Imports only
+``ir.*`` + the shared carrier algebra — never ``enumeration``.
 """
 
 from __future__ import annotations
@@ -46,7 +42,7 @@ from deplodock.compiler.ir.kernel.ir import (
     frag_layout,
 )
 from deplodock.compiler.ir.stmt import Assign, Init, Monoid, Stmt
-from deplodock.compiler.ir.stmt.carrier_algebra import classify_merge_program, split_carrier
+from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
 
 _SUBTRACT = ElementwiseImpl("subtract")
 _EXP = ElementwiseImpl("exp")
@@ -82,113 +78,129 @@ class FragmentSoftmax:
     epilogue: tuple[Stmt, ...]
 
 
+def _prob_name(accum_merge: tuple, value: str) -> str | None:
+    """The distributed SSA that feeds the P@V ``Mma`` — the fragment operand of the accum merge's
+    value-multiply (``pv = p·v``). It must land in the geometry's ``prob_frags`` (the registers the
+    consume ``Mma`` reads). Read structurally off the carrier, not from an ``exp`` role."""
+    for a in accum_merge:
+        if a.op.name == "multiply" and value in a.args and len(a.args) == 2:
+            return a.args[0] if a.args[1] == value else a.args[1]
+    return None
+
+
+class FragmentDist:
+    """The m16n8 C-fragment :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution`
+    backend — realizes a carrier's projected merge over the tensor-core register tile. The geometry
+    (``FragGeom`` + ``FragLayout``) and the Mma coupling (which fragment feeds P@V) live here; the
+    carrier algebra (``Monoid.project``) drives it generically.
+
+    Distribution roles → fragment ops: ``fold`` → ``FragmentRowReduce`` (cross-column reduce) + the
+    per-row scalar update; ``pointwise`` → one ``FragmentApply`` per N-atom (its result lands in the
+    geometry's ``prob_frags`` when it's the P@V probability, else a fresh fragment); ``scalar`` /
+    ``state`` → row-distributed ``Assign`` / ``Reassign``."""
+
+    def __init__(self, geom: FragGeom):
+        self.geom = geom
+        self.layout = frag_layout(geom.atom_m, geom.atom_n)  # per-atom C-fragment geometry (raises if unmodeled)
+        self.out: list[Stmt] = []  # the emitted merge stmts
+        self.frag_binding: dict[str, tuple[str, ...]] = {}  # distributed SSA -> per-N-atom fragment arrays
+        self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
+        self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
+        self.prob_name: str | None = None  # the distributed SSA bound to geom.prob_frags (feeds P@V)
+
+    # --- Distribution protocol (driven by Monoid.project) ---
+
+    def fold(self, name, op, src, scalar, *, is_state) -> None:
+        r0, r1 = f"{name}_r0", f"{name}_r1"
+        self.out.append(FragmentRowReduce(top=r0, bot=r1, frags=self.frag_binding[src], op=op, group=self.layout.reduce_group))
+        self.fold_op_of[name] = op
+        if is_state:  # state-update fold: l = lm + rowsum(p)
+            n0, n1 = f"{name}_n0", f"{name}_n1"
+            self.out += [Assign(n0, op, (f"{scalar}0", r0)), Assign(n1, op, (f"{scalar}1", r1))]
+            self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
+            self.state_fold_op[name] = op
+        else:  # temp fold: mx = max(m, rowmax(s))
+            self.out += [Assign(f"{name}0", op, (f"{scalar}0", r0)), Assign(f"{name}1", op, (f"{scalar}1", r1))]
+
+    def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — taint via frag_binding
+        # The P@V probability lands in the geometry's prob fragments; any other distributed result
+        # gets a fresh per-N-atom fragment. One FragmentApply per N-atom: a fragment arg uses that
+        # atom's fragment, a per-row scalar arg is the (row0, row1) pair.
+        frags = self.geom.prob_frags if name == self.prob_name else tuple(f"{name}_{j}" for j in range(len(self.geom.score_frags)))
+        for j, out_fr in enumerate(frags):
+            a_args, kinds = [], []
+            for x in args:
+                bound = self.frag_binding.get(x)
+                a_args.append(bound[j] if bound is not None else (f"{x}0", f"{x}1"))
+                kinds.append(FRAG if bound is not None else ROW)
+            self.out.append(FragmentApply(out=out_fr, op=op, args=tuple(a_args), kinds=tuple(kinds), layout=self.layout))
+        self.frag_binding[name] = frags
+
+    def scalar(self, name, op, args) -> None:  # a replicated scalar temp, per row
+        for sfx in ("0", "1"):
+            self.out.append(Assign(f"{name}{sfx}", op, tuple(f"{x}{sfx}" for x in args)))
+
+    def state(self, name, op, args) -> None:  # a carried-state reassign (copy / scalar)
+        if op.name == "copy" and len(args) == 1:
+            src = args[0]
+            self.out += [Reassign(f"{name}0", f"{src}0"), Reassign(f"{name}1", f"{src}1")]
+            if src in self.fold_op_of:
+                self.state_fold_op[name] = self.fold_op_of[src]
+        else:
+            n0, n1 = f"{name}_n0", f"{name}_n1"
+            self.out += [Assign(n0, op, tuple(f"{x}0" for x in args)), Assign(n1, op, tuple(f"{x}1" for x in args))]
+            self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
+
+    # --- the full flash realization built around the projection ---
+
+    def realize(self, carrier: Monoid) -> FragmentSoftmax:
+        """Realize the m16n8 fragment flash from a streaming ``Monoid``: split the twisted carrier
+        (``split_carrier``), **project** the stats merge onto this backend (``stats.project`` →
+        ``Monoid.project``), then add the accum ``O·α`` rescale, the per-state ``Init`` seeds, and
+        the ``O /= l`` epilogue. The merge body is pure carrier projection (no softmax knowledge);
+        only the Mma coupling (the prob/accum fragment bindings) lives here."""
+        stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
+        score = stats.partial[0]
+        self.prob_name = _prob_name(accum.merge, carrier.partial[1])
+        self.frag_binding = {score: self.geom.score_frags}
+        stats.project(stats.merge, distributed_inputs={score}, dist=self)
+
+        # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
+        # O = O·α + p·v are the SEMIRING P@V Mma (the consume cell), accumulated into the O fragments.
+        rescale_out: list[Stmt] = []
+        for a in accum.merge:
+            if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
+                scalar = a.args[0] if a.args[1] == d_state else a.args[1]
+                alpha = (f"{scalar}0", f"{scalar}1")
+                rescale_out += [
+                    FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
+                    for fr in self.geom.accum_frags
+                ]
+
+        init_out: list[Stmt] = []
+        for st in stats.state:
+            op = self.state_fold_op[st]
+            init_out += [Init(name=f"{st}0", op=op, dtype=F32), Init(name=f"{st}1", op=op, dtype=F32)]
+
+        # The denominator is the add-fold stats state (flash's l); normalize each O by it per row.
+        denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
+        denom_pair = (f"{denom}0", f"{denom}1")
+        epilogue_out: list[Stmt] = [
+            FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
+            for fr in self.geom.accum_frags
+        ]
+        return FragmentSoftmax(
+            init=tuple(init_out), merge=tuple(self.out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
+        )
+
+
 def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoftmax:
-    """Generate the m16n8 fragment realization of a streaming flash ``Monoid``.
-
-    Splits the twisted carrier into stats ``(m, l)`` + accum ``(O)`` (``split_carrier``), then
-    consumes the carrier-algebra classification of the stats ``merge`` (``classify_merge_program``
-    → role-tagged :class:`MergeStep`s) as a **thin geometry emitter**: each role maps to the
-    m16n8 fragment ops (fold → ``FragmentRowReduce`` + the row-scalar update; exp → a ``subtract``
-    then ``exp`` ``FragmentApply`` over the prob fragments; a generic ``frag_apply`` → one
-    ``FragmentApply`` per N-atom; state/scalar → row-distributed ``Assign`` / ``Reassign``). The
-    accum ``merge``'s ``O·α`` rescale is an in-place ``FragmentApply`` multiply; ``O = O·α + p·v``
-    is left to the SEMIRING P@V ``Mma`` (the consume cell), not emitted here. Every pointwise
-    fragment op is the ONE ``FragmentApply`` node (it subsumed the former ``FragmentExp`` /
-    ``FragmentScale``), so any carrier's vocabulary — not just softmax's — reaches the tier."""
-    layout = frag_layout(geom.atom_m, geom.atom_n)  # the per-atom C-fragment geometry (raises if unmodeled)
-    stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
-    score = stats.partial[0]
-    steps, _frag = classify_merge_program(stats.merge, score, stats.state)
-
-    frag_binding: dict[str, tuple[str, ...]] = {score: geom.score_frags}  # fragment SSA -> frag-array
-    state_fold_op: dict[str, object] = {}  # state -> its reduce op (drives Init identity + the denominator)
-    fold_op_of: dict[str, object] = {}  # temp -> reduce op (for copy chains, e.g. m = copy(mx))
-    prob_emitted = False
-
-    merge_out: list[Stmt] = []
-    for st in steps:
-        if st.role == "fold":
-            r0, r1 = f"{st.name}_r0", f"{st.name}_r1"
-            merge_out.append(FragmentRowReduce(top=r0, bot=r1, frags=frag_binding[st.frag_src], op=st.op, group=layout.reduce_group))
-            fold_op_of[st.name] = st.op
-            if st.is_state:  # state-update fold: l = lm + rowsum(p)
-                n0, n1 = f"{st.name}_n0", f"{st.name}_n1"
-                merge_out += [Assign(n0, st.op, (f"{st.scalar}0", r0)), Assign(n1, st.op, (f"{st.scalar}1", r1))]
-                merge_out += [Reassign(f"{st.name}0", n0), Reassign(f"{st.name}1", n1)]
-                state_fold_op[st.name] = st.op
-            else:  # temp fold: mx = max(m, rowmax(s))
-                merge_out += [Assign(f"{st.name}0", st.op, (f"{st.scalar}0", r0)), Assign(f"{st.name}1", st.op, (f"{st.scalar}1", r1))]
-        elif st.role == "exp":
-            if prob_emitted:
-                raise NotImplementedError("v1 fragment softmax supports a single probability fragment map")
-            # ``p = exp(s − m)`` = a per-row ``subtract`` then an ``exp`` (the former fused
-            # ``FragmentExp``, now two generic ``FragmentApply``s). The exp lands in the geometry's
-            # probability fragments (consumed by the P@V ``Mma`` / the C→A handoff).
-            sub = (f"{st.scalar}0", f"{st.scalar}1")  # the per-row new-max, explicit pair
-            for j, (sf, pf) in enumerate(zip(frag_binding[st.frag_src], geom.prob_frags, strict=True)):
-                ds = f"{st.name}_ds_{j}"
-                merge_out.append(FragmentApply(out=ds, op=_SUBTRACT, args=(sf, sub), kinds=(FRAG, ROW), layout=layout))
-                merge_out.append(FragmentApply(out=pf, op=_EXP, args=(ds,), kinds=(FRAG,), layout=layout))
-            frag_binding[st.name] = geom.prob_frags
-            prob_emitted = True
-        elif st.role == "state_copy":  # scalar state reassign (m = copy(mx))
-            src = st.args[0]
-            merge_out += [Reassign(f"{st.name}0", f"{src}0"), Reassign(f"{st.name}1", f"{src}1")]
-            if src in fold_op_of:
-                state_fold_op[st.name] = fold_op_of[src]
-        elif st.role == "state_scalar":
-            n0, n1 = f"{st.name}_n0", f"{st.name}_n1"
-            merge_out += [Assign(n0, st.op, tuple(f"{x}0" for x in st.args)), Assign(n1, st.op, tuple(f"{x}1" for x in st.args))]
-            merge_out += [Reassign(f"{st.name}0", n0), Reassign(f"{st.name}1", n1)]
-        elif st.role == "frag_apply":  # a generic fragment-producing op (any non-exp activation, mul/div, …)
-            # One FragmentApply per N-atom; a fragment arg uses that atom's fragment, a per-row
-            # scalar arg is broadcast by row (the FragmentApply render adds the 0/1 suffix). The
-            # result is a fresh per-N-atom fragment array, registered for downstream steps.
-            new_frags = tuple(f"{st.name}_{j}" for j in range(len(geom.score_frags)))
-            for j, out_fr in enumerate(new_frags):
-                args, kinds = [], []
-                for a in st.args:
-                    bound = frag_binding.get(a)
-                    args.append(bound[j] if bound is not None else (f"{a}0", f"{a}1"))
-                    kinds.append(FRAG if bound is not None else ROW)
-                merge_out.append(FragmentApply(out=out_fr, op=st.op, args=tuple(args), kinds=tuple(kinds), layout=layout))
-            frag_binding[st.name] = new_frags
-        else:  # pure scalar temp, row-distributed
-            for sfx in ("0", "1"):
-                merge_out.append(Assign(f"{st.name}{sfx}", st.op, tuple(f"{x}{sfx}" for x in st.args)))
-
-    # accum.merge: only the `O·α` rescale is realized here; `p·v` + `O = O·α + p·v` are the
-    # SEMIRING P@V Mma (the consume cell), accumulated in place into the O fragments.
-    rescale_out: list[Stmt] = []
-    for a in accum.merge:
-        if a.name == d_state:
-            continue  # O = om + pv — the Mma accumulate
-        if a.op.name == "multiply" and d_state in a.args:
-            scalar = a.args[0] if a.args[1] == d_state else a.args[1]
-            # O *= α — in-place per-row multiply (the former FragmentScale).
-            alpha = (f"{scalar}0", f"{scalar}1")
-            rescale_out += [
-                FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=layout)
-                for fr in geom.accum_frags
-            ]
-        # else: pv = p·v (reads the value partial) — part of the consume Mma, not emitted.
-
-    init_out: list[Stmt] = []
-    for st in stats.state:
-        op = state_fold_op[st]
-        init_out += [Init(name=f"{st}0", op=op, dtype=F32), Init(name=f"{st}1", op=op, dtype=F32)]
-
-    # The denominator is the add-fold stats state (flash's l); the max-fold state (m) isn't
-    # read in the epilogue. Normalize each O accumulator by the per-row denom (in-place divide).
-    denom = next(st for st in stats.state if state_fold_op[st].name == "add")
-    denom_pair = (f"{denom}0", f"{denom}1")
-    epilogue_out: list[Stmt] = [
-        FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True, layout=layout) for fr in geom.accum_frags
-    ]
-
-    return FragmentSoftmax(
-        init=tuple(init_out), merge=tuple(merge_out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
-    )
+    """Realize the m16n8 fragment flash from a streaming ``Monoid`` — the thin entry the assembler
+    calls: build the :class:`FragmentDist` backend and project the carrier onto it. The merge body
+    is generated by ``Monoid.project`` (carrier-generic, no softmax knowledge); ``FragmentDist``
+    supplies the geometry. (The former hand-rolled classify+realize; the carrier vocabulary + the
+    geometry are now the distribution backend, driven by the one projection method.)"""
+    return FragmentDist(geom).realize(carrier)
 
 
 def realize_score_mask(geom: FragGeom, *, q_row_base: Expr, kv_col_bases: tuple[Expr, ...]) -> list[Stmt]:

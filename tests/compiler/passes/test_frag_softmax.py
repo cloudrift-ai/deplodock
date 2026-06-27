@@ -139,15 +139,35 @@ def test_fragment_apply_renders_frag_row_and_uniform_args():
     assert "O[0] = O[0] * 0.25f;" in src2 and "O[3] = O[3] * 0.25f;" in src2
 
 
-def test_classify_emits_frag_apply_for_a_generic_op():
-    """The op cap is gone: a fragment-producing op the softmax vocabulary never had (here ``tanh``)
-    classifies as a generic ``frag_apply`` step instead of raising NotImplementedError."""
-    from deplodock.compiler.ir.stmt import Assign
-    from deplodock.compiler.ir.stmt.carrier_algebra import classify_merge_program
+def test_monoid_project_dispatches_by_distribution_role():
+    """``Monoid.project`` — the generic projection driver — dispatches each merge op by its role
+    under the distribution (fold = reduce over the distributed axis, pointwise = elementwise,
+    scalar, carried-state), with no op cap and no shape knowledge. A recording backend captures
+    the calls; ``tanh`` (never in the softmax vocabulary) flows through as a plain pointwise."""
+    from deplodock.compiler.ir.stmt import Assign, Monoid
 
-    steps, frag = classify_merge_program((Assign("p", "tanh", ("s",)),), "s", state_names=())
-    assert "p" in frag
-    assert [(st.role, st.op.name) for st in steps] == [("frag_apply", "tanh")]
+    class _Rec:
+        def __init__(self):
+            self.calls = []
+
+        def fold(self, name, op, src, scalar, *, is_state):
+            self.calls.append(("fold", name, op.name, is_state))
+
+        def pointwise(self, name, op, args, distributed):
+            self.calls.append(("pointwise", name, op.name))
+
+        def scalar(self, name, op, args):
+            self.calls.append(("scalar", name, op.name))
+
+        def state(self, name, op, args):
+            self.calls.append(("state", name, op.name))
+
+    # state (l,), partial (s,); merge: sq = tanh(s) [a generic distributed pointwise], then
+    # l = add(l, sq) [a reduce over the distributed axis that updates the carried state].
+    carrier = Monoid(state=("l",), partial=("s",), merge=(Assign("sq", "tanh", ("s",)), Assign("l", "add", ("l", "sq"))))
+    rec = _Rec()
+    carrier.project(carrier.merge, distributed_inputs={"s"}, dist=rec)
+    assert rec.calls == [("pointwise", "sq", "tanh"), ("fold", "l", "add", True)]
 
 
 def _carrier_with_generic_op():

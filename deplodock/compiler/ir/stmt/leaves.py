@@ -792,6 +792,19 @@ class Monoid(ReduceCarrier):
         split-KV / split-K reductions fold through."""
         return self.combine_states
 
+    def project(self, program, *, distributed_inputs, dist) -> None:
+        """Project this carrier's ``program`` (a ``merge`` / ``combine_states`` body) onto a
+        ``Distribution`` backend — the **magic method** that takes the carrier algebra to a target
+        distribution by the distribution law. Taints the distributed values (seeded by
+        ``distributed_inputs``), then dispatches each ``Assign`` to the backend's fold (a reduce
+        over the distributed axis → its cross-partition combine) / pointwise (elementwise → its
+        per-element map) / scalar / carried-state reassign — carrier-generic, no shape knowledge.
+        The fragment realizer is one such backend (``assembly/_frag_softmax.FragmentDist``);
+        ``dist`` is the stateful backend, mutated in place. See ``ir/stmt/carrier_algebra``."""
+        from deplodock.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
+
+        interpret(program, distributed_inputs=distributed_inputs, state_names=self.state, dist=dist)
+
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.
     @property
