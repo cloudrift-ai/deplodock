@@ -155,44 +155,58 @@ class Combiner(ABC):
     # --- the one carrier-generic combine driver ---
 
     def combine(self, carrier: Monoid) -> CombinePhases:
-        """Generate the per-iteration phases for a streaming ``Monoid``: split the twisted carrier
-        (``split_carrier``), **project** the stats merge onto this backend (``stats.project`` →
-        ``Monoid.project``), then add the accum rescale (``O·α``), the per-state seeds + the accum
-        declarations, and the normalize epilogue (``O / l``). The merge body is pure carrier
-        projection (no softmax knowledge); only the tier-specific emission lives in the backend
-        hooks. ``combine(carrier, backend)`` is spelled ``backend.combine(carrier)``."""
+        """Generate the per-iteration phases for a streaming ``Monoid`` — carrier-shape-generic:
+
+        - **twisted** ``MONOID(SEMIRING)`` (a value partial — flash's ``(s, v)`` over ``(m, l, O)``):
+          ``split_carrier`` into the softmax stats + the accumulator, **project** the stats merge onto
+          this backend, then add the accum rescale (``O·α``), the accumulator declaration, and the
+          normalize epilogue (``O / l``);
+        - **non-twisted** (no value partial — online softmax ``(s)`` over ``(m, d)``, or a pure reduce
+          ``(x)`` over ``(acc)``): project the whole merge as stats + seed the states. There is no
+          accumulator, so rescale / consume / declare / normalize are empty — the carrier just folds.
+
+        The merge body is pure carrier projection (no softmax knowledge); only the tier-specific
+        emission lives in the backend hooks. ``combine(carrier, backend)`` is spelled
+        ``backend.combine(carrier)``."""
         from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier  # noqa: PLC0415
 
         self._reset()
-        stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
+        twisted = len(carrier.partial) > 1  # a value partial → an embedded contraction to accumulate
+        if twisted:
+            stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
+            self.d_state = d_state
+            self.accum_op = next((a.op for a in accum.merge if a.name == d_state), None)
+            self.weight_name = _weight_name(accum.merge, carrier.partial[1])
+        else:
+            stats, accum, d_state = carrier, None, None
         score = stats.partial[0]
-        self.d_state = d_state
-        self.accum_op = next((a.op for a in accum.merge if a.name == d_state), None)
-        self.weight_name = _weight_name(accum.merge, carrier.partial[1])
         self.bind_score(score)
         stats.project(stats.merge, distributed_inputs={score}, dist=self)
 
         # accum.merge splits into the O·α rescale multiplies and the consume remainder (p·v + the O
         # add). MmaTwist realizes the rescale (in-place per-row multiply) and leaves the consume to
-        # the assembler's Mma cells; a scalar backend realizes both.
+        # the assembler's Mma cells; a scalar backend realizes both. Empty for a non-twisted carrier.
         rescale_out: list[Stmt] = []
         consume_in: list[Assign] = []
-        for a in accum.merge:
+        for a in accum.merge if accum is not None else ():
             if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
                 rescale_out += self.rescale_accum(a)
             else:
                 consume_in.append(a)
         consume_out = self.consume_accum(tuple(consume_in))
 
-        # init: the carried-state identity seeds, then the accumulator declarations.
+        # init: the carried-state identity seeds, then the accumulator declarations (none if untwisted).
         init_out: list[Stmt] = []
         for st in stats.state:
             init_out += self.seed_state(st, self.state_fold_op[st])
         init_out += self.declare_accum()
 
-        # The denominator is the add-fold stats state (flash's l); normalize each accum by it per row.
-        denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
-        epilogue_out = self.normalize_accum(denom)
+        # The normalize epilogue (``O / l``) exists only for a twisted carrier; its denominator is the
+        # accumulator's add-fold stats state (flash's l).
+        epilogue_out: list[Stmt] = []
+        if twisted:
+            denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
+            epilogue_out = self.normalize_accum(denom)
         return CombinePhases(
             init=tuple(init_out),
             merge=tuple(self.out),
@@ -374,6 +388,8 @@ class ScalarCombiner(Combiner):
         return [Init(name=name, op=op, dtype=F32)]
 
     def declare_accum(self) -> list[Stmt]:
+        if self.d_state is None:  # non-twisted carrier (online softmax / pure reduce) — no accumulator
+            return []
         return [Init(name=self.d_state, op=self.accum_op, dtype=F32)]
 
     def rescale_accum(self, a: Assign) -> list[Stmt]:

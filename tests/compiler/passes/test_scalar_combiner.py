@@ -12,13 +12,41 @@ from __future__ import annotations
 
 from collections import Counter
 
-from deplodock.compiler.ir.stmt import Assign, Init
+from deplodock.compiler.ir.expr import Literal
+from deplodock.compiler.ir.stmt import Assign, Init, Monoid
 from deplodock.compiler.ir.twist import ScalarCombiner
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
 def _carrier():
     return flash_combine("m_i", "l_i", "O_i", "s", "v")
+
+
+def _softmax_carrier() -> Monoid:
+    # Pure online softmax: state (m, d), partial (s) — NO value, NO O accumulator (non-twisted).
+    t = lambda s: f"m__{s}"  # noqa: E731
+    return Monoid(
+        state=("m", "d"),
+        partial=("s",),
+        merge=(
+            Assign(t("mx"), "maximum", ("m", "s")),
+            Assign(t("dm"), "subtract", ("m", t("mx"))),
+            Assign(t("al"), "exp", (t("dm"),)),
+            Assign(t("ds"), "subtract", ("s", t("mx"))),
+            Assign(t("p"), "exp", (t("ds"),)),
+            Assign(t("dl"), "multiply", ("d", t("al"))),
+            Assign("d", "add", (t("dl"), t("p"))),
+            Assign("m", "copy", (t("mx"),)),
+        ),
+        identity=(Literal(-1e30), Literal(0.0)),
+        commutative=True,
+        axes=("kv",),
+    )
+
+
+def _sum_carrier() -> Monoid:
+    # A pure reduction: state (acc,), partial (x,) — the simplest non-twisted carrier.
+    return Monoid(state=("acc",), partial=("x",), merge=(Assign("acc", "add", ("acc", "x")),), identity=(Literal(0.0),))
 
 
 def _sig(a: Assign) -> tuple:
@@ -75,3 +103,27 @@ def test_statement_order_is_dependency_valid() -> None:
         for arg in s.args if isinstance(s, Assign) else ():
             assert arg in defined, f"{arg} used before definition in {_sig(s) if isinstance(s, Assign) else s}"
         defined.add(s.name)
+
+
+# --- non-twisted carriers (online softmax / pure reduce): combine() degenerates ---
+
+
+def test_online_softmax_carrier_folds_without_accumulator() -> None:
+    # A non-twisted carrier (state (m, d), partial (s), no value) runs through the SAME combine():
+    # the whole merge projects as stats, the states seed, and there is NO accumulator — so rescale /
+    # consume / epilogue are empty. The (m, d) softmax stats are exactly flash's embedded stats half.
+    carrier = _softmax_carrier()
+    fs = ScalarCombiner().combine(carrier)
+    assert fs.rescale == () and fs.consume == () and fs.epilogue == ()
+    # init seeds both states with their fold identity: m (max → −inf), d (add → 0).
+    assert {s.name: s.op.name for s in fs.init} == {"m": "maximum", "d": "add"}
+    # merge reproduces the carrier's fold algebra exactly (identity projection at the scalar tier).
+    assert Counter(_sig(a) for a in fs.merge) == Counter(_sig(a) for a in carrier.merge)
+
+
+def test_pure_reduction_carrier_is_a_single_fold() -> None:
+    # The simplest non-twisted carrier: acc += x. One seed (add → 0), one fold, nothing else.
+    fs = ScalarCombiner().combine(_sum_carrier())
+    assert fs.rescale == () and fs.consume == () and fs.epilogue == ()
+    assert [_sig(a) for a in fs.merge] == [("acc", "add", ("acc", "x"))]
+    assert [(s.name, s.op.name) for s in fs.init] == [("acc", "add")]
