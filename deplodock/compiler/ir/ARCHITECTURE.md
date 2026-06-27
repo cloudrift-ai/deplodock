@@ -147,14 +147,21 @@ with a per-instance `commutative` field).
 derived `AlgebraKind`: a kernel's algebra is read directly off its carriers and
 partial structure where a pass needs it. The fold ⊕ is the carrier (`Accum`
 scalar fold, or `Monoid` + `Twist`); the lift is the partial — a unary value
-(`MONOID`: sum / max / online softmax) or a ⊗-product over several contraction
-operands (`SEMIRING`: matmul). A non-reduce scope is the pointwise `MAP`. The one
-structural question the schedule still asks lives here: `matmul_reduce(loop)` —
-"is this reduce a contraction (≥ 2 K-indexed operands folded by a carrier)?"
-`lowering/tile/010_recognize` uses it to keep a matmul's `Accum` an `Accum`
-(rather than degenerate-monoidizing it like a plain reduce); `020_schedule`
-gates flash structurally (a reduce loop nested inside a reduce loop); the mma
-atom tier reads `matmul_reduce` to pick the tensor-core cell.
+(a reduction: sum / max / online softmax) or a ⊗-product over several contraction
+operands (a contraction: matmul). A non-reduce scope is pointwise.
+
+The one structural shape the schedule must recognize lives here: `Semiring` (the
+`reduce(⊕) ∘ map(⊗)` view) and `Semiring.match(loop)`, computed on demand. A
+reduce is a contraction not by "two loads" but by the genuine algebra — the lift
+⊗ **distributes over** the fold ⊕ (`multiply` over `add`; *not* `add` over `add`,
+a sum of two operands) and contracts ≥ 2 distinct operands (`x·x` is a squared
+reduce, not a contraction). The view exposes `fold` / `lift` / `operands` /
+`reduce_axis` (and `is_additive` — the `(×, +)` semiring the mma atom implements).
+`lowering/tile/010_recognize` uses `Semiring.match(...) is None` to keep a
+matmul's `Accum` an `Accum` (rather than degenerate-monoidizing it like a plain
+reduce); `020_schedule` gates flash structurally (a reduce loop nested inside a
+reduce loop); the mma atom tier reads the operands + `is_additive` to pick the
+tensor-core cell.
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (the carried SSA

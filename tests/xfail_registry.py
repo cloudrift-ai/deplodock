@@ -56,7 +56,6 @@ XFAIL: dict[str, str] = {
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
-    "test_warp_specialize_deadlock.py": _R,
     # --- individual cases: the file still has passing tests ---
     # matmul enabled at the scalar tier — these files partially recovered; residuals still need
     # the mma / staging / split-K / dynamic / attention tiers (scalar fallback gives correct
