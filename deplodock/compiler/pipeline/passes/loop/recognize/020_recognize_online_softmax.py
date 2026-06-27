@@ -9,8 +9,7 @@ ones that re-read ``x`` to recompute the same `exp` — into a single streaming 
 
 The carried states keep the original Accum names (``m`` = the rowmax acc, ``d`` = the sum acc), so the
 downstream ``reciprocal(d)`` + normalize loop are untouched — 3 passes over ``x`` become 2. The
-resulting flat ``Monoid`` flows through the MONOID regime like any reduce; its serial realization is
-the carrier-generic :class:`~deplodock.compiler.ir.twist.ScalarCombiner`.
+resulting flat ``Monoid`` flows through the MONOID regime like any reduce.
 
 A pattern-recognition pass (sibling of ``010_recognize_flash``): runs after the ``loop/fusion``
 fixpoint, gated by the ``ONLINE_SOFTMAX`` knob (off → untouched). The matcher anchors on an adjacent
