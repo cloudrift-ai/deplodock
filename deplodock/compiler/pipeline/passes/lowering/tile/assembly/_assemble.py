@@ -27,8 +27,9 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
+from deplodock.compiler.ir.kernel.ir import FRAG, UNIFORM, FragmentApply, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
@@ -318,7 +319,12 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     # structural facts (a graph op / a shape extent), never an attention flag; the scale is keyed on
     # the shape fact ``D``.
     produce: list = [_relabel_tile(t, c=f"Sf{nt}", sfx=f"q{nt}", guards=_qk_guards(nt)) for nt, t in enumerate(produce_tiles)]
-    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(nt_count)]
+    produce += [
+        FragmentApply(
+            out=f"Sf{nt}_frag", op=ElementwiseImpl("multiply"), args=(f"Sf{nt}_frag", scale), kinds=(FRAG, UNIFORM), in_place=True
+        )
+        for nt in range(nt_count)
+    ]
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
     if causal:
         produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)

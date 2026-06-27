@@ -16,7 +16,8 @@ how state and partials are distributed):
 - **cross-thread** (lanes / smem) — ``lowering/kernel/_combine.emit_combine`` → ``WarpShuffle`` /
   ``TreeHalve`` (the cooperative reduce of a partial split across the CTA's threads).
 - **fragment** (m16n8 tensor-core registers) — ``assembly/_frag_softmax.realize_fragment_softmax``
-  → ``FragmentRowReduce`` / ``FragmentExp`` / ``FragmentScale`` (the warp-chain flash softmax).
+  → ``FragmentRowReduce`` (the cross-column fold) + the carrier-generic ``FragmentApply`` (every
+  pointwise step — ``exp`` / scale / any op, the warp-chain flash softmax and beyond).
 
 The cross-thread and fragment realizers are deliberate siblings — same algebra source, mirrored
 structure — not two hand-authored transcriptions.
@@ -77,7 +78,12 @@ class MergeStep:
     - ``"state_copy"`` — a carried-state reassign from a single source (``m = copy(mx)``);
       ``args = (src,)``.
     - ``"state_scalar"`` / ``"scalar"`` — a scalar state reassign / a pure scalar temp;
-      ``op`` + ``args`` are the source program's."""
+      ``op`` + ``args`` are the source program's.
+    - ``"frag_apply"`` — a generic fragment-producing pointwise op (NOT a recognized fold or the
+      fused ``exp(s − m)``): any elementwise op over fragment / per-row-scalar operands (Welford's
+      ``divide`` / ``multiply``, a different activation, …). ``op`` + ``args`` are the source
+      program's; the realizer reads ``frag`` to tag each arg fragment-vs-scalar. This is the
+      carrier-vocabulary generality — any op the scalar path renders reaches the fragment tier."""
 
     role: str
     name: str
@@ -96,23 +102,44 @@ def classify_merge_program(merge: tuple[Assign, ...], score_partial: str, state_
     no IR-dialect / geometry dependency — the realizer supplies the fragment / lane distribution."""
     frag = fragment_taint(merge, score_partial)
     states = set(state_names)
-    sub_fuse: dict[str, tuple[str, str]] = {}  # subtract name -> (src fragment, sub scalar)
+    by_name = {a.name: a for a in merge}
+    uses: dict[str, int] = {}
+    for a in merge:
+        for x in a.args:
+            uses[x] = uses.get(x, 0) + 1
+    # The ``exp(s − m)`` recognition: a fragment ``subtract(src, row_scalar)`` whose SOLE consumer
+    # is an ``exp`` is tagged one ``exp`` step (the realizer knows its result is THE probability map
+    # → the geometry's prob fragments). Every other fragment-producing op is the generic
+    # ``frag_apply`` (no op cap — any elementwise op the scalar path renders).
+    fused_sub: set[str] = set()
+    for a in merge:
+        if a.op.name == "exp" and len(a.args) == 1 and a.args[0] in frag:
+            sub = by_name.get(a.args[0])
+            if (
+                sub is not None
+                and sub.op.name == "subtract"
+                and len(sub.args) == 2
+                and sub.args[0] in frag
+                and sub.args[1] not in frag
+                and uses.get(sub.name, 0) == 1
+            ):
+                fused_sub.add(sub.name)
     steps: list[MergeStep] = []
     for a in merge:
+        if a.name in fused_sub:
+            continue  # folded into its exp below
         frag_args = [x for x in a.args if x in frag]
         is_fold = a.op.name in _REDUCE_OPS and len(frag_args) == 1 and len(a.args) == 2
         if is_fold:
             fragnm = frag_args[0]
             scalarnm = a.args[0] if a.args[1] == fragnm else a.args[1]
             steps.append(MergeStep("fold", a.name, op=a.op, frag_src=fragnm, scalar=scalarnm, is_state=a.name in states))
-        elif frag_args:
-            if a.op.name == "subtract" and len(a.args) == 2 and a.args[0] in frag and a.args[1] not in frag:
-                sub_fuse[a.name] = (a.args[0], a.args[1])  # `src - scalar`, fused into the next exp
-            elif a.op.name == "exp" and len(a.args) == 1 and a.args[0] in sub_fuse:
-                src, sub = sub_fuse[a.args[0]]
+        elif a.name in frag:  # a fragment-producing op (reads a fragment, isn't a fold)
+            if a.op.name == "exp" and len(a.args) == 1 and a.args[0] in fused_sub:
+                src, sub = by_name[a.args[0]].args
                 steps.append(MergeStep("exp", a.name, frag_src=src, scalar=sub))
-            else:
-                raise NotImplementedError(f"v1 fragment softmax: unhandled fragment op {a.op.name!r} on {a.name!r}")
+            else:  # any other elementwise op — the carrier-generic fragment apply (no op cap)
+                steps.append(MergeStep("frag_apply", a.name, op=a.op, args=a.args))
         elif a.name in states:
             if a.op.name == "copy" and len(a.args) == 1:
                 steps.append(MergeStep("state_copy", a.name, args=(a.args[0],)))

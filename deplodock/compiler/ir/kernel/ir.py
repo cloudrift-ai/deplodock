@@ -578,61 +578,76 @@ class Reassign(Stmt):
         return [f"{_pad(ctx.indent)}{self.name} = {self.value};"]
 
 
-@dataclass(frozen=True)
-class FragmentExp(Stmt):
-    """Per-element ``exp(in − row_sub)`` over an ``mma.sync`` ``m16n8`` C-fragment — the
-    flash ``P = exp(S − m)``.
+#: The per-arg distribution kinds of a :class:`FragmentApply` operand.
+FRAG = "frag"  # a C-fragment operand — indexed per element (``arg[i]``)
+ROW = "row"  # a per-row scalar — broadcast by row (suffix ``0`` for rows g, ``1`` for rows g+8)
+UNIFORM = "uniform"  # a cell-uniform scalar / literal — the same value for all 4 elements
 
-    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g=lane/4``): elements ``[0,1]``
-    are row ``g`` (subtract ``top_sub``), ``[2,3]`` are row ``g+8`` (subtract ``bot_sub``)
-    — the per-row online-softmax max in fragment-distributed form. Writes the result to
-    ``out`` (declared as ``float out[4]``)."""
+
+@dataclass(frozen=True)
+class FragmentApply(Stmt):
+    """Generic per-element pointwise op over ``mma.sync`` ``m16n8`` C-fragments — the
+    **carrier-generic** fragment-tier sibling of the scalar ``Assign``, and the ONE fragment
+    pointwise node (it subsumes the former hard-coded ``FragmentExp`` / ``FragmentScale``).
+
+    Writes ``out`` (a ``float[4]`` C-fragment) ``= op(args…)`` per element ``i`` via the same
+    ``op_to_expr`` translation the scalar ``Assign`` uses — so ANY elementwise op reaches the
+    tensor-core tier, not just softmax's ``exp`` / scale. Each arg is one of three
+    :data:`FRAG` / :data:`ROW` / :data:`UNIFORM` ``kinds``:
+
+    - ``FRAG`` — a C-fragment, indexed ``arg[i]``;
+    - ``ROW`` — a per-row scalar, broadcast by row (suffix ``0`` for rows ``g`` = elements
+      ``[0,1]``, ``1`` for rows ``g+8`` = elements ``[2,3]`` — the m16n8 2-rows/lane layout);
+    - ``UNIFORM`` — a cell-uniform scalar / literal, the same value for all 4 elements.
+
+    Realizations: ``exp(s − m)`` = a ``subtract`` (FRAG, ROW) then an ``exp`` (FRAG); ``O *= α`` =
+    an in-place ``multiply`` (FRAG, ROW); ``O /= l`` = an in-place ``divide`` (FRAG, ROW); ``S *=
+    scale`` = an in-place ``multiply`` (FRAG, UNIFORM). ``in_place`` reassigns ``out`` (no ``float
+    out[4]`` decl — ``out`` must be the first FRAG arg).
+
+    Each ``args`` entry is a ``str`` for a FRAG / UNIFORM operand, or a ``(row0, row1)`` pair of
+    SSA names for a ROW operand (the two per-row scalars stored explicitly — so SSA rename keeps
+    them consistent with their definitions; a bare name + render-time suffix would diverge under
+    rename)."""
 
     out: str
-    src: str
-    top_sub: str  # the per-row max for rows g (an SSA scalar)
-    bot_sub: str  # the per-row max for rows g+8
+    op: ElementwiseImpl
+    args: tuple[object, ...]  # str (FRAG / UNIFORM) | (row0, row1) tuple (ROW)
+    kinds: tuple[str, ...]  # per-arg: FRAG | ROW | UNIFORM
+    in_place: bool = False
 
     def deps(self) -> tuple[str, ...]:
-        return (self.src, self.top_sub, self.bot_sub)
+        out: list[str] = []
+        for a, k in zip(self.args, self.kinds, strict=True):
+            out += list(a) if k == ROW else [a]
+        return tuple(out)
 
     def defines(self) -> tuple[str, ...]:
         return (self.out,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentExp({self.out} <- exp({self.src} - [{self.top_sub},{self.bot_sub}]))"]
+        def _show(a: object, k: str) -> str:
+            return f"{a}[]" if k == FRAG else (f"[{a[0]},{a[1]}]" if k == ROW else str(a))
+
+        shown = ", ".join(_show(a, k) for a, k in zip(self.args, self.kinds, strict=True))
+        return [f"{indent}FragmentApply({self.out} {'*=' if self.in_place else '<-'} {self.op.name}({shown}))"]
+
+    def _arg(self, name: object, kind: str, i: int) -> Var:
+        if kind == FRAG:
+            return Var(f"{name}[{i}]")
+        if kind == ROW:
+            return Var(name[0] if i < 2 else name[1])  # the per-row scalar (rows g / g+8)
+        return Var(str(name))  # UNIFORM — verbatim
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+
         pad = _pad(ctx.indent)
-        exp = ctx.target.intrinsic("exp", "f32")
-        subs = (self.top_sub, self.top_sub, self.bot_sub, self.bot_sub)
-        return [f"{pad}float {self.out}[4];"] + [f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)]
-
-
-@dataclass(frozen=True)
-class FragmentScale(Stmt):
-    """Per-row in-place scale of an ``mma.sync`` ``m16n8`` C-fragment — the flash
-    accumulator rescale ``O *= α`` and the epilogue ``O /= l`` (Phase 3). Elements
-    ``[0,1]`` (rows ``g``) scale by ``top``, ``[2,3]`` (rows ``g+8``) by ``bot`` (SSA
-    scalars or literals). A uniform scale (``top == bot``) is the score ``S *= scale``."""
-
-    frag: str
-    top: str
-    bot: str
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.frag, self.top, self.bot)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentScale({self.frag} *= [{self.top},{self.bot}])"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        scales = (self.top, self.top, self.bot, self.bot)
-        return [f"{pad}{self.frag}[{i}] *= {scales[i]};" for i in range(4)]
+        lines = [] if self.in_place else [f"{pad}float {self.out}[4];"]
+        for i in range(4):
+            argvars = [self._arg(a, k, i) for a, k in zip(self.args, self.kinds, strict=True)]
+            lines.append(f"{pad}{self.out}[{i}] = {op_to_expr(self.op.name, argvars).render(ctx)};")
+        return lines
 
 
 @dataclass(frozen=True)
@@ -1800,13 +1815,9 @@ def _(s: Reassign, rename, sigma, axis_fn):
 
 
 @_rewrite.register
-def _(s: FragmentExp, rename, sigma, axis_fn):
-    return FragmentExp(out=rename(s.out), src=rename(s.src), top_sub=rename(s.top_sub), bot_sub=rename(s.bot_sub))
-
-
-@_rewrite.register
-def _(s: FragmentScale, rename, sigma, axis_fn):
-    return FragmentScale(frag=rename(s.frag), top=rename(s.top), bot=rename(s.bot))
+def _(s: FragmentApply, rename, sigma, axis_fn):
+    args = tuple((rename(a[0]), rename(a[1])) if k == ROW else rename(a) for a, k in zip(s.args, s.kinds, strict=True))
+    return FragmentApply(out=rename(s.out), op=s.op, args=args, kinds=s.kinds, in_place=s.in_place)
 
 
 @_rewrite.register
