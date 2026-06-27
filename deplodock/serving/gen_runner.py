@@ -47,6 +47,28 @@ class _Program:
             out = self.program.outputs({"num_tokens": t})
         return [out[n] for n in self.output_names]
 
+    def run_device(self, arrays):
+        """Device-resident captured-replay twin of :meth:`run` for the **static M=bucket** decode
+        programs. ``arrays``: torch CUDA tensors aligned to ``input_names`` (each ``[T, …]``,
+        ``T <= bucket``). Uploads the ``T`` real rows into the buffer prefix (device-to-device),
+        captures-or-replays the whole-program graph, and returns the outputs as torch CUDA tensors
+        sliced to ``T`` — no host round-trip. Stale prefix padding rows are safe (pre/post are
+        per-token-independent; only ``[:T]`` is read out). All cupy work runs on torch's current
+        stream so the upload, replay and output read stay ordered."""
+        import cupy as cp
+        import torch
+
+        from deplodock.compiler.backend.gpu_lock import gpu_lock
+
+        t = arrays[0].shape[0]
+        with gpu_lock(), cp.cuda.Stream.from_external(torch.cuda.current_stream()):
+            feed = {n: cp.from_dlpack(a.detach().contiguous()) for n, a in zip(self.input_names, arrays, strict=True)}
+            self.program.upload_prefix_device(feed)
+            self.program.capture_program_graph()  # static graph → one cached entry (empty sym_values)
+            self.program.replay_program_graph()
+            outs = self.program.output_prefix_device()
+            return [torch.from_dlpack(outs[n])[:t].clone() for n in self.output_names]
+
 
 def _pad_rows(arr, bucket):
     """Pad axis 0 from ``t`` up to ``bucket`` with zeros. The decode programs are static at
@@ -67,7 +89,7 @@ def _compile_split(wrapper, example_args, argnames, np_dtype):
     arg's axis-0 to a shared symbolic ``num_tokens`` Dim — the **prefill** program (one program,
     any width). ``argnames=None`` traces a **fully static** graph at the example shapes — the
     **decode-bucket** program (efficient at small M; the symbolic program's hint-sized M-tile is
-    pathological at decode — see ``plans/generative-decode-perf-findings.md``)."""
+    pathological at decode)."""
     import torch
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend
@@ -112,6 +134,16 @@ class DeplodockGenRunner:
     @property
     def num_layers(self) -> int:
         return len(self._pre)
+
+    @property
+    def decode_bucket(self) -> int:
+        return self._decode_bucket
+
+    @property
+    def has_device_decode(self) -> bool:
+        """True when the static decode-bucket programs exist → the device-resident decode path
+        (``embed_device`` / ``forward_layer_*_device`` / ``final_norm_device``) is available."""
+        return self._pre_decode is not None
 
     @classmethod
     def create(cls, model_id, *, dtype_str="float16", decode_bucket=16):
@@ -229,3 +261,43 @@ class DeplodockGenRunner:
         with torch.no_grad():
             out = self._norm(torch.from_numpy(np.ascontiguousarray(hidden)))
         return out.numpy()
+
+    # --- Device-resident decode path (Phase A of plans/generative-device-resident-decode.md) ---
+    # Used by the vLLM plugin for the decode hot path (T <= decode_bucket); the numpy methods
+    # above stay for prefill / the standalone ``deplodock generate`` oracle.
+
+    def _ensure_device(self):
+        """Lazily build CUDA copies of the embed table + final norm (once) for the device path.
+        A **deep copy** of the norm — `.to()` is in-place, and the host `final_norm` (oracle /
+        prefill) still feeds it CPU tensors, so the shared module must stay on CPU."""
+        if getattr(self, "_dev_ready", False):
+            return
+        import copy
+
+        import torch
+
+        self._embed_weight_dev = torch.from_numpy(self._embed_weight).cuda()
+        self._norm_dev = copy.deepcopy(self._norm).to("cuda")
+        self._dev_ready = True
+
+    def embed_device(self, input_ids):
+        """``input_ids``: 1-D int torch CUDA tensor → ``[T, H]`` CUDA tensor (on-device gather)."""
+        self._ensure_device()
+        return self._embed_weight_dev[input_ids.long()]
+
+    def forward_layer_pre_device(self, layer, hidden):
+        """Device twin of :meth:`forward_layer_pre` (decode path, ``T <= decode_bucket``):
+        ``hidden[T,H]`` CUDA → un-rotated ``(q, k, v)`` CUDA tensors."""
+        return tuple(self._pre_decode[layer].run_device([hidden]))
+
+    def forward_layer_post_device(self, layer, attn_out, residual):
+        """Device twin of :meth:`forward_layer_post`: ``(attn_out, residual)`` CUDA → ``[T,H]`` CUDA."""
+        return self._post_decode[layer].run_device([attn_out, residual])[0]
+
+    def final_norm_device(self, hidden):
+        """Apply the final norm on CUDA to a ``hidden[T,H]`` CUDA tensor."""
+        import torch
+
+        self._ensure_device()
+        with torch.no_grad():
+            return self._norm_dev(hidden)
