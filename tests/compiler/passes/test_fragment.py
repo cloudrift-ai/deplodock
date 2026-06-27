@@ -1,5 +1,5 @@
-"""The fragment-tier combiner (``assembly/_frag_softmax.Fragment``) — CPU-only, the structural
-oracle for "generate the m16n8 phases + masks from the carrier algebra".
+"""The fragment-tier combiner (``ir/kernel/ir.Fragment``) — CPU-only, the structural oracle for
+"generate the m16n8 phases + masks from the carrier algebra".
 
 Asserts that ``Fragment.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
 right fragment ops + row-distributed scalars (the analog of the cooperative path's ``emit_combine``)
@@ -8,10 +8,9 @@ and ``Fragment.mask`` builds the coordinate-predicated masks, without any GPU co
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign
+from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, Fragment, FragmentApply, FragmentMask, FragmentRowReduce, Reassign
 from deplodock.compiler.ir.stmt import Assign, Init
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import Fragment
 
 
 def _frag(nd: int = 4) -> Fragment:

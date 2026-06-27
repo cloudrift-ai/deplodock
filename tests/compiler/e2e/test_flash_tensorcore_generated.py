@@ -8,7 +8,7 @@ default path (no ``CHAIN`` pin) is unchanged — the scalar streaming flash / ma
 path still deploys, so this only fires under the explicit opt-in.
 
 v1 scope: fp16 / bf16, causal or non-causal, equal-head, ``D % 16 == 0``, ``S % 16 == 0``.
-The softmax is generated from the carrier by the fragment realizer (``_frag_softmax``), so
+The softmax is generated from the carrier by the fragment realizer (``ir/kernel/ir.Fragment``), so
 dtype (f32 algebra) and causal (a score-partial mask) are orthogonal — this file covers
 their cross-product. Out of scope falls back cleanly.
 """

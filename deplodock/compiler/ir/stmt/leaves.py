@@ -799,7 +799,7 @@ class Monoid(ReduceCarrier):
         ``distributed_inputs``), then dispatches each ``Assign`` to the backend's fold (a reduce
         over the distributed axis → its cross-partition combine) / pointwise (elementwise → its
         per-element map) / scalar / carried-state reassign — carrier-generic, no shape knowledge.
-        The fragment realizer is one such backend (``assembly/_frag_softmax.FragmentDist``);
+        The fragment realizer is one such backend (``ir/kernel/ir.Fragment``);
         ``dist`` is the stateful backend, mutated in place. See ``ir/stmt/carrier_algebra``."""
         from deplodock.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
 

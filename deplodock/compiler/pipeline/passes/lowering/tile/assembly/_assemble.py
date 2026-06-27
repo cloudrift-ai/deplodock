@@ -34,6 +34,7 @@ from deplodock.compiler.ir.kernel.ir import (
     FRAG_COL,
     FRAG_ROW,
     UNIFORM,
+    Fragment,
     FragmentApply,
     LdmatrixLoad,
     RegFragment,
@@ -61,7 +62,6 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import Fragment
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
