@@ -1,9 +1,9 @@
-"""The fragment-tier flash-softmax realizer (``assembly/_frag_softmax.py``) — CPU-only,
-the structural oracle for "generate the m16n8 softmax phases from the carrier algebra".
+"""The fragment-tier combiner (``assembly/_frag_softmax.Fragment``) — CPU-only, the structural
+oracle for "generate the m16n8 phases + masks from the carrier algebra".
 
-Asserts that ``realize_fragment_softmax`` maps the ``flash_combine`` ``Monoid``'s ``merge``
-program onto the right fragment ops + row-distributed scalars (the analog of the cooperative
-path's ``emit_combine``), without any GPU compile.
+Asserts that ``Fragment.combine`` projects the ``flash_combine`` ``Monoid``'s ``merge`` onto the
+right fragment ops + row-distributed scalars (the analog of the cooperative path's ``emit_combine``)
+and ``Fragment.mask`` builds the coordinate-predicated masks, without any GPU compile.
 """
 
 from __future__ import annotations
@@ -11,15 +11,11 @@ from __future__ import annotations
 from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign
 from deplodock.compiler.ir.stmt import Assign, Init
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
-    FragmentGeom,
-    fragment_mask,
-    realize_fragment_softmax,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import Fragment
 
 
-def _geom(nd: int = 4) -> FragmentGeom:
-    return FragmentGeom(
+def _frag(nd: int = 4) -> Fragment:
+    return Fragment(
         atom_m=16,
         atom_n=8,
         partial_frags=("Sf0_frag", "Sf1_frag"),
@@ -34,7 +30,7 @@ def _carrier():
 
 def test_init_seeds_the_fold_identities():
     """Two stats states × 2 rows: m is a max-fold (-inf identity), l an add-fold (0)."""
-    fs = realize_fragment_softmax(_carrier(), geom=_geom())
+    fs = _frag().combine(_carrier())
     inits = [s for s in fs.init if isinstance(s, Init)]
     assert len(inits) == 4, [s.pretty()[0] for s in fs.init]
     by_op = {s.name: s.op.name for s in inits}
@@ -46,7 +42,7 @@ def test_merge_emits_two_rowreduces_then_the_exp_map():
     (add) — the fragment-distributed online-softmax, recovered from the scalar program. The exp
     map is now two generic ``FragmentApply``s per N-atom (subtract then exp), not the former fused
     ``FragmentExp``."""
-    fs = realize_fragment_softmax(_carrier(), geom=_geom())
+    fs = _frag().combine(_carrier())
     reduces = [s for s in fs.merge if isinstance(s, FragmentRowReduce)]
     applies = [s for s in fs.merge if isinstance(s, FragmentApply)]
 
@@ -70,7 +66,7 @@ def test_merge_emits_two_rowreduces_then_the_exp_map():
 def test_state_is_reassigned_in_merge_update_is_empty():
     """m and l are loop-carried: reassigned in-place at the end of merge (after every read of
     their old value), so the update phase is empty."""
-    fs = realize_fragment_softmax(_carrier(), geom=_geom())
+    fs = _frag().combine(_carrier())
     assert fs.update == ()
     reassigned = {s.name for s in fs.merge if isinstance(s, Reassign)}
     assert reassigned == {"m_i0", "m_i1", "l_i0", "l_i1"}
@@ -81,7 +77,7 @@ def test_rescale_scales_every_accumulator_by_alpha():
     (ROW) alpha is shared across accumulators (the rescale is the accum carrier's only realized
     step — p·v + O += … are the P@V Mma)."""
     for nd in (2, 4, 8):
-        fs = realize_fragment_softmax(_carrier(), geom=_geom(nd))
+        fs = _frag(nd).combine(_carrier())
         scales = [s for s in fs.rescale if isinstance(s, FragmentApply)]
         assert len(scales) == nd
         assert all(s.op.name == "multiply" and s.in_place and s.kinds == (FRAG, ROW) for s in scales)
@@ -93,7 +89,7 @@ def test_rescale_scales_every_accumulator_by_alpha():
 def test_epilogue_normalizes_every_accumulator_by_the_denominator():
     """O /= l per D-atom — the add-fold state (l) is the denominator; an in-place ``FragmentApply``
     divide by the per-row denom (the former FragmentScale-by-1/l)."""
-    fs = realize_fragment_softmax(_carrier(), geom=_geom(nd=4))
+    fs = _frag(nd=4).combine(_carrier())
     scales = [s for s in fs.epilogue if isinstance(s, FragmentApply)]
     assert len(scales) == 4
     assert all(s.op.name == "divide" and s.in_place and s.kinds == (FRAG, ROW) and s.args[1] == ("l_i0", "l_i1") for s in scales)
@@ -101,7 +97,7 @@ def test_epilogue_normalizes_every_accumulator_by_the_denominator():
 
 def test_scalar_updates_are_row_distributed():
     """Every per-row scalar stat is two scalars (rows g / g+8) — the 0/1 suffixing."""
-    fs = realize_fragment_softmax(_carrier(), geom=_geom())
+    fs = _frag().combine(_carrier())
     scalar_names = {s.name for s in fs.merge if isinstance(s, Assign)}
     # the subtract (m - m_new) and the exp (alpha) both appear suffixed 0 and 1
     assert any(n.endswith("0") for n in scalar_names) and any(n.endswith("1") for n in scalar_names)
@@ -115,7 +111,7 @@ def test_fragment_mask_builder_masks_each_partial_frag():
     from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
 
     causal = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
-    masks = fragment_mask(_geom(), mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
+    masks = _frag().mask(mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
     assert [m.frag for m in masks] == ["Sf0_frag", "Sf1_frag"]
     assert all(isinstance(m, FragmentMask) and m.mask_when is causal for m in masks)
 
@@ -237,7 +233,7 @@ def test_realizer_emits_frag_apply_for_a_generic_carrier_op():
     """The realizer turns a generic stats-merge fragment op (``relu`` of the score, one per N-atom)
     into a ``FragmentApply`` — carrier-vocabulary generality reaching the tensor-core tier, the
     same realizer that handles softmax's exp/fold."""
-    fs = realize_fragment_softmax(_carrier_with_generic_op(), geom=_geom())
+    fs = _frag().combine(_carrier_with_generic_op())
     relus = [s for s in fs.merge if isinstance(s, FragmentApply) and s.op.name == "relu"]
     assert [r.out for r in relus] == ["sq_0", "sq_1"]  # one per N-atom (the 2 score frags)
     assert [r.args for r in relus] == [("Sf0_frag",), ("Sf1_frag",)]

@@ -61,11 +61,7 @@ from deplodock.compiler.ir.tile.ir import (
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
-    FragmentGeom,
-    fragment_mask,
-    realize_fragment_softmax,
-)
+from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import Fragment
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
@@ -306,14 +302,14 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     qload = next(s for s in produce_tiles[0].body.iter() if isinstance(s, Load))
     bh_dims = tuple(qload.index[:2])  # (batch, head) — the leading 4D dims, shared with the output
 
-    geom = FragmentGeom(
+    frag = Fragment(
         atom_m=atom_m,
         atom_n=atom_n,
         partial_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
         weight_frags=tuple(f"Pf{nt}" for nt in range(nt_count)),
         accum_frags=tuple(f"Of{n}" for n in range(nd)),
     )
-    fs = realize_fragment_softmax(carrier, geom=geom)
+    fs = frag.combine(carrier)
 
     init: list = list(fs.init)
     init += [RegFragment(name=f"Of{n}", role="c", shape=atom.shape, dtype=F32) for n in range(nd)]
@@ -343,13 +339,13 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
     if causal:
         causal_pred = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
-        produce += fragment_mask(geom, mask_when=causal_pred, col_bases=kv_col_bases, row_base=_fmul(qb, 16))
+        produce += frag.mask(mask_when=causal_pred, col_bases=kv_col_bases, row_base=_fmul(qb, 16))
     if symbolic:
-        produce += fragment_mask(geom, mask_when=BinaryExpr(">=", Var(FRAG_COL), seq), col_bases=kv_col_bases)
+        produce += frag.mask(mask_when=BinaryExpr(">=", Var(FRAG_COL), seq), col_bases=kv_col_bases)
 
     merge: list = list(fs.merge)
     rescale: list = list(fs.rescale)
-    handoff = synthesize_frag_handoff(geom.weight_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
+    handoff = synthesize_frag_handoff(frag.weight_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
 
     pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
     consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]

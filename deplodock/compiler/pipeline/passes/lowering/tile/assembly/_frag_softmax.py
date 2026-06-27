@@ -1,24 +1,23 @@
-"""Fragment-tier realization of a streaming flash ``Monoid`` — the m16n8 sibling of the
-cross-thread ``emit_combine`` (``lowering/kernel/_combine.py``).
+"""Fragment-tier realization of a streaming ``Monoid`` carrier onto the mma C-fragment registers —
+the m16n8 sibling of the cross-thread ``emit_combine`` (``lowering/kernel/_combine.py``).
 
-``emit_combine`` realizes a carrier's reduce *across lanes / smem* (``WarpShuffle`` /
-``TreeHalve``). This module realizes the SAME ``flash_combine`` ``Monoid`` (online softmax,
-``state=(m, l, O)``, ``partial=(score, value)``) *across the m16n8 C-fragment registers*:
-the per-row stats ``(m, l)`` are 2 scalars per lane (rows ``g`` / ``g+8`` → suffixes 0/1),
-the score partial lives fragment-distributed in the C-fragment, and the reduction over the
-tile's columns is a :class:`FragmentRowReduce` (the fragment-tier analog of the lane reduce).
+``emit_combine`` realizes a carrier's reduce *across lanes / smem* (``WarpShuffle`` / ``TreeHalve``).
+:class:`Fragment` realizes a carrier *across the m16n8 C-fragment registers* (flash online softmax is
+the motivating carrier — ``state=(m, l, O)``, ``partial=(score, value)`` — but the realizer is
+carrier-generic): the per-row stats are scalars per lane (rows ``g`` / ``g+8`` → suffixes 0/1), the
+partial lives fragment-distributed in the C-fragment, and the reduction over its columns is a
+:class:`FragmentRowReduce` (the fragment-tier analog of the lane reduce).
 
-The split (``ir/stmt/carrier_algebra.split_carrier``) separates the ``d``-invariant stats monoid
-from the ``d``-varying accumulation monoid; :class:`FragmentDist` is then a
-:class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` **backend** that ``Monoid.project``
-drives over the stats ``merge`` — each ``Assign`` dispatches by its role under the distribution
-(fold → ``FragmentRowReduce``, pointwise → ``FragmentApply``, scalar / carried-state → row
-``Assign`` / ``Reassign``). No softmax knowledge in the driver; this module supplies only the
-*geometry* (which fragment registers, the Mma coupling) — the ``FragmentGeom`` register names + the
-**per-atom C-fragment layout** ``FragLayout`` (``frag_layout(atom_m, atom_n)``) the emitted nodes
-carry, so a second atom plugs in by adding a descriptor, not editing the nodes. Only m16n8 is
-modeled today; the per-row scalar distribution (the ``0`` / ``1`` suffixes) is still its 2-rows/lane
-form (generalizing it to ``rows_per_lane > 2`` needs a real second atom to design + test against).
+:class:`Fragment` IS the :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` **backend**
+``Monoid.project`` drives: it holds the geometry (the MMA register roles + the per-atom ``FragLayout``)
+and **generates the combine + mask ops for a carrier** — ``Fragment.combine(carrier)`` projects the
+split-off stats ``merge`` (each ``Assign`` dispatched by its role under the distribution: fold →
+``FragmentRowReduce``, pointwise → ``FragmentApply``, scalar / carried-state → row ``Assign`` /
+``Reassign``) + adds the accum rescale / init / normalize; ``Fragment.mask(mask_when, …)`` builds the
+coordinate-predicated ``FragmentMask``s. No softmax / causal / boundary knowledge here — the caller
+supplies the mask predicate; the carrier supplies the merge. A second atom plugs in by adding a
+``FragLayout`` (``frag_layout``), not editing the nodes; only m16n8 is modeled today (the per-row
+scalar distribution is still its 2-rows/lane form — ``rows_per_lane > 2`` awaits a real second atom).
 
 Leading-underscore module name keeps the pass loader from treating it as a rule. Imports only
 ``ir.*`` + the shared carrier algebra — never ``enumeration``.
@@ -50,28 +49,6 @@ _DIVIDE = ElementwiseImpl("divide")
 
 
 @dataclass(frozen=True)
-class FragmentGeom:
-    """The fragment-combiner geometry the carrier projection can't derive from the program — the
-    MMA fragment register roles + the atom (a tiling decision). Carrier-generic, no softmax /
-    attention naming:
-
-    - ``partial_frags`` — the distributed partial the projection reduces (the produce ``Mma``'s
-      C-fragment output, named by ``kernel/005``).
-    - ``weight_frags`` — the fragments the projection writes that feed the embedded consume
-      contraction (the value's carrier-computed coefficient — flash's probability; the C→A handoff).
-    - ``accum_frags`` — the streaming output accumulators (the consume ``Mma``'s C-fragments, one
-      per output atom).
-
-    ``atom_m``/``atom_n`` select the per-atom ``FragLayout``."""
-
-    atom_m: int
-    atom_n: int
-    partial_frags: tuple[str, ...]
-    weight_frags: tuple[str, ...]
-    accum_frags: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class FragmentPhases:
     """The realized per-iteration carrier phases for the warp-chain ``CarryScope`` (the fragment-tier
     analog of the streaming ``CarryScope``'s phases) — what the projection produces. ``epilogue`` is
@@ -97,25 +74,44 @@ def _weight_name(accum_merge: tuple, value: str) -> str | None:
     return None
 
 
-class FragmentDist:
-    """The m16n8 C-fragment :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution`
-    backend — realizes a carrier's projected merge over the tensor-core register tile. The geometry
-    (``FragmentGeom`` + ``FragLayout``) and the Mma coupling (which fragment feeds P@V) live here; the
-    carrier algebra (``Monoid.project``) drives it generically.
+class Fragment:
+    """The mma C-fragment combiner for one warp-chain kernel — the carrier's projection target,
+    holding the geometry (the atom + the MMA register roles) and **generating the combine + mask
+    ops for a given carrier**:
 
-    Distribution roles → fragment ops: ``fold`` → ``FragmentRowReduce`` (cross-column reduce) + the
-    per-row scalar update; ``pointwise`` → one ``FragmentApply`` per N-atom (its result lands in the
-    geometry's ``weight_frags`` when it's the consume contraction's value-weight, else a fresh
-    fragment); ``scalar`` / ``state`` → row-distributed ``Assign`` / ``Reassign``."""
+    - :meth:`combine` projects the carrier's merge onto the fragment tier and assembles the
+      per-iteration :class:`FragmentPhases`. ``Fragment`` IS the
+      :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` backend ``Monoid.project``
+      drives — fold → ``FragmentRowReduce`` (cross-column reduce) + the per-row scalar update;
+      pointwise → one ``FragmentApply`` per N-atom (landing in ``weight_frags`` when it's the
+      consume contraction's value-coefficient, else a fresh fragment); scalar / carried-state →
+      row-distributed ``Assign`` / ``Reassign``.
+    - :meth:`mask` neutralizes each distributed partial fragment to the carrier fold identity where
+      a coordinate predicate holds (one ``FragmentMask`` per fragment).
 
-    def __init__(self, geom: FragmentGeom):
-        self.geom = geom
-        self.layout = frag_layout(geom.atom_m, geom.atom_n)  # per-atom C-fragment geometry (raises if unmodeled)
+    Carrier-generic — no softmax / causal / boundary knowledge. The register roles: ``partial_frags``
+    (the produce contraction's distributed partial), ``weight_frags`` (the consume contraction's
+    value-coefficient — flash's probability; the C→A handoff), ``accum_frags`` (the output
+    accumulators); ``atom_m`` / ``atom_n`` select the per-atom ``FragLayout``."""
+
+    def __init__(
+        self, *, atom_m: int, atom_n: int, partial_frags: tuple[str, ...], weight_frags: tuple[str, ...], accum_frags: tuple[str, ...]
+    ):
+        self.atom_m = atom_m
+        self.atom_n = atom_n
+        self.partial_frags = partial_frags
+        self.weight_frags = weight_frags
+        self.accum_frags = accum_frags
+        self.layout = frag_layout(atom_m, atom_n)  # per-atom C-fragment geometry (raises if unmodeled)
+        self._reset()
+
+    def _reset(self) -> None:
+        # Per-``combine`` projection scratch (so a Fragment is reusable across calls).
         self.out: list[Stmt] = []  # the emitted merge stmts
         self.frag_binding: dict[str, tuple[str, ...]] = {}  # distributed SSA -> per-N-atom fragment arrays
         self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
         self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
-        self.weight_name: str | None = None  # the distributed SSA bound to geom.weight_frags (feeds P@V)
+        self.weight_name: str | None = None  # the distributed SSA bound to weight_frags (feeds the consume Mma)
 
     # --- Distribution protocol (driven by Monoid.project) ---
 
@@ -132,10 +128,10 @@ class FragmentDist:
             self.out += [Assign(f"{name}0", op, (f"{scalar}0", r0)), Assign(f"{name}1", op, (f"{scalar}1", r1))]
 
     def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — taint via frag_binding
-        # The consume contraction's value-weight lands in the geometry's weight fragments; any other
+        # The consume contraction's value-coefficient lands in the weight fragments; any other
         # distributed result gets a fresh per-N-atom fragment. One FragmentApply per N-atom: a
         # fragment arg uses that atom's fragment, a per-row scalar arg is the (row0, row1) pair.
-        frags = self.geom.weight_frags if name == self.weight_name else tuple(f"{name}_{j}" for j in range(len(self.geom.partial_frags)))
+        frags = self.weight_frags if name == self.weight_name else tuple(f"{name}_{j}" for j in range(len(self.partial_frags)))
         for j, out_fr in enumerate(frags):
             a_args, kinds = [], []
             for x in args:
@@ -160,22 +156,24 @@ class FragmentDist:
             self.out += [Assign(n0, op, tuple(f"{x}0" for x in args)), Assign(n1, op, tuple(f"{x}1" for x in args))]
             self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
 
-    # --- the full flash realization built around the projection ---
+    # --- generators (combine + mask) given the carrier ---
 
-    def realize(self, carrier: Monoid) -> FragmentPhases:
-        """Realize the m16n8 fragment flash from a streaming ``Monoid``: split the twisted carrier
-        (``split_carrier``), **project** the stats merge onto this backend (``stats.project`` →
-        ``Monoid.project``), then add the accum ``O·α`` rescale, the per-state ``Init`` seeds, and
-        the ``O /= l`` epilogue. The merge body is pure carrier projection (no softmax knowledge);
-        only the Mma coupling (the prob/accum fragment bindings) lives here."""
+    def combine(self, carrier: Monoid) -> FragmentPhases:
+        """Generate the per-iteration fragment phases for a streaming ``Monoid``: split the twisted
+        carrier (``split_carrier``), **project** the stats merge onto this Fragment
+        (``stats.project`` → ``Monoid.project``), then add the accum rescale (``O·α``), the per-state
+        ``Init`` seeds, and the normalize epilogue (``O / l``). The merge body is pure carrier
+        projection (no softmax knowledge); only the Mma coupling (the weight/accum fragment
+        bindings) lives here."""
+        self._reset()
         stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
         score = stats.partial[0]
         self.weight_name = _weight_name(accum.merge, carrier.partial[1])
-        self.frag_binding = {score: self.geom.partial_frags}
+        self.frag_binding = {score: self.partial_frags}
         stats.project(stats.merge, distributed_inputs={score}, dist=self)
 
         # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
-        # O = O·α + p·v are the SEMIRING P@V Mma (the consume cell), accumulated into the O fragments.
+        # O = O·α + p·v are the SEMIRING consume Mma, accumulated into the accum fragments.
         rescale_out: list[Stmt] = []
         for a in accum.merge:
             if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
@@ -183,7 +181,7 @@ class FragmentDist:
                 alpha = (f"{scalar}0", f"{scalar}1")
                 rescale_out += [
                     FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
-                    for fr in self.geom.accum_frags
+                    for fr in self.accum_frags
                 ]
 
         init_out: list[Stmt] = []
@@ -191,39 +189,27 @@ class FragmentDist:
             op = self.state_fold_op[st]
             init_out += [Init(name=f"{st}0", op=op, dtype=F32), Init(name=f"{st}1", op=op, dtype=F32)]
 
-        # The denominator is the add-fold stats state (flash's l); normalize each O by it per row.
+        # The denominator is the add-fold stats state (flash's l); normalize each accum by it per row.
         denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
         denom_pair = (f"{denom}0", f"{denom}1")
         epilogue_out: list[Stmt] = [
             FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
-            for fr in self.geom.accum_frags
+            for fr in self.accum_frags
         ]
         return FragmentPhases(
             init=tuple(init_out), merge=tuple(self.out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
         )
 
-
-def realize_fragment_softmax(carrier: Monoid, *, geom: FragmentGeom) -> FragmentPhases:
-    """Realize the m16n8 fragment flash from a streaming ``Monoid`` — the thin entry the assembler
-    calls: build the :class:`FragmentDist` backend and project the carrier onto it. The merge body
-    is generated by ``Monoid.project`` (carrier-generic, no softmax knowledge); ``FragmentDist``
-    supplies the geometry. (The former hand-rolled classify+realize; the carrier vocabulary + the
-    geometry are now the distribution backend, driven by the one projection method.)"""
-    return FragmentDist(geom).realize(carrier)
-
-
-def fragment_mask(geom: FragmentGeom, *, mask_when: Expr, col_bases: tuple[Expr, ...], row_base: Expr | None = None) -> list[Stmt]:
-    """The generic fragment-tier masking method — neutralize each distributed partial fragment to
-    the carrier's fold identity where ``mask_when`` holds, before the fold. ONE method for any
-    coordinate predicate: the caller passes ``mask_when`` (a predicate ``Expr`` over the reserved
-    :data:`~deplodock.compiler.ir.kernel.ir.FRAG_COL` / :data:`~deplodock.compiler.ir.kernel.ir.FRAG_ROW`
-    coordinate vars) + the per-N-atom column origins ``col_bases`` (+ ``row_base`` when the predicate
-    references the row). Knows nothing about causal / boundary / softmax — those are coordinate
-    predicates the caller builds (``__fcol > __frow`` / ``__fcol >= seq_len`` / a windowed band /
-    …). One :class:`~deplodock.compiler.ir.kernel.ir.FragmentMask` per partial fragment; sequencing
-    two masks ANDs their keep-predicates."""
-    layout = frag_layout(geom.atom_m, geom.atom_n)
-    return [
-        FragmentMask(frag=sf, mask_when=mask_when, col_base=cb, row_base=row_base, layout=layout)
-        for sf, cb in zip(geom.partial_frags, col_bases, strict=True)
-    ]
+    def mask(self, *, mask_when: Expr, col_bases: tuple[Expr, ...], row_base: Expr | None = None) -> list[Stmt]:
+        """Generate the fragment mask — neutralize each distributed partial fragment to the carrier
+        fold identity where ``mask_when`` holds, before the fold. ONE method for any coordinate
+        predicate: ``mask_when`` is a predicate ``Expr`` over the reserved
+        :data:`~deplodock.compiler.ir.kernel.ir.FRAG_COL` / :data:`~deplodock.compiler.ir.kernel.ir.FRAG_ROW`
+        coordinate vars; ``col_bases`` the per-N-atom column origins (+ ``row_base`` when the
+        predicate references the row). Knows nothing about causal / boundary / softmax — those are
+        coordinate predicates the caller builds (``__fcol > __frow`` / ``__fcol >= seq_len`` / a
+        windowed band / …). Sequencing two masks ANDs their keep-predicates."""
+        return [
+            FragmentMask(frag=sf, mask_when=mask_when, col_base=cb, row_base=row_base, layout=self.layout)
+            for sf, cb in zip(self.partial_frags, col_bases, strict=True)
+        ]
