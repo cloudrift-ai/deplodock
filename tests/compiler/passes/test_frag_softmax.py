@@ -177,6 +177,21 @@ def _carrier_with_generic_op():
     )
 
 
+def test_frag_layout_is_the_per_atom_geometry_source():
+    """The per-atom layout descriptor: ``frag_layout`` is the single source the fragment nodes read
+    their geometry from (n_elems, elem→row, reduce group, coord codegen); an unmodeled atom raises
+    rather than miscompiling. m16n8 is 4 regs / lane, 2 rows / lane."""
+    import pytest
+
+    from deplodock.compiler.ir.kernel.ir import M16N8, frag_layout
+
+    lay = frag_layout(16, 8)
+    assert lay is M16N8
+    assert lay.n_elems == 4 and lay.rows_per_lane == 2 and lay.elem_row == (0, 0, 1, 1) and lay.reduce_group == 4
+    with pytest.raises(NotImplementedError):
+        frag_layout(8, 8)  # an atom with no modeled C-layout fails loudly
+
+
 def test_realizer_emits_frag_apply_for_a_generic_carrier_op():
     """The realizer turns a generic stats-merge fragment op (``relu`` of the score, one per N-atom)
     into a ``FragmentApply`` — carrier-vocabulary generality reaching the tensor-core tier, the

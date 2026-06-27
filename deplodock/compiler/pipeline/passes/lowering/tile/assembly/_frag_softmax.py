@@ -16,8 +16,13 @@ fragment-valued; a reduce-eligible op consuming it is a FOLD whose result is a p
 This module is a **thin geometry emitter** over that classification: the carrier supplies the
 *algebra* (which ops, what order, which reductions, the normalizer); the caller supplies the
 *fragment geometry* (N-atom / D-atom frag names) via :class:`FragGeom` — that geometry is a
-tiling decision, not recoverable from the scalar program. v1 targets the m16n8 layout
-(2 rows/lane) exercised by the warp-chain flash.
+tiling decision, not recoverable from the scalar program. The **per-atom C-fragment layout** (how
+many registers / lane, which element is which row, the reduce butterfly span, the coord codegen) is
+the :class:`~deplodock.compiler.ir.kernel.ir.FragLayout` descriptor (``frag_layout(atom_m, atom_n)``)
+the emitted nodes carry — so a second atom plugs in by adding a descriptor, not by editing the
+nodes. Only m16n8 is modeled today; the realizer's per-row scalar distribution (the ``0`` / ``1``
+suffixes) is still its 2-rows/lane form (generalizing it to ``rows_per_lane > 2`` is the part that
+needs a real second atom to design + test against).
 
 Pure functions; leading-underscore module name keeps the pass loader from treating it as a
 rule. Imports only ``ir.*`` + the shared carrier algebra — never ``enumeration``.
@@ -38,6 +43,7 @@ from deplodock.compiler.ir.kernel.ir import (
     FragmentCausalMask,
     FragmentRowReduce,
     Reassign,
+    frag_layout,
 )
 from deplodock.compiler.ir.stmt import Assign, Init, Monoid, Stmt
 from deplodock.compiler.ir.stmt.carrier_algebra import classify_merge_program, split_carrier
@@ -89,8 +95,7 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
     is left to the SEMIRING P@V ``Mma`` (the consume cell), not emitted here. Every pointwise
     fragment op is the ONE ``FragmentApply`` node (it subsumed the former ``FragmentExp`` /
     ``FragmentScale``), so any carrier's vocabulary — not just softmax's — reaches the tier."""
-    if geom.atom_m != 16 or geom.atom_n != 8:
-        raise NotImplementedError(f"v1 fragment softmax targets m16n8; got atom ({geom.atom_m}, {geom.atom_n})")
+    layout = frag_layout(geom.atom_m, geom.atom_n)  # the per-atom C-fragment geometry (raises if unmodeled)
     stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
     score = stats.partial[0]
     steps, _frag = classify_merge_program(stats.merge, score, stats.state)
@@ -104,7 +109,7 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
     for st in steps:
         if st.role == "fold":
             r0, r1 = f"{st.name}_r0", f"{st.name}_r1"
-            merge_out.append(FragmentRowReduce(top=r0, bot=r1, frags=frag_binding[st.frag_src], op=st.op))
+            merge_out.append(FragmentRowReduce(top=r0, bot=r1, frags=frag_binding[st.frag_src], op=st.op, group=layout.reduce_group))
             fold_op_of[st.name] = st.op
             if st.is_state:  # state-update fold: l = lm + rowsum(p)
                 n0, n1 = f"{st.name}_n0", f"{st.name}_n1"
@@ -122,8 +127,8 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
             sub = (f"{st.scalar}0", f"{st.scalar}1")  # the per-row new-max, explicit pair
             for j, (sf, pf) in enumerate(zip(frag_binding[st.frag_src], geom.prob_frags, strict=True)):
                 ds = f"{st.name}_ds_{j}"
-                merge_out.append(FragmentApply(out=ds, op=_SUBTRACT, args=(sf, sub), kinds=(FRAG, ROW)))
-                merge_out.append(FragmentApply(out=pf, op=_EXP, args=(ds,), kinds=(FRAG,)))
+                merge_out.append(FragmentApply(out=ds, op=_SUBTRACT, args=(sf, sub), kinds=(FRAG, ROW), layout=layout))
+                merge_out.append(FragmentApply(out=pf, op=_EXP, args=(ds,), kinds=(FRAG,), layout=layout))
             frag_binding[st.name] = geom.prob_frags
             prob_emitted = True
         elif st.role == "state_copy":  # scalar state reassign (m = copy(mx))
@@ -146,7 +151,7 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
                     bound = frag_binding.get(a)
                     args.append(bound[j] if bound is not None else (f"{a}0", f"{a}1"))
                     kinds.append(FRAG if bound is not None else ROW)
-                merge_out.append(FragmentApply(out=out_fr, op=st.op, args=tuple(args), kinds=tuple(kinds)))
+                merge_out.append(FragmentApply(out=out_fr, op=st.op, args=tuple(args), kinds=tuple(kinds), layout=layout))
             frag_binding[st.name] = new_frags
         else:  # pure scalar temp, row-distributed
             for sfx in ("0", "1"):
@@ -163,7 +168,8 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
             # O *= α — in-place per-row multiply (the former FragmentScale).
             alpha = (f"{scalar}0", f"{scalar}1")
             rescale_out += [
-                FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True) for fr in geom.accum_frags
+                FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=layout)
+                for fr in geom.accum_frags
             ]
         # else: pv = p·v (reads the value partial) — part of the consume Mma, not emitted.
 
@@ -177,7 +183,7 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragGeom) -> FragmentSoft
     denom = next(st for st in stats.state if state_fold_op[st].name == "add")
     denom_pair = (f"{denom}0", f"{denom}1")
     epilogue_out: list[Stmt] = [
-        FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True) for fr in geom.accum_frags
+        FragmentApply(out=fr, op=_DIVIDE, args=(fr, denom_pair), kinds=(FRAG, ROW), in_place=True, layout=layout) for fr in geom.accum_frags
     ]
 
     return FragmentSoftmax(
@@ -192,8 +198,10 @@ def realize_score_mask(geom: FragGeom, *, q_row_base: Expr, kv_col_bases: tuple[
     that avoids ``-inf − -inf = nan``) over the strict upper triangle, before the rowmax fold.
     ``kv_col_bases`` is the absolute column origin per N-atom (caller adds the ``nt·atom_n``
     offset — an expr/geometry concern)."""
+    layout = frag_layout(geom.atom_m, geom.atom_n)
     return [
-        FragmentCausalMask(frag=sf, q_row_base=q_row_base, kv_col_base=cb) for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
+        FragmentCausalMask(frag=sf, q_row_base=q_row_base, kv_col_base=cb, layout=layout)
+        for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
     ]
 
 
@@ -205,4 +213,8 @@ def realize_boundary_mask(geom: FragGeom, *, kv_col_bases: tuple[Expr, ...], bou
     them (``exp(0) = 1`` would corrupt it). Composes with the causal mask by sequencing both
     (each writes ``-1e30``, the AND of the keep predicates). ``kv_col_bases`` is the absolute
     column origin per N-atom."""
-    return [FragmentBoundaryMask(frag=sf, kv_col_base=cb, bound=bound) for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)]
+    layout = frag_layout(geom.atom_m, geom.atom_n)
+    return [
+        FragmentBoundaryMask(frag=sf, kv_col_base=cb, bound=bound, layout=layout)
+        for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
+    ]
