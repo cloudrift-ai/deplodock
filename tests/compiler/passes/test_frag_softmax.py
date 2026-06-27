@@ -13,8 +13,8 @@ from deplodock.compiler.ir.stmt import Assign, Init
 from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragmentGeom,
+    fragment_mask,
     realize_fragment_softmax,
-    realize_score_mask,
 )
 
 
@@ -22,8 +22,8 @@ def _geom(nd: int = 4) -> FragmentGeom:
     return FragmentGeom(
         atom_m=16,
         atom_n=8,
-        score_frags=("Sf0_frag", "Sf1_frag"),
-        prob_frags=("Pf0", "Pf1"),
+        partial_frags=("Sf0_frag", "Sf1_frag"),
+        weight_frags=("Pf0", "Pf1"),
         accum_frags=tuple(f"Of{n}" for n in range(nd)),
     )
 
@@ -108,13 +108,16 @@ def test_scalar_updates_are_row_distributed():
     assert all(n.endswith("0") or n.endswith("1") for n in scalar_names), scalar_names
 
 
-def test_score_mask_is_one_causal_mask_per_score_frag():
-    fs_geom = _geom()
-    from deplodock.compiler.ir.expr import Literal, Var
+def test_fragment_mask_builder_masks_each_partial_frag():
+    """The generic ``fragment_mask`` builder emits one ``FragmentMask`` per distributed partial
+    fragment for an arbitrary coordinate predicate — no causal / boundary / softmax naming."""
+    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+    from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
 
-    masks = realize_score_mask(fs_geom, q_row_base=Var("qb"), kv_col_bases=(Literal(0, "int"), Literal(8, "int")))
+    causal = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
+    masks = fragment_mask(_geom(), mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
     assert [m.frag for m in masks] == ["Sf0_frag", "Sf1_frag"]
-    assert all(isinstance(m, FragmentMask) for m in masks)
+    assert all(isinstance(m, FragmentMask) and m.mask_when is causal for m in masks)
 
 
 def test_fragment_mask_is_one_generic_node_for_causal_and_boundary():

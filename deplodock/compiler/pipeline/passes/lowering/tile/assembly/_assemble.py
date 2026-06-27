@@ -29,7 +29,18 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import FRAG, UNIFORM, FragmentApply, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
+from deplodock.compiler.ir.kernel.ir import (
+    FRAG,
+    FRAG_COL,
+    FRAG_ROW,
+    UNIFORM,
+    FragmentApply,
+    LdmatrixLoad,
+    RegFragment,
+    RegStore,
+    Smem,
+    Sync,
+)
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
@@ -52,9 +63,8 @@ from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
     FragmentGeom,
-    realize_boundary_mask,
+    fragment_mask,
     realize_fragment_softmax,
-    realize_score_mask,
 )
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
@@ -299,8 +309,8 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     geom = FragmentGeom(
         atom_m=atom_m,
         atom_n=atom_n,
-        score_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
-        prob_frags=tuple(f"Pf{nt}" for nt in range(nt_count)),
+        partial_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
+        weight_frags=tuple(f"Pf{nt}" for nt in range(nt_count)),
         accum_frags=tuple(f"Of{n}" for n in range(nd)),
     )
     fs = realize_fragment_softmax(carrier, geom=geom)
@@ -325,15 +335,21 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
         )
         for nt in range(nt_count)
     ]
+    # The masks are coordinate predicates over the generic FragmentMask node (this assembler is the
+    # attention realizer, so it builds them; the fragment combiner knows no causal / boundary):
+    # causal = key col > query row (strict upper triangle); boundary = key col >= seq_len (the
+    # symbolic partial-final-tile padding keys). Both neutralize the partial to the carrier's fold
+    # identity before the rowmax.
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
     if causal:
-        produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)
+        causal_pred = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
+        produce += fragment_mask(geom, mask_when=causal_pred, col_bases=kv_col_bases, row_base=_fmul(qb, 16))
     if symbolic:
-        produce += realize_boundary_mask(geom, kv_col_bases=kv_col_bases, bound=seq)
+        produce += fragment_mask(geom, mask_when=BinaryExpr(">=", Var(FRAG_COL), seq), col_bases=kv_col_bases)
 
     merge: list = list(fs.merge)
     rescale: list = list(fs.rescale)
-    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
+    handoff = synthesize_frag_handoff(geom.weight_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
 
     pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
     consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]

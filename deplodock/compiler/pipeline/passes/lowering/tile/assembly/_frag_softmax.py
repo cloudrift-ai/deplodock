@@ -30,11 +30,9 @@ from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Var
+from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.kernel.ir import (
     FRAG,
-    FRAG_COL,
-    FRAG_ROW,
     ROW,
     FragmentApply,
     FragmentMask,
@@ -54,16 +52,22 @@ _DIVIDE = ElementwiseImpl("divide")
 @dataclass(frozen=True)
 class FragmentGeom:
     """The fragment-combiner geometry the carrier projection can't derive from the program — the
-    tiling decision (the register roles + the atom). ``atom_m``/``atom_n`` select the per-atom
-    ``FragLayout``. ``score_frags`` are the live QK^T C-fragments (named by ``kernel/005`` off the
-    produce ``Mma``); ``prob_frags`` the probability fragments the projection writes (consumed by
-    the P@V ``Mma`` — the C→A handoff); ``accum_frags`` the streaming output accumulators (one per
-    D-atom)."""
+    MMA fragment register roles + the atom (a tiling decision). Carrier-generic, no softmax /
+    attention naming:
+
+    - ``partial_frags`` — the distributed partial the projection reduces (the produce ``Mma``'s
+      C-fragment output, named by ``kernel/005``).
+    - ``weight_frags`` — the fragments the projection writes that feed the embedded consume
+      contraction (the value's carrier-computed coefficient — flash's probability; the C→A handoff).
+    - ``accum_frags`` — the streaming output accumulators (the consume ``Mma``'s C-fragments, one
+      per output atom).
+
+    ``atom_m``/``atom_n`` select the per-atom ``FragLayout``."""
 
     atom_m: int
     atom_n: int
-    score_frags: tuple[str, ...]
-    prob_frags: tuple[str, ...]
+    partial_frags: tuple[str, ...]
+    weight_frags: tuple[str, ...]
     accum_frags: tuple[str, ...]
 
 
@@ -82,10 +86,11 @@ class FragmentPhases:
     epilogue: tuple[Stmt, ...]
 
 
-def _prob_name(accum_merge: tuple, value: str) -> str | None:
-    """The distributed SSA that feeds the P@V ``Mma`` — the fragment operand of the accum merge's
-    value-multiply (``pv = p·v``). It must land in the geometry's ``prob_frags`` (the registers the
-    consume ``Mma`` reads). Read structurally off the carrier, not from an ``exp`` role."""
+def _weight_name(accum_merge: tuple, value: str) -> str | None:
+    """The distributed SSA the embedded consume contraction multiplies the value by — the fragment
+    operand of the accum merge's value-multiply (``coeff · value``). It must land in the geometry's
+    ``weight_frags`` (the registers the consume ``Mma``'s A operand reads). Read structurally off the
+    carrier — no softmax / ``exp`` knowledge (flash's ``p`` is one instance)."""
     for a in accum_merge:
         if a.op.name == "multiply" and value in a.args and len(a.args) == 2:
             return a.args[0] if a.args[1] == value else a.args[1]
@@ -100,8 +105,8 @@ class FragmentDist:
 
     Distribution roles → fragment ops: ``fold`` → ``FragmentRowReduce`` (cross-column reduce) + the
     per-row scalar update; ``pointwise`` → one ``FragmentApply`` per N-atom (its result lands in the
-    geometry's ``prob_frags`` when it's the P@V probability, else a fresh fragment); ``scalar`` /
-    ``state`` → row-distributed ``Assign`` / ``Reassign``."""
+    geometry's ``weight_frags`` when it's the consume contraction's value-weight, else a fresh
+    fragment); ``scalar`` / ``state`` → row-distributed ``Assign`` / ``Reassign``."""
 
     def __init__(self, geom: FragmentGeom):
         self.geom = geom
@@ -110,7 +115,7 @@ class FragmentDist:
         self.frag_binding: dict[str, tuple[str, ...]] = {}  # distributed SSA -> per-N-atom fragment arrays
         self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
         self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
-        self.prob_name: str | None = None  # the distributed SSA bound to geom.prob_frags (feeds P@V)
+        self.weight_name: str | None = None  # the distributed SSA bound to geom.weight_frags (feeds P@V)
 
     # --- Distribution protocol (driven by Monoid.project) ---
 
@@ -127,10 +132,10 @@ class FragmentDist:
             self.out += [Assign(f"{name}0", op, (f"{scalar}0", r0)), Assign(f"{name}1", op, (f"{scalar}1", r1))]
 
     def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — taint via frag_binding
-        # The P@V probability lands in the geometry's prob fragments; any other distributed result
-        # gets a fresh per-N-atom fragment. One FragmentApply per N-atom: a fragment arg uses that
-        # atom's fragment, a per-row scalar arg is the (row0, row1) pair.
-        frags = self.geom.prob_frags if name == self.prob_name else tuple(f"{name}_{j}" for j in range(len(self.geom.score_frags)))
+        # The consume contraction's value-weight lands in the geometry's weight fragments; any other
+        # distributed result gets a fresh per-N-atom fragment. One FragmentApply per N-atom: a
+        # fragment arg uses that atom's fragment, a per-row scalar arg is the (row0, row1) pair.
+        frags = self.geom.weight_frags if name == self.weight_name else tuple(f"{name}_{j}" for j in range(len(self.geom.partial_frags)))
         for j, out_fr in enumerate(frags):
             a_args, kinds = [], []
             for x in args:
@@ -165,8 +170,8 @@ class FragmentDist:
         only the Mma coupling (the prob/accum fragment bindings) lives here."""
         stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
         score = stats.partial[0]
-        self.prob_name = _prob_name(accum.merge, carrier.partial[1])
-        self.frag_binding = {score: self.geom.score_frags}
+        self.weight_name = _weight_name(accum.merge, carrier.partial[1])
+        self.frag_binding = {score: self.geom.partial_frags}
         stats.project(stats.merge, distributed_inputs={score}, dist=self)
 
         # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
@@ -207,33 +212,18 @@ def realize_fragment_softmax(carrier: Monoid, *, geom: FragmentGeom) -> Fragment
     return FragmentDist(geom).realize(carrier)
 
 
-def realize_score_mask(geom: FragmentGeom, *, q_row_base: Expr, kv_col_bases: tuple[Expr, ...]) -> list[Stmt]:
-    """The fragment-tier score-partial mask — the same "neutralize ``partial[0]`` to the fold
-    identity past a bound" operation Part D's ``_mask_carrier`` does cooperatively, one tier
-    down. Masks each score C-fragment to ``-1e30`` (the carrier's ``m`` identity, the soft -inf
-    that avoids ``-inf − -inf = nan``) over the strict upper triangle, before the rowmax fold.
-    ``kv_col_bases`` is the absolute column origin per N-atom (caller adds the ``nt·atom_n``
-    offset — an expr/geometry concern). The causal predicate is the generic ``FragmentMask``'s
-    ``mask_when`` = ``key_col > query_row`` (the strict upper triangle)."""
+def fragment_mask(geom: FragmentGeom, *, mask_when: Expr, col_bases: tuple[Expr, ...], row_base: Expr | None = None) -> list[Stmt]:
+    """The generic fragment-tier masking method — neutralize each distributed partial fragment to
+    the carrier's fold identity where ``mask_when`` holds, before the fold. ONE method for any
+    coordinate predicate: the caller passes ``mask_when`` (a predicate ``Expr`` over the reserved
+    :data:`~deplodock.compiler.ir.kernel.ir.FRAG_COL` / :data:`~deplodock.compiler.ir.kernel.ir.FRAG_ROW`
+    coordinate vars) + the per-N-atom column origins ``col_bases`` (+ ``row_base`` when the predicate
+    references the row). Knows nothing about causal / boundary / softmax — those are coordinate
+    predicates the caller builds (``__fcol > __frow`` / ``__fcol >= seq_len`` / a windowed band /
+    …). One :class:`~deplodock.compiler.ir.kernel.ir.FragmentMask` per partial fragment; sequencing
+    two masks ANDs their keep-predicates."""
     layout = frag_layout(geom.atom_m, geom.atom_n)
-    causal = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))  # mask where key col > query row
     return [
-        FragmentMask(frag=sf, mask_when=causal, col_base=cb, row_base=q_row_base, layout=layout)
-        for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
-    ]
-
-
-def realize_boundary_mask(geom: FragmentGeom, *, kv_col_bases: tuple[Expr, ...], bound: Expr) -> list[Stmt]:
-    """The fragment-tier symbolic-``seq_len`` boundary mask — the column-only sibling of
-    :func:`realize_score_mask`. Masks each score C-fragment to ``-1e30`` (the carrier's ``m``
-    identity) where the element's absolute key column ``>= bound`` (the partial final KV
-    tile's padding keys), before the rowmax fold — so the online-softmax denominator excludes
-    them (``exp(0) = 1`` would corrupt it). Composes with the causal mask by sequencing both
-    (each writes ``-1e30``, the AND of the keep predicates). ``kv_col_bases`` is the absolute
-    column origin per N-atom. The boundary predicate is the generic ``FragmentMask``'s
-    ``mask_when`` = ``key_col >= bound`` (column-only — no ``row_base``)."""
-    layout = frag_layout(geom.atom_m, geom.atom_n)
-    beyond = BinaryExpr(">=", Var(FRAG_COL), bound)  # mask where key col >= seq_len (padding keys)
-    return [
-        FragmentMask(frag=sf, mask_when=beyond, col_base=cb, layout=layout) for sf, cb in zip(geom.score_frags, kv_col_bases, strict=True)
+        FragmentMask(frag=sf, mask_when=mask_when, col_base=cb, row_base=row_base, layout=layout)
+        for sf, cb in zip(geom.partial_frags, col_bases, strict=True)
     ]
