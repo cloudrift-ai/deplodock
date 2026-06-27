@@ -368,6 +368,27 @@ def _mask_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
     return tuple(out)
 
 
+def _realize_serial_monoid(stmts: tuple[Stmt, ...], carrier: Monoid) -> tuple[Stmt, ...]:
+    """Replace the ``carrier`` ``Monoid`` (matched by its carried state) wherever it sits in ``stmts``
+    — recursing into ``Loop`` bodies — with the ``ScalarCombiner``-projected serial merge (the fold as
+    ``Assign`` / ``Reassign`` statements). The carried-state ``Init`` seeds live above the reduce loop
+    already (the recognizer placed them), so only the per-iteration merge is realized here."""
+    merge = ScalarCombiner().combine(carrier).merge
+
+    def walk(body: tuple[Stmt, ...]) -> list[Stmt]:
+        out: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Monoid) and s.state == carrier.state:
+                out.extend(merge)
+            elif isinstance(s, Loop):
+                out.append(replace(s, body=Body(tuple(walk(tuple(s.body))))))
+            else:
+                out.append(s)
+        return out
+
+    return tuple(walk(stmts))
+
+
 def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
     """The MONOID build move — one move for the cooperative reduce (softmax / rmsnorm
     / mean / max) AND the streaming flash (online-softmax over a nested QK^T). Apply
@@ -401,8 +422,21 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     # mirrors the intra-CTA cooperative ``K_c`` lane one partition level up.
     k_s = _k_s_axis(dag, knobs, targets)
     block = graph.blocks[0]
+    compute_in = tuple(block.compute)
+
+    # A serial (br=1, single-CTA), non-twisted ``Monoid`` reduce — the fused online-softmax ``(m, d)``
+    # carrier — is realized through the carrier-generic ``ScalarCombiner`` (the scalar tier of the
+    # combiner, sibling of the fragment ``MmaTwist``), the SAME ``combine()`` the flash tiers drive,
+    # instead of being left a ``Monoid`` for ``render_merge_program``. Its ``Init`` seeds are already
+    # placed (the recognizer emits them) and a serial reduce has no cross-thread combine. Cooperative
+    # (``br > 1``) / split-K ``Monoid``s keep the carrier for ``emit_combine``; flat ``Accum`` reduces
+    # and twisted carriers (flash → ``chain_build`` / ``warp_chain_build``) are untouched.
+    carrier = dag.reduction.carrier if dag.reduction is not None else None
+    if br == 1 and k_s is None and isinstance(carrier, Monoid) and len(carrier.partial) == 1:
+        compute_in = _realize_serial_monoid(compute_in, carrier)
+
     compute = _rebracket_k(
-        tuple(block.compute),
+        compute_in,
         targets,
         bk=bk,
         fk=fk,
