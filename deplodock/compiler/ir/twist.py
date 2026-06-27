@@ -52,9 +52,13 @@ _DIVIDE = ElementwiseImpl("divide")
 class CombinePhases:
     """The realized per-iteration carrier phases for a streaming ``CarryScope`` — what
     :meth:`Combiner.combine` produces, at whatever tier the backend realizes. ``init`` seeds the
-    carried-state identities + declares the accumulators; ``epilogue`` is the per-output normalize
+    carried-state identities + declares the accumulators; ``merge`` is the projected stats fold;
+    ``rescale`` scales the accumulator by the twist (``O·α``); ``consume`` accumulates the embedded
+    contraction (``p·v``) into the rescaled accumulator; ``epilogue`` is the per-output normalize
     (``O / l``); the caller interleaves the stores. ``update`` is empty (state reassigned in
-    ``merge``). Not softmax- or tier-specific — any streaming carrier projected onto any backend
+    ``merge``). ``consume`` is empty for backends that realize the embedded contraction OUTSIDE the
+    combiner (``MmaTwist`` — the assembler builds the consume ``Mma`` cells from the graph); a scalar
+    backend fills it. Not softmax- or tier-specific — any streaming carrier projected onto any backend
     yields these phases."""
 
     init: tuple[Stmt, ...]
@@ -62,6 +66,7 @@ class CombinePhases:
     rescale: tuple[Stmt, ...]
     update: tuple[Stmt, ...]
     epilogue: tuple[Stmt, ...]
+    consume: tuple[Stmt, ...] = ()
 
 
 def _weight_name(accum_merge: tuple, value: str) -> str | None:
@@ -97,6 +102,8 @@ class Combiner(ABC):
         self.state_fold_op: dict[str, object] = {}  # state -> fold op (drives Init identity + the denominator)
         self.fold_op_of: dict[str, object] = {}  # temp -> fold op (for copy chains, e.g. m = copy(mx))
         self.weight_name: str | None = None  # the distributed SSA bound to the consume contraction's value coeff
+        self.d_state: str | None = None  # the accumulator carried-state name (flash's O), set by combine()
+        self.accum_op = None  # the accumulator's fold op (add), read off accum.merge by combine()
 
     # --- Distribution protocol (driven by Monoid.project) — tier-specific emission ---
 
@@ -129,8 +136,17 @@ class Combiner(ABC):
         """Declare the output accumulator(s) (e.g. the accum C ``RegFragment``s)."""
 
     @abstractmethod
-    def rescale_accum(self, scalar: str) -> list[Stmt]:
-        """Rescale each accumulator by the per-row carrier scalar ``scalar`` (the twist's ``O·α``)."""
+    def rescale_accum(self, a: Assign) -> list[Stmt]:
+        """Rescale each accumulator by the twist (``a`` is the accum-merge multiply ``om = O · α``,
+        with the accumulator state ``self.d_state`` as one operand and the per-row carrier scalar the
+        other)."""
+
+    @abstractmethod
+    def consume_accum(self, assigns: tuple[Assign, ...]) -> list[Stmt]:
+        """Accumulate the embedded contraction into the accumulator. ``assigns`` is the accum-merge
+        remainder (``p·v`` + the ``O`` add) AFTER the rescale multiplies are removed. Empty for a
+        backend that realizes the contraction outside the combiner (``MmaTwist`` — the assembler
+        builds the consume ``Mma`` cells); a scalar backend emits the multiply + add directly."""
 
     @abstractmethod
     def normalize_accum(self, denom: str) -> list[Stmt]:
@@ -150,17 +166,23 @@ class Combiner(ABC):
         self._reset()
         stats, accum, d_state = split_carrier(carrier, carrier.partial[1])
         score = stats.partial[0]
+        self.d_state = d_state
+        self.accum_op = next((a.op for a in accum.merge if a.name == d_state), None)
         self.weight_name = _weight_name(accum.merge, carrier.partial[1])
         self.bind_score(score)
         stats.project(stats.merge, distributed_inputs={score}, dist=self)
 
-        # accum.merge: only the O·α rescale is realized here (in-place per-row multiply); p·v +
-        # O = O·α + p·v are the SEMIRING consume contraction, accumulated into the accumulators.
+        # accum.merge splits into the O·α rescale multiplies and the consume remainder (p·v + the O
+        # add). MmaTwist realizes the rescale (in-place per-row multiply) and leaves the consume to
+        # the assembler's Mma cells; a scalar backend realizes both.
         rescale_out: list[Stmt] = []
+        consume_in: list[Assign] = []
         for a in accum.merge:
             if a.name != d_state and a.op.name == "multiply" and d_state in a.args:
-                scalar = a.args[0] if a.args[1] == d_state else a.args[1]
-                rescale_out += self.rescale_accum(scalar)
+                rescale_out += self.rescale_accum(a)
+            else:
+                consume_in.append(a)
+        consume_out = self.consume_accum(tuple(consume_in))
 
         # init: the carried-state identity seeds, then the accumulator declarations.
         init_out: list[Stmt] = []
@@ -172,7 +194,12 @@ class Combiner(ABC):
         denom = next(st for st in stats.state if self.state_fold_op[st].name == "add")
         epilogue_out = self.normalize_accum(denom)
         return CombinePhases(
-            init=tuple(init_out), merge=tuple(self.out), rescale=tuple(rescale_out), update=(), epilogue=tuple(epilogue_out)
+            init=tuple(init_out),
+            merge=tuple(self.out),
+            rescale=tuple(rescale_out),
+            update=(),
+            epilogue=tuple(epilogue_out),
+            consume=tuple(consume_out),
         )
 
 
@@ -262,12 +289,18 @@ class MmaTwist(Combiner):
     def declare_accum(self) -> list[Stmt]:
         return [RegFragment(name=fr, role="c", shape=self.atom.shape, dtype=F32) for fr in self.accum_frags]
 
-    def rescale_accum(self, scalar: str) -> list[Stmt]:
+    def rescale_accum(self, a: Assign) -> list[Stmt]:
+        scalar = a.args[0] if a.args[1] == self.d_state else a.args[1]
         alpha = (f"{scalar}0", f"{scalar}1")
         return [
             FragmentApply(out=fr, op=_MULTIPLY, args=(fr, alpha), kinds=(FRAG, ROW), in_place=True, layout=self.layout)
             for fr in self.accum_frags
         ]
+
+    def consume_accum(self, assigns: tuple[Assign, ...]) -> list[Stmt]:  # noqa: ARG002 — Mma cells realize p·v
+        # The embedded P@V contraction is the assembler's consume Mma cells (built from the graph),
+        # accumulated into the accum fragments — not realized here.
+        return []
 
     def normalize_accum(self, denom: str) -> list[Stmt]:
         denom_pair = (f"{denom}0", f"{denom}1")
@@ -291,3 +324,63 @@ class MmaTwist(Combiner):
             FragmentMask(frag=sf, mask_when=mask_when, col_base=cb, row_base=row_base, layout=self.layout)
             for sf, cb in zip(self.partial_frags, col_bases, strict=True)
         ]
+
+
+class ScalarCombiner(Combiner):
+    """The **scalar** (single-thread, undistributed) combiner — the degenerate sibling of
+    :class:`MmaTwist`. At the scalar tier the partial-merge projection is the identity (a fold over a
+    one-element partition is the value itself), so every ``Distribution`` step is a plain ``Assign``:
+    a fold ``mx = max(m, s)`` and a pointwise ``p = exp(s − mx)`` alike. Unlike :class:`MmaTwist`
+    (which leaves the embedded ``p·v`` contraction to the assembler's ``Mma`` cells), the scalar tier
+    has no separate consume cell — it realizes the ``p·v`` accumulation itself in :meth:`consume_accum`.
+
+    The emitted phases mirror the streaming ``render_merge_program`` semantics exactly (a state-named
+    ``Assign`` reassigns the carried value; every other ``Assign`` is an fp32 temp), but as IR
+    statements split into the carrier-generic :class:`CombinePhases` so the scalar streaming reduce and
+    the fragment flash share one ``combine`` orchestration."""
+
+    def __init__(self) -> None:
+        self._reset()
+
+    # --- Distribution protocol: identity projection (one scalar per logical value) ---
+
+    def fold(self, name, op, src, scalar, *, is_state) -> None:
+        # A fold over a one-element partition: the reduce of ``src`` is ``src`` itself, so the step is
+        # ``name = op(scalar, src)`` — a state reassign (name is the carried state) or a temp.
+        self.out.append(Assign(name=name, op=op, args=(scalar, src)))
+        self.fold_op_of[name] = op
+        if is_state:
+            self.state_fold_op[name] = op
+
+    def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — undistributed at the scalar tier
+        self.out.append(Assign(name=name, op=op, args=tuple(args)))
+
+    def scalar(self, name, op, args) -> None:
+        self.out.append(Assign(name=name, op=op, args=tuple(args)))
+
+    def state(self, name, op, args) -> None:
+        self.out.append(Assign(name=name, op=op, args=tuple(args)))
+        if op.name == "copy" and len(args) == 1 and args[0] in self.fold_op_of:
+            self.state_fold_op[name] = self.fold_op_of[args[0]]
+
+    # --- phase hooks (scalar emission) ---
+
+    def bind_score(self, score: str) -> None:
+        # The score is a plain scalar at this tier — the driver's taint (seeded by it) routes the
+        # dispatch; no per-tier value binding is needed.
+        pass
+
+    def seed_state(self, name: str, op) -> list[Stmt]:
+        return [Init(name=name, op=op, dtype=F32)]
+
+    def declare_accum(self) -> list[Stmt]:
+        return [Init(name=self.d_state, op=self.accum_op, dtype=F32)]
+
+    def rescale_accum(self, a: Assign) -> list[Stmt]:
+        return [Assign(name=a.name, op=a.op, args=a.args)]  # om = O · α, verbatim
+
+    def consume_accum(self, assigns: tuple[Assign, ...]) -> list[Stmt]:
+        return [Assign(name=a.name, op=a.op, args=a.args) for a in assigns]  # p·v + O = om + p·v
+
+    def normalize_accum(self, denom: str) -> list[Stmt]:
+        return [Assign(name=self.d_state, op=_DIVIDE, args=(self.d_state, denom))]
