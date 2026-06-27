@@ -589,45 +589,34 @@ def knob_features(knobs: dict) -> dict[str, float]:
 
 def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes — read
-    from the native ``SPLIT@<axis>`` values (``"<par>x<reg>"``) when any are present,
-    else the legacy ``BN``/``FN`` + ``BM``/``FM`` (thread tier) / ``WN``/``FN`` +
+    from the legacy ``BN``/``FN`` + ``BM``/``FM`` (thread tier) / ``WN``/``FN`` +
     ``WM``/``FM`` (warp tier) names.
 
-    The native key carries the axis's IR *name*, not the legacy n/m rank, and the
-    featurizer has no dag — so the two axes are canonicalized by ``par`` (the wider
-    parallel binding is the ``n`` / coalesced slot, the narrower the ``m`` slot). This
-    is dag-free and identical across both schemas; in the golden region (``BN ≥ BM``)
-    it reduces to the legacy labelling. A single free axis fills the ``n`` slot with a
-    degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no complete free split is
-    present (a non-tiled kernel or a par-only transitional row)."""
+    The two axes are canonicalized by ``par`` (the wider parallel binding is the
+    ``n`` / coalesced slot, the narrower the ``m`` slot); in the golden region
+    (``BN ≥ BM``) it reduces to the legacy labelling. A single free axis fills the
+    ``n`` slot with a degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no
+    complete free split is present (a non-tiled kernel)."""
     pairs: list[tuple[int, int]] = []
-    native = [k for k in knobs if k.startswith("SPLIT@")]
-    if native:
-        from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
 
-        for k in native:
-            par, reg = fam.dec_split(knobs[k])
-            if reg is not None:  # skip par-only transitional values (incomplete tile)
-                pairs.append((par, reg))
-    else:
-        # Scalar ``BN``/``BM`` and warp ``WN``/``WM`` are mutually exclusive (a row is
-        # scalar XOR warp), so pick the par names by which tier has a non-zero count —
-        # not via ``is_warp`` (needs the atom key a bare ``_warp_tile_features`` unit
-        # input may omit), and not by mere presence (the off tier is present as the 0
-        # sentinel: a scalar row carries ``WN=WM=0``, a warp row ``BN=BM=0``).
-        def _nz(name: str) -> int:
+    # Scalar ``BN``/``BM`` and warp ``WN``/``WM`` are mutually exclusive (a row is
+    # scalar XOR warp), so pick the par names by which tier has a non-zero count —
+    # not via ``is_warp`` (needs the atom key a bare ``_warp_tile_features`` unit
+    # input may omit), and not by mere presence (the off tier is present as the 0
+    # sentinel: a scalar row carries ``WN=WM=0``, a warp row ``BN=BM=0``).
+    def _nz(name: str) -> int:
+        try:
+            return int(knobs.get(name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    n, m = ("WN", "WM") if (_nz("WN") > 0 or _nz("WM") > 0) else ("BN", "BM")
+    for par_key, reg_key in ((n, "FN"), (m, "FM")):
+        if par_key in knobs and reg_key in knobs:
             try:
-                return int(knobs.get(name, 0) or 0)
+                pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
             except (TypeError, ValueError):
-                return 0
-
-        n, m = ("WN", "WM") if (_nz("WN") > 0 or _nz("WM") > 0) else ("BN", "BM")
-        for par_key, reg_key in ((n, "FN"), (m, "FM")):
-            if par_key in knobs and reg_key in knobs:
-                try:
-                    pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
-                except (TypeError, ValueError):
-                    return None
+                return None
     if not pairs:
         return None
     pairs.sort(key=lambda pr: (pr[0], pr[1]), reverse=True)  # wider par = the n slot
@@ -636,17 +625,23 @@ def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     return par_n, reg_n, par_m, reg_m
 
 
-def _reduce_decomp(knobs: dict):
-    """The primary reduce axis's ``(serial, fold, cta, coop)`` factors — from the native
-    ``REDUCE@<axis>`` value (the deepest-``serial`` axis when a streaming nest has more
-    than one) when present, else the legacy ``BK``/``FK``/``SPLITK``/``BR``. Returns a
-    :class:`_families.Decomp`."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+@dataclass(frozen=True)
+class _Decomp:
+    """Local stand-in for the demolished ``_families.Decomp`` — the reduce-axis
+    decomposition factors the featurizer reads (``serial``/``fold``/``cta``/``coop``)
+    plus the cross-CTA ``finalize`` codec letter."""
 
-    native = [knobs[k] for k in knobs if k.startswith("REDUCE@")]
-    if native:
-        return max((fam.dec_reduce(v) for v in native), key=lambda d: (d.serial, d.cta))
-    return fam.Decomp(
+    serial: int = 1
+    fold: int = 1
+    cta: int = 1
+    coop: int = 1
+    finalize: str = "atomic"
+
+
+def _reduce_decomp(knobs: dict) -> _Decomp:
+    """The primary reduce axis's ``(serial, fold, cta, coop)`` factors — from the
+    legacy ``BK``/``FK``/``SPLITK``/``BR`` knobs. Returns a :class:`_Decomp`."""
+    return _Decomp(
         serial=int(knobs.get("BK", 1) or 1),
         fold=int(knobs.get("FK", 1) or 1),
         cta=int(knobs.get("SPLITK", 1) or 1),
