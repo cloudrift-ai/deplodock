@@ -1,7 +1,8 @@
 # Tile IR rebuild
 
-Status: **demolition landed — tile IR + tile/kernel lowering passes removed, the codebase imports clean, the
-test suite is green through the xfail registry below. Rebuild not started.** Branch `refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phase 1a (the no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` →
+`CudaOp`) has landed; every elementwise + index-only `e2e/` kernel is recovered and un-xfailed. The fold kinds
+(reduce / matmul / attention) remain registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -90,9 +91,41 @@ A single registry drives expected failures during the rebuild — no scattered `
   their now-failing cases are registered in `XFAIL` above. A rebuild that reintroduces and then renames a tile symbol
   should repeat that pattern — guard the import, register the nodeid — rather than letting a collection error return.
 
-## Phase 1+ — Rebuild (not started)
+## Phase 1+ — Rebuild (in progress)
 
-To be designed. The recovery loop is fixed regardless of design: tear out a slice of the old tile IR, watch the
-relevant `e2e/` tests go red, register them in `XFAIL`, build the replacement, and remove registry entries as the tests
-flip to XPASS. The rebuild is complete when `e2e/` is green and `XFAIL` is empty. Design phases (data model, lowering
-moves, scheduling/search integration) will be appended here as they are scoped.
+The recovery loop is fixed regardless of design: tear out a slice of the old tile IR, watch the relevant `e2e/` tests go
+red, register them in `XFAIL`, build the replacement, and remove registry entries as the tests flip to XPASS. The
+rebuild is complete when `e2e/` is green and `XFAIL` is empty.
+
+### Phase 1a — the skeleton (no-fold kernels) — done
+
+The first slice rebuilds the layering end-to-end for the simplest algebraic kind — kernels that carry **no combine**
+(every axis parallel, no fold). The design follows the algebra: **the schedule is separate from the combine.** One op
+carries the schedule; the combine stays in the body and is read back by kind, so the later kinds extend the same
+skeleton by supplying a combine rather than adding lowering code.
+
+- **`ir/tile/` — `TileOp`** (rebuilt): a `BodyOp` carrying the *schedule* — `grid_axes`, the axes tiled onto the thread
+  grid — while the body holds the leaf compute (and, later, a reduce `Loop` + `ReduceCarrier` for the fold). The algebra
+  is **not stored**: `TileOp.algebra_kind` reads it back via `classify_algebra` (the project's "algebra is a derived
+  cache" rule). Wired into `search/keys.py` (`dialect_of` → `"tile"`, `op_cache_key`).
+- **`ir/kernel/` — `Tile`** (kernel-IR stmt): the hardware realization of the schedule — one thread per output cell. It
+  emits the linear-thread decode (`_gid = blockIdx.x·blockDim.x + threadIdx.x`, the `_gid < N` guard, the per-axis index
+  decode) around the body. Geometry only; static extents for now.
+- **`lowering/tile/enumeration/010_schedule.py`** — `LoopOp → TileOp`: dispatches on `Loop.algebra_kind`; schedules the
+  no-fold kind by flattening the free-loop nest into `grid_axes` + a per-cell body. A kernel that carries a combine
+  (`reduce_axis_names` non-empty) is left un-lowered (still xfailed) until its schedule is built.
+- **`lowering/kernel/010_materialize.py`** — `TileOp → KernelOp`: wraps the per-cell body in `Tile`. Algebra-generic — a
+  fold would ride inside the body untouched.
+- **`lowering/cuda/010_lower_kernelop.py`** — `KernelOp → CudaOp`: renders the body and sizes the launch
+  (`ceil(N/256)` CTAs × 256). (Was the demolition stub.)
+
+Recovered `e2e/` capability: every elementwise + index-only (broadcast / reshape / transpose / slice / unsqueeze / cat /
+gather / embedding / index-select / pow) kernel, fp32 and fp16. Their `XFAIL` entries are removed; the matmul / reduce /
+softmax / attention kernels remain registered, waiting on their schedules.
+
+### Phase 1b+ — the fold kinds — not started
+
+Add a schedule per remaining `AlgebraKind`: the serial / cooperative reduce (`MONOID`), the contraction (`SEMIRING`),
+and the streaming monoid (flash). Each supplies a combine to the same `TileOp` / `Tile` skeleton — the reduce `Loop` +
+`ReduceCarrier` already render through the carrier — plus its own launch geometry (cooperative threads, split-K, mma).
+To be scoped here as each lands.

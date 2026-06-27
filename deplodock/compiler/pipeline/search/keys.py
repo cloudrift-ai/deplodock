@@ -62,6 +62,7 @@ def op_cache_key(op: object) -> str | None:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -71,7 +72,7 @@ def op_cache_key(op: object) -> str | None:
         # whole-model compile.
         src = op.kernel_source.replace(op.kernel_name, "_K_") if op.kernel_name else op.kernel_source
         return digest("CudaOp", src, op.arg_order, op.grid, op.block, op.smem_bytes)
-    if isinstance(op, (LoopOp, KernelOp)):
+    if isinstance(op, (LoopOp, TileOp, KernelOp)):
         # Knobs are part of the key: same-body / different-knobs variants must
         # not collide with their parent in the search tree, or
         # ``SearchTree.expand`` self-parents the node and
@@ -86,11 +87,14 @@ def dialect_of(op: object) -> Dialect | None:
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         return "cuda"
     if isinstance(op, KernelOp):
         return "kernel"
+    if isinstance(op, TileOp):
+        return "tile"
     if isinstance(op, LoopOp):
         return "loop"
     return None

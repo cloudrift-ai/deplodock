@@ -40,8 +40,10 @@ from deplodock.compiler.ir.expr import (
     Var,
 )
 from deplodock.compiler.ir.stmt import (
+    INDENT,
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -52,6 +54,8 @@ from deplodock.compiler.ir.stmt import (
     StridedLoop,
     Write,
     _pad,
+    pretty_body,
+    render_body,
 )
 from deplodock.compiler.ir.stmt.base import render_merge_program
 from deplodock.compiler.ir.stmt.ir import BodyOp
@@ -149,6 +153,104 @@ class Sync(Stmt):
         if self.count is None:
             raise ValueError(f"Sync(barrier_id={self.barrier_id}) requires count")
         return [f'{pad}asm volatile("bar.sync {self.barrier_id}, {self.count};\\n" ::: "memory");']
+
+
+@dataclass(frozen=True)
+class Tile(Stmt):
+    """Tile coordinate binding — one GPU thread per output element.
+
+    The kernel-IR realization of a :class:`~deplodock.compiler.ir.tile.TileOp`'s
+    thread schedule (geometry only — the combine, if any, lives in the wrapped
+    ``body``): it maps the kernel's iteration space (the product of its ``axes``
+    extents — the tile's ``grid_axes``) onto a 1-D linear thread grid. Each
+    thread derives a global linear id
+    ``_gid = blockIdx.x * blockDim.x + threadIdx.x``, guards ``_gid < N``
+    (``N`` = ∏ extents), decodes its per-axis indices from ``_gid``, and
+    runs the ``body`` once. Index motion (broadcast, transpose, gather) is
+    already encoded in the body's ``Load`` index Exprs, so the decode only
+    has to bind the axis induction variables.
+
+    Renders to::
+
+        int _gid = blockIdx.x * blockDim.x + threadIdx.x;
+        if (_gid < N) {
+            int a0 = _gid / s0;          // outermost (s0 = ∏ inner extents)
+            int a1 = _gid / s1 % e1;
+            ...
+            <body>
+        }
+
+    The cuda lowering reads ``N`` to size the launch grid
+    (``ceil(N / blockDim)`` CTAs of ``blockDim`` threads). Static extents only
+    for now — a symbolic axis raises (the runtime-arg / masked-tile forms land
+    as the skeleton grows).
+    """
+
+    axes: tuple[Axis, ...]
+    body: Body
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body(self.body))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.body,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return Tile(axes=self.axes, body=body)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset(a.name for a in self.axes)
+
+    @property
+    def extents(self) -> tuple[int, ...]:
+        """Static extent of each axis (raises on a symbolic extent)."""
+        out: list[int] = []
+        for a in self.axes:
+            if not a.extent.is_static:
+                raise NotImplementedError(f"Tile: symbolic axis {a.name!r} not supported yet")
+            out.append(a.extent.as_static())
+        return tuple(out)
+
+    @property
+    def n_elements(self) -> int:
+        """Total iteration-space size — one thread per element."""
+        from math import prod  # noqa: PLC0415
+
+        return prod(self.extents) if self.axes else 1
+
+    def pretty(self, indent: str = "") -> list[str]:
+        names = ", ".join(a.name for a in self.axes)
+        return [f"{indent}Tile[{names}] (N={self.n_elements})", *pretty_body(self.body, indent + INDENT)]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        from math import prod  # noqa: PLC0415
+
+        pad = _pad(ctx.indent)
+        extents = self.extents
+        # Inner-stride of each axis = product of the extents to its right.
+        strides: list[int] = [1] * len(extents)
+        acc = 1
+        for i in range(len(extents) - 1, -1, -1):
+            strides[i] = acc
+            acc *= extents[i]
+        n = prod(extents) if extents else 1
+        out = [
+            f"{pad}int _gid = blockIdx.x * blockDim.x + threadIdx.x;",
+            f"{pad}if (_gid < {n}) {{",
+        ]
+        inner = ctx.child()
+        ipad = _pad(inner.indent)
+        for i, a in enumerate(self.axes):
+            s, e = strides[i], extents[i]
+            term = "_gid" if s == 1 else f"_gid / {s}"
+            # The outermost axis needs no modulo (``_gid / s0 < e0`` since _gid < N).
+            expr = term if i == 0 else f"({term}) % {e}"
+            out.append(f"{ipad}int {a.name} = {expr};")
+        out.extend(render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
 
 
 @dataclass(frozen=True)
@@ -1568,6 +1670,7 @@ __all__ = [
     "Cond",
     "Loop",
     # Kernel-IR statements
+    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",
@@ -1607,6 +1710,16 @@ __all__ = [
 
 
 from deplodock.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
+
+
+@_rewrite.register
+def _(s: Tile, rename, sigma, axis_fn):
+    # ``axes`` map through ``axis_fn``; the body's stmts route through the
+    # generic per-stmt rewrite so SSA names / Exprs canonicalize inside.
+    return Tile(
+        axes=tuple(axis_fn(a) for a in s.axes),
+        body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.body)),
+    )
 
 
 @_rewrite.register

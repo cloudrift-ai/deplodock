@@ -34,7 +34,7 @@ try:
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag, seed_graph
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-except ModuleNotFoundError:
+except ImportError:  # module may now exist sans these (partially rebuilt) symbols → ImportError, not ModuleNotFoundError
     Buffer = Edge = Placement = Space = TileGraph = TileGraphOp = TileOp = Transport = None
     assemble_block = fam = build_dag = seed_graph = classify = iter_dag = None
 from tests.compiler.conftest import requires_cuda

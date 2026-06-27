@@ -23,7 +23,7 @@ from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 # module collects and its tests register as xfail rather than a collection error.
 try:
     from deplodock.compiler.ir.tile.ir import StageBundle, TileOp
-except ModuleNotFoundError:
+except ImportError:  # module may now exist sans these (partially rebuilt) symbols → ImportError, not ModuleNotFoundError
     StageBundle = TileOp = None
 
 from ..conftest import requires_cuda
