@@ -85,11 +85,16 @@ class Combiner(ABC):
     phase orchestration that wraps it. :meth:`combine` is the one carrier-generic driver shared by
     every tier; subclasses supply only the tier-specific emission:
 
-    - the ``Distribution`` protocol (:meth:`fold` / :meth:`pointwise` / :meth:`scalar` /
-      :meth:`state`) — how a fold / elementwise / replicated-scalar / carried-state step is emitted,
-    - the phase hooks (:meth:`bind_score` / :meth:`seed_state` / :meth:`declare_accum` /
-      :meth:`rescale_accum` / :meth:`normalize_accum`) — how the accumulator is seeded, declared,
-      rescaled by the twist, and normalized.
+    - the **tier primitives** (:attr:`comps` / :meth:`_temp` / :meth:`_reduce`) — how a carried scalar
+      splits into per-partition components, the rebind temp naming, and the cross-partition reduce —
+      over which the ``Distribution`` ``fold`` / ``scalar`` / ``state`` synthesis (and the
+      ``seed_state`` seed) is written ONCE here on the base,
+    - :meth:`pointwise` — the one ``Distribution`` step whose emission genuinely differs by tier
+      (per-atom ``FragmentApply`` vs a scalar ``Assign``),
+    - the accumulator hooks (:meth:`bind_score` / :meth:`declare_accum` / :meth:`rescale_accum` /
+      :meth:`consume_accum` / :meth:`normalize_accum`) — structurally divergent (mma realizes the
+      consume from the graph ``Mma`` cells + rescales fragments in place; the scalar tier emits the
+      arithmetic), so they stay per-tier.
 
     The scratch fields (``out`` / ``frag_binding`` / ``state_fold_op`` / ``fold_op_of`` /
     ``weight_name``) are populated during projection and read by :meth:`combine`; :meth:`_reset` is
@@ -105,31 +110,72 @@ class Combiner(ABC):
         self.d_state: str | None = None  # the accumulator carried-state name (flash's O), set by combine()
         self.accum_op = None  # the accumulator's fold op (add), read off accum.merge by combine()
 
-    # --- Distribution protocol (driven by Monoid.project) — tier-specific emission ---
+    # --- tier primitives: the per-partition layout + naming + the cross-partition reduce ---
+
+    @property
+    @abstractmethod
+    def comps(self) -> tuple[str, ...]:
+        """The per-partition SSA component suffixes a carried scalar splits into at this tier — ``("",)``
+        for the scalar tier (one value, ``m``), ``("0", "1")`` for the mma tier (the two fragment rows
+        per lane, ``m0`` / ``m1``). The shared ``fold`` / ``scalar`` / ``state`` / ``seed_state``
+        synthesis loops over them."""
 
     @abstractmethod
-    def fold(self, name, op, src, scalar, *, is_state) -> None: ...
+    def _temp(self, name: str, comp: str) -> str:
+        """The rebind temp name for carried-state component ``comp`` of ``name`` — a state update
+        computes into this temp, then ``Reassign``s the state from it (``Assign`` would re-declare)."""
+
+    @abstractmethod
+    def _reduce(self, name: str, src: str, op) -> tuple[str, ...]:
+        """Reduce the distributed ``src`` over the partitioned axis to one per-component operand each,
+        EMITTING the cross-partition reduce: a ``FragmentRowReduce`` over the C-fragment columns at the
+        mma tier; the identity at the scalar tier (a one-element partition reduces to itself, ``(src,)``,
+        no emission)."""
+
+    # --- Distribution protocol (driven by Monoid.project) — synthesized once over the tier primitives ---
+
+    def fold(self, name, op, src, scalar, *, is_state) -> None:
+        # A reduce over the distributed axis (``rowmax`` / ``rowsum``): reduce ``src`` to a per-component
+        # scalar, then combine with the carried scalar per component (a carried-state fold rebinds via a
+        # temp + ``Reassign``; a temp fold assigns directly).
+        reduced = self._reduce(name, src, op)
+        self.fold_op_of[name] = op
+        if is_state:
+            self.state_fold_op[name] = op
+            temps = [self._temp(name, c) for c in self.comps]
+            self.out += [Assign(t, op, (f"{scalar}{c}", r)) for t, c, r in zip(temps, self.comps, reduced, strict=True)]
+            self.out += [Reassign(f"{name}{c}", t) for t, c in zip(temps, self.comps, strict=True)]
+        else:
+            self.out += [Assign(f"{name}{c}", op, (f"{scalar}{c}", r)) for c, r in zip(self.comps, reduced, strict=True)]
 
     @abstractmethod
     def pointwise(self, name, op, args, distributed) -> None: ...
 
-    @abstractmethod
-    def scalar(self, name, op, args) -> None: ...
+    def scalar(self, name, op, args) -> None:  # a replicated scalar temp, per component
+        self.out += [Assign(f"{name}{c}", op, tuple(f"{x}{c}" for x in args)) for c in self.comps]
 
-    @abstractmethod
-    def state(self, name, op, args) -> None: ...
+    def state(self, name, op, args) -> None:  # a carried-state reassign (copy / scalar update)
+        if op.name == "copy" and len(args) == 1:
+            src = args[0]
+            self.out += [Reassign(f"{name}{c}", f"{src}{c}") for c in self.comps]
+            if src in self.fold_op_of:
+                self.state_fold_op[name] = self.fold_op_of[src]
+        else:
+            temps = [self._temp(name, c) for c in self.comps]
+            self.out += [Assign(t, op, tuple(f"{x}{c}" for x in args)) for t, c in zip(temps, self.comps, strict=True)]
+            self.out += [Reassign(f"{name}{c}", t) for t, c in zip(temps, self.comps, strict=True)]
 
-    # --- phase hooks — tier-specific accumulator handling ---
+    def seed_state(self, name: str, op) -> list[Stmt]:
+        """The carried-state identity seeds for state ``name`` folded by ``op`` — one ``Init`` per
+        per-partition component."""
+        return [Init(name=f"{name}{c}", op=op, dtype=F32) for c in self.comps]
+
+    # --- accumulator hooks — structurally divergent, per tier ---
 
     @abstractmethod
     def bind_score(self, score: str) -> None:
         """Bind the distributed input (the score partial) to this backend's representation, before
         projection — for :class:`MmaTwist` the per-N-atom score fragments."""
-
-    @abstractmethod
-    def seed_state(self, name: str, op) -> list[Stmt]:
-        """The carried-state identity seed(s) for state ``name`` folded by ``op`` (e.g. an ``Init``
-        per distributed row)."""
 
     @abstractmethod
     def declare_accum(self) -> list[Stmt]:
@@ -249,19 +295,19 @@ class MmaTwist(Combiner):
         self.weight_frags = tuple(f"Pf{j}" for j in range(len(produce)))  # the probability — minted (not a cell field)
         self._reset()
 
-    # --- Distribution protocol (driven by Monoid.project) ---
+    # --- tier primitives (mma: two C-fragment rows per lane; reduce = FragmentRowReduce) ---
 
-    def fold(self, name, op, src, scalar, *, is_state) -> None:
+    comps = ("0", "1")  # the two C-fragment rows per lane (``m0`` / ``m1``)
+
+    def _temp(self, name: str, comp: str) -> str:
+        return f"{name}_n{comp}"  # the per-row rebind temp (``<name>_n0`` / ``<name>_n1``)
+
+    def _reduce(self, name: str, src: str, op) -> tuple[str, ...]:
         r0, r1 = f"{name}_r0", f"{name}_r1"
         self.out.append(FragmentRowReduce(top=r0, bot=r1, frags=self.frag_binding[src], op=op, group=self.layout.reduce_group))
-        self.fold_op_of[name] = op
-        if is_state:  # state-update fold: l = lm + rowsum(p)
-            n0, n1 = f"{name}_n0", f"{name}_n1"
-            self.out += [Assign(n0, op, (f"{scalar}0", r0)), Assign(n1, op, (f"{scalar}1", r1))]
-            self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
-            self.state_fold_op[name] = op
-        else:  # temp fold: mx = max(m, rowmax(s))
-            self.out += [Assign(f"{name}0", op, (f"{scalar}0", r0)), Assign(f"{name}1", op, (f"{scalar}1", r1))]
+        return (r0, r1)
+
+    # --- pointwise: the one Distribution step with tier-specific (per-N-atom) emission ---
 
     def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — taint via frag_binding
         # The consume contraction's value-coefficient lands in the weight fragments; any other
@@ -277,28 +323,10 @@ class MmaTwist(Combiner):
             self.out.append(FragmentApply(out=out_fr, op=op, args=tuple(a_args), kinds=tuple(kinds), layout=self.layout))
         self.frag_binding[name] = frags
 
-    def scalar(self, name, op, args) -> None:  # a replicated scalar temp, per row
-        for sfx in ("0", "1"):
-            self.out.append(Assign(f"{name}{sfx}", op, tuple(f"{x}{sfx}" for x in args)))
-
-    def state(self, name, op, args) -> None:  # a carried-state reassign (copy / scalar)
-        if op.name == "copy" and len(args) == 1:
-            src = args[0]
-            self.out += [Reassign(f"{name}0", f"{src}0"), Reassign(f"{name}1", f"{src}1")]
-            if src in self.fold_op_of:
-                self.state_fold_op[name] = self.fold_op_of[src]
-        else:
-            n0, n1 = f"{name}_n0", f"{name}_n1"
-            self.out += [Assign(n0, op, tuple(f"{x}0" for x in args)), Assign(n1, op, tuple(f"{x}1" for x in args))]
-            self.out += [Reassign(f"{name}0", n0), Reassign(f"{name}1", n1)]
-
-    # --- phase hooks (fragment-tier emission) ---
+    # --- accumulator hooks (fragment-tier emission) ---
 
     def bind_score(self, score: str) -> None:
         self.frag_binding = {score: self.partial_frags}
-
-    def seed_state(self, name: str, op) -> list[Stmt]:
-        return [Init(name=f"{name}0", op=op, dtype=F32), Init(name=f"{name}1", op=op, dtype=F32)]
 
     def declare_accum(self) -> list[Stmt]:
         return [RegFragment(name=fr, role="c", shape=self.atom.shape, dtype=F32) for fr in self.accum_frags]
@@ -366,41 +394,27 @@ class ScalarCombiner(Combiner):
         tmp = f"{name}__sc"
         return [Assign(name=tmp, op=op, args=tuple(args)), Reassign(name=name, value=tmp)]
 
-    # --- Distribution protocol: identity projection (one scalar per logical value) ---
+    # --- tier primitives (scalar: one component per value; reduce = identity) ---
 
-    def fold(self, name, op, src, scalar, *, is_state) -> None:
-        # A fold over a one-element partition: the reduce of ``src`` is ``src`` itself, so the step is
-        # ``name = op(scalar, src)`` — a carried-state rebind (via temp + Reassign) or a plain temp.
-        self.fold_op_of[name] = op
-        if is_state:
-            self.state_fold_op[name] = op
-            self.out.extend(self._state_update(name, op, (scalar, src)))
-        else:
-            self.out.append(Assign(name=name, op=op, args=(scalar, src)))
+    comps = ("",)  # one undistributed value per carried scalar (``m``)
+
+    def _temp(self, name: str, comp: str) -> str:  # noqa: ARG002 — one component, no per-row suffix
+        return f"{name}__sc"  # the carried-state rebind temp
+
+    def _reduce(self, name: str, src: str, op) -> tuple[str, ...]:  # noqa: ARG002 — a 1-element partition
+        return (src,)  # the reduce of a one-element partition is the value itself (no emission)
+
+    # --- pointwise: a plain Assign (undistributed at the scalar tier) ---
 
     def pointwise(self, name, op, args, distributed) -> None:  # noqa: ARG002 — undistributed at the scalar tier
         self.out.append(Assign(name=name, op=op, args=tuple(args)))
 
-    def scalar(self, name, op, args) -> None:
-        self.out.append(Assign(name=name, op=op, args=tuple(args)))
-
-    def state(self, name, op, args) -> None:
-        if op.name == "copy" and len(args) == 1:  # a carried-state copy (m = m_new) — a direct Reassign
-            self.out.append(Reassign(name=name, value=args[0]))
-            if args[0] in self.fold_op_of:
-                self.state_fold_op[name] = self.fold_op_of[args[0]]
-        else:
-            self.out.extend(self._state_update(name, op, args))
-
-    # --- phase hooks (scalar emission) ---
+    # --- accumulator hooks (scalar emission) ---
 
     def bind_score(self, score: str) -> None:
         # The score is a plain scalar at this tier — the driver's taint (seeded by it) routes the
         # dispatch; no per-tier value binding is needed.
         pass
-
-    def seed_state(self, name: str, op) -> list[Stmt]:
-        return [Init(name=name, op=op, dtype=F32)]
 
     def declare_accum(self) -> list[Stmt]:
         if self.d_state is None:  # non-twisted carrier (online softmax / pure reduce) — no accumulator
