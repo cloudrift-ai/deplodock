@@ -210,6 +210,24 @@ def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple
     return body
 
 
+def _lay_domain(layers: list[tuple[Axis, Binding]]) -> tuple[tuple[Axis, ...], dict[str, Binding]]:
+    """Build a block's ``(domain, binding)`` from innermost-first ``(axis, binding)`` layers — the
+    shared domain construction of ``warp_build`` / ``chain_build`` / ``warp_chain_build`` (each lays
+    its own σ-split axes + a GRID trail). ``domain`` order is load-bearing (the tower nests
+    inner→outer); the ``binding`` dict is keyed by name (``structural_key`` sorts it)."""
+    return tuple(a for a, _ in layers), {a.name: b for a, b in layers}
+
+
+def _stream_compute(compute, new_kv: Stmt) -> Body:
+    """Wrap a kv-stream carry loop between the carrier-state ``Init`` seeds (above) and the epilogue
+    ``Assign`` / ``Write`` (below) — the identical postamble of both chain builds (scalar
+    ``chain_build`` + warp ``warp_chain_build``). The register-replication / fragment realizer derives
+    which seeds / epilogue depend on ``d``; the chain restructure only relocates the stream loop."""
+    head_inits = tuple(s for s in compute if isinstance(s, Init))
+    epilogue = tuple(s for s in compute if isinstance(s, (Assign, Write)))
+    return Body((*head_inits, new_kv, *epilogue))
+
+
 def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis | None:
     """The split-K GRID axis ``K_s`` (the cross-CTA partition factor), or ``None``
     when there is no contraction (``MAP``) or ``SPLITK == 1``. Computed identically
@@ -429,8 +447,8 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     # combiner, sibling of the fragment ``MmaTwist``), the SAME ``combine()`` the flash tiers drive,
     # instead of being left a ``Monoid`` for ``render_merge_program``. Its ``Init`` seeds are already
     # placed (the recognizer emits them) and a serial reduce has no cross-thread combine. Cooperative
-    # (``br > 1``) / split-K ``Monoid``s keep the carrier for ``emit_combine``; flat ``Accum`` reduces
-    # and twisted carriers (flash → ``chain_build`` / ``warp_chain_build``) are untouched.
+    # (``br > 1``) / split-K ``Monoid``s keep the carrier for the cross-thread ``emit_combine`` /
+    # cross-CTA combine; flat ``Accum`` reduces and twisted carriers (flash) are untouched.
     carrier = dag.reduction.carrier if dag.reduction is not None else None
     if br == 1 and k_s is None and isinstance(carrier, Monoid) and len(carrier.partial) == 1:
         compute_in = _realize_serial_monoid(compute_in, carrier)
@@ -521,12 +539,11 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
     m_thread = fam.dec_split(m_split)[0] if m_split is not None else 1
     m_b, (m_t, m_r), m_expr, m_bound = _split_axis(m_axis, [("t", m_thread, True), ("r", 1, True)], interleave_when_masked=True)
 
-    # The carrier-state Inits + epilogue stay where they are; the register-replication
-    # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
-    head_inits = tuple(s for s in body if isinstance(s, Init))
-    epilogue = tuple(s for s in body if isinstance(s, (Assign, Write)))
+    # The carrier-state Inits + epilogue stay where they are; the register-replication pass derives
+    # which (the ``O`` init / normalize / write) depend on ``d``. ``_stream_compute`` is the shared
+    # chain postamble (also warp_chain_build).
     new_kv = replace(kv_loop, body=Body((*prefix, *fs.merge, value_load, *fs.rescale, *fs.consume)))
-    compute: tuple[Stmt, ...] = (*head_inits, new_kv, *epilogue)
+    compute: tuple[Stmt, ...] = tuple(_stream_compute(body, new_kv))
 
     # σ-rewrite: ``d`` -> the register axis var; ``m`` -> its block/thread split.
     sigma = Sigma({d_axis.name: Var(d_r.name), m_axis.name: m_expr})
@@ -536,17 +553,16 @@ def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
 
     # Domain ordered register..thread..grid (inner→outer) so the tower groups
     # GridTile > ThreadTile > RegisterTile cleanly; ``d_r`` is the innermost register.
-    domain: list[Axis] = [d_r, m_r, m_t, m_b]
-    binding: dict[str, Binding] = {
-        d_r.name: Binding.REGISTER,
-        m_r.name: Binding.REGISTER,
-        m_t.name: Binding.THREAD,
-        m_b.name: Binding.GRID,
-    }
-    for lp in reversed(grid):
-        domain.append(lp.axis)
-        binding[lp.axis.name] = Binding.GRID
-    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
+    domain, binding = _lay_domain(
+        [
+            (d_r, Binding.REGISTER),
+            (m_r, Binding.REGISTER),
+            (m_t, Binding.THREAD),
+            (m_b, Binding.GRID),
+            *[(lp.axis, Binding.GRID) for lp in reversed(grid)],
+        ]
+    )
+    new_block = Block(name=block.name, domain=domain, compute=Body(compute))
     return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
 
 
@@ -657,12 +673,9 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
     # epilogue) around these AtomTiles, reading causality off the ``Select``'s presence.
     mask = (score_mask,) if score_mask is not None else ()
     new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, reduction.carrier, *consume)), kind="serial_outer")
-    head_inits = tuple(s for s in block.compute if isinstance(s, Init))
-    epilogue = tuple(s for s in block.compute if isinstance(s, (Assign, Write)))
-    compute = (*head_inits, new_kv, *epilogue)
+    compute = _stream_compute(block.compute, new_kv)  # the shared chain postamble (also chain_build)
 
-    domain = (m_b, *(lp.axis for lp in reversed(grid)))
-    binding = {m_b.name: Binding.GRID, **{lp.axis.name: Binding.GRID for lp in grid}}
+    domain, binding = _lay_domain([(m_b, Binding.GRID), *[(lp.axis, Binding.GRID) for lp in reversed(grid)]])
     handoff_edge = Edge(src=block.name, dst=block.name, buffer="flash_pv_smem")
     schedule = replace(
         tg.schedule,
@@ -670,7 +683,7 @@ def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoi
         carry=frozenset({kv_b.name}),
         staged={**tg.schedule.staged, handoff_edge: Transport.SYNC},
     )
-    new_block = replace(block, domain=domain, compute=Body(compute))
+    new_block = replace(block, domain=domain, compute=compute)
     return replace(tg, blocks=(new_block, *tg.blocks[1:]), schedule=schedule)
 
 
@@ -711,21 +724,16 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
     new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)
 
-    # Domain: N then M, each split b/w/r/a. ``_free_layers`` orders the tiers
-    # (ATOM innermost … GRID outermost) for ``assemble``; extra-outer trail GRID.
-    domain: list[Axis] = []
-    binding: dict[str, Binding] = {}
-    for a_b, a_w, a_r, a_a in ((n_b, n_w, n_r, n_a), (m_b, m_w, m_r, m_a)):
-        domain.extend((a_b, a_w, a_r, a_a))
-        binding[a_b.name] = Binding.GRID
-        binding[a_w.name] = Binding.WARP
-        binding[a_r.name] = Binding.REGISTER
-        binding[a_a.name] = Binding.ATOM
-    for lp in reversed(extra_outer):
-        domain.append(lp.axis)
-        binding[lp.axis.name] = Binding.GRID
-
-    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(new_inner))
+    # Domain: N then M, each split b/w/r/a (GRID/WARP/REGISTER/ATOM); extra-outer trail GRID.
+    # ``_free_layers`` orders the tiers (ATOM innermost … GRID outermost) for ``assemble``.
+    tiers = (Binding.GRID, Binding.WARP, Binding.REGISTER, Binding.ATOM)
+    domain, binding = _lay_domain(
+        [
+            *[(ax, b) for axes in ((n_b, n_w, n_r, n_a), (m_b, m_w, m_r, m_a)) for ax, b in zip(axes, tiers, strict=True)],
+            *[(lp.axis, Binding.GRID) for lp in reversed(extra_outer)],
+        ]
+    )
+    new_block = Block(name=block.name, domain=domain, compute=Body(new_inner))
     return replace(
         graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding})
     )

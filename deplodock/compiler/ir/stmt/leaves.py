@@ -525,6 +525,22 @@ class Accum(ReduceCarrier):
         ``Monoid.combine_states``."""
         return (Assign(name=self.name, op=self.op, args=(self.name, f"{self.name}__o"), dtype=self.dtype),)
 
+    def as_monoid(self) -> Monoid:
+        """This additive/associative ``Accum`` AS the degenerate 1-component ``Monoid`` it already is —
+        state ``(name,)``, partial ``(value,)``, ``merge`` = ``name = op(name, value)``, identity the
+        op's. The carrier-algebra fact that a SEMIRING / scalar reduce is the trivial monoid: it lets an
+        ``Accum`` lower through the **same** ``Combiner`` / cross-partition path as a general ``Monoid``,
+        with no additive special-case. The auto-derived ``combine_states`` (``name = op(name, name__o)``)
+        equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
+        return Monoid(
+            state=(self.name,),
+            partial=(self.value,),
+            merge=(Assign(name=self.name, op=self.op, args=(self.name, self.value), dtype=self.dtype),),
+            identity=(self.init,),
+            commutative=self.op.commutative,
+            axes=self.axes,
+        )
+
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
     # ``sum`` Accum differ, and ``self.op`` is the source of truth.
     @property
@@ -792,18 +808,8 @@ class Monoid(ReduceCarrier):
         split-KV / split-K reductions fold through."""
         return self.combine_states
 
-    def project(self, program, *, distributed_inputs, dist) -> None:
-        """Project this carrier's ``program`` (a ``merge`` / ``combine_states`` body) onto a
-        ``Distribution`` backend — the **magic method** that takes the carrier algebra to a target
-        distribution by the distribution law. Taints the distributed values (seeded by
-        ``distributed_inputs``), then dispatches each ``Assign`` to the backend's fold (a reduce
-        over the distributed axis → its cross-partition combine) / pointwise (elementwise → its
-        per-element map) / scalar / carried-state reassign — carrier-generic, no shape knowledge.
-        The fragment realizer is one such backend (``ir/twist.MmaTwist``);
-        ``dist`` is the stateful backend, mutated in place. See ``ir/stmt/carrier_algebra``."""
-        from deplodock.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
-
-        interpret(program, distributed_inputs=distributed_inputs, state_names=self.state, dist=dist)
+    # ``project`` is the shared ``ReduceCarrier`` default (keyed off ``carried_names()`` ==
+    # ``state``) — the one magic method every carrier inherits; no Monoid-specific override.
 
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.

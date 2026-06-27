@@ -104,8 +104,8 @@ def atomic_finalize_legal(carrier, dtype) -> bool:
     ``Accum`` (``max`` / ``min`` / ``mul``), a twisted ``Monoid`` (flash's online ``(m, l)`` —
     the cross-partition merge carries an ``e^{Δm}`` rescale, not a sum), or a non-atomicAdd
     ``dtype`` must use the **deferred** ``kernel_boundary`` finalize (a fresh combine kernel,
-    always legal — ``enumeration/_partition.additive_reduce_tilegraph`` /
-    ``monoid_reduce_tilegraph``)."""
+    always legal — ``enumeration/_partition.deferred_combine_tilegraph``, an ``Accum`` folded as a
+    degenerate ``Monoid`` via ``Accum.as_monoid``)."""
     return isinstance(carrier, Accum) and carrier.op.name == "add" and getattr(dtype, "name", None) in _ATOMICADD_DTYPES
 
 

@@ -205,7 +205,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     # Cross-CTA split-KV (Flash-Decoding) of the streaming flash — **pin-gated** (an explicit
     # ``REDUCE`` ``c<cta>`` on the KV stream): each CTA folds a slice of the KV stream into its
     # own partial ``(m, l, O)`` state, ``150_cross_cta_finalize`` writes the 3 state workspaces
-    # and the carrier-generic combine merges them (``monoid_reduce_tilegraph``). Static KV only
+    # and the carrier-generic combine merges them (``deferred_combine_tilegraph``). Static KV only
     # (the slice must divide); the serial-stream ``monoid_build`` carries the split-K grid (the
     # FA-2 ``chain_build`` doesn't thread it yet), so cta>1 forces the ``monoid_build`` path.
     _, _, sk_pin, _ = fam.reduce_fields(op.dag, op.dag.k_node.loop.axis.name)

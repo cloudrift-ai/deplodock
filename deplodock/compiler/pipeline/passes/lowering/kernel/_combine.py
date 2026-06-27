@@ -2,15 +2,16 @@
 
 A cooperative reduce carrier — a scalar ``Accum`` or the general tuple ``Monoid``
 (flash online-softmax) — whose reduction axis is split across the CTA's threads
-needs a cross-thread reduce after the per-thread partials land. ``emit_combine``
-picks warp-shuffle / hierarchical / block-wide smem tree-halve by thread count,
-driven uniformly off the carrier's algebra surface (``carried_names`` /
-``combine_operands`` / ``combine_partials``): a scalar ``Accum`` is the degenerate
-1-component monoid (``state=("acc",)``, ``combine_states=(Assign("acc", op,
-("acc","acc__o")),)``), so ONE emitter and ONE pair of stmts (``WarpShuffle`` /
-``TreeHalve``) cover both. The combine reassigns the carried state **in place** — no
-``_b`` rename, since the butterfly / tree leaves every thread holding the full
-reduction in the carried SSA names.
+needs a cross-thread reduce after the per-thread partials land. ``emit_combine`` builds the
+cross-thread **distribution** — pure geometry (``WarpShuffle`` / ``Smem`` / ``TreeHalve`` by
+thread count), NOT a combiner: it carries the carrier's ``combine_states`` straight onto those
+nodes, which realize the combine ALGEBRA via ``render_merge_program`` (the SAME realizer the
+scalar ``ScalarCombiner`` / ``Monoid.render`` use). Driven off the carrier's algebra surface
+(``carried_names`` / ``combine_operands`` / ``combine_partials``): a scalar ``Accum`` is the
+degenerate 1-component monoid (``state=("acc",)``, ``combine_states=(Assign("acc", op,
+("acc","acc__o")),)``), so ONE emitter and ONE pair of stmts (``WarpShuffle`` / ``TreeHalve``)
+cover both. The combine reassigns the carried state **in place** — no ``_b`` rename, since the
+butterfly / tree leaves every thread holding the full reduction in the carried SSA names.
 
 ``find_nested_reduce_carriers`` and ``cooperative_combine_geometry`` are the small
 queries the materializer uses to locate the carriers and the combine's tid var +
@@ -161,53 +162,28 @@ def cooperative_combine_geometry(thread_axes: tuple[Axis, ...], coop_names: froz
     return coop[0].name, n_coop
 
 
-def emit_combine(
-    carrier,
-    t: str,
-    n_threads: int,
-    *,
-    warp_size: int,
-    barrier_id: int = 0,
-    barrier_count: int | None = None,
-) -> list[Stmt]:
-    """Emit the cross-thread combine for a reduce carrier (``Accum`` / ``Monoid``),
-    reassigning the carried state **in place**.
+def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int, barrier_id: int = 0, barrier_count: int | None = None) -> list[Stmt]:
+    """Build the **cross-thread distribution** of a reduce carrier's combine across the CTA's threads
+    — the butterfly / smem tree (``WarpShuffle`` / ``TreeHalve``). This is pure *geometry*: it carries
+    the carrier's ``combine_states`` straight onto the nodes, which realize the combine ALGEBRA
+    themselves via ``render_merge_program`` (the SAME realizer the scalar ``ScalarCombiner`` /
+    ``Monoid.render`` use). So there is no per-tier "combiner" here — the carrier's
+    ``carried_names`` / ``combine_operands`` / ``combine_partials`` surface IS the combine, and
+    ``Accum`` is the degenerate 1-component case (``combine_partials`` = the additive ``⊙``).
 
-    Driven off the carrier's algebra surface — ``carried_names()`` (the state),
-    ``combine_operands()`` (the second-operand state names), ``combine_partials()``
-    (the state-merges-state program). A scalar ``Accum`` is the degenerate
-    1-component case; the tuple ``Monoid`` (flash online-softmax) is the general one.
+    The geometry is the derived intra-CTA :data:`CombinePlan` (:func:`derive_combine_plan`):
 
-    The geometry is the derived intra-CTA :data:`CombinePlan`
-    (:func:`derive_combine_plan` of ``n_threads`` / ``warp_size``) — an ordered array of
-    :class:`CombineStage`s this function emits one-for-one (all require ``commutative`` —
-    the butterfly / tree reorders — checked at the carrier):
+    - a ``SHFL`` stage → a single ``WarpShuffle`` register butterfly. The XOR butterfly never crosses
+      an aligned ``width``-lane group, so a lone ``SHFL`` stage is also the SEGMENTED per-row combine
+      for strided-cooperative rows (caller passes the segment size as ``n_threads``).
+    - a ``SMEM`` stage **after** a ``SHFL`` stage → the *hierarchical* cross-warp slab: lane-0 of each
+      warp writes its broadcast state to a ``smem[width]`` slab per component; one ``Sync`` +
+      ``TreeHalve(tid_var="warp")`` collapses across warps and broadcasts.
+    - a standalone ``SMEM`` stage → the *block* slab: every thread writes its partial, one ``Sync``,
+      a single ``TreeHalve`` reduces + broadcasts in place.
 
-    - a ``SHFL`` stage → a single ``WarpShuffle`` register butterfly (no smem, no
-      syncthreads). The XOR butterfly never crosses an aligned ``width``-lane group, so a
-      lone ``SHFL`` stage is also the SEGMENTED per-row combine for strided-cooperative
-      rows (caller passes the segment size as ``n_threads`` — see
-      :func:`cooperative_combine_geometry`).
-    - a ``SMEM`` stage **after** a ``SHFL`` stage → the *hierarchical* cross-warp slab:
-      each warp has already shuffle-reduced its lanes in place; lane 0 of each warp writes
-      the per-warp state to a tiny ``smem[width]`` slab per component; one ``Sync`` +
-      ``TreeHalve(length=width, tid_var="warp")`` collapses across warps and broadcasts.
-    - a standalone ``SMEM`` stage → the *block* slab: every thread writes its partial to a
-      ``smem[width]`` slab per component, one ``Sync``, a single ``TreeHalve`` reduces +
-      broadcasts in place.
-
-    ``dtype`` flows from the carrier (``Accum.dtype``; fp32 for a ``Monoid``) so the
-    smem slabs + the combine render in the accumulator's element type.
-
-    The Tile renderer emits ``int lane = threadIdx.x & 31;`` and ``int warp =
-    threadIdx.x >> 5;`` for any cooperative Tile with ``n_threads > warp_size`` so
-    the hierarchical path's ``Var("lane")`` / ``Var("warp")`` references resolve.
-
-    ``barrier_id`` / ``barrier_count`` route the emitted ``Sync`` + ``TreeHalve``'s
-    per-iter sync to a named barrier when non-zero (warp-specialized consumer branch
-    — sync only the consumer threads, not the whole CTA). The warp-shuffle path uses
-    ``__shfl_xor_sync`` (intra-warp), so it's unaffected.
-    """
+    ``barrier_id`` / ``barrier_count`` route the ``Sync`` + ``TreeHalve`` per-iter sync to a named
+    barrier (warp-specialized consumer branch). The warp-shuffle path uses ``__shfl_xor_sync``."""
     state = carrier.carried_names()
     state_b = carrier.combine_operands()
     prog = carrier.combine_partials()
@@ -224,10 +200,9 @@ def emit_combine(
         if stage.fold is Fold.SHFL:
             out.append(WarpShuffle(state=state, state_b=state_b, combine_states=prog, length=stage.width, dtype=dtype))
         elif stage.fold is Fold.SMEM:
-            # Two SMEM forms, distinguished by the preceding stage: a cross-warp SMEM after
-            # a per-warp SHFL is the *hierarchical* slab — lane-0 of each warp stages its
-            # warp's broadcast state, indexed by ``warp``; a standalone SMEM is the *block*
-            # slab — every thread stages its own partial, indexed by ``t``.
+            # Two SMEM forms, distinguished by the preceding stage: a cross-warp SMEM after a per-warp
+            # SHFL is the *hierarchical* slab — lane-0 of each warp stages its warp's broadcast state,
+            # indexed by ``warp``; a standalone SMEM is the *block* slab — every thread stages its own.
             hierarchical = i > 0 and plan[i - 1].fold is Fold.SHFL
             tid_var = "warp" if hierarchical else t
             out += [Smem(name=b, extents=(stage.width,), dtype=smem_c) for b in bufs]
