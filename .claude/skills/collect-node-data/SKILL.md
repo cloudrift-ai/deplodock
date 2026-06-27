@@ -71,46 +71,59 @@ Use the SSH options the codebase uses (`deplodock/provisioning/ssh_transport.py`
 ```bash
 REMOTE="<user@host>"
 KEY="$HOME/.ssh/id_ed25519"
-SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -i $KEY"
-# If the VM uses a non-22 port: add `-p <PORT>` to ssh and `-P <PORT>` to scp/rsync.
+# The harness shell is zsh, which does NOT word-split a plain string var — so pass the SSH options as an
+# ARRAY (expands correctly in both bash and zsh). A plain SSHOPTS="-o …" string fails under zsh with
+# `keyword stricthostkeychecking extra arguments at end of line`.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -i "$KEY")
+# Non-22 port: append `-p <PORT>` to SSH_OPTS for ssh; for scp/rsync pass `-P <PORT>` (scp's flag) separately.
+# zsh gotcha: never name a helper var `status` or `path` (read-only/reserved in zsh) in any poll/waiter loop.
 ```
+
+Invoke ssh as `ssh "${SSH_OPTS[@]}" "$REMOTE" …` and rsync as `rsync … -e "ssh ${SSH_OPTS[*]}" …` below.
 
 **1. Sanity-check the toolchain** (driver + nvcc + python):
 
 ```bash
-ssh $SSHOPTS "$REMOTE" 'nvidia-smi -L; (command -v nvcc || ls /usr/local/cuda*/bin/nvcc 2>/dev/null); python3 --version'
+ssh "${SSH_OPTS[@]}" "$REMOTE" 'nvidia-smi -L; (command -v nvcc || ls /usr/local/cuda*/bin/nvcc 2>/dev/null); python3 --version'
 ```
 
 - **`nvcc` missing?** CloudRift / GCP images ship the NVIDIA driver + CUDA 12.9, but the CloudRift image may carry only
   the runtime. If `nvcc` isn't found, either it's under `/usr/local/cuda/bin` (just export the PATH, below) or install
   the toolkit matching the driver: `sudo apt-get update -qq && sudo apt-get install -y -qq cuda-toolkit-12-9`.
-- **`python3` not 3.12?** GCP DLVM images sometimes ship a different Python:
-  `sudo apt-get install -y -qq python3.12 python3.12-venv`.
+- **Always install the Python 3.12 venv + dev packages before `make setup`** — do NOT gate this on the version check.
+  Even when `python3` *is* already 3.12, the CloudRift image ships it **without** the venv module (so `make setup` dies
+  with `ensurepip is not available`, exit 127) and **without** the dev headers (so the cppyy wheel build fails with
+  `fatal error: Python.h: No such file or directory`, exit 1). Install both up front (add `python3.12` itself only if
+  `python3 --version` isn't 3.12):
+  ```bash
+  ssh "${SSH_OPTS[@]}" "$REMOTE" 'sudo apt-get update -qq && sudo apt-get install -y -qq python3.12-venv python3.12-dev'
+  ```
+  If a previous `make setup` already created a half-built `venv/`, `rm -rf ~/deplodock/venv` before re-running it.
 
 **2. Rsync the working tree and set up the venv.** Rsync (not clone) so the remote runs the **exact local code**,
 including any uncommitted changes:
 
 ```bash
 REPO="$(git rev-parse --show-toplevel)"   # repo root, wherever this skill runs from
-rsync -az -e "ssh $SSHOPTS" \
+rsync -az -e "ssh ${SSH_OPTS[*]}" \
   --exclude venv --exclude .git --exclude recipes --exclude _tune --exclude '__pycache__' --exclude '*.pyc' \
   "$REPO/" "$REMOTE:~/deplodock/"
-ssh $SSHOPTS "$REMOTE" 'cd ~/deplodock && export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda && make setup'
+ssh "${SSH_OPTS[@]}" "$REMOTE" 'cd ~/deplodock && export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda && make setup'
 ```
 
 `make setup` is a no-op if `venv/` already exists and installs `.[dev]` (CUDA torch, cupy-cuda12x, cppyy, catboost, …).
-It installs **no** system packages — that's why Step 2.1 ensures `python3.12` / `nvcc` first.
+It installs **no** system packages — that's why Step 2.1 ensures the `python3.12-venv`/`-dev` packages + `nvcc` first.
 
 ## Step 3 — Run the golden tune (detached) and wait
 
 Run it detached with a logfile so it survives a shaky SSH link:
 
 ```bash
-ssh $SSHOPTS "$REMOTE" '
+ssh "${SSH_OPTS[@]}" "$REMOTE" '
   cd ~/deplodock
   export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda
   nohup ./venv/bin/deplodock tune --dataset golden > ~/tune.log 2>&1 &
-  echo "started tune pid $!"
+  echo "tune_pid=$!"
 '
 ```
 
@@ -121,14 +134,21 @@ Notes:
 - tune compiles at `-Xcicc -O1` (a fast *ranking* pass) and re-benches near-best configs at `-O3`; both are recorded as
   node rows. We want the whole search tree, not just deployable winners.
 
-**Poll until it finishes** (~30–45 min):
+**Poll until it finishes** (~30–45 min). Each poll is its **own short ssh** — do NOT hold a single ssh session open
+running a multi-minute `for`/`sleep` loop: long-lived sessions drop with `client_loop: send disconnect: Broken pipe`
+(exit 255). Re-poll every few minutes from the parent loop instead:
 
 ```bash
-ssh $SSHOPTS "$REMOTE" 'tail -n 25 ~/tune.log; echo "---"; pgrep -af "deplodock tune" || echo "TUNE DONE"'
+# Note the `[d]` bracket trick: a plain `pgrep -f "deplodock tune"` ALSO matches the pgrep wrapper's own
+# command line (it contains the string "deplodock tune"), so it reports the tune as alive forever — even long
+# after it finished. `"[d]eplodock tune"` matches the real process but not the literal pattern string.
+ssh "${SSH_OPTS[@]}" "$REMOTE" 'tail -n 25 ~/tune.log; echo "---"; pgrep -af "[d]eplodock tune" || echo "TUNE DONE"'
 ```
 
-Re-poll every few minutes. Done = `TUNE DONE` **and** the log ends with the tune summary (no traceback). An
-`nvcc`/`CUDA_HOME` error means the toolchain export from Step 2 didn't take — fix and re-run Step 3.
+Re-poll every few minutes. Done = `TUNE DONE` **and** the log ends with the tune summary (no traceback). If in doubt,
+cross-check with `ssh "${SSH_OPTS[@]}" "$REMOTE" 'ps -C python3.12 -o pid,etime,cmd; nvidia-smi --query-compute-apps=pid
+--format=csv,noheader'` — an empty process list + idle GPU confirms the tune actually exited. An `nvcc`/`CUDA_HOME`
+error means the toolchain export from Step 2 didn't take — fix and re-run Step 3.
 
 ## Step 4 — Copy the node rows back and merge into the local DB
 
@@ -192,3 +212,7 @@ If any check fails, report the failure + raw output instead of claiming success.
 - **Don't rent more than 1 GPU** — node data is per-card; extra GPUs just burn money.
 - **Don't auto-delete the VM** — confirm teardown with the user first (and never modify a CloudRift server beyond the
   tune we explicitly started).
+- **Don't trust a plain `pgrep -f "deplodock tune"`** — it self-matches the wrapper's own argv and reports the tune
+  alive forever. Use the `[d]eplodock tune` bracket trick (Step 3) and cross-check with `ps -C python3.12` + an idle GPU.
+- **Don't pass SSH options as an unquoted string var** — the harness shell is zsh; use the `SSH_OPTS=(…)` array, and
+  never name a helper var `status`/`path` (read-only in zsh — a waiter that does `status=$(…)` crashes outright).
