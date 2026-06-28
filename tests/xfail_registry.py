@@ -41,7 +41,6 @@ XFAIL: dict[str, str] = {
     # --- whole files: every collected test currently fails ---
     "test_attention_split_gpu.py": _R,
     "test_bank_conflicts.py": _R,
-    "test_flash_attention.py": _R,
     "test_flash_cooperative_kv.py": _R,
     "test_fuse_sibling_register_cells.py": _R,
     "test_fused_edge.py": _R,
@@ -57,14 +56,20 @@ XFAIL: dict[str, str] = {
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
     # --- individual cases: the file still has passing tests ---
+    # scalar flash landed — test_flash_attention residuals are the dynamic/symbolic variants
+    # (need the dynamic-shape tier) and the now-obsolete flash-knob-off test.
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_additive_mask_dynamic_matches_torch": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_gqa_dynamic_matches_torch": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_off_keeps_decomposition": _R,
+    "tests/compiler/e2e/test_flash_attention.py::test_flash_sdpa_dynamic_matches_torch": _R,
     # matmul enabled at the scalar tier — these files partially recovered; residuals still need
     # the mma / staging / split-K / dynamic / attention tiers (scalar fallback gives correct
     # accuracy for the rest, which is un-xfailed).
-    "tests/compiler/e2e/test_attention_chains.py::test_full_self_attn_tinyllama": _R,
     "tests/compiler/e2e/test_attention_chains.py::test_full_self_attn_tinyllama_seq512": _R,
     "tests/compiler/e2e/test_attention_chains.py::test_qkv_attn_no_rope": _R,
-    "tests/compiler/e2e/test_attention_chains.py::test_sdpa_explicit_additive_mask[1-32]": _R,
-    "tests/compiler/e2e/test_attention_chains.py::test_sdpa_explicit_additive_mask[16-32]": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_article_tma_sgemm_reproduction": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN16_BM32_FM1_FN16]": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN32_BM16_FM2_FN8]": _R,
@@ -92,14 +97,11 @@ XFAIL: dict[str, str] = {
     # test_reduction_combine_coverage.py / test_tune_accuracy.py: scalar-tier reduction
     # recovered the serial + cooperative reduce kernels; these residuals need flash /
     # cross-CTA split-reduce / matmul tiers.
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_attention_combine_accuracy[coop_kv]": _R,
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_attention_combine_accuracy[serial]": _R,
     "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[flash-kernel]": _R,
     "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[matmul-atomic]": _R,
     "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[matmul-kernel]": _R,
     "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[sum-atomic]": _R,
     "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[sum-kernel]": _R,
-    "tests/compiler/pipeline/search/test_tune_accuracy.py::test_tuned_variant_matches_reference[sdpa]": _R,
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
     # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
     # TileGraph lowering).
@@ -116,16 +118,10 @@ XFAIL: dict[str, str] = {
     "tests/compiler/cli/test_compile.py::test_compile_dynamic_emits_runtime_arg": _R,
     "tests/compiler/cli/test_run.py::test_compile_fp16_matmul_window_emits_half2": _R,
     "tests/compiler/cli/test_run.py::test_run_code_dynamic_seq_len": _R,
-    "tests/compiler/cli/test_run.py::test_run_code_sdpa_k_chunked": _R,
-    "tests/compiler/cli/test_run.py::test_run_code_sdpa_seq1024_dynamic_smem": _R,
-    "tests/compiler/cli/test_run.py::test_run_code_sdpa_tinyllama_full": _R,
-    "tests/compiler/cli/test_run.py::test_run_code_sdpa_tinyllama_per_head": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_bench": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_kernel_stage": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_seed_reproducible": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_tile_stage": _R,
-    "tests/compiler/e2e/test_block.py::test_qwen_block_accuracy": _R,
-    "tests/compiler/e2e/test_block.py::test_tinyllama_block_accuracy[cuda]": _R,
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_generated_tensorcore_flash_bf16_matches_torch[1-2-32-16]": _R,
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_generated_tensorcore_flash_bf16_matches_torch[1-4-128-64]": _R,
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_generated_tensorcore_flash_causal_bf16_matches_torch[1-2-32-16]": _R,
@@ -169,9 +165,6 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_mma_matches_reference[32-1024-3072-1-out_dtype0]": _R,
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_admits_warp_tier": _R,
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_mma_matches_reference": _R,
-    "tests/compiler/e2e/test_ops_vs_torch.py::test_sdpa[cuda]": _R,
-    "tests/compiler/e2e/test_ops_vs_torch.py::test_sdpa_causal[cuda]": _R,
-    "tests/compiler/e2e/test_ops_vs_torch.py::test_sdpa_gqa[cuda]": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_cache_rmsnorm_over_capacity_buffers": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_device_io_matches_eager": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len": _R,

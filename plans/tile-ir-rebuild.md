@@ -1,10 +1,12 @@
 # Tile IR rebuild
 
-Status: **rebuild in progress — Phase 1a (no-fold kernel skeleton: `TileOp` schedule → kernel-IR `Tile` → `CudaOp`),
-1b (the per-cell reduce, normal reduction + online softmax unified by the twist), and 1c (scalar-tier matmul /
-`SEMIRING`) have landed; every elementwise, index-only, reduction, and static-matmul `e2e/` kernel is recovered and
-un-xfailed. The remaining tiers (the mma/blocked/split-K Atom, cooperative / cross-CTA reduce schedules, dynamic shapes,
-flash attention) stay registered in the xfail registry.** Branch `refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phases 1a–1d have landed: the no-fold skeleton, the per-cell reduce (reduction + online
+softmax unified by the twist), scalar matmul (`SEMIRING`), and scalar **flash attention** (the nested
+`MONOID(SEMIRING)`). Every elementwise, index-only, reduction, static-matmul, and static-attention `e2e/` kernel —
+including whole transformer blocks — is recovered and un-xfailed, all through one generic `Tile` + carrier render path.
+Phase 2 (the high-level `Map`/`Reduce` op tree replacing the `build_*` assembly) is in progress. Remaining: dynamic
+shapes, and the perf tiers (cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch
+`refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -180,9 +182,28 @@ the matmul `tune`/`two_level` cases) — the pinned tile/mma/staging/split-K kno
 output is correct, so they pass on accuracy now and will *guard* their tier once it's built. Registry residuals in those
 files are the genuinely tier-needing cases (mma codegen, dynamic, split-K, attention).
 
-### Phase 1d+ — the remaining tiers — not started
+### Phase 1d — scalar flash attention (nested contraction) — done
 
-Add the cooperative / cross-CTA reduce *schedules* (warp-shuffle / smem-tree combine, split-reduce, flash-decoding —
-perf, not correctness), the contraction **Atom** (`SEMIRING` → mma.sync / blocked register tiles / split-K — perf), and
-streaming-monoid flash attention (the nested contraction `020` currently gates). Each supplies its combine + launch
-geometry to the same `TileOp` / `Tile` skeleton. To be scoped here as each lands.
+`020_schedule` no longer gates the nested contraction. Flash is a `MONOID(SEMIRING)`: the `kv` monoid (the `(m,l,O)`
+LSE carrier) streaming over the inner `Q·K` `SEMIRING` dot product. At the scalar tier each reduce loop — flat or
+nested — renders as a serial fold through its carrier (one thread per output cell), so the nested flash nest lowers
+through the **same** generic `Tile` + `Monoid.render` + `Loop.render` path as any reduce; **no flash-specific lowering
+exists**. The `build_flash_*` output (still the recognizer's, for now) is just an ordinary `LoopOp` that this generic
+path materializes.
+
+Recovered: `sdpa` / `sdpa_causal` / `sdpa_gqa`, the `test_flash_attention` static cases (causal / GQA / additive mask /
+kv-tile), `test_attention_chains` self-attn + masks, and the **whole transformer blocks** (`test_block` TinyLlama +
+Qwen). Residuals: the **dynamic/symbolic** flash variants (need the dynamic-shape tier) and the obsolete flash-knob-off
+test.
+
+### Phase 2 — the high-level op tree (dissolving `build_*`) — in progress
+
+The compute layer is being lifted from hand-assembled low-level loop stmts to a small algebraic op tree
+(`ir/tile/ops.py`): **`Map`** (pointwise lift) and **`Reduce`** (a fold through a `Monoid`+`Twist` carrier, with
+**partials as nested ops**). `TensorRef` (buffer + index exprs) is the only place layout lives. `lower(op)` walks the
+tree → loop IR: the carrier generates the structure (`Init` from identity, the streaming `Loop` + the fold from the
+`Twist`), the nested ops the lift, the `TensorRef`s the loads. A contraction is `Reduce(+)∘Map(×)`; flash is
+`Map(÷, (Reduce(lse, (Reduce(+)∘Map(×), V)), l))` — validated against `softmax(QK^T)·V` (slices 1–2). Geometry stays
+separate: `Tile(op, placement)` maps axes to grid/thread/serial/coop/split (a later slice). Next: the flash recognizer
+emits the op tree, **deleting `build_flash_frag` / `_flash_loop_body` / `build_flash_recovered`**; then the remaining
+perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree.

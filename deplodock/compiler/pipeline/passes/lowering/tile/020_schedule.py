@@ -80,11 +80,10 @@ def rewrite(match: Match, root: Node) -> TileOp | None:
         raise RuleSkipped("symbolic axis — scalar tier needs static extents (dynamic tier not built)")
     axes, cell = _peel(loop.body)
     folds = _reduce_loops(cell)
-    # A reduce loop whose body contains a further reduce loop is a nested
-    # contraction (flash: kv-monoid over the Q·K dot product) — the scalar tier
-    # schedules flat reductions / contractions only; nested awaits the streaming tier.
-    if any(_reduce_loops(list(f.body)) for f in folds):
-        raise RuleSkipped("nested contraction (flash attention) — streaming tier not built yet")
+    # Nested contractions (flash: the kv monoid streaming over the Q·K dot product)
+    # schedule at the scalar tier too — each reduce loop, flat or nested, renders as
+    # a serial fold through its carrier (one thread per output cell). The
+    # cooperative / split realizations are a later (perf) tier.
     if not axes and not folds:
         raise RuleSkipped("no work to schedule")
     return TileOp(body=Body(tuple(cell)), name=loop.name, grid_axes=tuple(axes))
