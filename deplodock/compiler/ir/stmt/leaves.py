@@ -671,37 +671,33 @@ class Mma(Stmt):
 
 @dataclass(frozen=True)
 class Init(Stmt):
-    """Explicit accumulator initialization at this scope.
+    """Explicit accumulator / carried-state seed at this scope:
+    ``<dtype> <name> = <identity>;`` — a scope-local declaration.
 
-    By default, the renderer emits ``float <name> = <identity>;`` above
-    a ``Loop`` whose immediate body contains a matching ``Accum``. That
-    semantics is wrong when the same ``Accum`` is reduced across multiple
-    nested ``Loop``s (e.g. matmul chunked-K: ``Loop(k_o) > Loop(k_i) >
-    Accum(acc)`` should not reset ``acc`` per ``k_o`` iteration).
+    The primary use is seeding a ``Monoid`` carrier's carried state: its lowering
+    emits one ``Init`` per ``State`` component (``State.inits``) before the
+    streaming ``Loop``, so the seed is explicit IR and ``Loop.render`` never reaches
+    into the carrier. ``identity`` is the neutral element (one scalar — 0 / 1 /
+    -inf), held directly so the renderer picks it without scanning ahead and so a
+    twisted carrier (whose combine isn't a single op) seeds uniformly.
 
-    Placing an ``Init(name, op)`` Stmt at the desired enclosing scope
-    declares the accumulator there. The renderer emits the init at this
-    point, and suppresses the default Loop-immediate init for any
-    ``Accum`` whose name has a matching ``Init`` in an enclosing scope.
-
-    The ``op`` is redundant with the matching ``Accum.op`` (the
-    accumulator carries its own combine), but is kept here so the
-    renderer can pick the identity without scanning ahead. (A ``Monoid``
-    carrier uses the sibling :class:`Seed` stmt instead — its lowering
-    emits one ``Seed`` per carried state from ``state.identity``.)
+    The ``Init`` declares at its own scope; a deeper same-named ``Accum`` re-inits
+    per its enclosing iteration (scope-local shadowing the renderer already relies
+    on for accumulator name reuse), so the seed and a same-named matmul accumulator
+    coexist. (A cross-nested-scope hoist — matmul chunked-K, where one ``Accum``
+    spans ``Loop(k_o) > Loop(k_i)`` and must NOT reset per ``k_o`` — would need the
+    renderer to suppress the inner init; that path has no producer today.)
     """
 
     name: str
-    op: ElementwiseImpl
-    # Accumulator dtype — required. Placing an ``Init`` is the freeze
+    identity: float
+    # Accumulator / state dtype — required. Placing an ``Init`` is the freeze
     # point; the pass that emits it must commit to a concrete dtype. The
     # same pass stamps the matching ``Accum``'s ``dtype`` to this value
     # so the IR stays self-consistent.
     dtype: DataType = field(kw_only=True)
 
     def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
         if isinstance(self.dtype, str):
             from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
 
@@ -714,50 +710,11 @@ class Init(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Init({self.dtype.name} {self.name}, op={self.op.name})"]
+        return [f"{indent}Init({self.dtype.name} {self.name} = {self.identity})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        identity = self.op.identity
-        if identity is None:
-            raise ValueError(f"Init {self.name!r} op {self.op.name!r} has no identity")
-        ctx.explicit_inits.add(self.name)
         ctx.ssa_dtypes[self.name] = self.dtype.name
-        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(identity, self.dtype)};"]
-
-
-@dataclass(frozen=True)
-class Seed(Stmt):
-    """Pre-loop declaration of a ``Monoid`` carrier's state component:
-    ``<f32> name = <identity>;``. The monoid analog of ``Init`` (the ``Accum``
-    seed): the lowering that builds a ``Loop`` carrying a ``Monoid``
-    (``ir.tile.ops._lower_monoid`` and the ``010_recognize`` /
-    ``_softmax`` recognizers) emits one ``Seed`` per carried state component
-    **before** the loop, so the carried value is seeded as explicit IR rather
-    than discovered by ``Loop.render`` reaching into ``Monoid.state``.
-
-    ``identity`` is the component's neutral element (one :class:`Expr`, e.g.
-    ``Literal(0.0)`` / ``Literal(-1e30)``); the seed is always fp32 (the carrier
-    renders its merge program in fp32). Suppressed when an enclosing ``Init``
-    already declared the name (``explicit_inits``) — the split-KV /
-    cooperative-combine case where the state is seeded at an outer scope."""
-
-    name: str
-    identity: Expr
-
-    def deps(self) -> tuple[str, ...]:
-        return ()
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.name,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}{F32.name} {self.name} = {self.identity.pretty()}"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        if self.name in ctx.explicit_inits:
-            return []
-        ctx.ssa_dtypes[self.name] = F32.name
-        return [f"{_pad(ctx.indent)}{ctx.type_name(F32)} {self.name} = {ctx.identity_literal(self.identity.value, F32)};"]
+        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(self.identity, self.dtype)};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols

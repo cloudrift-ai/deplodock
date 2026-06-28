@@ -15,10 +15,9 @@ import pytest
 
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, State, Twist, Write
+from deplodock.compiler.ir.stmt import Assign, Load, Loop, Monoid, State, Twist, Write
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 
@@ -41,16 +40,16 @@ def _softmax_loopop(n: int) -> LoopOp:
     then a second free sweep dividing ``exp(x − m) / l``. The reduce sweep must run
     first (a swap would read the identity m=−inf, l=0)."""
     merge = (*_online_softmax_steps("m", "l", "s"), Assign("m", "copy", ("m_mx",)))
+    state = State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0)))
     return LoopOp(
         body=(
-            Init(name="m", op=ElementwiseImpl("maximum"), dtype="f32"),
-            Init(name="l", op=ElementwiseImpl("add"), dtype="f32"),
+            *state.inits(),  # <f32> m = -inf; <f32> l = 0; (the carrier's seeds)
             Loop(
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
                     Monoid(
-                        state=State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0))),
+                        state=state,
                         partial=(),  # loop-IR carrier — ``s`` is the sibling Load above
                         twist=Twist(merge=merge),
                     ),
@@ -80,18 +79,17 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
         Assign("acc", "add", ("m_om", "m_pv")),  # O = O·alpha + p·v   [state]
         Assign("m", "copy", ("m_mx",)),  # m = m_new (last)            [state]
     )
+    state = State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0)))
     return LoopOp(
         body=(
-            Init(name="m", op=ElementwiseImpl("maximum"), dtype="f32"),
-            Init(name="l", op=ElementwiseImpl("add"), dtype="f32"),
-            Init(name="acc", op=ElementwiseImpl("add"), dtype="f32"),
+            *state.inits(),  # <f32> m = -inf; <f32> l = 0; <f32> acc = 0;
             Loop(
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
                     Load(name="vj", input="v", index=(Var("j"),)),
                     Monoid(
-                        state=State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0))),
+                        state=state,
                         partial=(),  # loop-IR carrier — ``s`` / ``vj`` are the sibling Loads above
                         twist=Twist(merge=merge),
                     ),
@@ -104,20 +102,19 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
 
 
 def _streaming_half(m: str, ll: str, acc: str, x_buf: str, v_buf: str, lo: int, n: int, jname: str) -> tuple:
-    """Init + streaming-reduce loop folding ``x[lo:n]`` / ``v[lo:n]`` into the
-    ``(m, l, acc)`` state via the flash ``Monoid``'s ``merge`` program — one
-    partition of a two-partition split reduce."""
+    """State seeds (``State.inits()``) + streaming-reduce loop folding ``x[lo:n]`` /
+    ``v[lo:n]`` into the ``(m, l, acc)`` state via the flash ``Monoid``'s ``merge``
+    program — one partition of a two-partition split reduce."""
     idx = Var(jname) if lo == 0 else BinaryExpr("+", Var(jname), Literal(lo, "int"))
+    combine = flash_combine(m, ll, acc, f"s_{jname}", f"v_{jname}")
     return (
-        Init(name=m, op=ElementwiseImpl("maximum"), dtype="f32"),
-        Init(name=ll, op=ElementwiseImpl("add"), dtype="f32"),
-        Init(name=acc, op=ElementwiseImpl("add"), dtype="f32"),
+        *combine.state.inits(),  # seed (m, l, acc) from the carrier's own State
         Loop(
             axis=Axis(name=jname, extent=Dim(n - lo)),
             body=(
                 Load(name=f"s_{jname}", input=x_buf, index=(idx,)),
                 Load(name=f"v_{jname}", input=v_buf, index=(idx,)),
-                flash_combine(m, ll, acc, f"s_{jname}", f"v_{jname}"),
+                combine,
             ),
         ),
     )

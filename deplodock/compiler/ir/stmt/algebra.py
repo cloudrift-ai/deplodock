@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Seed
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load
 
 
 class Map(Body):
@@ -118,6 +119,15 @@ class State:
         """The second-operand state names for the cross-partition combine — ``"<n>__o"``
         per component, the right operand ``combine_states`` reads."""
         return tuple(f"{n}__o" for n in self.names)
+
+    def inits(self) -> list[Init]:
+        """The carried state's seed stmts — one ``Init`` per component
+        (``<f32> name = identity;``). The carrier's lowering emits these before its
+        streaming ``Loop`` so the state is seeded as explicit IR and ``Loop.render``
+        never reaches into the carrier. fp32 (the merge program renders in fp32); the
+        identity is the neutral element this state carries. Construction lives here —
+        ``State`` owns the identity, so it owns how to initialize from it."""
+        return [Init(name=n, identity=ident.value, dtype=_F32) for n, ident in zip(self.names, self.identity, strict=False)]
 
 
 @dataclass(frozen=True)
@@ -246,13 +256,6 @@ class Monoid(Stmt):
         first-use order. Derived from the merge (its source of truth), so it holds whether
         ``partial`` carries op-tree source nodes or is the empty loop-IR carrier."""
         return _merge_reads(self.twist.merge, self.state.names)
-
-    def seeds(self) -> list[Seed]:
-        """One :class:`Seed` per carried state component — the pre-loop
-        ``<f32> name = identity;`` declarations. The lowering / recognizer that
-        builds the carrier's ``Loop`` emits these **before** it so the carried
-        state is seeded as explicit IR (``Loop.render`` never reads ``state``)."""
-        return [Seed(name=n, identity=ident) for n, ident in zip(self.state.names, self.state.identity, strict=False)]
 
     def __post_init__(self) -> None:
         # Complete the twist's cross-partition surface against this monoid's state.

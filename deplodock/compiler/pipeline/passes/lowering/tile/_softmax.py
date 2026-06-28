@@ -11,7 +11,7 @@ untouched, reading the final ``m`` + ``1/d``).
 ``online_softmax_combine`` builds the ``(m, d)`` carrier; :func:`try_online_softmax`
 recognizes an adjacent ``(rowmax, Σexp)`` reduce pair over the same input + reduce
 extent in a ``LoopOp`` body and rewrites it to the fused streaming loop (the carried
-``(m, d)`` states are seeded by explicit ``Seed`` stmts before the loop). Recognition is
+``(m, d)`` states are seeded by explicit ``Init`` stmts before the loop). Recognition is
 called from ``lowering/tile/010_recognize``
 (after flash, before the plain-reduce normalize — each later step consumes the
 ``Accum``\\ s an earlier one matches).
@@ -129,9 +129,9 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                         axis=s.axis,
                         body=Body.coerce((Load(name=src, input=input_buf, index=index), mono)),
                     )
-                    # The (m, d) states are seeded by explicit ``Seed`` stmts before the
+                    # The (m, d) states are seeded by explicit ``Init`` stmts before the
                     # loop, from the carrier's ``state.identity`` ((−inf, 0)).
-                    out.extend(mono.seeds())
+                    out.extend(mono.state.inits())
                     out.append(fused)
                     changed = True
                     i += 2

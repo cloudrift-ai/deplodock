@@ -15,8 +15,8 @@ unified twisted ``Monoid`` representation. Three recognitions, tried in order
    Recognition + construction live in ``_softmax`` (``try_online_softmax``).
 3. **Normalize** — any remaining scalar ``Accum`` (a plain sum / max / mean) becomes
    its **degenerate** monoid (``Accum.as_monoid`` — the identity twist, no rescale);
-   each carried state is seeded by an explicit ``Seed`` stmt before the loop
-   (``Monoid.seeds()``). A semiring contraction (``Semiring.match``)
+   each carried state is seeded by explicit ``Init`` stmts before the loop
+   (``State.inits()``). A semiring contraction (``Semiring.match``)
    keeps its ``Accum`` — degenerate-monoidizing it would lose the contraction
    structure the matmul tier reads off the body. This generic step stays here.
 
@@ -45,8 +45,8 @@ PATTERN = [Pattern("root", LoopOp)]
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to their degenerate
-    ``Monoid`` (deep; each carried state seeded by an explicit ``Seed`` stmt before
-    the loop, ``Monoid.seeds()``). A semiring contraction (``Semiring.match``) keeps its
+    ``Monoid`` (deep; each carried state seeded by explicit ``Init`` stmts before
+    the loop, ``State.inits()``). A semiring contraction (``Semiring.match``) keeps its
     ``Accum`` — degenerate-monoidizing it would lose the contraction structure the
     matmul tier reads. Returns ``(stmts, changed)``."""
     out: list[Stmt] = []
@@ -54,10 +54,10 @@ def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and Semiring.match(s) is None:
             if any(isinstance(x, Accum) for x in s.body):
-                # Each Accum becomes its degenerate Monoid; each carried state is seeded by
-                # an explicit ``Seed`` stmt emitted before the loop (from ``state.identity``).
+                # Each Accum becomes its degenerate Monoid; each carrier is seeded by
+                # explicit ``Init`` stmts emitted before the loop (from its ``state.identity``).
                 new_body = [x.as_monoid() if isinstance(x, Accum) else x for x in s.body]
-                out.extend(seed for x in new_body if isinstance(x, Monoid) for seed in x.seeds())
+                out.extend(init for x in new_body if isinstance(x, Monoid) for init in x.state.inits())
                 out.append(Loop(axis=s.axis, body=Body(tuple(new_body)), unroll=s.unroll))
                 changed = True
                 continue

@@ -56,9 +56,6 @@ class RenderCtx:
 
     ``shapes`` maps every buffer to its declared shape so multi-dim
     ``Load`` / ``Write`` indices can be flattened row-major.
-    ``explicit_inits`` carries the set of accumulator names whose init
-    has been emitted by an enclosing ``Init`` Stmt — Loop's default
-    per-Loop init is suppressed for those names.
     """
 
     target: RenderTarget = field(default_factory=_default_render_target)
@@ -66,7 +63,6 @@ class RenderCtx:
     indent: int = 1
     intrinsics: dict[str, str] = field(default_factory=dict)
     builtins: dict[str, str] = field(default_factory=dict)
-    explicit_inits: set[str] = field(default_factory=set)
     literal_constants: dict[str, float] = field(default_factory=dict)
     # SSA names whose defining Load came from a ``literal_constants``
     # input — populated by ``render_body`` after scanning the body, and
@@ -119,7 +115,6 @@ class RenderCtx:
             indent=self.indent + 1,
             intrinsics=self.intrinsics,
             builtins=self.builtins,
-            explicit_inits=self.explicit_inits,
             literal_constants=self.literal_constants,
             literal_ssa=self.literal_ssa,
             smem_dynamic_offsets=self.smem_dynamic_offsets,

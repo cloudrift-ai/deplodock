@@ -97,17 +97,16 @@ class Loop(Stmt):
         pad = _pad(ctx.indent)
         out: list[str] = []
         # Per-Loop ``<dtype> <acc> = identity;`` for each distinct Accum in
-        # the immediate body — suppressed when an enclosing Init already
-        # declared it. dtype comes from the Accum's optional ``dtype`` field
+        # the immediate body. dtype comes from the Accum's optional ``dtype`` field
         # (defaults to fp32) so fp32-over-fp16 accumulators declare as
         # ``float acc = 0.0f;`` while a fp16-typed Accum declares as
-        # ``__half acc = __float2half(0.0f);``.
+        # ``__half acc = __float2half(0.0f);``. A nested Accum re-declares per
+        # enclosing iteration — scope-local shadowing, so a same-named ``Init``
+        # seed (or outer Accum) at a wider scope is harmless.
         seen: set[str] = set()
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
                 seen.add(s.name)
-                if s.name in ctx.explicit_inits:
-                    continue
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
@@ -318,8 +317,6 @@ class StridedLoop(Stmt):
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
                 seen.add(s.name)
-                if s.name in ctx.explicit_inits:
-                    continue
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")

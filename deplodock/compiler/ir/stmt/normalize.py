@@ -20,7 +20,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Seed, Select, Unpack, Write
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, Unpack, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -519,7 +519,7 @@ def hoist_loop_invariants(stmts: Body) -> Body:
     move together: hoisting just the consumer would leave it referencing
     an Accum still defined inside the outer Loop body.
 
-    ``Accum`` / ``Init`` / ``Seed`` / ``Write`` always stay (iteration-tied
+    ``Accum`` / ``Init`` / ``Write`` always stay (iteration-tied
     semantics). Loop-invariance is queried via :meth:`Body.depends_on`
     against the body's transitive read closure, so the hoisted set is
     automatically closed under SSA dependencies — no separate ordering
@@ -528,11 +528,11 @@ def hoist_loop_invariants(stmts: Body) -> Body:
     stmts = Body.coerce(stmts)
 
     def _hoistable(s: Stmt, axis: str) -> bool:
-        # Accum / Init / Seed are scope-bound to their enclosing Loop's reduction (a Seed
-        # seeds a Monoid carrier's state per output cell, like Init for an Accum) — they
-        # can't move alone, but the whole enclosing block can. Side-effecting stmts (Write,
-        # or any block containing a Write) pin their iteration count and stay put.
-        if isinstance(s, (Accum, Init, Seed)) or s.has_side_effects():
+        # Accum / Init are scope-bound to their enclosing Loop's reduction (an Init seeds an
+        # Accum or a Monoid carrier's state per output cell) — they can't move alone, but the
+        # whole enclosing block can. Side-effecting stmts (Write, or any block containing a
+        # Write) pin their iteration count and stay put.
+        if isinstance(s, (Accum, Init)) or s.has_side_effects():
             return False
         return not stmts.depends_on(s, axis)
 
