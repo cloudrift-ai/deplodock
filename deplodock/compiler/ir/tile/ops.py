@@ -91,20 +91,24 @@ def _lower_semiring(s: Semiring) -> list[Stmt]:
 
 
 def pretty(op, indent: str = "") -> list[str]:
-    """Structurally pretty-print an op tree (for dumps) — WITHOUT lowering. A ``Map`` is
-    its ``source`` (if any) above its pointwise body; a ``Monoid`` / ``Semiring`` is a
-    header (the carrier / contraction over its axis, projecting to ``out``) above its named
-    children; any other stmt prints itself."""
+    """Structurally pretty-print an op tree (for dumps) — WITHOUT lowering. A pure
+    pointwise ``Map`` (no source) is just its body; a projection ``Map`` (``source`` set) is
+    a ``map over:`` block holding the nested node above a ``project:`` block holding the
+    pointwise body — both indented under the map so the nesting is unambiguous. A ``Monoid``
+    / ``Semiring`` is a header (the carrier / contraction over its axis, projecting to
+    ``out``) above its named children; any other stmt prints itself."""
     if isinstance(op, Map):
-        lines = []
-        if op.source is not None:
-            lines.append(f"{indent}map over:")
-            lines += pretty(op.source, indent + "    ")
-        return lines + list(pretty_body(op.body, indent))
+        if op.source is None:
+            return list(pretty_body(op.body, indent))  # pure pointwise — the body IS the map
+        lines = [f"{indent}map over:"]
+        lines += pretty(op.source, indent + "    ")
+        lines.append(f"{indent}project:")
+        lines += list(pretty_body(op.body, indent + "    "))
+        return lines
     if isinstance(op, Monoid):
         carrier = op.pretty()[0].strip()
         ax = op.axis.name if op.axis is not None else "?"
-        lines = [f"{indent}reduce[{ax}] {carrier} -> {op.out}"]
+        lines = [f"{indent}monoid[{ax}] {carrier} -> {op.out}"]
         for src, pname in zip(op.partial, op.partial_names(), strict=True):
             lines.append(f"{indent}  partial {pname}:")
             lines += pretty(src, indent + "    ")
