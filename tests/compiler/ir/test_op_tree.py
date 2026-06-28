@@ -19,7 +19,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Semiring, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Semiring, Write
 from deplodock.compiler.ir.tile.ops import Map, lower
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
@@ -44,8 +44,8 @@ def test_contraction_op_tree_matches_numpy() -> None:
         lift=MUL,
         fold=Accum(name="acc", value="p", op="add"),
         operands=(
-            Map([Load(name="a_e", input="A", index=(Var("m"), Var("k")))]),
-            Map([Load(name="b_e", input="B", index=(Var("k"), Var("n")))]),
+            Map(body=[Load(name="a_e", input="A", index=(Var("m"), Var("k")))]),
+            Map(body=[Load(name="b_e", input="B", index=(Var("k"), Var("n")))]),
         ),
         reduce_axis=k,
     )
@@ -64,7 +64,7 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
     # one-Load Map (the direct operand read).
     red = replace(
         Accum(name="acc", value="v", op="add").as_monoid(),
-        partial=(Map([Load(name="v", input="x", index=(Var("r"), Var("k")))]),),
+        partial=(Map(body=[Load(name="v", input="x", index=(Var("r"), Var("k")))]),),
         axis=k,  # out ("acc") + seed (identity 0) derived from the carrier
     )
     cell = (*lower(red), Write(output="y", index=(Var("r"),), value="acc"))
@@ -77,8 +77,8 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
 def test_flash_op_tree_matches_softmax_qkv() -> None:
     """Flash attention as a pure op tree — a 3-state twisted ``Monoid`` (m,l,O) folding
     over kv, whose score partial is a NESTED ``Semiring`` (Σ_k Q·K). The O/l projection
-    is the carrier's φ ``finalize`` (emitted post-loop by ``lower``), so the kernel root
-    is just that Monoid + the Write. Lowers generically and matches softmax(QK^T)·V."""
+    is a ``Map`` *over* that Monoid (``project ∘ reduce``), so the kernel root is that Map
+    + the Write. Lowers generically and matches softmax(QK^T)·V."""
     S, D = 4, 3
     i, d = Axis("i", Dim(S)), Axis("d", Dim(D))  # free: query row, value dim
     j, k = Axis("j", Dim(S)), Axis("k", Dim(D))  # reduce: kv (outer), head-dim (inner)
@@ -86,16 +86,18 @@ def test_flash_op_tree_matches_softmax_qkv() -> None:
         lift=MUL,
         fold=Accum(name="s", value="qk", op="add"),
         operands=(
-            Map([Load(name="q_e", input="Q", index=(Var("i"), Var("k")))]),
-            Map([Load(name="k_e", input="K", index=(Var("j"), Var("k")))]),
+            Map(body=[Load(name="q_e", input="Q", index=(Var("i"), Var("k")))]),
+            Map(body=[Load(name="k_e", input="K", index=(Var("j"), Var("k")))]),
         ),
         reduce_axis=k,
     )
-    flash = replace(
+    flash_monoid = replace(
         flash_combine("m", "l", "O", "s", "v"),
-        partial=(score, Map([Load(name="v", input="V", index=(Var("j"), Var("d")))])),
-        axis=j,  # out ("O__proj", the carrier's finalize) + seeds derived from the carrier
+        partial=(score, Map(body=[Load(name="v", input="V", index=(Var("j"), Var("d")))])),
+        axis=j,
     )
+    # The O/l projection is a Map *over* the reduce (project ∘ reduce).
+    flash = Map(source=flash_monoid, body=[Assign(name="O__proj", op="divide", args=("O", "l"))])
     cell = (*lower(flash), Write(output="attn", index=(Var("i"), Var("d")), value="O__proj"))
     op = _wrap((i, d), cell)
     rng = np.random.default_rng(0)

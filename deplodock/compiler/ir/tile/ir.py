@@ -13,9 +13,10 @@ separate from the combine.** A ``TileOp`` records the *schedule* —
   thread per output cell).
 
 — while the *combine* lives entirely in the ``op`` tree (``ir/stmt/algebra``): a
-pointwise ``Map`` of leaf compute, a ``Monoid`` folding through its carrier (``Twist``)
-whose ``finalize`` φ projects the final state to the output, or a ``Semiring``
-contraction. The algebra is **not stored as a tag**; the carriers
+pointwise ``Map`` of leaf compute (optionally OVER a nested node — a ``Map`` over a
+``Monoid`` is the φ projection ``project ∘ reduce``), a ``Monoid`` folding through its
+carrier (``Twist``), or a ``Semiring`` contraction. The algebra is **not stored as a
+tag**; the carriers
 and partial structure are read directly where a pass needs them, per the project's
 "the op tree is the single source of truth" rule. There is no stored per-cell body —
 ``lower(op)`` generates it at materialize (and on demand for the dump / cache key).
@@ -40,10 +41,9 @@ class TileOp(Op):
     Holds exactly the op tree (``op``) and the schedule (``grid_axes``) — not a
     pre-lowered body, and not a ``BodyOp``. ``op`` is a single
     :class:`~deplodock.compiler.ir.stmt.algebra.Map` (a pointwise per-cell body that
-    carries its own ``Write``) or a reduction — a
-    :class:`~deplodock.compiler.ir.stmt.algebra.Monoid` / ``Semiring`` whose carrier
-    ``finalize``\\ s the output value. ``grid_axes`` are the parallel axes mapped onto the
-    thread grid.
+    carries its own ``Write``, or a projection ``Map`` over a reduction) or a reduction —
+    a :class:`~deplodock.compiler.ir.stmt.algebra.Monoid` / ``Semiring`` whose ``out`` is
+    the carried value. ``grid_axes`` are the parallel axes mapped onto the thread grid.
 
     There is **no stored body and no stored output store**: the per-cell loop-IR body
     is generated at materialize time by ``lower(op)``, and the ``Write`` that binds a

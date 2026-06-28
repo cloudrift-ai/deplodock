@@ -189,7 +189,6 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
             combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
             state_b=tuple(rn(n) for n in s.twist.state_b),
         ),
-        finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state
         # The reduce axis — threaded through σ so the cooperative-axis analysis keys off the
         # renamed name (loop-IR carriers from non-op-tree builders have it None).
         axis=axis_fn(s.axis) if s.axis is not None else None,

@@ -9,9 +9,9 @@ halves:
 - **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
   hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
-  is the ``(m,l,O)`` LSE ``Monoid`` over kv whose score partial ``Map`` holds the ``Σ
-  Q·K`` contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns
-  that ``Monoid`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
+  is the ``O/l`` projection ``Map`` over the ``(m,l,O)`` LSE ``Monoid`` over kv, whose
+  score partial ``Map`` holds the ``Σ Q·K`` contraction. ``build_flash_frag`` returns that
+  ``Map`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
   ``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
   it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
 
@@ -126,13 +126,12 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     )
     # A loop-IR carrier — ``partial=()``; the (score, value) it folds are siblings whose
     # names live in ``merge`` (``_flash_op`` wraps this with the op-tree partial nodes +
-    # the kv ``axis``). φ projection: the streamed output O is unnormalized — divide by the
-    # log-sum-exp denominator l once, after the kv loop. ``lower`` emits it post-loop.
+    # the kv ``axis``). The φ projection (O / l) is a ``Map`` *over* this Monoid, added in
+    # ``_flash_op`` — not a carrier field.
     return Monoid(
         state=State(names=(m, ll, o), identity=identity),
         partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
-        finalize=(Assign(f"{o}__proj", "divide", (o, ll)),),
     )
 
 
@@ -211,8 +210,8 @@ def build_flash_frag(
     """Build the fragment graph holding the fused flash ``TileOp`` (+ its scale /
     -inf constants). The caller guarantees :func:`flash_shape_eligible`.
 
-    The compute is the op tree itself — a ``Monoid`` (the ``(m,l,O)`` LSE fold whose
-    carrier ``finalize``\\ s ``O/l``) carried unlowered on the ``TileOp``; the free
+    The compute is the op tree itself — a ``Map`` (the ``O/l`` projection) over the
+    ``(m,l,O)`` LSE ``Monoid`` fold, carried unlowered on the ``TileOp``; the free
     ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest).
     ``020_schedule`` passes the ``TileOp`` through; ``materialize`` lowers it and
     generates the output-store glue (the ``Write`` at the grid cell) — it isn't stored
@@ -226,7 +225,7 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    flash_monoid = _flash_op(
+    flash_op = _flash_op(
         q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     grid = (
@@ -234,7 +233,7 @@ def build_flash_frag(
         Axis(name="m", extent=s_q_dim),
         Axis(name="d", extent=Dim(d_v)),
     )
-    tile = TileOp(op=flash_monoid, grid_axes=grid)
+    tile = TileOp(op=flash_op, grid_axes=grid)
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -274,13 +273,13 @@ def _flash_op(
     group: int = 1,
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
-) -> Monoid:
+) -> Map:
     """The per-output-element ``(…, m, d)`` compute as the op tree itself: flash is the
-    ``(m,l,O)`` LSE :class:`Monoid` over ``kv`` whose score partial ``Map`` holds a
-    NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked); the carrier
-    ``finalize``\\ s ``O/l``. Returns the unlowered ``Monoid`` (carried on the
-    ``TileOp``). The free ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops
-    here; the output store is glue generated at materialize.
+    ``O/l`` projection :class:`Map` *over* the ``(m,l,O)`` LSE :class:`Monoid` over ``kv``,
+    whose score partial ``Map`` holds a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally
+    masked). Returns that unlowered ``Map`` (carried on the ``TileOp``). The free
+    ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is
+    glue generated at materialize.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
     ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
@@ -303,7 +302,7 @@ def _flash_op(
         Accum(name="sacc", value="qk", op=add).as_monoid(),
         partial=(
             Map(
-                [
+                body=[
                     Load(name="q_e", input=q_buf, index=q_idx),
                     Load(name="k_e", input=k_buf, index=k_idx),
                     Assign(name="qk", op="multiply", args=("q_e", "k_e")),
@@ -340,15 +339,17 @@ def _flash_op(
         score_name = "s_masked"
     else:
         score_name = "s"
-    # the (m,l,O) streaming fold over kv; carrier.finalize emits O_i/l_i post-loop. The
-    # partial sources are the score ``Map`` (binds ``score_name``) and the value ``Map``
-    # (one ``Load`` binding ``v_e``); ``flash_combine`` supplies state + twist + finalize.
+    # the (m,l,O) streaming fold over kv. The partial sources are the score ``Map`` (binds
+    # ``score_name``) and the value ``Map`` (one ``Load`` binding ``v_e``); ``flash_combine``
+    # supplies state + twist.
     flash_monoid = replace(
         flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
-        partial=(Map(score_stmts), Map([Load(name="v_e", input=v_buf, index=v_idx)])),
-        axis=Axis(name="kv", extent=s_k),  # out ("O_i__proj") + seeds derived from the carrier
+        partial=(Map(body=score_stmts), Map(body=[Load(name="v_e", input=v_buf, index=v_idx)])),
+        axis=Axis(name="kv", extent=s_k),
     )
-    return flash_monoid
+    # φ projection: normalize the streamed (unnormalized) output by the LSE denominator —
+    # a ``Map`` *over* the reduce (``project ∘ reduce``), O_i / l_i after the kv loop.
+    return Map(source=flash_monoid, body=[Assign(name="O_i__proj", op="divide", args=("O_i", "l_i"))])
 
 
 # --------------------------------------------------------------------------- #

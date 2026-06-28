@@ -15,7 +15,7 @@ the algebra lives in one place:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis
@@ -26,13 +26,34 @@ from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load
 
 
-class Map(Body):
-    """A pointwise body — a typed :class:`Body` (a sequence of loop-IR stmts: operand
-    ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and the output
-    ``Write`` at the kernel root) that binds a value name as its last defining stmt. It
-    has no fields of its own: it IS its stmts, and so carries Body's analysis helpers.
-    Used as a carrier partial (supplying that partial's stmts, last-binding the partial
-    name) or as the kernel root (last stmt = the ``Write``)."""
+@dataclass(frozen=True)
+class Map:
+    """A pointwise lift over an optional nested :data:`AlgebraNode` ``source``.
+
+    - ``source`` — the nested computation this Map maps over (a ``Monoid`` / ``Semiring`` /
+      ``Map``), lowered BEFORE the body, whose stmts read its result; ``None`` = a pure
+      pointwise lift. ``Map(source=reduce, body=…)`` is ``project ∘ reduce`` — flash's
+      ``O/l`` over the ``(m, l, O)`` ``Monoid``, a fused epilogue over a ``Semiring``.
+    - ``body`` — the pointwise :class:`Body` of loop-IR stmts (operand ``Load``\\ s, the
+      lift ``Assign``\\ s, an optional masking ``Select``, and — at the kernel root — the
+      output ``Write``) that binds a value name as its last defining stmt.
+
+    Used as a carrier partial / contraction operand (``out`` = the body's last bound name)
+    or as the kernel root (last stmt = the ``Write``). It HAS a Body (composition), not
+    IS one."""
+
+    source: AlgebraNode | None = None
+    body: Body = field(default_factory=Body)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body.coerce(self.body))
+
+    @property
+    def out(self) -> str:
+        """The bound output name — the body's last defining stmt's name (the projected
+        value / the partial this Map supplies)."""
+        return self.body[-1].defines()[-1]
 
 
 @dataclass(frozen=True)
@@ -94,7 +115,7 @@ class Semiring:
         loads = [ld for ld in body if isinstance(ld, Load) and k in {v for e in ld.index for v in e.free_vars()}]
         if len({ld.input for ld in loads}) < 2:
             return None
-        return Semiring(lift=lift.op, fold=fold, operands=tuple(Map([ld]) for ld in loads), reduce_axis=loop.axis)
+        return Semiring(lift=lift.op, fold=fold, operands=tuple(Map(body=[ld]) for ld in loads), reduce_axis=loop.axis)
 
 
 def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
@@ -198,18 +219,15 @@ class Monoid(Stmt):
       **additive** carrier whose partial lifts to a state, auto-derives
       ``combine_states`` from ``merge``; an asymmetric monoid (flash's LSE) authors
       both on the twist.
-    - ``commutative`` — whether the operation also commutes (split-KV legality);
-      ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
-      monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
-    - ``finalize`` — the carrier's **φ projection**: the post-reduction program that
-      maps the *final* carried state to the kernel's output value (the article's
-      ``project`` in ``project ∘ reduce ∘ map``), emitted by ``lower`` AFTER
-      the streaming loop. As data — a tuple of ``Assign``\\ s reading the state. Empty
-      = identity (the state itself is the output, e.g. a plain reduce / matmul). Flash
-      authors ``O_i / l_i`` (normalize the streamed output by the denominator). Named
-      ``finalize`` is the φ of ``project ∘ reduce ∘ map`` — the post-reduction map to
-      the output value (distinct from any cross-partition / cooperative realization,
-      which the carrier's ``combine_states`` data describes).
+    - ``axis`` — the reduce :class:`Axis` of a self-contained op-tree carrier (``None`` on
+      a loop-IR carrier, whose axis is the enclosing ``Loop``'s). A monoid is associative
+      with identity by construction; commutativity is unused (split/reorder legality is a
+      future cooperative-tier concern).
+
+    The **φ projection** (``project`` in ``project ∘ reduce ∘ map``) is no longer a carrier
+    field — it is a :class:`Map` *over* this Monoid: ``Map(source=monoid, body=[O/l])``
+    lowers the reduce then the post-loop pointwise project. Flash's ``O_i / l_i`` is that
+    Map; a plain reduce / matmul needs none (its ``out`` is the state itself).
 
     The whole operation lives **inside this carrier**, not as loose body
     statements, so the gates that reject online algorithms (``accums_independent``,
@@ -235,20 +253,19 @@ class Monoid(Stmt):
     # (``partial_names`` / ``deps``), so the carrier needs no source nodes.
     partial: tuple[AlgebraNode, ...]
     twist: Twist
-    finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
     # Self-contained reduction axis (op-tree node). ``None`` = a loop-IR carrier stmt that
     # sits inside an existing ``Loop`` (axis from the enclosing loop, partials are
     # siblings). Set by the op-tree builders; ``ir.tile.ops.lower`` reads it to emit the
-    # ``Loop`` + ``finalize`` and clears ``partial`` on the in-loop carrier it leaves.
+    # ``Loop`` and clears ``partial`` on the in-loop carrier it leaves.
     axis: Axis | None = None
 
     @property
     def out(self) -> str:
-        """The bound output name — the φ ``finalize``'s result if any, else the primary
-        carried state. Derived, not stored: we always know what a monoid accumulates (and
-        an mma-fragment output won't fit a stored ``str``). Seeds at lowering come from
-        ``state.identity``, so there is no separate ``init_ops``."""
-        return self.finalize[-1].name if self.finalize else self.state.names[0]
+        """The bound output name — the primary carried state (the φ projection, if any, is
+        a :class:`Map` *over* this Monoid, not a field here). Derived, not stored: we
+        always know what a monoid accumulates (and an mma-fragment output won't fit a
+        stored ``str``). Seeds at lowering come from ``state.identity`` (``State.inits``)."""
+        return self.state.names[0]
 
     def partial_names(self) -> tuple[str, ...]:
         """The bound name of each partial the merge folds in — the twist's ``merge``
@@ -324,12 +341,10 @@ AlgebraNode = Map | Monoid | Semiring
 
 def _partial_name(p: AlgebraNode) -> str:
     """The SSA name an algebra-node source binds — the value a carrier folds / a
-    contraction reads: a :class:`Monoid` / :class:`Semiring` binds its ``out``, a
-    :class:`Map` its last defining stmt's name."""
-    if isinstance(p, (Monoid, Semiring)):
+    contraction reads. Every node kind exposes it as ``out`` (``Map`` = its body's last
+    def, ``Monoid`` = primary state, ``Semiring`` = the fold accumulator)."""
+    if isinstance(p, (Map, Monoid, Semiring)):
         return p.out
-    if isinstance(p, Map):
-        return list(p)[-1].defines()[-1]
     raise TypeError(f"_partial_name: unsupported source {type(p).__name__}")
 
 

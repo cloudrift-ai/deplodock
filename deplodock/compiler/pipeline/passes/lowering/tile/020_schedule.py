@@ -90,4 +90,4 @@ def rewrite(match: Match, root: Node) -> TileOp | None:
     # reduce Loop + carrier inside). TileOp carries it as its op tree; the body is
     # derived by ``lower``. A scalar fold lowers from a Map verbatim (lower(Map) == its
     # stmts); flash carries a Reduce instead, emitted upstream by the recognizer.
-    return TileOp(op=Map(tuple(cell)), name=loop.name, grid_axes=tuple(axes))
+    return TileOp(op=Map(body=tuple(cell)), name=loop.name, grid_axes=tuple(axes))

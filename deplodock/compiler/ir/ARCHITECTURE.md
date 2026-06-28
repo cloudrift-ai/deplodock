@@ -151,17 +151,22 @@ read directly off its nodes where a pass needs it. The high-level op tree
 `Semiring.operands`) is itself one of the three — a uniform tree, no separate `Operand` /
 `Reduce` / `Load`-as-partial:
 
-- `Map` — the pointwise lift (a `Body` of stmts); a bare operand load is a one-`Load` `Map`.
+- `Map` — the pointwise lift: a `body` (a `Body` of stmts) over an optional nested
+  `source` node. `source=None` is the bare lift (a bare operand load is a one-`Load`
+  `Map`); `Map(source=reduce, body=…)` is `project ∘ reduce` — the φ projection. It HAS a
+  `Body` (composition), it is not one.
 - `Monoid` (+ `Twist`) — the fold ⊕ over a carried `State`; a self-contained reduction also
-  carries `axis` (the reduce `Axis`), so a nested fold is just a child `Monoid`.
+  carries `axis` (the reduce `Axis`), so a nested fold is just a child `Monoid`. No
+  `finalize` field: the φ projection is a `Map` *over* the Monoid (flash's `O/l`).
 - `Semiring` — the contraction `reduce(⊕) ∘ map(⊗)` (matmul) as a first-class node.
 
 `AlgebraNode = Map | Monoid | Semiring` is the child type (`Monoid.partial` /
-`Semiring.operands`). A node's output name (`Monoid` / `Semiring` `out`) is **derived, not
-stored** — we always know what a carrier accumulates, and a future mma-fragment output
-won't fit a stored `str`. A loop-IR `Monoid` carrier has `partial = ()` (its partials are
-sibling stmts in the enclosing `Loop`); `partial_names()` reads them off the twist's
-`merge` (the external reads), so the names live in one place.
+`Semiring.operands`). A node's output name (`out`) is **derived, not stored** — `Map` = its
+body's last def, `Monoid` = primary state, `Semiring` = the fold accumulator; we always
+know what a node produces, and a future mma-fragment output won't fit a stored `str`. A
+loop-IR `Monoid` carrier has `partial = ()` (its partials are sibling stmts in the
+enclosing `Loop`); `partial_names()` reads them off the twist's `merge` (the external
+reads), so the names live in one place.
 
 `ir.tile.ops.lower` expands the tree to loop IR; `Monoid` / `Semiring` carry the reduction
 shape so the separate `Reduce` op is gone (a nested reduction is a child node, not a
