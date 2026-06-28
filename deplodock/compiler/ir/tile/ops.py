@@ -121,7 +121,7 @@ def pretty(op, indent: str = "") -> list[str]:
             lines += pretty(src, sub2)
         return lines
     if isinstance(op, Semiring):
-        lines = [f"{indent}contract[{op.reduce_axis.name}] {op.lift.name} / {op.fold.op.name} -> {op.out}"]
+        lines = [f"{indent}semiring[{op.reduce_axis.name}] {op.lift.name} / {op.fold.op.name} -> {op.out}"]
         for opnd in op.operands:
             lines.append(f"{sub}operand {_partial_name(opnd)}:")
             lines += pretty(opnd, sub2)
