@@ -41,12 +41,29 @@ def lower(op) -> list[Stmt]:
     (if any) then its pointwise ``body``; a ``Monoid`` / ``Semiring`` generates its reduce
     ``Loop``. One ``lower`` call on the root node emits the kernel's per-cell body."""
     if isinstance(op, Map):
-        return (lower(op.source) if op.source is not None else []) + list(op.body)
+        return (lower(op.source) if op.source is not None else []) + _dissolve_carriers(list(op.body))
     if isinstance(op, Monoid):
         return _lower_monoid(op)
     if isinstance(op, Semiring):
         return _lower_semiring(op)
     raise TypeError(f"lower: expected Map / Monoid / Semiring node, got {type(op).__name__}")
+
+
+def _dissolve_carriers(stmts: list[Stmt]) -> list[Stmt]:
+    """Replace every ``Monoid`` carrier stmt (deep) with its loose fold stmts
+    (:meth:`Monoid.dissolve`). A flat-``Map`` fallback keeps its reduce loop-IR verbatim,
+    so a ``Monoid`` carrier sits inside its reduce ``Loop``; dissolving it here means a
+    ``Monoid`` stmt never reaches a rendered loop body — seeding goes through the fold
+    ``Accum``\\ s alone (``Loop.render``), the same path the lifted carrier already takes."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Monoid):
+            out.extend(s.dissolve())
+        elif s.nested():
+            out.append(s.with_bodies(tuple(Body(tuple(_dissolve_carriers(list(b)))) for b in s.nested())))
+        else:
+            out.append(s)
+    return out
 
 
 def _lower_partial(p) -> list[Stmt]:
@@ -72,8 +89,7 @@ def _lower_monoid(m: Monoid) -> list[Stmt]:
     body: list[Stmt] = []
     for p in m.partial:
         body += _lower_partial(p)
-    accums = m.as_accums()
-    body += accums if accums is not None else list(m.twist.merge)
+    body += m.dissolve()
     return [Loop(axis=m.axis, body=Body(tuple(body)))]
 
 

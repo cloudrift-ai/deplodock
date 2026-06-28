@@ -125,9 +125,10 @@ class State:
     """The carried state of a :class:`Monoid` — the internal-state SSA ``names``. The state
     is the *carrier* a :class:`Twist` operates on: the twist's ``merge`` folds a partial into
     :attr:`names`, its ``combine_states`` merges this state with a second one named by
-    :attr:`other`. The seed (neutral element) is NOT stored here — it's the fold's
-    ``op.identity``, read via :meth:`Monoid.seed_identities` (so there's one source of truth
-    for the seed: the fold, not a separately-authored identity that could drift)."""
+    :attr:`other`. The seed (neutral element) is NOT stored here — a carrier dissolves into
+    its fold ``Accum``\\ s (:meth:`Monoid.dissolve`), and each fold's seed is its
+    ``op.identity`` (so there's one source of truth for the seed: the fold, not a
+    separately-authored identity that could drift)."""
 
     names: tuple[str, ...]
 
@@ -190,9 +191,10 @@ class Monoid(Stmt):
     - ``state`` — the carried :class:`State`: the internal-state SSA ``names``
       (read-and-written across the reduce axis — the carried read is implicit, like
       ``Accum.name`` / ``Mma.c`` — and the defs visible after the loop). The seed (neutral
-      element) per component is the fold's ``op.identity``, read via :meth:`seed_identities`
-      (the uniform carrier interface a schedule realization places — serial loop today,
-      cooperative / cross-CTA later).
+      element) per component is its fold's ``op.identity``: the carrier :meth:`dissolve`\\ s
+      into its fold ``Accum``\\ s at lowering, and a schedule realization seeds those (the
+      serial reduce's ``Loop.render`` declares before the loop; cooperative / cross-CTA
+      seeds each partial — same fold, different placement).
     - ``partial`` — this iteration's contribution sources, one per partial slot: each an
       :data:`AlgebraNode` (the self-contained op-tree form, e.g. flash's score is a
       ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name (the loop-IR
@@ -288,29 +290,15 @@ class Monoid(Stmt):
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
 
-    def carried_names(self) -> tuple[str, ...]:
-        """The carried state names — the uniform carrier interface (matching
-        :meth:`Accum.carried_names`) a schedule realization reads alongside
-        :meth:`seed_identities`."""
-        return self.state.names
-
-    def seed_identities(self) -> tuple[float, ...]:
-        """The seed (neutral element) for each carried state component — the ``op.identity``
-        of the merge fold that writes it (an ``Accum`` for a twisted carrier, the
-        identity-twist ``Assign`` for a degenerate one). The fold is the single source of
-        truth for the seed (matching :meth:`Accum.seed_identities`); a schedule realization
-        reads this to place the seed (the serial reduce declares it before the loop; a future
-        cooperative / cross-CTA realization seeds each partial). Raises if a component's fold
-        carries no identity (e.g. a ``copy``-spelled state-merge) — that program is a combine,
-        not a streaming fold, and is never a seed source."""
-        folds = {s.name: s.op for s in self.twist.merge if s.name in set(self.state.names)}
-        out: list[float] = []
-        for n in self.state.names:
-            op = folds.get(n)
-            if op is None or op.identity is None:
-                raise ValueError(f"Monoid carrier {n!r}: no identity-bearing fold to seed from")
-            out.append(op.identity)
-        return tuple(out)
+    def dissolve(self) -> list[Stmt]:
+        """The loose fold stmts this carrier lowers to — bare ``Accum``\\ s for a degenerate
+        carrier (:meth:`as_accums`), else the streaming ``merge`` (ψ-rescale ``Assign``\\ s +
+        ``base``-``Accum`` folds). The ``Monoid`` stmt is a recognition-time grouping; once the
+        schedule is realized it dissolves into these folds, so seeding always goes through the
+        fold ``Accum``\\ s (ONE placement path — ``Loop.render`` never special-cases a carrier)
+        and no ``Monoid`` stmt reaches a rendered loop body."""
+        accums = self.as_accums()
+        return list(accums) if accums is not None else list(self.twist.merge)
 
     def as_accums(self) -> list[Accum] | None:
         """If this is a **degenerate** carrier (the identity twist — each state
@@ -372,12 +360,14 @@ class Monoid(Stmt):
         return lines
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Emit the merge program in fp32 (the flat-``Map`` fallback, where the carrier
-        renders standalone). Each ``Assign``/``Accum`` targeting a ``state`` name is a
-        reassignment of the carried value (declared + seeded by ``Loop.render`` from
-        ``state.identity``); every other ``Assign`` declares a local temp. The builder
-        orders the program so each old-state read precedes that state's update (e.g. flash
-        reads the old ``m`` for ``alpha`` before ``m = m_new``)."""
+        """Emit the merge program in fp32. A streaming carrier never renders here — it
+        :meth:`dissolve`\\ s into loose fold ``Accum``\\ s at lowering. This is reached only
+        by the cross-partition **state-merge** (:meth:`as_state_merge`), rendered at the
+        enclosing scope (its state already declared + seeded by the partition reduces). Each
+        ``Assign``/``Accum`` targeting a ``state`` name is a reassignment of the carried
+        value; every other ``Assign`` declares a local temp. The builder orders the program
+        so each old-state read precedes that state's update (flash reads the old ``m`` for
+        ``alpha`` before ``m = m_new``)."""
         return render_merge_program(self.twist.merge, self.state.names, ctx)
 
 

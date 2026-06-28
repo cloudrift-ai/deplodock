@@ -78,7 +78,7 @@ def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
     # A loop-IR carrier — ``partial=()``; the score ``s`` it folds is a sibling whose name
     # lives in ``merge``. (The reduce axis is the enclosing fused ``Loop``'s.)
     return Monoid(
-        state=State(names=(m, d)),  # seed (−inf, 0) derived from the fold ops via seed_identities
+        state=State(names=(m, d)),  # seed (−inf, 0) rides on the fold Accums (op.identity)
         partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
     )
@@ -136,10 +136,9 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                         axis=s.axis,
                         body=Body.coerce((Load(name=src, input=input_buf, index=index), mono)),
                     )
-                    # No explicit ``Init`` seeds — the carrier's seed rides on its fold and
-                    # is derived by ``Loop.render`` (the lifted path seeds the bare
-                    # ``base``-``Accum``\\ s; the flat-``Map`` fallback seeds the ``Monoid``
-                    # carrier via ``seed_identities`` = (−inf, 0)).
+                    # No explicit ``Init`` seeds — the carrier dissolves into its fold
+                    # ``base``-``Accum``\\ s (lifted, or the flat-``Map`` fallback at lowering),
+                    # and ``Loop.render`` seeds those from ``op.identity`` ((−inf, 0)).
                     out.append(fused)
                     changed = True
                     i += 2

@@ -96,15 +96,16 @@ class Loop(Stmt):
 
         pad = _pad(ctx.indent)
         out: list[str] = []
-        # Per-Loop ``<dtype> <carrier> = identity;`` for each distinct carried fold in
-        # the immediate body — the seed rides on the fold, derived here (no explicit
-        # ``Init``). An ``Accum``'s seed is its ``op.identity`` at its ``dtype`` (so
-        # fp32-over-fp16 declares ``float acc = 0.0f;``, a fp16 ``max`` declares
-        # ``__half acc = __float2half(0.0f);``). A ``Monoid`` carrier (the flat-``Map``
-        # fallback, where the carrier renders standalone rather than as lifted bare
-        # ``Accum``\\ s) seeds each state component from ``seed_identities()`` at fp32 (the
-        # merge runs fp32). A nested fold re-declares per enclosing iteration —
-        # scope-local shadowing — so a same-named outer carrier is harmless.
+        # Per-Loop ``<dtype> <acc> = identity;`` for each distinct ``Accum`` fold in the
+        # immediate body — the seed rides on the fold, derived here from ``op.identity`` at
+        # the fold's ``dtype`` (so fp32-over-fp16 declares ``float acc = 0.0f;``, a fp16
+        # ``max`` declares ``__half acc = __float2half(0.0f);``), no explicit ``Init``. This
+        # is the SINGLE seed-placement path: a carrier (``Monoid``) dissolves into its loose
+        # fold ``Accum``\\ s before it reaches here (``ir.tile.ops`` lowering), so there is
+        # never a ``Monoid`` stmt to special-case. A nested fold re-declares per enclosing
+        # iteration (scope-local shadowing), so a same-named outer carrier is harmless. This
+        # is the *serial* schedule's placement; a cooperative / cross-CTA realization reads
+        # the same fold ``Accum``\\ s' ``op.identity`` to seed its partials.
         seen: set[str] = set()
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
@@ -114,19 +115,6 @@ class Loop(Stmt):
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
-            elif isinstance(s, Monoid):
-                # The carrier's seed is each fold's ``op.identity`` — the uniform carrier
-                # interface (``seed_identities`` / ``carried_names``), the SAME source a bare
-                # ``Accum`` uses, not a separately-stored identity. This branch is the *serial*
-                # schedule's placement (declare before the loop); a cooperative / cross-CTA
-                # realization reads the same interface to seed its partials. The carrier merge
-                # runs fp32, so seed at fp32.
-                for name, ident in zip(s.carried_names(), s.seed_identities(), strict=True):
-                    if name in seen:
-                        continue
-                    seen.add(name)
-                    out.append(f"{pad}{ctx.type_name(_F32)} {name} = {ctx.identity_literal(ident, _F32)};")
-                    ctx.ssa_dtypes[name] = "f32"
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)
         if self.unroll:

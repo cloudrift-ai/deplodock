@@ -66,10 +66,9 @@ def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to their degenerate
     ``Monoid`` (deep). A semiring contraction (``Semiring.match``) keeps its ``Accum`` —
     degenerate-monoidizing it would lose the contraction structure the matmul tier reads.
-    No explicit ``Init`` seeds are emitted: a carrier's seed rides on its fold and is
-    derived by ``Loop.render`` — bare ``Accum``\\ s on the lifted path (``Monoid.as_accums``)
-    or the ``Monoid`` carrier's ``seed_identities`` on the flat-``Map`` fallback. Returns
-    ``(stmts, changed)``."""
+    No explicit ``Init`` seeds are emitted: the ``Monoid`` carrier dissolves into its fold
+    ``Accum``\\ s at lowering (``Monoid.dissolve`` — lifted, or the flat-``Map`` fallback),
+    and ``Loop.render`` seeds those from ``op.identity``. Returns ``(stmts, changed)``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
