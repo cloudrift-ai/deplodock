@@ -35,7 +35,7 @@ from dataclasses import replace
 
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, Monoid, Semiring
 from deplodock.compiler.ir.stmt.algebra import _partial_name
-from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
+from deplodock.compiler.ir.stmt.base import INDENT, Stmt, pretty_body
 
 
 def lower(op) -> list[Stmt]:
@@ -98,29 +98,33 @@ def pretty(op, indent: str = "") -> list[str]:
     reads as part of it. A ``Monoid`` / ``Semiring`` is a header (the carrier / contraction
     over its axis, projecting to ``out``) above its named children; any other stmt prints
     itself."""
+    # Every nesting level steps by one ``INDENT`` (a ``label:`` header sits at +INDENT under
+    # its parent node, its content at +INDENT under the label) so the whole tree lines up.
+    sub = indent + INDENT
+    sub2 = sub + INDENT
     if isinstance(op, Map):
         if op.source is None:
             return list(pretty_body(op.body, indent))  # pure pointwise — the body IS the map
         # A projection Map: its ``body`` (the φ projection) and the ``source`` it maps over
         # are BOTH the map's — nest them under one ``map:`` so the body reads as part of it.
-        lines = [f"{indent}map:", f"{indent}    over:"]
-        lines += pretty(op.source, indent + "        ")
-        lines.append(f"{indent}    body:")
-        lines += list(pretty_body(op.body, indent + "        "))
+        lines = [f"{indent}map:", f"{sub}over:"]
+        lines += pretty(op.source, sub2)
+        lines.append(f"{sub}body:")
+        lines += list(pretty_body(op.body, sub2))
         return lines
     if isinstance(op, Monoid):
         carrier = op.pretty()[0].strip()
         ax = op.axis.name if op.axis is not None else "?"
         lines = [f"{indent}monoid[{ax}] {carrier} -> {op.out}"]
         for src, pname in zip(op.partial, op.partial_names(), strict=True):
-            lines.append(f"{indent}  partial {pname}:")
-            lines += pretty(src, indent + "    ")
+            lines.append(f"{sub}partial {pname}:")
+            lines += pretty(src, sub2)
         return lines
     if isinstance(op, Semiring):
         lines = [f"{indent}contract[{op.reduce_axis.name}] {op.lift.name} / {op.fold.op.name} -> {op.out}"]
         for opnd in op.operands:
-            lines.append(f"{indent}  operand {_partial_name(opnd)}:")
-            lines += pretty(opnd, indent + "    ")
+            lines.append(f"{sub}operand {_partial_name(opnd)}:")
+            lines += pretty(opnd, sub2)
         return lines
     if isinstance(op, Stmt):
         return list(op.pretty(indent))
