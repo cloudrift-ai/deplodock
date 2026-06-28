@@ -118,7 +118,6 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
         Accum(name=o, value=t("pv"), op="add", base=t("om"), dtype=F32),  # O = O·alpha + p·v [seed 0]
         Accum(name=m, value=s, op="maximum", dtype=F32),  # m = max(m, s)  [seed −inf, last]
     )
-    identity = (Literal(-1e30), Literal(0.0), Literal(0.0))  # (−inf, 0, 0)
     state_b = (f"{m}__o", f"{ll}__o", f"{o}__o")  # the second partition's (m, l, O)
     mb, lb, ob = state_b
     combine_states = (
@@ -140,7 +139,7 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     # the kv ``axis``). The φ projection (O / l) is a ``Map`` *over* this Monoid, added in
     # ``_flash_op`` — not a carrier field.
     return Monoid(
-        state=State(names=(m, ll, o), identity=identity),
+        state=State(names=(m, ll, o)),
         partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
     )

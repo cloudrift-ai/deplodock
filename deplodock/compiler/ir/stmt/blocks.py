@@ -115,13 +115,17 @@ class Loop(Stmt):
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
             elif isinstance(s, Monoid):
-                # The carrier's seed is its monoid identity — ``State.identity`` (the neutral
-                # element), a property of the carried algebra, not the twist's combine spelling.
-                for name, ident in zip(s.state.names, s.state.identity, strict=True):
+                # The carrier's seed is each fold's ``op.identity`` — the uniform carrier
+                # interface (``seed_identities`` / ``carried_names``), the SAME source a bare
+                # ``Accum`` uses, not a separately-stored identity. This branch is the *serial*
+                # schedule's placement (declare before the loop); a cooperative / cross-CTA
+                # realization reads the same interface to seed its partials. The carrier merge
+                # runs fp32, so seed at fp32.
+                for name, ident in zip(s.carried_names(), s.seed_identities(), strict=True):
                     if name in seen:
                         continue
                     seen.add(name)
-                    out.append(f"{pad}{ctx.type_name(_F32)} {name} = {ctx.identity_literal(ident.value, _F32)};")
+                    out.append(f"{pad}{ctx.type_name(_F32)} {name} = {ctx.identity_literal(ident, _F32)};")
                     ctx.ssa_dtypes[name] = "f32"
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)

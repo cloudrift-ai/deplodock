@@ -26,7 +26,6 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid, State, Twist
 
@@ -79,7 +78,7 @@ def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
     # A loop-IR carrier — ``partial=()``; the score ``s`` it folds is a sibling whose name
     # lives in ``merge``. (The reduce axis is the enclosing fused ``Loop``'s.)
     return Monoid(
-        state=State(names=(m, d), identity=(Literal(-1e30), Literal(0.0))),  # (−inf, 0)
+        state=State(names=(m, d)),  # seed (−inf, 0) derived from the fold ops via seed_identities
         partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
     )

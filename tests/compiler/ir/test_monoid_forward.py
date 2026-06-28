@@ -39,8 +39,8 @@ def _softmax_loopop(n: int) -> LoopOp:
     """Online softmax of a vector ``x`` → ``out``: a ``(m, l)`` streaming Monoid,
     then a second free sweep dividing ``exp(x − m) / l``. The reduce sweep must run
     first (a swap would read the identity m=−inf, l=0)."""
-    merge = (*_online_softmax_steps("m", "l", "s"), Assign("m", "copy", ("m_mx",)))
-    state = State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0)))
+    merge = (*_online_softmax_steps("m", "l", "s"), Assign("m", "maximum", ("m", "s")))  # m = max(m, s) [seed-derivable]
+    state = State(names=("m", "l"))
     return LoopOp(
         body=(
             # No explicit Init — Loop.render seeds the carrier from State.identity.
@@ -77,9 +77,9 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
         Assign("m_om", "multiply", ("acc", "m_al")),  # O·alpha
         Assign("m_pv", "multiply", ("m_p", "vj")),  # p·v
         Assign("acc", "add", ("m_om", "m_pv")),  # O = O·alpha + p·v   [state]
-        Assign("m", "copy", ("m_mx",)),  # m = m_new (last)            [state]
+        Assign("m", "maximum", ("m", "s")),  # m = max(m, s) (last)    [state, seed-derivable]
     )
-    state = State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0)))
+    state = State(names=("m", "l", "acc"))
     return LoopOp(
         body=(
             # No explicit Init — Loop.render seeds the carrier from State.identity.
@@ -155,7 +155,7 @@ def test_combine_states_default_derived_for_additive() -> None:
     """An additive carrier (partial lifts to a state) auto-derives
     ``combine_states`` from ``merge`` — partial reads swapped for ``state_b``."""
     c = Monoid(
-        state=State(names=("acc",), identity=(Literal(0.0),)),
+        state=State(names=("acc",)),
         partial=(),  # the partial ``p`` is read off the merge program
         twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
     )

@@ -19,7 +19,6 @@ from dataclasses import dataclass, field, replace
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load
@@ -123,17 +122,14 @@ def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
 
 @dataclass(frozen=True)
 class State:
-    """The carried state of a :class:`Monoid` — the internal-state SSA ``names`` and
-    their per-component ``identity`` (the monoid's neutral element, one :class:`Expr`
-    each; empty = unseeded). The state is the *carrier* a :class:`Twist` operates on:
-    the twist's ``merge`` folds a partial into :attr:`names`, its ``combine_states``
-    merges this state with a second one named by :attr:`other`. ``identity`` is the seed:
-    ``Loop.render`` reads it to declare-and-seed the carrier when a ``Monoid`` renders
-    standalone (the flat-``Map`` fallback); the lifted path seeds the bare fold
-    ``Accum``\\ s from ``op.identity`` directly (which agrees)."""
+    """The carried state of a :class:`Monoid` — the internal-state SSA ``names``. The state
+    is the *carrier* a :class:`Twist` operates on: the twist's ``merge`` folds a partial into
+    :attr:`names`, its ``combine_states`` merges this state with a second one named by
+    :attr:`other`. The seed (neutral element) is NOT stored here — it's the fold's
+    ``op.identity``, read via :meth:`Monoid.seed_identities` (so there's one source of truth
+    for the seed: the fold, not a separately-authored identity that could drift)."""
 
     names: tuple[str, ...]
-    identity: tuple[Expr, ...] = ()
 
     @property
     def other(self) -> tuple[str, ...]:
@@ -193,10 +189,10 @@ class Monoid(Stmt):
 
     - ``state`` — the carried :class:`State`: the internal-state SSA ``names``
       (read-and-written across the reduce axis — the carried read is implicit, like
-      ``Accum.name`` / ``Mma.c`` — and the defs visible after the loop) plus their
-      per-component ``identity`` (the monoid's neutral element, one ``Expr`` each;
-      ``Loop.render`` reads it to seed the carrier, and split-KV / cooperative-combine
-      reductions read it to seed their partial accumulators).
+      ``Accum.name`` / ``Mma.c`` — and the defs visible after the loop). The seed (neutral
+      element) per component is the fold's ``op.identity``, read via :meth:`seed_identities`
+      (the uniform carrier interface a schedule realization places — serial loop today,
+      cooperative / cross-CTA later).
     - ``partial`` — this iteration's contribution sources, one per partial slot: each an
       :data:`AlgebraNode` (the self-contained op-tree form, e.g. flash's score is a
       ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name (the loop-IR
@@ -291,6 +287,30 @@ class Monoid(Stmt):
             combine_states = tuple(_rename_assign_args(a, sub) for a in tw.merge)
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
+
+    def carried_names(self) -> tuple[str, ...]:
+        """The carried state names — the uniform carrier interface (matching
+        :meth:`Accum.carried_names`) a schedule realization reads alongside
+        :meth:`seed_identities`."""
+        return self.state.names
+
+    def seed_identities(self) -> tuple[float, ...]:
+        """The seed (neutral element) for each carried state component — the ``op.identity``
+        of the merge fold that writes it (an ``Accum`` for a twisted carrier, the
+        identity-twist ``Assign`` for a degenerate one). The fold is the single source of
+        truth for the seed (matching :meth:`Accum.seed_identities`); a schedule realization
+        reads this to place the seed (the serial reduce declares it before the loop; a future
+        cooperative / cross-CTA realization seeds each partial). Raises if a component's fold
+        carries no identity (e.g. a ``copy``-spelled state-merge) — that program is a combine,
+        not a streaming fold, and is never a seed source."""
+        folds = {s.name: s.op for s in self.twist.merge if s.name in set(self.state.names)}
+        out: list[float] = []
+        for n in self.state.names:
+            op = folds.get(n)
+            if op is None or op.identity is None:
+                raise ValueError(f"Monoid carrier {n!r}: no identity-bearing fold to seed from")
+            out.append(op.identity)
+        return tuple(out)
 
     def as_accums(self) -> list[Accum] | None:
         """If this is a **degenerate** carrier (the identity twist — each state

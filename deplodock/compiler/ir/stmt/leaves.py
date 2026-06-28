@@ -521,6 +521,16 @@ class Accum(Stmt):
     def carried_names(self) -> tuple[str, ...]:
         return (self.name,)
 
+    def seed_identities(self) -> tuple[float, ...]:
+        """The seed (neutral element) for each carried name — the fold ``op``'s identity.
+        The uniform carrier interface (matching :meth:`Monoid.seed_identities`) a schedule
+        realization reads to place the seed: the serial reduce (``Loop.render``) declares it
+        before the loop, a future cooperative / cross-CTA realization seeds each partial.
+        The seed is the fold's identity regardless of where it lands."""
+        if self.op.identity is None:
+            raise ValueError(f"Accum {self.name!r}: op {self.op.name!r} has no identity to seed from")
+        return (self.op.identity,)
+
     def combine_operands(self) -> tuple[str, ...]:
         return (f"{self.name}__o",)
 
@@ -543,7 +553,7 @@ class Accum(Stmt):
         # A loop-IR carrier — ``partial=()``; the folded ``value`` is a sibling whose name
         # lives in the degenerate ``merge`` (``name = op(name, value)``).
         return Monoid(
-            state=State(names=(self.name,), identity=(self.init,)),
+            state=State(names=(self.name,)),
             partial=(),
             twist=Twist.degenerate((self.name,), (self.value,), (self.op,), self.dtype),
         )

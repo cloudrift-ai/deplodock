@@ -180,8 +180,8 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         return overlay.get(name, name)
 
     return Monoid(
-        # ``identity`` is constant Exprs — no SSA names to rename, only the ``names`` move.
-        state=State(names=tuple(rn(n) for n in names), identity=s.state.identity),
+        # State carries only ``names`` (the seed is the fold's ``op.identity``); rename them.
+        state=State(names=tuple(rn(n) for n in names)),
         # ``rewrite`` runs on loop-IR carriers (``partial`` already cleared to ``()``); the
         # partial names live in ``merge`` and are renamed there.
         partial=s.partial,
