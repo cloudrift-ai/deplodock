@@ -30,10 +30,9 @@ class _Softmax(torch.nn.Module):
 def test_online_softmax_combine_builds_asymmetric_monoid() -> None:
     # state (m, d), partial (s); the asymmetric LSE monoid must author combine_states (the
     # cross-partition combine can't derive it from merge).
-    mono = online_softmax_combine("m", "d", "s", axis="kv")
-    assert mono.state.names == ("m", "d") and mono.partial == ("s",)
+    mono = online_softmax_combine("m", "d", "s")
+    assert mono.state.names == ("m", "d") and mono.partial_names() == ("s",)
     assert mono.twist.combine_states, "combine_states must be authored for the asymmetric LSE monoid"
-    assert mono.commutative
 
 
 def _softmax_body() -> Body:

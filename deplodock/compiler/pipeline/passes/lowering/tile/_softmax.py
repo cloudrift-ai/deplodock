@@ -27,7 +27,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid, State, Twist
 
 
-def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoid:
+def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
     """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the P@V
     accumulator. State ``(m, d)`` (running row max / exp-sum denominator) folds this element's score
     partial ``s`` in ONE streaming pass (vs the classic two: a row-max reduce then a
@@ -68,12 +68,12 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
         Assign(d, "add", (t("cda2"), t("cdb2"))),  # d = d·a + d_o·b           [state]
         Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
     )
+    # A loop-IR carrier — ``partial=()``; the score ``s`` it folds is a sibling whose name
+    # lives in ``merge``. (The reduce axis is the enclosing fused ``Loop``'s.)
     return Monoid(
         state=State(names=(m, d), identity=(Literal(-1e30), Literal(0.0))),  # (−inf, 0)
-        partial=(s,),
+        partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
-        commutative=True,
-        axes=(axis,),
     )
 
 
@@ -127,7 +127,7 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                     fused = Loop(
                         axis=s.axis,
                         body=Body.coerce(
-                            (Load(name=src, input=input_buf, index=index), online_softmax_combine(maxacc, sumacc, src, axis=s.axis.name))
+                            (Load(name=src, input=input_buf, index=index), online_softmax_combine(maxacc, sumacc, src))
                         ),
                     )
                     # The (m, d) states are seeded by ``Loop.render`` from the carrier's

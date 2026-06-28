@@ -528,12 +528,12 @@ class Accum(Stmt):
         (``name = op(name, name__o)``) equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
         from deplodock.compiler.ir.stmt.algebra import Monoid, State, Twist  # local: algebra imports leaves
 
+        # A loop-IR carrier — ``partial=()``; the folded ``value`` is a sibling whose name
+        # lives in the degenerate ``merge`` (``name = op(name, value)``).
         return Monoid(
             state=State(names=(self.name,), identity=(self.init,)),
-            partial=(self.value,),
+            partial=(),
             twist=Twist.degenerate((self.name,), (self.value,), (self.op,), self.dtype),
-            commutative=self.op.commutative,
-            axes=self.axes,
         )
 
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a

@@ -124,14 +124,14 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
         Assign(o, "add", (t("coa"), t("cob"))),  # O = O·a + O_o·b            [state]
         Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
     )
+    # A loop-IR carrier — ``partial=()``; the (score, value) it folds are siblings whose
+    # names live in ``merge`` (``_flash_op`` wraps this with the op-tree partial nodes +
+    # the kv ``axis``). φ projection: the streamed output O is unnormalized — divide by the
+    # log-sum-exp denominator l once, after the kv loop. ``lower`` emits it post-loop.
     return Monoid(
         state=State(names=(m, ll, o), identity=identity),
-        partial=(s, v),
+        partial=(),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
-        commutative=True,
-        axes=("kv",),
-        # φ projection: the streamed output O is unnormalized — divide by the
-        # log-sum-exp denominator l once, after the kv loop. ``lower`` emits it post-loop.
         finalize=(Assign(f"{o}__proj", "divide", (o, ll)),),
     )
 

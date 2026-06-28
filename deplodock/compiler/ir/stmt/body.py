@@ -687,7 +687,9 @@ class Body(tuple[Stmt, ...]):
         # materializer keys the cross-thread combine off the first state name).
         accum_cooperative = {acc.name: frozenset(acc.axes) & thread_axes_fz for acc in accums}
         for c in combines:
-            coop = frozenset(c.axes) & thread_axes_fz
+            # The carrier's reduce axis (``None`` on a non-cooperative loop-IR carrier);
+            # cooperative-K = that axis ∩ the CTA thread axes.
+            coop = (frozenset({c.axis.name}) if c.axis is not None else frozenset()) & thread_axes_fz
             for st in c.state.names:
                 accum_cooperative[st] = coop
         cooperative_thread_axes = frozenset().union(*accum_cooperative.values()) if accum_cooperative else frozenset()

@@ -52,10 +52,10 @@ def lower(op) -> list[Stmt]:
 
 
 def _lower_partial(p) -> list[Stmt]:
-    """Emit the stmts a partial / operand source contributes: a node (``Map`` →
-    its stmts, ``Monoid`` / ``Semiring`` → ``lower``), or nothing for a ``str`` (an
-    already-bound sibling name — a loop-IR carrier shape, not an op-tree source)."""
-    return [] if isinstance(p, str) else lower(p)
+    """Emit the stmts a partial / operand source node contributes: a ``Map`` → its stmts,
+    a ``Monoid`` / ``Semiring`` → its ``lower``. (Op-tree sources are always nodes; a
+    loop-IR carrier has no source nodes — its partials are already siblings.)"""
+    return lower(p)
 
 
 def _lower_monoid(m: Monoid) -> list[Stmt]:
@@ -64,13 +64,13 @@ def _lower_monoid(m: Monoid) -> list[Stmt]:
     of the final state to the output — empty for a plain reduce, ``O/l`` for flash). No
     ``Init`` stmts: ``Loop.render`` seeds each carried state from ``state.identity`` in
     the same pre-loop prelude it uses for ``Accum``\\ s. The in-loop carrier is this
-    ``Monoid`` with its partial sources reduced to their bound names and its
-    self-contained ``axis`` / ``finalize`` stripped — the loop-IR carrier stmt the
-    renderer / passes consume. Pure structure-from-carrier."""
+    ``Monoid`` with its partial sources expanded to siblings (so ``partial`` is cleared)
+    and ``finalize`` stripped — the loop-IR carrier stmt the renderer / passes consume;
+    its ``axis`` is kept for the cooperative-axis analysis. Pure structure-from-carrier."""
     body: list[Stmt] = []
     for p in m.partial:
         body += _lower_partial(p)
-    carrier = replace(m, partial=m.partial_names(), axis=None, finalize=())
+    carrier = replace(m, partial=(), finalize=())
     body.append(carrier)
     return [Loop(axis=m.axis, body=Body(tuple(body))), *m.finalize]
 

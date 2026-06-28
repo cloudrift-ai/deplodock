@@ -51,9 +51,8 @@ def _softmax_loopop(n: int) -> LoopOp:
                     Load(name="s", input="x", index=(Var("j"),)),
                     Monoid(
                         state=State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0))),
-                        partial=("s",),
+                        partial=(),  # loop-IR carrier — ``s`` is the sibling Load above
                         twist=Twist(merge=merge),
-                        axes=("j",),
                     ),
                 ),
             ),
@@ -93,9 +92,8 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
                     Load(name="vj", input="v", index=(Var("j"),)),
                     Monoid(
                         state=State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0))),
-                        partial=("s", "vj"),
+                        partial=(),  # loop-IR carrier — ``s`` / ``vj`` are the sibling Loads above
                         twist=Twist(merge=merge),
-                        axes=("j",),
                     ),
                 ),
             ),
@@ -161,9 +159,10 @@ def test_combine_states_default_derived_for_additive() -> None:
     ``combine_states`` from ``merge`` — partial reads swapped for ``state_b``."""
     c = Monoid(
         state=State(names=("acc",), identity=(Literal(0.0),)),
-        partial=("p",),
+        partial=(),  # the partial ``p`` is read off the merge program
         twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
     )
+    assert c.partial_names() == ("p",)  # derived from the merge's external read
     assert c.twist.state_b == ("acc__o",)
     assert len(c.twist.combine_states) == 1
     assert c.twist.combine_states[0].name == "acc"

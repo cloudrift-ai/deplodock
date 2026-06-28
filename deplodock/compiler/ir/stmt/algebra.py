@@ -219,20 +219,17 @@ class Monoid(Stmt):
     """
 
     state: State
-    # The partial-contribution sources: each an :data:`AlgebraNode` (the self-contained
-    # op-tree form), or a bound ``str`` name (the loop-IR carrier form, post-lowering /
-    # degenerate ``Accum.as_monoid`` — the value is produced by a sibling stmt in the
-    # enclosing ``Loop``). ``partial_names`` reads the bound name off either; ``deps`` /
-    # the twist's ``merge`` reference those names.
-    partial: tuple[AlgebraNode | str, ...]
+    # The partial-contribution sources, each an :data:`AlgebraNode` — the self-contained
+    # op-tree form. EMPTY ``()`` on a loop-IR carrier: there the partials are sibling
+    # stmts in the enclosing ``Loop`` and their names are read off the twist's ``merge``
+    # (``partial_names`` / ``deps``), so the carrier needs no source nodes.
+    partial: tuple[AlgebraNode, ...]
     twist: Twist
-    commutative: bool = True
-    axes: tuple[str, ...] = ()
     finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
     # Self-contained reduction axis (op-tree node). ``None`` = a loop-IR carrier stmt that
     # sits inside an existing ``Loop`` (axis from the enclosing loop, partials are
     # siblings). Set by the op-tree builders; ``ir.tile.ops.lower`` reads it to emit the
-    # ``Init`` + ``Loop`` + ``finalize`` and strips it off the in-loop carrier it leaves.
+    # ``Loop`` + ``finalize`` and clears ``partial`` on the in-loop carrier it leaves.
     axis: Axis | None = None
 
     @property
@@ -244,9 +241,11 @@ class Monoid(Stmt):
         return self.finalize[-1].name if self.finalize else self.state.names[0]
 
     def partial_names(self) -> tuple[str, ...]:
-        """The bound name of each partial — the node's output (``Map`` last def /
-        ``Monoid`` / ``Semiring`` ``out``), or the ``str`` itself for a loop-IR carrier."""
-        return tuple(_partial_name(p) for p in self.partial)
+        """The bound name of each partial the merge folds in — the twist's ``merge``
+        external reads (args that are neither carried state nor merge-internal temps), in
+        first-use order. Derived from the merge (its source of truth), so it holds whether
+        ``partial`` carries op-tree source nodes or is the empty loop-IR carrier."""
+        return _merge_reads(self.twist.merge, self.state.names)
 
     def __post_init__(self) -> None:
         # Complete the twist's cross-partition surface against this monoid's state.
@@ -260,8 +259,9 @@ class Monoid(Stmt):
         # (the partial lifts to a state, one component each): substitute the
         # partial reads with the second-operand state names. An asymmetric monoid
         # (different partial / state arity, e.g. flash LSE) must author it.
-        if not combine_states and len(self.partial) == len(self.state.names):
-            sub = dict(zip(self.partial_names(), state_b, strict=True))
+        partial_names = self.partial_names()
+        if not combine_states and len(partial_names) == len(self.state.names):
+            sub = dict(zip(partial_names, state_b, strict=True))
             combine_states = tuple(_rename_assign_args(a, sub) for a in tw.merge)
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
@@ -270,18 +270,16 @@ class Monoid(Stmt):
         """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
         a second fully-reduced state named ``other`` (the cross-partition
         combine's right operand). The returned carrier's ``merge`` IS
-        ``combine_states`` with ``state_b`` renamed to ``other`` and its
-        ``partial`` set to ``other`` — so the cooperative-tree / cross-CTA reduce
-        renders the state-merge through the same machinery as a streaming step.
+        ``combine_states`` with ``state_b`` renamed to ``other`` — so the
+        cooperative-tree / cross-CTA reduce renders the state-merge through the same
+        machinery as a streaming step (``other`` is read off that merge as its partials).
         """
         sub = dict(zip(self.twist.state_b, other, strict=True))
         merged = tuple(_rename_assign_args(a, sub) for a in self.twist.combine_states)
         return Monoid(
             state=self.state,  # the State (names + identity) carries over unchanged
-            partial=other,
+            partial=(),  # a loop-IR carrier — its partials (``other``) are read off ``merged``
             twist=Twist(merge=merged, combine_states=merged, state_b=other),
-            commutative=self.commutative,
-            axes=self.axes,
         )
 
     def deps(self) -> tuple[str, ...]:
@@ -309,23 +307,34 @@ class Monoid(Stmt):
 
 
 # The three algebra node kinds — the compute tree's vocabulary. A partial / operand
-# source is one of these (``Monoid.partial`` also admits a bound ``str`` name in its
-# loop-IR carrier form). Defined after the classes; annotations are strings (``from
+# source is one of these. Defined after the classes; annotations are strings (``from
 # __future__ import annotations``) so the forward reference in the fields above resolves.
 AlgebraNode = Map | Monoid | Semiring
 
 
-def _partial_name(p) -> str:
-    """The SSA name a partial source binds — the value the carrier folds. A ``str`` is
-    the name itself (loop-IR carrier); a :class:`Monoid` / :class:`Semiring` binds its
-    ``out``; a :class:`Map` binds its last defining stmt's name."""
-    if isinstance(p, str):
-        return p
+def _partial_name(p: AlgebraNode) -> str:
+    """The SSA name an algebra-node source binds — the value a carrier folds / a
+    contraction reads: a :class:`Monoid` / :class:`Semiring` binds its ``out``, a
+    :class:`Map` its last defining stmt's name."""
     if isinstance(p, (Monoid, Semiring)):
         return p.out
     if isinstance(p, Map):
         return list(p)[-1].defines()[-1]
-    raise TypeError(f"_partial_name: unsupported partial source {type(p).__name__}")
+    raise TypeError(f"_partial_name: unsupported source {type(p).__name__}")
+
+
+def _merge_reads(merge: tuple[Assign, ...], state_names: tuple[str, ...]) -> tuple[str, ...]:
+    """The external read names of a merge program — args read but neither carried state
+    nor a temp defined within the program — in first-use order. These are the partials the
+    merge folds into the state (the source of truth for ``Monoid.partial_names``)."""
+    state, defined, seen, reads = set(state_names), set(), set(), []
+    for a in merge:
+        for arg in a.args:
+            if arg not in state and arg not in defined and arg not in seen:
+                seen.add(arg)
+                reads.append(arg)
+        defined.add(a.name)
+    return tuple(reads)
 
 
 __all__ = ["AlgebraNode", "Map", "Semiring", "State", "Twist", "Monoid"]

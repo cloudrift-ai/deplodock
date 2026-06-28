@@ -138,11 +138,11 @@ iteration axes. Free vs reduce is inferred from body structure — a
 form `Mma`, or the general monoid `Monoid`. `is_reduce` (and axis threading and
 the other carrier-agnostic checks) test exactly that `isinstance(s, (Accum, Mma,
 Monoid))` tuple — there is no shared base class; the carriers are plain `Stmt`s
-that happen to share the reduce-surface methods. Rules that need the combine's
-algebra read the carrier's `associative` / `commutative` / `has_identity` traits
-directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
-constants; `Monoid` reports `associative` / `has_identity` `True` by construction
-with a per-instance `commutative` field).
+that happen to share the reduce-surface methods. `Accum` / `Mma` expose
+`associative` / `commutative` / `has_identity` traits (`Accum` forwards to its scalar
+`op`; `Mma` reports the additive-fold constants); a `Monoid` is associative-with-identity
+by construction and carries no such fields (commutativity is unused — split/reorder
+legality is a future cooperative-tier concern, recorded structurally when it returns).
 
 **The algebra is in the body, not a tag** (`ir/stmt/algebra.py` — the consolidated
 algebraic vocabulary). There is no stored / derived `AlgebraKind`: a kernel's algebra is
@@ -156,10 +156,12 @@ read directly off its nodes where a pass needs it. The high-level op tree
   carries `axis` (the reduce `Axis`), so a nested fold is just a child `Monoid`.
 - `Semiring` — the contraction `reduce(⊕) ∘ map(⊗)` (matmul) as a first-class node.
 
-`AlgebraNode = Map | Monoid | Semiring` is the child type (`Monoid.partial` also admits a
-bound `str` name in its loop-IR carrier form). A node's output name (`Monoid` / `Semiring`
-`out`) is **derived, not stored** — we always know what a carrier accumulates, and a
-future mma-fragment output won't fit a stored `str`.
+`AlgebraNode = Map | Monoid | Semiring` is the child type (`Monoid.partial` /
+`Semiring.operands`). A node's output name (`Monoid` / `Semiring` `out`) is **derived, not
+stored** — we always know what a carrier accumulates, and a future mma-fragment output
+won't fit a stored `str`. A loop-IR `Monoid` carrier has `partial = ()` (its partials are
+sibling stmts in the enclosing `Loop`); `partial_names()` reads them off the twist's
+`merge` (the external reads), so the names live in one place.
 
 `ir.tile.ops.lower` expands the tree to loop IR; `Monoid` / `Semiring` carry the reduction
 shape so the separate `Reduce` op is gone (a nested reduction is a child node, not a
@@ -183,12 +185,12 @@ tensor-core cell.
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (a `State`), `partial`
-(this step's contribution sources — each an `AlgebraNode`, or a bound `str` name in the
-loop-IR carrier form; `partial_names()` reads the name off either), a `commutative` flag,
-and a `twist` (below) that holds the operation. A self-contained reduction also carries
-`axis` (`None` on the loop-IR carrier `ir.tile.ops.lower` leaves inside the emitted
-`Loop`); its `out` is derived and it has no per-state init op. The carried state itself is
-its own class, **extracted like the `Twist`**:
+(this step's contribution sources — each an `AlgebraNode`, empty `()` on a loop-IR carrier
+whose partials are siblings), and a `twist` (below) that holds the operation. A
+self-contained reduction also carries `axis` (`None` on the loop-IR carrier
+`ir.tile.ops.lower` leaves inside the emitted `Loop` — kept for the cooperative-axis
+analysis); its `out` / `partial_names()` are derived, and it has no per-state init op. The
+carried state itself is its own class, **extracted like the `Twist`**:
 `State` bundles the internal-state SSA `names` with their per-component `identity` (one
 `Expr` each, the monoid's neutral element). `Loop.render` seeds each carried state from
 `state.identity` in the same pre-loop prelude it uses for `Accum`s (so a `Monoid` carrier

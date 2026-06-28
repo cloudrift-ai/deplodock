@@ -154,7 +154,6 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
     # The merge / combine_states programs reference state / partial / state_b
     # (all in the rename map) PLUS carrier-internal temps that are NOT surfaced via
     # ``defines()`` — so a register-tile replicator that renames the state per cell
@@ -182,19 +181,17 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Monoid(
         # ``identity`` is constant Exprs — no SSA names to rename, only the ``names`` move.
         state=State(names=tuple(rn(n) for n in names), identity=s.state.identity),
-        # In loop-IR (what ``rewrite`` sees) the partials are bound ``str`` names; an
-        # op-tree node partial (pre-lowering, not rewritten here) is passed through.
-        partial=tuple(rn(p) if isinstance(p, str) else p for p in s.partial),
+        # ``rewrite`` runs on loop-IR carriers (``partial`` already cleared to ``()``); the
+        # partial names live in ``merge`` and are renamed there.
+        partial=s.partial,
         twist=Twist(
             merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
             combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
             state_b=tuple(rn(n) for n in s.twist.state_b),
         ),
-        commutative=s.commutative,
-        axes=new_axes,
         finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state
-        # Self-contained op-tree axis — preserved across rename (loop-IR carriers have it
-        # None; ``out`` is derived from finalize / state, no field to thread).
+        # The reduce axis — threaded through σ so the cooperative-axis analysis keys off the
+        # renamed name (loop-IR carriers from non-op-tree builders have it None).
         axis=axis_fn(s.axis) if s.axis is not None else None,
     )
 
