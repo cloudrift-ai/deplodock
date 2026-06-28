@@ -1,6 +1,6 @@
 """Symbolic-extent ``Dim`` round-trips through trace → lift → ``LoopOp.forward``.
 
-Plan: ``plans/dynamic-shapes.md``. Tests cover the position-based dynamic
+Tests cover the position-based dynamic
 shape flow: ``torch.export(..., dynamic_shapes={input: {axis: Dim(name)}})``
 threads ``Dim(name)`` through every downstream FX node via SymInt, the
 compile pipeline emits one CudaOp whose signature carries
@@ -510,7 +510,7 @@ def test_qwen_whole_model_dynamic_traces():
 # set_sym_values + upload_prefix + capture_program_graph[cached] +
 # replay_program_graph + outputs(sym_values)). Each graph is captured at its
 # EXACT seq_len, so every kernel runs at its exact grid — no oversized-grid
-# guard story needed. Plan: plans/serving-dynamic-shape-cuda-graphs.md.
+# guard story needed.
 # ---------------------------------------------------------------------------
 
 

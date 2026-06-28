@@ -2,7 +2,7 @@
 
 A reduce partition with a GRID stage (``ReducePlan.needs_split``) splits the reduce axis
 across CTAs: a **partial** kernel and a **finalize** kernel. This pass would emit them; it
-is a documented stub until the ``cta`` tier lands (``plans/cooperative-reduction-tile-ir.md``).
+is a documented stub until the ``cta`` tier lands.
 
 The key point recorded here is that **splits are expressible in the algebra tile IR** — the
 finalize is just another reduce node:
@@ -39,6 +39,6 @@ def rewrite(match: Match, root: Node) -> TileOp | None:
         raise RuleSkipped("no cross-CTA split stage — nothing to split")
     raise NotImplementedError(
         "cross-CTA split-reduce (cta tier) is not built yet — see 030_split module docstring "
-        "and plans/cooperative-reduction-tile-ir.md (partial kernel → ws workspace; finalize "
+        "(partial kernel → ws workspace; finalize "
         "kernel = a reduce over the split axis via carrier.as_state_merge)."
     )

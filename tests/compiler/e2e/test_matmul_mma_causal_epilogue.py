@@ -4,8 +4,7 @@ The attention scores kernel applies a causal mask after the matmul:
 ``out[m,n] = (n <= m) ? acc*scale : mask_fill``. The mask is a ``Select`` whose
 predicate compares the output coordinates — foldable into the fragment store
 because each lane's 4 elements own known (row, col) of the C tile. Without the
-fold the consumer drops to the scalar tier (the QK^T's binding blocker, see
-``plans/qwen3-embedding-0.6b-layer0-low-performer-analysis.md`` Finding 1).
+fold the consumer drops to the scalar tier (the QK^T's binding blocker).
 
 Uses a CANONICAL matmul (``b[k,n]``) to isolate the epilogue fold from the
 transposed-B path; the real QK^T composes both (transposed-B split consumer +

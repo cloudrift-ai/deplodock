@@ -1,5 +1,4 @@
-"""Behavior-preservation tests for the op algebra traits (Part A of
-``plans/algebraic-carrier-analysis.md``).
+"""Behavior-preservation tests for the op algebra traits.
 
 These pin the trait queries (``selecting`` / ``associative`` / ``commutative``
 / ``has_identity`` / semiring role / reduce render-spelling) to the values the

@@ -271,7 +271,7 @@ matrices:
 
 ### SGLang Quantization for AWQ MoE Models
 
-SGLang does not automatically detect AWQ quantization for MoE architectures. For AWQ-quantized MoE models, `--quantization moe_wna16` must be passed via `extra_args`. See [/docs/sglang-awq-moe.md](/docs/sglang-awq-moe.md) for full details and tested configurations.
+SGLang does not automatically detect AWQ quantization for MoE architectures. For AWQ-quantized MoE models, `--quantization moe_wna16` must be passed via `extra_args`.
 
 ## Data Flow
 

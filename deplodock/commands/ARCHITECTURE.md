@@ -30,78 +30,61 @@ commands/vm ────► provisioning (create/delete instances)
 
 ### `deplodock/recipe/` — Recipe Library
 
-Recipe loading, configuration dataclasses, and engine flag mapping.
-
-**Modules:**
-- `types.py` — `Recipe`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`, `SglangConfig`, `BenchmarkConfig` dataclasses
-- `recipe.py` — `deep_merge()`, `load_recipe()`, `resolve_for_hardware()`, `validate_extra_args()`
-- `engines.py` — `VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`, `banned_extra_arg_flags()`, `build_engine_args()`
-
-`load_recipe()` returns a `Recipe` dataclass. All consumers use attribute access (e.g. `recipe.engine.llm.tensor_parallel_size`).
+Recipe loading, configuration dataclasses (`Recipe`, `ModelConfig`, `EngineConfig`, `LLMConfig`, `VllmConfig`,
+`SglangConfig`, `BenchmarkConfig`), deep merge / hardware resolution / extra-arg validation, and engine flag mapping
+(`VLLM_FLAG_MAP`, `SGLANG_FLAG_MAP`). `load_recipe()` returns a `Recipe` dataclass; all consumers use attribute access
+(e.g. `recipe.engine.llm.tensor_parallel_size`).
 
 ### `deplodock/deploy/` — Deploy Library
 
-The central orchestration layer. Provides a single entry point for deploying recipes to servers.
+The central orchestration layer. Provides a single entry point (`run_deploy()` / `run_teardown()` and the lower-level
+`deploy()` / `teardown()`) for deploying recipes to servers, plus compose / nginx generation, SSH and local-subprocess
+transports, and the scale-out strategies (`DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`).
+`DeployParams` carries the `recipe`, `gpu_device_ids`, etc. `run_deploy()` / `deploy()` accept an optional
+`timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics)).
 
-**Modules:**
-- `params.py` — `DeployParams` dataclass (holds `recipe: Recipe`, `gpu_device_ids`, etc.)
-- `compose.py` — `calculate_num_instances()`, `generate_compose()`, `generate_nginx_conf()`
-- `orchestrate.py` — `run_deploy()`, `run_teardown()`, `deploy()`, `teardown()`. `run_deploy()` / `deploy()` accept an
-  optional `timer: PhaseTimer` that records per-step durations (see [Timing metrics](#timing-metrics)). The
-  post-health smoke test branches on `recipe.is_embedding` (`model.task: embed`): chat models POST
-  `/v1/chat/completions` ("What is 2+2?" must contain "4"); embedding models POST `/v1/embeddings` and require a
-  non-empty finite vector with L2 norm in [0.9, 1.1] (the pooler normalizes — garbage/NaN models fail). Same
-  retry/timeout/log-dump loop either way (`_check_chat_response` / `_check_embedding_response`).
-- `log_phases.py` — `parse_engine_load_phases()` (best-effort `weights_load` / `cuda_graph_capture` from container logs)
-- `ssh.py` — `ssh_base_args()`, `make_run_cmd()`, `scp_file()`, `make_write_file()`
-- `scale_out.py` — `ScaleOutStrategy` ABC, `DataParallelismScaleOutStrategy`, `ReplicaParallelismScaleOutStrategy`, `STRATEGIES`, `DEFAULT_STRATEGY`
-- `local.py` — `make_run_cmd()`, `make_write_file()` (local subprocess transport)
+The post-health **smoke test** branches on `recipe.is_embedding` (`model.task: embed`): chat models POST
+`/v1/chat/completions` ("What is 2+2?" must contain "4"); embedding models POST `/v1/embeddings` and require a non-empty
+finite vector with L2 norm in [0.9, 1.1] (the pooler normalizes — garbage/NaN models fail). Same retry/timeout/log-dump
+loop either way. `parse_engine_load_phases()` extracts best-effort `weights_load` / `cuda_graph_capture` from container
+logs.
 
-**GPU visibility:** `generate_compose()` accepts a `gpu_device_ids` parameter to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
+**GPU visibility:** `generate_compose()` accepts a `gpu_device_ids` parameter to restrict GPU visibility via
+`device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
 
 ### `deplodock/provisioning/` — Provisioning Library
 
-VM lifecycle management and cloud provisioning.
-
-**Modules:**
-- `types.py` — `VMConnectionInfo` dataclass
-- `ssh.py` — `wait_for_ssh()` (provider-agnostic SSH polling)
-- `shell.py` — `run_shell_cmd()`
-- `host.py` — `Host`, `LocalHost`, `RemoteHost` (sudo-gated command runner — `LocalHost.run(sudo=True)` raises so local deploys can't modify the dev box)
-- `remote.py` — `provision_remote()` (install Docker, optional NVIDIA driver/CUDA, NVIDIA container toolkit; reboots and waits for the host on driver/CUDA install)
-- `cloud.py` — `resolve_vm_spec()`, `provision_cloud_vm()`, `delete_cloud_vm()`
-- `cloudrift.py` — CloudRift REST API provider
-- `gcp.py` — GCP gcloud provider
+VM lifecycle management and cloud provisioning. `VMConnectionInfo` is the connection dataclass; `wait_for_ssh()` does
+provider-agnostic SSH polling. The `Host` / `LocalHost` / `RemoteHost` hierarchy is a sudo-gated command runner
+(`LocalHost.run(sudo=True)` raises so local deploys can't modify the dev box). `provision_remote()` installs Docker, the
+NVIDIA container toolkit, and optional NVIDIA driver/CUDA (rebooting and waiting for the host on driver/CUDA install).
+`provision_cloud_vm()` / `delete_cloud_vm()` orchestrate cloud VMs over the CloudRift (REST API) and GCP (gcloud)
+providers.
 
 ### `deplodock/benchmark/` — Benchmark Library
 
-Benchmark configuration, task enumeration, and execution.
+Benchmark configuration (`load_config()` / `validate_config()`), per-run logging, task enumeration
+(`enumerate_tasks()`), execution (`run_execution_group()` — times provisioning per group + deploy/bench/teardown per
+task; task results are `(task, ok, timing)` triples), and structured results (`BenchmarkMetrics` / `SystemInfo`
+dataclasses, `parse_benchmark_metrics()`, `compose_json_result()` / `compose_result()` — both take an optional `timing`
+arg feeding the `"timing"` JSON key / `=== Timing ===` text section).
 
-**Modules:**
-- `config.py` — `load_config()`, `validate_config()`, `_expand_path()`
-- `bench_logging.py` — `setup_logging()`, `add_file_handler()`, `add_group_file_handler()`, `_get_group_logger()`, `active_run_dir` context var, `_RunDirFilter`, `_GroupNameFilter`, `_BenchConsoleFormatter`
-- `workload.py` — `extract_benchmark_results()`, `run_benchmark_workload()`. Embedding recipes
-  (`model.task: embed`) bench with `vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` and drop
-  `--random-output-len` (nothing is generated); the output's labels (request/token throughput, E2EL percentiles — no
-  TTFT/TPOT/ITL) already parse via `parse_benchmark_metrics`' missing-field-tolerant label regexes
-- `tasks.py` — `enumerate_tasks()`
-- `execution.py` — `run_execution_group()`, `_run_groups()`, `OnTaskDone` callback type. Times provisioning (per
-  group) + deploy/bench/teardown (per task); task results are `(task, ok, timing)` triples
-- `results.py` — `BenchmarkMetrics`, `SystemInfo` dataclasses, `parse_benchmark_metrics()`, `parse_system_info()`,
-  `compose_json_result()` (optional `timing` arg → `"timing"` key)
-- `workload.py` — `compose_result()` (optional `timing` arg → `=== Timing ===` section), `run_benchmark_workload()`
+`run_benchmark_workload()` drives `vllm bench serve`. Embedding recipes (`model.task: embed`) bench with
+`--backend openai-embeddings --endpoint /v1/embeddings` and drop `--random-output-len` (nothing is generated); the
+output's labels (request/token throughput, E2EL percentiles — no TTFT/TPOT/ITL) already parse via
+`parse_benchmark_metrics`' missing-field-tolerant label regexes.
 
 ### `planner/` — Planner Layer
 
-Groups benchmark tasks into execution groups for VM allocation.
+Groups benchmark tasks into execution groups for VM allocation. The abstract interface defines `BenchmarkTask` (one
+recipe+variant combination, with run-directory management helpers), `ExecutionGroup` (tasks sharing one VM; its `label`
+property returns a unique label like `rtx5090_x_8` or `rtx5090_x_8_r01` when an index is set), and the
+`BenchmarkPlanner` ABC (`plan(tasks) -> list[ExecutionGroup]`).
 
-**Abstract interface (`planner/__init__.py`):**
-- `BenchmarkTask` — one recipe+variant combination (recipe_dir, variant, recipe, gpu_name, gpu_count); includes `task_id` property, `to_dict()`, `setup_run_dir()`, and static methods for run directory management (`compute_code_hash()`, `create_run_dir()`, `write_tasks_json()`, `read_tasks_json()`)
-- `ExecutionGroup` — group of tasks sharing one VM (gpu_name, gpu_count, tasks, index); `gpu_short` property returns short GPU name, `label` property returns unique label (e.g. `rtx5090_x_8` or `rtx5090_x_8_r01` when index is set)
-- `BenchmarkPlanner` — ABC with `plan(tasks) -> list[ExecutionGroup]`
-
-**Implementations:**
-- `planner/group_by_model_and_gpu.py` — `GroupByModelAndGpuPlanner(gpu_concurrency=1)`: groups by (model_name, gpu_name) tuple. Same model on same GPU shares a VM to reuse cached weights. Max gpu_count determines VM size; tasks sorted descending. With `gpu_concurrency > 1`, each group is split into up to N sub-groups via round-robin, each provisioning its own VM (trades weight-cache reuse for wall-clock time).
+`GroupByModelAndGpuPlanner(gpu_concurrency=1)` groups by `(model_name, gpu_name)` so the same model on the same GPU
+shares a VM and reuses cached weights; max gpu_count determines VM size, tasks sorted descending. With
+`gpu_concurrency > 1`, each group is split into up to N sub-groups via round-robin, each provisioning its own VM (trades
+weight-cache reuse for wall-clock time).
 
 ### `commands/` — CLI Layer (thin handlers only)
 
@@ -115,13 +98,11 @@ async def _handle_foo(args):
     await ...
 ```
 
-**Command modules:**
-- `commands/bench/` — `handle_bench()`, `register_bench_command()`, `GitCommitter` (incremental result commits)
-- `commands/deploy/ssh.py` — `handle_ssh()`, `register_ssh_target()` — auto-detects remote GPU via SSH, resolves matrix, applies scale-out strategy
-- `commands/deploy/local.py` — `handle_local()`, `register_local_target()` — auto-detects local GPU via PCI sysfs, resolves matrix, applies scale-out strategy
-- `commands/deploy/cloud.py` — `handle_cloud()`, `register_cloud_target()` — uses recipe's `deploy.gpu` for matrix resolution
-- `commands/teardown.py` — `handle_teardown()`, `register_teardown_command()`
-- `commands/vm/` — `register_vm_command()`, CLI handlers for each provider
+**Command modules:** `commands/bench/` (with `GitCommitter` for incremental result commits),
+`commands/deploy/{ssh,local,cloud}.py` (`deploy ssh` auto-detects the remote GPU via SSH, `deploy local` the local GPU
+via PCI sysfs, both resolve the matrix + apply a scale-out strategy; `deploy cloud` uses the recipe's `deploy.gpu` for
+matrix resolution), `commands/teardown.py`, and `commands/vm/` (a CLI handler per provider). Each exposes a `handle_*`
+and a `register_*` function.
 
 ## Data Flow
 
@@ -216,6 +197,7 @@ deplodock
 +-- teardown     -- clean up VMs left by bench --no-teardown
 +-- vm
     +-- create
+    |   +-- gpu        -- name a GPU from the hardware table (orchestrator: retries + fallback)
     |   +-- gcp
     |   +-- cloudrift
     +-- delete

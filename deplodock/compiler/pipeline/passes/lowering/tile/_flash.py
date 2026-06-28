@@ -30,8 +30,7 @@ was removed rather than kept half-converted to the op tree.
 The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
 independent streaming softmax per output element ``(…, m, d)`` — a correct, if
-redundant, scalar form; the tensor-core P@V tier is future work
-(``plans/online-softmax-flash-attention.md``)::
+redundant, scalar form; the tensor-core P@V tier is future work::
 
     for *batch, m (query rows), d (value dim):       # free / grid
       Init (m_i = -inf, l_i = 0, O_i = 0)            # running (max, denom, out)

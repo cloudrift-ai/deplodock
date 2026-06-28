@@ -68,7 +68,6 @@ _W_A: dict[str, float] = {
     "D_l2_bk": 0.9757523358723075,
     # Per-role split of the former ``D_neg_overhang`` (the fit kept the three roles at
     # one shared weight here; the dynamic set below separates them).
-    # See plans/drop-overhang-knob-structural-masked-feature.md.
     "D_neg_masked_k": -0.8646029028646691,
     "D_neg_masked_m": -0.8646029028646691,
     "D_neg_masked_n": -0.8646029028646691,
@@ -172,7 +171,7 @@ class AnalyticPrior(Prior):
         # exp() argument scale — keeps the proxy in a finite, sane range; does not
         # affect ranking (monotone), only the proxy's magnitude.
         self._scale = scale
-        # Atomic-free split-K preference (see plans/atomic-free-monoid-combine.md).
+        # Atomic-free split-K preference.
         # Hardcoded — NOT fit into ``_W_A`` (a plain linear weight can't express the
         # "good when split wide, bad when split narrow" interaction). The learned
         # CatBoostPrior takes over once real atomic-vs-free ``H_opt=3`` rows exist.

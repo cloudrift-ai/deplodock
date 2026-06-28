@@ -2,10 +2,10 @@
 
 Rules that apply to EVERY pass in this tree (`frontend/`, `loop/`, `lowering/`). Per-dialect details live in
 [`../ARCHITECTURE.md`](../ARCHITECTURE.md) (pass order, knob table, fork semantics). The **tile-lowering** phase
-([`lowering/tile/ARCHITECTURE.md`](lowering/tile/ARCHITECTURE.md)) is the canonical instance of the invariant below —
-a **purely algebraic moveset, no specializations**: it dispatches on the carrier algebra (`MAP` / `SEMIRING` /
-`MONOID`), never on a named shape (matmul / pointwise / attention) — flash attention is the `MONOID` algebra on the
-streaming schedule (a twisted monoid is a monoid), selected structurally, not a distinct kind.
+(`lowering/tile/`) is the canonical instance of the invariant below — a **purely algebraic moveset, no
+specializations**: it dispatches on the carrier algebra (`MAP` / `SEMIRING` / `MONOID`), never on a named shape
+(matmul / pointwise / attention) — flash attention is the `MONOID` algebra on the streaming schedule (a twisted
+monoid is a monoid), selected structurally, not a distinct kind.
 
 ## No shape-specific pattern matching
 

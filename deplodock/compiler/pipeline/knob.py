@@ -500,7 +500,7 @@ def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
 
 def _cut_features(knobs: dict) -> dict[str, float]:
     """The engineered ``D_*`` edge-cost feature for the demoted-matmul cut (the
-    ``CUT`` knob — ``plans/split-cone-to-cut-knob.md`` §3). A cut materializes the
+    ``CUT`` knob). A cut materializes the
     demoted operand cone to a **gmem intermediate** — a round-trip the fused keep
     avoids — so the prior needs the materialized volume to price the cut's Σ vs.
     keep's. ``D_cut_roundtrip`` is the cost axis that discriminates the two
@@ -578,8 +578,7 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # featurizer already put in ``feats`` (``MMA_atom_m`` / ``_n``), since knob.py
     # can't import ``ATOM_REGISTRY``. Shared ``D_*`` names across tiers let the
     # prior learn occupancy / CTA-count uniformly (the signal that picks the
-    # skewed-vs-square warp tile per shape — the fp16 mis-pick in
-    # ``plans/golden-sweep-report.md``).
+    # skewed-vs-square warp tile per shape — the fp16 mis-pick).
     if is_warp(knobs):
         feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
     if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)

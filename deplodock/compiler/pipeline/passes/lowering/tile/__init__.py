@@ -14,6 +14,5 @@
 Recognition reads algebraic structure; scheduling is geometry; materialization back to
 loop IR happens in ``lowering/kernel`` — so the tile passes work purely with algebra
 primitives. The cooperative / cross-CTA reduce and the mma / blocked / split-K contraction
-schedules arrive later as richer mappings of the same ``free`` axes
-(``plans/tile-ir-rebuild.md``).
+schedules arrive later as richer mappings of the same ``free`` axes.
 """

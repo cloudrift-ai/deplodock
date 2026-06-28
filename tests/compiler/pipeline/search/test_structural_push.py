@@ -1,4 +1,4 @@
-"""Fork classification by effect (``plans/structural-forks-in-two-level.md`` step 1).
+"""Fork classification by effect.
 
 The engine classifies every multi-option fork at the spawn site in ``Run.drive``
 — where the raw option list is concrete — and threads the result through

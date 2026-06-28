@@ -55,8 +55,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   ceil-div / clamp) and the `Dim` name is threaded as a runtime `int`
   arg. The cross-CTA split (`030_split`), `reg` fold, a symbolic FREE
   axis (dynamic grid), strided rows, and the tensor-core `warp_tile`
-  (incl. flash's warp tier) are reserved future tiers
-  (`plans/cooperative-reduction-tile-ir.md`).
+  (incl. flash's warp tier) are reserved future tiers.
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.
 
@@ -71,8 +70,7 @@ keep working unchanged. `source` is excluded from
 along different lowering paths still dedup in the tuning cache.
 
 **Stmt subclasses are `@dataclass(frozen=True)`** — every concrete Loop-IR
-/ Tile-IR / Kernel-IR statement (`Loop`, `Cond`, leaves, `GridTile`,
-`ThreadTile`, `WarpTile`, `Stage`, `StageBundle`, `Smem`, `Sync`,
+/ Tile-IR / Kernel-IR statement (`Loop`, `Cond`, leaves, `Tile`, `Smem`, `Sync`,
 `CpAsyncCopy`, `TmaDescriptor`, …) is immutable + hashable. `Body` is a `tuple[Stmt, ...]`
 subclass, so a full body tree hashes structurally end-to-end. This makes
 `Body.structural_key()` and any other bodies-as-cache-keys path work
@@ -216,58 +214,30 @@ whose partials are siblings), and a `twist` (below) that holds the operation. A
 self-contained reduction also carries `axis` (`None` on the loop-IR carrier
 `ir.tile.ops.lower` leaves inside the emitted `Loop` — kept for the cooperative-axis
 analysis); its `out` / `partial_names()` are derived, and it has no per-state init op. The
-carried state itself is its own class, **extracted like the `Twist`**:
-`State` bundles the internal-state SSA `names` with their per-component `identity` (one
-`Expr` each, the monoid's neutral element). `State.inits()` builds the seed stmts — one
-`Init` per component (`<f32> name = identity;`) — and the carrier's lowering
-(`ir.tile.ops.lower`, the `010_recognize` / `_softmax` recognizers) emits them **before**
-the `Loop`, so the seed is explicit IR and `Loop.render` stays generic — it never reaches
-into `state`. A `Monoid` carrier reuses the plain `Init` seed stmt (no bespoke construct);
-`State` owns the identity, so it owns how to build the `Init` (scope-bound — not hoisted out
-of its enclosing reduce loop). `State` also exposes
-`State.other` — the second-operand names `"<n>__o"` the cross-partition combine reads. So
-a `Twist` operates on a `State`: `merge` folds a partial into `state.names`,
-`combine_states` merges `state` with a second one named `state.other`. The whole
-operation lives inside the carrier, not as loose body statements, so the
-online-algorithm gates (`accums_independent`, `classify_fragment_epilogue`) never see the
-cross-state coupling. `carried_names()` / `defines()` return `state.names`; `deps()` /
-`partial_deps()` return `partial` (the carried read is implicit, like `Accum` / `Mma`).
+carried state itself is its own class: `State` (`ir/stmt/algebra.py`) bundles the internal-state
+SSA `names`. The neutral element (seed) is NOT stored on `State` — a carrier dissolves into its
+fold `Accum`s (`Monoid.dissolve`) and each fold's seed is its `op.identity`, so there is one source
+of truth for the seed. `State.other` is the second-operand names `"<n>__o"` the cross-partition
+combine reads. `carried_names()` / `defines()` return `state.names`; `deps()` / `partial_deps()`
+return `partial` (the carried read is implicit, like `Accum` / `Mma`).
 
-**The `Twist` — the part that varies, extracted from the algebra.** Transport of
-structure: a monoid `(·, e)` conjugated by a bijection ψ gives the twisted combine
-`x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))`. The monoid algebra above is shared; ψ is the twist.
-`Monoid.twist` is a `Twist` holding the operation **as data** — `merge` (a short
-`Assign` program that reads old state + partial and reassigns the new state;
-state-targeting Assigns are updates, the rest local temps) and `combine_states`
-(the **state-merges-state** form the cross-partition combine needs —
-cooperative-tree / split-KV / split-K cross-CTA reduce, where each partition holds
-a complete state, reading the second operand `state_b`, default `"<s>__o"`). ψ
-lives entirely in those programs — a plain reduction's identity twist
-(`Twist.degenerate`: componentwise `state_i = op_i(state_i, partial_i)`, used by
-`Accum.as_monoid`), online softmax's max-rescale, a future mma-fragment
-realization — all the *same* monoid, differing only in the combine. Readers reach
-it directly off the carrier (`monoid.twist.merge` / `.combine_states` /
-`.state_b`). `Monoid.__post_init__` completes the twist
-against the state: defaults `state_b` and, for an **additive** carrier whose
-partial lifts to a state (`len(partial) == len(state)`), auto-derives
-`combine_states` from `merge` (partial reads swapped for `state_b`); an asymmetric
-monoid (flash's LSE) authors both on the twist (`flash_combine`).
-`as_state_merge(other)` returns a one-shot `Monoid` whose `merge` IS
-`combine_states` with `state_b` renamed to `other`, so a two-partition merge
-renders through the same machinery as a streaming step.
-
-`Monoid.render` emits the `merge` program in fp32: each `Assign` targeting a
-`state` name is a reassignment of the carried value (declared by an enclosing
-`Init`); every other `Assign` declares a local temp. Statement order is
-load-bearing (a state update follows every read of that state's old value).
-`rewrite` threads the merge through the SSA renamer (state / partial refs map;
-the carrier-internal temps pass through). `LoopOp` validation threads `Init` (a
-carried-name binding site) and `Monoid` (partials must be in scope; state is
-loop-carried and exports), so a hand-written streaming nest type-checks and runs
-through `LoopOp.forward`. **Example** — flash attention's online softmax (the
-log-sum-exp monoid): state `(m, l, O)`, partial `(score, value)`, identity
-`(−inf, 0, 0)`, merge `m_new=max(m,s); alpha=exp(m−m_new); l=l·alpha+exp(s−m_new);
-O=O·alpha+exp(s−m_new)·v; m=m_new` (built by `loop/fusion/_flash.flash_combine`).
+**The `Twist` — the part that varies, extracted from the algebra.** Transport of structure: a
+monoid `(·, e)` conjugated by a bijection ψ gives the twisted combine `x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))`.
+The monoid algebra above is shared; ψ is the twist, held on `Monoid.twist` **as data** — `merge`
+(fold one partial into the state, the streaming reduce step — a mix of `Assign` rescales/temps and
+`Accum` folds) and `combine_states` (the state-merges-state form the cross-partition combine needs —
+cooperative-tree / split-KV / split-K reduce, reading the second operand named by `state_b`). ψ lives
+entirely in those programs — a plain reduction's identity twist (`Twist.degenerate`: componentwise
+`state_i = op_i(state_i, partial_i)`, used by `Accum.as_monoid`), online softmax's max-rescale, a
+future mma-fragment realization — all the *same* monoid, differing only in the combine.
+`Monoid.__post_init__` completes the twist against the state (defaults `state_b`; auto-derives
+`combine_states` from `merge` for an additive carrier whose partial lifts to a state; an asymmetric
+monoid like flash's LSE authors both on the twist via `lowering/tile/_flash.flash_combine`).
+`as_state_merge(other)` returns a one-shot `Monoid` whose `merge` IS `combine_states`, so a
+two-partition merge renders through the same machinery as a streaming step. **Example** — flash
+attention's online softmax (the log-sum-exp monoid): state `(m, l, O)`, partial `(score, value)`,
+identity `(−inf, 0, 0)`, merge `m_new=max(m,s); alpha=exp(m−m_new); l=l·alpha+exp(s−m_new);
+O=O·alpha+exp(s−m_new)·v; m=m_new`.
 
 ### `loop/ir.py` — LoopOp types
 
@@ -284,7 +254,7 @@ O=O·alpha+exp(s−m_new)·v; m=m_new` (built by `loop/fusion/_flash.flash_combi
 | `Loop`                       | Serial iteration block: `axis` + nested `body`.                                                                   |
 | `StridedLoop`                | Strided iteration (`start`, `step`) — cooperative thread-stride loop reused by Tile/Kernel IR.                    |
 | `Cond`                       | If/else block over an `Expr` predicate.                                                                           |
-| `Stmt`                       | Base class — every body statement subclasses it. Leaves and control-flow nodes live in `ir/stmt.py`.              |
+| `Stmt`                       | Base class — every body statement subclasses it. Leaves and control-flow nodes live in `ir/stmt/`.               |
 
 Body walkers: `iter_body(body)` (pre-order; powers `for s in loop_op`),
 `map_body(body, fn)` (transformer), `Stmt.rewrite(rename_ssa, sigma)`
@@ -298,11 +268,11 @@ axes excluded), plus `external_reads`, the names read from outside (axis vars an
 Construction never fails: unresolved names are data, and chaining scope levels means seeding the next level's
 `backward_cone` with the previous one's `external_reads`. `Body.defs_die_at(members, roots=…, allowed=…)` is the
 matching escape check (may the cone be cut out, with only the designated consumers reading its roots?). This is
-the shared substrate behind the rules that slice cones (`010_split_demoted`'s producer cut, `assembly/_slab._hoist_masked`'s masked-load
-guard) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. Two dataflow walks
-deliberately do NOT use it: `classify_fragment_epilogue` (single pass interleaving reduce-scope flags with its
-negative-form blocker reporting) and `030_hoist_invariant_compute` (all-deps saturation under an axis-invariance
-predicate — a different operator than the cone's any-dep taint).
+the shared substrate behind the rules that slice cones (the demoted-operand producer cut in
+`lowering/tile/030_split`) — eligibility judgments stay in the rules, per `pipeline/passes/ARCHITECTURE.md`. The
+`classify_fragment_epilogue` walk (`ir/stmt/algebra.py`) deliberately does NOT use it: it is a single pass
+interleaving reduce-scope flags with its negative-form blocker reporting, a different operator than the cone's
+any-dep taint.
 
 `rewrite` has two distinct rename channels that must stay disjoint:
 `rename_ssa` carries **SSA-name** renames, `sigma` carries **axis**
@@ -313,7 +283,7 @@ both maps renames it twice — and if the two passes form a chain (e.g.
 `x → in5` and a pre-existing `in5 → in26`) the double application
 collapses it transitively, silently wiring a gather to the wrong row.
 
-### `loop/normalize.py` — structural canonicalization
+### `ir/stmt/normalize.py` — structural canonicalization
 
 Pure `body → body` passes run from `LoopOp.__post_init__` so every
 constructed `LoopOp` (including intermediate fusion results) is
@@ -369,9 +339,9 @@ that differ only by SSA / axis names, commutative-arg order, or
 external-buffer names produce the same key. Use it as a dict key /
 set member when deduping candidate bodies in a search.
 
-### `loop/simplify.py` — Expr simplification
+### `ir/expr.py` — Expr simplification
 
-Called inside `normalize_body`. Generic bottom-up Expr rewriter:
+`simplify` (called inside `normalize_body`). Generic bottom-up Expr rewriter:
 constant folding, algebraic identities, range-based comparison folding
 (`(k0 > 2047 ? 2047 : k0) < 0 ? 0 : k0` → `k0`). `SimplifyCtx`/`Interval`
 track integer ranges from axis extents (`axis.extend_simplify_ctx` pushes
@@ -384,8 +354,6 @@ emits back to `i`, the symbolic-shape counterpart of the literal-divisor
 `_div_mod_decompose` cleanup (a static `seq_len` already constant-folds it).
 Symbolic-extent axes get `[0, sentinel]` ranges (non-negativity for the inner
 `(i*c + …)//c → i` div fold) instead of being dropped.
-
-Also used by `ir/kernel/normalize.py` for GpuKernel Expr simplification.
 
 ### `loop/splicer.py` — LoopOp merger
 
@@ -403,12 +371,13 @@ node must rename its body `Write.output` to match (`fusion/_helpers.py::rename_w
 Every `_NotSupported` carries a reason string, logged at DEBUG by `splice_loops`
 — `compile -vv` shows which pattern a rejected edge hit.
 
-### `loop/interpret.py` — numpy interpreter
+### `loop/runner.py` — C++ JIT executor
 
-`execute_loop_op(loop, input_arrays, out_shape) → ndarray` walks the
-LoopOp body against pre-provided input arrays. Powers `LoopOp.forward`
-— so post-fusion graphs run through the default `Backend.run`
-topo-walk like any pre-fusion graph.
+`execute_loop_op_cpp(loop, input_arrays, out_shape) → ndarray` renders the
+LoopOp body to a C++ source string and JIT-compiles it in-process via cppyy /
+Cling (cached by the rendered source), then calls it with raw pointers to the
+input arrays. Powers `LoopOp.forward` — so post-fusion graphs run through the
+default `Backend.run` topo-walk like any pre-fusion graph.
 
 ### `loop/builder.py` — fluent construction
 
@@ -417,110 +386,25 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 ## `tile/`
 
-Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
-`BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` wraps consumer subtrees
-that read smem-cached operands. Coordination decisions (cooperative-reduce
-combine emission, atomic-write classification, broadcast-write guards) were
-derived from the body at materialize / render time by the `Body.coordination`
-escape analysis; that helper was **removed in the tile-IR rebuild** along with
-the cooperative / cross-CTA scheduling passes that fed it (`GridTile` /
-`ThreadTile` structures), to be rebuilt against the op tree once those
-schedules return. The intended derivation — cooperative axes from
-``Accum.axes ∩ ThreadTile.axes``, atomic writes from enclosing ``GridTile.axes``
-vs ``Write.index``, broadcast guards from cooperative thread axes vs
-``Write.index`` — covered every reduce carrier uniformly: a scalar
-``Accum`` is the degenerate 1-component monoid (its ``combine_partials`` is the
-one-``Assign`` op-fold), the general ``Monoid`` (flash online-softmax) the
-multi-component case — keyed by the carrier's first carried name. The
-materializer's single ``emit_combine`` backend (the realization layer that composed
-this off the carrier — the pre-rebuild ``carrier_algebra`` interpreter + the carrier's
-``project`` magic method — was removed in the tile-IR rebuild, to be rebuilt against the
-op tree) emits the cross-thread fold off the carrier's ``carried_names`` /
-``combine_operands`` / ``combine_partials``:
-``WarpShuffle`` (register ``__shfl_xor_sync`` butterfly, ≤ warp), a hierarchical
-per-warp ``WarpShuffle`` + ``n_warps``-wide ``TreeHalve`` (power-of-two warp
-multiple), or a block-wide per-component ``TreeHalve`` (> warp) — all folding via
-the carrier's ``combine_states`` and reassigning the state in place (no ``_b``
-rename). No explicit coordination stmt or per-tile tag
-carries this information. Compute leaves (`Load` / `Assign` / `Accum` / `Write`)
-and control flow (`Loop` / `StridedLoop` / `Cond`) come from `ir/stmt.py`;
-``Accum.axes`` carries the names of the loops being reduced over and is
-the source of truth for cooperativity.
+Tile IR (`tile/ir.py`, `tile/schedule.py`, `tile/ops.py`) carries the scheduling decisions on a typed `Kernel`
+rather than re-deriving them from the body. A `TileOp` holds exactly one `Kernel` — the op-tree node
+(`Map` / `Monoid` / `Semiring` from `ir/stmt/algebra.py`) paired with its typed schedule, keyed by algebra kind so a
+kind/schedule mismatch is unrepresentable: `MapKernel` / `MonoidKernel` / `SemiringKernel` (`tile/schedule.py`). The
+schedule holds the free→grid `Placement` and, for a reduction, the `ReducePlan`.
 
-**Binding-tier tile flavors.** Three `ParallelTile` subclasses bind a
-parallel coord: `GridTile` (one coord = one CTA, lifts to `blockIdx`),
-`ThreadTile` (one coord = one thread, lifts to `threadIdx`), and
-`WarpTile` (one coord = one warp; the body presumes 32 lanes execute it
-collectively, with `lane = threadIdx.x & 31` exposed unconditionally).
-`ThreadTile` and `WarpTile` are mutually exclusive inside one
-`TileOp.body` — both bind `threadIdx`. `RegisterTile` (per-thread
-register cell) and `AtomTile` (hardware-atomic MMA cell — one coord =
-one fragment) are both consumed before kernel render: `RegisterTile` by
-`kernel/010_split_register_axes` (cell-body replication); `AtomTile` by
-`kernel/005_lower_atom_tile`. `RegisterTile.reduce` (default `False` = the
-FM/FN output-cell tile) flags the **reduce-axis** `K_f` tile the planner
-emits for the `FK` multiple-accumulator optimization (non-matmul reduces;
-see `plans/fk-register-tile-reductions.md`): it strip-mines the K serial
-loop so each cell owns an independent accumulator, and
-`010_split_register_axes` appends a cross-accumulator tree-fold (collapsing
-`acc_0..acc_{FK-1}` back to one `acc` after the K serial loops) when the tile
-wraps `Accum`s — the flag also routes `FK`-vs-`FM`/`FN` knob stamping. `partition_loops` stamps the `Atom` spec (cell
-shape + operand dtypes — `Atom` lives in `ir/tile/ir.py`) **onto the `AtomTile`
-itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
-tensor cores" signal, carried in the IR rather than re-derived from a knob.
-Right after, `tile/enumeration/050_warp_build` reads `.atom` off the tile and
-collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
-(`c += a @ b`, a reduce-accumulate sibling of `Accum` — both are carriers in the
-`is_reduce` tuple, so the `Mma` makes its loop `is_reduce` with no special-casing,
-and reports the additive-fold traits `associative` / `commutative` /
-`has_identity` directly) that carries that `Atom` and names its A/B
-operand `Load`s by SSA
-value. The operand loads stay **plain** — the `Mma` is the sole tensor-core
-marker downstream. Both are ordinary IR the staging passes carry through (the
-loads stage like any `Load`); `kernel/005_lower_atom_tile` recovers each
-operand's role from the co-located `Mma` and lowers the loads →
-`RegFragment`+`LdmatrixLoad` and the `Mma` → `MmaSyncPtx`, with a final
-`RegStore`. The `ATOM_KIND` knob on the enclosing `TileOp` is the *tuning*
-shadow of the same choice (DB / config / search identity), not the semantic
-source. Downstream consumer plans (MMA fragment
-factorization, warp-specialize refactor) emit `WarpTile` to drive
-warp-cooperative codegen.
+`ReducePlan` (`tile/schedule.py`) is a list of `ReduceStage`s, one per hardware `Level` the reduce axis is
+partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooperative threads within a CTA), `REG`
+(ILP register-fold), `SERIAL` (the per-thread remainder). The per-level combine `Fold` (`SHFL` lane butterfly /
+`SMEM` block tree / `ATOMIC` cross-CTA finalize) is **derived** from the level (`ReduceStage.combine`), not stored
+or tuned. The single `REDUCE` codec knob decides the plan in `020_schedule`; the combine itself stays in the op
+tree.
 
-The `Mma` also carries optional **explicit masked-tile guards** (`m_guard` /
-`n_guard` / `k_zero`, each `(base, bound)` or `None`) for a HAND-BUILT cell — the
-symbolic-`seq_len` warp-chain flash, where `kernel/005` can't derive guards from a
-Write boundary `Cond` (a fragment-output / fragment-A cell has no Write) or the
-operand tensor shape (the flash uses flat single-index Loads). When set, `005`
-routes them straight to the operand `LdmatrixLoad`s (A row clamp / B col clamp / B
-reduce-row zero-fill); `None` (the default, the enumeration-σ path) keeps `005`
-deriving guards from the Write `Cond` + operand shape as before.
-
-**Stage + StageBundle:** `Stage` is a sources-only group of gmem
-transport operands behind one barrier — it carries no body. The
-producer (cooperative `Load+Write` per source) is synthesized at
-materialize time from `Stage.sources` — each `Source` carries `name`
-(smem buffer), `buf` (gmem operand), `cache_dims`, `origin`, optional
-`pad`, and a stored `addressing` of type `AffineAddressing |
-TemplateAddressing` describing how cache vars decode into source-buffer
-indices. Multi-source bundles (e.g. matmul A+B) load all behind one sync
-boundary. The `StageBundle` owns the consumer `body`, the transport
-`policy` (`StagePolicy.SYNC/BUFFERED/ASYNC/TMA` + policy fields
-`buffer_count`/`phase`/`pipeline_depth`), and an optional
-hoisted-invariant `compute` phase (a self-describing cooperative body
-that reads sibling slabs and writes a fresh fused slab — emitted after
-the transport sources, before the consumer body).
-
-| Symbol             | Role                                                              |
-|--------------------|-------------------------------------------------------------------|
-| `TileOp`              | Graph-op carrying a `Tile`-rooted body. One per kernel.                                                                              |
-| `Tile`                | Axis-bound scope wrapper (`axes: tuple[BoundAxis, ...]` + body).                                                                     |
-| `StageBundle`         | Single-policy cooperative-staging unit: ``sources: tuple[Source, ...]`` (gmem transport operands, per-operand smem layouts) wrapping one consumer `body`. Materialize emits leading `Sync` + per-source cooperative `Load+Write` (or `CpAsyncCopy` / per-source TMA box copy per the policy) + trailing `Sync`. Carries the transport `policy` (`StagePolicy.SYNC/BUFFERED/ASYNC/TMA`) + policy fields (`buffer_count` ≥ 2 rotating slabs selected by `phase`; `pipeline_depth` > 1 marks temporal pipelining expanded by the pipeline-stages pass), and an optional `compute` phase. ASYNC `cp.async` loads are **vectorized** — `_stage_expand._cp_async_width` picks the widest legal copy (`CpAsyncCopy.nbytes` ∈ {4,8,16}; 16⇒`cp.async.cg`) gated on inner-axis stride-1 contiguity + alloc/gmem-stride alignment. TMA shared-memory swizzle is per-`Source` (`Source.swizzle`), not a bundle field. |
-| `StageBundle.compute` | Optional hoisted-invariant cooperative compute phase (a `Body`, set by `030_hoist_invariant_compute`): `Load`s reading sibling cone slabs + `Assign`s + a single `Write` into a fresh fused slab. Self-describing — the materializer recovers the slab name / loop domain / dtype from the body's `Write` + the cone sources (no output `Source`). Emitted after the transport sources, before the consumer body. |
-| `Source`              | One gmem operand staged into one smem slab. Fields: `name`, `buf`, `cache_dims`, `origin`, `pad`, `addressing`, `dtype`, `swizzle` (per-operand TMA smem-swizzle mode; `NONE` except on mma.sync ldmatrix operands). A `StageBundle` carries one or more. |
-| `CacheDim`            | One cache (smem) axis paired with the source-buffer dim it maps to. `Source.cache_dims` is a tuple of these.                          |
-| `AffineAddressing`    | Stored addressing variant: `source_index[d] = origin[d] + decoded_coord(dims[i] == d)`. Fast path; no symbolic substitution. Optional per-cache-dim `block` multiplier grows the slab and producer iteration range by `block[i]` per cache dim (e.g. MMA atom factor); default `()` keeps coef-1 semantics. |
-| `TemplateAddressing`  | Stored addressing variant: source index expressed verbatim with cache-axis Vars; materialize Sigma-substitutes them. Used for collapsed-reshape views and any other case where `origin + decoded` can't reconstruct the load. |
-| `AsyncWait`           | Explicit wait carrier for pipelined async / TMA schedules. Emitted by `080_pipeline_stages` between issue / consume halves of each steady-state K_o iter and at the epilogue drain. ``keep`` is the cp.async ``wait_group`` arg; ``phase`` / ``slot`` are TMA mbarrier-test args. Sync-style (``pipeline_depth==1``) stages don't carry one — the materializer emits an implicit wait at the wrap boundary. |
+`tile/ops.py` `lower(op)` expands the op tree to loop IR (`Monoid` / `Semiring` carry their reduction shape, so a
+nested reduction is a child node, not a separate wrapper op); `pretty(op)` renders it for dumps. The tensor-core,
+cooperative-combine, staging (cp.async / TMA), and warp-specialization tiers are materialized downstream in
+`lowering/kernel` against the op tree + schedule — the older tile-level `GridTile` / `ThreadTile` / `Stage`
+structures were removed in the tile-IR rebuild and are being rebuilt there as the schedules return (see
+`pipeline/passes/ARCHITECTURE.md`).
 
 ## `kernel/`
 
@@ -536,11 +420,11 @@ directly (no separate AST class).
 | `Smem`             | `__shared__` array allocation (name + dtype + extents + optional `align`). Swizzled TMA operand slabs align to their full swizzle atom (`8 × swizzle_width` B: B128→1024, B64→512, B32→256) — the coordinate-only `ldmatrix` XOR only reproduces the hardware's absolute-address swizzle when the base zeroes the swizzle's source-address bits; non-swizzled TMA keeps 128 B, fp16 16 B. `pack_smem` (the shared pool packer used by `smem_bytes` and the renderer) pads each buffer to `max(sizeof(dtype), align)` so the static-vs-dynamic gate and the launch-time dynamic-pool size agree. |
 | `Sync`             | `__syncthreads()` barrier.                                        |
 | `TreeHalve`        | Cross-thread tree reduction over a smem buffer.                   |
-| `RegFragment`      | mma.sync (s16816) per-thread register array decl (one per operand role `"a"`/`"b"`/`"c"`): `unsigned a[4]`/`b[2]` (16-bit operands, 2 elems/reg) or `float c[4]` (f32 acc, zero-init at decl — no separate fill). Carries the cell shape `(M, N, K)` + dtype. Emitted by the MMA cell lowering pass (`kernel/005_lower_atom_tile`). The sole tensor-core fragment family (the opaque `nvcuda::wmma` nodes were removed). |
+| `RegFragment`      | mma.sync (s16816) per-thread register array decl (one per operand role `"a"`/`"b"`/`"c"`): `unsigned a[4]`/`b[2]` (16-bit operands, 2 elems/reg) or `float c[4]` (f32 acc, zero-init at decl — no separate fill). Carries the cell shape `(M, N, K)` + dtype. Emitted by the MMA lowering pass. The sole tensor-core fragment family (the opaque `nvcuda::wmma` nodes were removed). |
 | `LdmatrixLoad`     | Load one operand into a `RegFragment`. `staged=True` (default): `ldmatrix.sync.aligned.m8n8.x{4,trans}.b16` from smem (`role="a"` → x4; `role="b"` → x2.trans; each lane derives its row address from `threadIdx.x & 31`; `swizzle` applies the per-lane chunk XOR for a TMA-swizzled slab). `staged=False`: operand not staged into smem (ldmatrix is smem-only) → renders a **gmem-direct fragment load** (`dpl_mma_load_{a,b}_gmem`) reading the fragment straight from gmem with the same m16n8k16 lane→element map — slower (no smem reuse) but lets an unstageable MMA tile compile instead of crashing. `b_trans=True` (role "b" only) marks a transposed-B operand stored `[N, K]` (the native `mma.row.col` col-major B — a Q@K^T cell): gmem-direct via `dpl_mma_load_b_gmem_trans` (k contiguous; masked → `_trans_nclamp`). |
 | `MmaSyncPtx`       | `mma.sync.aligned.m16n8k16.row.col.f32.{f16,bf16}.{f16,bf16}.f32` — one s16816 MMA via inline PTX (`c += a @ b`). `ab_dtype` (`"f16"`/`"bf16"`) picks the `dpl_mma_…` wrapper. |
-| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order, plus `selects` — coord-predicated causal-mask ternaries) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations, the causal attention mask — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by `kernel/005_lower_atom_tile._scan_epilogue` after the shared negative-form gate `lowering/_predicates.classify_fragment_epilogue` admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). Each `selects` entry `(name, ((cond|None, value), …))` renders as a per-element ternary, its `__M__`/`__N__` placeholder coords substituted with the element's absolute (row, col). |
-| Shared from `tile` | `Tile` (launch geometry); from `ir/stmt.py`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
+| `RegStore`         | Per-lane epilogue store of the f32 `c[4]` accumulator to the output (no `store_matrix_sync` for mma.sync) — direct for f32 dst, `__float2half` downconvert for f16. Optional `epilogue` (a `RegEpilogue`: leaf `EpilogueLoad`s with per-dim `m`/`n`/`fixed` roles + `(name, op, args)` chain in topo order, plus `selects` — coord-predicated causal-mask ternaries) carries a fused pointwise chain — residual adds, bias/scale broadcasts, activations, the causal attention mask — evaluated per element in f32 at the element's own (row, col), leaves loaded at each buffer's own dim stride, ops rendered via `op_to_expr` (folded in by the MMA lowering pass after the shared negative-form gate `classify_fragment_epilogue` (`ir/stmt/algebra.py`) admits the slice; leaf buffers declared via `external_reads` so they stay in the kernel signature after their scalar Loads are stripped). Each `selects` entry `(name, ((cond|None, value), …))` renders as a per-element ternary, its `__M__`/`__N__` placeholder coords substituted with the element's absolute (row, col). |
+| Shared from `tile` | `Tile` (launch geometry); from `ir/stmt/`: `Loop`, `StridedLoop`, `Load`, `Assign`, `Accum`, `Write`, `Select`, `Cond`. |
 
 ## `cuda/ir.py`
 

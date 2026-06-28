@@ -21,7 +21,7 @@ The schedule of a reducing kind is **either** that kind's uniform (SIMT) schedul
 types makes a ``Monoid``-with-``MapSchedule`` mismatch unrepresentable.
 
 This module builds only the **uniform** arm; ``WarpTile`` / ``Stage`` / ``Channel`` /
-``WarpSpec`` are reserved slots (``# TODO``) — see ``plans/cooperative-reduction-tile-ir.md``.
+``WarpSpec`` are reserved slots (``# TODO``).
 """
 
 from __future__ import annotations
@@ -214,7 +214,7 @@ class Placement:
 # --------------------------------------------------------------------------- #
 # Reserved slots — the tensor-core tile, operand pipelining, warp specialization.
 # Defined so the type system is complete (the schedule fields reference them); not
-# constructed by this cut. See ``plans/cooperative-reduction-tile-ir.md``.
+# constructed by this cut.
 # --------------------------------------------------------------------------- #
 
 

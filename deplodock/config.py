@@ -196,7 +196,7 @@ def tune_eps(default: float = 0.0) -> float:
     probability a selection step descends a uniformly random child instead of the
     PUCT argmax. Opt-in (default ``0`` = deterministic PUCT): on the fp16 sweep it
     didn't recover the lost configs (the gap is a tune-path eligibility issue, not
-    selection — see ``plans/golden-sweep-report.md``) and pure randomness regresses
+    selection) and pure randomness regresses
     tuning, so it's a knob for shapes where the heuristic order is known-bad, not a
     default."""
     return float_env(TUNE_EPS, default)

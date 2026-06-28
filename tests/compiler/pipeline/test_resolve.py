@@ -1,6 +1,6 @@
 """``Run.resolve`` — the deterministic-resolution entry point (one live graph,
 a ``decide`` callback per fork, a ``Decision`` trace as the only process-state
-output; see ``plans/resolve-trace-driver.md`` M1).
+output).
 
 Pins the M1 contract: in-place apply (the terminal IS the seeded graph object,
 no per-fork copies), an option-0 ``decide`` reproducing the no-prior greedy

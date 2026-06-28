@@ -15,7 +15,7 @@ have opposite structure:
 
 So we split the search in two, drawing the boundary on the fork's *effect*
 (the ``Op``-rebind / ``Graph``-splice classification stamped at the engine's
-spawn site — see ``plans/structural-forks-in-two-level.md``), not on a fixed
+spawn site), not on a fixed
 pass index:
 
 - **Outer** (:func:`run_two_level_tune`) drives the graph-changing passes —
@@ -105,7 +105,7 @@ def outer_pipeline() -> Pipeline:
     branching the OUTER tree on it would explode the tree (every tile combination ×
     every structural choice) with no kernel-set distinction. The split boundary is
     exactly where the kernel set is fixed but tiling is not — the right outer/inner
-    seam (``plans/structural-forks-in-two-level.md`` step 2). Sub-partition splices
+    seam. Sub-partition splices
     (``150_cross_cta_finalize``'s combine) likewise stay inner — their trigger knob
     (``SPLITK``) doesn't exist until partition runs."""
     passes = [Pass.load(name, i) for i, name in enumerate(LOOP_PASSES)]

@@ -19,8 +19,7 @@ The selection here is **conservative module constants** standing in for the even
 ``knob.py::_reduce_decomp`` (BR→coop, BK→serial, FK→reg, SPLITK→cta) + the learned /
 analytic prior. Strided-cooperative rows (a small whole free axis packed alongside the
 coop lanes), the ``reg`` (ILP) fold, the cross-CTA ``cta`` split (``030_split``), the
-symbolic-axis cooperative tier, and flash cooperative-KV remain future steps
-(``plans/cooperative-reduction-tile-ir.md``).
+symbolic-axis cooperative tier, and flash cooperative-KV remain future steps.
 """
 
 from __future__ import annotations

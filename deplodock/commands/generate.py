@@ -1,5 +1,4 @@
-"""``deplodock generate`` — standalone naive generation oracle (Phase 0 of
-``plans/generative-inference-support.md``).
+"""``deplodock generate`` — standalone naive generation oracle (Phase 0).
 
 Re-runs the whole growing prefix each step (O(S^2)) on the deplodock CUDA backend with
 **no vLLM** — deplodock controls the loop, so this is the token-for-token correctness

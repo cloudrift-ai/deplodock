@@ -5,8 +5,7 @@ carrying the reduce axis K in their LAST index dim (``A[m,k]`` and ``B[n,k]`` �
 B is N×K, the transpose of the canonical ``B[k,n]``). This is the native
 ``mma.row.col`` layout (B col-major K×N == physically ``[n,k]``), but the
 operand classifier used to reject it (``b_load is None`` → scalar tier), so the
-dominant attention kernel never reached the tensor cores. See
-``plans/qwen3-embedding-0.6b-layer0-low-performer-analysis.md`` Finding 1.
+dominant attention kernel never reached the tensor cores.
 
 Mirrors ``test_matmul_mma.py`` but with the transposed-B operand layout and an
 ``a @ b.T`` reference. Pins the warp-tier atom + a multi-warp tile.

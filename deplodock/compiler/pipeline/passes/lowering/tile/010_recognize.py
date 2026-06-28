@@ -38,7 +38,7 @@ step unconditional — no knobs):
 Flash must precede online-softmax which must precede normalize: each later step consumes
 the ``Accum``\\ s an earlier one matches. A **symbolic** axis (dynamic ``seq_len``) is left
 un-lifted (the scalar ``Tile`` decode needs static extents) — the ``LoopOp`` stays put for
-the dynamic-shape tier (``plans/tile-ir-rebuild.md``).
+the dynamic-shape tier.
 
 This is case-by-case recognition today (flash / online-softmax / contraction patterns);
 the intent is to grow it toward ONE algorithmic algebra recognizer.

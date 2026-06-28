@@ -25,15 +25,15 @@ Note on collection-time import errors
 -------------------------------------
 A file whose *module-level* import of a tile symbol breaks raises at COLLECTION, before any item
 exists to mark — pytest reports it as an error, which xfail cannot catch. The demolition handled
-this two ways: pure tile-IR unit-test files (they only inspected tile Python objects) were deleted
-per ``plans/tile-ir-rebuild.md``; integration/accuracy files whose imports were load-bearing had
+this two ways: pure tile-IR unit-test files (they only inspected tile Python objects) were deleted;
+integration/accuracy files whose imports were load-bearing had
 those imports **guarded** (``try/except ModuleNotFoundError``) so the module still collects and its
 tests become markable items registered below. ``TILE_ENTANGLED_FILES`` is therefore empty now.
 """
 
 from __future__ import annotations
 
-_R = "tile IR demolished — rebuild in progress (see plans/tile-ir-rebuild.md)"
+_R = "tile IR demolished — rebuild in progress"
 
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).

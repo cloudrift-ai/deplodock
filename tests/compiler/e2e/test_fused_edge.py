@@ -24,7 +24,7 @@ from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 
-# tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md). The imports are
+# tile IR demolished — pending rebuild. The imports are
 # guarded so the module still collects; its tests then fail at runtime and are caught by
 # the xfail registry (a hard collection error could not be).
 try:

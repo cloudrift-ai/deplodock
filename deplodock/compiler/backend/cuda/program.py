@@ -175,7 +175,7 @@ class _Compiled:
     # benches a symbolic graph at the hint size).
     symbolic_hints: dict[str, int] = field(default_factory=dict)
     # Symbolic axis name → its capacity CAP. A capacity-capped kernel (the
-    # smem-staged fused symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)
+    # smem-staged fused symbolic-K SDPA P@V)
     # bakes its smem slab at the ``Dim`` hint and is only correct for runtime
     # extents ≤ that cap, so the launch resolver hard-errors when the supplied
     # input shape exceeds it (rather than reading/writing past the baked slab).

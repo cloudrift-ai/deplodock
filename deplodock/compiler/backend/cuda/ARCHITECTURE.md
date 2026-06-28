@@ -109,8 +109,7 @@ prefix of its capacity buffer (a logically `(1, S, …)` tensor occupies the fir
 host launch; `outputs({"seq_len": S})` slices each capacity buffer to its real-S prefix. Each graph is captured at its
 EXACT S, so every kernel runs at its exact grid: no oversized-grid masking is needed (and a single capacity-baked graph
 for ALL S is not viable — several symbolic-M kernels read OOB at an oversized grid: the CTA-swizzle decode reconstructs
-`num_m` from the runtime seq_len, and ceil-div staged loads over-read; see
-`plans/serving-dynamic-shape-cuda-graphs.md`). `rebind` clears `_graph_cache` on re-allocation. Validate multi-S
+`num_m` from the runtime seq_len, and ceil-div staged loads over-read). `rebind` clears `_graph_cache` on re-allocation. Validate multi-S
 correctness under `compute-sanitizer` (`tests/compiler/ir/test_dynamic_shapes.py`).
 
 `benchmark_program(graph, input_data, warmup, num_iters)` adds a
@@ -146,8 +145,7 @@ in place as re-tunes measure them captured. See `tests/compiler/backend/test_gra
 **Whole-program (e2e) windows.** The per-launch windows each replay a *single* kernel back-to-back, so
 their sum is not an end-to-end time: it misses cross-kernel cache effects and inter-kernel gaps, and on
 multi-kernel programs individual per-launch numbers can mis-attribute wildly (two identical-work gemms in
-the Qwen3 layer-0 assembly measured 5.2 µs vs 0.8 µs solo; NCU shows them equal — finding 6 of
-`plans/qwen3-embedding-layer0-tune-findings.md`). For any **multi-launch** program `benchmark_program`
+the Qwen3 layer-0 assembly measured 5.2 µs vs 0.8 µs solo; NCU shows them equal). For any **multi-launch** program `benchmark_program`
 therefore also captures **one** CUDA graph holding every launch in program order
 (`CompiledProgram.capture_program_graph`) and, once per measured iter, times one event window around
 `replays` back-to-back whole-program replays (`time_program_window`, replays calibrated to

@@ -6,7 +6,7 @@
 - :mod:`.greedy` — :func:`greedy_decide`: the deterministic greedy pick for
   ``Pipeline.run`` / the structural pricing probes. Not a ``Search``: it is a
   ``Run.resolve`` decide factory (a deterministic resolution has no frontier
-  to rank — see ``plans/resolve-trace-driver.md``).
+  to rank).
 """
 
 from deplodock.compiler.pipeline.search.policy.base import Search

@@ -77,7 +77,7 @@ def test_lowering_tile_does_not_import_kernel_passes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 firewall (plans/tileop-schedule-boundary-fixes.md) — keep the
+# Fix 1 firewall — keep the
 # assemble→TileOp boundary clean: every benched scheduling choice lives in the
 # enumeration ``Schedule`` (above assemble); every kernel pass is *mechanical*
 # (it lowers the stamped ``TileOp``, it never re-derives a scheduling decision).

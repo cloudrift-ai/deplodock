@@ -97,8 +97,7 @@ def test_gen_runner_stitch_matches_eager():
 def test_gen_runner_device_path_matches_host():
     """The device-resident decode path (``run_device`` / ``*_device``) must match the host numpy
     path for the real ``T`` rows (``T <= decode_bucket``) — stale prefix padding never leaks
-    because pre/post are per-token-independent. Regression guard for Phase A
-    (``plans/generative-device-resident-decode.md``)."""
+    because pre/post are per-token-independent. Regression guard for Phase A."""
     pytest.importorskip("cupy")
     import torch
     import transformers

@@ -906,8 +906,7 @@ class Run:
 
 
 def _is_structural_option(option: object) -> bool:
-    """Classify one raw rewrite option by its effect (see
-    ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
+    """Classify one raw rewrite option by its effect: a ``Graph`` splice
     changes which ops exist — **structural**; an ``Op`` rebind is in-place —
     **op-variant**. The Op/Graph return type IS the classification; rules wrap
     a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/010_split_demoted``),

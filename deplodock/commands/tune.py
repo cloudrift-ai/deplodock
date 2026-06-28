@@ -68,7 +68,7 @@ def register_tune_command(subparsers):
             "ε-greedy exploration: probability a selection step descends a uniformly random child "
             "instead of the PUCT argmax, perturbing (not replacing) the heuristic order for shapes "
             "where it's known-bad. Falls back to ``DEPLODOCK_TUNE_EPS`` env var, then to 0.0 "
-            "(deterministic PUCT) — opt-in; see plans/golden-sweep-report.md."
+            "(deterministic PUCT) — opt-in."
         ),
     )
     parser.add_argument(

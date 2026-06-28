@@ -46,7 +46,7 @@ class Search(ABC):
         ``structural`` marks a fork whose options include a ``Graph``
         splice — a kernel-set-changing (structural) decision, classified
         at the spawn site in ``Run.drive`` where the raw option list is
-        concrete (see ``plans/structural-forks-in-two-level.md`` step 1).
+        concrete.
         ``False`` for op-variant forks, engine continuation pushes, and
         the seed candidate."""
 
