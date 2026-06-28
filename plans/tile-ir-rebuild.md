@@ -312,11 +312,15 @@ The dtype policy from old `020_place_inits` rides on the `Accum` now, stamped by
 and the twisted-carrier LSE stats, pinned f32) promotes to f32. Recovered `test_fp16_max_reduction_stays_in_fp16`,
 `test_fp16_reduction_uses_fp32_accumulator_on_cuda`, `test_reduce_emits_k_loop`.
 
-**Seeding is now uniformly `Loop.render`'s job — no explicit `Init` anywhere.** A cell the generic `_lift` can't factor
-stays a flat `Map` (loop-IR verbatim) carrying a `Monoid` *stmt* rather than lifted bare `Accum`s; `Loop.render` seeds
-that carrier from its monoid identity (`State.identity` — the neutral element, a property of the carried algebra, not the
-`Twist` combine spelling) exactly as it seeds an `Accum` from `op.identity`. So `_normalize` / `_fuse` stopped emitting
-seed stmts and `State.inits()` is gone. The `Init` stmt class is retained but **unproduced** — a primitive (with its
-render / rewrite / validation handlers) kept for an explicit cross-scope seed the cooperative / split-K reduce tier may
-later want (e.g. a chunked-K accumulator seeded above the outer loop). `State` is now just `names` + `identity`; the
-`Twist` holds only the combine programs.
+**The seed has ONE source — the fold's `op.identity` — and placement is a schedule-dependent realization.** The carrier
+holds the seed *information* but not its placement: `seed_identities()` on **both** `Accum` and `Monoid` (the uniform
+carrier interface) returns each carried component's seed = its fold's `op.identity` (a `Monoid` reads it off its merge
+folds). `State` no longer stores `identity` — that was a second, drift-prone source; `State` is now just `names`, the
+`Twist` only the combine programs. *Where* the seed lands depends on the schedule: the **serial** reduce places it via
+`Loop.render` (declare before the loop, consuming the carrier interface — it is NOT a source of truth, just the serial
+realizer); a future **cooperative / cross-CTA** reduce has no enclosing loop, so it reads the same `seed_identities()`
+to seed each partial. Deferring placement to the carrier is also why the dtype-dependent seed lands at render time (after
+`030_stamp_types` finalizes the accumulator dtype). No explicit `Init` is emitted anywhere — `_normalize` / `_fuse`
+stopped, and `State.inits()` is gone; the `Init` stmt class is retained but **unproduced**, a primitive kept for an
+explicit cross-scope seed the cooperative tier may later want. `combine_states` keeps its `copy` spelling — it is the
+cross-partition combine, never a seed source.
