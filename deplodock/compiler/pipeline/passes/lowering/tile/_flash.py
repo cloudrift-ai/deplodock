@@ -62,7 +62,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.tile import TileOp
-from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
+from deplodock.compiler.ir.tile.ops import Map, Reduce, lower
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
@@ -344,7 +344,7 @@ def _flash_op(
         out="O_i__proj",
         axis=Axis(name="kv", extent=s_k),
         carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
-        partials=(Map(score_stmts), TensorRef(v_buf, v_idx)),
+        partials=(Map(score_stmts), Load(name="v_e", input=v_buf, index=v_idx)),
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
     return flash_reduce

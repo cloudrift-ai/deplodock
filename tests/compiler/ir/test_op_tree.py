@@ -2,9 +2,9 @@
 
 The kernel *is* the lowered tree — no per-kernel builder. A contraction is
 ``Reduce(+)`` over a ``Map`` (the ``×`` lift, a stmt body); a plain reduction is
-``Reduce`` over a direct ``TensorRef`` load. Validated by running the lowered ``LoopOp``
+``Reduce`` over a direct ``Load`` partial. Validated by running the lowered ``LoopOp``
 (cppyy, CPU) against numpy — the carrier generates the ``Init`` + fold, a ``Map`` is the
-lift stmts, the ``TensorRef``s the loads.
+lift stmts, a ``Load`` partial the direct operand read.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
+from deplodock.compiler.ir.tile.ops import Map, Reduce, lower
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 ADD = ElementwiseImpl("add")
@@ -66,7 +66,7 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
         out="acc",
         axis=k,
         carrier=Accum(name="acc", value="v", op="add").as_monoid(),
-        partials=(TensorRef("x", (Var("r"), Var("k"))),),  # the partial is a direct load
+        partials=(Load(name="v", input="x", index=(Var("r"), Var("k"))),),  # the partial is a direct load (named for the carrier partial)
         init_ops=(ADD,),
     )
     cell = (*lower(red), Write(output="y", index=(Var("r"),), value="acc"))
@@ -104,7 +104,7 @@ def test_flash_op_tree_matches_softmax_qkv() -> None:
         out="O__proj",  # the carrier's finalize binds O/l here, post-loop
         axis=j,
         carrier=flash_combine("m", "l", "O", "s", "v"),
-        partials=(score, TensorRef("V", (Var("j"), Var("d")))),
+        partials=(score, Load(name="v", input="V", index=(Var("j"), Var("d")))),
         init_ops=(MAX, ADD, ADD),
     )
     cell = (*lower(flash), Write(output="attn", index=(Var("i"), Var("d")), value="O__proj"))
