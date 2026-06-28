@@ -11,10 +11,10 @@ halves:
   hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
   is the ``O/l`` projection ``Map`` over the ``(m,l,O)`` LSE ``Monoid`` over kv, whose
   score partial ``Map`` holds the ``Σ Q·K`` contraction. ``build_flash_frag`` returns that
-  ``Map`` UNLOWERED, on a ``TileOp`` with an EMPTY schedule — the free ``(batch…, m, d)``
-  axes ride on the ``Map``'s ``free`` field (like every recognizer), and ``020_schedule``
-  moves them onto ``grid_axes``; ``materialize`` lowers the node + generates the
-  output-store glue (the ``Write`` at the grid cell — not stored).
+  ``Map`` UNLOWERED, on a ``TileOp`` with an UNMAPPED ``Schedule`` — the free
+  ``(batch…, m, d)`` axes are the schedule's (like every recognizer), and ``020_schedule``
+  maps them onto the grid; ``materialize`` lowers the node + generates the output-store
+  glue (the ``Write`` at the grid cell — not stored).
 
 ``is_flash_score_producer`` lets ``010_recognize`` defer the general lift of a scaled-QK
 score producer until its softmax-then-P@V consumer has fused (the fusion reads the
@@ -67,7 +67,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, State, Twist, Write
-from deplodock.compiler.ir.tile import TileOp
+from deplodock.compiler.ir.tile import Schedule, TileOp
 from deplodock.compiler.ir.tile.ops import Map, lower
 
 if TYPE_CHECKING:
@@ -216,10 +216,10 @@ def build_flash_frag(
 
     The compute is the op tree itself — a ``Map`` (the ``O/l`` projection) over the
     ``(m,l,O)`` LSE ``Monoid`` fold, carried unlowered on the ``TileOp`` with an empty
-    schedule; the free ``(batch…, m, d)`` axes ride on the ``Map``'s ``free`` field (no
-    free-axis loop nest). ``020_schedule`` moves them onto ``grid_axes``; ``materialize``
-    lowers the node and generates the output-store glue (the ``Write`` at the grid cell) —
-    it isn't stored here.
+    schedule; the free ``(batch…, m, d)`` axes are the ``Schedule``'s ``free`` (no
+    free-axis loop nest). ``020_schedule`` maps them onto the grid; ``materialize`` lowers
+    the node and generates the output-store glue (the ``Write`` at the grid cell) — it
+    isn't stored here.
 
     ``group`` is the GQA head ratio (K/V indexed at ``head // group``); ``mask`` is
     an optional ``(buffer_id, shape)`` additive bias loaded per ``(m, kv)``."""
@@ -235,9 +235,9 @@ def build_flash_frag(
         Axis(name="m", extent=s_q_dim),
         Axis(name="d", extent=Dim(d_v)),
     )
-    # Carry the free axes on the lifted node with an EMPTY schedule, like every other
-    # recognizer — ``020_schedule`` moves ``free`` onto ``grid_axes``.
-    tile = TileOp(op=replace(flash_op, free=grid))
+    # The free axes are the schedule's, carried on the ``TileOp`` with an UNMAPPED grid —
+    # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid.
+    tile = TileOp(op=flash_op, schedule=Schedule(free=grid))
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):

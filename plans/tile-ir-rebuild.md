@@ -4,8 +4,9 @@ Status: **rebuild in progress — Phases 1a–1d, 2 and 3 have landed: the no-fo
 + online softmax unified by the twist), scalar matmul (`SEMIRING`), scalar **flash attention** (the nested
 `MONOID(SEMIRING)`), the high-level op tree that replaced the `build_*` body assembly, and the op tree now FLOWING as
 the carried IR: `010_recognize` is the sole Loop-IR → Tile-IR boundary — it lifts EVERY kernel to a `TileOp` carrying
-one op-tree `AlgebraNode` (`Map` / `Monoid` / `Semiring`) with its parallel axes on the node's `free` field and an
-**empty** schedule, and `020_schedule` only moves `free` onto `grid_axes`; loop materialization is deferred entirely to
+one op-tree `AlgebraNode` (`Map` / `Monoid` / `Semiring`) and an **unmapped** `Schedule` (its parallel `free` axes,
+carried on the `TileOp` — a root-schedule property, not the node's), and `020_schedule` only maps `free` onto the
+schedule's `grid`; loop materialization is deferred entirely to
 `lowering/kernel`. All recognition (flash, online softmax, normalize, lift) is consolidated in `010_recognize` (the
 `_flash` / `_softmax` helpers hold the pattern matchers). Every elementwise, index-only, reduction, static-matmul, and
 static-attention `e2e/` kernel — including whole transformer blocks (TinyLlama + Qwen) AND the un-fused RoPE
@@ -247,10 +248,12 @@ the carried IR, and recognition is unified in ONE rule:
   several reduces, or a nested non-flash reduce) stays a flat `Map` of the per-cell stmts — still a valid op-tree node,
   and it lowers verbatim (this is what recovered the un-fused RoPE-attention path: a multi-reduce softmax-then-P@V kernel
   is a correct flat `Map`).
-- **Free axes live on the algebra node (`Map` / `Monoid` / `Semiring` gained a `free` field).** This resolves the type
-  tension that an op-tree node can't be wrapped by loop-IR `Loop` stmts: the lifted node carries its parallel axes
-  directly. `010_recognize` fills `free` and leaves `TileOp.grid_axes` empty; `020_schedule` moves `free → grid_axes`
-  and clears the field; `materialize` lowers a free-less node.
+- **Free axes live on the `TileOp`'s `Schedule`, not the algebra node.** The parallel axes are a property of the root
+  schedule (which axes are parallel, how they bind to threads), not of any individual carrier — so `TileOp` carries a
+  `Schedule(free, grid)` (`ir/tile/ir.py`). `010_recognize` builds an unmapped schedule (just `free`); `020_schedule`
+  maps every free axis onto `grid` (`Schedule.on_grid`, the scalar tier); `materialize` reads `schedule.grid`. The op
+  tree (`Map` / `Monoid` / `Semiring`) stays schedule-free — the lift returns `(node, free axes)` and the free axes go
+  onto the `TileOp`. Richer tiers (cooperative / split-K) extend the `Schedule`'s axis mapping, never the op tree.
 - **Flash-producer deferral.** Because flash fusion reads the score producer's Q/K as plain `Load`s, a node that IS a
   flash score producer is deferred (left a `LoopOp`, `_flash.is_flash_score_producer`) so step 4's lift doesn't turn it
   into a `TileOp` before its consumer fuses. A later scan re-visits it (by then consumed/removed, or lifted normally if

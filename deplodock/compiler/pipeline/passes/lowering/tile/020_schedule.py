@@ -1,22 +1,20 @@
 """Schedule a lifted ``TileOp`` onto the thread grid.
 
 Second of the two tile-lowering steps — ``010_recognize`` lifted the kernel to a
-``TileOp`` carrying one op-tree ``AlgebraNode`` with its parallel axes on the node's
-``free`` field and an **empty** ``grid_axes``. Scheduling is purely geometry: at the
-scalar (one-thread-per-output-cell) tier every free axis maps onto the thread grid, so
-this step just moves the node's ``free`` axes onto ``TileOp.grid_axes`` and clears the
-field. The fold (a ``Monoid`` / ``Semiring`` reduce, or a serial reduce ``Loop`` inside a
-flat ``Map``) stays in the op tree and is materialized to loop IR in ``lowering/kernel`` —
-nothing here, nor downstream, branches on reduction-vs-softmax-vs-contraction.
+``TileOp`` carrying one op-tree ``AlgebraNode`` and an UNMAPPED :class:`Schedule` (its
+parallel ``free`` axes, empty ``grid``). Scheduling is purely geometry: at the scalar
+(one-thread-per-output-cell) tier every free axis maps onto the thread grid, so this step
+just binds the schedule's ``free`` axes onto ``grid`` (``Schedule.on_grid``). The fold (a
+``Monoid`` / ``Semiring`` reduce, or a serial reduce ``Loop`` inside a flat ``Map``) stays
+in the op tree and is materialized to loop IR in ``lowering/kernel`` — nothing here, nor
+downstream, branches on reduction-vs-softmax-vs-contraction.
 
 The cooperative / cross-CTA reduce schedules and the mma / blocked / split-K contraction
-schedules arrive later as richer mappings of the same ``free`` axes (see
-``plans/tile-ir-rebuild.md``).
+schedules arrive later as richer mappings of the same ``free`` axes on the ``Schedule``
+(see ``plans/tile-ir-rebuild.md``).
 """
 
 from __future__ import annotations
-
-from dataclasses import replace
 
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.tile import TileOp
@@ -27,12 +25,8 @@ PATTERN = [Pattern("root", TileOp)]
 
 def rewrite(match: Match, root: Node) -> TileOp | None:
     tile: TileOp = root.op
-    if tile.grid_axes:
-        raise RuleSkipped("already scheduled")
-    node = tile.op
-    free = getattr(node, "free", ())
-    if not free:
-        raise RuleSkipped("no free axes to map onto the grid")
-    # Move the node's parallel axes onto the thread grid (the schedule) and clear them off
-    # the op tree — materialize sees a free-less node and lowers its per-cell body.
-    return TileOp(op=replace(node, free=()), name=tile.name, grid_axes=tuple(free))
+    if tile.schedule.is_mapped:
+        # Already mapped (grid set), or nothing to map (a scalar-output kernel materializes
+        # on an empty grid) — leave it for materialize.
+        raise RuleSkipped("schedule already mapped")
+    return TileOp(op=tile.op, schedule=tile.schedule.on_grid(), name=tile.name)

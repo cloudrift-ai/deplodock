@@ -30,8 +30,8 @@ step unconditional — no knobs):
    into ONE :data:`AlgebraNode`: a pure pointwise body is a ``Map``; a single flat reduce
    becomes a self-contained ``Monoid`` (plain reduce / online softmax) or ``Semiring``
    (contraction) node, with any pre/post pointwise stmts wrapped as a projection ``Map``
-   over it. The free axes ride on the root node's ``free`` field; ``TileOp.grid_axes`` is
-   left empty for ``020_schedule`` to fill. A cell the lift can't cleanly factor (no
+   over it. The free axes ride on the ``TileOp``'s ``Schedule`` (the root's concern, not the
+   node's); ``020_schedule`` maps them onto the grid. A cell the lift can't cleanly factor (no
    reduce, several reduces, or a nested non-flash reduce) stays a flat ``Map`` of the
    per-cell stmts — still a valid op-tree node, just not factored.
 
@@ -54,7 +54,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, Write
 from deplodock.compiler.ir.stmt.algebra import AlgebraNode, Map, Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import TileOp
+from deplodock.compiler.ir.tile import Schedule, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
@@ -219,12 +219,12 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> AlgebraNode:
     return Map(source=node, body=pre_epilogue + tuple(after))
 
 
-def _lift(stmts: list[Stmt], output: str) -> AlgebraNode:
-    """Peel the free axes and lift the per-cell compute, returning the root node with its
-    ``free`` axes set (``020_schedule`` moves them to the grid)."""
+def _lift(stmts: list[Stmt], output: str) -> tuple[AlgebraNode, tuple]:
+    """Peel the free axes and lift the per-cell compute, returning ``(root node, free
+    axes)``. The free axes are the schedule's (carried on the ``TileOp``, not the node);
+    ``020_schedule`` maps them onto the grid."""
     free, cell = _peel(Body(tuple(stmts)))
-    node = _lift_cell(cell, free, output)
-    return replace(node, free=tuple(free))
+    return _lift_cell(cell, free, output), tuple(free)
 
 
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
@@ -249,5 +249,5 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
         raise RuleSkipped("symbolic axis — scalar tier needs static extents (dynamic tier not built)")
     fused, _ = _fuse(loop.body)
     normed, _ = _normalize(list(fused))
-    node = _lift(normed, root.output.name)
-    return TileOp(op=node, name=loop.name)
+    node, free = _lift(normed, root.output.name)
+    return TileOp(op=node, schedule=Schedule(free=free), name=loop.name)

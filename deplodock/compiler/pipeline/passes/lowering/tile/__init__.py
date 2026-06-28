@@ -4,12 +4,12 @@
    lives here (no separate flash / softmax rule): fuse flash attention, fuse online
    softmax, normalize plain ``Accum``\\ s to twisted ``Monoid``s, then **lift** the kernel
    to a ``TileOp`` carrying ONE op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``)
-   with its parallel axes on the node's ``free`` field and an **empty** schedule. After this
-   nothing downstream traffics in ``LoopOp``. The ``_flash`` / ``_softmax`` helper modules
-   hold the flash / online-softmax pattern matchers the rule calls.
-2. **Schedule** (``020_schedule``) — pure geometry: move the lifted node's ``free`` axes
-   onto ``TileOp.grid_axes`` (the per-cell, one-thread-per-output-cell tier maps every free
-   axis onto the thread grid).
+   with an **unmapped** ``Schedule`` (its parallel ``free`` axes, on the ``TileOp`` not the
+   node). After this nothing downstream traffics in ``LoopOp``. The ``_flash`` / ``_softmax``
+   helper modules hold the flash / online-softmax pattern matchers the rule calls.
+2. **Schedule** (``020_schedule``) — pure geometry: map the schedule's ``free`` axes onto
+   ``grid`` (the per-cell, one-thread-per-output-cell tier maps every free axis onto the
+   thread grid).
 
 Recognition reads algebraic structure; scheduling is geometry; materialization back to
 loop IR happens in ``lowering/kernel`` — so the tile passes work purely with algebra

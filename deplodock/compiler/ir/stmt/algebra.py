@@ -40,15 +40,10 @@ class Map:
 
     Used as a carrier partial / contraction operand (``out`` = the body's last bound name)
     or as the kernel root (last stmt = the ``Write``). It HAS a Body (composition), not
-    IS one.
-
-    ``free`` — the parallel (grid) axes enclosing this node, set ONLY when this Map is the
-    kernel root (the recognizer fills them; ``020_schedule`` moves them to ``TileOp.grid_axes``
-    and clears the field). Empty on a nested partial / operand Map — those run per grid cell."""
+    IS one."""
 
     source: AlgebraNode | None = None
     body: Body = field(default_factory=Body)
-    free: tuple[Axis, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -81,10 +76,6 @@ class Semiring:
     fold: Accum
     operands: tuple[AlgebraNode, ...]
     reduce_axis: Axis
-    # The parallel (grid) axes enclosing the contraction, set ONLY when this Semiring is
-    # the kernel root (a bare matmul: its ``out`` stores at the grid cell). The recognizer
-    # fills them; ``020_schedule`` moves them to ``TileOp.grid_axes`` and clears the field.
-    free: tuple[Axis, ...] = ()
 
     @property
     def out(self) -> str:
@@ -267,11 +258,6 @@ class Monoid(Stmt):
     # siblings). Set by the op-tree builders; ``ir.tile.ops.lower`` reads it to emit the
     # ``Loop`` and clears ``partial`` on the in-loop carrier it leaves.
     axis: Axis | None = None
-    # The parallel (grid) axes enclosing the reduce, set ONLY when this Monoid is the kernel
-    # root (a bare reduction: its ``out`` stores at the grid cell). The recognizer fills them;
-    # ``020_schedule`` moves them to ``TileOp.grid_axes`` and clears the field. Empty on a
-    # nested partial Monoid (e.g. a self-contained inner reduce).
-    free: tuple[Axis, ...] = ()
 
     @property
     def out(self) -> str:

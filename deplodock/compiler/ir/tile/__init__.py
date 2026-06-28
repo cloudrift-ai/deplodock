@@ -5,6 +5,6 @@ records the *schedule* (which axes tile onto the thread grid) while the
 *combine* stays in the body, so one op covers MAP / MONOID / SEMIRING.
 """
 
-from deplodock.compiler.ir.tile.ir import TileOp
+from deplodock.compiler.ir.tile.ir import Schedule, TileOp
 
-__all__ = ["TileOp"]
+__all__ = ["Schedule", "TileOp"]

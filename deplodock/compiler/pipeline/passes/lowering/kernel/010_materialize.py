@@ -1,7 +1,7 @@
 """Materialize a ``TileOp``'s schedule into a ``KernelOp``.
 
-Binds the ``TileOp``'s ``grid_axes`` to GPU threads — one thread per output cell
-— by wrapping the per-cell body in a single :class:`Tile` kernel-IR primitive,
+Binds the ``TileOp``'s ``schedule.grid`` axes to GPU threads — one thread per output
+cell — by wrapping the per-cell body in a single :class:`Tile` kernel-IR primitive,
 which emits the linear-thread decode (``_gid = blockIdx.x·blockDim.x +
 threadIdx.x``, the bounds guard, the per-axis index decode) around the body.
 
@@ -48,8 +48,9 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # body already carries a ``Write`` (a pure pointwise Map, or a projection that writes
     # through its own output sweep) needs no glue.
     needs_store = not _has_write(stmts)
+    grid = tile.schedule.grid
     if needs_store:
-        index = tuple(Var(ax.name) for ax in tile.grid_axes)
+        index = tuple(Var(ax.name) for ax in grid)
         stmts = [*stmts, Write(output=root.output.name, index=index, value=op.out)]
-    bound = Tile(axes=tuple(tile.grid_axes), body=Body(tuple(stmts)))
+    bound = Tile(axes=tuple(grid), body=Body(tuple(stmts)))
     return KernelOp(body=Body((bound,)), name=tile.name)
