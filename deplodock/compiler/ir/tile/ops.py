@@ -16,9 +16,8 @@ tiling. Geometry is the separate ``Tile(op, placement)`` layer.
 generates the structure (``Init`` ← identity, the streaming ``Loop`` + the carrier
 fold ← ``merge``), the nested ops generate the lift, and the operands' index exprs
 come straight from the ``TensorRef``s. So there is no per-kernel builder: a kernel
-*is* the lowered tree. (Today ``lower`` targets a single-component carrier — the
-contraction / plain reduce; multi-component carriers, e.g. flash's ``(m,d,O)``,
-land in the next slice once per-state ``Init`` is plumbed.)
+*is* the lowered tree — including flash's multi-state ``(m,l,O)`` LSE carrier (one
+``Init`` per carried state) and an index-dependent ``Mask`` (the causal fill).
 """
 
 from __future__ import annotations
@@ -28,8 +27,8 @@ from dataclasses import dataclass, field
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Loop
+from deplodock.compiler.ir.expr import Expr, Literal
+from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Loop, Select, SelectBranch
 from deplodock.compiler.ir.stmt.base import Stmt
 
 
@@ -43,8 +42,8 @@ class TensorRef:
     index: tuple[Expr, ...]
 
 
-# A partial source: a nested op (Map / Reduce) or a direct operand load (TensorRef).
-Source = "Map | Reduce | TensorRef"
+# A partial source: a nested op (Map / Mask / Reduce) or a direct operand load (TensorRef).
+Source = "Map | Mask | Reduce | TensorRef"
 
 
 @dataclass(frozen=True)
@@ -55,6 +54,21 @@ class Map:
     out: str
     op: ElementwiseImpl
     args: tuple
+
+
+@dataclass(frozen=True)
+class Mask:
+    """Predicated fill over the iteration axes: ``out = pred ? val : fill``. The op
+    tree is index-aware (it carries the operands' index exprs), so an index-dependent
+    mask — the causal ``kv ≤ m``, where a masked score is filled with ``−inf`` so
+    ``exp(s − m) = 0`` — lives HERE, never in the carrier (the ``Monoid`` / ``Twist``
+    stays index-free). ``val`` / ``fill`` are sources (``Map`` / ``Reduce`` /
+    ``TensorRef``) or bare SSA names; ``pred`` is an ``Expr`` over the axes."""
+
+    out: str
+    val: object
+    fill: object
+    pred: Expr
 
 
 @dataclass(frozen=True)
@@ -75,34 +89,55 @@ class Reduce:
 
 def _lower_source(src, name: str, ssa) -> list[Stmt]:
     """Emit stmts that bind ``name`` to the value produced by ``src`` (a nested
-    ``Map`` / ``Reduce`` or a ``TensorRef`` load). ``ssa`` is a fresh-name counter."""
+    ``Map`` / ``Mask`` / ``Reduce`` or a ``TensorRef`` load). ``ssa`` is a fresh-name
+    counter. For a nested op the binding name is the op's own ``out`` (the callers that
+    pass ``name`` for an op rely on having set ``out`` to match)."""
     if isinstance(src, TensorRef):
         return [Load(name=name, input=src.buf, index=src.index)]
     if isinstance(src, Map):
         return _lower_map(src, ssa)
+    if isinstance(src, Mask):
+        return _lower_mask(src, ssa)
     if isinstance(src, Reduce):
         return lower(src, ssa)
     raise TypeError(f"_lower_source: unsupported partial source {type(src).__name__}")
 
 
+def _bind_arg(a, ssa, stmts: list[Stmt]) -> str:
+    """Bind one operand ``a`` (a bare SSA name, a ``TensorRef`` load, or a nested
+    ``Map`` / ``Mask`` / ``Reduce``), appending its binding stmts to ``stmts``, and
+    return the SSA name holding its value."""
+    if isinstance(a, str):
+        return a
+    if isinstance(a, TensorRef):
+        nm = ssa()
+        stmts.append(Load(name=nm, input=a.buf, index=a.index))
+        return nm
+    if isinstance(a, (Map, Mask, Reduce)):
+        stmts += _lower_source(a, a.out, ssa)
+        return a.out
+    raise TypeError(f"_bind_arg: unsupported operand {type(a).__name__}")
+
+
 def _lower_map(m: Map, ssa) -> list[Stmt]:
     """Lower a ``Map`` to ``[<arg binds>…, Assign(out, op, arg_names)]``."""
     stmts: list[Stmt] = []
-    arg_names: list[str] = []
-    for a in m.args:
-        if isinstance(a, str):
-            arg_names.append(a)
-        elif isinstance(a, TensorRef):
-            nm = ssa()
-            stmts.append(Load(name=nm, input=a.buf, index=a.index))
-            arg_names.append(nm)
-        elif isinstance(a, (Map, Reduce)):
-            nm = a.out
-            stmts += _lower_source(a, nm, ssa)
-            arg_names.append(nm)
-        else:
-            raise TypeError(f"_lower_map: unsupported arg {type(a).__name__}")
+    arg_names = [_bind_arg(a, ssa, stmts) for a in m.args]
     stmts.append(Assign(name=m.out, op=m.op, args=tuple(arg_names)))
+    return stmts
+
+
+def _lower_mask(mk: Mask, ssa) -> list[Stmt]:
+    """Lower a ``Mask`` to ``[<val binds>…, <fill binds>…, Select(out, pred?val:fill)]``."""
+    stmts: list[Stmt] = []
+    vname = _bind_arg(mk.val, ssa, stmts)
+    fname = _bind_arg(mk.fill, ssa, stmts)
+    stmts.append(
+        Select(
+            name=mk.out,
+            branches=(SelectBranch(value=vname, select=mk.pred), SelectBranch(value=fname, select=Literal(1, "int"))),
+        )
+    )
     return stmts
 
 
@@ -115,9 +150,11 @@ def lower(op, ssa=None) -> list[Stmt]:
         ssa = _counter()
     if isinstance(op, Map):
         return _lower_map(op, ssa)
+    if isinstance(op, Mask):
+        return _lower_mask(op, ssa)
     if isinstance(op, Reduce):
         return _lower_reduce(op, ssa)
-    raise TypeError(f"lower: expected Map / Reduce root, got {type(op).__name__}")
+    raise TypeError(f"lower: expected Map / Mask / Reduce root, got {type(op).__name__}")
 
 
 def _lower_reduce(r: Reduce, ssa) -> list[Stmt]:
@@ -145,4 +182,4 @@ def _counter():
     return fresh
 
 
-__all__ = ["TensorRef", "Map", "Reduce", "lower"]
+__all__ = ["TensorRef", "Map", "Mask", "Reduce", "lower"]

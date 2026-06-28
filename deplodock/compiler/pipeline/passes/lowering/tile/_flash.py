@@ -44,8 +44,9 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
+from deplodock.compiler.ir.tile.ops import Map, Mask, Reduce, TensorRef, lower
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -245,21 +246,8 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    body = _flash_loop_body(
-        q_id,
-        k_id,
-        v_id,
-        "_flash_scale",
-        batch,
-        s_q_dim,
-        s_k_dim,
-        head_dim,
-        d_v,
-        out.name,
-        causal=causal,
-        group=group,
-        mask_buf=mask_buf,
-        mask_shape=mask_shape,
+    body = _flash_body(
+        q_id, k_id, v_id, batch, s_k_dim, head_dim, out.name, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     nest = _wrap_free_axes(body, batch, s_q_dim, d_v)
 
@@ -289,16 +277,13 @@ def _batch_vars(n: int) -> tuple[Var, ...]:
     return tuple(Var(f"b{i}") for i in range(n))
 
 
-def _flash_loop_body(
+def _flash_body(
     q_buf: str,
     k_buf: str,
     v_buf: str,
-    scale_buf: str,
     batch: list[int],
-    s_q: Dim,
     s_k: Dim,
     head_dim: int,
-    d_v: int,
     out_buf: str,
     *,
     causal: bool = False,
@@ -306,19 +291,19 @@ def _flash_loop_body(
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
 ) -> tuple:
-    """The per-output-element ``(…, m, d)`` body: streaming KV reduce + finalize.
-
-    The score ``s = Σ_dd Q·K`` is an inner reduce nested in the KV streaming
-    reduce, so ``Init(sacc)`` is pre-placed at the KV-body scope (reset per step):
-    the streaming ``Monoid`` loop is a per-iteration boundary the default
-    Init-placement would otherwise cross.
+    """The per-output-element ``(…, m, d)`` body as a lowered op tree (no per-kernel
+    assembly): flash is the ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score
+    partial is a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked), with the
+    ``O/l`` projection as the root :class:`Map`. ``lower`` walks the tree — the
+    carriers generate the ``Init``\\ s + streaming folds, the ``TensorRef``\\ s the loads.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
-    ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so
-    the kv_heads-many K/V are read without materializing the q_heads expansion.
-    An additive ``mask_buf`` (broadcast leading dims) is loaded per ``(m, kv)`` and
-    summed into the score before the streaming combine — ``-inf`` entries make
-    ``exp(s − m_new) = 0``, so masked keys contribute nothing."""
+    ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
+    kv_heads-many K/V are read without materializing the q_heads expansion. An additive
+    ``mask_buf`` (broadcast leading dims) is added to the score; causal masking is a
+    :class:`Mask` (``kv ≤ m`` else −inf) — the index predicate lives in the op tree,
+    never in the carrier. Both make ``exp(s − m_new) = 0``, so masked keys contribute
+    nothing."""
     bvars = _batch_vars(len(batch))
     head_axis = len(batch) - 1  # last batch dim is the head (when there is one)
     kv_bvars = tuple(BinaryExpr("/", bv, Literal(group, "int")) if (group > 1 and i == head_axis) else bv for i, bv in enumerate(bvars))
@@ -327,57 +312,42 @@ def _flash_loop_body(
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
     out_idx = (*bvars, Var("m"), Var("d"))
 
-    score_reduce = Loop(
+    add = ElementwiseImpl("add")
+    score = Reduce(  # s = Σ_dd Q·K — the inner contraction (SEMIRING), reset per kv step
+        out="sacc",
         axis=Axis(name="dd", extent=Dim(head_dim)),
-        body=(
-            Load(name="q_e", input=q_buf, index=q_idx),
-            Load(name="k_e", input=k_buf, index=k_idx),
-            Assign(name="qk", op="multiply", args=("q_e", "k_e")),
-            Accum(name="sacc", value="qk", op=ElementwiseImpl("add")),
-        ),
+        carrier=Accum(name="sacc", value="qk", op=add).as_monoid(),
+        partials=(Map(out="qk", op=ElementwiseImpl("multiply"), args=(TensorRef(q_buf, q_idx), TensorRef(k_buf, k_idx))),),
+        init_ops=(add,),
     )
-    score: tuple = (Assign(name="s", op="multiply", args=("sacc", "scale_c")),)
-    score_name = "s"
-    prologue: tuple = ()
+    scaled = Map(out="s", op=ElementwiseImpl("multiply"), args=(score, TensorRef("_flash_scale", ())))
     if causal:
-        # Causal mask: keep the score where key ≤ query (kv ≤ m), else −inf.
-        prologue = (Load(name="ninf_c", input="_flash_ninf", index=()),)
-        score += (
-            Select(
-                name="s_masked",
-                branches=(
-                    SelectBranch(value="s", select=BinaryExpr("<=", Var("kv"), Var("m"))),
-                    SelectBranch(value="ninf_c", select=Literal(1, "int")),
-                ),
-            ),
-        )
+        score_src = Mask(out="s_masked", val=scaled, fill=TensorRef("_flash_ninf", ()), pred=BinaryExpr("<=", Var("kv"), Var("m")))
         score_name = "s_masked"
     elif mask_buf is not None:
-        # Additive bias: leading dims broadcast (indexed to 0), trailing two are
-        # the query row m and the streaming key kv.
+        # Additive bias: leading dims broadcast (indexed to 0), trailing two are the
+        # query row m and the streaming key kv.
         mask_idx = (*(Literal(0, "int") for _ in mask_shape[:-2]), Var("m"), Var("kv"))
-        score += (
-            Load(name="mask_e", input=mask_buf, index=mask_idx),
-            Assign(name="s_masked", op="add", args=(score_name, "mask_e")),
-        )
+        score_src = Map(out="s_masked", op=add, args=(scaled, TensorRef(mask_buf, mask_idx)))
         score_name = "s_masked"
-    kv_body = (
-        Init(name="sacc", op=ElementwiseImpl("add"), dtype="f32"),
-        score_reduce,
-        *score,
-        Load(name="v_e", input=v_buf, index=v_idx),
-        flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
+    else:
+        score_src = scaled
+        score_name = "s"
+    flash = Map(  # the projection O/l is the root, wrapping the (m,l,O) streaming fold
+        out="res",
+        op=ElementwiseImpl("divide"),
+        args=(
+            Reduce(
+                out="O_i",
+                axis=Axis(name="kv", extent=s_k),
+                carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
+                partials=(score_src, TensorRef(v_buf, v_idx)),
+                init_ops=(ElementwiseImpl("maximum"), add, add),
+            ),
+            "l_i",
+        ),
     )
-    return (
-        Load(name="scale_c", input=scale_buf, index=()),
-        *prologue,
-        Init(name="m_i", op=ElementwiseImpl("maximum"), dtype="f32"),
-        Init(name="l_i", op=ElementwiseImpl("add"), dtype="f32"),
-        Init(name="O_i", op=ElementwiseImpl("add"), dtype="f32"),
-        Loop(axis=Axis(name="kv", extent=s_k), body=kv_body),
-        Assign(name="res", op="divide", args=("O_i", "l_i")),
-        Write(output=out_buf, index=out_idx, value="res"),
-    )
+    return tuple(lower(flash)) + (Write(output=out_buf, index=out_idx, value="res"),)
 
 
 def _wrap_free_axes(body: tuple, batch: list[int], s_q: Dim, d_v: int) -> tuple:
