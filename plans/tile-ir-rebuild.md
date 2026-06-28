@@ -1,13 +1,16 @@
 # Tile IR rebuild
 
-Status: **rebuild in progress — Phases 1a–1d and 2 have landed: the no-fold skeleton, the per-cell reduce (reduction +
-online softmax unified by the twist), scalar matmul (`SEMIRING`), scalar **flash attention** (the nested
-`MONOID(SEMIRING)`), and the high-level `Map`/`Reduce`/`Mask`/`Inline` op tree that replaced the `build_*` body
-assembly. Every elementwise, index-only, reduction, static-matmul, and static-attention `e2e/` kernel — including whole
-transformer blocks — is recovered and un-xfailed, all through one generic `Tile` + carrier render path; the compute
-layer is the op tree, which now FLOWS as the carried IR (`TileOp` holds a `Map` / `Reduce`; the carrier finalizes the
-projection; the synthetic-flash recognizer emits `TileOp(Reduce)` directly — Phase 3). Remaining: dynamic shapes, and
-the perf tiers (cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch `refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phases 1a–1d, 2 and 3 have landed: the no-fold skeleton, the per-cell reduce (reduction
++ online softmax unified by the twist), scalar matmul (`SEMIRING`), scalar **flash attention** (the nested
+`MONOID(SEMIRING)`), the high-level op tree that replaced the `build_*` body assembly, and the op tree now FLOWING as
+the carried IR: `010_recognize` is the sole Loop-IR → Tile-IR boundary — it lifts EVERY kernel to a `TileOp` carrying
+one op-tree `AlgebraNode` (`Map` / `Monoid` / `Semiring`) with its parallel axes on the node's `free` field and an
+**empty** schedule, and `020_schedule` only moves `free` onto `grid_axes`; loop materialization is deferred entirely to
+`lowering/kernel`. All recognition (flash, online softmax, normalize, lift) is consolidated in `010_recognize` (the
+`_flash` / `_softmax` helpers hold the pattern matchers). Every elementwise, index-only, reduction, static-matmul, and
+static-attention `e2e/` kernel — including whole transformer blocks (TinyLlama + Qwen) AND the un-fused RoPE
+self-attention — is recovered and un-xfailed. Remaining: dynamic shapes, and the perf tiers (cooperative / cross-CTA
+reduce, the mma/blocked/split-K `Atom`).** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -228,36 +231,47 @@ Geometry stays separate: `Tile(op, placement)` maps axes to grid/thread/serial/c
 remaining perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree, plus the dynamic-shape
 (symbolic `seq_len`) tier.
 
-### Phase 3 — the op tree as flowing IR (`TileOp` carries it) — in progress
+### Phase 3 — the op tree as flowing IR (`TileOp` carries it; recognition consolidated) — done
 
 The op tree was a construction-time scaffold (built inside `build_*`, immediately lowered to a `LoopOp`). It now flows as
-the carried IR, in three slices:
+the carried IR, and recognition is unified in ONE rule:
 
-- **The carrier's φ projection (`Monoid.finalize`).** The kernel's output projection — the article's `project` in
-  `project ∘ reduce ∘ map` — is a new `Monoid.finalize` surface (a post-reduction program mapping the final state to the
-  output value), emitted by `lower(Reduce)` after the streaming loop. Empty = identity (plain reduce / matmul: the state
-  IS the output); flash authors `O_i / l_i`. Named `finalize`, not `project`, because `ReduceCarrier.project` is the
-  distinct *distribution* projection (onto a cooperative / fragment realization). So a bare `Reduce` is self-contained
-  (fold + finalize).
-- **`TileOp` carries the op tree (only the op + the schedule).** `TileOp` is a plain `Op` (not a `BodyOp`) holding
-  `op` (a `Map` pointwise per-cell body, or a `Reduce` fold) + `grid_axes`. **No stored output store** — the `Write`
-  binding a `Reduce`'s output value to the kernel buffer at the grid cell is *glue*, generated at `materialize` from
-  `grid_axes` + the graph node's output buffer. `inputs` / `outputs` come from the base `Op.populate_io` (graph edges);
-  the `body` property derives the per-cell compute (sans glue) from `op` for the cache-key / dump machinery. The op tree
-  is the source of truth. `020_schedule` emits `TileOp(op=Map(cell))` for the general scalar tier (the `Map` carries its
-  own `Write`, so no glue).
-- **The recognizer emits `TileOp(Reduce)`.** `build_flash_frag` (clean SDPA) returns the flash `Reduce` UNLOWERED on a
-  `TileOp` — the free `(batch…, m, d)` axes are its `grid_axes` — instead of a lowered `LoopOp` fragment. `Graph.splice`
-  is op-type-agnostic, so the `TileOp` terminal splices fine; `020_schedule` passes it through; `materialize` lowers it
-  and appends the output-store glue.
+- **`010_recognize` is the sole Loop-IR → Tile-IR boundary.** It lifts EVERY kernel (not just flash) to a `TileOp`
+  carrying one op-tree `AlgebraNode` with an **empty** schedule. After it, nothing downstream traffics in `LoopOp`. The
+  steps, in order, all in this one rule (no separate `005_flash` / softmax pass): (1) **flash** — a graph rewrite fusing
+  a softmax-then-P@V kernel with its clean scaled-QK producer (`_flash.try_flash`); (2) **online softmax** —
+  `_softmax._fuse`; (3) **normalize** — `Accum → degenerate Monoid` (`Semiring.match` keeps a contraction's `Accum`);
+  (4) **lift** — `_peel` the free axes, then lift the per-cell compute into ONE node: a pure pointwise body is a `Map`; a
+  single FLAT reduce is a self-contained `Monoid` (plain reduce / online softmax) or `Semiring` (clean contraction)
+  node, with any pre/post pointwise stmts as a projection `Map` over it. A cell the lift can't cleanly factor (no reduce,
+  several reduces, or a nested non-flash reduce) stays a flat `Map` of the per-cell stmts — still a valid op-tree node,
+  and it lowers verbatim (this is what recovered the un-fused RoPE-attention path: a multi-reduce softmax-then-P@V kernel
+  is a correct flat `Map`).
+- **Free axes live on the algebra node (`Map` / `Monoid` / `Semiring` gained a `free` field).** This resolves the type
+  tension that an op-tree node can't be wrapped by loop-IR `Loop` stmts: the lifted node carries its parallel axes
+  directly. `010_recognize` fills `free` and leaves `TileOp.grid_axes` empty; `020_schedule` moves `free → grid_axes`
+  and clears the field; `materialize` lowers a free-less node.
+- **Flash-producer deferral.** Because flash fusion reads the score producer's Q/K as plain `Load`s, a node that IS a
+  flash score producer is deferred (left a `LoopOp`, `_flash.is_flash_score_producer`) so step 4's lift doesn't turn it
+  into a `TileOp` before its consumer fuses. A later scan re-visits it (by then consumed/removed, or lifted normally if
+  no flash consumer remains).
+- **Output-store glue is `Write`-presence-driven.** `materialize` adds the grid-cell store (`Write(out, grid, op.out)`)
+  iff the lowered body carries no `Write` of its own — so a bare `Monoid` / `Semiring` (reduce / matmul) and a flash
+  projection `Map` get glue, while a pointwise `Map` or a projection that writes through its own output sweep
+  (rmsnorm / softmax) does not.
+- **Contraction-lift soundness.** `Semiring.match` reconstructs operands as bare one-`Load` `Map`s, so the lift only
+  emits a `Semiring` for a CLEAN contraction (`_clean_contraction`: the lift multiplies the operand loads directly); a
+  contraction with per-operand preprocessing (e.g. pre-scaled inputs `Σ (x·s)·(y·s)`) lifts to a `Monoid` whose partial
+  `Map` captures the full per-element compute instead. Loop-invariant prologue stmts that feed the reduce are routed
+  into that partial (lowered inside the loop, like flash's scale); ones feeding only the epilogue stay after it; a stmt
+  feeding both keeps the whole cell a flat `Map`.
 
-Flash now recognizes only the **clean** scaled-QK producer (Q/K as plain `Load`s). The fused-RoPE producer-splicing
-builder (`build_flash_recovered`) was **deleted** rather than kept half-converted to the op tree — RoPE attention no
-longer fuses to flash, and its un-fused fallback isn't covered, so `test_block` (TinyLlama / Qwen) + the RoPE
-`test_attention_chains` case are xfailed (`_NO_RECOVERED`). Re-supporting RoPE attention means a producer-splicing score
-`Map` (a per-cell prologue slot on the op tree), to be rebuilt cleanly on the op-tree path.
+Flash recognizes only the **clean** scaled-QK producer (Q/K as plain `Load`s); RoPE'd-QK attention is not fused, but its
+**un-fused** fallback now lowers correctly via the flat-`Map` lift, so `test_block` (TinyLlama + Qwen) and the RoPE
+`test_attention_chains` self-attention recovered (their `_NO_RECOVERED` xfails are removed). Re-supporting flash *fusion*
+of RoPE attention (a producer-splicing score `Map`) is a perf follow-up, not a correctness gap.
 
-Remaining in this phase: `build_flash_recovered` is gone (RoPE attention to be rebuilt cleanly on the op-tree path, per
-above); the `body` property still lowers on access (for the cache key / dumps) while `materialize` does the deployable
-lower + glue — a structural key off `op` directly would drop even the property-side lower, but the payoff is small since
-`lower` is pure.
+This recognition is still case-by-case (flash / online-softmax / contraction patterns); the intent is to grow it toward
+ONE algorithmic algebra recognizer. Remaining: the `body` property still lowers on access (for the cache key / dumps)
+while `materialize` does the deployable lower + glue — a structural key off `op` directly would drop even the
+property-side lower, but the payoff is small since `lower` is pure.

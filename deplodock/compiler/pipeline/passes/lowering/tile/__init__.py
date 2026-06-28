@@ -1,16 +1,19 @@
-"""Tile-IR lowering: ``LoopOp`` → ``TileOp``, in two steps.
+"""Tile-IR lowering: ``LoopOp`` → ``TileOp``, in two rules.
 
-1. **Recognize** (``010_recognize``) — read the reduce carrier's algebra and
-   normalize it to the unified twisted ``Monoid`` (a scalar ``Accum`` becomes its
-   degenerate, identity-twist monoid; an online-softmax ``Monoid`` is kept;
-   a ``SEMIRING`` contraction is left alone). After this, a plain reduction and
-   online softmax share one representation.
-2. **Schedule** (``020_schedule``) — choose the per-cell schedule: map the free
-   (output) axes onto the thread grid and keep any fold serial in the per-cell
-   body.
+1. **Recognize** (``010_recognize``) — the Loop-IR → Tile-IR boundary. ALL recognition
+   lives here (no separate flash / softmax rule): fuse flash attention, fuse online
+   softmax, normalize plain ``Accum``\\ s to twisted ``Monoid``s, then **lift** the kernel
+   to a ``TileOp`` carrying ONE op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``)
+   with its parallel axes on the node's ``free`` field and an **empty** schedule. After this
+   nothing downstream traffics in ``LoopOp``. The ``_flash`` / ``_softmax`` helper modules
+   hold the flash / online-softmax pattern matchers the rule calls.
+2. **Schedule** (``020_schedule``) — pure geometry: move the lifted node's ``free`` axes
+   onto ``TileOp.grid_axes`` (the per-cell, one-thread-per-output-cell tier maps every free
+   axis onto the thread grid).
 
-Recognition is purely about algebraic structure; scheduling is purely geometry —
-so neither, nor the downstream lowering, branches on reduction-vs-softmax. The
-contraction (``SEMIRING``) schedule and the cooperative / cross-CTA reduce
-schedules arrive later, per ``plans/tile-ir-rebuild.md``.
+Recognition reads algebraic structure; scheduling is geometry; materialization back to
+loop IR happens in ``lowering/kernel`` — so the tile passes work purely with algebra
+primitives. The cooperative / cross-CTA reduce and the mma / blocked / split-K contraction
+schedules arrive later as richer mappings of the same ``free`` axes
+(``plans/tile-ir-rebuild.md``).
 """

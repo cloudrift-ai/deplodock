@@ -11,9 +11,14 @@ halves:
   hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
   is the ``O/l`` projection ``Map`` over the ``(m,l,O)`` LSE ``Monoid`` over kv, whose
   score partial ``Map`` holds the ``Σ Q·K`` contraction. ``build_flash_frag`` returns that
-  ``Map`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
-  ``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
-  it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
+  ``Map`` UNLOWERED, on a ``TileOp`` with an EMPTY schedule — the free ``(batch…, m, d)``
+  axes ride on the ``Map``'s ``free`` field (like every recognizer), and ``020_schedule``
+  moves them onto ``grid_axes``; ``materialize`` lowers the node + generates the
+  output-store glue (the ``Write`` at the grid cell — not stored).
+
+``is_flash_score_producer`` lets ``010_recognize`` defer the general lift of a scaled-QK
+score producer until its softmax-then-P@V consumer has fused (the fusion reads the
+producer's Q/K as plain ``Load``\\ s, so it must stay a ``LoopOp`` until then).
 
 (Online softmax — flash's softmax-stats half without the P@V — lives in ``_softmax``.)
 
@@ -68,7 +73,6 @@ from deplodock.compiler.ir.tile.ops import Map, lower
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
     from deplodock.compiler.ir.stmt.base import Stmt
-    from deplodock.compiler.pipeline import Match
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -211,11 +215,11 @@ def build_flash_frag(
     -inf constants). The caller guarantees :func:`flash_shape_eligible`.
 
     The compute is the op tree itself — a ``Map`` (the ``O/l`` projection) over the
-    ``(m,l,O)`` LSE ``Monoid`` fold, carried unlowered on the ``TileOp``; the free
-    ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest).
-    ``020_schedule`` passes the ``TileOp`` through; ``materialize`` lowers it and
-    generates the output-store glue (the ``Write`` at the grid cell) — it isn't stored
-    here.
+    ``(m,l,O)`` LSE ``Monoid`` fold, carried unlowered on the ``TileOp`` with an empty
+    schedule; the free ``(batch…, m, d)`` axes ride on the ``Map``'s ``free`` field (no
+    free-axis loop nest). ``020_schedule`` moves them onto ``grid_axes``; ``materialize``
+    lowers the node and generates the output-store glue (the ``Write`` at the grid cell) —
+    it isn't stored here.
 
     ``group`` is the GQA head ratio (K/V indexed at ``head // group``); ``mask`` is
     an optional ``(buffer_id, shape)`` additive bias loaded per ``(m, kv)``."""
@@ -225,15 +229,15 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    flash_op = _flash_op(
-        q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
-    )
+    flash_op = _flash_op(q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape)
     grid = (
         *(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch)),
         Axis(name="m", extent=s_q_dim),
         Axis(name="d", extent=Dim(d_v)),
     )
-    tile = TileOp(op=flash_op, grid_axes=grid)
+    # Carry the free axes on the lifted node with an EMPTY schedule, like every other
+    # recognizer — ``020_schedule`` moves ``free`` onto ``grid_axes``.
+    tile = TileOp(op=replace(flash_op, free=grid))
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -484,15 +488,14 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
     return x_buf, v_buf, mask_kind, mask_buf
 
 
-def try_flash(match: Match, root: Node) -> Graph | None:
+def try_flash(graph: Graph, root: Node) -> Graph | None:
     """Recognize SDPA on ``root`` and return the fused flash ``Graph`` fragment (a
     ``TileOp`` holding the flash ``Monoid`` + its scale / -inf constants), or ``None``
     if ``root`` is not a recognizable / eligible attention kernel."""
-    found = _recognize(match.graph, root)
+    found = _recognize(graph, root)
     if found is None:
         return None
     x_buf, v_id, mask_kind, mask_buf = found
-    graph = match.graph
     operands = (x_buf, v_id, *((mask_buf,) if mask_buf is not None else ()))
     if any(nid not in graph.nodes for nid in operands):
         return None
@@ -519,3 +522,19 @@ def try_flash(match: Match, root: Node) -> Graph | None:
     return build_flash_frag(
         q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
     )
+
+
+def is_flash_score_producer(graph: Graph, root: Node) -> bool:
+    """True iff ``root`` is the **score producer** (the scaled-QK matmul) of a flash kernel
+    that :func:`try_flash` would fuse — i.e. some consumer of ``root`` is an eligible
+    softmax-then-P@V kernel whose fusion **consumes** ``root``. The general lift in
+    ``010_recognize`` defers such a node (leaving it a ``LoopOp``) so the consumer's fusion
+    can still read its Q/K as plain loads. The consumed score buffer is the one node absent
+    from the fused fragment — Q/K/V inputs survive as the fragment's operands."""
+    for consumer in graph.nodes.values():
+        if root.id not in consumer.inputs:
+            continue
+        frag = try_flash(graph, consumer)
+        if frag is not None and root.id not in frag.nodes:
+            return True
+    return False
