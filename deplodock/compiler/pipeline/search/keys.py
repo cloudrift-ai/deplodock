@@ -78,7 +78,16 @@ def op_cache_key(op: object) -> str | None:
         # ``SearchTree.expand`` self-parents the node and
         # ``_propagate_expected`` walks the parent chain forever.
         knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
-        return digest(type(op).__name__, op.body.structural_key(), knob_key)
+        # ``TileOp`` has no stored body — its compute is the ``op`` tree; lower it on
+        # demand for the structural key (the body proper is generated at materialize).
+        if isinstance(op, TileOp):
+            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+            from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415
+
+            body = Body(lower(op.op)) if op.op is not None else Body(())
+        else:
+            body = op.body
+        return digest(type(op).__name__, body.structural_key(), knob_key)
     return None
 
 

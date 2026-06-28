@@ -42,7 +42,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt import Body, Init, Load, Loop, Map  # Map re-exported from ir.stmt.algebra
-from deplodock.compiler.ir.stmt.base import Stmt
+from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
 
 
 @dataclass(frozen=True)
@@ -118,4 +118,26 @@ def _lower_reduce(r: Reduce) -> list[Stmt]:
     return out
 
 
-__all__ = ["TensorRef", "Map", "Reduce", "lower"]
+def pretty(op, indent: str = "") -> list[str]:
+    """Structurally pretty-print an op tree (for dumps) — WITHOUT lowering. A
+    ``TensorRef`` is ``buf[index]``; a ``Map`` is its stmt body (each stmt's
+    ``pretty``); a ``Reduce`` is a header (carrier ``(state) <- combine(partial)`` over
+    its axis, projecting to ``out``) above its named partials + the carrier ``finalize``."""
+    if isinstance(op, TensorRef):
+        idx = ", ".join(e.pretty() for e in op.index)
+        return [f"{indent}{op.buf}[{idx}]" if idx else f"{indent}{op.buf}"]
+    if isinstance(op, Map):
+        return list(pretty_body(op, indent))
+    if isinstance(op, Reduce):
+        carrier = op.carrier.pretty()[0].strip() if hasattr(op.carrier, "pretty") else repr(op.carrier)
+        lines = [f"{indent}reduce[{op.axis.name}] {carrier} -> {op.out}"]
+        for src, pname in zip(op.partials, op.carrier.partial, strict=True):
+            lines.append(f"{indent}  partial {pname}:")
+            lines += pretty(src, indent + "    ")
+        for a in getattr(op.carrier, "finalize", ()):
+            lines += a.pretty(indent + "  ")
+        return lines
+    return [f"{indent}{op!r}"]
+
+
+__all__ = ["TensorRef", "Map", "Reduce", "lower", "pretty"]

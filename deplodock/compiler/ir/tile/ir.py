@@ -17,8 +17,8 @@ separate from the combine.** A ``TileOp`` records the *schedule* —
 through a carrier (``Accum`` / ``Monoid`` + ``Twist``) whose ``finalize`` φ projects
 the final state to the output. The algebra is **not stored as a tag**; the carriers
 and partial structure are read directly where a pass needs them, per the project's
-"the op tree is the single source of truth" rule. The per-cell ``body`` is *derived*
-from ``op`` by ``lower`` for the matcher / cache-key / dump machinery.
+"the op tree is the single source of truth" rule. There is no stored per-cell body —
+``lower(op)`` generates it at materialize (and on demand for the dump / cache key).
 
 Because the combine is in the op tree and the schedule is in ``grid_axes``, the SAME
 op and the SAME materializer extend across kernel kinds — only the carrier (the ⊕)
@@ -44,28 +44,20 @@ class TileOp(Op):
     fold whose carrier ``finalize``\\ s the output value). ``grid_axes`` are the parallel
     axes mapped onto the thread grid.
 
-    There is **no stored output store**: the ``Write`` that binds a ``Reduce``'s output
-    value to the kernel's output buffer at the grid cell is *glue*, generated at
-    materialize time from ``grid_axes`` + the graph node's output buffer (see
+    There is **no stored body and no stored output store**: the per-cell loop-IR body
+    is generated at materialize time by ``lower(op)``, and the ``Write`` that binds a
+    ``Reduce``'s output value to the kernel's output buffer at the grid cell is *glue*
+    generated there too, from ``grid_axes`` + the graph node's output buffer (see
     ``lowering/kernel/010_materialize``). ``inputs`` / ``outputs`` come from the base
-    :meth:`Op.populate_io` (graph edges) — no body walk. The ``body`` property derives
-    the per-cell compute from ``op`` (sans glue) for the cache-key / dump machinery."""
+    :meth:`Op.populate_io` (graph edges) — no body walk. ``pretty_body`` lowers ``op``
+    on demand for dumps (the cache key lowers it likewise in ``search/keys``)."""
 
     op: object = None  # Map | Reduce — the op tree; None for placeholder nodes
     grid_axes: tuple[Axis, ...] = field(default_factory=tuple)
     name: str = ""
 
-    @property
-    def body(self):
-        """The per-cell compute as loop-IR stmts, derived from ``op`` (the source of
-        truth) — NO output-store ``Write`` (that glue is generated at materialize).
-        Empty when ``op`` is unset. Read by the cache key / dumps."""
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415  (tile.ir loads mid ir.stmt import)
-        from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415
-
-        return Body(lower(self.op)) if self.op is not None else Body(())
-
     def pretty_body(self) -> str:
-        from deplodock.compiler.ir.stmt.base import pretty_body as _pretty  # noqa: PLC0415
+        """Render the ``op`` tree structurally (the dump view) — no lowering."""
+        from deplodock.compiler.ir.tile.ops import pretty  # noqa: PLC0415
 
-        return "\n".join(_pretty(self.body, "    "))
+        return "\n".join(pretty(self.op, "    ")) if self.op is not None else ""
