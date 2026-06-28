@@ -319,9 +319,16 @@ class Monoid(Stmt):
         return self.state.names
 
     def pretty(self, indent: str = "") -> list[str]:
+        # Summary header (carried state <- combine(partials)) followed by the stored
+        # ``merge`` program with real names — the state-update reassignments print as
+        # ordinary lines (the dump is text, not SSA-constrained), so the carrier's
+        # actual fold is visible in the loop-IR dump instead of an opaque one-liner.
         state = ", ".join(self.state.names)
         partial = ", ".join(self.partial_names())
-        return [f"{indent}({state}) <- combine({partial})"]
+        lines = [f"{indent}({state}) <- combine({partial})"]
+        for a in self.twist.merge:
+            lines += a.pretty(indent + "    ")
+        return lines
 
     def render(self, ctx: RenderCtx) -> list[str]:
         """Emit the merge program in fp32: each ``Assign`` targeting a ``state``
