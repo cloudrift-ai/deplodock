@@ -266,28 +266,6 @@ class Monoid(Stmt):
     def defines(self) -> tuple[str, ...]:
         return self.state.names
 
-    def carried_names(self) -> tuple[str, ...]:
-        return self.state.names
-
-    def combine_operands(self) -> tuple[str, ...]:
-        return self.twist.state_b
-
-    def combine_partials(self) -> tuple[Assign, ...]:
-        """The state-merges-state monoid op (the twist's ``combine_states``) —
-        already the realization-agnostic cross-partition combine the
-        cooperative-tree / split-KV / split-K reductions fold through."""
-        return self.twist.combine_states
-
-    # A monoid is associative with identity by construction; commutativity is the
-    # extra property (the ``commutative`` field) split-KV / split reordering needs.
-    @property
-    def associative(self) -> bool:
-        return True
-
-    @property
-    def has_identity(self) -> bool:
-        return True
-
     def pretty(self, indent: str = "") -> list[str]:
         state = ", ".join(self.state.names)
         partial = ", ".join(self.partial)
