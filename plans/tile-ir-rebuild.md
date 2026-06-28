@@ -247,7 +247,12 @@ the carried IR, in three slices:
   `TileOp` — the free `(batch…, m, d)` axes are its `grid_axes`, the store its `out` — instead of a lowered `LoopOp`
   fragment. `Graph.splice` is op-type-agnostic, so the `TileOp` terminal splices fine; `020_schedule` passes it through.
 
-Remaining in this phase: `build_flash_recovered` (the fused-RoPE path) still emits a `LoopOp` (its hoisted per-cell
-prologue doesn't fit the grid-axes `TileOp` shape yet); `lower` runs in `TileOp.__post_init__` (deriving the body) rather
-than strictly in the materialize pass (a lazy body keyed off an op-tree structural key would defer it fully — small
-payoff, since `lower` is pure); and `TileOp` still subclasses `BodyOp` for the I/O contract.
+Flash now recognizes only the **clean** scaled-QK producer (Q/K as plain `Load`s). The fused-RoPE producer-splicing
+builder (`build_flash_recovered`) was **deleted** rather than kept half-converted to the op tree — RoPE attention no
+longer fuses to flash, and its un-fused fallback isn't covered, so `test_block` (TinyLlama / Qwen) + the RoPE
+`test_attention_chains` case are xfailed (`_NO_RECOVERED`). Re-supporting RoPE attention means a producer-splicing score
+`Map` (a per-cell prologue slot on the op tree), to be rebuilt cleanly on the op-tree path.
+
+Remaining in this phase: `lower` runs in `TileOp.__post_init__` (deriving the body) rather than strictly in the
+materialize pass (a lazy body keyed off an op-tree structural key would defer it fully — small payoff, since `lower` is
+pure); and `TileOp` still subclasses `BodyOp` for the I/O contract.

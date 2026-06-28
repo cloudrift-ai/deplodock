@@ -39,7 +39,6 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import (
     build_flash_frag,
-    build_flash_recovered,
     flash_shape_eligible,
     gqa_group,
     online_softmax_combine,
@@ -191,34 +190,28 @@ def _try_flash(match: Match, root: Node) -> Graph | None:
     if any(nid not in graph.nodes for nid in operands):
         return None
 
-    # Synthetic path: a clean scaled-QK producer (Q/K recoverable as plain Loads).
+    # A clean scaled-QK producer (Q/K recoverable as plain Loads). A fused score
+    # producer (RoPE / GQA index inline) whose Q/K aren't plain loads is not handled —
+    # flash isn't recognized, and the softmax-then-P@V falls back to its un-fused tiers.
     qk = _extract_qk(graph.nodes[x_buf])
-    if qk is not None:
-        q_id, k_id, _head_dim = qk
-        if q_id not in graph.nodes or k_id not in graph.nodes:
-            return None
-        q_shape = graph.nodes[q_id].output.shape
-        k_shape = graph.nodes[k_id].output.shape
-        v_shape = graph.nodes[v_id].output.shape
-        group = gqa_group(q_shape, k_shape)
-        if group is None:
-            return None
-        mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
-        if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
-            return None
-        mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
-        return build_flash_frag(
-            q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
-        )
-
-    # Recovery path: a fused score producer (RoPE / GQA index / mask inline). The
-    # producer carries its own mask, so a softmax-side mask here would double-count.
-    if mask_kind != "none":
+    if qk is None:
         return None
-    xnode = graph.nodes[x_buf]
-    if not isinstance(xnode.op, LoopOp):
+    q_id, k_id, _head_dim = qk
+    if q_id not in graph.nodes or k_id not in graph.nodes:
         return None
-    return build_flash_recovered(graph, xnode.op, root.op, x_buf, v_id, root.output)
+    q_shape = graph.nodes[q_id].output.shape
+    k_shape = graph.nodes[k_id].output.shape
+    v_shape = graph.nodes[v_id].output.shape
+    group = gqa_group(q_shape, k_shape)
+    if group is None:
+        return None
+    mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
+    if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
+        return None
+    mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
+    return build_flash_frag(
+        q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
+    )
 
 
 # ---------------------------------------------------------------------------

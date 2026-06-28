@@ -34,6 +34,10 @@ tests become markable items registered below. ``TILE_ENTANGLED_FILES`` is theref
 from __future__ import annotations
 
 _R = "tile IR demolished — rebuild in progress (see plans/tile-ir-rebuild.md)"
+# Flash recognizes only the clean scaled-QK producer; the RoPE fused-attention path
+# (build_flash_recovered) was removed rather than kept half-converted to the op tree, so
+# RoPE attention no longer fuses to flash and its un-fused fallback isn't covered yet.
+_NO_RECOVERED = "build_flash_recovered removed — clean-SDPA-only flash (see plans/tile-ir-rebuild.md)"
 
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).
@@ -70,6 +74,11 @@ XFAIL: dict[str, str] = {
     # accuracy for the rest, which is un-xfailed).
     "tests/compiler/e2e/test_attention_chains.py::test_full_self_attn_tinyllama_seq512": _R,
     "tests/compiler/e2e/test_attention_chains.py::test_qkv_attn_no_rope": _R,
+    # RoPE fused attention — needs build_flash_recovered (removed). Keep AFTER the
+    # _seq512 entry above: this key substring-matches it too, and conftest is first-wins.
+    "tests/compiler/e2e/test_attention_chains.py::test_full_self_attn_tinyllama": _NO_RECOVERED,
+    "tests/compiler/e2e/test_block.py::test_tinyllama_block_accuracy[cuda]": _NO_RECOVERED,
+    "tests/compiler/e2e/test_block.py::test_qwen_block_accuracy": _NO_RECOVERED,
     "tests/compiler/e2e/test_knob_pinning.py::test_article_tma_sgemm_reproduction": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN16_BM32_FM1_FN16]": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN32_BM16_FM2_FN8]": _R,

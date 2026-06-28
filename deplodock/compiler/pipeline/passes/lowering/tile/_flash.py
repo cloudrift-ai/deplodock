@@ -1,21 +1,21 @@
 """Flash-attention shared helper — the carrier builders, eligibility predicate,
-and the graph-fragment builders.
+and the graph-fragment builder.
 
 Recognition itself lives in ``lowering/tile/010_recognize`` (which calls these
 builders); this module owns the *construction* side: the ``flash_combine`` /
 ``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
-predicates, and the fragment builders ``build_flash_frag`` / ``build_flash_recovered``.
-Neither hand-assembles a kernel body: both build the high-level op tree (``ir/tile/ops``
-— flash is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the
-``Σ Q·K`` contraction, the carrier ``finalize``\\ ing ``O/l``).
+predicates, and the fragment builder ``build_flash_frag``. It doesn't hand-assemble a
+kernel body — it builds the high-level op tree (``ir/tile/ops``): flash is the
+``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the ``Σ Q·K``
+contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns that
+``Reduce`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
+``grid_axes``, the store its ``out``; ``020_schedule`` passes the ``TileOp`` through and
+``lower`` runs at materialize.
 
-``build_flash_frag`` (clean ``Load``\\ s of Q/K) returns the ``Reduce`` UNLOWERED, on a
-``TileOp`` — the free ``(batch…, m, d)`` axes are its ``grid_axes``, the store its
-``out``; ``020_schedule`` passes it through and ``lower`` runs at materialize.
-``build_flash_recovered`` (a recovered fused-RoPE score, spliced in verbatim as a
-``Map``) still ``lower``\\ s to a ``LoopOp`` that ``020_schedule`` peels — its hoisted
-per-cell RoPE prologue doesn't yet fit the grid-axes ``TileOp`` shape. Both end as
-``TileOp``\\ s; the flash skeleton lives once, in the tree.
+Scope is the **clean** scaled-QK producer (Q/K recoverable as plain ``Load``\\ s). A
+fused score producer whose Q/K are computed SSA — RoPE'd QK — is NOT recognized as
+flash (it falls back to its un-fused tiers); a producer-splicing builder for that case
+was removed rather than kept half-converted to the op tree.
 
 The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
@@ -52,11 +52,8 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
-from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Monoid, Select, SelectBranch, Twist
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
 
@@ -390,181 +387,3 @@ def _flash_op(
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
     return flash_reduce, out_idx
-
-
-# --------------------------------------------------------------------------- #
-# Recovered-body flash — for fused score producers the synthetic builder can't
-# reconstruct (the QK reduce carries RoPE + GQA index + scale + mask inline, so
-# Q/K are computed SSA values, not plain Loads). Instead of rebuilding the score
-# from recovered Q/K buffers, inline the producer's score COMPUTATION wholesale
-# and recover the V-load / output-write index arithmetic from the consumer — so
-# RoPE, the GQA ``head // group`` index, the per-element mask, and the o_proj
-# reshape all ride along verbatim. The only thing flash adds is the streaming
-# softmax + P@V (the score never round-trips through gmem).
-# --------------------------------------------------------------------------- #
-
-
-def _var_name(e: Expr) -> str | None:
-    return e.name if isinstance(e, Var) else None
-
-
-def _only_write(op: LoopOp) -> Write | None:
-    ws = [s for s in op.body.iter() if isinstance(s, Write)]
-    return ws[0] if len(ws) == 1 else None
-
-
-def _loop_containing(stmts: tuple, target: object) -> Loop | None:
-    """The innermost ``Loop`` whose immediate body holds ``target`` (by identity)."""
-    for s in stmts:
-        if isinstance(s, Loop):
-            if any(c is target for c in s.body):
-                return s
-            inner = _loop_containing(s.body, target)
-            if inner is not None:
-                return inner
-    return None
-
-
-def _collect_ssa(stmts: tuple) -> set[str]:
-    """Every SSA name a (possibly nested) stmt sequence defines."""
-    names: set[str] = set()
-    for s in stmts:
-        if isinstance(s, Loop):
-            names |= _collect_ssa(s.body)
-        else:
-            names |= set(s.defines())
-    return names
-
-
-def _all_loads(stmts: tuple) -> list[Load]:
-    out: list[Load] = []
-    for s in stmts:
-        if isinstance(s, Loop):
-            out += _all_loads(s.body)
-        elif isinstance(s, Load):
-            out.append(s)
-    return out
-
-
-def _ext(op: LoopOp, name: str):
-    for lp in op.body.iter_of_type(Loop):
-        if lp.axis.name == name:
-            return lp.axis.extent
-    return None
-
-
-def build_flash_recovered(graph: Graph, producer: LoopOp, consumer: LoopOp, x_buf: str, v_id: str, out: Tensor) -> Graph | None:
-    """Rewrite a (score producer, softmax-P@V consumer) pair into one streaming
-    flash ``LoopOp`` by inlining the producer's recovered score body and recovering
-    the consumer's V-load / output-write indices. Returns ``None`` (→ fall through)
-    when the pair doesn't match the recoverable shape.
-
-    The producer must write the score per ``(…, head, m, kv)`` with a single inner
-    reduce (over ``dd``); the consumer's P@V reduce supplies the V access pattern
-    (``head // group`` + any o_proj reshape) and the output index."""
-    # --- producer: the per-(head, m, kv) score computation ---
-    pw = _only_write(producer)
-    if pw is None or pw.output != x_buf or len(pw.index) < 3:
-        return None
-    p_head, p_m, p_kv = _var_name(pw.index[-3]), _var_name(pw.index[-2]), _var_name(pw.index[-1])
-    if None in (p_head, p_m, p_kv):
-        return None
-    score_loop = _loop_containing(producer.body, pw)
-    if score_loop is None or score_loop.axis.name != p_kv:
-        return None
-    score_stmts = tuple(s for s in score_loop.body if s is not pw)
-    reduce_loops = [s for s in score_stmts if isinstance(s, Loop)]
-    if len(reduce_loops) != 1:
-        return None  # exactly one inner score reduce (the dd dot product)
-    p_dd = reduce_loops[0].axis.name
-    accums = [s for s in reduce_loops[0].body if isinstance(s, Accum)]
-    if not accums:
-        return None
-    prologue: list = []
-    for s in producer.body:
-        if isinstance(s, Loop):
-            break
-        prologue.append(s)
-
-    # --- consumer: V-load index, output index, free extents ---
-    cw = _only_write(consumer)
-    if cw is None:
-        return None
-    pv_loop = None
-    for lp in consumer.body.iter_of_type(Loop):
-        if any(isinstance(s, Accum) and s.name == cw.value for s in lp.body):
-            pv_loop = lp
-    if pv_loop is None:
-        return None
-    c_kv = pv_loop.axis.name
-    v_loads = [s for s in pv_loop.body if isinstance(s, Load) and s.input == v_id]
-    if len(v_loads) != 1:
-        return None
-    v_index = v_loads[0].index
-    d_loop = _loop_containing(consumer.body, cw)
-    if d_loop is None:
-        return None
-    c_d = d_loop.axis.name
-    x_loads = [s for s in consumer.body.iter() if isinstance(s, Load) and s.input == x_buf]
-    if not x_loads or len(x_loads[0].index) < 3:
-        return None
-    c_head, c_m = _var_name(x_loads[0].index[-3]), _var_name(x_loads[0].index[-2])
-    if c_head is None or c_m is None:
-        return None
-
-    head_ext, m_ext = _ext(consumer, c_head), _ext(consumer, c_m)
-    d_ext, kv_ext = d_loop.axis.extent, pv_loop.axis.extent  # the dd reduce keeps the producer's own extent
-    if any(e is None for e in (head_ext, m_ext)):
-        return None
-
-    # --- remap the producer score body into flash's (h, m, kv, dd) namespace ---
-    prod_sigma = Sigma({p_head: Var("h"), p_m: Var("m"), p_kv: Var("kv"), p_dd: Var("dd")})
-
-    def prod_axis(ax: Axis) -> Axis:
-        return Axis(name="dd", extent=ax.extent) if ax.name == p_dd else ax
-
-    ssa = _collect_ssa(tuple(prologue)) | _collect_ssa(score_stmts)
-
-    def prod_rename(n: str) -> str:
-        return f"sc_{n}" if n in ssa else n
-
-    new_prologue = [rewrite_stmt(s, prod_rename, prod_sigma, prod_axis) for s in prologue]
-    new_score = [rewrite_stmt(s, prod_rename, prod_sigma, prod_axis) for s in score_stmts]
-    score_name = prod_rename(pw.value)
-    inits = [Init(name=prod_rename(a.name), op=a.op, dtype="f32") for a in accums]
-
-    # --- recover the consumer's V-load and output indices ---
-    v_sigma = Sigma({c_head: Var("h"), c_kv: Var("kv"), c_d: Var("d")})
-    out_sigma = Sigma({c_head: Var("h"), c_m: Var("m"), c_d: Var("d")})
-    new_v_index = tuple(v_sigma.apply(e) for e in v_index)
-    new_out_index = tuple(out_sigma.apply(e) for e in cw.index)
-
-    # Same flash skeleton as the clean path — expressed once in the op tree. Only the
-    # score partial is opaque: a recovered fused-RoPE subgraph (Q/K are computed SSA,
-    # not loads), which is just a Map (a stmt body last-binding score_name); the kv fold
-    # + O/l projection are generic.
-    add = ElementwiseImpl("add")
-    flash_reduce = Reduce(
-        out="O_i__proj",
-        axis=Axis(name="kv", extent=kv_ext),
-        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),  # carrier.finalize emits O_i/l_i post-loop
-        partials=(Map([*inits, *new_score]), TensorRef(v_id, new_v_index)),
-        init_ops=(ElementwiseImpl("maximum"), add, add),
-    )
-    elem = (*lower(flash_reduce), Write(output=out.name, index=new_out_index, value="O_i__proj"))
-    nest = (
-        *new_prologue,
-        Loop(
-            axis=Axis(name="h", extent=head_ext),
-            body=(Loop(axis=Axis(name="m", extent=m_ext), body=(Loop(axis=Axis(name="d", extent=d_ext), body=elem),)),),
-        ),
-    )
-
-    frag = Graph()
-    bufs = {ld.input for ld in (*_all_loads(tuple(new_prologue)), *_all_loads(tuple(new_score)))} | {v_id}
-    for bid in sorted(bufs):
-        t = graph.nodes[bid].output
-        frag.add_node(op=InputOp(), inputs=[], output=Tensor(bid, t.shape, t.dtype), node_id=bid)
-    frag.add_node(op=LoopOp(body=nest), inputs=sorted(bufs), output=Tensor(out.name, out.shape, out.dtype), node_id=out.name)
-    frag.outputs = [out.name]
-    return frag
