@@ -40,7 +40,6 @@ and produce Loop-IR's canonical form.
 from deplodock.compiler.ir.stmt.algebra import Map, Monoid, Operand, Semiring, State, Twist
 from deplodock.compiler.ir.stmt.base import (
     INDENT,
-    ReduceCarrier,
     RenderCtx,
     Stmt,
     op_to_expr,
@@ -97,7 +96,6 @@ __all__ = [
     "Mma",
     "Operand",
     "Pack",
-    "ReduceCarrier",
     "Semiring",
     "RenderCtx",
     "Select",

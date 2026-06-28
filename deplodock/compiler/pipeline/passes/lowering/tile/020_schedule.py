@@ -6,7 +6,7 @@ map onto the per-cell (one-thread-per-output-cell) tier:
 
 - **no fold** (every axis free): the whole iteration space maps onto the thread
   grid; the per-cell body is just the leaf compute.
-- **a fold** (a reduce ``Loop`` carrying a ``ReduceCarrier``): only the free axes
+- **a fold** (a reduce ``Loop`` carrying a carrier — ``Accum`` / ``Mma`` / ``Monoid``): only the free axes
   *enclosing* the fold map onto the grid; the reduce loop — and any epilogue /
   output sweep that shares its accumulator — stays serial inside the per-cell
   body. One thread owns one output row's fold.

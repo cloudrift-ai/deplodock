@@ -14,7 +14,6 @@ from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from deplodock.compiler.ir.stmt.base import (
-    ReduceCarrier,
     RenderCtx,
     Stmt,
     _pad,
@@ -453,7 +452,7 @@ class Assign(Stmt):
 
 
 @dataclass(frozen=True)
-class Accum(ReduceCarrier):
+class Accum(Stmt):
     """Reduce accumulator — declares-and-folds in one statement.
 
     Semantics: ``name = op(name, value)`` inside the enclosing reduce
@@ -573,7 +572,7 @@ class Accum(ReduceCarrier):
 
 
 @dataclass(frozen=True)
-class Mma(ReduceCarrier):
+class Mma(Stmt):
     """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul

@@ -134,10 +134,11 @@ max/min family) drives the init-placement dtype choice.
 
 One `LoopOp` = one GPU kernel described as an SSA program over named
 iteration axes. Free vs reduce is inferred from body structure — a
-`Loop` is a reduce Loop iff its body contains a `ReduceCarrier` (the shared
-base of `Accum`, its tensor-core form `Mma`, and the general monoid `Monoid`;
-`is_reduce`, axis threading, and the other carrier-agnostic checks key off the
-base, not an `isinstance(s, (Accum, Mma))` ladder). Rules that need the combine's
+`Loop` is a reduce Loop iff its body holds a carrier — `Accum`, its tensor-core
+form `Mma`, or the general monoid `Monoid`. `is_reduce` (and axis threading and
+the other carrier-agnostic checks) test exactly that `isinstance(s, (Accum, Mma,
+Monoid))` tuple — there is no shared base class; the carriers are plain `Stmt`s
+that happen to share the reduce-surface methods. Rules that need the combine's
 algebra read the carrier's `associative` / `commutative` / `has_identity` traits
 directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
 constants; `Monoid` reports `associative` / `has_identity` `True` by construction
@@ -412,8 +413,8 @@ itself** (`AtomTile.atom`) — the structural "this matmul factorizes through
 tensor cores" signal, carried in the IR rather than re-derived from a knob.
 Right after, `tile/enumeration/050_warp_build` reads `.atom` off the tile and
 collapses the cell's `Assign(multiply) + Accum` into a single `Mma` op
-(`c += a @ b`, a reduce-accumulate sibling of `Accum` — both subclass
-`ReduceCarrier`, so the `Mma` makes its loop `is_reduce` with no special-casing,
+(`c += a @ b`, a reduce-accumulate sibling of `Accum` — both are carriers in the
+`is_reduce` tuple, so the `Mma` makes its loop `is_reduce` with no special-casing,
 and reports the additive-fold traits `associative` / `commutative` /
 `has_identity` directly) that carries that `Atom` and names its A/B
 operand `Load`s by SSA

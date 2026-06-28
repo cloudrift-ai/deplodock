@@ -14,9 +14,14 @@ from dataclasses import dataclass
 from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.stmt.base import INDENT, ReduceCarrier, RenderCtx, Stmt, _pad, pretty_body, render_body
+from deplodock.compiler.ir.stmt.algebra import Monoid
+from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum
+from deplodock.compiler.ir.stmt.leaves import Accum, Mma
+
+# The loop-carried reduce accumulators — a Loop is a *reduce* loop iff its immediate
+# body holds one of these (the predicate `is_reduce` keys off, see below).
+_CARRIERS = (Accum, Mma, Monoid)
 
 
 def _source_suffix(axis: Axis) -> str:
@@ -79,9 +84,9 @@ class Loop(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A loop is a reduce-loop iff its immediate body contains a
-        ``ReduceCarrier`` (``Accum``, or its tensor-core form ``Mma``)."""
-        return any(isinstance(s, ReduceCarrier) for s in self.body)
+        """A loop is a reduce-loop iff its immediate body contains a carrier
+        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``)."""
+        return any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
@@ -293,9 +298,9 @@ class StridedLoop(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A strided loop is a reduce-loop iff its immediate body contains a
-        ``ReduceCarrier`` (``Accum``, or its tensor-core form ``Mma``)."""
-        return any(isinstance(s, ReduceCarrier) for s in self.body)
+        """A strided loop is a reduce-loop iff its immediate body contains a carrier
+        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``)."""
+        return any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()

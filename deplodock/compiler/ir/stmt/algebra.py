@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.stmt.base import ReduceCarrier, RenderCtx, render_merge_program
+from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load
 
@@ -153,7 +153,7 @@ class Twist:
 
 
 @dataclass(frozen=True)
-class Monoid(ReduceCarrier):
+class Monoid(Stmt):
     """A loop-carried **monoid** combine — a general associative reduce over
     internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
     ``Mma`` (tensor-core fragment fold).
@@ -277,9 +277,6 @@ class Monoid(ReduceCarrier):
         already the realization-agnostic cross-partition combine the
         cooperative-tree / split-KV / split-K reductions fold through."""
         return self.twist.combine_states
-
-    # ``project`` is the shared ``ReduceCarrier`` default (keyed off ``carried_names()`` ==
-    # ``state``) — the one magic method every carrier inherits; no Monoid-specific override.
 
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.

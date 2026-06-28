@@ -193,7 +193,7 @@ def test_combine_weighted_average_matches_numpy(n: int) -> None:
 
 
 def test_combine_reduce_loop_recognized() -> None:
-    """The streaming sweep is a reduce loop via the ReduceCarrier protocol — the
+    """The streaming sweep is a reduce loop because its body holds a carrier — the
     pipeline's reduce-axis machinery keys off this with no Monoid-specific
     isinstance ladder."""
     op = _softmax_loopop(8)
