@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Body, Loop
+from deplodock.compiler.ir.stmt import Body, Loop, Map
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -86,4 +86,8 @@ def rewrite(match: Match, root: Node) -> TileOp | None:
     # cooperative / split realizations are a later (perf) tier.
     if not axes and not folds:
         raise RuleSkipped("no work to schedule")
-    return TileOp(body=Body(tuple(cell)), name=loop.name, grid_axes=tuple(axes))
+    # The per-cell program is a Map (a pointwise stmt body — it may hold a serial
+    # reduce Loop + carrier inside). TileOp carries it as its op tree; the body is
+    # derived by ``lower``. A scalar fold lowers from a Map verbatim (lower(Map) == its
+    # stmts); flash carries a Reduce instead, emitted upstream by the recognizer.
+    return TileOp(op=Map(tuple(cell)), name=loop.name, grid_axes=tuple(axes))
