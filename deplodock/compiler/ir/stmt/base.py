@@ -599,22 +599,6 @@ class ReduceCarrier(Stmt):
         ``"<carried>__o"`` to match."""
         raise NotImplementedError(f"{type(self).__name__}.combine_operands")
 
-    def project(self, program, *, distributed_inputs, dist) -> None:
-        """Project this carrier's ``program`` (a ``merge`` forward-step / ``combine_states``
-        body) onto a :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` backend
-        — the **magic method** that takes the carrier algebra to a target distribution by the
-        distribution law. Taints the distributed values (seeded by ``distributed_inputs``), then
-        dispatches each ``Assign`` to the backend's fold (a reduce over the distributed axis →
-        its cross-partition combine) / pointwise (elementwise → its per-element map) / scalar /
-        carried-state reassign — carrier-generic, no shape knowledge, no carrier-type switch.
-        The fragment realizer is one such backend (``ir/twist.MmaTwist``); ``dist`` is the
-        stateful backend, mutated in place. Default keyed off :meth:`carried_names` — the one
-        ``project`` every carrier (``Accum`` / ``Mma`` / ``Monoid``) shares. See
-        ``ir/stmt/carrier_algebra``."""
-        from deplodock.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
-
-        interpret(program, distributed_inputs=distributed_inputs, state_names=self.carried_names(), dist=dist)
-
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:
     """Flatten ``stmt.pretty(indent)`` over a body sequence."""

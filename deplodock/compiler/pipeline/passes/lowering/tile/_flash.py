@@ -133,8 +133,8 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
         d = d·alpha + p;     m = m_new   (last)
 
-    A non-twisted carrier (no value partial) — :meth:`ScalarCombiner.combine` realizes it at the
-    scalar tier; the downstream normalize pass reads the final ``m`` and ``1/d``. Temps are namespaced
+    A non-twisted carrier (no value partial) — ``Monoid.render`` realizes its merge at the scalar
+    tier; the downstream normalize pass reads the final ``m`` and ``1/d``. Temps are namespaced
     by ``m`` so they stay unique per kernel."""
 
     def t(suf: str) -> str:

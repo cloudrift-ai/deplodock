@@ -524,9 +524,9 @@ class Accum(ReduceCarrier):
         """This additive/associative ``Accum`` AS the degenerate 1-component ``Monoid`` it already is —
         state ``(name,)``, partial ``(value,)``, ``merge`` = ``name = op(name, value)``, identity the
         op's. The carrier-algebra fact that a SEMIRING / scalar reduce is the trivial monoid: it lets an
-        ``Accum`` lower through the **same** ``Combiner`` / cross-partition path as a general ``Monoid``,
-        with no additive special-case. The auto-derived ``combine_states`` (``name = op(name, name__o)``)
-        equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
+        ``Accum`` lower through the **same** ``Monoid.render`` / cross-partition path as a general
+        ``Monoid``, with no additive special-case. The auto-derived ``combine_states``
+        (``name = op(name, name__o)``) equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
         from deplodock.compiler.ir.stmt.algebra import Monoid, Twist  # local: algebra imports leaves
 
         return Monoid(

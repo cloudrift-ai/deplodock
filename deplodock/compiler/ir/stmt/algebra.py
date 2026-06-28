@@ -173,8 +173,9 @@ class Monoid(ReduceCarrier):
       the streaming loop. As data — a tuple of ``Assign``\\ s reading the state. Empty
       = identity (the state itself is the output, e.g. a plain reduce / matmul). Flash
       authors ``O_i / l_i`` (normalize the streamed output by the denominator). Named
-      ``finalize`` not ``project`` because :meth:`ReduceCarrier.project` is the
-      distinct *distribution* projection (onto a cooperative / fragment realization).
+      ``finalize`` is the φ of ``project ∘ reduce ∘ map`` — the post-reduction map to
+      the output value (distinct from any cross-partition / cooperative realization,
+      which the carrier's ``combine_states`` data describes).
 
     The whole operation lives **inside this carrier**, not as loose body
     statements, so the gates that reject online algorithms (``accums_independent``,

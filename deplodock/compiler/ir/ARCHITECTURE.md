@@ -370,9 +370,11 @@ atomic-write classification from enclosing ``GridTile.axes`` vs
 ``Accum`` is the degenerate 1-component monoid (its ``combine_partials`` is the
 one-``Assign`` op-fold), the general ``Monoid`` (flash online-softmax) the
 multi-component case — keyed by the carrier's first carried name. The
-materializer's single ``emit_combine`` backend (reached via the one
-``carrier_algebra.realize(carrier, dist)`` composer) emits the cross-thread fold off the
-carrier's ``carried_names`` / ``combine_operands`` / ``combine_partials``:
+materializer's single ``emit_combine`` backend (the realization layer that composed
+this off the carrier — the pre-rebuild ``carrier_algebra`` interpreter + the carrier's
+``project`` magic method — was removed in the tile-IR rebuild, to be rebuilt against the
+op tree) emits the cross-thread fold off the carrier's ``carried_names`` /
+``combine_operands`` / ``combine_partials``:
 ``WarpShuffle`` (register ``__shfl_xor_sync`` butterfly, ≤ warp), a hierarchical
 per-warp ``WarpShuffle`` + ``n_warps``-wide ``TreeHalve`` (power-of-two warp
 multiple), or a block-wide per-component ``TreeHalve`` (> warp) — all folding via

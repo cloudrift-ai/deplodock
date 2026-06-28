@@ -28,12 +28,13 @@ from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
 # guarded so the module still collects; its tests then fail at runtime and are caught by
 # the xfail registry (a hard collection error could not be).
 try:
-    from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, TileGraph, TileGraphOp, TileOp, Transport
     from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag, seed_graph
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+
+    from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, TileGraph, TileGraphOp, TileOp, Transport
 except ImportError:  # module may now exist sans these (partially rebuilt) symbols → ImportError, not ModuleNotFoundError
     Buffer = Edge = Placement = Space = TileGraph = TileGraphOp = TileOp = Transport = None
     assemble_block = fam = build_dag = seed_graph = classify = iter_dag = None
@@ -284,11 +285,12 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     feeding the matmul. The reduce over the full row precedes the matmul K-loop. Scalar
     tier here; the live warp-tier path is covered by
     ``test_offering_fork_fused_edge_runs_correctly[warp]``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.algebra import AlgebraKind
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.stmt import Write
     from deplodock.compiler.ir.tile.ir import Placement, TileGraphOp
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
 
     monkeypatch.setenv("DEPLODOCK_BN", "16")
     monkeypatch.setenv("DEPLODOCK_BM", "16")
