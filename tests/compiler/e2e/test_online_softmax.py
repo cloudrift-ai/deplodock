@@ -16,15 +16,10 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop, Monoid
-from deplodock.compiler.pipeline.passes.lowering.tile._flash import online_softmax_combine
+from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse, online_softmax_combine
 from deplodock.compiler.trace.torch import trace_module
 
 from ..conftest import requires_cuda
-
-_fuse = __import__(
-    "deplodock.compiler.pipeline.passes.lowering.tile.010_recognize",
-    fromlist=["_fuse"],
-)._fuse
 
 
 class _Softmax(torch.nn.Module):

@@ -1,16 +1,21 @@
-"""Flash-attention shared helper — the carrier builders, eligibility predicate,
-and the graph-fragment builder.
+"""Flash-attention helper — recognition and construction.
 
-Recognition itself lives in ``lowering/tile/010_recognize`` (which calls these
-builders); this module owns the *construction* side: the ``flash_combine`` /
-``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
-predicates, and the fragment builder ``build_flash_frag``. It doesn't hand-assemble a
-kernel body — it builds the high-level op tree (``ir/tile/ops``): flash is the
-``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the ``Σ Q·K``
-contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns that
-``Reduce`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
-``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
-it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
+The ``010_recognize`` pass calls :func:`try_flash`; everything flash lives here. Two
+halves:
+
+- **Recognition** — :func:`try_flash` matches a softmax-then-P@V kernel (+ its clean
+  scaled-QK producer) via ``_recognize`` / ``_extract_qk`` / ``_classify_rowmax``, and
+  emits the fused fragment.
+- **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
+  ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
+  hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
+  is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the ``Σ
+  Q·K`` contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns
+  that ``Reduce`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
+  ``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
+  it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
+
+(Online softmax — flash's softmax-stats half without the P@V — lives in ``_softmax``.)
 
 Scope is the **clean** scaled-QK producer (Q/K recoverable as plain ``Load``\\ s). A
 fused score producer whose Q/K are computed SSA — RoPE'd QK — is NOT recognized as
@@ -46,6 +51,7 @@ offer + ``AnalyticPrior`` cold-start are a follow-up.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Tensor
@@ -53,9 +59,15 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Monoid, Select, SelectBranch, Twist
+from deplodock.compiler.ir.loop.ir import LoopOp
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
+
+if TYPE_CHECKING:
+    from deplodock.compiler.graph import Node
+    from deplodock.compiler.ir.stmt.base import Stmt
+    from deplodock.compiler.pipeline import Match
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -121,57 +133,6 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
         # φ projection: the streamed output O is unnormalized — divide by the
         # log-sum-exp denominator l once, after the kv loop. ``lower`` emits it post-loop.
         finalize=(Assign(f"{o}__proj", "divide", (o, ll)),),
-    )
-
-
-def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoid:
-    """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the P@V
-    accumulator. State ``(m, d)`` (running row max / exp-sum denominator) folds this element's score
-    partial ``s`` in ONE streaming pass (vs the classic two: a row-max reduce then a
-    ``Σ exp(x − max)`` reduce)::
-
-        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
-        d = d·alpha + p;     m = m_new   (last)
-
-    A non-twisted carrier (no value partial) — ``Monoid.render`` realizes its merge at the scalar
-    tier; the downstream normalize pass reads the final ``m`` and ``1/d``. Temps are namespaced
-    by ``m`` so they stay unique per kernel."""
-
-    def t(suf: str) -> str:
-        return f"{m}__{suf}"
-
-    merge = (
-        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)
-        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new
-        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)  (reads OLD m)
-        Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
-        Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
-        Assign(t("dl"), "multiply", (d, t("al"))),  # d·alpha
-        Assign(d, "add", (t("dl"), t("p"))),  # d = d·alpha + p          [state]
-        Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
-    )
-    # The LSE monoid is asymmetric (partial arity ≠ state arity), so the state-merges-state form the
-    # cross-partition combine (cooperative-tree / split-KV) needs is authored explicitly (not derivable
-    # from ``merge``): merge this partition's (m, d) with a second's (m_o, d_o).
-    mb, db = f"{m}__o", f"{d}__o"
-    combine_states = (
-        Assign(t("cmx"), "maximum", (m, mb)),  # m_new = max(m, m_o)
-        Assign(t("cda"), "subtract", (m, t("cmx"))),  # m − m_new
-        Assign(t("ca"), "exp", (t("cda"),)),  # a = exp(m − m_new)   (reads OLD m)
-        Assign(t("cdb"), "subtract", (mb, t("cmx"))),  # m_o − m_new
-        Assign(t("cb"), "exp", (t("cdb"),)),  # b = exp(m_o − m_new)
-        Assign(t("cda2"), "multiply", (d, t("ca"))),  # d·a
-        Assign(t("cdb2"), "multiply", (db, t("cb"))),  # d_o·b
-        Assign(d, "add", (t("cda2"), t("cdb2"))),  # d = d·a + d_o·b           [state]
-        Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
-    )
-    return Monoid(
-        state=(m, d),
-        partial=(s,),
-        twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
-        identity=(Literal(-1e30), Literal(0.0)),  # (−inf, 0)
-        commutative=True,
-        axes=(axis,),
     )
 
 
@@ -387,3 +348,172 @@ def _flash_op(
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
     return flash_reduce
+
+
+# --------------------------------------------------------------------------- #
+# Recognition — match a softmax-then-P@V kernel (+ its clean scaled-QK producer)
+# and emit the fused flash fragment. Called from ``lowering/tile/010_recognize``.
+# --------------------------------------------------------------------------- #
+
+
+def _is_sum(accum: Accum) -> bool:
+    """The accum is the semiring additive reduce ``⊕`` (``add`` / ``sum``)."""
+    return accum.op.reduce_canon == "add"
+
+
+def _is_rowmax(accum: Accum) -> bool:
+    """The accum is the softmax rowmax reduce (``maximum`` / ``amax``)."""
+    return accum.op.reduce_canon == "maximum"
+
+
+def _accum_loops(op: LoopOp) -> list[Loop]:
+    """Loops whose immediate body folds an ``Accum`` (the matmul / softmax-stat reduces)."""
+    return [lp for lp in op.body.iter_of_type(Loop) if any(isinstance(s, Accum) for s in lp.body)]
+
+
+def _var_at(index: tuple, pos: int) -> str | None:
+    """The plain axis-var name at ``index[pos]``, or None (literal / affine)."""
+    if abs(pos) > len(index):
+        return None
+    e = index[pos]
+    return e.name if isinstance(e, Var) else None
+
+
+def _extract_qk(xnode: Node) -> tuple[str, str, object] | None:
+    """From the scaled-QK^T producer of the score buffer, return ``(q_id, k_id,
+    head_dim_extent)``. Q vs K by index (fusion reorders the operands): the matmul
+    operand whose seq index equals the score's row (M) axis is Q."""
+    op = xnode.op
+    if not isinstance(op, LoopOp):
+        return None
+    writes = [s for s in op.body.iter() if isinstance(s, Write)]
+    if len(writes) != 1:
+        return None
+    m_var = _var_at(writes[0].index, -2)  # score [..., M (query), N (kv)] → row var
+    if m_var is None:
+        return None
+    for lp in _accum_loops(op):
+        loads = [s for s in lp.body if isinstance(s, Load)]
+        accs = [s for s in lp.body if isinstance(s, Accum)]
+        muls = [s for s in lp.body if isinstance(s, Assign) and s.op.semiring_product]
+        if len(loads) == 2 and len(accs) == 1 and _is_sum(accs[0]) and muls:
+            q_id = k_id = None
+            for ld in loads:
+                if _var_at(ld.index, -2) == m_var:
+                    q_id = ld.input
+                else:
+                    k_id = ld.input
+            if q_id is not None and k_id is not None:
+                return q_id, k_id, lp.axis.extent
+    return None
+
+
+def _def(stmts: tuple[Stmt, ...], name: str) -> Stmt | None:
+    """The statement in ``stmts`` (one loop body, flat) that defines SSA ``name``."""
+    for s in stmts:
+        if isinstance(s, Load) and name in s.names:
+            return s
+        if isinstance(s, (Assign, Select)) and s.name == name:
+            return s
+    return None
+
+
+def _is_loopop(graph: Graph, buf: str) -> bool:
+    node = graph.nodes.get(buf)
+    return node is not None and isinstance(node.op, LoopOp)
+
+
+def _classify_rowmax(graph: Graph, lp: Loop) -> tuple[str, str, str | None] | None:
+    """For the rowmax reduce loop, return ``(score_buf, mask_kind, mask_buf)`` where
+    ``mask_kind`` is ``"none"`` / ``"causal"`` / ``"additive"``; else None. The value
+    folded by the ``maximum`` Accum is the bare score Load (no mask) or
+    ``add(score, mask)`` — the mask a coord ``Select`` (causal) or a buffer ``Load``."""
+    max_accs = [s for s in lp.body if isinstance(s, Accum) and _is_rowmax(s)]
+    if len(max_accs) != 1:
+        return None
+    feed = _def(lp.body, max_accs[0].value)
+    if isinstance(feed, Load):
+        return feed.input, "none", None
+    if isinstance(feed, Assign) and feed.op.name == "add":
+        a, b = feed.args
+        for sc, mk in ((a, b), (b, a)):
+            sdef, mdef = _def(lp.body, sc), _def(lp.body, mk)
+            if isinstance(sdef, Load) and _is_loopop(graph, sdef.input):
+                if isinstance(mdef, Select):
+                    return sdef.input, "causal", None
+                if isinstance(mdef, Load):
+                    return sdef.input, "additive", mdef.input
+    return None
+
+
+def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | None:
+    """If ``node`` is a softmax-then-P@V kernel, return ``(x_buf, v_buf, mask_kind,
+    mask_buf)`` — the score buffer the rowmax reduces, the P@V's V operand, and the
+    softmax-side mask (if any). Q/K recovery is left to the caller."""
+    op = node.op
+    if not isinstance(op, LoopOp):
+        return None
+    body = op.body
+    if not any(isinstance(s, Assign) and s.op.name == "exp" for s in body.iter()):
+        return None
+    writes = [s for s in body.iter() if isinstance(s, Write)]
+    if len(writes) != 1:
+        return None
+    out_write = writes[0]
+    x_buf: str | None = None
+    mask_kind = "none"
+    mask_buf: str | None = None
+    for lp in _accum_loops(op):
+        cls = _classify_rowmax(graph, lp)
+        if cls is not None:
+            x_buf, mask_kind, mask_buf = cls
+            break
+    if x_buf is None:
+        return None
+    v_buf: str | None = None
+    for lp in _accum_loops(op):
+        if not any(isinstance(s, Accum) and s.name == out_write.value and _is_sum(s) for s in lp.body):
+            continue
+        others = {s.input for s in lp.body if isinstance(s, Load)} - {x_buf, mask_buf}
+        if len(others) == 1:
+            v_buf = next(iter(others))
+    if v_buf is None:
+        return None
+    return x_buf, v_buf, mask_kind, mask_buf
+
+
+def try_flash(match: Match, root: Node) -> Graph | None:
+    """Recognize SDPA on ``root`` and return the fused flash ``Graph`` fragment (a
+    ``TileOp`` holding the flash ``Reduce`` + its scale / -inf constants), or ``None``
+    if ``root`` is not a recognizable / eligible attention kernel."""
+    found = _recognize(match.graph, root)
+    if found is None:
+        return None
+    x_buf, v_id, mask_kind, mask_buf = found
+    graph = match.graph
+    operands = (x_buf, v_id, *((mask_buf,) if mask_buf is not None else ()))
+    if any(nid not in graph.nodes for nid in operands):
+        return None
+
+    # A clean scaled-QK producer (Q/K recoverable as plain Loads). A fused score
+    # producer (RoPE / GQA index inline) whose Q/K aren't plain loads is not handled —
+    # flash isn't recognized, and the softmax-then-P@V falls back to its un-fused tiers.
+    qk = _extract_qk(graph.nodes[x_buf])
+    if qk is None:
+        return None
+    q_id, k_id, _head_dim = qk
+    if q_id not in graph.nodes or k_id not in graph.nodes:
+        return None
+    q_shape = graph.nodes[q_id].output.shape
+    k_shape = graph.nodes[k_id].output.shape
+    v_shape = graph.nodes[v_id].output.shape
+    group = gqa_group(q_shape, k_shape)
+    if group is None:
+        return None
+    mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
+    if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
+        return None
+    mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
+    return build_flash_frag(
+        q_id, k_id, v_id, q_shape, k_shape, v_shape, root.output, causal=(mask_kind == "causal"), group=group, mask=mask
+    )
