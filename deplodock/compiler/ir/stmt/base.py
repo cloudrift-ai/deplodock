@@ -92,11 +92,6 @@ class RenderCtx:
     # so they compose with non-default-dtype operands. Set transiently
     # by ``Assign.render`` around the native expression render.
     literal_default_dtype: str | None = None
-    # True inside a ``GridTile``'s render scope. Set by ``GridTile.render``
-    # when descending into its body so a nested ``ThreadTile.render`` picks
-    # the cooperative-decode form (threadIdx → axes) rather than the
-    # standalone pointwise form (linear tid + bounds guard).
-    inside_grid_tile: bool = False
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -112,7 +107,6 @@ class RenderCtx:
             buffer_dtypes=self.buffer_dtypes,
             ssa_dtypes=self.ssa_dtypes,
             literal_default_dtype=self.literal_default_dtype,
-            inside_grid_tile=self.inside_grid_tile,
         )
 
     # ---- Convenience wrappers over ``self.target``. These exist so the
