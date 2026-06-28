@@ -82,23 +82,35 @@ _OPS = {
 }
 
 
-def _compile_run(code: str, env: dict[str, str], monkeypatch) -> tuple[np.ndarray, list[np.ndarray], str]:
+def _compile_run(
+    code: str, env: dict[str, str], monkeypatch, *, dynamic: str | None = None, seq: int = 512
+) -> tuple[np.ndarray, list[np.ndarray], str]:
     """Trace + compile ``code`` under the pinned ``env``, run on seeded inputs, and return
-    ``(output, ordered_inputs, kernel_source)``."""
+    ``(output, ordered_inputs, kernel_source)``. With ``dynamic`` (a ``parse_position_specs``
+    spec like ``"seq_len@x:1"``) the named axis is traced symbolic and run at runtime size
+    ``seq`` — one compiled kernel exercised at an off-hint length (the cooperative reduce
+    strides to ``seq``, idle lanes folding the identity)."""
     from deplodock.commands.trace import graph_from_code
     from deplodock.compiler.backend.cuda.backend import CudaBackend
     from deplodock.compiler.ir.base import ConstantOp
 
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    graph = graph_from_code(code)[0]
+    if dynamic is not None:
+        from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+
+        ds = build_torch_dynamic_shapes(parse_position_specs([dynamic]))
+        graph = graph_from_code(code, dynamic_shapes=ds)[0]
+    else:
+        graph = graph_from_code(code)[0]
     be = CudaBackend()
     compiled = be.compile(graph)
     rng = np.random.default_rng(0)
     feed: dict[str, np.ndarray] = {}
     ordered: list[np.ndarray] = []
     for name in graph.inputs:
-        shape = tuple(d.as_static() for d in graph.nodes[name].output.shape)
+        # A symbolic axis resolves to the runtime size ``seq``; static dims keep their extent.
+        shape = tuple(d.as_static() if d.is_static else seq for d in graph.nodes[name].output.shape)
         arr = (rng.standard_normal(shape) * 0.5).astype(np.float32)
         feed[name] = arr
         ordered.append(arr)
@@ -119,6 +131,13 @@ def _compile_run(code: str, env: dict[str, str], monkeypatch) -> tuple[np.ndarra
 # below (not just output accuracy).
 _COOP_VARIANTS = {"serial": "", "coop_warp": "b32", "coop_hier": "b128"}
 _REDUCE_OPS = ("mean", "amax", "softmax")
+
+# Shape modes — the reduce-carrier ops all reduce dim=1 of input ``x``, so the SAME matrix
+# runs over a static reduce axis and a SYMBOLIC one (``seq_len@x:1``, traced dynamic, run at
+# an off-hint runtime size so the cooperative reduce's strided ``< seq_len`` bound masks the
+# tail). One compiled kernel per (op, variant) covers any length.
+_SHAPES = {"static": None, "dynamic": "seq_len@x:1"}
+_DYNAMIC_SEQ = 700  # off the 512 Dim hint → exercises the masked tail / partial final warp
 
 
 def _assert_combine_structure(src: str, variant: str, label: str) -> None:
@@ -141,17 +160,29 @@ def _assert_combine_structure(src: str, variant: str, label: str) -> None:
 
 @pytest.mark.parametrize("op", _REDUCE_OPS)
 @pytest.mark.parametrize("variant", list(_COOP_VARIANTS))
-def test_cooperative_combine_accuracy(op, variant, monkeypatch):
+@pytest.mark.parametrize("shape", list(_SHAPES))
+def test_cooperative_combine_accuracy(op, variant, shape, monkeypatch):
     """Every reduce-carrier op — degenerate (``mean`` / ``amax``) AND twisted full-row
-    (``softmax``, the online-softmax ``(m, d)`` carrier) — stays accurate AND emits the
-    pinned intra-CTA combine structure across the three stages (serial → warp-shuffle →
-    hierarchical smem), pinned via the ``REDUCE`` coop field."""
+    (``softmax``, the online-softmax ``(m, d)`` carrier) — over BOTH a static and a SYMBOLIC
+    reduce axis, stays accurate AND emits the pinned intra-CTA combine structure across the
+    three stages (serial → warp-shuffle → hierarchical smem), pinned via the ``REDUCE`` coop
+    field. The dynamic column proves the same combine deploys over a runtime ``seq_len`` (the
+    strided ``< seq_len`` bound masking the tail), one kernel for any length."""
+    if shape == "dynamic" and op == "mean":
+        # ``mean`` decomposes to ``sum × (1/N)`` with ``N`` baked from the TRACE shape, so a
+        # symbolic reduce divides by the wrong (compile-time) count. The cooperative reduce
+        # itself is fine (``amax`` / ``softmax`` dynamic pass); dynamic ``mean`` needs a
+        # separate frontend fix (a runtime ``1/seq_len`` divisor), tracked outside this tier.
+        pytest.skip("dynamic mean bakes its 1/N divisor from the trace shape — separate dynamic-mean fix")
     code, ref_fn = _OPS[op]
-    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch)
+    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch, dynamic=_SHAPES[shape], seq=_DYNAMIC_SEQ)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
-    assert diff < 1e-3, f"{op}/{variant}: combine mismatch (max abs err {diff})"
-    _assert_combine_structure(src, variant, op)
+    assert diff < 1e-3, f"{op}/{variant}/{shape}: combine mismatch (max abs err {diff})"
+    _assert_combine_structure(src, variant, f"{op}/{shape}")
+    if shape == "dynamic":
+        assert "int seq_len" in src, f"{op}/dynamic: symbolic reduce must carry the runtime extent arg"
+        assert "< seq_len" in src, f"{op}/dynamic: each lane must stride to the runtime extent (the masked tail)"
 
 
 @pytest.mark.parametrize("variant", ["serial", "coop_warp"])
