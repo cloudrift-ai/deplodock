@@ -9,9 +9,9 @@ halves:
 - **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
   hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
-  is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the ``Σ
+  is the ``(m,l,O)`` LSE ``Monoid`` over kv whose score partial ``Map`` holds the ``Σ
   Q·K`` contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns
-  that ``Reduce`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
+  that ``Monoid`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
   ``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
   it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
 
@@ -51,6 +51,7 @@ offer + ``AnalyticPrior`` cold-start are a follow-up.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
@@ -62,7 +63,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, State, Twist, Write
 from deplodock.compiler.ir.tile import TileOp
-from deplodock.compiler.ir.tile.ops import Map, Reduce, lower
+from deplodock.compiler.ir.tile.ops import Map, lower
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
@@ -210,7 +211,7 @@ def build_flash_frag(
     """Build the fragment graph holding the fused flash ``TileOp`` (+ its scale /
     -inf constants). The caller guarantees :func:`flash_shape_eligible`.
 
-    The compute is the op tree itself — a ``Reduce`` (the ``(m,l,O)`` LSE fold whose
+    The compute is the op tree itself — a ``Monoid`` (the ``(m,l,O)`` LSE fold whose
     carrier ``finalize``\\ s ``O/l``) carried unlowered on the ``TileOp``; the free
     ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest).
     ``020_schedule`` passes the ``TileOp`` through; ``materialize`` lowers it and
@@ -225,7 +226,7 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    flash_reduce = _flash_op(
+    flash_monoid = _flash_op(
         q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     grid = (
@@ -233,7 +234,7 @@ def build_flash_frag(
         Axis(name="m", extent=s_q_dim),
         Axis(name="d", extent=Dim(d_v)),
     )
-    tile = TileOp(op=flash_reduce, grid_axes=grid)
+    tile = TileOp(op=flash_monoid, grid_axes=grid)
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -273,11 +274,11 @@ def _flash_op(
     group: int = 1,
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
-) -> Reduce:
+) -> Monoid:
     """The per-output-element ``(…, m, d)`` compute as the op tree itself: flash is the
-    ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score partial ``Map`` holds a
+    ``(m,l,O)`` LSE :class:`Monoid` over ``kv`` whose score partial ``Map`` holds a
     NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked); the carrier
-    ``finalize``\\ s ``O/l``. Returns the unlowered ``Reduce`` (carried on the
+    ``finalize``\\ s ``O/l``. Returns the unlowered ``Monoid`` (carried on the
     ``TileOp``). The free ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops
     here; the output store is glue generated at materialize.
 
@@ -296,11 +297,11 @@ def _flash_op(
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
 
     add = ElementwiseImpl("add")
-    score_reduce = Reduce(  # s = Σ_dd Q·K — the inner contraction (SEMIRING), reset per kv step
-        out="sacc",
-        axis=Axis(name="dd", extent=Dim(head_dim)),
-        carrier=Accum(name="sacc", value="qk", op=add).as_monoid(),
-        partials=(
+    # s = Σ_dd Q·K — the inner contraction, reset per kv step. A degenerate (additive)
+    # ``Monoid`` self-contained over ``dd``: its one partial source is the lift ``Map``.
+    score_monoid = replace(
+        Accum(name="sacc", value="qk", op=add).as_monoid(),
+        partial=(
             Map(
                 [
                     Load(name="q_e", input=q_buf, index=q_idx),
@@ -309,12 +310,14 @@ def _flash_op(
                 ]
             ),
         ),
+        axis=Axis(name="dd", extent=Dim(head_dim)),
+        out="sacc",
         init_ops=(add,),
     )
     # The score partial is one Map: the dd contraction, the scale, and the mask — its
     # last stmt binds ``score_name`` (the carrier's score partial).
     score_stmts = [
-        *lower(score_reduce),
+        *lower(score_monoid),
         Load(name="scale_c", input="_flash_scale", index=()),
         Assign(name="s", op="multiply", args=("sacc", "scale_c")),
     ]
@@ -339,14 +342,17 @@ def _flash_op(
         score_name = "s_masked"
     else:
         score_name = "s"
-    flash_reduce = Reduce(  # the (m,l,O) streaming fold over kv; carrier.finalize emits O_i/l_i post-loop
-        out="O_i__proj",
+    # the (m,l,O) streaming fold over kv; carrier.finalize emits O_i/l_i post-loop. The
+    # partial sources are the score ``Map`` (binds ``score_name``) and the value ``Map``
+    # (one ``Load`` binding ``v_e``); ``flash_combine`` supplies state + twist + finalize.
+    flash_monoid = replace(
+        flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
+        partial=(Map(score_stmts), Map([Load(name="v_e", input=v_buf, index=v_idx)])),
         axis=Axis(name="kv", extent=s_k),
-        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
-        partials=(Map(score_stmts), Load(name="v_e", input=v_buf, index=v_idx)),
+        out="O_i__proj",
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    return flash_reduce
+    return flash_monoid
 
 
 # --------------------------------------------------------------------------- #
@@ -483,7 +489,7 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
 
 def try_flash(match: Match, root: Node) -> Graph | None:
     """Recognize SDPA on ``root`` and return the fused flash ``Graph`` fragment (a
-    ``TileOp`` holding the flash ``Reduce`` + its scale / -inf constants), or ``None``
+    ``TileOp`` holding the flash ``Monoid`` + its scale / -inf constants), or ``None``
     if ``root`` is not a recognizable / eligible attention kernel."""
     found = _recognize(match.graph, root)
     if found is None:

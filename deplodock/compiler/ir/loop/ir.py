@@ -433,7 +433,7 @@ def _validate(loop: LoopOp) -> None:
                 # must be in scope; its ``state`` is loop-carried (seeded by an
                 # enclosing Init, like Accum's implicit declare) and exports to the
                 # enclosing scope.
-                for pdep in stmt.partial:
+                for pdep in stmt.partial_names():
                     if pdep not in defined:
                         raise ValueError(f"Monoid: partial dep {pdep!r} not defined")
                 for nm in stmt.state.names:

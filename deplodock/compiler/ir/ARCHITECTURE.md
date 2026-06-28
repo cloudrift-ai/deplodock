@@ -145,31 +145,43 @@ constants; `Monoid` reports `associative` / `has_identity` `True` by constructio
 with a per-instance `commutative` field).
 
 **The algebra is in the body, not a tag** (`ir/stmt/algebra.py` — the consolidated
-algebraic vocabulary: the lift `Map`, the carrier `Monoid` + `Twist`, and the
-`Semiring` contraction view). There is no stored / derived `AlgebraKind`: a kernel's
-algebra is read directly off its carriers and partial structure where a pass needs it.
-The fold ⊕ is the carrier (`Accum` scalar fold, or `Monoid` + `Twist`); the lift is
-the partial — a unary value (a reduction: sum / max / online softmax) or a ⊗-product
-over several contraction operands (a contraction: matmul). A non-reduce scope is
-pointwise.
+algebraic vocabulary). There is no stored / derived `AlgebraKind`: a kernel's algebra is
+read directly off its nodes where a pass needs it. The high-level op tree
+(`ir/tile/ops.py`) is three node kinds, each of whose children (`Monoid.partial` /
+`Semiring.operands`) is itself one of the three — a uniform tree, no separate `Operand` /
+`Reduce` / `Load`-as-partial:
 
-The one structural shape the schedule must recognize lives here: `Semiring` (the
-`reduce(⊕) ∘ map(⊗)` view) and `Semiring.match(loop)`, computed on demand. A
-reduce is a contraction not by "two loads" but by the genuine algebra — the lift
-⊗ **distributes over** the fold ⊕ (`multiply` over `add`; *not* `add` over `add`,
-a sum of two operands) and contracts ≥ 2 distinct operands (`x·x` is a squared
-reduce, not a contraction). The view exposes `fold` / `lift` / `operands` /
-`reduce_axis` (and `is_additive` — the `(×, +)` semiring the mma atom implements).
-`lowering/tile/010_recognize` uses `Semiring.match(...) is None` to keep a
-matmul's `Accum` an `Accum` (rather than degenerate-monoidizing it like a plain
-reduce); `020_schedule` gates flash structurally (a reduce loop nested inside a
+- `Map` — the pointwise lift (a `Body` of stmts); a bare operand load is a one-`Load` `Map`.
+- `Monoid` (+ `Twist`) — the fold ⊕ over a carried `State`; self-contained reductions also
+  carry `axis` / `out` / `init_ops`, so a nested fold is just a child `Monoid`.
+- `Semiring` — the contraction `reduce(⊕) ∘ map(⊗)` (matmul) as a first-class node.
+
+`ir.tile.ops.lower` expands the tree to loop IR; `Monoid` / `Semiring` carry the reduction
+shape so the separate `Reduce` op is gone (a nested reduction is a child node, not a
+wrapper). The lift is the partial — a unary value (a reduction: sum / max / online
+softmax) or a ⊗-product over several contraction operands. A non-reduce scope is pointwise.
+
+`Semiring` (the `reduce(⊕) ∘ map(⊗)` node) has `lift` / `fold` / `operands` (each a
+`Map | Monoid | Semiring`) / `reduce_axis` / `out`, and lowers to the recognizable
+`Accum`-in-`Loop` form. A reduce is a contraction not by "two loads" but by the genuine
+algebra — the lift ⊗ **distributes over** the fold ⊕ (`multiply` over `add`; *not* `add`
+over `add`, a sum of two operands) and contracts ≥ 2 distinct operand buffers (`x·x` is a
+squared reduce, not a contraction). `Semiring.match(loop)` recognizes that form on demand
+(building the operands back as one-`Load` `Map`s, with `is_additive` — the `(×, +)`
+semiring the mma atom implements): `lowering/tile/010_recognize` uses `Semiring.match(...)
+is None` to keep a matmul's `Accum` an `Accum` (rather than degenerate-monoidizing it like
+a plain reduce); `020_schedule` gates flash structurally (a reduce loop nested inside a
 reduce loop); the mma atom tier reads the operands + `is_additive` to pick the
 tensor-core cell.
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
 associative operation, internal state)* made explicit: `state` (a `State`), `partial`
-(this step's contribution), a `commutative` flag, and a `twist` (below) that holds the
-operation. The carried state itself is its own class, **extracted like the `Twist`**:
+(this step's contribution sources — each a `Map | Monoid | Semiring` node, or a bound
+`str` name in the loop-IR carrier form; `partial_names()` reads the name off either), a
+`commutative` flag, and a `twist` (below) that holds the operation. Self-contained
+reductions also carry `axis` / `out` / `init_ops` (empty on the loop-IR carrier
+`ir.tile.ops.lower` leaves inside the emitted `Loop`). The carried state itself is its own
+class, **extracted like the `Twist`**:
 `State` bundles the internal-state SSA `names` with their per-component `identity` (one
 `Expr` each, the monoid's neutral element, seeded by the enclosing `Init`), and exposes
 `State.other` — the second-operand names `"<n>__o"` the cross-partition combine reads. So

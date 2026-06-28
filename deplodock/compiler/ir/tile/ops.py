@@ -1,130 +1,123 @@
 """High-level algebraic op tree — the geometry-free compute layer.
 
 The algebraic vocabulary itself lives in :mod:`deplodock.compiler.ir.stmt.algebra` —
-the lift :class:`~deplodock.compiler.ir.stmt.algebra.Map` (re-exported here), the
-carrier ``Monoid`` + ``Twist``, and the ``Semiring`` contraction view. This module is
-the **op tree** built on top of them: the fold node :class:`Reduce` and :func:`lower`.
+the lift :class:`~deplodock.compiler.ir.stmt.algebra.Map` (re-exported here), the fold
+carrier ``Monoid`` (+ ``Twist``), and the contraction ``Semiring``. This module is the
+**lowering** of that tree to loop IR (:func:`lower`) plus the structural pretty-printer.
 
-A kernel's compute is built from two things:
+A kernel's compute is a tree of three node kinds, each of whose children
+(``Monoid.partial`` / ``Semiring.operands``) is itself one of the three:
 
-- :class:`Reduce` — a fold over one axis through a carrier (``Monoid`` + ``Twist``),
-  whose **partials are nested**: a ``Map`` (a stmt body), a ``Load`` (a direct operand
-  read — buffer + index, named by the carrier partial it feeds), or another ``Reduce``.
-  A contraction (matmul / the SEMIRING) is ``Reduce(⊕=+)`` over ``Map(⊗=·)``; flash is
-  ``Reduce(lse)`` over the scaled ``Σ Q·K`` and the value ``Load`` ``V``.
-- ``Map`` — a pointwise body: a typed sequence of loop-IR stmts (the operand
-  ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and — at the
-  kernel root — the output ``Write``) that binds a value name as its last defining
-  stmt. It **is** a :class:`Body`, so it carries Body's analysis helpers and there is
-  nothing to "lower" — the stmts are the lowering. A ``Map`` plugged into a carrier
-  partial supplies that partial's stmts (last-binding the partial's name); an opaque
-  recovered subgraph — e.g. a fused-RoPE score whose Q/K are computed SSA, not loads —
-  is just a ``Map``.
+- ``Map`` — a pointwise body: a typed sequence of loop-IR stmts (operand ``Load``\\ s, the
+  lift ``Assign``\\ s, an optional masking ``Select``, and — at the kernel root — the
+  output ``Write``) that binds a value name as its last defining stmt. It **is** a
+  :class:`~deplodock.compiler.ir.stmt.body.Body`, so there is nothing to "lower" — the
+  stmts are the lowering. A bare operand load is a one-``Load`` ``Map``.
+- ``Monoid`` — a fold over its ``axis`` through the carrier (its ``Twist`` is the
+  combine), folding the ``partial`` sources. Flash is the ``(m, l, O)`` monoid whose
+  score partial is a ``Map`` (or a nested ``Semiring``) and value partial a one-``Load``
+  ``Map``.
+- ``Semiring`` — a contraction ``reduce(⊕) ∘ map(⊗)`` (the matmul): the ``lift`` ⊗ over
+  its ``operands``, folded by the additive ``fold`` ⊕ over ``reduce_axis``.
 
-The tree is **geometry-free**: a ``Load``'s index exprs are the only place layout lives;
-the tree names the axes it folds and the operands it reads but says nothing about
-threads / tiling (that is the separate ``Tile(op, placement)`` layer).
-
-:func:`lower` emits loop-IR stmts: a ``Reduce`` generates the structure (an ``Init``
-per carried state ← the carrier identity, the streaming ``Loop`` + the carrier fold,
-then the carrier's ``finalize`` φ — the post-loop projection of the final state to the
-output value, e.g. flash's ``O/l``), a ``Map`` is already stmts (returned as-is), and a
-``Load`` is itself a stmt. So a kernel *is* the lowered tree — no per-kernel builder.
+:func:`lower` emits loop-IR stmts: a ``Monoid`` generates an ``Init`` per carried state
+(← the carrier identity), the streaming ``Loop`` (its partials expanded as sibling stmts
++ the carrier fold), then the carrier's ``finalize`` φ — and leaves an in-loop carrier
+with its partials reduced to bound names; a ``Semiring`` generates its contraction
+``Loop`` in the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` is already
+stmts (returned as-is). So a kernel *is* the lowered tree — no per-kernel builder.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import replace
 
-from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.stmt import Body, Init, Load, Loop, Map  # Map re-exported from ir.stmt.algebra
+from deplodock.compiler.dtype import F32
+from deplodock.compiler.ir.stmt import Assign, Body, Init, Loop, Map, Monoid, Semiring
+from deplodock.compiler.ir.stmt.algebra import _partial_name
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
-
-# A partial source: a Map (stmt body), a direct operand Load, or a nested Reduce.
-Source = "Map | Load | Reduce"
-
-
-@dataclass(frozen=True)
-class Reduce:
-    """Fold over ``axis`` through ``carrier`` (a ``Monoid`` — its ``Twist`` is the
-    combine). ``partials`` produce the carrier's ``partial`` contributions (one source
-    per ``carrier.partial`` name, in order — a ``Map`` whose stmts last-bind that name,
-    a ``Load`` named for it, or a nested ``Reduce``). ``init_ops`` gives the per-state
-    identity-bearing op for the enclosing ``Init`` (one per ``carrier.state.names``).
-    ``out`` is the carried state read after the fold (the carrier's primary state)."""
-
-    out: str
-    axis: Axis
-    carrier: object  # Monoid
-    partials: tuple
-    init_ops: tuple[ElementwiseImpl, ...]
-    dtype: DataType = field(default=F32)
-
-
-def _lower_source(src) -> list[Stmt]:
-    """Emit the stmts a carrier partial contributes: a ``Load`` (itself a stmt, binding
-    its own name), a ``Map`` (its stmts verbatim — they last-bind the partial name), or
-    a nested ``Reduce`` (→ ``lower``). The source is responsible for binding the carrier
-    partial's name (the builder names the ``Load`` / the ``Map``'s last def for it)."""
-    if isinstance(src, Load):
-        return [src]
-    if isinstance(src, Map):
-        return list(src)
-    if isinstance(src, Reduce):
-        return lower(src)
-    raise TypeError(f"_lower_source: unsupported partial source {type(src).__name__}")
 
 
 def lower(op) -> list[Stmt]:
     """Lower an op-tree node to loop-IR stmts. A ``Map`` is already stmts (returned
-    as-is); a ``Reduce`` generates its ``Init``\\ s + streaming ``Loop``. One ``lower``
-    call on the root ``Map`` emits a whole kernel's per-cell body."""
+    as-is); a ``Monoid`` / ``Semiring`` generates its ``Init``\\ s + reduce ``Loop``. One
+    ``lower`` call on the root node emits a whole kernel's per-cell body."""
     if isinstance(op, Map):
         return list(op)
-    if isinstance(op, Reduce):
-        return _lower_reduce(op)
-    raise TypeError(f"lower: expected Map / Reduce root, got {type(op).__name__}")
+    if isinstance(op, Monoid):
+        return _lower_monoid(op)
+    if isinstance(op, Semiring):
+        return _lower_semiring(op)
+    raise TypeError(f"lower: expected Map / Monoid / Semiring node, got {type(op).__name__}")
 
 
-def _lower_reduce(r: Reduce) -> list[Stmt]:
-    """An ``Init`` per carried state (the carrier's identity), then the streaming
-    ``Loop`` whose body computes the partials and applies the carrier fold, then the
-    carrier's ``finalize`` φ (the post-loop projection of the final state to the output
-    value — empty for a plain reduce / matmul, ``O/l`` for flash). Pure
-    structure-from-carrier — no per-kernel assembly."""
-    out: list[Stmt] = []
-    for s, op in zip(r.carrier.state.names, r.init_ops, strict=True):
-        out.append(Init(name=s, op=op, dtype=r.dtype))
+def _lower_partial(p) -> list[Stmt]:
+    """Emit the stmts a partial / operand source contributes: a node (``Map`` →
+    its stmts, ``Monoid`` / ``Semiring`` → ``lower``), or nothing for a ``str`` (an
+    already-bound sibling name — a loop-IR carrier shape, not an op-tree source)."""
+    return [] if isinstance(p, str) else lower(p)
+
+
+def _lower_monoid(m: Monoid) -> list[Stmt]:
+    """An ``Init`` per carried state (the carrier identity), then the streaming ``Loop``
+    whose body expands the partial sources (siblings) and applies the carrier fold, then
+    the carrier's ``finalize`` φ (the post-loop projection of the final state to the
+    output — empty for a plain reduce, ``O/l`` for flash). The in-loop carrier is this
+    ``Monoid`` with its partial sources reduced to their bound names and its
+    self-contained fields (``axis`` / ``out`` / ``init_ops`` / ``finalize``) stripped —
+    the loop-IR carrier stmt the renderer / passes consume. Pure structure-from-carrier."""
+    out: list[Stmt] = [Init(name=s, op=op, dtype=F32) for s, op in zip(m.state.names, m.init_ops, strict=True)]
     body: list[Stmt] = []
-    for src, _pname in zip(r.partials, r.carrier.partial, strict=True):  # strict: partial arity must match
-        body += _lower_source(src)
-    body.append(r.carrier)  # the Monoid fold (its Twist is the combine)
-    out.append(Loop(axis=r.axis, body=Body(tuple(body))))
-    out.extend(getattr(r.carrier, "finalize", ()))  # the carrier's φ: final state → output value (post-loop)
+    for p in m.partial:
+        body += _lower_partial(p)
+    carrier = replace(m, partial=m.partial_names(), axis=None, out=None, init_ops=(), finalize=())
+    body.append(carrier)
+    out.append(Loop(axis=m.axis, body=Body(tuple(body))))
+    out.extend(m.finalize)
     return out
+
+
+def _lower_semiring(s: Semiring) -> list[Stmt]:
+    """The contraction ``Loop`` in the matmul-recognizable ``Accum``-in-``Loop`` form
+    (``Semiring.match`` reads it back): expand each operand source (siblings), the lift
+    ⊗ ``Assign`` (``fold.value = lift(operands…)``), and the additive ``fold`` ⊕ (its
+    identity init is the ``Loop``'s immediate-``Accum`` prelude — no explicit ``Init``)."""
+    body: list[Stmt] = []
+    names: list[str] = []
+    for opnd in s.operands:
+        body += _lower_partial(opnd)
+        names.append(_partial_name(opnd))
+    body.append(Assign(name=s.fold.value, op=s.lift, args=tuple(names)))
+    body.append(s.fold)
+    return [Loop(axis=s.reduce_axis, body=Body(tuple(body)))]
 
 
 def pretty(op, indent: str = "") -> list[str]:
     """Structurally pretty-print an op tree (for dumps) — WITHOUT lowering. A ``Map`` is
-    its stmt body (each stmt's ``pretty``); a ``Reduce`` is a header (carrier ``(state)
-    <- combine(partial)`` over its axis, projecting to ``out``) above its named partials
-    + the carrier ``finalize``; any other stmt (e.g. a ``Load`` partial) prints itself."""
+    its stmt body; a ``Monoid`` / ``Semiring`` is a header (the carrier / contraction
+    over its axis, projecting to ``out``) above its named children, with the ``Monoid``'s
+    ``finalize`` φ; any other stmt prints itself."""
     if isinstance(op, Map):
         return list(pretty_body(op, indent))
-    if isinstance(op, Reduce):
-        carrier = op.carrier.pretty()[0].strip() if hasattr(op.carrier, "pretty") else repr(op.carrier)
-        lines = [f"{indent}reduce[{op.axis.name}] {carrier} -> {op.out}"]
-        for src, pname in zip(op.partials, op.carrier.partial, strict=True):
+    if isinstance(op, Monoid):
+        carrier = op.pretty()[0].strip()
+        ax = op.axis.name if op.axis is not None else "?"
+        lines = [f"{indent}reduce[{ax}] {carrier} -> {op.out}"]
+        for src, pname in zip(op.partial, op.partial_names(), strict=True):
             lines.append(f"{indent}  partial {pname}:")
             lines += pretty(src, indent + "    ")
-        for a in getattr(op.carrier, "finalize", ()):
+        for a in op.finalize:
             lines += a.pretty(indent + "  ")
+        return lines
+    if isinstance(op, Semiring):
+        lines = [f"{indent}contract[{op.reduce_axis.name}] {op.lift.name} / {op.fold.op.name} -> {op.out}"]
+        for opnd in op.operands:
+            lines.append(f"{indent}  operand {_partial_name(opnd)}:")
+            lines += pretty(opnd, indent + "    ")
         return lines
     if isinstance(op, Stmt):
         return list(op.pretty(indent))
     return [f"{indent}{op!r}"]
 
 
-__all__ = ["Map", "Reduce", "lower", "pretty"]
+__all__ = ["Map", "Monoid", "Semiring", "lower", "pretty"]

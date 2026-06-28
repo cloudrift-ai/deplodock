@@ -182,7 +182,9 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Monoid(
         # ``identity`` is constant Exprs — no SSA names to rename, only the ``names`` move.
         state=State(names=tuple(rn(n) for n in names), identity=s.state.identity),
-        partial=tuple(rn(n) for n in s.partial),
+        # In loop-IR (what ``rewrite`` sees) the partials are bound ``str`` names; an
+        # op-tree node partial (pre-lowering, not rewritten here) is passed through.
+        partial=tuple(rn(p) if isinstance(p, str) else p for p in s.partial),
         twist=Twist(
             merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
             combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
@@ -191,6 +193,11 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         commutative=s.commutative,
         axes=new_axes,
         finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state
+        # Self-contained op-tree fields — preserved across rename (loop-IR carriers have
+        # them empty; an op-tree Monoid keeps its axis / projected out / init ops).
+        axis=axis_fn(s.axis) if s.axis is not None else None,
+        out=rn(s.out) if isinstance(s.out, str) else s.out,
+        init_ops=s.init_ops,
     )
 
 

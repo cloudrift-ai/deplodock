@@ -1,13 +1,16 @@
-"""High-level op tree (``ir/tile/ops.py``): Map / Reduce lower to loop IR generically.
+"""High-level op tree (``ir/tile/ops.py``): Map / Monoid / Semiring lower to loop IR.
 
-The kernel *is* the lowered tree — no per-kernel builder. A contraction is
-``Reduce(+)`` over a ``Map`` (the ``×`` lift, a stmt body); a plain reduction is
-``Reduce`` over a direct ``Load`` partial. Validated by running the lowered ``LoopOp``
-(cppyy, CPU) against numpy — the carrier generates the ``Init`` + fold, a ``Map`` is the
-lift stmts, a ``Load`` partial the direct operand read.
+The kernel *is* the lowered tree — no per-kernel builder. A contraction is a
+``Semiring`` (the ``×`` lift over its operands, folded by ``+``); a plain reduction is a
+degenerate ``Monoid`` over a ``Map`` partial; flash is the ``(m, l, O)`` ``Monoid`` whose
+score partial is a NESTED ``Semiring``. Validated by running the lowered ``LoopOp``
+(cppyy, CPU) against numpy — each node generates its ``Init`` + fold, a ``Map`` is the
+lift stmts, and partial / operand sources are ``Map`` / ``Monoid`` / ``Semiring`` nodes.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import numpy as np
 
@@ -16,12 +19,13 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from deplodock.compiler.ir.tile.ops import Map, Reduce, lower
+from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Semiring, Write
+from deplodock.compiler.ir.tile.ops import Map, lower
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 ADD = ElementwiseImpl("add")
 MAX = ElementwiseImpl("maximum")
+MUL = ElementwiseImpl("multiply")
 
 
 def _wrap(free_axes, cell) -> LoopOp:
@@ -36,22 +40,19 @@ def _wrap(free_axes, cell) -> LoopOp:
 def test_contraction_op_tree_matches_numpy() -> None:
     M, K, N = 3, 4, 5
     m, k, n = Axis("m", Dim(M)), Axis("k", Dim(K)), Axis("n", Dim(N))
-    red = Reduce(
-        out="acc",
-        axis=k,
-        carrier=Accum(name="acc", value="p", op="add").as_monoid(),
-        partials=(
-            Map(
-                [
-                    Load(name="a_e", input="A", index=(Var("m"), Var("k"))),
-                    Load(name="b_e", input="B", index=(Var("k"), Var("n"))),
-                    Assign(name="p", op="multiply", args=("a_e", "b_e")),  # the ⊗ lift
-                ]
-            ),
+    # A matmul as a first-class Semiring node: ⊗ = multiply over two one-Load Map
+    # operands, ⊕ = the additive fold over k.
+    semi = Semiring(
+        lift=MUL,
+        fold=Accum(name="acc", value="p", op="add"),
+        operands=(
+            Map([Load(name="a_e", input="A", index=(Var("m"), Var("k")))]),
+            Map([Load(name="b_e", input="B", index=(Var("k"), Var("n")))]),
         ),
-        init_ops=(ADD,),
+        reduce_axis=k,
+        out="acc",
     )
-    cell = (*lower(red), Write(output="C", index=(Var("m"), Var("n")), value="acc"))
+    cell = (*lower(semi), Write(output="C", index=(Var("m"), Var("n")), value="acc"))
     op = _wrap((m, n), cell)
     a = np.random.rand(M, K).astype(np.float32)
     b = np.random.rand(K, N).astype(np.float32)
@@ -62,11 +63,13 @@ def test_contraction_op_tree_matches_numpy() -> None:
 def test_plain_reduce_op_tree_matches_numpy() -> None:
     R, K = 4, 8
     r, k = Axis("r", Dim(R)), Axis("k", Dim(K))
-    red = Reduce(
-        out="acc",
+    # A plain sum as a degenerate (self-contained) Monoid: its one partial source is a
+    # one-Load Map (the direct operand read).
+    red = replace(
+        Accum(name="acc", value="v", op="add").as_monoid(),
+        partial=(Map([Load(name="v", input="x", index=(Var("r"), Var("k")))]),),
         axis=k,
-        carrier=Accum(name="acc", value="v", op="add").as_monoid(),
-        partials=(Load(name="v", input="x", index=(Var("r"), Var("k"))),),  # the partial is a direct load (named for the carrier partial)
+        out="acc",
         init_ops=(ADD,),
     )
     cell = (*lower(red), Write(output="y", index=(Var("r"),), value="acc"))
@@ -77,34 +80,28 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
 
 
 def test_flash_op_tree_matches_softmax_qkv() -> None:
-    """Flash attention as a pure op tree — a 3-state twisted carrier (m,l,O) folding
-    over kv, whose score partial is a NESTED contraction (Σ_k Q·K). The O/l projection
+    """Flash attention as a pure op tree — a 3-state twisted ``Monoid`` (m,l,O) folding
+    over kv, whose score partial is a NESTED ``Semiring`` (Σ_k Q·K). The O/l projection
     is the carrier's φ ``finalize`` (emitted post-loop by ``lower``), so the kernel root
-    is just that Reduce + the Write. Lowers generically (no build_flash_*) and matches
-    softmax(QK^T)·V."""
+    is just that Monoid + the Write. Lowers generically and matches softmax(QK^T)·V."""
     S, D = 4, 3
     i, d = Axis("i", Dim(S)), Axis("d", Dim(D))  # free: query row, value dim
     j, k = Axis("j", Dim(S)), Axis("k", Dim(D))  # reduce: kv (outer), head-dim (inner)
-    score = Reduce(
-        out="s",
-        axis=k,
-        carrier=Accum(name="s", value="qk", op="add").as_monoid(),
-        partials=(
-            Map(
-                [
-                    Load(name="q_e", input="Q", index=(Var("i"), Var("k"))),
-                    Load(name="k_e", input="K", index=(Var("j"), Var("k"))),
-                    Assign(name="qk", op="multiply", args=("q_e", "k_e")),
-                ]
-            ),
+    score = Semiring(
+        lift=MUL,
+        fold=Accum(name="s", value="qk", op="add"),
+        operands=(
+            Map([Load(name="q_e", input="Q", index=(Var("i"), Var("k")))]),
+            Map([Load(name="k_e", input="K", index=(Var("j"), Var("k")))]),
         ),
-        init_ops=(ADD,),
+        reduce_axis=k,
+        out="s",
     )
-    flash = Reduce(
-        out="O__proj",  # the carrier's finalize binds O/l here, post-loop
+    flash = replace(
+        flash_combine("m", "l", "O", "s", "v"),
+        partial=(score, Map([Load(name="v", input="V", index=(Var("j"), Var("d")))])),
         axis=j,
-        carrier=flash_combine("m", "l", "O", "s", "v"),
-        partials=(score, Load(name="v", input="V", index=(Var("j"), Var("d")))),
+        out="O__proj",  # the carrier's finalize binds O/l here, post-loop
         init_ops=(MAX, ADD, ADD),
     )
     cell = (*lower(flash), Write(output="attn", index=(Var("i"), Var("d")), value="O__proj"))

@@ -10,7 +10,7 @@ the algebra lives in one place:
 
 - :class:`Map` — the pointwise lift, a typed :class:`Body` of stmts.
 - :class:`Twist` / :class:`Monoid` — the loop-carried associative combine (the fold ⊕).
-- :class:`Operand` / :class:`Semiring` — the structural contraction view.
+- :class:`Semiring` — the structural contraction (the matmul) as a node.
 """
 
 from __future__ import annotations
@@ -35,31 +35,30 @@ class Map(Body):
 
 
 @dataclass(frozen=True)
-class Operand:
-    """One ⊗ input of a contraction — a buffer read plus its index exprs. The
-    index is what the scheduler reads to derive operand reuse (which free axis the
-    operand is invariant in) and layout (for smem staging / the mma fragment)."""
-
-    buf: str
-    index: tuple[Expr, ...]
-
-
-@dataclass(frozen=True)
 class Semiring:
-    """Structural view of a semiring contraction in a reduce loop —
-    ``reduce(⊕) ∘ map(⊗)``. Built by :meth:`match` from the loop body, never
-    stored (the body is the source of truth).
+    """A semiring contraction ``reduce(⊕) ∘ map(⊗)`` — the structural matmul — as a
+    **first-class** algebra node. Its ``operands`` are themselves algebra nodes
+    (:class:`Map` / :class:`Monoid` / :class:`Semiring`), so a contraction reads a
+    buffer (a ``Map`` of one ``Load``) or another reduction's result. Lowered by
+    ``ir.tile.ops.lower`` to the recognizable ``Accum``-in-``Loop`` form the matmul
+    tier reads; recognized from that form on demand by :meth:`match`.
 
-    - ``fold`` — the ⊕ monoid carrier (an additive ``Accum``: identity 0, assoc + comm).
     - ``lift`` — the ⊗ product op; distributes over ⊕ and has a multiplicative identity.
-    - ``operands`` — the contracted inputs (≥ 2 distinct buffers).
+    - ``fold`` — the ⊕ additive carrier (an ``Accum``: identity 0, assoc + comm).
+    - ``operands`` — the contracted inputs, each a ``Map | Monoid | Semiring`` (≥ 2).
     - ``reduce_axis`` — the contracted (K) axis.
+    - ``out`` — the bound result name (defaults to ``fold.name``, the accumulator).
     """
 
-    fold: Accum
     lift: ElementwiseImpl
-    operands: tuple[Operand, ...]
+    fold: Accum
+    operands: tuple
     reduce_axis: Axis
+    out: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.out:
+            object.__setattr__(self, "out", self.fold.name)
 
     @property
     def is_additive(self) -> bool:
@@ -70,13 +69,14 @@ class Semiring:
 
     @staticmethod
     def match(loop) -> Semiring | None:
-        """Recognize a semiring contraction on ``loop``, or ``None``. Duck-typed on
-        ``.is_reduce`` / ``.axis`` / ``.body`` so it serves a Loop-IR ``Loop`` /
-        ``StridedLoop`` alike (the caller restricts the type).
+        """Recognize a semiring contraction on a loop-IR ``loop``, or ``None``.
+        Duck-typed on ``.is_reduce`` / ``.axis`` / ``.body`` so it serves a Loop-IR
+        ``Loop`` / ``StridedLoop`` alike (the caller restricts the type).
 
         A reduce loop is a contraction iff its single ``Accum`` fold's partial is
         produced by a lift that **distributes over** the fold op, contracting ≥ 2
-        distinct operands over the reduce axis."""
+        distinct operand buffers over the reduce axis. The operands are reconstructed
+        as one-``Load`` :class:`Map` nodes (the buffer read)."""
         if not getattr(loop, "is_reduce", False):
             return None
         body = loop.body
@@ -88,12 +88,10 @@ class Semiring:
         if lift is None or not lift.op.distributes_over(fold.op):
             return None
         k = loop.axis.name
-        operands = tuple(
-            Operand(ld.input, ld.index) for ld in body if isinstance(ld, Load) and k in {v for e in ld.index for v in e.free_vars()}
-        )
-        if len({o.buf for o in operands}) < 2:
+        loads = [ld for ld in body if isinstance(ld, Load) and k in {v for e in ld.index for v in e.free_vars()}]
+        if len({ld.input for ld in loads}) < 2:
             return None
-        return Semiring(fold=fold, lift=lift.op, operands=operands, reduce_axis=loop.axis)
+        return Semiring(lift=lift.op, fold=fold, operands=tuple(Map([ld]) for ld in loads), reduce_axis=loop.axis)
 
 
 def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
@@ -168,8 +166,12 @@ class Monoid(Stmt):
       per-component ``identity`` (the monoid's neutral element, one ``Expr`` each; the
       enclosing ``Init`` seeds it at the carrier's scope, and split-KV /
       cooperative-combine reductions read it to seed their partial accumulators).
-    - ``partial`` — this iteration's contribution SSA names (the right operand the
-      step folds into the state).
+    - ``partial`` — this iteration's contribution sources, one per partial slot: each a
+      ``Map | Monoid | Semiring`` node (the self-contained op-tree form, e.g. flash's
+      score is a ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name
+      (the loop-IR carrier form). The bound name (``partial_names``) is the right operand
+      the merge folds into the state. Self-contained reductions also carry ``axis`` /
+      ``out`` / ``init_ops``; ``ir.tile.ops.lower`` expands the nodes into the loop.
     - ``twist`` — the :class:`Twist`: the ψ-conjugated combine, **as data**, the
       one part that varies (degenerate / scalar / fragment) while the algebra above
       stays the same. It carries the ``merge`` program (fold a partial into the
@@ -189,7 +191,7 @@ class Monoid(Stmt):
       monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
     - ``finalize`` — the carrier's **φ projection**: the post-reduction program that
       maps the *final* carried state to the kernel's output value (the article's
-      ``project`` in ``project ∘ reduce ∘ map``), emitted by ``lower(Reduce)`` AFTER
+      ``project`` in ``project ∘ reduce ∘ map``), emitted by ``lower`` AFTER
       the streaming loop. As data — a tuple of ``Assign``\\ s reading the state. Empty
       = identity (the state itself is the output, e.g. a plain reduce / matmul). Flash
       authors ``O_i / l_i`` (normalize the streamed output by the denominator). Named
@@ -215,11 +217,29 @@ class Monoid(Stmt):
     """
 
     state: State
-    partial: tuple[str, ...]
+    # The partial-contribution sources: each a ``Map | Monoid | Semiring`` node (the
+    # self-contained op-tree form), or a bound ``str`` name (the loop-IR carrier form,
+    # post-lowering / degenerate ``Accum.as_monoid`` — the value is produced by a
+    # sibling stmt in the enclosing ``Loop``). ``partial_names`` reads the bound name
+    # off either. ``deps`` / the twist's ``merge`` reference those names.
+    partial: tuple
     twist: Twist
     commutative: bool = True
     axes: tuple[str, ...] = ()
     finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
+    # Self-contained reduction fields (op-tree node). ``None`` / empty = a loop-IR
+    # carrier stmt that sits inside an existing ``Loop`` (axis from the enclosing loop,
+    # partials are siblings). Set together by the op-tree builders; ``ir.tile.ops.lower``
+    # reads them to emit ``Init`` + ``Loop`` + ``finalize`` and strips them off the
+    # in-loop carrier it leaves behind.
+    axis: Axis | None = None
+    out: str | None = None
+    init_ops: tuple[ElementwiseImpl, ...] = ()
+
+    def partial_names(self) -> tuple[str, ...]:
+        """The bound name of each partial — the node's output (``Map`` last def /
+        ``Monoid`` / ``Semiring`` ``out``), or the ``str`` itself for a loop-IR carrier."""
+        return tuple(_partial_name(p) for p in self.partial)
 
     def __post_init__(self) -> None:
         # Complete the twist's cross-partition surface against this monoid's state.
@@ -234,7 +254,7 @@ class Monoid(Stmt):
         # partial reads with the second-operand state names. An asymmetric monoid
         # (different partial / state arity, e.g. flash LSE) must author it.
         if not combine_states and len(self.partial) == len(self.state.names):
-            sub = dict(zip(self.partial, state_b, strict=True))
+            sub = dict(zip(self.partial_names(), state_b, strict=True))
             combine_states = tuple(_rename_assign_args(a, sub) for a in tw.merge)
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
@@ -261,14 +281,14 @@ class Monoid(Stmt):
         # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit
         # (loop-carried), so only this iteration's partial contribution is listed —
         # keeps sibling-def analyses from treating the state as a same-scope read.
-        return self.partial
+        return self.partial_names()
 
     def defines(self) -> tuple[str, ...]:
         return self.state.names
 
     def pretty(self, indent: str = "") -> list[str]:
         state = ", ".join(self.state.names)
-        partial = ", ".join(self.partial)
+        partial = ", ".join(self.partial_names())
         return [f"{indent}({state}) <- combine({partial})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -281,4 +301,17 @@ class Monoid(Stmt):
         return render_merge_program(self.twist.merge, self.state.names, ctx)
 
 
-__all__ = ["Map", "Operand", "Semiring", "State", "Twist", "Monoid"]
+def _partial_name(p) -> str:
+    """The SSA name a partial source binds — the value the carrier folds. A ``str`` is
+    the name itself (loop-IR carrier); a :class:`Monoid` / :class:`Semiring` binds its
+    ``out``; a :class:`Map` binds its last defining stmt's name."""
+    if isinstance(p, str):
+        return p
+    if isinstance(p, (Monoid, Semiring)):
+        return p.out
+    if isinstance(p, Map):
+        return list(p)[-1].defines()[-1]
+    raise TypeError(f"_partial_name: unsupported partial source {type(p).__name__}")
+
+
+__all__ = ["Map", "Semiring", "State", "Twist", "Monoid"]
