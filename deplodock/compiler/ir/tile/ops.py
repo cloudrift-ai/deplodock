@@ -60,18 +60,26 @@ def _lower_partial(p) -> list[Stmt]:
 
 def _lower_monoid(m: Monoid) -> list[Stmt]:
     """The streaming ``Loop`` whose body expands the partial sources (siblings) and applies
-    the carrier fold. The carried state is seeded by explicit ``Init`` stmts
-    (``m.state.inits()`` — ``<f32> state = identity;`` from ``state.identity``) emitted
-    before the ``Loop``, so ``Loop.render`` never reaches into the carrier. The in-loop
-    carrier is this ``Monoid`` with its partial sources expanded to siblings (so
-    ``partial`` is cleared); its ``axis`` is kept for the cooperative-axis analysis. The φ
+    the carrier fold.
+
+    A **degenerate** carrier (plain reduce — the identity twist) lowers to bare ``Accum``
+    folds (``m.as_accums()``): the seed is derived from each ``Accum``'s ``op.identity`` by
+    ``Loop.render``, so no explicit ``Init`` is emitted and the accumulator dtype rides on
+    the ``Accum`` (stamped by ``030_stamp_types``). A **twisted** carrier (online softmax /
+    flash) keeps the streaming merge: its state components are coupled (the ψ rescale reads
+    sibling components), so it can't collapse to independent ``Accum``\\ s — its carried
+    state is seeded by explicit ``Init`` stmts (``m.state.inits()``) before the ``Loop``.
+    The in-loop carrier keeps its ``axis`` for the cooperative-axis analysis. The φ
     projection, if any, is a :class:`Map` *over* this Monoid — emitted by ``lower(Map)``,
     not here. Pure structure-from-carrier."""
     body: list[Stmt] = []
     for p in m.partial:
         body += _lower_partial(p)
-    carrier = replace(m, partial=())
-    body.append(carrier)
+    accums = m.as_accums()
+    if accums is not None:
+        body += accums
+        return [Loop(axis=m.axis, body=Body(tuple(body)))]
+    body.append(replace(m, partial=()))
     return [*m.state.inits(), Loop(axis=m.axis, body=Body(tuple(body)))]
 
 

@@ -67,7 +67,9 @@ def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
         return _stamp_assign(s, ctx)
     if isinstance(s, Write):
         return _stamp_write(s, ctx)
-    if isinstance(s, (Accum, Init)):
+    if isinstance(s, Accum):
+        return _stamp_accum(s, ctx)
+    if isinstance(s, Init):
         ctx.ssa_dtypes[s.name] = s.dtype or F32
         return s
     if isinstance(s, Pack):
@@ -84,6 +86,23 @@ def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
     if not nested:
         return s
     return s.with_bodies(tuple(_stamp_body(b, ctx) for b in nested))
+
+
+def _stamp_accum(s: Accum, ctx: _StampCtx) -> Accum:
+    """Freeze the accumulator dtype — the old ``020_place_inits`` policy, applied to the
+    ``Accum`` itself (the carrier is the source of truth; ``Loop.render`` derives the seed
+    from it). A **selecting** combine (``max`` / ``min``) picks an existing value, so it
+    stays in the folded value's dtype — fp16 ``max`` accumulates in fp16. An
+    **accumulating** combine (``sum`` / ``prod`` — incl. the matmul fold) builds magnitude,
+    so it promotes fp16 to f32 to avoid precision loss / overflow. Already-stamped Accums
+    keep their dtype."""
+    if s.dtype is not None:
+        ctx.ssa_dtypes[s.name] = s.dtype
+        return s
+    value_dt = ctx.ssa_dtypes.get(s.value) or F32
+    dt = value_dt if s.op.selecting else F32
+    ctx.ssa_dtypes[s.name] = dt
+    return replace(s, dtype=dt)
 
 
 def _stamp_load(s: Load, ctx: _StampCtx) -> Load:

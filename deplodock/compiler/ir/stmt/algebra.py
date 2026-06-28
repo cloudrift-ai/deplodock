@@ -293,6 +293,28 @@ class Monoid(Stmt):
         if state_b != tw.state_b or combine_states != tw.combine_states:
             object.__setattr__(self, "twist", replace(tw, state_b=state_b, combine_states=combine_states))
 
+    def as_accums(self) -> list[Accum] | None:
+        """If this is a **degenerate** carrier (the identity twist — each state
+        component folded by its own self-op, ``state_i = op_i(state_i, partial_i)``,
+        no rescale temps), return the equivalent list of ``Accum`` folds; else
+        ``None``. A plain reduce (``sum`` / ``max`` / ``min``) is degenerate; a
+        twisted carrier (online softmax / flash) is not (its merge reads sibling
+        components + rescale temps). Lets ``ir.tile.ops.lower`` emit a degenerate
+        reduce as bare ``Accum``\\ s — seed derived from ``op.identity`` by
+        ``Loop.render``, no explicit ``Init`` — instead of a ``Monoid`` carrier."""
+        merge = self.twist.merge
+        names = set(self.state.names)
+        if len(merge) != len(self.state.names):
+            return None
+        accums: list[Accum] = []
+        for a in merge:
+            # identity-twist shape: ``state = op(state, partial)`` — target is a state
+            # component, left operand is that same component, one partial right operand.
+            if a.name not in names or len(a.args) != 2 or a.args[0] != a.name:
+                return None
+            accums.append(Accum(name=a.name, value=a.args[1], op=a.op, dtype=a.dtype))
+        return accums
+
     def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
         """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
         a second fully-reduced state named ``other`` (the cross-partition
