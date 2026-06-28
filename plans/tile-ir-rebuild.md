@@ -278,3 +278,17 @@ This recognition is still case-by-case (flash / online-softmax / contraction pat
 ONE algorithmic algebra recognizer. Remaining: the `body` property still lowers on access (for the cache key / dumps)
 while `materialize` does the deployable lower + glue — a structural key off `op` directly would drop even the
 property-side lower, but the payoff is small since `lower` is pure.
+
+### Post-materialize codegen passes restored (independent of the tile rebuild)
+
+The kernel-IR codegen-quality passes that run *after* `010_materialize` were restored ahead of the tile-tier rebuild:
+`030_stamp_types`, `040_demote_to_write_dtype`, `050_vectorize_loads`, `080_vectorize_stores`, `095_interleave_loads`,
+`110_drop_redundant_syncs`. They are `KernelOp` → `KernelOp` rewrites over the materialized body's `Load` / `Assign` /
+`Write` / `Sync` vocabulary — they never touch tile structure — so they were ported by changing only the pattern root
+(`TileOp` → `KernelOp`) and dropping the demolished tile-type scope walks (`Source` / `StageBundle` staged-smem branches,
+the `GridTile` / `ThreadTile` sync scope, `Body.coordination` atomic detection). `040_demote` is dormant under today's
+f32 reduction accumulators and re-activates once the f16-accumulator selection (demolished `020_place_inits`) returns;
+`050` / `080` / `095` largely no-op on the scalar tier (one Load/Write per thread) and light up with the register tile.
+The **tile-tier** kernel passes (mma fragment lowering, register-tile split, smem staging, fp16 K-window packing) stay
+demolished — they consume tile structures the materializer does not yet produce, so they belong to the tile rebuild, not
+this set.
