@@ -23,8 +23,6 @@ from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Semiring, Write
 from deplodock.compiler.ir.tile.ops import Map, lower
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
-ADD = ElementwiseImpl("add")
-MAX = ElementwiseImpl("maximum")
 MUL = ElementwiseImpl("multiply")
 
 
@@ -50,7 +48,6 @@ def test_contraction_op_tree_matches_numpy() -> None:
             Map([Load(name="b_e", input="B", index=(Var("k"), Var("n")))]),
         ),
         reduce_axis=k,
-        out="acc",
     )
     cell = (*lower(semi), Write(output="C", index=(Var("m"), Var("n")), value="acc"))
     op = _wrap((m, n), cell)
@@ -68,9 +65,7 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
     red = replace(
         Accum(name="acc", value="v", op="add").as_monoid(),
         partial=(Map([Load(name="v", input="x", index=(Var("r"), Var("k")))]),),
-        axis=k,
-        out="acc",
-        init_ops=(ADD,),
+        axis=k,  # out ("acc") + seed (identity 0) derived from the carrier
     )
     cell = (*lower(red), Write(output="y", index=(Var("r"),), value="acc"))
     op = _wrap((r,), cell)
@@ -95,14 +90,11 @@ def test_flash_op_tree_matches_softmax_qkv() -> None:
             Map([Load(name="k_e", input="K", index=(Var("j"), Var("k")))]),
         ),
         reduce_axis=k,
-        out="s",
     )
     flash = replace(
         flash_combine("m", "l", "O", "s", "v"),
         partial=(score, Map([Load(name="v", input="V", index=(Var("j"), Var("d")))])),
-        axis=j,
-        out="O__proj",  # the carrier's finalize binds O/l here, post-loop
-        init_ops=(MAX, ADD, ADD),
+        axis=j,  # out ("O__proj", the carrier's finalize) + seeds derived from the carrier
     )
     cell = (*lower(flash), Write(output="attn", index=(Var("i"), Var("d")), value="O__proj"))
     op = _wrap((i, d), cell)

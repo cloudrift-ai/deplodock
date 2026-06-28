@@ -10,8 +10,9 @@ untouched, reading the final ``m`` + ``1/d``).
 
 ``online_softmax_combine`` builds the ``(m, d)`` carrier; :func:`try_online_softmax`
 recognizes an adjacent ``(rowmax, Σexp)`` reduce pair over the same input + reduce
-extent in a ``LoopOp`` body and rewrites it to the fused streaming loop (+ the
-carried-state ``Init`` seeds). Recognition is called from ``lowering/tile/010_recognize``
+extent in a ``LoopOp`` body and rewrites it to the fused streaming loop (the carried
+``(m, d)`` states are seeded by ``Loop.render`` from ``state.identity``). Recognition is
+called from ``lowering/tile/010_recognize``
 (after flash, before the plain-reduce normalize — each later step consumes the
 ``Accum``\\ s an earlier one matches).
 """
@@ -21,10 +22,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, State, Twist
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid, State, Twist
 
 
 def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoid:
@@ -130,11 +130,9 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                             (Load(name=src, input=input_buf, index=index), online_softmax_combine(maxacc, sumacc, src, axis=s.axis.name))
                         ),
                     )
-                    out += [
-                        Init(name=maxacc, op=ElementwiseImpl("maximum"), dtype="f32"),
-                        Init(name=sumacc, op=ElementwiseImpl("add"), dtype="f32"),
-                        fused,
-                    ]
+                    # The (m, d) states are seeded by ``Loop.render`` from the carrier's
+                    # ``state.identity`` ((−inf, 0)) — no explicit ``Init``.
+                    out.append(fused)
                     changed = True
                     i += 2
                     continue

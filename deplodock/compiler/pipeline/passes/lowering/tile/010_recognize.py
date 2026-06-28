@@ -14,8 +14,9 @@ unified twisted ``Monoid`` representation. Three recognitions, tried in order
    input fuses into one streaming online-softmax ``Monoid`` (the ``(m, d)`` twist).
    Recognition + construction live in ``_softmax`` (``try_online_softmax``).
 3. **Normalize** — any remaining scalar ``Accum`` (a plain sum / max / mean) becomes
-   its **degenerate** monoid (``Accum.as_monoid`` — the identity twist, no rescale),
-   seeded by an enclosing :class:`Init`. A semiring contraction (``Semiring.match``)
+   its **degenerate** monoid (``Accum.as_monoid`` — the identity twist, no rescale);
+   the carried state is seeded by ``Loop.render`` from ``state.identity``. A semiring
+   contraction (``Semiring.match``)
    keeps its ``Accum`` — degenerate-monoidizing it would lose the contraction
    structure the matmul tier reads off the body. This generic step stays here.
 
@@ -30,10 +31,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Body, Init, Loop
+from deplodock.compiler.ir.stmt import Accum, Body, Loop
 from deplodock.compiler.ir.stmt.algebra import Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -44,18 +44,18 @@ PATTERN = [Pattern("root", LoopOp)]
 
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
-    """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to ``Init`` + degenerate
-    ``Monoid`` (deep). A semiring contraction (``Semiring.match``) keeps its
+    """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to their degenerate
+    ``Monoid`` (deep; the carried states are seeded by ``Loop.render`` from
+    ``state.identity``). A semiring contraction (``Semiring.match``) keeps its
     ``Accum`` — degenerate-monoidizing it would lose the contraction structure the
     matmul tier reads. Returns ``(stmts, changed)``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and Semiring.match(s) is None:
-            accums = [x for x in s.body if isinstance(x, Accum)]
-            if accums:
-                for acc in accums:
-                    out.append(Init(name=acc.name, op=acc.op, dtype=F32))
+            if any(isinstance(x, Accum) for x in s.body):
+                # Each Accum becomes its degenerate Monoid; the carried states are seeded
+                # by ``Loop.render`` from ``state.identity`` (no explicit ``Init``).
                 new_body = [x.as_monoid() if isinstance(x, Accum) else x for x in s.body]
                 out.append(Loop(axis=s.axis, body=Body(tuple(new_body)), unroll=s.unroll))
                 changed = True

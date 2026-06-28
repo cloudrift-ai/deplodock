@@ -45,20 +45,22 @@ class Semiring:
 
     - ``lift`` — the ⊗ product op; distributes over ⊕ and has a multiplicative identity.
     - ``fold`` — the ⊕ additive carrier (an ``Accum``: identity 0, assoc + comm).
-    - ``operands`` — the contracted inputs, each a ``Map | Monoid | Semiring`` (≥ 2).
-    - ``reduce_axis`` — the contracted (K) axis.
-    - ``out`` — the bound result name (defaults to ``fold.name``, the accumulator).
+    - ``operands`` — the contracted inputs, each an :data:`AlgebraNode` (≥ 2).
+    - ``reduce_axis`` — the contracted (K) :class:`Axis` (extent-bearing — it sizes the
+      lowered ``Loop``; the fold ``Accum``'s ``axes`` is names-only, a different layer).
     """
 
     lift: ElementwiseImpl
     fold: Accum
-    operands: tuple
+    operands: tuple[AlgebraNode, ...]
     reduce_axis: Axis
-    out: str = ""
 
-    def __post_init__(self) -> None:
-        if not self.out:
-            object.__setattr__(self, "out", self.fold.name)
+    @property
+    def out(self) -> str:
+        """The bound result name — the contraction's accumulator (``fold.name``). Derived,
+        not stored: we always know what a semiring accumulates (and a future mma-fragment
+        output, which is not a single SSA name, won't fit a stored ``str``)."""
+        return self.fold.name
 
     @property
     def is_additive(self) -> bool:
@@ -166,12 +168,12 @@ class Monoid(Stmt):
       per-component ``identity`` (the monoid's neutral element, one ``Expr`` each; the
       enclosing ``Init`` seeds it at the carrier's scope, and split-KV /
       cooperative-combine reductions read it to seed their partial accumulators).
-    - ``partial`` — this iteration's contribution sources, one per partial slot: each a
-      ``Map | Monoid | Semiring`` node (the self-contained op-tree form, e.g. flash's
-      score is a ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name
-      (the loop-IR carrier form). The bound name (``partial_names``) is the right operand
-      the merge folds into the state. Self-contained reductions also carry ``axis`` /
-      ``out`` / ``init_ops``; ``ir.tile.ops.lower`` expands the nodes into the loop.
+    - ``partial`` — this iteration's contribution sources, one per partial slot: each an
+      :data:`AlgebraNode` (the self-contained op-tree form, e.g. flash's score is a
+      ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name (the loop-IR
+      carrier form). The bound name (``partial_names``) is the right operand the merge
+      folds into the state. A self-contained reduction also carries ``axis`` (its ``out``
+      is derived); ``ir.tile.ops.lower`` expands the nodes into the loop.
     - ``twist`` — the :class:`Twist`: the ψ-conjugated combine, **as data**, the
       one part that varies (degenerate / scalar / fragment) while the algebra above
       stays the same. It carries the ``merge`` program (fold a partial into the
@@ -217,24 +219,29 @@ class Monoid(Stmt):
     """
 
     state: State
-    # The partial-contribution sources: each a ``Map | Monoid | Semiring`` node (the
-    # self-contained op-tree form), or a bound ``str`` name (the loop-IR carrier form,
-    # post-lowering / degenerate ``Accum.as_monoid`` — the value is produced by a
-    # sibling stmt in the enclosing ``Loop``). ``partial_names`` reads the bound name
-    # off either. ``deps`` / the twist's ``merge`` reference those names.
-    partial: tuple
+    # The partial-contribution sources: each an :data:`AlgebraNode` (the self-contained
+    # op-tree form), or a bound ``str`` name (the loop-IR carrier form, post-lowering /
+    # degenerate ``Accum.as_monoid`` — the value is produced by a sibling stmt in the
+    # enclosing ``Loop``). ``partial_names`` reads the bound name off either; ``deps`` /
+    # the twist's ``merge`` reference those names.
+    partial: tuple[AlgebraNode | str, ...]
     twist: Twist
     commutative: bool = True
     axes: tuple[str, ...] = ()
     finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
-    # Self-contained reduction fields (op-tree node). ``None`` / empty = a loop-IR
-    # carrier stmt that sits inside an existing ``Loop`` (axis from the enclosing loop,
-    # partials are siblings). Set together by the op-tree builders; ``ir.tile.ops.lower``
-    # reads them to emit ``Init`` + ``Loop`` + ``finalize`` and strips them off the
-    # in-loop carrier it leaves behind.
+    # Self-contained reduction axis (op-tree node). ``None`` = a loop-IR carrier stmt that
+    # sits inside an existing ``Loop`` (axis from the enclosing loop, partials are
+    # siblings). Set by the op-tree builders; ``ir.tile.ops.lower`` reads it to emit the
+    # ``Init`` + ``Loop`` + ``finalize`` and strips it off the in-loop carrier it leaves.
     axis: Axis | None = None
-    out: str | None = None
-    init_ops: tuple[ElementwiseImpl, ...] = ()
+
+    @property
+    def out(self) -> str:
+        """The bound output name — the φ ``finalize``'s result if any, else the primary
+        carried state. Derived, not stored: we always know what a monoid accumulates (and
+        an mma-fragment output won't fit a stored ``str``). Seeds at lowering come from
+        ``state.identity``, so there is no separate ``init_ops``."""
+        return self.finalize[-1].name if self.finalize else self.state.names[0]
 
     def partial_names(self) -> tuple[str, ...]:
         """The bound name of each partial — the node's output (``Map`` last def /
@@ -301,6 +308,13 @@ class Monoid(Stmt):
         return render_merge_program(self.twist.merge, self.state.names, ctx)
 
 
+# The three algebra node kinds — the compute tree's vocabulary. A partial / operand
+# source is one of these (``Monoid.partial`` also admits a bound ``str`` name in its
+# loop-IR carrier form). Defined after the classes; annotations are strings (``from
+# __future__ import annotations``) so the forward reference in the fields above resolves.
+AlgebraNode = Map | Monoid | Semiring
+
+
 def _partial_name(p) -> str:
     """The SSA name a partial source binds — the value the carrier folds. A ``str`` is
     the name itself (loop-IR carrier); a :class:`Monoid` / :class:`Semiring` binds its
@@ -314,4 +328,4 @@ def _partial_name(p) -> str:
     raise TypeError(f"_partial_name: unsupported partial source {type(p).__name__}")
 
 
-__all__ = ["Map", "Semiring", "State", "Twist", "Monoid"]
+__all__ = ["AlgebraNode", "Map", "Semiring", "State", "Twist", "Monoid"]

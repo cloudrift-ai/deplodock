@@ -20,28 +20,28 @@ A kernel's compute is a tree of three node kinds, each of whose children
 - ``Semiring`` — a contraction ``reduce(⊕) ∘ map(⊗)`` (the matmul): the ``lift`` ⊗ over
   its ``operands``, folded by the additive ``fold`` ⊕ over ``reduce_axis``.
 
-:func:`lower` emits loop-IR stmts: a ``Monoid`` generates an ``Init`` per carried state
-(← the carrier identity), the streaming ``Loop`` (its partials expanded as sibling stmts
-+ the carrier fold), then the carrier's ``finalize`` φ — and leaves an in-loop carrier
-with its partials reduced to bound names; a ``Semiring`` generates its contraction
-``Loop`` in the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` is already
-stmts (returned as-is). So a kernel *is* the lowered tree — no per-kernel builder.
+:func:`lower` emits loop-IR stmts: a ``Monoid`` generates the streaming ``Loop`` (its
+partials expanded as sibling stmts + the carrier fold) then the carrier's ``finalize`` φ
+— and leaves an in-loop carrier with its partials reduced to bound names; the carried
+states are seeded by ``Loop.render`` from ``state.identity`` (no ``Init`` stmts, the same
+prelude it uses for ``Accum``\\ s). A ``Semiring`` generates its contraction ``Loop`` in
+the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` is already stmts (returned
+as-is). So a kernel *is* the lowered tree — no per-kernel builder.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.stmt import Assign, Body, Init, Loop, Map, Monoid, Semiring
+from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, Monoid, Semiring
 from deplodock.compiler.ir.stmt.algebra import _partial_name
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
 
 
 def lower(op) -> list[Stmt]:
     """Lower an op-tree node to loop-IR stmts. A ``Map`` is already stmts (returned
-    as-is); a ``Monoid`` / ``Semiring`` generates its ``Init``\\ s + reduce ``Loop``. One
-    ``lower`` call on the root node emits a whole kernel's per-cell body."""
+    as-is); a ``Monoid`` / ``Semiring`` generates its reduce ``Loop`` (states seeded by
+    ``Loop.render``). One ``lower`` call on the root node emits the kernel's per-cell body."""
     if isinstance(op, Map):
         return list(op)
     if isinstance(op, Monoid):
@@ -59,22 +59,20 @@ def _lower_partial(p) -> list[Stmt]:
 
 
 def _lower_monoid(m: Monoid) -> list[Stmt]:
-    """An ``Init`` per carried state (the carrier identity), then the streaming ``Loop``
-    whose body expands the partial sources (siblings) and applies the carrier fold, then
-    the carrier's ``finalize`` φ (the post-loop projection of the final state to the
-    output — empty for a plain reduce, ``O/l`` for flash). The in-loop carrier is this
+    """The streaming ``Loop`` whose body expands the partial sources (siblings) and
+    applies the carrier fold, then the carrier's ``finalize`` φ (the post-loop projection
+    of the final state to the output — empty for a plain reduce, ``O/l`` for flash). No
+    ``Init`` stmts: ``Loop.render`` seeds each carried state from ``state.identity`` in
+    the same pre-loop prelude it uses for ``Accum``\\ s. The in-loop carrier is this
     ``Monoid`` with its partial sources reduced to their bound names and its
-    self-contained fields (``axis`` / ``out`` / ``init_ops`` / ``finalize``) stripped —
-    the loop-IR carrier stmt the renderer / passes consume. Pure structure-from-carrier."""
-    out: list[Stmt] = [Init(name=s, op=op, dtype=F32) for s, op in zip(m.state.names, m.init_ops, strict=True)]
+    self-contained ``axis`` / ``finalize`` stripped — the loop-IR carrier stmt the
+    renderer / passes consume. Pure structure-from-carrier."""
     body: list[Stmt] = []
     for p in m.partial:
         body += _lower_partial(p)
-    carrier = replace(m, partial=m.partial_names(), axis=None, out=None, init_ops=(), finalize=())
+    carrier = replace(m, partial=m.partial_names(), axis=None, finalize=())
     body.append(carrier)
-    out.append(Loop(axis=m.axis, body=Body(tuple(body))))
-    out.extend(m.finalize)
-    return out
+    return [Loop(axis=m.axis, body=Body(tuple(body))), *m.finalize]
 
 
 def _lower_semiring(s: Semiring) -> list[Stmt]:

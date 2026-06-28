@@ -193,11 +193,9 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         commutative=s.commutative,
         axes=new_axes,
         finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state
-        # Self-contained op-tree fields — preserved across rename (loop-IR carriers have
-        # them empty; an op-tree Monoid keeps its axis / projected out / init ops).
+        # Self-contained op-tree axis — preserved across rename (loop-IR carriers have it
+        # None; ``out`` is derived from finalize / state, no field to thread).
         axis=axis_fn(s.axis) if s.axis is not None else None,
-        out=rn(s.out) if isinstance(s.out, str) else s.out,
-        init_ops=s.init_ops,
     )
 
 

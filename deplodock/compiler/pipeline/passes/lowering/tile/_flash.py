@@ -310,9 +310,7 @@ def _flash_op(
                 ]
             ),
         ),
-        axis=Axis(name="dd", extent=Dim(head_dim)),
-        out="sacc",
-        init_ops=(add,),
+        axis=Axis(name="dd", extent=Dim(head_dim)),  # out ("sacc") + seeds derived from the carrier
     )
     # The score partial is one Map: the dd contraction, the scale, and the mask — its
     # last stmt binds ``score_name`` (the carrier's score partial).
@@ -348,9 +346,7 @@ def _flash_op(
     flash_monoid = replace(
         flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
         partial=(Map(score_stmts), Map([Load(name="v_e", input=v_buf, index=v_idx)])),
-        axis=Axis(name="kv", extent=s_k),
-        out="O_i__proj",
-        init_ops=(ElementwiseImpl("maximum"), add, add),
+        axis=Axis(name="kv", extent=s_k),  # out ("O_i__proj") + seeds derived from the carrier
     )
     return flash_monoid
 

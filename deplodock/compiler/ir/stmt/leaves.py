@@ -686,7 +686,10 @@ class Init(Stmt):
 
     The ``op`` is redundant with the matching ``Accum.op`` (the
     accumulator carries its own combine), but is kept here so the
-    renderer can pick the identity without scanning ahead.
+    renderer can pick the identity without scanning ahead. (A ``Monoid``
+    carrier needs no ``Init``: ``Loop.render`` seeds each carried state
+    from ``state.identity`` in the same pre-loop prelude it uses for
+    ``Accum``\\ s.)
     """
 
     name: str
