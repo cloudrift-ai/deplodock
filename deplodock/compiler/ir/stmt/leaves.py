@@ -489,6 +489,14 @@ class Accum(Stmt):
     # f32 rendering.
     dtype: DataType | None = None
     axes: tuple[str, ...] = ()
+    # Optional rescaled base — the value the fold reads as its left operand instead
+    # of ``name`` (``name = op(base, value)``). ``None`` = the ordinary self-fold
+    # ``name = op(name, value)``. A twisted carrier's streaming merge lowers each
+    # state component to a ``base``-``Accum``: the ψ rescale is a preceding ``Assign``
+    # binding ``base`` (e.g. ``lm = l·alpha``), so the fold itself stays an ``Accum``
+    # whose seed is still ``op.identity``. The seed (and ``Loop.render``'s per-Accum
+    # init) is unchanged — ``base`` only redirects the in-loop left operand.
+    base: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):
@@ -501,6 +509,10 @@ class Accum(Stmt):
         return Literal(identity if identity is not None else 0.0)
 
     def deps(self) -> tuple[str, ...]:
+        # ``base`` (when it redirects the left operand) is a same-scope read; the
+        # carried ``name`` read is implicit (loop-carried), like the default fold.
+        if self.base is not None and self.base != self.name:
+            return (self.value, self.base)
         return (self.value,)
 
     def defines(self) -> tuple[str, ...]:
@@ -552,23 +564,29 @@ class Accum(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         prefix = f"{self.dtype.name} " if self.dtype is not None else ""
-        return [f"{indent}{prefix}{self.name} <- {self.op.name}({self.name}, {self.value})"]
+        base = self.base if self.base is not None else self.name
+        return [f"{indent}{prefix}{self.name} <- {self.op.name}({base}, {self.value})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        # Accumulator dtype — explicit on Accum once the Init-placement pass
+        # Accumulator dtype — explicit on Accum once the dtype policy
         # has frozen it; otherwise default to fp32 (legacy behavior).
         acc_dt = (self.dtype or F32).name
         ctx.ssa_dtypes[self.name] = acc_dt
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
         rhs = ctx.target.convert(self.value, value_dt, acc_dt)
+        # Left operand of the fold: ``base`` (a rescaled state, already at acc_dt)
+        # when set, else the carried ``name`` itself.
+        base = self.base if self.base is not None else self.name
         # Spelling (``+=`` / ``*=`` / ``fmax`` / ``fmin``) from the shared reduce
         # registry; defaults to additive for non-reduce ops.
         spelling = reduce_spelling(self.op)
         if spelling.intrinsic is not None:
             fn = ctx.target.intrinsic(spelling.intrinsic, acc_dt)
-            return [f"{pad}{self.name} = {fn}({self.name}, {rhs});"]
-        return [f"{pad}{self.name} {spelling.compound} {rhs};"]
+            return [f"{pad}{self.name} = {fn}({base}, {rhs});"]
+        if base == self.name:
+            return [f"{pad}{self.name} {spelling.compound} {rhs};"]
+        return [f"{pad}{self.name} = {base} {spelling.infix} {rhs};"]
 
 
 @dataclass(frozen=True)
