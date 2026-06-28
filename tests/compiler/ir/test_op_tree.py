@@ -17,9 +17,12 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Body, Loop, Write
 from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
+from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 ADD = ElementwiseImpl("add")
 MUL = ElementwiseImpl("multiply")
+MAX = ElementwiseImpl("maximum")
+DIV = ElementwiseImpl("divide")
 
 
 def _wrap(free_axes, cell, out_buf, out_index) -> LoopOp:
@@ -61,3 +64,42 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
     x = np.random.rand(R, K).astype(np.float32)
     got = np.asarray(op.forward(x)).reshape(R)
     np.testing.assert_allclose(got, x.sum(-1), rtol=1e-5, atol=1e-5)
+
+
+def test_flash_op_tree_matches_softmax_qkv() -> None:
+    """Flash attention as a pure op tree — a 3-state twisted carrier (m,l,O) folding
+    over kv, whose score partial is a NESTED contraction (Σ_k Q·K), with the O/l
+    projection as the root Map. Lowers generically (no build_flash_*) and matches
+    softmax(QK^T)·V."""
+    S, D = 4, 3
+    i, d = Axis("i", Dim(S)), Axis("d", Dim(D))  # free: query row, value dim
+    j, k = Axis("j", Dim(S)), Axis("k", Dim(D))  # reduce: kv (outer), head-dim (inner)
+    score = Reduce(
+        out="s",
+        axis=k,
+        carrier=Accum(name="s", value="qk", op="add").as_monoid(),
+        partials=(Map(out="qk", op=MUL, args=(TensorRef("Q", (Var("i"), Var("k"))), TensorRef("K", (Var("j"), Var("k"))))),),
+        init_ops=(ADD,),
+    )
+    flash = Map(  # the projection O/l is the root, wrapping the (m,l,O) fold
+        out="acc",
+        op=DIV,
+        args=(
+            Reduce(
+                out="O",
+                axis=j,
+                carrier=flash_combine("m", "l", "O", "s", "v"),
+                partials=(score, TensorRef("V", (Var("j"), Var("d")))),
+                init_ops=(MAX, ADD, ADD),
+            ),
+            "l",
+        ),
+    )
+    op = _wrap((i, d), lower(flash), "attn", (Var("i"), Var("d")))
+    rng = np.random.default_rng(0)
+    q, ky, v = (rng.standard_normal((S, D)).astype(np.float32) for _ in range(3))
+    got = np.asarray(op.forward(q, ky, v)).reshape(S, D)
+    smat = q @ ky.T
+    p = np.exp(smat - smat.max(-1, keepdims=True))
+    ref = (p / p.sum(-1, keepdims=True)) @ v
+    np.testing.assert_allclose(got, ref, rtol=1e-4, atol=1e-4)

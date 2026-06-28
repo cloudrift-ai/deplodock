@@ -106,16 +106,26 @@ def _lower_map(m: Map, ssa) -> list[Stmt]:
     return stmts
 
 
-def lower(r: Reduce, ssa=None) -> list[Stmt]:
-    """Lower a :class:`Reduce` to loop-IR stmts: an ``Init`` per carried state (the
-    carrier's identity), then the streaming ``Loop`` whose body computes the
-    partials and applies the carrier fold. Pure structure-from-carrier — no
-    per-kernel assembly."""
+def lower(op, ssa=None) -> list[Stmt]:
+    """Lower an op-tree node (``Map`` / ``Reduce``) to loop-IR stmts that bind its
+    ``out``. The projection of a reduce is just a root ``Map`` wrapping the
+    ``Reduce`` (``Map(divide, (Reduce(...), 'l'))``), so one ``lower`` call emits a
+    whole kernel's per-cell body."""
     if ssa is None:
         ssa = _counter()
+    if isinstance(op, Map):
+        return _lower_map(op, ssa)
+    if isinstance(op, Reduce):
+        return _lower_reduce(op, ssa)
+    raise TypeError(f"lower: expected Map / Reduce root, got {type(op).__name__}")
+
+
+def _lower_reduce(r: Reduce, ssa) -> list[Stmt]:
+    """An ``Init`` per carried state (the carrier's identity), then the streaming
+    ``Loop`` whose body computes the partials and applies the carrier fold. Pure
+    structure-from-carrier — no per-kernel assembly."""
     out: list[Stmt] = []
-    states = r.carrier.state
-    for s, op in zip(states, r.init_ops, strict=True):
+    for s, op in zip(r.carrier.state, r.init_ops, strict=True):
         out.append(Init(name=s, op=op, dtype=r.dtype))
     body: list[Stmt] = []
     for src, pname in zip(r.partials, r.carrier.partial, strict=True):
