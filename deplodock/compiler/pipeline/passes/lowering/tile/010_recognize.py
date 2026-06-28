@@ -30,11 +30,11 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.algebra import Semiring
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Select, Write
+from deplodock.compiler.ir.stmt.algebra import Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import (

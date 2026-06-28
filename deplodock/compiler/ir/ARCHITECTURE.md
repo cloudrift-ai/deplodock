@@ -143,12 +143,14 @@ directly (`Accum` forwards to its scalar `op`; `Mma` reports the additive-fold
 constants; `Monoid` reports `associative` / `has_identity` `True` by construction
 with a per-instance `commutative` field).
 
-**The algebra is in the body, not a tag** (`ir/algebra.py`). There is no stored /
-derived `AlgebraKind`: a kernel's algebra is read directly off its carriers and
-partial structure where a pass needs it. The fold ⊕ is the carrier (`Accum`
-scalar fold, or `Monoid` + `Twist`); the lift is the partial — a unary value
-(a reduction: sum / max / online softmax) or a ⊗-product over several contraction
-operands (a contraction: matmul). A non-reduce scope is pointwise.
+**The algebra is in the body, not a tag** (`ir/stmt/algebra.py` — the consolidated
+algebraic vocabulary: the lift `Map`, the carrier `Monoid` + `Twist`, and the
+`Semiring` contraction view). There is no stored / derived `AlgebraKind`: a kernel's
+algebra is read directly off its carriers and partial structure where a pass needs it.
+The fold ⊕ is the carrier (`Accum` scalar fold, or `Monoid` + `Twist`); the lift is
+the partial — a unary value (a reduction: sum / max / online softmax) or a ⊗-product
+over several contraction operands (a contraction: matmul). A non-reduce scope is
+pointwise.
 
 The one structural shape the schedule must recognize lives here: `Semiring` (the
 `reduce(⊕) ∘ map(⊗)` view) and `Semiring.match(loop)`, computed on demand. A

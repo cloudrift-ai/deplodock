@@ -1,13 +1,19 @@
 """High-level algebraic op tree — the geometry-free compute layer.
 
+The algebraic vocabulary itself lives in :mod:`deplodock.compiler.ir.stmt.algebra` —
+the lift :class:`~deplodock.compiler.ir.stmt.algebra.Map` (re-exported here), the
+carrier ``Monoid`` + ``Twist``, and the ``Semiring`` contraction view. This module is
+the **op tree** built on top of them: the fold node :class:`Reduce`, the operand
+descriptor :class:`TensorRef`, and :func:`lower`.
+
 A kernel's compute is built from two things:
 
 - :class:`Reduce` — a fold over one axis through a carrier (``Monoid`` + ``Twist``),
-  whose **partials are nested**: a :class:`Map` (a stmt body), a :class:`TensorRef`
+  whose **partials are nested**: a ``Map`` (a stmt body), a :class:`TensorRef`
   (a direct operand load), or another ``Reduce``. A contraction (matmul / the
   SEMIRING) is ``Reduce(⊕=+)`` over ``Map(⊗=·)``; flash is ``Reduce(lse)`` over the
   scaled ``Σ Q·K`` and ``V``.
-- :class:`Map` — a pointwise body: a typed sequence of loop-IR stmts (the operand
+- ``Map`` — a pointwise body: a typed sequence of loop-IR stmts (the operand
   ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and — at the
   kernel root — the output ``Write``) that binds a value name as its last defining
   stmt. It **is** a :class:`Body`, so it carries Body's analysis helpers and there is
@@ -34,7 +40,7 @@ from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.stmt import Body, Init, Load, Loop
+from deplodock.compiler.ir.stmt import Body, Init, Load, Loop, Map  # Map re-exported from ir.stmt.algebra
 from deplodock.compiler.ir.stmt.base import Stmt
 
 
@@ -46,15 +52,6 @@ class TensorRef:
 
     buf: str
     index: tuple[Expr, ...]
-
-
-class Map(Body):
-    """A pointwise body — a typed :class:`Body` (a sequence of loop-IR stmts: operand
-    ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and the output
-    ``Write`` at the kernel root) that binds a value name as its last defining stmt. It
-    has no fields of its own: it IS its stmts, and so carries Body's analysis helpers.
-    Used as a carrier partial (supplying that partial's stmts, last-binding the partial
-    name) or as the kernel root (last stmt = the ``Write``)."""
 
 
 # A partial source: a Map (stmt body), a direct operand load (TensorRef), or a nested Reduce.

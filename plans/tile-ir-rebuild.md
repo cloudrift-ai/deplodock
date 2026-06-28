@@ -198,8 +198,10 @@ test.
 
 ### Phase 2 — the high-level op tree (dissolving `build_*`) — done
 
-The compute layer is lifted from hand-assembled low-level loop stmts to a small algebraic op tree (`ir/tile/ops.py`)
-with just two node kinds plus an operand descriptor:
+The compute layer is lifted from hand-assembled low-level loop stmts to a small algebraic op tree. The algebraic
+vocabulary is consolidated in `ir/stmt/algebra.py` — the lift `Map`, the carrier `Monoid` + `Twist`, and the `Semiring`
+contraction view — and the op tree built on it (`Reduce`, `TensorRef`, `lower`) lives in `ir/tile/ops.py`. Just two node
+kinds plus an operand descriptor:
 
 - **`Reduce`** — a fold over one axis through a `Monoid`+`Twist` carrier, with **partials nested** (a `Map`, a
   `TensorRef`, or another `Reduce`). `lower` generates its structure: an `Init` per carried state (from the carrier

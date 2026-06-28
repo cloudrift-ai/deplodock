@@ -112,7 +112,7 @@ enumeration's flat per-family forks), and the tree builder's branch / leaf node 
 the block-DAG Tile IR (`ir/tile/ir.py`): `split/` (pre-build structural forks) → `enumeration/` (the move composer
 that seeds a logical `TileGraph` and refines it move-by-move while searching the `Schedule`) → `assembly/`
 (deterministic materialization to `TileOp`). It **never dispatches on a named shape** — every decision is gated on
-the reduce axes' carrier algebra read off the body (`ir/algebra.py::Semiring.match` + the carrier types — the fold ⊕ is
+the reduce axes' carrier algebra read off the body (`ir/stmt/algebra.py::Semiring.match` + the carrier types — the fold ⊕ is
 the `Accum` / `Monoid`+`Twist`, the lift is the partial: a distributing ⊗-product contraction vs a unary value),
 not on a matmul/pointwise/attention archetype (flash attention is a `Monoid` streaming over a nested contraction,
 flagged structurally — a twisted monoid is a monoid). The full design — the per-family enumeration rule passes, the

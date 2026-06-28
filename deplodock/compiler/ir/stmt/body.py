@@ -658,7 +658,8 @@ class Body(tuple[Stmt, ...]):
         # imports Body from this module). Smem / StageBundle staging buffers
         # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
         # import is needed.
-        from deplodock.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt.algebra import Monoid  # noqa: PLC0415
+        from deplodock.compiler.ir.stmt.leaves import Accum, Write  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()

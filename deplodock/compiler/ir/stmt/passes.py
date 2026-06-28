@@ -17,6 +17,7 @@ from functools import singledispatch
 from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
 from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt.algebra import Monoid, Twist
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import (
@@ -25,11 +26,9 @@ from deplodock.compiler.ir.stmt.leaves import (
     Init,
     Load,
     Mma,
-    Monoid,
     Pack,
     Select,
     SelectBranch,
-    Twist,
     Unpack,
     Write,
 )
