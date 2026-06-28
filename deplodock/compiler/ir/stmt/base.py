@@ -97,15 +97,6 @@ class RenderCtx:
     # the cooperative-decode form (threadIdx → axes) rather than the
     # standalone pointwise form (linear tid + bounds guard).
     inside_grid_tile: bool = False
-    # Per-Write coordination metadata derived from the escape-analysis
-    # helper. Populated once at ``render_kernelop`` entry; consumed by
-    # ``Write.render`` to decide atomicAdd vs plain store and whether to
-    # wrap the store in a single-thread broadcast guard. Keyed by
-    # ``id(write)`` because ``Write.index`` may hold ``BinaryExpr`` nodes
-    # that aren't hashable. Empty when no helper analysis was run (legacy
-    # callers / unit-test fixtures that build a RenderCtx directly).
-    atomic_writes: dict[int, frozenset[str]] = field(default_factory=dict)
-    broadcast_writes: dict[int, frozenset[str]] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
         """Return a new ctx one indent level deeper, sharing all tables."""
@@ -122,8 +113,6 @@ class RenderCtx:
             ssa_dtypes=self.ssa_dtypes,
             literal_default_dtype=self.literal_default_dtype,
             inside_grid_tile=self.inside_grid_tile,
-            atomic_writes=self.atomic_writes,
-            broadcast_writes=self.broadcast_writes,
         )
 
     # ---- Convenience wrappers over ``self.target``. These exist so the

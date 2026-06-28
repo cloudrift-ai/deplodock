@@ -393,12 +393,16 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 Tile IR encodes scheduling decisions structurally — `Tile.axes` carry
 `BIND_THREAD` / `BIND_BLOCK` bindings, `Stage` wraps consumer subtrees
-that read smem-cached operands. Coordination decisions are derived from
-the body at materialize / render time via ``ir/tile/escape_analysis.py``:
-cooperative-reduce combine emission from ``Accum.axes ∩ ThreadTile.axes``,
-atomic-write classification from enclosing ``GridTile.axes`` vs
-``Write.index``, broadcast-write guards from cooperative thread axes vs
-``Write.index``. One cooperative analysis covers every reduce carrier — a scalar
+that read smem-cached operands. Coordination decisions (cooperative-reduce
+combine emission, atomic-write classification, broadcast-write guards) were
+derived from the body at materialize / render time by the `Body.coordination`
+escape analysis; that helper was **removed in the tile-IR rebuild** along with
+the cooperative / cross-CTA scheduling passes that fed it (`GridTile` /
+`ThreadTile` structures), to be rebuilt against the op tree once those
+schedules return. The intended derivation — cooperative axes from
+``Accum.axes ∩ ThreadTile.axes``, atomic writes from enclosing ``GridTile.axes``
+vs ``Write.index``, broadcast guards from cooperative thread axes vs
+``Write.index`` — covered every reduce carrier uniformly: a scalar
 ``Accum`` is the degenerate 1-component monoid (its ``combine_partials`` is the
 one-``Assign`` op-fold), the general ``Monoid`` (flash online-softmax) the
 multi-component case — keyed by the carrier's first carried name. The

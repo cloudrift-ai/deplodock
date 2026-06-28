@@ -743,12 +743,6 @@ class Write(Stmt):
     node's id, or — for multi-output kernels — one of its output buffer
     names). ``index`` uses axis Vars to compute the per-dim offset.
 
-    Whether the store lowers to ``atomicAdd`` or a plain store is
-    decided at codegen time by ``escape_analysis.atomic_axes`` (any
-    enclosing block axis missing from ``index`` ⇒ atomic). The vectorize
-    pass also consults the helper to refuse atomic-add Writes (each lane
-    would need its own atomicAdd).
-
     ``value_dtype`` is optional; when set, names the SSA-value dtype being
     stored. Stamped by ``030_stamp_types``; downstream passes read it
     instead of querying ``ctx.ssa_dtypes`` at render time.
@@ -832,29 +826,10 @@ class Write(Stmt):
             # Scalar path. Convert at the store boundary only when the
             # value's SSA dtype disagrees with the destination buffer's
             # dtype — native chains write through with no conversion.
-            # Applies to both plain stores and atomic reduce-writes
-            # (split-K matmul fans an f32 accumulator into an f16 output;
-            # without conversion the ``atomicAdd(__half*, float)`` call
-            # is silently broken).
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(_resolve_value(self.value, ctx), value_dt, out_dt)
-            # Atomic-Write trigger: helper-derived signal from
-            # ``ctx.atomic_writes``, populated by ``render_kernelop``.
-            # Standalone-render unit tests that build a bare RenderCtx
-            # see an empty dict and get a plain store.
-            is_atomic = bool(ctx.atomic_writes.get(id(self)))
-            store = f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});" if is_atomic else f"{pad}{self.output}[{flat}] = {rhs};"
-            # Broadcast guard: when the helper says this Write is missing
-            # one or more cooperative thread axes from its index, wrap the
-            # store in ``if (axis == 0)`` so only one thread of the
-            # cooperative group performs it. The guard condition is the
-            # conjunction of all missing axes.
-            broadcast = ctx.broadcast_writes.get(id(self), frozenset())
-            if broadcast:
-                cond = " && ".join(f"{ax} == 0" for ax in sorted(broadcast))
-                return [f"{pad}if ({cond}) {{", store, f"{pad}}}"]
-            return [store]
+            return [f"{pad}{self.output}[{flat}] = {rhs};"]
         # Vectorized path. Per-value dtype conversion: every SSA arg
         # must be at ``out_dt`` before packing.
         n = self.width
