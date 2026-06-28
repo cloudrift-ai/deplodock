@@ -6,11 +6,12 @@ builders); this module owns the *construction* side: the ``flash_combine`` /
 ``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
 predicates, and the fragment builders ``build_flash_frag`` / ``build_flash_recovered``.
 Neither hand-assembles a kernel body any more: each builds the high-level op tree
-(``ir/tile/ops`` — flash is the ``(m,l,O)`` LSE ``Reduce`` over kv wrapping the
-``Σ Q·K`` contraction, with ``O/l`` the root projection ``Map``) and calls
-``lower``; they differ only in how the score partial is obtained — clean
-``TensorRef`` loads (``build_flash_frag``) vs. an ``Inline`` recovered RoPE
-subgraph (``build_flash_recovered``). The flash skeleton lives once, in the tree.
+(``ir/tile/ops`` — flash is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial
+``Map`` holds the ``Σ Q·K`` contraction; the kernel root is the ``O/l`` projection
+``Map``) and calls ``lower``. They differ only in that score ``Map``: clean
+``Load``\\ s of Q/K (``build_flash_frag``) vs. a recovered fused-RoPE subgraph spliced
+in verbatim (``build_flash_recovered``) — a ``Map`` is just a stmt body either way. The
+flash skeleton lives once, in the tree.
 
 The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
@@ -50,9 +51,9 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Twist, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
-from deplodock.compiler.ir.tile.ops import Inline, Map, Mask, Reduce, TensorRef, lower
+from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -299,17 +300,18 @@ def _flash_body(
 ) -> tuple:
     """The per-output-element ``(…, m, d)`` body as a lowered op tree (no per-kernel
     assembly): flash is the ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score
-    partial is a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked), with the
-    ``O/l`` projection as the root :class:`Map`. ``lower`` walks the tree — the
-    carriers generate the ``Init``\\ s + streaming folds, the ``TensorRef``\\ s the loads.
+    partial ``Map`` holds a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked);
+    the kernel root is the ``O/l`` projection ``Map`` whose last stmt is the output
+    ``Write``. ``lower`` turns the ``Reduce``\\ s into ``Init``\\ s + streaming folds; the
+    ``Map``\\ s are already stmts.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
     ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
     kv_heads-many K/V are read without materializing the q_heads expansion. An additive
     ``mask_buf`` (broadcast leading dims) is added to the score; causal masking is a
-    :class:`Mask` (``kv ≤ m`` else −inf) — the index predicate lives in the op tree,
-    never in the carrier. Both make ``exp(s − m_new) = 0``, so masked keys contribute
-    nothing."""
+    ``Select`` stmt (``kv ≤ m`` else −inf) in the score ``Map`` — the index predicate
+    lives in the op tree, never in the carrier. Both make ``exp(s − m_new) = 0``, so
+    masked keys contribute nothing."""
     bvars = _batch_vars(len(batch))
     head_axis = len(batch) - 1  # last batch dim is the head (when there is one)
     kv_bvars = tuple(BinaryExpr("/", bv, Literal(group, "int")) if (group > 1 and i == head_axis) else bv for i, bv in enumerate(bvars))
@@ -319,41 +321,60 @@ def _flash_body(
     out_idx = (*bvars, Var("m"), Var("d"))
 
     add = ElementwiseImpl("add")
-    score = Reduce(  # s = Σ_dd Q·K — the inner contraction (SEMIRING), reset per kv step
+    score_reduce = Reduce(  # s = Σ_dd Q·K — the inner contraction (SEMIRING), reset per kv step
         out="sacc",
         axis=Axis(name="dd", extent=Dim(head_dim)),
         carrier=Accum(name="sacc", value="qk", op=add).as_monoid(),
-        partials=(Map(out="qk", op=ElementwiseImpl("multiply"), args=(TensorRef(q_buf, q_idx), TensorRef(k_buf, k_idx))),),
+        partials=(
+            Map(
+                [
+                    Load(name="q_e", input=q_buf, index=q_idx),
+                    Load(name="k_e", input=k_buf, index=k_idx),
+                    Assign(name="qk", op="multiply", args=("q_e", "k_e")),
+                ]
+            ),
+        ),
         init_ops=(add,),
     )
-    scaled = Map(out="s", op=ElementwiseImpl("multiply"), args=(score, TensorRef("_flash_scale", ())))
+    # The score partial is one Map: the dd contraction, the scale, and the mask — its
+    # last stmt binds ``score_name`` (the carrier's score partial).
+    score_stmts = [
+        *lower(score_reduce),
+        Load(name="scale_c", input="_flash_scale", index=()),
+        Assign(name="s", op="multiply", args=("sacc", "scale_c")),
+    ]
     if causal:
-        score_src = Mask(out="s_masked", val=scaled, fill=TensorRef("_flash_ninf", ()), pred=BinaryExpr("<=", Var("kv"), Var("m")))
+        # Causal mask: keep the score where key ≤ query (kv ≤ m), else −inf.
+        score_stmts += [
+            Load(name="ninf_c", input="_flash_ninf", index=()),
+            Select(
+                name="s_masked",
+                branches=(
+                    SelectBranch(value="s", select=BinaryExpr("<=", Var("kv"), Var("m"))),
+                    SelectBranch(value="ninf_c", select=Literal(1, "int")),
+                ),
+            ),
+        ]
         score_name = "s_masked"
     elif mask_buf is not None:
         # Additive bias: leading dims broadcast (indexed to 0), trailing two are the
         # query row m and the streaming key kv.
         mask_idx = (*(Literal(0, "int") for _ in mask_shape[:-2]), Var("m"), Var("kv"))
-        score_src = Map(out="s_masked", op=add, args=(scaled, TensorRef(mask_buf, mask_idx)))
+        score_stmts += [Load(name="mask_e", input=mask_buf, index=mask_idx), Assign(name="s_masked", op="add", args=("s", "mask_e"))]
         score_name = "s_masked"
     else:
-        score_src = scaled
         score_name = "s"
-    flash = Map(  # the projection O/l is the root, wrapping the (m,l,O) streaming fold
-        out="res",
-        op=ElementwiseImpl("divide"),
-        args=(
-            Reduce(
-                out="O_i",
-                axis=Axis(name="kv", extent=s_k),
-                carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
-                partials=(score_src, TensorRef(v_buf, v_idx)),
-                init_ops=(ElementwiseImpl("maximum"), add, add),
-            ),
-            "l_i",
-        ),
+    flash_reduce = Reduce(  # the (m,l,O) streaming fold over kv
+        out="O_i",
+        axis=Axis(name="kv", extent=s_k),
+        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
+        partials=(Map(score_stmts), TensorRef(v_buf, v_idx)),
+        init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    return tuple(lower(flash)) + (Write(output=out_buf, index=out_idx, value="res"),)
+    root = Map(
+        [*lower(flash_reduce), Assign(name="res", op="divide", args=("O_i", "l_i")), Write(output=out_buf, index=out_idx, value="res")]
+    )
+    return tuple(root)
 
 
 def _wrap_free_axes(body: tuple, batch: list[int], s_q: Dim, d_v: int) -> tuple:
@@ -513,23 +534,21 @@ def build_flash_recovered(graph: Graph, producer: LoopOp, consumer: LoopOp, x_bu
 
     # Same flash skeleton as the clean path — expressed once in the op tree. Only the
     # score partial is opaque: a recovered fused-RoPE subgraph (Q/K are computed SSA,
-    # not loads), plugged in via Inline; the kv fold + O/l projection are generic.
+    # not loads), which is just a Map (a stmt body last-binding score_name); the kv fold
+    # + O/l projection are generic.
     add = ElementwiseImpl("add")
-    flash = Map(
-        out="res",
-        op=ElementwiseImpl("divide"),
-        args=(
-            Reduce(
-                out="O_i",
-                axis=Axis(name="kv", extent=kv_ext),
-                carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),
-                partials=(Inline(out=score_name, stmts=(*inits, *new_score)), TensorRef(v_id, new_v_index)),
-                init_ops=(ElementwiseImpl("maximum"), add, add),
-            ),
-            "l_i",
-        ),
+    flash_reduce = Reduce(
+        out="O_i",
+        axis=Axis(name="kv", extent=kv_ext),
+        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),
+        partials=(Map([*inits, *new_score]), TensorRef(v_id, new_v_index)),
+        init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    elem = (*lower(flash), Write(output=out.name, index=new_out_index, value="res"))
+    elem = (
+        *lower(flash_reduce),
+        Assign(name="res", op="divide", args=("O_i", "l_i")),
+        Write(output=out.name, index=new_out_index, value="res"),
+    )
     nest = (
         *new_prologue,
         Loop(

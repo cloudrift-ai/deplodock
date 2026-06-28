@@ -1,23 +1,29 @@
 """High-level algebraic op tree — the geometry-free compute layer.
 
-A kernel's compute is a tree of two primitives:
+A kernel's compute is built from two things:
 
-- :class:`Map` — a pointwise op ``out = φ(args)`` (the lift / elementwise).
 - :class:`Reduce` — a fold over one axis through a carrier (``Monoid`` + ``Twist``),
-  whose **partials are nested ops** (a ``Map``, a ``TensorRef`` load, or another
-  ``Reduce``). A contraction (matmul / the SEMIRING) is just ``Reduce(⊕=+)`` over
-  ``Map(⊗=·)``; flash is ``Reduce(lse)`` over ``(Map(scale, Reduce(+)∘Map(·)), V)``.
+  whose **partials are nested**: a :class:`Map` (a stmt body), a :class:`TensorRef`
+  (a direct operand load), or another ``Reduce``. A contraction (matmul / the
+  SEMIRING) is ``Reduce(⊕=+)`` over ``Map(⊗=·)``; flash is ``Reduce(lse)`` over the
+  scaled ``Σ Q·K`` and ``V``.
+- :class:`Map` — a pointwise body: a typed sequence of loop-IR stmts (the operand
+  ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and — at the
+  kernel root — the output ``Write``) that binds a value name as its last defining
+  stmt. It **is** a :class:`Body`, so it carries Body's analysis helpers and there is
+  nothing to "lower" — the stmts are the lowering. A ``Map`` plugged into a carrier
+  partial supplies that partial's stmts (last-binding the partial's name); an opaque
+  recovered subgraph — e.g. a fused-RoPE score whose Q/K are computed SSA, not loads —
+  is just a ``Map``.
 
-The tree is **geometry-free**: it names the axes it folds and the operands it
-reads (``TensorRef`` = buffer + index exprs), but says nothing about threads /
-tiling. Geometry is the separate ``Tile(op, placement)`` layer.
+The tree is **geometry-free**: ``TensorRef`` (buffer + index exprs) is the only place
+layout lives; the tree names the axes it folds and the operands it reads but says
+nothing about threads / tiling (that is the separate ``Tile(op, placement)`` layer).
 
-:func:`lower` walks the tree and emits ordinary **loop-IR** stmts — the carrier
-generates the structure (``Init`` ← identity, the streaming ``Loop`` + the carrier
-fold ← ``merge``), the nested ops generate the lift, and the operands' index exprs
-come straight from the ``TensorRef``s. So there is no per-kernel builder: a kernel
-*is* the lowered tree — including flash's multi-state ``(m,l,O)`` LSE carrier (one
-``Init`` per carried state) and an index-dependent ``Mask`` (the causal fill).
+:func:`lower` emits loop-IR stmts: a ``Reduce`` generates the structure (an ``Init``
+per carried state ← the carrier identity, the streaming ``Loop`` + the carrier fold),
+a ``Map`` is already stmts (returned as-is), and a ``TensorRef`` is a ``Load``. So a
+kernel *is* the lowered tree — there is no per-kernel builder.
 """
 
 from __future__ import annotations
@@ -27,70 +33,42 @@ from dataclasses import dataclass, field
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr, Literal
-from deplodock.compiler.ir.stmt import Assign, Body, Init, Load, Loop, Select, SelectBranch
+from deplodock.compiler.ir.expr import Expr
+from deplodock.compiler.ir.stmt import Body, Init, Load, Loop
 from deplodock.compiler.ir.stmt.base import Stmt
 
 
 @dataclass(frozen=True)
 class TensorRef:
     """An operand read: a buffer plus the index exprs that address it (over the
-    iteration axes). The index is the *only* place layout lives — staging / the
-    mma fragment read it; nothing is duplicated into the carrier."""
+    iteration axes). The index is the *only* place layout lives — staging / the mma
+    fragment read it; nothing is duplicated into the carrier."""
 
     buf: str
     index: tuple[Expr, ...]
 
 
-# A partial source: a nested op (Map / Mask / Reduce), a direct operand load
-# (TensorRef), or an opaque precomputed stmt-list (Inline).
-Source = "Map | Mask | Reduce | TensorRef | Inline"
+class Map(Body):
+    """A pointwise body — a typed :class:`Body` (a sequence of loop-IR stmts: operand
+    ``Load``\\ s, the lift ``Assign``\\ s, an optional masking ``Select``, and the output
+    ``Write`` at the kernel root) that binds a value name as its last defining stmt. It
+    has no fields of its own: it IS its stmts, and so carries Body's analysis helpers.
+    Used as a carrier partial (supplying that partial's stmts, last-binding the partial
+    name) or as the kernel root (last stmt = the ``Write``)."""
 
 
-@dataclass(frozen=True)
-class Inline:
-    """An opaque precomputed source: a stmt-list that already binds ``out``. For a
-    subgraph the op tree can't reconstruct as ``Map`` / ``Reduce`` — e.g. a recovered
-    fused-RoPE score, where Q/K are computed SSA values, not plain loads. It plugs
-    into a carrier's partial like any other source, so the flash skeleton (the
-    streaming fold + projection) stays expressed ONCE in the tree."""
-
-    out: str
-    stmts: tuple
-
-
-@dataclass(frozen=True)
-class Map:
-    """Pointwise lift: ``out = op(args)``. Each arg is a :class:`TensorRef` (→ a
-    ``Load``), a nested op (→ its result), or a bare SSA name already in scope."""
-
-    out: str
-    op: ElementwiseImpl
-    args: tuple
-
-
-@dataclass(frozen=True)
-class Mask:
-    """Predicated fill over the iteration axes: ``out = pred ? val : fill``. The op
-    tree is index-aware (it carries the operands' index exprs), so an index-dependent
-    mask — the causal ``kv ≤ m``, where a masked score is filled with ``−inf`` so
-    ``exp(s − m) = 0`` — lives HERE, never in the carrier (the ``Monoid`` / ``Twist``
-    stays index-free). ``val`` / ``fill`` are sources (``Map`` / ``Reduce`` /
-    ``TensorRef``) or bare SSA names; ``pred`` is an ``Expr`` over the axes."""
-
-    out: str
-    val: object
-    fill: object
-    pred: Expr
+# A partial source: a Map (stmt body), a direct operand load (TensorRef), or a nested Reduce.
+Source = "Map | TensorRef | Reduce"
 
 
 @dataclass(frozen=True)
 class Reduce:
     """Fold over ``axis`` through ``carrier`` (a ``Monoid`` — its ``Twist`` is the
-    combine). ``partials`` produce the carrier's ``partial`` contributions (one
-    source per ``carrier.partial`` name, in order). ``init_ops`` gives the per-state
-    identity-bearing op for the enclosing ``Init`` (one per ``carrier.state``).
-    ``out`` is the carried state read after the fold."""
+    combine). ``partials`` produce the carrier's ``partial`` contributions (one source
+    per ``carrier.partial`` name, in order — a ``Map`` whose stmts last-bind that name,
+    a ``TensorRef`` loaded into it, or a nested ``Reduce``). ``init_ops`` gives the
+    per-state identity-bearing op for the enclosing ``Init`` (one per ``carrier.state``).
+    ``out`` is the carried state read after the fold (the carrier's primary state)."""
 
     out: str
     axis: Axis
@@ -100,79 +78,31 @@ class Reduce:
     dtype: DataType = field(default=F32)
 
 
-def _lower_source(src, name: str, ssa) -> list[Stmt]:
-    """Emit stmts that bind ``name`` to the value produced by ``src`` (a nested
-    ``Map`` / ``Mask`` / ``Reduce`` or a ``TensorRef`` load). ``ssa`` is a fresh-name
-    counter. For a nested op the binding name is the op's own ``out`` (the callers that
-    pass ``name`` for an op rely on having set ``out`` to match)."""
+def _lower_source(src, name: str) -> list[Stmt]:
+    """Emit stmts that bind ``name`` to the value produced by ``src``: a ``TensorRef``
+    (→ a ``Load`` into ``name``), a ``Map`` (→ its stmts verbatim — they already bind
+    ``name`` as their last defining stmt), or a nested ``Reduce`` (→ ``lower``)."""
     if isinstance(src, TensorRef):
         return [Load(name=name, input=src.buf, index=src.index)]
-    if isinstance(src, Inline):
-        return list(src.stmts)
     if isinstance(src, Map):
-        return _lower_map(src, ssa)
-    if isinstance(src, Mask):
-        return _lower_mask(src, ssa)
+        return list(src)
     if isinstance(src, Reduce):
-        return lower(src, ssa)
+        return lower(src)
     raise TypeError(f"_lower_source: unsupported partial source {type(src).__name__}")
 
 
-def _bind_arg(a, ssa, stmts: list[Stmt]) -> str:
-    """Bind one operand ``a`` (a bare SSA name, a ``TensorRef`` load, or a nested
-    ``Map`` / ``Mask`` / ``Reduce``), appending its binding stmts to ``stmts``, and
-    return the SSA name holding its value."""
-    if isinstance(a, str):
-        return a
-    if isinstance(a, TensorRef):
-        nm = ssa()
-        stmts.append(Load(name=nm, input=a.buf, index=a.index))
-        return nm
-    if isinstance(a, (Map, Mask, Reduce, Inline)):
-        stmts += _lower_source(a, a.out, ssa)
-        return a.out
-    raise TypeError(f"_bind_arg: unsupported operand {type(a).__name__}")
-
-
-def _lower_map(m: Map, ssa) -> list[Stmt]:
-    """Lower a ``Map`` to ``[<arg binds>…, Assign(out, op, arg_names)]``."""
-    stmts: list[Stmt] = []
-    arg_names = [_bind_arg(a, ssa, stmts) for a in m.args]
-    stmts.append(Assign(name=m.out, op=m.op, args=tuple(arg_names)))
-    return stmts
-
-
-def _lower_mask(mk: Mask, ssa) -> list[Stmt]:
-    """Lower a ``Mask`` to ``[<val binds>…, <fill binds>…, Select(out, pred?val:fill)]``."""
-    stmts: list[Stmt] = []
-    vname = _bind_arg(mk.val, ssa, stmts)
-    fname = _bind_arg(mk.fill, ssa, stmts)
-    stmts.append(
-        Select(
-            name=mk.out,
-            branches=(SelectBranch(value=vname, select=mk.pred), SelectBranch(value=fname, select=Literal(1, "int"))),
-        )
-    )
-    return stmts
-
-
-def lower(op, ssa=None) -> list[Stmt]:
-    """Lower an op-tree node (``Map`` / ``Reduce``) to loop-IR stmts that bind its
-    ``out``. The projection of a reduce is just a root ``Map`` wrapping the
-    ``Reduce`` (``Map(divide, (Reduce(...), 'l'))``), so one ``lower`` call emits a
-    whole kernel's per-cell body."""
-    if ssa is None:
-        ssa = _counter()
+def lower(op) -> list[Stmt]:
+    """Lower an op-tree node to loop-IR stmts. A ``Map`` is already stmts (returned
+    as-is); a ``Reduce`` generates its ``Init``\\ s + streaming ``Loop``. One ``lower``
+    call on the root ``Map`` emits a whole kernel's per-cell body."""
     if isinstance(op, Map):
-        return _lower_map(op, ssa)
-    if isinstance(op, Mask):
-        return _lower_mask(op, ssa)
+        return list(op)
     if isinstance(op, Reduce):
-        return _lower_reduce(op, ssa)
-    raise TypeError(f"lower: expected Map / Mask / Reduce root, got {type(op).__name__}")
+        return _lower_reduce(op)
+    raise TypeError(f"lower: expected Map / Reduce root, got {type(op).__name__}")
 
 
-def _lower_reduce(r: Reduce, ssa) -> list[Stmt]:
+def _lower_reduce(r: Reduce) -> list[Stmt]:
     """An ``Init`` per carried state (the carrier's identity), then the streaming
     ``Loop`` whose body computes the partials and applies the carrier fold. Pure
     structure-from-carrier — no per-kernel assembly."""
@@ -181,20 +111,10 @@ def _lower_reduce(r: Reduce, ssa) -> list[Stmt]:
         out.append(Init(name=s, op=op, dtype=r.dtype))
     body: list[Stmt] = []
     for src, pname in zip(r.partials, r.carrier.partial, strict=True):
-        body += _lower_source(src, pname, ssa)
+        body += _lower_source(src, pname)
     body.append(r.carrier)  # the Monoid fold (its Twist is the combine)
     out.append(Loop(axis=r.axis, body=Body(tuple(body))))
     return out
 
 
-def _counter():
-    n = [0]
-
-    def fresh() -> str:
-        n[0] += 1
-        return f"_t{n[0]}"
-
-    return fresh
-
-
-__all__ = ["TensorRef", "Map", "Mask", "Reduce", "Inline", "lower"]
+__all__ = ["TensorRef", "Map", "Reduce", "lower"]

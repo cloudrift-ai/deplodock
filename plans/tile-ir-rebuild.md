@@ -198,19 +198,28 @@ test.
 
 ### Phase 2 — the high-level op tree (dissolving `build_*`) — done
 
-The compute layer is lifted from hand-assembled low-level loop stmts to a small algebraic op tree (`ir/tile/ops.py`):
-**`Map`** (pointwise lift), **`Reduce`** (a fold through a `Monoid`+`Twist` carrier, with **partials as nested ops**),
-**`Mask`** (an index-predicate fill — `pred ? val : fill` — so the causal `kv ≤ m` lives in the index-aware tree, never
-in the index-free carrier), and **`Inline`** (an opaque precomputed stmt-list, for a recovered subgraph the tree can't
-reconstruct as `Map`/`Reduce`). `TensorRef` (buffer + index exprs) is the only place layout lives. `lower(op)` walks the
-tree → loop IR: the carrier generates the structure (`Init` from identity, the streaming `Loop` + the fold from the
-`Twist`), the nested ops the lift, the `TensorRef`s the loads. A contraction is `Reduce(+)∘Map(×)`; flash is
-`Map(÷, (Reduce(lse, (Reduce(+)∘Map(×), V)), l))` — validated against `softmax(QK^T)·V`.
+The compute layer is lifted from hand-assembled low-level loop stmts to a small algebraic op tree (`ir/tile/ops.py`)
+with just two node kinds plus an operand descriptor:
+
+- **`Reduce`** — a fold over one axis through a `Monoid`+`Twist` carrier, with **partials nested** (a `Map`, a
+  `TensorRef`, or another `Reduce`). `lower` generates its structure: an `Init` per carried state (from the carrier
+  identity), the streaming `Loop`, and the carrier fold.
+- **`Map`** — a pointwise body. It **subclasses `Body`** (so it carries Body's analysis helpers and has *no fields*): a
+  `Map` simply *is* its loop-IR stmts — the operand `Load`s, the lift `Assign`s, an optional masking `Select`, and the
+  output `Write` at the kernel root — last-binding a value name. There is nothing to lower; the stmts are the lowering.
+  This folds in what would otherwise be separate nodes: the causal mask is just a `Select` stmt inside the score `Map`
+  (the index predicate `kv ≤ m` lives in the index-aware tree, never in the index-free carrier), and a recovered
+  fused-RoPE score the tree can't reconstruct is just a `Map` of the spliced stmts.
+- **`TensorRef`** (buffer + index exprs) — the only place layout lives; a direct-load partial of a `Reduce`.
+
+A contraction is `Reduce(+)` over a `Map` (the `×` lift); flash is `Reduce(lse)` over `(scaled Σ Q·K, V)` with the `O/l`
+projection as the root `Map` — validated against `softmax(QK^T)·V`.
 
 `_flash_loop_body` is **deleted**; `build_flash_frag` / `build_flash_recovered` no longer hand-assemble a kernel body —
-each builds this op tree and calls `lower`, differing only in the score partial (clean `TensorRef` loads vs. an `Inline`
-recovered RoPE subgraph). The flash skeleton (the `(m,l,O)` streaming fold + the `O/l` projection) is expressed exactly
-once, in the tree. The `build_*` functions remain only as the recognizer's pattern → graph-fragment constructors.
+each builds this op tree and calls `lower`, differing only in the score `Map` (clean `Load`s of Q/K vs. a recovered
+fused-RoPE subgraph spliced in verbatim). The flash skeleton (the `(m,l,O)` streaming fold + the `O/l` projection) is
+expressed exactly once, in the tree. The `build_*` functions remain only as the recognizer's pattern → graph-fragment
+constructors.
 
 Geometry stays separate: `Tile(op, placement)` maps axes to grid/thread/serial/coop/split (a later slice). Next: the
 remaining perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree, plus the dynamic-shape
