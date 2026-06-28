@@ -522,7 +522,7 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
     import cupy as cp
 
     out: dict[int, dict[str, cp.ndarray]] = {}
-    for li, launch in enumerate(compiled.launches):
+    for launch in compiled.launches:
         if not launch.tma_descriptors:
             continue
         # TMA descriptor encoding demolished — pending rebuild. ``tma_descriptors``
