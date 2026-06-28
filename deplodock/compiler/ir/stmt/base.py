@@ -235,6 +235,15 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     sset = set(state_names)
     out: list[str] = []
     for a in program:
+        # A twisted streaming merge interleaves ``Assign`` temps/rescales with ``Accum``
+        # state folds (the ``base``-``Accum`` form). An ``Accum`` renders its own
+        # reassignment (``name = op(base, value)``) — the carried state is already declared
+        # (an enclosing ``Init`` or ``Loop.render`` seed), so it never declares. Duck-typed
+        # (``base.py`` can't import ``Accum`` — leaves.py imports base): an ``Assign`` has
+        # ``args``, an ``Accum`` does not.
+        if not hasattr(a, "args"):
+            out += a.render(ctx)
+            continue
         # The merge runs at ``dt`` — cast any arg with a different dtype (e.g. a raw
         # ``__half`` value loaded into the partial, as in fp16 flash's ``p · v``) so
         # the operator isn't ambiguous. The cast is a no-op for matching args.

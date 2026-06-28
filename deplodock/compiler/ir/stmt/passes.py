@@ -129,6 +129,7 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         op=s.op,
         dtype=s.dtype,
         axes=new_axes,
+        base=rename(s.base) if s.base is not None else None,
     )
 
 

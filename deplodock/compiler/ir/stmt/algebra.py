@@ -164,12 +164,19 @@ class Twist:
     online softmax's max-rescale, a future mma-fragment realization — all the same
     monoid, differing only in these programs:
 
-    - ``merge`` — fold one partial into the state (the streaming reduce step);
-    - ``combine_states`` — merge two fully-reduced states (the cross-partition
-      step), reading the second operand named by ``state_b``.
+    - ``merge`` — fold one partial into the state (the streaming reduce step). A mix of
+      ``Assign`` temps/rescales and ``Accum`` folds: a twisted carrier's ψ rescale is a
+      preceding ``Assign`` (``lm = l·alpha``) and the fold itself a ``base``-``Accum``
+      (``l = lm + p``), so each state component carries its own seed (``op.identity``) and
+      ``Loop.render`` seeds it — no explicit ``Init``. A degenerate twist's merge is all
+      ``Assign`` (the identity-twist form ``Twist.degenerate`` builds).
+    - ``combine_states`` — merge two fully-reduced states (the cross-partition step),
+      reading the second operand named by ``state_b``. All ``Assign`` (rendered by the
+      cross-thread combine via ``render_merge_program``; unchanged by the streaming
+      ``Accum`` form).
     """
 
-    merge: tuple[Assign, ...]
+    merge: tuple[Stmt, ...]
     combine_states: tuple[Assign, ...] = ()
     state_b: tuple[str, ...] = ()
 
@@ -377,13 +384,25 @@ def _partial_name(p: AlgebraNode) -> str:
     raise TypeError(f"_partial_name: unsupported source {type(p).__name__}")
 
 
-def _merge_reads(merge: tuple[Assign, ...], state_names: tuple[str, ...]) -> tuple[str, ...]:
+def _stmt_reads(a: Stmt) -> tuple[str, ...]:
+    """The arg reads of one merge-program stmt. An ``Assign`` reads its ``args``; an
+    ``Accum`` reads its folded ``value`` and (when redirected) its rescaled ``base`` — its
+    carried ``name`` is the loop-carried state, not a same-program read."""
+    if isinstance(a, Accum):
+        return (a.base, a.value) if a.base is not None and a.base != a.name else (a.value,)
+    return a.args
+
+
+def _merge_reads(merge: tuple[Stmt, ...], state_names: tuple[str, ...]) -> tuple[str, ...]:
     """The external read names of a merge program — args read but neither carried state
     nor a temp defined within the program — in first-use order. These are the partials the
-    merge folds into the state (the source of truth for ``Monoid.partial_names``)."""
+    merge folds into the state (the source of truth for ``Monoid.partial_names``). The
+    program is a mix of ``Assign`` temps/rescales and ``Accum`` folds (a twisted carrier's
+    streaming merge); both expose their reads via :func:`_stmt_reads` and their def via
+    ``name``."""
     state, defined, seen, reads = set(state_names), set(), set(), []
     for a in merge:
-        for arg in a.args:
+        for arg in _stmt_reads(a):
             if arg not in state and arg not in defined and arg not in seen:
                 seen.add(arg)
                 reads.append(arg)

@@ -60,6 +60,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import ConstantOp, InputOp
@@ -98,18 +99,24 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
     def t(suf: str) -> str:
         return f"{m}__{suf}"
 
+    # The streaming merge as ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds: each
+    # state component's update is a rescale (``lm = l·alpha``) followed by an ``Accum``
+    # whose left operand is that rescale (``l = lm + p``), so the seed rides on the
+    # ``Accum`` (``op.identity``) and ``Loop.render`` seeds it — no explicit ``Init``. The
+    # carrier accumulates in f32 (the LSE precision), so the folds are stamped ``F32``. The
+    # ``m`` max-fold is last: its old value feeds every correction above.
     merge = (
-        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)
-        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new
-        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)  (reads OLD m)
+        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)  (temp for the corrections)
+        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new  (reads OLD m)
+        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)
         Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
         Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
-        Assign(t("lm"), "multiply", (ll, t("al"))),  # l·alpha
-        Assign(ll, "add", (t("lm"), t("p"))),  # l = l·alpha + p          [state]
-        Assign(t("om"), "multiply", (o, t("al"))),  # O·alpha
+        Assign(t("lm"), "multiply", (ll, t("al"))),  # l·alpha  (rescale, reads OLD l)
+        Accum(name=ll, value=t("p"), op="add", base=t("lm"), dtype=F32),  # l = l·alpha + p   [seed 0]
+        Assign(t("om"), "multiply", (o, t("al"))),  # O·alpha  (rescale, reads OLD O)
         Assign(t("pv"), "multiply", (t("p"), v)),  # p·v
-        Assign(o, "add", (t("om"), t("pv"))),  # O = O·alpha + p·v        [state]
-        Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
+        Accum(name=o, value=t("pv"), op="add", base=t("om"), dtype=F32),  # O = O·alpha + p·v [seed 0]
+        Accum(name=m, value=s, op="maximum", dtype=F32),  # m = max(m, s)  [seed −inf, last]
     )
     identity = (Literal(-1e30), Literal(0.0), Literal(0.0))  # (−inf, 0, 0)
     state_b = (f"{m}__o", f"{ll}__o", f"{o}__o")  # the second partition's (m, l, O)

@@ -387,6 +387,16 @@ def _validate(loop: LoopOp) -> None:
         disambiguate (the axis is only referenced as Var(name), and SSA
         scoping handles variable shadowing).
         """
+        # Loop-carried accumulators are live across the WHOLE body, not just from
+        # their fold stmt onward: a twisted carrier's ψ rescale reads the carried value
+        # (``lm = l·alpha``) before the ``base``-``Accum`` that folds it (``l = lm + p``).
+        # Seed those carried names up front so the pre-fold read validates. (A plain
+        # self-fold ``acc += x`` reads ``acc`` implicitly, so this is a no-op there.)
+        for stmt in stmts:
+            if isinstance(stmt, Accum):
+                defined.add(stmt.name)
+            elif isinstance(stmt, Monoid):
+                defined.update(stmt.state.names)
         exported_accs: set[str] = set()
         for stmt in stmts:
             if isinstance(stmt, Assign):

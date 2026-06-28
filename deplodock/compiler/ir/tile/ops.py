@@ -31,8 +31,6 @@ per-kernel builder.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, Monoid, Semiring
 from deplodock.compiler.ir.stmt.algebra import _partial_name
 from deplodock.compiler.ir.stmt.base import INDENT, Stmt, pretty_body
@@ -63,24 +61,20 @@ def _lower_monoid(m: Monoid) -> list[Stmt]:
     the carrier fold.
 
     A **degenerate** carrier (plain reduce — the identity twist) lowers to bare ``Accum``
-    folds (``m.as_accums()``): the seed is derived from each ``Accum``'s ``op.identity`` by
-    ``Loop.render``, so no explicit ``Init`` is emitted and the accumulator dtype rides on
-    the ``Accum`` (stamped by ``030_stamp_types``). A **twisted** carrier (online softmax /
-    flash) keeps the streaming merge: its state components are coupled (the ψ rescale reads
-    sibling components), so it can't collapse to independent ``Accum``\\ s — its carried
-    state is seeded by explicit ``Init`` stmts (``m.state.inits()``) before the ``Loop``.
-    The in-loop carrier keeps its ``axis`` for the cooperative-axis analysis. The φ
-    projection, if any, is a :class:`Map` *over* this Monoid — emitted by ``lower(Map)``,
-    not here. Pure structure-from-carrier."""
+    folds (``m.as_accums()`` reconstructs them from the identity-twist merge). A **twisted**
+    carrier (online softmax / flash) emits its streaming ``merge`` directly — a mix of
+    ψ-rescale ``Assign`` temps and ``base``-``Accum`` folds the builder already shaped. In
+    both cases the per-component seed rides on an ``Accum`` (``op.identity``) and
+    ``Loop.render`` seeds it, so no explicit ``Init`` is emitted; the accumulator dtype
+    rides on the ``Accum`` (stamped by ``030_stamp_types``, or pinned f32 on a twisted
+    carrier). The φ projection, if any, is a :class:`Map` *over* this Monoid — emitted by
+    ``lower(Map)``, not here. Pure structure-from-carrier."""
     body: list[Stmt] = []
     for p in m.partial:
         body += _lower_partial(p)
     accums = m.as_accums()
-    if accums is not None:
-        body += accums
-        return [Loop(axis=m.axis, body=Body(tuple(body)))]
-    body.append(replace(m, partial=()))
-    return [*m.state.inits(), Loop(axis=m.axis, body=Body(tuple(body)))]
+    body += accums if accums is not None else list(m.twist.merge)
+    return [Loop(axis=m.axis, body=Body(tuple(body)))]
 
 
 def _lower_semiring(s: Semiring) -> list[Stmt]:

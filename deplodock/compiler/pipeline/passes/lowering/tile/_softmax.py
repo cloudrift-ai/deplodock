@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.loop import LoopOp
@@ -43,15 +44,19 @@ def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
     def t(suf: str) -> str:
         return f"{m}__{suf}"
 
+    # The streaming merge as ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds (see
+    # ``_flash.flash_combine``): the seed rides on each ``Accum`` (``op.identity``) and
+    # ``Loop.render`` seeds it — no explicit ``Init``. The carrier accumulates in f32; the
+    # ``m`` max-fold is last (its old value feeds the correction).
     merge = (
-        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)
-        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new
-        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)  (reads OLD m)
+        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)  (temp for the corrections)
+        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new  (reads OLD m)
+        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)
         Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
         Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
-        Assign(t("dl"), "multiply", (d, t("al"))),  # d·alpha
-        Assign(d, "add", (t("dl"), t("p"))),  # d = d·alpha + p          [state]
-        Assign(m, "copy", (t("mx"),)),  # m = m_new                       [state, last]
+        Assign(t("dl"), "multiply", (d, t("al"))),  # d·alpha  (rescale, reads OLD d)
+        Accum(name=d, value=t("p"), op="add", base=t("dl"), dtype=F32),  # d = d·alpha + p   [seed 0]
+        Accum(name=m, value=s, op="maximum", dtype=F32),  # m = max(m, s)  [seed −inf, last]
     )
     # The LSE monoid is asymmetric (partial arity ≠ state arity), so the state-merges-state form the
     # cross-partition combine (cooperative-tree / split-KV) needs is authored explicitly (not derivable
