@@ -5,13 +5,17 @@ Recognition itself lives in ``lowering/tile/010_recognize`` (which calls these
 builders); this module owns the *construction* side: the ``flash_combine`` /
 ``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
 predicates, and the fragment builders ``build_flash_frag`` / ``build_flash_recovered``.
-Neither hand-assembles a kernel body any more: each builds the high-level op tree
-(``ir/tile/ops`` — flash is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial
-``Map`` holds the ``Σ Q·K`` contraction; the kernel root is the ``O/l`` projection
-``Map``) and calls ``lower``. They differ only in that score ``Map``: clean
-``Load``\\ s of Q/K (``build_flash_frag``) vs. a recovered fused-RoPE subgraph spliced
-in verbatim (``build_flash_recovered``) — a ``Map`` is just a stmt body either way. The
-flash skeleton lives once, in the tree.
+Neither hand-assembles a kernel body: both build the high-level op tree (``ir/tile/ops``
+— flash is the ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the
+``Σ Q·K`` contraction, the carrier ``finalize``\\ ing ``O/l``).
+
+``build_flash_frag`` (clean ``Load``\\ s of Q/K) returns the ``Reduce`` UNLOWERED, on a
+``TileOp`` — the free ``(batch…, m, d)`` axes are its ``grid_axes``, the store its
+``out``; ``020_schedule`` passes it through and ``lower`` runs at materialize.
+``build_flash_recovered`` (a recovered fused-RoPE score, spliced in verbatim as a
+``Map``) still ``lower``\\ s to a ``LoopOp`` that ``020_schedule`` peels — its hoisted
+per-cell RoPE prologue doesn't yet fit the grid-axes ``TileOp`` shape. Both end as
+``TileOp``\\ s; the flash skeleton lives once, in the tree.
 
 The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
@@ -53,6 +57,7 @@ from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
+from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import Map, Reduce, TensorRef, lower
 
 
@@ -245,8 +250,14 @@ def build_flash_frag(
     group: int = 1,
     mask: tuple[str, tuple] | None = None,
 ) -> Graph:
-    """Build the fragment graph holding the fused flash ``LoopOp`` (+ its scale /
+    """Build the fragment graph holding the fused flash ``TileOp`` (+ its scale /
     -inf constants). The caller guarantees :func:`flash_shape_eligible`.
+
+    The compute is the op tree itself — a ``Reduce`` (the ``(m,l,O)`` LSE fold whose
+    carrier ``finalize``\\ s ``O/l``) carried unlowered on the ``TileOp``; the free
+    ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest), and the
+    output store is its ``out`` ``TensorRef``. ``020_schedule`` passes the ``TileOp``
+    through; the per-cell body is derived by ``lower`` for the materializer.
 
     ``group`` is the GQA head ratio (K/V indexed at ``head // group``); ``mask`` is
     an optional ``(buffer_id, shape)`` additive bias loaded per ``(m, kv)``."""
@@ -256,10 +267,15 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    body = _flash_body(
-        q_id, k_id, v_id, batch, s_k_dim, head_dim, out.name, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
+    flash_reduce, out_idx = _flash_op(
+        q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
-    nest = _wrap_free_axes(body, batch, s_q_dim, d_v)
+    grid = (
+        *(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch)),
+        Axis(name="m", extent=s_q_dim),
+        Axis(name="d", extent=Dim(d_v)),
+    )
+    tile = TileOp(op=flash_reduce, out=TensorRef(out.name, out_idx), grid_axes=grid)
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -278,7 +294,7 @@ def build_flash_frag(
             op=ConstantOp(name="_flash_ninf", value=-1e30), inputs=[], output=Tensor("_flash_ninf", (1,), out.dtype), node_id="_flash_ninf"
         )
         inputs.append("_flash_ninf")
-    frag.add_node(op=LoopOp(body=nest), inputs=inputs, output=Tensor(out.name, out.shape, out.dtype), node_id=out.name)
+    frag.add_node(op=tile, inputs=inputs, output=Tensor(out.name, out.shape, out.dtype), node_id=out.name)
     frag.outputs = [out.name]
     return frag
 
@@ -287,26 +303,25 @@ def _batch_vars(n: int) -> tuple[Var, ...]:
     return tuple(Var(f"b{i}") for i in range(n))
 
 
-def _flash_body(
+def _flash_op(
     q_buf: str,
     k_buf: str,
     v_buf: str,
     batch: list[int],
     s_k: Dim,
     head_dim: int,
-    out_buf: str,
     *,
     causal: bool = False,
     group: int = 1,
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
 ) -> tuple:
-    """The per-output-element ``(…, m, d)`` body as a lowered op tree (no per-kernel
-    assembly): flash is the ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score
-    partial ``Map`` holds a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked);
-    the kernel root is the ``O/l`` projection ``Map`` whose last stmt is the output
-    ``Write``. ``lower`` turns the ``Reduce``\\ s into ``Init``\\ s + streaming folds; the
-    ``Map``\\ s are already stmts.
+    """The per-output-element ``(…, m, d)`` compute as the op tree itself: flash is the
+    ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score partial ``Map`` holds a
+    NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked); the carrier
+    ``finalize``\\ s ``O/l``. Returns ``(reduce, out_index)`` — the unlowered ``Reduce``
+    (carried on the ``TileOp``) and the output store's index exprs. The free
+    ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
     ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
@@ -374,16 +389,7 @@ def _flash_body(
         partials=(Map(score_stmts), TensorRef(v_buf, v_idx)),
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    root = Map([*lower(flash_reduce), Write(output=out_buf, index=out_idx, value="O_i__proj")])
-    return tuple(root)
-
-
-def _wrap_free_axes(body: tuple, batch: list[int], s_q: Dim, d_v: int) -> tuple:
-    """Wrap the per-element body in the free grid loops: batch…, query m, value d."""
-    nest: tuple = (Loop(axis=Axis(name="m", extent=s_q), body=(Loop(axis=Axis(name="d", extent=Dim(d_v)), body=body),)),)
-    for i in reversed(range(len(batch))):
-        nest = (Loop(axis=Axis(name=f"b{i}", extent=Dim(batch[i])), body=nest),)
-    return nest
+    return flash_reduce, out_idx
 
 
 # --------------------------------------------------------------------------- #
