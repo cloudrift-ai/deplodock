@@ -124,12 +124,15 @@ def _compile_run(
     return got, ordered, src
 
 
-# Cooperative-combine variants for the reduce-carrier ops, pinned via the ``REDUCE`` codec's
-# coop field ``b<coop>`` (the cooperative-reduce decision the schedule's ``020_schedule`` makes,
-# authoritative when pinned): serial (``""``) / single-warp shuffle (``b32``) / 4-warp
-# hierarchical smem (``b128``). Each variant has a distinct intra-CTA combine STRUCTURE, asserted
-# below (not just output accuracy).
-_COOP_VARIANTS = {"serial": "", "coop_warp": "b32", "coop_hier": "b128"}
+# Reduce-partition variants, pinned via the ``REDUCE`` codec (the schedule's ``020_schedule``
+# decision, authoritative when pinned). Each has a distinct lowering STRUCTURE, asserted below
+# (not just output accuracy):
+#   serial (``""``)        — one thread per cell, no cross-thread / register fold
+#   coop_warp (``b32``)    — a single-warp ``__shfl_xor_sync`` butterfly
+#   coop_hier (``b128``)   — the 4-warp hierarchical shuffle→smem-tree
+#   ilp (``r4``)           — standalone ILP: 4 register accumulators + a register tree (no coop)
+#   ilp_coop (``r2/b32``)  — ILP composed with coop: 2 register accs, register tree, then shuffle
+_COOP_VARIANTS = {"serial": "", "coop_warp": "b32", "coop_hier": "b128", "ilp": "r4", "ilp_coop": "r2/b32"}
 _REDUCE_OPS = ("mean", "amax", "softmax")
 
 # Shape modes — the reduce-carrier ops all reduce dim=1 of input ``x``, so the SAME matrix
@@ -146,16 +149,26 @@ def _assert_combine_structure(src: str, variant: str, label: str) -> None:
     compute the right answer serially must not pass as ``coop_warp`` / ``coop_hier``)."""
     has_shfl = "__shfl_xor_sync" in src
     has_smem_tree = "_smem[" in src and "for (int s =" in src  # the cross-warp TreeHalve slab
+    has_reg = "__r1" in src  # a replicated register-accumulator copy (the ILP fold)
     if variant == "serial":
         assert not has_shfl, f"{label}/serial: unexpected warp-shuffle combine in a serial reduce"
+        assert not has_reg, f"{label}/serial: unexpected register-fold replication"
         assert "__launch_bounds__(256)" in src, f"{label}/serial: expected the scalar-tier block (256)"
     elif variant == "coop_warp":
         assert has_shfl, f"{label}/coop_warp: expected a __shfl_xor_sync warp butterfly"
         assert not has_smem_tree, f"{label}/coop_warp: single-warp coop must NOT emit a cross-warp smem tree"
         assert "__launch_bounds__(32)" in src, f"{label}/coop_warp: expected a one-warp block (32)"
-    else:  # coop_hier
+    elif variant == "coop_hier":
         assert has_shfl and has_smem_tree, f"{label}/coop_hier: expected the hierarchical shuffle→smem-tree combine"
         assert "__launch_bounds__(128)" in src, f"{label}/coop_hier: expected the 4-warp block (128)"
+    elif variant == "ilp":
+        assert has_reg, f"{label}/ilp: expected replicated register accumulators (the ILP fold)"
+        assert not has_shfl, f"{label}/ilp: standalone ILP must NOT emit a cross-thread combine"
+        assert "__launch_bounds__(256)" in src, f"{label}/ilp: standalone ILP runs the scalar-tier block (256)"
+    else:  # ilp_coop
+        assert has_reg, f"{label}/ilp_coop: expected replicated register accumulators (the ILP fold)"
+        assert has_shfl, f"{label}/ilp_coop: ILP composed with coop must still emit the warp butterfly"
+        assert "__launch_bounds__(32)" in src, f"{label}/ilp_coop: coop=32 sets a one-warp block"
 
 
 @pytest.mark.parametrize("op", _REDUCE_OPS)

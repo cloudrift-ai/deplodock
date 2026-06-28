@@ -4,7 +4,8 @@ Status: **the scalar + cooperative tiers have landed.** `010_recognize` is the s
 lifts every kernel to a `TileOp` carrying one op-tree node — `Map` / `Monoid` / `Semiring` — plus a typed schedule);
 `020_schedule` maps the free axes onto the grid and picks the reduce partition; `lowering/kernel` materializes. Every
 elementwise, reduction, online-softmax, RMSNorm, static-matmul, scalar-flash, and whole-transformer-block kernel is
-recovered, plus the **cooperative (BLOCK) reduce** tier (whole-CTA + strided rows, static AND symbolic reduce axis).
+recovered, plus the **cooperative (BLOCK) reduce** tier (whole-CTA + strided rows, static AND symbolic reduce axis)
+and the **register-fold ILP (REG)** tier (independent per-thread accumulator chains, standalone or composed with coop).
 **Remaining: the warp / tensor-core tier (the `Semiring` warp recovery — mma matmul + warp-tier flash), cross-CTA
 split, operand pipelining, and warp specialization.** Branch `refactoring/tile-ir-rebuild`.
 
@@ -55,6 +56,12 @@ Recorded compactly; details in git + `ARCHITECTURE.md`:
 - **The typed schedule + the cooperative (BLOCK) reduce** — `TileOp` carries a typed `Kernel` (op + `*Schedule`); the
   reduce axis partitions across the BLOCK level (whole-CTA + strided-cooperative rows), the cross-thread combine is
   **derived** from the level, static AND symbolic reduce axis. This established the schedule type system below.
+- **The REG (ILP) reduce level** — the `ReducePlan` `reg` width gives each thread `reg` independent register-accumulator
+  chains (breaking the serial fold's loop-carried dependency), folded by a register tree (`carrier.as_state_merge`,
+  carrier-generic) before the cross-thread combine. The materializer replicates the reduce body `reg`×, offset `r·coop`,
+  in one `StridedLoop` of step `coop·reg`; a symbolic / non-divisible tail is **clamp-to-identity** (in-bounds `% extent`
+  read + value masked to the fold identity). Composes with coop or stands alone (`coop = 1`). `reg = 1` default (ILP via
+  the `REDUCE` `r<n>` pin / prior fork, not the cold path).
 
 ## The schedule design
 
@@ -85,11 +92,11 @@ combine *mechanism* is derived from `(level, fragment)`: a `Warp` reduce row-red
 
 ### The matrix
 
-| `op` kind \ tier | uniform · `Scalar` | uniform · `Warp` | `WarpSpec` |
-|---|---|---|---|
-| **`Map`** (pointwise) | `MapSchedule` | — | — |
-| **`Monoid`** (reduce / flash) | `MonoidSchedule(Scalar)` | `MonoidSchedule(Warp)` | `WarpSpec` |
-| **`Semiring`** (contraction) | `SemiringSchedule(Scalar)` | `SemiringSchedule(Warp)` | `WarpSpec` |
+| `op` kind \ tier              | uniform · `Scalar`         | uniform · `Warp`         | `WarpSpec` |
+|-------------------------------|----------------------------|--------------------------|------------|
+| **`Map`** (pointwise)         | `MapSchedule`              | —                        | —          |
+| **`Monoid`** (reduce / flash) | `MonoidSchedule(Scalar)`   | `MonoidSchedule(Warp)`   | `WarpSpec` |
+| **`Semiring`** (contraction)  | `SemiringSchedule(Scalar)` | `SemiringSchedule(Warp)` | `WarpSpec` |
 
 The Scalar / Warp columns are the **same class, different `fragment`** — "defined by the operation, not the block."
 `Map` has no fragment axis (pointwise never accumulates, so never tensor-cores). The per-kernel schedule union is each
