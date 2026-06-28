@@ -93,17 +93,20 @@ def _lower_semiring(s: Semiring) -> list[Stmt]:
 def pretty(op, indent: str = "") -> list[str]:
     """Structurally pretty-print an op tree (for dumps) — WITHOUT lowering. A pure
     pointwise ``Map`` (no source) is just its body; a projection ``Map`` (``source`` set) is
-    a ``map over:`` block holding the nested node above a ``project:`` block holding the
-    pointwise body — both indented under the map so the nesting is unambiguous. A ``Monoid``
-    / ``Semiring`` is a header (the carrier / contraction over its axis, projecting to
-    ``out``) above its named children; any other stmt prints itself."""
+    a ``map:`` node with an ``over:`` block (the nested node it maps over) and a ``body:``
+    block (its pointwise body / the φ projection) — both nested under the map, so the body
+    reads as part of it. A ``Monoid`` / ``Semiring`` is a header (the carrier / contraction
+    over its axis, projecting to ``out``) above its named children; any other stmt prints
+    itself."""
     if isinstance(op, Map):
         if op.source is None:
             return list(pretty_body(op.body, indent))  # pure pointwise — the body IS the map
-        lines = [f"{indent}map over:"]
-        lines += pretty(op.source, indent + "    ")
-        lines.append(f"{indent}project:")
-        lines += list(pretty_body(op.body, indent + "    "))
+        # A projection Map: its ``body`` (the φ projection) and the ``source`` it maps over
+        # are BOTH the map's — nest them under one ``map:`` so the body reads as part of it.
+        lines = [f"{indent}map:", f"{indent}    over:"]
+        lines += pretty(op.source, indent + "        ")
+        lines.append(f"{indent}    body:")
+        lines += list(pretty_body(op.body, indent + "        "))
         return lines
     if isinstance(op, Monoid):
         carrier = op.pretty()[0].strip()
