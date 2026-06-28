@@ -5,8 +5,9 @@ online softmax unified by the twist), scalar matmul (`SEMIRING`), scalar **flash
 `MONOID(SEMIRING)`), and the high-level `Map`/`Reduce`/`Mask`/`Inline` op tree that replaced the `build_*` body
 assembly. Every elementwise, index-only, reduction, static-matmul, and static-attention `e2e/` kernel — including whole
 transformer blocks — is recovered and un-xfailed, all through one generic `Tile` + carrier render path; the compute
-layer is now the lowered op tree (no hand-assembled kernel bodies). Remaining: dynamic shapes, and the perf tiers
-(cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch `refactoring/tile-ir-rebuild`.
+layer is the op tree, which now FLOWS as the carried IR (`TileOp` holds a `Map` / `Reduce`; the carrier finalizes the
+projection; the synthetic-flash recognizer emits `TileOp(Reduce)` directly — Phase 3). Remaining: dynamic shapes, and
+the perf tiers (cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -226,3 +227,27 @@ constructors.
 Geometry stays separate: `Tile(op, placement)` maps axes to grid/thread/serial/coop/split (a later slice). Next: the
 remaining perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree, plus the dynamic-shape
 (symbolic `seq_len`) tier.
+
+### Phase 3 — the op tree as flowing IR (`TileOp` carries it) — in progress
+
+The op tree was a construction-time scaffold (built inside `build_*`, immediately lowered to a `LoopOp`). It now flows as
+the carried IR, in three slices:
+
+- **The carrier's φ projection (`Monoid.finalize`).** The kernel's output projection — the article's `project` in
+  `project ∘ reduce ∘ map` — is a new `Monoid.finalize` surface (a post-reduction program mapping the final state to the
+  output value), emitted by `lower(Reduce)` after the streaming loop. Empty = identity (plain reduce / matmul: the state
+  IS the output); flash authors `O_i / l_i`. Named `finalize`, not `project`, because `ReduceCarrier.project` is the
+  distinct *distribution* projection (onto a cooperative / fragment realization). So a bare `Reduce` is self-contained
+  (fold + finalize).
+- **`TileOp` carries the op tree.** `TileOp.op` is a `Map` (pointwise per-cell body) or a `Reduce` (fold), with an
+  optional `out` `TensorRef` (the store for a `Reduce`; a `Map` carries its own `Write`). The per-cell `body` is
+  *derived* from `op` via `lower`, so the matcher / cache-key / dump machinery is untouched — the op tree is the source
+  of truth. `020_schedule` emits `TileOp(op=Map(cell))` for the general scalar tier.
+- **The recognizer emits `TileOp(Reduce)`.** `build_flash_frag` (clean SDPA) returns the flash `Reduce` UNLOWERED on a
+  `TileOp` — the free `(batch…, m, d)` axes are its `grid_axes`, the store its `out` — instead of a lowered `LoopOp`
+  fragment. `Graph.splice` is op-type-agnostic, so the `TileOp` terminal splices fine; `020_schedule` passes it through.
+
+Remaining in this phase: `build_flash_recovered` (the fused-RoPE path) still emits a `LoopOp` (its hoisted per-cell
+prologue doesn't fit the grid-axes `TileOp` shape yet); `lower` runs in `TileOp.__post_init__` (deriving the body) rather
+than strictly in the materialize pass (a lazy body keyed off an op-tree structural key would defer it fully — small
+payoff, since `lower` is pure); and `TileOp` still subclasses `BodyOp` for the I/O contract.
