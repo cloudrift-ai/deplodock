@@ -112,6 +112,41 @@ class ReducePlan:
             stages.append(ReduceStage(Level.REG, reg))
         return cls(tuple(stages))
 
+    @classmethod
+    def parse(cls, spec: str | None) -> ReducePlan:
+        """Decode the ``REDUCE`` knob codec (the schedule's single reduce-partition knob,
+        decided in ``020_schedule``) into a plan: ``/``-separated level-named tokens,
+        coarse→fine — ``g<n>[a|k]`` (GRID cross-CTA split + finalize letter), ``b<n>``
+        (BLOCK cooperative threads), ``r<n>`` (REG ILP fold). Empty / ``None`` = the scalar
+        serial fold. (The ``serial`` remainder is never spelled — it's derived as
+        ``ceil(extent / parallel)``.)"""
+        spec = (spec or "").strip()
+        if not spec:
+            return cls()
+        cta = coop = reg = 1
+        for raw in spec.split("/"):
+            tok = raw.strip()
+            if not tok:
+                continue
+            kind, num = tok[0], tok[1:]
+            if kind == "g":
+                if num and num[-1] in "ak":  # the finalize letter (atomic / kernel) — 030_split
+                    num = num[:-1]
+                cta = int(num)
+            elif kind == "b":
+                coop = int(num)
+            elif kind == "r":
+                reg = int(num)
+            else:
+                raise ValueError(f"bad REDUCE token {tok!r} (expect g<n> / b<n> / r<n>)")
+        return cls.of(cta=cta, coop=coop, reg=reg)
+
+    def spell(self) -> str:
+        """The ``REDUCE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
+        the scalar serial fold."""
+        letter = {Level.GRID: "g", Level.BLOCK: "b", Level.REG: "r"}
+        return "/".join(f"{letter[s.level]}{s.width}" for s in self.stages if s.level in letter)
+
     @property
     def parallel(self) -> int:
         """The total parallel degree = ∏ stage widths (the lane/CTA fan-out the serial
@@ -126,13 +161,26 @@ class ReducePlan:
         """True iff any stage is a cross-CTA GRID split (``030_split`` territory)."""
         return any(s.level is Level.GRID for s in self.stages)
 
+    def _width(self, level: Level) -> int:
+        for s in self.stages:
+            if s.level is level:
+                return s.width
+        return 1
+
     @property
     def coop(self) -> int:
         """The BLOCK (cooperative-thread) width, or 1 if no BLOCK stage."""
-        for s in self.stages:
-            if s.level is Level.BLOCK:
-                return s.width
-        return 1
+        return self._width(Level.BLOCK)
+
+    @property
+    def cta(self) -> int:
+        """The GRID (cross-CTA split) width, or 1 if no GRID stage."""
+        return self._width(Level.GRID)
+
+    @property
+    def reg(self) -> int:
+        """The REG (ILP fold) width, or 1 if no REG stage."""
+        return self._width(Level.REG)
 
     @property
     def block_stage(self) -> ReduceStage | None:

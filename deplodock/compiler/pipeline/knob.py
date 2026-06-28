@@ -639,14 +639,16 @@ class _Decomp:
 
 
 def _reduce_decomp(knobs: dict) -> _Decomp:
-    """The primary reduce axis's ``(serial, fold, cta, coop)`` factors — from the
-    legacy ``BK``/``FK``/``SPLITK``/``BR`` knobs. Returns a :class:`_Decomp`."""
-    return _Decomp(
-        serial=int(knobs.get("BK", 1) or 1),
-        fold=int(knobs.get("FK", 1) or 1),
-        cta=int(knobs.get("SPLITK", 1) or 1),
-        coop=int(knobs.get("BR", 1) or 1),
-    )
+    """The primary reduce axis's ``(cta, coop, reg)`` partition factors, decoded from the
+    single ``REDUCE`` codec knob (``g<n>`` cta / ``b<n>`` coop / ``r<n>`` reg — the reduce
+    tier's one decomposition knob, decided in ``lowering/tile/020_schedule``). The ``serial``
+    remainder is derived from the schedule (``ceil(extent / parallel)``), not a knob, so it
+    stays the ``_Decomp`` default. No legacy ``BK``/``FK``/``SPLITK``/``BR`` reads — the
+    learned prior is refit on the ``REDUCE`` schema."""
+    from deplodock.compiler.ir.tile.schedule import ReducePlan  # noqa: PLC0415
+
+    plan = ReducePlan.parse(knobs.get("REDUCE"))
+    return _Decomp(fold=plan.reg, cta=plan.cta, coop=plan.coop)
 
 
 def tile_signature(knobs: dict) -> tuple:

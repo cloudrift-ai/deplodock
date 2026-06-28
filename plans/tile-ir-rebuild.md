@@ -350,26 +350,37 @@ level (whole-CTA cooperation). See `plans/cooperative-reduction-tile-ir.md` for 
   `ceil(extent / parallel)`. The schedule is **either** the kind's uniform (SIMT) schedule **or** `WarpSpec` (the
   warp-role pipeline — ONE shared struct, no `*WarpSpec*` per-kind variants); the union at the field IS the either.
 
-- **`020_schedule` picks the plan** from **conservative module constants** (placeholders for the eventual `REDUCE` knob
-  + prior): whole-CTA cooperation for a **static, scalar-output, degenerate-monoid** reduce (`sum`/`max`/`mean`) whose
-  axis is wide (`extent ≥ 128`) and grid small (`free ≤ 256`, under-occupied) — `coop = prevpow2(extent/8)` capped at
-  256. Twisted / full-row reductions (online-softmax, RMSNorm), contractions, and symbolic axes keep the scalar serial
-  fold. `# TODO`: replace the constants with `knob._reduce_decomp` (BR→coop, BK→serial, FK→reg, SPLITK→cta) + the
-  learned/analytic prior; the agreed `REDUCE` codec (`b<n>`/`g<n>`/`r<n>`, level-named) is documented but **not wired**.
+- **`020_schedule` decides the plan via the `REDUCE` codec knob** — the schedule's single reduce-partition knob
+  (`g<n>[a|k]` cta / `b<n>` coop / `r<n>` reg; empty = serial), decided here through the **knob decision hierarchy**: an
+  env pin (`DEPLODOCK_REDUCE`, authoritative via `Knob.narrow`) > the search / prior fork > the conservative-constant
+  default. The knob is **ephemeral** — resolved here into the schedule's `ReducePlan` (the materialized form), with the
+  spec also stamped on `TileOp.knobs` so the learned prior featurizes / tunes the decision (`knob._reduce_decomp` decodes
+  the codec — no legacy `BR`/`SPLITK`/`FK` fallback; the prior is refit on the `REDUCE` schema). An **eligible** reduce
+  (any cleanly-lifted static `MonoidKernel` — `_coop_carrier`) offers `[conservative coop, scalar]` as a fork (option-0 =
+  the conservative pick, so a cold greedy compile keeps cooperating); a pinned `REDUCE` collapses it. The conservative
+  default cooperates a wide reduce (`extent ≥ 128`) feeding a small grid (`free ≤ 256`, under-occupied), `coop =
+  prevpow2(extent/8)` capped at 256. **Eligibility spans degenerate AND twisted carriers** (`sum`/`max`/`mean`,
+  online-softmax `(m, d)`, flash `(m, l, O)`) and scalar AND full-row outputs — the combine is carrier-generic, so the
+  only gates are "a static `Monoid` carrier" (a flat-`Map` multi-reduce fallback is a `MapKernel`, not eligible).
 
 - **The cooperative materializer** (`kernel/010_materialize._cooperative`) lowers a BLOCK plan: the serial reduce `Loop`
   becomes a `StridedLoop(start=lane, step=coop)` (each lane strides the axis from its lane index — the `< extent` bound
-  masks the tail, no explicit mask), seeded automatically by the dissolved fold `Accum`s (the Phase-3 single-seed path,
-  now realized for the cooperative tier); then `_combine.emit_combine` walks the derived `Fold`s emitting
-  `WarpShuffle` / `Smem`+`Sync`+`TreeHalve` (driven off the carrier's `state.names` / `twist.state_b` /
-  `twist.combine_states` — carrier-generic: a `sum` and a `max` differ only in the auto-derived combine op); then the
-  output `Write` runs guarded to lane 0. The `Tile` gains the coop lane axis (innermost) + `block_threads = coop`, and
+  masks the tail, no explicit mask; a flash carrier's nested QK `Semiring` rides inside, per-lane), seeded automatically
+  by the dissolved fold `Accum`s (the Phase-3 single-seed path, now realized for the cooperative tier); then
+  `_combine.emit_combine` walks the derived `Fold`s emitting `WarpShuffle` / `Smem`+`Sync`+`TreeHalve` (driven off the
+  carrier's `state.names` / `twist.state_b` / `twist.combine_states` — carrier-generic: degenerate `sum`/`max` and the
+  twisted multi-component online-softmax `(m, d)` / flash `(m, l, O)` merges fold through the SAME butterfly / tree). The
+  post-combine projection then runs: a **full-row** output (softmax / RMSNorm — the projection sweeps the feature axis in
+  a `Loop`) is **distributed across the coop lanes** (each output `Loop` → a `StridedLoop`, scalar prep recomputed per
+  lane from the shared state); a **scalar** output (a bare reduce, or flash's `O/l` per `(m, d)` cell — `d` is a grid
+  axis) is written once, guarded to lane 0. The `Tile` gains the coop lane axis (innermost) + `block_threads = coop`, and
   the cuda lowering / `_launch_bounds_for` derive `blockDim = coop`, `gridDim = output cells`; `render_kernelop` emits the
-  hardware `lane`/`warp` ids when the combine needs them.
+  hardware `lane`/`warp` ids when the combine needs them. Cooperative-KV flash (flash-decoding) thus works at the scalar
+  tier — its mma `warp_tile` is the remaining perf step.
 
 - **Reserved slots** (defined in the type system, raise / never fire): strided-cooperative rows (`MonoidSchedule.block` —
   a whole free axis packed alongside the coop lanes; this cut is whole-CTA only, so a sub-warp coop runs a small CTA
   rather than packing rows), the `reg` (ILP) fold, the cross-CTA `cta` split (`030_split` — a documented stub: partial
   kernel → `ws` workspace, finalize = a reduce over the split axis via `carrier.as_state_merge`), the symbolic-axis
-  cooperative tier, the shared `WarpTile` (tensor-core mma tile), operand pipelining (`Stage`/`Channel`), and warp
-  specialization (`WarpSpec`).
+  cooperative tier, the shared `WarpTile` (tensor-core mma tile, including flash's warp-tier QK/PV), operand pipelining
+  (`Stage`/`Channel`), and warp specialization (`WarpSpec`).

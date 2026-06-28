@@ -9,10 +9,10 @@ stage (warp-shuffle / hierarchical smem) or the cross-CTA finalize (atomic ``c<c
 deferred ``c<cta>k``) can't silently break a carrier it wasn't tuned on.
 
 - **op types** — reduction (mean / max), softmax, attention (SDPA), matmul.
-- **reduction variants** — the cooperative combine stage (native ``REDUCE`` coop field ``t<n>``
+- **reduction variants** — the cooperative combine stage (``REDUCE`` coop field ``b<n>``
   = serial / warp-shuffle / hierarchical smem) for the reduce-carrier ops; the cross-CTA finalize
-  fold (the ``REDUCE`` ``c``-letter ``c2a`` / ``c2k``) for the split-K matmul. All pins are the
-  native ``DEPLODOCK_REDUCE`` codec — no legacy ``BR`` / ``SPLITK`` / ``NOATOMIC``.
+  fold (the ``REDUCE`` GRID field ``g<n>a`` / ``g<n>k``) for the split-K matmul. All pins are the
+  ``DEPLODOCK_REDUCE`` codec — no legacy ``BR`` / ``SPLITK`` / ``NOATOMIC``.
 
 Pure GPU accuracy (no ``-O1`` numerics change), so it runs in the correctness lane.
 """
@@ -112,35 +112,67 @@ def _compile_run(code: str, env: dict[str, str], monkeypatch) -> tuple[np.ndarra
     return got, ordered, src
 
 
-# Cooperative-combine variants for the reduce-carrier ops, pinned via the native REDUCE codec's
-# coop field ``t<coop>`` (a partial pin — only ``coop`` is fixed, the offer still picks ``serial``
-# so the reduce extent is covered): serial / single-warp shuffle / 4-warp hierarchical smem.
-_COOP_VARIANTS = {"serial": "t1", "coop_warp": "t32", "coop_hier": "t128"}
+# Cooperative-combine variants for the reduce-carrier ops, pinned via the ``REDUCE`` codec's
+# coop field ``b<coop>`` (the cooperative-reduce decision the schedule's ``020_schedule`` makes,
+# authoritative when pinned): serial (``""``) / single-warp shuffle (``b32``) / 4-warp
+# hierarchical smem (``b128``). Each variant has a distinct intra-CTA combine STRUCTURE, asserted
+# below (not just output accuracy).
+_COOP_VARIANTS = {"serial": "", "coop_warp": "b32", "coop_hier": "b128"}
 _REDUCE_OPS = ("mean", "amax", "softmax")
+
+
+def _assert_combine_structure(src: str, variant: str, label: str) -> None:
+    """Assert the kernel source carries the intra-CTA combine each ``REDUCE`` variant pins —
+    the structural counterpart to the accuracy check (a wrong schedule that still happens to
+    compute the right answer serially must not pass as ``coop_warp`` / ``coop_hier``)."""
+    has_shfl = "__shfl_xor_sync" in src
+    has_smem_tree = "_smem[" in src and "for (int s =" in src  # the cross-warp TreeHalve slab
+    if variant == "serial":
+        assert not has_shfl, f"{label}/serial: unexpected warp-shuffle combine in a serial reduce"
+        assert "__launch_bounds__(256)" in src, f"{label}/serial: expected the scalar-tier block (256)"
+    elif variant == "coop_warp":
+        assert has_shfl, f"{label}/coop_warp: expected a __shfl_xor_sync warp butterfly"
+        assert not has_smem_tree, f"{label}/coop_warp: single-warp coop must NOT emit a cross-warp smem tree"
+        assert "__launch_bounds__(32)" in src, f"{label}/coop_warp: expected a one-warp block (32)"
+    else:  # coop_hier
+        assert has_shfl and has_smem_tree, f"{label}/coop_hier: expected the hierarchical shuffle→smem-tree combine"
+        assert "__launch_bounds__(128)" in src, f"{label}/coop_hier: expected the 4-warp block (128)"
 
 
 @pytest.mark.parametrize("op", _REDUCE_OPS)
 @pytest.mark.parametrize("variant", list(_COOP_VARIANTS))
 def test_cooperative_combine_accuracy(op, variant, monkeypatch):
-    """Every reduce-carrier op stays accurate across the three intra-CTA combine stages
-    (serial → warp-shuffle → hierarchical smem), pinned via the native ``REDUCE`` coop field."""
+    """Every reduce-carrier op — degenerate (``mean`` / ``amax``) AND twisted full-row
+    (``softmax``, the online-softmax ``(m, d)`` carrier) — stays accurate AND emits the
+    pinned intra-CTA combine structure across the three stages (serial → warp-shuffle →
+    hierarchical smem), pinned via the ``REDUCE`` coop field."""
     code, ref_fn = _OPS[op]
-    got, xs, _src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch)
+    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
     assert diff < 1e-3, f"{op}/{variant}: combine mismatch (max abs err {diff})"
+    _assert_combine_structure(src, variant, op)
 
 
-@pytest.mark.parametrize("variant", ["serial", "coop_kv"])
+@pytest.mark.parametrize("variant", ["serial", "coop_warp"])
 def test_attention_combine_accuracy(variant, monkeypatch):
-    """The flash ``(m, d, o)`` twisted-monoid carrier is accurate serially and with a
-    cooperative-KV combine (the native ``REDUCE`` coop field over the static KV axis)."""
-    env = {"DEPLODOCK_REDUCE": "t1"} if variant == "serial" else {"DEPLODOCK_REDUCE": "t32"}
+    """The flash ``(m, l, O)`` twisted-monoid carrier is accurate AND emits the pinned combine
+    serially and with a cooperative-KV combine — a 3-component warp butterfly over the static
+    KV axis (the same carrier-generic combine, ``coop_warp`` = ``b32``)."""
+    env = {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}
     code, ref_fn = _OPS["attention"]
-    got, xs, _src = _compile_run(code, env, monkeypatch)
+    got, xs, src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
     assert diff < 2e-3, f"attention/{variant}: flash mismatch (max abs err {diff})"
+    if variant == "serial":
+        assert "__shfl_xor_sync" not in src, "attention/serial: unexpected cooperative combine"
+    else:
+        # The flash carrier folds 3 state components (m, l, O) through the SAME butterfly.
+        assert "__shfl_xor_sync" in src, "attention/coop_warp: expected the cooperative-KV warp butterfly"
+        assert all(f"__shfl_xor_sync(__activemask(), {c}" in src for c in ("m_i", "l_i", "O_i")), (
+            "attention/coop_warp: the flash combine must shuffle all 3 carrier components"
+        )
 
 
 # The carrier-generic cross-CTA producer + finalize, one case per (carrier × finalize). The
@@ -168,7 +200,7 @@ def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatc
     The finalize is the native ``REDUCE`` codec's ``c`` letter — one knob owns split + finalize."""
     spec = _CROSS_CTA[carrier]
     code, ref_fn = _OPS[spec["op"]]
-    env = {"DEPLODOCK_REDUCE": "c2a" if finalize == "atomic" else "c2k"}
+    env = {"DEPLODOCK_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
     if spec["flash"]:
         env["DEPLODOCK_FLASH"] = "1"
     got, xs, src = _compile_run(code, env, monkeypatch)

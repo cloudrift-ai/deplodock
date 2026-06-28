@@ -33,18 +33,25 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `MonoidKernel` / `SemiringKernel`, so a kind/schedule mismatch is
   unrepresentable). `010_recognize` lifts the algebra + builds the
   kernel with an UNMAPPED `Placement`; `020_schedule` maps the free
-  axes onto the grid and picks the reduce `ReducePlan` (this cut:
-  whole-CTA cooperation for a static scalar degenerate-monoid reduce
-  via conservative constants, else the scalar serial fold). The combine
-  stays in the op tree; the schedule holds only the geometry.
+  axes onto the grid and decides the reduce `ReducePlan` via the single
+  `REDUCE` codec knob (`g<n>` cta / `b<n>` coop / `r<n>` reg; the
+  decision hierarchy = env pin > search/prior fork > conservative
+  default). The knob is ephemeral — resolved here into the schedule's
+  `ReducePlan`; the combine stays in the op tree. Any static `Monoid`
+  reduce is cooperation-eligible (degenerate `sum`/`max`/`mean` AND
+  twisted online-softmax / flash, scalar AND full-row outputs); the
+  default cooperates a wide reduce feeding an under-occupied grid.
 - **Tile → kernel** (after `lowering/kernel`): `TileOp` materialized to
   `KernelOp` whose body is a `Tile` (the thread-grid decode) over the
   lowered op tree. A cooperative `ReducePlan` lowers the reduce as a
-  `StridedLoop` (lane-strided fold) + the derived cross-thread combine
-  (`_combine.emit_combine` → `WarpShuffle` / `Smem`+`Sync`+`TreeHalve`)
-  + a lane-0-guarded output `Write`; the `Tile` gains the coop lane axis
-  and `block_threads = coop`. The cross-CTA split (`030_split`), `reg`
-  fold, symbolic-axis cooperation, and flash cooperative-KV are reserved
+  `StridedLoop` (lane-strided fold) + the derived carrier-generic
+  cross-thread combine (`_combine.emit_combine` → `WarpShuffle` /
+  `Smem`+`Sync`+`TreeHalve`, multi-component for a twisted carrier) +
+  the projection (a full-row output sweep distributed across the coop
+  lanes, a scalar output guarded to lane 0); the `Tile` gains the coop
+  lane axis and `block_threads = coop`. The cross-CTA split
+  (`030_split`), `reg` fold, symbolic-axis cooperation, strided rows,
+  and the tensor-core `warp_tile` (incl. flash's warp tier) are reserved
   future tiers (`plans/cooperative-reduction-tile-ir.md`).
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.

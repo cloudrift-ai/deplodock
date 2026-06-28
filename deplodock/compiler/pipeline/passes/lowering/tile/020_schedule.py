@@ -29,14 +29,28 @@ from dataclasses import replace
 from math import prod
 
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.stmt import Loop
-from deplodock.compiler.ir.stmt.algebra import Map, Monoid
+from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, TileOp, reduce_node
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
-# Conservative cooperative-reduce selection constants (placeholders for the REDUCE knob).
+# The reduce-axis partition is decided HERE, by the single ``REDUCE`` codec knob — the
+# decision hierarchy (env pin via ``Knob.narrow`` > the search/prior fork > the conservative
+# constant default below). The knob is **ephemeral**: it's resolved here into the schedule's
+# ``ReducePlan`` (the materialized form ``kernel/010_materialize`` reads); the knob value
+# also rides on ``TileOp.knobs`` so the learned prior featurizes / tunes the decision.
+# ``off=""`` (the scalar serial fold) is auto-stamped on kernels this pass doesn't cooperate.
+REDUCE = Knob(
+    "REDUCE",
+    KnobType.STR,
+    help="Reduce-axis partition codec (g<n> cta / b<n> coop / r<n> reg; empty=serial). "
+    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
+    off="",
+)
+
+# Conservative cooperative-reduce selection constants (the default when REDUCE is unpinned).
 _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this wide
 _SERIAL_TARGET = 8  # aim for ~this many serial steps per cooperating thread
 _MAX_COOP = 256  # cap on cooperative threads per CTA (power of two)
@@ -64,59 +78,64 @@ def _pick_coop(extent: int, free: int) -> int:
     return coop if coop >= 2 else 1
 
 
-def _has_loop(stmts) -> bool:
-    """Any ``Loop`` reachable in ``stmts`` (deep) — a projection that sweeps the reduce
-    axis (a full-row output like softmax / RMSNorm) carries one, marking a non-scalar
-    output the whole-CTA scalar-write path can't cover this cut."""
-    for s in stmts:
-        if isinstance(s, Loop):
-            return True
-        if any(_has_loop(list(b)) for b in s.nested()):
-            return True
-    return False
-
-
 def _coop_carrier(kernel) -> Monoid | None:
     """The cooperative-eligible reduce carrier of ``kernel``, or ``None`` (keep serial).
 
-    Eligible this cut: a ``MonoidKernel`` over a **degenerate** carrier (``as_accums`` —
-    plain ``sum`` / ``max`` / ``mean``; twisted online-softmax / flash are future) reducing
-    a **static** axis, producing a **scalar** output (a bare ``Monoid`` or a projection
-    ``Map`` whose body doesn't sweep the reduce axis — full-row outputs stay serial)."""
+    Eligible: any ``MonoidKernel`` over a cleanly-lifted ``Monoid`` carrier reducing a
+    **static** axis — **degenerate** (plain ``sum`` / ``max`` / ``mean``) AND **twisted**
+    (online-softmax ``(m, d)``, flash ``(m, l, O)``) alike, since the cross-thread combine
+    is carrier-generic (it drives off the carrier's ``combine_states``, which a twisted
+    carrier authors). Both **scalar** outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d`` is
+    a grid axis) and **full-row** outputs (softmax / RMSNorm — the post-reduce sweep is
+    distributed across the coop lanes by the materializer) are handled. A flat-``Map``
+    fallback (multi / nested-non-flash reduce) is a ``MapKernel`` (``reduce_node`` is
+    ``None``), so it isn't eligible and keeps the serial fold."""
     if not isinstance(kernel, MonoidKernel):
         return None
     inner = reduce_node(kernel.op)
-    if not isinstance(inner, Monoid) or inner.as_accums() is None:
+    if not isinstance(inner, Monoid) or inner.axis is None or not inner.axis.extent.is_static:
         return None
-    if inner.axis is None or not inner.axis.extent.is_static:
-        return None
-    op = kernel.op
-    if isinstance(op, Map) and op.source is not None and _has_loop(list(op.body)):
-        return None  # projection sweeps the reduce axis → non-scalar output, keep serial
     return inner
 
 
-def _schedule_for(kernel):
-    """Map the free axes onto the grid and, for an eligible reduction, pick the cooperative
-    reduce partition (else the scalar serial fold). Returns the kernel's same ``*Schedule``
-    type with ``place`` mapped (and ``reduce`` set for a cooperative reduce)."""
-    place = kernel.schedule.place.on_grid()
-    if isinstance(kernel, MapKernel):
-        return replace(kernel.schedule, place=place)
+def _reduce_specs(kernel, place) -> list[str]:
+    """The candidate ``REDUCE`` codec strings for ``kernel``, applying the decision
+    hierarchy. A kernel the cooperative tier can't partition (pointwise, or a twisted /
+    full-row / contraction reduce) is the lone scalar fold ``[""]`` — the ``REDUCE`` pin is
+    ignored there, since it only governs the cooperative reduce tier. An eligible reduce
+    offers ``[conservative coop, scalar]`` (a fork the search / prior ranks, option-0 = the
+    conservative pick so a cold greedy compile keeps cooperating), with an env pin
+    (``DEPLODOCK_REDUCE``) authoritative over the candidates (``Knob.narrow``)."""
     carrier = _coop_carrier(kernel)
-    if carrier is not None:
-        extent = carrier.axis.extent.as_static()
-        free = prod(ax.extent.as_static() for ax in place.free) if place.free else 1
-        coop = _pick_coop(extent, free)
-        if coop > 1:
-            return replace(kernel.schedule, place=place, reduce=ReducePlan.of(coop=coop))
-    return replace(kernel.schedule, place=place)
+    if carrier is None:
+        return [""]  # not cooperative-eligible — scalar serial fold; the pin doesn't apply
+    extent = carrier.axis.extent.as_static()
+    free = prod(ax.extent.as_static() for ax in place.free) if place.free else 1
+    coop = _pick_coop(extent, free)
+    cands = [f"b{coop}", ""] if coop > 1 else [""]  # conservative coop first (cold greedy → option-0)
+    return list(REDUCE.narrow(cands))
 
 
-def rewrite(match: Match, root: Node) -> TileOp | None:
+def _option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+    """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec
+    resolved into the schedule's ``ReducePlan`` (the ephemeral knob → materialized plan),
+    with the spec stamped on ``knobs`` for the prior."""
+    sched = replace(kernel.schedule, place=place, reduce=ReducePlan.parse(spec))
+    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs={**knobs, REDUCE.name: spec})
+
+
+def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     tile: TileOp = root.op
     if tile.kernel is None or tile.kernel.schedule.place.is_mapped:
         # Already mapped (grid set), or nothing to map (a scalar-output kernel materializes
         # on an empty grid), or a placeholder node — leave it for materialize.
         raise RuleSkipped("schedule already mapped")
-    return TileOp(kernel=replace(tile.kernel, schedule=_schedule_for(tile.kernel)), name=tile.name)
+    kernel = tile.kernel
+    place = kernel.schedule.place.on_grid()
+    # A pointwise / non-cooperative kernel has no reduce decision — just map the grid (the
+    # off-default stamps ``REDUCE=""``). A reduction offers its ``REDUCE`` candidate(s): a
+    # single option applies directly; multiple options fork for the search / prior to rank.
+    if isinstance(kernel, MapKernel):
+        return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=tile.name)
+    specs = _reduce_specs(kernel, place)
+    return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]

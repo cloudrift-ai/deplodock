@@ -84,12 +84,26 @@ def _cooperative(tile: TileOp, root: Node) -> KernelOp:
     strided = StridedLoop(axis=rloop.axis, start=Var(lane.name), step=Literal(coop, "int"), body=rloop.body, unroll=rloop.unroll)
     combine = emit_combine(carrier, t=lane.name, n_threads=coop)
 
-    # The post-reduce projection / output store, guarded to lane 0 (every lane holds the
-    # full reduction after the combine, so one writer suffices for the scalar output).
-    tail = _with_store(list(stmts[ridx + 1 :]), root.output.name, grid, op)
-    guarded = Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(tail))
+    # The post-reduce projection. Every lane holds the full reduction after the combine, so:
+    #  - a FULL-ROW output (softmax / RMSNorm — the projection sweeps the feature axis in a
+    #    ``Loop``) is distributed across the coop lanes: each output ``Loop`` becomes a
+    #    ``StridedLoop`` (lane strides the row), no guard. Scalar prep stmts (e.g. ``1/l``)
+    #    run on every lane — each recomputes the same value from the shared state, harmless.
+    #  - a SCALAR output (a bare reduce, or flash's ``O/l`` per cell — ``d`` is a grid axis)
+    #    is written once, guarded to lane 0.
+    tail = list(stmts[ridx + 1 :])
+    if any(isinstance(s, Loop) for s in tail):
+        body_tail: list[Stmt] = [
+            StridedLoop(axis=s.axis, start=Var(lane.name), step=Literal(coop, "int"), body=s.body, unroll=s.unroll)
+            if isinstance(s, Loop)
+            else s
+            for s in tail
+        ]
+    else:
+        stored = _with_store(tail, root.output.name, grid, op)
+        body_tail = [Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(stored))]
 
-    body = [*stmts[:ridx], strided, *combine, guarded]
+    body = [*stmts[:ridx], strided, *combine, *body_tail]
     bound = Tile(axes=(*grid, lane), body=Body(tuple(body)), block_threads=coop)
     return KernelOp(body=Body((bound,)), name=tile.name)
 
