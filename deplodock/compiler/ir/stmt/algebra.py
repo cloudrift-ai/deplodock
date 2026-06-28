@@ -143,11 +143,12 @@ class State:
 
     def inits(self) -> list[Init]:
         """The carried state's seed stmts — one ``Init`` per component
-        (``<f32> name = identity;``). The carrier's lowering emits these before its
-        streaming ``Loop`` so the state is seeded as explicit IR and ``Loop.render``
-        never reaches into the carrier. fp32 (the merge program renders in fp32); the
-        identity is the neutral element this state carries. Construction lives here —
-        ``State`` owns the identity, so it owns how to initialize from it."""
+        (``<f32> name = identity;``). Emitted before a loop-IR ``Monoid`` carrier so that,
+        when a cell is rendered standalone (the flat-``Map`` fallback `_lift` keeps verbatim,
+        or a hand-built carrier in the forward-parity tests), the carried state is declared
+        for the merge's reassignments. The **lifted** path doesn't use these — it strips
+        them and reseeds from the carrier's fold ``Accum``\\ s (``op.identity`` via
+        ``Loop.render``). fp32; the identity is the neutral element this state carries."""
         return [Init(name=n, identity=ident.value, dtype=_F32) for n, ident in zip(self.names, self.identity, strict=False)]
 
 
@@ -271,7 +272,8 @@ class Monoid(Stmt):
         """The bound output name — the primary carried state (the φ projection, if any, is
         a :class:`Map` *over* this Monoid, not a field here). Derived, not stored: we
         always know what a monoid accumulates (and an mma-fragment output won't fit a
-        stored ``str``). Seeds at lowering come from ``state.identity`` (``State.inits``)."""
+        stored ``str``). Seeds at lowering ride on the carrier's fold ``Accum``\\ s
+        (``op.identity``), derived by ``Loop.render`` — no explicit ``Init``."""
         return self.state.names[0]
 
     def partial_names(self) -> tuple[str, ...]:

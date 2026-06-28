@@ -292,3 +292,22 @@ f32 reduction accumulators and re-activates once the f16-accumulator selection (
 The **tile-tier** kernel passes (mma fragment lowering, register-tile split, smem staging, fp16 K-window packing) stay
 demolished — they consume tile structures the materializer does not yet produce, so they belong to the tile rebuild, not
 this set.
+
+### Carrier seeding unified on `Accum`; the accumulator dtype policy restored
+
+The reduce carrier no longer emits explicit `Init` seeds. Every carried state component is folded by an `Accum`, and
+`Loop.render` derives its seed from `op.identity` — so the init is "clear from the carrier," not placed by a separate
+pass (the old `020_place_inits` is **not** restored). This holds for all three carrier shapes:
+
+- **Degenerate reduce** (`sum` / `max` / `min`) — already an `Accum`; `Monoid.as_accums` reconstructs it from the
+  identity-twist merge so `ir.tile.ops.lower` emits bare `Accum`s.
+- **Twisted carrier** (online softmax `(m,d)`, flash `(m,l,O)`) — the ψ rescale is a preceding `Assign`
+  (`lm = l·alpha`) and each fold a **`base`-`Accum`** (`Accum(l, value=p, base=lm)` → `l = lm + p`); the `m` lane is a
+  plain `Accum(max)`. `Accum` gained an optional `base` (the rescaled left operand; defaults to `name`). The streaming
+  merge (`Twist.merge`) is now a mix of `Assign` temps + `Accum` folds, emitted directly into the reduce `Loop`.
+  `combine_states` (cross-partition) is untouched — still all-`Assign`, rendered by `render_merge_program`.
+
+The dtype policy from old `020_place_inits` rides on the `Accum` now, stamped by `030_stamp_types`: a **selecting** fold
+(`max`/`min`) keeps the folded value's dtype (fp16 `max` stays fp16), an **accumulating** fold (`sum`/`prod`, the matmul,
+and the twisted-carrier LSE stats, pinned f32) promotes to f32. Recovered `test_fp16_max_reduction_stays_in_fp16`,
+`test_fp16_reduction_uses_fp32_accumulator_on_cuda`, `test_reduce_emits_k_loop`.

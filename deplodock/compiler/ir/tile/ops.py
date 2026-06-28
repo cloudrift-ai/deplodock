@@ -19,14 +19,14 @@ A kernel's compute is a tree of three node kinds, each of whose children
 - ``Semiring`` — a contraction ``reduce(⊕) ∘ map(⊗)`` (the matmul): the ``lift`` ⊗ over
   its ``operands``, folded by the additive ``fold`` ⊕ over ``reduce_axis``.
 
-:func:`lower` emits loop-IR stmts: a ``Monoid`` generates an explicit ``Init`` per carried
-state (``<f32> state = identity;``, via ``State.inits``) then the streaming ``Loop`` (its
-partials expanded as sibling stmts + the carrier fold), and leaves an in-loop carrier with
-its partials cleared. The ``Init`` stmts make the seed explicit IR so ``Loop.render`` stays
-generic — it never reads ``state``. A ``Semiring`` generates its contraction ``Loop`` in
-the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` emits its ``source``'s
-lowering (if any) then its pointwise body. So a kernel *is* the lowered tree — no
-per-kernel builder.
+:func:`lower` emits loop-IR stmts: a ``Monoid`` generates the streaming ``Loop`` (its
+partials expanded as sibling stmts + the carrier fold) with NO explicit ``Init`` — the
+carried state is folded by ``Accum``\\ s (a degenerate carrier's bare folds via
+``Monoid.as_accums``; a twisted carrier's ``base``-``Accum``\\ s in its ``merge``), so the
+seed rides on each ``Accum``'s ``op.identity`` and ``Loop.render`` derives it. A ``Semiring``
+generates its contraction ``Loop`` in the matmul-recognizable ``Accum``-in-``Loop`` form; a
+``Map`` emits its ``source``'s lowering (if any) then its pointwise body. So a kernel *is*
+the lowered tree — no per-kernel builder.
 """
 
 from __future__ import annotations

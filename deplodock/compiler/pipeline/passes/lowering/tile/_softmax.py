@@ -10,9 +10,12 @@ untouched, reading the final ``m`` + ``1/d``).
 
 ``online_softmax_combine`` builds the ``(m, d)`` carrier; :func:`try_online_softmax`
 recognizes an adjacent ``(rowmax, Σexp)`` reduce pair over the same input + reduce
-extent in a ``LoopOp`` body and rewrites it to the fused streaming loop (the carried
-``(m, d)`` states are seeded by explicit ``Init`` stmts before the loop). Recognition is
-called from ``lowering/tile/010_recognize``
+extent in a ``LoopOp`` body and rewrites it to the fused streaming loop. The carried
+``(m, d)`` states fold through ``base``-``Accum``\\ s, so when the cell is lifted to an
+op-tree ``Monoid`` the seed is derived from ``op.identity`` by ``Loop.render``; explicit
+``Init`` stmts are emitted before the loop as well, load-bearing only on the flat-``Map``
+fallback (a cell kept as loop-IR verbatim). Recognition is called from
+``lowering/tile/010_recognize``
 (after flash, before the plain-reduce normalize — each later step consumes the
 ``Accum``\\ s an earlier one matches).
 """
@@ -37,9 +40,9 @@ def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
         d = d·alpha + p;     m = m_new   (last)
 
-    A non-twisted carrier (no value partial) — ``Monoid.render`` realizes its merge at the scalar
-    tier; the downstream normalize pass reads the final ``m`` and ``1/d``. Temps are namespaced
-    by ``m`` so they stay unique per kernel."""
+    The streaming merge is ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds (so the seed
+    rides on each fold's ``op.identity``); the downstream normalize pass reads the final
+    ``m`` and ``1/d``. Temps are namespaced by ``m`` so they stay unique per kernel."""
 
     def t(suf: str) -> str:
         return f"{m}__{suf}"
@@ -134,8 +137,10 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                         axis=s.axis,
                         body=Body.coerce((Load(name=src, input=input_buf, index=index), mono)),
                     )
-                    # The (m, d) states are seeded by explicit ``Init`` stmts before the
-                    # loop, from the carrier's ``state.identity`` ((−inf, 0)).
+                    # Explicit ``Init`` seeds before the loop — load-bearing only if ``_lift``
+                    # keeps this cell as a flat ``Map`` (loop-IR verbatim, ``Monoid`` rendered
+                    # standalone). The lifted path strips them and reseeds from the carrier's
+                    # ``base``-``Accum`` folds (``op.identity`` = (−inf, 0)).
                     out.extend(mono.state.inits())
                     out.append(fused)
                     changed = True
