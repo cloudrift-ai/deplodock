@@ -45,9 +45,22 @@ XFAIL: dict[str, str] = {
     "test_fused_edge.py": _R,
     "test_gen_runner_gpu.py": _R,
     "test_launch_geometry_rules.py": _R,
-    "test_masked_cooperative_reduce.py": _R,
     "test_matmul_mma.py": _R,
-    "test_matmul_mma_masked.py": _R,
+    # test_matmul_mma_masked.py: the symbolic-K masked matmul recovered with the symbolic
+    # reduce tier (the reduce axis strides to the runtime extent, scalar fallback accurate).
+    # The symbolic-M/N (free-axis) + mma-tier residuals still need those tiers — registered
+    # per function so the recovered ``test_symbolic_k_masked_mma_accuracy`` is a hard
+    # requirement again.
+    "test_matmul_mma_masked.py::test_batched_symbolic_mk_masked_mma_accuracy": _R,
+    "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp": _R,
+    "test_matmul_mma_masked.py::test_demoted_masked_k_pv_tma_accuracy": _R,
+    "test_matmul_mma_masked.py::test_demoted_symbolic_n_accuracy": _R,
+    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_accuracy": _R,
+    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure": _R,
+    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_residual_epilogue_accuracy": _R,
+    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_accuracy": _R,
+    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure": _R,
+    "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy": _R,
     "test_matmul_mma_transposed_b.py": _R,
     "test_monoid_reduce_kernel.py": _R,
     "test_program_rebind.py": _R,
@@ -163,7 +176,7 @@ XFAIL: dict[str, str] = {
     "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_cache_rmsnorm_over_capacity_buffers": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_device_io_matches_eager": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_softmax_over_symbolic_seq_len": _R,
+    # test_cuda_softmax_over_symbolic_seq_len recovered with the symbolic cooperative reduce tier.
     "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_linear_traced_and_run": _R,
     "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_rmsnorm_traced_and_run": _R,

@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import replace
 from math import prod
 
+from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, TileOp, reduce_node
@@ -81,19 +82,21 @@ def _pick_coop(extent: int, free: int) -> int:
 def _coop_carrier(kernel) -> Monoid | None:
     """The cooperative-eligible reduce carrier of ``kernel``, or ``None`` (keep serial).
 
-    Eligible: any ``MonoidKernel`` over a cleanly-lifted ``Monoid`` carrier reducing a
-    **static** axis — **degenerate** (plain ``sum`` / ``max`` / ``mean``) AND **twisted**
-    (online-softmax ``(m, d)``, flash ``(m, l, O)``) alike, since the cross-thread combine
-    is carrier-generic (it drives off the carrier's ``combine_states``, which a twisted
-    carrier authors). Both **scalar** outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d`` is
-    a grid axis) and **full-row** outputs (softmax / RMSNorm — the post-reduce sweep is
-    distributed across the coop lanes by the materializer) are handled. A flat-``Map``
-    fallback (multi / nested-non-flash reduce) is a ``MapKernel`` (``reduce_node`` is
-    ``None``), so it isn't eligible and keeps the serial fold."""
+    Eligible: any ``MonoidKernel`` over a cleanly-lifted ``Monoid`` carrier — **degenerate**
+    (plain ``sum`` / ``max`` / ``mean``) AND **twisted** (online-softmax ``(m, d)``, flash
+    ``(m, l, O)``) alike, since the cross-thread combine is carrier-generic (it drives off
+    the carrier's ``combine_states``, which a twisted carrier authors). Both **scalar**
+    outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d`` is a grid axis) and **full-row**
+    outputs (softmax / RMSNorm — the post-reduce sweep is distributed across the coop lanes
+    by the materializer) are handled. The reduce axis may be **symbolic** (dynamic
+    ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len`` bound is the
+    masked tail). A flat-``Map`` fallback (multi / nested-non-flash reduce) is a
+    ``MapKernel`` (``reduce_node`` is ``None``), so it isn't eligible and keeps the serial
+    fold."""
     if not isinstance(kernel, MonoidKernel):
         return None
     inner = reduce_node(kernel.op)
-    if not isinstance(inner, Monoid) or inner.axis is None or not inner.axis.extent.is_static:
+    if not isinstance(inner, Monoid) or inner.axis is None:
         return None
     return inner
 
@@ -109,7 +112,10 @@ def _reduce_specs(kernel, place) -> list[str]:
     carrier = _coop_carrier(kernel)
     if carrier is None:
         return [""]  # not cooperative-eligible — scalar serial fold; the pin doesn't apply
-    extent = carrier.axis.extent.as_static()
+    # A symbolic reduce axis is sized by its ``Dim`` hint for the conservative pick (the
+    # kernel deploys at the hint and strides to the runtime extent); a pin overrides it.
+    ext = carrier.axis.extent
+    extent = ext.as_static() if ext.is_static else (ext.hint or DEFAULT_SEQ_HINT)
     free = prod(ax.extent.as_static() for ax in place.free) if place.free else 1
     coop = _pick_coop(extent, free)
     cands = [f"b{coop}", ""] if coop > 1 else [""]  # conservative coop first (cold greedy → option-0)

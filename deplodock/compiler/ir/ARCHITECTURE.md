@@ -49,10 +49,14 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `Smem`+`Sync`+`TreeHalve`, multi-component for a twisted carrier) +
   the projection (a full-row output sweep distributed across the coop
   lanes, a scalar output guarded to lane 0); the `Tile` gains the coop
-  lane axis and `block_threads = coop`. The cross-CTA split
-  (`030_split`), `reg` fold, symbolic-axis cooperation, strided rows,
-  and the tensor-core `warp_tile` (incl. flash's warp tier) are reserved
-  future tiers (`plans/cooperative-reduction-tile-ir.md`).
+  lane axis and `block_threads = coop`. A **symbolic reduce axis**
+  (dynamic `seq_len`) is supported — the `StridedLoop`'s `< seq_len`
+  bound is the runtime-extent mask (idle lanes fold the identity; no
+  ceil-div / clamp) and the `Dim` name is threaded as a runtime `int`
+  arg. The cross-CTA split (`030_split`), `reg` fold, a symbolic FREE
+  axis (dynamic grid), strided rows, and the tensor-core `warp_tile`
+  (incl. flash's warp tier) are reserved future tiers
+  (`plans/cooperative-reduction-tile-ir.md`).
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.
 

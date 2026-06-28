@@ -361,11 +361,17 @@ level (whole-CTA cooperation). See `plans/cooperative-reduction-tile-ir.md` for 
   default cooperates a wide reduce (`extent ≥ 128`) feeding a small grid (`free ≤ 256`, under-occupied), `coop =
   prevpow2(extent/8)` capped at 256. **Eligibility spans degenerate AND twisted carriers** (`sum`/`max`/`mean`,
   online-softmax `(m, d)`, flash `(m, l, O)`) and scalar AND full-row outputs — the combine is carrier-generic, so the
-  only gates are "a static `Monoid` carrier" (a flat-`Map` multi-reduce fallback is a `MapKernel`, not eligible).
+  only gate is "a `Monoid` carrier" (a flat-`Map` multi-reduce fallback is a `MapKernel`, not eligible). The reduce axis
+  may be **symbolic** (dynamic `seq_len`): `010_recognize` lifts a reduce whose FREE axes are static even when the reduce
+  / output-sweep axis is symbolic (a symbolic FREE axis still defers — the dynamic-grid tier), the conservative pick
+  sizes the symbolic extent by its `Dim` hint, and the cuda lowering threads the symbolic `Dim` name as a runtime `int`
+  arg (the launch resolves it from the input shapes — `CudaOp.runtime_args` / `resolve_dim`).
 
 - **The cooperative materializer** (`kernel/010_materialize._cooperative`) lowers a BLOCK plan: the serial reduce `Loop`
   becomes a `StridedLoop(start=lane, step=coop)` (each lane strides the axis from its lane index — the `< extent` bound
-  masks the tail, no explicit mask; a flash carrier's nested QK `Semiring` rides inside, per-lane), seeded automatically
+  masks the tail, **and for a symbolic axis `< seq_len` is the runtime-extent mask itself**: an idle lane whose start is
+  past `seq_len` does zero iterations and folds the carrier identity, so no ceil-div tiling / gmem clamp / per-element
+  mask is needed; a flash carrier's nested QK `Semiring` rides inside, per-lane), seeded automatically
   by the dissolved fold `Accum`s (the Phase-3 single-seed path, now realized for the cooperative tier); then
   `_combine.emit_combine` walks the derived `Fold`s emitting `WarpShuffle` / `Smem`+`Sync`+`TreeHalve` (driven off the
   carrier's `state.names` / `twist.state_b` / `twist.combine_states` — carrier-generic: degenerate `sum`/`max` and the
@@ -381,6 +387,7 @@ level (whole-CTA cooperation). See `plans/cooperative-reduction-tile-ir.md` for 
 - **Reserved slots** (defined in the type system, raise / never fire): strided-cooperative rows (`MonoidSchedule.block` —
   a whole free axis packed alongside the coop lanes; this cut is whole-CTA only, so a sub-warp coop runs a small CTA
   rather than packing rows), the `reg` (ILP) fold, the cross-CTA `cta` split (`030_split` — a documented stub: partial
-  kernel → `ws` workspace, finalize = a reduce over the split axis via `carrier.as_state_merge`), the symbolic-axis
-  cooperative tier, the shared `WarpTile` (tensor-core mma tile, including flash's warp-tier QK/PV), operand pipelining
-  (`Stage`/`Channel`), and warp specialization (`WarpSpec`).
+  kernel → `ws` workspace, finalize = a reduce over the split axis via `carrier.as_state_merge`), a **symbolic FREE
+  axis** (the dynamic-grid tier — a symbolic *reduce* axis is supported, but a dynamic row count still defers), the
+  shared `WarpTile` (tensor-core mma tile, including flash's warp-tier QK/PV), operand pipelining (`Stage`/`Channel`),
+  and warp specialization (`WarpSpec`).

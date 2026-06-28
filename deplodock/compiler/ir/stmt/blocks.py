@@ -328,9 +328,13 @@ class StridedLoop(Stmt):
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        # ``_extent_c`` renders a symbolic bound (a cooperative reduce over a dynamic
+        # ``seq_len`` strides each lane to the runtime extent — the ``< seq_len`` bound is the
+        # masked tail, idle lanes folding the carrier identity) as the C name, a static one as
+        # its literal int.
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {_extent_c(self.axis, ctx)}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
