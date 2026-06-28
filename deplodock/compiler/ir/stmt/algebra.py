@@ -167,6 +167,14 @@ class Monoid(ReduceCarrier):
     - ``commutative`` — whether the operation also commutes (split-KV legality);
       ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
       monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
+    - ``finalize`` — the carrier's **φ projection**: the post-reduction program that
+      maps the *final* carried state to the kernel's output value (the article's
+      ``project`` in ``project ∘ reduce ∘ map``), emitted by ``lower(Reduce)`` AFTER
+      the streaming loop. As data — a tuple of ``Assign``\\ s reading the state. Empty
+      = identity (the state itself is the output, e.g. a plain reduce / matmul). Flash
+      authors ``O_i / l_i`` (normalize the streamed output by the denominator). Named
+      ``finalize`` not ``project`` because :meth:`ReduceCarrier.project` is the
+      distinct *distribution* projection (onto a cooperative / fragment realization).
 
     The whole operation lives **inside this carrier**, not as loose body
     statements, so the gates that reject online algorithms (``accums_independent``,
@@ -191,6 +199,7 @@ class Monoid(ReduceCarrier):
     identity: tuple[Expr, ...] = ()
     commutative: bool = True
     axes: tuple[str, ...] = ()
+    finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
 
     def __post_init__(self) -> None:
         # Complete the twist's cross-partition surface against this monoid's state.

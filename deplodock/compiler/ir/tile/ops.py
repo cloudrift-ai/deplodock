@@ -27,9 +27,10 @@ layout lives; the tree names the axes it folds and the operands it reads but say
 nothing about threads / tiling (that is the separate ``Tile(op, placement)`` layer).
 
 :func:`lower` emits loop-IR stmts: a ``Reduce`` generates the structure (an ``Init``
-per carried state ← the carrier identity, the streaming ``Loop`` + the carrier fold),
-a ``Map`` is already stmts (returned as-is), and a ``TensorRef`` is a ``Load``. So a
-kernel *is* the lowered tree — there is no per-kernel builder.
+per carried state ← the carrier identity, the streaming ``Loop`` + the carrier fold,
+then the carrier's ``finalize`` φ — the post-loop projection of the final state to the
+output value, e.g. flash's ``O/l``), a ``Map`` is already stmts (returned as-is), and a
+``TensorRef`` is a ``Load``. So a kernel *is* the lowered tree — no per-kernel builder.
 """
 
 from __future__ import annotations
@@ -101,7 +102,9 @@ def lower(op) -> list[Stmt]:
 
 def _lower_reduce(r: Reduce) -> list[Stmt]:
     """An ``Init`` per carried state (the carrier's identity), then the streaming
-    ``Loop`` whose body computes the partials and applies the carrier fold. Pure
+    ``Loop`` whose body computes the partials and applies the carrier fold, then the
+    carrier's ``finalize`` φ (the post-loop projection of the final state to the output
+    value — empty for a plain reduce / matmul, ``O/l`` for flash). Pure
     structure-from-carrier — no per-kernel assembly."""
     out: list[Stmt] = []
     for s, op in zip(r.carrier.state, r.init_ops, strict=True):
@@ -111,6 +114,7 @@ def _lower_reduce(r: Reduce) -> list[Stmt]:
         body += _lower_source(src, pname)
     body.append(r.carrier)  # the Monoid fold (its Twist is the combine)
     out.append(Loop(axis=r.axis, body=Body(tuple(body))))
+    out.extend(getattr(r.carrier, "finalize", ()))  # the carrier's φ: final state → output value (post-loop)
     return out
 
 

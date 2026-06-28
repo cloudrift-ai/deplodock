@@ -116,6 +116,9 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
         identity=identity,
         commutative=True,
         axes=("kv",),
+        # φ projection: the streamed output O is unnormalized — divide by the
+        # log-sum-exp denominator l once, after the kv loop. ``lower`` emits it post-loop.
+        finalize=(Assign(f"{o}__proj", "divide", (o, ll)),),
     )
 
 
@@ -364,16 +367,14 @@ def _flash_body(
         score_name = "s_masked"
     else:
         score_name = "s"
-    flash_reduce = Reduce(  # the (m,l,O) streaming fold over kv
-        out="O_i",
+    flash_reduce = Reduce(  # the (m,l,O) streaming fold over kv; carrier.finalize emits O_i/l_i post-loop
+        out="O_i__proj",
         axis=Axis(name="kv", extent=s_k),
         carrier=flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
         partials=(Map(score_stmts), TensorRef(v_buf, v_idx)),
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    root = Map(
-        [*lower(flash_reduce), Assign(name="res", op="divide", args=("O_i", "l_i")), Write(output=out_buf, index=out_idx, value="res")]
-    )
+    root = Map([*lower(flash_reduce), Write(output=out_buf, index=out_idx, value="O_i__proj")])
     return tuple(root)
 
 
@@ -538,17 +539,13 @@ def build_flash_recovered(graph: Graph, producer: LoopOp, consumer: LoopOp, x_bu
     # + O/l projection are generic.
     add = ElementwiseImpl("add")
     flash_reduce = Reduce(
-        out="O_i",
+        out="O_i__proj",
         axis=Axis(name="kv", extent=kv_ext),
-        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),
+        carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),  # carrier.finalize emits O_i/l_i post-loop
         partials=(Map([*inits, *new_score]), TensorRef(v_id, new_v_index)),
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    elem = (
-        *lower(flash_reduce),
-        Assign(name="res", op="divide", args=("O_i", "l_i")),
-        Write(output=out.name, index=new_out_index, value="res"),
-    )
+    elem = (*lower(flash_reduce), Write(output=out.name, index=new_out_index, value="O_i__proj"))
     nest = (
         *new_prologue,
         Loop(

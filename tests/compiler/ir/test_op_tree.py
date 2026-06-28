@@ -78,9 +78,10 @@ def test_plain_reduce_op_tree_matches_numpy() -> None:
 
 def test_flash_op_tree_matches_softmax_qkv() -> None:
     """Flash attention as a pure op tree — a 3-state twisted carrier (m,l,O) folding
-    over kv, whose score partial is a NESTED contraction (Σ_k Q·K); the kernel root is
-    the O/l projection (a Map whose last stmt is the Write). Lowers generically (no
-    build_flash_*) and matches softmax(QK^T)·V."""
+    over kv, whose score partial is a NESTED contraction (Σ_k Q·K). The O/l projection
+    is the carrier's φ ``finalize`` (emitted post-loop by ``lower``), so the kernel root
+    is just that Reduce + the Write. Lowers generically (no build_flash_*) and matches
+    softmax(QK^T)·V."""
     S, D = 4, 3
     i, d = Axis("i", Dim(S)), Axis("d", Dim(D))  # free: query row, value dim
     j, k = Axis("j", Dim(S)), Axis("k", Dim(D))  # reduce: kv (outer), head-dim (inner)
@@ -100,13 +101,13 @@ def test_flash_op_tree_matches_softmax_qkv() -> None:
         init_ops=(ADD,),
     )
     flash = Reduce(
-        out="O",
+        out="O__proj",  # the carrier's finalize binds O/l here, post-loop
         axis=j,
         carrier=flash_combine("m", "l", "O", "s", "v"),
         partials=(score, TensorRef("V", (Var("j"), Var("d")))),
         init_ops=(MAX, ADD, ADD),
     )
-    cell = (*lower(flash), Assign(name="acc", op="divide", args=("O", "l")), Write(output="attn", index=(Var("i"), Var("d")), value="acc"))
+    cell = (*lower(flash), Write(output="attn", index=(Var("i"), Var("d")), value="O__proj"))
     op = _wrap((i, d), cell)
     rng = np.random.default_rng(0)
     q, ky, v = (rng.standard_normal((S, D)).astype(np.float32) for _ in range(3))

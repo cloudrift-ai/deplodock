@@ -189,6 +189,7 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,
         axes=new_axes,
+        finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state
     )
 
 
