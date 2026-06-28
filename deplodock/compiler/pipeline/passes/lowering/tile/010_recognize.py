@@ -15,8 +15,8 @@ unified twisted ``Monoid`` representation. Three recognitions, tried in order
    Recognition + construction live in ``_softmax`` (``try_online_softmax``).
 3. **Normalize** — any remaining scalar ``Accum`` (a plain sum / max / mean) becomes
    its **degenerate** monoid (``Accum.as_monoid`` — the identity twist, no rescale);
-   the carried state is seeded by ``Loop.render`` from ``state.identity``. A semiring
-   contraction (``Semiring.match``)
+   each carried state is seeded by an explicit ``Seed`` stmt before the loop
+   (``Monoid.seeds()``). A semiring contraction (``Semiring.match``)
    keeps its ``Accum`` — degenerate-monoidizing it would lose the contraction
    structure the matmul tier reads off the body. This generic step stays here.
 
@@ -33,7 +33,7 @@ from dataclasses import replace
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Body, Loop
+from deplodock.compiler.ir.stmt import Accum, Body, Loop, Monoid
 from deplodock.compiler.ir.stmt.algebra import Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -45,8 +45,8 @@ PATTERN = [Pattern("root", LoopOp)]
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to their degenerate
-    ``Monoid`` (deep; the carried states are seeded by ``Loop.render`` from
-    ``state.identity``). A semiring contraction (``Semiring.match``) keeps its
+    ``Monoid`` (deep; each carried state seeded by an explicit ``Seed`` stmt before
+    the loop, ``Monoid.seeds()``). A semiring contraction (``Semiring.match``) keeps its
     ``Accum`` — degenerate-monoidizing it would lose the contraction structure the
     matmul tier reads. Returns ``(stmts, changed)``."""
     out: list[Stmt] = []
@@ -54,9 +54,10 @@ def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and Semiring.match(s) is None:
             if any(isinstance(x, Accum) for x in s.body):
-                # Each Accum becomes its degenerate Monoid; the carried states are seeded
-                # by ``Loop.render`` from ``state.identity`` (no explicit ``Init``).
+                # Each Accum becomes its degenerate Monoid; each carried state is seeded by
+                # an explicit ``Seed`` stmt emitted before the loop (from ``state.identity``).
                 new_body = [x.as_monoid() if isinstance(x, Accum) else x for x in s.body]
+                out.extend(seed for x in new_body if isinstance(x, Monoid) for seed in x.seeds())
                 out.append(Loop(axis=s.axis, body=Body(tuple(new_body)), unroll=s.unroll))
                 changed = True
                 continue

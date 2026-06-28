@@ -192,9 +192,12 @@ self-contained reduction also carries `axis` (`None` on the loop-IR carrier
 analysis); its `out` / `partial_names()` are derived, and it has no per-state init op. The
 carried state itself is its own class, **extracted like the `Twist`**:
 `State` bundles the internal-state SSA `names` with their per-component `identity` (one
-`Expr` each, the monoid's neutral element). `Loop.render` seeds each carried state from
-`state.identity` in the same pre-loop prelude it uses for `Accum`s (so a `Monoid` carrier
-needs no `Init`). `State` also exposes
+`Expr` each, the monoid's neutral element). The carrier's lowering (`ir.tile.ops.lower`,
+the `010_recognize` / `_softmax` recognizers) emits an explicit `Seed` stmt per carried
+state (`<f32> state = identity;`) **before** the `Loop`, so `Loop.render` stays generic —
+it never reaches into `state` (the `Monoid` analog of `Init` for an `Accum`; a `Seed` is
+scope-bound like `Init`, never hoisted out of its enclosing reduce loop). `State` also
+exposes
 `State.other` — the second-operand names `"<n>__o"` the cross-partition combine reads. So
 a `Twist` operates on a `State`: `merge` folds a partial into `state.names`,
 `combine_states` merges `state` with a second one named `state.other`. The whole
@@ -249,6 +252,7 @@ O=O·alpha+exp(s−m_new)·v; m=m_new` (built by `loop/fusion/_flash.flash_combi
 | `Assign`                     | SSA body stmt: `name = op(args)` with `op: ElementwiseImpl`.                                                      |
 | `Accum`                      | Reduce accumulator: `name = op(name, value)` inside a reduce `Loop`. Initialized to its op's identity. ``axes`` lists the reduction axis names — propagated through Sigma renames (including σ-splits via `Expr.free_vars()`); the escape-analysis helper derives cross-thread cooperativity from ``axes ∩ enclosing ThreadTile.axes``. |
 | `Init`                       | Explicit accumulator initialization at an outer scope (matmul chunked-K).                                         |
+| `Seed`                       | Pre-loop declaration of a `Monoid` carrier's state component (`<f32> name = identity;`) — the monoid analog of `Init`. Emitted by the carrier's lowering before its `Loop`; scope-bound (never hoisted), suppressed when an enclosing `Init` already declared the name. |
 | `Write`                      | Write an SSA value to output at `index`.                                                                          |
 | `Select` + `SelectBranch`    | Coord-predicated binding (replaces the old Mux).                                                                  |
 | `Loop`                       | Serial iteration block: `axis` + nested `body`.                                                                   |

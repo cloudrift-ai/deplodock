@@ -687,9 +687,8 @@ class Init(Stmt):
     The ``op`` is redundant with the matching ``Accum.op`` (the
     accumulator carries its own combine), but is kept here so the
     renderer can pick the identity without scanning ahead. (A ``Monoid``
-    carrier needs no ``Init``: ``Loop.render`` seeds each carried state
-    from ``state.identity`` in the same pre-loop prelude it uses for
-    ``Accum``\\ s.)
+    carrier uses the sibling :class:`Seed` stmt instead — its lowering
+    emits one ``Seed`` per carried state from ``state.identity``.)
     """
 
     name: str
@@ -724,6 +723,41 @@ class Init(Stmt):
         ctx.explicit_inits.add(self.name)
         ctx.ssa_dtypes[self.name] = self.dtype.name
         return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(identity, self.dtype)};"]
+
+
+@dataclass(frozen=True)
+class Seed(Stmt):
+    """Pre-loop declaration of a ``Monoid`` carrier's state component:
+    ``<f32> name = <identity>;``. The monoid analog of ``Init`` (the ``Accum``
+    seed): the lowering that builds a ``Loop`` carrying a ``Monoid``
+    (``ir.tile.ops._lower_monoid`` and the ``010_recognize`` /
+    ``_softmax`` recognizers) emits one ``Seed`` per carried state component
+    **before** the loop, so the carried value is seeded as explicit IR rather
+    than discovered by ``Loop.render`` reaching into ``Monoid.state``.
+
+    ``identity`` is the component's neutral element (one :class:`Expr`, e.g.
+    ``Literal(0.0)`` / ``Literal(-1e30)``); the seed is always fp32 (the carrier
+    renders its merge program in fp32). Suppressed when an enclosing ``Init``
+    already declared the name (``explicit_inits``) — the split-KV /
+    cooperative-combine case where the state is seeded at an outer scope."""
+
+    name: str
+    identity: Expr
+
+    def deps(self) -> tuple[str, ...]:
+        return ()
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.name,)
+
+    def pretty(self, indent: str = "") -> list[str]:
+        return [f"{indent}{F32.name} {self.name} = {self.identity.pretty()}"]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        if self.name in ctx.explicit_inits:
+            return []
+        ctx.ssa_dtypes[self.name] = F32.name
+        return [f"{_pad(ctx.indent)}{ctx.type_name(F32)} {self.name} = {ctx.identity_literal(self.identity.value, F32)};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols

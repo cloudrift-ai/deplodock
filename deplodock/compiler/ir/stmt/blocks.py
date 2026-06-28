@@ -24,24 +24,6 @@ from deplodock.compiler.ir.stmt.leaves import Accum, Mma
 _CARRIERS = (Accum, Mma, Monoid)
 
 
-def _monoid_init_prelude(s, seen: set[str], ctx: RenderCtx, pad: str) -> list[str]:
-    """Pre-loop ``<f32> <state> = <identity>;`` for each carried state of a ``Monoid``
-    carrier in a reduce ``Loop`` body — the carrier's analog of the ``Accum`` init
-    prelude, seeded from ``state.identity`` (the neutral element; the carrier knows what
-    it accumulates, so no per-state op is stored). Empty for any non-``Monoid`` stmt or a
-    state already seeded / declared by an enclosing ``Init``."""
-    if not isinstance(s, Monoid):
-        return []
-    out: list[str] = []
-    for name, ident in zip(s.state.names, s.state.identity, strict=False):
-        if name in seen or name in ctx.explicit_inits:
-            continue
-        seen.add(name)
-        out.append(f"{pad}{ctx.type_name(_F32)} {name} = {ctx.identity_literal(ident.value, _F32)};")
-        ctx.ssa_dtypes[name] = _F32.name
-    return out
-
-
 def _source_suffix(axis: Axis) -> str:
     """Render ``" (of <source.name>)"`` when ``axis`` was carved out of a parent.
 
@@ -131,8 +113,6 @@ class Loop(Stmt):
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
-            else:
-                out += _monoid_init_prelude(s, seen, ctx, pad)
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)
         if self.unroll:
@@ -345,8 +325,6 @@ class StridedLoop(Stmt):
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
-            else:
-                out += _monoid_init_prelude(s, seen, ctx, pad)
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)

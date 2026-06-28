@@ -27,6 +27,7 @@ from deplodock.compiler.ir.stmt.leaves import (
     Load,
     Mma,
     Pack,
+    Seed,
     Select,
     SelectBranch,
     Unpack,
@@ -216,6 +217,13 @@ def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
 @rewrite.register
 def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     return Init(name=rename(s.name), op=s.op, dtype=s.dtype)
+
+
+@rewrite.register
+def _(s: Seed, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # ``identity`` is a constant Expr — only the state name moves. Renamed in lockstep
+    # with the carrier's ``Monoid.state`` (registered above) so the seed stays paired.
+    return Seed(name=rename(s.name), identity=s.identity)
 
 
 @rewrite.register

@@ -20,13 +20,13 @@ A kernel's compute is a tree of three node kinds, each of whose children
 - ``Semiring`` — a contraction ``reduce(⊕) ∘ map(⊗)`` (the matmul): the ``lift`` ⊗ over
   its ``operands``, folded by the additive ``fold`` ⊕ over ``reduce_axis``.
 
-:func:`lower` emits loop-IR stmts: a ``Monoid`` generates the streaming ``Loop`` (its
-partials expanded as sibling stmts + the carrier fold) then the carrier's ``finalize`` φ
-— and leaves an in-loop carrier with its partials reduced to bound names; the carried
-states are seeded by ``Loop.render`` from ``state.identity`` (no ``Init`` stmts, the same
-prelude it uses for ``Accum``\\ s). A ``Semiring`` generates its contraction ``Loop`` in
-the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` is already stmts (returned
-as-is). So a kernel *is* the lowered tree — no per-kernel builder.
+:func:`lower` emits loop-IR stmts: a ``Monoid`` generates an explicit ``Seed`` per carried
+state (``<f32> state = identity;``) then the streaming ``Loop`` (its partials expanded as
+sibling stmts + the carrier fold) then the carrier's ``finalize`` φ — and leaves an in-loop
+carrier with its partials reduced to bound names. The ``Seed`` stmts make the seed explicit
+IR so ``Loop.render`` stays generic — it never reads ``state``. A ``Semiring`` generates its
+contraction ``Loop`` in the matmul-recognizable ``Accum``-in-``Loop`` form; a ``Map`` is
+already stmts (returned as-is). So a kernel *is* the lowered tree — no per-kernel builder.
 """
 
 from __future__ import annotations
@@ -61,9 +61,10 @@ def _lower_partial(p) -> list[Stmt]:
 def _lower_monoid(m: Monoid) -> list[Stmt]:
     """The streaming ``Loop`` whose body expands the partial sources (siblings) and
     applies the carrier fold, then the carrier's ``finalize`` φ (the post-loop projection
-    of the final state to the output — empty for a plain reduce, ``O/l`` for flash). No
-    ``Init`` stmts: ``Loop.render`` seeds each carried state from ``state.identity`` in
-    the same pre-loop prelude it uses for ``Accum``\\ s. The in-loop carrier is this
+    of the final state to the output — empty for a plain reduce, ``O/l`` for flash).
+    Each carried state is seeded by an explicit ``Seed`` stmt (``m.seeds()``) emitted
+    before the ``Loop`` — ``<f32> state = identity;`` from ``state.identity`` — so
+    ``Loop.render`` never reaches into the carrier. The in-loop carrier is this
     ``Monoid`` with its partial sources expanded to siblings (so ``partial`` is cleared)
     and ``finalize`` stripped — the loop-IR carrier stmt the renderer / passes consume;
     its ``axis`` is kept for the cooperative-axis analysis. Pure structure-from-carrier."""
@@ -72,7 +73,7 @@ def _lower_monoid(m: Monoid) -> list[Stmt]:
         body += _lower_partial(p)
     carrier = replace(m, partial=(), finalize=())
     body.append(carrier)
-    return [Loop(axis=m.axis, body=Body(tuple(body))), *m.finalize]
+    return [*m.seeds(), Loop(axis=m.axis, body=Body(tuple(body))), *m.finalize]
 
 
 def _lower_semiring(s: Semiring) -> list[Stmt]:
