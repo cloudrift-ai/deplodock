@@ -184,10 +184,18 @@ class Tile(Stmt):
     (``ceil(N / blockDim)`` CTAs of ``blockDim`` threads). Static extents only
     for now — a symbolic axis raises (the runtime-arg / masked-tile forms land
     as the skeleton grows).
+
+    ``block_threads`` is the per-CTA thread count for a **cooperative** tile —
+    the materializer sets it to ``coop · ∏block-cells`` so the cuda lowering
+    derives ``blockDim = block_threads`` and ``gridDim = N / block_threads``
+    (the linear ``_gid`` decode then groups ``block_threads`` consecutive cells
+    per CTA, the innermost being the cooperative lanes). ``None`` is the scalar
+    tier (one thread per cell, ``blockDim = _BLOCK_SIZE``).
     """
 
     axes: tuple[Axis, ...]
     body: Body
+    block_threads: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -198,7 +206,7 @@ class Tile(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return Tile(axes=self.axes, body=body)
+        return Tile(axes=self.axes, body=body, block_threads=self.block_threads)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset(a.name for a in self.axes)

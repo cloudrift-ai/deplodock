@@ -54,7 +54,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, Write
 from deplodock.compiler.ir.stmt.algebra import AlgebraNode, Map, Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import Schedule, TileOp
+from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
@@ -248,4 +248,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     fused, _ = _fuse(loop.body)
     normed, _ = _normalize(list(fused))
     node, free = _lift(normed, root.output.name)
-    return TileOp(op=node, schedule=Schedule(free=free), name=loop.name)
+    # Wrap the lifted node + its unmapped placement in the matching ``*Kernel`` (keyed by
+    # the op kind — a bare reduction / projection over one is a Monoid/Semiring kernel,
+    # else a MapKernel). ``020_schedule`` maps the free axes + picks the reduce partition.
+    return TileOp(kernel=kernel_for(node, Placement(free=free)), name=loop.name)

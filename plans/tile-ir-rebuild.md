@@ -327,3 +327,49 @@ stmt class is retained but **unproduced**, a primitive kept for an explicit cros
 later want. The only `Monoid` stmt still rendered (via `Monoid.render`) is the cross-partition state-merge
 (`as_state_merge`), at the enclosing scope — never inside a loop, never seeded by `Loop.render`; its `combine_states`
 keeps the `copy` spelling, a combine, never a seed source.
+
+### Phase 4 — the schedule type system + the static cooperative (`coop`/BLOCK) reduce tier — done
+
+The schedule is now **typed and separate from the combine**, and the reduce axis can be partitioned across the BLOCK
+level (whole-CTA cooperation). See `plans/cooperative-reduction-tile-ir.md` for the full design; the settled shape:
+
+- **`TileOp` carries a typed `Kernel`** (`ir/tile/schedule.py`), not a loose `(op, Schedule)` pair. A `Kernel` is an
+  op-tree node + its matching `*Schedule`, keyed by the op kind: `MapKernel(op, MapSchedule)`,
+  `MonoidKernel(op, MonoidSchedule | WarpSpec)`, `SemiringKernel(op, SemiringSchedule | WarpSpec)`. The pairing makes a
+  kind/schedule mismatch (e.g. a `Monoid` with a `MapSchedule`) **unrepresentable** — no `classify_algebra` tag. The
+  schedule is **flat, typed by the outermost kind** (flash = a `Monoid` over a nested partial `Semiring` →
+  `MonoidKernel`; the op tree nests, the schedule does not). `TileOp.op` / `.schedule` are read-only projections of
+  `kernel` (preserving `op_cache_key` / `dialect_of` / `pretty_body` / the materialize call sites). `kernel_for(node,
+  place)` builds the kernel by peeling a projection `Map` to its reduced source.
+
+- **The reduce partition is a `ReducePlan`** — tuned widths only, coarse→fine (`ReducePlan.of(cta=, coop=, reg=)`): a
+  `ReduceStage(level, width)` per level (`GRID`/`BLOCK`/`REG`/`SERIAL`). The combine **mechanism** is **derived from the
+  level**, not stored — `ReduceStage.combine(warp_size, segmented)` returns the `Fold`s: `BLOCK` → `(SHFL,)` (one warp /
+  segmented row), `(SHFL, SMEM)` (warp-multiple → lanes then the cross-warp tree), or `(SMEM,)`; `GRID` → `(ATOMIC,)`
+  (split-K finalize, `030_split`); `SERIAL`/`REG` → `()`. The per-thread `serial` remainder is derived as
+  `ceil(extent / parallel)`. The schedule is **either** the kind's uniform (SIMT) schedule **or** `WarpSpec` (the
+  warp-role pipeline — ONE shared struct, no `*WarpSpec*` per-kind variants); the union at the field IS the either.
+
+- **`020_schedule` picks the plan** from **conservative module constants** (placeholders for the eventual `REDUCE` knob
+  + prior): whole-CTA cooperation for a **static, scalar-output, degenerate-monoid** reduce (`sum`/`max`/`mean`) whose
+  axis is wide (`extent ≥ 128`) and grid small (`free ≤ 256`, under-occupied) — `coop = prevpow2(extent/8)` capped at
+  256. Twisted / full-row reductions (online-softmax, RMSNorm), contractions, and symbolic axes keep the scalar serial
+  fold. `# TODO`: replace the constants with `knob._reduce_decomp` (BR→coop, BK→serial, FK→reg, SPLITK→cta) + the
+  learned/analytic prior; the agreed `REDUCE` codec (`b<n>`/`g<n>`/`r<n>`, level-named) is documented but **not wired**.
+
+- **The cooperative materializer** (`kernel/010_materialize._cooperative`) lowers a BLOCK plan: the serial reduce `Loop`
+  becomes a `StridedLoop(start=lane, step=coop)` (each lane strides the axis from its lane index — the `< extent` bound
+  masks the tail, no explicit mask), seeded automatically by the dissolved fold `Accum`s (the Phase-3 single-seed path,
+  now realized for the cooperative tier); then `_combine.emit_combine` walks the derived `Fold`s emitting
+  `WarpShuffle` / `Smem`+`Sync`+`TreeHalve` (driven off the carrier's `state.names` / `twist.state_b` /
+  `twist.combine_states` — carrier-generic: a `sum` and a `max` differ only in the auto-derived combine op); then the
+  output `Write` runs guarded to lane 0. The `Tile` gains the coop lane axis (innermost) + `block_threads = coop`, and
+  the cuda lowering / `_launch_bounds_for` derive `blockDim = coop`, `gridDim = output cells`; `render_kernelop` emits the
+  hardware `lane`/`warp` ids when the combine needs them.
+
+- **Reserved slots** (defined in the type system, raise / never fire): strided-cooperative rows (`MonoidSchedule.block` —
+  a whole free axis packed alongside the coop lanes; this cut is whole-CTA only, so a sub-warp coop runs a small CTA
+  rather than packing rows), the `reg` (ILP) fold, the cross-CTA `cta` split (`030_split` — a documented stub: partial
+  kernel → `ws` workspace, finalize = a reduce over the split axis via `carrier.as_state_merge`), the symbolic-axis
+  cooperative tier, the shared `WarpTile` (tensor-core mma tile), operand pipelining (`Stage`/`Channel`), and warp
+  specialization (`WarpSpec`).

@@ -68,7 +68,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, State, Twist, Write
-from deplodock.compiler.ir.tile import Schedule, TileOp
+from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.ir.tile.ops import Map, lower
 
 if TYPE_CHECKING:
@@ -242,8 +242,11 @@ def build_flash_frag(
         Axis(name="d", extent=Dim(d_v)),
     )
     # The free axes are the schedule's, carried on the ``TileOp`` with an UNMAPPED grid —
-    # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid.
-    tile = TileOp(op=flash_op, schedule=Schedule(free=grid))
+    # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid. Flash is a
+    # ``Monoid`` over a nested partial ``Semiring`` (the schedule is typed by the OUTERMOST
+    # kind), so ``kernel_for`` wraps it as a ``MonoidKernel``; its cooperative-KV / warp tier
+    # is future work, so it keeps the scalar (serial) reduce partition.
+    tile = TileOp(kernel=kernel_for(flash_op, Placement(free=grid)))
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):

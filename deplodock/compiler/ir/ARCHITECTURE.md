@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` + scheduling stmts (`Tile`, sources-only `Stage` carrying `Source`/`CacheDim` per-operand layouts, `StageBundle` carrying policy + optional `compute` phase, `StridedLoop`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` carrying a typed `Kernel` (`tile/schedule`: an op-tree node + its `*Schedule` — `MapKernel`/`MonoidKernel`/`SemiringKernel`); the schedule holds the free→grid `Placement` + the reduce `ReducePlan` |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -28,14 +28,24 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `Accum.op` (`ElementwiseOp` only — `ReduceOp` is not a valid body
   op; reductions are `Accum` statements inside a reduce `Loop`).
 - **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
-  `TileOp` whose body is a `Tile` carrying scheduling decisions
-  (`BIND_THREAD`/`BIND_BLOCK` axes, `Stage`). Cooperative-reduce
-  emission, atomic-write classification, and broadcast-write guards
-  are derived by ``escape_analysis`` at materialize / render time
-  rather than carried as explicit Stmts.
+  `TileOp` carrying a typed `Kernel` (`tile/schedule` — an op-tree node
+  paired with its `*Schedule`, keyed by kind: `MapKernel` /
+  `MonoidKernel` / `SemiringKernel`, so a kind/schedule mismatch is
+  unrepresentable). `010_recognize` lifts the algebra + builds the
+  kernel with an UNMAPPED `Placement`; `020_schedule` maps the free
+  axes onto the grid and picks the reduce `ReducePlan` (this cut:
+  whole-CTA cooperation for a static scalar degenerate-monoid reduce
+  via conservative constants, else the scalar serial fold). The combine
+  stays in the op tree; the schedule holds only the geometry.
 - **Tile → kernel** (after `lowering/kernel`): `TileOp` materialized to
-  `KernelOp` whose body uses hardware primitives (`Smem`, `Sync`,
-  `TreeHalve`, `StridedLoop`).
+  `KernelOp` whose body is a `Tile` (the thread-grid decode) over the
+  lowered op tree. A cooperative `ReducePlan` lowers the reduce as a
+  `StridedLoop` (lane-strided fold) + the derived cross-thread combine
+  (`_combine.emit_combine` → `WarpShuffle` / `Smem`+`Sync`+`TreeHalve`)
+  + a lane-0-guarded output `Write`; the `Tile` gains the coop lane axis
+  and `block_threads = coop`. The cross-CTA split (`030_split`), `reg`
+  fold, symbolic-axis cooperation, and flash cooperative-KV are reserved
+  future tiers (`plans/cooperative-reduction-tile-ir.md`).
 - **Kernel → CUDA** (after `lowering/cuda`): `KernelOp` replaced by
   `CudaOp` carrying rendered source.
 

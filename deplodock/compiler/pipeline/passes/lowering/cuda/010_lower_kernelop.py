@@ -36,10 +36,19 @@ def rewrite(match: Match, root: Node) -> CudaOp | None:
     tensors = {**kernel.inputs, **kernel.outputs}
     source = render_kernelop(kernel, tensors=tensors)
 
+    # A cooperative tile fixes the per-CTA thread count (``coop · ∏block-cells``): one CTA
+    # per output-cell group, ``blockDim = block_threads``, ``gridDim = N / block_threads``
+    # (the linear ``_gid`` decode groups ``block_threads`` consecutive cells per CTA). The
+    # scalar tier is one thread per cell over the fixed ``_BLOCK_SIZE`` block.
     n = tile.n_elements
-    blocks = (n + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+    if tile.block_threads is not None:
+        blockdim = tile.block_threads
+        blocks = (n + blockdim - 1) // blockdim
+    else:
+        blockdim = _BLOCK_SIZE
+        blocks = (n + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     grid = ((blocks,), (1,), (1,))
-    block = ((_BLOCK_SIZE,), (1,), (1,))
+    block = ((blockdim,), (1,), (1,))
     arg_order = (*kernel.inputs, *kernel.outputs)
     return CudaOp(
         kernel_source=source,

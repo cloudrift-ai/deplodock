@@ -446,6 +446,12 @@ def render_kernelop(
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_text = "\n".join(render_body(kernel_op.body, ctx))
+    # The cross-thread combine (``WarpShuffle`` / ``TreeHalve``) references the hardware
+    # warp ``lane`` / ``warp`` ids; declare them at function entry when the body needs them.
+    from deplodock.compiler.ir.stmt.blocks import _body_uses_lane_warp  # noqa: PLC0415
+
+    if _body_uses_lane_warp(kernel_op.body):
+        body_text = "    int lane = threadIdx.x & 31;\n    int warp = threadIdx.x >> 5;\n" + body_text
     if smem_offsets:
         # All Smem decls were rewritten to pointer aliases into a single
         # dynamic pool; declare the pool at function entry. The pool base must
@@ -496,12 +502,14 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:
-    """Derive ``__launch_bounds__`` from the outermost tile flavor.
+    """Derive ``__launch_bounds__`` from the (single) ``Tile``'s per-CTA thread count — a
+    cooperative tile's ``block_threads`` (``coop · ∏block-cells``), else the scalar tier's
+    ``_BLOCK_SIZE``. Matches the ``blockDim`` the cuda lowering picks."""
+    from deplodock.compiler.ir.kernel.ir import Tile  # noqa: PLC0415
 
-    NOTE: the tile-flavor walk (``GridTile`` / ``ThreadTile`` / ``WarpTile``)
-    that derived the per-CTA thread count was demolished with the tile IR and
-    is pending rebuild. Falls back to the default ``_BLOCK_SIZE``.
-    """
+    for s in kernel_op.body.iter_of_type(Tile):
+        if s.block_threads is not None:
+            return s.block_threads
     return _BLOCK_SIZE
 
 
