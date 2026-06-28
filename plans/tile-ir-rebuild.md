@@ -239,13 +239,17 @@ the carried IR, in three slices:
   IS the output); flash authors `O_i / l_i`. Named `finalize`, not `project`, because `ReduceCarrier.project` is the
   distinct *distribution* projection (onto a cooperative / fragment realization). So a bare `Reduce` is self-contained
   (fold + finalize).
-- **`TileOp` carries the op tree.** `TileOp.op` is a `Map` (pointwise per-cell body) or a `Reduce` (fold), with an
-  optional `out` `TensorRef` (the store for a `Reduce`; a `Map` carries its own `Write`). The per-cell `body` is
-  *derived* from `op` via `lower`, so the matcher / cache-key / dump machinery is untouched — the op tree is the source
-  of truth. `020_schedule` emits `TileOp(op=Map(cell))` for the general scalar tier.
+- **`TileOp` carries the op tree (only the op + the schedule).** `TileOp` is a plain `Op` (not a `BodyOp`) holding
+  `op` (a `Map` pointwise per-cell body, or a `Reduce` fold) + `grid_axes`. **No stored output store** — the `Write`
+  binding a `Reduce`'s output value to the kernel buffer at the grid cell is *glue*, generated at `materialize` from
+  `grid_axes` + the graph node's output buffer. `inputs` / `outputs` come from the base `Op.populate_io` (graph edges);
+  the `body` property derives the per-cell compute (sans glue) from `op` for the cache-key / dump machinery. The op tree
+  is the source of truth. `020_schedule` emits `TileOp(op=Map(cell))` for the general scalar tier (the `Map` carries its
+  own `Write`, so no glue).
 - **The recognizer emits `TileOp(Reduce)`.** `build_flash_frag` (clean SDPA) returns the flash `Reduce` UNLOWERED on a
-  `TileOp` — the free `(batch…, m, d)` axes are its `grid_axes`, the store its `out` — instead of a lowered `LoopOp`
-  fragment. `Graph.splice` is op-type-agnostic, so the `TileOp` terminal splices fine; `020_schedule` passes it through.
+  `TileOp` — the free `(batch…, m, d)` axes are its `grid_axes` — instead of a lowered `LoopOp` fragment. `Graph.splice`
+  is op-type-agnostic, so the `TileOp` terminal splices fine; `020_schedule` passes it through; `materialize` lowers it
+  and appends the output-store glue.
 
 Flash now recognizes only the **clean** scaled-QK producer (Q/K as plain `Load`s). The fused-RoPE producer-splicing
 builder (`build_flash_recovered`) was **deleted** rather than kept half-converted to the op tree — RoPE attention no
@@ -253,6 +257,7 @@ longer fuses to flash, and its un-fused fallback isn't covered, so `test_block` 
 `test_attention_chains` case are xfailed (`_NO_RECOVERED`). Re-supporting RoPE attention means a producer-splicing score
 `Map` (a per-cell prologue slot on the op tree), to be rebuilt cleanly on the op-tree path.
 
-Remaining in this phase: `lower` runs in `TileOp.__post_init__` (deriving the body) rather than strictly in the
-materialize pass (a lazy body keyed off an op-tree structural key would defer it fully — small payoff, since `lower` is
-pure); and `TileOp` still subclasses `BodyOp` for the I/O contract.
+Remaining in this phase: `build_flash_recovered` is gone (RoPE attention to be rebuilt cleanly on the op-tree path, per
+above); the `body` property still lowers on access (for the cache key / dumps) while `materialize` does the deployable
+lower + glue — a structural key off `op` directly would drop even the property-side lower, but the payoff is small since
+`lower` is pure.

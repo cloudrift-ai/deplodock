@@ -29,7 +29,6 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
-from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.pipeline import LoweringError
 
 # tile IR demolished — pending rebuild (see plans/tile-ir-rebuild.md); guarded so the
@@ -53,7 +52,7 @@ def _graph_with_tile() -> Graph:
     rewrite ignores the body, so an empty one is fine."""
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4,), "f32"), node_id="x")
-    g.add_node(op=TileOp(body=Body(()), name="k_test"), inputs=["x"], output=Tensor("y", (4,), "f32"), node_id="y")
+    g.add_node(op=TileOp(name="k_test"), inputs=["x"], output=Tensor("y", (4,), "f32"), node_id="y")
     g.inputs = ["x"]
     g.outputs = ["y"]
     return g
@@ -184,7 +183,7 @@ def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
     from deplodock.compiler.pipeline.pipeline import RuleSkipped
 
     def _tile_leaf(bn: int) -> TileOp:
-        return TileOp(body=Body(()), name="k_test", knobs={"BN": bn})
+        return TileOp(name="k_test", knobs={"BN": bn})
 
     def emit_tiles(root):
         if "BN" in root.op.knobs:  # already tiled (our own output) → don't re-fork
@@ -299,11 +298,12 @@ def test_compute_phase_info_raises_on_collapsed_index():
     # single-Write materializer — ``compute_phase_info`` flags it as a
     # ``LoweringError`` (caught + pruned under tune by the containment above)
     # instead of an opaque ``AttributeError`` mid-tune.
+    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
+
     from deplodock.compiler.ir.axis import Axis
     from deplodock.compiler.ir.expr import Literal, Var
     from deplodock.compiler.ir.stmt import Write
     from deplodock.compiler.ir.tile.ir import Source
-    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
 
     sources = (Source(name="slab", buf="x", cache_axes=(Axis("a2", 4), Axis("a4", 8)), origin=(Literal(0, "int"), Literal(0, "int"))),)
     # Clean all-Var index → recovers the two cache axes.

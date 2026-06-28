@@ -9,8 +9,8 @@ kernel body — it builds the high-level op tree (``ir/tile/ops``): flash is the
 ``(m,l,O)`` LSE ``Reduce`` over kv whose score partial ``Map`` holds the ``Σ Q·K``
 contraction, the carrier ``finalize``\\ ing ``O/l``. ``build_flash_frag`` returns that
 ``Reduce`` UNLOWERED, on a ``TileOp`` — the free ``(batch…, m, d)`` axes are its
-``grid_axes``, the store its ``out``; ``020_schedule`` passes the ``TileOp`` through and
-``lower`` runs at materialize.
+``grid_axes``; ``020_schedule`` passes the ``TileOp`` through, and ``materialize`` lowers
+it + generates the output-store glue (the ``Write`` at the grid cell — not stored).
 
 Scope is the **clean** scaled-QK producer (Q/K recoverable as plain ``Load``\\ s). A
 fused score producer whose Q/K are computed SSA — RoPE'd QK — is NOT recognized as
@@ -252,9 +252,10 @@ def build_flash_frag(
 
     The compute is the op tree itself — a ``Reduce`` (the ``(m,l,O)`` LSE fold whose
     carrier ``finalize``\\ s ``O/l``) carried unlowered on the ``TileOp``; the free
-    ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest), and the
-    output store is its ``out`` ``TensorRef``. ``020_schedule`` passes the ``TileOp``
-    through; the per-cell body is derived by ``lower`` for the materializer.
+    ``(batch…, m, d)`` axes become its ``grid_axes`` (no free-axis loop nest).
+    ``020_schedule`` passes the ``TileOp`` through; ``materialize`` lowers it and
+    generates the output-store glue (the ``Write`` at the grid cell) — it isn't stored
+    here.
 
     ``group`` is the GQA head ratio (K/V indexed at ``head // group``); ``mask`` is
     an optional ``(buffer_id, shape)`` additive bias loaded per ``(m, kv)``."""
@@ -264,7 +265,7 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    flash_reduce, out_idx = _flash_op(
+    flash_reduce = _flash_op(
         q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     grid = (
@@ -272,7 +273,7 @@ def build_flash_frag(
         Axis(name="m", extent=s_q_dim),
         Axis(name="d", extent=Dim(d_v)),
     )
-    tile = TileOp(op=flash_reduce, out=TensorRef(out.name, out_idx), grid_axes=grid)
+    tile = TileOp(op=flash_reduce, grid_axes=grid)
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -312,13 +313,13 @@ def _flash_op(
     group: int = 1,
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
-) -> tuple:
+) -> Reduce:
     """The per-output-element ``(…, m, d)`` compute as the op tree itself: flash is the
     ``(m,l,O)`` LSE :class:`Reduce` over ``kv`` whose score partial ``Map`` holds a
     NESTED contraction ``Σ_dd Q·K`` (scaled, optionally masked); the carrier
-    ``finalize``\\ s ``O/l``. Returns ``(reduce, out_index)`` — the unlowered ``Reduce``
-    (carried on the ``TileOp``) and the output store's index exprs. The free
-    ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here.
+    ``finalize``\\ s ``O/l``. Returns the unlowered ``Reduce`` (carried on the
+    ``TileOp``). The free ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops
+    here; the output store is glue generated at materialize.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
     ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
@@ -333,7 +334,6 @@ def _flash_op(
     q_idx = (*bvars, Var("m"), Var("dd"))
     k_idx = (*kv_bvars, Var("kv"), Var("dd"))
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
-    out_idx = (*bvars, Var("m"), Var("d"))
 
     add = ElementwiseImpl("add")
     score_reduce = Reduce(  # s = Σ_dd Q·K — the inner contraction (SEMIRING), reset per kv step
@@ -386,4 +386,4 @@ def _flash_op(
         partials=(Map(score_stmts), TensorRef(v_buf, v_idx)),
         init_ops=(ElementwiseImpl("maximum"), add, add),
     )
-    return flash_reduce, out_idx
+    return flash_reduce

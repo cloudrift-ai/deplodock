@@ -30,38 +30,42 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.stmt.ir import BodyOp
+from deplodock.compiler.ir.base import Op
 
 
 @dataclass
-class TileOp(BodyOp):
+class TileOp(Op):
     """One scheduled map/reduce kernel (see module docstring).
 
-    The kernel's compute is the op tree in ``op`` — a single
-    :class:`~deplodock.compiler.ir.stmt.algebra.Map` (a pointwise per-cell body) or
-    :class:`~deplodock.compiler.ir.tile.ops.Reduce` (a fold whose carrier finalizes to
-    the output value). ``out`` is the output store for a ``Reduce`` op (a ``Map``
-    carries its own ``Write``); ``grid_axes`` are the parallel axes mapped onto the
-    thread grid. The per-cell ``body`` (inherited) is **derived** from ``op`` by
-    ``lower`` — the op tree is the source of truth — so the matcher / cache-key / dump
-    machinery that reads ``body`` keeps working. (Constructing with ``body=`` directly
-    is still accepted for tests / hand-built guardrail nodes.)"""
+    Holds exactly the op tree (``op``) and the schedule (``grid_axes``) — not a
+    pre-lowered body, and not a ``BodyOp``. ``op`` is a single
+    :class:`~deplodock.compiler.ir.stmt.algebra.Map` (a pointwise per-cell body that
+    carries its own ``Write``) or a :class:`~deplodock.compiler.ir.tile.ops.Reduce` (a
+    fold whose carrier ``finalize``\\ s the output value). ``grid_axes`` are the parallel
+    axes mapped onto the thread grid.
 
-    op: object = None  # Map | Reduce — the op tree (source of truth); None when body= is supplied directly
-    out: object = None  # TensorRef | None — output store for a Reduce op (a Map carries its own Write)
+    There is **no stored output store**: the ``Write`` that binds a ``Reduce``'s output
+    value to the kernel's output buffer at the grid cell is *glue*, generated at
+    materialize time from ``grid_axes`` + the graph node's output buffer (see
+    ``lowering/kernel/010_materialize``). ``inputs`` / ``outputs`` come from the base
+    :meth:`Op.populate_io` (graph edges) — no body walk. The ``body`` property derives
+    the per-cell compute from ``op`` (sans glue) for the cache-key / dump machinery."""
+
+    op: object = None  # Map | Reduce — the op tree; None for placeholder nodes
     grid_axes: tuple[Axis, ...] = field(default_factory=tuple)
+    name: str = ""
 
-    def __post_init__(self) -> None:
-        if self.op is not None and not self.body:
-            # Local imports: tile.ir is loaded while ir.stmt is mid-import (normalize
-            # pulls Stage from here), so module-level tile.ops / stmt-package imports
-            # would re-enter a partially-built package. Construction-time is safe.
-            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-            from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
-            from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415
+    @property
+    def body(self):
+        """The per-cell compute as loop-IR stmts, derived from ``op`` (the source of
+        truth) — NO output-store ``Write`` (that glue is generated at materialize).
+        Empty when ``op`` is unset. Read by the cache key / dumps."""
+        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415  (tile.ir loads mid ir.stmt import)
+        from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415
 
-            stmts = list(lower(self.op))
-            if self.out is not None:  # a Reduce: store the carrier-finalized output value
-                stmts.append(Write(output=self.out.buf, index=self.out.index, value=self.op.out))
-            self.body = Body(stmts)
-        super().__post_init__()
+        return Body(lower(self.op)) if self.op is not None else Body(())
+
+    def pretty_body(self) -> str:
+        from deplodock.compiler.ir.stmt.base import pretty_body as _pretty  # noqa: PLC0415
+
+        return "\n".join(_pretty(self.body, "    "))
