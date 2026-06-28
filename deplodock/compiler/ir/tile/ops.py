@@ -42,8 +42,21 @@ class TensorRef:
     index: tuple[Expr, ...]
 
 
-# A partial source: a nested op (Map / Mask / Reduce) or a direct operand load (TensorRef).
-Source = "Map | Mask | Reduce | TensorRef"
+# A partial source: a nested op (Map / Mask / Reduce), a direct operand load
+# (TensorRef), or an opaque precomputed stmt-list (Inline).
+Source = "Map | Mask | Reduce | TensorRef | Inline"
+
+
+@dataclass(frozen=True)
+class Inline:
+    """An opaque precomputed source: a stmt-list that already binds ``out``. For a
+    subgraph the op tree can't reconstruct as ``Map`` / ``Reduce`` — e.g. a recovered
+    fused-RoPE score, where Q/K are computed SSA values, not plain loads. It plugs
+    into a carrier's partial like any other source, so the flash skeleton (the
+    streaming fold + projection) stays expressed ONCE in the tree."""
+
+    out: str
+    stmts: tuple
 
 
 @dataclass(frozen=True)
@@ -94,6 +107,8 @@ def _lower_source(src, name: str, ssa) -> list[Stmt]:
     pass ``name`` for an op rely on having set ``out`` to match)."""
     if isinstance(src, TensorRef):
         return [Load(name=name, input=src.buf, index=src.index)]
+    if isinstance(src, Inline):
+        return list(src.stmts)
     if isinstance(src, Map):
         return _lower_map(src, ssa)
     if isinstance(src, Mask):
@@ -113,7 +128,7 @@ def _bind_arg(a, ssa, stmts: list[Stmt]) -> str:
         nm = ssa()
         stmts.append(Load(name=nm, input=a.buf, index=a.index))
         return nm
-    if isinstance(a, (Map, Mask, Reduce)):
+    if isinstance(a, (Map, Mask, Reduce, Inline)):
         stmts += _lower_source(a, a.out, ssa)
         return a.out
     raise TypeError(f"_bind_arg: unsupported operand {type(a).__name__}")
@@ -182,4 +197,4 @@ def _counter():
     return fresh
 
 
-__all__ = ["TensorRef", "Map", "Mask", "Reduce", "lower"]
+__all__ = ["TensorRef", "Map", "Mask", "Reduce", "Inline", "lower"]

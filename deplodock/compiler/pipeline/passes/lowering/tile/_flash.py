@@ -46,7 +46,7 @@ from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Twist, Write
 from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
-from deplodock.compiler.ir.tile.ops import Map, Mask, Reduce, TensorRef, lower
+from deplodock.compiler.ir.tile.ops import Inline, Map, Mask, Reduce, TensorRef, lower
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
@@ -505,20 +505,25 @@ def build_flash_recovered(graph: Graph, producer: LoopOp, consumer: LoopOp, x_bu
     new_v_index = tuple(v_sigma.apply(e) for e in v_index)
     new_out_index = tuple(out_sigma.apply(e) for e in cw.index)
 
-    kv_body = (
-        *inits,
-        *new_score,
-        Load(name="rv_e", input=v_id, index=new_v_index),
-        flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),
+    # Same flash skeleton as the clean path — expressed once in the op tree. Only the
+    # score partial is opaque: a recovered fused-RoPE subgraph (Q/K are computed SSA,
+    # not loads), plugged in via Inline; the kv fold + O/l projection are generic.
+    add = ElementwiseImpl("add")
+    flash = Map(
+        out="res",
+        op=ElementwiseImpl("divide"),
+        args=(
+            Reduce(
+                out="O_i",
+                axis=Axis(name="kv", extent=kv_ext),
+                carrier=flash_combine("m_i", "l_i", "O_i", score_name, "rv_e"),
+                partials=(Inline(out=score_name, stmts=(*inits, *new_score)), TensorRef(v_id, new_v_index)),
+                init_ops=(ElementwiseImpl("maximum"), add, add),
+            ),
+            "l_i",
+        ),
     )
-    elem = (
-        Init(name="m_i", op=ElementwiseImpl("maximum"), dtype="f32"),
-        Init(name="l_i", op=ElementwiseImpl("add"), dtype="f32"),
-        Init(name="O_i", op=ElementwiseImpl("add"), dtype="f32"),
-        Loop(axis=Axis(name="kv", extent=kv_ext), body=kv_body),
-        Assign(name="res", op="divide", args=("O_i", "l_i")),
-        Write(output=out.name, index=new_out_index, value="res"),
-    )
+    elem = (*lower(flash), Write(output=out.name, index=new_out_index, value="res"))
     nest = (
         *new_prologue,
         Loop(
