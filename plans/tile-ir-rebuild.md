@@ -365,7 +365,11 @@ level (whole-CTA cooperation). See `plans/cooperative-reduction-tile-ir.md` for 
   may be **symbolic** (dynamic `seq_len`): `010_recognize` lifts a reduce whose FREE axes are static even when the reduce
   / output-sweep axis is symbolic (a symbolic FREE axis still defers — the dynamic-grid tier), the conservative pick
   sizes the symbolic extent by its `Dim` hint, and the cuda lowering threads the symbolic `Dim` name as a runtime `int`
-  arg (the launch resolves it from the input shapes — `CudaOp.runtime_args` / `resolve_dim`).
+  arg (the launch resolves it from the input shapes — `CudaOp.runtime_args` / `resolve_dim`). A reduction whose *result*
+  depends on the runtime count (a dynamic `mean = sum / N`) binds that divisor through `ConstantOp.context_value` — a
+  generalized constant that is EITHER a static `value` OR a runtime `context_value` (an `Expr` over the `sym_values`
+  context, resolved per launch), never both (`__post_init__`-enforced); the backend fills its buffer with
+  `float(seq_len)` per run.
 
 - **The cooperative materializer** (`kernel/010_materialize._cooperative`) lowers a BLOCK plan: the serial reduce `Loop`
   becomes a `StridedLoop(start=lane, step=coop)` (each lane strides the axis from its lane index — the `< extent` bound

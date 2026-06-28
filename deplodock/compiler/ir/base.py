@@ -24,6 +24,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Graph, Node
+    from deplodock.compiler.ir.expr import Expr
     from deplodock.compiler.tensor import Tensor
 
 
@@ -121,14 +122,34 @@ class ConstantOp(Op):
     layout — what the loader needs to read from safetensors before
     running ``load_ops``. Empty for scalar constants and for synthetic
     constants emitted by passes (which never reach the loader).
+
+    **Value binding** — a scalar constant binds its value EXACTLY ONE of three ways, never
+    ambiguously (enforced in :meth:`__post_init__`):
+
+    - ``value`` — a **static** scalar fixed at trace/compile time (eps, scale, a folded dim).
+    - ``context_value`` — a **runtime** scalar bound at launch from the context (the
+      ``sym_values`` symbolic-dim env) via an :class:`~deplodock.compiler.ir.expr.Expr` over
+      symbolic-dim names; e.g. a dynamic mean's divisor = the runtime reduce-axis size
+      (``Var("seq_len")``). The backend fills the buffer with ``float(expr.eval(sym_values))``
+      per run.
+    - **neither** — an **executor-supplied** tensor (weights / RoPE tables loaded from
+      safetensors, or fed as ``input_data``).
+
+    Static-value readers gate on ``value is not None``; a ``context_value`` constant has
+    ``value is None`` so they correctly treat it as non-static (the backend resolves it).
     """
 
     name: str
-    value: float | None = None  # scalar value captured at trace time
+    value: float | None = None  # a STATIC scalar (None ⇒ not a static constant)
+    context_value: Expr | None = None  # a RUNTIME scalar bound from context (sym_values); see class doc
     load_ops: tuple[Op, ...] = ()
     source_path: str | None = None
     source_shape: tuple[int, ...] | None = None
     source_dtype: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.value is not None and self.context_value is not None:
+            raise ValueError(f"ConstantOp {self.name!r} binds EITHER a static value OR a context_value, not both")
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         raise NotImplementedError("ConstantOp has no inputs; use node.output.shape directly")

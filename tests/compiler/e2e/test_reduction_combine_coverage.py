@@ -167,13 +167,9 @@ def test_cooperative_combine_accuracy(op, variant, shape, monkeypatch):
     reduce axis, stays accurate AND emits the pinned intra-CTA combine structure across the
     three stages (serial → warp-shuffle → hierarchical smem), pinned via the ``REDUCE`` coop
     field. The dynamic column proves the same combine deploys over a runtime ``seq_len`` (the
-    strided ``< seq_len`` bound masking the tail), one kernel for any length."""
-    if shape == "dynamic" and op == "mean":
-        # ``mean`` decomposes to ``sum × (1/N)`` with ``N`` baked from the TRACE shape, so a
-        # symbolic reduce divides by the wrong (compile-time) count. The cooperative reduce
-        # itself is fine (``amax`` / ``softmax`` dynamic pass); dynamic ``mean`` needs a
-        # separate frontend fix (a runtime ``1/seq_len`` divisor), tracked outside this tier.
-        pytest.skip("dynamic mean bakes its 1/N divisor from the trace shape — separate dynamic-mean fix")
+    strided ``< seq_len`` bound masking the tail), one kernel for any length. ``mean``'s
+    divisor is the runtime extent too (a ``context_value`` constant resolved at launch), so
+    dynamic ``mean`` divides by the right count."""
     code, ref_fn = _OPS[op]
     got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch, dynamic=_SHAPES[shape], seq=_DYNAMIC_SEQ)
     want = ref_fn(xs).reshape(got.shape)

@@ -104,6 +104,25 @@ def _constant_values(graph: Graph) -> dict[str, float]:
     return {nid: node.op.value for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.value is not None}
 
 
+def _runtime_constants(graph: Graph):
+    """``{nid: Expr}`` for each ``ConstantOp`` bound to a runtime ``context_value`` (a value
+    set by the symbolic context — e.g. a dynamic mean's divisor = the runtime reduce-axis
+    size). Resolved to a concrete float per run from ``sym_values``."""
+    return {
+        nid: node.op.context_value
+        for nid, node in graph.nodes.items()
+        if isinstance(node.op, ConstantOp) and getattr(node.op, "context_value", None) is not None
+    }
+
+
+def _resolved_constants(compiled: _Compiled, sym_values: dict[str, int]) -> dict[str, float]:
+    """The constant-value map for this run: the static constants plus each runtime
+    ``context_value`` constant evaluated at ``sym_values`` (``float(seq_len)``)."""
+    if not compiled.runtime_constants:
+        return compiled.constants
+    return {**compiled.constants, **{nid: float(expr.eval(sym_values)) for nid, expr in compiled.runtime_constants.items()}}
+
+
 def _launches(graph: Graph) -> list[Node]:
     nodes: list[Node] = []
     for nid in graph.topological_order():
@@ -163,6 +182,10 @@ class _Compiled:
     # Empty for every kernel set that tiles the symbolic extent with a ceil-div
     # grid (those handle any runtime size); populated only by the capped cut.
     symbolic_caps: dict[str, int] = field(default_factory=dict)
+    # ConstantOp nid → ``Expr`` (over symbolic-dim names) whose runtime value fills the
+    # constant (a dynamic mean's divisor = the runtime reduce-axis size). Resolved per run
+    # via :func:`_resolved_constants`.
+    runtime_constants: dict = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -172,6 +195,7 @@ def _compile(graph: Graph) -> _Compiled:
     launches_nodes = _launches(graph)
     symbolic_bindings = _symbolic_bindings(graph)
     symbolic_hints = _symbolic_hints(graph)
+    runtime_constants = _runtime_constants(graph)
 
     # ``nvcc.load_function`` returns a cupy ``Function`` (or a ``RawKernel`` on
     # NVRTC fallback) — both launch-callable and smem-attr settable.
@@ -212,6 +236,7 @@ def _compile(graph: Graph) -> _Compiled:
         launches=launches,
         symbolic_bindings=symbolic_bindings,
         symbolic_hints=symbolic_hints,
+        runtime_constants=runtime_constants,
     )
 
 
@@ -377,6 +402,7 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     input/constant/output buffers stay standalone (persistent across the call)."""
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
+    constants = _resolved_constants(compiled, sym_values)
     arrays: dict[str, cp.ndarray] = {}
     # Saturating casts here are intended, not bugs: e.g. an SDPA mask-fill
     # constant (``-1e9``) is meant to become ``-inf`` in fp16 (masked → 0 after
@@ -386,7 +412,7 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
             if buf.role == "scratch":
                 continue  # placed into the slab below
             shape = buf.resolve_shape(sym_values) or (1,)
-            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), compiled.constants)
+            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), constants)
     # ``scratch`` buffers become views into one zero-init slab. The build-time
     # zero preserves the contract scratch had under ``cp.zeros``; per-launch
     # ``zero_outputs`` re-zeros atomic-reduction outputs, and every other kernel
@@ -759,6 +785,12 @@ class CompiledProgram:
             for buf in self.compiled.bufs:
                 if reuse and buf.role == "scratch":
                     continue  # slab-managed; re-planned below when dims change
+                # A runtime ``context_value`` constant (a dynamic mean's divisor) keeps a
+                # static (1,) shape but its VALUE tracks the runtime context — refill in place
+                # whenever sym_values change (the shape-change check below would skip it).
+                if buf.name in self.compiled.runtime_constants:
+                    self.arrays[buf.name].fill(float(self.compiled.runtime_constants[buf.name].eval(new_sym)))
+                    continue
                 src = input_data.get(buf.name)
                 if src is None and not buf.is_symbolic:
                     continue

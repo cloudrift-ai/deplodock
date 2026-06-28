@@ -72,10 +72,12 @@ def reduction_shape(shape: tuple, axis: int) -> tuple:
     return tuple(shape[:a]) + (1,) + tuple(shape[a + 1 :])
 
 
-def const_bc(frag: Graph, *, name: str, value, target_shape: tuple, dtype: str) -> Node:
-    """Add a scalar ConstantOp and broadcast it to ``target_shape``."""
+def const_bc(frag: Graph, *, name: str, value=None, context_value=None, target_shape: tuple, dtype: str) -> Node:
+    """Add a scalar ConstantOp and broadcast it to ``target_shape``. Pass ``value`` for a
+    static scalar, or ``context_value`` (an ``Expr`` over symbolic-dim names) for a runtime
+    scalar resolved at launch — e.g. a dynamic mean's divisor = the runtime reduce-axis size."""
     cid = frag.add_node(
-        op=ConstantOp(name=name, value=value),
+        op=ConstantOp(name=name, value=value, context_value=context_value),
         inputs=[],
         output=Tensor(name, (1,), dtype),
     )
