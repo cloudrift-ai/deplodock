@@ -43,7 +43,7 @@ def _softmax_loopop(n: int) -> LoopOp:
     state = State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0)))
     return LoopOp(
         body=(
-            *state.inits(),  # <f32> m = -inf; <f32> l = 0; (the carrier's seeds)
+            # No explicit Init — Loop.render seeds the carrier from State.identity.
             Loop(
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
@@ -82,7 +82,7 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
     state = State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0)))
     return LoopOp(
         body=(
-            *state.inits(),  # <f32> m = -inf; <f32> l = 0; <f32> acc = 0;
+            # No explicit Init — Loop.render seeds the carrier from State.identity.
             Loop(
                 axis=Axis(name="j", extent=Dim(n)),
                 body=(
@@ -102,13 +102,13 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
 
 
 def _streaming_half(m: str, ll: str, acc: str, x_buf: str, v_buf: str, lo: int, n: int, jname: str) -> tuple:
-    """State seeds (``State.inits()``) + streaming-reduce loop folding ``x[lo:n]`` /
-    ``v[lo:n]`` into the ``(m, l, acc)`` state via the flash ``Monoid``'s ``merge``
-    program — one partition of a two-partition split reduce."""
+    """Streaming-reduce loop folding ``x[lo:n]`` / ``v[lo:n]`` into the ``(m, l, acc)``
+    state via the flash ``Monoid``'s ``merge`` program — one partition of a two-partition
+    split reduce. ``Loop.render`` seeds the carrier from ``State.identity`` (no explicit
+    Init)."""
     idx = Var(jname) if lo == 0 else BinaryExpr("+", Var(jname), Literal(lo, "int"))
     combine = flash_combine(m, ll, acc, f"s_{jname}", f"v_{jname}")
     return (
-        *combine.state.inits(),  # seed (m, l, acc) from the carrier's own State
         Loop(
             axis=Axis(name=jname, extent=Dim(n - lo)),
             body=(

@@ -137,11 +137,10 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                         axis=s.axis,
                         body=Body.coerce((Load(name=src, input=input_buf, index=index), mono)),
                     )
-                    # Explicit ``Init`` seeds before the loop — load-bearing only if ``_lift``
-                    # keeps this cell as a flat ``Map`` (loop-IR verbatim, ``Monoid`` rendered
-                    # standalone). The lifted path strips them and reseeds from the carrier's
-                    # ``base``-``Accum`` folds (``op.identity`` = (−inf, 0)).
-                    out.extend(mono.state.inits())
+                    # No explicit ``Init`` seeds — the carrier's seed rides on its fold and
+                    # is derived by ``Loop.render`` (the lifted path seeds the bare
+                    # ``base``-``Accum``\\ s; the flat-``Map`` fallback seeds the ``Monoid``
+                    # carrier via ``seed_identities`` = (−inf, 0)).
                     out.append(fused)
                     changed = True
                     i += 2

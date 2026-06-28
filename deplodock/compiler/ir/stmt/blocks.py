@@ -96,13 +96,15 @@ class Loop(Stmt):
 
         pad = _pad(ctx.indent)
         out: list[str] = []
-        # Per-Loop ``<dtype> <acc> = identity;`` for each distinct Accum in
-        # the immediate body. dtype comes from the Accum's optional ``dtype`` field
-        # (defaults to fp32) so fp32-over-fp16 accumulators declare as
-        # ``float acc = 0.0f;`` while a fp16-typed Accum declares as
-        # ``__half acc = __float2half(0.0f);``. A nested Accum re-declares per
-        # enclosing iteration — scope-local shadowing, so a same-named ``Init``
-        # seed (or outer Accum) at a wider scope is harmless.
+        # Per-Loop ``<dtype> <carrier> = identity;`` for each distinct carried fold in
+        # the immediate body — the seed rides on the fold, derived here (no explicit
+        # ``Init``). An ``Accum``'s seed is its ``op.identity`` at its ``dtype`` (so
+        # fp32-over-fp16 declares ``float acc = 0.0f;``, a fp16 ``max`` declares
+        # ``__half acc = __float2half(0.0f);``). A ``Monoid`` carrier (the flat-``Map``
+        # fallback, where the carrier renders standalone rather than as lifted bare
+        # ``Accum``\\ s) seeds each state component from ``seed_identities()`` at fp32 (the
+        # merge runs fp32). A nested fold re-declares per enclosing iteration —
+        # scope-local shadowing — so a same-named outer carrier is harmless.
         seen: set[str] = set()
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
@@ -112,6 +114,15 @@ class Loop(Stmt):
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
                 out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
+            elif isinstance(s, Monoid):
+                # The carrier's seed is its monoid identity — ``State.identity`` (the neutral
+                # element), a property of the carried algebra, not the twist's combine spelling.
+                for name, ident in zip(s.state.names, s.state.identity, strict=True):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    out.append(f"{pad}{ctx.type_name(_F32)} {name} = {ctx.identity_literal(ident.value, _F32)};")
+                    ctx.ssa_dtypes[name] = "f32"
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)
         if self.unroll:

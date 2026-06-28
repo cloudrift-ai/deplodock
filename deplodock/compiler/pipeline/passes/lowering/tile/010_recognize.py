@@ -64,20 +64,18 @@ PATTERN = [Pattern("root", LoopOp)]
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
     """Rewrite each plain reduce ``Loop``'s ``Accum``\\ s to their degenerate
-    ``Monoid`` (deep), seeded by explicit ``Init`` stmts before the loop. A semiring
-    contraction (``Semiring.match``) keeps its ``Accum`` — degenerate-monoidizing it would
-    lose the contraction structure the matmul tier reads. The ``Init`` seeds are
-    load-bearing only on the **flat-``Map`` fallback** path (a cell ``_lift`` keeps as
-    loop-IR verbatim, where the ``Monoid`` renders standalone and its reassignments need
-    the carried state declared); the lifted path strips them (``_lift_cell``) and reseeds
-    from the carrier's fold ``Accum``\\ s. Returns ``(stmts, changed)``."""
+    ``Monoid`` (deep). A semiring contraction (``Semiring.match``) keeps its ``Accum`` —
+    degenerate-monoidizing it would lose the contraction structure the matmul tier reads.
+    No explicit ``Init`` seeds are emitted: a carrier's seed rides on its fold and is
+    derived by ``Loop.render`` — bare ``Accum``\\ s on the lifted path (``Monoid.as_accums``)
+    or the ``Monoid`` carrier's ``seed_identities`` on the flat-``Map`` fallback. Returns
+    ``(stmts, changed)``."""
     out: list[Stmt] = []
     changed = False
     for s in stmts:
         if isinstance(s, Loop) and s.is_reduce and Semiring.match(s) is None:
             if any(isinstance(x, Accum) for x in s.body):
                 new_body = [x.as_monoid() if isinstance(x, Accum) else x for x in s.body]
-                out.extend(init for x in new_body if isinstance(x, Monoid) for init in x.state.inits())
                 out.append(Loop(axis=s.axis, body=Body(tuple(new_body)), unroll=s.unroll))
                 changed = True
                 continue
