@@ -1,12 +1,12 @@
 # Tile IR rebuild
 
-Status: **rebuild in progress — Phases 1a–1d have landed: the no-fold skeleton, the per-cell reduce (reduction + online
-softmax unified by the twist), scalar matmul (`SEMIRING`), and scalar **flash attention** (the nested
-`MONOID(SEMIRING)`). Every elementwise, index-only, reduction, static-matmul, and static-attention `e2e/` kernel —
-including whole transformer blocks — is recovered and un-xfailed, all through one generic `Tile` + carrier render path.
-Phase 2 (the high-level `Map`/`Reduce` op tree replacing the `build_*` assembly) is in progress. Remaining: dynamic
-shapes, and the perf tiers (cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch
-`refactoring/tile-ir-rebuild`.
+Status: **rebuild in progress — Phases 1a–1d and 2 have landed: the no-fold skeleton, the per-cell reduce (reduction +
+online softmax unified by the twist), scalar matmul (`SEMIRING`), scalar **flash attention** (the nested
+`MONOID(SEMIRING)`), and the high-level `Map`/`Reduce`/`Mask`/`Inline` op tree that replaced the `build_*` body
+assembly. Every elementwise, index-only, reduction, static-matmul, and static-attention `e2e/` kernel — including whole
+transformer blocks — is recovered and un-xfailed, all through one generic `Tile` + carrier render path; the compute
+layer is now the lowered op tree (no hand-assembled kernel bodies). Remaining: dynamic shapes, and the perf tiers
+(cooperative / cross-CTA reduce, the mma/blocked/split-K `Atom`).** Branch `refactoring/tile-ir-rebuild`.
 
 The tile IR — `deplodock/compiler/ir/tile/` (the `TileGraph` / `TileOp` / `StageBundle` / block-DAG / warp-tile
 datatypes) and `deplodock/compiler/pipeline/passes/lowering/tile/` (the `enumeration` + `assembly` lowering passes) —
@@ -196,14 +196,22 @@ kv-tile), `test_attention_chains` self-attn + masks, and the **whole transformer
 Qwen). Residuals: the **dynamic/symbolic** flash variants (need the dynamic-shape tier) and the obsolete flash-knob-off
 test.
 
-### Phase 2 — the high-level op tree (dissolving `build_*`) — in progress
+### Phase 2 — the high-level op tree (dissolving `build_*`) — done
 
-The compute layer is being lifted from hand-assembled low-level loop stmts to a small algebraic op tree
-(`ir/tile/ops.py`): **`Map`** (pointwise lift) and **`Reduce`** (a fold through a `Monoid`+`Twist` carrier, with
-**partials as nested ops**). `TensorRef` (buffer + index exprs) is the only place layout lives. `lower(op)` walks the
+The compute layer is lifted from hand-assembled low-level loop stmts to a small algebraic op tree (`ir/tile/ops.py`):
+**`Map`** (pointwise lift), **`Reduce`** (a fold through a `Monoid`+`Twist` carrier, with **partials as nested ops**),
+**`Mask`** (an index-predicate fill — `pred ? val : fill` — so the causal `kv ≤ m` lives in the index-aware tree, never
+in the index-free carrier), and **`Inline`** (an opaque precomputed stmt-list, for a recovered subgraph the tree can't
+reconstruct as `Map`/`Reduce`). `TensorRef` (buffer + index exprs) is the only place layout lives. `lower(op)` walks the
 tree → loop IR: the carrier generates the structure (`Init` from identity, the streaming `Loop` + the fold from the
 `Twist`), the nested ops the lift, the `TensorRef`s the loads. A contraction is `Reduce(+)∘Map(×)`; flash is
-`Map(÷, (Reduce(lse, (Reduce(+)∘Map(×), V)), l))` — validated against `softmax(QK^T)·V` (slices 1–2). Geometry stays
-separate: `Tile(op, placement)` maps axes to grid/thread/serial/coop/split (a later slice). Next: the flash recognizer
-emits the op tree, **deleting `build_flash_frag` / `_flash_loop_body` / `build_flash_recovered`**; then the remaining
-perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree.
+`Map(÷, (Reduce(lse, (Reduce(+)∘Map(×), V)), l))` — validated against `softmax(QK^T)·V`.
+
+`_flash_loop_body` is **deleted**; `build_flash_frag` / `build_flash_recovered` no longer hand-assemble a kernel body —
+each builds this op tree and calls `lower`, differing only in the score partial (clean `TensorRef` loads vs. an `Inline`
+recovered RoPE subgraph). The flash skeleton (the `(m,l,O)` streaming fold + the `O/l` projection) is expressed exactly
+once, in the tree. The `build_*` functions remain only as the recognizer's pattern → graph-fragment constructors.
+
+Geometry stays separate: `Tile(op, placement)` maps axes to grid/thread/serial/coop/split (a later slice). Next: the
+remaining perf tiers (cooperative / split / mma `Atom`) become placements/atoms on the same tree, plus the dynamic-shape
+(symbolic `seq_len`) tier.

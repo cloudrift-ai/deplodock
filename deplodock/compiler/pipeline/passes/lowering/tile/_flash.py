@@ -1,12 +1,18 @@
 """Flash-attention shared helper — the carrier builders, eligibility predicate,
-and the streaming online-softmax ``LoopOp`` nest builder.
+and the graph-fragment builders.
 
 Recognition itself lives in ``lowering/tile/010_recognize`` (which calls these
 builders); this module owns the *construction* side: the ``flash_combine`` /
 ``online_softmax_combine`` carriers, the ``flash_shape_eligible`` / ``gqa_group``
-predicates, and the nest builders ``build_flash_frag`` / ``build_flash_recovered``.
+predicates, and the fragment builders ``build_flash_frag`` / ``build_flash_recovered``.
+Neither hand-assembles a kernel body any more: each builds the high-level op tree
+(``ir/tile/ops`` — flash is the ``(m,l,O)`` LSE ``Reduce`` over kv wrapping the
+``Σ Q·K`` contraction, with ``O/l`` the root projection ``Map``) and calls
+``lower``; they differ only in how the score partial is obtained — clean
+``TensorRef`` loads (``build_flash_frag``) vs. an ``Inline`` recovered RoPE
+subgraph (``build_flash_recovered``). The flash skeleton lives once, in the tree.
 
-The nest fuses scaled-dot-product attention into ONE kernel that tiles the KV
+The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. It runs one
 independent streaming softmax per output element ``(…, m, d)`` — a correct, if
 redundant, scalar form; the tensor-core P@V tier is future work
