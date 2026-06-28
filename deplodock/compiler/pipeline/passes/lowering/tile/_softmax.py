@@ -24,7 +24,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Literal
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, Twist
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, State, Twist
 
 
 def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoid:
@@ -69,10 +69,9 @@ def online_softmax_combine(m: str, d: str, s: str, *, axis: str = "kv") -> Monoi
         Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
     )
     return Monoid(
-        state=(m, d),
+        state=State(names=(m, d), identity=(Literal(-1e30), Literal(0.0))),  # (−inf, 0)
         partial=(s,),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
-        identity=(Literal(-1e30), Literal(0.0)),  # (−inf, 0)
         commutative=True,
         axes=(axis,),
     )

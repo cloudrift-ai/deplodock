@@ -31,7 +31,7 @@ def test_online_softmax_combine_builds_asymmetric_monoid() -> None:
     # state (m, d), partial (s); the asymmetric LSE monoid must author combine_states (the
     # cross-partition combine can't derive it from merge).
     mono = online_softmax_combine("m", "d", "s", axis="kv")
-    assert mono.state == ("m", "d") and mono.partial == ("s",)
+    assert mono.state.names == ("m", "d") and mono.partial == ("s",)
     assert mono.twist.combine_states, "combine_states must be authored for the asymmetric LSE monoid"
     assert mono.commutative
 
@@ -63,7 +63,7 @@ def test_fuse_collapses_the_two_reduces_into_one_monoid() -> None:
     monoids = [s for s in fused.iter() if isinstance(s, Monoid)]
     loops = [s for s in fused if isinstance(s, Loop)]
     assert len(loops) == 1, "the two reduce loops fuse into one online-softmax loop"
-    assert len(monoids) == 1 and monoids[0].state == ("acc0", "acc1"), "carrier keeps the original acc names"
+    assert len(monoids) == 1 and monoids[0].state.names == ("acc0", "acc1"), "carrier keeps the original acc names"
 
 
 def test_fuse_is_a_noop_on_an_unrelated_reduce_pair() -> None:

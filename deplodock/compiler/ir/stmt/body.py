@@ -688,7 +688,7 @@ class Body(tuple[Stmt, ...]):
         accum_cooperative = {acc.name: frozenset(acc.axes) & thread_axes_fz for acc in accums}
         for c in combines:
             coop = frozenset(c.axes) & thread_axes_fz
-            for st in c.state:
+            for st in c.state.names:
                 accum_cooperative[st] = coop
         cooperative_thread_axes = frozenset().union(*accum_cooperative.values()) if accum_cooperative else frozenset()
 

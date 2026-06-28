@@ -527,13 +527,12 @@ class Accum(ReduceCarrier):
         ``Accum`` lower through the **same** ``Monoid.render`` / cross-partition path as a general
         ``Monoid``, with no additive special-case. The auto-derived ``combine_states``
         (``name = op(name, name__o)``) equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
-        from deplodock.compiler.ir.stmt.algebra import Monoid, Twist  # local: algebra imports leaves
+        from deplodock.compiler.ir.stmt.algebra import Monoid, State, Twist  # local: algebra imports leaves
 
         return Monoid(
-            state=(self.name,),
+            state=State(names=(self.name,), identity=(self.init,)),
             partial=(self.value,),
             twist=Twist.degenerate((self.name,), (self.value,), (self.op,), self.dtype),
-            identity=(self.init,),
             commutative=self.op.commutative,
             axes=self.axes,
         )

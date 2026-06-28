@@ -101,6 +101,26 @@ def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
 
 
 @dataclass(frozen=True)
+class State:
+    """The carried state of a :class:`Monoid` — the internal-state SSA ``names`` and
+    their per-component ``identity`` (the monoid's neutral element, one :class:`Expr`
+    each; empty = unseeded). The state is the *carrier* a :class:`Twist` operates on:
+    the twist's ``merge`` folds a partial into :attr:`names`, its ``combine_states``
+    merges this state with a second one named by :attr:`other`. ``identity`` seeds the
+    enclosing ``Init`` at the carrier's scope (split-KV / cooperative-combine reductions
+    read it to seed their partial accumulators)."""
+
+    names: tuple[str, ...]
+    identity: tuple[Expr, ...] = ()
+
+    @property
+    def other(self) -> tuple[str, ...]:
+        """The second-operand state names for the cross-partition combine — ``"<n>__o"``
+        per component, the right operand ``combine_states`` reads."""
+        return tuple(f"{n}__o" for n in self.names)
+
+
+@dataclass(frozen=True)
 class Twist:
     """The ψ-conjugated combine of a :class:`Monoid` — the part that VARIES while
     the monoid algebra (carried state + neutral element) stays the same.
@@ -142,14 +162,14 @@ class Monoid(ReduceCarrier):
     ``Monoid`` makes all three explicit so the streaming-reduce machinery isn't
     tied to any one recurrence:
 
-    - ``state`` — the carried SSA names (the internal state); read-and-written
-      across the reduce axis (the carried read is implicit, like ``Accum.name`` /
-      ``Mma.c``), and the defs visible after the loop.
+    - ``state`` — the carried :class:`State`: the internal-state SSA ``names``
+      (read-and-written across the reduce axis — the carried read is implicit, like
+      ``Accum.name`` / ``Mma.c`` — and the defs visible after the loop) plus their
+      per-component ``identity`` (the monoid's neutral element, one ``Expr`` each; the
+      enclosing ``Init`` seeds it at the carrier's scope, and split-KV /
+      cooperative-combine reductions read it to seed their partial accumulators).
     - ``partial`` — this iteration's contribution SSA names (the right operand the
       step folds into the state).
-    - ``identity`` — the monoid's neutral element, one ``Expr`` per state
-      component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
-      cooperative-combine reductions read it to seed their partial accumulators).
     - ``twist`` — the :class:`Twist`: the ψ-conjugated combine, **as data**, the
       one part that varies (degenerate / scalar / fragment) while the algebra above
       stays the same. It carries the ``merge`` program (fold a partial into the
@@ -194,10 +214,9 @@ class Monoid(ReduceCarrier):
     ``lowering/tile/_flash.flash_combine``.
     """
 
-    state: tuple[str, ...]
+    state: State
     partial: tuple[str, ...]
     twist: Twist
-    identity: tuple[Expr, ...] = ()
     commutative: bool = True
     axes: tuple[str, ...] = ()
     finalize: tuple[Assign, ...] = ()  # φ: final state → output value (post-loop); empty = identity
@@ -206,15 +225,15 @@ class Monoid(ReduceCarrier):
         # Complete the twist's cross-partition surface against this monoid's state.
         # ``object.__setattr__`` — the dataclass is frozen.
         tw = self.twist
-        # Default the second-operand state names ("<s>__o") so a twist built with
-        # only ``merge`` still has a complete cross-partition surface.
-        state_b = tw.state_b or tuple(f"{s}__o" for s in self.state)
+        # Default the second-operand state names ("<s>__o", i.e. ``state.other``) so a
+        # twist built with only ``merge`` still has a complete cross-partition surface.
+        state_b = tw.state_b or self.state.other
         combine_states = tw.combine_states
         # Auto-derive ``combine_states`` from ``merge`` for an additive carrier
         # (the partial lifts to a state, one component each): substitute the
         # partial reads with the second-operand state names. An asymmetric monoid
         # (different partial / state arity, e.g. flash LSE) must author it.
-        if not combine_states and len(self.partial) == len(self.state):
+        if not combine_states and len(self.partial) == len(self.state.names):
             sub = dict(zip(self.partial, state_b, strict=True))
             combine_states = tuple(_rename_assign_args(a, sub) for a in tw.merge)
         if state_b != tw.state_b or combine_states != tw.combine_states:
@@ -231,10 +250,9 @@ class Monoid(ReduceCarrier):
         sub = dict(zip(self.twist.state_b, other, strict=True))
         merged = tuple(_rename_assign_args(a, sub) for a in self.twist.combine_states)
         return Monoid(
-            state=self.state,
+            state=self.state,  # the State (names + identity) carries over unchanged
             partial=other,
             twist=Twist(merge=merged, combine_states=merged, state_b=other),
-            identity=self.identity,
             commutative=self.commutative,
             axes=self.axes,
         )
@@ -246,10 +264,10 @@ class Monoid(ReduceCarrier):
         return self.partial
 
     def defines(self) -> tuple[str, ...]:
-        return self.state
+        return self.state.names
 
     def carried_names(self) -> tuple[str, ...]:
-        return self.state
+        return self.state.names
 
     def combine_operands(self) -> tuple[str, ...]:
         return self.twist.state_b
@@ -274,7 +292,7 @@ class Monoid(ReduceCarrier):
         return True
 
     def pretty(self, indent: str = "") -> list[str]:
-        state = ", ".join(self.state)
+        state = ", ".join(self.state.names)
         partial = ", ".join(self.partial)
         return [f"{indent}({state}) <- combine({partial})"]
 
@@ -285,7 +303,7 @@ class Monoid(ReduceCarrier):
         builder orders the program so each old-state read precedes that state's
         update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
         """
-        return render_merge_program(self.twist.merge, self.state, ctx)
+        return render_merge_program(self.twist.merge, self.state.names, ctx)
 
 
-__all__ = ["Map", "Operand", "Semiring", "Twist", "Monoid"]
+__all__ = ["Map", "Operand", "Semiring", "State", "Twist", "Monoid"]

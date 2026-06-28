@@ -18,7 +18,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Twist, Write
+from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, State, Twist, Write
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 
 
@@ -50,10 +50,9 @@ def _softmax_loopop(n: int) -> LoopOp:
                 body=(
                     Load(name="s", input="x", index=(Var("j"),)),
                     Monoid(
-                        state=("m", "l"),
+                        state=State(names=("m", "l"), identity=(Literal(-1e30), Literal(0.0))),
                         partial=("s",),
                         twist=Twist(merge=merge),
-                        identity=(Literal(-1e30), Literal(0.0)),
                         axes=("j",),
                     ),
                 ),
@@ -93,10 +92,9 @@ def _weighted_avg_loopop(n: int) -> LoopOp:
                     Load(name="s", input="x", index=(Var("j"),)),
                     Load(name="vj", input="v", index=(Var("j"),)),
                     Monoid(
-                        state=("m", "l", "acc"),
+                        state=State(names=("m", "l", "acc"), identity=(Literal(-1e30), Literal(0.0), Literal(0.0))),
                         partial=("s", "vj"),
                         twist=Twist(merge=merge),
-                        identity=(Literal(-1e30), Literal(0.0), Literal(0.0)),
                         axes=("j",),
                     ),
                 ),
@@ -162,10 +160,9 @@ def test_combine_states_default_derived_for_additive() -> None:
     """An additive carrier (partial lifts to a state) auto-derives
     ``combine_states`` from ``merge`` — partial reads swapped for ``state_b``."""
     c = Monoid(
-        state=("acc",),
+        state=State(names=("acc",), identity=(Literal(0.0),)),
         partial=("p",),
         twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
-        identity=(Literal(0.0),),
     )
     assert c.twist.state_b == ("acc__o",)
     assert len(c.twist.combine_states) == 1

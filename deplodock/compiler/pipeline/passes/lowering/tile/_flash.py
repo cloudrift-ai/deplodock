@@ -60,7 +60,7 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Twist, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, State, Twist, Write
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import Map, Reduce, lower
 
@@ -124,10 +124,9 @@ def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
         Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
     )
     return Monoid(
-        state=(m, ll, o),
+        state=State(names=(m, ll, o), identity=identity),
         partial=(s, v),
         twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
-        identity=identity,
         commutative=True,
         axes=("kv",),
         # φ projection: the streamed output O is unnormalized — divide by the

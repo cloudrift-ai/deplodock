@@ -166,14 +166,18 @@ reduce loop); the mma atom tier reads the operands + `is_additive` to pick the
 tensor-core cell.
 
 `Monoid` is the general loop-carried **monoid** carrier — *(identity element,
-associative operation, internal state)* made explicit: `state` (the carried SSA
-names), `partial` (this step's contribution), `identity` (one `Expr` per state
-component, seeded by the enclosing `Init`), a `commutative` flag, and a `twist`
-(below) that holds the operation. The whole operation lives inside the carrier,
-not as loose body statements, so the online-algorithm gates (`accums_independent`,
-`classify_fragment_epilogue`) never see the cross-state coupling. `carried_names()`
-/ `defines()` return `state`; `deps()` / `partial_deps()` return `partial` (the
-carried read is implicit, like `Accum` / `Mma`).
+associative operation, internal state)* made explicit: `state` (a `State`), `partial`
+(this step's contribution), a `commutative` flag, and a `twist` (below) that holds the
+operation. The carried state itself is its own class, **extracted like the `Twist`**:
+`State` bundles the internal-state SSA `names` with their per-component `identity` (one
+`Expr` each, the monoid's neutral element, seeded by the enclosing `Init`), and exposes
+`State.other` — the second-operand names `"<n>__o"` the cross-partition combine reads. So
+a `Twist` operates on a `State`: `merge` folds a partial into `state.names`,
+`combine_states` merges `state` with a second one named `state.other`. The whole
+operation lives inside the carrier, not as loose body statements, so the
+online-algorithm gates (`accums_independent`, `classify_fragment_epilogue`) never see the
+cross-state coupling. `carried_names()` / `defines()` return `state.names`; `deps()` /
+`partial_deps()` return `partial` (the carried read is implicit, like `Accum` / `Mma`).
 
 **The `Twist` — the part that varies, extracted from the algebra.** Transport of
 structure: a monoid `(·, e)` conjugated by a bijection ψ gives the twisted combine

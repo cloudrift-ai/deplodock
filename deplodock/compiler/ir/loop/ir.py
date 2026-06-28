@@ -436,7 +436,7 @@ def _validate(loop: LoopOp) -> None:
                 for pdep in stmt.partial:
                     if pdep not in defined:
                         raise ValueError(f"Monoid: partial dep {pdep!r} not defined")
-                for nm in stmt.state:
+                for nm in stmt.state.names:
                     defined.add(nm)
                     exported_accs.add(nm)
             elif isinstance(stmt, Write):

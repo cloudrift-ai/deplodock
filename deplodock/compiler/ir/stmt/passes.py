@@ -17,7 +17,7 @@ from functools import singledispatch
 from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
 from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.algebra import Monoid, Twist
+from deplodock.compiler.ir.stmt.algebra import Monoid, State, Twist
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import (
@@ -162,11 +162,12 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     # suffix derived from the renamed first state name whenever the state actually
     # moves (identity rename / pure σ-split leaves them untouched, preserving the
     # streaming-form SSA).
-    new_state0 = rename(s.state[0]) if s.state else None
-    carried = set(s.state) | set(s.twist.state_b)
+    names = s.state.names
+    new_state0 = rename(names[0]) if names else None
+    carried = set(names) | set(s.twist.state_b)
     temps = {a.name for a in (*s.twist.merge, *s.twist.combine_states)} - carried
     overlay: dict[str, str] = {}
-    if new_state0 is not None and new_state0 != s.state[0]:
+    if new_state0 is not None and new_state0 != names[0]:
         overlay = {t: f"{t}__{new_state0}" for t in temps}
 
     def rn(name: str) -> str:
@@ -179,14 +180,14 @@ def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         return overlay.get(name, name)
 
     return Monoid(
-        state=tuple(rn(n) for n in s.state),
+        # ``identity`` is constant Exprs — no SSA names to rename, only the ``names`` move.
+        state=State(names=tuple(rn(n) for n in names), identity=s.state.identity),
         partial=tuple(rn(n) for n in s.partial),
         twist=Twist(
             merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
             combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
             state_b=tuple(rn(n) for n in s.twist.state_b),
         ),
-        identity=s.identity,  # constant Exprs — no SSA names to rename
         commutative=s.commutative,
         axes=new_axes,
         finalize=tuple(rewrite(a, rn, sigma, axis_fn) for a in s.finalize),  # φ reads the (renamed) state

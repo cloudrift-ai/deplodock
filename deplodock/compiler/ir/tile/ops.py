@@ -52,7 +52,7 @@ class Reduce:
     combine). ``partials`` produce the carrier's ``partial`` contributions (one source
     per ``carrier.partial`` name, in order — a ``Map`` whose stmts last-bind that name,
     a ``Load`` named for it, or a nested ``Reduce``). ``init_ops`` gives the per-state
-    identity-bearing op for the enclosing ``Init`` (one per ``carrier.state``).
+    identity-bearing op for the enclosing ``Init`` (one per ``carrier.state.names``).
     ``out`` is the carried state read after the fold (the carrier's primary state)."""
 
     out: str
@@ -95,7 +95,7 @@ def _lower_reduce(r: Reduce) -> list[Stmt]:
     value — empty for a plain reduce / matmul, ``O/l`` for flash). Pure
     structure-from-carrier — no per-kernel assembly."""
     out: list[Stmt] = []
-    for s, op in zip(r.carrier.state, r.init_ops, strict=True):
+    for s, op in zip(r.carrier.state.names, r.init_ops, strict=True):
         out.append(Init(name=s, op=op, dtype=r.dtype))
     body: list[Stmt] = []
     for src, _pname in zip(r.partials, r.carrier.partial, strict=True):  # strict: partial arity must match
