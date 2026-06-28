@@ -312,15 +312,18 @@ The dtype policy from old `020_place_inits` rides on the `Accum` now, stamped by
 and the twisted-carrier LSE stats, pinned f32) promotes to f32. Recovered `test_fp16_max_reduction_stays_in_fp16`,
 `test_fp16_reduction_uses_fp32_accumulator_on_cuda`, `test_reduce_emits_k_loop`.
 
-**The seed has ONE source — the fold's `op.identity` — and placement is a schedule-dependent realization.** The carrier
-holds the seed *information* but not its placement: `seed_identities()` on **both** `Accum` and `Monoid` (the uniform
-carrier interface) returns each carried component's seed = its fold's `op.identity` (a `Monoid` reads it off its merge
-folds). `State` no longer stores `identity` — that was a second, drift-prone source; `State` is now just `names`, the
-`Twist` only the combine programs. *Where* the seed lands depends on the schedule: the **serial** reduce places it via
-`Loop.render` (declare before the loop, consuming the carrier interface — it is NOT a source of truth, just the serial
-realizer); a future **cooperative / cross-CTA** reduce has no enclosing loop, so it reads the same `seed_identities()`
-to seed each partial. Deferring placement to the carrier is also why the dtype-dependent seed lands at render time (after
-`030_stamp_types` finalizes the accumulator dtype). No explicit `Init` is emitted anywhere — `_normalize` / `_fuse`
-stopped, and `State.inits()` is gone; the `Init` stmt class is retained but **unproduced**, a primitive kept for an
-explicit cross-scope seed the cooperative tier may later want. `combine_states` keeps its `copy` spelling — it is the
-cross-partition combine, never a seed source.
+**A carrier dissolves into its fold `Accum`s; seeding is ONE path.** A `Monoid` is a recognition-time grouping — at
+lowering it `dissolve()`s into its loose fold stmts (bare `Accum`s for a degenerate carrier, the `base`-`Accum` streaming
+merge for a twisted one). The lifted path (`_lower_monoid`) and the flat-`Map` fallback (`lower(Map)` →
+`_dissolve_carriers`) both do this, so a `Monoid` stmt never reaches a rendered loop body. That collapses seeding to a
+single placement: the
+fold `Accum`'s seed is its `op.identity`, and the schedule realization seeds it — the **serial** reduce via `Loop.render`
+(declare before the loop), a future **cooperative / cross-CTA** reduce (no enclosing loop) by seeding each partial from
+the same `op.identity`. There is no Monoid-seeding special case (removed) and so no double-placement risk; `State` is just
+`names` (no stored `identity` — the fold is the one source), the `Twist` only the combine programs. Deferring placement to
+the carrier is also why the dtype-dependent seed lands at render time (after `030_stamp_types` finalizes the accumulator
+dtype). No explicit `Init` is emitted anywhere — `_normalize` / `_fuse` stopped, `State.inits()` is gone, and the `Init`
+stmt class is retained but **unproduced**, a primitive kept for an explicit cross-scope seed the cooperative tier may
+later want. The only `Monoid` stmt still rendered (via `Monoid.render`) is the cross-partition state-merge
+(`as_state_merge`), at the enclosing scope — never inside a loop, never seeded by `Loop.render`; its `combine_states`
+keeps the `copy` spelling, a combine, never a seed source.
