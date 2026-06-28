@@ -692,19 +692,13 @@ class Init(Stmt):
     """Explicit accumulator / carried-state seed at this scope:
     ``<dtype> <name> = <identity>;`` — a scope-local declaration.
 
-    The primary use is seeding a ``Monoid`` carrier's carried state: its lowering
-    emits one ``Init`` per ``State`` component (``State.inits``) before the
-    streaming ``Loop``, so the seed is explicit IR and ``Loop.render`` never reaches
-    into the carrier. ``identity`` is the neutral element (one scalar — 0 / 1 /
-    -inf), held directly so the renderer picks it without scanning ahead and so a
-    twisted carrier (whose combine isn't a single op) seeds uniformly.
-
-    The ``Init`` declares at its own scope; a deeper same-named ``Accum`` re-inits
-    per its enclosing iteration (scope-local shadowing the renderer already relies
-    on for accumulator name reuse), so the seed and a same-named matmul accumulator
-    coexist. (A cross-nested-scope hoist — matmul chunked-K, where one ``Accum``
-    spans ``Loop(k_o) > Loop(k_i)`` and must NOT reset per ``k_o`` — would need the
-    renderer to suppress the inner init; that path has no producer today.)
+    Currently UNPRODUCED — a carrier's seed now rides on its fold and is derived by
+    ``Loop.render`` (an ``Accum`` from ``op.identity``, a ``Monoid`` carrier from
+    ``State.identity``), so no pass emits an explicit ``Init``. Kept as a primitive
+    (with its render / rewrite / validation handlers) for an explicit cross-scope seed
+    the cooperative / split-K reduce tier may want — e.g. a chunked-K accumulator that
+    must seed above the outer loop and NOT reset per chunk. ``identity`` is the neutral
+    element (one scalar — 0 / 1 / -inf), held directly.
     """
 
     name: str

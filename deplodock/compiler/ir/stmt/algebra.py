@@ -17,13 +17,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Expr
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load
+from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load
 
 
 @dataclass(frozen=True)
@@ -128,9 +127,10 @@ class State:
     their per-component ``identity`` (the monoid's neutral element, one :class:`Expr`
     each; empty = unseeded). The state is the *carrier* a :class:`Twist` operates on:
     the twist's ``merge`` folds a partial into :attr:`names`, its ``combine_states``
-    merges this state with a second one named by :attr:`other`. ``identity`` seeds the
-    enclosing ``Init`` at the carrier's scope (split-KV / cooperative-combine reductions
-    read it to seed their partial accumulators)."""
+    merges this state with a second one named by :attr:`other`. ``identity`` is the seed:
+    ``Loop.render`` reads it to declare-and-seed the carrier when a ``Monoid`` renders
+    standalone (the flat-``Map`` fallback); the lifted path seeds the bare fold
+    ``Accum``\\ s from ``op.identity`` directly (which agrees)."""
 
     names: tuple[str, ...]
     identity: tuple[Expr, ...] = ()
@@ -140,16 +140,6 @@ class State:
         """The second-operand state names for the cross-partition combine — ``"<n>__o"``
         per component, the right operand ``combine_states`` reads."""
         return tuple(f"{n}__o" for n in self.names)
-
-    def inits(self) -> list[Init]:
-        """The carried state's seed stmts — one ``Init`` per component
-        (``<f32> name = identity;``). Emitted before a loop-IR ``Monoid`` carrier so that,
-        when a cell is rendered standalone (the flat-``Map`` fallback `_lift` keeps verbatim,
-        or a hand-built carrier in the forward-parity tests), the carried state is declared
-        for the merge's reassignments. The **lifted** path doesn't use these — it strips
-        them and reseeds from the carrier's fold ``Accum``\\ s (``op.identity`` via
-        ``Loop.render``). fp32; the identity is the neutral element this state carries."""
-        return [Init(name=n, identity=ident.value, dtype=_F32) for n, ident in zip(self.names, self.identity, strict=False)]
 
 
 @dataclass(frozen=True)
@@ -204,9 +194,9 @@ class Monoid(Stmt):
     - ``state`` — the carried :class:`State`: the internal-state SSA ``names``
       (read-and-written across the reduce axis — the carried read is implicit, like
       ``Accum.name`` / ``Mma.c`` — and the defs visible after the loop) plus their
-      per-component ``identity`` (the monoid's neutral element, one ``Expr`` each; the
-      enclosing ``Init`` seeds it at the carrier's scope, and split-KV /
-      cooperative-combine reductions read it to seed their partial accumulators).
+      per-component ``identity`` (the monoid's neutral element, one ``Expr`` each;
+      ``Loop.render`` reads it to seed the carrier, and split-KV / cooperative-combine
+      reductions read it to seed their partial accumulators).
     - ``partial`` — this iteration's contribution sources, one per partial slot: each an
       :data:`AlgebraNode` (the self-contained op-tree form, e.g. flash's score is a
       ``Map``, a nested contraction a ``Semiring``) or a bound ``str`` name (the loop-IR
@@ -362,12 +352,12 @@ class Monoid(Stmt):
         return lines
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        """Emit the merge program in fp32: each ``Assign`` targeting a ``state``
-        name is a reassignment of the carried value (already declared by an
-        enclosing ``Init``); every other ``Assign`` declares a local temp. The
-        builder orders the program so each old-state read precedes that state's
-        update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
-        """
+        """Emit the merge program in fp32 (the flat-``Map`` fallback, where the carrier
+        renders standalone). Each ``Assign``/``Accum`` targeting a ``state`` name is a
+        reassignment of the carried value (declared + seeded by ``Loop.render`` from
+        ``state.identity``); every other ``Assign`` declares a local temp. The builder
+        orders the program so each old-state read precedes that state's update (e.g. flash
+        reads the old ``m`` for ``alpha`` before ``m = m_new``)."""
         return render_merge_program(self.twist.merge, self.state.names, ctx)
 
 
