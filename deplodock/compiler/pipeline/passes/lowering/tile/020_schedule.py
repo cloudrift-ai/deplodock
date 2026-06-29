@@ -31,6 +31,7 @@ from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
+from deplodock.compiler.ir.tile.schedule import WarpTile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -61,6 +62,23 @@ TILE = Knob(
     help="Free-axis output-tile codec (n<N>[xm<M>] parallel thread-tile / f<fn>[xf<fm>] register "
     "sub-tile; empty=per-cell). Decided in lowering/tile/020_schedule, materialized in "
     "lowering/kernel/010_materialize.",
+    off="",
+)
+
+# The tensor-core warp tile is decided HERE too, by the single ``WARP`` codec knob (the
+# ``Warp``-fragment sibling of ``TILE``) — a contraction's mma tile (atom + warps + register
+# sub-tile + K-chunk). ``WARP`` is pin-only this cut (the prior auto-fork is a follow-up, as
+# ``TILE``'s is): a non-empty ``DEPLODOCK_WARP`` selects the warp tier and wins over ``TILE``
+# (the either-ness — a kernel is the scalar register-tile OR the warp tile, never both); empty
+# (``off=""``) keeps the scalar path. Only a ``Semiring`` contraction warp-tiles today. The codec
+# is exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
+# learned-prior featurizer (``knob.py``: ``mma_atom`` / ``is_warp`` / ``_free_slots`` /
+# ``tile_signature``) already reads, so the codec stays the pin/display spelling.
+WARP = Knob(
+    "WARP",
+    KnobType.STR,
+    help="Tensor-core warp-tile codec (a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>; empty=scalar). "
+    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
     off="",
 )
 
@@ -176,6 +194,28 @@ def _semiring_reduce_spec() -> str:
     return pinned if plan.needs_split else ""
 
 
+def _warp_spec(kernel) -> str:
+    """The pinned ``WARP`` codec for ``kernel`` — only a ``Semiring`` contraction warp-tiles
+    (everything else is ``""``, the pin doesn't apply). Pin-only this cut: returns the
+    authoritative ``DEPLODOCK_WARP`` pin (``Knob.narrow``) or ``""`` (no warp tier — the
+    scalar ``TILE`` path runs instead)."""
+    if not isinstance(kernel, SemiringKernel):
+        return ""
+    return WARP.narrow([""])[0]
+
+
+def _warp_option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+    """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the
+    ``WARP`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment). The codec is
+    exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
+    learned-prior featurizer already reads (the codec stays the pin/display spelling)."""
+    wt = WarpTile.parse(spec)
+    sched = replace(kernel.schedule, place=place, warp_tile=wt)
+    (wm, wn), (fm, fn) = wt.warps, wt.reg
+    stamped = {**knobs, WARP.name: spec, "ATOM@out": wt.atom.name, "WM": wm, "WN": wn, "FM": fm, "FN": fn, "BK": wt.bk}
+    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
+
+
 def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "") -> TileOp:
     """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
     resolved into the schedule's ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the
@@ -204,7 +244,12 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
     # A ``Semiring`` ALSO honors a cross-CTA split-K (``g``) ``REDUCE`` pin — orthogonal to the
     # output tile (``reduce`` = the K partition, consumed by ``030_split``).
+    # A ``WARP`` pin selects the tensor-core warp tier and wins over ``TILE`` (the either-ness);
+    # without it the scalar register-tile (``TILE``) path runs.
     if isinstance(kernel, SemiringKernel):
+        warp = _warp_spec(kernel)
+        if warp:
+            return _warp_option(kernel, place, warp, tile.name, tile.knobs)
         reduce_spec = _semiring_reduce_spec()
         return [_tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec) for spec in _tile_specs(kernel)]
     specs = _reduce_specs(kernel, place)
