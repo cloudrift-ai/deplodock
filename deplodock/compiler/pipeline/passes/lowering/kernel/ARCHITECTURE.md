@@ -34,19 +34,21 @@ the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition ch
   fold, the cross-thread combine (`_combine`), and the projection.
 
 The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(Contraction)`
-root that `005_contract` produced — **expands the contraction** through the shared tiling layer (below): the mma arm via
-`_warp_factor.factorize_mma`, the scalar arm via `_scalar_factor.factorize_scalar`. The pass's `PATTERN` matches
-`(TileOp, KernelOp)` so the single rule covers both; at this point in the kernel pass the only `KernelOp`s are the
-contraction nodes.
+root that `005_contract` produced — **expands the contraction** through the one atom-generic `_factor.factorize` over the
+shared tiling layer (below); the atom selects the leaf `Unit` (mma / scalar). The pass's `PATTERN` matches `(TileOp,
+KernelOp)` so the single rule covers both; at this point in the kernel pass the only `KernelOp`s are the contraction
+nodes.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
 
-### The atom factorization — one tiling layer, two atoms (`_tiling.py`)
+### The atom factorization — one factorizer, two atoms (`_factor.py` / `_tiling.py`)
 
-A `Contraction` is expanded by tiling a **leaf atom** four ways through the unit-generic layer in `_tiling.py`:
-`grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The two arms
-run the *same* pipeline; only the atom (and its `Unit` leaf) differs:
+`_factor.factorize` is the **single** contraction factorizer — there is no per-atom variant. It expands any `Contraction`
+by tiling a **leaf atom** four ways through the unit-generic layer in `_tiling.py`:
+`grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. Both arms run
+that *same* pipeline; the atom only selects the leaf `Unit`, which exposes a common tiling-geometry interface
+(`atom_m`/`reg_m`/`units_m`/`m_uvar`/`tile_m`/`lanes`/…) the factorizer reads:
 
 - **mma** (`_warp_factor.AtomUnit`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the leaf emits
   `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop + operand staging (gmem-direct / cp.async /
@@ -84,7 +86,7 @@ Both compose (`d3/cp/p2`) and are pure perf transforms — bit-identical to the 
 
 **The `CtaTile` seam.** The fill is written against a small `CtaTile` (the CTA tile-base coords + an independent linear
 intra-CTA thread id + the thread count), NOT a materializer's internal warp/register geometry — so one fill helper drives
-any tier. `factorize_mma` builds the seam from its decoded block / warp / lane axis vars (never a raw `threadIdx.x`,
+any tier. `AtomUnit` builds the seam from its decoded block / warp / lane axis vars (never a raw `threadIdx.x`,
 whose `free_vars()` would leak into param collection).
 
 **Two producers, one drain.** `cp_async_fill` (the `sync` / `cp.async` thread-stripe) and `tma_fill`

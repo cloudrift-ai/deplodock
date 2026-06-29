@@ -384,7 +384,7 @@ class ScalarContraction(Stmt):
     projection ``tail`` — together with the tiled output axes (``m_axis`` is ``None`` for a 1-D
     output), any leading (batch) grid ``lead_axes``, the register (``reg_m``/``reg_n``) + parallel
     (``par_m``/``par_n``) widths, and the ``output`` buffer. ``010_materialize`` expands it into the
-    per-thread ``reg_m × reg_n`` cell ``Tile`` via ``_scalar_factor.factorize_scalar`` (the SAME
+    per-thread ``reg_m × reg_n`` cell ``Tile`` via the shared ``_factor.factorize`` (the SAME
     generic ``atomize → register_tile → unit_tile → grid_tile`` layer the mma arm uses, with the
     scalar atom = 1×1, lanes = 1, so the UNIT level is the parallel thread-tile).
 

@@ -3,12 +3,12 @@
 Binds the schedule's grid axes to GPU threads and realizes the reduce partition. The step
 dispatches on the kernel kind / its reduce plan.
 
-The **warp (tensor-core mma) tier** is constructed one pass earlier — ``005_contract`` turns a
-warp-tier ``Semiring`` contraction into a ``KernelOp`` holding a single high-level
-``MmaContraction``. Materialize **folds in its expansion**: a ``KernelOp(MmaContraction)`` root is
-expanded via ``_warp_factor.factorize_mma`` into the ``RegFragment`` / ``LdmatrixLoad`` /
-``MmaSyncPtx`` / ``RegStore`` fragment soup (the four-way GRID/WARP/REGISTER/ATOM split). Every
-``TileOp`` root takes one of the thread-binding tiers below:
+A ``Semiring`` **contraction** (warp / register-tiled) is constructed one pass earlier —
+``005_contract`` turns it into a ``KernelOp`` holding a single high-level :data:`Contraction` node.
+Materialize **folds in its expansion**: a ``KernelOp(Contraction)`` root is expanded via the one
+atom-generic ``_factor.factorize`` (mma → the ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
+``RegStore`` fragment soup; scalar → the per-thread register cell tile) through the shared four-level
+``_tiling`` layer. Every ``TileOp`` root takes one of the thread-binding tiers below:
 
 - **Scalar tier** (``MapKernel``, or a reduction with a trivial ``ReducePlan``) — one
   thread per output cell. ``lower(op)`` emits the per-cell body (a serial reduce ``Loop``
@@ -45,8 +45,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import (
-    MmaContraction,
-    ScalarContraction,
+    Contraction,
     Smem,
     Sync,
 )
@@ -57,10 +56,9 @@ from deplodock.compiler.ir.tile import MonoidKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._scalar_factor import factorize_scalar
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
-from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import factorize_mma
 
 PATTERN = [Pattern("root", (TileOp, KernelOp))]
 
@@ -288,10 +286,8 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     if isinstance(root.op, KernelOp):
         kop: KernelOp = root.op
         body = kop.body
-        if len(body) == 1 and isinstance(body[0], MmaContraction):
-            return KernelOp(body=Body((factorize_mma(body[0]),)), name=kop.name)
-        if len(body) == 1 and isinstance(body[0], ScalarContraction):
-            return KernelOp(body=Body((factorize_scalar(body[0]),)), name=kop.name)
+        if len(body) == 1 and isinstance(body[0], Contraction):
+            return KernelOp(body=Body((factorize(body[0]),)), name=kop.name)
         raise RuleSkipped("no Contraction to expand")
 
     tile: TileOp = root.op

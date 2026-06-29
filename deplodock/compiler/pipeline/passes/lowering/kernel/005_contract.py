@@ -35,7 +35,7 @@ PATTERN = [Pattern("root", TileOp)]
 def _warp_contraction(tile: TileOp, sched, root: Node) -> MmaContraction:
     """The mma arm: read the ``020_schedule`` binding + warp geometry and resolve the projection
     epilogue (``with_store`` needs the op's ``out`` + grid). The exact atom factorization is
-    expanded from the node by ``010_materialize`` (:func:`_warp_factor.factorize_mma`)."""
+    expanded from the node by ``010_materialize`` (:func:`_factor.factorize`)."""
     node = tile.op
     grid = list(sched.place.grid)
     if len(grid) < 2:
@@ -70,7 +70,7 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> MmaContraction:
 def _scalar_contraction(tile: TileOp, sched, root: Node) -> ScalarContraction:
     """The scalar arm: lower the per-cell body (``lower(op)`` + output-store glue) and capture it
     with the tiled output axes + the register / parallel widths. Cell tiling is expanded from the
-    node by ``010_materialize`` (:func:`_scalar_factor.factorize_scalar`)."""
+    node by ``010_materialize`` (:func:`_factor.factorize`)."""
     node = tile.op
     grid = list(sched.place.grid)
     n_axis = grid[-1]

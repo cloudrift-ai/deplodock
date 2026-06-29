@@ -1,17 +1,17 @@
-"""Warp/mma tier — the exact tensor-core atom factorization (the expansion ``010_materialize``
-folds in).
+"""Warp/mma tier — the mma :class:`AtomUnit` leaf for the shared contraction factorizer.
 
-:func:`factorize_mma` expands an :class:`MmaContraction` into the ``Tile`` of ``RegFragment`` /
-``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` — the four-way GRID/WARP/REGISTER/ATOM split,
-the operand-staging decision (cp.async / TMA / gmem-direct), and the per-cell projection
-epilogue. All atom geometry lives here, out of the node constructor (``005_contract`` emits only
-the high-level ``MmaContraction``). Leading ``_`` so the pass loader skips this module."""
+:class:`AtomUnit` is the tensor-core ``Unit`` the generic tiling layer (``_tiling`` /
+``_factor.factorize``) tiles into the ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
+``RegStore`` four-way GRID/UNIT/REGISTER/ATOM split — it owns the K-loop + operand-staging decision
+(cp.async / TMA / gmem-direct) and the per-cell projection epilogue, and exposes the canonical
+tiling-geometry interface ``factorize`` reads. All atom geometry lives here, out of the node
+constructor (``005_contract`` emits only the high-level ``MmaContraction``). Leading ``_`` so the
+pass loader skips this module."""
 
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
-from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.kernel.ir import (
     EpilogueLoad,
     LdmatrixLoad,
@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     tma_fill,
     tma_mbar_prologue,
 )
-from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Operand, Unit, atomize, grid_tile, register_tile, unit_tile
+from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Operand, Unit
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 
@@ -505,6 +505,53 @@ class AtomUnit(Unit):
         self.a_frags = [f"_a{i}_s{s}" for i in range(self.fm) for s in range(rd)] if rd >= 2 else [f"_a{i}" for i in range(self.fm)]
         self.b_frags = [f"_b{j}_s{s}" for j in range(self.fn) for s in range(rd)] if rd >= 2 else [f"_b{j}" for j in range(self.fn)]
 
+    # The canonical tiling-geometry interface the shared ``_factor.factorize`` reads — the mma
+    # ``fm``/``wm``/``m_w`` (fragment / warp / warp-axis) names mapped onto the generic REGISTER /
+    # UNIT vocabulary. ``lead_axes`` is empty: the warp tier always has a clean (m, n) grid.
+    @property
+    def reg_m(self) -> int:
+        return self.fm
+
+    @property
+    def reg_n(self) -> int:
+        return self.fn
+
+    @property
+    def units_m(self) -> int:
+        return self.wm
+
+    @property
+    def units_n(self) -> int:
+        return self.wn
+
+    @property
+    def m_uvar(self) -> str:
+        return self.m_w
+
+    @property
+    def n_uvar(self) -> str:
+        return self.n_w
+
+    @property
+    def lanes(self) -> int:
+        return self.atom.lanes
+
+    @property
+    def block_threads(self) -> int:
+        return self.wt.block_threads
+
+    @property
+    def lead_axes(self) -> tuple:
+        return ()
+
+    @property
+    def m_ext(self):
+        return _extent_expr(self.m_axis)
+
+    @property
+    def n_ext(self):
+        return _extent_expr(self.n_axis)
+
     def state_decls(self, cells) -> list[Stmt]:
         atom = self.atom
         decls: list[Stmt] = []
@@ -628,28 +675,3 @@ class AtomUnit(Unit):
                 n_guard=(offset.base("n", j), n_ext) if mask_n else None,
             )
         ]
-
-
-def factorize_mma(mma: MmaContraction) -> Tile:
-    """Expand a high-level :class:`MmaContraction` into the warp-tier ``Tile`` via the composable
-    tiling layer: the mma :class:`AtomUnit` leaf, tiled four ways
-    ``grid_tile(unit_tile(register_tile(atomize(...))))`` (GRID block / UNIT=warp / REGISTER / ATOM;
-    the atom-lane offset decoded at render). The unit owns the K-loop + operand staging
-    (gmem-direct / cp.async / TMA); the layer owns the offset, the axes, and the splice."""
-    unit = AtomUnit(mma)
-    masks = (unit.mask_m, unit.mask_n, _extent_expr(unit.m_axis), _extent_expr(unit.n_axis))
-    t = atomize(unit, unit.atom_m, unit.atom_n)
-    t = register_tile(t, unit.fm, unit.fn)
-    t = unit_tile(t, unit.wm, unit.wn, unit.m_w, unit.n_w)
-    return grid_tile(
-        t,
-        masks,
-        m_axis=unit.m_axis,
-        n_axis=unit.n_axis,
-        m_b=unit.m_b,
-        n_b=unit.n_b,
-        tile_m=unit.tile_m,
-        tile_n=unit.tile_n,
-        block_threads=unit.wt.block_threads,
-        lanes=unit.atom.lanes,
-    )
