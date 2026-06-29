@@ -61,9 +61,14 @@ def _opts(ssh_key: str | None, port: int | None) -> list[str]:
     return out
 
 
-def _run(remote: str, ssh_key: str | None, port: int | None, command: str, *, timeout: int = 600) -> tuple[int, str]:
-    """Run one remote command over a fresh ssh connection; return (rc, combined output)."""
-    argv = ["ssh", *_opts(ssh_key, port), remote, command]
+def _run(remote: str, ssh_key: str | None, port: int | None, command: str, *, timeout: int = 600, detach: bool = False) -> tuple[int, str]:
+    """Run one remote command over a fresh ssh connection; return (rc, combined output).
+
+    ``detach=True`` adds ssh ``-n`` (stdin from /dev/null) — needed when launching a
+    remote background process: without it (plus a ``< /dev/null`` redirect on the
+    command itself) ssh holds the channel open past a ``nohup … &``, so this call
+    times out (rc 124) long *after* the process already started successfully."""
+    argv = ["ssh", *(["-n"] if detach else []), *_opts(ssh_key, port), remote, command]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout + p.stderr)
@@ -151,14 +156,24 @@ def main() -> int:
         if "SETUP_OK" not in out:
             return _fail(remote, key, port, "make setup", "~/setup.log")
 
-    # 4. launch the tune detached.
+    # 4. launch the tune detached. Redirect ALL three std streams away from the ssh
+    #    channel (`< /dev/null` + `> ~/tune.log 2>&1`) and use ssh -n (detach=True),
+    #    else ssh holds the channel open past the `&` and this call times out *after*
+    #    a successful launch.
     _log("launching `deplodock tune --dataset golden` (detached -> ~/tune.log) ...")
     launch = (
-        f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && nohup ./venv/bin/deplodock tune --dataset golden > ~/tune.log 2>&1 & echo tune_launched"
+        f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && "
+        "nohup ./venv/bin/deplodock tune --dataset golden > ~/tune.log 2>&1 < /dev/null & echo tune_launched"
     )
-    rc, out = _run(remote, key, port, launch)
+    rc, out = _run(remote, key, port, launch, timeout=60, detach=True)
     if "tune_launched" not in out:
-        return _fail(remote, key, port, f"launch (rc={rc})", "~/tune.log")
+        # Belt-and-suspenders: if the launch ssh still didn't confirm, the tune may
+        # have started anyway — verify the process before declaring failure.
+        time.sleep(5)
+        _, chk = _run(remote, key, port, "pgrep -f '[d]eplodock tune' >/dev/null 2>&1 && echo ALIVE || echo DEAD")
+        if "ALIVE" not in chk:
+            return _fail(remote, key, port, f"launch (rc={rc})", "~/tune.log")
+        _log("launch ssh did not confirm but the tune process is alive — continuing")
 
     # 5. poll the remote log internally until done / dead / timeout. The `[d]eplodock tune`
     #    bracket pattern is what stops pgrep from matching this very poll command's own argv.
