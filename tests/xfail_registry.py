@@ -54,7 +54,6 @@ XFAIL: dict[str, str] = {
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure": _R,
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure": _R,
     "test_matmul_mma_transposed_b.py": _R,
-    "test_monoid_reduce_kernel.py": _R,
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
@@ -86,14 +85,6 @@ XFAIL: dict[str, str] = {
     # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts).
     "tests/compiler/e2e/test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": _R,
     "tests/compiler/e2e/test_stage_scalar.py::test_scalar_matmul_stages_through_pipeline": _R,
-    # test_reduction_combine_coverage.py / test_tune_accuracy.py: scalar-tier reduction
-    # recovered the serial + cooperative reduce kernels; these residuals need flash /
-    # cross-CTA split-reduce / matmul tiers.
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[flash-kernel]": _R,
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[matmul-atomic]": _R,
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[matmul-kernel]": _R,
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[sum-atomic]": _R,
-    "tests/compiler/e2e/test_reduction_combine_coverage.py::test_cross_cta_finalize_accuracy_and_structure[sum-kernel]": _R,
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
     # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
     # TileGraph lowering).

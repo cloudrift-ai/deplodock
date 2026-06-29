@@ -103,8 +103,9 @@ def _try_vec_store(stmts: Iterable[Stmt], start: int, n: int, top: KernelOp) -> 
     writes = stmts_list[start : start + n]
     if not all(isinstance(s, Write) for s in writes):
         return None
-    # Already-widened Writes in the run aren't safe to re-merge — bail.
-    if any(s.is_vector for s in writes):
+    # Already-widened Writes in the run aren't safe to re-merge — bail. Atomic reduce-writes
+    # never vectorize (each contributing lane needs its own ``atomicAdd``).
+    if any(s.is_vector or s.atomic for s in writes):
         return None
 
     outputs = {s.output for s in writes}

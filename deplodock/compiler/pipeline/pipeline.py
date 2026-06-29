@@ -934,8 +934,8 @@ def _option_decision(option: object, root_knobs: dict) -> dict | None:
     change** vs the offer (a ``Graph`` option reads the union over its nodes'
     op knobs — fragment kernels restamp their own ``S_*``, which describe the
     child bodies, not the decision). A *changed value* on an existing key counts
-    (e.g. the cross-CTA finalize fork mutates the ``REDUCE@<axis>`` codec's ``c``
-    field from a bare ``c<cta>`` to ``c<cta>a`` / ``c<cta>k`` — same key, new
+    (e.g. the cross-CTA finalize fork mutates the ``REDUCE`` codec's ``g``
+    field from a bare ``g<cta>`` to ``g<cta>a`` / ``g<cta>k`` — same key, new
     value), not only a brand-new key. ``None`` when the option stamps nothing new."""
     if isinstance(option, Graph):
         knobs: dict = {}

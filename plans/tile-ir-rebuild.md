@@ -1,16 +1,19 @@
 # Tile IR rebuild
 
-Status: **the scalar + cooperative tiers have landed, plus the scalar register-tile and the dynamic-grid tier.**
-`010_recognize` is the sole Loop-IR → Tile-IR boundary (it lifts every kernel to a `TileOp` carrying one op-tree node
-— `Map` / `Monoid` / `Semiring` — plus a typed schedule); `020_schedule` maps the free axes onto the grid and picks
-the reduce partition + the free-axis output tile; `lowering/kernel` materializes. Every elementwise, reduction,
-online-softmax, RMSNorm, matmul, scalar-flash, and whole-transformer-block kernel is recovered, plus the
-**cooperative (BLOCK) reduce** tier (whole-CTA + strided rows), the **register-fold ILP (REG)** tier (independent
-per-thread accumulator chains), the **scalar register-tile (`TILE` codec)** tier (each thread owns a `reg_m·reg_n`
-block of output cells, operands reused across them, the small inner reduce unrolled), and the **dynamic-grid** tier
-(a symbolic free / output axis → a symbolic launch grid sized from the runtime `Dim` arg; register-tiled symbolic
-axes mask their tail). All of these work over **static AND symbolic** axes. **Remaining: the warp / tensor-core tier
-(the `Semiring` warp recovery — mma matmul + warp-tier flash), cross-CTA split, operand pipelining, and warp
+Status: **the scalar + cooperative + cross-CTA-split tiers have landed, plus the scalar register-tile and the
+dynamic-grid tier.** `010_recognize` is the sole Loop-IR → Tile-IR boundary (it lifts every kernel to a `TileOp`
+carrying one op-tree node — `Map` / `Monoid` / `Semiring` — plus a typed schedule); `020_schedule` maps the free axes
+onto the grid and picks the reduce partition + the free-axis output tile; `030_split` consumes a cross-CTA `GRID` stage
+as a graph rewrite; `lowering/kernel` materializes. Every elementwise, reduction, online-softmax, RMSNorm, matmul,
+scalar-flash, and whole-transformer-block kernel is recovered, plus the **cooperative (BLOCK) reduce** tier (whole-CTA +
+strided rows), the **register-fold ILP (REG)** tier (independent per-thread accumulator chains), the **scalar
+register-tile (`TILE` codec)** tier (each thread owns a `reg_m·reg_n` block of output cells, operands reused across
+them, the small inner reduce unrolled), the **dynamic-grid** tier (a symbolic free / output axis → a symbolic launch
+grid sized from the runtime `Dim` arg; register-tiled symbolic axes mask their tail), and the **cross-CTA (GRID) split**
+tier (`030_split`: the `g<n>[a|k]` codec — `atomicAdd` one-kernel finalize OR a deferred `__partial`-workspace +
+sibling combine kernel; additive `sum` / split-K matmul AND the twisted flash `(m, l, O)` split-KV, carrier-generic via
+`as_state_merge`). All of these work over **static AND symbolic** axes. **Remaining: the warp / tensor-core tier
+(the `Semiring` warp recovery — mma matmul + warp-tier flash, incl. MMA split-K), operand pipelining, and warp
 specialization.** Branch `refactoring/tile-ir-rebuild`.
 
 This doc is now thin: the executed phases live in git history and the `ARCHITECTURE.md` files. What remains is the
@@ -322,6 +325,9 @@ examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter h
 ✅ Monoid·Scalar  REDUCE=b64/r4          # 64-way coop + 4 ILP register accumulators
 ✅ Monoid·Scalar  REDUCE=b16  TILE=n8    # strided-coop rows: 16 lanes, 8 output rows/CTA
 ✅ Monoid·Scalar  REDUCE=b32             # flash-decoding (cooperative-KV, scalar flash)
+✅ Monoid·Scalar  REDUCE=g2a             # cross-CTA split-reduce, atomicAdd finalize (one kernel)
+✅ Monoid·Scalar  REDUCE=g2k             # cross-CTA split-reduce / flash split-KV, deferred __partial + combine kernel
+✅ Semiring·Scalar REDUCE=g2a            # split-K matmul, atomicAdd finalize (1-component additive carrier)
 ✅ Semiring·Scalar TILE=n128xm64/f4xf4   # register-blocked SGEMM: 4×4 reg cells/thread, operands reused, inner reduce unrolled
 🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp   # + operand staging (STAGE still proposed)
 🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize
@@ -339,10 +345,10 @@ the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
   *scalar* path. Either keep `WM`/`WN`/`ATOM@`/`FM`/`FN` as the on-dict representation and treat `WARP`/`TILE` as the
   pin/display spelling that explodes into those keys at stamp time (featurizers unchanged), **or** make all four entry
   points parse the codec. Pick one; the former is the smaller change and keeps `tile_signature` golden-matching working.
-- **`REDUCE`'s finalize letter is currently dropped (latent bug).** `ReducePlan.parse` strips the `g<n>[a|k]` letter and
-  `spell` never re-emits it, so `_Decomp.finalize` stays `"atomic"` and `D_finalize_kernel` can never fire. Harmless
-  today (no `g` is produced — `030_split` is stubbed), but the `cta` tier must carry the finalize on `ReduceStage` and
-  round-trip it before `g…a`/`g…k` mean anything.
+- **`REDUCE`'s finalize letter round-trips (landed).** `ReduceStage.finalize` carries `"atomic"` | `"kernel"`;
+  `ReducePlan.parse`/`spell` round-trip the `g<n>[a|k]` letter and `ReducePlan.finalize` reads it (`030_split` picks the
+  atomic vs deferred-kernel arm off it). `_Decomp.finalize` / `D_finalize_kernel` therefore featurize correctly. (The
+  auto-fork still doesn't *propose* `g` — cross-CTA split is pin-/prior-driven, like `r`/ILP.)
 - **OFF-sentinel & validity need a codec-aware home.** `apply_off_defaults` / the tier filters work per *named* knob; a
   packed code has no per-subfield OFF, so "decided: not a warp kernel" needs an explicit empty-codec OFF (`WARP=""`).
   And the per-(kind,fragment) validity must live as a **codec-dict validator** (where pins / the featurizer run), not
@@ -377,8 +383,11 @@ fragment / `WarpSpec` into those primitives). The phased recovery, feature by fe
    `test_matmul_mma_causal_epilogue.py` (static).
 3. **Operand staging** — make `Stage` real: smem slabs + `ldmatrix`, double-buffered via cp.async (sm_80) / TMA (sm_90).
    Recovers `test_stage_scalar.py`, `test_matmul_mma_parity.py` (cp.async / tma), the blocked-prologue tests.
-4. **Cross-CTA split** — `030_split` (the `GRID` stage → atomic / partial+finalize above). Recovers
-   `test_mma_atomic_free_splitk.py`, the cross-CTA-finalize matmul cases, the split-K rule tests.
+4. **Cross-CTA split** — `030_split` (the `GRID` stage → atomic / partial+finalize above) has **landed for the scalar
+   tier**: additive `sum` split-reduce, split-K scalar matmul, and the twisted flash `(m, l, O)` split-KV
+   (carrier-generic via `as_state_merge`), both atomic and deferred-kernel arms (the `test_cross_cta_finalize` matrix).
+   What remains under the warp tier is **MMA split-K** — `test_mma_atomic_free_splitk.py` and the split-K rule tests —
+   which needs the `Warp` fragment's contraction to feed the same `030_split` rewrite.
 5. **Symbolic M / N / K edges** — masked mma tiles (per-element `RegStore` guards, clamped / zero-filled K slabs).
    Recovers `test_matmul_mma_masked.py`, the dynamic mma-parity / causal-epilogue / dynamic-shape matmul cases.
 6. **Warp-tier flash** — the `Warp` fragment on a `MonoidSchedule` (flash's inner QK / PV), reusing the fragment

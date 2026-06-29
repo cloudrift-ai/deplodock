@@ -57,10 +57,16 @@ class ReduceStage:
 
     The combine *mechanism* is **derived** (:meth:`combine`), not stored — the level
     implies the fold, and a BLOCK width derives warp-shuffle vs hierarchical-smem from the
-    warp size. ``width`` is power-of-two for BLOCK (the butterfly / tree reorder)."""
+    warp size. ``width`` is power-of-two for BLOCK (the butterfly / tree reorder).
+
+    ``finalize`` is meaningful only at ``GRID``: how ``030_split`` realizes the cross-CTA
+    combine — ``"atomic"`` (the partial kernel ``atomicAdd``\\ s into the output, one kernel,
+    additive carriers only) or ``"kernel"`` (a deferred sibling combine kernel over a
+    workspace, the only legal arm for a twisted carrier). The ``g<n>[a|k]`` codec letter."""
 
     level: Level
     width: int = 1
+    finalize: str = "kernel"  # GRID only: "atomic" | "kernel" (the g<n> finalize letter)
 
     def combine(self, *, warp_size: int, segmented: bool = False) -> tuple[Fold, ...]:
         """The derived per-level combine fold(s), fine→coarse within this stage.
@@ -99,12 +105,12 @@ class ReducePlan:
     stages: tuple[ReduceStage, ...] = ()
 
     @classmethod
-    def of(cls, *, cta: int = 1, coop: int = 1, reg: int = 1) -> ReducePlan:
+    def of(cls, *, cta: int = 1, coop: int = 1, reg: int = 1, finalize: str = "kernel") -> ReducePlan:
         """Build a plan from per-level widths (1 = absent). Order is coarse→fine:
-        GRID (cta) → BLOCK (coop) → REG (reg)."""
+        GRID (cta) → BLOCK (coop) → REG (reg). ``finalize`` rides the GRID stage."""
         stages: list[ReduceStage] = []
         if cta > 1:
-            stages.append(ReduceStage(Level.GRID, cta))
+            stages.append(ReduceStage(Level.GRID, cta, finalize=finalize))
         if coop > 1:
             stages.append(ReduceStage(Level.BLOCK, coop))
         if reg > 1:
@@ -123,6 +129,7 @@ class ReducePlan:
         if not spec:
             return cls()
         cta = coop = reg = 1
+        finalize = "kernel"
         for raw in spec.split("/"):
             tok = raw.strip()
             if not tok:
@@ -130,6 +137,7 @@ class ReducePlan:
             kind, num = tok[0], tok[1:]
             if kind == "g":
                 if num and num[-1] in "ak":  # the finalize letter (atomic / kernel) — 030_split
+                    finalize = "atomic" if num[-1] == "a" else "kernel"
                     num = num[:-1]
                 cta = int(num)
             elif kind == "b":
@@ -138,13 +146,21 @@ class ReducePlan:
                 reg = int(num)
             else:
                 raise ValueError(f"bad REDUCE token {tok!r} (expect g<n> / b<n> / r<n>)")
-        return cls.of(cta=cta, coop=coop, reg=reg)
+        return cls.of(cta=cta, coop=coop, reg=reg, finalize=finalize)
 
     def spell(self) -> str:
         """The ``REDUCE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
-        the scalar serial fold."""
+        the scalar serial fold. A GRID stage re-emits its finalize letter (``g<n>a`` /
+        ``g<n>k``)."""
         letter = {Level.GRID: "g", Level.BLOCK: "b", Level.REG: "r"}
-        return "/".join(f"{letter[s.level]}{s.width}" for s in self.stages if s.level in letter)
+        fin = {"atomic": "a", "kernel": "k"}
+        toks = []
+        for s in self.stages:
+            if s.level not in letter:
+                continue
+            suffix = fin[s.finalize] if s.level is Level.GRID else ""
+            toks.append(f"{letter[s.level]}{s.width}{suffix}")
+        return "/".join(toks)
 
     @property
     def parallel(self) -> int:
@@ -175,6 +191,15 @@ class ReducePlan:
     def cta(self) -> int:
         """The GRID (cross-CTA split) width, or 1 if no GRID stage."""
         return self._width(Level.GRID)
+
+    @property
+    def finalize(self) -> str:
+        """The GRID stage's cross-CTA finalize — ``"atomic"`` | ``"kernel"`` (``"kernel"``
+        if no GRID stage; the value is only meaningful when :attr:`needs_split`)."""
+        for s in self.stages:
+            if s.level is Level.GRID:
+                return s.finalize
+        return "kernel"
 
     @property
     def reg(self) -> int:

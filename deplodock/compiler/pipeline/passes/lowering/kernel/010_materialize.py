@@ -361,6 +361,11 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 def rewrite(match: Match, root: Node) -> KernelOp | None:
     tile: TileOp = root.op
     kernel = tile.kernel
+    # By the kernel pass, ``030_split`` has consumed every cross-CTA ``GRID`` stage (the
+    # partial's plan is stripped, the finalize is a fresh ``ReducePlan``). A surviving split
+    # request is a bug — the materializer only lowers single-launch kernels.
+    rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
+    assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
     # Register-tile tier: a Semiring contraction whose ``TILE`` plan tiles the output (each
     # thread owns a reg_m×reg_n register block of cells, operands reused across them).
     sched = kernel.schedule

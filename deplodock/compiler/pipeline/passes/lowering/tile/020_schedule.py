@@ -161,11 +161,30 @@ def _tile_specs(kernel) -> list[str]:
     return list(TILE.narrow([""]))
 
 
-def _tile_option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+def _semiring_reduce_spec() -> str:
+    """The ``REDUCE`` spec a ``Semiring`` contraction honors today — only a **cross-CTA split**
+    (``g``) pin (split-K). The K-axis coop / reg reduce tiers aren't built for the scalar
+    contraction, so a non-``g`` ``REDUCE`` pin is ignored here; the split partition is
+    orthogonal to the output ``TILE``. Returns the pinned spec when it carries a GRID stage,
+    else ``""`` (no split). A pin in another tier's codec (e.g. the warp/MMA ``s``/``c`` split
+    spelling) doesn't parse as ``g``/``b``/``r`` — it's not ours, so ignore it rather than fail."""
+    pinned = REDUCE.narrow([""])[0]
+    try:
+        plan = ReducePlan.parse(pinned)
+    except ValueError:
+        return ""
+    return pinned if plan.needs_split else ""
+
+
+def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "") -> TileOp:
     """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
-    resolved into the schedule's ``TilePlan``, the spec stamped on ``knobs`` for the prior."""
-    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec))
-    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs={**knobs, TILE.name: spec})
+    resolved into the schedule's ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the
+    orthogonal ``ReducePlan``), the specs stamped on ``knobs`` for the prior."""
+    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec), reduce=ReducePlan.parse(reduce_spec))
+    stamped = {**knobs, TILE.name: spec}
+    if reduce_spec:
+        stamped[REDUCE.name] = reduce_spec
+    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
 
 
 def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
@@ -183,7 +202,10 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
         return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=tile.name)
     # A contraction picks its free-axis output tile (``TILE``); a reduction picks its reduce
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
+    # A ``Semiring`` ALSO honors a cross-CTA split-K (``g``) ``REDUCE`` pin — orthogonal to the
+    # output tile (``reduce`` = the K partition, consumed by ``030_split``).
     if isinstance(kernel, SemiringKernel):
-        return [_tile_option(kernel, place, spec, tile.name, tile.knobs) for spec in _tile_specs(kernel)]
+        reduce_spec = _semiring_reduce_spec()
+        return [_tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec) for spec in _tile_specs(kernel)]
     specs = _reduce_specs(kernel, place)
     return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]

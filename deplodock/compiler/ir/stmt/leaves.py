@@ -734,6 +734,11 @@ class Write(Stmt):
     index: tuple[Expr, ...]
     values: tuple[str, ...]
     value_dtype: DataType | None
+    # An ``atomicAdd`` reduce-write (cross-CTA split-reduce, ``030_split``'s atomic finalize):
+    # every contributing CTA adds its partial into the SAME output cell, so the store is an
+    # atomic accumulate (the output is zero-init'd per launch — ``CudaOp.zero_outputs``).
+    # Scalar only; never vectorized (each lane needs its own ``atomicAdd``).
+    atomic: bool
 
     def __init__(
         self,
@@ -743,6 +748,7 @@ class Write(Stmt):
         *,
         values: tuple[str, ...] | None = None,
         value_dtype: DataType | None = None,
+        atomic: bool = False,
     ) -> None:
         if values is None:
             if value is None:
@@ -756,10 +762,13 @@ class Write(Stmt):
             raise TypeError("Write requires `index=`")
         if not values:
             raise ValueError("Write.values must be non-empty")
+        if atomic and len(values) != 1:
+            raise ValueError("an atomic Write is scalar (one value per atomicAdd)")
         object.__setattr__(self, "output", output)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "values", tuple(values))
         object.__setattr__(self, "value_dtype", value_dtype)
+        object.__setattr__(self, "atomic", atomic)
 
     @property
     def value(self) -> str:
@@ -796,6 +805,8 @@ class Write(Stmt):
         idx = ", ".join(e.pretty() for e in self.index)
         if self.is_vector:
             return [f"{indent}{self.output}[{idx}] = ({', '.join(self.values)})"]
+        if self.atomic:
+            return [f"{indent}{self.output}[{idx}] += {self.values[0]}  (atomic)"]
         return [f"{indent}{self.output}[{idx}] = {self.values[0]}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -811,6 +822,10 @@ class Write(Stmt):
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(_resolve_value(self.value, ctx), value_dt, out_dt)
+            if self.atomic:
+                # Cross-CTA additive finalize: every contributing CTA accumulates into the
+                # same cell (the output is zero-init'd per launch — ``CudaOp.zero_outputs``).
+                return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
             return [f"{pad}{self.output}[{flat}] = {rhs};"]
         # Vectorized path. Per-value dtype conversion: every SSA arg
         # must be at ``out_dt`` before packing.

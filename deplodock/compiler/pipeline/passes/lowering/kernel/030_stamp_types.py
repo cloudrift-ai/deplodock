@@ -149,4 +149,4 @@ def _stamp_write(s: Write, ctx: _StampCtx) -> Write:
     dt = ctx.ssa_dtypes.get(s.values[0])
     if dt is None:
         return s
-    return Write(output=s.output, index=s.index, values=s.values, value_dtype=dt)
+    return Write(output=s.output, index=s.index, values=s.values, value_dtype=dt, atomic=s.atomic)

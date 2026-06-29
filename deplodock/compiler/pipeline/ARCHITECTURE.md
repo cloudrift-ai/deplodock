@@ -421,9 +421,12 @@ for the per-rule mechanics):
 | `ONLINE_SOFTMAX` | BOOL | `loop/recognize/020_recognize_online_softmax` | Fuse a standalone two-pass softmax (row-max + `Σ exp(x−max)`) into one streaming `(m, d)` `Monoid` pass. Off by default. |
 | `S_*`    | FLOAT   | `loop/stamp/020_stamp_structural_features` | The LoopOp's structural features (stmt/op histogram + loop extents + operand dtypes). Not tunable — identity facts that make a knob dict a complete variant identity (the learned prior's feature vector). Skipped by `format_tuning_knobs`. |
 
-The `REDUCE` codec's cross-CTA **finalize** is the `c` field's trailing letter, not a standalone knob: `c<cta>a` =
-in-place `atomicAdd`, `c<cta>k` = deferred workspace + sibling combine kernel. Pin via `DEPLODOCK_REDUCE_<axis>=…c2k…`
-(or the convenience `DEPLODOCK_FINALIZE=atomic|kernel`).
+The `REDUCE` codec's cross-CTA split is its `g<n>` field (GRID stage), and the **finalize** is that field's trailing
+letter — `g<n>a` = in-place `atomicAdd` (one kernel, additive carriers only), `g<n>k` = deferred `__partial` workspace +
+a sibling combine kernel (any carrier; the only legal arm for the twisted flash `(m, l, O)` split-KV). Pin via
+`DEPLODOCK_REDUCE=g2k` (one flat knob — no per-axis `DEPLODOCK_REDUCE_<axis>`, no `DEPLODOCK_FINALIZE`). The split is
+consumed by `lowering/tile/030_split` as a graph rewrite (partial + finalize); the letter round-trips through
+`ReducePlan.parse`/`spell` and reads back as `ReducePlan.finalize`.
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2), the keywords `"all"` / `"none"`, or a decimal /
 `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered `knobs=` line —

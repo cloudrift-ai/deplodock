@@ -31,7 +31,7 @@ the lowered tree — no per-kernel builder.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, Monoid, Semiring
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Map, Monoid, Semiring
 from deplodock.compiler.ir.stmt.algebra import _partial_name
 from deplodock.compiler.ir.stmt.base import INDENT, Stmt, pretty_body
 
@@ -49,6 +49,16 @@ def lower(op) -> list[Stmt]:
     raise TypeError(f"lower: expected Map / Monoid / Semiring node, got {type(op).__name__}")
 
 
+def _is_state_merge(m: Monoid) -> bool:
+    """True for a cross-partition **state-merge** carrier (``Monoid.as_state_merge``): a
+    non-degenerate twist whose merge reassigns state purely by ``Assign`` (the ψ-rescale
+    ``combine_states`` form, no ``Accum`` folds). Such a carrier must render via
+    ``render_merge_program`` (state reassignment + seeding), NOT dissolve to loose stmts. A
+    degenerate carrier (``as_accums`` ≠ None) and a twisted *streaming* carrier (``Accum``
+    folds in its merge) both dissolve correctly and are excluded."""
+    return m.as_accums() is None and not any(isinstance(s, Accum) for s in m.twist.merge)
+
+
 def _dissolve_carriers(stmts: list[Stmt]) -> list[Stmt]:
     """Replace every ``Monoid`` carrier stmt (deep) with its loose fold stmts
     (:meth:`Monoid.dissolve`). A flat-``Map`` fallback keeps its reduce loop-IR verbatim,
@@ -57,7 +67,14 @@ def _dissolve_carriers(stmts: list[Stmt]) -> list[Stmt]:
     ``Accum``\\ s alone (``Loop.render``), the same path the lifted carrier already takes."""
     out: list[Stmt] = []
     for s in stmts:
-        if isinstance(s, Monoid):
+        if isinstance(s, Monoid) and _is_state_merge(s):
+            # A cross-partition **state-merge** carrier (``as_state_merge`` — ``030_split``'s
+            # twisted finalize): its ``combine_states`` reassigns state via the ψ-rescale
+            # ``Assign`` form (no ``Accum`` folds), which only ``Monoid.render`` /
+            # ``render_merge_program`` realizes correctly. Dissolving it to loose stmts would
+            # lose the state reassignment + seeding, so keep it as a stmt to render.
+            out.append(s)
+        elif isinstance(s, Monoid):
             out.extend(s.dissolve())
         elif s.nested():
             out.append(s.with_bodies(tuple(Body(tuple(_dissolve_carriers(list(b)))) for b in s.nested())))

@@ -17,9 +17,21 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.cuda import CudaOp
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.render import _BLOCK_SIZE, render_kernelop
+from deplodock.compiler.ir.stmt import Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
+
+
+def _atomic_outputs(kernel: KernelOp) -> tuple[str, ...]:
+    """Output buffers an atomic reduce-write (``030_split``'s atomic finalize) accumulates
+    into — they must be zero-init'd before each launch (``CudaOp.zero_outputs``), since every
+    contributing CTA ``atomicAdd``\\ s into the same cell. Dict-keyed for stable order."""
+    seen: dict[str, None] = {}
+    for s in kernel.body.iter():
+        if isinstance(s, Write) and s.atomic:
+            seen.setdefault(s.output, None)
+    return tuple(seen)
 
 
 def _symbolic_runtime_args(kernel: KernelOp) -> tuple[str, ...]:
@@ -79,4 +91,5 @@ def rewrite(match: Match, root: Node) -> CudaOp | None:
         smem_bytes=kernel.smem_bytes(),
         comment=name,
         runtime_args=runtime_args,
+        zero_outputs=_atomic_outputs(kernel),
     )
