@@ -120,10 +120,11 @@ and bumps `Run._dropped_candidates` — without this, one search-only un-lowerab
 
 ### Tile lowering at the pipeline level
 
-`lowering/tile/` lowers each fused `LoopOp` to a kernel-ready `TileOp` in three passes over the block-DAG Tile IR
-(`ir/tile/ir.py`): `split/` (pre-build structural forks) → `enumeration/` (the move composer that seeds a logical
-`TileGraph` and refines it move-by-move while searching the `Schedule`) → `assembly/` (deterministic materialization to
-`TileOp`). It **never dispatches on a named shape** — every decision is gated on the reduce axes' carrier algebra read
+`lowering/tile/` lowers each fused `LoopOp` to a kernel-ready `TileOp` over the block-DAG Tile IR (`ir/tile/ir.py`):
+`010_recognize` (lift `LoopOp` → `TileOp`, recognize flash / softmax carriers, normalize to `Monoid`s) → `020_schedule`
+(map free axes to the grid, pick the reduce partition + output `TILE` fragment) → `030_split` (cross-CTA split-K as a
+graph rewrite) → `040_atomize` (resolve the algebra→hardware-atom binding structurally onto the schedule — see
+[`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)). It **never dispatches on a named shape** — every decision is gated on the reduce axes' carrier algebra read
 off the body (`MAP` / `SEMIRING` / `MONOID`; flash attention is the `MONOID` algebra on the streaming schedule, a twisted
 monoid is a monoid, selected structurally), not on a matmul / pointwise / attention archetype. The full design lives in
 [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md). Two interactions reach up to the pipeline level:

@@ -36,3 +36,22 @@ How to comply:
   condition. See the dependence-cones section of `compiler/ir/ARCHITECTURE.md`.
 - **When generalizing an existing rule, normalize its incidental divergences** (one dtype rule, one index rule)
   and name the behavioral deltas explicitly in the commit — don't preserve two behaviors behind one entry point.
+
+## Resolve the hardware-atom binding once, structurally, at the tile level
+
+The same invariant applies *across* the tile→kernel boundary: the kernel materializer must not re-recognize structure
+the tile IR already holds. `lowering/tile/040_atomize` resolves the algebra→hardware-atom binding once — dispatching on
+kernel **kind** (the typed `*Kernel` seam) — and stamps it on the *schedule* (never the op tree, so `op_cache_key`, which
+digests `lower(op.op)`, stays byte-identical):
+
+- a warp `SemiringKernel` → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to roles by which output
+  grid axis each operand's OWN leaf `Load` index carries (structural — not a flattened-loop scan), plus `b_trans`, the
+  fold accumulator, and the projection epilogue. `_warp` reads the binding instead of `lower()`-ing the `Semiring` and
+  pattern-matching the result.
+- a cooperative/ILP `MonoidKernel` → a `ReduceBinding`: the `MonoidAtom` (accumulator dtype) + partition widths, with the
+  shuffle/tree fold mechanism left **derived** (`ReduceStage.combine`), never stored.
+
+The atom spec is subtyped by kind (`ir/tile/atom.py`: `SemiringAtom` is the fixed mma cell selected by name; `MonoidAtom`
+is the spec-less cooperative combine — its realization is derived, so it carries only a dtype). The Semiring binder
+(`bind_contraction`) is node-addressable so warp-flash can later reuse it on flash's nested QK^T / PV; that recursion is
+deferred until those inner contractions are structural `Semiring` nodes carrying geometry (see the pass docstring).
