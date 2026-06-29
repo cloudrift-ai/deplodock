@@ -30,6 +30,7 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
 
 
 class Level(enum.Enum):
@@ -322,10 +323,77 @@ class Placement:
 
 @dataclass(frozen=True)
 class WarpTile:
-    """TODO(warp): the tensor-core mma tile — a **shared** descriptor on both
-    :class:`MonoidSchedule` (flash's inner QK/PV) and :class:`SemiringSchedule` (matmul).
-    A contraction is mma-tiled onto the one mapping whether it is the top node or nested;
-    never a nested/second schedule. Reserved — no fields built this cut."""
+    """The tensor-core mma tile — a **shared** descriptor on both :class:`MonoidSchedule`
+    (flash's inner QK/PV — ``# TODO(warp-flash)``) and :class:`SemiringSchedule` (matmul,
+    built). A contraction is mma-tiled onto the one mapping whether it is the top node or
+    nested; never a nested/second schedule.
+
+    Each warp owns a ``reg`` (``FM × FN``) block of ``atom`` cells; the CTA runs ``WM × WN``
+    warps. So the per-CTA output tile is ``tile_m × tile_n`` (:attr:`tile_m` / :attr:`tile_n`)
+    and the CTA launches :attr:`block_threads` ``= WM·WN·32`` threads. ``bk`` chunks the K
+    (contraction) axis ``bk`` atom-cells per inner mma step. Spelled by the ``WARP`` codec
+    ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>`` (decided in ``020_schedule``)."""
+
+    atom: AtomKind
+    warps: tuple[int, int] = (1, 1)  # (WM, WN) — warps per CTA, m then n
+    reg: tuple[int, int] = (1, 1)  # (FM, FN) — atom sub-tiles per warp, m then n
+    bk: int = 1  # K-chunk per inner mma step, in atom_k units
+
+    @classmethod
+    def parse(cls, spec: str) -> WarpTile:
+        """Decode the ``WARP`` codec into a tile: ``/``-separated tokens —
+        ``a:<atom>`` (the registered atom kind), ``w<WM>xw<WN>`` (warps, m then n),
+        ``f<FM>xf<FN>`` (register sub-tile, m then n), ``k<bk>`` (K-chunk). The atom token is
+        mandatory; the rest default to ``1``."""
+        atom_name = None
+        wm = wn = fm = fn = bk = 1
+        for raw in spec.split("/"):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if tok.startswith("a:"):
+                atom_name = tok[2:]
+            elif tok[0] == "w":  # w<WM>xw<WN>
+                m, _, n = tok[1:].partition("xw")
+                wm = int(m)
+                if n:
+                    wn = int(n)
+            elif tok[0] == "f":  # f<FM>xf<FN>
+                m, _, n = tok[1:].partition("xf")
+                fm = int(m)
+                if n:
+                    fn = int(n)
+            elif tok[0] == "k":
+                bk = int(tok[1:])
+            else:
+                raise ValueError(f"bad WARP token {tok!r} (expect a:<atom> / w<WM>xw<WN> / f<FM>xf<FN> / k<bk>)")
+        if atom_name is None:
+            raise ValueError(f"WARP codec {spec!r} names no atom (expect a:<atom>)")
+        return cls(atom=atom_for(atom_name), warps=(wm, wn), reg=(fm, fn), bk=bk)
+
+    def spell(self) -> str:
+        """The ``WARP`` codec string for this tile (inverse of :meth:`parse`)."""
+        wm, wn = self.warps
+        fm, fn = self.reg
+        toks = [f"a:{self.atom.name}", f"w{wm}xw{wn}", f"f{fm}xf{fn}"]
+        if self.bk > 1:
+            toks.append(f"k{self.bk}")
+        return "/".join(toks)
+
+    @property
+    def tile_m(self) -> int:
+        """The per-CTA output rows = ``WM · FM · atom_m``."""
+        return self.warps[0] * self.reg[0] * self.atom.atom_m
+
+    @property
+    def tile_n(self) -> int:
+        """The per-CTA output cols = ``WN · FN · atom_n``."""
+        return self.warps[1] * self.reg[1] * self.atom.atom_n
+
+    @property
+    def block_threads(self) -> int:
+        """The per-CTA thread count = ``WM · WN · 32`` (32 lanes per warp)."""
+        return self.warps[0] * self.warps[1] * 32
 
 
 @dataclass(frozen=True)
