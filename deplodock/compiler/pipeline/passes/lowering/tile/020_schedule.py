@@ -34,7 +34,7 @@ from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
-from deplodock.compiler.ir.tile.schedule import Stage, WarpTile
+from deplodock.compiler.ir.tile.schedule import Stage, WarpTile, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -55,32 +55,21 @@ REDUCE = Knob(
 )
 
 # The free-axis output tile is decided HERE too, by the single ``TILE`` codec knob (the
-# ``Scalar``-fragment sibling of ``REDUCE``) — a contraction's per-thread register sub-tile
-# (each thread owns ``reg_m·reg_n`` output cells, reusing operands across them). Same decision
-# hierarchy: env pin via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only
-# a ``Semiring`` contraction tiles its output today; ``off=""`` auto-stamps everything else.
+# output-fragment sibling of ``REDUCE``). ``TILE`` is the **unified output-fragment** knob — a
+# contraction's output tile is *either* the scalar register sub-tile (``n<N>[xm<M>]`` parallel
+# thread-tile / ``f<fn>[xf<fm>]`` register sub-tile) *or* the tensor-core warp mma tile
+# (``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>``), never both. The value self-discriminates: an
+# ``a:<atom>`` token selects the warp fragment (:class:`WarpTile`); otherwise the scalar
+# fragment (:class:`TilePlan`) — see ``schedule.is_warp_codec``. Same decision hierarchy: env pin
+# via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``Semiring``
+# contraction tiles its output today; ``off=""`` auto-stamps everything else. The codec is the
+# sole on-dict spelling — the learned-prior featurizer (``knob.py``: ``mma_atom`` / ``is_warp`` /
+# ``_free_slots`` / ``tile_signature``) parses it directly (no legacy ``WM``/``WN``/``MMA`` keys).
 TILE = Knob(
     "TILE",
     KnobType.STR,
-    help="Free-axis output-tile codec (n<N>[xm<M>] parallel thread-tile / f<fn>[xf<fm>] register "
-    "sub-tile; empty=per-cell). Decided in lowering/tile/020_schedule, materialized in "
-    "lowering/kernel/010_materialize.",
-    off="",
-)
-
-# The tensor-core warp tile is decided HERE too, by the single ``WARP`` codec knob (the
-# ``Warp``-fragment sibling of ``TILE``) — a contraction's mma tile (atom + warps + register
-# sub-tile + K-chunk). ``WARP`` is pin-only this cut (the prior auto-fork is a follow-up, as
-# ``TILE``'s is): a non-empty ``DEPLODOCK_WARP`` selects the warp tier and wins over ``TILE``
-# (the either-ness — a kernel is the scalar register-tile OR the warp tile, never both); empty
-# (``off=""``) keeps the scalar path. Only a ``Semiring`` contraction warp-tiles today. The codec
-# is exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
-# learned-prior featurizer (``knob.py``: ``mma_atom`` / ``is_warp`` / ``_free_slots`` /
-# ``tile_signature``) already reads, so the codec stays the pin/display spelling.
-WARP = Knob(
-    "WARP",
-    KnobType.STR,
-    help="Tensor-core warp-tile codec (a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>; empty=scalar). "
+    help="Output-fragment codec — scalar tile (n<N>[xm<M>]/f<fn>[xf<fm>]) OR warp mma tile "
+    "(a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>, selected by the a:<atom> token); empty=per-cell. "
     "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
     off="",
 )
@@ -90,8 +79,8 @@ WARP = Knob(
 # producer (``sync`` plain copy / ``cp.async`` / ``tma``) over the serial reduce loop, instead
 # of the gmem-direct register baseline. Resolved here into the schedule's :class:`Stage`
 # (``None`` = gmem-direct); the codec also rides on ``TileOp.knobs`` for the prior. ``STAGE`` is
-# pin-only this cut (the prior auto-fork is a follow-up, as ``WARP``/``TILE``'s is). Composes
-# with both the scalar register-tile (``TILE``) and the warp (``WARP``) tier.
+# pin-only this cut (the prior auto-fork is a follow-up, as ``TILE``'s is). Composes with both
+# fragments of the unified ``TILE`` knob (the scalar register-tile and the warp mma tile).
 STAGE = Knob(
     "STAGE",
     KnobType.STR,
@@ -213,16 +202,6 @@ def _semiring_reduce_spec() -> str:
     return pinned if plan.needs_split else ""
 
 
-def _warp_spec(kernel) -> str:
-    """The pinned ``WARP`` codec for ``kernel`` — only a ``Semiring`` contraction warp-tiles
-    (everything else is ``""``, the pin doesn't apply). Pin-only this cut: returns the
-    authoritative ``DEPLODOCK_WARP`` pin (``Knob.narrow``) or ``""`` (no warp tier — the
-    scalar ``TILE`` path runs instead)."""
-    if not isinstance(kernel, SemiringKernel):
-        return ""
-    return WARP.narrow([""])[0]
-
-
 def _stage_spec(kernel) -> str:
     """The pinned ``STAGE`` codec for ``kernel`` — only a ``Semiring`` contraction stages its
     operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
@@ -258,25 +237,24 @@ def _check_warp_static_k(kernel, wt) -> None:
     step = wt.atom.atom_k * wt.bk
     if k % step:
         raise ValueError(
-            f"WARP pin K-step {step} (atom_k={wt.atom.atom_k}·bk={wt.bk}) does not divide the "
+            f"warp TILE pin K-step {step} (atom_k={wt.atom.atom_k}·bk={wt.bk}) does not divide the "
             f"static contraction K={k}; the warp K-loop has no static-K tail masking yet, so a "
             f"partial final step corrupts the result. Pin a K that is a multiple of {step}, or "
-            f"drop the WARP pin to use the scalar tier."
+            f"drop the a:<atom> token to use the scalar tier."
         )
 
 
 def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
-    """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the
-    ``WARP`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment), plus an
-    optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The codec is
-    exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
-    learned-prior featurizer already reads (the codec stays the pin/display spelling)."""
+    """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
+    form of the ``TILE`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment),
+    plus an optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The packed
+    ``TILE`` codec is the sole on-dict spelling — the learned-prior featurizer parses it directly
+    (no legacy ``WM``/``WN``/``MMA`` explosion)."""
     wt = WarpTile.parse(spec)
     _check_warp_static_k(kernel, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
     sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage)
-    (wm, wn), (fm, fn) = wt.warps, wt.reg
-    stamped = {**knobs, WARP.name: spec, "ATOM@out": wt.atom.name, "WM": wm, "WN": wn, "FM": fm, "FN": fn, "BK": wt.bk}
+    stamped = {**knobs, TILE.name: spec}
     if stage_spec:
         stamped[STAGE.name] = stage_spec
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
@@ -325,14 +303,17 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
     # A ``Semiring`` ALSO honors a cross-CTA split-K (``g``) ``REDUCE`` pin — orthogonal to the
     # output tile (``reduce`` = the K partition, consumed by ``030_split``).
-    # A ``WARP`` pin selects the tensor-core warp tier and wins over ``TILE`` (the either-ness);
-    # without it the scalar register-tile (``TILE``) path runs.
+    # ``TILE`` is the unified output-fragment knob: a candidate whose codec names an atom
+    # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
+    # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
     if isinstance(kernel, SemiringKernel):
         stage_spec = _stage_spec(kernel)
-        warp = _warp_spec(kernel)
-        if warp:
-            return _warp_option(kernel, place, warp, tile.name, tile.knobs, stage_spec)
         reduce_spec = _semiring_reduce_spec()
-        return [_tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec, stage_spec) for spec in _tile_specs(kernel)]
+        return [
+            _warp_option(kernel, place, spec, tile.name, tile.knobs, stage_spec)
+            if is_warp_codec(spec)
+            else _tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec, stage_spec)
+            for spec in _tile_specs(kernel)
+        ]
     specs = _reduce_specs(kernel, place)
     return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]

@@ -14,7 +14,6 @@ from deplodock.compiler.pipeline.knob import (
     is_warp,
     knob_features,
     mma_atom,
-    mma_decode,
 )
 
 
@@ -189,52 +188,39 @@ def test_apply_off_defaults_fills_only_unspecified_off_knobs():
     assert knobs2 == {"WM": 2, "BK": 64}
 
 
-def test_mma_decode_value_semantics():
-    """``mma_decode`` maps unset/empty/truthy → auto, falsy → scalar-only, an
-    atom name → pinned warp."""
-    assert mma_decode(None) == (True, None)
-    assert mma_decode("") == (True, None)
-    assert mma_decode("1") == (True, None)
-    assert mma_decode("0") == (False, None)
-    assert mma_decode("false") == (False, None)
-    assert mma_decode("mma_m16n8k16_f16") == (True, "mma_m16n8k16_f16")
-
-
 def test_is_warp_and_mma_atom_tier_discriminator():
-    """The ``"0"`` OFF sentinel (and absent / falsy / auto) read as scalar; only a
-    concrete atom name is the warp tier. Guards the truthy-string footgun: the
-    old ``knobs.get("MMA")`` check misread ``"0"`` as warp."""
+    """The unified ``TILE`` knob self-discriminates: a value carrying an ``a:<atom>`` token is the
+    warp fragment (and names the atom); a scalar ``n../f..`` codec / empty / absent is the scalar
+    tier (no atom)."""
     assert not is_warp({}) and mma_atom({}) is None
-    assert not is_warp({"MMA": "0"}) and mma_atom({"MMA": "0"}) is None
-    assert not is_warp({"MMA": "1"})  # pre-enumeration auto control, not an atom
-    assert is_warp({"MMA": "mma_m16n8k16_f16"})
-    assert mma_atom({"MMA": "mma_m16n8k16_f16"}) == "mma_m16n8k16_f16"
+    assert not is_warp({"TILE": ""}) and mma_atom({"TILE": ""}) is None
+    assert not is_warp({"TILE": "n32xm8/f2xf4"})  # scalar fragment names no atom
+    assert is_warp({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"})
+    assert mma_atom({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"}) == "mma_m16n8k16_f16"
 
 
 def test_scalar_tile_features_from_thread_tile():
     """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from its
     ``TILE`` codec free split (``par_n·par_m`` threads, ``par_m·reg_m × par_n·reg_n``
     output) — ``n32xm8`` parallel thread-tile, ``f2xf4`` register sub-tile."""
-    sf = knob_features({"TILE": "n32xm8/f2xf4", "MMA": "0", "WM": 0, "WN": 0})
+    sf = knob_features({"TILE": "n32xm8/f2xf4"})
     assert any(k.startswith("D_") for k in sf)
     assert sf["D_threads"] == 32 * 8
     assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2
 
 
 def test_warp_tile_features_from_warp_tile():
-    """``_warp_tile_features`` builds the ``D_*`` family from the warp tile
-    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the warp
-    ``BM=BN=0`` OFF sentinels never feed a scalar tile. Atom dims (16×8 for
-    ``m16n8k16``) come from the MMA featurizer in the real pipeline; here passed
-    directly to avoid needing the registry loaded."""
+    """``_warp_tile_features`` builds the ``D_*`` family from the warp form of the ``TILE`` codec
+    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the atom cell dims (16×8 for
+    ``m16n8k16``) are read off the parsed atom. A scalar ``TILE`` value → empty."""
     from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
 
-    wf = _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2, "SPLITK": 1, "S_ext_free_prod": 2048 * 2048}, 16.0, 8.0)
+    wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2", "S_ext_free_prod": 2048 * 2048})
     assert wf["D_threads"] == 128.0  # WM·WN·32
     assert wf["D_tile_m"] == 2 * 2 * 16  # WM·FM·atom_m
     assert wf["D_tile_n"] == 2 * 2 * 8  # WN·FN·atom_n
     assert "D_log2_ctas" in wf and "D_log2_waves" in wf  # occupancy present (free_prod given)
-    assert _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2}, None, None) == {}  # missing atom dims → empty
+    assert _warp_tile_features({"TILE": "n32xm8/f2xf4"}) == {}  # scalar fragment → empty
 
 
 # ---------------------------------------------------------------------------
@@ -391,12 +377,9 @@ def test_stage_codec_reg_depth_roundtrip():
 
 
 def test_knob_features_mma_expansion():
-    # MMA expansion now dispatches through the MMA Knob's ``features`` callable,
-    # so the declaring module must be loaded + present in the registry.
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knobs  # noqa: F401, PLC0415
-
-    knob_mod.reset_registry()
-    feats = knob_features({"MMA": "mma_m16n8k16_f16"})
+    # The warp fragment names its atom on the ``TILE`` codec (``a:<atom>``); ``knob_features``
+    # expands its physical cell / dtype properties into the ``MMA_*`` family.
+    feats = knob_features({"TILE": "a:mma_m16n8k16_f16/w1xw1/f1xf1"})
     assert feats["MMA_tier"] == 1.0
     assert (feats["MMA_atom_m"], feats["MMA_atom_n"], feats["MMA_atom_k"]) == (16.0, 8.0, 16.0)
     assert feats["MMA_a_bits"] == 16.0  # f16 operand
@@ -443,12 +426,10 @@ def test_format_tuning_knobs_skips_struct():
 
 
 def test_format_tuning_knobs_canonical_order():
-    """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
-    alphabetical — shared with the ``deplodock eval`` golden tables. (Uses a
-    tier-consistent warp dict so the tier-foreign display filter doesn't drop
-    anything — a warp variant carries WM/WN/MMA, not BM/BN.)"""
-    out = format_tuning_knobs({"SPLITK": 1, "WN": 4, "WM": 2, "BK": 64, "MMA": "x", "FM": 4})
-    assert out == "BK=64, FM=4, WM=2, WN=4, SPLITK=1, MMA=x"
+    """The codec knobs render in canonical order (``KNOB_ORDER`` = ``TILE``, ``REDUCE``,
+    ``STAGE``), not alphabetical — shared with the ``deplodock eval`` golden tables."""
+    out = format_tuning_knobs({"STAGE": "d2/cp", "REDUCE": "b32", "TILE": "a:mma_m16n8k16_f16/w2xw2"})
+    assert out == "TILE=a:mma_m16n8k16_f16/w2xw2, REDUCE=b32, STAGE=d2/cp"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):

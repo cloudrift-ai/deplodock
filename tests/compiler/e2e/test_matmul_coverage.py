@@ -487,11 +487,11 @@ _MMA_CASES = [
 @requires_sm90
 @requires_cuda
 def test_matmul_mma_coverage(M, N, K, out, trans, mode, monkeypatch):
-    """An f16×f16 matmul under the pinned ``DEPLODOCK_WARP`` codec lowers to ``mma.sync`` and
+    """An f16×f16 matmul under the pinned ``DEPLODOCK_TILE`` codec lowers to ``mma.sync`` and
     agrees with the f32 reference (within fp16 tolerance) — for canonical AND transposed-B
     operands, f16 AND f32 output, over a STATIC M (tile divisor) and a SYMBOLIC M run at a
     straddling length (the dynamic-grid tier + the masked-tile store)."""
-    monkeypatch.setenv("DEPLODOCK_WARP", _WARP_PIN)
+    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
     run_m = M if mode == "static" else M + 2
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((run_m, K)) * 0.1).astype(np.float16)
@@ -596,7 +596,7 @@ def test_matmul_mma_epilogue_coverage(epilogue, mode, monkeypatch):
     """A warp-tier matmul with a fused pointwise / causal epilogue stays accurate AND folds the
     epilogue into the ONE mma.sync kernel (the per-element ``RegStore`` chain), over static and
     symbolic M."""
-    monkeypatch.setenv("DEPLODOCK_WARP", _WARP_PIN)
+    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
     M = N = K = 128
     run_m = M if mode == "static" else M + 2
     rng = np.random.default_rng(1)
@@ -652,7 +652,7 @@ def _parity_mma_graph(mode: str, *, M: int):
 def transport(request, monkeypatch) -> str:
     """Pin the warp tile (``WARP`` codec) + the operand-staging transport (``STAGE`` codec —
     ``d2/cp`` = cp.async, ``d2/tma`` = cp.async.bulk.tensor). The "pinned knobs" fixture."""
-    monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
     monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma" if request.param == "tma" else "d2/cp")
     return request.param
 
@@ -714,7 +714,7 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
         if stage:
             monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         else:
@@ -752,7 +752,7 @@ def test_register_double_buffer_matches_single_buffer_bit_for_bit(monkeypatch, t
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
         monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
@@ -783,7 +783,7 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
     b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
-        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
         if stage:
             monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         else:
@@ -810,7 +810,7 @@ def test_bf16_operands_stage_via_cp_async(monkeypatch):
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_bf16/w2xw2/f2xf2/k2")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_bf16/w2xw2/f2xf2/k2")
     monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
     M = 256
     g = Graph()
@@ -905,21 +905,21 @@ def test_warp_static_k_indivisible_rejected(monkeypatch) -> None:
     """A WARP pin whose static K is not a multiple of ``atom_k·bk`` is rejected — the warp
     K-loop has no static-K tail masking, so lowering it would silently corrupt the result (the
     error the accuracy gate's mean-error escape clause misses)."""
-    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")  # K-step 16
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")  # K-step 16
     with pytest.raises(ValueError, match="does not divide the static contraction K=100"):
         _run_tile_pass(_guard_mm_graph(128, 128, 100))
 
 
 def test_warp_static_k_divisible_ok(monkeypatch) -> None:
     """The same pin on a K that IS a multiple of the K-step lowers without the guard firing."""
-    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")
     _run_tile_pass(_guard_mm_graph(128, 128, 128))  # 128 % 16 == 0 — no raise
 
 
 def test_warp_symbolic_k_not_guarded(monkeypatch) -> None:
     """A symbolic K reaches the masked tier (ceil-div grid + zero-filled partial slab), so the
     static-K guard does not fire even when the hint is not a K-step multiple."""
-    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k2")  # K-step 32
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k2")  # K-step 32
     _run_tile_pass(_guard_mm_graph(64, 128, Dim("seq_len")))  # symbolic K — no raise
 
 
@@ -947,8 +947,8 @@ def test_tile_block_within_limit_ok(monkeypatch) -> None:
 # off-hint / straddling sizes (1, 31, 130, 700 — NOT tile-divisor multiples), which exercise the
 # boundary-guard + clamp + zero-fill interplay the tile-divisor parity sweep cannot reach.
 _MASK_WARP = "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"
-_CP_KNOBS = {"WARP": _MASK_WARP, "STAGE": "d2/cp"}
-_TMA_KNOBS = {"WARP": _MASK_WARP, "STAGE": "d2/tma"}
+_CP_KNOBS = {"TILE": _MASK_WARP, "STAGE": "d2/cp"}
+_TMA_KNOBS = {"TILE": _MASK_WARP, "STAGE": "d2/tma"}
 
 
 def _symbolic_m_graph(*, K: int = 512, N: int = 1024) -> Graph:

@@ -44,9 +44,9 @@ def test_ratio_and_golden_derive(deplodock_us, cublas_us, ratio, golden):
 
 
 def test_repro_command_round_trips_knobs_and_snippet():
-    c = MatmulGoldenConfig(name="square.2048", M=2048, N=2048, K=2048, knobs={"BM": 8, "BN": 32, "TMA": 1, "STAGE": "11"})
+    c = MatmulGoldenConfig(name="square.2048", M=2048, N=2048, K=2048, knobs={"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"})
     cmd = c.repro_command()
-    assert 'DEPLODOCK_KNOBS="BM=8,BN=32,TMA=1,STAGE=11"' in cmd
+    assert 'DEPLODOCK_KNOBS="TILE=n32xm8/f4xf26,STAGE=d2/tma"' in cmd
     assert c.snippet() in cmd
     assert "--ir cuda" in cmd
 
@@ -58,8 +58,11 @@ def test_golden_configs_set_is_well_formed():
         if isinstance(c, MatmulGoldenConfig):
             assert c.M > 0 and c.N > 0 and c.K > 0, c.name
         elif isinstance(c, ReduceGoldenConfig):
+            from deplodock.compiler.ir.tile.schedule import ReducePlan
+
             assert c.M > 0 and c.K > 0, c.name
-            assert c.knobs.get("BR", 1) > 1, f"{c.name} reduce golden must be cooperative (BR>1)"
+            coop = ReducePlan.parse(c.knobs.get("REDUCE")).coop
+            assert coop > 1, f"{c.name} reduce golden must be cooperative (REDUCE coop>1, got {coop})"
         else:
             assert c.M > 0 and c.N > 0, c.name
         assert c.deplodock_us > 0 and c.cublas_us > 0, c.name
@@ -86,6 +89,28 @@ def test_goldens_load_from_yaml():
     loaded = _load_goldens()
     assert loaded  # non-empty
     assert len(loaded) == len(GOLDEN_CONFIGS)
+
+
+def test_goldens_speak_native_codecs_and_featurize():
+    """Every golden's ``knobs`` parse cleanly through the native output-fragment / reduce / stage
+    codecs (no legacy GEMM-letter vocabulary survives), and every **matmul** golden featurizes to a
+    non-empty tile geometry family — the scalar path that silently produced empty ``D_*`` features
+    while the goldens still spelled ``BM``/``BN`` (the bug the migration fixed)."""
+    from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile, is_warp_codec
+    from deplodock.compiler.pipeline import knob
+
+    legacy = {"BN", "BM", "FM", "FN", "BK", "BR", "FK", "SPLITK", "WN", "WM", "MMA", "RING", "TMA"}
+    for g in GOLDEN_CONFIGS:
+        assert not (legacy & set(g.knobs)), f"{g.name} still carries legacy knobs: {sorted(legacy & set(g.knobs))}"
+        tile = g.knobs.get("TILE")
+        if tile:
+            (WarpTile.parse(tile) if is_warp_codec(tile) else TilePlan.parse(tile))  # parses, or raises
+        ReducePlan.parse(g.knobs.get("REDUCE"))
+        if g.knobs.get("STAGE"):
+            Stage.parse(g.knobs["STAGE"])
+        if isinstance(g, MatmulGoldenConfig):
+            feats = knob.knob_features(g.knobs)
+            assert feats.get("D_threads", 0) > 0 and "D_tile_m" in feats, f"{g.name} featurized to empty tile geometry"
 
 
 # --- dynamic (symbolic-axis) matmul goldens ----------------------------------
@@ -184,7 +209,7 @@ def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
     the old one); ``goldens_by_name`` returns them all, empty for an unknown name."""
     from deplodock.compiler.pipeline.search import golden as gmod
 
-    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    a, b = _dup({"TILE": "n16xm8/f2xf2"}, 12.0), _dup({"TILE": "n16xm8/f4xf4"}, 14.0)
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
     assert gmod.goldens_by_name("dup.512") == [a, b]
     assert gmod.goldens_by_name("nope") == []
@@ -198,7 +223,7 @@ def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
 
     from deplodock.compiler.pipeline.search import golden as gmod
 
-    a, b = _dup({"BM": 8}, 12.0), _dup({"BM": 16}, 14.0)
+    a, b = _dup({"TILE": "n16xm8/f2xf2"}, 12.0), _dup({"TILE": "n16xm8/f4xf4"}, 14.0)
     # Dataset.from_golden reads golden.GOLDEN_CONFIGS via a lazy import, so this patch is seen.
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
 
@@ -207,7 +232,7 @@ def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
     args = Namespace(golden="dup.512", code=None, input=None, ir=None)
     cmod.resolve_golden_arg(args)
     assert [s.name for s in args.golden_configs] == ["dup.512", "dup.512"]
-    assert [s.knobs for s in args.golden_configs] == [{"BM": 8}, {"BM": 16}]
+    assert [s.knobs for s in args.golden_configs] == [{"TILE": "n16xm8/f2xf2"}, {"TILE": "n16xm8/f4xf4"}]
     assert args.code == a.snippet()
     assert all(s.source == "golden" for s in args.golden_configs)
 
@@ -230,7 +255,7 @@ def test_resolve_golden_arg_applies_dynamic_spec(monkeypatch):
         M=512,
         N=512,
         K=512,
-        knobs={"BM": 8},
+        knobs={"TILE": "n16xm8/f2xf2"},
         deplodock_us=12.0,
         cublas_us=14.0,
         dynamic={"seq_len": {"input": "x0", "axis": 0}},

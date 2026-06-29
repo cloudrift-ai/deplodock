@@ -6,7 +6,7 @@ configs:
     M: 512
     N: 512
     K: 512
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 6, FN: 2, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf6', STAGE: 'd2/tma/ring'}
     deplodock_us: 11.0
     cublas_us: 12.6
   - kernel: matmul
@@ -14,7 +14,7 @@ configs:
     M: 1024
     N: 1024
     K: 1024
-    knobs: {BM: 16, BN: 16, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 4, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm16/f4xf6', STAGE: 'd4/tma/ring'}
     deplodock_us: 49.2
     cublas_us: 55.6
   - kernel: matmul
@@ -22,7 +22,7 @@ configs:
     M: 2048
     N: 2048
     K: 2048
-    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 12, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm16/f4xf12', STAGE: 'd2/tma/ring'}
     deplodock_us: 357.6
     cublas_us: 324.8
   - kernel: matmul
@@ -30,7 +30,7 @@ configs:
     M: 4096
     N: 4096
     K: 4096
-    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 3, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm16/f4xf6', STAGE: 'd3/tma/ring'}
     deplodock_us: 3021.4
     cublas_us: 2426.0
   - kernel: matmul
@@ -39,7 +39,7 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {BK: 4, FM: 2, FN: 2, WM: 2, WN: 2, SPLITK: 1, RING: 3, STAGE: '11', MMA: 'mma_m16n8k16_f16', TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2xw2/f2xf2/k4', STAGE: 'd3/tma/ring'}
     deplodock_us: 3.8
     cublas_us: 6.1
   - kernel: matmul
@@ -48,7 +48,7 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {BK: 4, FM: 2, FN: 2, WM: 1, WN: 4, SPLITK: 1, RING: 2, STAGE: '11', MMA: 'mma_m16n8k16_f16', TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1xw4/f2xf2/k4', STAGE: 'd2/tma/ring'}
     deplodock_us: 3.7
     cublas_us: 6.1
   - kernel: matmul
@@ -57,7 +57,7 @@ configs:
     N: 1024
     K: 1024
     dtype: fp16
-    knobs: {BK: 2, FM: 4, FN: 2, WM: 1, WN: 4, SPLITK: 1, RING: 4, STAGE: '11', MMA: 'mma_m16n8k16_f16', TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1xw4/f4xf2/k2', STAGE: 'd4/tma/ring'}
     deplodock_us: 13.9
     cublas_us: 12.5
   - kernel: matmul
@@ -66,7 +66,7 @@ configs:
     N: 2048
     K: 2048
     dtype: fp16
-    knobs: {BK: 2, FM: 2, FN: 4, WM: 4, WN: 2, SPLITK: 1, RING: 2, STAGE: '11', MMA: 'mma_m16n8k16_f16', TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w4xw2/f2xf4/k2', STAGE: 'd2/tma/ring'}
     deplodock_us: 78.6
     cublas_us: 69.9
   - kernel: matmul
@@ -75,7 +75,7 @@ configs:
     N: 4096
     K: 4096
     dtype: fp16
-    knobs: {BK: 4, FM: 2, FN: 8, WM: 8, WN: 2, SPLITK: 1, RING: 2, STAGE: '11', MMA: 'mma_m16n8k16_f16', TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w8xw2/f2xf8/k4', STAGE: 'd2/tma/ring'}
     deplodock_us: 515.9
     cublas_us: 467.2
   - kernel: matmul
@@ -83,7 +83,7 @@ configs:
     M: 32
     N: 2048
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 7.8
     cublas_us: 8.7
   - kernel: matmul
@@ -91,7 +91,7 @@ configs:
     M: 32
     N: 1024
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 2, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 6.2
     cublas_us: 8.5
   - kernel: matmul
@@ -99,7 +99,7 @@ configs:
     M: 32
     N: 1024
     K: 2048
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 2, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 10.0
     cublas_us: 10.3
   - kernel: matmul
@@ -107,7 +107,7 @@ configs:
     M: 32
     N: 3072
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 11.6
     cublas_us: 12.6
   - kernel: matmul
@@ -115,7 +115,7 @@ configs:
     M: 32
     N: 1024
     K: 3072
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 2, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 13.8
     cublas_us: 14.4
   - kernel: matmul
@@ -123,7 +123,7 @@ configs:
     M: 128
     N: 2048
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 18.7
     cublas_us: 19.7
   - kernel: matmul
@@ -131,7 +131,7 @@ configs:
     M: 128
     N: 1024
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf4', STAGE: 'd2/tma/ring'}
     deplodock_us: 12.1
     cublas_us: 14.5
   - kernel: matmul
@@ -139,7 +139,7 @@ configs:
     M: 128
     N: 1024
     K: 2048
-    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 4, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f2xf4', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     deplodock_us: 20.9
     cublas_us: 22.6
   - kernel: matmul
@@ -147,7 +147,7 @@ configs:
     M: 128
     N: 3072
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf4', STAGE: 'd2/tma/ring'}
     deplodock_us: 30.9
     cublas_us: 26.4
   - kernel: matmul
@@ -155,7 +155,7 @@ configs:
     M: 128
     N: 1024
     K: 3072
-    knobs: {BM: 16, BN: 16, BK: 32, BR: 1, FM: 4, FN: 2, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm16/f2xf4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 30.0
     cublas_us: 31.1
   - kernel: matmul
@@ -163,7 +163,7 @@ configs:
     M: 512
     N: 2048
     K: 1024
-    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 3, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f4xf6', STAGE: 'd3/tma/ring'}
     deplodock_us: 50.5
     cublas_us: 55.4
   - kernel: matmul
@@ -171,7 +171,7 @@ configs:
     M: 512
     N: 1024
     K: 1024
-    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 30.3
     cublas_us: 39.5
   - kernel: matmul
@@ -179,7 +179,7 @@ configs:
     M: 512
     N: 1024
     K: 2048
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f4xf6', STAGE: 'd2/tma/ring'}
     deplodock_us: 66.3
     cublas_us: 68.6
   - kernel: matmul
@@ -187,7 +187,7 @@ configs:
     M: 512
     N: 3072
     K: 1024
-    knobs: {BM: 16, BN: 32, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 3, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm16/f4xf6', STAGE: 'd3/tma/ring'}
     deplodock_us: 85.1
     cublas_us: 81.3
   - kernel: matmul
@@ -195,7 +195,7 @@ configs:
     M: 512
     N: 1024
     K: 3072
-    knobs: {BM: 8, BN: 16, BK: 64, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f4xf6', STAGE: 'd2/tma/ring'}
     deplodock_us: 97.8
     cublas_us: 92.0
   - kernel: matmul
@@ -204,7 +204,7 @@ configs:
     N: 512
     K: 512
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 16, BK: 32, BR: 1, FM: 6, FN: 2, FK: 1, SPLITK: 2, RING: 4, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n16xm8/f2xf6', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     deplodock_us: 10.2
     cublas_us: 12.6
   - kernel: matmul
@@ -213,7 +213,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 32, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 1, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', STAGE: 'd2/tma/ring'}
     deplodock_us: 55.2
     cublas_us: 55.3
   - kernel: matmul
@@ -222,7 +222,7 @@ configs:
     N: 1024
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 29.8
     cublas_us: 39.5
   - kernel: matmul
@@ -231,7 +231,7 @@ configs:
     N: 1024
     K: 2048
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 32, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 2, RING: 3, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     deplodock_us: 53.7
     cublas_us: 68.4
   - kernel: matmul
@@ -240,7 +240,7 @@ configs:
     N: 3072
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 32, BK: 32, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 83.9
     cublas_us: 80.9
   - kernel: matmul
@@ -249,6 +249,6 @@ configs:
     N: 1024
     K: 3072
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BM: 8, BN: 32, BK: 64, BR: 1, FM: 6, FN: 4, FK: 1, SPLITK: 2, RING: 2, STAGE: '11', TMA: 1}
+    knobs: {TILE: 'n32xm8/f4xf6', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     deplodock_us: 78.3
     cublas_us: 92.1

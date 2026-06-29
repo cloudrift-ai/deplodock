@@ -57,14 +57,14 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
 
     from deplodock.commands.run import _pinned_knobs
 
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
-    monkeypatch.setenv("DEPLODOCK_BN", "preexisting")
-    with _pinned_knobs({"BM": 8, "BN": 32, "WARP_SPECIALIZE": False}):
-        assert os.environ["DEPLODOCK_BM"] == "8"
-        assert os.environ["DEPLODOCK_BN"] == "32"
+    monkeypatch.delenv("DEPLODOCK_TILE", raising=False)
+    monkeypatch.setenv("DEPLODOCK_STAGE", "preexisting")
+    with _pinned_knobs({"TILE": "n32xm8/f2xf4", "STAGE": "d2/cp", "WARP_SPECIALIZE": False}):
+        assert os.environ["DEPLODOCK_TILE"] == "n32xm8/f2xf4"
+        assert os.environ["DEPLODOCK_STAGE"] == "d2/cp"
         assert os.environ["DEPLODOCK_WARP_SPECIALIZE"] == "False"
-    assert "DEPLODOCK_BM" not in os.environ  # was unset → removed
-    assert os.environ["DEPLODOCK_BN"] == "preexisting"  # restored
+    assert "DEPLODOCK_TILE" not in os.environ  # was unset → removed
+    assert os.environ["DEPLODOCK_STAGE"] == "preexisting"  # restored
     assert "DEPLODOCK_WARP_SPECIALIZE" not in os.environ
 
 
@@ -214,14 +214,14 @@ def test_ab_samples_parse_label_and_shape():
     cue to nest by kernel ``S_*`` signature instead of a golden matmul shape)."""
     from deplodock.commands.run import _ab_samples
 
-    (s,) = _ab_samples(["bm=8, BN=16"])
-    assert s.knobs == {"BM": "8", "BN": "16"}  # names uppercased, whitespace tolerated
-    assert s.name == "ab bm=8, BN=16"
+    (s,) = _ab_samples(["tile=n16xm8, STAGE=d2/cp"])
+    assert s.knobs == {"TILE": "n16xm8", "STAGE": "d2/cp"}  # names uppercased, whitespace tolerated
+    assert s.name == "ab tile=n16xm8, STAGE=d2/cp"
     assert s.shape is None
     assert s.dynamic is None
     # A --dynamic run stamps its specs on the pseudo-sample so the A/B re-trace
     # builds the same symbolic graph as the greedy run.
-    (d,) = _ab_samples(["BM=8"], dynamic=["seq_len@x0:0"])
+    (d,) = _ab_samples(["TILE=n16xm8"], dynamic=["seq_len@x0:0"])
     assert d.dynamic == ("seq_len@x0:0",)
 
 
@@ -247,8 +247,8 @@ def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
         return SimpleNamespace()
 
     backend = SimpleNamespace(compile=lambda g: g, benchmark_async=fake_benchmark_async)
-    dyn = SimpleNamespace(name="g.dynM", knobs={"BM": 8}, shape=None, dynamic=("seq_len@x0:0",))
-    static = SimpleNamespace(name="g", knobs={"BM": 8}, shape=None, dynamic=None)
+    dyn = SimpleNamespace(name="g.dynM", knobs={"TILE": "n16xm8/f2xf2"}, shape=None, dynamic=("seq_len@x0:0",))
+    static = SimpleNamespace(name="g", knobs={"TILE": "n16xm8/f2xf2"}, shape=None, dynamic=None)
     benches = asyncio.run(
         _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
     )

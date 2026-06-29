@@ -343,8 +343,10 @@ class WarpTile:
     Each warp owns a ``reg`` (``FM × FN``) block of ``atom`` cells; the CTA runs ``WM × WN``
     warps. So the per-CTA output tile is ``tile_m × tile_n`` (:attr:`tile_m` / :attr:`tile_n`)
     and the CTA launches :attr:`block_threads` ``= WM·WN·32`` threads. ``bk`` chunks the K
-    (contraction) axis ``bk`` atom-cells per inner mma step. Spelled by the ``WARP`` codec
-    ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>`` (decided in ``020_schedule``)."""
+    (contraction) axis ``bk`` atom-cells per inner mma step. Spelled by the warp form of the
+    unified ``TILE`` knob — ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>`` (an ``a:<atom>`` token
+    selects this :class:`WarpTile` over the scalar :class:`TilePlan`; see :func:`is_warp_codec`),
+    decided in ``020_schedule``."""
 
     atom: AtomKind
     warps: tuple[int, int] = (1, 1)  # (WM, WN) — warps per CTA, m then n
@@ -406,6 +408,16 @@ class WarpTile:
     def block_threads(self) -> int:
         """The per-CTA thread count = ``WM · WN · 32`` (32 lanes per warp)."""
         return self.warps[0] * self.warps[1] * 32
+
+
+def is_warp_codec(spec: str | None) -> bool:
+    """True iff a ``TILE`` codec value spells the **warp** fragment (a :class:`WarpTile`) rather
+    than the scalar :class:`TilePlan` — i.e. it carries an ``a:<atom>`` token naming a tensor-core
+    atom. This is the single discriminator for the unified output-fragment knob: a contraction's
+    output tile is *either* the scalar register sub-tile (``n../f..``) *or* the warp mma tile
+    (``a:.../w../f../k..``), never both, and the value self-describes which. Empty / ``None`` (the
+    per-cell scalar baseline) is not warp."""
+    return bool(spec) and any(t.strip().startswith("a:") for t in spec.split("/"))
 
 
 #: The codec transport token (``cp``) vs the canonical stored value (``cp.async``).

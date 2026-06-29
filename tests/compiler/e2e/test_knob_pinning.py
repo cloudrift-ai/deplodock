@@ -1,18 +1,17 @@
 """CUDA accuracy regression for specific planner knob tuples.
 
 Where ``test_tune_accuracy`` lets the search wander and checks the
-*picked* variant, this file pins each (BN, BM, FM, FN, BK, SPLITK, BR)
-to a configuration that previously emitted a wrong-output kernel and
-confirms the lowered kernel matches the numpy-backend reference within
-fp32 tolerance.
+*picked* variant, this file pins each output-fragment / reduce / stage
+codec (the ``TILE`` / ``REDUCE`` / ``STAGE`` knobs) to a configuration
+that previously emitted a wrong-output kernel and confirms the lowered
+kernel matches the numpy-backend reference within fp32 tolerance.
 
 Knob pinning rides on the existing ``DEPLODOCK_KNOBS="K1=V1,..."``
 env-var mechanism (see ``deplodock/compiler/pipeline/knob.py`` —
 ``apply_knobs_env`` splats the aggregate into per-knob
-``DEPLODOCK_<K>=V`` vars at import time, and ``Knob.narrow`` intersects
-the planner's candidate lists with the pinned values inside
-``010_partition_loops._enumerate_cartesian`` so only matching
-``TileParams`` are enumerated).
+``DEPLODOCK_<K>=V`` vars at import time, and ``Knob.narrow`` overrides
+the schedule's candidate codecs with the pinned value in
+``lowering/tile/020_schedule`` so only the matching variant is built).
 
 The shared failure mode is the "single-CTA + F-replicated" codegen
 class: ``BN·FN = full_N AND BM·FM = full_M`` with ``FM·FN > 1`` (so
@@ -116,15 +115,14 @@ def _assert_match(forced: np.ndarray, ref: np.ndarray) -> None:
 # matrix in ``test_matmul_tile_coverage`` (static AND dynamic, accuracy + lowering structure).
 
 
-# The #244 dynamic-tune wedge: a scalar (``MMA=0``) cooperative norm-reduce whose
-# fp16 per-slot box is a single ``BK=32`` axis = 64 B — not a 128 B multiple, so
-# under ``RING=2`` the second TMA ring slot lands at a 64 B offset. The 128 B slot
-# check sized off the fp32 ``BYTES_PER_ELEM`` constant let the fp16 64 B slab
-# through, the materializer left it unpadded, and ``cp.async.bulk.tensor`` faulted
-# with ``CUDA_ERROR_MISALIGNED_ADDRESS`` → 1 s watchdog hang → bench_fail. The
-# dtype-aware gate now declines TMA for this slab (→ cp.async). ``MMA=0`` forces
-# the scalar tier; ``RING=2`` double-buffers so the slot offset matters.
-_NORM_REDUCE_WEDGE_KNOBS = {"BM": 1, "BN": 128, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1, "MMA": 0, "RING": 2}
+# The #244 dynamic-tune wedge: a scalar (no-atom) cooperative norm-reduce whose fp16 per-slot box
+# is 64 B — not a 128 B multiple, so under a depth-2 staging ring the second slot lands at a 64 B
+# offset. The 128 B slot check sized off the fp32 ``BYTES_PER_ELEM`` constant let the fp16 64 B slab
+# through, the materializer left it unpadded, and ``cp.async.bulk.tensor`` faulted with
+# ``CUDA_ERROR_MISALIGNED_ADDRESS`` → 1 s watchdog hang → bench_fail. The dtype-aware gate now
+# declines TMA for this slab (→ cp.async). The scalar ``TILE`` (no ``a:`` atom) forces the scalar
+# tier; the depth-2 ``STAGE`` ring double-buffers so the slot offset matters.
+_NORM_REDUCE_WEDGE_KNOBS = {"TILE": "n128", "STAGE": "d2/cp"}
 _NORM_DIMS = {"S": 32, "H": 128, "I": 512}
 
 
@@ -192,7 +190,7 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2")  # force the warp (mma) tier
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=F16), node_id="b")
@@ -215,9 +213,9 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
 
 # Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM). On cc>=9.0 the F16 atom is
 # eligible whenever the K-loads are F16, so at >=512^3 the greedy compile
-# *prefers* the tensor-core variant; ``DEPLODOCK_MMA=0`` is what forces the
+# *prefers* the tensor-core variant; a scalar ``TILE`` codec (no ``a:`` atom) is what forces the
 # scalar register-tile FMA path (fp16 in -> fp32 accumulate -> fp16 out). The
-# 512^3 shape is the smallest where MMA=0 is load-bearing (<=256^3 greedy picks
+# 512^3 shape is the smallest where the scalar pin is load-bearing (<=256^3 greedy picks
 # scalar on its own, so a small shape wouldn't prove the knob does anything).
 def _build_f16_matmul_graph(M: int, N: int, K: int):
     from deplodock.compiler.dtype import F16
@@ -239,19 +237,17 @@ def _build_f16_matmul_graph(M: int, N: int, K: int):
     return g, inputs, ref
 
 
-# Scalar-only knobs (no ATOM_KIND / WARP_SPECIALIZE). With DEPLODOCK_MMA unset
-# these make the greedy compile pick the (unstaged-with-TMA=0) atom variant.
-_SCALAR_F16_KNOBS = {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0, "STAGE": 11}
+# Scalar-tile knob: a scalar ``TILE`` codec (no ``a:`` atom) forces the scalar register-tile FMA
+# path — the ``n32xm8/f4xf26`` (BN=32 BM=8 FN=4 FM=26) hero tile, gmem-direct.
+_SCALAR_F16_KNOBS = {"TILE": "n32xm8/f4xf26"}
 
 
 @requires_cuda
 def test_scalar_matmul_f16(monkeypatch):
-    """fp16 matmul forced through the scalar register-tile FMA path
-    (``DEPLODOCK_MMA=0``); fp32 accumulate, verified vs the numpy backend.
-    Guards against fp16 being re-routed to the tensor-core atom path and
-    against the fp16 scalar render (``__half2float`` multiply, ``__float2half``
-    store) regressing."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    """fp16 matmul forced through the scalar register-tile FMA path (a scalar ``TILE`` codec, no
+    ``a:`` atom); fp32 accumulate, verified vs the numpy backend. Guards against fp16 being
+    re-routed to the tensor-core atom path and against the fp16 scalar render (``__half2float``
+    multiply, ``__float2half`` store) regressing."""
     g, inputs, ref = _build_f16_matmul_graph(512, 512, 512)
     forced = _run_with_knobs(g, inputs, "c", _SCALAR_F16_KNOBS, monkeypatch)
     peak = float(np.max(np.abs(ref.astype(np.float32))))
@@ -276,7 +272,7 @@ def test_article_tma_sgemm_reproduction(monkeypatch):
     from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+    for k, v in {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
     bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
@@ -301,7 +297,7 @@ def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
     from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
+    for k, v in {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
     src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
@@ -327,17 +323,11 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
-    # Pin only the WARP-tier geometry (the over-ceiling register tile + atom-K chunk)
-    # and leave STAGE unpinned — an explicit STAGE pin is authoritative (no budget
-    # filter), but here we want the budget-aware filter to decline the over-budget
-    # staging so the operands fall to the gmem-direct path. Scalar-tier knobs (BN/BM)
-    # are deliberately NOT pinned: they are foreign to the warp tier and the strict
-    # knob-pin validator (``_validate``) rejects them alongside a ``MMA=<kind>`` pin.
-    for k, v in {"FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
-    # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
-    # tier), so greedy MUST take the atom variant.
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    # Pin the WARP-tier geometry via a warp ``TILE`` codec (the over-ceiling ``f26xf4`` register
+    # tile + atom-K chunk) and leave STAGE unpinned — an explicit STAGE pin is authoritative (no
+    # budget filter), but here we want the budget-aware filter to decline the over-budget staging so
+    # the operands fall to the gmem-direct path. The ``a:<atom>`` token forces the warp (mma) tier.
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f26xf4/k2")
     compiled = CudaBackend().compile(g)  # no longer raises
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
     assert "dpl_mma_load_a_gmem" in src and "dpl_mma_load_b_gmem" in src, "unstaged operands not loaded gmem-direct"
@@ -348,10 +338,10 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
 def test_unstaged_atom_mma_accuracy(monkeypatch):
     """The gmem-direct mma fragment load must produce CORRECT results — a wrong
     lane→element map silently corrupts the matmul. Force an unstaged tensor-core
-    matmul (a full warp pin + ``STAGE=00`` stages nothing) and verify it matches
+    matmul (a warp ``TILE`` pin, STAGE unpinned ⇒ gmem-direct) and verify it matches
     the numpy reference. Guards the m16n8k16 fragment layout in the gmem helpers."""
     g, inputs, ref = _build_f16_matmul_graph(128, 128, 128)
-    knobs = {"MMA": "mma_m16n8k16_f16", "WN": 2, "WM": 2, "FM": 2, "FN": 2, "BK": 2, "SPLITK": 1, "STAGE": "00"}
+    knobs = {"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k1"}
     forced = _run_with_knobs(g, inputs, "c", knobs, monkeypatch)
     _assert_match(forced.astype(np.float32), ref.astype(np.float32))
 
@@ -418,33 +408,33 @@ def _build_2d_matmul_graph(dims: dict):
 # passes were removed in the block-DAG rewrite) were dropped here.
 _SMALL_DIMS = {"M": 512, "K": 512, "N": 512}
 _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
-    # BM=8 outside _TUNE_AXIS_CHOICES — the pin must be honored authoritatively.
-    ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # FM=26 non-divisor of M/BM → a 208-row masked-M tile (ceil-div grid + per-row
+    # A scalar TILE pin (n32xm8 = BN=32 BM=8) the planner must honor authoritatively.
+    ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"TILE": "n32xm8"}, {}),
+    # reg_m=26 (FM) non-divisor of M → a 208-row masked-M tile (ceil-div grid + per-row
     # boundary Cond on the Write).
-    ("fm26_masked_m", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 1, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # FN=4 multi-axis composite cache on N (BN_thread × FN_register on one source dim) —
+    ("fm26_masked_m", _ARTICLE_DIMS, {"TILE": "n32xm8/f1xf26"}, {}),
+    # reg_n=4 (FN) multi-axis composite cache on N (BN_thread × FN_register on one source dim) —
     # the composite stride must round-trip through smem stage → revert-to-gmem.
-    ("multi_axis_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 1, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # Multi-axis composite on BOTH axes: FM=4 and FN=4 (the FM×FN > 1 register tile).
-    ("multi_axis_fm4_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    ("multi_axis_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4"}, {}),
+    # Multi-axis composite on BOTH axes: reg_m=4 and reg_n=4 (the FM×FN > 1 register tile).
+    ("multi_axis_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf4"}, {}),
     # kernel/095_interleave_loads opt-out (flat-LDS layout) must still be correct.
     (
         "interleave_loads_disabled",
         _ARTICLE_DIMS,
-        {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1},
+        {"TILE": "n32xm8/f4xf4"},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
-    # The blogs' hero register tile: BM=8 BN=32 FM=26 FN=4 BK=32 → a 208×128 masked-M
-    # tile (TM=26 ≈ 106 % of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
-    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
-    # Symmetric masked-N: FN=26 FM=4 on 512³ → a 320-col overhang (boundary Cond on N).
-    ("fn26_masked_n", _SMALL_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 26, "BK": 32, "SPLITK": 1, "BR": 1}, {}),
+    # The blogs' hero register tile: n32xm8/f4xf26 → a 208×128 masked-M tile (reg_m=26 ≈ 106 %
+    # of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
+    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf26"}, {}),
+    # Symmetric masked-N: reg_n=26 reg_m=4 on 512³ → a 320-col overhang (boundary Cond on N).
+    ("fn26_masked_n", _SMALL_DIMS, {"TILE": "n32xm8/f26xf4"}, {}),
     # Scalar-tile TMA: the staged operands ride the cp.async.bulk.tensor ring (unswizzled
-    # deposit, plain-Load consumer). A clean (FM=4 FN=4) tile and the masked-M hero tile
-    # (FM=26 FN=4 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
-    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
-    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1, "TMA": 1}, {}),
+    # deposit, plain-Load consumer). A clean (f4xf4) tile and the masked-M hero tile
+    # (f4xf26 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
+    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf4", "STAGE": "d2/tma"}, {}),
+    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}, {}),
 )
 
 

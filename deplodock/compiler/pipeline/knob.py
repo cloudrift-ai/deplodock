@@ -84,55 +84,22 @@ class _Unset:
 
 _UNSET = _Unset()
 
-# --- MMA tier decode -------------------------------------------------------
-# The ``MMA`` knob (declared in ``lowering/tile/_enumeration.py``) selects the
-# tensor-core "warp" tier: a falsy / empty value is scalar-only, an atom-kind
-# name (e.g. ``mma_m16n8k16_f16``) is the warp tier, ``1``/``true`` is the
-# pre-enumeration auto control. These live here (not with the knob) so every
-# layer — the tile passes, the ``ir/tile/ir.py`` scorer, and ``_tile_features``
-# below — shares ONE tier test without importing the pipeline (knob.py has no
-# pipeline deps). ``_enumeration.mma_mode`` delegates to :func:`mma_decode`.
-_MMA_FALSY = frozenset({"0", "false", "no", "off"})
-_MMA_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-
-def mma_decode(raw: str | None) -> tuple[bool, str | None]:
-    """Decode a raw ``MMA`` value into ``(enabled, pinned_kind)``.
-
-    Unset / empty / truthy → ``(True, None)`` (auto-enumerate); falsy →
-    ``(False, None)`` (scalar-only); any other string is an atom-kind name →
-    ``(True, name)``."""
-    if raw is None:
-        return True, None
-    s = raw.strip()
-    if not s or s.lower() in _MMA_TRUTHY:
-        return True, None
-    if s.lower() in _MMA_FALSY:
-        return False, None
-    return True, s
-
-
 def mma_atom(knobs: dict) -> str | None:
-    """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None``
-    for the scalar tier (no atom / the ``"scalar"`` decision / the pre-enumeration
-    auto control — none of which name an atom).
+    """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None`` for the scalar
+    tier (no warp fragment).
 
-    Native schema: scan the per-cell ``ATOM@<cell>`` keys and return the first that
-    names a real atom kind (``"scalar"`` is the scalar decision, not a kind). A
-    legacy ``MMA`` key (golden YAML / pre-migration DB row) is honored as a fallback
-    — the one legacy spelling read here, an ingest convenience, not impl vocabulary."""
-    for k, v in knobs.items():
-        if k.startswith("ATOM@"):
-            s = str(v).strip()
-            if s and s.lower() != "scalar":
-                return s
-    v = knobs.get("MMA")  # legacy ingest fallback
-    if v is None:
+    The atom is named by the warp form of the unified ``TILE`` codec (``a:<atom>/…``): a ``TILE``
+    value carrying an ``a:<atom>`` token is the warp fragment, and its parsed :class:`WarpTile`
+    names the atom. A scalar ``TILE`` (``n../f..`` or empty) names no atom → ``None``."""
+    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+
+    spec = knobs.get("TILE")
+    if not is_warp_codec(spec):
         return None
-    s = str(v).strip()
-    if not s or s.lower() in _MMA_FALSY or s.lower() in _MMA_TRUTHY:
+    try:
+        return WarpTile.parse(spec).atom.name
+    except ValueError:
         return None
-    return s
 
 
 def is_warp(knobs: dict) -> bool:
@@ -436,17 +403,17 @@ apply_knobs_env()
 # Canonical display order for tuning knobs. The native ``MOVE@element`` families lead —
 # ``SPLIT@`` (free-axis tiles), then ``REDUCE@`` (contraction tower), then ``ATOM@``
 # (atomize), then ``PLACE@`` (placement) — each family's keys sorted by element; the
-# legacy exact-name knobs (``STAGE``/``TMA``/``CUT``/… still un-folded, plus any legacy
-# golden/DB row) follow in the historical order, unknown knobs last (alpha). Shared by the
-# ``run --bench`` kernel table and the ``deplodock eval`` tables so columns read stably.
+# unified-codec exact-name knobs (the output-fragment ``TILE``, the ``REDUCE`` partition, the
+# ``STAGE`` pipeline) follow, unknown knobs last (alpha). Shared by the ``run --bench`` kernel
+# table and the ``deplodock eval`` tables so columns read stably.
 _FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
-KNOB_ORDER = ("TILE", "REDUCE", "BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
+KNOB_ORDER = ("TILE", "REDUCE", "STAGE")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 
 def knob_sort_key(name: str) -> tuple[int, str]:
     """Sort key: native ``MOVE@element`` families first (by :data:`_FAMILY_ORDER`, then
-    element), then the legacy names in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
+    element), then the codec knobs in :data:`KNOB_ORDER`, unknown knobs last (alpha)."""
     for i, prefix in enumerate(_FAMILY_ORDER):
         if name.startswith(prefix):
             return (i, name[len(prefix) :])
@@ -469,31 +436,16 @@ def format_tuning_knobs(knobs: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in items) if items else "-"
 
 
-# Tier-foreign knobs hidden from the tuning *display* (not the feature vector,
-# the DB row, or the repro env): a scalar kernel shouldn't show the warp knobs
-# (their OFF sentinels ``WM=0 WN=0 MMA=0``) and a warp kernel shouldn't show the
-# scalar thread-tile knobs (``BM=0 BN=0 BR=0 FK=0``) — those carry OFF values so
-# the learned prior sees them, but rendering them is pure noise in the bench /
-# eval tables. Kept here as plain name sets (knob.py has no pipeline deps); the
-# tier is picked value-based via :func:`is_warp`.
-_WARP_TIER_KNOBS = frozenset({"WM", "WN", "MMA"})
-# The scalar tier's free-axis tile is the ``TILE`` codec (the legacy ``BM``/``BN``/``BR``/``FK``
-# names are kept for back-compat with old golden/DB rows).
-_SCALAR_TIER_KNOBS = frozenset({"TILE", "BM", "BN", "BR", "FK"})
-
-
 def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
     """The filtered, canonically-ordered ``(name, str(value))`` tuning knobs —
     the same view :func:`format_tuning_knobs` renders, but as items so callers can
     build aligned columns. ``STRUCT_PREFIX`` / ``CTX_PREFIX`` features and marker
-    booleans are dropped, as are the tier-foreign OFF knobs (warp knobs on a
-    scalar kernel and vice-versa); the rest is sorted by :func:`knob_sort_key`."""
-    foreign = _SCALAR_TIER_KNOBS if is_warp(knobs) else _WARP_TIER_KNOBS
+    booleans are dropped; the rest is sorted by :func:`knob_sort_key`. The unified
+    ``TILE`` output-fragment knob is one column for both the scalar and warp tiers
+    (the value self-describes), so there are no tier-foreign OFF knobs to hide."""
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
         if k.startswith(STRUCT_PREFIX) or k.startswith(CTX_PREFIX):
-            continue
-        if k in foreign:
             continue
         knob = get(k)
         if knob is not None and knob.type is KnobType.BOOL:
@@ -597,26 +549,26 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_width"] = float(len(s))
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
         # STR knobs with no custom featurizer: no generic numeric encoding.
-    # Atom (tensor-core cell) features. The legacy ``MMA`` key already routed through
-    # its ``features`` callable in the loop above; the native schema names the atom on
-    # ``ATOM@<cell>`` instead (no ``MMA`` key), so derive the same ``MMA_*`` features
-    # from the native key here. Idempotent for a legacy row (same values).
-    atom = mma_atom(knobs)
-    if atom is not None:
-        mk = get("MMA")
-        if mk is not None and mk.features is not None:
-            feats.update(mk.features(atom))
-    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no atom-kind knob present
+    # Atom (tensor-core cell) features. The warp fragment names its atom on the ``TILE`` codec
+    # (``a:<atom>``); expand its physical cell / dtype properties into the ``MMA_*`` family the
+    # priors rank on. A scalar ``TILE`` names no atom → only the ``MMA_tier=0`` default below.
+    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+
+    tile_spec = knobs.get("TILE")
+    if is_warp_codec(tile_spec):
+        try:
+            feats.update(_atom_features(WarpTile.parse(tile_spec).atom))
+        except ValueError:
+            pass
+    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no warp atom
     feats.update(_tile_features(knobs))
-    # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread
-    # tile (``BN·BM``) and skips warp rows, so compute the SAME ``D_*`` family
-    # from the warp tile geometry instead — using the atom cell dims the MMA
-    # featurizer already put in ``feats`` (``MMA_atom_m`` / ``_n``), since knob.py
-    # can't import ``ATOM_REGISTRY``. Shared ``D_*`` names across tiers let the
-    # prior learn occupancy / CTA-count uniformly (the signal that picks the
+    # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread tile (``BN·BM``)
+    # and skips warp rows, so compute the SAME ``D_*`` family from the warp tile geometry instead —
+    # using the atom cell dims read off the parsed warp ``TILE`` codec. Shared ``D_*`` names across
+    # tiers let the prior learn occupancy / CTA-count uniformly (the signal that picks the
     # skewed-vs-square warp tile per shape — the fp16 mis-pick).
     if is_warp(knobs):
-        feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
+        feats.update(_warp_tile_features(knobs))
     feats.update(_stage_features(knobs))  # operand-staging pipeline (STAGE codec); {} when gmem-direct
     if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
         feats.update(_cut_features(knobs))
@@ -626,32 +578,25 @@ def knob_features(knobs: dict) -> dict[str, float]:
 def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes.
 
-    The **scalar** tier sources its free split from the ``TILE`` codec
-    (``n<N>[xm<M>]/f<fn>[xf<fm>]`` — the schedule's free-axis output-tile knob); the **warp**
-    tier keeps its ``WN``/``FN`` + ``WM``/``FM`` names (not yet rebuilt onto a codec). The two
-    axes are canonicalized by ``par`` (the wider parallel binding is the ``n`` / coalesced
-    slot, the narrower the ``m`` slot). A single free axis fills the ``n`` slot with a
-    degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no complete free split is present
-    (a non-tiled kernel)."""
+    Both fragments source the free split from the single ``TILE`` codec: the **scalar** fragment
+    from ``n<N>[xm<M>]/f<fn>[xf<fm>]`` (the wider parallel binding is the ``n`` / coalesced slot,
+    the narrower the ``m`` slot), the **warp** fragment from ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>``
+    (the ``(WN, FN)`` / ``(WM, FM)`` warp + register sub-tiles). A single free axis fills the ``n``
+    slot with a degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` for a non-tiled scalar kernel
+    (per-cell ``TILE``)."""
+    from deplodock.compiler.ir.tile.schedule import TilePlan, WarpTile, is_warp_codec  # noqa: PLC0415
 
-    def _nz(name: str) -> int:
-        try:
-            return int(knobs.get(name, 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
+    spec = knobs.get("TILE")
     pairs: list[tuple[int, int]] = []
-    if _nz("WN") > 0 or _nz("WM") > 0:  # warp tier — legacy W*/F* names
-        for par_key, reg_key in (("WN", "FN"), ("WM", "FM")):
-            if par_key in knobs and reg_key in knobs:
-                try:
-                    pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
-                except (TypeError, ValueError):
-                    return None
-    else:  # scalar tier — the TILE codec
-        from deplodock.compiler.ir.tile.schedule import TilePlan  # noqa: PLC0415
-
-        plan = TilePlan.parse(knobs.get("TILE"))
+    if is_warp_codec(spec):  # warp fragment — the a:<atom>/w../f.. codec
+        try:
+            wt = WarpTile.parse(spec)
+        except ValueError:
+            return None
+        (wm, wn), (fm, fn) = wt.warps, wt.reg
+        pairs = [(wn, fn), (wm, fm)]
+    else:  # scalar fragment — the n../f.. codec
+        plan = TilePlan.parse(spec)
         if not plan.is_tiled:
             return None
         pairs = [(plan.par_n, plan.reg_n), (plan.par_m, plan.reg_m)]
@@ -880,18 +825,23 @@ def _tile_features(knobs: dict) -> dict[str, float]:
     )
 
 
-def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None) -> dict[str, float]:
+def _warp_tile_features(knobs: dict) -> dict[str, float]:
     """Warp-tier (tensor-core MMA) tile ``D_*`` features — the warp analogue of
     :func:`_tile_features`. The CTA runs ``WM·WN`` warps (``·32`` lanes) over a
-    ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the
-    MMA cell dims the featurizer already derived. Empty if the warp knobs or atom
-    dims are missing (so a malformed row degrades gracefully)."""
-    slots = _free_slots(knobs)
-    if slots is None:
+    ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the MMA cell dims read
+    from the parsed warp ``TILE`` codec's atom. Empty if the ``TILE`` value isn't a warp codec or
+    doesn't parse (so a malformed row degrades gracefully)."""
+    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+
+    spec = knobs.get("TILE")
+    if not is_warp_codec(spec):
         return {}
     try:
-        am, an = int(atom_m), int(atom_n)
-    except (TypeError, ValueError):
+        am, an = WarpTile.parse(spec).atom.atom_m, WarpTile.parse(spec).atom.atom_n
+    except ValueError:
+        return {}
+    slots = _free_slots(knobs)
+    if slots is None:
         return {}
     wn, fn, wm, fm = slots  # (WN, FN, WM, FM) — warp counts in the par slots
     if wm <= 0 or wn <= 0:
@@ -912,6 +862,21 @@ def _warp_tile_features(knobs: dict, atom_m: float | None, atom_n: float | None)
         sm=float(knobs.get("H_sm_count") or 170.0),
         warp=True,
     )
+
+
+def _atom_features(atom) -> dict[str, float]:
+    """Physical-property expansion of a tensor-core :class:`AtomKind` (the warp ``TILE`` codec's
+    ``a:<atom>``) into the ``MMA_*`` feature family the priors rank on: the tier flag, the cell
+    ``(m, n, k)`` dims, and the multiplicand / accumulator bit-widths."""
+    m, n, k = atom.shape
+    return {
+        "MMA_tier": 1.0,
+        "MMA_atom_m": float(m),
+        "MMA_atom_n": float(n),
+        "MMA_atom_k": float(k),
+        "MMA_a_bits": float(atom.operand_dtype("a").nbytes * 8),
+        "MMA_acc_bits": float(atom.operand_dtype("c").nbytes * 8),
+    }
 
 
 def _as_bool(v: object) -> bool:
