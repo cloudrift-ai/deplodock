@@ -19,7 +19,7 @@ the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition ch
 - **Warp / tensor-core tier** (`_warp`, a `SemiringKernel` carrying a `WarpTile`) — `WM·WN` warps over a
   `tile_m × tile_n` block of `mma_m16n8k16` atom cells; gmem-direct `LdmatrixLoad` + `MmaSyncPtx`, then a `RegStore`
   (fused projection epilogue + masked-tile guards). `_warp` here is **thin** — it does only the op-tree-dependent part
-  (capture the m/n/k axes, read the `040_atomize` binding, resolve the projection epilogue) and emits a single
+  (capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve the projection epilogue) and emits a single
   high-level `MmaContraction` node. The **exact atom factorization** is a separate pass — see `015_factorize` below.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the

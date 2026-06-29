@@ -420,20 +420,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
         # per-fold uniquify needed.
         reg_fold.append(carrier.as_state_merge(other))
 
-    # The cooperative-combine binding 040_atomize resolved (the MonoidAtom dtype + the derived
-    # fold sequence); falls back to emit_combine's own derivation if absent (byte-identical).
-    rbind = getattr(kernel.schedule, "bind", None)
-    combine = (
-        emit_combine(
-            carrier,
-            t=lane.name,
-            n_threads=coop,
-            atom=rbind.atom if rbind is not None else None,
-            folds=rbind.folds() if rbind is not None else None,
-        )
-        if lane is not None
-        else []
-    )
+    combine = emit_combine(carrier, t=lane.name, n_threads=coop) if lane is not None else []
 
     # Post-reduce projection. A full-row output (softmax / RMSNorm) distributes its sweep
     # across the coop lanes; a scalar output is written once, guarded to lane 0. With no
@@ -465,7 +452,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 
 def _warp(tile: TileOp, root: Node) -> KernelOp:
     """Emit the high-level :class:`MmaContraction` for a tensor-core contraction. Does the
-    op-tree-dependent part only — capture the m/n/k axes, read the ``040_atomize`` binding, and
+    op-tree-dependent part only — capture the m/n/k axes, read the ``020_schedule`` binding, and
     resolve the projection epilogue (``_with_store`` needs the op's ``out`` + grid). The exact
     atom factorization (the four-way split, operand staging, fragments, mma, store) is expanded
     from the node by ``015_factorize`` (:func:`_warp_factor.factorize_mma`)."""
@@ -477,7 +464,7 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
     m_axis, n_axis = grid[-2], grid[-1]
     k_axis = node.reduce_node.reduce_axis
     bind = kernel.schedule.bind
-    assert bind is not None, "warp tier: 040_atomize did not stamp a binding"
+    assert bind is not None, "warp tier: 020_schedule did not stamp a binding"
     # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized
     # store of the accumulator (``_with_store`` needs ``node.out`` / the grid, so it stays here).
     tail = list(bind.epilogue)

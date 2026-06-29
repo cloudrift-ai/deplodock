@@ -40,9 +40,11 @@ How to comply:
 ## Resolve the hardware-atom binding once, structurally, at the tile level
 
 The same invariant applies *across* the tile→kernel boundary: the kernel materializer must not re-recognize structure
-the tile IR already holds. `lowering/tile/040_atomize` resolves the algebra→hardware-atom binding once — dispatching on
-kernel **kind** (the typed `*Kernel` seam) — and stamps it on the *schedule* (never the op tree, so `op_cache_key`, which
-digests `lower(op.op)`, stays byte-identical):
+the tile IR already holds. The **atomize** step (`lowering/tile/_atomize.py`, called from `020_schedule` when it builds
+the warp / cooperative option — *not* a standalone pass) resolves the algebra→hardware-atom binding once and stamps it on
+the *schedule* (never the op tree, so `op_cache_key`, which digests `lower(op.op)`, stays byte-identical). Resolving it at
+option-build time means an atom that **cannot** be bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul)
+is rejected at fork construction, alongside `_check_warp_static_k`, instead of failing several passes later:
 
 - a warp `SemiringKernel` → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to roles by which output
   grid axis each operand's OWN leaf `Load` index carries (structural — not a flattened-loop scan), plus `b_trans`, the

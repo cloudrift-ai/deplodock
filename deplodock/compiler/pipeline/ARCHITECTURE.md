@@ -122,9 +122,10 @@ and bumps `Run._dropped_candidates` — without this, one search-only un-lowerab
 
 `lowering/tile/` lowers each fused `LoopOp` to a kernel-ready `TileOp` over the block-DAG Tile IR (`ir/tile/ir.py`):
 `010_recognize` (lift `LoopOp` → `TileOp`, recognize flash / softmax carriers, normalize to `Monoid`s) → `020_schedule`
-(map free axes to the grid, pick the reduce partition + output `TILE` fragment) → `030_split` (cross-CTA split-K as a
-graph rewrite) → `040_atomize` (resolve the algebra→hardware-atom binding structurally onto the schedule — see
-[`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)). It **never dispatches on a named shape** — every decision is gated on the reduce axes' carrier algebra read
+(map free axes to the grid, pick the reduce partition + output `TILE` fragment, and **atomize** — resolve the
+algebra→hardware-atom binding structurally onto the schedule as each warp / cooperative option is built, so an unbindable
+atom is rejected at fork construction; `_atomize.py`, see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)) → `030_split`
+(cross-CTA split-K as a graph rewrite). It **never dispatches on a named shape** — every decision is gated on the reduce axes' carrier algebra read
 off the body (`MAP` / `SEMIRING` / `MONOID`; flash attention is the `MONOID` algebra on the streaming schedule, a twisted
 monoid is a monoid, selected structurally), not on a matmul / pointwise / attention archetype. The full design lives in
 [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md). Two interactions reach up to the pipeline level:
@@ -452,7 +453,7 @@ algebraic moveset are also documented there.
 | `loop/fusion/`            | `split_shared_indexmap` (first) fuses a fan-out pure-indexmap `LoopOp` into all its consumers in one rewrite; `merge_loop_ops` then splices adjacent single-consumer `LoopOp` pairs; `dedup_loads` drops identical `(input, index)` Loads. Folding scalar-constant broadcasts into consumers cuts Qwen3-Embedding-0.6B from 394 → 337 kernels. |
 | `loop/recognize/`         | Pattern recognizers run AFTER the `loop/fusion` fixpoint settles (not interleaved). `recognize_flash` folds a softmax-then-P@V SDPA into one streaming flash `LoopOp` (the `FLASH` knob); `020_recognize_online_softmax` is the standalone-softmax sibling. |
 | `loop/stamp/`             | `stamp_loop_names` (`provenance.name_for`, e.g. `k_rms_norm_3f2a1b`) + `stamp_structural_features` (the `S_*` dict). Runs last in the loop dialect — after fusion and recognition — so every kernel is named / stamped against its final body. |
-| `lowering/tile/`          | `LoopOp → TileOp` over the block-DAG Tile IR: `010_recognize` → `020_schedule` → `030_split` → `040_atomize` (resolve the algebra→atom binding onto the schedule). Dispatch is on the carrier algebra (`MAP` / `SEMIRING` / `MONOID`), never a named shape. |
+| `lowering/tile/`          | `LoopOp → TileOp` over the block-DAG Tile IR: `010_recognize` → `020_schedule` (maps the grid, picks the reduce/output fragment, and **atomizes** — resolves the algebra→atom binding onto the schedule via `_atomize.py` when each option is built, rejecting an unbindable atom at fork construction) → `030_split`. Dispatch is on the carrier algebra (`MAP` / `SEMIRING` / `MONOID`), never a named shape. |
 | `lowering/kernel/`        | `010_materialize` is a thin `TileOp → KernelOp` tier dispatcher (scalar / `_reduce` / `_reg_tile` / `_warp`); the warp tier emits a high-level `MmaContraction` that `015_factorize` expands into the tensor-core `mma.sync` fragment soup (`_warp_factor.factorize_mma`). Then the Kernel-IR peepholes: `030_stamp_types` (+ `040_demote_to_write_dtype`) resolve dtypes, `050_vectorize_loads` / `080_vectorize_stores` / `095_interleave_loads` pack/reorder memory ops, `110_drop_redundant_syncs`. See [`passes/lowering/kernel/ARCHITECTURE.md`](passes/lowering/kernel/ARCHITECTURE.md). |
 | `lowering/cuda/`          | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (`ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 

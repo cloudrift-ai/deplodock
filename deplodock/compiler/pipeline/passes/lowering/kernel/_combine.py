@@ -29,14 +29,9 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import Fold, Level, ReduceStage
 
 
-def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmented: bool = False, atom=None, folds=None) -> list[Stmt]:
+def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmented: bool = False) -> list[Stmt]:
     """Build the cross-thread combine of a cooperative reduce ``carrier`` (a ``Monoid``)
     over ``n_threads`` cooperating threads, reassigning the carried state in place.
-
-    ``atom`` (a :class:`~deplodock.compiler.ir.tile.atom.MonoidAtom`) and ``folds`` (the
-    :meth:`ReduceStage.combine` sequence) come from the schedule's :class:`ReduceBinding` when
-    ``040_atomize`` resolved one; both default to the carrier-/width-derived values (identical
-    by construction), so a direct call without a binding behaves exactly as before.
 
     The mechanism per level is derived by :meth:`ReduceStage.combine`:
 
@@ -55,10 +50,8 @@ def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmen
     state = carrier.state.names
     state_b = carrier.state_b
     prog = carrier.combine_states
-    # dtype + fold mechanism: from the atomize binding when present, else derived (identical).
-    dtype = atom.dtype if atom is not None else (next((a.dtype for a in prog if a.dtype is not None), None) or F32)
-    if folds is None:
-        folds = ReduceStage(Level.BLOCK, n_threads).combine(warp_size=warp_size, segmented=segmented)
+    dtype = next((a.dtype for a in prog if a.dtype is not None), None) or F32
+    folds = ReduceStage(Level.BLOCK, n_threads).combine(warp_size=warp_size, segmented=segmented)
 
     from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
 

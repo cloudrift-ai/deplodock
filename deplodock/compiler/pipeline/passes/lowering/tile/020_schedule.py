@@ -37,6 +37,7 @@ from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, Semi
 from deplodock.compiler.ir.tile.schedule import Stage, WarpTile, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -253,7 +254,10 @@ def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: s
     wt = WarpTile.parse(spec)
     _check_warp_static_k(kernel, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
-    sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage)
+    # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
+    # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
+    bind = semiring_binding(kernel.op, place.grid)
+    sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage, bind=bind)
     stamped = {**knobs, TILE.name: spec}
     if stage_spec:
         stamped[STAGE.name] = stage_spec
