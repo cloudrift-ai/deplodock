@@ -16,11 +16,13 @@ the algebra lives in one place:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
+from deplodock.compiler.ir.stmt.carrier import Channel, exp_combine_states, exp_merge
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load
 
 
@@ -176,7 +178,14 @@ class Twist:
       ``Accum`` form).
     """
 
-    merge: tuple[Stmt, ...]
+    # SPEC mode (``family`` set): the combine programs are DERIVED on demand by ``Monoid`` from
+    # ``(family, channels, state)`` — the stored program fields stay empty. BOUND mode
+    # (``family is None``): the programs are stored here verbatim (a one-shot ``as_state_merge``
+    # finalize, or a legacy hand-authored carrier). A ``Monoid`` reads ``monoid.merge`` /
+    # ``.combine_states`` / ``.state_b`` (which pick the mode), never these fields directly.
+    family: str | None = None
+    channels: tuple[Channel, ...] = ()
+    merge: tuple[Stmt, ...] = ()
     combine_states: tuple[Assign, ...] = ()
     state_b: tuple[str, ...] = ()
 
@@ -281,17 +290,46 @@ class Monoid(Stmt):
         """This carrier IS the reduction (identity for the projection-peeling query)."""
         return self
 
+    @property
+    def state_b(self) -> tuple[str, ...]:
+        """The second-operand state names for the cross-partition combine. Derived from the
+        carrier ``State`` in spec mode (``"<n>__o"``); the stored value in bound mode."""
+        tw = self.twist
+        return self.state.other if tw.family is not None else tw.state_b
+
+    @cached_property
+    def merge(self) -> tuple[Stmt, ...]:
+        """The streaming single-element fold program. Generated from the channel spec in spec
+        mode (``family`` set), the stored program in bound mode. Cached on the instance —
+        ``Monoid`` is frozen with a ``__dict__`` (never give it ``slots=True``)."""
+        tw = self.twist
+        if tw.family == "exp":
+            return exp_merge(self.state.names, tw.channels, key=self.state.names[0])
+        return tw.merge
+
+    @cached_property
+    def combine_states(self) -> tuple[Assign, ...]:
+        """The cross-partition state⊕state fold program. Generated in spec mode (temps keyed on
+        ``state_b[0]`` so distinct REG-tier folds never collide), the stored program in bound
+        mode."""
+        tw = self.twist
+        if tw.family == "exp":
+            return exp_combine_states(self.state.names, self.state_b, key=self.state_b[0])
+        return tw.combine_states
+
     def partial_names(self) -> tuple[str, ...]:
-        """The bound name of each partial the merge folds in — the twist's ``merge``
-        external reads (args that are neither carried state nor merge-internal temps), in
-        first-use order. Derived from the merge (its source of truth), so it holds whether
-        ``partial`` carries op-tree source nodes or is the empty loop-IR carrier."""
-        return _merge_reads(self.twist.merge, self.state.names)
+        """The bound name of each partial the merge folds in — the merge's external reads (args
+        that are neither carried state nor merge-internal temps), in first-use order. Derived
+        from the merge (its source of truth), so it holds whether ``partial`` carries op-tree
+        source nodes or is the empty loop-IR carrier."""
+        return _merge_reads(self.merge, self.state.names)
 
     def __post_init__(self) -> None:
         # Complete the twist's cross-partition surface against this monoid's state.
         # ``object.__setattr__`` — the dataclass is frozen.
         tw = self.twist
+        if tw.family is not None:
+            return  # spec mode: merge / combine_states / state_b are derived, nothing to complete
         # Default the second-operand state names ("<s>__o", i.e. ``state.other``) so a
         # twist built with only ``merge`` still has a complete cross-partition surface.
         state_b = tw.state_b or self.state.other
@@ -315,7 +353,7 @@ class Monoid(Stmt):
         fold ``Accum``\\ s (ONE placement path — ``Loop.render`` never special-cases a carrier)
         and no ``Monoid`` stmt reaches a rendered loop body."""
         accums = self.as_accums()
-        return list(accums) if accums is not None else list(self.twist.merge)
+        return list(accums) if accums is not None else list(self.merge)
 
     def as_accums(self) -> list[Accum] | None:
         """If this is a **degenerate** carrier (the identity twist — each state
@@ -326,7 +364,7 @@ class Monoid(Stmt):
         components + rescale temps). Lets ``ir.tile.ops.lower`` emit a degenerate
         reduce as bare ``Accum``\\ s — seed derived from ``op.identity`` by
         ``Loop.render``, no explicit ``Init`` — instead of a ``Monoid`` carrier."""
-        merge = self.twist.merge
+        merge = self.merge
         names = set(self.state.names)
         if len(merge) != len(self.state.names):
             return None
@@ -347,12 +385,12 @@ class Monoid(Stmt):
         cooperative-tree / cross-CTA reduce renders the state-merge through the same
         machinery as a streaming step (``other`` is read off that merge as its partials).
         """
-        sub = dict(zip(self.twist.state_b, other, strict=True))
-        merged = tuple(_rename_assign_args(a, sub) for a in self.twist.combine_states)
+        sub = dict(zip(self.state_b, other, strict=True))
+        merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
         return Monoid(
             state=self.state,  # the State (names + identity) carries over unchanged
             partial=(),  # a loop-IR carrier — its partials (``other``) are read off ``merged``
-            twist=Twist(merge=merged, combine_states=merged, state_b=other),
+            twist=Twist(merge=merged, combine_states=merged, state_b=other),  # BOUND mode (no family)
         )
 
     def deps(self) -> tuple[str, ...]:
@@ -372,7 +410,7 @@ class Monoid(Stmt):
         state = ", ".join(self.state.names)
         partial = ", ".join(self.partial_names())
         lines = [f"{indent}({state}) <- combine({partial})"]
-        for a in self.twist.merge:
+        for a in self.merge:
             lines += a.pretty(indent + "    ")
         return lines
 
@@ -385,7 +423,7 @@ class Monoid(Stmt):
         value; every other ``Assign`` declares a local temp. The builder orders the program
         so each old-state read precedes that state's update (flash reads the old ``m`` for
         ``alpha`` before ``m = m_new``)."""
-        return render_merge_program(self.twist.merge, self.state.names, ctx)
+        return render_merge_program(self.merge, self.state.names, ctx)
 
 
 # The three algebra node kinds — the compute tree's vocabulary. A partial / operand

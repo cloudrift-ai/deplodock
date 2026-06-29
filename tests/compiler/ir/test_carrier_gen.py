@@ -9,13 +9,9 @@ from __future__ import annotations
 import pytest
 
 from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.pipeline.passes.lowering.tile import _carrier
-from deplodock.compiler.pipeline.passes.lowering.tile._carrier import (
-    UnstableCarrierError,
-    denom,
-    exp_family_twist,
-    expect,
-)
+from deplodock.compiler.ir.stmt import carrier as _carrier
+from deplodock.compiler.ir.stmt.carrier import UnstableCarrierError
+from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import online_softmax_combine
 
@@ -78,8 +74,8 @@ def _merge_is_seedable(prog: tuple, state: tuple[str, ...]) -> bool:
 
 def test_generated_flash_matches_handwritten():
     state = ("m_i", "l_i", "O_i")
-    gen = exp_family_twist("s_e", [denom(), expect("v_e")], state).twist
-    hand = flash_combine("m_i", "l_i", "O_i", "s_e", "v_e").twist
+    gen = exp_family_twist("s_e", [denom(), expect("v_e")], state)  # spec-mode Monoid
+    hand = flash_combine("m_i", "l_i", "O_i", "s_e", "v_e")  # bound-mode (hand-written) Monoid
     assert _canon(gen.merge, state) == _canon(hand.merge, state)
     assert _canon(gen.combine_states, state) == _canon(hand.combine_states, state)
     assert gen.state_b == hand.state_b
@@ -88,8 +84,8 @@ def test_generated_flash_matches_handwritten():
 
 def test_generated_online_softmax_matches_handwritten():
     state = ("m", "d")
-    gen = exp_family_twist("s", [denom()], state).twist
-    hand = online_softmax_combine("m", "d", "s").twist
+    gen = exp_family_twist("s", [denom()], state)
+    hand = online_softmax_combine("m", "d", "s")
     assert _canon(gen.merge, state) == _canon(hand.merge, state)
     assert _canon(gen.combine_states, state) == _canon(hand.combine_states, state)
     assert gen.state_b == hand.state_b
@@ -111,7 +107,7 @@ def test_certificate_rejects_unstable_combine():
 def test_every_exp_arg_is_nonpositive_by_construction():
     # The certificate runs inside the builders; if it passed, every exp is x − max(…, x, …).
     state = ("m_i", "l_i", "O_i")
-    tw = exp_family_twist("s_e", [denom(), expect("v_e")], state).twist
+    tw = exp_family_twist("s_e", [denom(), expect("v_e")], state)
     for prog in (tw.merge, tw.combine_states):
         defs = {s.name: s for s in prog if isinstance(s, Assign)}
         exps = [s for s in prog if isinstance(s, Assign) and s.op.name == "exp"]
@@ -124,8 +120,8 @@ def test_every_exp_arg_is_nonpositive_by_construction():
 def test_softmax_is_flash_minus_the_expectation_channel():
     # Structural: the (m, d) softmax combine_states is the (m, l) projection of flash's — same
     # generator, one fewer accumulator channel.
-    flash = exp_family_twist("s", [denom(), expect("v")], ("m", "l", "O")).twist
-    soft = exp_family_twist("s", [denom()], ("m", "d")).twist
+    flash = exp_family_twist("s", [denom(), expect("v")], ("m", "l", "O"))
+    soft = exp_family_twist("s", [denom()], ("m", "d"))
     # both have exactly one exp-rescale pair (a, b) in combine_states
     n_exp = lambda p: sum(isinstance(s, Assign) and s.op.name == "exp" for s in p)  # noqa: E731
     assert n_exp(soft.combine_states) == n_exp(flash.combine_states) == 2
