@@ -1,42 +1,45 @@
-"""Reduction-combine coverage — one accuracy matrix over (op type × reduction variant).
+"""Cooperative-reduce coverage — the carrier-generic monoid combine, one file.
 
-The cross-execution-unit reduction the monoid-combine work generalizes (lanes → warps →
-CTAs) is **carrier-generic**: a plain reduction (``Accum``), online softmax / its stats
-(``Accum`` max+sum), and flash attention (the ``(m, d, o)`` twisted ``Monoid``) all fold
-through the SAME combine, differing only in carrier state. This test pins each reduction
-*variant* and checks every op type stays bit-accurate vs torch, so a change to one combine
-stage (warp-shuffle / hierarchical smem) or the cross-CTA finalize (atomic ``c<cta>a`` vs
-deferred ``c<cta>k``) can't silently break a carrier it wasn't tuned on.
+The cross-execution-unit reduction the monoid-combine work generalizes (lanes → warps → CTAs)
+is **carrier-generic**: a plain reduction (``Accum``), online softmax / its stats (``Accum``
+max+sum), and flash attention (the ``(m, d, o)`` twisted ``Monoid``) all fold through the SAME
+combine, differing only in carrier state. This file pins each reduction *variant* and checks
+every op type stays accurate vs torch AND emits the matching lowering structure, so a change to
+one combine stage (warp-shuffle / hierarchical smem) or the cross-CTA finalize (atomic ``c<cta>a``
+vs deferred ``c<cta>k``) can't silently break a carrier it wasn't tuned on.
 
-- **op types** — reduction (mean / max), softmax, attention (SDPA), matmul, and the fused
-  prologue / epilogue carriers (``sumsq`` = ``sum(x·x)``, ``l2`` = ``sqrt(sum(x·x))``).
-- **reduction variants** — the cooperative combine stage (``REDUCE`` coop field ``b<n>``
-  = serial / warp-shuffle / hierarchical smem) for the reduce-carrier ops; the cross-CTA finalize
-  fold (the ``REDUCE`` GRID field ``g<n>a`` / ``g<n>k``) for the split-K matmul. All pins are the
-  ``DEPLODOCK_REDUCE`` codec — no legacy ``BR`` / ``SPLITK`` / ``NOATOMIC``.
+Sections:
+- **cooperative combine matrix** — op type × reduction variant × (static / symbolic) reduce axis.
+- **symbolic straddling sweep** — one symbolic-reduce softmax kernel run at off-hint runtime
+  sizes (the strided ``< seq_len`` bound IS the masked tail).
+- **flash carrier + cross-CTA finalize** — the twisted ``(m, l, O)`` combine, split-KV / split-K,
+  atomic vs deferred-kernel finalize, and the projection-epilogue distributivity guard.
+- **online-softmax fusion** — the two-pass → one-pass streaming recognizer (IR-unit + GPU).
+- **2D segmented coop** — a pinned ``BN>1`` × ``BR>1`` reduce, segmented shuffle per row.
 
-Pure GPU accuracy (no ``-O1`` numerics change), so it runs in the correctness lane.
+Pure GPU accuracy (no ``-O1`` numerics change), so it runs in the correctness lane. The
+fusion-recognizer IR-unit tests need no GPU and stay ungated.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
+from deplodock.compiler.dim import Dim
+from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop, Monoid
+from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse, online_softmax_combine
+from deplodock.compiler.trace.torch import trace_module
 
-def _has_cuda() -> bool:
-    try:
-        import cupy as cp
+from ..conftest import requires_cuda
 
-        return cp.cuda.runtime.getDeviceCount() > 0
-    except Exception:  # noqa: BLE001
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _has_cuda(), reason="reduction-combine accuracy runs on CUDA")
-
-
-# --- op fixtures: code → graph, plus a torch reference over the ordered inputs ---
+# --------------------------------------------------------------------------- #
+# Shared harness: code → graph → compiled kernel, plus a torch reference.
+# --------------------------------------------------------------------------- #
 
 
 def _ref_mean(xs):
@@ -48,14 +51,10 @@ def _ref_amax(xs):
 
 
 def _ref_softmax(xs):
-    import torch
-
     return torch.softmax(torch.from_numpy(xs[0]), dim=1).numpy()
 
 
 def _ref_attention(xs):
-    import torch
-
     q, k, v = (torch.from_numpy(a) for a in xs)
     return torch.nn.functional.scaled_dot_product_attention(q, k, v).numpy()
 
@@ -139,6 +138,10 @@ def _compile_run(
     return got, ordered, src
 
 
+# --------------------------------------------------------------------------- #
+# Cooperative combine matrix — op type × reduction variant × shape mode.
+# --------------------------------------------------------------------------- #
+
 # Reduce-partition variants, pinned via the ``REDUCE`` codec (the schedule's ``020_schedule``
 # decision, authoritative when pinned). Each has a distinct lowering STRUCTURE, asserted below
 # (not just output accuracy):
@@ -188,6 +191,7 @@ def _assert_combine_structure(src: str, variant: str, label: str) -> None:
         assert "__launch_bounds__(32)" in src, f"{label}/ilp_coop: coop=32 sets a one-warp block"
 
 
+@requires_cuda
 @pytest.mark.parametrize("op", _REDUCE_OPS)
 @pytest.mark.parametrize("variant", list(_COOP_VARIANTS))
 @pytest.mark.parametrize("shape", list(_SHAPES))
@@ -211,6 +215,44 @@ def test_cooperative_combine_accuracy(op, variant, shape, monkeypatch):
         assert "< seq_len" in src, f"{op}/dynamic: each lane must stride to the runtime extent (the masked tail)"
 
 
+# --------------------------------------------------------------------------- #
+# Symbolic straddling sweep — one symbolic-reduce softmax kernel, off-hint sizes.
+# --------------------------------------------------------------------------- #
+# The cooperative reduce splits a symbolic axis across ``coop`` lanes exactly like a static
+# reduce: each lane strides ``for k = lane; k < seq_len; k += coop`` and the partials fold
+# through the carrier-generic combine. The strided ``< seq_len`` bound IS the masked tail — a
+# lane whose start is past ``seq_len`` does zero iterations and folds the carrier identity, so
+# no ceil-div tiling / gmem clamp / explicit per-element mask is needed. This is the deployed
+# softmax-producer perf path over a symbolic key axis. ``coop=b64`` sets a 2-warp block.
+_STRADDLE_SOFTMAX = "torch.softmax(torch.randn(8, 512), dim=1)"
+
+
+@requires_cuda
+@pytest.mark.parametrize("seq", [1, 31, 64, 512, 513, 700])
+def test_symbolic_cooperative_softmax_sweep(monkeypatch, seq):
+    """One compiled symbolic-reduce softmax kernel is accurate at runtime sizes below / at /
+    above the 512 hint — the off-hint sizes (1, 31, 513, 700) straddle the coop tile, so idle
+    lanes (start past ``seq_len``) must fold the reduce identity, not garbage. The same kernel
+    carries the runtime ``seq_len`` arg + the cooperative ``__shfl_xor_sync`` combine over the
+    strided ``< seq_len`` bound (vs the old degenerate per-thread serial reduce), in a 2-warp
+    block."""
+    got, xs, src = _compile_run(_STRADDLE_SOFTMAX, {"DEPLODOCK_REDUCE": "b64"}, monkeypatch, dynamic="seq_len@x:1", seq=seq)
+    want = _ref_softmax(xs).reshape(got.shape)
+    assert got.shape == (8, seq)
+    diff = float(np.abs(got - want).max())
+    assert diff < 1e-4, f"seq={seq}: cooperative symbolic softmax mismatch (max abs err {diff})"
+    assert "int seq_len" in src, "symbolic reduce must carry the runtime extent arg"
+    assert "__shfl_xor_sync" in src, "cooperative reduce must emit the segmented-shuffle combine"
+    assert "< seq_len" in src, "each lane must stride to the runtime extent (the strided bound is the masked tail)"
+    assert "__launch_bounds__(64)" in src, "the pinned coop=64 sets the per-CTA thread count"
+
+
+# --------------------------------------------------------------------------- #
+# Flash carrier + cross-CTA finalize.
+# --------------------------------------------------------------------------- #
+
+
+@requires_cuda
 @pytest.mark.parametrize("variant", ["serial", "coop_warp"])
 def test_attention_combine_accuracy(variant, monkeypatch):
     """The flash ``(m, l, O)`` twisted-monoid carrier is accurate AND emits the pinned combine
@@ -245,6 +287,7 @@ _CROSS_CTA = {
 _CROSS_CTA_CASES = [(carrier, fin) for carrier, spec in _CROSS_CTA.items() for fin in spec["finalizes"]]
 
 
+@requires_cuda
 @pytest.mark.parametrize("carrier,finalize", _CROSS_CTA_CASES)
 def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatch):
     """The **carrier-generic cross-CTA producer + finalize**, one matrix over (carrier × finalize):
@@ -283,6 +326,7 @@ def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatc
 _PROJECTION_DISTRIBUTES = {"mean": True, "l2": False}
 
 
+@requires_cuda
 @pytest.mark.parametrize("op", list(_PROJECTION_DISTRIBUTES))
 @pytest.mark.parametrize("finalize", ["atomic", "kernel"])
 def test_split_reduce_projection_epilogue(op, finalize, monkeypatch):
@@ -306,3 +350,137 @@ def test_split_reduce_projection_epilogue(op, finalize, monkeypatch):
     else:
         assert "atomicAdd" not in src, f"{op}/kernel: the deferred finalize must not emit atomicAdd"
         assert src.count("__global__") == 2, f"{op}/kernel: the deferred finalize splices a combine kernel"
+
+
+# --------------------------------------------------------------------------- #
+# Online-softmax fusion — the two-pass → one-pass streaming recognizer.
+# --------------------------------------------------------------------------- #
+# The standalone two-pass softmax (row-max reduce + ``Σ exp(x − max)`` reduce + normalize) fuses
+# into a single streaming online-softmax ``(m, d)`` ``Monoid`` pass (3 reads of ``x`` → 2). The
+# IR-unit tests pin the recognition (3 loops → 2 + the monoid); the GPU test pins numerics vs
+# torch and that the recognizer fired.
+
+
+class _Softmax(torch.nn.Module):
+    def forward(self, x):
+        return torch.softmax(x, dim=-1)
+
+
+def _softmax_body() -> Body:
+    # The decomposed two-pass softmax over reduce axis a1: a row-max reduce then a Σ exp(x − max) reduce.
+    idx = (Var("a0"), Var("a1"))
+    rowmax = Loop(
+        axis=Axis(name="a1", extent=Dim(128)),
+        body=Body.coerce((Load(name="in0", input="x", index=idx), Accum(name="acc0", value="in0", op=ElementwiseImpl("maximum")))),
+    )
+    sumexp = Loop(
+        axis=Axis(name="a1", extent=Dim(128)),
+        body=Body.coerce(
+            (
+                Load(name="in1", input="x", index=idx),
+                Assign(name="v0", op="subtract", args=("in1", "acc0")),
+                Assign(name="v1", op="exp", args=("v0",)),
+                Accum(name="acc1", value="v1", op=ElementwiseImpl("add")),
+            )
+        ),
+    )
+    return Body.coerce((rowmax, sumexp))
+
+
+def _unrelated_reduce_pair() -> Body:
+    # A row-max followed by a plain sum (no exp(x − max)) — must NOT fuse.
+    idx = (Var("a0"), Var("a1"))
+    rowmax = Loop(
+        axis=Axis(name="a1", extent=Dim(128)),
+        body=Body.coerce((Load(name="in0", input="x", index=idx), Accum(name="acc0", value="in0", op=ElementwiseImpl("maximum")))),
+    )
+    plainsum = Loop(
+        axis=Axis(name="a1", extent=Dim(128)),
+        body=Body.coerce((Load(name="in1", input="x", index=idx), Accum(name="acc1", value="in1", op=ElementwiseImpl("add")))),
+    )
+    return Body.coerce((rowmax, plainsum))
+
+
+def test_online_softmax_combine_builds_asymmetric_monoid() -> None:
+    # state (m, d), partial (s); the asymmetric LSE monoid derives combine_states (the
+    # cross-partition state⊕state combine) from its exp-family spec.
+    mono = online_softmax_combine("m", "d", "s")
+    assert mono.state.names == ("m", "d") and mono.partial_names() == ("s",)
+    assert mono.combine_states, "combine_states must be derived for the asymmetric LSE monoid"
+
+
+@pytest.mark.parametrize("kind,should_fuse", [("softmax_pair", True), ("unrelated_pair", False)])
+def test_fuse_collapses_only_the_online_softmax_pair(kind, should_fuse) -> None:
+    """``_fuse`` collapses the decomposed two-pass softmax (row-max + ``Σ exp(x − max)``) into one
+    online-softmax loop + monoid (carrier keeps the original ``acc`` names), and is a no-op on an
+    unrelated row-max + plain-sum pair."""
+    body = _softmax_body() if should_fuse else _unrelated_reduce_pair()
+    fused, changed = _fuse(body)
+    assert changed == should_fuse
+    if should_fuse:
+        monoids = [s for s in fused.iter() if isinstance(s, Monoid)]
+        loops = [s for s in fused if isinstance(s, Loop)]
+        assert len(loops) == 1, "the two reduce loops fuse into one online-softmax loop"
+        assert len(monoids) == 1 and monoids[0].state.names == ("acc0", "acc1"), "carrier keeps the original acc names"
+
+
+@requires_cuda
+@pytest.mark.parametrize("shape", [(4, 128), (8, 256), (2, 64), (2, 4, 128)])
+def test_online_softmax_matches_torch(shape) -> None:
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    torch.manual_seed(0)
+    x = torch.randn(*shape)
+    graph = trace_module(_Softmax().cpu(), (x,))
+    backend = CudaBackend()
+    compiled = backend.compile(graph)
+
+    # The recognizer must have fired: a single fused kernel streaming one online-softmax loop
+    # (the ``<rowmax>__osin`` fused-score input is the recognizer's signature, stable across the
+    # carrier's internal temp naming).
+    srcs = [getattr(compiled.nodes[n].op, "kernel_source", "") for n in compiled.nodes]
+    assert any("__osin" in src for src in srcs), "online-softmax fusion did not fire"
+
+    run_result, eager = backend.run(compiled, input_data={"x": x.numpy()}, pre_run=lambda: _Softmax()(x).numpy())
+    got = list(run_result.outputs.values())[0]
+    assert got.shape == eager.shape
+    assert np.max(np.abs(got.flatten() - eager.flatten())) < 1e-4
+
+
+# --------------------------------------------------------------------------- #
+# 2D segmented coop — a pinned BN>1 × BR>1 reduce, segmented shuffle per row.
+# --------------------------------------------------------------------------- #
+# A pinned 2D cooperative reduce (``BN > 1`` free-axis threads alongside ``BR > 1`` cooperative-K
+# lanes) must compute the same per-row sums as numpy: the cross-thread combine is a SEGMENTED
+# warp shuffle over each row's ``BR`` lanes, combining each row independently. (Legacy ``BN`` /
+# ``BR`` / ``FN`` / ``FK`` / ``BK`` knobs — the surviving backend-accuracy assertion from the
+# deleted ``passes/test_strided_coop_rows.py``.)
+
+
+def _reduce_graph(shape: tuple):
+    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tensor.ir import ReduceOp  # noqa: PLC0415
+
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("x", shape), node_id="x")
+    out_shape = (*shape[:-1], 1)
+    g.add_node(ReduceOp(op="sum", axis=-1), ["x"], Tensor("o", out_shape), node_id="o")
+    g.inputs, g.outputs = ["x"], ["o"]
+    return g
+
+
+@requires_cuda
+def test_2d_segmented_coop_reduce_accuracy(monkeypatch):
+    """A pinned 2D row (BN=8, BR=16) computes the same per-row sums as numpy —
+    the segmented shuffle combines each row independently."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    for key, val in dict(BN=8, BR=16, FN=1, FK=1, BK=2).items():
+        monkeypatch.setenv(f"DEPLODOCK_{key}", str(val))
+    g = _reduce_graph((64, 128))
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((64, 128)).astype(np.float32)
+    be = CudaBackend()
+    out = be.run(be.compile(g), input_data={"x": x})[0].outputs["o"]
+    np.testing.assert_allclose(out, x.sum(-1, keepdims=True), rtol=1e-4, atol=1e-4)
