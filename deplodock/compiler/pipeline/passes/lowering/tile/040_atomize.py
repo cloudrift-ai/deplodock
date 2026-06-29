@@ -14,8 +14,25 @@ The binding rides the **schedule**, not the op tree: ``op_cache_key`` digests
 ``030_split`` rewrites operand indices for cross-CTA slices, and after ``020_schedule`` has
 chosen the ``WarpTile`` (split partials drop ``warp_tile``, so they fall through here).
 
-Phase 1 handles the ``Semiring`` (matmul) arm; the ``Monoid`` arm + flash recursion land in
-Phase 2."""
+The pass dispatches on kernel **kind** (the typed ``*Kernel`` seam, mirroring ``lower``):
+
+- a warp-tiled ``SemiringKernel`` → :func:`bind_contraction` resolves the operand→role
+  :class:`AtomBinding`;
+- a cooperative / ILP ``MonoidKernel`` → :func:`_atomize_monoid` resolves the
+  :class:`ReduceBinding` (the ``MonoidAtom`` dtype + partition widths; the shuffle/tree fold
+  sequence stays derived).
+
+**Recursion seam (deferred — warp-flash).** Flash is a ``Monoid`` (online-softmax) over a
+nested contraction, so a kind-recursive atomize would bind the inner QK^T / PV with the same
+:func:`bind_contraction` the root uses — that function is node-addressable for exactly this
+reuse. It is **not wired yet** because flash's inner contractions are not structural
+``Semiring`` nodes today: ``_flash._flash_op`` ``lower()``-s the QK score (a degenerate
+``Monoid``) straight into loop-IR inside the score ``Map`` body, and carries no per-node
+``WarpTile``. Wiring the recursion requires warp-flash to first (1) keep the inner
+contractions as ``Semiring`` nodes and (2) attach inner warp geometry — at which point the
+``MonoidKernel`` arm walks ``carrier.partial`` for nested ``Semiring``\\ s and calls
+:func:`bind_contraction` per inner contraction. Until then a tree-walk would bind nothing, so
+it is intentionally absent."""
 
 from __future__ import annotations
 
@@ -56,31 +73,33 @@ def _operand_leaf(operand) -> Load:
     return leaf
 
 
-def _atomize_semiring(tile: TileOp) -> AtomBinding:
-    """Resolve the operand→role binding off the ``Semiring`` carrier + the output grid."""
-    kernel = tile.kernel
-    sched = kernel.schedule
-    node = tile.op  # a Semiring, or a Map(source=Semiring) projection
-    semi = node.reduce_node  # the Semiring (the contraction)
-    grid = sched.place.grid
-    if len(grid) < 2:
-        raise LoweringError("warp tier: contraction output needs an (m, n) grid")
-    m_name, n_name = grid[-2].name, grid[-1].name
-    k_name = semi.reduce_axis.name
+def bind_contraction(semi, m_name: str, n_name: str, epilogue: Body) -> AtomBinding:
+    """Resolve the operand→role :class:`AtomBinding` for a contraction ``semi`` whose output is
+    indexed by grid axes ``m_name`` / ``n_name``, with projection ``epilogue``.
 
-    # Bind A/B by which grid output axis each operand's OWN index carries — read off the
-    # operand's leaf Load, NOT a flattened loop. (Phase 1: each operand is a one-Load Map.)
+    **Node-addressable** — it binds any ``Semiring`` node, not just a kernel root — so warp-flash
+    can reuse it on flash's nested QK^T / PV contractions (the recursion seam in the module
+    docstring). A/B are bound by which output axis each operand's OWN leaf ``Load`` index carries
+    (Phase 1: each operand is a one-``Load`` ``Map``); ``b_trans`` from B's last index component."""
+    k_name = semi.reduce_axis.name
     leaves = [_operand_leaf(o) for o in semi.operands]
     a_leaf = next((ld for ld in leaves if m_name in _idx_vars(ld.index)), None)
     b_leaf = next((ld for ld in leaves if n_name in _idx_vars(ld.index)), None)
     if a_leaf is None or b_leaf is None:
         raise LoweringError("warp tier: could not bind A/B operands by grid (m, n) axis")
     b_trans = k_name in b_leaf.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
-
-    # The projection epilogue is the Map body verbatim (scale/bias/relu/residual + the output
-    # Write); a bare Semiring root has none (the materializer synthesizes the store).
-    epilogue = node.body if isinstance(node, Map) else Body(())
     return AtomBinding(a=Operand(a_leaf, "a"), b=Operand(b_leaf, "b"), b_trans=b_trans, acc=semi.out, epilogue=epilogue)
+
+
+def _atomize_semiring(tile: TileOp) -> AtomBinding:
+    """The root contraction: extract the ``Semiring`` + output grid + projection epilogue (the
+    ``Map`` body, or empty for a bare contraction) and delegate to :func:`bind_contraction`."""
+    node = tile.op  # a Semiring, or a Map(source=Semiring) projection
+    grid = tile.kernel.schedule.place.grid
+    if len(grid) < 2:
+        raise LoweringError("warp tier: contraction output needs an (m, n) grid")
+    epilogue = node.body if isinstance(node, Map) else Body(())
+    return bind_contraction(node.reduce_node, grid[-2].name, grid[-1].name, epilogue)
 
 
 def _atomize_monoid(tile: TileOp) -> ReduceBinding:
