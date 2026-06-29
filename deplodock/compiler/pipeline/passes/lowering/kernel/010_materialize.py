@@ -37,7 +37,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
-from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore, Sync
+from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore, Smem, Sync
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -291,6 +291,84 @@ def _reg_tile(tile: TileOp, root: Node) -> KernelOp:
     return KernelOp(body=Body((bound,)), name=tile.name)
 
 
+def _scalar_loads(stmts: list[Stmt]) -> list[Load]:
+    """Every scalar ``Load`` reachable in ``stmts`` (deep)."""
+    out: list[Load] = []
+    for s in stmts:
+        if isinstance(s, Load) and s.is_scalar:
+            out.append(s)
+        for b in s.nested():
+            out.extend(_scalar_loads(list(b)))
+    return out
+
+
+def _has_accum(stmts: list[Stmt]) -> bool:
+    return any(isinstance(s, Accum) or any(_has_accum(list(b)) for b in s.nested()) for s in stmts)
+
+
+def _has_contraction_tail(stmts: list[Stmt]) -> bool:
+    """The post-reduce tail contracts over a NEW free axis — a ``Loop`` (the free output
+    axis) whose body holds an inner reduce ``Loop`` (an ``Accum``). This is the fused
+    norm→linear shape (``for n: for k: acc += …``), and it distinguishes it from a plain
+    softmax tail (a single ``for k`` sum over the SAME reduce axis, no nested contraction).
+    Only the former benefits from staging the shared input row — and only it is rewritten."""
+    for s in stmts:
+        if isinstance(s, Loop) and any(isinstance(c, Loop) and _has_accum(list(c.body)) for c in s.body):
+            return True
+        if any(_has_contraction_tail(list(b)) for b in s.nested()):
+            return True
+    return False
+
+
+def _shared_row_buf(carrier_body, tail: list[Stmt], grid_vars: tuple, raxis: Axis, inputs: dict) -> str | None:
+    """The input buffer reused as a CTA-shared ROW across the reduce + a contraction tail — an
+    input read in the carrier reduce at ``(grid…, raxis)`` AND in the tail at ``(grid…, k)``,
+    whose trailing dim is the (static) reduce extent. That row (e.g. RMSNorm's ``x[m, :]``,
+    folded by the mean reduce then re-read per output column of the fused linear) is the one
+    operand worth staging into smem. ``None`` ⇒ no eligible operand (stay gmem-direct)."""
+    if not raxis.extent.is_static or not _has_contraction_tail(tail):
+        return None
+    n = len(grid_vars)
+    carrier_bufs = {
+        s.input
+        for s in _scalar_loads(list(carrier_body))
+        if len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars and s.index[-1] == Var(raxis.name)
+    }
+    for s in _scalar_loads(tail):
+        if s.input in carrier_bufs and len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars:
+            t = inputs.get(s.input)
+            if t is not None and t.shape[-1].is_static and t.shape[-1].as_static() == raxis.extent.as_static():
+                return s.input
+    return None
+
+
+def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_vars: tuple) -> list[Stmt]:
+    """Rewrite every ``(grid…, k)`` scalar ``Load`` of ``buf`` to read ``smem[k]`` (the staged
+    row), recursing into nested bodies. Other loads (and ``buf`` loads with a different index
+    shape) pass through untouched."""
+    out: list[Stmt] = []
+    for s in stmts:
+        if isinstance(s, Load) and s.is_scalar and s.input == buf and len(s.index) == n_grid + 1 and tuple(s.index[:n_grid]) == grid_vars:
+            out.append(Load(name=s.name, input=smem, index=(s.index[-1],)))
+            continue
+        bodies = s.nested()
+        if bodies:
+            s = s.with_bodies(tuple(Body(tuple(_restage_loads(list(b), buf, smem, n_grid, grid_vars))) for b in bodies))
+        out.append(s)
+    return out
+
+
+def _shared_row_fill(buf: str, smem: str, extent: int, grid_vars: tuple, n_threads: int, start, dtype_c: str) -> list[Stmt]:
+    """Cooperatively copy the CTA-shared ``buf`` row ``[grid…, 0:extent]`` into ``smem`` (the
+    ``n_threads`` lanes stripe it, ``for k = lane; k < extent; k += n_threads``), then a CTA
+    barrier so every lane sees the filled row before the reduce + tail read it."""
+    fe = Axis(name=f"_{smem}_f", extent=extent)
+    load = Load(name=f"_{smem}_v", input=buf, index=(*grid_vars, Var(fe.name)))
+    write = Write(output=smem, index=(Var(fe.name),), value=f"_{smem}_v")
+    loop = StridedLoop(axis=fe, start=start, step=Literal(n_threads, "int"), body=Body((load, write)), unroll=False)
+    return [Smem(name=smem, extents=(extent,), dtype=dtype_c), loop, Sync()]
+
+
 def _reduce(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a cooperative / ILP reduce (see module docstring)."""
     kernel = tile.kernel
@@ -311,6 +389,28 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     # cooperate; standalone ILP (coop == 1) runs one thread per cell, lane fixed at 0.
     lane = Axis(name=f"{axis.name}_co", extent=coop) if coop > 1 else None
     start = Var(lane.name) if lane is not None else Literal(0, "int")
+
+    # Shared-row staging (the fused norm→linear prologue): when an input row is folded by the
+    # cooperative reduce AND re-read per output column of a contraction tail, stage it into smem
+    # once (cooperatively) and rewrite both readers to the slab — one ``__shared__`` row shared
+    # by the prologue + the matmul body. Only the cooperative tier (coop > 1) stages.
+    pre = list(stmts[:ridx])
+    tail_src = list(stmts[ridx + 1 :])
+    fill_stmts: list[Stmt] = []
+    if lane is not None:
+        grid_vars = tuple(Var(a.name) for a in grid)
+        staged = _shared_row_buf(rloop.body, tail_src, grid_vars, axis, tile.inputs)
+        if staged is not None:
+            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+            smem_name = f"{staged}_smem"
+            fill_stmts = _shared_row_fill(
+                staged, smem_name, axis.extent.as_static(), grid_vars, coop, start, cuda_name(tile.inputs[staged].dtype)
+            )
+            n_grid = len(grid)
+            rloop = replace(rloop, body=Body(tuple(_restage_loads(list(rloop.body), staged, smem_name, n_grid, grid_vars))))
+            pre = _restage_loads(pre, staged, smem_name, n_grid, grid_vars)
+            tail_src = _restage_loads(tail_src, staged, smem_name, n_grid, grid_vars)
 
     # The reduce loop: ``reg`` interleaved accumulator chains (ILP), striding the axis by
     # ``coop·reg`` from the lane's start. The dissolved fold ``Accum``\\ s seed each copy's
@@ -344,7 +444,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     # Post-reduce projection. A full-row output (softmax / RMSNorm) distributes its sweep
     # across the coop lanes; a scalar output is written once, guarded to lane 0. With no
     # cooperation (coop == 1) the single thread runs the projection as-is.
-    tail = list(stmts[ridx + 1 :])
+    tail = tail_src
     if lane is None:
         body_tail = _with_store(tail, root.output.name, grid, op)
     elif any(isinstance(s, Loop) for s in tail):
@@ -358,7 +458,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
         stored = _with_store(tail, root.output.name, grid, op)
         body_tail = [Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(stored))]
 
-    body = [*stmts[:ridx], strided, *reg_fold, *combine, *body_tail]
+    body = [*fill_stmts, *pre, strided, *reg_fold, *combine, *body_tail]
     axes = (*grid, lane) if lane is not None else tuple(grid)
     bound = Tile(axes=axes, body=Body(tuple(body)), block_threads=coop if lane is not None else None)
     return KernelOp(body=Body((bound,)), name=tile.name)

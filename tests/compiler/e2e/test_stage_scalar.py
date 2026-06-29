@@ -1,11 +1,11 @@
-"""Staging — backend-accuracy coverage on the scalar reduce tier.
+"""Staging — schedule + backend-accuracy coverage on the scalar reduce tier.
 
-``stage(read)`` writes ``Schedule.staged[edge] = SYNC`` for a reused gmem read (the
-enumeration fork ``120_stage``); ``assemble`` synthesizes the smem slab + cooperative
-producer from that annotation. These tests pin the staged path end to end on a scalar
-fp32 matmul (the regime that has reuse and lowers today): the full ``TILE_PASSES`` chain
-emits a ``StageBundle`` under the all-staged mask, and the staged kernel matches a numpy
-reference for every stage subset, including a masked (non-divisor) output axis.
+The orthogonal ``STAGE`` codec (``d<depth>/sync|cp|tma``) annotates the typed ``Stage``
+schedule struct on a Semiring contraction; the materializer assembles the smem slab +
+cooperative producer from it. These tests pin the staged path on a scalar fp32 matmul (the
+regime that has operand reuse): the ``TILE_PASSES`` chain stamps the ``Stage`` onto the
+``SemiringKernel`` schedule, and the staged kernel matches a numpy reference for every stage
+subset, including a masked (non-divisor) output axis.
 """
 
 from __future__ import annotations
@@ -17,14 +17,8 @@ from deplodock.compiler.context import Context
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
+from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-
-# tile IR demolished — pending rebuild; guarded so the
-# module collects and its tests register as xfail rather than a collection error.
-try:
-    from deplodock.compiler.ir.tile.ir import StageBundle, TileOp
-except ImportError:  # module may now exist sans these (partially rebuilt) symbols → ImportError, not ModuleNotFoundError
-    StageBundle = TileOp = None
 
 from ..conftest import requires_cuda
 
@@ -39,15 +33,16 @@ def _matmul_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
 
 
 def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
-    """The full ``TILE_PASSES`` chain (greedy) stages a scalar matmul when
-    ``DEPLODOCK_STAGE`` pins the all-staged mask (ingested as ``PLACE@<edge>=smem``): the
-    emitted ``TileOp`` carries the native ``PLACE@<edge>`` placement and a ``StageBundle``."""
-    monkeypatch.setenv("DEPLODOCK_STAGE", "all")
+    """The ``TILE_PASSES`` chain stamps the ``STAGE`` codec onto the scalar matmul's typed
+    ``Stage`` schedule struct (the orthogonal codec on the ``SemiringKernel`` arm — no
+    resurrected ``StageBundle`` / ``PLACE@<edge>=smem`` placement). ``d1/sync`` is the
+    single-buffer plain-``__syncthreads`` staging point."""
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")
     out = Pipeline.build(TILE_PASSES).run(_matmul_graph(), ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    placed = {k: v for k, v in tile_op.knobs.items() if k.startswith("PLACE@")}
-    assert placed and all(v.startswith("smem") for v in placed.values()), placed  # both operands staged
-    assert any(isinstance(s, StageBundle) for s in tile_op.body.iter())
+    assert tile_op.knobs.get("STAGE") == "d1/sync", tile_op.knobs.get("STAGE")
+    stage = tile_op.kernel.schedule.stage
+    assert stage is not None and stage.transport == "sync" and stage.depth == 1, stage
 
 
 @requires_cuda
