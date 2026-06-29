@@ -149,7 +149,7 @@ def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
     # The transport is the orthogonal STAGE codec on the schedule (``d<depth>/tma``), not a
     # legacy ``PLACE@<edge>=…:tma`` placement knob — symbolic-M with a static innermost dim
     # is TMA-eligible, so the pin survives onto the lowered op.
-    assert kop.knobs.get("STAGE", "").endswith("/tma"), f"symbolic-M with static innermost dim must stage via TMA: {kop.knobs.get('STAGE')!r}"
+    assert kop.knobs.get("STAGE", "").endswith("/tma"), f"symbolic-M static-innermost must stage via TMA: {kop.knobs.get('STAGE')!r}"
     src = kop.kernel_source
     assert "int seq_len" in src, "runtime extent must still be a kernel arg"
     assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"

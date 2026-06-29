@@ -388,7 +388,7 @@ module — no manual registration. `knob.py` also owns the `DEPLODOCK_<KNOB>` en
 
 - **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_BK=32`). Read by the rule that owns the knob via
   `Knob.narrow`. The env-var key is built by `config.knob_var` and read via `config.knob_raw` / `config.int_env`.
-- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="BK=2,BM=16,BN=128,FM=8,FN=8,STAGE=111"`).
+- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="WARP=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2,STAGE=d2/cp"`).
   Parsed once at `knob.py` import via `apply_knobs_env()`, which splats each entry into the corresponding
   `DEPLODOCK_<K>` var (`config.set_knob(..., overwrite=False)`). An explicit per-knob var wins over the aggregate.
 
@@ -413,9 +413,8 @@ for the per-rule mechanics):
 | `BR`     | INT     | `enumeration/070_coop_reduce`     | Cooperative-K thread count (`1` = pure serial chunked reduce); `>1` routes through the cooperative reduce path with cross-thread combine. |
 | `WM`     | INT     | `enumeration/030_warp_geometry`   | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only). |
 | `WN`     | INT     | `enumeration/030_warp_geometry`   | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only). |
-| `STAGE`  | BINMASK | `enumeration/120_stage`           | Bitmask over ranked candidate buffers (char `i` = stage buffer `i`); selected buffers fold into one `StageBundle`. |
+| `STAGE`  | STR (codec) | `lowering/tile/020_schedule` → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring]` on the typed `Stage` schedule struct (the `TILE`/`WARP` Semiring arms); `sync`/`cp.async`/TMA transport, `tma` folds in what the old `TMA` bool selected. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
 | `MMA`    | STR     | `enumeration/020_tensorize`       | Three-way control for warp-tier MMA (tensor-core) enumeration: falsy forces the scalar path, truthy/unset auto-enumerates eligible atoms, any other value names + pins an atom kind. `DEPLODOCK_ATOM_KIND` is its env alias. |
-| `TMA`    | BOOL    | `enumeration/130_transport`       | Promote BUFFERED/ASYNC bundles to TMA. `1` = force (hard-fail on ineligibility), `0` = skip. Default on for Hopper+. Several device-only-failure shapes (oversized box dims, re-entered pipelines, misaligned slots, unaligned symbolic inner dims) are declined by gates verified in `tests/compiler/passes/test_use_tma_gates.py`. |
 | `CUT`    | BINMASK | `split/010_split_demoted`         | Cut a demoted matmul's computed multiply-operand cone(s) into producer kernel(s) + the clean gemm — the structural fork above. Width-1 today; `"0"` = considered-and-declined, `"1"` = cut. Deliberately declares no `off=` (to preserve the absent-vs-declined distinction). |
 | `FLASH`  | BOOL    | `loop/recognize/010_recognize_flash` | Fuse SDPA into one streaming online-softmax kernel (the `Monoid` carrier) instead of the score-materializing `010_sdpa` decomposition. Recovers causal / additive mask + GQA + RoPE-fused producers structurally from the fused body. Static or symbolic-`seq_len`. Off by default (env pin `DEPLODOCK_FLASH=1` today). |
 | `ONLINE_SOFTMAX` | BOOL | `loop/recognize/020_recognize_online_softmax` | Fuse a standalone two-pass softmax (row-max + `Σ exp(x−max)`) into one streaming `(m, d)` `Monoid` pass. Off by default. |

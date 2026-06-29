@@ -184,8 +184,9 @@ class WarpTile:
     bk: int = 1                                 # K-chunk per inner step, in atom_k units
     # .parse/.spell (the WARP codec a<atom>/w<m>x<n>/f<m>x<n>/k<n>)
 
-# Operand transport over the serial reduce loop (TODO past the cooperative cut, for the warp
-# tier's smem pipeline). depth=1 / sync = gmem-direct, no staging.
+# Operand transport over the reduce loop (built: the warp tier's smem pipeline + the scalar
+# fused-prologue shared row). stage=None = gmem-direct; Stage(d1/sync) = real single-buffer
+# staging (a plain __syncthreads fill, no prefetch); cp / tma add async / descriptor transport.
 @dataclass(frozen=True)
 class Stage:
     depth: int = 1
@@ -295,7 +296,7 @@ differently. The payoff is precisely two things — and **not** a third that's e
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
 | `TILE` | free-axis output tile (`TilePlan` — par + `Scalar` reg) | `Semiring` (`Map`/`Monoid` reserved) | `n<N>[xm<M>]` parallel · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** (`Semiring·Scalar`) |
 | `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (`Semiring·Warp`, gmem-direct + epilogues; pin-only) |
-| `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | proposed |
+| `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | **built** (warp tier: cp.async + TMA, static/masked-M/symbolic-K; scalar fused-prologue shared row; pin-only) |
 
 **Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser, which splits on `,` and requires
 `=` per entry — `knob.py::parse_knob_spec`): **`,` is reserved** as the knob-list separator and MUST NOT appear inside a
@@ -332,7 +333,7 @@ examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter h
 ✅ Semiring·Scalar REDUCE=g2a            # split-K matmul, atomicAdd finalize (1-component additive carrier)
 ✅ Semiring·Scalar TILE=n128xm64/f4xf4   # register-blocked SGEMM: 4×4 reg cells/thread, operands reused, inner reduce unrolled
 ✅ Semiring·Warp  WARP=a:mma_m16n8k16_f16/w2xw2/f4xf8/k2   # gmem-direct mma.sync, 128×128 tile, 128 threads (+ fused epilogue / transposed-B / dynamic-grid)
-🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp   # + operand staging (STAGE still proposed)
+✅ Semiring·Warp  WARP=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2  STAGE=d2/tma   # + TMA operand staging (cp.async.bulk.tensor)
 🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize (staging + split still proposed)
 🔲 Monoid·Warp    WARP=a:m16n8k16_f16/w4xw1/f1xf1/k1  REDUCE=b2  STAGE=d2/tma   # warp-tier flash, coop-KV
 🔲 WarpSpec       CHANNEL=K:d3/cp;V:d3/cp  mma:WARP=…/k2  reducer:REDUCE=b2  producer:STAGE=d3/cp

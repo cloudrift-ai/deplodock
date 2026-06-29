@@ -65,7 +65,7 @@ tests/
 │   │   ├── test_real_trace.py                  # TinyLlama fixture sanity (op-type counts)
 │   │   ├── test_body_deps.py / test_op_shape_invariants.py / …
 │   │   ├── stmt/   — SSA-body unit tests (hoist / merge / rename / structural_key)
-│   │   ├── tile/   — TileOp / StageBundle unit tests
+│   │   ├── tile/   — TileOp / schedule-codec (TILE / WARP / STAGE / REDUCE) unit tests
 │   │   └── loop/   — splicer / runner-cache unit tests
 │   ├── passes/                         # single-pass + pass-suite tests
 │   │   ├── conftest.py                         # RecordingDump fixture
@@ -195,12 +195,11 @@ LPT-bucketed across the remaining workers using the cached duration table.
 mma.sync warp tier (swizzled `ldmatrix` + `mma.sync`, TMA transport) auto-enumerates and is validated on **sm_90+**;
 on sm_80-89 it is pin-only and currently non-functional for two independent reasons — the `sm_NNa` arch-accelerated
 target the TMA path emits is rejected by nvcc (`Unsupported gpu architecture 'sm_89a'`), and `ldmatrix` itself faults
-at runtime on at least Ada (sm_89). Tests that **force** the warp tier via `DEPLODOCK_MMA` / `TMA` pins carry
+at runtime on at least Ada (sm_89). Tests that **force** the warp tier via the `WARP` / `STAGE` codecs carry
 `requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
-context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The pure mma suites
-(`test_matmul_mma.py`, `test_matmul_mma_tma.py`, `test_matmul_mma_staged_pipelined.py`,
-`test_matmul_mma_causal_epilogue.py`, `test_matmul_mma_transposed_b.py`) gate at module scope; mixed files that also
-hold GPU-less structure / compile-only tests (`test_matmul_mma_masked.py`, `test_matmul_mma_parity.py`,
-`test_matmul_mma_residual.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
-tests, and `test_knob_pinning.py` skips its `TMA=1` rows in-body. `_supports_mma_sync()` (≥ sm_80, the
-instruction-availability check) and `_supports_tma()` (≥ sm_90) still gate on top.
+context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The warp-tier matmul
+suites — `test_matmul_tile_coverage.py` (scalar `TILE` + warp `WARP` accuracy/structure matrix), `test_matmul_mma_masked.py`
+and `test_matmul_mma_parity.py` (symbolic-M masked + static-vs-dynamic parity, across the `STAGE=d2/cp` and `d2/tma`
+transports) — gate their GPU cases on `_supports_mma_sync()` (≥ sm_80, the instruction-availability check) and
+`_supports_tma()` (≥ sm_90); their GPU-less render / structure cases run anywhere. The TMA accuracy path additionally
+exercises the host descriptor encoder (`backend/cuda/_tma.py`).
