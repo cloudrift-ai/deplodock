@@ -51,10 +51,9 @@ XFAIL: dict[str, str] = {
     # bias/relu/residual/causal epilogues, static AND dynamic, all recovered by the gmem-direct
     # mma.sync _warp materializer. test_matmul_rules.py / test_register_tile_rules.py deleted too
     # — unit tests on the demolished split-K / register-tile rule passes.
-    # test_matmul_mma_masked.py: the masked symbolic-M/N matmul **accuracy** recovered with the
-    # dynamic-grid tier. Only the cases asserting the **staged / symbolic-K warp** STRUCTURE
-    # (operand staging + K zero-fill — a later phase) still xfail.
-    "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp": _R,
+    # test_matmul_coverage.py (masked symbolic warp tier): the masked symbolic-M/N matmul
+    # **accuracy** recovered with the dynamic-grid tier; the batched-M+K structure render
+    # (test_batched_symbolic_mk_reaches_warp) reaches the warp tier again, so its entry is gone.
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
@@ -78,8 +77,10 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": _R,
     # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
-    # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts).
-    "tests/compiler/e2e/test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": _R,
+    # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts). The
+    # atomic-free split-K (deferred ``c2k`` finalize) on the warp tier still needs its workspace
+    # retarget rebuilt; the atomic arm (``c2a``) of the merged test passes.
+    "tests/compiler/e2e/test_matmul_coverage.py::test_mma_splitk_finalize[deferred]": _R,
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
     # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
     # TileGraph lowering).
