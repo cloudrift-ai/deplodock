@@ -26,7 +26,16 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
+
+
+def _tile_mask(axis, tile: int) -> bool:
+    """A tiled axis masks its tail iff it's symbolic or its extent isn't a clean multiple of the
+    per-CTA ``tile`` (the last block overhangs the real extent)."""
+    if tile <= 1:
+        return False
+    return not (axis.extent.is_static and axis.extent.as_static() % tile == 0)
 
 
 @dataclass(frozen=True)
@@ -91,17 +100,60 @@ class Tiling:
 
 
 class Unit:
-    """A leaf cell realization — a tensor-core mma cell or a scalar fma cell. The tiling layer is
-    generic over this; two impls live in ``_warp_factor`` (``AtomUnit``) and ``_scalar_factor``
-    (``ScalarUnit``)."""
+    """A leaf cell realization PLUS its derived tiling geometry. The base ``__init__`` derives the
+    SHARED geometry — ``tile_m``/``tile_n`` (``units·reg·atom``), ``mask_m``/``mask_n`` (tail
+    overhang), ``m_b``/``n_b`` + ``m_uvar``/``n_uvar`` (the bound GRID-block / UNIT axis names),
+    ``m_ext``/``n_ext``, ``block_threads`` (``units·units·lanes``), ``lanes`` — once, from the atom +
+    axes + widths a subclass passes via ``super().__init__``. So the two impls duplicate NO geometry;
+    each carries only its atom-specific leaf state and the four leaf methods below, which are the
+    genuine difference: ``_warp_factor.AtomUnit`` emits tensor-core fragments + owns operand staging,
+    ``_scalar_factor.ScalarUnit`` replicates the lowered per-cell body into scalar fma cells.
+
+    ``m_axis is None`` is a 1-D output (only ``n`` tiled). ``b_suffix``/``u_suffix`` spell the bound
+    axis names (``_wb``/``_ww`` for the warp tier, ``_b``/``_u`` for the scalar tier — they differ so
+    the warp kernels stay byte-identical)."""
+
+    def __init__(
+        self,
+        *,
+        atom,
+        m_axis,
+        n_axis,
+        reg_m: int,
+        reg_n: int,
+        units_m: int,
+        units_n: int,
+        b_suffix: str,
+        u_suffix: str,
+        lead_axes: tuple = (),
+    ) -> None:
+        self.atom = atom
+        self.atom_m, self.atom_n, self.lanes = atom.atom_m, atom.atom_n, atom.lanes
+        self.m_axis, self.n_axis = m_axis, n_axis
+        self.reg_m, self.reg_n = reg_m, reg_n
+        self.units_m, self.units_n = units_m, units_n
+        self.lead_axes = lead_axes
+        self.tile_m = units_m * reg_m * self.atom_m
+        self.tile_n = units_n * reg_n * self.atom_n
+        self.mask_m = m_axis is not None and _tile_mask(m_axis, self.tile_m)
+        self.mask_n = _tile_mask(n_axis, self.tile_n)
+        self.m_ext = _extent_expr(m_axis) if m_axis is not None else None
+        self.n_ext = _extent_expr(n_axis)
+        bt = units_m * units_n * self.lanes
+        self.block_threads = bt if bt > 1 else None  # None ⇒ the scalar default block size
+        self.n_b, self.n_uvar = n_axis.name + b_suffix, n_axis.name + u_suffix
+        self.m_b = m_axis.name + b_suffix if m_axis is not None else ""
+        self.m_uvar = m_axis.name + u_suffix if m_axis is not None else "_m_u"
 
     def state_decls(self, cells: list[tuple[int, int]]) -> list[Stmt]:
         """Per-cell state decls (mma C ``RegFragment``s / scalar ``Init`` accumulators)."""
         raise NotImplementedError
 
     def operands(self) -> list[Operand]:
-        """The contraction operands, each tagged with its free-axis dependence (for dedup)."""
-        raise NotImplementedError
+        """The contraction operands, each tagged with its free-axis dependence (for dedup).
+        Unused by the generic layer today (the units build their operands internally); default
+        ``()``."""
+        return []
 
     def reduce_region(self, cells: list[tuple[int, int]], offset: OffsetFn, masks) -> tuple[list[Stmt], list[Stmt]]:
         """``(top_decls, kstmts)`` — the CTA-scope decls (staged slabs / descriptors, empty for

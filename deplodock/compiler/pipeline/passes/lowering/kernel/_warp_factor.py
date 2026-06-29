@@ -472,24 +472,31 @@ class AtomUnit(Unit):
     def __init__(self, mma: MmaContraction):
         wt = mma.warp_tile
         atom = wt.atom
-        atom_m, atom_n, atom_k = atom.shape
-        self.mma, self.wt, self.atom = mma, wt, atom
-        self.atom_m, self.atom_n, self.atom_k = atom_m, atom_n, atom_k
-        self.wm, self.wn = wt.warps
-        self.fm, self.fn = wt.reg
-        self.m_axis, self.n_axis, self.k_axis = mma.m_axis, mma.n_axis, mma.k_axis
+        # The shared tiling geometry (tile / mask / axis-name / block / extents) is derived by the
+        # base from the atom + axes + widths; the warp tier's UNIT is the warp (``lanes == 32``),
+        # its block / unit axes spelled ``_wb`` / ``_ww``. Only the mma-leaf state (operands,
+        # fragments, staging) is set here.
+        super().__init__(
+            atom=atom,
+            m_axis=mma.m_axis,
+            n_axis=mma.n_axis,
+            reg_m=wt.reg[0],
+            reg_n=wt.reg[1],
+            units_m=wt.warps[0],
+            units_n=wt.warps[1],
+            b_suffix="_wb",
+            u_suffix="_ww",
+        )
+        self.mma, self.wt, self.atom_k = mma, wt, atom.atom_k
+        self.k_axis = mma.k_axis
         self.a_load, self.b_load, self.b_trans, self.acc = mma.a_load, mma.b_load, mma.b_trans, mma.acc
         self.stage = mma.stage
         self.pre: list[Stmt] = []
         self.tail = list(mma.epilogue)
         self.write = next(s for s in self.tail if isinstance(s, Write))
-        self.tile_m, self.tile_n = wt.tile_m, wt.tile_n
-        self.mask_m = not (self.m_axis.extent.is_static and self.m_axis.extent.as_static() % self.tile_m == 0)
-        self.mask_n = not (self.n_axis.extent.is_static and self.n_axis.extent.as_static() % self.tile_n == 0)
-        self.m_b, self.n_b = f"{self.m_axis.name}_wb", f"{self.n_axis.name}_wb"
-        self.m_w, self.n_w = f"{self.m_axis.name}_ww", f"{self.n_axis.name}_ww"
         # The operand-staging decision (TMA > cp.async > gmem-direct) drives the operand-fragment
         # naming + the K-loop, so it is computed once here and read by state_decls + reduce_region.
+        atom_k = self.atom_k
         a_nbytes = atom.operand_dtype("a").nbytes
         self.a_nbytes = a_nbytes
         self.tma_ok = _can_stage_warp_tma(
@@ -502,55 +509,8 @@ class AtomUnit(Unit):
         _slot_bytes = (self.tile_m * wt.bk * atom_k + wt.bk * atom_k * self.tile_n) * a_nbytes
         self.gmem_depth = min(self.stage.depth, max(1, (48 * 1024) // _slot_bytes)) if (self.stage is not None and self.cp_ok) else 1
         rd = self.reg_depth
-        self.a_frags = [f"_a{i}_s{s}" for i in range(self.fm) for s in range(rd)] if rd >= 2 else [f"_a{i}" for i in range(self.fm)]
-        self.b_frags = [f"_b{j}_s{s}" for j in range(self.fn) for s in range(rd)] if rd >= 2 else [f"_b{j}" for j in range(self.fn)]
-
-    # The canonical tiling-geometry interface the shared ``_factor.factorize`` reads — the mma
-    # ``fm``/``wm``/``m_w`` (fragment / warp / warp-axis) names mapped onto the generic REGISTER /
-    # UNIT vocabulary. ``lead_axes`` is empty: the warp tier always has a clean (m, n) grid.
-    @property
-    def reg_m(self) -> int:
-        return self.fm
-
-    @property
-    def reg_n(self) -> int:
-        return self.fn
-
-    @property
-    def units_m(self) -> int:
-        return self.wm
-
-    @property
-    def units_n(self) -> int:
-        return self.wn
-
-    @property
-    def m_uvar(self) -> str:
-        return self.m_w
-
-    @property
-    def n_uvar(self) -> str:
-        return self.n_w
-
-    @property
-    def lanes(self) -> int:
-        return self.atom.lanes
-
-    @property
-    def block_threads(self) -> int:
-        return self.wt.block_threads
-
-    @property
-    def lead_axes(self) -> tuple:
-        return ()
-
-    @property
-    def m_ext(self):
-        return _extent_expr(self.m_axis)
-
-    @property
-    def n_ext(self):
-        return _extent_expr(self.n_axis)
+        self.a_frags = [f"_a{i}_s{s}" for i in range(self.reg_m) for s in range(rd)] if rd >= 2 else [f"_a{i}" for i in range(self.reg_m)]
+        self.b_frags = [f"_b{j}_s{s}" for j in range(self.reg_n) for s in range(rd)] if rd >= 2 else [f"_b{j}" for j in range(self.reg_n)]
 
     def state_decls(self, cells) -> list[Stmt]:
         atom = self.atom
@@ -559,8 +519,8 @@ class AtomUnit(Unit):
             decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
         for name in self.b_frags:
             decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
-        for i in range(self.fm):
-            for j in range(self.fn):
+        for i in range(self.reg_m):
+            for j in range(self.reg_n):
                 decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
         return decls
 
@@ -579,12 +539,12 @@ class AtomUnit(Unit):
                 k_axis=self.k_axis,
                 m_b=self.m_b,
                 n_b=self.n_b,
-                m_w=self.m_w,
-                n_w=self.n_w,
-                wm=self.wm,
-                wn=self.wn,
-                fm=self.fm,
-                fn=self.fn,
+                m_w=self.m_uvar,
+                n_w=self.n_uvar,
+                wm=self.units_m,
+                wn=self.units_n,
+                fm=self.reg_m,
+                fn=self.reg_n,
                 atom=atom,
                 bk=wt.bk,
                 tile_m=self.tile_m,
@@ -605,12 +565,12 @@ class AtomUnit(Unit):
                 k_axis=self.k_axis,
                 m_b=self.m_b,
                 n_b=self.n_b,
-                m_w=self.m_w,
-                n_w=self.n_w,
-                wm=self.wm,
-                wn=self.wn,
-                fm=self.fm,
-                fn=self.fn,
+                m_w=self.m_uvar,
+                n_w=self.n_uvar,
+                wm=self.units_m,
+                wn=self.units_n,
+                fm=self.reg_m,
+                fn=self.reg_n,
                 atom=atom,
                 bk=wt.bk,
                 tile_m=self.tile_m,
@@ -630,7 +590,7 @@ class AtomUnit(Unit):
             raise LoweringError("warp tier: transposed-B symbolic-K mma not supported (no gmem-direct K zero-fill)")
         k_zero = None if k_static else (Var(self.k_axis.name), _extent_expr(self.k_axis))
         chain: list[Stmt] = []
-        for i in range(self.fm):
+        for i in range(self.reg_m):
             idx = tuple(Sigma({self.m_axis.name: offset.base("m", i)}).apply(e) for e in self.a_load.index)
             guard = (offset.base("m", i), m_ext) if mask_m else None
             chain.append(
@@ -638,7 +598,7 @@ class AtomUnit(Unit):
                     frag=f"_a{i}", src_buffer=self.a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero
                 )
             )
-        for j in range(self.fn):
+        for j in range(self.reg_n):
             idx = tuple(Sigma({self.n_axis.name: offset.base("n", j)}).apply(e) for e in self.b_load.index)
             guard = (offset.base("n", j), n_ext) if mask_n else None
             chain.append(
@@ -653,8 +613,8 @@ class AtomUnit(Unit):
                     k_zero=k_zero,
                 )
             )
-        for i in range(self.fm):
-            for j in range(self.fn):
+        for i in range(self.reg_m):
+            for j in range(self.reg_n):
                 chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
         kstmts = [
             StridedLoop(axis=self.k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=k_static)

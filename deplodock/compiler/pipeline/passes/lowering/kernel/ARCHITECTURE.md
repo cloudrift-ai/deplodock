@@ -47,12 +47,14 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 `_factor.factorize` is the **single** contraction factorizer — there is no per-atom variant. It expands any `Contraction`
 by tiling a **leaf atom** four ways through the unit-generic layer in `_tiling.py`:
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. Both arms run
-that *same* pipeline; the atom only selects the leaf `Unit`, which exposes a common tiling-geometry interface
-(`atom_m`/`reg_m`/`units_m`/`m_uvar`/`tile_m`/`lanes`/…) the factorizer reads:
+that *same* pipeline; the atom only selects the leaf `Unit`. The `Unit` **base** (`_tiling.py`) derives the shared
+tiling geometry (`tile_m`/`mask_m`/`m_b`/`m_uvar`/`block_threads`/`lanes`/…) once from `(atom, axes, reg, units)` — the
+two impls duplicate **no** geometry; each supplies only its atom + widths via `super().__init__` and the **four leaf
+methods** (`state_decls` / `operands` / `reduce_region` / `store`), which are the genuine per-atom difference:
 
 - **mma** (`_warp_factor.AtomUnit`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the leaf emits
   `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop + operand staging (gmem-direct / cp.async /
-  TMA), and decodes the atom-lane offset at render. All mma geometry lives in `_warp_factor.py`, the new-atom seam.
+  TMA), and decodes the atom-lane offset at render. All mma codegen lives in `_warp_factor.py`, the new-atom seam.
 - **scalar** (`_scalar_factor.ScalarUnit`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a **single thread** (so there is
   no `_lane` axis); the leaf comes from the lowered per-cell body (split into a `pre` region / the reduce `Loop` / a
   projection `tail`), replicated per register cell with its operand loads deduped (the arithmetic-intensity reuse).
