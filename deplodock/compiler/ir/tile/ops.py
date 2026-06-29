@@ -56,7 +56,7 @@ def _is_state_merge(m: Monoid) -> bool:
     ``render_merge_program`` (state reassignment + seeding), NOT dissolve to loose stmts. A
     degenerate carrier (``as_accums`` ≠ None) and a twisted *streaming* carrier (``Accum``
     folds in its merge) both dissolve correctly and are excluded."""
-    return m.as_accums() is None and not any(isinstance(s, Accum) for s in m.twist.merge)
+    return m.as_accums() is None and not any(isinstance(s, Accum) for s in m.merge)
 
 
 def _dissolve_carriers(stmts: list[Stmt]) -> list[Stmt]:

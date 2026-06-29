@@ -48,8 +48,8 @@ def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmen
     ``twist.combine_states``) drives the nodes; the combine renders at the accumulator dtype
     (fp32 for a reduction, with the carrier's own dtype honored when set)."""
     state = carrier.state.names
-    state_b = carrier.twist.state_b
-    prog = carrier.twist.combine_states
+    state_b = carrier.state_b
+    prog = carrier.combine_states
     dtype = next((a.dtype for a in prog if a.dtype is not None), None) or F32
 
     folds = ReduceStage(Level.BLOCK, n_threads).combine(warp_size=warp_size, segmented=segmented)

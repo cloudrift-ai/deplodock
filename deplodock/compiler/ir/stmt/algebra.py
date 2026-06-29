@@ -230,7 +230,7 @@ class Monoid(Stmt):
       load-bearing) and the ``combine_states`` program (merge two fully-reduced
       partition states, reading the second operand ``state_b`` — the form the
       cross-partition combine needs). Read the combine off the twist directly
-      (``monoid.twist.merge`` / ``.combine_states`` / ``.state_b``).
+      (``monoid.merge`` / ``.combine_states`` / ``.state_b`` — the mode-dispatching accessors).
       ``__post_init__`` completes the twist
       against this state: defaults ``state_b`` to ``"<s>__o"`` and, for an
       **additive** carrier whose partial lifts to a state, auto-derives
@@ -385,8 +385,13 @@ class Monoid(Stmt):
         cooperative-tree / cross-CTA reduce renders the state-merge through the same
         machinery as a streaming step (``other`` is read off that merge as its partials).
         """
-        sub = dict(zip(self.state_b, other, strict=True))
-        merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
+        if self.twist.family == "exp":
+            # Regenerate (not rename) so the finalize temps key on ``other[0]`` — distinct
+            # REG-tier folds get distinct temps, no manual uniquify needed.
+            merged = exp_combine_states(self.state.names, other, key=other[0])
+        else:
+            sub = dict(zip(self.state_b, other, strict=True))
+            merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
         return Monoid(
             state=self.state,  # the State (names + identity) carries over unchanged
             partial=(),  # a loop-IR carrier — its partials (``other``) are read off ``merged``

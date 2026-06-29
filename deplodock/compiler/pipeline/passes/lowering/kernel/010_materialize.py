@@ -326,8 +326,8 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
         # A twisted carrier's state-merge carries internal temps with fixed names; uniquify
         # them per fold (the survivor state stays put, so ``Monoid.rewrite``'s own temp
         # uniquify — keyed on a moving state — doesn't fire). A degenerate fold has no temps.
-        carried = set(merge.state.names) | set(merge.twist.state_b)
-        temps = {a.name for a in (*merge.twist.merge, *merge.twist.combine_states)} - carried
+        carried = set(merge.state.names) | set(merge.state_b)
+        temps = {a.name for a in (*merge.merge, *merge.combine_states)} - carried
         if temps:
             sub = {t: f"{t}__rf{r}" for t in temps}
             merge = merge.rewrite(lambda n, sub=sub: sub.get(n, n))

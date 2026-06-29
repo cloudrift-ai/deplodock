@@ -11,7 +11,7 @@ silent-drop bug).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from functools import singledispatch
 
 from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
@@ -155,44 +155,40 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    # The merge / combine_states programs reference state / partial / state_b
-    # (all in the rename map) PLUS carrier-internal temps that are NOT surfaced via
-    # ``defines()`` — so a register-tile replicator that renames the state per cell
-    # leaves the temps shared, colliding across replicas. Uniquify the temps with a
-    # suffix derived from the renamed first state name whenever the state actually
-    # moves (identity rename / pure σ-split leaves them untouched, preserving the
-    # streaming-form SSA).
+    tw = s.twist
+    new_state = tuple(rename(n) for n in s.state.names)
+    new_axis = axis_fn(s.axis) if s.axis is not None else None
+    if tw.family is not None:
+        # SPEC mode: the combine programs are derived, so only the state names and the channel
+        # terms (the partial SSA reads — score / value) need renaming; the programs regenerate
+        # from the renamed spec with fresh temps (keyed on the new state), so there is no shared
+        # temp to uniquify.
+        channels = tuple(replace(c, term=rename(c.term)) if isinstance(c.term, str) else c for c in tw.channels)
+        return Monoid(state=State(names=new_state), partial=s.partial, twist=replace(tw, channels=channels), axis=new_axis)
+    # BOUND mode: rename the stored programs. They reference state / partial / state_b (all in
+    # the rename map) PLUS carrier-internal temps NOT surfaced via ``defines()`` — so a
+    # register-tile replicator that renames the state per cell leaves the temps shared, colliding
+    # across replicas. Uniquify the temps with a suffix derived from the renamed first state name
+    # whenever the state actually moves (identity rename / pure σ-split leaves them untouched).
     names = s.state.names
     new_state0 = rename(names[0]) if names else None
-    carried = set(names) | set(s.twist.state_b)
-    temps = {a.name for a in (*s.twist.merge, *s.twist.combine_states)} - carried
-    overlay: dict[str, str] = {}
-    if new_state0 is not None and new_state0 != names[0]:
-        overlay = {t: f"{t}__{new_state0}" for t in temps}
+    carried = set(names) | set(tw.state_b)
+    temps = {a.name for a in (*tw.merge, *tw.combine_states)} - carried
+    overlay = {t: f"{t}__{new_state0}" for t in temps} if new_state0 is not None and new_state0 != names[0] else {}
 
     def rn(name: str) -> str:
-        # Prefer the caller's rename; the overlay is a fallback only for the
-        # internal temps a SELECTIVE replicator rename leaves untouched (a uniform
-        # ``f"{n}__r"`` rename already suffixes them — don't double-rename).
         r = rename(name)
-        if r != name:
-            return r
-        return overlay.get(name, name)
+        return r if r != name else overlay.get(name, name)
 
     return Monoid(
-        # State carries only ``names`` (the seed is the fold's ``op.identity``); rename them.
         state=State(names=tuple(rn(n) for n in names)),
-        # ``rewrite`` runs on loop-IR carriers (``partial`` already cleared to ``()``); the
-        # partial names live in ``merge`` and are renamed there.
         partial=s.partial,
         twist=Twist(
-            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.merge),
-            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.twist.combine_states),
-            state_b=tuple(rn(n) for n in s.twist.state_b),
+            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in tw.merge),
+            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in tw.combine_states),
+            state_b=tuple(rn(n) for n in tw.state_b),
         ),
-        # The reduce axis — threaded through σ so the cooperative-axis analysis keys off the
-        # renamed name (loop-IR carriers from non-op-tree builders have it None).
-        axis=axis_fn(s.axis) if s.axis is not None else None,
+        axis=new_axis,
     )
 
 

@@ -116,7 +116,7 @@ def _carrier_identities(carrier) -> dict[str, float]:
     accums = base.as_accums()
     if accums is not None:
         return {a.name: a.op.identity for a in accums}
-    return {s.name: s.op.identity for s in base.twist.merge if isinstance(s, Accum)}
+    return {s.name: s.op.identity for s in base.merge if isinstance(s, Accum)}
 
 
 def _mapped(op, grid, *, reduce: ReducePlan | None = None, tile=None):
@@ -198,7 +198,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # A twisted state-merge (kept as a Monoid stmt, rendered by render_merge_program) must seed
     # the state explicitly; a degenerate one dissolves to ``Accum``\\ s whose seed ``Loop.render``
     # derives — an ``Init`` there would double-declare the accumulator.
-    kept = combine.as_accums() is None and not any(isinstance(s, Accum) for s in combine.twist.merge)
+    kept = combine.as_accums() is None and not any(isinstance(s, Accum) for s in combine.merge)
     ids = _carrier_identities(carrier)
     seeds = tuple(Init(name=state[i], identity=ids[state[i]], dtype=F32) for i in range(n_comp)) if kept else ()
     loads = tuple(Load(name=other[i], input=ws_name, index=ws_index(i)) for i in range(n_comp))
