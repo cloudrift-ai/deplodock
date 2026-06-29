@@ -1,15 +1,12 @@
 """Factorize — expand the high-level ``MmaContraction`` into the warp-tier fragment soup.
 
-``010_materialize`` emits a warp/mma contraction as a single :class:`MmaContraction` node (the
-op tree + schedule are gone by then). This pass does the **exact atom factorization**: it
-replaces that node with the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
-``RegStore`` — the four-way GRID/WARP/REGISTER/ATOM split, operand staging, and the per-cell
-projection epilogue (all in :func:`_warp_factor.factorize_mma`). It runs at ``015`` — right
-after materialize, before ``030_stamp_types`` — so every later kernel pass + the cuda render
-see ordinary expanded kernel-IR; the ``MmaContraction`` never survives this pass.
+This pass does the **exact atom factorization**: it replaces a :class:`MmaContraction` node with
+the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` — the four-way
+GRID/WARP/REGISTER/ATOM split, operand staging, and the per-cell projection epilogue (all in
+:func:`_warp_factor.factorize_mma`).
 
-The materializer always emits the contraction as the lone stmt of the ``KernelOp`` body
-(``Body((mma,))``), so the match is a single top-level node — no recursion."""
+The contraction is the lone stmt of the ``KernelOp`` body (``Body((mma,))``), so the match is a
+single top-level node — no recursion."""
 
 from __future__ import annotations
 

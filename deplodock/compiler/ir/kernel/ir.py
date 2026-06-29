@@ -303,15 +303,13 @@ class MmaContraction(Stmt):
     """A tensor-core contraction **before** atom factorization — the high-level seam between
     the materializer and ``015_factorize``.
 
-    ``010_materialize`` emits this single node (the op tree + schedule are gone by the time
-    factorization runs, so it captures everything the factorization needs): the operand
-    ``Load``\\ s + their role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
+    ``010_materialize`` emits this single node, capturing everything the factorization needs:
+    the operand ``Load``\\ s + their role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
     accumulator name ``acc``, the resolved projection ``epilogue`` (post-``_with_store`` — it
     always ends in the output ``Write``), the ``warp_tile`` geometry + operand ``stage``, the
     captured ``m_axis`` / ``n_axis`` / ``k_axis``, and the ``output`` buffer. ``015_factorize``
     expands it into the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
-    ``RegStore`` (the four-way GRID/WARP/REGISTER/ATOM split). It is **transient** — it never
-    survives to the cuda backend (``render`` raises), but it IS ``structural_key``-ed as an
+    ``RegStore`` (the four-way GRID/WARP/REGISTER/ATOM split). It IS ``structural_key``-ed as an
     intermediate ``KernelOp``, so it carries the kernel-stmt protocol + a ``_rewrite`` handler.
 
     The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the

@@ -28,17 +28,16 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 ## `015_factorize` — the exact tensor-core atom factorization
 
 The warp tier is the one place where the materializer used to carry hundreds of lines of atom geometry. That geometry is
-factored out: `010_materialize._warp` emits a transient `MmaContraction` (`ir/kernel/ir.py`) carrying everything the
-expansion needs (the operand `Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the
-`Stage`, the m/n/k axes, the output buffer), and **`015_factorize`** (a `KernelOp → KernelOp` pass, after materialize and
-before `030_stamp_types`) expands it via `_warp_factor.factorize_mma` into the `Tile` of `RegFragment` / `LdmatrixLoad` /
-`MmaSyncPtx` / `RegStore` — the four-way GRID/WARP/REGISTER/ATOM split, the operand staging decision, and the per-cell
-epilogue. The `MmaContraction` is transient: it never reaches the cuda render (`015` always expands it), but it IS
-`structural_key`-ed as an intermediate `KernelOp`, so it carries the kernel-stmt protocol + a `_rewrite` handler.
+factored out: `010_materialize._warp` emits an `MmaContraction` (`ir/kernel/ir.py`) carrying everything the expansion
+needs (the operand `Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the `Stage`, the
+m/n/k axes, the output buffer), and **`015_factorize`** (a `KernelOp → KernelOp` pass) expands it via
+`_warp_factor.factorize_mma` into the `Tile` of `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore` — the
+four-way GRID/WARP/REGISTER/ATOM split, the operand staging decision, and the per-cell epilogue. The `MmaContraction`
+IS `structural_key`-ed as an intermediate `KernelOp`, so it carries the kernel-stmt protocol + a `_rewrite` handler.
 
 This keeps materialize a thin tier dispatcher and homes the explicit "atom-tiled contraction" representation at the
-kernel level (where the body **is** the `op_cache_key`, so the always-expanded final `KernelOp` / `CudaOp` keys stay
-byte-identical — the perf cache / prior transfer untouched). All atom geometry — `_axis_base`, the staging eligibility
+kernel level (where the body **is** the `op_cache_key`, so the final `KernelOp` / `CudaOp` keys stay byte-identical —
+the perf cache / prior transfer untouched). All atom geometry — `_axis_base`, the staging eligibility
 (`_can_stage_warp[_tma]`), the staged K-loops, the `RegStore` epilogue — lives in `_warp_factor.py`, the new-atom seam.
 
 ## Operand staging (`_stage.py`) — the `STAGE` codec
