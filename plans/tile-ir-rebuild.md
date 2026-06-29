@@ -250,6 +250,96 @@ the **graph** (two `TileOp` nodes). What the schedule carries is the *request*: 
 
 So the schedule carries the partition (including the split request); the **graph** carries the kernel count.
 
+### The knob schema — shared orthogonal codes, not per-class
+
+A schedule is **spelled** by a small set of **orthogonal codes**, one per tunable sub-component. A kernel's full
+config is the **union** of the codes that apply to it — NOT one monolithic code per `*Schedule` class. The schedules
+recompose the same sub-components (a `ReducePlan` lives on both `Monoid` and `Semiring`; a `WarpTile` on both `Warp`
+fragments; a `Stage` on every reduce loop), so a per-class code would re-encode shared concepts and spell them
+differently. The payoff is precisely two things — and **not** a third that's easy to over-claim:
+
+- **No duplicated concept** — one vocabulary for the reduce partition, the tile, the warp fragment, the transport,
+  wherever each appears. The knob schema mirrors the schedule's *fields* and the prior's *feature families*
+  (`_reduce_decomp` / `_free_slots` / `_warp_tile_features`).
+- **Learned-feature generalization across kinds** — because the featurizer reads ONE code schema-agnostically (today
+  `_reduce_decomp` reads the raw `REDUCE` key), a `b32` reduce featurizes identically on a `Monoid` and a `Semiring`, so
+  the *learned model* transfers what it knows about reduce width across kinds.
+- **NOT cross-kind measured-evidence sharing.** `op_cache_key` digests the op-tree body + kind (`keys.py`), so a
+  `Monoid` and a `Semiring` `perf`/reservoir row never share a key regardless of spelling — the *measured* `evidence_pick`
+  is siloed by kind either way. Shared spelling buys the learned-feature transfer above, not measured-row reuse; don't
+  expect the latter.
+
+| code | sub-component (schedule field) | schedules | grammar (coarse→fine) | status |
+|---|---|---|---|---|
+| `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
+| `TILE` | free-axis output tile (`Placement` + `Scalar` reg) | `Map`, `Monoid`, `Semiring` | `n<N>[xm<M>]` parallel · `f<FM>[xf<FN>]` reg | proposed |
+| `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | proposed |
+| `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | proposed |
+
+**Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser, which splits on `,` and requires
+`=` per entry — `knob.py::parse_knob_spec`): **`,` is reserved** as the knob-list separator and MUST NOT appear inside a
+code value. Within a value: `/` separates fields, `x` pairs dims, `:` introduces a name (`a:<atom>`), `;` lists
+(e.g. a multi-`Channel` `WarpSpec`). Sub-field order is fixed **m-then-n** everywhere (`f<FM>xf<FN>`, `w<WM>xw<WN>`) to
+match the legacy `FM`/`FN`/`WM`/`WN` order — but note `_free_slots` re-canonicalizes the two free slots by parallel
+width (wider = the `n`/coalesced slot), so the codec's `m`/`n` labels are nominal, not the feature's source of truth.
+
+Three rules keep it unambiguous (the same separation the type design already draws):
+
+1. **Vocabulary is shared; interpretation is per-class.** A code names a single-meaning sub-component; the `*Schedule`
+   *type* resolves which axis it targets. `REDUCE b32` = "32-wide BLOCK partition of *the* reduce axis" — `Monoid`
+   reads KV, `Semiring` reads K. This is why a shared knob does NOT reintroduce the ambiguity that a shared
+   `WarpSchedule` *type* would: the K-vs-KV relationship stays in the type, never in the code.
+2. **Fragment is implicit in which output code is present.** `TILE` ⇒ `Scalar` (`n`/`m` are threads); `WARP` ⇒ `Warp`
+   (`n`/`m` are warps; `WARP` carries its own reg `f` + atom + `k`-chunk). Never both — the either-ness mirrors the
+   `fragment` field.
+3. **Grammar (validity) is per-(kind, fragment); vocabulary is not.** `Map` offers only `TILE`; `Monoid·Scalar` offers
+   `REDUCE`+`TILE`+`STAGE`; `Semiring·Warp` offers `WARP`+`REDUCE`+`STAGE`. The enumeration (the `020_schedule` fork)
+   decides which codes/values are valid candidates per cell; the codec vocabulary is the same everywhere.
+
+`WarpSpec` reuses the role vocabulary (`REDUCE` reducer / `WARP` mma / `STAGE` producer) but DOES add one piece of
+grammar: **role-namespacing** (a flat `TileOp.knobs` dict can't hold two roles each with a `STAGE` otherwise). A
+role-prefixed key (`mma:WARP=…`) plus the `CHANNEL` ring is genuine new vocabulary — it must be registered so
+`knob_features` / `apply_off_defaults` / `tuning_knob_items` handle role-prefixed keys, not silently drop them. Worked
+examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter hierarchy):
+
+```
+✅ Monoid·Scalar  REDUCE=b64/r4          # 64-way coop + 4 ILP register accumulators
+✅ Monoid·Scalar  REDUCE=b16  TILE=n8    # strided-coop rows: 16 lanes, 8 output rows/CTA
+✅ Monoid·Scalar  REDUCE=b32             # flash-decoding (cooperative-KV, scalar flash)
+🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp
+🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize
+🔲 Monoid·Warp    WARP=a:m16n8k16_f16/w4xw1/f1xf1/k1  REDUCE=b2  STAGE=d2/tma   # warp-tier flash, coop-KV
+🔲 WarpSpec       CHANNEL=K:d3/cp;V:d3/cp  mma:WARP=…/k2  reducer:REDUCE=b2  producer:STAGE=d3/cp
+```
+
+### Wiring cost & open gaps (from the design review)
+
+The cost is **not** "only the source keys move" — featurization is **codec-aware** (as `_reduce_decomp` already parses
+the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
+
+- **Codec-aware tier discriminator (blocking).** `is_warp` / `mma_atom` / `_free_slots` / `_warp_tile_features` key off
+  scalar names (`WN`/`WM`/`ATOM@`) today; a packed `WARP=…` value has none, so a warp kernel would featurize through the
+  *scalar* path. Either keep `WM`/`WN`/`ATOM@`/`FM`/`FN` as the on-dict representation and treat `WARP`/`TILE` as the
+  pin/display spelling that explodes into those keys at stamp time (featurizers unchanged), **or** make all four entry
+  points parse the codec. Pick one; the former is the smaller change and keeps `tile_signature` golden-matching working.
+- **`REDUCE`'s finalize letter is currently dropped (latent bug).** `ReducePlan.parse` strips the `g<n>[a|k]` letter and
+  `spell` never re-emits it, so `_Decomp.finalize` stays `"atomic"` and `D_finalize_kernel` can never fire. Harmless
+  today (no `g` is produced — `030_split` is stubbed), but the `cta` tier must carry the finalize on `ReduceStage` and
+  round-trip it before `g…a`/`g…k` mean anything.
+- **OFF-sentinel & validity need a codec-aware home.** `apply_off_defaults` / the tier filters work per *named* knob; a
+  packed code has no per-subfield OFF, so "decided: not a warp kernel" needs an explicit empty-codec OFF (`WARP=""`).
+  And the per-(kind,fragment) validity must live as a **codec-dict validator** (where pins / the featurizer run), not
+  only a schedule `__post_init__` — a pinned illegal union (`TILE`+`WARP`) otherwise constructs and mislowers silently.
+- **Type reconciliation.** The "kind × fragment" section types the fragment as `Fragment = Scalar() | Warp(tile)`, but
+  the *built* `schedule.py` carries `warp_tile: WarpTile | None` (no `Fragment` type yet) and has no `__post_init__`.
+  Land the `Fragment` type (or restate the section against `warp_tile`) so the codec rules ("`TILE`⇒Scalar / `WARP`⇒Warp")
+  have something to assert against.
+- **Unspellable today (note, not block).** `>2` free axes (batched outputs) and the `block` strided-rows field beyond
+  one packed axis have no dedicated code; `STAGE.depth` / `WarpTile.bk` / `Channel.depth` are three interacting depths,
+  not fully orthogonal.
+
+Today only `REDUCE` is wired (`r<n>` ILP reachable via pin; the auto-fork offers `b`/scalar, not `r`/`g` yet).
+
 ## Remaining — the warp / tensor-core tier
 
 The `Warp` fragment + `WarpSpec` are the recovery target. The kernel-IR tensor-core vocabulary **survived the
