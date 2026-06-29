@@ -45,6 +45,8 @@ from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     TMA_SLAB_ALIGN,
     CtaTile,
@@ -82,12 +84,6 @@ def _with_store(stmts: list[Stmt], output: str, grid, op) -> list[Stmt]:
         return stmts
     index = tuple(Var(ax.name) for ax in grid)
     return [*stmts, Write(output=output, index=index, value=op.out)]
-
-
-def _extent_expr(axis: Axis):
-    """The reduce axis's extent as an ``Expr`` — a literal int (static) or the symbolic
-    ``Dim`` expr (dynamic ``seq_len``)."""
-    return Literal(axis.extent.as_static(), "int") if axis.extent.is_static else axis.extent.expr
 
 
 def _mask_streamed(body: list[Stmt], axis: str, offset: int, extent) -> list[Stmt]:
@@ -128,15 +124,6 @@ def _replicate(body: Body, r: int, coop: int, axis: Axis, masked: bool, protecte
     rename = lambda n: n if n in protected else f"{n}__r{r}"  # noqa: E731
     out = [s.rewrite(rename, sigma) for s in body]
     return _mask_streamed(out, axis.name, offset, _extent_expr(axis)) if masked else out
-
-
-def _shrink_axis(axis: Axis, reg: int) -> Axis:
-    """The grid (cell) axis for a register-tiled free axis: ``ceil(E / reg)`` cells, each a
-    per-thread ``reg``-wide register sub-tile. ``Dim.ceil_div`` keeps a symbolic extent
-    symbolic (``(seq_len+reg-1)//reg``) so the launch grid sizes from the runtime extent."""
-    if reg <= 1:
-        return axis
-    return Axis(name=axis.name, extent=axis.extent.ceil_div(reg), source_axis=axis.source_axis or axis)
 
 
 def _needs_mask(axis: Axis | None, reg: int) -> bool:
