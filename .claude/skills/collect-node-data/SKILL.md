@@ -64,100 +64,43 @@ Capture from the final `VM ready at <user@host[:port]>` line:
 
 Do not wrap the command in a retry loop — the orchestrator handles fallback itself.
 
-## Step 2 — Set up deplodock on the remote
+## Step 2 — Set up + tune on the remote (one backgrounded script)
 
-Use the SSH options the codebase uses (`deplodock/provisioning/ssh_transport.py`). Define once:
+`scripts/remote_node_tune.py` does the whole token-heavy middle in **one process**: ensures the Python 3.12 venv/dev
+packages + `nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes), runs `make setup` (output to
+the remote `~/setup.log` — only a tail returns on failure), launches `deplodock tune --dataset golden` detached, then
+**polls the remote log internally** until it finishes. The four traps from the first run are baked in: argv-list ssh (no
+zsh word-split), `[d]eplodock tune` bracket-pgrep (no self-match), one short ssh per poll (no broken-pipe), and venv/dev
+always installed before `make setup`.
 
-```bash
-REMOTE="<user@host>"
-KEY="$HOME/.ssh/id_ed25519"
-# The harness shell is zsh, which does NOT word-split a plain string var — so pass the SSH options as an
-# ARRAY (expands correctly in both bash and zsh). A plain SSHOPTS="-o …" string fails under zsh with
-# `keyword stricthostkeychecking extra arguments at end of line`.
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -i "$KEY")
-# Non-22 port: append `-p <PORT>` to SSH_OPTS for ssh; for scp/rsync pass `-P <PORT>` (scp's flag) separately.
-# zsh gotcha: never name a helper var `status` or `path` (read-only/reserved in zsh) in any poll/waiter loop.
-```
-
-Invoke ssh as `ssh "${SSH_OPTS[@]}" "$REMOTE" …` and rsync as `rsync … -e "ssh ${SSH_OPTS[*]}" …` below.
-
-**1. Sanity-check the toolchain** (driver + nvcc + python):
+Run it in the **background** (Bash `run_in_background: true`) — the tune is ~30–45 min, past a foreground tool timeout,
+and you only want the final summary in context, not ~20 ssh polls:
 
 ```bash
-ssh "${SSH_OPTS[@]}" "$REMOTE" 'nvidia-smi -L; (command -v nvcc || ls /usr/local/cuda*/bin/nvcc 2>/dev/null); python3 --version'
+./venv/bin/python scripts/remote_node_tune.py --remote "<user@host>" --ssh-key ~/.ssh/id_ed25519 [--port <PORT>]
 ```
 
-- **`nvcc` missing?** CloudRift / GCP images ship the NVIDIA driver + CUDA 12.9, but the CloudRift image may carry only
-  the runtime. If `nvcc` isn't found, either it's under `/usr/local/cuda/bin` (just export the PATH, below) or install
-  the toolkit matching the driver: `sudo apt-get update -qq && sudo apt-get install -y -qq cuda-toolkit-12-9`.
-- **Always install the Python 3.12 venv + dev packages before `make setup`** — do NOT gate this on the version check.
-  Even when `python3` *is* already 3.12, the CloudRift image ships it **without** the venv module (so `make setup` dies
-  with `ensurepip is not available`, exit 127) and **without** the dev headers (so the cppyy wheel build fails with
-  `fatal error: Python.h: No such file or directory`, exit 1). Install both up front (add `python3.12` itself only if
-  `python3 --version` isn't 3.12):
-  ```bash
-  ssh "${SSH_OPTS[@]}" "$REMOTE" 'sudo apt-get update -qq && sudo apt-get install -y -qq python3.12-venv python3.12-dev'
-  ```
-  If a previous `make setup` already created a half-built `venv/`, `rm -rf ~/deplodock/venv` before re-running it.
+When it exits you get one compact summary:
+- **success** → `status: ok`, `shapes: N/N`, `bench_fails: K`, elapsed, and the remote log path. (A `bench_fail` on a big
+  shape like `square.4096` is expected — an 8 s bench-wall guard, non-fatal; `K` small is fine.) The tune wrote the
+  default `~/.cache/deplodock/autotune.db` on the remote, ready for Step 3.
+- **failure** → `status: FAILED (<phase>)` plus the last 40 lines of the relevant remote log (`~/setup.log` or
+  `~/tune.log`). Fix and re-run — the script is idempotent (rsync + `make setup` no-op when already done).
 
-**2. Rsync the working tree and set up the venv.** Rsync (not clone) so the remote runs the **exact local code**,
-including any uncommitted changes:
+**Manual debugging** (only if the script fails and you need to poke the box): the harness shell is zsh, so pass ssh
+options as an **array** — `SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i
+"$HOME/.ssh/id_ed25519")` (a plain string var fails: zsh doesn't word-split it). Then `ssh "${SSH_OPTS[@]}" "$REMOTE"
+'tail -n 40 ~/tune.log'`; check liveness with `pgrep -f "[d]eplodock tune"` (bracket trick — a plain pattern self-matches
+the poll's own argv); never run a multi-minute loop inside one ssh session.
 
-```bash
-REPO="$(git rev-parse --show-toplevel)"   # repo root, wherever this skill runs from
-rsync -az -e "ssh ${SSH_OPTS[*]}" \
-  --exclude venv --exclude .git --exclude recipes --exclude _tune --exclude '__pycache__' --exclude '*.pyc' \
-  "$REPO/" "$REMOTE:~/deplodock/"
-ssh "${SSH_OPTS[@]}" "$REMOTE" 'cd ~/deplodock && export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda && make setup'
-```
-
-`make setup` is a no-op if `venv/` already exists and installs `.[dev]` (CUDA torch, cupy-cuda12x, cppyy, catboost, …).
-It installs **no** system packages — that's why Step 2.1 ensures the `python3.12-venv`/`-dev` packages + `nvcc` first.
-
-## Step 3 — Run the golden tune (detached) and wait
-
-Run it detached with a logfile so it survives a shaky SSH link:
-
-```bash
-ssh "${SSH_OPTS[@]}" "$REMOTE" '
-  cd ~/deplodock
-  export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda
-  nohup ./venv/bin/deplodock tune --dataset golden > ~/tune.log 2>&1 &
-  echo "tune_pid=$!"
-'
-```
-
-Notes:
-
-- **No `--clean`** — the VM is fresh, nothing to clean.
-- **No `DEPLODOCK_TUNE_DB`** — let it write the default `~/.cache/deplodock/autotune.db`; Step 4 reads that path.
-- tune compiles at `-Xcicc -O1` (a fast *ranking* pass) and re-benches near-best configs at `-O3`; both are recorded as
-  node rows. We want the whole search tree, not just deployable winners.
-
-**Poll until it finishes** (~30–45 min). Each poll is its **own short ssh** — do NOT hold a single ssh session open
-running a multi-minute `for`/`sleep` loop: long-lived sessions drop with `client_loop: send disconnect: Broken pipe`
-(exit 255). Re-poll every few minutes from the parent loop instead:
-
-```bash
-# Note the `[d]` bracket trick: a plain `pgrep -f "deplodock tune"` ALSO matches the pgrep wrapper's own
-# command line (it contains the string "deplodock tune"), so it reports the tune as alive forever — even long
-# after it finished. `"[d]eplodock tune"` matches the real process but not the literal pattern string.
-ssh "${SSH_OPTS[@]}" "$REMOTE" 'tail -n 25 ~/tune.log; echo "---"; pgrep -af "[d]eplodock tune" || echo "TUNE DONE"'
-```
-
-Re-poll every few minutes. Done = `TUNE DONE` **and** the log ends with the tune summary (no traceback). If in doubt,
-cross-check with `ssh "${SSH_OPTS[@]}" "$REMOTE" 'ps -C python3.12 -o pid,etime,cmd; nvidia-smi --query-compute-apps=pid
---format=csv,noheader'` — an empty process list + idle GPU confirms the tune actually exited. An `nvcc`/`CUDA_HOME`
-error means the toolchain export from Step 2 didn't take — fix and re-run Step 3.
-
-## Step 4 — Copy the node rows back and merge into the local DB
+## Step 3 — Copy the node rows back and merge into the local DB
 
 Use the merge helper — it snapshots the remote DB (WAL-safe `VACUUM INTO`), scps it back, and merges **only** the `node`
 table into the local canonical DB with keep-min semantics (a remote row wins only when strictly faster for the *same*
 `(gpu, op, knobs)` — which, cross-card, never happens, so other cards' rows are untouched):
 
 ```bash
-./venv/bin/python scripts/merge_node_db.py --remote "$REMOTE"   # add --ssh-key / --port if non-default
+./venv/bin/python scripts/merge_node_db.py --remote "<user@host>"   # add --ssh-key / --port if non-default
 ```
 
 (For an already-fetched local snapshot, use `--src <file.db>` instead of `--remote`. Override the destination with
@@ -166,7 +109,7 @@ table into the local canonical DB with keep-min semantics (a remote row wins onl
 It prints a **per-card receipt** (`node rows per card now: …`): the rented card should appear as its own line (e.g.
 `NVIDIA H200 141GB: <n>`) and the counts of cards already present should be unchanged.
 
-## Step 5 — Verify
+## Step 4 — Verify
 
 ```bash
 ./venv/bin/deplodock eval prior --dataset nodes
@@ -175,7 +118,7 @@ It prints a **per-card receipt** (`node rows per card now: …`): the rented car
 `node_report` groups by card — confirm a block headed with the rented GPU's name appears (`[<gpu>] <n> nodes`, with fork
 sibling-ranking + leaf reachability for that card). `--kernel matmul` / `reduce` / `pointwise` narrows to one op family.
 
-## Step 6 — Tear down the server
+## Step 5 — Tear down the server
 
 The VM bills until deleted, and this skill's job is done once the merge verifies. **Confirm with the user, then delete**
 (never delete a VM without an explicit go-ahead):
@@ -192,8 +135,7 @@ If the user wants to keep the box for more tuning, leave it up and report the SS
 Before reporting success:
 
 - [ ] `vm create gpu` exited 0 and an SSH target was captured (and `--billing-exempt` was passed for CloudRift).
-- [ ] Remote `nvcc` resolved and `make setup` completed without error.
-- [ ] `~/tune.log` ended with the tune summary (no traceback); the `deplodock tune` process exited.
+- [ ] `remote_node_tune.py` printed `status: ok` with `shapes: N/N` (not `FAILED`).
 - [ ] The merge printed the rented card as its own per-card line; counts for other cards are unchanged.
 - [ ] `eval prior --dataset nodes` shows a block for the rented GPU.
 - [ ] The VM was deleted (or the user explicitly chose to keep it, and has the teardown command).
@@ -212,7 +154,8 @@ If any check fails, report the failure + raw output instead of claiming success.
 - **Don't rent more than 1 GPU** — node data is per-card; extra GPUs just burn money.
 - **Don't auto-delete the VM** — confirm teardown with the user first (and never modify a CloudRift server beyond the
   tune we explicitly started).
-- **Don't trust a plain `pgrep -f "deplodock tune"`** — it self-matches the wrapper's own argv and reports the tune
-  alive forever. Use the `[d]eplodock tune` bracket trick (Step 3) and cross-check with `ps -C python3.12` + an idle GPU.
-- **Don't pass SSH options as an unquoted string var** — the harness shell is zsh; use the `SSH_OPTS=(…)` array, and
-  never name a helper var `status`/`path` (read-only in zsh — a waiter that does `status=$(…)` crashes outright).
+- **Don't hand-roll the remote setup/poll loop** — `scripts/remote_node_tune.py` (Step 2) already handles it correctly:
+  argv-list ssh (zsh doesn't word-split a string var), the `[d]eplodock tune` bracket-pgrep (a plain pattern self-matches
+  the poll's own argv and reports the tune alive forever), one short ssh per poll, and venv/dev install. Only drop to
+  manual ssh for debugging — and then keep the same precautions (array ssh opts; never name a var `status`/`path`, which
+  are read-only in zsh).

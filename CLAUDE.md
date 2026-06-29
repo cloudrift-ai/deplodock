@@ -287,6 +287,13 @@ fails fast with a specific message.
   `SearchDB.merge_nodes` (keep-min per `node_key`; the GPU-folded key means other cards' rows are never clobbered).
   Prints a per-card row-count receipt. The copy-back step of the `collect-node-data` skill (rent a GPU → `tune --dataset
   golden` there → merge its node rows home).
+- Remote node-tune driver: `python scripts/remote_node_tune.py --remote user@host [--ssh-key PATH] [--port N] [--repo
+  DIR] [--poll S] [--timeout S]` — the setup+tune+wait middle of the `collect-node-data` skill, extracted so the agent
+  makes one **backgrounded** call instead of ~20 ssh polls: ensures the python3.12 venv/dev pkgs + `nvcc`, rsyncs the
+  working tree, runs `make setup` (output to the remote `~/setup.log`), launches `deplodock tune --dataset golden`
+  detached, then polls the remote log **internally** until done and prints one compact summary (`status`, `shapes N/N`,
+  `bench_fails`, elapsed) — a log tail only on failure. Robustness baked in: argv-list ssh (zsh-safe), `[d]eplodock
+  tune` bracket-pgrep, one ssh per poll. Run via Bash `run_in_background: true` (the tune is ~30–45 min).
 
 ## Key Make Targets
 
