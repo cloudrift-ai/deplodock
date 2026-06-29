@@ -362,7 +362,7 @@ the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
   Land the `Fragment` type (or restate the section against `warp_tile`) so the codec rules ("`TILE`⇒Scalar / `WARP`⇒Warp")
   have something to assert against.
 - **Interacting depths — resolved.** The operand pipeline has two buffer **depths** plus a **granularity**, kept
-  distinct: `STAGE.depth` = the gmem→smem ring (cp.async/TMA prefetch over the K-chunk loop), `STAGE.reg_depth`
+  distinct: `STAGE.depth` = the gmem→smem ring (cp.async prefetch over the K-chunk loop; TMA single-buffer), `STAGE.reg_depth`
   (`/p<n>`) = the smem→register double-buffer (the ldmatrix ping-pong over the inner atom-K steps), and `WarpTile.bk`
   = the slab K-granularity (how much K is resident — NOT a depth). The two depths both live on `STAGE` (same kind of
   quantity, one level apart); `bk` stays on `WarpTile`. `Channel.depth` (WarpSpec) is the shared-ring variant, still
