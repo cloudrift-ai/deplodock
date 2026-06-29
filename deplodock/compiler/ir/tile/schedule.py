@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
+from deplodock.compiler.ir.tile.binding import AtomBinding
 
 
 def _codec_width(num: str, *, tok: str, codec: str) -> int:
@@ -590,6 +591,8 @@ class SemiringSchedule:
     tile: TilePlan = field(default_factory=TilePlan)
     warp_tile: WarpTile | None = None  # TODO(warp-flash)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
+    bind: AtomBinding | None = None  # the operand→role binding, filled by 040_atomize after
+    # the warp tile is chosen (None until then / on a scalar-tile or split-partial contraction)
 
 
 # --------------------------------------------------------------------------- #

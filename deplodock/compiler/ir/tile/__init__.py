@@ -7,6 +7,7 @@ separate from the *combine* (the op tree), and one ``TileOp`` covers MAP / MONOI
 SEMIRING.
 """
 
+from deplodock.compiler.ir.tile.binding import AtomBinding, Operand
 from deplodock.compiler.ir.tile.ir import Schedule, TileOp
 from deplodock.compiler.ir.tile.schedule import (
     Channel,
@@ -31,6 +32,7 @@ from deplodock.compiler.ir.tile.schedule import (
 )
 
 __all__ = [
+    "AtomBinding",
     "Channel",
     "Fold",
     "Kernel",
@@ -39,6 +41,7 @@ __all__ = [
     "MapSchedule",
     "MonoidKernel",
     "MonoidSchedule",
+    "Operand",
     "Placement",
     "ReducePlan",
     "ReduceStage",
