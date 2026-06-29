@@ -45,7 +45,16 @@ from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage import CtaTile, cp_async_barrier, cp_async_fill, slab_smem
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
+    TMA_SLAB_ALIGN,
+    CtaTile,
+    cp_async_barrier,
+    cp_async_fill,
+    slab_smem,
+    tma_descriptor,
+    tma_fill,
+    tma_mbar_prologue,
+)
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
@@ -443,6 +452,27 @@ def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom
     return (bk_elems % 2 == 0) and (tile_n % 2 == 0)
 
 
+def _staged_inner_atom_loop(*, a_slab, b_slab, m_w, n_w, fm, fn, atom, bk_elems, tile_n, ki) -> StridedLoop:
+    """The inner atom-K loop shared by the cp.async and TMA staged paths: read the
+    A/B slabs via ``LdmatrixLoad(staged=True)`` + ``MmaSyncPtx``. Slab-local indices —
+    A[tile_m][bk_elems] (ldm=bk_elems), B[bk_elems][tile_n] (ldm=tile_n) — independent
+    of which producer (cp.async / TMA) filled the (plain row-major, NONE-swizzle) slab."""
+    atom_m, atom_n, atom_k = atom.shape
+    inner: list[Stmt] = []
+    for i in range(fm):
+        a_row = BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(fm * atom_m, "int")), Literal(i * atom_m, "int"))
+        inner.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_slab, src_index=(a_row, Var(ki)), role="a", staged=True, ldm=bk_elems))
+    for j in range(fn):
+        b_col = BinaryExpr("+", BinaryExpr("*", Var(n_w), Literal(fn * atom_n, "int")), Literal(j * atom_n, "int"))
+        inner.append(LdmatrixLoad(frag=f"_b{j}", src_buffer=b_slab, src_index=(Var(ki), b_col), role="b", staged=True, ldm=tile_n))
+    for i in range(fm):
+        for j in range(fn):
+            inner.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
+    return StridedLoop(
+        axis=Axis(name=ki, extent=bk_elems), start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(inner)), unroll=True
+    )
+
+
 def _warp_staged_kloop(
     *, a_load, b_load, m_axis, n_axis, k_axis, m_b, n_b, m_w, n_w, wm, wn, fm, fn, atom, bk, tile_m, tile_n, slab_dtype, elem_bytes, mask_m
 ) -> tuple[list[Stmt], list[Stmt]]:
@@ -455,7 +485,7 @@ def _warp_staged_kloop(
     ``mask_m`` (symbolic / non-divisible output rows): the A-slab fill clamps the gmem row
     in-bounds (``% M``) so an overhanging row reads a duplicate rather than past the buffer;
     the duplicate's contribution is discarded by the ``RegStore`` ``m_guard``."""
-    atom_m, atom_n, atom_k = atom.shape
+    atom_k = atom.shape[2]
     bk_elems = bk * atom_k  # K elements per slab (the BK chunk)
     a_slab, b_slab = "_a_smem", "_b_smem"
     n_threads = wm * wn * 32
@@ -492,20 +522,9 @@ def _warp_staged_kloop(
     )
     fills += cp_async_barrier()
 
-    # Inner atom loop: read the slabs via staged ldmatrix + mma. Slab-local indices —
-    # A[tile_m][BK] (ldm=BK), B[BK][tile_n] (ldm=tile_n).
-    inner: list[Stmt] = []
-    for i in range(fm):
-        a_row = BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(fm * atom_m, "int")), Literal(i * atom_m, "int"))
-        inner.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_slab, src_index=(a_row, Var(ki)), role="a", staged=True, ldm=bk_elems))
-    for j in range(fn):
-        b_col = BinaryExpr("+", BinaryExpr("*", Var(n_w), Literal(fn * atom_n, "int")), Literal(j * atom_n, "int"))
-        inner.append(LdmatrixLoad(frag=f"_b{j}", src_buffer=b_slab, src_index=(Var(ki), b_col), role="b", staged=True, ldm=tile_n))
-    for i in range(fm):
-        for j in range(fn):
-            inner.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
-    inner_loop = StridedLoop(
-        axis=Axis(name=ki, extent=bk_elems), start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(inner)), unroll=True
+    # Inner atom loop: read the slabs via staged ldmatrix + mma (shared with the TMA path).
+    inner_loop = _staged_inner_atom_loop(
+        a_slab=a_slab, b_slab=b_slab, m_w=m_w, n_w=n_w, fm=fm, fn=fn, atom=atom, bk_elems=bk_elems, tile_n=tile_n, ki=ki
     )
 
     # Single buffer: a trailing Sync so the next slab fill can't clobber the slab while a
@@ -520,6 +539,79 @@ def _warp_staged_kloop(
     )
     slab_decls = [slab_smem(a_slab, tile_m, bk_elems, slab_dtype), slab_smem(b_slab, bk_elems, tile_n, slab_dtype)]
     return slab_decls, [outer]
+
+
+def _can_stage_warp_tma(
+    stage, k_axis: Axis, n_axis: Axis, tile_n: int, bk: int, atom_k: int, elem_bytes: int, mask_n: bool, b_trans: bool
+) -> bool:
+    """Staging eligibility for the warp tier via TMA (``cp.async.bulk.tensor``): a ``tma``
+    stage over a contraction with a STATIC, tile-divisible K and a canonical B. A masked /
+    symbolic **M** is fine — the descriptor's globalDim is the runtime M and TMA zero-fills
+    the box overhang past it (no fill clamp needed). A masked **N** and a symbolic / non-
+    divisible **K** stay gmem-direct. The box's inner dim (A's BK, B's tile_n) and the
+    source's inner global stride (A's K, B's N) must be 16 B-aligned (the NONE-swizzle TMA
+    box-copy rule)."""
+    if stage is None or stage.transport != "tma" or b_trans or mask_n:
+        return False
+    if not (k_axis.extent.is_static and n_axis.extent.is_static):
+        return False
+    bk_elems = bk * atom_k
+    k, n = k_axis.extent.as_static(), n_axis.extent.as_static()
+    if k % bk_elems != 0:
+        return False
+    # 16 B alignment: box inner dims (BK, tile_n) and source inner strides (K, N).
+    return all((x * elem_bytes) % 16 == 0 for x in (bk_elems, tile_n, k, n))
+
+
+def _warp_tma_staged_kloop(
+    *, a_load, b_load, k_axis, m_b, n_b, m_w, n_w, wm, wn, fm, fn, atom, bk, tile_m, tile_n, slab_dtype, elem_bytes
+) -> tuple[list[Stmt], list[Stmt]]:
+    """The warp tier's STAGED K loop via **TMA** (single-buffer): declare the A/B
+    ``CUtensorMap`` descriptors + the destination slabs + one mbarrier, then an outer
+    K-slab loop where the issuer thread box-copies both operand tiles (``cp.async.bulk.tensor``)
+    and every thread waits on the mbarrier parity before the shared staged-``LdmatrixLoad`` +
+    mma drain. ``mask_m`` needs no fill clamp — TMA zero-fills the box overhang past the
+    descriptor's runtime globalDim (the RegStore still guards the masked-row stores)."""
+    atom_k = atom.shape[2]
+    bk_elems = bk * atom_k
+    a_slab, b_slab, mbar = "_a_smem", "_b_smem", "_mbar"
+    desc_a, desc_b = "_desc_a", "_desc_b"
+    row_base = BinaryExpr("*", Var(m_b), Literal(tile_m, "int"))
+    col_base = BinaryExpr("*", Var(n_b), Literal(tile_n, "int"))
+    linear_tid = BinaryExpr(
+        "+", BinaryExpr("*", BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(wn, "int")), Var(n_w)), Literal(32, "int")), Var("_lane")
+    )
+    tid0 = BinaryExpr("==", linear_tid, Literal(0, "int"))
+
+    k0, ki = "_ks", "_ki"
+    a_bytes = tile_m * bk_elems * elem_bytes
+    b_bytes = bk_elems * tile_n * elem_bytes
+    # Box origins (C-order) per K chunk: A[row_base][k0], B[k0][col_base].
+    a_coords = (row_base, Var(k0))
+    b_coords = (Var(k0), col_base)
+    phase = BinaryExpr("%", BinaryExpr("/", Var(k0), Literal(bk_elems, "int")), Literal(2, "int"))
+
+    fill = tma_fill(
+        loads=[(desc_a, a_slab, a_coords), (desc_b, b_slab, b_coords)], mbar=mbar, tid0=tid0, phase=phase, total_bytes=a_bytes + b_bytes
+    )
+    inner_loop = _staged_inner_atom_loop(
+        a_slab=a_slab, b_slab=b_slab, m_w=m_w, n_w=n_w, fm=fm, fn=fn, atom=atom, bk_elems=bk_elems, tile_n=tile_n, ki=ki
+    )
+    outer = StridedLoop(
+        axis=Axis(name=k0, extent=k_axis.extent.as_static()),
+        start=Literal(0, "int"),
+        step=Literal(bk_elems, "int"),
+        body=Body((*fill, inner_loop, Sync())),
+        unroll=False,
+    )
+    slab_decls = [
+        tma_descriptor(desc_a, a_load.input, (tile_m, bk_elems), slab_dtype),
+        tma_descriptor(desc_b, b_load.input, (bk_elems, tile_n), slab_dtype),
+        slab_smem(a_slab, tile_m, bk_elems, slab_dtype, align=TMA_SLAB_ALIGN),
+        slab_smem(b_slab, bk_elems, tile_n, slab_dtype, align=TMA_SLAB_ALIGN),
+    ]
+    prologue = tma_mbar_prologue(mbar, tid0)
+    return slab_decls, [*prologue, outer]
 
 
 def _warp(tile: TileOp, root: Node) -> KernelOp:
@@ -585,7 +677,30 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
 
     stage = kernel.schedule.stage
     slab_decls: list[Stmt] = []
-    if _can_stage_warp(stage, k_axis, tile_m, tile_n, wt.bk, atom_k, mask_m, mask_n, b_trans):
+    if _can_stage_warp_tma(stage, k_axis, n_axis, tile_n, wt.bk, atom_k, atom.operand_dtype("a").nbytes, mask_n, b_trans):
+        from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+        slab_dtype = cuda_name(atom.operand_dtype("a"))
+        slab_decls, kstmts = _warp_tma_staged_kloop(
+            a_load=a_load,
+            b_load=b_load,
+            k_axis=k_axis,
+            m_b=m_b,
+            n_b=n_b,
+            m_w=m_w,
+            n_w=n_w,
+            wm=wm,
+            wn=wn,
+            fm=fm,
+            fn=fn,
+            atom=atom,
+            bk=wt.bk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            slab_dtype=slab_dtype,
+            elem_bytes=atom.operand_dtype("a").nbytes,
+        )
+    elif _can_stage_warp(stage, k_axis, tile_m, tile_n, wt.bk, atom_k, mask_m, mask_n, b_trans):
         from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
         slab_dtype = cuda_name(atom.operand_dtype("a"))

@@ -55,7 +55,6 @@ XFAIL: dict[str, str] = {
     # dynamic-grid tier. Only the cases asserting the **staged / symbolic-K warp** STRUCTURE
     # (operand staging + K zero-fill — a later phase) still xfail.
     "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp": _R,
-    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure": _R,
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
@@ -79,8 +78,6 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": _R,
     "tests/compiler/e2e/test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": _R,
     # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
     # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts).
     "tests/compiler/e2e/test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": _R,

@@ -20,8 +20,19 @@ from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
-from deplodock.compiler.ir.stmt import Body, StridedLoop
+from deplodock.compiler.ir.kernel.ir import (
+    CpAsyncCommit,
+    CpAsyncCopy,
+    CpAsyncWait,
+    MbarrierArriveExpectTx,
+    MbarrierInit,
+    MbarrierWait,
+    Smem,
+    Sync,
+    TmaDescriptor,
+    TmaLoad,
+)
+from deplodock.compiler.ir.stmt import Body, Cond, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt
 
 
@@ -106,7 +117,50 @@ def cp_async_barrier() -> list[Stmt]:
     return [CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
 
 
-def slab_smem(name: str, rows: int, cols: int, dtype: str) -> Smem:
+def slab_smem(name: str, rows: int, cols: int, dtype: str, *, align: int = 0) -> Smem:
     """A row-major ``rows × cols`` operand slab; ``ldm`` (the staged-load row stride)
-    is ``cols``."""
-    return Smem(name=name, extents=(rows, cols), dtype=dtype)
+    is ``cols``. ``align`` stamps an explicit byte alignment — TMA destination slabs
+    need 128 B (``cp.async.bulk.tensor`` requires an aligned smem base)."""
+    return Smem(name=name, extents=(rows, cols), dtype=dtype, align=align)
+
+
+# --------------------------------------------------------------------------- #
+# TMA (``cp.async.bulk.tensor``) fill — single-thread descriptor box copy +
+# mbarrier handshake. Shares the slab + staged-``LdmatrixLoad`` drain with the
+# cp.async path; only the producer differs (one thread issues the TMA, every
+# thread waits on the mbarrier parity).
+# --------------------------------------------------------------------------- #
+
+# TMA destination smem must be aligned (``cp.async.bulk.tensor`` faults otherwise);
+# 128 B satisfies the NONE-swizzle box copy.
+TMA_SLAB_ALIGN = 128
+
+
+def tma_descriptor(name: str, src: str, box: tuple[int, int], dtype: str) -> TmaDescriptor:
+    """A host-encoded ``CUtensorMap`` for the operand ``src`` with a ``box`` tile
+    (C-order). The source globalDim is resolved from the bound array at launch, so a
+    symbolic (masked-M) extent rides the runtime shape and TMA zero-fills the box
+    overhang. NONE swizzle: the plain row-major slab feeds the staged ``LdmatrixLoad``
+    drain directly."""
+    return TmaDescriptor(name=name, src_buf=src, src_shape=(), box_extents=box, swizzle="NONE", dtype=dtype)
+
+
+def tma_mbar_prologue(mbar: str, tid0: Expr, count: int = 1) -> list[Stmt]:
+    """One single-slot mbarrier, initialized by the issuer thread, then a CTA barrier so
+    every consumer sees the init before the first wait. ``count`` = number of producer
+    ``arrive``\\ s per phase (one — the issuer's single ``arrive.expect_tx`` covers both
+    operand box copies via the summed transaction-byte count)."""
+    init = Cond(cond=tid0, body=(MbarrierInit(mbar=mbar, count=count, slot=_lit(0)),))
+    return [Smem(name=mbar, extents=(1,), dtype="unsigned long long"), init, Sync()]
+
+
+def tma_fill(*, loads: list[tuple[str, str, tuple]], mbar: str, tid0: Expr, phase: Expr, total_bytes: int) -> list[Stmt]:
+    """One pipeline stage of the TMA fill: the issuer thread declares the expected
+    transaction bytes and issues every operand's box ``TmaLoad`` onto ``mbar``; every
+    thread then waits on the barrier parity for ``phase``. ``loads`` is a list of
+    ``(desc_name, slab, coords)`` (coords C-order, the box origin in the source). The
+    barrier (not a predicate) gates the readers — every CTA thread reaches the wait."""
+    body: list[Stmt] = [MbarrierArriveExpectTx(mbar=mbar, bytes_=total_bytes, slot=_lit(0))]
+    for desc_name, slab, coords in loads:
+        body.append(TmaLoad(smem=slab, smem_index=(_lit(0), _lit(0)), desc=desc_name, coords=tuple(coords), mbar=mbar, mbar_slot=_lit(0)))
+    return [Cond(cond=tid0, body=tuple(body)), MbarrierWait(mbar=mbar, phase=phase, slot=_lit(0))]

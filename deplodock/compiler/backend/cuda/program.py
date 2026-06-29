@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
-from deplodock.compiler.backend.cuda import nvcc
+from deplodock.compiler.backend.cuda import _tma, nvcc
 from deplodock.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
 from deplodock.compiler.backend.cuda.dtype import cupy_dtype
 from deplodock.compiler.dim import Dim
@@ -483,12 +483,22 @@ def _prebuild_descriptors(compiled: _Compiled, arrays: dict[str, cp.ndarray]) ->
     import cupy as cp
 
     out: dict[int, dict[str, cp.ndarray]] = {}
-    for launch in compiled.launches:
+    for li, launch in enumerate(compiled.launches):
         if not launch.tma_descriptors:
             continue
-        # TMA descriptor encoding demolished — pending rebuild. ``tma_descriptors``
-        # is always empty today (no pass emits one), so this is unreachable.
-        raise NotImplementedError("TMA descriptor encoding demolished — pending rebuild")
+        per_launch: dict[str, cp.ndarray] = {}
+        for desc in launch.tma_descriptors:
+            arr = arrays[desc.src_buf]
+            src_shape = _collapse_inert_dims(tuple(int(d) for d in arr.shape), desc.box_extents)
+            desc_bytes = _tma.encode_tiled(
+                global_address=int(arr.data.ptr),
+                src_shape=src_shape,
+                box_extents=desc.box_extents,
+                elem_size=int(arr.itemsize),
+                swizzle=desc.swizzle,
+            )
+            per_launch[desc.name] = cp.asarray(np.frombuffer(desc_bytes, dtype=np.uint64))
+        out[li] = per_launch
     if out:
         cp.cuda.runtime.deviceSynchronize()
     return out

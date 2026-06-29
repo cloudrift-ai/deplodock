@@ -14,8 +14,9 @@ from dataclasses import replace
 
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.cuda import CudaOp
+from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
 from deplodock.compiler.ir.kernel import KernelOp, Tile
+from deplodock.compiler.ir.kernel.ir import TmaDescriptor
 from deplodock.compiler.ir.kernel.render import _BLOCK_SIZE, render_kernelop
 from deplodock.compiler.ir.stmt import Write
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
@@ -32,6 +33,17 @@ def _atomic_outputs(kernel: KernelOp) -> tuple[str, ...]:
         if isinstance(s, Write) and s.atomic:
             seen.setdefault(s.output, None)
     return tuple(seen)
+
+
+def _tma_descriptors(kernel: KernelOp) -> tuple[TmaDescMeta, ...]:
+    """Each distinct ``TmaDescriptor`` in the body → a ``TmaDescMeta`` the backend
+    encodes at launch (``cuTensorMapEncodeTiled`` off the bound array's device
+    pointer + the box). First-seen order; deduped by descriptor name so the param
+    list matches the renderer's signature (``const CUtensorMap* <name>``)."""
+    seen: dict[str, TmaDescMeta] = {}
+    for s in kernel.body.iter_of_type(TmaDescriptor):
+        seen.setdefault(s.name, TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle))
+    return tuple(seen.values())
 
 
 def _symbolic_runtime_args(kernel: KernelOp) -> tuple[str, ...]:
@@ -81,7 +93,11 @@ def rewrite(match: Match, root: Node) -> CudaOp | None:
         # factor resolved from ``sym_values`` at launch (the ``Expr`` grid factor).
         grid = ((tile.n_dim.ceil_div(blockdim).expr,), (1,), (1,))
     block = ((blockdim,), (1,), (1,))
-    arg_order = (*kernel.inputs, *kernel.outputs)
+    # Signature / arg order: buffers, then the TMA descriptor params (bound to the
+    # launch-encoded ``CUtensorMap`` device arrays), then the symbolic ``int`` args
+    # (tail-appended in ``_launch``) — matching ``render_kernelop``'s param layout.
+    tma_descs = _tma_descriptors(kernel)
+    arg_order = (*kernel.inputs, *kernel.outputs, *(d.name for d in tma_descs))
     return CudaOp(
         kernel_source=source,
         kernel_name=name,
@@ -92,4 +108,5 @@ def rewrite(match: Match, root: Node) -> CudaOp | None:
         comment=name,
         runtime_args=runtime_args,
         zero_outputs=_atomic_outputs(kernel),
+        tma_descriptors=tma_descs,
     )

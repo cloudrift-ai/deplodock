@@ -146,8 +146,10 @@ def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
         monkeypatch.setenv(f"DEPLODOCK_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
-    placed = [v for k, v in kop.knobs.items() if k.startswith("PLACE@")]
-    assert placed and any(v.endswith(":tma") for v in placed), f"symbolic-M with static innermost dim must be TMA-eligible: {placed}"
+    # The transport is the orthogonal STAGE codec on the schedule (``d<depth>/tma``), not a
+    # legacy ``PLACE@<edge>=…:tma`` placement knob — symbolic-M with a static innermost dim
+    # is TMA-eligible, so the pin survives onto the lowered op.
+    assert kop.knobs.get("STAGE", "").endswith("/tma"), f"symbolic-M with static innermost dim must stage via TMA: {kop.knobs.get('STAGE')!r}"
     src = kop.kernel_source
     assert "int seq_len" in src, "runtime extent must still be a kernel arg"
     assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"
