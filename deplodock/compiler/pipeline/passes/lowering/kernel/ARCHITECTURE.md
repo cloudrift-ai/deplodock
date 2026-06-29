@@ -25,9 +25,25 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 
 ## Operand staging (`_stage.py`) — the `STAGE` codec
 
-When the schedule carries a `Stage` (the `STAGE` codec `d<depth>/sync|cp|tma[/ring]`), the warp tier stages its A/B
-operands through a shared-memory slab instead of reading gmem-direct. `_stage.py` assembles the surviving Kernel-IR
-transport leaves — it does **not** resurrect the demolished `StageBundle` / `StagePolicy` orchestration.
+When the schedule carries a `Stage` (the `STAGE` codec `d<depth>/sync|cp|tma[/ring][/p<reg_depth>]`), the warp tier
+stages its A/B operands through a shared-memory slab instead of reading gmem-direct. `_stage.py` assembles the surviving
+Kernel-IR transport leaves — it does **not** resurrect the demolished `StageBundle` / `StagePolicy` orchestration.
+
+**The two-level pipeline.** Staging has two independent buffering levels, each with its own depth (`depth` and
+`reg_depth` are both buffer depths on `Stage`; `WarpTile.bk` is the slab K-*granularity*, kept distinct):
+
+- **`depth` — the gmem→smem ring** (cp.async only today; TMA stays single-buffer). A `depth`-slot slab; a prologue
+  primes the first `depth-1` K-chunks, then each step prefetches the chunk `depth-1` ahead into a free slot while the
+  mma consumes the current one (`CpAsyncWait(group=depth-1)` keeps the prefetches in flight). The tail prefetch is
+  clamped to the last chunk — an in-bounds re-read into a slot that's never consumed — so the commit/wait stays uniform
+  across all CTA threads (the barrier-under-mask invariant). `depth` is clamped to the 48 KB smem cap (a deeper pin
+  falls back to a shallower ring). `depth=1` is the plain single-buffer fill→wait→drain.
+- **`reg_depth` (`/p<n>`) — the smem→register double-buffer.** `_staged_inner_atom_loop` unrolls the inner atom-K loop
+  into a software pipeline that ldmatrixes the next atom-K step into an alternate fragment slot (`_a{i}_s{slot}`)
+  `reg_depth-1` steps ahead, breaking the per-step WAR hazard on the operand fragments. `reg_depth` is capped at the
+  atom-K step count (`bk`).
+
+Both compose (`d3/cp/p2`) and are pure perf transforms — bit-identical to the single-buffer / gmem-direct baseline.
 
 **The `CtaTile` seam.** The fill is written against a small `CtaTile` (the CTA tile-base coords + an independent linear
 intra-CTA thread id + the thread count), NOT a materializer's internal warp/register geometry — so one fill helper drives

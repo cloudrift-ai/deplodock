@@ -296,7 +296,7 @@ differently. The payoff is precisely two things — and **not** a third that's e
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
 | `TILE` | free-axis output tile (`TilePlan` — par + `Scalar` reg) | `Semiring` (`Map`/`Monoid` reserved) | `n<N>[xm<M>]` parallel · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** (`Semiring·Scalar`) |
 | `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (`Semiring·Warp`, gmem-direct + epilogues; pin-only) |
-| `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | **built** (warp tier: cp.async + TMA, static/masked-M/symbolic-K; scalar fused-prologue shared row; pin-only) |
+| `STAGE` | `Stage` (the two-level operand pipeline) | `Monoid`, `Semiring` | `d<depth>` (gmem→smem ring) · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` (smem→register double-buffer) · empty = gmem-direct | **built** (warp tier: cp.async ring depth>1 + register double-buffer; TMA single-buffer; static/masked-M/symbolic-K; scalar fused-prologue shared row; pin-only) |
 
 **Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser, which splits on `,` and requires
 `=` per entry — `knob.py::parse_knob_spec`): **`,` is reserved** as the knob-list separator and MUST NOT appear inside a
@@ -361,13 +361,20 @@ the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
   the *built* `schedule.py` carries `warp_tile: WarpTile | None` (no `Fragment` type yet) and has no `__post_init__`.
   Land the `Fragment` type (or restate the section against `warp_tile`) so the codec rules ("`TILE`⇒Scalar / `WARP`⇒Warp")
   have something to assert against.
+- **Interacting depths — resolved.** The operand pipeline has two buffer **depths** plus a **granularity**, kept
+  distinct: `STAGE.depth` = the gmem→smem ring (cp.async/TMA prefetch over the K-chunk loop), `STAGE.reg_depth`
+  (`/p<n>`) = the smem→register double-buffer (the ldmatrix ping-pong over the inner atom-K steps), and `WarpTile.bk`
+  = the slab K-granularity (how much K is resident — NOT a depth). The two depths both live on `STAGE` (same kind of
+  quantity, one level apart); `bk` stays on `WarpTile`. `Channel.depth` (WarpSpec) is the shared-ring variant, still
+  reserved.
 - **Unspellable today (note, not block).** `>2` free axes (batched outputs) and the `block` strided-rows field beyond
-  one packed axis have no dedicated code; `STAGE.depth` / `WarpTile.bk` / `Channel.depth` are three interacting depths,
-  not fully orthogonal.
+  one packed axis have no dedicated code.
 
-`REDUCE`, `TILE`, and `WARP` are wired (reachable via pin; `REDUCE` `r<n>` ILP, `TILE` reg-tile, `WARP` gmem-direct
-mma.sync). Each one's auto-fork — the prior-ranked candidate set — is still a follow-up, so a cold greedy compile stays
-scalar per-cell unless pinned. `STAGE` remains proposed.
+`REDUCE`, `TILE`, `WARP`, and `STAGE` are wired (reachable via pin; `REDUCE` `r<n>` ILP, `TILE` reg-tile, `WARP`
+mma.sync, `STAGE` the two-level cp.async pipeline). Each one's auto-fork — the prior-ranked candidate set — is still a
+follow-up, so a cold greedy compile stays scalar per-cell unless pinned. Pipelining gaps remaining: the **TMA ring**
+(depth>1 — TMA is single-buffer today) and general **scalar-tier operand staging** (only the fused-prologue shared row
+exists, so scalar has no `STAGE` slab to pipeline).
 
 ## Remaining — the warp / tensor-core tier
 
