@@ -4,7 +4,19 @@ This stage turns a scheduled `TileOp` into a `KernelOp` (a thread-bound CUDA-IR 
 Kernel-IR peepholes over it. The CUDA lowering (`lowering/cuda`) renders the `KernelOp` to a `__global__` source string
 afterwards.
 
-## `010_materialize` — bind the schedule to threads
+## `005_contract` — construct the contraction node (before materialize)
+
+A tensor-core contraction's high-level node is built one pass **before** the materializer. `005_contract` matches a
+warp-tier `SemiringKernel` (a `Semiring` whose schedule carries a `WarpTile`) and emits a single high-level
+`MmaContraction` (`ir/kernel/ir.py`) — **thin**, doing only the op-tree-dependent part: capture the m/n/k axes, read the
+atomize binding (resolved in `020_schedule`), resolve the projection epilogue (`_store.with_store`). Every other tier
+(scalar / reduce / register-tile) is left untouched here (`RuleSkipped`) and binds to threads in `010_materialize`.
+
+Homing the construction here keeps the contraction a first-class node that exists *before* thread-binding. The
+`MmaContraction` IS `structural_key`-ed as an intermediate `KernelOp` (it carries the kernel-stmt protocol + a `_rewrite`
+handler), so the final `KernelOp` / `CudaOp` keys stay byte-identical — the perf cache / prior transfer untouched.
+
+## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
 `010_materialize` dispatches on the kernel kind / its schedule (the article's "schedule separate from combine" thesis —
 the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
@@ -16,29 +28,24 @@ the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition ch
 - **Register-tile tier** (`_reg_tile`, a `SemiringKernel` whose `TILE` plan tiles the output) — each thread owns a
   `reg_m × reg_n` block of cells, the reduce body replicated per cell with its operand loads deduped (the
   arithmetic-intensity reuse).
-- **Warp / tensor-core tier** (`_warp`, a `SemiringKernel` carrying a `WarpTile`) — `WM·WN` warps over a
-  `tile_m × tile_n` block of `mma_m16n8k16` atom cells; gmem-direct `LdmatrixLoad` + `MmaSyncPtx`, then a `RegStore`
-  (fused projection epilogue + masked-tile guards). `_warp` here is **thin** — it does only the op-tree-dependent part
-  (capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve the projection epilogue) and emits a single
-  high-level `MmaContraction` node. The **exact atom factorization** is a separate pass — see `015_factorize` below.
+The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(MmaContraction)`
+root that `005_contract` produced — **expands the contraction**: `_warp_factor.factorize_mma` turns the high-level node
+into the `Tile` of `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore` (the four-way GRID/WARP/REGISTER/ATOM
+split, the operand staging decision, the per-cell epilogue). The pass's `PATTERN` matches `(TileOp, KernelOp)` so the
+single rule covers both; at this point in the kernel pass the only `KernelOp`s are the contraction nodes.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
 
-## `015_factorize` — the exact tensor-core atom factorization
+### The exact tensor-core atom factorization (`_warp_factor.py`)
 
-The warp tier is the one place where the materializer used to carry hundreds of lines of atom geometry. That geometry is
-factored out: `010_materialize._warp` emits an `MmaContraction` (`ir/kernel/ir.py`) carrying everything the expansion
-needs (the operand `Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the `Stage`, the
-m/n/k axes, the output buffer), and **`015_factorize`** (a `KernelOp → KernelOp` pass) expands it via
-`_warp_factor.factorize_mma` into the `Tile` of `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore` — the
-four-way GRID/WARP/REGISTER/ATOM split, the operand staging decision, and the per-cell epilogue. The `MmaContraction`
-IS `structural_key`-ed as an intermediate `KernelOp`, so it carries the kernel-stmt protocol + a `_rewrite` handler.
-
-This keeps materialize a thin tier dispatcher and homes the explicit "atom-tiled contraction" representation at the
-kernel level (where the body **is** the `op_cache_key`, so the final `KernelOp` / `CudaOp` keys stay byte-identical —
-the perf cache / prior transfer untouched). All atom geometry — `_axis_base`, the staging eligibility
-(`_can_stage_warp[_tma]`), the staged K-loops, the `RegStore` epilogue — lives in `_warp_factor.py`, the new-atom seam.
+The warp tier is the one place the lowering used to carry hundreds of lines of atom geometry. That geometry is factored
+out: `005_contract` emits an `MmaContraction` (`ir/kernel/ir.py`) carrying everything the expansion needs (the operand
+`Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the `Stage`, the m/n/k axes, the output
+buffer), and `010_materialize` expands it via `_warp_factor.factorize_mma`. All atom geometry — `_axis_base`, the staging
+eligibility (`_can_stage_warp[_tma]`), the staged K-loops, the `RegStore` epilogue — lives in `_warp_factor.py`, the
+new-atom seam. (The store-glue helpers `with_store` / `has_write`, shared by the constructor and the thread-binding
+tiers, live in `_store.py`.)
 
 ## Operand staging (`_stage.py`) — the `STAGE` codec
 

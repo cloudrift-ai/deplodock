@@ -8,8 +8,8 @@ kernel-IR transport leaf nodes (``Smem`` / ``CpAsyncCopy`` / ``CpAsyncCommit`` /
 
 The fill is written against a small :class:`CtaTile` seam (the CTA tile-base + a
 linear intra-CTA thread id + the thread count), NOT a materializer's internal
-warp/register geometry — so the same helper drives both the warp (``_warp``) and
-the future scalar (``_reg_tile``) tiers.
+warp/register geometry — so the same helper drives both the warp
+(``_warp_factor.factorize_mma``) and the future scalar (``_reg_tile``) tiers.
 
 Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips it.
 """

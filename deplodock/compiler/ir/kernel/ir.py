@@ -301,13 +301,14 @@ class Tile(Stmt):
 @dataclass(frozen=True)
 class MmaContraction(Stmt):
     """A tensor-core contraction **before** atom factorization — the high-level seam between
-    the materializer and ``015_factorize``.
+    ``005_contract`` (which constructs it, before materialize) and ``010_materialize`` (which
+    expands it).
 
-    ``010_materialize`` emits this single node, capturing everything the factorization needs:
+    ``005_contract`` emits this single node, capturing everything the factorization needs:
     the operand ``Load``\\ s + their role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
-    accumulator name ``acc``, the resolved projection ``epilogue`` (post-``_with_store`` — it
+    accumulator name ``acc``, the resolved projection ``epilogue`` (post-``with_store`` — it
     always ends in the output ``Write``), the ``warp_tile`` geometry + operand ``stage``, the
-    captured ``m_axis`` / ``n_axis`` / ``k_axis``, and the ``output`` buffer. ``015_factorize``
+    captured ``m_axis`` / ``n_axis`` / ``k_axis``, and the ``output`` buffer. ``010_materialize``
     expands it into the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
     ``RegStore`` (the four-way GRID/WARP/REGISTER/ATOM split). It IS ``structural_key``-ed as an
     intermediate ``KernelOp``, so it carries the kernel-stmt protocol + a ``_rewrite`` handler.
@@ -362,7 +363,7 @@ class MmaContraction(Stmt):
         return [head, *pretty_body(self.epilogue, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        raise AssertionError("MmaContraction must be expanded by 015_factorize before render")
+        raise AssertionError("MmaContraction must be expanded by 010_materialize before render")
 
 
 @dataclass(frozen=True)

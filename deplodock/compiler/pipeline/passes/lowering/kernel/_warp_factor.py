@@ -1,10 +1,11 @@
-"""Warp/mma tier — the exact tensor-core atom factorization (the ``015_factorize`` body).
+"""Warp/mma tier — the exact tensor-core atom factorization (the expansion ``010_materialize``
+folds in).
 
 :func:`factorize_mma` expands an :class:`MmaContraction` into the ``Tile`` of ``RegFragment`` /
 ``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` — the four-way GRID/WARP/REGISTER/ATOM split,
 the operand-staging decision (cp.async / TMA / gmem-direct), and the per-cell projection
-epilogue. All atom geometry lives here, out of the materializer (which only emits the
-high-level ``MmaContraction``). Leading ``_`` so the pass loader skips this module."""
+epilogue. All atom geometry lives here, out of the node constructor (``005_contract`` emits only
+the high-level ``MmaContraction``). Leading ``_`` so the pass loader skips this module."""
 
 from __future__ import annotations
 

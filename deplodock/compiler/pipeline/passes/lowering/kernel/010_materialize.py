@@ -1,7 +1,14 @@
 """Materialize a ``TileOp``'s schedule into a ``KernelOp``.
 
 Binds the schedule's grid axes to GPU threads and realizes the reduce partition. The step
-dispatches on the kernel kind / its reduce plan:
+dispatches on the kernel kind / its reduce plan.
+
+The **warp (tensor-core mma) tier** is constructed one pass earlier — ``005_contract`` turns a
+warp-tier ``Semiring`` contraction into a ``KernelOp`` holding a single high-level
+``MmaContraction``. Materialize **folds in its expansion**: a ``KernelOp(MmaContraction)`` root is
+expanded via ``_warp_factor.factorize_mma`` into the ``RegFragment`` / ``LdmatrixLoad`` /
+``MmaSyncPtx`` / ``RegStore`` fragment soup (the four-way GRID/WARP/REGISTER/ATOM split). Every
+``TileOp`` root takes one of the thread-binding tiers below:
 
 - **Scalar tier** (``MapKernel``, or a reduction with a trivial ``ReducePlan``) — one
   thread per output cell. ``lower(op)`` emits the per-cell body (a serial reduce ``Loop``
@@ -47,35 +54,14 @@ from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Sele
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
-from deplodock.compiler.pipeline import Match, Pattern
+from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
-from deplodock.compiler.pipeline.pipeline import LoweringError
+from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
+from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import factorize_mma
 
-PATTERN = [Pattern("root", TileOp)]
-
-
-def _has_write(stmts: list[Stmt]) -> bool:
-    """Any ``Write`` reachable in ``stmts`` (deep — a projection's output sweep nests
-    its ``Write`` inside a per-cell ``Loop``)."""
-    for s in stmts:
-        if isinstance(s, Write):
-            return True
-        if any(_has_write(list(b)) for b in s.nested()):
-            return True
-    return False
-
-
-def _with_store(stmts: list[Stmt], output: str, grid, op) -> list[Stmt]:
-    """Append the output-store glue when the body has none — a bare reduction (``op`` a
-    ``Monoid`` / ``Semiring``) produces its finalized value as an SSA name (``op.out``) that
-    must be written to the output buffer at the grid cell. A body that already carries a
-    ``Write`` needs no glue (and ``op.out`` is left unread)."""
-    if _has_write(stmts):
-        return stmts
-    index = tuple(Var(ax.name) for ax in grid)
-    return [*stmts, Write(output=output, index=index, value=op.out)]
+PATTERN = [Pattern("root", (TileOp, KernelOp))]
 
 
 def _mask_streamed(body: list[Stmt], axis: str, offset: int, extent) -> list[Stmt]:
@@ -445,51 +431,19 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     return KernelOp(body=Body((bound,)), name=tile.name)
 
 
-# --------------------------------------------------------------------------- #
-# The warp (tensor-core mma) tier — a ``Semiring`` contraction's ``WarpTile`` fragment.
-# --------------------------------------------------------------------------- #
-
-
-def _warp(tile: TileOp, root: Node) -> KernelOp:
-    """Emit the high-level :class:`MmaContraction` for a tensor-core contraction. Does the
-    op-tree-dependent part only — capture the m/n/k axes, read the ``020_schedule`` binding, and
-    resolve the projection epilogue (``_with_store`` needs the op's ``out`` + grid). The exact
-    atom factorization (the four-way split, operand staging, fragments, mma, store) is expanded
-    from the node by ``015_factorize`` (:func:`_warp_factor.factorize_mma`)."""
-    kernel = tile.kernel
-    node = tile.op
-    grid = list(kernel.schedule.place.grid)
-    if len(grid) < 2:
-        raise LoweringError("warp tier: contraction output needs an (m, n) grid")
-    m_axis, n_axis = grid[-2], grid[-1]
-    k_axis = node.reduce_node.reduce_axis
-    bind = kernel.schedule.bind
-    assert bind is not None, "warp tier: 020_schedule did not stamp a binding"
-    # TODO(warp-spec): emit the producer/consumer warp split from kernel.schedule.workers (the WSPEC
-    # role allocation) — dedicate producer warps to the Stage load half, compute warps to the mma.
-    # Reserved this cut: the codec + schedule field land, but materialization stays uniform SIMT.
-    # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized
-    # store of the accumulator (``_with_store`` needs ``node.out`` / the grid, so it stays here).
-    tail = list(bind.epilogue)
-    if not _has_write(tail):
-        tail = _with_store(tail, root.output.name, grid, node)
-    mma = MmaContraction(
-        a_load=bind.a.load,
-        b_load=bind.b.load,
-        b_trans=bind.b_trans,
-        acc=bind.acc,
-        epilogue=Body(tail),
-        warp_tile=kernel.schedule.warp_tile,
-        stage=kernel.schedule.stage,
-        m_axis=m_axis,
-        n_axis=n_axis,
-        k_axis=k_axis,
-        output=root.output.name,
-    )
-    return KernelOp(body=Body((mma,)), name=tile.name)
-
-
 def rewrite(match: Match, root: Node) -> KernelOp | None:
+    # Warp (tensor-core mma) expansion: ``005_contract`` already turned a warp-tier ``Semiring``
+    # contraction into a ``KernelOp`` holding a single high-level ``MmaContraction``. Fold the exact
+    # atom factorization in here — expand it into the ``RegFragment`` / ``LdmatrixLoad`` /
+    # ``MmaSyncPtx`` / ``RegStore`` fragment soup. Any other ``KernelOp`` (none exist this early, but
+    # be defensive) passes through untouched.
+    if isinstance(root.op, KernelOp):
+        kop: KernelOp = root.op
+        body = kop.body
+        if not (len(body) == 1 and isinstance(body[0], MmaContraction)):
+            raise RuleSkipped("no MmaContraction to expand")
+        return KernelOp(body=Body((factorize_mma(body[0]),)), name=kop.name)
+
     tile: TileOp = root.op
     kernel = tile.kernel
     # By the kernel pass, ``030_split`` has consumed every cross-CTA ``GRID`` stage (the
@@ -497,10 +451,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # request is a bug — the materializer only lowers single-launch kernels.
     rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
-    # Warp (tensor-core mma) tier: a Semiring contraction carrying a WarpTile fragment.
     sched = kernel.schedule
-    if isinstance(kernel, SemiringKernel) and getattr(sched, "warp_tile", None) is not None:
-        return _warp(tile, root)
     # Register-tile tier: a Semiring contraction whose ``TILE`` plan tiles the output (each
     # thread owns a reg_m×reg_n register block of cells, operands reused across them).
     tplan = getattr(sched, "tile", None) if isinstance(kernel, SemiringKernel) else None
