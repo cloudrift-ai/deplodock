@@ -72,7 +72,13 @@ class TileOp(Op):
         return self.kernel.schedule if self.kernel is not None else Placement()
 
     def pretty_body(self) -> str:
-        """Render the ``op`` tree structurally (the dump view) — no lowering."""
+        """Render the ``op`` tree structurally (the dump view) — no lowering. Prefixes the
+        atomize ``bind:`` line when the schedule carries one (the resolved operand→role
+        binding, surfaced so ``compile --ir tile`` shows it above the combine)."""
         from deplodock.compiler.ir.tile.ops import pretty  # noqa: PLC0415
 
-        return "\n".join(pretty(self.op, "    ")) if self.op is not None else ""
+        if self.op is None:
+            return ""
+        body = "\n".join(pretty(self.op, "    "))
+        bind = getattr(self.schedule, "bind", None)
+        return f"    {bind.pretty()}\n{body}" if bind is not None else body

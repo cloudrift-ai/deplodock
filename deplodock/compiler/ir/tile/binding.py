@@ -47,5 +47,11 @@ class AtomBinding:
     # residual + the output Write + any loop-invariant scalar Loads); empty Body = a bare
     # contraction (_warp emits the accumulator Write itself).
 
+    def pretty(self) -> str:
+        """One-line dump summary: ``bind: a:<buf>@m b:<buf>@n[ trans][ +epi] -> <acc>``."""
+        trans = " trans" if self.b_trans else ""
+        epi = " +epi" if len(self.epilogue) else ""
+        return f"bind: a:{self.a.load.input}@m b:{self.b.load.input}@n{trans}{epi} -> {self.acc}"
+
 
 __all__ = ["AtomBinding", "Operand"]
