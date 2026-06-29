@@ -854,8 +854,8 @@ class FragmentApply(Stmt):
 @dataclass(frozen=True)
 class FragmentRowReduce(Stmt):
     """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
-    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated in
-    ``tests/compiler/e2e/test_flash_tensorcore_reference.py``).
+    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated by the FA-2 reference
+    kernel in ``tests/compiler/e2e/test_attention_coverage.py``).
 
     Each lane of an ``m16n8`` C-fragment owns 4 f32 elements: rows ``g`` / ``g+8``
     (``g = lane/4``), cols ``(lane%4)*2 + {0,1}``. A ``BN``-wide score tile is

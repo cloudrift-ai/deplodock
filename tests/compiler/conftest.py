@@ -285,8 +285,8 @@ def shape_mode(request) -> str:
     The dynamic mode compiles ONE symbolic kernel (``Dim('seq_len')``, runtime
     ``int seq_len`` arg) tiled at the 512 hint and run at the concrete M fed in
     the input arrays; the static mode bakes M. Use tile-divisor M for strict
-    static-vs-dynamic parity (off-hint masked sizes live in
-    ``test_matmul_mma_masked.py``)."""
+    static-vs-dynamic parity (off-hint masked sizes live in the masked-symbolic
+    section of ``test_matmul_coverage.py``)."""
     return request.param
 
 

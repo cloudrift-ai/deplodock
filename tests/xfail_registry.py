@@ -47,7 +47,7 @@ XFAIL: dict[str, str] = {
     "test_launch_geometry_rules.py": _R,
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
     # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the
-    # warp-tier matrix in test_matmul_tile_coverage (the WARP codec): plain + transposed-B + the
+    # warp-tier matrix in test_matmul_coverage (the WARP codec): plain + transposed-B + the
     # bias/relu/residual/causal epilogues, static AND dynamic, all recovered by the gmem-direct
     # mma.sync _warp materializer. test_matmul_rules.py / test_register_tile_rules.py deleted too
     # — unit tests on the demolished split-K / register-tile rule passes.
@@ -73,7 +73,7 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_knob_pinning.py::test_article_tma_sgemm_reproduction": _R,
     # test_matmul_single_cta_f_replicated / test_gated_mlp_single_cta_f_replicated deleted —
     # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
-    # dynamic, by test_matmul_tile_coverage.
+    # dynamic, by test_matmul_coverage.
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": _R,
     # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
