@@ -85,6 +85,7 @@ def cp_async_fill(
     cta: CtaTile,
     elem_bytes: int,
     name: str,
+    row_offset: Expr | None = None,
 ) -> list[Stmt]:
     """Cooperatively ``cp.async``-copy a ``slab_rows × slab_cols`` row-major smem
     ``slab`` from gmem ``src``. ``gmem_index(row_expr, col_expr)`` returns the gmem
@@ -93,16 +94,21 @@ def cp_async_fill(
     lane runs ``for e = tid; e < n_chunks; e += n_threads``. Emits the fill loop only
     — the caller appends one ``CpAsyncCommit`` + ``CpAsyncWait`` + ``Sync`` after the
     A and B fills together. The loop bound (not a predicate) masks the tail, so every
-    lane still reaches the shared barrier (the barrier-under-mask invariant)."""
+    lane still reaches the shared barrier (the barrier-under-mask invariant).
+
+    ``row_offset`` (the gmem→smem ring): when staging through a depth>1 slab, it picks
+    the ring SLOT — the write row becomes ``row_offset + row`` (each slot is a contiguous
+    ``slab_rows``-row block), so the fill targets one slot while the drain reads another."""
     v = _cp_async_width(slab_cols, elem_bytes)
     n_chunks = (slab_rows * slab_cols) // v
     fe = Axis(name=f"_f{name}", extent=n_chunks)
     base = _mul(Var(fe.name), _lit(v))  # flat element offset of this chunk
     row = BinaryExpr("/", base, _lit(slab_cols))
     col = BinaryExpr("%", base, _lit(slab_cols))
+    smem_row = _add(row_offset, row) if row_offset is not None else row
     copy = CpAsyncCopy(
         smem=slab,
-        smem_index=(row, col),
+        smem_index=(smem_row, col),
         src=src,
         src_index=tuple(gmem_index(row, col)),
         nbytes=v * elem_bytes,
@@ -111,10 +117,25 @@ def cp_async_fill(
     return [loop]
 
 
-def cp_async_barrier() -> list[Stmt]:
-    """The handshake after the cooperative cp.async fills: commit the group, wait for
-    it to drain, then a CTA barrier so every lane sees the filled slab."""
-    return [CpAsyncCommit(), CpAsyncWait(group=0), Sync()]
+def cp_async_barrier(group: int = 0) -> list[Stmt]:
+    """The handshake after the cooperative cp.async fills: commit the group, wait until
+    at most ``group`` groups remain in flight, then a CTA barrier so every lane sees the
+    drained slab. ``group=0`` (single-buffer) drains everything; a depth-``D`` ring keeps
+    ``D-1`` prefetch groups outstanding (``group=D-1``)."""
+    return [CpAsyncCommit(), CpAsyncWait(group=group), Sync()]
+
+
+def cp_async_commit() -> list[Stmt]:
+    """Close the current cp.async batch into a commit-group (the depth-``D`` ring commits one
+    group per filled slot, so ``CpAsyncWait(group=D-1)`` can drain exactly the slot it needs)."""
+    return [CpAsyncCommit()]
+
+
+def cp_async_wait(group: int) -> list[Stmt]:
+    """Wait until at most ``group`` cp.async commit-groups remain in flight, then a CTA barrier
+    so every lane sees the drained slot (the depth-``D`` ring's per-chunk handshake — the commit
+    happened in the prefetch fill above)."""
+    return [CpAsyncWait(group=group), Sync()]
 
 
 def slab_smem(name: str, rows: int, cols: int, dtype: str, *, align: int = 0) -> Smem:

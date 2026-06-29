@@ -769,6 +769,39 @@ def test_register_double_buffer_matches_single_buffer_bit_for_bit(monkeypatch, t
 
 @requires_sm90
 @requires_cuda
+@pytest.mark.parametrize("depth", [2, 3])
+@pytest.mark.parametrize("M", [128, 256])
+def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
+    """The gmem→smem ring (``STAGE=d<depth>/cp``, depth≥2) prefetches ``depth-1`` K-chunks ahead so
+    the cp.async copy overlaps the mma. It is a PURE perf transform: bit-identical to the gmem-direct
+    baseline, and the kernel allocates ``depth`` ring slots (``depth`` cp.async ``commit_group``\\ s —
+    the prologue primes ``depth-1``, the steady loop commits one prefetch per chunk)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    rng = np.random.default_rng(1)
+    a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
+
+    def _go(stage: str | None) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        if stage:
+            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+        else:
+            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+        be = CudaBackend()
+        compiled = be.compile(_parity_mma_graph("static", M=M))
+        src = compiled.nodes["o"].op.kernel_source
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, src
+
+    ring, ring_src = _go(f"d{depth}/cp")
+    gmem, _ = _go(None)
+    np.testing.assert_array_equal(ring, gmem)  # bit-identical: prefetch perturbs nothing
+    assert ring_src.count("commit_group") == depth, f"a depth-{depth} ring must issue {depth} cp.async commit groups"
+
+
+@requires_sm90
+@requires_cuda
 def test_bf16_operands_stage_via_cp_async(monkeypatch):
     """The bf16 MMA atom (``mma_m16n8k16_bf16``) stages through cp.async and stays accurate vs
     torch — the cp.async byte-width fill must handle the 2-byte bf16 operand. (No native numpy
