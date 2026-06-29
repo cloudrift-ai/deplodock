@@ -404,7 +404,10 @@ def _warp_epilogue(pre: list[Stmt], tail: list[Stmt], acc: str, m_name: str, n_n
         if isinstance(s, Load):
             loads.append(
                 EpilogueLoad(
-                    name=s.names[0], buffer=s.input, index=tuple(sigma.apply(e) for e in s.index), roles=_warp_roles(s.index, m_name, n_name)
+                    name=s.names[0],
+                    buffer=s.input,
+                    index=tuple(sigma.apply(e) for e in s.index),
+                    roles=_warp_roles(s.index, m_name, n_name),
                 )
             )
         elif isinstance(s, Assign):

@@ -248,13 +248,11 @@ def _mma_matmul_graph(mode: str, M: int, N: int, K: int, out: str, trans: bool):
     return g
 
 
-def _compile_run_mma(graph, run_m: int, feed_extra: dict) -> tuple[np.ndarray, str]:
-    """Compile the (already WARP-pinned) graph and run it at runtime ``run_m`` on seeded f16
-    operands; return ``(output, kernel_source)``."""
+def _compile_run_mma(graph, feed: dict) -> tuple[np.ndarray, str]:
+    """Compile the (already WARP-pinned) graph and run it on the seeded f16 operands in ``feed``;
+    return ``(output, kernel_source)``."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend
 
-    rng = np.random.default_rng(0)
-    feed = dict(feed_extra)
     be = CudaBackend()
     compiled = be.compile(graph)
     got = np.asarray(be.run(compiled, input_data=feed)[0].outputs["c"])
@@ -288,7 +286,7 @@ def test_matmul_mma_coverage(M, N, K, out, trans, mode, monkeypatch):
     rng = np.random.default_rng(0)
     a = (rng.standard_normal((run_m, K)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((N, K) if trans else (K, N)) * 0.1).astype(np.float16)
-    got, src = _compile_run_mma(_mma_matmul_graph(mode, M, N, K, out, trans), run_m, {"a": a, "b": b})
+    got, src = _compile_run_mma(_mma_matmul_graph(mode, M, N, K, out, trans), {"a": a, "b": b})
 
     ref = a.astype(np.float32) @ (b.T if trans else b).astype(np.float32)
     diff = float(np.abs(got.reshape(run_m, N) - ref).max())
@@ -420,7 +418,7 @@ def test_matmul_mma_epilogue_coverage(epilogue, mode, monkeypatch):
         keep = np.arange(N)[None, :] <= np.arange(run_m)[:, None]
         ref = np.where(keep, base, -1e30)
 
-    got, src = _compile_run_mma(_mma_epilogue_graph(mode, epilogue), run_m, feed)
+    got, src = _compile_run_mma(_mma_epilogue_graph(mode, epilogue), feed)
     diff = float(np.abs(got.reshape(run_m, N) - ref).max())
     assert diff < 1e-2, f"{epilogue}/{mode}: fused-epilogue mma mismatch (max abs err {diff})"
     assert "mma.sync.aligned.m16n8k16" in src, f"{epilogue}/{mode}: must reach the warp tier"
