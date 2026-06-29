@@ -82,7 +82,6 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": _R,
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-cp.async]": _R,
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-cp.async]": _R,
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": _R,
     # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
     # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts).

@@ -87,7 +87,9 @@ def rewrite(root: Node) -> KernelOp | None:
         deduped = _drop_redundant_syncs(tuple(t.body))
         if list(deduped) != list(t.body):
             changed = True
-            return Tile(axes=t.axes, body=Body(deduped))
+            # ``with_bodies`` preserves ``block_threads`` — a bare ``Tile(axes, body)``
+            # would drop it, reverting a cooperative / staged tile's ``blockDim``.
+            return t.with_bodies((Body(deduped),))
         return t
 
     new_body: list[Stmt] = [clean_tile(s) if isinstance(s, Tile) else s for s in op.body]

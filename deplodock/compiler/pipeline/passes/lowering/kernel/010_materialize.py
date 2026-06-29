@@ -37,7 +37,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
-from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore
+from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore, Sync
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
@@ -45,6 +45,7 @@ from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage import CtaTile, cp_async_barrier, cp_async_fill, slab_smem
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
@@ -421,6 +422,96 @@ def _warp_epilogue(pre: list[Stmt], tail: list[Stmt], acc: str, m_name: str, n_n
     return RegEpilogue(acc=acc, loads=tuple(loads), ops=tuple(ops), result=write.value, selects=tuple(selects))
 
 
+def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom_k: int, mask_m: bool, mask_n: bool, b_trans: bool) -> bool:
+    """Phase-A staging eligibility for the warp tier: a ``cp.async`` stage over a
+    STATIC, tile-divisible contraction with a canonical (non-transposed) B operand.
+    Everything else (sync/tma transports, symbolic / non-divisible axes, transposed-B)
+    keeps the gmem-direct path — staging only ever *adds* a faster lowering, never a
+    required one, so an ineligible kernel silently falls back."""
+    if stage is None or stage.transport != "cp.async" or b_trans or mask_m or mask_n:
+        return False
+    if not k_axis.extent.is_static:
+        return False
+    bk_elems = bk * atom_k
+    k = k_axis.extent.as_static()
+    if k % bk_elems != 0:
+        return False
+    # cp.async needs a ≥4-byte contiguous chunk; the 16-bit mma operands give 2 B/elem,
+    # so the inner slab dim must be even (A's BK, B's tile_n). Odd ⇒ fall back.
+    return (bk_elems % 2 == 0) and (tile_n % 2 == 0)
+
+
+def _warp_staged_kloop(
+    *, a_load, b_load, m_axis, n_axis, k_axis, m_b, n_b, m_w, n_w, wm, wn, fm, fn, atom, bk, tile_m, tile_n, slab_dtype, elem_bytes
+) -> tuple[list[Stmt], list[Stmt]]:
+    """The warp tier's STAGED K loop (cp.async, single-buffer): allocate the A/B smem
+    slabs, then an outer K-slab loop that cooperatively cp.async-fills both slabs, syncs,
+    and runs the inner atom loop reading the slabs via ``LdmatrixLoad(staged=True)``.
+    Returns ``(slab_decls, [outer_loop])``. depth>1 double-buffering is a follow-up — this
+    is the correct single-buffer form (numerically identical, no prefetch overlap)."""
+    atom_m, atom_n, atom_k = atom.shape
+    bk_elems = bk * atom_k  # K elements per slab (the BK chunk)
+    a_slab, b_slab = "_a_smem", "_b_smem"
+    n_threads = wm * wn * 32
+    row_base = BinaryExpr("*", Var(m_b), Literal(tile_m, "int"))  # CTA tile base row
+    col_base = BinaryExpr("*", Var(n_b), Literal(tile_n, "int"))  # CTA tile base col
+    # intra-CTA linear thread id from the decoded warp / lane axis vars (the innermost
+    # block_threads of the [m_b, n_b, m_w, n_w, _lane] tile) — never a raw threadIdx.x.
+    linear_tid = BinaryExpr(
+        "+", BinaryExpr("*", BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(wn, "int")), Var(n_w)), Literal(32, "int")), Var("_lane")
+    )
+    cta = CtaTile(row_base=row_base, col_base=col_base, linear_tid=linear_tid, n_threads=n_threads)
+
+    k0 = "_ks"  # the outer K-slab offset var
+    ki = "_ki"  # the inner atom-K offset within the slab
+
+    def a_gmem(row, col):  # slab[row][col] = A[row_base + row][k0 + col]
+        sig = Sigma({m_axis.name: BinaryExpr("+", row_base, row), k_axis.name: BinaryExpr("+", Var(k0), col)})
+        return tuple(sig.apply(e) for e in a_load.index)
+
+    def b_gmem(row, col):  # slab[row][col] = B[k0 + row][col_base + col]
+        sig = Sigma({k_axis.name: BinaryExpr("+", Var(k0), row), n_axis.name: BinaryExpr("+", col_base, col)})
+        return tuple(sig.apply(e) for e in b_load.index)
+
+    fills: list[Stmt] = []
+    fills += cp_async_fill(
+        slab=a_slab, slab_rows=tile_m, slab_cols=bk_elems, src=a_load.input, gmem_index=a_gmem, cta=cta, elem_bytes=elem_bytes, name="a"
+    )
+    fills += cp_async_fill(
+        slab=b_slab, slab_rows=bk_elems, slab_cols=tile_n, src=b_load.input, gmem_index=b_gmem, cta=cta, elem_bytes=elem_bytes, name="b"
+    )
+    fills += cp_async_barrier()
+
+    # Inner atom loop: read the slabs via staged ldmatrix + mma. Slab-local indices —
+    # A[tile_m][BK] (ldm=BK), B[BK][tile_n] (ldm=tile_n).
+    inner: list[Stmt] = []
+    for i in range(fm):
+        a_row = BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(fm * atom_m, "int")), Literal(i * atom_m, "int"))
+        inner.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_slab, src_index=(a_row, Var(ki)), role="a", staged=True, ldm=bk_elems))
+    for j in range(fn):
+        b_col = BinaryExpr("+", BinaryExpr("*", Var(n_w), Literal(fn * atom_n, "int")), Literal(j * atom_n, "int"))
+        inner.append(LdmatrixLoad(frag=f"_b{j}", src_buffer=b_slab, src_index=(Var(ki), b_col), role="b", staged=True, ldm=tile_n))
+    for i in range(fm):
+        for j in range(fn):
+            inner.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
+    inner_loop = StridedLoop(
+        axis=Axis(name=ki, extent=bk_elems), start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(inner)), unroll=True
+    )
+
+    # Single buffer: a trailing Sync so the next slab fill can't clobber the slab while a
+    # lagging thread still reads it.
+    outer_body = (*fills, inner_loop, Sync())
+    outer = StridedLoop(
+        axis=Axis(name=k0, extent=k_axis.extent.as_static()),
+        start=Literal(0, "int"),
+        step=Literal(bk_elems, "int"),
+        body=Body(outer_body),
+        unroll=False,
+    )
+    slab_decls = [slab_smem(a_slab, tile_m, bk_elems, slab_dtype), slab_smem(b_slab, bk_elems, tile_n, slab_dtype)]
+    return slab_decls, [outer]
+
+
 def _warp(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a tensor-core (mma) contraction (the ``WARP`` codec): the CTA runs ``WM·WN``
     warps over a ``tile_m × tile_n`` output block, each warp owning an ``FM × FN`` block of
@@ -484,21 +575,52 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
         for j in range(fn):
             decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
 
-    chain: list[Stmt] = []
-    for i in range(fm):
-        idx = tuple(Sigma({m_axis.name: base_m(i)}).apply(e) for e in a_load.index)
-        guard = (base_m(i), _extent_expr(m_axis)) if mask_m else None
-        chain.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard))
-    for j in range(fn):
-        idx = tuple(Sigma({n_axis.name: base_n(j)}).apply(e) for e in b_load.index)
-        guard = (base_n(j), _extent_expr(n_axis)) if mask_n else None
-        chain.append(
-            LdmatrixLoad(frag=f"_b{j}", src_buffer=b_load.input, src_index=idx, role="b", staged=False, b_trans=b_trans, gmem_guard=guard)
+    stage = kernel.schedule.stage
+    slab_decls: list[Stmt] = []
+    if _can_stage_warp(stage, k_axis, tile_m, tile_n, wt.bk, atom_k, mask_m, mask_n, b_trans):
+        from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+        slab_dtype = cuda_name(atom.operand_dtype("a"))
+        elem_bytes = atom.operand_dtype("a").nbytes
+        slab_decls, kstmts = _warp_staged_kloop(
+            a_load=a_load,
+            b_load=b_load,
+            m_axis=m_axis,
+            n_axis=n_axis,
+            k_axis=k_axis,
+            m_b=m_b,
+            n_b=n_b,
+            m_w=m_w,
+            n_w=n_w,
+            wm=wm,
+            wn=wn,
+            fm=fm,
+            fn=fn,
+            atom=atom,
+            bk=wt.bk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            slab_dtype=slab_dtype,
+            elem_bytes=elem_bytes,
         )
-    for i in range(fm):
+    else:
+        chain: list[Stmt] = []
+        for i in range(fm):
+            idx = tuple(Sigma({m_axis.name: base_m(i)}).apply(e) for e in a_load.index)
+            guard = (base_m(i), _extent_expr(m_axis)) if mask_m else None
+            chain.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard))
         for j in range(fn):
-            chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
-    kloop = StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=True)
+            idx = tuple(Sigma({n_axis.name: base_n(j)}).apply(e) for e in b_load.index)
+            guard = (base_n(j), _extent_expr(n_axis)) if mask_n else None
+            chain.append(
+                LdmatrixLoad(
+                    frag=f"_b{j}", src_buffer=b_load.input, src_index=idx, role="b", staged=False, b_trans=b_trans, gmem_guard=guard
+                )
+            )
+        for i in range(fm):
+            for j in range(fn):
+                chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
+        kstmts = [StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=True)]
 
     stores: list[Stmt] = []
     for i in range(fm):
@@ -523,7 +645,7 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
         Axis(name=n_w, extent=wn),
         Axis(name="_lane", extent=32),
     )
-    bound = Tile(axes=axes, body=Body((*decls, kloop, *stores)), block_threads=wt.block_threads)
+    bound = Tile(axes=axes, body=Body((*decls, *slab_decls, *kstmts, *stores)), block_threads=wt.block_threads)
     return KernelOp(body=Body((bound,)), name=tile.name)
 
 

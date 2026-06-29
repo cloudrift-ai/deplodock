@@ -37,7 +37,9 @@ from ..conftest import dyn_M, requires_sm90
 # break the 16 B global-stride alignment; that N-masked case stays on cp.async
 # and is covered by test_matmul_mma_masked.py).
 _N, _K = 1024, 512
-_WARP_KNOBS = {"MMA": "mma_m16n8k16_f16", "WM": "2", "WN": "2", "FM": "2", "FN": "2", "BK": "2"}
+# The warp tile + operand-staging codecs (the new knob design): WM=WN=FM=FN=2, BK=2 atoms
+# per inner mma step; the transport is the STAGE codec (cp.async vs tma), not a TMA bool.
+_WARP_CODEC = "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"
 
 
 def _has_cuda() -> bool:
@@ -81,11 +83,10 @@ def _mma_graph(mode: str, *, M: int):
 
 @pytest.fixture(params=["cp.async", "tma"])
 def transport(request, monkeypatch) -> str:
-    """Pin the warp tile + force the transport (``TMA=1`` = cp.async.bulk.tensor,
-    ``TMA=0`` = cp.async). The "pinned knobs" fixture."""
-    for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    monkeypatch.setenv("DEPLODOCK_TMA", "1" if request.param == "tma" else "0")
+    """Pin the warp tile (``WARP`` codec) + the operand-staging transport (``STAGE`` codec
+    — ``d2/cp`` = cp.async, ``d2/tma`` = cp.async.bulk.tensor). The "pinned knobs" fixture."""
+    monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma" if request.param == "tma" else "d2/cp")
     return request.param
 
 
@@ -101,6 +102,10 @@ def test_pinned_transport_and_shape_fire(shape_mode, transport):
         assert "CUtensorMap" in src, "TMA kernel must take the descriptor param"
     else:
         assert "cp.async.bulk.tensor" not in src, f"{shape_mode}/cp.async: TMA must NOT fire"
+        # Positive staging assertion: the operands ride an smem slab filled by cp.async (not
+        # gmem-direct) — otherwise the pin is silently ignored and the test proves nothing.
+        assert "cp.async" in src, f"{shape_mode}/cp.async: operands must stage via cp.async"
+        assert "__shared__" in src, f"{shape_mode}/cp.async: staged operands need an smem slab"
     if shape_mode == "dynamic":
         assert "int seq_len" in src, "dynamic kernel must carry the runtime extent arg"
     else:
