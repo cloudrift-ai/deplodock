@@ -51,7 +51,6 @@ from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
-from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import factorize_mma
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
@@ -497,7 +496,7 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
         k_axis=k_axis,
         output=root.output.name,
     )
-    return KernelOp(body=Body((factorize_mma(mma),)), name=tile.name)
+    return KernelOp(body=Body((mma,)), name=tile.name)
 
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:
