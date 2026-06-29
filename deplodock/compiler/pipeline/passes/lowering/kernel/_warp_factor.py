@@ -37,7 +37,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     tma_fill,
     tma_mbar_prologue,
 )
-from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Operand, Unit, atomize, grid_tile, register_tile, warp_tile
+from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Operand, Unit, atomize, grid_tile, register_tile, unit_tile
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 
@@ -614,31 +614,33 @@ class AtomUnit(Unit):
         ]
         return [], kstmts
 
-    def store(self, i, j, offset, masks) -> Stmt:
+    def store(self, i, j, offset, masks) -> list[Stmt]:
         mask_m, mask_n, m_ext, n_ext = masks
         sigma = Sigma({self.m_axis.name: offset.base("m", i), self.n_axis.name: offset.base("n", j)})
-        return RegStore(
-            dst_buffer=self.write.output,
-            dst_index=tuple(sigma.apply(e) for e in self.write.index),
-            frag=f"_c{i}_{j}",
-            shape=self.atom.shape,
-            epilogue=_warp_epilogue(self.pre, self.tail, self.acc, self.m_axis.name, self.n_axis.name, sigma),
-            m_guard=(offset.base("m", i), m_ext) if mask_m else None,
-            n_guard=(offset.base("n", j), n_ext) if mask_n else None,
-        )
+        return [
+            RegStore(
+                dst_buffer=self.write.output,
+                dst_index=tuple(sigma.apply(e) for e in self.write.index),
+                frag=f"_c{i}_{j}",
+                shape=self.atom.shape,
+                epilogue=_warp_epilogue(self.pre, self.tail, self.acc, self.m_axis.name, self.n_axis.name, sigma),
+                m_guard=(offset.base("m", i), m_ext) if mask_m else None,
+                n_guard=(offset.base("n", j), n_ext) if mask_n else None,
+            )
+        ]
 
 
 def factorize_mma(mma: MmaContraction) -> Tile:
     """Expand a high-level :class:`MmaContraction` into the warp-tier ``Tile`` via the composable
     tiling layer: the mma :class:`AtomUnit` leaf, tiled four ways
-    ``grid_tile(warp_tile(register_tile(atomize(...))))`` (GRID block / WARP / REGISTER / ATOM;
+    ``grid_tile(unit_tile(register_tile(atomize(...))))`` (GRID block / UNIT=warp / REGISTER / ATOM;
     the atom-lane offset decoded at render). The unit owns the K-loop + operand staging
     (gmem-direct / cp.async / TMA); the layer owns the offset, the axes, and the splice."""
     unit = AtomUnit(mma)
     masks = (unit.mask_m, unit.mask_n, _extent_expr(unit.m_axis), _extent_expr(unit.n_axis))
     t = atomize(unit, unit.atom_m, unit.atom_n)
     t = register_tile(t, unit.fm, unit.fn)
-    t = warp_tile(t, unit.wm, unit.wn, unit.m_w, unit.n_w)
+    t = unit_tile(t, unit.wm, unit.wn, unit.m_w, unit.n_w)
     return grid_tile(
         t,
         masks,
@@ -649,5 +651,5 @@ def factorize_mma(mma: MmaContraction) -> Tile:
         tile_m=unit.tile_m,
         tile_n=unit.tile_n,
         block_threads=unit.wt.block_threads,
-        lane=32,
+        lanes=unit.atom.lanes,
     )

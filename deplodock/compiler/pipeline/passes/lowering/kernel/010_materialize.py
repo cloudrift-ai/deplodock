@@ -46,18 +46,19 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import (
     MmaContraction,
+    ScalarContraction,
     Smem,
     Sync,
 )
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
+from deplodock.compiler.ir.tile import MonoidKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
+from deplodock.compiler.pipeline.passes.lowering.kernel._scalar_factor import factorize_scalar
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
 from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import factorize_mma
 
@@ -102,160 +103,6 @@ def _replicate(body: Body, r: int, coop: int, axis: Axis, masked: bool, protecte
     rename = lambda n: n if n in protected else f"{n}__r{r}"  # noqa: E731
     out = [s.rewrite(rename, sigma) for s in body]
     return _mask_streamed(out, axis.name, offset, _extent_expr(axis)) if masked else out
-
-
-def _needs_mask(axis: Axis | None, reg: int) -> bool:
-    """A register-tiled axis masks its tail iff it's symbolic or its extent isn't a clean
-    multiple of ``reg`` (the last cell overhangs the real extent)."""
-    if axis is None or reg <= 1:
-        return False
-    return not (axis.extent.is_static and axis.extent.as_static() % reg == 0)
-
-
-def _cell_offset(axis: Axis, reg: int, k: int):
-    """The real coordinate of register cell ``k`` along ``axis``: ``cell·reg + k``."""
-    return BinaryExpr("+", BinaryExpr("*", Var(axis.name), Literal(reg, "int")), Literal(k, "int"))
-
-
-def _cell_sigma(m_axis, reg_m, i, mask_m, n_axis, reg_n, j, mask_n) -> Sigma:
-    """σ for register cell ``(i, j)``: each tiled free index becomes its real coordinate
-    ``cell·reg + k``; a **masked** axis wraps it in-bounds (``% extent``) so an overhang cell
-    clamp-reads rather than runs off the buffer (its guarded write is dropped)."""
-    smap: dict = {}
-    if reg_m > 1 and m_axis is not None:
-        off = _cell_offset(m_axis, reg_m, i)
-        smap[m_axis.name] = BinaryExpr("%", off, _extent_expr(m_axis)) if mask_m else off
-    if reg_n > 1:
-        off = _cell_offset(n_axis, reg_n, j)
-        smap[n_axis.name] = BinaryExpr("%", off, _extent_expr(n_axis)) if mask_n else off
-    return Sigma(smap) if smap else Sigma.IDENTITY
-
-
-def _cell_bound(m_axis, reg_m, i, mask_m, n_axis, reg_n, j, mask_n):
-    """The in-bounds predicate for register cell ``(i, j)`` — ``cell·reg + k < extent`` for each
-    masked axis (anded), or ``None`` when nothing overhangs."""
-    conds = []
-    if mask_m and m_axis is not None:
-        conds.append(BinaryExpr("<", _cell_offset(m_axis, reg_m, i), _extent_expr(m_axis)))
-    if mask_n:
-        conds.append(BinaryExpr("<", _cell_offset(n_axis, reg_n, j), _extent_expr(n_axis)))
-    if not conds:
-        return None
-    cond = conds[0]
-    for c in conds[1:]:
-        cond = BinaryExpr("&&", cond, c)
-    return cond
-
-
-def _dedup_loads(stmts: list[Stmt]) -> list[Stmt]:
-    """Collapse syntactically-identical scalar ``Load``s (same buffer + index) to one binding,
-    rewriting the dropped names to the survivor — the operand reuse a register tile exists for
-    (a load not referencing the ``m`` cell axis is shared across the ``n`` cells, and vice
-    versa)."""
-    seen: dict = {}
-    rename: dict[str, str] = {}
-    kept: list[Stmt] = []
-    for s in stmts:
-        if isinstance(s, Load) and s.is_scalar:
-            sig = (s.input, tuple(e.pretty() for e in s.index))
-            if sig in seen:
-                rename[s.names[0]] = seen[sig]
-                continue
-            seen[sig] = s.names[0]
-        kept.append(s)
-    if rename:
-        kept = [s.rewrite(lambda nm: rename.get(nm, nm)) for s in kept]
-    return kept
-
-
-def _guard_writes(stmts: list[Stmt], cond) -> list[Stmt]:
-    """Wrap each output ``Write`` in ``Cond(cond, …)`` — the masked tail cell computes (with
-    clamp-read operands) but only stores when in bounds. Non-``Write`` stmts pass through."""
-    if cond is None:
-        return stmts
-    return [Cond(cond=cond, body=(s,)) if isinstance(s, Write) else s for s in stmts]
-
-
-def _replicate_cells(
-    region: list[Stmt],
-    reg_m: int,
-    reg_n: int,
-    m_axis: Axis | None,
-    n_axis: Axis,
-    mask_m: bool,
-    mask_n: bool,
-    protected: frozenset[str],
-    *,
-    guard: bool,
-) -> list[Stmt]:
-    """Replicate ``region`` over the ``reg_m × reg_n`` register sub-tile: each cell ``(i, j)``
-    σ-offsets the free indices (clamp-reading a masked axis) and suffixes its per-cell SSA names
-    (``__c{i}_{j}``); the shared iteration coordinates in ``protected`` (the grid / reduce axis
-    vars) stay common. With ``guard`` the cell's output ``Write`` is gated to its in-bounds
-    predicate (the masked tail). Shared operand loads then collapse via :func:`_dedup_loads`."""
-    copies: list[Stmt] = []
-    for i in range(reg_m):
-        for j in range(reg_n):
-            sigma = _cell_sigma(m_axis, reg_m, i, mask_m, n_axis, reg_n, j, mask_n)
-            rename = lambda nm, i=i, j=j: nm if nm in protected else f"{nm}__c{i}_{j}"  # noqa: E731
-            cell = [s.rewrite(rename, sigma) for s in region]
-            if guard:
-                cell = _guard_writes(cell, _cell_bound(m_axis, reg_m, i, mask_m, n_axis, reg_n, j, mask_n))
-            copies.extend(cell)
-    return _dedup_loads(copies)
-
-
-def _unroll_inner(axis: Axis) -> bool:
-    """Mark the inner contraction loop for ``#pragma unroll`` when it's a small static reduce
-    (≤ 64 trips) — register-resident operand reuse + ILP, the scalar-SGEMM lever."""
-    return axis.extent.is_static and axis.extent.as_static() <= 64
-
-
-def _reg_tile(tile: TileOp, root: Node) -> KernelOp:
-    """Materialize a scalar register-tiled contraction (the ``TILE`` codec): each thread owns a
-    ``reg_m × reg_n`` block of output cells. The reduce-loop body is replicated per cell with
-    its operand loads deduped (the reuse), the small inner reduce is unrolled, and each cell
-    seeds its own accumulator (``Loop.render``) and writes its own output cell. The parallel
-    thread-tile (``par_n · par_m``) sets ``block_threads`` so ``par·reg == extent`` is one CTA."""
-    kernel = tile.kernel
-    op = tile.op
-    plan = kernel.schedule.tile
-    grid = list(kernel.schedule.place.grid)
-    carrier = op.reduce_node
-    raxis = carrier.reduce_axis
-
-    n_axis = grid[-1]
-    m_axis = grid[-2] if len(grid) >= 2 else None
-    reg_n = plan.reg_n
-    reg_m = plan.reg_m if m_axis is not None else 1
-    mask_n = _needs_mask(n_axis, reg_n)
-    mask_m = _needs_mask(m_axis, reg_m)
-
-    full = _with_store(lower(op), root.output.name, grid, op)
-    ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == raxis.name)
-    pre, rloop, tail = full[:ridx], full[ridx], full[ridx + 1 :]
-
-    new_grid = list(grid)
-    new_grid[-1] = _shrink_axis(n_axis, reg_n)
-    if m_axis is not None:
-        new_grid[-2] = _shrink_axis(m_axis, reg_m)
-
-    # The grid / reduce axis vars AND any symbolic-extent runtime arg (e.g. ``seq_len`` in a
-    # ``% extent`` clamp or a ceil-div grid stride) are shared across cells — exclude them from
-    # the per-cell SSA rename.
-    ext_vars = {v for a in (*grid, raxis) for v in _extent_expr(a).free_vars()}
-    protected = frozenset({a.name for a in grid} | {raxis.name} | ext_vars)
-    cells = lambda region, guard: _replicate_cells(  # noqa: E731
-        list(region), reg_m, reg_n, m_axis, n_axis, mask_m, mask_n, protected, guard=guard
-    )
-    pre_cells = cells(pre, False) if pre else []
-    loop_body = cells(rloop.body, False)
-    tail_cells = cells(tail, True)
-
-    new_loop = Loop(axis=raxis, body=Body(tuple(loop_body)), unroll=rloop.unroll or _unroll_inner(raxis))
-    block_threads = plan.par_n * plan.par_m if (plan.par_n > 1 or plan.par_m > 1) else None
-    bound = Tile(axes=tuple(new_grid), body=Body((*pre_cells, new_loop, *tail_cells)), block_threads=block_threads)
-    return KernelOp(body=Body((bound,)), name=tile.name)
 
 
 def _scalar_loads(stmts: list[Stmt]) -> list[Load]:
@@ -432,17 +279,20 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:
-    # Warp (tensor-core mma) expansion: ``005_contract`` already turned a warp-tier ``Semiring``
-    # contraction into a ``KernelOp`` holding a single high-level ``MmaContraction``. Fold the exact
-    # atom factorization in here — expand it into the ``RegFragment`` / ``LdmatrixLoad`` /
-    # ``MmaSyncPtx`` / ``RegStore`` fragment soup. Any other ``KernelOp`` (none exist this early, but
-    # be defensive) passes through untouched.
+    # Contraction expansion: ``005_contract`` already turned a warp / register-tiled ``Semiring``
+    # contraction into a ``KernelOp`` holding a single high-level :data:`Contraction` node. Fold the
+    # exact atom factorization in here — the mma arm into the ``RegFragment`` / ``LdmatrixLoad`` /
+    # ``MmaSyncPtx`` / ``RegStore`` fragment soup, the scalar arm into the per-thread register cell
+    # tile — both via the shared ``_tiling`` layer. Any other ``KernelOp`` (none exist this early,
+    # but be defensive) passes through untouched.
     if isinstance(root.op, KernelOp):
         kop: KernelOp = root.op
         body = kop.body
-        if not (len(body) == 1 and isinstance(body[0], MmaContraction)):
-            raise RuleSkipped("no MmaContraction to expand")
-        return KernelOp(body=Body((factorize_mma(body[0]),)), name=kop.name)
+        if len(body) == 1 and isinstance(body[0], MmaContraction):
+            return KernelOp(body=Body((factorize_mma(body[0]),)), name=kop.name)
+        if len(body) == 1 and isinstance(body[0], ScalarContraction):
+            return KernelOp(body=Body((factorize_scalar(body[0]),)), name=kop.name)
+        raise RuleSkipped("no Contraction to expand")
 
     tile: TileOp = root.op
     kernel = tile.kernel
@@ -451,12 +301,8 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # request is a bug — the materializer only lowers single-launch kernels.
     rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
-    sched = kernel.schedule
-    # Register-tile tier: a Semiring contraction whose ``TILE`` plan tiles the output (each
-    # thread owns a reg_m×reg_n register block of cells, operands reused across them).
-    tplan = getattr(sched, "tile", None) if isinstance(kernel, SemiringKernel) else None
-    if tplan is not None and tplan.is_tiled:
-        return _reg_tile(tile, root)
+    # The warp / register-tiled contraction tiers are built one pass earlier (``005_contract``) and
+    # expanded above; here a ``Semiring`` only reaches the cooperative / per-cell tiers below.
     plan = getattr(kernel.schedule, "reduce", None) if isinstance(kernel, MonoidKernel) else None
     # Reduce tier: a Monoid reduction whose plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):

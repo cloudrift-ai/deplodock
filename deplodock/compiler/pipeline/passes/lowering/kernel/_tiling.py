@@ -1,11 +1,14 @@
-"""Generic tiling-construction layer — ``atomize → register_tile → warp_tile → grid_tile``.
+"""Generic tiling-construction layer — ``atomize → register_tile → unit_tile → grid_tile``.
 
-The kernel materializer builds a contraction by tiling a **leaf unit** (an mma :class:`Atom`
-or a **scalar** cell) four ways: GRID block / WARP / REGISTER / ATOM. This module makes that
-nesting composable and **unit-generic**: a :class:`Unit` realizes one output cell (its state
-decl, operands, compute, store, and reduce-region), and the tiling functions wrap it level by
-level, building the per-cell coordinate offset incrementally (one :class:`OffsetFn` reproduces
-both the warp ``_axis_base`` and the scalar ``_cell_offset``).
+The kernel materializer builds a contraction by tiling a **leaf atom** (a tensor-core mma cell or
+a scalar fma cell — see ``ir/tile/atom``) four ways: GRID block / UNIT / REGISTER / ATOM. The
+**UNIT** is the atom's parallel thread footprint (``atom.lanes``) — a warp (32 lanes) for mma, a
+single thread for scalar — so the tensor-core warp tile and the scalar parallel thread-tile are the
+same level, differing only in ``lanes``. This module makes that nesting composable and
+**unit-generic**: a :class:`Unit` realizes one output cell (its state decl, operands, compute,
+store, and reduce-region), and the tiling functions wrap it level by level, building the per-cell
+coordinate offset incrementally (one :class:`OffsetFn` reproduces both the warp ``_axis_base`` and
+the scalar ``_cell_offset``).
 
 The reuse is real but **moderate**: ``register_tile`` is generic for the cell grid, the offset,
 the masks/guards, the state decls, and the stores. The **reduce loop + operand staging live in
@@ -41,12 +44,14 @@ class Operand:
 
 @dataclass(frozen=True)
 class OffsetFn:
-    """The per-axis cell-offset coordinate, built up across tiling levels. ``base`` reproduces
-    the warp ``_axis_base`` (``block·(WM·FM·atom) + warp·(FM·atom) + r·atom``) when a warp level
-    is present, else the scalar ``_cell_offset`` (``Var(axis)·reg + r``). Also accumulates the
-    ``Tile`` axes (grid block → warp → lane) + ``block_threads``."""
+    """The per-axis cell-offset coordinate, built up across tiling levels. ``base`` reproduces the
+    ``_axis_base`` ``block·(units·reg·atom) + unit·(reg·atom) + r·atom`` once the UNIT level is
+    present (the mma warp tile AND the scalar thread tile both go through ``unit_tile``), else the
+    bare ``_cell_offset`` ``Var(axis)·reg + r``. Also accumulates the ``Tile`` axes (grid block →
+    unit → lane) + ``block_threads``."""
 
-    # Per axis ("m"/"n"): (atom_dim, reg, grid_block_var, warp_var | None, warp_count).
+    # Per axis ("m"/"n"): (atom_dim, reg, grid_block_var, unit_var | None, unit_count). ``unit_var``
+    # is the UNIT-level axis var (a warp for mma, a thread for scalar).
     levels: dict = field(default_factory=dict)
     axes: tuple[Axis, ...] = ()
     block_threads: int | None = None
@@ -55,7 +60,7 @@ class OffsetFn:
         """The offset of register cell index ``r`` along axis ``which`` ("m"/"n")."""
         atom_dim, reg, block_var, warp_var, warp_count = self.levels[which]
         reg_term = Literal(r * atom_dim, "int")
-        if warp_var is not None:  # warp tier: block·(WM·FM·atom) + warp·(FM·atom) + r·atom
+        if warp_var is not None:  # unit present: block·(units·reg·atom) + unit·(reg·atom) + r·atom
             tile = warp_count * reg * atom_dim
             e = BinaryExpr("*", Var(block_var), Literal(tile, "int"))
             e = BinaryExpr("+", e, BinaryExpr("*", Var(warp_var), Literal(reg * atom_dim, "int")))
@@ -75,7 +80,7 @@ class OffsetFn:
 
 @dataclass(frozen=True)
 class Tiling:
-    """The accumulating tiling state threaded through ``atomize → register_tile → warp_tile →
+    """The accumulating tiling state threaded through ``atomize → register_tile → unit_tile →
     grid_tile``. ``build`` (called by ``grid_tile``, the finalizer) splices the unit's state +
     reduce-region + stores into the ``Tile``."""
 
@@ -86,8 +91,8 @@ class Tiling:
 
 
 class Unit:
-    """A leaf cell realization — an mma ``Atom`` or a scalar cell. The tiling layer is generic
-    over this; two impls live in ``_warp_factor`` (``AtomUnit``) and the scalar materializer
+    """A leaf cell realization — a tensor-core mma cell or a scalar fma cell. The tiling layer is
+    generic over this; two impls live in ``_warp_factor`` (``AtomUnit``) and ``_scalar_factor``
     (``ScalarUnit``)."""
 
     def state_decls(self, cells: list[tuple[int, int]]) -> list[Stmt]:
@@ -104,10 +109,11 @@ class Unit:
         reduce loop + staging are the Unit's strategy; the generic layer never branches on it."""
         raise NotImplementedError
 
-    def store(self, i: int, j: int, offset: OffsetFn, masks) -> Stmt:
-        """The per-cell guarded output store (``RegStore`` / guarded ``Write``). Builds its own
-        cell σ from ``offset`` — the warp store uses a raw σ + separate ``m_guard``/``n_guard``,
-        the scalar store a masked (``%extent``) σ + a guarded ``Write`` — so the unit owns it."""
+    def store(self, i: int, j: int, offset: OffsetFn, masks) -> list[Stmt]:
+        """The per-cell output store stmts (``[RegStore]`` for mma; the guarded projection-tail
+        cell for scalar — possibly several stmts). Builds its own cell σ from ``offset`` — the
+        warp store uses a raw σ + separate ``m_guard``/``n_guard``, the scalar store a masked
+        (``%extent``) σ + a guarded ``Write`` — so the unit owns it."""
         raise NotImplementedError
 
 
@@ -131,14 +137,18 @@ def register_tile(t: Tiling, reg_m: int, reg_n: int) -> Tiling:
     return replace(t, reg_m=reg_m, reg_n=reg_n, offset=replace(t.offset, levels=levels))
 
 
-def warp_tile(t: Tiling, wm: int, wn: int, m_w: str, n_w: str) -> Tiling:
-    """The WARP level (scalar skips this): ``wm × wn`` warps per CTA. Adds the warp term
-    ``warp·(reg·atom)`` to each axis offset and the ``m_w`` / ``n_w`` warp axes."""
+def unit_tile(t: Tiling, um: int, un: int, m_u: str, n_u: str) -> Tiling:
+    """The UNIT level: ``um × un`` parallel units per CTA, where a *unit* is the atom's thread
+    footprint — a warp (32 lanes) for an mma atom, a single thread for a scalar atom. (So the
+    tensor-core warp tile and the scalar parallel thread-tile are the same level, differing only
+    in the atom's ``lanes``; ``um``/``un`` are the warp counts ``WM``/``WN`` for mma, the thread
+    counts ``par_m``/``par_n`` for scalar.) Adds the unit term ``unit·(reg·atom)`` to each axis
+    offset and the ``m_u`` / ``n_u`` unit axes."""
     levels = dict(t.offset.levels)
-    for which, count, var in (("m", wm, m_w), ("n", wn, n_w)):
+    for which, count, var in (("m", um, m_u), ("n", un, n_u)):
         atom_dim, reg, block_var, _, _ = levels[which]
         levels[which] = (atom_dim, reg, block_var, var, count)
-    axes = (*t.offset.axes, Axis(name=m_w, extent=wm), Axis(name=n_w, extent=wn))
+    axes = (*t.offset.axes, Axis(name=m_u, extent=um), Axis(name=n_u, extent=un))
     return replace(t, offset=replace(t.offset, levels=levels, axes=axes))
 
 
@@ -146,32 +156,38 @@ def grid_tile(
     t: Tiling,
     masks,
     *,
-    m_axis: Axis,
     n_axis: Axis,
-    m_b: str,
     n_b: str,
-    tile_m: int,
     tile_n: int,
+    m_axis: Axis | None = None,
+    m_b: str = "",
+    tile_m: int = 1,
+    lead_axes: tuple[Axis, ...] = (),
     block_threads: int | None,
-    lane: int | None,
+    lanes: int = 1,
 ) -> Tile:
     """The GRID level + finalize: bind the block axes (the shrunk grid), set the per-axis grid
-    term ``block·tile``, optionally append the atom ``_lane`` axis, then splice the unit's state
-    + reduce-region + stores into the ``Tile``. This is the outermost stage — it emits."""
+    term ``block·tile``, append any leading (e.g. batch) grid axes verbatim and — when the atom is
+    warp-cooperative (``lanes > 1``) — the atom ``_lane`` axis, then splice the unit's state +
+    reduce-region + stores into the ``Tile``. This is the outermost stage — it emits.
+
+    ``m_axis is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.
+    ``lead_axes`` are extra outer grid axes (a batched contraction's leading dims) carried through
+    untiled. ``lanes == 1`` (scalar) emits no ``_lane`` axis."""
     levels = dict(t.offset.levels)
-    levels["m"] = _with_block(levels["m"], m_b)
     levels["n"] = _with_block(levels["n"], n_b)
-    grid_axes = (
-        _shrink_axis(Axis(name=m_b, extent=m_axis.extent, source_axis=m_axis), tile_m),
-        _shrink_axis(Axis(name=n_b, extent=n_axis.extent, source_axis=n_axis), tile_n),
-    )
-    lane_axes = (Axis(name="_lane", extent=lane),) if lane is not None else ()
+    grid_axes: tuple[Axis, ...] = lead_axes
+    if m_axis is not None:
+        levels["m"] = _with_block(levels["m"], m_b)
+        grid_axes = (*grid_axes, _shrink_axis(Axis(name=m_b, extent=m_axis.extent, source_axis=m_axis), tile_m))
+    grid_axes = (*grid_axes, _shrink_axis(Axis(name=n_b, extent=n_axis.extent, source_axis=n_axis), tile_n))
+    lane_axes = (Axis(name="_lane", extent=lanes),) if lanes > 1 else ()
     offset = replace(t.offset, levels=levels, axes=(*grid_axes, *t.offset.axes, *lane_axes), block_threads=block_threads)
 
     cells = [(i, j) for i in range(t.reg_m) for j in range(t.reg_n)]
     state = t.unit.state_decls(cells)
     top_decls, kstmts = t.unit.reduce_region(cells, offset, masks)
-    stores = [t.unit.store(i, j, offset, masks) for (i, j) in cells]
+    stores = [s for (i, j) in cells for s in t.unit.store(i, j, offset, masks)]
     return Tile(axes=offset.axes, body=Body((*state, *top_decls, *kstmts, *stores)), block_threads=block_threads)
 
 
@@ -180,4 +196,4 @@ def _with_block(level: tuple, block_var: str) -> tuple:
     return (atom_dim, reg, block_var, warp_var, warp_count)
 
 
-__all__ = ["OffsetFn", "Operand", "Tiling", "Unit", "atomize", "grid_tile", "register_tile", "warp_tile"]
+__all__ = ["OffsetFn", "Operand", "Tiling", "Unit", "atomize", "grid_tile", "register_tile", "unit_tile"]

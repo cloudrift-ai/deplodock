@@ -6,15 +6,22 @@ afterwards.
 
 ## `005_contract` — construct the contraction node (before materialize)
 
-A tensor-core contraction's high-level node is built one pass **before** the materializer. `005_contract` matches a
-warp-tier `SemiringKernel` (a `Semiring` whose schedule carries a `WarpTile`) and emits a single high-level
-`MmaContraction` (`ir/kernel/ir.py`) — **thin**, doing only the op-tree-dependent part: capture the m/n/k axes, read the
-atomize binding (resolved in `020_schedule`), resolve the projection epilogue (`_store.with_store`). Every other tier
-(scalar / reduce / register-tile) is left untouched here (`RuleSkipped`) and binds to threads in `010_materialize`.
+A `Semiring` contraction's high-level node is built one pass **before** the materializer. The node is one of two arms of
+the `Contraction` family (`ir/kernel/ir.py`), keyed by its **atom** (`ir/tile/atom.py`) — a tensor-core mma cell
+(`AtomKind`, `lanes == 32`) or a scalar fma cell (`ScalarAtom`, `lanes == 1`):
 
-Homing the construction here keeps the contraction a first-class node that exists *before* thread-binding. The
-`MmaContraction` IS `structural_key`-ed as an intermediate `KernelOp` (it carries the kernel-stmt protocol + a `_rewrite`
-handler), so the final `KernelOp` / `CudaOp` keys stay byte-identical — the perf cache / prior transfer untouched.
+- **mma arm** (`MmaContraction`) — a warp-tier `SemiringKernel` (its schedule carries a `WarpTile`): **thin**, the
+  op-tree-dependent part only — capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve
+  the projection epilogue (`_store.with_store`).
+- **scalar arm** (`ScalarContraction`) — a register-tiled `SemiringKernel` (its `TILE` plan tiles the output): lower the
+  per-cell body (`lower(op)` + output-store glue) and capture it with the tiled axes + register / parallel widths.
+
+A non-tiled contraction (per-cell fallback) and the cooperative reduce tier are left untouched here (`RuleSkipped`) and
+bind to threads in `010_materialize`. Homing the construction here keeps the contraction a first-class node that exists
+*before* thread-binding. Both arms ARE `structural_key`-ed as an intermediate `KernelOp` (the kernel-stmt protocol + a
+`_rewrite` handler). The mma arm's final `KernelOp` / `CudaOp` keys stay byte-identical to the old single-pass
+materialize; the scalar arm is restructured onto the shared tiling layer (explicit unit axes — its `op_cache_key`
+shifts, so the scalar perf cache / prior re-warms).
 
 ## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
@@ -25,27 +32,33 @@ the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition ch
 - **Reduce tier** (`_reduce`, a `MonoidKernel` whose `ReducePlan` cooperates / register-folds) — the reduce axis is
   partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP), then a REG-tree
   fold, the cross-thread combine (`_combine`), and the projection.
-- **Register-tile tier** (`_reg_tile`, a `SemiringKernel` whose `TILE` plan tiles the output) — each thread owns a
-  `reg_m × reg_n` block of cells, the reduce body replicated per cell with its operand loads deduped (the
-  arithmetic-intensity reuse).
-The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(MmaContraction)`
-root that `005_contract` produced — **expands the contraction**: `_warp_factor.factorize_mma` turns the high-level node
-into the `Tile` of `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore` (the four-way GRID/WARP/REGISTER/ATOM
-split, the operand staging decision, the per-cell epilogue). The pass's `PATTERN` matches `(TileOp, KernelOp)` so the
-single rule covers both; at this point in the kernel pass the only `KernelOp`s are the contraction nodes.
+
+The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(Contraction)`
+root that `005_contract` produced — **expands the contraction** through the shared tiling layer (below): the mma arm via
+`_warp_factor.factorize_mma`, the scalar arm via `_scalar_factor.factorize_scalar`. The pass's `PATTERN` matches
+`(TileOp, KernelOp)` so the single rule covers both; at this point in the kernel pass the only `KernelOp`s are the
+contraction nodes.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
 
-### The exact tensor-core atom factorization (`_warp_factor.py`)
+### The atom factorization — one tiling layer, two atoms (`_tiling.py`)
 
-The warp tier is the one place the lowering used to carry hundreds of lines of atom geometry. That geometry is factored
-out: `005_contract` emits an `MmaContraction` (`ir/kernel/ir.py`) carrying everything the expansion needs (the operand
-`Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the `Stage`, the m/n/k axes, the output
-buffer), and `010_materialize` expands it via `_warp_factor.factorize_mma`. All atom geometry — `_axis_base`, the staging
-eligibility (`_can_stage_warp[_tma]`), the staged K-loops, the `RegStore` epilogue — lives in `_warp_factor.py`, the
-new-atom seam. (The store-glue helpers `with_store` / `has_write`, shared by the constructor and the thread-binding
-tiers, live in `_store.py`.)
+A `Contraction` is expanded by tiling a **leaf atom** four ways through the unit-generic layer in `_tiling.py`:
+`grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The two arms
+run the *same* pipeline; only the atom (and its `Unit` leaf) differs:
+
+- **mma** (`_warp_factor.AtomUnit`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the leaf emits
+  `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop + operand staging (gmem-direct / cp.async /
+  TMA), and decodes the atom-lane offset at render. All mma geometry lives in `_warp_factor.py`, the new-atom seam.
+- **scalar** (`_scalar_factor.ScalarUnit`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a **single thread** (so there is
+  no `_lane` axis); the leaf comes from the lowered per-cell body (split into a `pre` region / the reduce `Loop` / a
+  projection `tail`), replicated per register cell with its operand loads deduped (the arithmetic-intensity reuse).
+
+The **unit** is the atom's parallel thread footprint (`atom.lanes`) — so the tensor-core warp tile and the scalar
+parallel thread-tile are the *same* level, differing only in `lanes`; `block_threads = units · lanes`. `grid_tile` also
+carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The store-glue helpers `with_store` /
+`has_write`, shared by the constructor and the thread-binding tiers, live in `_store.py`.)
 
 ## Operand staging (`_stage.py`) — the `STAGE` codec
 
