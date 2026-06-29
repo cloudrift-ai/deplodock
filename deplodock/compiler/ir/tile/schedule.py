@@ -30,7 +30,7 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
+from deplodock.compiler.ir.tile.atom import SemiringAtom, atom_for
 from deplodock.compiler.ir.tile.binding import AtomBinding
 
 
@@ -350,7 +350,7 @@ class WarpTile:
     selects this :class:`WarpTile` over the scalar :class:`TilePlan`; see :func:`is_warp_codec`),
     decided in ``020_schedule``."""
 
-    atom: AtomKind
+    atom: SemiringAtom
     warps: tuple[int, int] = (1, 1)  # (WM, WN) — warps per CTA, m then n
     reg: tuple[int, int] = (1, 1)  # (FM, FN) — atom sub-tiles per warp, m then n
     bk: int = 1  # K-chunk per inner mma step, in atom_k units
