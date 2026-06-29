@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
 from deplodock.compiler.ir.tile.binding import AtomBinding
+from deplodock.compiler.ir.tile.codec import Field, FieldKind, Schema, decode, encode
 
 
 def _codec_width(num: str, *, tok: str, codec: str) -> int:
@@ -107,6 +108,19 @@ class ReduceStage:
         return (Fold.SMEM,)
 
 
+#: The ``REDUCE`` codec schema (decoded / encoded by :mod:`codec`): ``g<n>[a|k]`` (GRID cross-CTA
+#: split + finalize letter), ``b<n>`` (BLOCK cooperative threads), ``r<n>`` (REG ILP fold).
+_REDUCE_SCHEMA = Schema(
+    "REDUCE",
+    (
+        Field("g", FieldKind.TUPLE, suffix=(("a", "atomic"), ("k", "kernel")), suffix_default="kernel"),
+        Field("b", FieldKind.TUPLE),
+        Field("r", FieldKind.TUPLE),
+    ),
+    expect="expect g<n> / b<n> / r<n>",
+)
+
+
 @dataclass(frozen=True)
 class ReducePlan:
     """The kernel's single reduce partition — the **tuned widths only**, coarse→fine.
@@ -138,43 +152,16 @@ class ReducePlan:
         coarse→fine — ``g<n>[a|k]`` (GRID cross-CTA split + finalize letter), ``b<n>``
         (BLOCK cooperative threads), ``r<n>`` (REG ILP fold). Empty / ``None`` = the scalar
         serial fold. (The ``serial`` remainder is never spelled — it's derived as
-        ``ceil(extent / parallel)``.)"""
-        spec = (spec or "").strip()
-        if not spec:
-            return cls()
-        cta = coop = reg = 1
-        finalize = "kernel"
-        for raw in spec.split("/"):
-            tok = raw.strip()
-            if not tok:
-                continue
-            kind, num = tok[0], tok[1:]
-            if kind == "g":
-                if num and num[-1] in "ak":  # the finalize letter (atomic / kernel) — 030_split
-                    finalize = "atomic" if num[-1] == "a" else "kernel"
-                    num = num[:-1]
-                cta = _codec_width(num, tok=tok, codec="REDUCE")
-            elif kind == "b":
-                coop = _codec_width(num, tok=tok, codec="REDUCE")
-            elif kind == "r":
-                reg = _codec_width(num, tok=tok, codec="REDUCE")
-            else:
-                raise ValueError(f"bad REDUCE token {tok!r} (expect g<n> / b<n> / r<n>)")
-        return cls.of(cta=cta, coop=coop, reg=reg, finalize=finalize)
+        ``ceil(extent / parallel)``.) Ser/de routes through :mod:`codec` (``_REDUCE_SCHEMA``)."""
+        v = decode(_REDUCE_SCHEMA, spec)
+        width, finalize = v["g"]
+        return cls.of(cta=width, coop=v["b"], reg=v["r"], finalize=finalize)
 
     def spell(self) -> str:
         """The ``REDUCE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
         the scalar serial fold. A GRID stage re-emits its finalize letter (``g<n>a`` /
         ``g<n>k``)."""
-        letter = {Level.GRID: "g", Level.BLOCK: "b", Level.REG: "r"}
-        fin = {"atomic": "a", "kernel": "k"}
-        toks = []
-        for s in self.stages:
-            if s.level not in letter:
-                continue
-            suffix = fin[s.finalize] if s.level is Level.GRID else ""
-            toks.append(f"{letter[s.level]}{s.width}{suffix}")
-        return "/".join(toks)
+        return encode(_REDUCE_SCHEMA, {"g": (self.cta, self.finalize), "b": self.coop, "r": self.reg})
 
     @property
     def parallel(self) -> int:
