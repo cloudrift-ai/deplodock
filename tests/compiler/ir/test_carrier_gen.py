@@ -1,7 +1,8 @@
-"""The generated exp-family carrier (``_carrier.exp_twist``) must reproduce the hand-written
-``flash_combine`` / ``online_softmax_combine`` programs — the safety net that lets the
-hand-authored bodies be deleted. Compared after structural normalization (alpha-rename of
-non-state temps + commutative-arg sort), since the generator chooses its own temp names/order.
+"""The generated exp-family carrier (``carrier.exp_merge`` / ``exp_combine_states``, via
+``exp_family_twist``) must reproduce the original hand-authored flash / online-softmax combine
+programs — the frozen golden below — so the hand-authored bodies could be deleted. Compared by
+value-numbering (inline temps to per-output expression trees), since the generator chooses its own
+temp names and statement order.
 """
 
 from __future__ import annotations
