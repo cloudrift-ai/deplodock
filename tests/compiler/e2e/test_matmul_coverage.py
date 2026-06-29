@@ -736,6 +736,39 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
 
 @requires_sm90
 @requires_cuda
+@pytest.mark.parametrize("tr", ["cp", "tma"])
+@pytest.mark.parametrize("M", [128, 256])
+def test_register_double_buffer_matches_single_buffer_bit_for_bit(monkeypatch, tr, M):
+    """The smem→register double-buffer (``STAGE=d2/<tr>/p2``) is a PURE perf transform over the
+    single-buffer staged kernel (``d2/<tr>``): same loads, same mmas, only ldmatrix-prefetched
+    onto alternate fragment slots — so the output is **bit-identical**, and the source actually
+    ping-pongs (``_a0_s0``/``_a0_s1`` fragments the single-buffer kernel does not emit)."""
+    if tr == "tma" and not _supports_tma():
+        pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    rng = np.random.default_rng(0)
+    a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
+
+    def _go(stage: str) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+        be = CudaBackend()
+        compiled = be.compile(_parity_mma_graph("static", M=M))
+        src = compiled.nodes["o"].op.kernel_source
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, src
+
+    single, single_src = _go(f"d2/{tr}")
+    double, double_src = _go(f"d2/{tr}/p2")
+    assert "_a0_s0" in double_src and "_a0_s1" in double_src, "p2 must declare per-slot ping-pong fragments"
+    assert "_s0" not in single_src, "the single-buffer kernel must not slot its fragments"
+    np.testing.assert_array_equal(double, single)  # bit-identical: prefetch reordering perturbs nothing
+
+
+@requires_sm90
+@requires_cuda
 def test_bf16_operands_stage_via_cp_async(monkeypatch):
     """The bf16 MMA atom (``mma_m16n8k16_bf16``) stages through cp.async and stays accurate vs
     torch — the cp.async byte-width fill must handle the 2-byte bf16 operand. (No native numpy
