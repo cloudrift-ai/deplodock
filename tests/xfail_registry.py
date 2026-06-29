@@ -45,15 +45,18 @@ XFAIL: dict[str, str] = {
     "test_fused_edge.py": _R,
     "test_gen_runner_gpu.py": _R,
     "test_launch_geometry_rules.py": _R,
-    "test_matmul_mma.py": _R,
+    # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
+    # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the
+    # warp-tier matrix in test_matmul_tile_coverage (the WARP codec): plain + transposed-B + the
+    # bias/relu/residual/causal epilogues, static AND dynamic, all recovered by the gmem-direct
+    # mma.sync _warp materializer. test_matmul_rules.py / test_register_tile_rules.py deleted too
+    # — unit tests on the demolished split-K / register-tile rule passes.
     # test_matmul_mma_masked.py: the masked symbolic-M/N matmul **accuracy** recovered with the
-    # dynamic-grid tier (the symbolic free axis sizes a symbolic grid, the scalar fallback masks
-    # its tail). Only the residual cases that assert the **mma / warp tier** STRUCTURE (a
-    # tensor-core tile that hasn't been rebuilt) still xfail.
+    # dynamic-grid tier. Only the cases asserting the **staged / symbolic-K warp** STRUCTURE
+    # (operand staging + K zero-fill — a later phase) still xfail.
     "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp": _R,
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure": _R,
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure": _R,
-    "test_matmul_mma_transposed_b.py": _R,
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
@@ -128,34 +131,6 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_warp_chain_gqa_dynamic_matches_torch[8]": _R,
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_warp_chain_gqa_static_matches_torch[16-8-32-32]": _R,
     "tests/compiler/e2e/test_flash_tensorcore_generated.py::test_warp_chain_gqa_static_matches_torch[4-2-32-16]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[dynamic-128-out_dtype0]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[dynamic-128-out_dtype1]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[dynamic-130-out_dtype0]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[dynamic-130-out_dtype1]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[static-128-out_dtype0]": _R,
-    "tests/compiler/e2e/test_matmul_mma_causal_epilogue.py::test_causal_mask_epilogue_mma[static-128-out_dtype1]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_chain_epilogue_mma_matches_reference[1]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_chain_epilogue_mma_matches_reference[4]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_epilogue_warp_rows_stay_splitk_one": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_multiply_epilogue_admits_warp_tier": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_pointwise_chain_with_broadcast_admits_warp_tier": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_epilogue_admits_warp_tier": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_mma_matches_reference[128-256-128-4-out_dtype1]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_mma_matches_reference[128-256-128-4-out_dtype2]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_mma_matches_reference[32-1024-3072-1-out_dtype0]": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_admits_warp_tier": _R,
-    "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_mma_matches_reference": _R,
-    # test_dynamic_shapes.py: the dynamic-grid tier (a symbolic FREE/output axis → a symbolic
-    # launch grid, ``_gid < ∏extents`` sizing from the runtime ``Dim`` arg) recovered the
-    # symbolic elementwise / linear / rmsnorm / sdpa kernels and the dynamic Qwen layer +
-    # whole-model (and their capture-replay), so they are hard requirements again.
-    "tests/compiler/passes/test_matmul_rules.py::test_elwise_lhs_matmul_fires_split_k_and_blockify": _R,
-    "tests/compiler/passes/test_matmul_rules.py::test_matmul_then_elwise_fires_split_k_and_blockify": _R,
-    "tests/compiler/passes/test_matmul_rules.py::test_plain_matmul_fires_split_k_and_blockify": _R,
-    "tests/compiler/passes/test_matmul_rules.py::test_pure_elementwise_does_not_fire_split_k": _R,
-    "tests/compiler/passes/test_matmul_rules.py::test_two_elwise_lhs_matmul_fires_split_k_and_blockify": _R,
-    "tests/compiler/passes/test_register_tile_rules.py::test_plain_matmul_fires_register_tile": _R,
-    "tests/compiler/passes/test_register_tile_rules.py::test_sdpa_qk_matmul_fires_register_tile": _R,
     "tests/compiler/pipeline/search/test_diagnostics.py::test_golden_prior_eval_joins_fp16_goldens": _R,
     "tests/compiler/pipeline/search/test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": _R,
     "tests/compiler/pipeline/search/test_structural_push.py::test_split_demoted_fork_pushes_structural": _R,
