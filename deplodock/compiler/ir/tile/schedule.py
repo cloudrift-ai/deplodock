@@ -30,21 +30,9 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
+from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.binding import AtomBinding
-from deplodock.compiler.ir.tile.codec import Field, FieldKind, Schema, decode, encode
-
-
-def _codec_width(num: str, *, tok: str, codec: str) -> int:
-    """Parse a codec field's positive-integer width, rejecting empty / non-numeric / ``< 1``
-    values with a clear message. Without this a bad pin either threw a bare
-    ``int('') ValueError`` (e.g. a ``REDUCE`` ``g`` with no number) or — for a degenerate
-    ``0`` (``b0`` / ``f0`` / ``n0``) — parsed to a width the plan silently dropped, so the
-    pin became a no-op while the knob column still echoed it. A ``1`` width is the legal
-    identity (the level is off); only ``0`` / negatives / non-digits are rejected."""
-    if not num.isdigit() or int(num) < 1:
-        raise ValueError(f"bad {codec} token {tok!r}: expected a positive integer width, got {num!r}")
-    return int(num)
+from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode
 
 
 class Level(enum.Enum):
@@ -216,6 +204,16 @@ class ReducePlan:
         return None
 
 
+#: The scalar ``TILE`` codec schema: ``n<N>[x<M>]`` (parallel thread-tile, n-then-m) and
+#: ``f<fn>[x<fm>]`` (register sub-tile). The warp fragment uses ``_WARP_SCHEMA`` instead, selected
+#: string-side by :func:`is_warp_codec` before either class's ``parse`` runs.
+_TILE_SCALAR_SCHEMA = Schema(
+    "TILE",
+    (Field("n", FieldKind.TUPLE, arity=2), Field("f", FieldKind.TUPLE, arity=2)),
+    expect="expect n<N>[x<M>] / f<fn>[x<fm>]",
+)
+
+
 @dataclass(frozen=True)
 class TilePlan:
     """The free-axis output tile — the **tuned widths only** for the (≤2) tiled output
@@ -241,38 +239,16 @@ class TilePlan:
         (the parallel thread-tile, ``N`` threads on the inner axis, optional ``M`` on the
         outer) and ``f<fn>[x<fm>]`` (the register sub-tile, ``fn`` cells on the inner axis,
         optional ``fm`` on the outer). The ``x`` is a plain dimension separator (n-then-m
-        order). Empty / ``None`` = the per-cell tier."""
-        spec = (spec or "").strip()
-        if not spec:
-            return cls()
-        par_n = reg_n = par_m = reg_m = 1
-        for raw in spec.split("/"):
-            tok = raw.strip()
-            if not tok:
-                continue
-            if tok[0] == "n":  # n<N>[x<M>] — the parallel thread-tile
-                n, _, m = tok[1:].partition("x")
-                par_n = _codec_width(n, tok=tok, codec="TILE")
-                if m:
-                    par_m = _codec_width(m, tok=tok, codec="TILE")
-            elif tok[0] == "f":  # f<fn>[x<fm>] — the register sub-tile
-                fn, _, fm = tok[1:].partition("x")
-                reg_n = _codec_width(fn, tok=tok, codec="TILE")
-                if fm:
-                    reg_m = _codec_width(fm, tok=tok, codec="TILE")
-            else:
-                raise ValueError(f"bad TILE token {tok!r} (expect n<N>[x<M>] / f<fn>[x<fm>])")
+        order). Empty / ``None`` = the per-cell tier. Ser/de routes through :mod:`codec`."""
+        v = decode(_TILE_SCALAR_SCHEMA, spec)
+        par_n, par_m = v["n"]
+        reg_n, reg_m = v["f"]
         return cls(par_n=par_n, reg_n=reg_n, par_m=par_m, reg_m=reg_m)
 
     def spell(self) -> str:
         """The ``TILE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
         the per-cell tier."""
-        toks: list[str] = []
-        if self.par_n > 1 or self.par_m > 1:
-            toks.append(f"n{self.par_n}" + (f"x{self.par_m}" if self.par_m > 1 else ""))
-        if self.reg_n > 1 or self.reg_m > 1:
-            toks.append(f"f{self.reg_n}" + (f"x{self.reg_m}" if self.reg_m > 1 else ""))
-        return "/".join(toks)
+        return encode(_TILE_SCALAR_SCHEMA, {"n": (self.par_n, self.par_m), "f": (self.reg_n, self.reg_m)})
 
     @property
     def is_tiled(self) -> bool:
@@ -322,6 +298,21 @@ class Placement:
 # --------------------------------------------------------------------------- #
 
 
+#: The warp ``TILE`` codec schema: ``a:<atom>`` (required, the registered atom), ``w<WM>x<WN>``
+#: (warps m-then-n, always both dims), ``f<FM>x<FN>`` (register sub-tile), ``k<bk>`` (K-chunk,
+#: omitted at 1). ``a``/``w``/``f`` always spell; ``k`` only when > 1 — the old ``spell`` policy.
+_WARP_SCHEMA = Schema(
+    "WARP",
+    (
+        Field("a", FieldKind.NAME, required=True, emit=Emit.ALWAYS),
+        Field("w", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
+        Field("f", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
+        Field("k", FieldKind.TUPLE),
+    ),
+    expect="expect a:<atom> / w<WM>x<WN> / f<FM>x<FN> / k<bk>",
+)
+
+
 @dataclass(frozen=True)
 class WarpTile:
     """The tensor-core mma tile — a **shared** descriptor on both :class:`MonoidSchedule`
@@ -347,41 +338,14 @@ class WarpTile:
         """Decode the ``WARP`` codec into a tile: ``/``-separated tokens —
         ``a:<atom>`` (the registered atom kind), ``w<WM>x<WN>`` (warps, m then n),
         ``f<FM>x<FN>`` (register sub-tile, m then n), ``k<bk>`` (K-chunk). The ``x`` is a plain
-        dimension separator. The atom token is mandatory; the rest default to ``1``."""
-        atom_name = None
-        wm = wn = fm = fn = bk = 1
-        for raw in spec.split("/"):
-            tok = raw.strip()
-            if not tok:
-                continue
-            if tok.startswith("a:"):
-                atom_name = tok[2:]
-            elif tok[0] == "w":  # w<WM>x<WN>
-                m, _, n = tok[1:].partition("x")
-                wm = _codec_width(m, tok=tok, codec="WARP")
-                if n:
-                    wn = _codec_width(n, tok=tok, codec="WARP")
-            elif tok[0] == "f":  # f<FM>x<FN>
-                m, _, n = tok[1:].partition("x")
-                fm = _codec_width(m, tok=tok, codec="WARP")
-                if n:
-                    fn = _codec_width(n, tok=tok, codec="WARP")
-            elif tok[0] == "k":
-                bk = _codec_width(tok[1:], tok=tok, codec="WARP")
-            else:
-                raise ValueError(f"bad WARP token {tok!r} (expect a:<atom> / w<WM>x<WN> / f<FM>x<FN> / k<bk>)")
-        if atom_name is None:
-            raise ValueError(f"WARP codec {spec!r} names no atom (expect a:<atom>)")
-        return cls(atom=atom_for(atom_name), warps=(wm, wn), reg=(fm, fn), bk=bk)
+        dimension separator. The atom token is mandatory; the rest default to ``1``. Ser/de
+        routes through :mod:`codec`."""
+        v = decode(_WARP_SCHEMA, spec)
+        return cls(atom=v["a"], warps=v["w"], reg=v["f"], bk=v["k"])
 
     def spell(self) -> str:
         """The ``WARP`` codec string for this tile (inverse of :meth:`parse`)."""
-        wm, wn = self.warps
-        fm, fn = self.reg
-        toks = [f"a:{self.atom.name}", f"w{wm}x{wn}", f"f{fm}x{fn}"]
-        if self.bk > 1:
-            toks.append(f"k{self.bk}")
-        return "/".join(toks)
+        return encode(_WARP_SCHEMA, {"a": self.atom, "w": self.warps, "f": self.reg, "k": self.bk})
 
     @property
     def tile_m(self) -> int:
@@ -412,6 +376,19 @@ def is_warp_codec(spec: str | None) -> bool:
 #: The codec transport token (``cp``) vs the canonical stored value (``cp.async``).
 _TRANSPORT_CODEC = {"sync": "sync", "cp": "cp.async", "tma": "tma"}
 _TRANSPORT_SPELL = {v: k for k, v in _TRANSPORT_CODEC.items()}
+
+#: The ``STAGE`` codec schema: ``d<depth>`` and the transport always spell; ``ring`` only when set;
+#: ``p<reg_depth>`` only at ≥ 2. The transport choices derive from ``_TRANSPORT_CODEC`` (one source).
+_STAGE_SCHEMA = Schema(
+    "STAGE",
+    (
+        Field("d", FieldKind.TUPLE, emit=Emit.ALWAYS),
+        Field("transport", FieldKind.CHOICE, choices=tuple(_TRANSPORT_CODEC.items()), default="sync", emit=Emit.ALWAYS),
+        Field("ring", FieldKind.FLAG, emit=Emit.TRUE),
+        Field("p", FieldKind.TUPLE),
+    ),
+    expect="expect d<depth> / sync|cp|tma / ring / p<reg_depth>",
+)
 
 
 @dataclass(frozen=True)
@@ -460,40 +437,19 @@ class Stage:
         optional ``ring`` flag, and an optional ``p<reg_depth>`` (smem→register double-buffer
         depth). Empty / ``None`` = the depth-1 ``sync`` default (the caller maps an empty
         ``STAGE`` to ``stage=None``, the gmem-direct baseline — ``parse`` is only reached on a
-        non-empty spec). ``smem`` is filled in later by the scheduler."""
-        spec = (spec or "").strip()
-        if not spec:
-            return cls()
-        depth = 1
-        transport = "sync"
-        ring = False
-        reg_depth = 1
-        for raw in spec.split("/"):
-            tok = raw.strip()
-            if not tok:
-                continue
-            if tok[0] == "d" and tok[1:].isdigit():
-                depth = int(tok[1:])
-            elif tok in _TRANSPORT_CODEC:
-                transport = _TRANSPORT_CODEC[tok]
-            elif tok == "ring":
-                ring = True
-            elif tok[0] == "p" and tok[1:].isdigit():
-                reg_depth = int(tok[1:])
-            else:
-                raise ValueError(f"bad STAGE token {tok!r} (expect d<depth> / sync|cp|tma / ring / p<reg_depth>)")
-        return cls(depth=depth, transport=transport, ring=ring, reg_depth=reg_depth)
+        non-empty spec). ``smem`` is filled in later by the scheduler. Ser/de routes through
+        :mod:`codec`; ``cls(...)`` then runs :meth:`__post_init__` (the depth / ring semantics)."""
+        v = decode(_STAGE_SCHEMA, spec)
+        return cls(depth=v["d"], transport=v["transport"], ring=v["ring"], reg_depth=v["p"])
 
     def spell(self) -> str:
         """The ``STAGE`` codec string for this stage (inverse of :meth:`parse`). ``smem`` is
         derived, so it is not spelled; ``reg_depth`` is spelled only when ≥ 2 (the ``p1``
         default is omitted, so an unstaged-register config round-trips byte-identical)."""
-        toks = [f"d{self.depth}", _TRANSPORT_SPELL[self.transport]]
-        if self.ring:
-            toks.append("ring")
-        if self.reg_depth >= 2:
-            toks.append(f"p{self.reg_depth}")
-        return "/".join(toks)
+        return encode(
+            _STAGE_SCHEMA,
+            {"d": self.depth, "transport": self.transport, "ring": self.ring, "p": self.reg_depth},
+        )
 
     @property
     def is_async(self) -> bool:
