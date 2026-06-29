@@ -133,10 +133,10 @@ def test_combine_states_default_derived_for_additive() -> None:
         twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
     )
     assert c.partial_names() == ("p",)  # derived from the merge's external read
-    assert c.twist.state_b == ("acc__o",)
-    assert len(c.twist.combine_states) == 1
-    assert c.twist.combine_states[0].name == "acc"
-    assert c.twist.combine_states[0].args == ("acc", "acc__o")  # partial p → state_b acc__o
+    assert c.state_b == ("acc__o",)
+    assert len(c.combine_states) == 1
+    assert c.combine_states[0].name == "acc"
+    assert c.combine_states[0].args == ("acc", "acc__o")  # partial p → state_b acc__o
 
 
 @pytest.mark.parametrize("n", [1, 4, 8, 33])

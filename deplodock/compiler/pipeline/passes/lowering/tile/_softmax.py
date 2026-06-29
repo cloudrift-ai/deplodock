@@ -24,64 +24,24 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid, State, Twist
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid
+from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist
 
 
 def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
-    """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the P@V
-    accumulator. State ``(m, d)`` (running row max / exp-sum denominator) folds this element's score
-    partial ``s`` in ONE streaming pass (vs the classic two: a row-max reduce then a
-    ``Σ exp(x − max)`` reduce)::
+    """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the
+    P@V accumulator (``expect`` channel). State ``(m, d)`` (running row max / exp-sum denominator)
+    folds this element's score partial ``s`` in ONE streaming pass::
 
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
         d = d·alpha + p;     m = m_new   (last)
 
-    The streaming merge is ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds (so the seed
-    rides on each fold's ``op.identity``); the downstream normalize pass reads the final
-    ``m`` and ``1/d``. Temps are namespaced by ``m`` so they stay unique per kernel."""
-
-    def t(suf: str) -> str:
-        return f"{m}__{suf}"
-
-    # The streaming merge as ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds (see
-    # ``_flash.flash_combine``): the seed rides on each ``Accum`` (``op.identity``) and
-    # ``Loop.render`` seeds it — no explicit ``Init``. The carrier accumulates in f32; the
-    # ``m`` max-fold is last (its old value feeds the correction).
-    merge = (
-        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)  (temp for the corrections)
-        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new  (reads OLD m)
-        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)
-        Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
-        Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
-        Assign(t("dl"), "multiply", (d, t("al"))),  # d·alpha  (rescale, reads OLD d)
-        Accum(name=d, value=t("p"), op="add", base=t("dl"), dtype=F32),  # d = d·alpha + p   [seed 0]
-        Accum(name=m, value=s, op="maximum", dtype=F32),  # m = max(m, s)  [seed −inf, last]
-    )
-    # The LSE monoid is asymmetric (partial arity ≠ state arity), so the state-merges-state form the
-    # cross-partition combine (cooperative-tree / split-KV) needs is authored explicitly (not derivable
-    # from ``merge``): merge this partition's (m, d) with a second's (m_o, d_o).
-    mb, db = f"{m}__o", f"{d}__o"
-    combine_states = (
-        Assign(t("cmx"), "maximum", (m, mb)),  # m_new = max(m, m_o)
-        Assign(t("cda"), "subtract", (m, t("cmx"))),  # m − m_new
-        Assign(t("ca"), "exp", (t("cda"),)),  # a = exp(m − m_new)   (reads OLD m)
-        Assign(t("cdb"), "subtract", (mb, t("cmx"))),  # m_o − m_new
-        Assign(t("cb"), "exp", (t("cdb"),)),  # b = exp(m_o − m_new)
-        Assign(t("cda2"), "multiply", (d, t("ca"))),  # d·a
-        Assign(t("cdb2"), "multiply", (db, t("cb"))),  # d_o·b
-        Assign(d, "add", (t("cda2"), t("cdb2"))),  # d = d·a + d_o·b           [state]
-        Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
-    )
-    # A loop-IR carrier — ``partial=()``; the score ``s`` it folds is a sibling whose name
-    # lives in ``merge``. (The reduce axis is the enclosing fused ``Loop``'s.)
-    return Monoid(
-        state=State(names=(m, d)),  # seed (−inf, 0) rides on the fold Accums (op.identity)
-        partial=(),
-        twist=Twist(merge=merge, combine_states=combine_states, state_b=(mb, db)),
-    )
+    Built as a name-free exp-family **spec** (``pivot`` + ``denom``); ``merge`` /
+    ``combine_states`` are *generated* (see ``ir/stmt/carrier.py``). The downstream normalize pass
+    reads the final ``m`` and ``1/d``."""
+    return exp_family_twist(s, [denom()], (m, d))
 
 
 def _rowmax(loop: Loop) -> tuple[str, str, tuple] | None:

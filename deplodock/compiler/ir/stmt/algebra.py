@@ -22,7 +22,14 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.carrier import Channel, exp_combine_states, exp_merge
+from deplodock.compiler.ir.stmt.carrier import (
+    Channel,
+    exp_combine_states,
+    exp_merge,
+    id_accums,
+    id_combine_states,
+    id_merge,
+)
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load
 
 
@@ -305,6 +312,8 @@ class Monoid(Stmt):
         tw = self.twist
         if tw.family == "exp":
             return exp_merge(self.state.names, tw.channels, key=self.state.names[0])
+        if tw.family == "id":
+            return id_merge(self.state.names, tw.channels)
         return tw.merge
 
     @cached_property
@@ -315,6 +324,8 @@ class Monoid(Stmt):
         tw = self.twist
         if tw.family == "exp":
             return exp_combine_states(self.state.names, self.state_b, key=self.state_b[0])
+        if tw.family == "id":
+            return id_combine_states(self.state.names, self.state_b, tw.channels)
         return tw.combine_states
 
     def partial_names(self) -> tuple[str, ...]:
@@ -364,6 +375,10 @@ class Monoid(Stmt):
         components + rescale temps). Lets ``ir.tile.ops.lower`` emit a degenerate
         reduce as bare ``Accum``\\ s — seed derived from ``op.identity`` by
         ``Loop.render``, no explicit ``Init`` — instead of a ``Monoid`` carrier."""
+        if self.twist.family == "id":  # the degenerate family IS the bare folds
+            return id_accums(self.state.names, self.twist.channels)
+        if self.twist.family is not None:  # a twisted family (exp) is never degenerate
+            return None
         merge = self.merge
         names = set(self.state.names)
         if len(merge) != len(self.state.names):

@@ -59,16 +59,16 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, State, Twist, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Write
 from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.ir.tile.ops import Map, lower
+from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
@@ -76,72 +76,18 @@ if TYPE_CHECKING:
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:
-    """Build the online-softmax (log-sum-exp) :class:`Monoid` for one streaming
-    KV step: state ``(m, l, O)`` folds this key's ``(score, value)`` partial.
+    """The online-softmax (log-sum-exp) :class:`Monoid` for one streaming KV step: state
+    ``(m, l, O)`` folds this key's ``(score, value)`` partial::
 
         m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
         l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
 
-    The LSE monoid is asymmetric (partial ``(s, v)`` has different arity than
-    state ``(m, l, O)``), so the **state-merges-state** form can't be derived from
-    ``merge`` — ``combine_states`` is authored too: it merges this carrier's
-    ``(m, l, O)`` with a second partition's ``(m_o, l_o, O_o)`` (named by
-    ``state_b``), the form the cross-partition combine (cooperative-tree /
-    split-KV / split-K cross-CTA reduce) folds::
-
-        m_new = max(m, m_o);  a = exp(m − m_new);  b = exp(m_o − m_new)
-        l = l·a + l_o·b;      O = O·a + O_o·b;     m = m_new   (last)
-
-    Temps are namespaced by the state's first name so they stay unique per kernel
-    (they're internal to the carrier — invisible to the body's SSA renamer)."""
-
-    def t(suf: str) -> str:
-        return f"{m}__{suf}"
-
-    # The streaming merge as ψ-rescale ``Assign``\\ s + ``base``-``Accum`` folds: each
-    # state component's update is a rescale (``lm = l·alpha``) followed by an ``Accum``
-    # whose left operand is that rescale (``l = lm + p``), so the seed rides on the
-    # ``Accum`` (``op.identity``) and ``Loop.render`` seeds it — no explicit ``Init``. The
-    # carrier accumulates in f32 (the LSE precision), so the folds are stamped ``F32``. The
-    # ``m`` max-fold is last: its old value feeds every correction above.
-    merge = (
-        Assign(t("mx"), "maximum", (m, s)),  # m_new = max(m, s)  (temp for the corrections)
-        Assign(t("dm"), "subtract", (m, t("mx"))),  # m − m_new  (reads OLD m)
-        Assign(t("al"), "exp", (t("dm"),)),  # alpha = exp(m − m_new)
-        Assign(t("ds"), "subtract", (s, t("mx"))),  # s − m_new
-        Assign(t("p"), "exp", (t("ds"),)),  # p = exp(s − m_new)
-        Assign(t("lm"), "multiply", (ll, t("al"))),  # l·alpha  (rescale, reads OLD l)
-        Accum(name=ll, value=t("p"), op="add", base=t("lm"), dtype=F32),  # l = l·alpha + p   [seed 0]
-        Assign(t("om"), "multiply", (o, t("al"))),  # O·alpha  (rescale, reads OLD O)
-        Assign(t("pv"), "multiply", (t("p"), v)),  # p·v
-        Accum(name=o, value=t("pv"), op="add", base=t("om"), dtype=F32),  # O = O·alpha + p·v [seed 0]
-        Accum(name=m, value=s, op="maximum", dtype=F32),  # m = max(m, s)  [seed −inf, last]
-    )
-    state_b = (f"{m}__o", f"{ll}__o", f"{o}__o")  # the second partition's (m, l, O)
-    mb, lb, ob = state_b
-    combine_states = (
-        Assign(t("cmx"), "maximum", (m, mb)),  # m_new = max(m, m_o)
-        Assign(t("cda"), "subtract", (m, t("cmx"))),  # m − m_new
-        Assign(t("ca"), "exp", (t("cda"),)),  # a = exp(m − m_new)   (reads OLD m)
-        Assign(t("cdb"), "subtract", (mb, t("cmx"))),  # m_o − m_new
-        Assign(t("cb"), "exp", (t("cdb"),)),  # b = exp(m_o − m_new)
-        Assign(t("cla"), "multiply", (ll, t("ca"))),  # l·a
-        Assign(t("clb"), "multiply", (lb, t("cb"))),  # l_o·b
-        Assign(ll, "add", (t("cla"), t("clb"))),  # l = l·a + l_o·b           [state]
-        Assign(t("coa"), "multiply", (o, t("ca"))),  # O·a
-        Assign(t("cob"), "multiply", (ob, t("cb"))),  # O_o·b
-        Assign(o, "add", (t("coa"), t("cob"))),  # O = O·a + O_o·b            [state]
-        Assign(m, "copy", (t("cmx"),)),  # m = m_new                          [state, last]
-    )
-    # A loop-IR carrier — ``partial=()``; the (score, value) it folds are siblings whose
-    # names live in ``merge`` (``_flash_op`` wraps this with the op-tree partial nodes +
-    # the kv ``axis``). The φ projection (O / l) is a ``Map`` *over* this Monoid, added in
-    # ``_flash_op`` — not a carrier field.
-    return Monoid(
-        state=State(names=(m, ll, o)),
-        partial=(),
-        twist=Twist(merge=merge, combine_states=combine_states, state_b=state_b),
-    )
+    Built as a name-free exp-family **spec** (``pivot``, ``denom``, ``expect``) — the streaming
+    ``merge`` and the cross-partition ``combine_states`` are *generated* from the spec (and the
+    stable max-rescale recovered by the stabilizer), not authored here. See
+    ``ir/stmt/carrier.py``. A loop-IR carrier (``partial=()``); the φ projection ``O/l`` is a
+    ``Map`` *over* this Monoid, added in ``_flash_op``."""
+    return exp_family_twist(s, [denom(), expect(v)], (m, ll, o))
 
 
 def _static(d) -> int | None:

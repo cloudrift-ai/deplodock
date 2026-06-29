@@ -50,11 +50,14 @@ class Channel:
     ``lift`` is the ⊗ combining the softmax weight with ``term`` (``None`` = pivot/denominator;
     ``multiply`` = expectation) — at the scalar tier ⊗ is the implicit scalar multiply already
     in the generation; ``lift`` is carried so a future fragment realizer can lower ⊗ to a
-    contraction (mma). See the tile-lowering ARCHITECTURE notes on tier independence."""
+    contraction (mma). See the tile-lowering ARCHITECTURE notes on tier independence. ``dtype``
+    is the accumulator dtype — used by the degenerate (``id``) family (an exp carrier folds in
+    f32); ``None`` defers to the lowering default."""
 
     fold: ElementwiseImpl
     term: str | float
     lift: ElementwiseImpl | None = None
+    dtype: object = None
 
 
 # --------------------------------------------------------------------------------------------
@@ -292,6 +295,30 @@ def exp_merge(state: tuple[str, ...], channels: tuple[Channel, ...], *, key: str
     prog = _emit(outs, state, key or state[0], merge=True)
     _certify(prog)
     return prog
+
+
+# --------------------------------------------------------------------------------------------
+# The degenerate ``id`` family — a plain reduce (ψ = identity, no stabilization). Each component
+# folds independently by its own op; there is no rescale, so the combine is the bare self-fold.
+# --------------------------------------------------------------------------------------------
+
+
+def id_accums(state: tuple[str, ...], channels: tuple[Channel, ...]) -> list[Accum]:
+    """The bare fold ``Accum``\\ s a degenerate carrier dissolves to — ``name = op(name, term)``,
+    seed ``op.identity`` (derived by ``Loop.render``)."""
+    return [Accum(name=s, value=str(c.term), op=c.fold, dtype=c.dtype) for s, c in zip(state, channels, strict=True)]
+
+
+def id_merge(state: tuple[str, ...], channels: tuple[Channel, ...]) -> tuple[Assign, ...]:
+    """The identity-twist streaming fold ``name = op(name, term)`` (one ``Assign`` per
+    component) — the self-fold form ``as_accums`` recognizes and ``dissolve`` lowers."""
+    return tuple(Assign(name=s, op=c.fold, args=(s, str(c.term)), dtype=c.dtype) for s, c in zip(state, channels, strict=True))
+
+
+def id_combine_states(state: tuple[str, ...], state_b: tuple[str, ...], channels: tuple[Channel, ...]) -> tuple[Assign, ...]:
+    """The cross-partition fold of two degenerate partials — componentwise ``name =
+    op(name, name__o)``."""
+    return tuple(Assign(name=s, op=c.fold, args=(s, sb), dtype=c.dtype) for s, sb, c in zip(state, state_b, channels, strict=True))
 
 
 # Channel constructors mirroring the expectation-semiring vocabulary.

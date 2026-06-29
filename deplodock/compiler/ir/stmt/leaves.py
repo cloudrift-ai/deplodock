@@ -509,13 +509,14 @@ class Accum(Stmt):
         ``Monoid``, with no additive special-case. The auto-derived ``combine_states``
         (``name = op(name, name__o)``) equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
         from deplodock.compiler.ir.stmt.algebra import Monoid, State, Twist  # local: algebra imports leaves
+        from deplodock.compiler.ir.stmt.carrier import Channel
 
-        # A loop-IR carrier — ``partial=()``; the folded ``value`` is a sibling whose name
-        # lives in the degenerate ``merge`` (``name = op(name, value)``).
+        # A loop-IR carrier — ``partial=()``; the folded ``value`` is a sibling whose name lives
+        # in the degenerate ``merge`` (``name = op(name, value)``), built as the ``id``-family spec.
         return Monoid(
             state=State(names=(self.name,)),
             partial=(),
-            twist=Twist.degenerate((self.name,), (self.value,), (self.op,), self.dtype),
+            twist=Twist(family="id", channels=(Channel(fold=self.op, term=self.value, dtype=self.dtype),)),
         )
 
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a

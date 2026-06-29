@@ -8,14 +8,73 @@ from __future__ import annotations
 
 import pytest
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.stmt import Accum, Assign
 from deplodock.compiler.ir.stmt import carrier as _carrier
 from deplodock.compiler.ir.stmt.carrier import UnstableCarrierError
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
-from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
-from deplodock.compiler.pipeline.passes.lowering.tile._softmax import online_softmax_combine
 
 _COMMUTATIVE = {"add", "multiply", "maximum"}
+
+# FROZEN GOLDEN — the original hand-authored flash / online-softmax combine programs (the
+# log-sum-exp recurrence). The spec-driven generator must reproduce these; this is the safety
+# net that guards the generator after the hand-written builders were deleted. Do NOT regenerate
+# these from the builders (that would make the check circular) — they are a literal snapshot.
+
+
+def _t(suf: str) -> str:
+    return f"m_i__{suf}"
+
+
+_HAND_FLASH_MERGE = (
+    Assign(_t("mx"), "maximum", ("m_i", "s_e")),
+    Assign(_t("dm"), "subtract", ("m_i", _t("mx"))),
+    Assign(_t("al"), "exp", (_t("dm"),)),
+    Assign(_t("ds"), "subtract", ("s_e", _t("mx"))),
+    Assign(_t("p"), "exp", (_t("ds"),)),
+    Assign(_t("lm"), "multiply", ("l_i", _t("al"))),
+    Accum(name="l_i", value=_t("p"), op="add", base=_t("lm"), dtype=F32),
+    Assign(_t("om"), "multiply", ("O_i", _t("al"))),
+    Assign(_t("pv"), "multiply", (_t("p"), "v_e")),
+    Accum(name="O_i", value=_t("pv"), op="add", base=_t("om"), dtype=F32),
+    Accum(name="m_i", value="s_e", op="maximum", dtype=F32),
+)
+_HAND_FLASH_COMBINE_STATES = (
+    Assign(_t("cmx"), "maximum", ("m_i", "m_i__o")),
+    Assign(_t("cda"), "subtract", ("m_i", _t("cmx"))),
+    Assign(_t("ca"), "exp", (_t("cda"),)),
+    Assign(_t("cdb"), "subtract", ("m_i__o", _t("cmx"))),
+    Assign(_t("cb"), "exp", (_t("cdb"),)),
+    Assign(_t("cla"), "multiply", ("l_i", _t("ca"))),
+    Assign(_t("clb"), "multiply", ("l_i__o", _t("cb"))),
+    Assign("l_i", "add", (_t("cla"), _t("clb"))),
+    Assign(_t("coa"), "multiply", ("O_i", _t("ca"))),
+    Assign(_t("cob"), "multiply", ("O_i__o", _t("cb"))),
+    Assign("O_i", "add", (_t("coa"), _t("cob"))),
+    Assign("m_i", "copy", (_t("cmx"),)),
+)
+# online softmax = flash minus the O / value-expectation channel, state (m, d), temps keyed on m.
+_HAND_SOFTMAX_MERGE = (
+    Assign("m__mx", "maximum", ("m", "s")),
+    Assign("m__dm", "subtract", ("m", "m__mx")),
+    Assign("m__al", "exp", ("m__dm",)),
+    Assign("m__ds", "subtract", ("s", "m__mx")),
+    Assign("m__p", "exp", ("m__ds",)),
+    Assign("m__dl", "multiply", ("d", "m__al")),
+    Accum(name="d", value="m__p", op="add", base="m__dl", dtype=F32),
+    Accum(name="m", value="s", op="maximum", dtype=F32),
+)
+_HAND_SOFTMAX_COMBINE_STATES = (
+    Assign("m__cmx", "maximum", ("m", "m__o")),
+    Assign("m__cda", "subtract", ("m", "m__cmx")),
+    Assign("m__ca", "exp", ("m__cda",)),
+    Assign("m__cdb", "subtract", ("m__o", "m__cmx")),
+    Assign("m__cb", "exp", ("m__cdb",)),
+    Assign("m__cda2", "multiply", ("d", "m__ca")),
+    Assign("m__cdb2", "multiply", ("d__o", "m__cb")),
+    Assign("d", "add", ("m__cda2", "m__cdb2")),
+    Assign("m", "copy", ("m__cmx",)),
+)
 
 
 def _canon(prog: tuple, state: tuple[str, ...]) -> dict:
@@ -75,20 +134,18 @@ def _merge_is_seedable(prog: tuple, state: tuple[str, ...]) -> bool:
 def test_generated_flash_matches_handwritten():
     state = ("m_i", "l_i", "O_i")
     gen = exp_family_twist("s_e", [denom(), expect("v_e")], state)  # spec-mode Monoid
-    hand = flash_combine("m_i", "l_i", "O_i", "s_e", "v_e")  # bound-mode (hand-written) Monoid
-    assert _canon(gen.merge, state) == _canon(hand.merge, state)
-    assert _canon(gen.combine_states, state) == _canon(hand.combine_states, state)
-    assert gen.state_b == hand.state_b
+    assert _canon(gen.merge, state) == _canon(_HAND_FLASH_MERGE, state)
+    assert _canon(gen.combine_states, state) == _canon(_HAND_FLASH_COMBINE_STATES, state)
+    assert gen.state_b == ("m_i__o", "l_i__o", "O_i__o")
     assert _merge_is_seedable(gen.merge, state)
 
 
 def test_generated_online_softmax_matches_handwritten():
     state = ("m", "d")
     gen = exp_family_twist("s", [denom()], state)
-    hand = online_softmax_combine("m", "d", "s")
-    assert _canon(gen.merge, state) == _canon(hand.merge, state)
-    assert _canon(gen.combine_states, state) == _canon(hand.combine_states, state)
-    assert gen.state_b == hand.state_b
+    assert _canon(gen.merge, state) == _canon(_HAND_SOFTMAX_MERGE, state)
+    assert _canon(gen.combine_states, state) == _canon(_HAND_SOFTMAX_COMBINE_STATES, state)
+    assert gen.state_b == ("m__o", "d__o")
     assert _merge_is_seedable(gen.merge, state)
 
 

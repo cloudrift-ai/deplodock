@@ -28,11 +28,11 @@ class _Softmax(torch.nn.Module):
 
 
 def test_online_softmax_combine_builds_asymmetric_monoid() -> None:
-    # state (m, d), partial (s); the asymmetric LSE monoid must author combine_states (the
-    # cross-partition combine can't derive it from merge).
+    # state (m, d), partial (s); the asymmetric LSE monoid derives combine_states (the
+    # cross-partition state⊕state combine) from its exp-family spec.
     mono = online_softmax_combine("m", "d", "s")
     assert mono.state.names == ("m", "d") and mono.partial_names() == ("s",)
-    assert mono.twist.combine_states, "combine_states must be authored for the asymmetric LSE monoid"
+    assert mono.combine_states, "combine_states must be derived for the asymmetric LSE monoid"
 
 
 def _softmax_body() -> Body:
@@ -91,9 +91,11 @@ def test_online_softmax_matches_torch(shape) -> None:
     backend = CudaBackend()
     compiled = backend.compile(graph)
 
-    # The recognizer must have fired: exactly one Monoid kernel carrying the online-softmax fold.
-    ks = [n for n in compiled.nodes if getattr(compiled.nodes[n].op, "kernel_source", None)]
-    assert "combine(" in compiled.nodes[ks[0]].op.kernel_source or "acc0__mx" in compiled.nodes[ks[0]].op.kernel_source
+    # The recognizer must have fired: a single fused kernel streaming one online-softmax loop
+    # (the ``<rowmax>__osin`` fused-score input is the recognizer's signature, stable across the
+    # carrier's internal temp naming).
+    srcs = [getattr(compiled.nodes[n].op, "kernel_source", "") for n in compiled.nodes]
+    assert any("__osin" in src for src in srcs), "online-softmax fusion did not fire"
 
     run_result, eager = backend.run(compiled, input_data={"x": x.numpy()}, pre_run=lambda: _Softmax()(x).numpy())
     got = list(run_result.outputs.values())[0]
