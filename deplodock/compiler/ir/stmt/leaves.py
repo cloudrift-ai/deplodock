@@ -62,36 +62,6 @@ def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt:
     return out
 
 
-def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -> list[Expr]:
-    """Wrap each non-f32 SSA name with ``target.convert(name, dt, "f32")``
-    so the resulting Expr tree composes in fp32. Used by ``Assign.render``
-    for the f32 result path and the f16-fallback path.
-
-    Returns an ``Expr`` list, with conversions threaded through a
-    ``FuncCallExpr``-style ``Cast``: we synthesize a no-op
-    :class:`Var` for f32 args and an inline-rendered cast for others."""
-    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
-
-    out: list[Expr] = []
-    for a, dt in zip(args, arg_dtypes, strict=True):
-        if dt == "f32":
-            out.append(Var(a))
-        else:
-            # ``target.convert`` returns a fully-rendered string; wrap as
-            # a synthetic FuncCallExpr so it slots into ``op_to_expr``'s
-            # Expr-tree output without round-tripping through Var lookups.
-            converted = target.convert(a, dt, "f32")
-            # Strip the synthesized prefix to reuse FuncCallExpr's
-            # "name(args)" rendering. ``target.convert("x", "f16", "f32")``
-            # returns ``"__half2float(x)"`` — we split on the open paren.
-            paren = converted.index("(") if "(" in converted else -1
-            if paren > 0 and converted.endswith(")"):
-                out.append(FuncCallExpr(converted[:paren], (Var(a),)))
-            else:
-                out.append(Var(a))
-    return out
-
-
 def _dtype_intrinsics(target, result_dt: str, expr: Expr) -> dict[str, str]:
     """Per-dtype intrinsic overrides for the abstract op names that
     appear inside ``expr``. The Expr renderer reads ``ctx.intrinsics``
@@ -442,7 +412,7 @@ class Assign(Stmt):
 
         # f32 / no-native path: promote args to f32, render in f32, then
         # convert the result back to ``result_dt`` when narrower.
-        promoted = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
+        promoted = _args_at_dtype(ctx.target, self.args, arg_dtypes, "f32")
         expr = op_to_expr(op_name, promoted)
         body_str = expr.render(ctx)
         if result_dt != "f32":

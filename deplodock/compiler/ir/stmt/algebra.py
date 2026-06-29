@@ -53,6 +53,13 @@ class Map:
         value / the partial this Map supplies)."""
         return self.body[-1].defines()[-1]
 
+    @property
+    def reduce_node(self) -> Monoid | Semiring | None:
+        """The nested reduction this Map projects over (``project ∘ reduce``) — its
+        ``source`` when that is a ``Monoid`` / ``Semiring``, else ``None`` (a pure or flat
+        pointwise Map reduces over nothing at this level)."""
+        return self.source if isinstance(self.source, (Monoid, Semiring)) else None
+
 
 @dataclass(frozen=True)
 class Semiring:
@@ -88,6 +95,11 @@ class Semiring:
         mma atom (a tropical / min-plus contraction is still a semiring, still tiles,
         but has no hardware atom)."""
         return self.lift.name == "multiply" and self.fold.op.reduce_canon == "add"
+
+    @property
+    def reduce_node(self) -> Semiring:
+        """This contraction IS the reduction (identity for the projection-peeling query)."""
+        return self
 
     @staticmethod
     def match(loop) -> Semiring | None:
@@ -263,6 +275,11 @@ class Monoid(Stmt):
         stored ``str``). Seeds at lowering ride on the carrier's fold ``Accum``\\ s
         (``op.identity``), derived by ``Loop.render`` — no explicit ``Init``."""
         return self.state.names[0]
+
+    @property
+    def reduce_node(self) -> Monoid:
+        """This carrier IS the reduction (identity for the projection-peeling query)."""
+        return self
 
     def partial_names(self) -> tuple[str, ...]:
         """The bound name of each partial the merge folds in — the twist's ``merge``

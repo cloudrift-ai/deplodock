@@ -233,8 +233,6 @@ class Tile(Stmt):
         return [f"{indent}Tile[{names}] (N={self.n_elements})", *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from math import prod  # noqa: PLC0415
-
         pad = _pad(ctx.indent)
         extents = self.extents
         # Inner-stride of each axis = product of the extents to its right.
@@ -243,7 +241,7 @@ class Tile(Stmt):
         for i in range(len(extents) - 1, -1, -1):
             strides[i] = acc
             acc *= extents[i]
-        n = prod(extents) if extents else 1
+        n = self.n_elements
         out = [
             f"{pad}int _gid = blockIdx.x * blockDim.x + threadIdx.x;",
             f"{pad}if (_gid < {n}) {{",

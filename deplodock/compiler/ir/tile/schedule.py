@@ -30,7 +30,6 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.stmt.algebra import Map
 
 
 class Level(enum.Enum):
@@ -348,23 +347,14 @@ class SemiringKernel:
 Kernel = MapKernel | MonoidKernel | SemiringKernel
 
 
-def reduce_node(op):
-    """The nested ``Monoid`` / ``Semiring`` a kernel reduces over, peeling a projection
-    ``Map`` (``project ∘ reduce``) to its ``source``; ``None`` for a pure pointwise
-    ``Map`` (or a flat ``Map`` whose reduces stay as loop-IR inside its body)."""
-    inner = op.source if isinstance(op, Map) and op.source is not None else op
-    from deplodock.compiler.ir.stmt.algebra import Monoid, Semiring  # noqa: PLC0415
-
-    return inner if isinstance(inner, (Monoid, Semiring)) else None
-
-
 def kernel_for(node, place: Placement) -> Kernel:
     """Wrap a lifted op-tree ``node`` + its :class:`Placement` in the matching ``*Kernel``,
     keyed by the (peeled) op kind — a bare reduction or a projection ``Map`` over one is a
-    ``Monoid`` / ``Semiring`` kernel; anything else is a ``MapKernel``."""
+    ``Monoid`` / ``Semiring`` kernel; anything else is a ``MapKernel``. The peel itself is
+    ``node.reduce_node`` (see :mod:`deplodock.compiler.ir.stmt.algebra`)."""
     from deplodock.compiler.ir.stmt.algebra import Monoid, Semiring  # noqa: PLC0415
 
-    inner = reduce_node(node)
+    inner = node.reduce_node
     if isinstance(inner, Monoid):
         return MonoidKernel(op=node, schedule=MonoidSchedule(place=place))
     if isinstance(inner, Semiring):
@@ -391,5 +381,4 @@ __all__ = [
     "WarpSpec",
     "WarpTile",
     "kernel_for",
-    "reduce_node",
 ]

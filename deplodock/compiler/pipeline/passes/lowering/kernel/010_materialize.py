@@ -40,7 +40,7 @@ from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import MonoidKernel, TileOp, reduce_node
+from deplodock.compiler.ir.tile import MonoidKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
@@ -130,7 +130,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a cooperative / ILP reduce (see module docstring)."""
     kernel = tile.kernel
     op = kernel.op
-    carrier = reduce_node(op)
+    carrier = op.reduce_node
     plan = kernel.schedule.reduce
     coop, reg = plan.coop, plan.reg
     grid = kernel.schedule.place.grid

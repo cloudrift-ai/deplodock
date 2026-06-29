@@ -170,6 +170,8 @@ def apply_binop(op: str, lv: object, rv: object) -> object:
             import numpy as np
 
             return np.logical_or(lv, rv)
+    if op == "^":
+        return int(lv) ^ int(rv)
     raise ValueError(f"Unknown BinOp: {op}")
 
 
@@ -276,47 +278,9 @@ class BinaryExpr(_ExprOps):
     right: Expr
 
     def eval(self, env: dict[str, object]) -> object:
-        lv, rv = self.left.eval(env), self.right.eval(env)
-        op = self.op
-        if op == "+":
-            return lv + rv
-        if op == "-":
-            return lv - rv
-        if op == "*":
-            return lv * rv
-        if op in ("/", "//"):
-            try:
-                return int(lv) // int(rv)
-            except TypeError:
-                return lv // rv
-        if op == "%":
-            try:
-                return int(lv) % int(rv)
-            except TypeError:
-                return lv % rv
-        if op == "<":
-            return lv < rv
-        if op == "<=":
-            return lv <= rv
-        if op == ">":
-            return lv > rv
-        if op == ">=":
-            return lv >= rv
-        if op == "==":
-            return lv == rv
-        if op == "&&":
-            try:
-                return bool(lv) and bool(rv)
-            except (TypeError, ValueError):
-                return np.logical_and(lv, rv)
-        if op == "||":
-            try:
-                return bool(lv) or bool(rv)
-            except (TypeError, ValueError):
-                return np.logical_or(lv, rv)
-        if op == "^":
-            return int(lv) ^ int(rv)
-        raise ValueError(f"Unknown BinaryExpr: {op}")
+        # Single source of binary-op semantics: ``apply_binop`` (also used by
+        # constant folding) — eval only supplies the evaluated operands.
+        return apply_binop(self.op, self.left.eval(env), self.right.eval(env))
 
     def pretty(self) -> str:
         return f"({self.left.pretty()} {self.op} {self.right.pretty()})"

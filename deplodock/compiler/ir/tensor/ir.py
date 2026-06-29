@@ -40,11 +40,12 @@ from deplodock.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
 
 
 @dataclass
-class ElementwiseOp(Op):
-    """Apply a scalar function independently to each element.
+class _ElementwiseImplOp(Op):
+    """Shared base for ops carrying an ``ElementwiseImpl`` combine in ``op``.
 
-    The ``op`` field is an ``ElementwiseImpl`` carrying the function's name +
-    arity + commutativity + (for reducer use) identity.
+    Centralizes the str→``ElementwiseImpl`` coercion and the ``name`` / ``fn``
+    accessors that ``ElementwiseOp`` / ``ReduceOp`` / ``ScanOp`` all expose.
+    Subclasses redeclare ``op`` only to change its default spelling.
     """
 
     op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("copy"))
@@ -62,6 +63,15 @@ class ElementwiseOp(Op):
     def fn(self) -> str:
         """Alias for ``name`` — kept for pattern-matcher ``constraints={"fn": ...}``."""
         return self.op.name
+
+
+@dataclass
+class ElementwiseOp(_ElementwiseImplOp):
+    """Apply a scalar function independently to each element.
+
+    The ``op`` field is an ``ElementwiseImpl`` carrying the function's name +
+    arity + commutativity + (for reducer use) identity.
+    """
 
     @property
     def arity(self) -> int:
@@ -97,27 +107,28 @@ class ElementwiseOp(Op):
 
 
 @dataclass
-class ReduceOp(Op):
+class ReduceLikeOp(_ElementwiseImplOp):
+    """Shared base for the axis-folding ops (``ReduceOp`` / ``ScanOp``): a ``sum``-default
+    ``ElementwiseImpl`` combine over one ``axis``, resolved to its numpy spelling."""
+
+    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("sum"))
+    axis: int | str = 0
+
+    def _spelling(self):
+        """The ``ReduceSpelling`` for this combine, or raise if it has none."""
+        spelling = _REDUCE_SPELLING.get(self.op.reduce_canon)
+        if spelling is None:
+            raise NotImplementedError(f"{type(self).__name__}.forward: unknown fn {self.op.name!r}")
+        return spelling
+
+
+@dataclass
+class ReduceOp(ReduceLikeOp):
     """Collapse one or more dimensions via an associative binary op.
 
     ``op`` is the combine (``sum`` / ``max`` / ``prod`` / …); ``axis`` is
     the reduced dimension (concrete int or symbolic name).
     """
-
-    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("sum"))
-    axis: int | str = 0
-
-    def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
-
-    @property
-    def name(self) -> str:
-        return self.op.name
-
-    @property
-    def fn(self) -> str:
-        return self.op.name
 
     @property
     def identity(self) -> float:
@@ -127,37 +138,19 @@ class ReduceOp(Op):
         return _keepdim_axis(input_shapes[0], self.axis)
 
     def forward(self, *inputs):
-        spelling = _REDUCE_SPELLING.get(self.op.reduce_canon)
-        if spelling is None:
-            raise NotImplementedError(f"ReduceOp.forward: unknown fn {self.op.name!r}")
-        return spelling.np_reduce(inputs[0], axis=self.axis, keepdims=True)
+        return self._spelling().np_reduce(inputs[0], axis=self.axis, keepdims=True)
 
 
 @dataclass
-class ScanOp(Op):
+class ScanOp(ReduceLikeOp):
     """Cumulative application of an associative binary op along an axis."""
-
-    op: ElementwiseImpl = field(default_factory=lambda: ElementwiseImpl("sum"))
-    axis: int | str = 0
-
-    def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
-
-    @property
-    def name(self) -> str:
-        return self.op.name
-
-    @property
-    def fn(self) -> str:
-        return self.op.name
 
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         return tuple(input_shapes[0])  # scan preserves shape
 
     def forward(self, *inputs):
-        spelling = _REDUCE_SPELLING.get(self.op.reduce_canon)
-        if spelling is None or spelling.np_scan is None:
+        spelling = self._spelling()
+        if spelling.np_scan is None:
             raise NotImplementedError(f"ScanOp.forward: unknown fn {self.op.name!r}")
         return spelling.np_scan(inputs[0], axis=self.axis)
 

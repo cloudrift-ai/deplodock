@@ -100,8 +100,8 @@ autotuning cache doesn't bust on cosmetic edits.
   (`(seq_len + bf - 1)//bf`), and a boundary `Cond(decoded_coord < seq_len)` wraps the body, so one cached kernel runs
   at any runtime `seq_len` — the grid (`ir/cuda/ir.py` `GridDimSpec` accepts an `Expr` factor, resolved via
   `Expr.eval` at launch) and the guard read the runtime value while the tile shape is tuned for the hint. The backend
-  benches a symbolic graph at the hint when no real inputs are supplied (`backend/cuda/program.py` `_symbolic_hints` /
-  `_resolve_symbolic`), so `tune` and `compile` agree on a hint-sized variant. (The masked tensor-core / cooperative /
+  benches a symbolic graph at the hint when no real inputs are supplied (`Graph.symbolic_hints` /
+  `backend/cuda/program.py` `_resolve_symbolic`), so `tune` and `compile` agree on a hint-sized variant. (The masked tensor-core / cooperative /
   split-K tiers for symbolic axes are part of the in-flight tile-IR rebuild — see `pipeline/passes/ARCHITECTURE.md`
   and the tile IR sources for current coverage.)
 - **`ElementwiseOp` inputs must already share the output shape.** The

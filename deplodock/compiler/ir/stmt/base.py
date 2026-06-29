@@ -94,20 +94,12 @@ class RenderCtx:
     literal_default_dtype: str | None = None
 
     def child(self) -> RenderCtx:
-        """Return a new ctx one indent level deeper, sharing all tables."""
-        return RenderCtx(
-            target=self.target,
-            shapes=self.shapes,
-            indent=self.indent + 1,
-            intrinsics=self.intrinsics,
-            builtins=self.builtins,
-            literal_constants=self.literal_constants,
-            literal_ssa=self.literal_ssa,
-            smem_dynamic_offsets=self.smem_dynamic_offsets,
-            buffer_dtypes=self.buffer_dtypes,
-            ssa_dtypes=self.ssa_dtypes,
-            literal_default_dtype=self.literal_default_dtype,
-        )
+        """Return a new ctx one indent level deeper, sharing all tables.
+
+        ``replace`` shallow-copies every field, so the mutable tables (``shapes``,
+        ``ssa_dtypes``, …) stay shared by reference with the parent — only ``indent``
+        is bumped."""
+        return replace(self, indent=self.indent + 1)
 
     # ---- Convenience wrappers over ``self.target``. These exist so the
     # render methods read ``ctx.type_name(dt)`` instead of pulling the

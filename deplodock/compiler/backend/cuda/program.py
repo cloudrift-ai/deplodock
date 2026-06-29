@@ -84,35 +84,21 @@ class _Buffer:
 
 
 def _buffers(graph: Graph) -> list[_Buffer]:
-    input_set = set(graph.inputs)
-    output_set = set(graph.outputs)
-    bufs: list[_Buffer] = []
-    for nid, node in graph.nodes.items():
-        if nid in input_set:
-            role = "input"
-        elif isinstance(node.op, ConstantOp):
-            role = "constant"
-        elif nid in output_set:
-            role = "output"
-        else:
-            role = "scratch"
-        bufs.append(_Buffer(name=nid, shape=tuple(node.output.shape), dtype=node.output.dtype, role=role))
-    return bufs
+    return [
+        _Buffer(name=nid, shape=tuple(node.output.shape), dtype=node.output.dtype, role=graph.node_role(nid))
+        for nid, node in graph.nodes.items()
+    ]
 
 
 def _constant_values(graph: Graph) -> dict[str, float]:
-    return {nid: node.op.value for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.value is not None}
+    return {nid: op.value for nid, op in graph.constant_ops() if op.value is not None}
 
 
 def _runtime_constants(graph: Graph):
     """``{nid: Expr}`` for each ``ConstantOp`` bound to a runtime ``context_value`` (a value
     set by the symbolic context — e.g. a dynamic mean's divisor = the runtime reduce-axis
     size). Resolved to a concrete float per run from ``sym_values``."""
-    return {
-        nid: node.op.context_value
-        for nid, node in graph.nodes.items()
-        if isinstance(node.op, ConstantOp) and getattr(node.op, "context_value", None) is not None
-    }
+    return {nid: op.context_value for nid, op in graph.constant_ops() if op.context_value is not None}
 
 
 def _resolved_constants(compiled: _Compiled, sym_values: dict[str, int]) -> dict[str, float]:
@@ -193,8 +179,8 @@ def _compile(graph: Graph) -> _Compiled:
     buf_by_name = {b.name: b for b in bufs}
     constants = _constant_values(graph)
     launches_nodes = _launches(graph)
-    symbolic_bindings = _symbolic_bindings(graph)
-    symbolic_hints = _symbolic_hints(graph)
+    symbolic_bindings = graph.symbolic_bindings()
+    symbolic_hints = graph.symbolic_hints()
     runtime_constants = _runtime_constants(graph)
 
     # ``nvcc.load_function`` returns a cupy ``Function`` (or a ``RawKernel`` on
@@ -238,57 +224,6 @@ def _compile(graph: Graph) -> _Compiled:
         symbolic_hints=symbolic_hints,
         runtime_constants=runtime_constants,
     )
-
-
-def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
-    """Walk graph inputs to map every symbolic dim name to its source
-    ``(input_buf, dim_index)`` — the launch resolver reads the runtime
-    value from ``input_arrays[buf].shape[dim_index]``. First-seen position
-    wins on conflicts so each name resolves deterministically.
-
-    A symbolic name is recovered from an **atomic** ``Var`` axis (``shape[d] ==
-    Var(name)``). A **composite** symbolic input dim — e.g. a sliced masked-K
-    producer slab's padded extent ``((seq_len + 63) // 64) * 64`` reaching a
-    standalone-benched consumer as a synthetic input — can't be inverted to its
-    free var directly, so it does NOT bind; it is fine as long as every free var
-    it carries is bound from an atomic axis somewhere (the slab's own ``seq_q``
-    axis, the sibling P operand, …). Only a name that appears *exclusively* in
-    composite dims is unrecoverable — that raises."""
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-
-    bindings: dict[str, tuple[str, int]] = {}
-    composite_names: set[str] = set()
-    for nid in graph.inputs:
-        for d, dim in enumerate(graph.nodes[nid].output.shape):
-            if dim.is_static:
-                continue
-            if isinstance(dim.expr, Var):
-                bindings.setdefault(dim.expr.name, (nid, d))
-            else:
-                composite_names |= dim.expr.free_vars()
-    unrecoverable = composite_names - bindings.keys()
-    if unrecoverable:
-        raise ValueError(
-            f"symbolic name(s) {sorted(unrecoverable)} appear only in composite input dims; "
-            "no atomic Var-backed axis to recover them from at launch"
-        )
-    return bindings
-
-
-def _symbolic_hints(graph: Graph) -> dict[str, int]:
-    """Map every symbolic input-dim name to its ``Dim`` hint (default expected
-    size). Read straight off the input ``Dim`` — convenient here since this
-    walks the same input shapes as ``_symbolic_bindings``. Used by
-    ``_resolve_symbolic`` as the fallback bench size when no ``input_data`` is
-    supplied (the autotuner case)."""
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-
-    hints: dict[str, int] = {}
-    for nid in graph.inputs:
-        for dim in graph.nodes[nid].output.shape:
-            if isinstance(dim.expr, Var) and dim.hint is not None:
-                hints.setdefault(dim.expr.name, dim.hint)
-    return hints
 
 
 def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:

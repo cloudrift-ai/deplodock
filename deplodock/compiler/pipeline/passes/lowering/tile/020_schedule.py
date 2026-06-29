@@ -30,7 +30,7 @@ from math import prod
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
-from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, TileOp, reduce_node
+from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -94,7 +94,7 @@ def _coop_carrier(kernel) -> Monoid | None:
     fold."""
     if not isinstance(kernel, MonoidKernel):
         return None
-    inner = reduce_node(kernel.op)
+    inner = kernel.op.reduce_node
     if not isinstance(inner, Monoid) or inner.axis is None:
         return None
     return inner

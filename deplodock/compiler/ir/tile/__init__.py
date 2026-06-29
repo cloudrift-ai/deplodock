@@ -27,7 +27,6 @@ from deplodock.compiler.ir.tile.schedule import (
     WarpSpec,
     WarpTile,
     kernel_for,
-    reduce_node,
 )
 
 __all__ = [
@@ -51,5 +50,4 @@ __all__ = [
     "WarpSpec",
     "WarpTile",
     "kernel_for",
-    "reduce_node",
 ]

@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from deplodock.compiler.ir.base import InputOp
 
 
 def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
@@ -63,15 +63,10 @@ def bind_constants(graph: Graph, sources: dict[str, np.ndarray]) -> dict[str, np
     ``value`` directly).
     """
     out: dict[str, np.ndarray] = {}
-    for nid, node in graph.nodes.items():
-        if not isinstance(node.op, ConstantOp):
+    for nid, op in graph.loadable_constants():
+        if op.source_path not in sources:
             continue
-        if node.op.value is not None:
-            continue
-        path = node.op.source_path
-        if path is None or path not in sources:
-            continue
-        out[nid] = apply_load_ops(sources[path], node.op.load_ops)
+        out[nid] = apply_load_ops(sources[op.source_path], op.load_ops)
     return out
 
 
