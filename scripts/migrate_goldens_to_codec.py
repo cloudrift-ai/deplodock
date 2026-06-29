@@ -35,7 +35,7 @@ from pathlib import Path
 import yaml
 
 from deplodock.compiler.ir.tile.atom import atom_for
-from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile
+from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile, is_warp_codec
 
 _GOLDENS_DIR = Path(__file__).resolve().parents[1] / "deplodock" / "compiler" / "pipeline" / "search" / "goldens"
 
@@ -52,11 +52,28 @@ def _is_legacy(knobs: dict) -> bool:
     return bool(stage) and all(c in "01" for c in stage)
 
 
+def _recanonicalize(knobs: dict) -> dict:
+    """Re-spell an already-native dict through the current codec ``*.spell()`` — compacting the old
+    ``xm``/``xw``/``xf`` pair spelling to the plain-``x`` form. Idempotent: a dict already in the
+    compact form round-trips byte-identical (the text replace is a no-op, then parse∘spell = id)."""
+    out = dict(knobs)
+    tile = out.get("TILE")
+    if tile:
+        compact = tile.replace("xm", "x").replace("xw", "x").replace("xf", "x")
+        out["TILE"] = (WarpTile.parse(compact) if is_warp_codec(compact) else TilePlan.parse(compact)).spell()
+    if out.get("REDUCE"):
+        out["REDUCE"] = ReducePlan.parse(out["REDUCE"]).spell()
+    if out.get("STAGE"):
+        out["STAGE"] = Stage.parse(out["STAGE"]).spell()
+    return out
+
+
 def legacy_to_codec(knobs: dict) -> dict:
     """Convert a legacy golden ``knobs`` dict to the native codec schema. Idempotent: a dict that
-    already speaks codecs (no legacy keys) is returned unchanged."""
+    already speaks codecs is re-canonicalized through the current ``*.spell()`` (compacting an old
+    ``xm``/``xw``/``xf`` pair spelling to the plain-``x`` form), then is stable on a second run."""
     if not _is_legacy(knobs):
-        return dict(knobs)
+        return _recanonicalize(knobs)
 
     def _int(name: str, default: int = 1) -> int:
         return int(knobs.get(name, default))

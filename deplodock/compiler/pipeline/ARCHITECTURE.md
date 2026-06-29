@@ -388,7 +388,7 @@ module — no manual registration. `knob.py` also owns the `DEPLODOCK_<KNOB>` en
 
 - **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_STAGE=d2/cp`). Read by the rule that owns the knob via
   `Knob.narrow`. The env-var key is built by `config.knob_var` and read via `config.knob_raw` / `config.int_env`.
-- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="TILE=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2,STAGE=d2/cp"`).
+- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="TILE=a:mma_m16n8k16_f16/w2x2/f2x2/k2,STAGE=d2/cp"`).
   Parsed once at `knob.py` import via `apply_knobs_env()`, which splats each entry into the corresponding
   `DEPLODOCK_<K>` var (`config.set_knob(..., overwrite=False)`). An explicit per-knob var wins over the aggregate.
 
@@ -410,7 +410,7 @@ for the per-rule mechanics):
 
 | Knob     | Type    | Owning rule                       | What it controls                                                        |
 |----------|---------|-----------------------------------|-------------------------------------------------------------------------|
-| `TILE`   | STR (codec) | `lowering/tile/020_schedule` | **Unified output-fragment** codec — a contraction's output tile is *either* the **scalar** register sub-tile `n<N>[xm<M>]/f<fn>[xf<fm>]` (parallel thread-tile `n`/`m`, register sub-tile `f`) *or* the **warp** tensor-core mma tile `a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>` (atom + warps + register sub-tile + K-chunk), never both. The value self-discriminates: an `a:<atom>` token selects the warp `WarpTile` (`schedule.is_warp_codec`), otherwise the scalar `TilePlan`. Empty = per-cell. |
+| `TILE`   | STR (codec) | `lowering/tile/020_schedule` | **Unified output-fragment** codec — a contraction's output tile is *either* the **scalar** register sub-tile `n<N>[x<M>]/f<fn>[x<fm>]` (parallel thread-tile `n`/`m`, register sub-tile `f`) *or* the **warp** tensor-core mma tile `a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>` (atom + warps + register sub-tile + K-chunk), never both. The value self-discriminates: an `a:<atom>` token selects the warp `WarpTile` (`schedule.is_warp_codec`), otherwise the scalar `TilePlan`. Empty = per-cell. |
 | `REDUCE` | STR (codec) | `lowering/tile/020_schedule` | Reduce-axis partition codec `g<n>[a\|k]/b<n>/r<n>` — `g` cross-CTA split-K (+ finalize letter), `b` cooperative-thread fold, `r` ILP register fold. Empty = serial (the per-thread remainder is derived, never spelled). |
 | `STAGE`  | STR (codec) | `lowering/tile/020_schedule` → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring][/p<reg_depth>]` on the typed `Stage` schedule struct (composes with both fragments of the `TILE` knob): `d<depth>` the gmem→smem ring depth, `sync`/`cp.async`/TMA transport (`tma` folds in what the old `TMA` bool selected), `p<reg_depth>` the smem→register double-buffer. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
 | `CUT`    | BINMASK | `split/010_split_demoted`         | Cut a demoted matmul's computed multiply-operand cone(s) into producer kernel(s) + the clean gemm — the structural fork above. Width-1 today; `"0"` = considered-and-declined, `"1"` = cut. Deliberately declares no `off=` (to preserve the absent-vs-declined distinction). |

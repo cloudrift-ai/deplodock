@@ -100,13 +100,13 @@ def _run(mode: str, tile: str, monkeypatch) -> tuple[np.ndarray, np.ndarray, str
 # (label, TILE codec, expects-register-replication, expected __launch_bounds__ or None).
 #   none        ("")            — one thread per cell, no register replication / unroll
 #   reg_inner   (f4)            — 4 register cells along N, B-load shared across them
-#   reg_2d      (f2xf2)         — full 2×2 register block, both operands reused
-#   single_cta  (n32xm16/f2xf4) — par·reg == 64×64 ⇒ one 512-thread CTA (static)
+#   reg_2d      (f2x2)         — full 2×2 register block, both operands reused
+#   single_cta  (n32x16/f2x4) — par·reg == 64×64 ⇒ one 512-thread CTA (static)
 _VARIANTS = {
     "none": ("", False, None),
     "reg_inner": ("f4", True, None),
-    "reg_2d": ("f2xf2", True, None),
-    "single_cta": ("n32xm16/f2xf4", True, 512),
+    "reg_2d": ("f2x2", True, None),
+    "single_cta": ("n32x16/f2x4", True, 512),
 }
 
 
@@ -139,7 +139,7 @@ def test_matmul_tile_coverage(variant, mode, monkeypatch):
 # pointwise op folds into the contraction kernel's tail, replicated per register cell. Each is a
 # distinct tail shape: a broadcast scalar, a per-``n`` bias (shared across the ``m`` cells), a
 # pure activation, and a full ``(m, n)`` residual (no sharing). Pinned to a 2×2 register tile.
-_EPILOGUE_TILE = "n16xm16/f2xf2"
+_EPILOGUE_TILE = "n16x16/f2x2"
 _EPILOGUES = ("scale", "bias", "relu", "residual")
 
 
@@ -411,7 +411,7 @@ def test_fused_prologue_compiles_in_budget(monkeypatch, case):
 # The contraction tiles onto ``WM·WN`` warps of ``mma_m16n8k16`` atom cells: f16/bf16 operands,
 # f32 accumulate, f16|f32 store. Requires sm_90+ (the warp tier is pin-only / non-functional
 # below: ldmatrix host fault + ``sm_NNa`` TMA compile).
-_WARP_PIN = "a:mma_m16n8k16_f16/w2xw2/f4xf8/k2"  # WM·FM·atom_m = WN·FN·atom_n = 128 tile, 128 threads
+_WARP_PIN = "a:mma_m16n8k16_f16/w2x2/f4x8/k2"  # WM·FM·atom_m = WN·FN·atom_n = 128 tile, 128 threads
 _F16 = "f16"
 
 
@@ -634,7 +634,7 @@ def test_matmul_mma_epilogue_coverage(epilogue, mode, monkeypatch):
 # the SAME runtime M, across cp.async AND TMA (pinned). K static so the source innermost dim stays
 # static — TMA-eligible. The ``shape_mode`` × ``transport`` fixtures fan one body over the matrix.
 _PN, _PK = 1024, 512
-_WARP_CODEC = "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"  # WM=WN=FM=FN=2, BK=2 — the 64-row tile
+_WARP_CODEC = "a:mma_m16n8k16_f16/w2x2/f2x2/k2"  # WM=WN=FM=FN=2, BK=2 — the 64-row tile
 
 
 def _parity_mma_graph(mode: str, *, M: int):
@@ -810,7 +810,7 @@ def test_bf16_operands_stage_via_cp_async(monkeypatch):
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_bf16/w2xw2/f2xf2/k2")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_bf16/w2x2/f2x2/k2")
     monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
     M = 256
     g = Graph()
@@ -905,35 +905,35 @@ def test_warp_static_k_indivisible_rejected(monkeypatch) -> None:
     """A WARP pin whose static K is not a multiple of ``atom_k·bk`` is rejected — the warp
     K-loop has no static-K tail masking, so lowering it would silently corrupt the result (the
     error the accuracy gate's mean-error escape clause misses)."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")  # K-step 16
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # K-step 16
     with pytest.raises(ValueError, match="does not divide the static contraction K=100"):
         _run_tile_pass(_guard_mm_graph(128, 128, 100))
 
 
 def test_warp_static_k_divisible_ok(monkeypatch) -> None:
     """The same pin on a K that IS a multiple of the K-step lowers without the guard firing."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k1")
     _run_tile_pass(_guard_mm_graph(128, 128, 128))  # 128 % 16 == 0 — no raise
 
 
 def test_warp_symbolic_k_not_guarded(monkeypatch) -> None:
     """A symbolic K reaches the masked tier (ceil-div grid + zero-filled partial slab), so the
     static-K guard does not fire even when the hint is not a K-step multiple."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k2")  # K-step 32
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f1x1/k2")  # K-step 32
     _run_tile_pass(_guard_mm_graph(64, 128, Dim("seq_len")))  # symbolic K — no raise
 
 
 def test_tile_block_over_thread_limit_rejected(monkeypatch) -> None:
     """A TILE parallel tile over the 1024-thread/CTA limit is rejected at compile time instead
     of failing the launch with an opaque ``CUDA_ERROR_INVALID_VALUE``."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "n128xm128")  # 16384 threads
+    monkeypatch.setenv("DEPLODOCK_TILE", "n128x128")  # 16384 threads
     with pytest.raises(ValueError, match="exceeds the 1024-thread/CTA limit"):
         _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
 
 
 def test_tile_block_within_limit_ok(monkeypatch) -> None:
     """A TILE parallel tile within the thread limit lowers without the guard firing."""
-    monkeypatch.setenv("DEPLODOCK_TILE", "n8xm8")  # 64 threads
+    monkeypatch.setenv("DEPLODOCK_TILE", "n8x8")  # 64 threads
     _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
 
 
@@ -946,7 +946,7 @@ def test_tile_block_within_limit_ok(monkeypatch) -> None:
 # K slab past a symbolic reduce extent. One cached kernel serves every runtime size. The point is
 # off-hint / straddling sizes (1, 31, 130, 700 — NOT tile-divisor multiples), which exercise the
 # boundary-guard + clamp + zero-fill interplay the tile-divisor parity sweep cannot reach.
-_MASK_WARP = "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"
+_MASK_WARP = "a:mma_m16n8k16_f16/w2x2/f2x2/k2"
 _CP_KNOBS = {"TILE": _MASK_WARP, "STAGE": "d2/cp"}
 _TMA_KNOBS = {"TILE": _MASK_WARP, "STAGE": "d2/tma"}
 

@@ -190,7 +190,7 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     from deplodock.compiler.ir.base import InputOp
     from deplodock.compiler.ir.frontend.ir import MatmulOp
 
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2")  # force the warp (mma) tier
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # force the warp (mma) tier
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=F16), node_id="b")
@@ -238,8 +238,8 @@ def _build_f16_matmul_graph(M: int, N: int, K: int):
 
 
 # Scalar-tile knob: a scalar ``TILE`` codec (no ``a:`` atom) forces the scalar register-tile FMA
-# path — the ``n32xm8/f4xf26`` (BN=32 BM=8 FN=4 FM=26) hero tile, gmem-direct.
-_SCALAR_F16_KNOBS = {"TILE": "n32xm8/f4xf26"}
+# path — the ``n32x8/f4x26`` (BN=32 BM=8 FN=4 FM=26) hero tile, gmem-direct.
+_SCALAR_F16_KNOBS = {"TILE": "n32x8/f4x26"}
 
 
 @requires_cuda
@@ -272,7 +272,7 @@ def test_article_tma_sgemm_reproduction(monkeypatch):
     from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    for k, v in {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}.items():
+    for k, v in {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
     bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
@@ -297,7 +297,7 @@ def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
     from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    for k, v in {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}.items():
+    for k, v in {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
     src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
@@ -323,11 +323,11 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     from deplodock.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
-    # Pin the WARP-tier geometry via a warp ``TILE`` codec (the over-ceiling ``f26xf4`` register
+    # Pin the WARP-tier geometry via a warp ``TILE`` codec (the over-ceiling ``f26x4`` register
     # tile + atom-K chunk) and leave STAGE unpinned — an explicit STAGE pin is authoritative (no
     # budget filter), but here we want the budget-aware filter to decline the over-budget staging so
     # the operands fall to the gmem-direct path. The ``a:<atom>`` token forces the warp (mma) tier.
-    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1xw1/f26xf4/k2")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w1x1/f26x4/k2")
     compiled = CudaBackend().compile(g)  # no longer raises
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
     assert "dpl_mma_load_a_gmem" in src and "dpl_mma_load_b_gmem" in src, "unstaged operands not loaded gmem-direct"
@@ -341,7 +341,7 @@ def test_unstaged_atom_mma_accuracy(monkeypatch):
     matmul (a warp ``TILE`` pin, STAGE unpinned ⇒ gmem-direct) and verify it matches
     the numpy reference. Guards the m16n8k16 fragment layout in the gmem helpers."""
     g, inputs, ref = _build_f16_matmul_graph(128, 128, 128)
-    knobs = {"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k1"}
+    knobs = {"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k1"}
     forced = _run_with_knobs(g, inputs, "c", knobs, monkeypatch)
     _assert_match(forced.astype(np.float32), ref.astype(np.float32))
 
@@ -408,33 +408,33 @@ def _build_2d_matmul_graph(dims: dict):
 # passes were removed in the block-DAG rewrite) were dropped here.
 _SMALL_DIMS = {"M": 512, "K": 512, "N": 512}
 _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
-    # A scalar TILE pin (n32xm8 = BN=32 BM=8) the planner must honor authoritatively.
-    ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"TILE": "n32xm8"}, {}),
+    # A scalar TILE pin (n32x8 = BN=32 BM=8) the planner must honor authoritatively.
+    ("bm8_pin_outside_hints", _ARTICLE_DIMS, {"TILE": "n32x8"}, {}),
     # reg_m=26 (FM) non-divisor of M → a 208-row masked-M tile (ceil-div grid + per-row
     # boundary Cond on the Write).
-    ("fm26_masked_m", _ARTICLE_DIMS, {"TILE": "n32xm8/f1xf26"}, {}),
+    ("fm26_masked_m", _ARTICLE_DIMS, {"TILE": "n32x8/f1x26"}, {}),
     # reg_n=4 (FN) multi-axis composite cache on N (BN_thread × FN_register on one source dim) —
     # the composite stride must round-trip through smem stage → revert-to-gmem.
-    ("multi_axis_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4"}, {}),
+    ("multi_axis_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4"}, {}),
     # Multi-axis composite on BOTH axes: reg_m=4 and reg_n=4 (the FM×FN > 1 register tile).
-    ("multi_axis_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf4"}, {}),
+    ("multi_axis_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x4"}, {}),
     # kernel/095_interleave_loads opt-out (flat-LDS layout) must still be correct.
     (
         "interleave_loads_disabled",
         _ARTICLE_DIMS,
-        {"TILE": "n32xm8/f4xf4"},
+        {"TILE": "n32x8/f4x4"},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
-    # The blogs' hero register tile: n32xm8/f4xf26 → a 208×128 masked-M tile (reg_m=26 ≈ 106 %
+    # The blogs' hero register tile: n32x8/f4x26 → a 208×128 masked-M tile (reg_m=26 ≈ 106 %
     # of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
-    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf26"}, {}),
+    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x26"}, {}),
     # Symmetric masked-N: reg_n=26 reg_m=4 on 512³ → a 320-col overhang (boundary Cond on N).
-    ("fn26_masked_n", _SMALL_DIMS, {"TILE": "n32xm8/f26xf4"}, {}),
+    ("fn26_masked_n", _SMALL_DIMS, {"TILE": "n32x8/f26x4"}, {}),
     # Scalar-tile TMA: the staged operands ride the cp.async.bulk.tensor ring (unswizzled
-    # deposit, plain-Load consumer). A clean (f4xf4) tile and the masked-M hero tile
-    # (f4xf26 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
-    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf4", "STAGE": "d2/tma"}, {}),
-    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"}, {}),
+    # deposit, plain-Load consumer). A clean (f4x4) tile and the masked-M hero tile
+    # (f4x26 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
+    ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x4", "STAGE": "d2/tma"}, {}),
+    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}, {}),
 )
 
 

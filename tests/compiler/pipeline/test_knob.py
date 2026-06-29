@@ -194,16 +194,16 @@ def test_is_warp_and_mma_atom_tier_discriminator():
     tier (no atom)."""
     assert not is_warp({}) and mma_atom({}) is None
     assert not is_warp({"TILE": ""}) and mma_atom({"TILE": ""}) is None
-    assert not is_warp({"TILE": "n32xm8/f2xf4"})  # scalar fragment names no atom
-    assert is_warp({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"})
-    assert mma_atom({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2"}) == "mma_m16n8k16_f16"
+    assert not is_warp({"TILE": "n32x8/f2x4"})  # scalar fragment names no atom
+    assert is_warp({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2"})
+    assert mma_atom({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2"}) == "mma_m16n8k16_f16"
 
 
 def test_scalar_tile_features_from_thread_tile():
     """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from its
     ``TILE`` codec free split (``par_n·par_m`` threads, ``par_m·reg_m × par_n·reg_n``
-    output) — ``n32xm8`` parallel thread-tile, ``f2xf4`` register sub-tile."""
-    sf = knob_features({"TILE": "n32xm8/f2xf4"})
+    output) — ``n32x8`` parallel thread-tile, ``f2x4`` register sub-tile."""
+    sf = knob_features({"TILE": "n32x8/f2x4"})
     assert any(k.startswith("D_") for k in sf)
     assert sf["D_threads"] == 32 * 8
     assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2
@@ -215,12 +215,12 @@ def test_warp_tile_features_from_warp_tile():
     ``m16n8k16``) are read off the parsed atom. A scalar ``TILE`` value → empty."""
     from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
 
-    wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2xw2/f2xf2/k2", "S_ext_free_prod": 2048 * 2048})
+    wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "S_ext_free_prod": 2048 * 2048})
     assert wf["D_threads"] == 128.0  # WM·WN·32
     assert wf["D_tile_m"] == 2 * 2 * 16  # WM·FM·atom_m
     assert wf["D_tile_n"] == 2 * 2 * 8  # WN·FN·atom_n
     assert "D_log2_ctas" in wf and "D_log2_waves" in wf  # occupancy present (free_prod given)
-    assert _warp_tile_features({"TILE": "n32xm8/f2xf4"}) == {}  # scalar fragment → empty
+    assert _warp_tile_features({"TILE": "n32x8/f2x4"}) == {}  # scalar fragment → empty
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +379,7 @@ def test_stage_codec_reg_depth_roundtrip():
 def test_knob_features_mma_expansion():
     # The warp fragment names its atom on the ``TILE`` codec (``a:<atom>``); ``knob_features``
     # expands its physical cell / dtype properties into the ``MMA_*`` family.
-    feats = knob_features({"TILE": "a:mma_m16n8k16_f16/w1xw1/f1xf1"})
+    feats = knob_features({"TILE": "a:mma_m16n8k16_f16/w1x1/f1x1"})
     assert feats["MMA_tier"] == 1.0
     assert (feats["MMA_atom_m"], feats["MMA_atom_n"], feats["MMA_atom_k"]) == (16.0, 8.0, 16.0)
     assert feats["MMA_a_bits"] == 16.0  # f16 operand
@@ -428,8 +428,8 @@ def test_format_tuning_knobs_skips_struct():
 def test_format_tuning_knobs_canonical_order():
     """The codec knobs render in canonical order (``KNOB_ORDER`` = ``TILE``, ``REDUCE``,
     ``STAGE``), not alphabetical — shared with the ``deplodock eval`` golden tables."""
-    out = format_tuning_knobs({"STAGE": "d2/cp", "REDUCE": "b32", "TILE": "a:mma_m16n8k16_f16/w2xw2"})
-    assert out == "TILE=a:mma_m16n8k16_f16/w2xw2, REDUCE=b32, STAGE=d2/cp"
+    out = format_tuning_knobs({"STAGE": "d2/cp", "REDUCE": "b32", "TILE": "a:mma_m16n8k16_f16/w2x2"})
+    assert out == "TILE=a:mma_m16n8k16_f16/w2x2, REDUCE=b32, STAGE=d2/cp"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):

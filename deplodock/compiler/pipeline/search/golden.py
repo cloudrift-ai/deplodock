@@ -71,7 +71,7 @@ def matmul_snippet(M: int, N: int, K: int, dtype: str = "fp32") -> str:
 
 
 def _knobs_env(knobs: dict) -> str:
-    """Render a knobs dict as a ``DEPLODOCK_KNOBS`` value: ``TILE=n32xm8/f4xf26,STAGE=d2/tma``.
+    """Render a knobs dict as a ``DEPLODOCK_KNOBS`` value: ``TILE=n32x8/f4x26,STAGE=d2/tma``.
 
     Structural-feature knobs (``STRUCT_PREFIX``) are dropped — a repro command
     pins tuning decisions, not the kernel's structural identity. ``WARPSPEC`` (a passthrough
@@ -194,7 +194,7 @@ class MatmulGoldenConfig(GoldenConfig):
     def repro_command(self, ir: str = "cuda") -> str:
         """A runnable ``deplodock`` command that rebuilds this config's kernel.
 
-        e.g. ``DEPLODOCK_KNOBS="TILE=n32xm8/f4xf26,STAGE=d2/tma" deplodock compile -c "torch.matmul(...)" --ir cuda``
+        e.g. ``DEPLODOCK_KNOBS="TILE=n32x8/f4x26,STAGE=d2/tma" deplodock compile -c "torch.matmul(...)" --ir cuda``
         """
         dyn = "".join(f" --dynamic {s}" for s in self.dynamic_specs())
         return f'DEPLODOCK_KNOBS="{_knobs_env(self.knobs)}" deplodock compile -c "{self.snippet()}"{dyn} --ir {ir}'

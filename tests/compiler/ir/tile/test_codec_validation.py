@@ -24,13 +24,13 @@ def test_reduce_codec_allows_identity(spec: str) -> None:
     ReducePlan.parse(spec)  # no raise
 
 
-@pytest.mark.parametrize("spec", ["n0", "f0", "n0xm4", "n4xm0", "f2xf0", "n", "fx"])
+@pytest.mark.parametrize("spec", ["n0", "f0", "n0x4", "n4x0", "f2x0", "n", "fx"])
 def test_tile_codec_rejects_degenerate(spec: str) -> None:
     with pytest.raises(ValueError, match="TILE"):
         TilePlan.parse(spec)
 
 
-@pytest.mark.parametrize("spec", ["n1", "f1", "n4xm4", "f2xf2"])
+@pytest.mark.parametrize("spec", ["n1", "f1", "n4x4", "f2x2"])
 def test_tile_codec_allows_valid(spec: str) -> None:
     TilePlan.parse(spec)  # no raise
 
@@ -38,9 +38,9 @@ def test_tile_codec_allows_valid(spec: str) -> None:
 @pytest.mark.parametrize(
     "spec",
     [
-        "a:mma_m16n8k16_f16/w0xw1/f1xf1/k1",
-        "a:mma_m16n8k16_f16/w1xw1/f0xf1/k1",
-        "a:mma_m16n8k16_f16/w1xw1/f1xf1/k0",
+        "a:mma_m16n8k16_f16/w0x1/f1x1/k1",
+        "a:mma_m16n8k16_f16/w1x1/f0x1/k1",
+        "a:mma_m16n8k16_f16/w1x1/f1x1/k0",
     ],
 )
 def test_warp_codec_rejects_degenerate(spec: str) -> None:
@@ -49,4 +49,4 @@ def test_warp_codec_rejects_degenerate(spec: str) -> None:
 
 
 def test_warp_codec_allows_identity() -> None:
-    WarpTile.parse("a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")  # all-1 widths — no raise
+    WarpTile.parse("a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # all-1 widths — no raise

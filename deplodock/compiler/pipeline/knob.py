@@ -581,8 +581,8 @@ def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes.
 
     Both fragments source the free split from the single ``TILE`` codec: the **scalar** fragment
-    from ``n<N>[xm<M>]/f<fn>[xf<fm>]`` (the wider parallel binding is the ``n`` / coalesced slot,
-    the narrower the ``m`` slot), the **warp** fragment from ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>``
+    from ``n<N>[x<M>]/f<fn>[x<fm>]`` (the wider parallel binding is the ``n`` / coalesced slot,
+    the narrower the ``m`` slot), the **warp** fragment from ``a:<atom>/w<WM>x<WN>/f<FM>x<FN>``
     (the ``(WN, FN)`` / ``(WM, FM)`` warp + register sub-tiles). A single free axis fills the ``n``
     slot with a degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` for a non-tiled scalar kernel
     (per-cell ``TILE``)."""

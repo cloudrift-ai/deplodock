@@ -249,10 +249,11 @@ class TilePlan:
     @classmethod
     def parse(cls, spec: str | None) -> TilePlan:
         """Decode the ``TILE`` knob codec (the schedule's free-axis output-tile knob,
-        decided in ``020_schedule``) into a plan: ``/``-separated tokens — ``n<N>[xm<M>]``
+        decided in ``020_schedule``) into a plan: ``/``-separated tokens — ``n<N>[x<M>]``
         (the parallel thread-tile, ``N`` threads on the inner axis, optional ``M`` on the
-        outer) and ``f<fn>[xf<fm>]`` (the register sub-tile, ``fn`` cells on the inner axis,
-        optional ``fm`` on the outer). Empty / ``None`` = the per-cell tier."""
+        outer) and ``f<fn>[x<fm>]`` (the register sub-tile, ``fn`` cells on the inner axis,
+        optional ``fm`` on the outer). The ``x`` is a plain dimension separator (n-then-m
+        order). Empty / ``None`` = the per-cell tier."""
         spec = (spec or "").strip()
         if not spec:
             return cls()
@@ -261,18 +262,18 @@ class TilePlan:
             tok = raw.strip()
             if not tok:
                 continue
-            if tok[0] == "n":  # n<N>[xm<M>] — the parallel thread-tile
-                n, _, m = tok[1:].partition("xm")
+            if tok[0] == "n":  # n<N>[x<M>] — the parallel thread-tile
+                n, _, m = tok[1:].partition("x")
                 par_n = _codec_width(n, tok=tok, codec="TILE")
                 if m:
                     par_m = _codec_width(m, tok=tok, codec="TILE")
-            elif tok[0] == "f":  # f<fn>[xf<fm>] — the register sub-tile
-                fn, _, fm = tok[1:].partition("xf")
+            elif tok[0] == "f":  # f<fn>[x<fm>] — the register sub-tile
+                fn, _, fm = tok[1:].partition("x")
                 reg_n = _codec_width(fn, tok=tok, codec="TILE")
                 if fm:
                     reg_m = _codec_width(fm, tok=tok, codec="TILE")
             else:
-                raise ValueError(f"bad TILE token {tok!r} (expect n<N>[xm<M>] / f<fn>[xf<fm>])")
+                raise ValueError(f"bad TILE token {tok!r} (expect n<N>[x<M>] / f<fn>[x<fm>])")
         return cls(par_n=par_n, reg_n=reg_n, par_m=par_m, reg_m=reg_m)
 
     def spell(self) -> str:
@@ -280,9 +281,9 @@ class TilePlan:
         the per-cell tier."""
         toks: list[str] = []
         if self.par_n > 1 or self.par_m > 1:
-            toks.append(f"n{self.par_n}" + (f"xm{self.par_m}" if self.par_m > 1 else ""))
+            toks.append(f"n{self.par_n}" + (f"x{self.par_m}" if self.par_m > 1 else ""))
         if self.reg_n > 1 or self.reg_m > 1:
-            toks.append(f"f{self.reg_n}" + (f"xf{self.reg_m}" if self.reg_m > 1 else ""))
+            toks.append(f"f{self.reg_n}" + (f"x{self.reg_m}" if self.reg_m > 1 else ""))
         return "/".join(toks)
 
     @property
@@ -344,7 +345,7 @@ class WarpTile:
     warps. So the per-CTA output tile is ``tile_m × tile_n`` (:attr:`tile_m` / :attr:`tile_n`)
     and the CTA launches :attr:`block_threads` ``= WM·WN·32`` threads. ``bk`` chunks the K
     (contraction) axis ``bk`` atom-cells per inner mma step. Spelled by the warp form of the
-    unified ``TILE`` knob — ``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>`` (an ``a:<atom>`` token
+    unified ``TILE`` knob — ``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>`` (an ``a:<atom>`` token
     selects this :class:`WarpTile` over the scalar :class:`TilePlan`; see :func:`is_warp_codec`),
     decided in ``020_schedule``."""
 
@@ -356,9 +357,9 @@ class WarpTile:
     @classmethod
     def parse(cls, spec: str) -> WarpTile:
         """Decode the ``WARP`` codec into a tile: ``/``-separated tokens —
-        ``a:<atom>`` (the registered atom kind), ``w<WM>xw<WN>`` (warps, m then n),
-        ``f<FM>xf<FN>`` (register sub-tile, m then n), ``k<bk>`` (K-chunk). The atom token is
-        mandatory; the rest default to ``1``."""
+        ``a:<atom>`` (the registered atom kind), ``w<WM>x<WN>`` (warps, m then n),
+        ``f<FM>x<FN>`` (register sub-tile, m then n), ``k<bk>`` (K-chunk). The ``x`` is a plain
+        dimension separator. The atom token is mandatory; the rest default to ``1``."""
         atom_name = None
         wm = wn = fm = fn = bk = 1
         for raw in spec.split("/"):
@@ -367,20 +368,20 @@ class WarpTile:
                 continue
             if tok.startswith("a:"):
                 atom_name = tok[2:]
-            elif tok[0] == "w":  # w<WM>xw<WN>
-                m, _, n = tok[1:].partition("xw")
+            elif tok[0] == "w":  # w<WM>x<WN>
+                m, _, n = tok[1:].partition("x")
                 wm = _codec_width(m, tok=tok, codec="WARP")
                 if n:
                     wn = _codec_width(n, tok=tok, codec="WARP")
-            elif tok[0] == "f":  # f<FM>xf<FN>
-                m, _, n = tok[1:].partition("xf")
+            elif tok[0] == "f":  # f<FM>x<FN>
+                m, _, n = tok[1:].partition("x")
                 fm = _codec_width(m, tok=tok, codec="WARP")
                 if n:
                     fn = _codec_width(n, tok=tok, codec="WARP")
             elif tok[0] == "k":
                 bk = _codec_width(tok[1:], tok=tok, codec="WARP")
             else:
-                raise ValueError(f"bad WARP token {tok!r} (expect a:<atom> / w<WM>xw<WN> / f<FM>xf<FN> / k<bk>)")
+                raise ValueError(f"bad WARP token {tok!r} (expect a:<atom> / w<WM>x<WN> / f<FM>x<FN> / k<bk>)")
         if atom_name is None:
             raise ValueError(f"WARP codec {spec!r} names no atom (expect a:<atom>)")
         return cls(atom=atom_for(atom_name), warps=(wm, wn), reg=(fm, fn), bk=bk)
@@ -389,7 +390,7 @@ class WarpTile:
         """The ``WARP`` codec string for this tile (inverse of :meth:`parse`)."""
         wm, wn = self.warps
         fm, fn = self.reg
-        toks = [f"a:{self.atom.name}", f"w{wm}xw{wn}", f"f{fm}xf{fn}"]
+        toks = [f"a:{self.atom.name}", f"w{wm}x{wn}", f"f{fm}x{fn}"]
         if self.bk > 1:
             toks.append(f"k{self.bk}")
         return "/".join(toks)

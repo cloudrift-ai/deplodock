@@ -56,9 +56,9 @@ REDUCE = Knob(
 
 # The free-axis output tile is decided HERE too, by the single ``TILE`` codec knob (the
 # output-fragment sibling of ``REDUCE``). ``TILE`` is the **unified output-fragment** knob — a
-# contraction's output tile is *either* the scalar register sub-tile (``n<N>[xm<M>]`` parallel
-# thread-tile / ``f<fn>[xf<fm>]`` register sub-tile) *or* the tensor-core warp mma tile
-# (``a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>``), never both. The value self-discriminates: an
+# contraction's output tile is *either* the scalar register sub-tile (``n<N>[x<M>]`` parallel
+# thread-tile / ``f<fn>[x<fm>]`` register sub-tile) *or* the tensor-core warp mma tile
+# (``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>``), never both. The value self-discriminates: an
 # ``a:<atom>`` token selects the warp fragment (:class:`WarpTile`); otherwise the scalar
 # fragment (:class:`TilePlan`) — see ``schedule.is_warp_codec``. Same decision hierarchy: env pin
 # via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``Semiring``
@@ -68,8 +68,8 @@ REDUCE = Knob(
 TILE = Knob(
     "TILE",
     KnobType.STR,
-    help="Output-fragment codec — scalar tile (n<N>[xm<M>]/f<fn>[xf<fm>]) OR warp mma tile "
-    "(a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>, selected by the a:<atom> token); empty=per-cell. "
+    help="Output-fragment codec — scalar tile (n<N>[x<M>]/f<fn>[x<fm>]) OR warp mma tile "
+    "(a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>, selected by the a:<atom> token); empty=per-cell. "
     "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
     off="",
 )

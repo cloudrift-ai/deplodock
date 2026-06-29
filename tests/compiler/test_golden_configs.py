@@ -44,9 +44,9 @@ def test_ratio_and_golden_derive(deplodock_us, cublas_us, ratio, golden):
 
 
 def test_repro_command_round_trips_knobs_and_snippet():
-    c = MatmulGoldenConfig(name="square.2048", M=2048, N=2048, K=2048, knobs={"TILE": "n32xm8/f4xf26", "STAGE": "d2/tma"})
+    c = MatmulGoldenConfig(name="square.2048", M=2048, N=2048, K=2048, knobs={"TILE": "n32x8/f4x26", "STAGE": "d2/tma"})
     cmd = c.repro_command()
-    assert 'DEPLODOCK_KNOBS="TILE=n32xm8/f4xf26,STAGE=d2/tma"' in cmd
+    assert 'DEPLODOCK_KNOBS="TILE=n32x8/f4x26,STAGE=d2/tma"' in cmd
     assert c.snippet() in cmd
     assert "--ir cuda" in cmd
 
@@ -209,7 +209,7 @@ def test_goldens_by_name_returns_every_config_under_a_name(monkeypatch):
     the old one); ``goldens_by_name`` returns them all, empty for an unknown name."""
     from deplodock.compiler.pipeline.search import golden as gmod
 
-    a, b = _dup({"TILE": "n16xm8/f2xf2"}, 12.0), _dup({"TILE": "n16xm8/f4xf4"}, 14.0)
+    a, b = _dup({"TILE": "n16x8/f2x2"}, 12.0), _dup({"TILE": "n16x8/f4x4"}, 14.0)
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
     assert gmod.goldens_by_name("dup.512") == [a, b]
     assert gmod.goldens_by_name("nope") == []
@@ -223,7 +223,7 @@ def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
 
     from deplodock.compiler.pipeline.search import golden as gmod
 
-    a, b = _dup({"TILE": "n16xm8/f2xf2"}, 12.0), _dup({"TILE": "n16xm8/f4xf4"}, 14.0)
+    a, b = _dup({"TILE": "n16x8/f2x2"}, 12.0), _dup({"TILE": "n16x8/f4x4"}, 14.0)
     # Dataset.from_golden reads golden.GOLDEN_CONFIGS via a lazy import, so this patch is seen.
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [a, b])
 
@@ -232,7 +232,7 @@ def test_resolve_golden_arg_stashes_all_matches(monkeypatch):
     args = Namespace(golden="dup.512", code=None, input=None, ir=None)
     cmod.resolve_golden_arg(args)
     assert [s.name for s in args.golden_configs] == ["dup.512", "dup.512"]
-    assert [s.knobs for s in args.golden_configs] == [{"TILE": "n16xm8/f2xf2"}, {"TILE": "n16xm8/f4xf4"}]
+    assert [s.knobs for s in args.golden_configs] == [{"TILE": "n16x8/f2x2"}, {"TILE": "n16x8/f4x4"}]
     assert args.code == a.snippet()
     assert all(s.source == "golden" for s in args.golden_configs)
 
@@ -255,7 +255,7 @@ def test_resolve_golden_arg_applies_dynamic_spec(monkeypatch):
         M=512,
         N=512,
         K=512,
-        knobs={"TILE": "n16xm8/f2xf2"},
+        knobs={"TILE": "n16x8/f2x2"},
         deplodock_us=12.0,
         cublas_us=14.0,
         dynamic={"seq_len": {"input": "x0", "axis": 0}},
