@@ -272,3 +272,37 @@ def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatc
         assert "atomicAdd" not in src, "the deferred kernel finalize must not emit atomicAdd"
         assert n_global == 2, f"deferred finalize splices a second combine kernel, got {n_global}"
         assert "__partial" in src, "the producer writes its partial state to a workspace"
+
+
+# A reduce carrier with a PROJECTION epilogue under cross-CTA split-reduce. The ATOMIC finalize
+# applies the projection to each CTA's partition before the ``atomicAdd``, so it is correct only
+# when the projection DISTRIBUTES over the add (``Σ φ(xₛ) = φ(Σ xₛ)``): ``mean``'s ``×1/N`` (a
+# constant scale) distributes; ``l2``'s ``sqrt`` does not. The deferred-KERNEL finalize projects
+# once after the cross-CTA combine, so it is correct for either. Regression guard for the bug
+# where the atomic finalize wrote raw partial sums and silently dropped ``mean``'s ``×1/N``.
+_PROJECTION_DISTRIBUTES = {"mean": True, "l2": False}
+
+
+@pytest.mark.parametrize("op", list(_PROJECTION_DISTRIBUTES))
+@pytest.mark.parametrize("finalize", ["atomic", "kernel"])
+def test_split_reduce_projection_epilogue(op, finalize, monkeypatch):
+    """A split-reduce carrier carrying a projection epilogue. ``mean``'s ``×1/N`` distributes over
+    the atomic add, so the atomic finalize rides it per-partition and stays accurate; ``l2``'s
+    ``sqrt`` does not, so the atomic finalize REFUSES (``NotImplementedError`` → pin ``g<n>k``).
+    The deferred-kernel finalize projects once after the combine and is accurate for both."""
+    code, ref_fn = _OPS[op]
+    env = {"DEPLODOCK_REDUCE": "g2a" if finalize == "atomic" else "g2k"}
+    if finalize == "atomic" and not _PROJECTION_DISTRIBUTES[op]:
+        with pytest.raises(NotImplementedError, match="non-distributive projection"):
+            _compile_run(code, env, monkeypatch)
+        return
+    got, xs, src = _compile_run(code, env, monkeypatch)
+    want = ref_fn(xs).reshape(got.shape)
+    diff = float(np.abs(got - want).max())
+    assert diff < 1e-2, f"{op}/{finalize}: split-reduce projection mismatch (max abs err {diff})"
+    if finalize == "atomic":
+        assert "atomicAdd" in src, f"{op}/atomic: the per-partition projection still finalizes via atomicAdd"
+        assert src.count("__global__") == 1, f"{op}/atomic: the atomic finalize is one kernel"
+    else:
+        assert "atomicAdd" not in src, f"{op}/kernel: the deferred finalize must not emit atomicAdd"
+        assert src.count("__global__") == 2, f"{op}/kernel: the deferred finalize splices a combine kernel"

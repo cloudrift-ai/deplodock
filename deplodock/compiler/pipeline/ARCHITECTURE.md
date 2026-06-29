@@ -426,7 +426,11 @@ letter — `g<n>a` = in-place `atomicAdd` (one kernel, additive carriers only), 
 a sibling combine kernel (any carrier; the only legal arm for the twisted flash `(m, l, O)` split-KV). Pin via
 `DEPLODOCK_REDUCE=g2k` (one flat knob — no per-axis `DEPLODOCK_REDUCE_<axis>`, no `DEPLODOCK_FINALIZE`). The split is
 consumed by `lowering/tile/030_split` as a graph rewrite (partial + finalize); the letter round-trips through
-`ReducePlan.parse`/`spell` and reads back as `ReducePlan.finalize`.
+`ReducePlan.parse`/`spell` and reads back as `ReducePlan.finalize`. The atomic finalize applies the kernel's projection
+epilogue **per partition** before the `atomicAdd`, so it is only correct when that projection *distributes* over the add
+(`Σ φ(xₛ) = φ(Σ xₛ)`): a constant scale like `mean`'s `×1/N` distributes and rides the atomic; a non-distributive
+epilogue (`l2`'s `sqrt`, a fused bias/activation) is refused (`NotImplementedError` → pin `g<n>k`, which projects once
+after the combine). The check is `030_split._projection_distributes`.
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2), the keywords `"all"` / `"none"`, or a decimal /
 `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered `knobs=` line —

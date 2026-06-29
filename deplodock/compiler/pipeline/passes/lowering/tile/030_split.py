@@ -14,8 +14,10 @@ carries the partition, the graph carries the kernel count:
     ``carrier.as_state_merge`` (the cross-partition combine) and projects the output. **2
     nodes.** The only legal arm for a twisted carrier (flash's ``e^{Δm}`` rescale can't be
     an atomic).
-  - ``"atomic"`` — the partial ``atomicAdd``\\ s its (additive) state straight into the
-    output; the output is zero-init'd per launch. **1 node.** Additive carriers only.
+  - ``"atomic"`` — the partial ``atomicAdd``\\ s its (additive) state into the output (applying
+    the kernel's projection epilogue per-partition first, when that epilogue *distributes* over
+    the add — ``mean``'s ``×1/N``; a non-distributive one like ``l2``'s ``sqrt`` is refused, use
+    ``"kernel"``); the output is zero-init'd per launch. **1 node.** Additive carriers only.
 
 So the schedule's GRID stage is **consumed** here (the partial's plan is stripped of it,
 the finalize is a fresh ``ReducePlan``); ``lowering/kernel`` only ever sees single-launch
@@ -37,7 +39,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Init, Load, Loop, Monoid, Semiring, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, Semiring, Write
 from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.tile import (
     Placement,
@@ -133,6 +135,37 @@ def _mapped(op, grid, *, reduce: ReducePlan | None = None, tile=None):
     return replace(k, schedule=sched)
 
 
+def _projection_distributes(body, states: tuple[str, ...]) -> bool:
+    """True if the kernel's projection epilogue is a **linear-homogeneous** map of the carrier
+    state(s) — i.e. it distributes over the atomic-add combine, so applying it to each CTA's
+    partition before the ``atomicAdd`` equals applying it once after the cross-CTA sum
+    (``Σ c·xₛ = c·(Σ xₛ)``). A bare state write (``proj = id``) trivially distributes; a constant
+    *scale* — ``mean``'s ``×1/N`` — does; an additive offset (a fused bias), a nonlinear unary
+    (``relu`` / ``reciprocal`` of the *state*), or a product of two state-derived values do NOT.
+
+    Conservative forward dataflow: ``linear`` is the set of SSA names that are a
+    linear-homogeneous function of the state. A value is grown into it only by ``multiply`` with
+    a state-independent operand (an arg not itself in ``linear``); any other op that consumes a
+    ``linear`` value — or any projection stmt we can't reason about — refuses. The final ``Write``
+    must store only ``linear`` values."""
+    linear = set(states)
+    for s in body:
+        if isinstance(s, Write):
+            return all(v in linear for v in s.values)
+        if isinstance(s, Load):
+            continue  # reads memory (the count / a per-output operand) — state-independent
+        if not isinstance(s, Assign):
+            return False  # an unfamiliar projection stmt — can't prove distributivity
+        hot = [a for a in s.args if a in linear]
+        if not hot:
+            continue  # state-independent — a constant w.r.t. the split
+        if s.op.name == "multiply" and len(hot) == 1:
+            linear.add(s.name)  # state · constant — still linear-homogeneous
+            continue
+        return False  # add / divide / nonlinear of a state value breaks distributivity
+    return False  # no Write reached
+
+
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     tile: TileOp = root.op
     sched = tile.kernel.schedule if tile.kernel is not None else None
@@ -166,7 +199,25 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     if plan.finalize == "atomic":
         if n_comp != 1:
             raise NotImplementedError("atomic finalize needs an additive (1-component) carrier; the twisted carrier is kernel-only")
-        atomic_op = Map(source=sliced, body=Body((Write(output=out.name, index=cell, values=states, atomic=True),)))
+        # The kernel's projection epilogue (``mean``'s ``×1/N``, a fused bias/activation, …)
+        # rides on ``op.body`` when ``op`` is a ``Map``; a bare carrier (``sum`` / a ``Semiring``
+        # matmul) has none. Atomic finalize applies the projection PER-PARTITION before the
+        # ``atomicAdd``, so it must distribute over the add — else each CTA's contribution is
+        # mis-scaled (the ``mean`` bug: writing raw partial sums dropped the ``×1/N``). When it
+        # doesn't distribute, refuse loudly: the deferred-kernel finalize (``g<n>k``) projects
+        # once after the combine and is always correct.
+        proj = list(op.body) if isinstance(op, Map) else []
+        if proj:
+            if not _projection_distributes(proj, states):
+                raise NotImplementedError(
+                    "atomic finalize can't carry a non-distributive projection epilogue "
+                    "(e.g. a fused bias / activation on a split reduce); pin the deferred-kernel "
+                    "finalize instead (REDUCE=…g<n>k)"
+                )
+            body = Body(tuple(replace(s, atomic=True) if isinstance(s, Write) else s for s in proj))
+            atomic_op = Map(source=sliced, body=body)
+        else:
+            atomic_op = Map(source=sliced, body=Body((Write(output=out.name, index=cell, values=states, atomic=True),)))
         atomic_kernel = _mapped(atomic_op, (split, *grid), reduce=_strip_grid(plan), tile=tile_plan)
         return TileOp(kernel=atomic_kernel, name=tile.name)
 
