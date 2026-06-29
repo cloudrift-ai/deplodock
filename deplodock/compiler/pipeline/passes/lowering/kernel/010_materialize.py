@@ -35,7 +35,7 @@ from dataclasses import replace
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore, Sync
 from deplodock.compiler.ir.sigma import Sigma
@@ -423,12 +423,14 @@ def _warp_epilogue(pre: list[Stmt], tail: list[Stmt], acc: str, m_name: str, n_n
 
 
 def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom_k: int, mask_m: bool, mask_n: bool, b_trans: bool) -> bool:
-    """Phase-A staging eligibility for the warp tier: a ``cp.async`` stage over a
-    STATIC, tile-divisible contraction with a canonical (non-transposed) B operand.
-    Everything else (sync/tma transports, symbolic / non-divisible axes, transposed-B)
-    keeps the gmem-direct path — staging only ever *adds* a faster lowering, never a
-    required one, so an ineligible kernel silently falls back."""
-    if stage is None or stage.transport != "cp.async" or b_trans or mask_m or mask_n:
+    """Staging eligibility for the warp tier (cp.async): a ``cp.async`` stage over a
+    contraction with a STATIC, tile-divisible K axis and a canonical (non-transposed) B
+    operand. A masked / symbolic **M** (output rows) is fine — the A-slab fill clamp-reads
+    the overhanging rows in-bounds and the ``RegStore`` guards their store. A masked **N**
+    (the B-slab inner dim) and a symbolic / non-divisible **K** stay gmem-direct for now
+    (K zero-fill is the symbolic-K follow-up). Staging only ever *adds* a faster lowering,
+    so an ineligible kernel silently falls back to gmem-direct."""
+    if stage is None or stage.transport != "cp.async" or b_trans or mask_n:
         return False
     if not k_axis.extent.is_static:
         return False
@@ -442,13 +444,17 @@ def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom
 
 
 def _warp_staged_kloop(
-    *, a_load, b_load, m_axis, n_axis, k_axis, m_b, n_b, m_w, n_w, wm, wn, fm, fn, atom, bk, tile_m, tile_n, slab_dtype, elem_bytes
+    *, a_load, b_load, m_axis, n_axis, k_axis, m_b, n_b, m_w, n_w, wm, wn, fm, fn, atom, bk, tile_m, tile_n, slab_dtype, elem_bytes, mask_m
 ) -> tuple[list[Stmt], list[Stmt]]:
     """The warp tier's STAGED K loop (cp.async, single-buffer): allocate the A/B smem
     slabs, then an outer K-slab loop that cooperatively cp.async-fills both slabs, syncs,
     and runs the inner atom loop reading the slabs via ``LdmatrixLoad(staged=True)``.
     Returns ``(slab_decls, [outer_loop])``. depth>1 double-buffering is a follow-up — this
-    is the correct single-buffer form (numerically identical, no prefetch overlap)."""
+    is the correct single-buffer form (numerically identical, no prefetch overlap).
+
+    ``mask_m`` (symbolic / non-divisible output rows): the A-slab fill clamps the gmem row
+    in-bounds (``% M``) so an overhanging row reads a duplicate rather than past the buffer;
+    the duplicate's contribution is discarded by the ``RegStore`` ``m_guard``."""
     atom_m, atom_n, atom_k = atom.shape
     bk_elems = bk * atom_k  # K elements per slab (the BK chunk)
     a_slab, b_slab = "_a_smem", "_b_smem"
@@ -466,7 +472,11 @@ def _warp_staged_kloop(
     ki = "_ki"  # the inner atom-K offset within the slab
 
     def a_gmem(row, col):  # slab[row][col] = A[row_base + row][k0 + col]
-        sig = Sigma({m_axis.name: BinaryExpr("+", row_base, row), k_axis.name: BinaryExpr("+", Var(k0), col)})
+        m = BinaryExpr("+", row_base, row)
+        if mask_m:  # clamp an overhanging row to the last valid one — its store is RegStore-guarded
+            mext = _extent_expr(m_axis)
+            m = TernaryExpr(cond=BinaryExpr("<", m, mext), if_true=m, if_false=BinaryExpr("-", mext, Literal(1, "int")))
+        sig = Sigma({m_axis.name: m, k_axis.name: BinaryExpr("+", Var(k0), col)})
         return tuple(sig.apply(e) for e in a_load.index)
 
     def b_gmem(row, col):  # slab[row][col] = B[k0 + row][col_base + col]
@@ -535,8 +545,6 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
         raise LoweringError("warp tier: contraction output needs an (m, n) grid")
     m_axis, n_axis = grid[-2], grid[-1]
     k_axis = carrier.reduce_axis
-    if not k_axis.extent.is_static:
-        raise LoweringError("warp tier: symbolic-K mma can't lower gmem-direct (no K zero-fill) — needs staging")
 
     full = _with_store(lower(node), root.output.name, grid, node)
     ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == k_axis.name)
@@ -602,25 +610,44 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
             tile_n=tile_n,
             slab_dtype=slab_dtype,
             elem_bytes=elem_bytes,
+            mask_m=mask_m,
         )
     else:
+        # Gmem-direct. A symbolic / non-divisible K zero-fills the masked-K tail via the
+        # ``k_zero`` helper variants (``dpl_mma_load_*_kzero``) — a duplicate read would
+        # corrupt the reduction (unlike a masked M/N row, whose store is just guarded), so
+        # the overhang must contribute ZERO, not a clamped duplicate. Transposed-B has no
+        # gmem-direct K zero-fill helper, so a transposed-B symbolic K still bails.
+        k_static = k_axis.extent.is_static
+        if not k_static and b_trans:
+            raise LoweringError("warp tier: transposed-B symbolic-K mma not supported (no gmem-direct K zero-fill)")
+        k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
         chain: list[Stmt] = []
         for i in range(fm):
             idx = tuple(Sigma({m_axis.name: base_m(i)}).apply(e) for e in a_load.index)
             guard = (base_m(i), _extent_expr(m_axis)) if mask_m else None
-            chain.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard))
+            chain.append(
+                LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero)
+            )
         for j in range(fn):
             idx = tuple(Sigma({n_axis.name: base_n(j)}).apply(e) for e in b_load.index)
             guard = (base_n(j), _extent_expr(n_axis)) if mask_n else None
             chain.append(
                 LdmatrixLoad(
-                    frag=f"_b{j}", src_buffer=b_load.input, src_index=idx, role="b", staged=False, b_trans=b_trans, gmem_guard=guard
+                    frag=f"_b{j}",
+                    src_buffer=b_load.input,
+                    src_index=idx,
+                    role="b",
+                    staged=False,
+                    b_trans=b_trans,
+                    gmem_guard=guard,
+                    k_zero=k_zero,
                 )
             )
         for i in range(fm):
             for j in range(fn):
                 chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
-        kstmts = [StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=True)]
+        kstmts = [StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=k_static)]
 
     stores: list[Stmt] = []
     for i in range(fm):
