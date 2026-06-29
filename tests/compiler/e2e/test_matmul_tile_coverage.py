@@ -98,3 +98,87 @@ def test_matmul_tile_coverage(variant, mode, monkeypatch):
         # The dynamic-grid tier: the launch sizes from the runtime extent (the symbolic ``Dim``
         # threaded as an ``int`` arg), and a register-tiled symbolic axis guards its tail store.
         assert "int seq_len" in src, f"{variant}/dynamic: symbolic grid must carry the runtime extent arg"
+
+
+# Fused epilogues — a projection ``Map`` over the ``Semiring`` (``project ∘ contract``): the
+# pointwise op folds into the contraction kernel's tail, replicated per register cell. Each is a
+# distinct tail shape: a broadcast scalar, a per-``n`` bias (shared across the ``m`` cells), a
+# pure activation, and a full ``(m, n)`` residual (no sharing). Pinned to a 2×2 register tile so
+# the reg-tile tail-replication + load-dedup is exercised by every epilogue.
+_EPILOGUE_TILE = "n16xm16/f2xf2"
+_EPILOGUES = ("scale", "bias", "relu", "residual")
+
+
+def _epilogue_graph(mode: str, epilogue: str):
+    """``(1, M, K) @ (K, N)`` with a fused pointwise ``epilogue`` on the contraction output."""
+    from deplodock.compiler.graph import Graph, Tensor
+    from deplodock.compiler.ir.base import InputOp
+    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+
+    Mg = dyn_M(mode, _M)
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (1, Mg, _K)), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (_K, _N)), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("ab", (1, Mg, _N)), node_id="ab")
+    inputs = ["a", "b"]
+    if epilogue == "scale":
+        g.add_node(InputOp(), [], Tensor("s", (1,)), node_id="s")
+        g.add_node(ElementwiseOp("multiply"), ["ab", "s"], Tensor("o", (1, Mg, _N)), node_id="o")
+        inputs.append("s")
+    elif epilogue == "bias":
+        g.add_node(InputOp(), [], Tensor("bias", (_N,)), node_id="bias")
+        g.add_node(ElementwiseOp("add"), ["ab", "bias"], Tensor("o", (1, Mg, _N)), node_id="o")
+        inputs.append("bias")
+    elif epilogue == "relu":
+        g.add_node(ElementwiseOp("relu"), ["ab"], Tensor("o", (1, Mg, _N)), node_id="o")
+    else:  # residual — a full (1, M, N) add (depends on both cell axes, no load sharing)
+        g.add_node(InputOp(), [], Tensor("r", (1, Mg, _N)), node_id="r")
+        g.add_node(ElementwiseOp("add"), ["ab", "r"], Tensor("o", (1, Mg, _N)), node_id="o")
+        inputs.append("r")
+    g.inputs, g.outputs = inputs, ["o"]
+    return g
+
+
+def _epilogue_ref(epilogue: str, feed: dict) -> np.ndarray:
+    base = feed["a"] @ feed["b"]
+    if epilogue == "scale":
+        return base * feed["s"]
+    if epilogue == "bias":
+        return base + feed["bias"]
+    if epilogue == "relu":
+        return np.maximum(base, 0.0)
+    return base + feed["r"]
+
+
+@pytest.mark.parametrize("epilogue", _EPILOGUES)
+@pytest.mark.parametrize("mode", _SHAPES)
+@requires_cuda
+def test_matmul_reg_tile_epilogue(epilogue, mode, monkeypatch):
+    """A register-tiled contraction with a fused pointwise epilogue stays accurate AND folds the
+    epilogue into the ONE contraction kernel (no separate elementwise launch), over static and
+    symbolic M. The epilogue is replicated per register cell in the tail (a per-``n`` bias shared
+    across the ``m`` cells, a full residual not shared)."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend
+
+    monkeypatch.setenv("DEPLODOCK_TILE", _EPILOGUE_TILE)
+    m = _DYN_M if mode == "dynamic" else _M
+    rng = np.random.default_rng(0)
+    feed = {"a": rng.standard_normal((1, m, _K), dtype=np.float32), "b": rng.standard_normal((_K, _N), dtype=np.float32)}
+    if epilogue == "scale":
+        feed["s"] = np.array([1.5], dtype=np.float32)
+    elif epilogue == "bias":
+        feed["bias"] = rng.standard_normal((_N,), dtype=np.float32)
+    elif epilogue == "residual":
+        feed["r"] = rng.standard_normal((1, m, _N), dtype=np.float32)
+
+    be = CudaBackend()
+    compiled = be.compile(_epilogue_graph(mode, epilogue))
+    got = np.asarray(be.run(compiled, input_data=feed)[0].outputs["o"])
+    src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if getattr(n.op, "kernel_source", None))
+
+    ref = _epilogue_ref(epilogue, feed)
+    diff = float(np.abs(got - ref.reshape(got.shape)).max())
+    assert diff < 1e-3, f"{epilogue}/{mode}: fused-epilogue mismatch (max abs err {diff})"
+    assert src.count("__global__") == 1, f"{epilogue}/{mode}: epilogue must fuse into the one contraction kernel"
+    assert "__c0_1" in src or "__c1_0" in src, f"{epilogue}/{mode}: expected the register-tiled tail (__c*)"

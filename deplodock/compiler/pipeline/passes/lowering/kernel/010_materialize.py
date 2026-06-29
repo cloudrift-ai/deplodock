@@ -38,7 +38,7 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
@@ -76,33 +76,23 @@ def _extent_expr(axis: Axis):
     return Literal(axis.extent.as_static(), "int") if axis.extent.is_static else axis.extent.expr
 
 
-def _consumer_identity(body: list[Stmt], name: str) -> float:
-    """The identity that makes ``name``'s downstream fold a no-op — the op of the first body
-    stmt that reads ``name`` (a ``sum`` Accum → 0, a ``max`` → −inf, online-softmax's score →
-    the ``maximum`` it feeds → −inf). The masked overhang binds ``name`` to this so the fold
-    contributes nothing. Defaults to 0.0 if no op-bearing consumer is found."""
-    for s in body:
-        op = getattr(s, "op", None)
-        if name in s.deps() and op is not None and getattr(op, "identity", None) is not None:
-            return op.identity
-    return 0.0
-
-
 def _mask_streamed(body: list[Stmt], axis: str, offset: int, extent) -> list[Stmt]:
-    """Clamp-to-identity the replicated reads of a masked tail copy. Each ``Load`` whose
-    index references ``axis`` (a streamed read) is split: the index already wraps in-bounds
-    (``% extent`` via the caller's σ), the raw value is bound to ``<name>__raw``, and the
-    output ``<name>`` becomes a ``Select`` of the raw value when ``axis + offset < extent``
-    else the carrier-fold identity — so an out-of-range lane folds a no-op."""
+    """Clamp-to-identity the FOLD contribution of a masked tail copy. Each ``Accum``'s folded
+    ``value`` becomes a ``Select`` of the value when ``axis + offset < extent`` else the fold's
+    own identity (``op.identity`` — ``sum`` → 0, ``max`` → −inf), so an out-of-range copy folds a
+    no-op. The streamed ``Load`` index is already wrapped in-bounds (``% extent`` via the caller's
+    σ), so the read is safe; masking the FOLD (not the load) is what makes a **prologue** correct
+    — ``sum(x·x)`` past the extent needs the *additive* identity 0, which masking the load to the
+    *multiply* identity (1) would not give. A twisted carrier masks each component Accum to its
+    own identity (score → −inf keeps the running max + rescale a no-op; the exp/value sums → 0)."""
     cond = BinaryExpr("<", BinaryExpr("+", Var(axis), Literal(offset, "int")), extent)
     out: list[Stmt] = []
     for s in body:
-        if isinstance(s, Load) and s.is_scalar and any(axis in e.free_vars() for e in s.index):
-            nm = s.name
-            raw, ident = f"{nm}__raw", f"{nm}__id"
-            out.append(replace(s, names=(raw,)))
-            out.append(Init(name=ident, identity=_consumer_identity(body, nm), dtype=F32))
-            out.append(Select(name=nm, branches=(SelectBranch(raw, cond), SelectBranch(ident, Literal(1, "int")))))
+        if isinstance(s, Accum):
+            ident, masked = f"{s.value}__id", f"{s.value}__m"
+            out.append(Init(name=ident, identity=s.op.identity, dtype=F32))
+            out.append(Select(name=masked, branches=(SelectBranch(s.value, cond), SelectBranch(ident, Literal(1, "int")))))
+            out.append(replace(s, value=masked))
         else:
             out.append(s)
     return out

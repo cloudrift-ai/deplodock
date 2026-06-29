@@ -8,7 +8,8 @@ through the SAME combine, differing only in carrier state. This test pins each r
 stage (warp-shuffle / hierarchical smem) or the cross-CTA finalize (atomic ``c<cta>a`` vs
 deferred ``c<cta>k``) can't silently break a carrier it wasn't tuned on.
 
-- **op types** — reduction (mean / max), softmax, attention (SDPA), matmul.
+- **op types** — reduction (mean / max), softmax, attention (SDPA), matmul, and the fused
+  prologue / epilogue carriers (``sumsq`` = ``sum(x·x)``, ``l2`` = ``sqrt(sum(x·x))``).
 - **reduction variants** — the cooperative combine stage (``REDUCE`` coop field ``b<n>``
   = serial / warp-shuffle / hierarchical smem) for the reduce-carrier ops; the cross-CTA finalize
   fold (the ``REDUCE`` GRID field ``g<n>a`` / ``g<n>k``) for the split-K matmul. All pins are the
@@ -67,6 +68,16 @@ def _ref_sum(xs):
     return xs[0].sum(axis=1, keepdims=True)
 
 
+def _ref_sumsq(xs):
+    # Prologue: the ⊗ pre-map (square) feeds the ⊕ fold — a Map partial under the Monoid.
+    return (xs[0] ** 2).sum(axis=1, keepdims=True)
+
+
+def _ref_l2(xs):
+    # Prologue (square) + epilogue (sqrt projection) around the sum carrier.
+    return np.sqrt((xs[0] ** 2).sum(axis=1, keepdims=True))
+
+
 # (label, code, ref_fn). The reduce axis is sized 1024 (reduction/softmax) so coop=128 reaches
 # the 4-warp hierarchical smem combine; attention's KV is 64 (coop ≤ 64).
 _OPS = {
@@ -79,6 +90,10 @@ _OPS = {
     ),
     "matmul": ("torch.matmul(torch.randn(8, 1024), torch.randn(1024, 16))", _ref_matmul),
     "sum": ("torch.randn(4, 1024).sum(dim=1, keepdim=True)", _ref_sum),
+    # Prologue (a ⊗ pre-map under the fold) and prologue+epilogue (the φ projection around it):
+    # ``sum(x·x)`` squares each element before the additive fold; ``l2`` then ``sqrt``s the result.
+    "sumsq": ("(lambda t: (t * t).sum(dim=1, keepdim=True))(torch.randn(4, 1024))", _ref_sumsq),
+    "l2": ("torch.sqrt((lambda t: (t * t).sum(dim=1, keepdim=True))(torch.randn(4, 1024)))", _ref_l2),
 }
 
 
@@ -133,7 +148,9 @@ def _compile_run(
 #   ilp (``r4``)           — standalone ILP: 4 register accumulators + a register tree (no coop)
 #   ilp_coop (``r2/b32``)  — ILP composed with coop: 2 register accs, register tree, then shuffle
 _COOP_VARIANTS = {"serial": "", "coop_warp": "b32", "coop_hier": "b128", "ilp": "r4", "ilp_coop": "r2/b32"}
-_REDUCE_OPS = ("mean", "amax", "softmax")
+# Degenerate (mean / amax), twisted full-row (softmax), and the prologue / prologue+epilogue
+# carriers (sumsq / l2) — the pre-map and projection ride the same cooperative combine.
+_REDUCE_OPS = ("mean", "amax", "softmax", "sumsq", "l2")
 
 # Shape modes — the reduce-carrier ops all reduce dim=1 of input ``x``, so the SAME matrix
 # runs over a static reduce axis and a SYMBOLIC one (``seq_len@x:1``, traced dynamic, run at
