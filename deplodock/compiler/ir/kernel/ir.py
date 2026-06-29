@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.dtype import F32, DataType
 from deplodock.compiler.ir.axis import Axis
@@ -59,6 +60,9 @@ from deplodock.compiler.ir.stmt import (
 )
 from deplodock.compiler.ir.stmt.base import render_merge_program
 from deplodock.compiler.ir.stmt.ir import BodyOp
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir.tile.schedule import Stage, WarpTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -292,6 +296,75 @@ class Tile(Stmt):
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")
         return out
+
+
+@dataclass(frozen=True)
+class MmaContraction(Stmt):
+    """A tensor-core contraction **before** atom factorization — the high-level seam between
+    the materializer and ``015_factorize``.
+
+    ``010_materialize`` emits this single node (the op tree + schedule are gone by the time
+    factorization runs, so it captures everything the factorization needs): the operand
+    ``Load``\\ s + their role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
+    accumulator name ``acc``, the resolved projection ``epilogue`` (post-``_with_store`` — it
+    always ends in the output ``Write``), the ``warp_tile`` geometry + operand ``stage``, the
+    captured ``m_axis`` / ``n_axis`` / ``k_axis``, and the ``output`` buffer. ``015_factorize``
+    expands it into the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
+    ``RegStore`` (the four-way GRID/WARP/REGISTER/ATOM split). It is **transient** — it never
+    survives to the cuda backend (``render`` raises), but it IS ``structural_key``-ed as an
+    intermediate ``KernelOp``, so it carries the kernel-stmt protocol + a ``_rewrite`` handler.
+
+    The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the
+    epilogue's loads + output ``Write`` surface automatically through :meth:`nested`."""
+
+    a_load: Load
+    b_load: Load
+    b_trans: bool
+    acc: str
+    epilogue: Body
+    warp_tile: WarpTile
+    stage: Stage | None
+    m_axis: Axis
+    n_axis: Axis
+    k_axis: Axis
+    output: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.epilogue, Body):
+            object.__setattr__(self, "epilogue", Body(self.epilogue))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.epilogue,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (epilogue,) = bodies
+        return MmaContraction(
+            a_load=self.a_load,
+            b_load=self.b_load,
+            b_trans=self.b_trans,
+            acc=self.acc,
+            epilogue=epilogue,
+            warp_tile=self.warp_tile,
+            stage=self.stage,
+            m_axis=self.m_axis,
+            n_axis=self.n_axis,
+            k_axis=self.k_axis,
+            output=self.output,
+        )
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.acc,)  # the accumulator the (still-unexpanded) contraction produces
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.a_load.input, self.b_load.input)  # epilogue buffers come via nested()
+
+    def pretty(self, indent: str = "") -> list[str]:
+        t = " trans" if self.b_trans else ""
+        head = f"{indent}MmaContraction {self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.warp_tile.atom.name})"
+        return [head, *pretty_body(self.epilogue, indent + INDENT)]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        raise AssertionError("MmaContraction must be expanded by 015_factorize before render")
 
 
 @dataclass(frozen=True)
@@ -1760,6 +1833,25 @@ def _(s: Tile, rename, sigma, axis_fn):
     return Tile(
         axes=tuple(axis_fn(a) for a in s.axes),
         body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.body)),
+    )
+
+
+@_rewrite.register
+def _(s: MmaContraction, rename, sigma, axis_fn):
+    # Route the operand Loads + epilogue body through the generic rewrite (SSA / Expr / axis
+    # canonicalization); map the captured axes; pass the geometry objects + output through.
+    return MmaContraction(
+        a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
+        b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
+        b_trans=s.b_trans,
+        acc=rename(s.acc),
+        epilogue=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.epilogue)),
+        warp_tile=s.warp_tile,
+        stage=s.stage,
+        m_axis=axis_fn(s.m_axis),
+        n_axis=axis_fn(s.n_axis),
+        k_axis=axis_fn(s.k_axis),
+        output=s.output,
     )
 
 
