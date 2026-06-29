@@ -94,6 +94,37 @@ def _fetch_remote_snapshot(server: str, *, ssh_key: str | None, port: int | None
     return Path(local)
 
 
+def _merge_and_report(src_path: Path | str, dest: str | None) -> int:
+    """Keep-min merge ``src_path``'s node rows into the destination DB (default: the
+    local tune DB) and print the per-card receipt. Returns the rows merged."""
+    dest_path = Path(dest).expanduser() if dest else resolve_tune_db()
+    db = SearchDB(dest_path)  # creates/migrates the node table + gpu column on the destination
+    merged = db.merge_nodes(src_path)
+    print(f"[merge_node_db] merged {merged} node rows from {src_path} into {dest_path}")
+    counts = Counter(n.gpu for n in db.iter_nodes())
+    print("[merge_node_db] node rows per card now:")
+    for gpu, count in sorted(counts.items()):
+        print(f"    {gpu or '(unknown card)'}: {count}")
+    db.close()
+    return merged
+
+
+def fetch_and_merge(
+    remote: str,
+    *,
+    ssh_key: str | None = None,
+    port: int | None = None,
+    remote_db: str = "~/.cache/deplodock/autotune.db",
+    dest: str | None = None,
+) -> int:
+    """Snapshot the remote autotune DB, scp it back, keep-min merge its node rows into
+    ``dest`` (default: the local tune DB), and print the per-card receipt. Returns the
+    rows merged. The reusable entry point shared by this CLI and the folded-in merge
+    step of ``remote_node_tune.py``."""
+    src = _fetch_remote_snapshot(remote, ssh_key=ssh_key, port=port, remote_db=remote_db)
+    return _merge_and_report(src, dest)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = p.add_mutually_exclusive_group(required=True)
@@ -110,22 +141,12 @@ def main() -> None:
     args = p.parse_args()
 
     if args.remote:
-        src = _fetch_remote_snapshot(args.remote, ssh_key=args.ssh_key, port=args.port, remote_db=args.remote_db)
+        fetch_and_merge(args.remote, ssh_key=args.ssh_key, port=args.port, remote_db=args.remote_db, dest=args.db)
     else:
         src = Path(args.src).expanduser()
         if not src.exists():
             p.error(f"--src not found: {src}")
-
-    dest = Path(args.db).expanduser() if args.db else resolve_tune_db()
-    db = SearchDB(dest)  # creates/migrates the node table + gpu column on the destination
-    merged = db.merge_nodes(src)
-
-    print(f"[merge_node_db] merged {merged} node rows from {src} into {dest}")
-    counts = Counter(n.gpu for n in db.iter_nodes())
-    print("[merge_node_db] node rows per card now:")
-    for gpu, count in sorted(counts.items()):
-        print(f"    {gpu or '(unknown card)'}: {count}")
-    db.close()
+        _merge_and_report(src, args.db)
 
 
 if __name__ == "__main__":

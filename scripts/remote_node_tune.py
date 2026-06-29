@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # Matches deplodock/provisioning/ssh_transport.py::ssh_base_args.
 _SSH_OPTS = [
@@ -97,6 +98,7 @@ def main() -> int:
     ap.add_argument("--repo", help="Local repo root to rsync (default: git toplevel)")
     ap.add_argument("--poll", type=int, default=60, help="Seconds between completion polls (default 60)")
     ap.add_argument("--timeout", type=int, default=7200, help="Max seconds to wait for the tune (default 7200)")
+    ap.add_argument("--no-merge", action="store_true", help="Skip the folded-in node-row merge after a successful tune")
     args = ap.parse_args()
 
     remote, key, port = args.remote, args.ssh_key, args.port
@@ -202,12 +204,27 @@ def main() -> int:
             print(f"bench_fails: {bench_fails}", flush=True)
             print(f"elapsed (wait only): {elapsed}s", flush=True)
             print(f"remote log: {remote}:~/tune.log", flush=True)
-            print(
-                f"next: ./venv/bin/python scripts/merge_node_db.py --remote {remote}"
+            manual = (
+                f"./venv/bin/python scripts/merge_node_db.py --remote {remote}"
                 + (f" --ssh-key {key}" if key else "")
-                + (f" --port {port}" if port else ""),
-                flush=True,
+                + (f" --port {port}" if port else "")
             )
+            if args.no_merge:
+                print(f"merge: skipped (--no-merge); run `{manual}`", flush=True)
+                return 0
+            # Fold the merge in so the single backgrounded call ends with the node rows
+            # already in the local DB and the per-card receipt printed — no separate step
+            # for the caller to remember to launch or to report on.
+            print("\n--- merging node rows into the local DB ---", flush=True)
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                import merge_node_db  # noqa: PLC0415  (sibling script in scripts/)
+
+                merge_node_db.fetch_and_merge(remote, ssh_key=key, port=port)
+            except Exception as exc:  # noqa: BLE001 — report any merge failure, don't crash the run
+                print(f"merge FAILED: {exc!r}; tune data is safe on {remote} — re-run `{manual}`", flush=True)
+                return 1
+            print("\nstatus: COMPLETE (tune + merge done)", flush=True)
             return 0
         if not alive:
             dead_streak += 1

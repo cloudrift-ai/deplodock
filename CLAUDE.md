@@ -288,12 +288,15 @@ fails fast with a specific message.
   Prints a per-card row-count receipt. The copy-back step of the `collect-node-data` skill (rent a GPU → `tune --dataset
   golden` there → merge its node rows home).
 - Remote node-tune driver: `python scripts/remote_node_tune.py --remote user@host [--ssh-key PATH] [--port N] [--repo
-  DIR] [--poll S] [--timeout S]` — the setup+tune+wait middle of the `collect-node-data` skill, extracted so the agent
-  makes one **backgrounded** call instead of ~20 ssh polls: ensures the python3.12 venv/dev pkgs + `nvcc`, rsyncs the
-  working tree, runs `make setup` (output to the remote `~/setup.log`), launches `deplodock tune --dataset golden`
-  detached, then polls the remote log **internally** until done and prints one compact summary (`status`, `shapes N/N`,
-  `bench_fails`, elapsed) — a log tail only on failure. Robustness baked in: argv-list ssh (zsh-safe), `[d]eplodock
-  tune` bracket-pgrep, one ssh per poll. Run via Bash `run_in_background: true` (the tune is ~30–45 min).
+  DIR] [--poll S] [--timeout S] [--no-merge]` — the setup+tune+**merge** core of the `collect-node-data` skill, extracted
+  so the agent makes one **backgrounded** call instead of ~20 ssh polls: ensures the python3.12 venv/dev pkgs + `nvcc`,
+  rsyncs the working tree, runs `make setup` (output to the remote `~/setup.log`), launches `deplodock tune --dataset
+  golden` detached, polls the remote log **internally** until done, then (unless `--no-merge`) reuses
+  `merge_node_db.fetch_and_merge` to fetch + keep-min merge the node rows into the local DB and print the per-card
+  receipt — ending `status: COMPLETE (tune + merge done)`. One compact summary; a log tail only on failure. Robustness
+  baked in: argv-list ssh (zsh-safe), `[d]eplodock tune` bracket-pgrep, one ssh per poll, non-tty-safe detached launch
+  (`-n` + `< /dev/null`, so `nohup … &` doesn't hang the launch ssh). Run via Bash `run_in_background: true` (the tune is
+  ~30–60 min).
 
 ## Key Make Targets
 

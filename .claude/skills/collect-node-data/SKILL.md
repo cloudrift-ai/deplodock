@@ -64,28 +64,37 @@ Capture from the final `VM ready at <user@host[:port]>` line:
 
 Do not wrap the command in a retry loop — the orchestrator handles fallback itself.
 
-## Step 2 — Set up + tune on the remote (one backgrounded script)
+## Step 2 — Set up, tune, and merge on the remote (one backgrounded script)
 
-`scripts/remote_node_tune.py` does the whole token-heavy middle in **one process**: ensures the Python 3.12 venv/dev
-packages + `nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes), runs `make setup` (output to
-the remote `~/setup.log` — only a tail returns on failure), launches `deplodock tune --dataset golden` detached, then
-**polls the remote log internally** until it finishes. The four traps from the first run are baked in: argv-list ssh (no
-zsh word-split), `[d]eplodock tune` bracket-pgrep (no self-match), one short ssh per poll (no broken-pipe), and venv/dev
-always installed before `make setup`.
+`scripts/remote_node_tune.py` does the whole core in **one process**: ensures the Python 3.12 venv/dev packages +
+`nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes), runs `make setup` (output to the remote
+`~/setup.log` — only a tail returns on failure), launches `deplodock tune --dataset golden` detached, **polls the remote
+log internally** until it finishes, then **fetches the node rows back and merges them** into the local
+`~/.cache/deplodock/autotune.db` (keep-min, `node` table only, GPU-keyed so other cards are untouched) and prints the
+per-card receipt. The robustness traps are baked in: argv-list ssh (no zsh word-split), `[d]eplodock tune` bracket-pgrep
+(no self-match), one short ssh per poll (no broken-pipe), venv/dev always installed, and a non-tty-safe detached launch.
 
-Run it in the **background** (Bash `run_in_background: true`) — the tune is ~30–45 min, past a foreground tool timeout,
-and you only want the final summary in context, not ~20 ssh polls:
+Run it in the **background** (Bash `run_in_background: true`) — the tune is ~30–60 min, past a foreground tool timeout,
+and you want only the final summary in context, not ~20 ssh polls. The harness re-invokes you with the summary when it
+exits, so **do not poll it manually** — wait for the completion notification:
 
 ```bash
 ./venv/bin/python scripts/remote_node_tune.py --remote "<user@host>" --ssh-key ~/.ssh/id_ed25519 [--port <PORT>]
 ```
 
-When it exits you get one compact summary:
-- **success** → `status: ok`, `shapes: N/N`, `bench_fails: K`, elapsed, and the remote log path. (A `bench_fail` on a big
-  shape like `square.4096` is expected — an 8 s bench-wall guard, non-fatal; `K` small is fine.) The tune wrote the
-  default `~/.cache/deplodock/autotune.db` on the remote, ready for Step 3.
-- **failure** → `status: FAILED (<phase>)` plus the last 40 lines of the relevant remote log (`~/setup.log` or
-  `~/tune.log`). Fix and re-run — the script is idempotent (rsync + `make setup` no-op when already done).
+When it exits you get one compact result:
+- **success** → the tune summary (`status: ok`, `shapes: N/N`, `bench_fails: K` — a `bench_fail` on a big shape like
+  `square.4096` is expected, an 8 s bench-wall guard) **followed by the merge receipt** and `status: COMPLETE (tune +
+  merge done)`. The rented card appears as its own line in `node rows per card now: …`; cards already present are
+  unchanged. Because merge is folded in, there is **no separate merge step to launch** — the local DB is already updated.
+- **failure** → `status: FAILED (<phase>)` or `merge FAILED: …` plus the last 40 lines of the relevant remote log
+  (`~/setup.log` / `~/tune.log`). Fix and re-run — the script is idempotent (rsync + `make setup` no-op when already
+  done; the keep-min merge is safe to repeat). `--no-merge` runs the tune only.
+
+**Re-merge / manual fallback.** If the merge step failed (or you used `--no-merge`), merge the rented card's rows without
+re-tuning: `./venv/bin/python scripts/merge_node_db.py --remote "<user@host>" [--ssh-key … --port …]` (or `--src
+<snapshot.db>` for an already-fetched file; `--db <path>` to override the destination). Same keep-min, `node`-only
+semantics.
 
 **Manual debugging** (only if the script fails and you need to poke the box): the harness shell is zsh, so pass ssh
 options as an **array** — `SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i
@@ -93,23 +102,7 @@ options as an **array** — `SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownH
 'tail -n 40 ~/tune.log'`; check liveness with `pgrep -f "[d]eplodock tune"` (bracket trick — a plain pattern self-matches
 the poll's own argv); never run a multi-minute loop inside one ssh session.
 
-## Step 3 — Copy the node rows back and merge into the local DB
-
-Use the merge helper — it snapshots the remote DB (WAL-safe `VACUUM INTO`), scps it back, and merges **only** the `node`
-table into the local canonical DB with keep-min semantics (a remote row wins only when strictly faster for the *same*
-`(gpu, op, knobs)` — which, cross-card, never happens, so other cards' rows are untouched):
-
-```bash
-./venv/bin/python scripts/merge_node_db.py --remote "<user@host>"   # add --ssh-key / --port if non-default
-```
-
-(For an already-fetched local snapshot, use `--src <file.db>` instead of `--remote`. Override the destination with
-`--db <path>` if not the default tune DB.)
-
-It prints a **per-card receipt** (`node rows per card now: …`): the rented card should appear as its own line (e.g.
-`NVIDIA H200 141GB: <n>`) and the counts of cards already present should be unchanged.
-
-## Step 4 — Verify
+## Step 3 — Verify
 
 ```bash
 ./venv/bin/deplodock eval prior --dataset nodes
@@ -118,7 +111,7 @@ It prints a **per-card receipt** (`node rows per card now: …`): the rented car
 `node_report` groups by card — confirm a block headed with the rented GPU's name appears (`[<gpu>] <n> nodes`, with fork
 sibling-ranking + leaf reachability for that card). `--kernel matmul` / `reduce` / `pointwise` narrows to one op family.
 
-## Step 5 — Tear down the server
+## Step 4 — Tear down the server
 
 The VM bills until deleted, and this skill's job is done once the merge verifies. **Confirm with the user, then delete**
 (never delete a VM without an explicit go-ahead):
@@ -135,8 +128,8 @@ If the user wants to keep the box for more tuning, leave it up and report the SS
 Before reporting success:
 
 - [ ] `vm create gpu` exited 0 and an SSH target was captured (and `--billing-exempt` was passed for CloudRift).
-- [ ] `remote_node_tune.py` printed `status: ok` with `shapes: N/N` (not `FAILED`).
-- [ ] The merge printed the rented card as its own per-card line; counts for other cards are unchanged.
+- [ ] `remote_node_tune.py` ended with `status: COMPLETE (tune + merge done)`, `shapes: N/N` (not `FAILED`).
+- [ ] Its merge receipt shows the rented card as its own per-card line; counts for other cards are unchanged.
 - [ ] `eval prior --dataset nodes` shows a block for the rented GPU.
 - [ ] The VM was deleted (or the user explicitly chose to keep it, and has the teardown command).
 
