@@ -18,10 +18,28 @@ the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition ch
   arithmetic-intensity reuse).
 - **Warp / tensor-core tier** (`_warp`, a `SemiringKernel` carrying a `WarpTile`) — `WM·WN` warps over a
   `tile_m × tile_n` block of `mma_m16n8k16` atom cells; gmem-direct `LdmatrixLoad` + `MmaSyncPtx`, then a `RegStore`
-  (fused projection epilogue + masked-tile guards).
+  (fused projection epilogue + masked-tile guards). `_warp` here is **thin** — it does only the op-tree-dependent part
+  (capture the m/n/k axes, read the `040_atomize` binding, resolve the projection epilogue) and emits a single
+  high-level `MmaContraction` node. The **exact atom factorization** is a separate pass — see `015_factorize` below.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
+
+## `015_factorize` — the exact tensor-core atom factorization
+
+The warp tier is the one place where the materializer used to carry hundreds of lines of atom geometry. That geometry is
+factored out: `010_materialize._warp` emits a transient `MmaContraction` (`ir/kernel/ir.py`) carrying everything the
+expansion needs (the operand `Load`s + roles, the accumulator, the resolved epilogue `Body`, the `WarpTile`, the
+`Stage`, the m/n/k axes, the output buffer), and **`015_factorize`** (a `KernelOp → KernelOp` pass, after materialize and
+before `030_stamp_types`) expands it via `_warp_factor.factorize_mma` into the `Tile` of `RegFragment` / `LdmatrixLoad` /
+`MmaSyncPtx` / `RegStore` — the four-way GRID/WARP/REGISTER/ATOM split, the operand staging decision, and the per-cell
+epilogue. The `MmaContraction` is transient: it never reaches the cuda render (`015` always expands it), but it IS
+`structural_key`-ed as an intermediate `KernelOp`, so it carries the kernel-stmt protocol + a `_rewrite` handler.
+
+This keeps materialize a thin tier dispatcher and homes the explicit "atom-tiled contraction" representation at the
+kernel level (where the body **is** the `op_cache_key`, so the always-expanded final `KernelOp` / `CudaOp` keys stay
+byte-identical — the perf cache / prior transfer untouched). All atom geometry — `_axis_base`, the staging eligibility
+(`_can_stage_warp[_tma]`), the staged K-loops, the `RegStore` epilogue — lives in `_warp_factor.py`, the new-atom seam.
 
 ## Operand staging (`_stage.py`) — the `STAGE` codec
 
@@ -47,8 +65,8 @@ Both compose (`d3/cp/p2`) and are pure perf transforms — bit-identical to the 
 
 **The `CtaTile` seam.** The fill is written against a small `CtaTile` (the CTA tile-base coords + an independent linear
 intra-CTA thread id + the thread count), NOT a materializer's internal warp/register geometry — so one fill helper drives
-any tier. `_warp` builds the seam from its decoded block / warp / lane axis vars (never a raw `threadIdx.x`, whose
-`free_vars()` would leak into param collection).
+any tier. `factorize_mma` builds the seam from its decoded block / warp / lane axis vars (never a raw `threadIdx.x`,
+whose `free_vars()` would leak into param collection).
 
 **Two producers, one drain.** `cp_async_fill` (the `sync` / `cp.async` thread-stripe) and `tma_fill`
 (`cp.async.bulk.tensor` — one thread issues `MbarrierArriveExpectTx` + the operand box `TmaLoad`s onto a single mbarrier;
