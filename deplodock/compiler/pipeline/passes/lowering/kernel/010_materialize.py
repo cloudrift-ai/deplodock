@@ -471,11 +471,6 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 # --------------------------------------------------------------------------- #
 
 
-def _idx_vars(index) -> set[str]:
-    """Every free Var name across an index tuple's exprs."""
-    return {v for e in index for v in e.free_vars()}
-
-
 def _axis_base(block: str, warp: str, n_warp: int, n_reg: int, atom_dim: int, r: int):
     """The base coordinate (NO atom/lane offset) of register cell ``r`` along one free axis:
     ``block·(n_warp·n_reg·atom_dim) + warp·(n_reg·atom_dim) + r·atom_dim``. The atom-lane
@@ -923,37 +918,20 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
     m_axis, n_axis = grid[-2], grid[-1]
     k_axis = carrier.reduce_axis
 
-    full = _with_store(lower(node), root.output.name, grid, node)
-    ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == k_axis.name)
-    pre, rloop, tail = list(full[:ridx]), full[ridx], list(full[ridx + 1 :])
-    # The lift parks loop-invariant scalar leaf Loads (a fused matmul's scale / mask constants)
-    # above the K loop — fold them into the epilogue. A non-Load prologue (a staged slab fill) is
-    # out of scope (gmem-direct, no staging).
-    if any(not isinstance(s, Load) for s in pre):
-        raise LoweringError("warp tier: a contraction compute prologue isn't supported (gmem-direct, no staging)")
-    rbody = list(rloop.body)
-    loads = [s for s in rbody if isinstance(s, Load)]
-    a_load = next((s for s in loads if m_axis.name in _idx_vars(s.index)), None)
-    b_load = next((s for s in loads if n_axis.name in _idx_vars(s.index)), None)
-    write = next((s for s in tail if isinstance(s, Write)), None)
-    acc = next((s.name for s in rbody if isinstance(s, Accum)), None)
-    if a_load is None or b_load is None or write is None or acc is None:
-        raise LoweringError("warp tier: unrecognised contraction body (expected A/B loads + Accum + Write)")
-    b_trans = k_axis.name in b_load.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
-
-    # TEMP (Phase-1 commit 2): verify 040_atomize's structural binding equals the old
-    # loop-pattern-match across the whole matmul matrix, before _warp depends on it. Removed
-    # in commit 3 when _warp reads the binding directly.
-    _bind = kernel.schedule.bind
-    assert _bind is not None, "warp tier: 040_atomize did not stamp a binding"
-    assert _bind.a.load == a_load and _bind.b.load == b_load, "atomize: A/B operand bind mismatch"
-    assert _bind.b_trans == b_trans and _bind.acc == acc, "atomize: b_trans / acc bind mismatch"
-    # Reconstruct commit-3's epilogue stream from the binding: a non-empty epilogue is the
-    # projection body verbatim; an empty one (bare contraction) synthesizes the store exactly
-    # as `_with_store` did. Must equal the old `[*pre, *tail]` (pre is always empty here).
-    _epi = list(_bind.epilogue)
-    _recon = _epi if _has_write(_epi) else _with_store(_epi, root.output.name, grid, node)
-    assert _recon == [*pre, *tail], "atomize: epilogue bind mismatch"
+    # The structural operand→role binding, resolved at the tile level by ``040_atomize`` off
+    # the ``Semiring`` node — no loop-IR pattern-matching here. ``a``/``b`` are the m-/n-bearing
+    # operand Loads (what the staged kloops σ-apply), ``b_trans`` the B[n,k]-vs-B[k,n] flag,
+    # ``acc`` the fold accumulator, ``epilogue`` the projection Map body.
+    bind = kernel.schedule.bind
+    assert bind is not None, "warp tier: 040_atomize did not stamp a binding"
+    a_load, b_load, b_trans, acc = bind.a.load, bind.b.load, bind.b_trans, bind.acc
+    # The epilogue stream the RegStore folds + the output Write: the projection body verbatim,
+    # or — for a bare contraction (empty epilogue) — a synthesized store of the accumulator.
+    pre: list[Stmt] = []
+    tail = list(bind.epilogue)
+    if not _has_write(tail):
+        tail = _with_store(tail, root.output.name, grid, node)
+    write = next(s for s in tail if isinstance(s, Write))
 
     tile_m, tile_n = wt.tile_m, wt.tile_n
     mask_m = not (m_axis.extent.is_static and m_axis.extent.as_static() % tile_m == 0)
