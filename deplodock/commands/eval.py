@@ -379,9 +379,6 @@ def _emit_registry() -> None:
             logger.info(indent + cont)
 
 
-_WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
-
-
 def _ratio_color(matched: int, total: int) -> str:
     """Green (all match) / yellow (>80%) / red (otherwise)."""
     frac = matched / total if total else 1.0
@@ -490,13 +487,14 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     from statistics import median  # noqa: PLC0415
 
     from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.analytic import evaluate_golden  # noqa: PLC0415
 
     configs = _golden_configs(kernel_filter)
     ranks: list[int] = []
     entries: list[tuple] = []  # ("row", lead_cells, gold, got) | ("err", name, message)
     for g in configs:
-        gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
+        gold = dict(tuning_knob_items(g.knobs))  # the native codec knobs (TILE/REDUCE/STAGE), tier-agnostic
         try:
             dyn = bool(getattr(g, "dynamic", None))
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), dynamic=dyn)

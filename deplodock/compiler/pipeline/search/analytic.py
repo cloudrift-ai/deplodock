@@ -17,12 +17,6 @@ from collections.abc import Callable
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline import knob
 
-# Free-axis knobs the thread-tier / warp-tier enumeration decides — the projection a
-# golden is matched on (the reduce decomposition is now the native ``REDUCE@<axis>``
-# value, dynamic per kernel, so it is matched separately, not as a static column).
-THREAD_KNOBS = ("BN", "BM", "FM", "FN")
-WARP_KNOBS = ("WN", "WM", "FM", "FN", "MMA")
-
 
 def _matmul_thread_gate(r: dict, dag, reduce_key: str) -> bool:
     """The heuristic-plausible band for thread-tier matmul tiles — pruned the
@@ -86,9 +80,9 @@ def evaluate_golden(
         return {}, None, 0
     if scorer is None:
         scorer = _analytic_scorer(M, N, K, ctx, dynamic=dynamic)
-    # Match the legacy-recorded golden against the native candidate rows by
-    # schema-agnostic structural signature (free slots + reduce decomp + atom) — the
-    # candidates speak native ``MOVE@element``, the golden YAML legacy GEMM-letters.
+    # Match the recorded golden against the native candidate rows by schema-agnostic
+    # structural signature (free slots + reduce decomp + atom + stage) — robust to either
+    # spelling, so it still joins a legacy-recorded DB row against the native enumeration.
     want = knob.tile_signature(golden_knobs) if golden_knobs else None
     gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None) if want else None
     scores = [scorer(r) for r in rows]

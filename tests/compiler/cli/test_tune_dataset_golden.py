@@ -93,7 +93,9 @@ def test_golden_dataset_target_carries_dynamic_spec(monkeypatch):
     static golden's target carries ``None``."""
     from deplodock.compiler.pipeline.search import golden as gmod
 
-    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"TILE": "n16xm8/f2xf2"}, deplodock_us=9.0, cublas_us=14.0)
+    static = gmod.MatmulGoldenConfig(
+        name="square.512", M=512, N=512, K=512, knobs={"TILE": "n16xm8/f2xf2"}, deplodock_us=9.0, cublas_us=14.0
+    )
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
     targets = tune._tune_targets(_args(dataset="golden"))
     by_name = {name: dyn for name, _code, _inp, dyn in targets}
@@ -187,7 +189,9 @@ def test_loop_sets_dynamic_per_target(monkeypatch):
         return SimpleNamespace(best_reward=None, assembled=None), None
 
     monkeypatch.setattr(tune, "_tune_one", capture)
-    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"TILE": "n16xm8/f2xf2"}, deplodock_us=9.0, cublas_us=14.0)
+    static = gmod.MatmulGoldenConfig(
+        name="square.512", M=512, N=512, K=512, knobs={"TILE": "n16xm8/f2xf2"}, deplodock_us=9.0, cublas_us=14.0
+    )
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
     with pytest.raises(SystemExit) as exc:
         tune.handle_tune(_args(dataset="golden"))

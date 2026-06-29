@@ -8,7 +8,8 @@ the whole run; pretty-printing routes through the descriptor so
 display matches storage.
 
 Knobs are declared as plain module-level constants inside the rule
-that owns them (e.g. ``BN`` / ``BM`` in ``005_blockify_launch``). The
+that owns them (e.g. ``TILE`` / ``REDUCE`` / ``STAGE`` in
+``lowering/tile/020_schedule``). The
 :func:`registry` introspects every loaded rule module under
 ``deplodock.compiler.pipeline.passes.`` and collects every ``Knob``
 instance — no ``register(...)`` wrapper, no manual bookkeeping.
@@ -83,6 +84,7 @@ class _Unset:
 
 
 _UNSET = _Unset()
+
 
 def mma_atom(knobs: dict) -> str | None:
     """The concrete tensor-core atom-kind name carried by ``knobs``, or ``None`` for the scalar

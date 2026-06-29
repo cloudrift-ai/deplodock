@@ -336,7 +336,7 @@ batched (`base.Prior`): each tuned op's value-of-position rows stream into a res
 writes it, `compile` / `run` read it.
 
 **-O3 deployable samples.** The sweep compiles at `-Xcicc -O1` (fast, but a *ranking* signal — it ties configs that
-differ at -O3, e.g. a reduction's `FK` or a warp tile's `WARPSPEC`). So whenever a bench lands **within `DEPLODOCK_O3_TOL`
+differ at -O3, e.g. a `REDUCE` ILP fold or a warp tile's `WARPSPEC`). So whenever a bench lands **within `DEPLODOCK_O3_TOL`
 (default 15%, `config.o3_tol`) of the best -O1 so far** — a band wider than a strict new best, so near-tied contenders all
 qualify — the engine re-benches it at `-Xcicc -O3` (`_rebench_o3`) and `observe_o3` records an extra row with the same
 realized knobs tagged `H_opt=3` (the deployable regime). Each config is re-benched at most once. The `H_*` feature lets
@@ -386,9 +386,9 @@ module — no manual registration. `knob.py` also owns the `DEPLODOCK_<KNOB>` en
 
 **Pinning knobs from the environment.** Two equivalent forms:
 
-- **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_BK=32`). Read by the rule that owns the knob via
+- **Per-knob:** `DEPLODOCK_<NAME>=<value>` (e.g. `DEPLODOCK_STAGE=d2/cp`). Read by the rule that owns the knob via
   `Knob.narrow`. The env-var key is built by `config.knob_var` and read via `config.knob_raw` / `config.int_env`.
-- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="WARP=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2,STAGE=d2/cp"`).
+- **Aggregate:** `DEPLODOCK_KNOBS="K1=V1,K2=V2,..."` (e.g. `DEPLODOCK_KNOBS="TILE=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2,STAGE=d2/cp"`).
   Parsed once at `knob.py` import via `apply_knobs_env()`, which splats each entry into the corresponding
   `DEPLODOCK_<K>` var (`config.set_knob(..., overwrite=False)`). An explicit per-knob var wins over the aggregate.
 
@@ -400,7 +400,7 @@ planner wouldn't reach on its own be explored manually.
 
 A few pins are rejected outright (a clear `ValueError`) rather than silently degraded — they would otherwise lower to a
 wrong or un-launchable kernel: a codec width must be `≥ 1` (a degenerate `b0` / `f0` / `n0` no longer parses to a
-silently-dropped level); a `WARP` pin needs its **static** contraction K to be a multiple of the inner mma K-step
+silently-dropped level); a warp `TILE` pin needs its **static** contraction K to be a multiple of the inner mma K-step
 (`atom_k·bk`) since the warp K-loop has no static-K tail masking (a **symbolic** K is fine — it reaches the masked
 zero-filled tier); a scalar `TILE` parallel block (`par_n·par_m`) is capped at the 1024-thread/CTA hardware limit; and a
 `BOOL` knob rejects an unrecognized value instead of coercing a typo (`ture`) to `False`.
@@ -410,18 +410,9 @@ for the per-rule mechanics):
 
 | Knob     | Type    | Owning rule                       | What it controls                                                        |
 |----------|---------|-----------------------------------|-------------------------------------------------------------------------|
-| `BK`     | INT     | `enumeration/060_reduce_tile`     | Per-stage K-chunk size for matmul reductions; K-loop trip count = K/BK. |
-| `SPLITK` | INT     | `enumeration/060_reduce_tile`     | Cross-CTA K-split factor; `1` = no split. Requires a final combine.     |
-| `FK`     | INT     | `enumeration/060_reduce_tile`     | Reduce-axis multiple-accumulator factor for ILP (non-matmul reduces); fp16 scalar matmul reuses it as the half2 window length. `FK=1` is byte-identical to the pre-FK planner. |
-| `BN`     | INT     | `enumeration/090_thread_tile`     | CTA innermost THREAD-axis width (the column tile each warp covers).     |
-| `BM`     | INT     | `enumeration/090_thread_tile`     | CTA outer THREAD-axis width (matmul only — the row tile each warp covers). |
-| `FM`     | INT     | `enumeration/100_register_tile` / `040_warp_reg` | Register-tile factor along the M (output row) axis. |
-| `FN`     | INT     | `enumeration/100_register_tile` / `040_warp_reg` | Register-tile factor along the N (output column) axis. The planner emits one outer `RegisterTile(N_r)`; the Kernel-IR replicator + `dedup_replicated` produce the blocked-GEMM shape. |
-| `BR`     | INT     | `enumeration/070_coop_reduce`     | Cooperative-K thread count (`1` = pure serial chunked reduce); `>1` routes through the cooperative reduce path with cross-thread combine. |
-| `WM`     | INT     | `enumeration/030_warp_geometry`   | CTA outer WARP count along the matmul output M axis (warp-tier MMA tiles only). |
-| `WN`     | INT     | `enumeration/030_warp_geometry`   | CTA innermost WARP count along the matmul output N axis (warp-tier MMA tiles only). |
-| `STAGE`  | STR (codec) | `lowering/tile/020_schedule` → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring][/p<reg_depth>]` on the typed `Stage` schedule struct (the `TILE`/`WARP` Semiring arms): `d<depth>` the gmem→smem ring depth, `sync`/`cp.async`/TMA transport (`tma` folds in what the old `TMA` bool selected), `p<reg_depth>` the smem→register double-buffer. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
-| `MMA`    | STR     | `enumeration/020_tensorize`       | Three-way control for warp-tier MMA (tensor-core) enumeration: falsy forces the scalar path, truthy/unset auto-enumerates eligible atoms, any other value names + pins an atom kind. `DEPLODOCK_ATOM_KIND` is its env alias. |
+| `TILE`   | STR (codec) | `lowering/tile/020_schedule` | **Unified output-fragment** codec — a contraction's output tile is *either* the **scalar** register sub-tile `n<N>[xm<M>]/f<fn>[xf<fm>]` (parallel thread-tile `n`/`m`, register sub-tile `f`) *or* the **warp** tensor-core mma tile `a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>` (atom + warps + register sub-tile + K-chunk), never both. The value self-discriminates: an `a:<atom>` token selects the warp `WarpTile` (`schedule.is_warp_codec`), otherwise the scalar `TilePlan`. Empty = per-cell. |
+| `REDUCE` | STR (codec) | `lowering/tile/020_schedule` | Reduce-axis partition codec `g<n>[a\|k]/b<n>/r<n>` — `g` cross-CTA split-K (+ finalize letter), `b` cooperative-thread fold, `r` ILP register fold. Empty = serial (the per-thread remainder is derived, never spelled). |
+| `STAGE`  | STR (codec) | `lowering/tile/020_schedule` → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring][/p<reg_depth>]` on the typed `Stage` schedule struct (composes with both fragments of the `TILE` knob): `d<depth>` the gmem→smem ring depth, `sync`/`cp.async`/TMA transport (`tma` folds in what the old `TMA` bool selected), `p<reg_depth>` the smem→register double-buffer. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
 | `CUT`    | BINMASK | `split/010_split_demoted`         | Cut a demoted matmul's computed multiply-operand cone(s) into producer kernel(s) + the clean gemm — the structural fork above. Width-1 today; `"0"` = considered-and-declined, `"1"` = cut. Deliberately declares no `off=` (to preserve the absent-vs-declined distinction). |
 | `FLASH`  | BOOL    | `loop/recognize/010_recognize_flash` | Fuse SDPA into one streaming online-softmax kernel (the `Monoid` carrier) instead of the score-materializing `010_sdpa` decomposition. Recovers causal / additive mask + GQA + RoPE-fused producers structurally from the fused body. Static or symbolic-`seq_len`. Off by default (env pin `DEPLODOCK_FLASH=1` today). |
 | `ONLINE_SOFTMAX` | BOOL | `loop/recognize/020_recognize_online_softmax` | Fuse a standalone two-pass softmax (row-max + `Σ exp(x−max)`) into one streaming `(m, d)` `Monoid` pass. Off by default. |
