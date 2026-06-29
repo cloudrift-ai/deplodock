@@ -867,7 +867,7 @@ def _warp_tile_features(knobs: dict) -> dict[str, float]:
 
 
 def _atom_features(atom) -> dict[str, float]:
-    """Physical-property expansion of a tensor-core :class:`SemiringAtom` (the warp ``TILE`` codec's
+    """Physical-property expansion of a tensor-core :class:`AtomKind` (the warp ``TILE`` codec's
     ``a:<atom>``) into the ``MMA_*`` feature family the priors rank on: the tier flag, the cell
     ``(m, n, k)`` dims, and the multiplicand / accumulator bit-widths."""
     m, n, k = atom.shape

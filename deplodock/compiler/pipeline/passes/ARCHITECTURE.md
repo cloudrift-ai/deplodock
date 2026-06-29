@@ -51,7 +51,7 @@ digests `lower(op.op)`, stays byte-identical):
 - a cooperative/ILP `MonoidKernel` → a `ReduceBinding`: the `MonoidAtom` (accumulator dtype) + partition widths, with the
   shuffle/tree fold mechanism left **derived** (`ReduceStage.combine`), never stored.
 
-The atom spec is subtyped by kind (`ir/tile/atom.py`: `SemiringAtom` is the fixed mma cell selected by name; `MonoidAtom`
+The atom spec is subtyped by kind (`ir/tile/atom.py`: `AtomKind` is the fixed mma cell selected by name; `MonoidAtom`
 is the spec-less cooperative combine — its realization is derived, so it carries only a dtype). The Semiring binder
 (`bind_contraction`) is node-addressable so warp-flash can later reuse it on flash's nested QK^T / PV; that recursion is
 deferred until those inner contractions are structural `Semiring` nodes carrying geometry (see the pass docstring).
