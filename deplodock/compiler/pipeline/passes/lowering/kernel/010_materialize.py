@@ -322,16 +322,10 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     reg_fold: list[Stmt] = []
     for r in range(1, reg):
         other = tuple(f"{n}__r{r}" for n in carrier.state.names)
-        merge = carrier.as_state_merge(other)
-        # A twisted carrier's state-merge carries internal temps with fixed names; uniquify
-        # them per fold (the survivor state stays put, so ``Monoid.rewrite``'s own temp
-        # uniquify — keyed on a moving state — doesn't fire). A degenerate fold has no temps.
-        carried = set(merge.state.names) | set(merge.state_b)
-        temps = {a.name for a in (*merge.merge, *merge.combine_states)} - carried
-        if temps:
-            sub = {t: f"{t}__rf{r}" for t in temps}
-            merge = merge.rewrite(lambda n, sub=sub: sub.get(n, n))
-        reg_fold.append(merge)
+        # ``as_state_merge`` regenerates the finalize with its temps keyed on ``other[0]`` (or has
+        # none, for a degenerate fold), so each fold's internal temps are already unique — no
+        # per-fold uniquify needed.
+        reg_fold.append(carrier.as_state_merge(other))
 
     combine = emit_combine(carrier, t=lane.name, n_threads=coop) if lane is not None else []
 

@@ -19,7 +19,7 @@ from deplodock.compiler.dim import Dim
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Load, Loop, Monoid, State, Twist, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Write
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import flash_combine
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import online_softmax_combine
 
@@ -124,15 +124,12 @@ def test_combine_states_two_partition_matches_numpy(n: int) -> None:
     np.testing.assert_allclose(out[0], ref, atol=1e-5)
 
 
-def test_combine_states_default_derived_for_additive() -> None:
-    """An additive carrier (partial lifts to a state) auto-derives
-    ``combine_states`` from ``merge`` — partial reads swapped for ``state_b``."""
-    c = Monoid(
-        state=State(names=("acc",)),
-        partial=(),  # the partial ``p`` is read off the merge program
-        twist=Twist(merge=(Assign("acc", "add", ("acc", "p")),)),
-    )
-    assert c.partial_names() == ("p",)  # derived from the merge's external read
+def test_combine_states_derived_for_degenerate_id_family() -> None:
+    """A degenerate (``id``-family) additive carrier derives its combine programs from the spec:
+    the streaming fold ``acc = add(acc, p)`` and the cross-partition fold
+    ``acc = add(acc, acc__o)``."""
+    c = Accum(name="acc", value="p", op="add").as_monoid()
+    assert c.partial_names() == ("p",)  # the merge's external read
     assert c.state_b == ("acc__o",)
     assert len(c.combine_states) == 1
     assert c.combine_states[0].name == "acc"
