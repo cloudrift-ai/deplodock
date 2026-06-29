@@ -223,10 +223,20 @@ def _stage_spec(kernel) -> str:
     """The pinned ``STAGE`` codec for ``kernel`` — only a ``Semiring`` contraction stages its
     operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
     returns the authoritative ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (gmem-direct,
-    ``stage=None``)."""
+    ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a legacy operand
+    binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
+    (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
+    codecs follow."""
     if not isinstance(kernel, SemiringKernel):
         return ""
-    return STAGE.narrow([""])[0]
+    pinned = STAGE.narrow([""])[0]
+    if not pinned:
+        return ""
+    try:
+        Stage.parse(pinned)
+    except ValueError:
+        return ""
+    return pinned
 
 
 def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
