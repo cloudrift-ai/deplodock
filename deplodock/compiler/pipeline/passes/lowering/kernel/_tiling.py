@@ -104,8 +104,10 @@ class Unit:
         reduce loop + staging are the Unit's strategy; the generic layer never branches on it."""
         raise NotImplementedError
 
-    def store(self, i: int, j: int, sigma: Sigma) -> Stmt:
-        """The per-cell guarded output store (``RegStore`` / guarded ``Write``)."""
+    def store(self, i: int, j: int, offset: OffsetFn, masks) -> Stmt:
+        """The per-cell guarded output store (``RegStore`` / guarded ``Write``). Builds its own
+        cell σ from ``offset`` — the warp store uses a raw σ + separate ``m_guard``/``n_guard``,
+        the scalar store a masked (``%extent``) σ + a guarded ``Write`` — so the unit owns it."""
         raise NotImplementedError
 
 
@@ -140,12 +142,22 @@ def warp_tile(t: Tiling, wm: int, wn: int, m_w: str, n_w: str) -> Tiling:
     return replace(t, offset=replace(t.offset, levels=levels, axes=axes))
 
 
-def grid_tile(t: Tiling, masks, *, m_axis: Axis, n_axis: Axis, m_b: str, n_b: str, tile_m: int, tile_n: int,
-              block_threads: int | None, lane: int | None) -> Tile:
+def grid_tile(
+    t: Tiling,
+    masks,
+    *,
+    m_axis: Axis,
+    n_axis: Axis,
+    m_b: str,
+    n_b: str,
+    tile_m: int,
+    tile_n: int,
+    block_threads: int | None,
+    lane: int | None,
+) -> Tile:
     """The GRID level + finalize: bind the block axes (the shrunk grid), set the per-axis grid
     term ``block·tile``, optionally append the atom ``_lane`` axis, then splice the unit's state
     + reduce-region + stores into the ``Tile``. This is the outermost stage — it emits."""
-    mask_m, mask_n, m_ext, n_ext = masks
     levels = dict(t.offset.levels)
     levels["m"] = _with_block(levels["m"], m_b)
     levels["n"] = _with_block(levels["n"], n_b)
@@ -159,10 +171,7 @@ def grid_tile(t: Tiling, masks, *, m_axis: Axis, n_axis: Axis, m_b: str, n_b: st
     cells = [(i, j) for i in range(t.reg_m) for j in range(t.reg_n)]
     state = t.unit.state_decls(cells)
     top_decls, kstmts = t.unit.reduce_region(cells, offset, masks)
-    stores = [
-        t.unit.store(i, j, offset.sigma(i, j, m_axis.name, n_axis.name, mask_m=mask_m, mask_n=mask_n, m_ext=m_ext, n_ext=n_ext))
-        for (i, j) in cells
-    ]
+    stores = [t.unit.store(i, j, offset, masks) for (i, j) in cells]
     return Tile(axes=offset.axes, body=Body((*state, *top_decls, *kstmts, *stores)), block_threads=block_threads)
 
 

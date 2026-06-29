@@ -24,7 +24,6 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Assign, Body, Load, Select, Stmt, StridedLoop, Write
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     TMA_SLAB_ALIGN,
     CtaTile,
@@ -37,6 +36,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     tma_fill,
     tma_mbar_prologue,
 )
+from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Operand, Unit, atomize, grid_tile, register_tile, warp_tile
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 
@@ -463,172 +463,190 @@ def _warp_tma_staged_kloop(
     return slab_decls, [*prologue, outer]
 
 
-def factorize_mma(mma: MmaContraction) -> Tile:
-    """Expand a high-level :class:`MmaContraction` into the warp-tier ``Tile`` (the CTA runs
-    ``WM·WN`` warps over a ``tile_m × tile_n`` output block, each warp owning an ``FM × FN``
-    block of ``atom`` cells; free axes split four ways GRID/WARP/REGISTER/ATOM, the atom-lane
-    offset decoded at render). Per register cell: a persistent f32 ``RegFragment`` accumulator +
-    a K loop of ``LdmatrixLoad`` a/b + ``MmaSyncPtx`` (gmem-direct or cp.async/TMA-staged), then
-    a ``RegStore`` (fused projection epilogue + masked-tile guards)."""
-    wt = mma.warp_tile
-    atom = wt.atom
-    atom_m, atom_n, atom_k = atom.shape
-    wm, wn = wt.warps
-    fm, fn = wt.reg
-    m_axis, n_axis, k_axis = mma.m_axis, mma.n_axis, mma.k_axis
-    a_load, b_load, b_trans, acc = mma.a_load, mma.b_load, mma.b_trans, mma.acc
-    stage = mma.stage
-    pre: list[Stmt] = []
-    tail = list(mma.epilogue)
-    write = next(s for s in tail if isinstance(s, Write))
-    tile_m, tile_n = wt.tile_m, wt.tile_n
-    mask_m = not (m_axis.extent.is_static and m_axis.extent.as_static() % tile_m == 0)
-    mask_n = not (n_axis.extent.is_static and n_axis.extent.as_static() % tile_n == 0)
-    m_b, n_b = f"{m_axis.name}_wb", f"{n_axis.name}_wb"
-    m_w, n_w = f"{m_axis.name}_ww", f"{n_axis.name}_ww"
-    base_m = lambda r: _axis_base(m_b, m_w, wm, fm, atom_m, r)  # noqa: E731
-    base_n = lambda r: _axis_base(n_b, n_w, wn, fn, atom_n, r)  # noqa: E731
+class AtomUnit(Unit):
+    """The mma-atom leaf for the warp tier — wraps the tensor-core fragment / staging logic so
+    the generic tiling layer assembles it. The staging decision (gmem-direct / cp.async / TMA)
+    + fragment naming are computed up front: they drive BOTH the state decls and the K-loop."""
 
-    # The operand-staging decision is made up front: it drives the operand-fragment naming.
-    # TMA wins over cp.async when both qualify (the elif order before). A register double-buffer
-    # (STAGE …/p<n>) is capped at the inner atom-K step count (nothing to prefetch beyond the
-    # last step) and only applies on a staged path (it ping-pongs slab→register reads).
-    a_nbytes = atom.operand_dtype("a").nbytes
-    tma_ok = _can_stage_warp_tma(stage, k_axis, n_axis, tile_n, wt.bk, atom_k, a_nbytes, mask_n, b_trans)
-    cp_ok = (not tma_ok) and _can_stage_warp(stage, k_axis, tile_m, tile_n, wt.bk, atom_k, mask_m, mask_n, b_trans)
-    reg_depth = min(stage.reg_depth, wt.bk) if (stage is not None and (tma_ok or cp_ok)) else 1
-    # The gmem→smem ring depth (cp.async only — the TMA path stays single-buffer for now). A
-    # depth-D ring needs D slab slots, so clamp it to the 48 KB static smem cap (fall back to a
-    # shallower ring rather than overflowing). TMA's depth is ignored here (single-buffer).
-    _slot_bytes = (tile_m * wt.bk * atom_k + wt.bk * atom_k * tile_n) * a_nbytes
-    gmem_depth = min(stage.depth, max(1, (48 * 1024) // _slot_bytes)) if (stage is not None and cp_ok) else 1
-
-    # Per register cell (i, j): operand fragments dedup across the OTHER axis (A on m only,
-    # B on n only — the arithmetic-intensity reuse), the C accumulator is per (i, j). A register
-    # double-buffer (reg_depth ≥ 2) declares each A/B fragment once per pipeline slot.
-    a_frags = [f"_a{i}_s{s}" for i in range(fm) for s in range(reg_depth)] if reg_depth >= 2 else [f"_a{i}" for i in range(fm)]
-    b_frags = [f"_b{j}_s{s}" for j in range(fn) for s in range(reg_depth)] if reg_depth >= 2 else [f"_b{j}" for j in range(fn)]
-    decls: list[Stmt] = []
-    for name in a_frags:
-        decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
-    for name in b_frags:
-        decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
-    for i in range(fm):
-        for j in range(fn):
-            decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
-
-    slab_decls: list[Stmt] = []
-    if tma_ok:
-        from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
-
-        slab_dtype = cuda_name(atom.operand_dtype("a"))
-        slab_decls, kstmts = _warp_tma_staged_kloop(
-            a_load=a_load,
-            b_load=b_load,
-            k_axis=k_axis,
-            m_b=m_b,
-            n_b=n_b,
-            m_w=m_w,
-            n_w=n_w,
-            wm=wm,
-            wn=wn,
-            fm=fm,
-            fn=fn,
-            atom=atom,
-            bk=wt.bk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            slab_dtype=slab_dtype,
-            elem_bytes=a_nbytes,
-            reg_depth=reg_depth,
+    def __init__(self, mma: MmaContraction):
+        wt = mma.warp_tile
+        atom = wt.atom
+        atom_m, atom_n, atom_k = atom.shape
+        self.mma, self.wt, self.atom = mma, wt, atom
+        self.atom_m, self.atom_n, self.atom_k = atom_m, atom_n, atom_k
+        self.wm, self.wn = wt.warps
+        self.fm, self.fn = wt.reg
+        self.m_axis, self.n_axis, self.k_axis = mma.m_axis, mma.n_axis, mma.k_axis
+        self.a_load, self.b_load, self.b_trans, self.acc = mma.a_load, mma.b_load, mma.b_trans, mma.acc
+        self.stage = mma.stage
+        self.pre: list[Stmt] = []
+        self.tail = list(mma.epilogue)
+        self.write = next(s for s in self.tail if isinstance(s, Write))
+        self.tile_m, self.tile_n = wt.tile_m, wt.tile_n
+        self.mask_m = not (self.m_axis.extent.is_static and self.m_axis.extent.as_static() % self.tile_m == 0)
+        self.mask_n = not (self.n_axis.extent.is_static and self.n_axis.extent.as_static() % self.tile_n == 0)
+        self.m_b, self.n_b = f"{self.m_axis.name}_wb", f"{self.n_axis.name}_wb"
+        self.m_w, self.n_w = f"{self.m_axis.name}_ww", f"{self.n_axis.name}_ww"
+        # The operand-staging decision (TMA > cp.async > gmem-direct) drives the operand-fragment
+        # naming + the K-loop, so it is computed once here and read by state_decls + reduce_region.
+        a_nbytes = atom.operand_dtype("a").nbytes
+        self.a_nbytes = a_nbytes
+        self.tma_ok = _can_stage_warp_tma(
+            self.stage, self.k_axis, self.n_axis, self.tile_n, wt.bk, atom_k, a_nbytes, self.mask_n, self.b_trans
         )
-    elif cp_ok:
-        from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
-
-        slab_dtype = cuda_name(atom.operand_dtype("a"))
-        slab_decls, kstmts = _warp_staged_kloop(
-            a_load=a_load,
-            b_load=b_load,
-            m_axis=m_axis,
-            n_axis=n_axis,
-            k_axis=k_axis,
-            m_b=m_b,
-            n_b=n_b,
-            m_w=m_w,
-            n_w=n_w,
-            wm=wm,
-            wn=wn,
-            fm=fm,
-            fn=fn,
-            atom=atom,
-            bk=wt.bk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            slab_dtype=slab_dtype,
-            elem_bytes=a_nbytes,
-            mask_m=mask_m,
-            reg_depth=reg_depth,
-            depth=gmem_depth,
+        self.cp_ok = (not self.tma_ok) and _can_stage_warp(
+            self.stage, self.k_axis, self.tile_m, self.tile_n, wt.bk, atom_k, self.mask_m, self.mask_n, self.b_trans
         )
-    else:
-        # Gmem-direct. A symbolic / non-divisible K zero-fills the masked-K tail via the
-        # ``k_zero`` helper variants (``dpl_mma_load_*_kzero``) — a duplicate read would
-        # corrupt the reduction (unlike a masked M/N row, whose store is just guarded), so
-        # the overhang must contribute ZERO, not a clamped duplicate. Transposed-B has no
-        # gmem-direct K zero-fill helper, so a transposed-B symbolic K still bails.
-        k_static = k_axis.extent.is_static
-        if not k_static and b_trans:
-            raise LoweringError("warp tier: transposed-B symbolic-K mma not supported (no gmem-direct K zero-fill)")
-        k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
-        chain: list[Stmt] = []
-        for i in range(fm):
-            idx = tuple(Sigma({m_axis.name: base_m(i)}).apply(e) for e in a_load.index)
-            guard = (base_m(i), _extent_expr(m_axis)) if mask_m else None
-            chain.append(
-                LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero)
+        self.reg_depth = min(self.stage.reg_depth, wt.bk) if (self.stage is not None and (self.tma_ok or self.cp_ok)) else 1
+        _slot_bytes = (self.tile_m * wt.bk * atom_k + wt.bk * atom_k * self.tile_n) * a_nbytes
+        self.gmem_depth = min(self.stage.depth, max(1, (48 * 1024) // _slot_bytes)) if (self.stage is not None and self.cp_ok) else 1
+        rd = self.reg_depth
+        self.a_frags = [f"_a{i}_s{s}" for i in range(self.fm) for s in range(rd)] if rd >= 2 else [f"_a{i}" for i in range(self.fm)]
+        self.b_frags = [f"_b{j}_s{s}" for j in range(self.fn) for s in range(rd)] if rd >= 2 else [f"_b{j}" for j in range(self.fn)]
+
+    def state_decls(self, cells) -> list[Stmt]:
+        atom = self.atom
+        decls: list[Stmt] = []
+        for name in self.a_frags:
+            decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
+        for name in self.b_frags:
+            decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
+        for i in range(self.fm):
+            for j in range(self.fn):
+                decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
+        return decls
+
+    def operands(self) -> list[Operand]:
+        return [Operand(self.a_load, "a", frozenset({self.m_axis.name})), Operand(self.b_load, "b", frozenset({self.n_axis.name}))]
+
+    def reduce_region(self, cells, offset, masks) -> tuple[list[Stmt], list[Stmt]]:
+        atom, wt, atom_k = self.atom, self.wt, self.atom_k
+        if self.tma_ok:
+            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+            slab_dtype = cuda_name(atom.operand_dtype("a"))
+            return _warp_tma_staged_kloop(
+                a_load=self.a_load,
+                b_load=self.b_load,
+                k_axis=self.k_axis,
+                m_b=self.m_b,
+                n_b=self.n_b,
+                m_w=self.m_w,
+                n_w=self.n_w,
+                wm=self.wm,
+                wn=self.wn,
+                fm=self.fm,
+                fn=self.fn,
+                atom=atom,
+                bk=wt.bk,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+                slab_dtype=slab_dtype,
+                elem_bytes=self.a_nbytes,
+                reg_depth=self.reg_depth,
             )
-        for j in range(fn):
-            idx = tuple(Sigma({n_axis.name: base_n(j)}).apply(e) for e in b_load.index)
-            guard = (base_n(j), _extent_expr(n_axis)) if mask_n else None
+        if self.cp_ok:
+            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+
+            slab_dtype = cuda_name(atom.operand_dtype("a"))
+            return _warp_staged_kloop(
+                a_load=self.a_load,
+                b_load=self.b_load,
+                m_axis=self.m_axis,
+                n_axis=self.n_axis,
+                k_axis=self.k_axis,
+                m_b=self.m_b,
+                n_b=self.n_b,
+                m_w=self.m_w,
+                n_w=self.n_w,
+                wm=self.wm,
+                wn=self.wn,
+                fm=self.fm,
+                fn=self.fn,
+                atom=atom,
+                bk=wt.bk,
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+                slab_dtype=slab_dtype,
+                elem_bytes=self.a_nbytes,
+                mask_m=self.mask_m,
+                reg_depth=self.reg_depth,
+                depth=self.gmem_depth,
+            )
+        # Gmem-direct. A symbolic / non-divisible K zero-fills the masked-K tail via the ``k_zero``
+        # helper variants — a duplicate read would corrupt the reduction (unlike a masked M/N row,
+        # whose store is just guarded). Transposed-B has no gmem-direct K zero-fill helper, so it bails.
+        mask_m, mask_n, m_ext, n_ext = masks
+        k_static = self.k_axis.extent.is_static
+        if not k_static and self.b_trans:
+            raise LoweringError("warp tier: transposed-B symbolic-K mma not supported (no gmem-direct K zero-fill)")
+        k_zero = None if k_static else (Var(self.k_axis.name), _extent_expr(self.k_axis))
+        chain: list[Stmt] = []
+        for i in range(self.fm):
+            idx = tuple(Sigma({self.m_axis.name: offset.base("m", i)}).apply(e) for e in self.a_load.index)
+            guard = (offset.base("m", i), m_ext) if mask_m else None
+            chain.append(
+                LdmatrixLoad(
+                    frag=f"_a{i}", src_buffer=self.a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero
+                )
+            )
+        for j in range(self.fn):
+            idx = tuple(Sigma({self.n_axis.name: offset.base("n", j)}).apply(e) for e in self.b_load.index)
+            guard = (offset.base("n", j), n_ext) if mask_n else None
             chain.append(
                 LdmatrixLoad(
                     frag=f"_b{j}",
-                    src_buffer=b_load.input,
+                    src_buffer=self.b_load.input,
                     src_index=idx,
                     role="b",
                     staged=False,
-                    b_trans=b_trans,
+                    b_trans=self.b_trans,
                     gmem_guard=guard,
                     k_zero=k_zero,
                 )
             )
-        for i in range(fm):
-            for j in range(fn):
+        for i in range(self.fm):
+            for j in range(self.fn):
                 chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
-        kstmts = [StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=k_static)]
+        kstmts = [
+            StridedLoop(axis=self.k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=k_static)
+        ]
+        return [], kstmts
 
-    stores: list[Stmt] = []
-    for i in range(fm):
-        for j in range(fn):
-            sigma = Sigma({m_axis.name: base_m(i), n_axis.name: base_n(j)})
-            stores.append(
-                RegStore(
-                    dst_buffer=write.output,
-                    dst_index=tuple(sigma.apply(e) for e in write.index),
-                    frag=f"_c{i}_{j}",
-                    shape=atom.shape,
-                    epilogue=_warp_epilogue(pre, tail, acc, m_axis.name, n_axis.name, sigma),
-                    m_guard=(base_m(i), _extent_expr(m_axis)) if mask_m else None,
-                    n_guard=(base_n(j), _extent_expr(n_axis)) if mask_n else None,
-                )
-            )
+    def store(self, i, j, offset, masks) -> Stmt:
+        mask_m, mask_n, m_ext, n_ext = masks
+        sigma = Sigma({self.m_axis.name: offset.base("m", i), self.n_axis.name: offset.base("n", j)})
+        return RegStore(
+            dst_buffer=self.write.output,
+            dst_index=tuple(sigma.apply(e) for e in self.write.index),
+            frag=f"_c{i}_{j}",
+            shape=self.atom.shape,
+            epilogue=_warp_epilogue(self.pre, self.tail, self.acc, self.m_axis.name, self.n_axis.name, sigma),
+            m_guard=(offset.base("m", i), m_ext) if mask_m else None,
+            n_guard=(offset.base("n", j), n_ext) if mask_n else None,
+        )
 
-    axes = (
-        _shrink_axis(Axis(name=m_b, extent=m_axis.extent, source_axis=m_axis), tile_m),
-        _shrink_axis(Axis(name=n_b, extent=n_axis.extent, source_axis=n_axis), tile_n),
-        Axis(name=m_w, extent=wm),
-        Axis(name=n_w, extent=wn),
-        Axis(name="_lane", extent=32),
+
+def factorize_mma(mma: MmaContraction) -> Tile:
+    """Expand a high-level :class:`MmaContraction` into the warp-tier ``Tile`` via the composable
+    tiling layer: the mma :class:`AtomUnit` leaf, tiled four ways
+    ``grid_tile(warp_tile(register_tile(atomize(...))))`` (GRID block / WARP / REGISTER / ATOM;
+    the atom-lane offset decoded at render). The unit owns the K-loop + operand staging
+    (gmem-direct / cp.async / TMA); the layer owns the offset, the axes, and the splice."""
+    unit = AtomUnit(mma)
+    masks = (unit.mask_m, unit.mask_n, _extent_expr(unit.m_axis), _extent_expr(unit.n_axis))
+    t = atomize(unit, unit.atom_m, unit.atom_n)
+    t = register_tile(t, unit.fm, unit.fn)
+    t = warp_tile(t, unit.wm, unit.wn, unit.m_w, unit.n_w)
+    return grid_tile(
+        t,
+        masks,
+        m_axis=unit.m_axis,
+        n_axis=unit.n_axis,
+        m_b=unit.m_b,
+        n_b=unit.n_b,
+        tile_m=unit.tile_m,
+        tile_n=unit.tile_n,
+        block_threads=unit.wt.block_threads,
+        lane=32,
     )
-    bound = Tile(axes=axes, body=Body((*decls, *slab_decls, *kstmts, *stores)), block_threads=wt.block_threads)
-    return bound
