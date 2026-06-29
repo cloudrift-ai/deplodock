@@ -21,11 +21,20 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt import Load
 from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile import AtomBinding, Operand, SemiringKernel, TileOp
+from deplodock.compiler.ir.tile import (
+    AtomBinding,
+    MonoidAtom,
+    MonoidKernel,
+    Operand,
+    ReduceBinding,
+    SemiringKernel,
+    TileOp,
+)
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
@@ -74,14 +83,32 @@ def _atomize_semiring(tile: TileOp) -> AtomBinding:
     return AtomBinding(a=Operand(a_leaf, "a"), b=Operand(b_leaf, "b"), b_trans=b_trans, acc=semi.out, epilogue=epilogue)
 
 
+def _atomize_monoid(tile: TileOp) -> ReduceBinding:
+    """Resolve the cooperative-combine binding off the ``Monoid`` carrier + its ``ReducePlan``.
+    The accumulator dtype is read off the carrier's combine program (the same fact
+    ``emit_combine`` derives at kernel time); the fold mechanism stays derived on the binding."""
+    kernel = tile.kernel
+    plan = kernel.schedule.reduce
+    carrier = tile.op.reduce_node
+    dtype = next((a.dtype for a in carrier.combine_states if a.dtype is not None), None) or F32
+    return ReduceBinding(atom=MonoidAtom(dtype=dtype), coop=plan.coop, reg=plan.reg)
+
+
 def rewrite(match: Match, root: Node) -> TileOp | None:
     tile: TileOp = root.op
     kernel = tile.kernel
     sched = kernel.schedule if kernel is not None else None
-    # Only a warp-tiled Semiring contraction atomizes (split partials drop warp_tile).
-    if not isinstance(kernel, SemiringKernel) or getattr(sched, "warp_tile", None) is None:
-        raise RuleSkipped("not a warp-tiled contraction — nothing to atomize")
-    if sched.bind is not None:
-        raise RuleSkipped("already atomized")  # idempotent / fixpoint-safe
-    bind = _atomize_semiring(tile)
-    return replace(tile, kernel=replace(kernel, schedule=replace(sched, bind=bind)))
+    # A warp-tiled Semiring contraction → the operand→role AtomBinding (split partials drop
+    # warp_tile, so they fall through here).
+    if isinstance(kernel, SemiringKernel) and getattr(sched, "warp_tile", None) is not None:
+        if sched.bind is not None:
+            raise RuleSkipped("already atomized")  # idempotent / fixpoint-safe
+        return replace(tile, kernel=replace(kernel, schedule=replace(sched, bind=_atomize_semiring(tile))))
+    # A cooperative / ILP Monoid reduce → the cooperative-combine ReduceBinding (the scalar
+    # tier — coop == reg == 1 — has no combine to bind and falls through).
+    plan = getattr(sched, "reduce", None) if isinstance(kernel, MonoidKernel) else None
+    if plan is not None and (plan.coop > 1 or plan.reg > 1):
+        if sched.bind is not None:
+            raise RuleSkipped("already atomized")
+        return replace(tile, kernel=replace(kernel, schedule=replace(sched, bind=_atomize_monoid(tile))))
+    raise RuleSkipped("not a warp contraction or cooperative reduce — nothing to atomize")

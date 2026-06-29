@@ -441,7 +441,20 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
         # per-fold uniquify needed.
         reg_fold.append(carrier.as_state_merge(other))
 
-    combine = emit_combine(carrier, t=lane.name, n_threads=coop) if lane is not None else []
+    # The cooperative-combine binding 040_atomize resolved (the MonoidAtom dtype + the derived
+    # fold sequence); falls back to emit_combine's own derivation if absent (byte-identical).
+    rbind = getattr(kernel.schedule, "bind", None)
+    combine = (
+        emit_combine(
+            carrier,
+            t=lane.name,
+            n_threads=coop,
+            atom=rbind.atom if rbind is not None else None,
+            folds=rbind.folds() if rbind is not None else None,
+        )
+        if lane is not None
+        else []
+    )
 
     # Post-reduce projection. A full-row output (softmax / RMSNorm) distributes its sweep
     # across the coop lanes; a scalar output is written once, guarded to lane 0. With no

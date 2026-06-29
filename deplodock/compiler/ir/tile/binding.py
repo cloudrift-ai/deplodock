@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Load
+from deplodock.compiler.ir.tile.atom import MonoidAtom
 
 
 @dataclass(frozen=True)
@@ -54,4 +55,33 @@ class AtomBinding:
         return f"bind: a:{self.a.load.input}@m b:{self.b.load.input}@n{trans}{epi} -> {self.acc}"
 
 
-__all__ = ["AtomBinding", "Operand"]
+@dataclass(frozen=True)
+class ReduceBinding:
+    """The cooperative-combine binding ``040_atomize`` resolves off a ``Monoid`` carrier + its
+    ``ReducePlan`` — the ``Monoid``-kind sibling of :class:`AtomBinding`. Carries the
+    :class:`~.atom.MonoidAtom` (the per-component accumulator dtype) and the partition widths;
+    the fold-mechanism sequence (shuffle / tree) is **derived** on demand (:meth:`folds`),
+    never stored — ``ReduceStage.combine`` owns that decision (level + width), so a stored copy
+    would be the recovered tag the rebuild forbids."""
+
+    atom: MonoidAtom
+    coop: int  # cooperating BLOCK threads (1 = ILP-only / scalar lane, no cross-thread combine)
+    reg: int = 1  # ILP register-fold copies
+    segmented: bool = False  # strided-row segmented combine (the plain cooperative path is False)
+
+    def folds(self, warp_size: int = 32) -> tuple:
+        """The derived per-level combine mechanism (a tuple of ``Fold``) — ``ReduceStage.combine``,
+        not a stored field. Empty when there is no cross-thread combine (``coop == 1``)."""
+        if self.coop <= 1:
+            return ()
+        from deplodock.compiler.ir.tile.schedule import Level, ReduceStage  # noqa: PLC0415
+
+        return ReduceStage(Level.BLOCK, self.coop).combine(warp_size=warp_size, segmented=self.segmented)
+
+    def pretty(self) -> str:
+        """One-line dump summary: ``reduce: coop:<n> reg:<n> <dtype> [<mech>]``."""
+        mech = "/".join(f.name.lower() for f in self.folds()) or "serial"
+        return f"reduce: coop:{self.coop} reg:{self.reg} {self.atom.dtype.name} [{mech}]"
+
+
+__all__ = ["AtomBinding", "Operand", "ReduceBinding"]

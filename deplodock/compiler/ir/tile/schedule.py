@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.atom import SemiringAtom, atom_for
-from deplodock.compiler.ir.tile.binding import AtomBinding
+from deplodock.compiler.ir.tile.binding import AtomBinding, ReduceBinding
 
 
 def _codec_width(num: str, *, tok: str, codec: str) -> int:
@@ -575,6 +575,8 @@ class MonoidSchedule:
     reduce: ReducePlan = field(default_factory=ReducePlan)
     warp_tile: WarpTile | None = None  # TODO(warp-flash)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
+    bind: ReduceBinding | None = None  # the cooperative-combine binding, filled by 040_atomize
+    # on a cooperative / ILP reduce (None on the scalar tier)
 
 
 @dataclass(frozen=True)
