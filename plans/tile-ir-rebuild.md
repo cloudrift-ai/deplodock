@@ -12,9 +12,11 @@ them, the small inner reduce unrolled), the **dynamic-grid** tier (a symbolic fr
 grid sized from the runtime `Dim` arg; register-tiled symbolic axes mask their tail), and the **cross-CTA (GRID) split**
 tier (`030_split`: the `g<n>[a|k]` codec — `atomicAdd` one-kernel finalize OR a deferred `__partial`-workspace +
 sibling combine kernel; additive `sum` / split-K matmul AND the twisted flash `(m, l, O)` split-KV, carrier-generic via
-`as_state_merge`). All of these work over **static AND symbolic** axes. **Remaining: the warp / tensor-core tier
-(the `Semiring` warp recovery — mma matmul + warp-tier flash, incl. MMA split-K), operand pipelining, and warp
-specialization.** Branch `refactoring/tile-ir-rebuild`.
+`as_state_merge`). All of these work over **static AND symbolic** axes, plus the **warp / tensor-core tier** — the
+`Semiring·Warp` gmem-direct `mma.sync` matmul (the `WARP` codec + the `_warp` materializer): canonical + transposed-B,
+f16/f32 out, fused projection / causal epilogues, static + dynamic-grid (pin-only). **Remaining: operand staging (smem +
+`ldmatrix`, cp.async / TMA), MMA split-K (the `Warp` contraction through `030_split`), symbolic-K masked tiles,
+warp-tier flash (the `Monoid·Warp` fragment), and warp specialization.** Branch `refactoring/tile-ir-rebuild`.
 
 This doc is now thin: the executed phases live in git history and the `ARCHITECTURE.md` files. What remains is the
 **recovery contract** (the governing invariant), the **xfail mechanism** (still driving the rebuild), a one-paragraph
@@ -292,7 +294,7 @@ differently. The payoff is precisely two things — and **not** a third that's e
 |---|---|---|---|---|
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
 | `TILE` | free-axis output tile (`TilePlan` — par + `Scalar` reg) | `Semiring` (`Map`/`Monoid` reserved) | `n<N>[xm<M>]` parallel · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** (`Semiring·Scalar`) |
-| `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | proposed |
+| `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (`Semiring·Warp`, gmem-direct + epilogues; pin-only) |
 | `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | proposed |
 
 **Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser, which splits on `,` and requires
@@ -329,8 +331,9 @@ examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter h
 ✅ Monoid·Scalar  REDUCE=g2k             # cross-CTA split-reduce / flash split-KV, deferred __partial + combine kernel
 ✅ Semiring·Scalar REDUCE=g2a            # split-K matmul, atomicAdd finalize (1-component additive carrier)
 ✅ Semiring·Scalar TILE=n128xm64/f4xf4   # register-blocked SGEMM: 4×4 reg cells/thread, operands reused, inner reduce unrolled
+✅ Semiring·Warp  WARP=a:mma_m16n8k16_f16/w2xw2/f4xf8/k2   # gmem-direct mma.sync, 128×128 tile, 128 threads (+ fused epilogue / transposed-B / dynamic-grid)
 🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp   # + operand staging (STAGE still proposed)
-🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize
+🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize (staging + split still proposed)
 🔲 Monoid·Warp    WARP=a:m16n8k16_f16/w4xw1/f1xf1/k1  REDUCE=b2  STAGE=d2/tma   # warp-tier flash, coop-KV
 🔲 WarpSpec       CHANNEL=K:d3/cp;V:d3/cp  mma:WARP=…/k2  reducer:REDUCE=b2  producer:STAGE=d3/cp
 ```
@@ -361,9 +364,9 @@ the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
   one packed axis have no dedicated code; `STAGE.depth` / `WarpTile.bk` / `Channel.depth` are three interacting depths,
   not fully orthogonal.
 
-`REDUCE` and `TILE` are wired (`REDUCE` `r<n>` ILP + `TILE` reg-tile reachable via pin; `TILE`'s auto-fork — the
-prior-ranked candidate set — is still a follow-up, so a cold greedy compile stays per-cell unless pinned). `WARP` /
-`STAGE` remain proposed.
+`REDUCE`, `TILE`, and `WARP` are wired (reachable via pin; `REDUCE` `r<n>` ILP, `TILE` reg-tile, `WARP` gmem-direct
+mma.sync). Each one's auto-fork — the prior-ranked candidate set — is still a follow-up, so a cold greedy compile stays
+scalar per-cell unless pinned. `STAGE` remains proposed.
 
 ## Remaining — the warp / tensor-core tier
 
@@ -375,12 +378,17 @@ the prior featurization (`is_warp`, `_warp_tile_features`). What is gone is only
 (`020_schedule` building a `Warp` fragment) and the **kernel-tier materializer** (`010_materialize` lowering a `Warp`
 fragment / `WarpSpec` into those primitives). The phased recovery, feature by feature:
 
-1. **Static fp16 mma matmul** — the `Warp` fragment + the `WARP` codec + the `_warp` materializer (gmem-direct, no
-   staging, no split-K, no fused epilogue). Recovers `test_matmul_mma.py`, `test_matmul_mma_transposed_b.py`, the
-   register-tile rule tests.
-2. **Fused epilogues** — the projection `Map` over the `Semiring` → `FragmentApply` (residual / bias / scale), the
-   out-dtype cast on `RegStore`, a causal `Select` → `FragmentMask`. Recovers `test_matmul_mma_residual.py`,
-   `test_matmul_mma_causal_epilogue.py` (static).
+1. **Static fp16 mma matmul** — ✅ **LANDED.** The `Warp` fragment (`WarpTile` on `SemiringSchedule`) + the `WARP`
+   codec (decided pin-only in `020_schedule`, exploded into the on-dict `ATOM@`/`WM`/`WN`/`FM`/`FN`/`BK` featurizer
+   keys) + the `_warp` materializer (`010_materialize`): free axes split four ways (GRID/WARP/REGISTER/ATOM), the
+   atom-lane offset decoded at render, a gmem-direct `LdmatrixLoad(staged=False)` a/b + `MmaSyncPtx` K loop per register
+   cell, `RegStore` out. Canonical + transposed-B, f16/f32 out, static + dynamic-grid (symbolic M). The legacy-API
+   `test_matmul_mma.py` / `test_matmul_mma_transposed_b.py` + the demolished rule tests were dropped; the capability is
+   covered by the `WARP`-codec matrix in `test_matmul_tile_coverage`.
+2. **Fused epilogues** — ✅ **LANDED.** The projection `Map` tail over the `Semiring` folds into the `RegStore`
+   `RegEpilogue` (residual / bias / scale), the out-dtype cast on `RegStore` (`__floats2half2_rn`), a causal `Select` →
+   per-element ternary. Covered by the epilogue matrix in `test_matmul_tile_coverage` (static + dynamic). Still gmem-direct
+   (no staging). **Remaining phases below: operand staging, MMA split-K, symbolic-K edges, warp-tier flash.**
 3. **Operand staging** — make `Stage` real: smem slabs + `ldmatrix`, double-buffered via cp.async (sm_80) / TMA (sm_90).
    Recovers `test_stage_scalar.py`, `test_matmul_mma_parity.py` (cp.async / tma), the blocked-prologue tests.
 4. **Cross-CTA split** — `030_split` (the `GRID` stage → atomic / partial+finalize above) has **landed for the scalar

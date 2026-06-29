@@ -165,9 +165,9 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
 # ``a[a0*16, a5*1024]``), so the kernel failed to compile with
 # ``identifier 'a5' is undefined``.
 #
-# ``test_matmul_mma``'s 16/64/128/256 squares all naturally pick
-# K_o = 1 (full K fits in one stage); we need an asymmetric M/N/K
-# shape with large K to force the K-split.
+# The warp-tier 16/64/128/256 squares all naturally pick K_o = 1
+# (full K fits in one stage); we need an asymmetric M/N/K shape
+# with large K to force the K-split.
 _MMA_K_SPLIT_SHAPES: tuple[tuple[int, int, int], ...] = (
     # (M, N, K). 2048³ matches the original reproducer from the
     # ``deplodock run --bench`` investigation; smaller shapes fit
