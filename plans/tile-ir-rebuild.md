@@ -1,13 +1,17 @@
 # Tile IR rebuild
 
-Status: **the scalar + cooperative tiers have landed.** `010_recognize` is the sole Loop-IR → Tile-IR boundary (it
-lifts every kernel to a `TileOp` carrying one op-tree node — `Map` / `Monoid` / `Semiring` — plus a typed schedule);
-`020_schedule` maps the free axes onto the grid and picks the reduce partition; `lowering/kernel` materializes. Every
-elementwise, reduction, online-softmax, RMSNorm, static-matmul, scalar-flash, and whole-transformer-block kernel is
-recovered, plus the **cooperative (BLOCK) reduce** tier (whole-CTA + strided rows, static AND symbolic reduce axis)
-and the **register-fold ILP (REG)** tier (independent per-thread accumulator chains, standalone or composed with coop).
-**Remaining: the warp / tensor-core tier (the `Semiring` warp recovery — mma matmul + warp-tier flash), cross-CTA
-split, operand pipelining, and warp specialization.** Branch `refactoring/tile-ir-rebuild`.
+Status: **the scalar + cooperative tiers have landed, plus the scalar register-tile and the dynamic-grid tier.**
+`010_recognize` is the sole Loop-IR → Tile-IR boundary (it lifts every kernel to a `TileOp` carrying one op-tree node
+— `Map` / `Monoid` / `Semiring` — plus a typed schedule); `020_schedule` maps the free axes onto the grid and picks
+the reduce partition + the free-axis output tile; `lowering/kernel` materializes. Every elementwise, reduction,
+online-softmax, RMSNorm, matmul, scalar-flash, and whole-transformer-block kernel is recovered, plus the
+**cooperative (BLOCK) reduce** tier (whole-CTA + strided rows), the **register-fold ILP (REG)** tier (independent
+per-thread accumulator chains), the **scalar register-tile (`TILE` codec)** tier (each thread owns a `reg_m·reg_n`
+block of output cells, operands reused across them, the small inner reduce unrolled), and the **dynamic-grid** tier
+(a symbolic free / output axis → a symbolic launch grid sized from the runtime `Dim` arg; register-tiled symbolic
+axes mask their tail). All of these work over **static AND symbolic** axes. **Remaining: the warp / tensor-core tier
+(the `Semiring` warp recovery — mma matmul + warp-tier flash), cross-CTA split, operand pipelining, and warp
+specialization.** Branch `refactoring/tile-ir-rebuild`.
 
 This doc is now thin: the executed phases live in git history and the `ARCHITECTURE.md` files. What remains is the
 **recovery contract** (the governing invariant), the **xfail mechanism** (still driving the rebuild), a one-paragraph
@@ -41,7 +45,7 @@ of running a graph and checking output) → **delete it**, don't port it; the ne
 **integration/accuracy** test (anything in `tests/compiler/e2e/`) → **never delete or weaken** it; xfail it if the
 in-progress rebuild breaks it, and it flips back to a hard requirement when the capability returns.
 
-## What has landed (scalar + cooperative)
+## What has landed (scalar + cooperative + register-tile + dynamic-grid)
 
 Recorded compactly; details in git + `ARCHITECTURE.md`:
 
@@ -62,6 +66,18 @@ Recorded compactly; details in git + `ARCHITECTURE.md`:
   in one `StridedLoop` of step `coop·reg`; a symbolic / non-divisible tail is **clamp-to-identity** (in-bounds `% extent`
   read + value masked to the fold identity). Composes with coop or stands alone (`coop = 1`). `reg = 1` default (ILP via
   the `REDUCE` `r<n>` pin / prior fork, not the cold path).
+- **The scalar register-tile (`TILE` codec)** — the `Scalar`-fragment sibling of `REDUCE` (`TilePlan` on
+  `SemiringSchedule`, decided in `020_schedule`, materialized by `_reg_tile`). The codec `n<N>[xm<M>]` (parallel
+  thread-tile) `/ f<fn>[xf<fm>]` (register sub-tile) gives each thread a `reg_m·reg_n` block of output cells: the
+  reduce-loop body is replicated per cell, **operand loads deduped** (an `A[m,k]` load is shared across the `n` cells,
+  `B[k,n]` across the `m` cells — the arithmetic-intensity reuse), the small inner reduce `#pragma unroll`'d, the
+  parallel widths set `block_threads` (`par·reg == extent` ⇒ one CTA). A non-divisible / symbolic tiled axis masks its
+  tail (clamp-read `% extent` + a guarded store). The featurizer sources its `_free_slots` from the `TILE` codec.
+- **The dynamic-grid tier** — a symbolic FREE / output axis rides a symbolic launch grid: `Tile` sizes the guard +
+  decode from the runtime extents (`_gid < ∏extents`), `lowering/cuda` builds the `gridDim` as `ceil(∏extents /
+  blockDim)` with the symbolic `Dim` resolved at launch (`runtime_args`). Recovered dynamic elementwise / linear /
+  rmsnorm / sdpa and the dynamic Qwen layer + whole-model (+ capture-replay). Composes with the register-tile (a
+  symbolic register-tiled axis masks its tail).
 
 ## The schedule design
 
@@ -272,7 +288,7 @@ differently. The payoff is precisely two things — and **not** a third that's e
 | code | sub-component (schedule field) | schedules | grammar (coarse→fine) | status |
 |---|---|---|---|---|
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
-| `TILE` | free-axis output tile (`Placement` + `Scalar` reg) | `Map`, `Monoid`, `Semiring` | `n<N>[xm<M>]` parallel · `f<FM>[xf<FN>]` reg | proposed |
+| `TILE` | free-axis output tile (`TilePlan` — par + `Scalar` reg) | `Semiring` (`Map`/`Monoid` reserved) | `n<N>[xm<M>]` parallel · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** (`Semiring·Scalar`) |
 | `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | proposed |
 | `STAGE` | `Stage` (operand transport over the reduce loop) | `Monoid`, `Semiring` | `d<depth>` · `sync\|cp\|tma` · `[ring]` | proposed |
 
@@ -306,7 +322,8 @@ examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter h
 ✅ Monoid·Scalar  REDUCE=b64/r4          # 64-way coop + 4 ILP register accumulators
 ✅ Monoid·Scalar  REDUCE=b16  TILE=n8    # strided-coop rows: 16 lanes, 8 output rows/CTA
 ✅ Monoid·Scalar  REDUCE=b32             # flash-decoding (cooperative-KV, scalar flash)
-🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp
+✅ Semiring·Scalar TILE=n128xm64/f4xf4   # register-blocked SGEMM: 4×4 reg cells/thread, operands reused, inner reduce unrolled
+🔲 Semiring·Scalar TILE=n128xm64/f4xf4  STAGE=d3/cp   # + operand staging (STAGE still proposed)
 🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize
 🔲 Monoid·Warp    WARP=a:m16n8k16_f16/w4xw1/f1xf1/k1  REDUCE=b2  STAGE=d2/tma   # warp-tier flash, coop-KV
 🔲 WarpSpec       CHANNEL=K:d3/cp;V:d3/cp  mma:WARP=…/k2  reducer:REDUCE=b2  producer:STAGE=d3/cp
@@ -338,7 +355,9 @@ the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
   one packed axis have no dedicated code; `STAGE.depth` / `WarpTile.bk` / `Channel.depth` are three interacting depths,
   not fully orthogonal.
 
-Today only `REDUCE` is wired (`r<n>` ILP reachable via pin; the auto-fork offers `b`/scalar, not `r`/`g` yet).
+`REDUCE` and `TILE` are wired (`REDUCE` `r<n>` ILP + `TILE` reg-tile reachable via pin; `TILE`'s auto-fork — the
+prior-ranked candidate set — is still a follow-up, so a cold greedy compile stays per-cell unless pinned). `WARP` /
+`STAGE` remain proposed.
 
 ## Remaining — the warp / tensor-core tier
 

@@ -203,9 +203,10 @@ def test_is_warp_and_mma_atom_tier_discriminator():
 
 
 def test_scalar_tile_features_from_thread_tile():
-    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from
-    its thread tile (``BN·BM`` threads, ``BM·FM × BN·FN`` output)."""
-    sf = knob_features({"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0})
+    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from its
+    ``TILE`` codec free split (``par_n·par_m`` threads, ``par_m·reg_m × par_n·reg_n``
+    output) — ``n32xm8`` parallel thread-tile, ``f2xf4`` register sub-tile."""
+    sf = knob_features({"TILE": "n32xm8/f2xf4", "MMA": "0", "WM": 0, "WN": 0})
     assert any(k.startswith("D_") for k in sf)
     assert sf["D_threads"] == 32 * 8
     assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2

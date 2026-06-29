@@ -40,71 +40,10 @@ import pytest
 
 from ..conftest import dyn_M, requires_cuda
 
-# Shapes match the user's offline scan.
-_MATMUL_DIMS = {"M": 32, "K": 128, "N": 64}
-_GATED_DIMS = {"S": 32, "H": 128, "I": 256}
-
-# Broken (BN, BM, FM, FN) tiles + a representative BK. The full
-# matrix in the user's offline scan crossed each tile with 6 BKs × 3
-# STAGE codes; BK varies the K-loop chunking and STAGE varies the
-# producer-consumer pipeline encoding, neither changes the underlying
-# single-CTA-vs-multi-CTA dispatch that was wrong. One BK is enough
-# to lock the regression.
-_BROKEN_MATMUL: tuple[dict, ...] = (
-    {"BN": 16, "BM": 32, "FM": 1, "FN": 4, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 32, "BM": 16, "FM": 2, "FN": 2, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 32, "BM": 32, "FM": 1, "FN": 2, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 64, "BM": 16, "FM": 2, "FN": 1, "BK": 64, "SPLITK": 1, "BR": 1},
-)
-_BROKEN_GATED: tuple[dict, ...] = (
-    {"BN": 16, "BM": 32, "FM": 1, "FN": 16, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 32, "BM": 16, "FM": 2, "FN": 8, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 32, "BM": 32, "FM": 1, "FN": 8, "BK": 64, "SPLITK": 1, "BR": 1},
-    {"BN": 64, "BM": 16, "FM": 2, "FN": 4, "BK": 64, "SPLITK": 1, "BR": 1},
-)
-
 
 def _format_knobs(knobs: dict) -> str:
     """Render a knob dict as ``"K1=V1,K2=V2,..."`` for ``DEPLODOCK_KNOBS``."""
     return ",".join(f"{k}={v}" for k, v in knobs.items())
-
-
-def _build_matmul_graph(dims: dict, mode: str = "static"):
-    """``(1, M, K) @ (K, N)``. ``mode='dynamic'`` makes the M axis symbolic
-    (``Dim('seq_len')``); the returned ``input_shapes`` stay concrete so the run
-    feeds a real (1, M, K) array the symbolic kernel resolves ``seq_len`` from."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-
-    M, K, N = dims["M"], dims["K"], dims["N"]
-    Mg = dyn_M(mode, M)
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("a", (1, Mg, K)), node_id="a")
-    g.add_node(InputOp(), [], Tensor("b", (K, N)), node_id="b")
-    g.add_node(MatmulOp(), ["a", "b"], Tensor("c", (1, Mg, N)), node_id="c")
-    g.inputs, g.outputs = ["a", "b"], ["c"]
-    return g, {"a": (1, M, K), "b": (K, N)}, ("c", (1, M, N))
-
-
-def _build_gated_graph(dims: dict, mode: str = "static"):
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-
-    S, H, Inter = dims["S"], dims["H"], dims["I"]
-    Sg = dyn_M(mode, S)
-    g = Graph()
-    g.add_node(InputOp(), [], Tensor("x", (1, Sg, H)), node_id="x")
-    g.add_node(InputOp(), [], Tensor("wg", (H, Inter)), node_id="wg")
-    g.add_node(InputOp(), [], Tensor("wu", (H, Inter)), node_id="wu")
-    g.add_node(MatmulOp(), ["x", "wg"], Tensor("mg", (1, Sg, Inter)), node_id="mg")
-    g.add_node(MatmulOp(), ["x", "wu"], Tensor("mu", (1, Sg, Inter)), node_id="mu")
-    g.add_node(ElementwiseOp("silu"), ["mg"], Tensor("sg", (1, Sg, Inter)), node_id="sg")
-    g.add_node(ElementwiseOp("multiply"), ["sg", "mu"], Tensor("y", (1, Sg, Inter)), node_id="y")
-    g.inputs, g.outputs = ["x", "wg", "wu"], ["y"]
-    return g, {"x": (1, S, H), "wg": (H, Inter), "wu": (H, Inter)}, ("y", (1, S, Inter))
 
 
 def _build_norm_linear_graph(dims: dict, mode: str = "static"):
@@ -172,32 +111,9 @@ def _assert_match(forced: np.ndarray, ref: np.ndarray) -> None:
     np.testing.assert_allclose(forced, ref, atol=atol, rtol=0.05)
 
 
-@requires_cuda
-@pytest.mark.parametrize("knobs", _BROKEN_MATMUL, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_matmul_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
-    """matmul (1, 32, 128) @ (128, 64) — single-CTA + F-replicated tile. The
-    pinned config must produce the same correct output whether M is baked
-    (static) or symbolic (dynamic ``seq_len``, masked path) — the numpy
-    reference is the static graph; the forced CUDA run uses the mode's graph."""
-    static_graph, input_shapes, (out_name, _) = _build_matmul_graph(_MATMUL_DIMS)
-    forced_graph, _, _ = _build_matmul_graph(_MATMUL_DIMS, mode=shape_mode)
-    inputs = _random_inputs(input_shapes)
-    ref = _reference(static_graph, inputs, out_name)
-    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
-    _assert_match(forced, ref)
-
-
-@requires_cuda
-@pytest.mark.parametrize("knobs", _BROKEN_GATED, ids=lambda k: f"BN{k['BN']}_BM{k['BM']}_FM{k['FM']}_FN{k['FN']}")
-def test_gated_mlp_single_cta_f_replicated(knobs: dict, shape_mode, monkeypatch):
-    """gated_mlp (1, 32, 128) → (1, 32, 256) — single-CTA + F-replicated tile,
-    static and dynamic (symbolic ``seq_len``). Reference is the static graph."""
-    static_graph, input_shapes, (out_name, _) = _build_gated_graph(_GATED_DIMS)
-    forced_graph, _, _ = _build_gated_graph(_GATED_DIMS, mode=shape_mode)
-    inputs = _random_inputs(input_shapes)
-    ref = _reference(static_graph, inputs, out_name)
-    forced = _run_with_knobs(forced_graph, inputs, out_name, knobs, monkeypatch)
-    _assert_match(forced, ref)
+# The single-CTA + F-replicated matmul / gated-mlp register-tile cases that used to live here
+# (pinned via legacy ``BN``/``BM``/``FM``/``FN``) are now covered by the new-schema ``TILE`` codec
+# matrix in ``test_matmul_tile_coverage`` (static AND dynamic, accuracy + lowering structure).
 
 
 # The #244 dynamic-tune wedge: a scalar (``MMA=0``) cooperative norm-reduce whose

@@ -30,7 +30,7 @@ from math import prod
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
-from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, TileOp
+from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -50,11 +50,32 @@ REDUCE = Knob(
     off="",
 )
 
+# The free-axis output tile is decided HERE too, by the single ``TILE`` codec knob (the
+# ``Scalar``-fragment sibling of ``REDUCE``) — a contraction's per-thread register sub-tile
+# (each thread owns ``reg_m·reg_n`` output cells, reusing operands across them). Same decision
+# hierarchy: env pin via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only
+# a ``Semiring`` contraction tiles its output today; ``off=""`` auto-stamps everything else.
+TILE = Knob(
+    "TILE",
+    KnobType.STR,
+    help="Free-axis output-tile codec (n<N>[xm<M>] parallel thread-tile / f<fn>[xf<fm>] register "
+    "sub-tile; empty=per-cell). Decided in lowering/tile/020_schedule, materialized in "
+    "lowering/kernel/010_materialize.",
+    off="",
+)
+
 # Conservative cooperative-reduce selection constants (the default when REDUCE is unpinned).
 _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this wide
 _SERIAL_TARGET = 8  # aim for ~this many serial steps per cooperating thread
 _MAX_COOP = 256  # cap on cooperative threads per CTA (power of two)
 _FREE_CAP = 256  # only cooperate when the output grid is at most this many cells (under-occupied)
+
+
+def _hint_extent(ax) -> int:
+    """An axis's static extent, or its ``Dim`` hint when symbolic (the occupancy heuristic
+    sizes a dynamic axis by its hint; the kernel still deploys over the runtime extent)."""
+    e = ax.extent
+    return e.as_static() if e.is_static else (e.hint or DEFAULT_SEQ_HINT)
 
 
 def _prevpow2(n: int) -> int:
@@ -113,9 +134,10 @@ def _reduce_specs(kernel, place) -> list[str]:
         return [""]  # not cooperative-eligible — scalar serial fold; the pin doesn't apply
     # A symbolic reduce axis is sized by its ``Dim`` hint for the conservative pick (the
     # kernel deploys at the hint and strides to the runtime extent); a pin overrides it.
-    ext = carrier.axis.extent
-    extent = ext.as_static() if ext.is_static else (ext.hint or DEFAULT_SEQ_HINT)
-    free = prod(ax.extent.as_static() for ax in place.free) if place.free else 1
+    extent = _hint_extent(carrier.axis)
+    # A symbolic free axis (dynamic-grid tier) is sized by its ``Dim`` hint for the occupancy
+    # heuristic — the kernel still deploys over the runtime grid.
+    free = prod(_hint_extent(a) for a in place.free) if place.free else 1
     coop = _pick_coop(extent, free)
     cands = [f"b{coop}", ""] if coop > 1 else [""]  # conservative coop first (cold greedy → option-0)
     return list(REDUCE.narrow(cands))
@@ -127,6 +149,23 @@ def _option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
     with the spec stamped on ``knobs`` for the prior."""
     sched = replace(kernel.schedule, place=place, reduce=ReducePlan.parse(spec))
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs={**knobs, REDUCE.name: spec})
+
+
+def _tile_specs(kernel) -> list[str]:
+    """Candidate ``TILE`` codec strings for ``kernel`` — only a ``Semiring`` contraction tiles
+    its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
+    pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); the default is the per-cell tier
+    (the auto reg-tile fork is a follow-up, wired through the prior alongside the codec)."""
+    if not isinstance(kernel, SemiringKernel):
+        return [""]
+    return list(TILE.narrow([""]))
+
+
+def _tile_option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+    """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
+    resolved into the schedule's ``TilePlan``, the spec stamped on ``knobs`` for the prior."""
+    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec))
+    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs={**knobs, TILE.name: spec})
 
 
 def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
@@ -142,5 +181,9 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # single option applies directly; multiple options fork for the search / prior to rank.
     if isinstance(kernel, MapKernel):
         return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=tile.name)
+    # A contraction picks its free-axis output tile (``TILE``); a reduction picks its reduce
+    # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
+    if isinstance(kernel, SemiringKernel):
+        return [_tile_option(kernel, place, spec, tile.name, tile.knobs) for spec in _tile_specs(kernel)]
     specs = _reduce_specs(kernel, place)
     return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]

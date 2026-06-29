@@ -14,7 +14,6 @@ Skipped without CUDA.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
@@ -244,40 +243,6 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     _assert_close(out, ref, atol_rel=0.05, atol_min=1e-3)
 
 
-# ---------------------------------------------------------------------------
-# Plain matmul, blocked default (no prologue, no STAGE, sanity for the M3 flip)
-# ---------------------------------------------------------------------------
-
-
-@requires_cuda
-@pytest.mark.parametrize(
-    ("m", "k", "n", "fm", "fn"),
-    [
-        (32, 32, 128, 1, 8),  # FN=8 clean-divisor; blocked path with 8 cells per thread
-        (64, 64, 64, 2, 2),  # FM=FN=2; M_r register-tiled too
-        (32, 128, 96, 1, 3),  # FN=3 clean-divisor; smaller blocked variant
-    ],
-    ids=["fn8_no_mr", "fm2_fn2_mr", "fn3_clean"],
-)
-def test_blocked_matmul_default_accuracy(monkeypatch, m, k, n, fm, fn):
-    """Sanity matrix for FN > 1 matmul shapes (SPLITK=1, BR=1, no
-    M-mask) — covers pure FN-only (no M_r), FM+FN (M_r register-tiled
-    too), and FN=3 clean-divisor (innermost cache-axis extent not a
-    multiple of 2 — exercises the vectorize alignment guard). These are
-    the shapes the deleted blocked-GEMM builder used to specialize.
-    """
-    bn = max(1, n // fn) if (n % (n // fn) == 0 and (n // fn) <= 256) else n // fn
-    bm = max(1, m // fm)
-    _pin_knobs(monkeypatch, BK=k, BM=bm, BN=bn, BR=1, FM=fm, FN=fn, SPLITK=1)
-
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k)), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (k, n)), node_id="b")
-    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (m, n)), node_id="o")
-    g.inputs = ["a", "b"]
-    g.outputs = ["o"]
-
-    inputs = {"a": _random((m, k), seed=8), "b": _random((k, n), seed=9)}
-    ref = _reference(g, inputs)["o"]
-    out = _run_cuda(g, inputs)["o"]
-    _assert_close(out, ref)
+# The FN > 1 blocked-matmul accuracy matrix that used to live here (pinned via legacy
+# ``BN``/``BM``/``FM``/``FN``) is now the new-schema ``TILE`` codec matrix in
+# ``test_matmul_tile_coverage`` (register replication accuracy + structure, static AND dynamic).

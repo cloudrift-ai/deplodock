@@ -223,10 +223,29 @@ class Tile(Stmt):
 
     @property
     def n_elements(self) -> int:
-        """Total iteration-space size — one thread per element."""
+        """Total iteration-space size — one thread per element. Static axes only (raises on a
+        symbolic axis; the dynamic-grid path uses :attr:`n_dim` instead)."""
         from math import prod  # noqa: PLC0415
 
         return prod(self.extents) if self.axes else 1
+
+    @property
+    def is_static_grid(self) -> bool:
+        """True iff every grid axis has a static extent (the static launch path)."""
+        return all(a.extent.is_static for a in self.axes)
+
+    @property
+    def n_dim(self):
+        """Total iteration-space size as a :class:`Dim` — the ∏ of the axis extents, holding a
+        symbolic factor (a dynamic ``seq_len``) when any axis is symbolic. The cuda lowering
+        sizes the launch from this (``ceil(n_dim / blockDim)`` CTAs, ``seq_len`` resolved at
+        launch); the renderer guards ``_gid < n_dim`` so the partial last block is masked."""
+        from deplodock.compiler.dim import Dim  # noqa: PLC0415
+
+        n = Dim(1)
+        for a in self.axes:
+            n = n * a.extent
+        return n
 
     def pretty(self, indent: str = "") -> list[str]:
         names = ", ".join(a.name for a in self.axes)
@@ -234,6 +253,22 @@ class Tile(Stmt):
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
+        # Symbolic grid (a dynamic free axis): size the guard + decode from the runtime extents
+        # via the symbolic-aware helpers (the ``Dim`` name renders to its ``int`` arg). Kept off
+        # the static path so static codegen stays byte-identical.
+        if not self.is_static_grid:
+            from deplodock.compiler.ir.stmt.blocks import _render_grid_axis_decode, _stride_c  # noqa: PLC0415
+
+            inner = ctx.child()
+            n = _stride_c(list(self.axes), inner)
+            out = [
+                f"{pad}int _gid = blockIdx.x * blockDim.x + threadIdx.x;",
+                f"{pad}if (_gid < {n}) {{",
+            ]
+            out.extend(_render_grid_axis_decode(self.axes, "_gid", inner))
+            out.extend(render_body(self.body, inner))
+            out.append(f"{pad}}}")
+            return out
         extents = self.extents
         # Inner-stride of each axis = product of the extents to its right.
         strides: list[int] = [1] * len(extents)

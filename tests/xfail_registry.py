@@ -46,52 +46,35 @@ XFAIL: dict[str, str] = {
     "test_gen_runner_gpu.py": _R,
     "test_launch_geometry_rules.py": _R,
     "test_matmul_mma.py": _R,
-    # test_matmul_mma_masked.py: the symbolic-K masked matmul recovered with the symbolic
-    # reduce tier (the reduce axis strides to the runtime extent, scalar fallback accurate).
-    # The symbolic-M/N (free-axis) + mma-tier residuals still need those tiers — registered
-    # per function so the recovered ``test_symbolic_k_masked_mma_accuracy`` is a hard
-    # requirement again.
-    "test_matmul_mma_masked.py::test_batched_symbolic_mk_masked_mma_accuracy": _R,
+    # test_matmul_mma_masked.py: the masked symbolic-M/N matmul **accuracy** recovered with the
+    # dynamic-grid tier (the symbolic free axis sizes a symbolic grid, the scalar fallback masks
+    # its tail). Only the residual cases that assert the **mma / warp tier** STRUCTURE (a
+    # tensor-core tile that hasn't been rebuilt) still xfail.
     "test_matmul_mma_masked.py::test_batched_symbolic_mk_reaches_warp": _R,
-    "test_matmul_mma_masked.py::test_demoted_masked_k_pv_tma_accuracy": _R,
-    "test_matmul_mma_masked.py::test_demoted_symbolic_n_accuracy": _R,
-    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_accuracy": _R,
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_kernel_structure": _R,
-    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_residual_epilogue_accuracy": _R,
-    "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_accuracy": _R,
     "test_matmul_mma_masked.py::test_symbolic_m_masked_mma_tma_structure": _R,
-    "test_matmul_mma_masked.py::test_symbolic_mn_masked_mma_accuracy": _R,
     "test_matmul_mma_transposed_b.py": _R,
     "test_monoid_reduce_kernel.py": _R,
-    "test_program_rebind.py": _R,
     "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
     # --- individual cases: the file still has passing tests ---
-    # scalar flash landed — test_flash_attention residuals are the dynamic/symbolic variants
-    # (need the dynamic-shape tier) and the now-obsolete flash-knob-off test.
-    "tests/compiler/e2e/test_flash_attention.py::test_flash_additive_mask_dynamic_matches_torch": _R,
+    # scalar flash landed; the dynamic single-flash variants (sdpa / gqa / additive-mask)
+    # recovered with the dynamic-grid tier. The residual flash-chain cases (a chained flash
+    # whose producer still needs a tier) and the obsolete flash-knob-off test remain.
     "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
     "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
     "tests/compiler/e2e/test_flash_attention.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
-    "tests/compiler/e2e/test_flash_attention.py::test_flash_gqa_dynamic_matches_torch": _R,
     "tests/compiler/e2e/test_flash_attention.py::test_flash_off_keeps_decomposition": _R,
-    "tests/compiler/e2e/test_flash_attention.py::test_flash_sdpa_dynamic_matches_torch": _R,
     # matmul enabled at the scalar tier — these files partially recovered; residuals still need
     # the mma / staging / split-K / dynamic / attention tiers (scalar fallback gives correct
     # accuracy for the rest, which is un-xfailed). The whole-block (TinyLlama / Qwen) and RoPE
     # self-attention cases recovered once the op-tree lift covered the un-fused RoPE-attention
     # fallback (multi-reduce kernels lower as a flat ``Map``), so they are no longer registered.
     "tests/compiler/e2e/test_knob_pinning.py::test_article_tma_sgemm_reproduction": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN16_BM32_FM1_FN16]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN32_BM16_FM2_FN8]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN32_BM32_FM1_FN8]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_gated_mlp_single_cta_f_replicated[dynamic-BN64_BM16_FM2_FN4]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_matmul_single_cta_f_replicated[dynamic-BN16_BM32_FM1_FN4]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_matmul_single_cta_f_replicated[dynamic-BN32_BM16_FM2_FN2]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_matmul_single_cta_f_replicated[dynamic-BN32_BM32_FM1_FN2]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_matmul_single_cta_f_replicated[dynamic-BN64_BM16_FM2_FN1]": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_norm_linear_fp16_scalar_reduce_tma_alignment[dynamic]": _R,
+    # test_matmul_single_cta_f_replicated / test_gated_mlp_single_cta_f_replicated deleted —
+    # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
+    # dynamic, by test_matmul_tile_coverage.
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
     "tests/compiler/e2e/test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": _R,
     "tests/compiler/e2e/test_lowering_blocked_gemm.py::test_fused_rmsnorm_linear_blocked_prologue": _R,
@@ -99,10 +82,8 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[dynamic-tma]": _R,
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-cp.async]": _R,
     "tests/compiler/e2e/test_matmul_mma_parity.py::test_pinned_transport_and_shape_fire[static-tma]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-cp.async-256]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-cp.async-512]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-tma-256]": _R,
-    "tests/compiler/e2e/test_matmul_mma_parity.py::test_static_dynamic_mma_parity[dynamic-tma-512]": _R,
+    # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
+    # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts).
     "tests/compiler/e2e/test_mma_atomic_free_splitk.py::test_mma_atomic_free_splitk_accurate_and_no_atomic": _R,
     "tests/compiler/e2e/test_stage_scalar.py::test_scalar_matmul_stages_through_pipeline": _R,
     # test_reduction_combine_coverage.py / test_tune_accuracy.py: scalar-tier reduction
@@ -123,9 +104,9 @@ XFAIL: dict[str, str] = {
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_raise_on_unlowered_fires_for_stuck_tileop": _R,
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_run_leaves_no_state_on_pipeline": _R,
     "tests/compiler/backend/test_emit.py::test_softmax_emits_multiple_k_loops": _R,
-    "tests/compiler/cli/test_compile.py::test_compile_dynamic_emits_runtime_arg": _R,
+    # test_compile_dynamic_emits_runtime_arg / test_run_code_dynamic_seq_len recovered with the
+    # dynamic-grid tier (a symbolic free axis lowers to a symbolic launch + runtime ``int`` arg).
     "tests/compiler/cli/test_run.py::test_compile_fp16_matmul_window_emits_half2": _R,
-    "tests/compiler/cli/test_run.py::test_run_code_dynamic_seq_len": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_bench": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_kernel_stage": _R,
     "tests/compiler/cli/test_run.py::test_run_ir_seed_reproducible": _R,
@@ -173,16 +154,10 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_residual_mma_matches_reference[32-1024-3072-1-out_dtype0]": _R,
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_admits_warp_tier": _R,
     "tests/compiler/e2e/test_matmul_mma_residual.py::test_transposed_residual_mma_matches_reference": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_cache_rmsnorm_over_capacity_buffers": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_capture_replay_device_io_matches_eager": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_sdpa_over_symbolic_seq_len": _R,
-    # test_cuda_softmax_over_symbolic_seq_len recovered with the symbolic cooperative reduce tier.
-    "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_elementwise_one_kernel_multiple_seq_lens": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_linear_traced_and_run": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_cuda_symbolic_rmsnorm_traced_and_run": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_qwen_layer_dynamic_compiles_and_matches_eager": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_qwen_whole_model_capture_replay_cache_matches_eager": _R,
-    "tests/compiler/ir/test_dynamic_shapes.py::test_qwen_whole_model_dynamic_compiles_and_matches_eager": _R,
+    # test_dynamic_shapes.py: the dynamic-grid tier (a symbolic FREE/output axis → a symbolic
+    # launch grid, ``_gid < ∏extents`` sizing from the runtime ``Dim`` arg) recovered the
+    # symbolic elementwise / linear / rmsnorm / sdpa kernels and the dynamic Qwen layer +
+    # whole-model (and their capture-replay), so they are hard requirements again.
     "tests/compiler/passes/test_matmul_rules.py::test_elwise_lhs_matmul_fires_split_k_and_blockify": _R,
     "tests/compiler/passes/test_matmul_rules.py::test_matmul_then_elwise_fires_split_k_and_blockify": _R,
     "tests/compiler/passes/test_matmul_rules.py::test_plain_matmul_fires_split_k_and_blockify": _R,

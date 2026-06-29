@@ -191,6 +191,84 @@ class ReducePlan:
 
 
 @dataclass(frozen=True)
+class TilePlan:
+    """The free-axis output tile — the **tuned widths only** for the (≤2) tiled output
+    axes, the scalar (``Scalar`` fragment) counterpart of :class:`ReducePlan`.
+
+    Each tiled free axis splits into a **parallel** width (threads per axis — the
+    ``n``/``m`` slots) and a **register** width (per-thread register sub-cells — the ``f``
+    slots): one thread owns a ``reg_m × reg_n`` block of output cells, reusing each loaded
+    operand across the block (the arithmetic-intensity lever for scalar matmul). All-``1``
+    is the per-cell tier (one thread per output cell), exactly as ``ReducePlan()`` is the
+    serial fold. The two axes follow the featurizer's canonical ``n`` (inner / coalesced)
+    vs ``m`` (outer) labelling (:func:`knob._free_slots`)."""
+
+    par_n: int = 1
+    reg_n: int = 1
+    par_m: int = 1
+    reg_m: int = 1
+
+    @classmethod
+    def parse(cls, spec: str | None) -> TilePlan:
+        """Decode the ``TILE`` knob codec (the schedule's free-axis output-tile knob,
+        decided in ``020_schedule``) into a plan: ``/``-separated tokens — ``n<N>[xm<M>]``
+        (the parallel thread-tile, ``N`` threads on the inner axis, optional ``M`` on the
+        outer) and ``f<fn>[xf<fm>]`` (the register sub-tile, ``fn`` cells on the inner axis,
+        optional ``fm`` on the outer). Empty / ``None`` = the per-cell tier."""
+        spec = (spec or "").strip()
+        if not spec:
+            return cls()
+        par_n = reg_n = par_m = reg_m = 1
+        for raw in spec.split("/"):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if tok[0] == "n":  # n<N>[xm<M>] — the parallel thread-tile
+                n, _, m = tok[1:].partition("xm")
+                par_n = int(n)
+                if m:
+                    par_m = int(m)
+            elif tok[0] == "f":  # f<fn>[xf<fm>] — the register sub-tile
+                fn, _, fm = tok[1:].partition("xf")
+                reg_n = int(fn)
+                if fm:
+                    reg_m = int(fm)
+            else:
+                raise ValueError(f"bad TILE token {tok!r} (expect n<N>[xm<M>] / f<fn>[xf<fm>])")
+        return cls(par_n=par_n, reg_n=reg_n, par_m=par_m, reg_m=reg_m)
+
+    def spell(self) -> str:
+        """The ``TILE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
+        the per-cell tier."""
+        toks: list[str] = []
+        if self.par_n > 1 or self.par_m > 1:
+            toks.append(f"n{self.par_n}" + (f"xm{self.par_m}" if self.par_m > 1 else ""))
+        if self.reg_n > 1 or self.reg_m > 1:
+            toks.append(f"f{self.reg_n}" + (f"xf{self.reg_m}" if self.reg_m > 1 else ""))
+        return "/".join(toks)
+
+    @property
+    def is_tiled(self) -> bool:
+        """True iff this plan tiles the output (any parallel or register width > 1)."""
+        return self.par_n > 1 or self.par_m > 1 or self.reg_n > 1 or self.reg_m > 1
+
+    @property
+    def reg(self) -> tuple[int, int]:
+        """The register sub-tile ``(reg_m, reg_n)`` — outer (m) then inner (n) cells/thread."""
+        return (self.reg_m, self.reg_n)
+
+    @property
+    def cells(self) -> int:
+        """Register cells per thread = ``reg_m · reg_n``."""
+        return self.reg_m * self.reg_n
+
+    @property
+    def slots(self) -> tuple[int, int, int, int]:
+        """The featurizer's canonical ``(par_n, reg_n, par_m, reg_m)`` free-split tuple."""
+        return (self.par_n, self.reg_n, self.par_m, self.reg_m)
+
+
+@dataclass(frozen=True)
 class Placement:
     """Kind-neutral free-axis → grid binding (the parallel output axes and their grid
     mapping). ``010_recognize`` builds an UNMAPPED placement (just ``free``);
@@ -301,11 +379,14 @@ class MonoidSchedule:
 @dataclass(frozen=True)
 class SemiringSchedule:
     """A contraction (``Semiring``) kernel's schedule — the same orthogonal reduce-axis
-    fields as :class:`MonoidSchedule` (``warp_tile`` is the matmul's mma tile)."""
+    fields as :class:`MonoidSchedule` (``warp_tile`` is the matmul's mma tile), plus the
+    free-axis output :class:`TilePlan` (``tile`` — the scalar register sub-tile, the
+    ``Scalar`` fragment of the matmul, decided by the ``TILE`` knob in ``020_schedule``)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
+    tile: TilePlan = field(default_factory=TilePlan)
     warp_tile: WarpTile | None = None  # TODO(warp)
     stage: Stage | None = None  # TODO(pipelining)
 
@@ -377,6 +458,7 @@ __all__ = [
     "SemiringKernel",
     "SemiringSchedule",
     "Stage",
+    "TilePlan",
     "WarpRole",
     "WarpSpec",
     "WarpTile",

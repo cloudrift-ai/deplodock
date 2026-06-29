@@ -243,14 +243,12 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     fused, _ = _fuse(loop.body)
     normed, _ = _normalize(list(fused))
     node, free = _lift(normed, root.output.name)
-    # The static thread grid (the ``Tile`` decode) needs static FREE (parallel) axes; a
-    # symbolic free axis (a dynamic row count) would need a symbolic grid (not built — left
-    # a ``LoopOp`` for the dynamic-grid tier). A symbolic REDUCE / output-sweep axis IS
-    # supported: the materializer renders the serial / cooperative reduce loop to the runtime
-    # extent (``Loop`` / ``StridedLoop`` symbolic bound, the ``< seq_len`` cap being the
-    # masked tail) and the cuda lowering threads the ``Dim`` name as a runtime ``int`` arg.
-    if any(not ax.extent.is_static for ax in free):
-        raise RuleSkipped("symbolic FREE axis — needs a symbolic grid (dynamic-grid tier not built)")
+    # A symbolic FREE (parallel) axis rides a **symbolic grid**: the ``Tile`` decode sizes the
+    # launch from the runtime extent (``_gid < ∏extents``, the ``Dim`` name threaded as an
+    # ``int`` arg by the cuda lowering) — the dynamic-grid tier. A symbolic REDUCE /
+    # output-sweep axis is likewise supported (the reduce loop strides to the runtime extent,
+    # the ``< seq_len`` cap masking the tail). Register-tiled symbolic axes mask their tail
+    # cell (clamp-read + guarded write) in ``lowering/kernel``.
     # Wrap the lifted node + its unmapped placement in the matching ``*Kernel`` (keyed by
     # the op kind — a bare reduction / projection over one is a Monoid/Semiring kernel,
     # else a MapKernel). ``020_schedule`` maps the free axes + picks the reduce partition.

@@ -433,7 +433,7 @@ apply_knobs_env()
 # golden/DB row) follow in the historical order, unknown knobs last (alpha). Shared by the
 # ``run --bench`` kernel table and the ``deplodock eval`` tables so columns read stably.
 _FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
-KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
+KNOB_ORDER = ("TILE", "REDUCE", "BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 
@@ -470,7 +470,9 @@ def format_tuning_knobs(knobs: dict) -> str:
 # eval tables. Kept here as plain name sets (knob.py has no pipeline deps); the
 # tier is picked value-based via :func:`is_warp`.
 _WARP_TIER_KNOBS = frozenset({"WM", "WN", "MMA"})
-_SCALAR_TIER_KNOBS = frozenset({"BM", "BN", "BR", "FK"})
+# The scalar tier's free-axis tile is the ``TILE`` codec (the legacy ``BM``/``BN``/``BR``/``FK``
+# names are kept for back-compat with old golden/DB rows).
+_SCALAR_TIER_KNOBS = frozenset({"TILE", "BM", "BN", "BR", "FK"})
 
 
 def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
@@ -587,35 +589,37 @@ def knob_features(knobs: dict) -> dict[str, float]:
 
 
 def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
-    """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes — read
-    from the legacy ``BN``/``FN`` + ``BM``/``FM`` (thread tier) / ``WN``/``FN`` +
-    ``WM``/``FM`` (warp tier) names.
+    """Canonical ``(par_n, reg_n, par_m, reg_m)`` for the (≤2) tiled free axes.
 
-    The two axes are canonicalized by ``par`` (the wider parallel binding is the
-    ``n`` / coalesced slot, the narrower the ``m`` slot); in the golden region
-    (``BN ≥ BM``) it reduces to the legacy labelling. A single free axis fills the
-    ``n`` slot with a degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no
-    complete free split is present (a non-tiled kernel)."""
-    pairs: list[tuple[int, int]] = []
+    The **scalar** tier sources its free split from the ``TILE`` codec
+    (``n<N>[xm<M>]/f<fn>[xf<fm>]`` — the schedule's free-axis output-tile knob); the **warp**
+    tier keeps its ``WN``/``FN`` + ``WM``/``FM`` names (not yet rebuilt onto a codec). The two
+    axes are canonicalized by ``par`` (the wider parallel binding is the ``n`` / coalesced
+    slot, the narrower the ``m`` slot). A single free axis fills the ``n`` slot with a
+    degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` when no complete free split is present
+    (a non-tiled kernel)."""
 
-    # Scalar ``BN``/``BM`` and warp ``WN``/``WM`` are mutually exclusive (a row is
-    # scalar XOR warp), so pick the par names by which tier has a non-zero count —
-    # not via ``is_warp`` (needs the atom key a bare ``_warp_tile_features`` unit
-    # input may omit), and not by mere presence (the off tier is present as the 0
-    # sentinel: a scalar row carries ``WN=WM=0``, a warp row ``BN=BM=0``).
     def _nz(name: str) -> int:
         try:
             return int(knobs.get(name, 0) or 0)
         except (TypeError, ValueError):
             return 0
 
-    n, m = ("WN", "WM") if (_nz("WN") > 0 or _nz("WM") > 0) else ("BN", "BM")
-    for par_key, reg_key in ((n, "FN"), (m, "FM")):
-        if par_key in knobs and reg_key in knobs:
-            try:
-                pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
-            except (TypeError, ValueError):
-                return None
+    pairs: list[tuple[int, int]] = []
+    if _nz("WN") > 0 or _nz("WM") > 0:  # warp tier — legacy W*/F* names
+        for par_key, reg_key in (("WN", "FN"), ("WM", "FM")):
+            if par_key in knobs and reg_key in knobs:
+                try:
+                    pairs.append((int(knobs[par_key]), int(knobs[reg_key])))
+                except (TypeError, ValueError):
+                    return None
+    else:  # scalar tier — the TILE codec
+        from deplodock.compiler.ir.tile.schedule import TilePlan  # noqa: PLC0415
+
+        plan = TilePlan.parse(knobs.get("TILE"))
+        if not plan.is_tiled:
+            return None
+        pairs = [(plan.par_n, plan.reg_n), (plan.par_m, plan.reg_m)]
     if not pairs:
         return None
     pairs.sort(key=lambda pr: (pr[0], pr[1]), reverse=True)  # wider par = the n slot
