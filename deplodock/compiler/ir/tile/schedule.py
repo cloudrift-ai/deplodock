@@ -410,15 +410,25 @@ class Stage:
 
     A constructed ``Stage`` means staging is **on** (the reused gmem operands ride a shared-
     memory slab); ``schedule.stage is None`` is the register / gmem-direct baseline (no
-    slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring]`` (decided in
-    ``020_schedule``). ``smem`` (the staged-operand buffer names) is **derived during
-    lowering** — the materializer stages the reused gmem reads — not spelled by the codec;
-    an empty ``smem`` means "stage every reused operand"."""
+    slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring][/p<reg_depth>]``
+    (decided in ``020_schedule``). ``smem`` (the staged-operand buffer names) is **derived
+    during lowering** — the materializer stages the reused gmem reads — not spelled by the
+    codec; an empty ``smem`` means "stage every reused operand".
 
-    depth: int = 1  # pipeline stages over the serial reduce loop (1 = single buffer, no prefetch)
+    The pipeline has two buffering levels down the memory hierarchy, each with its own depth:
+    ``depth`` is the **gmem→smem** ring (the cp.async / TMA prefetch over the serial reduce
+    loop), ``reg_depth`` is the **smem→register** double-buffer (the ldmatrix ping-pong over
+    the inner atom-K steps, breaking the WAR hazard on the operand fragments). They are
+    orthogonal — ``d3/cp/p2`` is a 3-deep gmem ring feeding a 2-deep register ping-pong.
+    ``reg_depth = 1`` (the default) is the "optional register" OFF point (no inner prefetch).
+    The slab K-*granularity* (how much K is resident) is ``WarpTile.bk``, NOT a third depth
+    here — granularity and buffer depth are kept distinct."""
+
+    depth: int = 1  # gmem→smem ring depth over the reduce loop (1 = single buffer, no prefetch)
     transport: str = "sync"  # sync | cp.async | tma (the gmem→smem producer)
     smem: tuple[str, ...] = ()  # operands staged through smem (derived; not in the codec)
     ring: bool = False  # ring buffer vs static double-buffer
+    reg_depth: int = 1  # smem→register double-buffer depth (1 = no inner ldmatrix prefetch)
 
     def __post_init__(self) -> None:
         if self.transport not in _TRANSPORT_SPELL:
@@ -427,20 +437,24 @@ class Stage:
             raise ValueError(f"Stage depth must be ≥ 1, got {self.depth}")
         if self.ring and self.depth < 2:
             raise ValueError("a ring buffer needs depth ≥ 2 (nothing to cycle at depth 1)")
+        if self.reg_depth < 1:
+            raise ValueError(f"Stage reg_depth must be ≥ 1, got {self.reg_depth}")
 
     @classmethod
     def parse(cls, spec: str | None) -> Stage:
         """Decode the ``STAGE`` knob codec into a stage: ``/``-separated tokens —
-        ``d<depth>`` (pipeline depth), ``sync`` | ``cp`` | ``tma`` (the transport), and an
-        optional ``ring`` flag. Empty / ``None`` = the depth-1 ``sync`` default (the caller
-        maps an empty ``STAGE`` to ``stage=None``, the gmem-direct baseline — ``parse`` is
-        only reached on a non-empty spec). ``smem`` is filled in later by the scheduler."""
+        ``d<depth>`` (gmem→smem ring depth), ``sync`` | ``cp`` | ``tma`` (the transport), an
+        optional ``ring`` flag, and an optional ``p<reg_depth>`` (smem→register double-buffer
+        depth). Empty / ``None`` = the depth-1 ``sync`` default (the caller maps an empty
+        ``STAGE`` to ``stage=None``, the gmem-direct baseline — ``parse`` is only reached on a
+        non-empty spec). ``smem`` is filled in later by the scheduler."""
         spec = (spec or "").strip()
         if not spec:
             return cls()
         depth = 1
         transport = "sync"
         ring = False
+        reg_depth = 1
         for raw in spec.split("/"):
             tok = raw.strip()
             if not tok:
@@ -451,16 +465,21 @@ class Stage:
                 transport = _TRANSPORT_CODEC[tok]
             elif tok == "ring":
                 ring = True
+            elif tok[0] == "p" and tok[1:].isdigit():
+                reg_depth = int(tok[1:])
             else:
-                raise ValueError(f"bad STAGE token {tok!r} (expect d<depth> / sync|cp|tma / ring)")
-        return cls(depth=depth, transport=transport, ring=ring)
+                raise ValueError(f"bad STAGE token {tok!r} (expect d<depth> / sync|cp|tma / ring / p<reg_depth>)")
+        return cls(depth=depth, transport=transport, ring=ring, reg_depth=reg_depth)
 
     def spell(self) -> str:
         """The ``STAGE`` codec string for this stage (inverse of :meth:`parse`). ``smem`` is
-        derived, so it is not spelled."""
+        derived, so it is not spelled; ``reg_depth`` is spelled only when ≥ 2 (the ``p1``
+        default is omitted, so an unstaged-register config round-trips byte-identical)."""
         toks = [f"d{self.depth}", _TRANSPORT_SPELL[self.transport]]
         if self.ring:
             toks.append("ring")
+        if self.reg_depth >= 2:
+            toks.append(f"p{self.reg_depth}")
         return "/".join(toks)
 
     @property

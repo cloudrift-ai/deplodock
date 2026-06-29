@@ -356,9 +356,29 @@ def test_knob_features_stage_codec():
     assert feats["D_stage_async"] == 1.0
     assert feats["D_stage_tma"] == 1.0
     assert feats["D_stage_ring"] == 1.0
+    assert feats["D_stage_reg_depth"] == 1.0  # no /p<n> ⇒ register pipeline OFF
     sync = knob_features({"STAGE": "d2/cp"})
     assert sync["D_stage_depth"] == 2.0 and sync["D_stage_async"] == 1.0 and sync["D_stage_tma"] == 0.0
+    # The smem→register double-buffer (``p<n>``) featurizes orthogonally to the gmem→smem ring.
+    pp = knob_features({"STAGE": "d3/cp/ring/p2"})
+    assert pp["D_stage_depth"] == 3.0 and pp["D_stage_reg_depth"] == 2.0 and pp["D_stage_ring"] == 1.0
     assert not any(k.startswith("D_stage_") for k in knob_features({"STAGE": ""}))
+
+
+def test_stage_codec_reg_depth_roundtrip():
+    """``Stage.parse``/``spell`` round-trip the ``p<reg_depth>`` token; ``p1`` (the default) is
+    omitted so an unstaged-register config spells byte-identical to before the field existed."""
+    from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
+
+    assert Stage.parse("d3/cp/ring/p2") == Stage(depth=3, transport="cp.async", ring=True, reg_depth=2)
+    assert Stage.parse("d2/cp/p4").reg_depth == 4
+    assert Stage.parse("d2/cp").reg_depth == 1  # absent ⇒ OFF
+    assert Stage(depth=2, transport="cp.async", reg_depth=2).spell() == "d2/cp/p2"
+    assert Stage(depth=2, transport="cp.async", reg_depth=1).spell() == "d2/cp"  # p1 omitted
+    # reg_depth is perf-only — NOT part of the structural signature (golden-match stability).
+    from deplodock.compiler.pipeline.knob import _stage_sig  # noqa: PLC0415
+
+    assert _stage_sig({"STAGE": "d2/cp/p2"}) == _stage_sig({"STAGE": "d2/cp"})
 
 
 def test_knob_features_mma_expansion():

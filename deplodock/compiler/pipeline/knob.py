@@ -546,6 +546,7 @@ def _stage_features(knobs: dict) -> dict[str, float]:
         "D_stage_async": 1.0 if st.is_async else 0.0,
         "D_stage_tma": 1.0 if st.transport == "tma" else 0.0,
         "D_stage_ring": 1.0 if st.ring else 0.0,
+        "D_stage_reg_depth": float(st.reg_depth),  # smem→register double-buffer (p<n>)
     }
 
 
