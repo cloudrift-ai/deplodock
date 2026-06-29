@@ -941,6 +941,20 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
         raise LoweringError("warp tier: unrecognised contraction body (expected A/B loads + Accum + Write)")
     b_trans = k_axis.name in b_load.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
 
+    # TEMP (Phase-1 commit 2): verify 040_atomize's structural binding equals the old
+    # loop-pattern-match across the whole matmul matrix, before _warp depends on it. Removed
+    # in commit 3 when _warp reads the binding directly.
+    _bind = kernel.schedule.bind
+    assert _bind is not None, "warp tier: 040_atomize did not stamp a binding"
+    assert _bind.a.load == a_load and _bind.b.load == b_load, "atomize: A/B operand bind mismatch"
+    assert _bind.b_trans == b_trans and _bind.acc == acc, "atomize: b_trans / acc bind mismatch"
+    # Reconstruct commit-3's epilogue stream from the binding: a non-empty epilogue is the
+    # projection body verbatim; an empty one (bare contraction) synthesizes the store exactly
+    # as `_with_store` did. Must equal the old `[*pre, *tail]` (pre is always empty here).
+    _epi = list(_bind.epilogue)
+    _recon = _epi if _has_write(_epi) else _with_store(_epi, root.output.name, grid, node)
+    assert _recon == [*pre, *tail], "atomize: epilogue bind mismatch"
+
     tile_m, tile_n = wt.tile_m, wt.tile_n
     mask_m = not (m_axis.extent.is_static and m_axis.extent.as_static() % tile_m == 0)
     mask_n = not (n_axis.extent.is_static and n_axis.extent.as_static() % tile_n == 0)
