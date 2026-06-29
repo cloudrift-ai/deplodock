@@ -401,12 +401,27 @@ partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooper
 or tuned. The single `REDUCE` codec knob decides the plan in `020_schedule`; the combine itself stays in the op
 tree.
 
+All four schedule codecs — `REDUCE`, `TILE` (scalar `TilePlan` / warp `WarpTile`), `STAGE`, and `WSPEC` — share one
+schema-driven ser/de engine (`tile/codec.py`): a `Schema` of typed `Field`s plus generic `desugar` / `decode` /
+`encode`. Each codec class keeps its `parse` / `spell` API and its semantics, delegating only the string ↔ struct
+conversion to the engine, so the featurizer and `020_schedule` call sites — and the on-disk golden wire format — are
+unchanged. The grammar collapses int and pair widths into one tuple kind and supports per-field params (the recursive
+`WSPEC` role case); the one non-uniform value codec is the `REDUCE` `g<n>[a|k]` finalize letter, kept inside the value
+so the round-trip stays byte-identical.
+
+`WSPEC` (warp specialization) is the worker-mapping pin — a role→warp-count allocation (`WarpSpec`; role descriptors in
+`tile/role.py`, the COMPUTE consumer implicit and sized by `WarpTile.warps`) carried on an **orthogonal**
+`workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
+split over the fixed pipeline rather than replacing it. Pin-only this cut — `020_schedule` stamps `workers` from a
+`DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the
+producer/consumer codegen in `lowering/kernel` is a documented `TODO(warp-spec)`.
+
 `tile/ops.py` `lower(op)` expands the op tree to loop IR (`Monoid` / `Semiring` carry their reduction shape, so a
 nested reduction is a child node, not a separate wrapper op); `pretty(op)` renders it for dumps. The tensor-core,
-cooperative-combine, staging (cp.async / TMA), and warp-specialization tiers are materialized downstream in
-`lowering/kernel` against the op tree + schedule — the older tile-level `GridTile` / `ThreadTile` / `Stage`
-structures were removed in the tile-IR rebuild and are being rebuilt there as the schedules return (see
-`pipeline/passes/ARCHITECTURE.md`).
+cooperative-combine, and staging (cp.async / TMA) tiers are materialized downstream in `lowering/kernel` against the
+op tree + schedule; warp specialization has its schedule codec (`WSPEC` → `workers`) but its producer/consumer codegen
+is still a `TODO(warp-spec)`. The older tile-level `GridTile` / `ThreadTile` / `Stage` structures were removed in the
+tile-IR rebuild and are being rebuilt there as the schedules return (see `pipeline/passes/ARCHITECTURE.md`).
 
 ## `kernel/`
 

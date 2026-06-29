@@ -338,7 +338,7 @@ batched (`base.Prior`): each tuned op's value-of-position rows stream into a res
 writes it, `compile` / `run` read it.
 
 **-O3 deployable samples.** The sweep compiles at `-Xcicc -O1` (fast, but a *ranking* signal — it ties configs that
-differ at -O3, e.g. a `REDUCE` ILP fold or a warp tile's `WARPSPEC`). So whenever a bench lands **within `DEPLODOCK_O3_TOL`
+differ at -O3, e.g. a `REDUCE` ILP fold or a warp tile's `WSPEC`). So whenever a bench lands **within `DEPLODOCK_O3_TOL`
 (default 15%, `config.o3_tol`) of the best -O1 so far** — a band wider than a strict new best, so near-tied contenders all
 qualify — the engine re-benches it at `-Xcicc -O3` (`_rebench_o3`) and `observe_o3` records an extra row with the same
 realized knobs tagged `H_opt=3` (the deployable regime). Each config is re-benched at most once. The `H_*` feature lets

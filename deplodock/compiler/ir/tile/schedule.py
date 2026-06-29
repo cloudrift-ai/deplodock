@@ -16,12 +16,15 @@ The schedule is **flat, typed by the outermost algebra kind**: a ``Map`` →
 :class:`MapSchedule`, a reduction ``Monoid`` → :class:`MonoidSchedule`, a contraction
 ``Semiring`` → :class:`SemiringSchedule` (flash — a ``Monoid`` over a nested partial
 ``Semiring`` — is a :class:`MonoidSchedule`; the op tree nests, the schedule does not).
-The schedule of a reducing kind is **either** that kind's uniform (SIMT) schedule **or**
-:class:`WarpSpec` (the warp-role pipeline, reserved). The pairing in the ``*Kernel``
-types makes a ``Monoid``-with-``MapSchedule`` mismatch unrepresentable.
+The pairing in the ``*Kernel`` types makes a ``Monoid``-with-``MapSchedule`` mismatch
+unrepresentable. Warp specialization is **orthogonal**, not a second schedule kind: it
+rides an optional ``workers: WarpSpec | None`` field on the uniform schedule (``None`` =
+uniform SIMT) — a role→warp-count split *over* the fixed pipeline, not a replacement of it.
 
-This module builds the **uniform** arm (``ReducePlan`` / ``TilePlan`` / ``WarpTile`` /
-``Stage``); ``Channel`` / ``WarpSpec`` (warp specialization) are reserved slots (``# TODO``).
+Every codec here — ``ReducePlan`` / ``TilePlan`` / ``WarpTile`` / ``Stage`` / ``WarpSpec`` —
+routes its ``parse`` / ``spell`` through the shared schema engine (:mod:`.codec`), declaring a
+``Schema`` of typed ``Field``\\s and keeping only its own semantics. ``WarpSpec`` materialization
+(the producer/consumer warp emission) is reserved this cut (``# TODO(warp-spec)``).
 """
 
 from __future__ import annotations
@@ -293,9 +296,10 @@ class Placement:
 
 
 # --------------------------------------------------------------------------- #
-# Reserved slots — the tensor-core tile, operand pipelining, warp specialization.
-# Defined so the type system is complete (the schedule fields reference them); not
-# constructed by this cut.
+# The warp-tier descriptors — the tensor-core tile, operand pipelining, the warp split.
+# ``WarpTile`` (matmul) and ``Stage`` (cp.async / TMA) are built and materialized; ``WarpSpec``
+# (the WSPEC worker split) is pin-only this cut — its codec + schedule field land, but its
+# producer/consumer codegen is reserved (``# TODO(warp-spec)`` in lowering/kernel/010_materialize).
 # --------------------------------------------------------------------------- #
 
 

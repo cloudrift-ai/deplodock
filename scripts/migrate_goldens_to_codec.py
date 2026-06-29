@@ -15,9 +15,10 @@ recorded ``deplodock_us`` / ``cublas_us`` latencies are left untouched — they 
 measurements; re-tuning the set on hardware (``scripts/tune_golden_set.py`` / the ``tune-golden``
 skill) is a separate follow-up.
 
-``WARPSPEC`` (warp-specialization) has no codec yet — the ``WarpSpec`` schedule slot is reserved —
-so it is carried through as a passthrough boolean knob (it featurizes as a plain 0/1) until the
-warp-spec codec lands.
+The legacy boolean ``WARPSPEC`` knob in pre-rebuild goldens is distinct from the new ``WSPEC``
+role-split codec (which is pin-only and not yet featurized): old goldens predate the codec, so their
+``WARPSPEC`` 0/1 is carried through as a passthrough boolean knob until warp-spec materialization +
+featurization land.
 
 Usage::
 
