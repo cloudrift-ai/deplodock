@@ -20,8 +20,8 @@ The schedule of a reducing kind is **either** that kind's uniform (SIMT) schedul
 :class:`WarpSpec` (the warp-role pipeline, reserved). The pairing in the ``*Kernel``
 types makes a ``Monoid``-with-``MapSchedule`` mismatch unrepresentable.
 
-This module builds only the **uniform** arm; ``WarpTile`` / ``Stage`` / ``Channel`` /
-``WarpSpec`` are reserved slots (``# TODO``).
+This module builds the **uniform** arm (``ReducePlan`` / ``TilePlan`` / ``WarpTile`` /
+``Stage``); ``Channel`` / ``WarpSpec`` (warp specialization) are reserved slots (``# TODO``).
 """
 
 from __future__ import annotations
@@ -396,16 +396,78 @@ class WarpTile:
         return self.warps[0] * self.warps[1] * 32
 
 
+#: The codec transport token (``cp``) vs the canonical stored value (``cp.async``).
+_TRANSPORT_CODEC = {"sync": "sync", "cp": "cp.async", "tma": "tma"}
+_TRANSPORT_SPELL = {v: k for k, v in _TRANSPORT_CODEC.items()}
+
+
 @dataclass(frozen=True)
 class Stage:
-    """TODO(pipelining): one operand-transport pipeline over the serial reduce loop —
-    one ``Stage`` per reduce loop (a ``Monoid`` ⇒ one reduce axis ⇒ one pipeline).
-    Reserved; the scalar/cooperative tier loads gmem-direct (``depth=1``, ``sync``)."""
+    """One operand-transport pipeline over the serial reduce loop — one ``Stage`` per reduce
+    loop (a ``Monoid`` / ``Semiring`` ⇒ one reduce axis ⇒ one pipeline). The schedule's
+    operand-staging knob, decided in ``020_schedule`` and materialized in
+    ``010_materialize``.
 
-    depth: int = 1  # pipeline stages over the serial reduce loop (1 = no prefetch)
-    transport: str = "sync"  # sync | cp.async | tma
-    smem: tuple[str, ...] = ()  # operands staged through smem (empty = register-only)
+    A constructed ``Stage`` means staging is **on** (the reused gmem operands ride a shared-
+    memory slab); ``schedule.stage is None`` is the register / gmem-direct baseline (no
+    slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring]`` (decided in
+    ``020_schedule``). ``smem`` (the staged-operand buffer names) is **derived during
+    lowering** — the materializer stages the reused gmem reads — not spelled by the codec;
+    an empty ``smem`` means "stage every reused operand"."""
+
+    depth: int = 1  # pipeline stages over the serial reduce loop (1 = single buffer, no prefetch)
+    transport: str = "sync"  # sync | cp.async | tma (the gmem→smem producer)
+    smem: tuple[str, ...] = ()  # operands staged through smem (derived; not in the codec)
     ring: bool = False  # ring buffer vs static double-buffer
+
+    def __post_init__(self) -> None:
+        if self.transport not in _TRANSPORT_SPELL:
+            raise ValueError(f"bad Stage transport {self.transport!r} (expect sync | cp.async | tma)")
+        if self.depth < 1:
+            raise ValueError(f"Stage depth must be ≥ 1, got {self.depth}")
+        if self.ring and self.depth < 2:
+            raise ValueError("a ring buffer needs depth ≥ 2 (nothing to cycle at depth 1)")
+
+    @classmethod
+    def parse(cls, spec: str | None) -> Stage:
+        """Decode the ``STAGE`` knob codec into a stage: ``/``-separated tokens —
+        ``d<depth>`` (pipeline depth), ``sync`` | ``cp`` | ``tma`` (the transport), and an
+        optional ``ring`` flag. Empty / ``None`` = the depth-1 ``sync`` default (the caller
+        maps an empty ``STAGE`` to ``stage=None``, the gmem-direct baseline — ``parse`` is
+        only reached on a non-empty spec). ``smem`` is filled in later by the scheduler."""
+        spec = (spec or "").strip()
+        if not spec:
+            return cls()
+        depth = 1
+        transport = "sync"
+        ring = False
+        for raw in spec.split("/"):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if tok[0] == "d" and tok[1:].isdigit():
+                depth = int(tok[1:])
+            elif tok in _TRANSPORT_CODEC:
+                transport = _TRANSPORT_CODEC[tok]
+            elif tok == "ring":
+                ring = True
+            else:
+                raise ValueError(f"bad STAGE token {tok!r} (expect d<depth> / sync|cp|tma / ring)")
+        return cls(depth=depth, transport=transport, ring=ring)
+
+    def spell(self) -> str:
+        """The ``STAGE`` codec string for this stage (inverse of :meth:`parse`). ``smem`` is
+        derived, so it is not spelled."""
+        toks = [f"d{self.depth}", _TRANSPORT_SPELL[self.transport]]
+        if self.ring:
+            toks.append("ring")
+        return "/".join(toks)
+
+    @property
+    def is_async(self) -> bool:
+        """True for the asynchronous-copy transports (``cp.async`` / ``tma``) — the ones
+        that issue a commit/wait or mbarrier handshake rather than a plain ``__syncthreads``."""
+        return self.transport in ("cp.async", "tma")
 
 
 @dataclass(frozen=True)
@@ -458,15 +520,16 @@ class MonoidSchedule:
 
     Three **orthogonal** reduce-axis fields (kept distinct so they don't become a
     grab-bag): ``reduce`` (the :class:`ReducePlan` partition), ``warp_tile`` (the mma
-    operand tile — ``# TODO(warp)``, flash's inner QK/PV), ``stage`` (operand transport —
-    ``# TODO(pipelining)``). ``block`` are free axes resident in the CTA alongside the
-    cooperative lanes (strided-cooperative rows)."""
+    operand tile — flash's inner QK/PV, ``# TODO(warp-flash)``), ``stage`` (operand
+    transport — the :class:`Stage` smem pipeline, ``None`` = gmem-direct). ``block`` are
+    free axes resident in the CTA alongside the cooperative lanes (strided-cooperative
+    rows)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
-    warp_tile: WarpTile | None = None  # TODO(warp)
-    stage: Stage | None = None  # TODO(pipelining)
+    warp_tile: WarpTile | None = None  # TODO(warp-flash)
+    stage: Stage | None = None  # None = gmem-direct (no smem slab)
 
 
 @dataclass(frozen=True)
@@ -474,14 +537,15 @@ class SemiringSchedule:
     """A contraction (``Semiring``) kernel's schedule — the same orthogonal reduce-axis
     fields as :class:`MonoidSchedule` (``warp_tile`` is the matmul's mma tile), plus the
     free-axis output :class:`TilePlan` (``tile`` — the scalar register sub-tile, the
-    ``Scalar`` fragment of the matmul, decided by the ``TILE`` knob in ``020_schedule``)."""
+    ``Scalar`` fragment of the matmul, decided by the ``TILE`` knob in ``020_schedule``).
+    ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
     tile: TilePlan = field(default_factory=TilePlan)
-    warp_tile: WarpTile | None = None  # TODO(warp)
-    stage: Stage | None = None  # TODO(pipelining)
+    warp_tile: WarpTile | None = None  # TODO(warp-flash)
+    stage: Stage | None = None  # None = gmem-direct (no smem slab)
 
 
 # --------------------------------------------------------------------------- #

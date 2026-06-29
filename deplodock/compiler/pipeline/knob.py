@@ -523,6 +523,32 @@ def _cut_features(knobs: dict) -> dict[str, float]:
     return {"D_cut_roundtrip": math.log2(free) if (cut and free > 1.0) else 0.0}
 
 
+def _stage_features(knobs: dict) -> dict[str, float]:
+    """Engineered ``D_*`` features for the operand-staging decision (the ``STAGE`` codec
+    ``d<depth>/sync|cp|tma[/ring]``). The prior prices the smem pipeline: a deeper / async
+    transport trades smem footprint + a fill prologue for K-loop overlap. Absent / empty
+    ``STAGE`` (the gmem-direct baseline) contributes nothing (``{}``); a present codec emits
+    the pipeline depth and a small transport one-hot so the model separates the synchronous
+    smem copy from cp.async from TMA. Read schema-agnostically off the raw codec, exactly as
+    ``_reduce_decomp`` reads ``REDUCE`` — so a ``d2/cp`` stage featurizes identically on a
+    scalar (``TILE``) and a warp (``WARP``) contraction (the cross-kind feature transfer)."""
+    spec = knobs.get("STAGE")
+    if not spec:
+        return {}
+    from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
+
+    try:
+        st = Stage.parse(spec)
+    except ValueError:
+        return {}
+    return {
+        "D_stage_depth": float(st.depth),
+        "D_stage_async": 1.0 if st.is_async else 0.0,
+        "D_stage_tma": 1.0 if st.transport == "tma" else 0.0,
+        "D_stage_ring": 1.0 if st.ring else 0.0,
+    }
+
+
 def knob_features(knobs: dict) -> dict[str, float]:
     """Convert a knob dict into a flat numeric feature vector for the (future)
     learned planner prior — the single featurizer over the whole dict.
@@ -583,6 +609,7 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # skewed-vs-square warp tile per shape — the fp16 mis-pick).
     if is_warp(knobs):
         feats.update(_warp_tile_features(knobs, feats.get("MMA_atom_m"), feats.get("MMA_atom_n")))
+    feats.update(_stage_features(knobs))  # operand-staging pipeline (STAGE codec); {} when gmem-direct
     if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
         feats.update(_cut_features(knobs))
     return feats
@@ -661,8 +688,26 @@ def tile_signature(knobs: dict) -> tuple:
     signatures are the same kernel variant whichever schema spelled them, so this is
     the bridge for matching a legacy-recorded golden YAML against the native
     enumeration's candidate rows (``scripts/golden_knob_heuristics.py`` /
-    ``search/analytic.evaluate_golden``)."""
-    return (_free_slots(knobs), _reduce_decomp(knobs), mma_atom(knobs))
+    ``search/analytic.evaluate_golden``). Operand staging (the ``STAGE`` codec) is part of the
+    identity — a staged and a gmem-direct config are different variants — but defaults to
+    ``None`` when absent, so a legacy golden (no ``STAGE``) still matches a native unstaged
+    candidate (both ``None``)."""
+    return (_free_slots(knobs), _reduce_decomp(knobs), mma_atom(knobs), _stage_sig(knobs))
+
+
+def _stage_sig(knobs: dict) -> tuple | None:
+    """The structural staging identity ``(depth, transport, ring)`` for ``tile_signature``, or
+    ``None`` when ``STAGE`` is absent / empty (the gmem-direct baseline)."""
+    spec = knobs.get("STAGE")
+    if not spec:
+        return None
+    from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
+
+    try:
+        st = Stage.parse(spec)
+    except ValueError:
+        return None
+    return (st.depth, st.transport, st.ring)
 
 
 def _geom_feats(

@@ -45,7 +45,7 @@ def test_bool_pretty():
 
 
 def test_binmask_parse_binary_string():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     # char i = bit i (left-to-right reads as buffer rank 0..n-1)
     assert k.parse("101", width=3) == 0b101
     assert k.parse("000", width=3) == 0
@@ -53,33 +53,33 @@ def test_binmask_parse_binary_string():
 
 
 def test_binmask_parse_keywords():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.parse("all", width=3) == 0b111
     assert k.parse("all", width=5) == 0b11111
     assert k.parse("none", width=3) == 0
 
 
 def test_binmask_parse_int_clamps_to_width():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.parse("0xFFFF", width=3) == 0b111
     assert k.parse("5", width=3) == 0b101
 
 
 def test_binmask_pretty():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.pretty(0b101, width=3) == "101"
     assert k.pretty(0, width=3) == "000"
     assert k.pretty(0b111, width=3) == "111"
 
 
 def test_binmask_roundtrip():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     for mask in range(16):
         assert k.parse(k.pretty(mask, width=4), width=4) == mask
 
 
 def test_binmask_requires_width():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     with pytest.raises(ValueError, match="width"):
         k.parse("101")
     with pytest.raises(ValueError, match="width"):
@@ -88,7 +88,7 @@ def test_binmask_requires_width():
 
 def test_env_property():
     assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
-    assert Knob("STAGE", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
+    assert Knob("MASK", KnobType.BINMASK).env == "DEPLODOCK_MASK"
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +133,8 @@ def test_narrow_bool(monkeypatch):
 
 
 def test_narrow_binmask_rejected(monkeypatch):
-    k = Knob("STAGE", KnobType.BINMASK)
-    monkeypatch.setenv("DEPLODOCK_STAGE", "111")
+    k = Knob("MASK", KnobType.BINMASK)
+    monkeypatch.setenv("DEPLODOCK_MASK", "111")
     with pytest.raises(ValueError, match="BINMASK"):
         k.narrow((0b000, 0b111))
 
@@ -306,7 +306,7 @@ def test_parse_knob_spec_grammar():
     whitespace tolerated, empties skipped, values kept as raw strings."""
     from deplodock.compiler.pipeline.knob import parse_knob_spec
 
-    assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=110 ") == {"BK": "2", "BM": "16", "STAGE": "110"}
+    assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=d2/cp ") == {"BK": "2", "BM": "16", "STAGE": "d2/cp"}
     assert parse_knob_spec("") == {}
     with pytest.raises(ValueError, match="missing '='"):
         parse_knob_spec("BK2")
@@ -337,15 +337,28 @@ def test_knob_features_typed_knobs(monkeypatch):
         {
             "BN": Knob("BN", KnobType.INT),
             "FLAG": Knob("FLAG", KnobType.BOOL),
-            "STAGE": Knob("STAGE", KnobType.BINMASK),
+            "MASK": Knob("MASK", KnobType.BINMASK),
         },
     )
-    feats = knob_features({"BN": 64, "FLAG": True, "STAGE": "101"})
+    feats = knob_features({"BN": 64, "FLAG": True, "MASK": "101"})
     assert feats["BN"] == 64.0
     assert feats["FLAG"] == 1.0
-    assert feats["STAGE_popcount"] == 2.0
-    assert feats["STAGE_width"] == 3.0
-    assert feats["STAGE_frac"] == 2 / 3
+    assert feats["MASK_popcount"] == 2.0
+    assert feats["MASK_width"] == 3.0
+    assert feats["MASK_frac"] == 2 / 3
+
+
+def test_knob_features_stage_codec():
+    """The ``STAGE`` codec (``d<depth>/sync|cp|tma[/ring]``) featurizes to the ``D_stage_*``
+    family; an absent / gmem-direct stage contributes nothing."""
+    feats = knob_features({"STAGE": "d3/tma/ring"})
+    assert feats["D_stage_depth"] == 3.0
+    assert feats["D_stage_async"] == 1.0
+    assert feats["D_stage_tma"] == 1.0
+    assert feats["D_stage_ring"] == 1.0
+    sync = knob_features({"STAGE": "d2/cp"})
+    assert sync["D_stage_depth"] == 2.0 and sync["D_stage_async"] == 1.0 and sync["D_stage_tma"] == 0.0
+    assert not any(k.startswith("D_stage_") for k in knob_features({"STAGE": ""}))
 
 
 def test_knob_features_mma_expansion():

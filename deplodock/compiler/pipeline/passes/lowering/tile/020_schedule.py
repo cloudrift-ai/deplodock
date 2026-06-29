@@ -31,7 +31,7 @@ from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
-from deplodock.compiler.ir.tile.schedule import WarpTile
+from deplodock.compiler.ir.tile.schedule import Stage, WarpTile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 
@@ -78,6 +78,21 @@ WARP = Knob(
     "WARP",
     KnobType.STR,
     help="Tensor-core warp-tile codec (a:<atom>/w<WM>xw<WN>/f<FM>xf<FN>/k<bk>; empty=scalar). "
+    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
+    off="",
+)
+
+# Operand staging is decided HERE too, by the single ``STAGE`` codec knob — the reused gmem
+# operands (matmul A/B, a fused prologue's read) ride a shared-memory slab + double-buffered
+# producer (``sync`` plain copy / ``cp.async`` / ``tma``) over the serial reduce loop, instead
+# of the gmem-direct register baseline. Resolved here into the schedule's :class:`Stage`
+# (``None`` = gmem-direct); the codec also rides on ``TileOp.knobs`` for the prior. ``STAGE`` is
+# pin-only this cut (the prior auto-fork is a follow-up, as ``WARP``/``TILE``'s is). Composes
+# with both the scalar register-tile (``TILE``) and the warp (``WARP``) tier.
+STAGE = Knob(
+    "STAGE",
+    KnobType.STR,
+    help="Operand-staging codec (d<depth>/sync|cp|tma[/ring]; empty=gmem-direct). "
     "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
     off="",
 )
@@ -204,26 +219,44 @@ def _warp_spec(kernel) -> str:
     return WARP.narrow([""])[0]
 
 
-def _warp_option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+def _stage_spec(kernel) -> str:
+    """The pinned ``STAGE`` codec for ``kernel`` — only a ``Semiring`` contraction stages its
+    operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
+    returns the authoritative ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (gmem-direct,
+    ``stage=None``)."""
+    if not isinstance(kernel, SemiringKernel):
+        return ""
+    return STAGE.narrow([""])[0]
+
+
+def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the
-    ``WARP`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment). The codec is
+    ``WARP`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment), plus an
+    optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The codec is
     exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
     learned-prior featurizer already reads (the codec stays the pin/display spelling)."""
     wt = WarpTile.parse(spec)
-    sched = replace(kernel.schedule, place=place, warp_tile=wt)
+    stage = Stage.parse(stage_spec) if stage_spec else None
+    sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage)
     (wm, wn), (fm, fn) = wt.warps, wt.reg
     stamped = {**knobs, WARP.name: spec, "ATOM@out": wt.atom.name, "WM": wm, "WN": wn, "FM": fm, "FN": fn, "BK": wt.bk}
+    if stage_spec:
+        stamped[STAGE.name] = stage_spec
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
 
 
-def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "") -> TileOp:
+def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
     """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
     resolved into the schedule's ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the
-    orthogonal ``ReducePlan``), the specs stamped on ``knobs`` for the prior."""
-    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec), reduce=ReducePlan.parse(reduce_spec))
+    orthogonal ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the specs
+    stamped on ``knobs`` for the prior."""
+    stage = Stage.parse(stage_spec) if stage_spec else None
+    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec), reduce=ReducePlan.parse(reduce_spec), stage=stage)
     stamped = {**knobs, TILE.name: spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec
+    if stage_spec:
+        stamped[STAGE.name] = stage_spec
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
 
 
@@ -247,10 +280,11 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # A ``WARP`` pin selects the tensor-core warp tier and wins over ``TILE`` (the either-ness);
     # without it the scalar register-tile (``TILE``) path runs.
     if isinstance(kernel, SemiringKernel):
+        stage_spec = _stage_spec(kernel)
         warp = _warp_spec(kernel)
         if warp:
-            return _warp_option(kernel, place, warp, tile.name, tile.knobs)
+            return _warp_option(kernel, place, warp, tile.name, tile.knobs, stage_spec)
         reduce_spec = _semiring_reduce_spec()
-        return [_tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec) for spec in _tile_specs(kernel)]
+        return [_tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec, stage_spec) for spec in _tile_specs(kernel)]
     specs = _reduce_specs(kernel, place)
     return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]
