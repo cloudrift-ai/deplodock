@@ -37,13 +37,15 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
+from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import MonoidKernel, SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -352,6 +354,176 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     return KernelOp(body=Body((bound,)), name=tile.name)
 
 
+# --------------------------------------------------------------------------- #
+# The warp (tensor-core mma) tier — a ``Semiring`` contraction's ``WarpTile`` fragment.
+# --------------------------------------------------------------------------- #
+
+
+def _idx_vars(index) -> set[str]:
+    """Every free Var name across an index tuple's exprs."""
+    return {v for e in index for v in e.free_vars()}
+
+
+def _axis_base(block: str, warp: str, n_warp: int, n_reg: int, atom_dim: int, r: int):
+    """The base coordinate (NO atom/lane offset) of register cell ``r`` along one free axis:
+    ``block·(n_warp·n_reg·atom_dim) + warp·(n_reg·atom_dim) + r·atom_dim``. The atom-lane
+    offset is added at render (inside ``dpl_mma_load_*`` / ``RegStore``), so it stays out of σ
+    — the four-way GRID/WARP/REGISTER/ATOM split with the ATOM term omitted."""
+    tile = n_warp * n_reg * atom_dim
+    e = BinaryExpr("*", Var(block), Literal(tile, "int"))
+    e = BinaryExpr("+", e, BinaryExpr("*", Var(warp), Literal(n_reg * atom_dim, "int")))
+    return BinaryExpr("+", e, Literal(r * atom_dim, "int"))
+
+
+def _warp_roles(index, m_name: str, n_name: str) -> tuple[str, ...]:
+    """Per-dim epilogue-load role: ``"m"`` / ``"n"`` for a dim varying with the output row /
+    col axis, else ``"fixed"`` (batch / grid literal — uniform across the fragment cell)."""
+    roles = []
+    for e in index:
+        fv = e.free_vars()
+        roles.append("m" if m_name in fv else "n" if n_name in fv else "fixed")
+    return tuple(roles)
+
+
+def _warp_epilogue(pre: list[Stmt], tail: list[Stmt], acc: str, m_name: str, n_name: str, sigma: Sigma) -> RegEpilogue | None:
+    """Fold the projection ``Map`` into a :class:`RegEpilogue` for cell ``sigma``. ``None`` when
+    there is no projection (a bare ``Write`` of the accumulator).
+
+    The projection is the ``lower`` stmts straddling the K reduce loop: ``pre`` — the
+    loop-invariant scalar leaf ``Load``s the lift parks above the loop (a fused matmul's scale /
+    mask constants) — plus ``tail`` — the post-reduce leaf ``Load``s + pointwise ``Assign``s +
+    an optional causal ``Select``. Each leaf ``Load`` becomes an :class:`EpilogueLoad` at the
+    cell-base coordinate (σ-applied; the render adds the per-element row/col motion on the
+    ``m``/``n`` dims); each ``Assign`` becomes an ``(name, op, args)`` op; a coord-predicated
+    ``Select`` (causal mask) rewrites its ``m``/``n`` coordinate vars to the ``__M__`` / ``__N__``
+    placeholders the store substitutes with the element's own (row, col)."""
+    loads, ops, selects = [], [], []
+    write = None
+    ph = {m_name: Var("__M__"), n_name: Var("__N__")}
+    for s in (*pre, *tail):
+        if isinstance(s, Load):
+            loads.append(
+                EpilogueLoad(
+                    name=s.names[0], buffer=s.input, index=tuple(sigma.apply(e) for e in s.index), roles=_warp_roles(s.index, m_name, n_name)
+                )
+            )
+        elif isinstance(s, Assign):
+            ops.append((s.name, s.op.name, tuple(s.args)))
+        elif isinstance(s, Select):
+            selects.append((s.name, tuple((br.select.substitute(ph), br.value) for br in s.branches)))
+        elif isinstance(s, Write):
+            write = s
+    if write is None or (not ops and not selects):
+        return None
+    return RegEpilogue(acc=acc, loads=tuple(loads), ops=tuple(ops), result=write.value, selects=tuple(selects))
+
+
+def _warp(tile: TileOp, root: Node) -> KernelOp:
+    """Materialize a tensor-core (mma) contraction (the ``WARP`` codec): the CTA runs ``WM·WN``
+    warps over a ``tile_m × tile_n`` output block, each warp owning an ``FM × FN`` block of
+    ``atom`` cells. Free axes split four ways (GRID block / WARP / REGISTER / ATOM); the block +
+    warp + register offsets ride σ, the atom-lane offset is decoded at render inside the
+    ``dpl_mma_load_*`` / ``RegStore`` helpers (so a ``Tile`` of ``[m_b, n_b, m_w, n_w, lane32]``
+    with ``block_threads = WM·WN·32`` binds threads to lanes). Per register cell: a persistent
+    f32 ``RegFragment`` accumulator + a K loop of gmem-direct ``LdmatrixLoad`` a/b + ``MmaSyncPtx``,
+    then a ``RegStore`` (fused projection epilogue + masked-tile guards). Gmem-direct, single
+    launch, static K (symbolic K needs the staged zero-fill — out of scope, bails)."""
+    kernel = tile.kernel
+    node = tile.op
+    carrier = node.reduce_node
+    wt = kernel.schedule.warp_tile
+    atom = wt.atom
+    atom_m, atom_n, atom_k = atom.shape
+    wm, wn = wt.warps
+    fm, fn = wt.reg
+    grid = list(kernel.schedule.place.grid)
+    if len(grid) < 2:
+        raise LoweringError("warp tier: contraction output needs an (m, n) grid")
+    m_axis, n_axis = grid[-2], grid[-1]
+    k_axis = carrier.reduce_axis
+    if not k_axis.extent.is_static:
+        raise LoweringError("warp tier: symbolic-K mma can't lower gmem-direct (no K zero-fill) — needs staging")
+
+    full = _with_store(lower(node), root.output.name, grid, node)
+    ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == k_axis.name)
+    pre, rloop, tail = list(full[:ridx]), full[ridx], list(full[ridx + 1 :])
+    # The lift parks loop-invariant scalar leaf Loads (a fused matmul's scale / mask constants)
+    # above the K loop — fold them into the epilogue. A non-Load prologue (a staged slab fill) is
+    # out of scope (gmem-direct, no staging).
+    if any(not isinstance(s, Load) for s in pre):
+        raise LoweringError("warp tier: a contraction compute prologue isn't supported (gmem-direct, no staging)")
+    rbody = list(rloop.body)
+    loads = [s for s in rbody if isinstance(s, Load)]
+    a_load = next((s for s in loads if m_axis.name in _idx_vars(s.index)), None)
+    b_load = next((s for s in loads if n_axis.name in _idx_vars(s.index)), None)
+    write = next((s for s in tail if isinstance(s, Write)), None)
+    acc = next((s.name for s in rbody if isinstance(s, Accum)), None)
+    if a_load is None or b_load is None or write is None or acc is None:
+        raise LoweringError("warp tier: unrecognised contraction body (expected A/B loads + Accum + Write)")
+    b_trans = k_axis.name in b_load.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
+
+    tile_m, tile_n = wt.tile_m, wt.tile_n
+    mask_m = not (m_axis.extent.is_static and m_axis.extent.as_static() % tile_m == 0)
+    mask_n = not (n_axis.extent.is_static and n_axis.extent.as_static() % tile_n == 0)
+    m_b, n_b = f"{m_axis.name}_wb", f"{n_axis.name}_wb"
+    m_w, n_w = f"{m_axis.name}_ww", f"{n_axis.name}_ww"
+    base_m = lambda r: _axis_base(m_b, m_w, wm, fm, atom_m, r)  # noqa: E731
+    base_n = lambda r: _axis_base(n_b, n_w, wn, fn, atom_n, r)  # noqa: E731
+
+    # Per register cell (i, j): operand fragments dedup across the OTHER axis (A on m only,
+    # B on n only — the arithmetic-intensity reuse), the C accumulator is per (i, j).
+    decls: list[Stmt] = []
+    for i in range(fm):
+        decls.append(RegFragment(name=f"_a{i}", role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
+    for j in range(fn):
+        decls.append(RegFragment(name=f"_b{j}", role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
+    for i in range(fm):
+        for j in range(fn):
+            decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
+
+    chain: list[Stmt] = []
+    for i in range(fm):
+        idx = tuple(Sigma({m_axis.name: base_m(i)}).apply(e) for e in a_load.index)
+        guard = (base_m(i), _extent_expr(m_axis)) if mask_m else None
+        chain.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard))
+    for j in range(fn):
+        idx = tuple(Sigma({n_axis.name: base_n(j)}).apply(e) for e in b_load.index)
+        guard = (base_n(j), _extent_expr(n_axis)) if mask_n else None
+        chain.append(
+            LdmatrixLoad(frag=f"_b{j}", src_buffer=b_load.input, src_index=idx, role="b", staged=False, b_trans=b_trans, gmem_guard=guard)
+        )
+    for i in range(fm):
+        for j in range(fn):
+            chain.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
+    kloop = StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom_k, "int"), body=Body(tuple(chain)), unroll=True)
+
+    stores: list[Stmt] = []
+    for i in range(fm):
+        for j in range(fn):
+            sigma = Sigma({m_axis.name: base_m(i), n_axis.name: base_n(j)})
+            stores.append(
+                RegStore(
+                    dst_buffer=write.output,
+                    dst_index=tuple(sigma.apply(e) for e in write.index),
+                    frag=f"_c{i}_{j}",
+                    shape=atom.shape,
+                    epilogue=_warp_epilogue(pre, tail, acc, m_axis.name, n_axis.name, sigma),
+                    m_guard=(base_m(i), _extent_expr(m_axis)) if mask_m else None,
+                    n_guard=(base_n(j), _extent_expr(n_axis)) if mask_n else None,
+                )
+            )
+
+    axes = (
+        _shrink_axis(Axis(name=m_b, extent=m_axis.extent, source_axis=m_axis), tile_m),
+        _shrink_axis(Axis(name=n_b, extent=n_axis.extent, source_axis=n_axis), tile_n),
+        Axis(name=m_w, extent=wm),
+        Axis(name=n_w, extent=wn),
+        Axis(name="_lane", extent=32),
+    )
+    bound = Tile(axes=axes, body=Body((*decls, kloop, *stores)), block_threads=wt.block_threads)
+    return KernelOp(body=Body((bound,)), name=tile.name)
+
+
 def rewrite(match: Match, root: Node) -> KernelOp | None:
     tile: TileOp = root.op
     kernel = tile.kernel
@@ -360,9 +532,12 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # request is a bug — the materializer only lowers single-launch kernels.
     rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
+    # Warp (tensor-core mma) tier: a Semiring contraction carrying a WarpTile fragment.
+    sched = kernel.schedule
+    if isinstance(kernel, SemiringKernel) and getattr(sched, "warp_tile", None) is not None:
+        return _warp(tile, root)
     # Register-tile tier: a Semiring contraction whose ``TILE`` plan tiles the output (each
     # thread owns a reg_m×reg_n register block of cells, operands reused across them).
-    sched = kernel.schedule
     tplan = getattr(sched, "tile", None) if isinstance(kernel, SemiringKernel) else None
     if tplan is not None and tplan.is_tiled:
         return _reg_tile(tile, root)
