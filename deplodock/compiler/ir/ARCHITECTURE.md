@@ -221,20 +221,22 @@ of truth for the seed. `State.other` is the second-operand names `"<n>__o"` the 
 combine reads. `carried_names()` / `defines()` return `state.names`; `deps()` / `partial_deps()`
 return `partial` (the carried read is implicit, like `Accum` / `Mma`).
 
-**The `Twist` — the part that varies, extracted from the algebra.** Transport of structure: a
+**The `Twist` — the part that varies, generated not hand-authored.** Transport of structure: a
 monoid `(·, e)` conjugated by a bijection ψ gives the twisted combine `x ⊕ y = ψ(ψ⁻¹(x) · ψ⁻¹(y))`.
-The monoid algebra above is shared; ψ is the twist, held on `Monoid.twist` **as data** — `merge`
-(fold one partial into the state, the streaming reduce step — a mix of `Assign` rescales/temps and
-`Accum` folds) and `combine_states` (the state-merges-state form the cross-partition combine needs —
-cooperative-tree / split-KV / split-K reduce, reading the second operand named by `state_b`). ψ lives
-entirely in those programs — a plain reduction's identity twist (`Twist.degenerate`: componentwise
-`state_i = op_i(state_i, partial_i)`, used by `Accum.as_monoid`), online softmax's max-rescale, a
-future mma-fragment realization — all the *same* monoid, differing only in the combine.
-`Monoid.__post_init__` completes the twist against the state (defaults `state_b`; auto-derives
-`combine_states` from `merge` for an additive carrier whose partial lifts to a state; an asymmetric
-monoid like flash's LSE authors both on the twist via `lowering/tile/_flash.flash_combine`).
-`as_state_merge(other)` returns a one-shot `Monoid` whose `merge` IS `combine_states`, so a
-two-partition merge renders through the same machinery as a streaming step. **Example** — flash
+The monoid algebra above is shared; ψ is the twist, carried on `Monoid.twist` **as data** in one of
+two modes. In **SPEC mode** the twist is a name-free `(family, channels)` — a tuple of `Channel`s
+(`fold` ⊕, `term`, `lift` ⊗) — and the combine *programs* are GENERATED on demand by the
+mode-dispatching accessors `monoid.merge` (streaming fold) / `.combine_states` (cross-partition
+state⊕state, reading the `state_b` operand `"<n>__o"`) / `.state_b`. Generation (`ir/stmt/carrier.py`)
+builds the naive `ψ∘base∘(ψ⁻¹×ψ⁻¹)` combine — associativity inherited from the base monoid for free —
+then a per-family stabilizer rewrites it to the numerically-stable form (distribute the ψ-rescale,
+fuse exponentials, fold identities, DCE/CSE) and a structural certificate asserts every surviving
+`exp` has a `≤ 0` argument. `family="exp"` is the online-softmax / flash log-sum-exp carrier (built
+from `pivot`/`denom`/`expect` channels — softmax is flash minus the `expect` channel); `family="id"`
+is the degenerate identity twist (a plain reduce, `Accum.as_monoid`). In **BOUND mode**
+(`family is None`) the programs are stored verbatim — used only by `as_state_merge(other)`, the
+one-shot finalize `Monoid` whose `merge` IS its `combine_states` (regenerated with temps keyed on
+`other[0]`), so a two-partition merge renders through the same machinery as a streaming step. **Example** — flash
 attention's online softmax (the log-sum-exp monoid): state `(m, l, O)`, partial `(score, value)`,
 identity `(−inf, 0, 0)`, merge `m_new=max(m,s); alpha=exp(m−m_new); l=l·alpha+exp(s−m_new);
 O=O·alpha+exp(s−m_new)·v; m=m_new`.
