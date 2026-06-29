@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F16
+from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
@@ -140,3 +140,82 @@ def test_static_dynamic_mma_parity(shape_mode, transport, M):
     assert got.shape == (M, _N)
     diff = np.abs(got - want).max()
     assert diff < 5e-2, f"{shape_mode}/{transport} M={M}: max abs err {diff}"
+
+
+# --- cp.async staging invariants (the landed warp-staging path) -------------
+# The parity sweep above asserts the staged path is *accurate*; these two pin the
+# properties that sweep can't: that staging is a pure perf transform (bit-identical
+# to gmem-direct) and that the bf16 atom stages too (the cp.async byte-width path
+# must handle the 2-byte operand, not just f16). Both pin the cp.async transport
+# only (`STAGE=d2/cp`); TMA / scalar / depth>1 are deferred and out of scope here.
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+@pytest.mark.parametrize("M", [128, 256])
+def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
+    """cp.async operand staging is a PURE perf transform: the staged kernel
+    (``STAGE=d2/cp``) must produce **bit-identical** output to the gmem-direct
+    baseline (same ``WARP`` tile, no ``STAGE``) on the same inputs — and actually
+    stage (cp.async + smem slab) where the baseline does not. Guards against a
+    staging-fill bug that perturbs the result, and against the pin silently
+    no-op'ing to gmem-direct."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    rng = np.random.default_rng(0)
+    a = (rng.standard_normal((M, _K)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((_K, _N)) * 0.1).astype(np.float16)
+
+    def _run(stage: str | None) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("DEPLODOCK_WARP", _WARP_CODEC)
+        if stage:
+            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+        else:
+            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+        be = CudaBackend()
+        compiled = be.compile(_mma_graph("static", M=M))
+        src = compiled.nodes["o"].op.kernel_source
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, src
+
+    staged, staged_src = _run("d2/cp")
+    gmem, gmem_src = _run(None)
+    assert "cp.async" in staged_src and "__shared__" in staged_src, "STAGE=d2/cp must stage via a cp.async smem slab"
+    assert "cp.async" not in gmem_src, "the gmem-direct baseline must not stage"
+    np.testing.assert_array_equal(staged, gmem)  # bit-identical: staging perturbs nothing
+    want = a.astype(np.float32) @ b.astype(np.float32)
+    assert np.abs(staged.astype(np.float32).reshape(M, _N) - want).max() < 5e-2
+
+
+@pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
+def test_bf16_operands_stage_via_cp_async(monkeypatch):
+    """The bf16 MMA atom (``mma_m16n8k16_bf16``) stages through cp.async and stays
+    accurate vs torch — the cp.async byte-width fill must handle the 2-byte bf16
+    operand, the same width as f16 but a distinct atom/dtype path. (No native numpy
+    bf16: feed the bits as uint16 and reinterpret the uint16 output, per
+    ``test_flash_tensorcore_generated``.)"""
+    import torch  # noqa: PLC0415
+
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_bf16/w2xw2/f2xf2/k2")
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
+    M = 256
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, _K), dtype=BF16), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (_K, _N), dtype=BF16), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (M, _N), dtype=BF16), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+    be = CudaBackend()
+    compiled = be.compile(g)
+    src = compiled.nodes["o"].op.kernel_source
+    assert "cp.async" in src and "mma.sync.aligned.m16n8k16" in src, "bf16 operands must stage on the mma tier"
+    assert "cp.async.bulk.tensor" not in src, "cp.async transport must not emit TMA"
+    torch.manual_seed(0)
+    qa = (torch.randn(M, _K) * 0.1).to(torch.bfloat16)
+    qb = (torch.randn(_K, _N) * 0.1).to(torch.bfloat16)
+    data = {"a": qa.view(torch.uint16).numpy(), "b": qb.view(torch.uint16).numpy()}
+    got_bits = np.asarray(be.run(compiled, input_data=data)[0].outputs["o"]).astype(np.uint16)
+    got = torch.from_numpy(got_bits).view(torch.bfloat16).float().numpy().reshape(M, _N)
+    want = (qa.float() @ qb.float()).numpy()
+    diff = float(np.abs(got - want).max())
+    assert diff < 1e-1, f"bf16 staged mma mismatch (max abs err {diff})"
