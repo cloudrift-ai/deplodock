@@ -17,9 +17,12 @@ full-row reductions like online-softmax & RMSNorm, contractions, symbolic axes) 
 The selection here is **conservative module constants** standing in for the eventual
 ``REDUCE`` knob + prior-driven choice. ``# TODO``: replace the constants with
 ``knob.py::_reduce_decomp`` (BR→coop, BK→serial, FK→reg, SPLITK→cta) + the learned /
-analytic prior. Strided-cooperative rows (a small whole free axis packed alongside the
-coop lanes), the ``reg`` (ILP) fold, the cross-CTA ``cta`` split (``030_split``), the
-symbolic-axis cooperative tier, and flash cooperative-KV remain future steps.
+analytic prior. The cross-CTA ``g<n>`` split (``030_split``) and the ``r<n>`` (ILP) reg
+fold are built and honored for an additive carrier via an explicit ``REDUCE`` pin (the
+split emits the partial + finalize kernels / atomicAdd; the reg fold emits the ILP
+accumulators). Strided-cooperative rows (a small whole free axis packed alongside the coop
+lanes), the symbolic-axis cooperative tier, the twisted-carrier (flash) cross-CTA split,
+and flash cooperative-KV remain future steps.
 """
 
 from __future__ import annotations
@@ -102,6 +105,7 @@ _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this w
 _SERIAL_TARGET = 8  # aim for ~this many serial steps per cooperating thread
 _MAX_COOP = 256  # cap on cooperative threads per CTA (power of two)
 _FREE_CAP = 256  # only cooperate when the output grid is at most this many cells (under-occupied)
+_MAX_BLOCK_THREADS = 1024  # CUDA hardware limit on threads per CTA (guards an oversized TILE parallel tile)
 
 
 def _hint_extent(ax) -> int:
@@ -239,6 +243,28 @@ def _stage_spec(kernel) -> str:
     return pinned
 
 
+def _check_warp_static_k(kernel, wt) -> None:
+    """Reject a warp pin whose **static** contraction K is not a multiple of the inner mma
+    K-step (``atom_k · bk``). The warp K-loop has no static-K tail handling — a partial final
+    K-step reads past the operand and silently corrupts the result (max error ≫ tol, yet the
+    output's *mean* error stays small so the accuracy gate passes it). A **symbolic** K is
+    fine: it reaches the masked tier (ceil-div grid + boundary ``Cond`` + zero-filled partial
+    slab), so guard only the static case. Raising here surfaces a clean compile error instead
+    of a numerically-wrong kernel."""
+    ext = kernel.op.reduce_node.reduce_axis.extent
+    if not ext.is_static:
+        return
+    k = ext.as_static()
+    step = wt.atom.atom_k * wt.bk
+    if k % step:
+        raise ValueError(
+            f"WARP pin K-step {step} (atom_k={wt.atom.atom_k}·bk={wt.bk}) does not divide the "
+            f"static contraction K={k}; the warp K-loop has no static-K tail masking yet, so a "
+            f"partial final step corrupts the result. Pin a K that is a multiple of {step}, or "
+            f"drop the WARP pin to use the scalar tier."
+        )
+
+
 def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the
     ``WARP`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment), plus an
@@ -246,6 +272,7 @@ def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: s
     exploded into the on-dict ``ATOM@`` / ``WM`` / ``WN`` / ``FM`` / ``FN`` / ``BK`` keys the
     learned-prior featurizer already reads (the codec stays the pin/display spelling)."""
     wt = WarpTile.parse(spec)
+    _check_warp_static_k(kernel, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
     sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage)
     (wm, wn), (fm, fn) = wt.warps, wt.reg
@@ -261,7 +288,18 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
     orthogonal ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the specs
     stamped on ``knobs`` for the prior."""
     stage = Stage.parse(stage_spec) if stage_spec else None
-    sched = replace(kernel.schedule, place=place, tile=TilePlan.parse(spec), reduce=ReducePlan.parse(reduce_spec), stage=stage)
+    plan = TilePlan.parse(spec)
+    # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
+    # each owning a ``reg_n · reg_m`` register sub-tile). Reject a parallel tile over the
+    # 1024-thread/CTA hardware limit — otherwise the launch fails late with an opaque
+    # ``CUDA_ERROR_INVALID_VALUE`` instead of a clear compile-time error.
+    block = plan.par_n * plan.par_m
+    if block > _MAX_BLOCK_THREADS:
+        raise ValueError(
+            f"TILE parallel block {plan.par_n}×{plan.par_m}={block} threads exceeds the "
+            f"{_MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
+        )
+    sched = replace(kernel.schedule, place=place, tile=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)
     stamped = {**knobs, TILE.name: spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec

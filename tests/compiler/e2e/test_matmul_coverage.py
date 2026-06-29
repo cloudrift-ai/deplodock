@@ -881,6 +881,63 @@ def test_mma_splitk_finalize(monkeypatch, finalize):
 
 
 # =========================================================================== #
+# Compile-time schedule guards — pins that would silently lower to a wrong / un-launchable
+# kernel. Run the TILE pass only (no GPU): the schedule rejects the pin with a clear
+# ``ValueError`` instead of corrupting numerics (warp static-K tail) or failing the launch
+# (oversized TILE parallel block).
+# =========================================================================== #
+
+
+def _guard_mm_graph(M, N, K, *, dtype=F16) -> Graph:
+    g = Graph()
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=dtype), node_id="a")
+    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=dtype), node_id="b")
+    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("o", (M, N), dtype=dtype), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+    return g
+
+
+def _run_tile_pass(graph: Graph):
+    return Pipeline.build(TILE_PASSES).run(graph, ctx=Context.from_target((12, 0)))
+
+
+def test_warp_static_k_indivisible_rejected(monkeypatch) -> None:
+    """A WARP pin whose static K is not a multiple of ``atom_k·bk`` is rejected — the warp
+    K-loop has no static-K tail masking, so lowering it would silently corrupt the result (the
+    error the accuracy gate's mean-error escape clause misses)."""
+    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")  # K-step 16
+    with pytest.raises(ValueError, match="does not divide the static contraction K=100"):
+        _run_tile_pass(_guard_mm_graph(128, 128, 100))
+
+
+def test_warp_static_k_divisible_ok(monkeypatch) -> None:
+    """The same pin on a K that IS a multiple of the K-step lowers without the guard firing."""
+    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k1")
+    _run_tile_pass(_guard_mm_graph(128, 128, 128))  # 128 % 16 == 0 — no raise
+
+
+def test_warp_symbolic_k_not_guarded(monkeypatch) -> None:
+    """A symbolic K reaches the masked tier (ceil-div grid + zero-filled partial slab), so the
+    static-K guard does not fire even when the hint is not a K-step multiple."""
+    monkeypatch.setenv("DEPLODOCK_WARP", "a:mma_m16n8k16_f16/w1xw1/f1xf1/k2")  # K-step 32
+    _run_tile_pass(_guard_mm_graph(64, 128, Dim("seq_len")))  # symbolic K — no raise
+
+
+def test_tile_block_over_thread_limit_rejected(monkeypatch) -> None:
+    """A TILE parallel tile over the 1024-thread/CTA limit is rejected at compile time instead
+    of failing the launch with an opaque ``CUDA_ERROR_INVALID_VALUE``."""
+    monkeypatch.setenv("DEPLODOCK_TILE", "n128xm128")  # 16384 threads
+    with pytest.raises(ValueError, match="exceeds the 1024-thread/CTA limit"):
+        _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
+
+
+def test_tile_block_within_limit_ok(monkeypatch) -> None:
+    """A TILE parallel tile within the thread limit lowers without the guard firing."""
+    monkeypatch.setenv("DEPLODOCK_TILE", "n8xm8")  # 64 threads
+    _run_tile_pass(_guard_mm_graph(256, 256, 256, dtype=F32))
+
+
+# =========================================================================== #
 # Masked symbolic warp tier — off-hint straddling sizes, every symbolic axis.
 # =========================================================================== #
 # A matmul whose M (and/or N, K) axis is symbolic reaches the mma.sync warp tier as a MASKED tile:

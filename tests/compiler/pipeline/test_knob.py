@@ -38,6 +38,15 @@ def test_bool_parse():
         assert k.parse(falsy) is False
 
 
+def test_bool_parse_rejects_unknown():
+    # An unrecognized value used to coerce silently to False (a typo'd ``ture`` disabled the
+    # knob with no diagnostic); it now fails loudly.
+    k = Knob("FLAG", KnobType.BOOL)
+    for bad in ("banana", "ture", "2", "yep"):
+        with pytest.raises(ValueError, match="bad BOOL"):
+            k.parse(bad)
+
+
 def test_bool_pretty():
     k = Knob("FLAG", KnobType.BOOL)
     assert k.pretty(True) == "True"

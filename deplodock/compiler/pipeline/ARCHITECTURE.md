@@ -398,6 +398,13 @@ hint membership). Downstream structural gates (divisibility, threads-per-CTA bud
 structurally invalid pin yields an empty enumeration and the per-call-site fallback takes over. This lets a tile shape the
 planner wouldn't reach on its own be explored manually.
 
+A few pins are rejected outright (a clear `ValueError`) rather than silently degraded — they would otherwise lower to a
+wrong or un-launchable kernel: a codec width must be `≥ 1` (a degenerate `b0` / `f0` / `n0` no longer parses to a
+silently-dropped level); a `WARP` pin needs its **static** contraction K to be a multiple of the inner mma K-step
+(`atom_k·bk`) since the warp K-loop has no static-K tail masking (a **symbolic** K is fine — it reaches the masked
+zero-filled tier); a scalar `TILE` parallel block (`par_n·par_m`) is capped at the 1024-thread/CTA hardware limit; and a
+`BOOL` knob rejects an unrecognized value instead of coercing a typo (`ture`) to `False`.
+
 **Registered knobs** (declared across `passes/lowering/tile/*.py`; see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)
 for the per-rule mechanics):
 

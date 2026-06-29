@@ -33,6 +33,18 @@ from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
 
 
+def _codec_width(num: str, *, tok: str, codec: str) -> int:
+    """Parse a codec field's positive-integer width, rejecting empty / non-numeric / ``< 1``
+    values with a clear message. Without this a bad pin either threw a bare
+    ``int('') ValueError`` (e.g. a ``REDUCE`` ``g`` with no number) or — for a degenerate
+    ``0`` (``b0`` / ``f0`` / ``n0``) — parsed to a width the plan silently dropped, so the
+    pin became a no-op while the knob column still echoed it. A ``1`` width is the legal
+    identity (the level is off); only ``0`` / negatives / non-digits are rejected."""
+    if not num.isdigit() or int(num) < 1:
+        raise ValueError(f"bad {codec} token {tok!r}: expected a positive integer width, got {num!r}")
+    return int(num)
+
+
 class Level(enum.Enum):
     """One hardware level the reduce axis can be partitioned across, coarse→fine."""
 
@@ -140,11 +152,11 @@ class ReducePlan:
                 if num and num[-1] in "ak":  # the finalize letter (atomic / kernel) — 030_split
                     finalize = "atomic" if num[-1] == "a" else "kernel"
                     num = num[:-1]
-                cta = int(num)
+                cta = _codec_width(num, tok=tok, codec="REDUCE")
             elif kind == "b":
-                coop = int(num)
+                coop = _codec_width(num, tok=tok, codec="REDUCE")
             elif kind == "r":
-                reg = int(num)
+                reg = _codec_width(num, tok=tok, codec="REDUCE")
             else:
                 raise ValueError(f"bad REDUCE token {tok!r} (expect g<n> / b<n> / r<n>)")
         return cls.of(cta=cta, coop=coop, reg=reg, finalize=finalize)
@@ -251,14 +263,14 @@ class TilePlan:
                 continue
             if tok[0] == "n":  # n<N>[xm<M>] — the parallel thread-tile
                 n, _, m = tok[1:].partition("xm")
-                par_n = int(n)
+                par_n = _codec_width(n, tok=tok, codec="TILE")
                 if m:
-                    par_m = int(m)
+                    par_m = _codec_width(m, tok=tok, codec="TILE")
             elif tok[0] == "f":  # f<fn>[xf<fm>] — the register sub-tile
                 fn, _, fm = tok[1:].partition("xf")
-                reg_n = int(fn)
+                reg_n = _codec_width(fn, tok=tok, codec="TILE")
                 if fm:
-                    reg_m = int(fm)
+                    reg_m = _codec_width(fm, tok=tok, codec="TILE")
             else:
                 raise ValueError(f"bad TILE token {tok!r} (expect n<N>[xm<M>] / f<fn>[xf<fm>])")
         return cls(par_n=par_n, reg_n=reg_n, par_m=par_m, reg_m=reg_m)
@@ -355,16 +367,16 @@ class WarpTile:
                 atom_name = tok[2:]
             elif tok[0] == "w":  # w<WM>xw<WN>
                 m, _, n = tok[1:].partition("xw")
-                wm = int(m)
+                wm = _codec_width(m, tok=tok, codec="WARP")
                 if n:
-                    wn = int(n)
+                    wn = _codec_width(n, tok=tok, codec="WARP")
             elif tok[0] == "f":  # f<FM>xf<FN>
                 m, _, n = tok[1:].partition("xf")
-                fm = int(m)
+                fm = _codec_width(m, tok=tok, codec="WARP")
                 if n:
-                    fn = int(n)
+                    fn = _codec_width(n, tok=tok, codec="WARP")
             elif tok[0] == "k":
-                bk = int(tok[1:])
+                bk = _codec_width(tok[1:], tok=tok, codec="WARP")
             else:
                 raise ValueError(f"bad WARP token {tok!r} (expect a:<atom> / w<WM>xw<WN> / f<FM>xf<FN> / k<bk>)")
         if atom_name is None:

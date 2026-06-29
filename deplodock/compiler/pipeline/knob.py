@@ -227,7 +227,14 @@ class Knob:
         if self.type is KnobType.INT:
             return int(s, 0)
         if self.type is KnobType.BOOL:
-            return s.lower() in {"1", "true", "yes", "on"}
+            low = s.lower()
+            if low in {"1", "true", "yes", "on"}:
+                return True
+            if low in {"", "0", "false", "no", "off"}:
+                return False
+            # Anything else (a typo like ``ture`` / ``banana``, or a stray ``2``) used to
+            # coerce silently to False, disabling the knob with no diagnostic. Fail loudly.
+            raise ValueError(f"bad BOOL value for knob {self.name!r}: {raw!r} (expect 1/true/yes/on or 0/false/no/off)")
         if self.type is KnobType.BINMASK:
             if width is None:
                 raise ValueError(f"BINMASK knob {self.name!r} parse needs width")
