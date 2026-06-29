@@ -10,8 +10,8 @@ SEMIRING.
 from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.binding import AtomBinding, Operand
 from deplodock.compiler.ir.tile.ir import Schedule, TileOp
+from deplodock.compiler.ir.tile.role import RoleKind, role_for
 from deplodock.compiler.ir.tile.schedule import (
-    Channel,
     Fold,
     Kernel,
     Level,
@@ -22,11 +22,11 @@ from deplodock.compiler.ir.tile.schedule import (
     Placement,
     ReducePlan,
     ReduceStage,
+    RoleAlloc,
     SemiringKernel,
     SemiringSchedule,
     Stage,
     TilePlan,
-    WarpRole,
     WarpSpec,
     WarpTile,
     kernel_for,
@@ -35,7 +35,6 @@ from deplodock.compiler.ir.tile.schedule import (
 __all__ = [
     "AtomBinding",
     "AtomKind",
-    "Channel",
     "Fold",
     "Kernel",
     "Level",
@@ -47,14 +46,16 @@ __all__ = [
     "Placement",
     "ReducePlan",
     "ReduceStage",
+    "RoleAlloc",
+    "RoleKind",
     "Schedule",
     "SemiringKernel",
     "SemiringSchedule",
     "Stage",
     "TileOp",
     "TilePlan",
-    "WarpRole",
     "WarpSpec",
     "WarpTile",
     "kernel_for",
+    "role_for",
 ]

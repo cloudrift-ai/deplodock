@@ -277,6 +277,12 @@ def encode(schema: Schema, values: dict[str, Any]) -> str:
     return "/".join(toks)
 
 
+def field_default(field: Field) -> Any:
+    """The value of an absent ``field`` — the public handle on the engine's default (used to drop
+    default-valued params when building a structured codec object, so they don't spell back)."""
+    return _default(field)
+
+
 __all__ = [
     "AtomKind",
     "Emit",
@@ -287,4 +293,5 @@ __all__ = [
     "decode",
     "desugar",
     "encode",
+    "field_default",
 ]

@@ -409,7 +409,7 @@ apply_knobs_env()
 # ``STAGE`` pipeline) follow, unknown knobs last (alpha). Shared by the ``run --bench`` kernel
 # table and the ``deplodock eval`` tables so columns read stably.
 _FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
-KNOB_ORDER = ("TILE", "REDUCE", "STAGE")
+KNOB_ORDER = ("TILE", "REDUCE", "STAGE", "WSPEC")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 

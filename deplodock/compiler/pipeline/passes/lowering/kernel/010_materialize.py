@@ -465,6 +465,9 @@ def _warp(tile: TileOp, root: Node) -> KernelOp:
     k_axis = node.reduce_node.reduce_axis
     bind = kernel.schedule.bind
     assert bind is not None, "warp tier: 020_schedule did not stamp a binding"
+    # TODO(warp-spec): emit the producer/consumer warp split from kernel.schedule.workers (the WSPEC
+    # role allocation) — dedicate producer warps to the Stage load half, compute warps to the mma.
+    # Reserved this cut: the codec + schedule field land, but materialization stays uniform SIMT.
     # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized
     # store of the accumulator (``_with_store`` needs ``node.out`` / the grid, so it stays here).
     tail = list(bind.epilogue)

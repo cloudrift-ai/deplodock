@@ -34,7 +34,7 @@ from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
-from deplodock.compiler.ir.tile.schedule import Stage, WarpTile, is_warp_codec
+from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, WarpTile, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -87,6 +87,24 @@ STAGE = Knob(
     KnobType.STR,
     help="Operand-staging codec (d<depth>/sync|cp|tma[/ring][/p<reg_depth>]; empty=gmem-direct). "
     "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
+    off="",
+)
+
+# Warp specialization is decided HERE too, by the single ``WSPEC`` codec knob — the worker-mapping
+# sibling of ``REDUCE``/``TILE``/``STAGE`` and ORTHOGONAL to all three: the pipeline (what's staged,
+# the mma tile, the reduce partition) is fixed by those pins; ``WSPEC`` only splits the warps that
+# run it into roles (``p<np>`` producer warps drive the ``STAGE`` load half; the compute warps stay
+# on the mma). ``off=""`` is uniform SIMT (every warp does both halves). Resolved here into the
+# schedule's :class:`WarpSpec` (``workers``; ``None`` = uniform); the codec also rides on
+# ``TileOp.knobs``. **Pin-only this cut, and gated** on a warp ``TILE`` + a ``STAGE`` (no mma
+# consumer / nothing to hand off ⇒ nothing to specialize); the producer/consumer materialization is
+# a follow-up (``# TODO(warp-spec)`` in 010_materialize).
+WSPEC = Knob(
+    "WSPEC",
+    KnobType.STR,
+    help="Warp-specialization codec — role→warp split over the fixed pipeline "
+    "(p<np> producer[:q<window>], s<ns> sfu, …; compute warps implicit = WarpTile.warps; empty=uniform SIMT). "
+    "Decided in lowering/tile/020_schedule; materialization reserved (TODO).",
     off="",
 )
 
@@ -223,6 +241,25 @@ def _stage_spec(kernel) -> str:
     return pinned
 
 
+def _wspec_workers(sched) -> tuple[WarpSpec | None, str]:
+    """The pinned ``WSPEC`` worker split for ``sched`` (which already carries its ``stage``), or
+    ``(None, "")`` — uniform SIMT. Pin-only this cut: returns the authoritative ``DEPLODOCK_WSPEC``
+    pin (``Knob.narrow``) when it parses AND every role is legal for the schedule (a producer needs
+    a ``stage`` to drive); a pin that doesn't parse, names no role, or whose roles are illegal
+    degrades to uniform — the same pin-validity rule the other codecs follow. The second element is
+    the spec to restamp on ``knobs`` (``""`` when uniform)."""
+    pinned = WSPEC.narrow([""])[0]
+    if not pinned:
+        return None, ""
+    try:
+        ws = WarpSpec.parse(pinned)
+    except ValueError:
+        return None, ""
+    if not ws.roles or not ws.is_legal(sched):
+        return None, ""
+    return ws, pinned
+
+
 def _check_warp_static_k(kernel, wt) -> None:
     """Reject a warp pin whose **static** contraction K is not a multiple of the inner mma
     K-step (``atom_k · bk``). The warp K-loop has no static-K tail handling — a partial final
@@ -258,9 +295,16 @@ def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: s
     # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
     bind = semiring_binding(kernel.op, place.grid)
     sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage, bind=bind)
+    # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
+    # splits the warps into roles over this fixed pipeline (gated on the stage now set on ``sched``).
+    workers, wspec_spec = _wspec_workers(sched)
+    if workers is not None:
+        sched = replace(sched, workers=workers)
     stamped = {**knobs, TILE.name: spec}
     if stage_spec:
         stamped[STAGE.name] = stage_spec
+    if wspec_spec:
+        stamped[WSPEC.name] = wspec_spec
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
 
 

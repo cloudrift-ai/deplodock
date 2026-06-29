@@ -240,6 +240,46 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     assert stage is not None and stage.transport == "sync" and stage.depth == 1, stage
 
 
+def test_warp_matmul_stamps_wspec_workers(monkeypatch) -> None:
+    """A ``WSPEC`` pin on a staged warp matmul stamps the orthogonal ``workers`` split (the
+    producer/compute warp roles) onto the ``SemiringSchedule`` — pin-only this cut (the
+    producer/consumer materialization is a documented TODO). The codec rides on ``knobs`` too."""
+    from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # warp (mma) tier
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
+    monkeypatch.setenv("DEPLODOCK_WSPEC", "p2:q8")
+    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    assert tile_op.knobs.get("WSPEC") == "p2:q8", tile_op.knobs.get("WSPEC")
+    workers = tile_op.kernel.schedule.workers
+    assert workers is not None and [a.role.token for a in workers.roles] == ["p"], workers
+    assert workers.roles[0].warps == 2 and workers.roles[0].params == (("q", 8),)
+
+
+@pytest.mark.parametrize(
+    ("tile", "stage"),
+    [
+        ("a:mma_m16n8k16_f16/w2x2/f2x2/k2", None),  # warp tier, no STAGE → producer has nothing to drive
+        ("n32x8/f4x4", "d2/cp"),  # scalar tier — WSPEC is only read on the warp path
+    ],
+)
+def test_wspec_degrades_to_uniform(monkeypatch, tile: str, stage: str | None) -> None:
+    """The ``WSPEC`` pin degrades to uniform (``workers=None``) when the producer is illegal — no
+    ``STAGE`` to drive, or the scalar tier (no mma consumer). The same pin-validity rule the other
+    codecs follow; the knob is then not explicitly stamped (only the ``off=""`` default)."""
+    from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_TILE", tile)
+    if stage is not None:
+        monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+    monkeypatch.setenv("DEPLODOCK_WSPEC", "p2")
+    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    assert tile_op.kernel.schedule.workers is None
+    assert tile_op.knobs.get("WSPEC", "") == ""  # off-default only, no explicit pin stamped
+
+
 @requires_cuda
 @pytest.mark.parametrize("stage_mask", ["11", "10", "01", "00"])
 @pytest.mark.parametrize("shape", [(64, 64, 64), (64, 47, 64), (128, 128, 128)])

@@ -32,7 +32,8 @@ from dataclasses import dataclass, field
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.binding import AtomBinding
-from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode
+from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode, field_default
+from deplodock.compiler.ir.tile.role import ROLE_REGISTRY, RoleKind
 
 
 class Level(enum.Enum):
@@ -458,35 +459,74 @@ class Stage:
         return self.transport in ("cp.async", "tma")
 
 
+#: The ``WSPEC`` codec schema — one GROUP field per registered :class:`RoleKind` (token =
+#: warp-count value, params = the role's per-role param schema). Built from ``ROLE_REGISTRY`` so a
+#: new role needs no edit here. The COMPUTE role is implicit (``WarpTile.warps``), never a field.
+_WSPEC_SCHEMA = Schema(
+    "WSPEC",
+    tuple(Field(r.token, FieldKind.GROUP, params=r.params) for r in ROLE_REGISTRY.values()),
+    expect="expect <role><warps>[:<param>,...]",
+)
+
+
 @dataclass(frozen=True)
-class Channel:
-    """TODO(warp-spec): a shared smem ring connecting a warp-spec producer/consumer."""
+class RoleAlloc:
+    """One warp-specialized band: a registered :class:`RoleKind`, its dedicated warp count, and its
+    per-role param values (canonical-sorted, default-valued params dropped so they don't re-spell)."""
 
-    name: str
-    depth: int
-
-
-@dataclass(frozen=True)
-class WarpRole:
-    """TODO(warp-spec): one warp role (producer / mma / reducer); its ``schedule`` is
-    itself a uniform schedule scoped to that role's warps, carrying its own :class:`Stage`."""
-
-    stage_node: object
-    warps: int
-    schedule: object  # MapSchedule | MonoidSchedule | SemiringSchedule
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
+    role: RoleKind
+    warps: int = 1
+    params: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
 class WarpSpec:
-    """TODO(warp-spec): the warp-role pipeline — ONE shared struct (no ``*WarpSpec*``
-    per-kind variants). Appears only at the top CTA-level schedule; roles bottom out in
-    uniform schedules. Reserved this cut."""
+    """The worker-mapping pin — a role→warp-count allocation over the fixed pipeline, ORTHOGONAL to
+    it (``reduce`` / ``tile`` / ``stage``): it adds no pipeline parameter, only the warp split. The
+    COMPUTE (mma-consumer) role is implicit (sized by ``WarpTile.warps``, never listed); each
+    :class:`RoleAlloc` is a band of dedicated warps split off the uniform pipeline, so the CTA
+    launches ``WarpTile.block_threads + 32·aux_warps`` threads. ``workers is None`` on the schedule
+    is uniform SIMT (every warp does every role's work, software-pipelined in-warp); a constructed
+    ``WarpSpec`` means specialization is on. Spelled by the ``WSPEC`` codec ``<token><np>[:<param>,
+    ...]`` per role (``p2`` / ``p2:q8`` / ``p2:q8/s1``), decided in ``020_schedule``.
 
-    place: Placement
-    channels: tuple[Channel, ...] = ()
-    roles: tuple[WarpRole, ...] = ()
+    **Reserved this cut**: the schedule field + the codec land (pin-only), but ``010_materialize``
+    does not yet emit producer/consumer warps (``# TODO(warp-spec)``)."""
+
+    roles: tuple[RoleAlloc, ...] = ()
+
+    @classmethod
+    def parse(cls, spec: str | None) -> WarpSpec:
+        """Decode the ``WSPEC`` codec into a role allocation (``""`` / ``None`` = no roles). Ser/de
+        routes through :mod:`codec` (``_WSPEC_SCHEMA``)."""
+        v = decode(_WSPEC_SCHEMA, spec)
+        allocs: list[RoleAlloc] = []
+        for token, role in ROLE_REGISTRY.items():
+            group = v[token]
+            if group is None:  # role absent from the codec
+                continue
+            params = tuple(sorted((p.token, group[p.token]) for p in role.params if group[p.token] != field_default(p)))
+            allocs.append(RoleAlloc(role=role, warps=group[""], params=params))
+        return cls(tuple(allocs))
+
+    def spell(self) -> str:
+        """The ``WSPEC`` codec string for this allocation (inverse of :meth:`parse`); ``""`` when
+        there are no roles (uniform SIMT)."""
+        values: dict[str, object] = {token: None for token in ROLE_REGISTRY}
+        for a in self.roles:
+            values[a.role.token] = {"": a.warps, **dict(a.params)}
+        return encode(_WSPEC_SCHEMA, values)
+
+    @property
+    def aux_warps(self) -> int:
+        """Total dedicated (non-COMPUTE) warps the split adds on top of the ``WarpTile`` grid."""
+        return sum(a.warps for a in self.roles)
+
+    def is_legal(self, sched: object) -> bool:
+        """True iff every allocated role is meaningful for ``sched`` (a producer needs a ``stage``).
+        A pin failing this degrades to uniform (``workers=None``) — the same pin-validity rule the
+        other codecs follow."""
+        return all(a.role.legal(sched) for a in self.roles)
 
 
 # --------------------------------------------------------------------------- #
@@ -518,6 +558,7 @@ class MonoidSchedule:
     reduce: ReducePlan = field(default_factory=ReducePlan)
     warp_tile: WarpTile | None = None  # TODO(warp-flash)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
+    workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
 
 
 @dataclass(frozen=True)
@@ -534,19 +575,22 @@ class SemiringSchedule:
     tile: TilePlan = field(default_factory=TilePlan)
     warp_tile: WarpTile | None = None  # TODO(warp-flash)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
+    workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
     bind: AtomBinding | None = None  # the operand→role binding, filled by 020_schedule after
     # the warp tile is chosen (None until then / on a scalar-tile or split-partial contraction)
 
 
 # --------------------------------------------------------------------------- #
-# The op + schedule pairs — the schedule is EITHER the kind's uniform schedule OR
-# WarpSpec (the union at the field IS the either; no wrapper class).
+# The op + schedule pairs — one uniform ``*Schedule`` per kind. Warp specialization
+# is an orthogonal ``workers: WarpSpec | None`` field ON that schedule (None = uniform
+# SIMT), NOT a union arm — it adds a warp split over the fixed pipeline, not a replacement.
 # --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
 class MapKernel:
-    """A pointwise kernel: a ``Map`` op + its :class:`MapSchedule` (no warp-spec arm)."""
+    """A pointwise kernel: a ``Map`` op + its :class:`MapSchedule` (no warp-spec — pointwise
+    never warp-specializes)."""
 
     op: object  # a Map (pure pointwise; the kernel root)
     schedule: MapSchedule
@@ -555,19 +599,19 @@ class MapKernel:
 @dataclass(frozen=True)
 class MonoidKernel:
     """A reduction kernel: a ``Monoid`` op (or a projection ``Map`` *over* one) + its
-    :class:`MonoidSchedule` or :class:`WarpSpec`."""
+    :class:`MonoidSchedule` (whose ``workers`` field carries any warp split)."""
 
     op: object  # a Monoid, or a Map(source=Monoid) projection
-    schedule: MonoidSchedule | WarpSpec
+    schedule: MonoidSchedule
 
 
 @dataclass(frozen=True)
 class SemiringKernel:
     """A contraction kernel: a ``Semiring`` op (or a projection ``Map`` *over* one) + its
-    :class:`SemiringSchedule` or :class:`WarpSpec`."""
+    :class:`SemiringSchedule` (whose ``workers`` field carries any warp split)."""
 
     op: object  # a Semiring, or a Map(source=Semiring) projection
-    schedule: SemiringSchedule | WarpSpec
+    schedule: SemiringSchedule
 
 
 #: A scheduled kernel — keyed by the op kind (no ``classify_algebra`` tag). The pairing
@@ -591,7 +635,6 @@ def kernel_for(node, place: Placement) -> Kernel:
 
 
 __all__ = [
-    "Channel",
     "Fold",
     "Kernel",
     "Level",
@@ -602,11 +645,11 @@ __all__ = [
     "Placement",
     "ReducePlan",
     "ReduceStage",
+    "RoleAlloc",
     "SemiringKernel",
     "SemiringSchedule",
     "Stage",
     "TilePlan",
-    "WarpRole",
     "WarpSpec",
     "WarpTile",
     "kernel_for",
