@@ -47,7 +47,6 @@ from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import (
-    Contraction,
     Smem,
     Sync,
 )
@@ -56,6 +55,7 @@ from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Sele
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import axis_role, lower
+from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize

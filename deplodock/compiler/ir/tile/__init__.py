@@ -25,10 +25,12 @@ from deplodock.compiler.ir.tile.schedule import (
     WarpSpec,
     kernel_for,
 )
+from deplodock.compiler.ir.tile.structural import Contraction
 
 __all__ = [
     "AtomBinding",
     "AtomKind",
+    "Contraction",
     "Fold",
     "Kernel",
     "Level",

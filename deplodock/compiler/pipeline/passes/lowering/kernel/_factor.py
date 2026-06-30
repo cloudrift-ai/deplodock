@@ -33,7 +33,6 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.kernel.ir import (
-    Contraction,
     EpilogueLoad,
     LdmatrixLoad,
     MmaSyncPtx,
@@ -45,6 +44,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.ops import contraction_loop
+from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile

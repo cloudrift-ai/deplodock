@@ -7,7 +7,7 @@ afterwards.
 ## `005_contract` — construct the contraction node (before materialize)
 
 A `CONTRACTION` contraction's high-level node is built one pass **before** the materializer. It's **one flat**
-`Contraction` Stmt (`ir/kernel/ir.py`) — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
+`Contraction` Stmt (`ir/tile/structural.py`) — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
 splits two concerns:
 
 - **algebra params** (what to contract): the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
