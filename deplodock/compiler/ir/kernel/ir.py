@@ -316,34 +316,31 @@ class Contraction(Stmt):
     """A contraction **before** atom factorization — the seam between ``005_contract`` (constructs
     it, before materialize) and ``010_materialize`` (expands it via ``_factor.factorize``). **ONE
     flat node, binding-driven for both atoms.** It holds the GRID skeleton (the tiled output
-    ``m_axis`` / ``n_axis``, the contraction ``k_axis``, any leading batch ``lead_axes``, the
-    ``output`` buffer), the per-CTA **UNIT** grid (``units_m`` × ``units_n`` — warps for mma, threads
-    for scalar) + the per-unit **REGISTER** sub-tile (``reg_m`` × ``reg_n``), the structured operands
-    (the A/B ``Load``\\ s + ``b_trans``), the fold accumulator ``acc``, the leaf ``atom`` (a
-    tensor-core :class:`AtomKind` or the ``1×1`` :class:`ScalarAtom`), and the projection
-    ``epilogue``.
+    ``m_axis`` / ``n_axis``, the contraction ``k_axis``, any leading batch ``lead_axes``), the per-CTA
+    **UNIT** grid (``units_m`` × ``units_n`` — warps for mma, threads for scalar) + the per-unit
+    **REGISTER** sub-tile (``reg_m`` × ``reg_n``), the structured operands (the A/B ``Load``\\ s), the
+    fold accumulator ``acc``, the leaf ``atom`` (a tensor-core :class:`AtomKind` or the ``1×1``
+    :class:`ScalarAtom`), and the projection ``epilogue`` (which carries the output ``Write``).
 
     The contraction itself is **never stored** — both tiers *synthesize* it from the operands:
     ``_factor.codegen`` lowers the mma atom into ``ldmatrix`` + ``mma.sync`` and the scalar atom into a
     ``for k: acc += a*b`` register-tiled loop — then run the ``epilogue`` (``acc`` is the SSA name the
     synthesized reduce produces and the epilogue consumes). The operand buffers ride
     :meth:`external_reads`; the epilogue is the only nested ``Body``. ``_factor.factorize`` reads the
-    **derived** tiling geometry below (``tile_m`` / ``mask_m`` / ``m_b`` / ``m_uvar`` /
-    ``block_threads`` / …) straight off the node; it's ``@property``, so it stays out of the fields
+    **derived** geometry below (``tile_m`` / ``mask_m`` / ``m_b`` / ``m_uvar`` / ``block_threads`` /
+    ``b_trans`` / …) straight off the node; it's ``@property``, so it stays out of the fields
     ``structural_key`` digests (the node IS keyed as an intermediate ``KernelOp``). The atom selects
     the codegen — there is no separate ``Leaf`` / per-atom subclass."""
 
     m_axis: Axis
     n_axis: Axis
     k_axis: Axis
-    output: str
     units_m: int
     units_n: int
     reg_m: int
     reg_n: int
     a_load: Load
     b_load: Load
-    b_trans: bool
     acc: str
     atom: Atom
     lead_axes: tuple[Axis, ...] = ()
@@ -383,6 +380,12 @@ class Contraction(Stmt):
     def block_threads(self) -> int | None:
         bt = self.units_m * self.units_n * self.atom.lanes
         return bt if bt > 1 else None  # None ⇒ the scalar default block size
+
+    @property
+    def b_trans(self) -> bool:
+        """B stored N×K (the K axis last in its index) vs the canonical B[k, n] — read off the
+        binding load, the same test ``_atomize`` made when it bound the operand."""
+        return self.k_axis.name in self.b_load.index[-1].free_vars()
 
     # The bound GRID-block / UNIT axis names — the original m/n names live in the operand indices,
     # so the bound axes take a fresh ``_b`` (block) / ``_u`` (unit) suffix.
@@ -1898,19 +1901,18 @@ def _(s: Tile, rename, sigma, axis_fn):
 @_rewrite.register
 def _(s: Contraction, rename, sigma, axis_fn):
     # Route the operand Loads + accumulator + epilogue through the generic rewrite (SSA / Expr / axis
-    # canonicalization); map the skeleton axes; pass the geometry / atom / output through.
+    # canonicalization); map the skeleton axes; pass the geometry / atom through. ``b_trans`` is
+    # derived from ``b_load`` (a property), so the rewritten load carries it.
     return Contraction(
         m_axis=axis_fn(s.m_axis),
         n_axis=axis_fn(s.n_axis),
         k_axis=axis_fn(s.k_axis),
-        output=s.output,
         units_m=s.units_m,
         units_n=s.units_n,
         reg_m=s.reg_m,
         reg_n=s.reg_n,
         a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
         b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
-        b_trans=s.b_trans,
         acc=rename(s.acc),
         atom=s.atom,
         lead_axes=tuple(axis_fn(a) for a in s.lead_axes),
