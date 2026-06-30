@@ -11,9 +11,9 @@ Stmt (`ir/kernel/ir.py`) holding the shared GRID skeleton (m/n/k axes, output, l
 payload — the ONLY atom-specific part, keyed by **atom** (`ir/tile/atom.py`) — a tensor-core mma cell (`AtomKind`,
 `lanes == 32`) or a scalar fma cell (`ScalarAtom`, `lanes == 1`):
 
-- **mma arm** (`MmaLeaf`) — a warp-tier `SemiringKernel` (its schedule carries a `WarpTile`): **thin**, the
+- **mma arm** (`MmaLeaf`) — a warp-tier `SemiringKernel` (its schedule's `tier` carries a tensor-core-atom `TilePlan`): **thin**, the
   op-tree-dependent part only — capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve
-  the projection epilogue (`_store.with_store`). Binding-driven (structured `a@b` operands + `WarpTile`).
+  the projection epilogue (`_store.with_store`). Binding-driven (structured `a@b` operands + a warp-atom `TilePlan`).
 - **scalar arm** (`ScalarLeaf`) — a register-tiled `SemiringKernel` (its `TILE` plan tiles the output): lower the
   per-cell body (`lower(op)` + output-store glue) and capture it with the register / parallel widths. Body-driven.
 

@@ -195,7 +195,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # Only the scalar output tier survives a split (a warp/None tier doesn't ride the partial
     # kernels — they materialize scalar); ``getattr`` covers a ``Monoid`` split (no ``tier`` field).
     tier = getattr(sched, "tier", None)
-    tile_plan = tier if isinstance(tier, TilePlan) else None
+    tile_plan = tier if isinstance(tier, TilePlan) and not tier.is_warp else None
 
     # --- atomic finalize: ONE kernel — each CTA atomicAdds its slice's state into the output
     # (zero-init'd per launch). Additive (single-component) carriers only; the GRID stage is

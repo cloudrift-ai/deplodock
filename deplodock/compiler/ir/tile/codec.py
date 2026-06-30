@@ -4,7 +4,7 @@ Every tunable schedule codec (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) is 
 ``/``-separated *nodes*. A node is ``TOKEN`` optionally followed by a value and, after a ``:``, a
 comma-separated list of params (themselves nodes — the recursive case used by ``WSPEC`` roles).
 This module owns the grammar (:func:`desugar` + :func:`decode` + :func:`encode`); each IR codec
-dataclass (``ReducePlan`` / ``TilePlan`` / ``WarpTile`` / ``Stage`` / ``WarpSpec``) declares a
+dataclass (``ReducePlan`` / ``TilePlan`` / ``Stage`` / ``WarpSpec``) declares a
 :class:`Schema` of :class:`Field`\\s and routes its ``parse`` / ``spell`` through here, keeping only
 its own semantics (``combine`` / ``tile_m`` / ``block_threads`` / ``is_async`` / validation).
 

@@ -401,7 +401,7 @@ partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooper
 or tuned. The single `REDUCE` codec knob decides the plan in `020_schedule`; the combine itself stays in the op
 tree.
 
-All four schedule codecs — `REDUCE`, `TILE` (scalar `TilePlan` / warp `WarpTile`), `STAGE`, and `WSPEC` — share one
+All four schedule codecs — `REDUCE`, `TILE` (scalar or warp `TilePlan`), `STAGE`, and `WSPEC` — share one
 schema-driven ser/de engine (`tile/codec.py`): a `Schema` of typed `Field`s plus generic `desugar` / `decode` /
 `encode`. Each codec class keeps its `parse` / `spell` API and its semantics, delegating only the string ↔ struct
 conversion to the engine, so the featurizer and `020_schedule` call sites — and the on-disk golden wire format — are
@@ -410,7 +410,7 @@ unchanged. The grammar collapses int and pair widths into one tuple kind and sup
 so the round-trip stays byte-identical.
 
 `WSPEC` (warp specialization) is the worker-mapping pin — a role→warp-count allocation (`WarpSpec`; role descriptors in
-`tile/role.py`, the COMPUTE consumer implicit and sized by `WarpTile.warps`) carried on an **orthogonal**
+`tile/role.py`, the COMPUTE consumer implicit and sized by `TilePlan.units`) carried on an **orthogonal**
 `workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
 split over the fixed pipeline rather than replacing it. Pin-only this cut — `020_schedule` stamps `workers` from a
 `DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the

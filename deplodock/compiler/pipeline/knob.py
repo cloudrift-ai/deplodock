@@ -91,15 +91,15 @@ def mma_atom(knobs: dict) -> str | None:
     tier (no warp fragment).
 
     The atom is named by the warp form of the unified ``TILE`` codec (``a:<atom>/…``): a ``TILE``
-    value carrying an ``a:<atom>`` token is the warp fragment, and its parsed :class:`WarpTile`
-    names the atom. A scalar ``TILE`` (``n../f..`` or empty) names no atom → ``None``."""
-    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+    value carrying an ``a:<atom>`` token is the warp fragment, and its parsed :class:`TilePlan`'s
+    ``atom`` names it. A scalar ``TILE`` (``n../f..`` or empty) names no atom → ``None``."""
+    from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
     spec = knobs.get("TILE")
     if not is_warp_codec(spec):
         return None
     try:
-        return WarpTile.parse(spec).atom.name
+        return TilePlan.parse(spec).atom.name
     except ValueError:
         return None
 
@@ -554,12 +554,12 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # Atom (tensor-core cell) features. The warp fragment names its atom on the ``TILE`` codec
     # (``a:<atom>``); expand its physical cell / dtype properties into the ``MMA_*`` family the
     # priors rank on. A scalar ``TILE`` names no atom → only the ``MMA_tier=0`` default below.
-    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
     tile_spec = knobs.get("TILE")
     if is_warp_codec(tile_spec):
         try:
-            feats.update(_atom_features(WarpTile.parse(tile_spec).atom))
+            feats.update(_atom_features(TilePlan.parse(tile_spec).atom))
         except ValueError:
             pass
     feats.setdefault("MMA_tier", 0.0)  # scalar tier = no warp atom
@@ -586,24 +586,16 @@ def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     (the ``(WN, FN)`` / ``(WM, FM)`` warp + register sub-tiles). A single free axis fills the ``n``
     slot with a degenerate ``(1, 1)`` ``m`` slot. Returns ``None`` for a non-tiled scalar kernel
     (per-cell ``TILE``)."""
-    from deplodock.compiler.ir.tile.schedule import TilePlan, WarpTile, is_warp_codec  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.schedule import TilePlan  # noqa: PLC0415
 
     spec = knobs.get("TILE")
-    pairs: list[tuple[int, int]] = []
-    if is_warp_codec(spec):  # warp fragment — the a:<atom>/w../f.. codec
-        try:
-            wt = WarpTile.parse(spec)
-        except ValueError:
-            return None
-        (wm, wn), (fm, fn) = wt.warps, wt.reg
-        pairs = [(wn, fn), (wm, fm)]
-    else:  # scalar fragment — the n../f.. codec
-        plan = TilePlan.parse(spec)
-        if not plan.is_tiled:
-            return None
-        pairs = [(plan.par_n, plan.reg_n), (plan.par_m, plan.reg_m)]
-    if not pairs:
+    try:
+        tile = TilePlan.parse(spec)  # one parse for both fragments — the atom discriminates
+    except ValueError:
         return None
+    if not tile.is_tiled:
+        return None
+    pairs = [(tile.units_n, tile.reg_n), (tile.units_m, tile.reg_m)]
     pairs.sort(key=lambda pr: (pr[0], pr[1]), reverse=True)  # wider par = the n slot
     (par_n, reg_n) = pairs[0]
     (par_m, reg_m) = pairs[1] if len(pairs) >= 2 else (1, 1)
@@ -833,13 +825,14 @@ def _warp_tile_features(knobs: dict) -> dict[str, float]:
     ``WM·FM·atom_m × WN·FN·atom_n`` output tile, where ``atom_m/atom_n`` are the MMA cell dims read
     from the parsed warp ``TILE`` codec's atom. Empty if the ``TILE`` value isn't a warp codec or
     doesn't parse (so a malformed row degrades gracefully)."""
-    from deplodock.compiler.ir.tile.schedule import WarpTile, is_warp_codec  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
     spec = knobs.get("TILE")
     if not is_warp_codec(spec):
         return {}
     try:
-        am, an = WarpTile.parse(spec).atom.atom_m, WarpTile.parse(spec).atom.atom_n
+        atom = TilePlan.parse(spec).atom
+        am, an = atom.atom_m, atom.atom_n
     except ValueError:
         return {}
     slots = _free_slots(knobs)

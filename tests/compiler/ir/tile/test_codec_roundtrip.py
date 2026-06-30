@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile
+from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan
 
 
 @pytest.mark.parametrize("spec", ["", "b8", "b16", "b32", "r4", "g2a", "g2k", "g4a/b32", "g2k/b16/r4"])
@@ -32,7 +32,7 @@ def test_tile_scalar_round_trip(spec: str) -> None:
     ],
 )
 def test_warp_round_trip(spec: str) -> None:
-    assert WarpTile.parse(spec).spell() == spec
+    assert TilePlan.parse(spec).spell() == spec
 
 
 @pytest.mark.parametrize("spec", ["d1/sync", "d1/cp", "d2/cp/ring", "d3/tma/ring", "d4/cp/ring/p2"])

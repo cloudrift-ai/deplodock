@@ -28,7 +28,6 @@ from deplodock.compiler.ir.tile.schedule import (
     Stage,
     TilePlan,
     WarpSpec,
-    WarpTile,
     kernel_for,
 )
 
@@ -55,7 +54,6 @@ __all__ = [
     "TileOp",
     "TilePlan",
     "WarpSpec",
-    "WarpTile",
     "kernel_for",
     "role_for",
 ]

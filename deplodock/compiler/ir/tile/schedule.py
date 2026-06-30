@@ -21,7 +21,7 @@ unrepresentable. Warp specialization is **orthogonal**, not a second schedule ki
 rides an optional ``workers: WarpSpec | None`` field on the uniform schedule (``None`` =
 uniform SIMT) — a role→warp-count split *over* the fixed pipeline, not a replacement of it.
 
-Every codec here — ``ReducePlan`` / ``TilePlan`` / ``WarpTile`` / ``Stage`` / ``WarpSpec`` —
+Every codec here — ``ReducePlan`` / ``TilePlan`` / ``Stage`` / ``WarpSpec`` —
 routes its ``parse`` / ``spell`` through the shared schema engine (:mod:`.codec`), declaring a
 ``Schema`` of typed ``Field``\\s and keeping only its own semantics. ``WarpSpec`` materialization
 (the producer/consumer warp emission) is reserved this cut (``# TODO(warp-spec)``).
@@ -33,7 +33,7 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.atom import AtomKind
+from deplodock.compiler.ir.tile.atom import SCALAR_ATOM, Atom, AtomKind
 from deplodock.compiler.ir.tile.binding import AtomBinding
 from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode, field_default
 from deplodock.compiler.ir.tile.role import ROLE_REGISTRY, RoleKind
@@ -208,71 +208,116 @@ class ReducePlan:
         return None
 
 
-#: The scalar ``TILE`` codec schema: ``n<N>[x<M>]`` (parallel thread-tile, n-then-m) and
-#: ``f<fn>[x<fm>]`` (register sub-tile). The warp fragment uses ``_WARP_SCHEMA`` instead, selected
-#: string-side by :func:`is_warp_codec` before either class's ``parse`` runs.
+#: The scalar form of the ``TILE`` codec: ``n<N>[x<M>]`` (parallel thread-tile, n-then-m) and
+#: ``f<fn>[x<fm>]`` (register sub-tile) — no atom token.
 _TILE_SCALAR_SCHEMA = Schema(
     "TILE",
     (Field("n", FieldKind.TUPLE, arity=2), Field("f", FieldKind.TUPLE, arity=2)),
     expect="expect n<N>[x<M>] / f<fn>[x<fm>]",
 )
 
+#: The warp form of the ``TILE`` codec: ``a:<atom>`` (required, the registered atom), ``w<WM>x<WN>``
+#: (warps m-then-n, always both dims), ``f<FM>x<FN>`` (register sub-tile), ``k<bk>`` (K-chunk,
+#: omitted at 1). ``a``/``w``/``f`` always spell; ``k`` only when > 1.
+_WARP_SCHEMA = Schema(
+    "WARP",
+    (
+        Field("a", FieldKind.NAME, required=True, emit=Emit.ALWAYS),
+        Field("w", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
+        Field("f", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
+        Field("k", FieldKind.TUPLE),
+    ),
+    expect="expect a:<atom> / w<WM>x<WN> / f<FM>x<FN> / k<bk>",
+)
+
+
+def is_warp_codec(spec: str | None) -> bool:
+    """True iff a ``TILE`` codec value names a tensor-core atom (an ``a:<atom>`` token) — the **warp**
+    form, vs the scalar register sub-tile (``n../f..``). This is the single string-side discriminator
+    for the unified output-tile knob: a contraction's output tile is *either* the scalar fragment *or*
+    the warp mma tile, never both, and the value self-describes which. Empty / ``None`` (the per-cell
+    scalar baseline) is not warp."""
+    return bool(spec) and any(t.strip().startswith("a:") for t in spec.split("/"))
+
 
 @dataclass(frozen=True)
 class TilePlan:
-    """The free-axis output tile — the **tuned widths only** for the (≤2) tiled output
-    axes, the scalar (``Scalar`` fragment) counterpart of :class:`ReducePlan`.
+    """The contraction's output tile — **one descriptor for both tiers**, discriminated by
+    :attr:`atom`: a tensor-core :class:`AtomKind` (the warp mma tile) or the scalar
+    :class:`~deplodock.compiler.ir.tile.atom.ScalarAtom` (the register sub-tile, the ``Scalar``
+    fragment). Each tiled output axis splits into a **unit** width (warps for mma / parallel threads
+    for scalar — :attr:`units`) and a **register** width (atom sub-cells / register cells per unit —
+    :attr:`regs`); ``bk`` chunks the K (contraction) axis (mma only). The all-``1`` scalar tile (a
+    scalar ``atom``, ``units``/``regs`` ``(1, 1)``) is the per-cell tier — one thread per output cell.
 
-    Each tiled free axis splits into a **parallel** width (threads per axis — the
-    ``n``/``m`` slots) and a **register** width (per-thread register sub-cells — the ``f``
-    slots): one thread owns a ``reg_m × reg_n`` block of output cells, reusing each loaded
-    operand across the block (the arithmetic-intensity lever for scalar matmul). All-``1``
-    is the per-cell tier (one thread per output cell), exactly as ``ReducePlan()`` is the
-    serial fold. The two axes follow the featurizer's canonical ``n`` (inner / coalesced)
-    vs ``m`` (outer) labelling (:func:`knob._free_slots`)."""
+    ``units`` / ``regs`` are stored in each tier's **native codec order** — warp ``(WM, WN)`` /
+    ``(FM, FN)`` (m-then-n), scalar ``(par_n, par_m)`` / ``(reg_n, reg_m)`` (n-then-m, the
+    featurizer's inner/coalesced ``n`` vs outer ``m``); the :attr:`units_m` / :attr:`units_n` /
+    :attr:`reg_m` / :attr:`reg_n` accessors normalize that order. Spelled by the unified ``TILE``
+    knob — the warp form ``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>`` or the scalar ``n<N>x<M>/f<fn>x<fm>``
+    (no atom token); :func:`is_warp_codec` discriminates string-side, :attr:`is_warp` on the object.
+    Decided in ``020_schedule``."""
 
-    par_n: int = 1
-    reg_n: int = 1
-    par_m: int = 1
-    reg_m: int = 1
+    atom: Atom = SCALAR_ATOM
+    units: tuple[int, int] = (1, 1)  # warp (WM, WN) m-then-n / scalar (par_n, par_m) n-then-m
+    regs: tuple[int, int] = (1, 1)  # warp (FM, FN) m-then-n / scalar (reg_n, reg_m) n-then-m
+    bk: int = 1  # K-chunk per inner mma step, in atom_k units (mma only; 1 for scalar)
 
     @classmethod
     def parse(cls, spec: str | None) -> TilePlan:
-        """Decode the ``TILE`` knob codec (the schedule's free-axis output-tile knob,
-        decided in ``020_schedule``) into a plan: ``/``-separated tokens — ``n<N>[x<M>]``
-        (the parallel thread-tile, ``N`` threads on the inner axis, optional ``M`` on the
-        outer) and ``f<fn>[x<fm>]`` (the register sub-tile, ``fn`` cells on the inner axis,
-        optional ``fm`` on the outer). The ``x`` is a plain dimension separator (n-then-m
-        order). Empty / ``None`` = the per-cell tier. Ser/de routes through :mod:`codec`."""
+        """Decode the unified ``TILE`` knob into a tile: the warp form (``a:<atom>/w../f../k..``) →
+        an mma tile, or the scalar form (``n../f..``, no atom token) → a scalar register sub-tile
+        (``atom`` defaults to the scalar atom). Empty / ``None`` = the per-cell tier. Ser/de routes
+        through :mod:`codec`."""
+        if is_warp_codec(spec):
+            v = decode(_WARP_SCHEMA, spec)
+            return cls(atom=v["a"], units=v["w"], regs=v["f"], bk=v["k"])
         v = decode(_TILE_SCALAR_SCHEMA, spec)
-        par_n, par_m = v["n"]
-        reg_n, reg_m = v["f"]
-        return cls(par_n=par_n, reg_n=reg_n, par_m=par_m, reg_m=reg_m)
+        return cls(units=v["n"], regs=v["f"])
 
     def spell(self) -> str:
-        """The ``TILE`` codec string for this plan (inverse of :meth:`parse`); ``""`` for
-        the per-cell tier."""
-        return encode(_TILE_SCALAR_SCHEMA, {"n": (self.par_n, self.par_m), "f": (self.reg_n, self.reg_m)})
+        """The ``TILE`` codec string for this tile (inverse of :meth:`parse`); ``""`` for the
+        per-cell tier. The warp form when :attr:`atom` is a tensor-core atom, else the scalar form."""
+        if self.is_warp:
+            return encode(_WARP_SCHEMA, {"a": self.atom, "w": self.units, "f": self.regs, "k": self.bk})
+        return encode(_TILE_SCALAR_SCHEMA, {"n": self.units, "f": self.regs})
+
+    @property
+    def is_warp(self) -> bool:
+        """True iff this is the tensor-core (mma) tile — :attr:`atom` is a real :class:`AtomKind`."""
+        return isinstance(self.atom, AtomKind)
 
     @property
     def is_tiled(self) -> bool:
-        """True iff this plan tiles the output (any parallel or register width > 1)."""
-        return self.par_n > 1 or self.par_m > 1 or self.reg_n > 1 or self.reg_m > 1
+        """True iff this materializes a tile: a warp tile always does; a scalar tile only when some
+        unit / register width > 1 (else it is the per-cell tier — one thread per output cell)."""
+        return self.is_warp or any(v > 1 for v in (*self.units, *self.regs))
 
     @property
-    def reg(self) -> tuple[int, int]:
-        """The register sub-tile ``(reg_m, reg_n)`` — outer (m) then inner (n) cells/thread."""
-        return (self.reg_m, self.reg_n)
+    def units_m(self) -> int:
+        """Units on the outer (m) output axis — ``WM`` (warp) / ``par_m`` (scalar)."""
+        return self.units[0] if self.is_warp else self.units[1]
 
     @property
-    def cells(self) -> int:
-        """Register cells per thread = ``reg_m · reg_n``."""
-        return self.reg_m * self.reg_n
+    def units_n(self) -> int:
+        """Units on the inner (n) output axis — ``WN`` (warp) / ``par_n`` (scalar)."""
+        return self.units[1] if self.is_warp else self.units[0]
 
     @property
-    def slots(self) -> tuple[int, int, int, int]:
-        """The featurizer's canonical ``(par_n, reg_n, par_m, reg_m)`` free-split tuple."""
-        return (self.par_n, self.reg_n, self.par_m, self.reg_m)
+    def reg_m(self) -> int:
+        """Register sub-cells on the outer (m) axis — ``FM`` (warp) / ``reg_m`` (scalar)."""
+        return self.regs[0] if self.is_warp else self.regs[1]
+
+    @property
+    def reg_n(self) -> int:
+        """Register sub-cells on the inner (n) axis — ``FN`` (warp) / ``reg_n`` (scalar)."""
+        return self.regs[1] if self.is_warp else self.regs[0]
+
+    @property
+    def block_threads(self) -> int:
+        """The per-CTA thread count = ``units_m · units_n · atom.lanes`` (mma: ``WM·WN·32``;
+        scalar: ``par_n·par_m·1``)."""
+        return self.units[0] * self.units[1] * self.atom.lanes
 
 
 @dataclass(frozen=True)
@@ -296,86 +341,11 @@ class Placement:
 
 
 # --------------------------------------------------------------------------- #
-# The warp-tier descriptors — the tensor-core tile, operand pipelining, the warp split.
-# ``WarpTile`` (matmul) and ``Stage`` (cp.async / TMA) are built and materialized; ``WarpSpec``
-# (the WSPEC worker split) is pin-only this cut — its codec + schedule field land, but its
-# producer/consumer codegen is reserved (``# TODO(warp-spec)`` in lowering/kernel/010_materialize).
+# The operand-transport + warp-split descriptors. ``Stage`` (cp.async / TMA) is built and
+# materialized; ``WarpSpec`` (the WSPEC worker split) is pin-only this cut — its codec + schedule
+# field land, but its producer/consumer codegen is reserved (``# TODO(warp-spec)`` in
+# lowering/kernel/010_materialize).
 # --------------------------------------------------------------------------- #
-
-
-#: The warp ``TILE`` codec schema: ``a:<atom>`` (required, the registered atom), ``w<WM>x<WN>``
-#: (warps m-then-n, always both dims), ``f<FM>x<FN>`` (register sub-tile), ``k<bk>`` (K-chunk,
-#: omitted at 1). ``a``/``w``/``f`` always spell; ``k`` only when > 1 — the old ``spell`` policy.
-_WARP_SCHEMA = Schema(
-    "WARP",
-    (
-        Field("a", FieldKind.NAME, required=True, emit=Emit.ALWAYS),
-        Field("w", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
-        Field("f", FieldKind.TUPLE, arity=2, emit=Emit.ALWAYS, suppress_trailing=False),
-        Field("k", FieldKind.TUPLE),
-    ),
-    expect="expect a:<atom> / w<WM>x<WN> / f<FM>x<FN> / k<bk>",
-)
-
-
-@dataclass(frozen=True)
-class WarpTile:
-    """The tensor-core mma tile — a **shared** descriptor on both :class:`MonoidSchedule`
-    (flash's inner QK/PV — ``# TODO(warp-flash)``) and :class:`SemiringSchedule` (matmul,
-    built). A contraction is mma-tiled onto the one mapping whether it is the top node or
-    nested; never a nested/second schedule.
-
-    Each warp owns a ``reg`` (``FM × FN``) block of ``atom`` cells; the CTA runs ``WM × WN``
-    warps. So the per-CTA output tile is ``tile_m × tile_n`` (:attr:`tile_m` / :attr:`tile_n`)
-    and the CTA launches :attr:`block_threads` ``= WM·WN·32`` threads. ``bk`` chunks the K
-    (contraction) axis ``bk`` atom-cells per inner mma step. Spelled by the warp form of the
-    unified ``TILE`` knob — ``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>`` (an ``a:<atom>`` token
-    selects this :class:`WarpTile` over the scalar :class:`TilePlan`; see :func:`is_warp_codec`),
-    decided in ``020_schedule``."""
-
-    atom: AtomKind
-    warps: tuple[int, int] = (1, 1)  # (WM, WN) — warps per CTA, m then n
-    reg: tuple[int, int] = (1, 1)  # (FM, FN) — atom sub-tiles per warp, m then n
-    bk: int = 1  # K-chunk per inner mma step, in atom_k units
-
-    @classmethod
-    def parse(cls, spec: str) -> WarpTile:
-        """Decode the ``WARP`` codec into a tile: ``/``-separated tokens —
-        ``a:<atom>`` (the registered atom kind), ``w<WM>x<WN>`` (warps, m then n),
-        ``f<FM>x<FN>`` (register sub-tile, m then n), ``k<bk>`` (K-chunk). The ``x`` is a plain
-        dimension separator. The atom token is mandatory; the rest default to ``1``. Ser/de
-        routes through :mod:`codec`."""
-        v = decode(_WARP_SCHEMA, spec)
-        return cls(atom=v["a"], warps=v["w"], reg=v["f"], bk=v["k"])
-
-    def spell(self) -> str:
-        """The ``WARP`` codec string for this tile (inverse of :meth:`parse`)."""
-        return encode(_WARP_SCHEMA, {"a": self.atom, "w": self.warps, "f": self.reg, "k": self.bk})
-
-    @property
-    def tile_m(self) -> int:
-        """The per-CTA output rows = ``WM · FM · atom_m``."""
-        return self.warps[0] * self.reg[0] * self.atom.atom_m
-
-    @property
-    def tile_n(self) -> int:
-        """The per-CTA output cols = ``WN · FN · atom_n``."""
-        return self.warps[1] * self.reg[1] * self.atom.atom_n
-
-    @property
-    def block_threads(self) -> int:
-        """The per-CTA thread count = ``WM · WN · 32`` (32 lanes per warp)."""
-        return self.warps[0] * self.warps[1] * 32
-
-
-def is_warp_codec(spec: str | None) -> bool:
-    """True iff a ``TILE`` codec value spells the **warp** fragment (a :class:`WarpTile`) rather
-    than the scalar :class:`TilePlan` — i.e. it carries an ``a:<atom>`` token naming a tensor-core
-    atom. This is the single discriminator for the unified output-fragment knob: a contraction's
-    output tile is *either* the scalar register sub-tile (``n../f..``) *or* the warp mma tile
-    (``a:.../w../f../k..``), never both, and the value self-describes which. Empty / ``None`` (the
-    per-cell scalar baseline) is not warp."""
-    return bool(spec) and any(t.strip().startswith("a:") for t in spec.split("/"))
 
 
 #: The codec transport token (``cp``) vs the canonical stored value (``cp.async``).
@@ -416,7 +386,7 @@ class Stage:
     the inner atom-K steps, breaking the WAR hazard on the operand fragments). They are
     orthogonal — ``d3/cp/p2`` is a 3-deep gmem ring feeding a 2-deep register ping-pong.
     ``reg_depth = 1`` (the default) is the "optional register" OFF point (no inner prefetch).
-    The slab K-*granularity* (how much K is resident) is ``WarpTile.bk``, NOT a third depth
+    The slab K-*granularity* (how much K is resident) is ``TilePlan.bk``, NOT a third depth
     here — granularity and buffer depth are kept distinct."""
 
     depth: int = 1  # gmem→smem ring depth over the reduce loop (1 = single buffer, no prefetch)
@@ -465,7 +435,7 @@ class Stage:
 
 #: The ``WSPEC`` codec schema — one GROUP field per registered :class:`RoleKind` (token =
 #: warp-count value, params = the role's per-role param schema). Built from ``ROLE_REGISTRY`` so a
-#: new role needs no edit here. The COMPUTE role is implicit (``WarpTile.warps``), never a field.
+#: new role needs no edit here. The COMPUTE role is implicit (``TilePlan.units``), never a field.
 _WSPEC_SCHEMA = Schema(
     "WSPEC",
     tuple(Field(r.token, FieldKind.GROUP, params=r.params) for r in ROLE_REGISTRY.values()),
@@ -487,9 +457,9 @@ class RoleAlloc:
 class WarpSpec:
     """The worker-mapping pin — a role→warp-count allocation over the fixed pipeline, ORTHOGONAL to
     it (``reduce`` / ``tile`` / ``stage``): it adds no pipeline parameter, only the warp split. The
-    COMPUTE (mma-consumer) role is implicit (sized by ``WarpTile.warps``, never listed); each
+    COMPUTE (mma-consumer) role is implicit (sized by ``TilePlan.units``, never listed); each
     :class:`RoleAlloc` is a band of dedicated warps split off the uniform pipeline, so the CTA
-    launches ``WarpTile.block_threads + 32·aux_warps`` threads. ``workers is None`` on the schedule
+    launches ``TilePlan.block_threads + 32·aux_warps`` threads. ``workers is None`` on the schedule
     is uniform SIMT (every warp does every role's work, software-pipelined in-warp); a constructed
     ``WarpSpec`` means specialization is on. Spelled by the ``WSPEC`` codec ``<token><np>[:<param>,
     ...]`` per role (``p2`` / ``p2:q8`` / ``p2:q8/s1``), decided in ``020_schedule``.
@@ -523,7 +493,7 @@ class WarpSpec:
 
     @property
     def aux_warps(self) -> int:
-        """Total dedicated (non-COMPUTE) warps the split adds on top of the ``WarpTile`` grid."""
+        """Total dedicated (non-COMPUTE) warps the split adds on top of the ``TilePlan`` warp grid."""
         return sum(a.warps for a in self.roles)
 
     def is_legal(self, sched: object) -> bool:
@@ -552,15 +522,15 @@ class MonoidSchedule:
 
     Three **orthogonal** reduce-axis fields (kept distinct so they don't become a
     grab-bag): ``reduce`` (the :class:`ReducePlan` partition), ``warp_tile`` (the mma
-    operand tile — flash's inner QK/PV, ``# TODO(warp-flash)``), ``stage`` (operand
-    transport — the :class:`Stage` smem pipeline, ``None`` = gmem-direct). ``block`` are
-    free axes resident in the CTA alongside the cooperative lanes (strided-cooperative
-    rows)."""
+    operand tile — flash's inner QK/PV, a warp-atom :class:`TilePlan`, ``# TODO(warp-flash)``),
+    ``stage`` (operand transport — the :class:`Stage` smem pipeline, ``None`` = gmem-direct).
+    ``block`` are free axes resident in the CTA alongside the cooperative lanes
+    (strided-cooperative rows)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
-    warp_tile: WarpTile | None = None  # TODO(warp-flash)
+    warp_tile: TilePlan | None = None  # a warp-atom TilePlan; TODO(warp-flash)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
     workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
 
@@ -568,16 +538,16 @@ class MonoidSchedule:
 @dataclass(frozen=True)
 class SemiringSchedule:
     """A contraction (``Semiring``) kernel's schedule — the orthogonal reduce-axis fields
-    (``reduce`` / ``stage`` / ``workers``) plus the **mutually-exclusive output tier** ``tier``:
-    the matmul's tensor-core :class:`WarpTile`, OR the scalar register sub-tile :class:`TilePlan`
-    (the ``Scalar`` fragment), OR ``None`` (the per-cell tier). A contraction is warp-tiled or
-    scalar-tiled, never both — the ``a:<atom>`` token in the ``TILE`` knob (decided in
-    ``020_schedule``) picks which. ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
+    (``reduce`` / ``stage`` / ``workers``) plus the output ``tier``: one :class:`TilePlan` whose
+    ``atom`` discriminates the **mutually-exclusive** fragment — a tensor-core mma atom (the warp
+    tile) or the scalar atom (the register sub-tile), OR ``None`` (the per-cell tier). A contraction
+    is warp-tiled or scalar-tiled, never both — the ``a:<atom>`` token in the ``TILE`` knob (decided
+    in ``020_schedule``) picks which. ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
-    tier: TilePlan | WarpTile | None = None  # the output tier: scalar TilePlan | tensor-core WarpTile | None (per-cell)
+    tier: TilePlan | None = None  # the output tier (scalar or mma TilePlan, discriminated by atom); None = per-cell
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
     workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
     bind: AtomBinding | None = None  # the operand→role binding, filled by 020_schedule after
@@ -655,6 +625,5 @@ __all__ = [
     "Stage",
     "TilePlan",
     "WarpSpec",
-    "WarpTile",
     "kernel_for",
 ]

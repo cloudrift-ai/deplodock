@@ -19,9 +19,7 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile import SemiringKernel, TileOp, TilePlan
-from deplodock.compiler.ir.tile.atom import SCALAR_ATOM
-from deplodock.compiler.ir.tile.schedule import WarpTile
+from deplodock.compiler.ir.tile import SemiringKernel, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -40,9 +38,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     if not isinstance(kernel, SemiringKernel):
         raise RuleSkipped("not a contraction")
     tier = sched.tier
-    is_warp = isinstance(tier, WarpTile)
-    is_tiled = isinstance(tier, TilePlan) and tier.is_tiled
-    if not (is_warp or is_tiled):
+    if tier is None or not tier.is_tiled:
         raise RuleSkipped("non-tiled contraction — per-cell fallback in 010")
 
     node = tile.op
@@ -65,26 +61,21 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
         tail = with_store(tail, root.output.name, grid, node)
 
     # TODO(warp-spec): emit the producer/consumer warp split from sched.workers (the WSPEC role
-    # allocation) — reserved this cut; materialization stays uniform SIMT.
-    if is_warp:
-        wt = tier
-        atom, units_m, units_n, reg_m, reg_n = wt.atom, wt.warps[0], wt.warps[1], wt.reg[0], wt.reg[1]
-    else:
-        plan = tier  # scalar: the parallel thread-tile IS the UNIT grid (lanes 1×1)
-        atom, units_m, units_n, reg_m, reg_n = SCALAR_ATOM, plan.par_m, plan.par_n, plan.reg_m, plan.reg_n
-
+    # allocation) — reserved this cut; materialization stays uniform SIMT. The tier's ``atom``
+    # selects the codegen (a tensor-core mma cell / the scalar fma cell); the unit / register widths
+    # read off it in normalized (m, n) order — for scalar the UNIT grid IS the parallel thread-tile.
     contraction = Contraction(
         m_axis=m_axis,
         n_axis=n_axis,
         k_axis=k_axis,
-        units_m=units_m,
-        units_n=units_n,
-        reg_m=reg_m,
-        reg_n=reg_n,
+        units_m=tier.units_m,
+        units_n=tier.units_n,
+        reg_m=tier.reg_m,
+        reg_n=tier.reg_n,
         a_load=bind.a.load,
         b_load=bind.b.load,
         acc=bind.acc,
-        atom=atom,
+        atom=tier.atom,
         lead_axes=lead,
         epilogue=Body(tail),
     )

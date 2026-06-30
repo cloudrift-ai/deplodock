@@ -26,7 +26,7 @@ def test_empty_is_uniform() -> None:
 
 
 def test_aux_warps_sums_non_compute_bands() -> None:
-    assert WarpSpec.parse("p2:q8/s1").aux_warps == 3  # COMPUTE (WarpTile.warps) is not counted here
+    assert WarpSpec.parse("p2:q8/s1").aux_warps == 3  # COMPUTE (TilePlan.units) is not counted here
 
 
 def test_default_params_dropped() -> None:

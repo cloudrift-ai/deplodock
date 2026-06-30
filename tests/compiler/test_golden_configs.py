@@ -96,7 +96,7 @@ def test_goldens_speak_native_codecs_and_featurize():
     codecs (no legacy GEMM-letter vocabulary survives), and every **matmul** golden featurizes to a
     non-empty tile geometry family — the scalar path that silently produced empty ``D_*`` features
     while the goldens still spelled ``BM``/``BN`` (the bug the migration fixed)."""
-    from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan, WarpTile, is_warp_codec
+    from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan
     from deplodock.compiler.pipeline import knob
 
     legacy = {"BN", "BM", "FM", "FN", "BK", "BR", "FK", "SPLITK", "WN", "WM", "MMA", "RING", "TMA"}
@@ -104,7 +104,7 @@ def test_goldens_speak_native_codecs_and_featurize():
         assert not (legacy & set(g.knobs)), f"{g.name} still carries legacy knobs: {sorted(legacy & set(g.knobs))}"
         tile = g.knobs.get("TILE")
         if tile:
-            (WarpTile.parse(tile) if is_warp_codec(tile) else TilePlan.parse(tile))  # parses, or raises
+            TilePlan.parse(tile)  # parses (warp or scalar form), or raises
         ReducePlan.parse(g.knobs.get("REDUCE"))
         if g.knobs.get("STAGE"):
             Stage.parse(g.knobs["STAGE"])

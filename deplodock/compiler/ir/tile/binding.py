@@ -4,7 +4,7 @@ The ``020_schedule`` tile pass resolves, *once and structurally*, the facts the 
 materializers used to re-recognize from lowered loop-IR: which contracted operand is the
 mma ``a`` vs ``b`` (by which grid output axis its index carries), whether ``b`` is
 transposed, the fold accumulator, and the fused-projection epilogue. The result rides the
-**schedule** (a sibling of :class:`~.schedule.WarpTile`), NOT the op tree — so the
+**schedule** (a sibling of :class:`~.schedule.TilePlan`), NOT the op tree — so the
 ``Semiring`` combine stays the single source of truth and ``op_cache_key`` (which digests
 ``lower(op.op)``, not the schedule) is untouched.
 
@@ -34,8 +34,8 @@ class Operand:
 class AtomBinding:
     """The atom-tier operand→role binding ``020_schedule`` resolves off the ``Semiring`` —
     the structural facts the warp materializer used to re-discover from lowered loop-IR.
-    The forward sibling of :class:`~.schedule.WarpTile` (which carries the *atom geometry*
-    decision); read only by ``_warp``. Carries NO ``atom`` (that's ``WarpTile.atom``) and no
+    The forward sibling of :class:`~.schedule.TilePlan` (which carries the *atom geometry*
+    decision); read only by ``_warp``. Carries NO ``atom`` (that's ``TilePlan.atom``) and no
     ``reduce_axis`` / ``m_axis`` / ``n_axis`` (those stay on the ``Semiring`` / the grid) —
     only what isn't already on the schedule or the still-present combine."""
 

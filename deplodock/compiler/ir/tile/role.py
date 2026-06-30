@@ -2,7 +2,7 @@
 
 A :class:`RoleKind` is one warp-specialized worker role (producer / sfu / ...): its ``WSPEC`` codec
 token, its per-role param schema, and a legality predicate over the (uniform) schedule it would
-specialize. The COMPUTE / mma-consumer role is **implicit** — it is sized by ``WarpTile.warps`` and
+specialize. The COMPUTE / mma-consumer role is **implicit** — it is sized by ``TilePlan.units`` and
 never appears in the ``WSPEC`` codec, so the worker split never restates the tile (the orthogonality
 litmus). Every other role is a band split off the fixed pipeline and spelled by its token in the
 ``WSPEC`` codec (``<token><np>[:<param>,...]`` — :class:`~deplodock.compiler.ir.tile.schedule.WarpSpec`).
@@ -47,7 +47,7 @@ class RoleKind:
 
 
 #: The registered warp-spec roles, keyed by the ``WSPEC`` codec token. COMPUTE (the mma consumer)
-#: is implicit — sized by ``WarpTile.warps``, never registered. PRODUCER drives the ``Stage`` load
+#: is implicit — sized by ``TilePlan.units``, never registered. PRODUCER drives the ``Stage`` load
 #: half; SFU is a stub example of the role-extension path (a transcendental epilogue band).
 ROLE_REGISTRY: dict[str, RoleKind] = {
     "p": RoleKind(

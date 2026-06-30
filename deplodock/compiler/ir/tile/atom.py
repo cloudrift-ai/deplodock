@@ -13,7 +13,7 @@ The **unit** is the atom's parallel thread footprint (:attr:`lanes`): a warp (32
 thread (1) for scalar. So the warp tile and the scalar parallel thread-tile are the *same* tiling
 level — a 2-D grid of units — differing only in ``lanes``. ``block_threads = units · lanes``.
 
-``AtomKind`` rides on the ``atom`` field of :class:`~deplodock.compiler.ir.tile.schedule.WarpTile`;
+``AtomKind`` rides on the ``atom`` field of :class:`~deplodock.compiler.ir.tile.schedule.TilePlan`;
 the kernel-IR ``MmaSyncPtx`` / ``RegFragment`` / ``RegStore`` render off its ``shape`` +
 ``operand_dtype`` per role; the ``TILE`` codec names an mma atom by its registry key
 (:data:`ATOM_REGISTRY`). The cooperative-reduce combine (``WarpShuffle`` / ``TreeHalve``) needs no
@@ -37,7 +37,7 @@ class AtomKind:
 
     ``operand_dtypes`` maps each role (``"a"`` / ``"b"`` / ``"c"``) to its element dtype;
     ``a``/``b`` are the multiplicands (f16 or bf16), ``c`` the f32 accumulator. Frozen + hashable so
-    it rides on a frozen ``WarpTile`` / ``Contraction``. :attr:`lanes` is 32 — an mma is
+    it rides on a frozen ``TilePlan`` / ``Contraction``. :attr:`lanes` is 32 — an mma is
     warp-cooperative (one warp executes a cell)."""
 
     name: str
@@ -80,7 +80,7 @@ class ScalarAtom:
     """The scalar fma leaf — one thread folds one output cell. The degenerate atom: a ``(1, 1,
     1)`` cell with ``lanes == 1``. No operand-dtype spec (the scalar body folds the carrier
     directly, dtypes resolved during lowering), so it carries only its identity. Selected when a
-    contraction has no tensor-core ``WarpTile`` (the register-tile / per-cell tier)."""
+    contraction has no tensor-core ``TilePlan`` (the register-tile / per-cell tier)."""
 
     name: str = "scalar"
     shape: tuple[int, int, int] = (1, 1, 1)

@@ -34,7 +34,7 @@ from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
-from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, WarpTile, is_warp_codec
+from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -60,7 +60,7 @@ REDUCE = Knob(
 # contraction's output tile is *either* the scalar register sub-tile (``n<N>[x<M>]`` parallel
 # thread-tile / ``f<fn>[x<fm>]`` register sub-tile) *or* the tensor-core warp mma tile
 # (``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>``), never both. The value self-discriminates: an
-# ``a:<atom>`` token selects the warp fragment (:class:`WarpTile`); otherwise the scalar
+# ``a:<atom>`` token selects the warp fragment (a tensor-core-atom :class:`TilePlan`); otherwise scalar
 # fragment (:class:`TilePlan`) — see ``schedule.is_warp_codec``. Same decision hierarchy: env pin
 # via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``Semiring``
 # contraction tiles its output today; ``off=""`` auto-stamps everything else. The codec is the
@@ -103,7 +103,7 @@ WSPEC = Knob(
     "WSPEC",
     KnobType.STR,
     help="Warp-specialization codec — role→warp split over the fixed pipeline "
-    "(p<np> producer[:q<window>], s<ns> sfu, …; compute warps implicit = WarpTile.warps; empty=uniform SIMT). "
+    "(p<np> producer[:q<window>], s<ns> sfu, …; compute warps implicit = TilePlan.units; empty=uniform SIMT). "
     "Decided in lowering/tile/020_schedule; materialization reserved (TODO).",
     off="",
 )
@@ -284,11 +284,11 @@ def _check_warp_static_k(kernel, wt) -> None:
 
 def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
-    form of the ``TILE`` spec resolved into the schedule's ``WarpTile`` (the ``Warp`` fragment),
+    form of the ``TILE`` spec resolved into the schedule's warp-atom :class:`TilePlan` (the ``Warp`` fragment),
     plus an optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The packed
     ``TILE`` codec is the sole on-dict spelling — the learned-prior featurizer parses it directly
     (no legacy ``WM``/``WN``/``MMA`` explosion)."""
-    wt = WarpTile.parse(spec)
+    wt = TilePlan.parse(spec)
     _check_warp_static_k(kernel, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
     # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
@@ -319,10 +319,10 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
     # each owning a ``reg_n · reg_m`` register sub-tile). Reject a parallel tile over the
     # 1024-thread/CTA hardware limit — otherwise the launch fails late with an opaque
     # ``CUDA_ERROR_INVALID_VALUE`` instead of a clear compile-time error.
-    block = plan.par_n * plan.par_m
+    block = plan.block_threads
     if block > _MAX_BLOCK_THREADS:
         raise ValueError(
-            f"TILE parallel block {plan.par_n}×{plan.par_m}={block} threads exceeds the "
+            f"TILE parallel block {plan.units_n}×{plan.units_m}={block} threads exceeds the "
             f"{_MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
         )
     sched = replace(kernel.schedule, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)

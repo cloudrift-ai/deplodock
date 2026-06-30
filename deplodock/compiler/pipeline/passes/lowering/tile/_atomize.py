@@ -6,7 +6,7 @@ transposed, the fold accumulator, and the projection epilogue. Every one of thos
 already first-class on the ``Semiring`` node (``operands`` / ``fold`` / ``reduce_axis`` /
 ``out``) and the grid. :func:`semiring_binding` reads them **structurally** — off each
 operand's own leaf ``Load`` index, never a flattened loop — and builds an :class:`AtomBinding`
-that rides the **schedule** (a sibling of the ``WarpTile`` decision; ``op_cache_key`` digests
+that rides the **schedule** (a sibling of the ``TilePlan`` decision; ``op_cache_key`` digests
 ``lower(op.op)``, not the schedule, so the perf / prior cache stays byte-identical). The
 cooperative reduce needs no binding here — its accumulator dtype + shuffle/tree mechanism are
 derived at materialize time (``emit_combine`` off the carrier + ``ReduceStage.combine``).
@@ -22,7 +22,7 @@ nested contraction, so a kind-recursive atomize would bind the inner QK^T / PV w
 :func:`bind_contraction` the root uses — that function is node-addressable for exactly this
 reuse. It is **not wired yet** because flash's inner contractions are not structural
 ``Semiring`` nodes today (``_flash._flash_op`` ``lower()``-s the QK score straight into loop-IR
-and carries no per-node ``WarpTile``). Wiring it requires warp-flash to first keep the inner
+and carries no per-node ``TilePlan``). Wiring it requires warp-flash to first keep the inner
 contractions as ``Semiring`` nodes + attach inner geometry; until then a tree-walk would bind
 nothing, so it is intentionally absent."""
 

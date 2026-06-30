@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan, WarpTile
+from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan
 
 
 @pytest.mark.parametrize("spec", ["b0", "r0", "g0", "g", "b", "bx", "g2k/b0"])
@@ -45,8 +45,8 @@ def test_tile_codec_allows_valid(spec: str) -> None:
 )
 def test_warp_codec_rejects_degenerate(spec: str) -> None:
     with pytest.raises(ValueError, match="WARP"):
-        WarpTile.parse(spec)
+        TilePlan.parse(spec)
 
 
 def test_warp_codec_allows_identity() -> None:
-    WarpTile.parse("a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # all-1 widths — no raise
+    TilePlan.parse("a:mma_m16n8k16_f16/w1x1/f1x1/k1")  # all-1 widths — no raise
