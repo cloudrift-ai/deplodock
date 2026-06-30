@@ -1,9 +1,9 @@
-"""Shared axis-geometry helpers for the kernel materializer + the warp factorizer.
+"""Shared axis-geometry helpers for the kernel materializer + the contraction factorizer.
 
 Tiny, dependency-light functions used by both ``010_materialize`` (scalar / reg / reduce
-tiers) and ``_warp_factor`` (the warp/mma factorization), lifted here so the warp geometry
-can move out of the materializer without duplicating them. Leading ``_`` so the pass loader
-(globs ``*.py``, skips ``_``-prefixed) skips this module."""
+tiers) and ``_factor`` (the atom-generic mma/scalar factorization), lifted here so the warp
+geometry can move out of the materializer without duplicating them. Leading ``_`` so the pass
+loader (globs ``*.py``, skips ``_``-prefixed) skips this module."""
 
 from __future__ import annotations
 

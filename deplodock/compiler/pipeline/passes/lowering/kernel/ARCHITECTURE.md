@@ -50,16 +50,18 @@ object**. It expands any `Contraction` by tiling a **leaf atom** four ways throu
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The tiling
 geometry (`tile_m` / `mask_m` / `m_b` / `m_uvar` / `block_threads` / `lanes` / …) is **derived on the `Contraction` node
 itself** (`@property`, computed from the leaf widths + skeleton axes); `factorize` reads it straight off `c` and hands
-`grid_tile` the atom-specific **codegen callables** (`state_decls` / `reduce_region` / `store`) that the leaf type
-selects — the only per-atom difference:
+`grid_tile` the atom-specific **codegen callables** (`state_decls` / `reduce_region` / `store`). The single
+`_factor.codegen` is a thin seam: it **dispatches that triple off the atom** (`isinstance(c.atom, AtomKind)`) and binds
+the `Contraction` — the only per-atom difference:
 
-- **mma** (`_warp_factor.mma_codegen`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the codegen emits
-  `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**), and decodes the
-  atom-lane offset at render. All mma codegen lives in `_warp_factor.py`, the new-atom seam.
-- **scalar** (`_scalar_factor.scalar_codegen`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a **single thread** (so
-  there is no `_lane` axis); the codegen comes from the lowered per-cell body (split into a `pre` region / the reduce
-  `Loop` / a projection `tail`), replicated per register cell with its operand loads deduped (the arithmetic-intensity
-  reuse).
+- **mma** (`_mma_state` / `_mma_reduce` / `_mma_store`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the
+  codegen emits `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**),
+  and decodes the atom-lane offset at render.
+- **scalar** (`_scalar_state` / `_scalar_reduce` / `_scalar_store`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a
+  **single thread** (so there is no `_lane` axis); the codegen **synthesizes** the reduce `Loop` from the operands and
+  replicates it + a projection `tail` per register cell with its operand loads deduped (the arithmetic-intensity reuse).
+
+Both triples are free functions in `_factor.py`, the new-atom seam.
 
 The **unit** is the atom's parallel thread footprint (`atom.lanes`) — so the tensor-core warp tile and the scalar
 parallel thread-tile are the *same* level, differing only in `lanes`; `block_threads = units · lanes`. `grid_tile` also
@@ -69,7 +71,7 @@ carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The
 ## Operand staging — reserved
 
 The warp tier's smem **operand-staging** pipeline (the `STAGE` codec's cp.async / TMA slab — formerly `_stage.py` +
-`_warp_factor`'s `_warp_staged_kloop` / `_warp_tma_staged_kloop`) was **dropped** so both contraction tiers load
+the warp factorizer's `_warp_staged_kloop` / `_warp_tma_staged_kloop`) was **dropped** so both contraction tiers load
 operands gmem-direct (the `MmaLeaf` / `ScalarLeaf` symmetry — neither carries a `stage`). The `STAGE` codec +
 `schedule.Stage` field still land (`020_schedule` stamps them — the knob/featurizer path is intact), but they are **not
 materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
