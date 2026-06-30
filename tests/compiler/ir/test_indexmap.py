@@ -1,6 +1,6 @@
 """Unit tests for IndexMapOp + coord_expr helpers."""
 
-from deplodock.compiler.ir.expr import (
+from emmy.compiler.ir.expr import (
     PLACEHOLDER_PREFIX,
     BinaryExpr,
     Literal,
@@ -9,7 +9,7 @@ from deplodock.compiler.ir.expr import (
     is_placeholder,
     placeholder,
 )
-from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+from emmy.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
 # ---------- placeholder helpers ----------
 
@@ -127,8 +127,8 @@ def test_indexmap_sources_round_trip_through_json():
     by ``json.dumps(default=str)`` and reloaded as ``str``, crashing
     ``030_lift_indexmap`` (``'str' has no attribute 'input_idx'``) on
     ``run --ir`` recompiles."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8)), node_id="a")

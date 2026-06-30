@@ -6,10 +6,10 @@ to a configuration that previously emitted a wrong-output kernel and
 confirms the lowered kernel matches the numpy-backend reference within
 fp32 tolerance.
 
-Knob pinning rides on the existing ``DEPLODOCK_KNOBS="K1=V1,..."``
-env-var mechanism (see ``deplodock/compiler/pipeline/knob.py`` —
+Knob pinning rides on the existing ``EMMY_KNOBS="K1=V1,..."``
+env-var mechanism (see ``emmy/compiler/pipeline/knob.py`` —
 ``apply_knobs_env`` splats the aggregate into per-knob
-``DEPLODOCK_<K>=V`` vars at import time, and ``Knob.narrow`` intersects
+``EMMY_<K>=V`` vars at import time, and ``Knob.narrow`` intersects
 the planner's candidate lists with the pinned values inside
 ``010_partition_loops._enumerate_cartesian`` so only matching
 ``TileParams`` are enumerated).
@@ -65,7 +65,7 @@ _BROKEN_GATED: tuple[dict, ...] = (
 
 
 def _format_knobs(knobs: dict) -> str:
-    """Render a knob dict as ``"K1=V1,K2=V2,..."`` for ``DEPLODOCK_KNOBS``."""
+    """Render a knob dict as ``"K1=V1,K2=V2,..."`` for ``EMMY_KNOBS``."""
     return ",".join(f"{k}={v}" for k, v in knobs.items())
 
 
@@ -73,9 +73,9 @@ def _build_matmul_graph(dims: dict, mode: str = "static"):
     """``(1, M, K) @ (K, N)``. ``mode='dynamic'`` makes the M axis symbolic
     (``Dim('seq_len')``); the returned ``input_shapes`` stay concrete so the run
     feeds a real (1, M, K) array the symbolic kernel resolves ``seq_len`` from."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     M, K, N = dims["M"], dims["K"], dims["N"]
     Mg = dyn_M(mode, M)
@@ -88,10 +88,10 @@ def _build_matmul_graph(dims: dict, mode: str = "static"):
 
 
 def _build_gated_graph(dims: dict, mode: str = "static"):
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
     S, H, Inter = dims["S"], dims["H"], dims["I"]
     Sg = dyn_M(mode, S)
@@ -113,10 +113,10 @@ def _build_norm_linear_graph(dims: dict, mode: str = "static"):
     seq axis symbolic (``Dim('seq_len')``, the deployable masked-tile path).
     The norm reduction stages ``x`` in ``BK``-element inner slabs; at fp16 +
     ``BK=32`` that slab is 64 B (not 128 B-aligned), the TMA-misalignment hazard."""
-    from deplodock.compiler.dtype import F16
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+    from emmy.compiler.dtype import F16
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import LinearOp, RmsNormOp
 
     S, H, Inter = dims["S"], dims["H"], dims["I"]
     Sg = dyn_M(mode, S)
@@ -131,15 +131,15 @@ def _build_norm_linear_graph(dims: dict, mode: str = "static"):
 
 
 def _run_with_knobs(graph, inputs: dict[str, np.ndarray], out_name: str, knobs: dict, monkeypatch) -> np.ndarray:
-    """Set the per-knob ``DEPLODOCK_<K>`` env vars (the same pinning
-    mechanism ``DEPLODOCK_KNOBS=...`` uses after ``apply_knobs_env``
+    """Set the per-knob ``EMMY_<K>`` env vars (the same pinning
+    mechanism ``EMMY_KNOBS=...`` uses after ``apply_knobs_env``
     splats it) so the partition planner filters its variant enumeration
     down to the single ``TileParams`` we want to verify, then compile
     + run via the CUDA backend."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     for k, v in knobs.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+        monkeypatch.setenv(f"EMMY_{k}", str(v))
 
     be = CudaBackend()
     compiled = be.compile(graph)
@@ -149,7 +149,7 @@ def _run_with_knobs(graph, inputs: dict[str, np.ndarray], out_name: str, knobs: 
 def _reference(graph, inputs: dict[str, np.ndarray], out_name: str) -> np.ndarray:
     """Numpy reference — runs the same Graph on the NumpyBackend so the
     comparison stays self-contained (no torch dependency)."""
-    from deplodock.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
 
     be = NumpyBackend()
     compiled = be.compile(graph)
@@ -166,7 +166,7 @@ def _assert_match(forced: np.ndarray, ref: np.ndarray) -> None:
     assert np.all(np.isfinite(forced)), "forced-knob output has non-finite values"
     # fp32 reduction-order drift across CTAs vs numpy's pairwise sum
     # can push max_diff to a few percent of peak — same 5%-of-peak
-    # tolerance ``deplodock run --bench`` uses.
+    # tolerance ``emmy run --bench`` uses.
     peak = float(np.max(np.abs(ref)))
     atol = max(1e-3, 0.05 * peak)
     np.testing.assert_allclose(forced, ref, atol=atol, rtol=0.05)
@@ -226,7 +226,7 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
     # This pins a scalar cooperative-reduce config for the demoted matmul's CUT producer
     # kernel (the #244 TMA wedge); SPLIT_CONE=1 forces that GMEM cut (the default is now the
     # keep(SMEM) fused edge, which has no separate norm-reduce producer to wedge).
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "1")
     static_graph, input_shapes, (out_name, _) = _build_norm_linear_graph(_NORM_DIMS)
     forced_graph, _, _ = _build_norm_linear_graph(_NORM_DIMS, mode=shape_mode)
     rng = np.random.default_rng(0)
@@ -254,7 +254,7 @@ def test_norm_linear_fp16_scalar_reduce_tma_alignment(shape_mode, monkeypatch):
 # shape with large K to force the K-split.
 _MMA_K_SPLIT_SHAPES: tuple[tuple[int, int, int], ...] = (
     # (M, N, K). 2048³ matches the original reproducer from the
-    # ``deplodock run --bench`` investigation; smaller shapes fit
+    # ``emmy run --bench`` investigation; smaller shapes fit
     # K fully in one stage and the regression doesn't surface.
     (2048, 2048, 2048),
 )
@@ -271,12 +271,12 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
     """
     import numpy as np
 
-    from deplodock.compiler.dtype import F16
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.dtype import F16
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "1")
+    monkeypatch.setenv("EMMY_MMA", "1")
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
     g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (K, N), dtype=F16), node_id="b")
@@ -299,15 +299,15 @@ def test_mma_matmul_k_split_staged(M: int, N: int, K: int, monkeypatch):
 
 # Scalar-FMA fp16 regression (prerequisite for the split-pipe GEMM). On cc>=9.0 the F16 atom is
 # eligible whenever the K-loads are F16, so at >=512^3 the greedy compile
-# *prefers* the tensor-core variant; ``DEPLODOCK_MMA=0`` is what forces the
+# *prefers* the tensor-core variant; ``EMMY_MMA=0`` is what forces the
 # scalar register-tile FMA path (fp16 in -> fp32 accumulate -> fp16 out). The
 # 512^3 shape is the smallest where MMA=0 is load-bearing (<=256^3 greedy picks
 # scalar on its own, so a small shape wouldn't prove the knob does anything).
 def _build_f16_matmul_graph(M: int, N: int, K: int):
-    from deplodock.compiler.dtype import F16
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.dtype import F16
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (M, K), dtype=F16), node_id="a")
@@ -323,7 +323,7 @@ def _build_f16_matmul_graph(M: int, N: int, K: int):
     return g, inputs, ref
 
 
-# Scalar-only knobs (no ATOM_KIND / WARP_SPECIALIZE). With DEPLODOCK_MMA unset
+# Scalar-only knobs (no ATOM_KIND / WARP_SPECIALIZE). With EMMY_MMA unset
 # these make the greedy compile pick the (unstaged-with-TMA=0) atom variant.
 _SCALAR_F16_KNOBS = {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0, "STAGE": 11}
 
@@ -331,11 +331,11 @@ _SCALAR_F16_KNOBS = {"BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1
 @requires_cuda
 def test_scalar_matmul_f16(monkeypatch):
     """fp16 matmul forced through the scalar register-tile FMA path
-    (``DEPLODOCK_MMA=0``); fp32 accumulate, verified vs the numpy backend.
+    (``EMMY_MMA=0``); fp32 accumulate, verified vs the numpy backend.
     Guards against fp16 being re-routed to the tensor-core atom path and
     against the fp16 scalar render (``__half2float`` multiply, ``__float2half``
     store) regressing."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("EMMY_MMA", "0")
     g, inputs, ref = _build_f16_matmul_graph(512, 512, 512)
     forced = _run_with_knobs(g, inputs, "c", _SCALAR_F16_KNOBS, monkeypatch)
     peak = float(np.max(np.abs(ref.astype(np.float32))))
@@ -354,14 +354,14 @@ def test_article_tma_sgemm_reproduction(monkeypatch):
     staged bundles flip to ``StagePolicy.TMA`` and that the lowered kernel emits the
     ``cp.async.bulk.tensor`` box copy. Tile-level (inspects the staging policy + source).
     No CUDA needed."""
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
-    from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.cuda.ir import CudaOp
+    from emmy.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+    from emmy.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
     for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+        monkeypatch.setenv(f"EMMY_{k}", str(v))
     res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
     bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
     assert bundles, "the staged scalar tile must synthesize at least one StageBundle"
@@ -380,13 +380,13 @@ def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
     at 255 regs / ~293 µs with the unroll, ~126 regs / ~384 µs without — the lever for
     the article's ~96 %-of-cuBLAS number). The K-outer pipeline loop (> 64 unrolled
     trips) stays rolled. Compile-only (inspects the kernel source). No CUDA needed."""
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.cuda.ir import CudaOp
+    from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
     for k, v in {"MMA": 0, "BM": 8, "BN": 32, "FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "STAGE": 11, "TMA": 1}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
+        monkeypatch.setenv(f"EMMY_{k}", str(v))
     res = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g, ctx=Context.from_target((12, 0)))
     src = "\n".join(n.op.kernel_source for n in res.nodes.values() if isinstance(n.op, CudaOp))
     assert "#pragma unroll" in src, "the small FMA inner reduce must be marked for #pragma unroll"
@@ -407,8 +407,8 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     pin the budget-aware ``120_stage`` filter prunes every over-budget staging subset
     to the empty one (``FM=26`` slabs blow the smem cap), so greedy's option-0 stages
     nothing and the operands lower gmem-direct."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda.ir import CudaOp
 
     g, _, _ = _build_f16_matmul_graph(512, 512, 512)
     # Pin only the WARP-tier geometry (the over-ceiling register tile + atom-K chunk)
@@ -418,10 +418,10 @@ def test_unstaged_atom_lowers_gmem_direct(monkeypatch):
     # are deliberately NOT pinned: they are foreign to the warp tier and the strict
     # knob-pin validator (``_validate``) rejects them alongside a ``MMA=<kind>`` pin.
     for k, v in {"FM": 26, "FN": 4, "BK": 32, "SPLITK": 1, "TMA": 0}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
-    # A DEPLODOCK_MMA=<kind> pin is authoritative (the planner drops the scalar
+        monkeypatch.setenv(f"EMMY_{k}", str(v))
+    # A EMMY_MMA=<kind> pin is authoritative (the planner drops the scalar
     # tier), so greedy MUST take the atom variant.
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
     compiled = CudaBackend().compile(g)  # no longer raises
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
     assert "dpl_mma_load_a_gmem" in src and "dpl_mma_load_b_gmem" in src, "unstaged operands not loaded gmem-direct"
@@ -474,9 +474,9 @@ _ARTICLE_DIMS = {"M": 2048, "K": 2048, "N": 2048}
 def _build_2d_matmul_graph(dims: dict):
     """2D matmul ``a (M, K) @ b (K, N)`` — the canonical SGEMM shape
     the article kernel targets, no leading batch dim."""
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     M, K, N = dims["M"], dims["K"], dims["N"]
     g = Graph()
@@ -488,7 +488,7 @@ def _build_2d_matmul_graph(dims: dict):
 
 
 # (label, dims, knobs, env extras). ``dims`` is the M/K/N; ``knobs`` is the per-knob
-# ``DEPLODOCK_<K>`` pin set; ``env`` carries non-knob ``DEPLODOCK_*`` vars (today only
+# ``EMMY_<K>`` pin set; ``env`` carries non-knob ``EMMY_*`` vars (today only
 # the ``INTERLEAVE_LOADS`` opt-out). Masked-N (FN=26) uses a smaller 512³ shape — the
 # per-launch watchdog in ``program.py`` is 1 s and the masked kernels are scalar
 # (SYNC) here, so the small shape keeps comfortably inside it under parallel xdist.
@@ -517,7 +517,7 @@ _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
         "interleave_loads_disabled",
         _ARTICLE_DIMS,
         {"BM": 8, "BN": 32, "FM": 4, "FN": 4, "BK": 32, "SPLITK": 1, "BR": 1},
-        {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
+        {"EMMY_INTERLEAVE_LOADS": "0"},
     ),
     # The blogs' hero register tile: BM=8 BN=32 FM=26 FN=4 BK=32 → a 208×128 masked-M
     # tile (TM=26 ≈ 106 % of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
@@ -534,7 +534,7 @@ _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
 
 def _run_with_knobs_and_env(graph, inputs, out_name: str, knobs: dict, env: dict, monkeypatch) -> np.ndarray:
     """Variant of ``_run_with_knobs`` that also stamps extra env vars
-    (used for opt-out flags like ``DEPLODOCK_INTERLEAVE_LOADS``)."""
+    (used for opt-out flags like ``EMMY_INTERLEAVE_LOADS``)."""
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     return _run_with_knobs(graph, inputs, out_name, knobs, monkeypatch)

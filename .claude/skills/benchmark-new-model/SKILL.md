@@ -1,18 +1,18 @@
 ---
 name: benchmark-new-model
-description: Use this skill when the user asks to "add a new model and benchmark it", "benchmark this model", "try out model X on a server", "benchmark <HF model id>", or otherwise wants to onboard a previously-unsupported model into deplodock and run benchmarks against it on an existing or freshly provisioned remote GPU server. The skill creates a recipe, web-searches optimal launch parameters and the right engine/image, validates context length / tool / reasoning parsers, and runs benchmarks with hard time caps.
+description: Use this skill when the user asks to "add a new model and benchmark it", "benchmark this model", "try out model X on a server", "benchmark <HF model id>", or otherwise wants to onboard a previously-unsupported model into emmy and run benchmarks against it on an existing or freshly provisioned remote GPU server. The skill creates a recipe, web-searches optimal launch parameters and the right engine/image, validates context length / tool / reasoning parsers, and runs benchmarks with hard time caps.
 version: 0.1.0
 ---
 
 # Benchmark a New Model
 
-Onboard a new model into deplodock by creating a recipe, validating that it actually launches and serves correctly on the chosen server, then running a benchmark within strict time bounds. The end result is a committed recipe under `recipes/<model>/` plus benchmark output in `recipes/<model>/<timestamp>_<hash>/`.
+Onboard a new model into emmy by creating a recipe, validating that it actually launches and serves correctly on the chosen server, then running a benchmark within strict time bounds. The end result is a committed recipe under `recipes/<model>/` plus benchmark output in `recipes/<model>/<timestamp>_<hash>/`.
 
-This skill **assumes** the deplodock CLI is the only tool that should touch the remote server. Never `ssh` in by hand to mutate state — that violates the "never modify deployed CloudRift servers" rule. Read-only inspection (logs, `nvidia-smi`, `docker ps`) over SSH is fine.
+This skill **assumes** the emmy CLI is the only tool that should touch the remote server. Never `ssh` in by hand to mutate state — that violates the "never modify deployed CloudRift servers" rule. Read-only inspection (logs, `nvidia-smi`, `docker ps`) over SSH is fine.
 
 ## Preflight — Load env files
 
-Before any `deplodock` command, source the relevant env file(s) so `HF_TOKEN`, `CLOUDRIFT_API_KEY`, `CLOUDRIFT_API_URL`, etc. are exported into the shell. deplodock reads these from `os.environ` directly and **does not auto-load `.env`** (no dotenv dep). Without this step, gated HF models fail to download and CloudRift commands hit the wrong cluster or fail to authenticate.
+Before any `emmy` command, source the relevant env file(s) so `HF_TOKEN`, `CLOUDRIFT_API_KEY`, `CLOUDRIFT_API_URL`, etc. are exported into the shell. emmy reads these from `os.environ` directly and **does not auto-load `.env`** (no dotenv dep). Without this step, gated HF models fail to download and CloudRift commands hit the wrong cluster or fail to authenticate.
 
 ### Which file(s) to source
 
@@ -23,18 +23,18 @@ If the user wants something other than `.env` but didn't say which file, **list 
 
 ### How to source
 
-Run sourcing in the **same Bash call** as the deplodock command (Bash sessions don't preserve env across calls). Order matters when overlaying: base first, overlay second, so the overlay wins on conflict.
+Run sourcing in the **same Bash call** as the emmy command (Bash sessions don't preserve env across calls). Order matters when overlaying: base first, overlay second, so the overlay wins on conflict.
 
 Default (just `.env`):
 
 ```bash
-[ -f .env ] && set -a && . ./.env && set +a && deplodock deploy ssh --recipe recipes/<name> --ssh <user@host>
+[ -f .env ] && set -a && . ./.env && set +a && emmy deploy ssh --recipe recipes/<name> --ssh <user@host>
 ```
 
 With a user-specified overlay file `<extra>` (e.g. `.env.local`, or whatever they named):
 
 ```bash
-set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && deplodock vm create cloudrift --instance-type <type> --ssh-key ~/.ssh/id_ed25519.pub
+set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && emmy vm create cloudrift --instance-type <type> --ssh-key ~/.ssh/id_ed25519.pub
 ```
 
 The `[ -f .env ] && . ./.env;` part lets the base file be optional but fails loudly if the overlay is missing — that's intentional, since a missing user-specified file usually means you're about to hit the wrong target.
@@ -51,7 +51,7 @@ After sourcing, confirm the variables you need are set **without echoing values*
 
 Do **not** use `echo "HF_TOKEN: ${HF_TOKEN:+set}${HF_TOKEN:-MISSING}"` — when the var is set, `${VAR:-MISSING}` still expands to the **value** (the default only applies when unset), so you get `set<actual-secret>` printed.
 
-If `HF_TOKEN` is missing, gated HF models will 401 silently-ish on download — stop and ask the user how to provide it. If a user-specified overlay was meant to redirect the cluster but `CLOUDRIFT_API_URL` shows as default, you sourced the wrong file (or didn't source the overlay at all) — fix and re-check before running the deplodock command.
+If `HF_TOKEN` is missing, gated HF models will 401 silently-ish on download — stop and ask the user how to provide it. If a user-specified overlay was meant to redirect the cluster but `CLOUDRIFT_API_URL` shows as default, you sourced the wrong file (or didn't source the overlay at all) — fix and re-check before running the emmy command.
 
 ## Inputs to Confirm
 
@@ -109,7 +109,7 @@ Initial values — start **conservative**, not optimal:
 | `benchmark.num_prompts`                | 64                                          | Fast first run.                        |
 | `benchmark.random_input_len`           | 2000                                        | Below context, room for output.        |
 | `benchmark.random_output_len`          | 2000                                        |                                        |
-| `matrices.deploy.gpu`                  | exact name from `deplodock/hardware.py`     | Must match — typo = no match.          |
+| `matrices.deploy.gpu`                  | exact name from `emmy/hardware.py`     | Must match — typo = no match.          |
 | `matrices.deploy.gpu_count`            | as confirmed                                |                                        |
 
 Place tool / reasoning parser flags in `extra_args`, e.g.:
@@ -131,7 +131,7 @@ For text-only on a vision model, add the disable flag from research.
 Deploy without benchmarking first to catch image/parser/quantization issues fast:
 
 ```bash
-deplodock deploy ssh --recipe recipes/<name> --ssh <user@host>
+emmy deploy ssh --recipe recipes/<name> --ssh <user@host>
 ```
 
 Run with `run_in_background: true` and follow logs. Watch for:
@@ -144,7 +144,7 @@ Run with `run_in_background: true` and follow logs. Watch for:
 If OOM at startup: lower `gpu_memory_utilization` by 0.05, or lower `context_length`, or raise `tensor_parallel_size`. If image-not-found or unknown-arg errors: re-research the engine version. **Tear down and re-deploy after each fix** — running deploys don't reload the recipe:
 
 ```bash
-deplodock deploy ssh --recipe recipes/<name> --ssh <user@host> --teardown
+emmy deploy ssh --recipe recipes/<name> --ssh <user@host> --teardown
 ```
 
 ### Unfamiliar startup errors → search before guessing
@@ -218,7 +218,7 @@ A context is **tight** if any of these hold at boot or under a single long reque
 | 2       | 131072         | Boots, tight    | Record + try one lower.    |
 | 3       | 65536          | Boots, comfortable | Use this for real bench. |
 
-Run each attempt as a fresh `deplodock deploy ssh` (not a multi-variant `bench` matrix) — that lets you read the boot log and decide before paying for the next attempt. Only roll the surviving value(s) into the matrix for Step 5.
+Run each attempt as a fresh `emmy deploy ssh` (not a multi-variant `bench` matrix) — that lets you read the boot log and decide before paying for the next attempt. Only roll the surviving value(s) into the matrix for Step 5.
 
 ## Step 5 — Run the Real Benchmark (Hard 20-Minute Cap)
 
@@ -233,7 +233,7 @@ Set `engine.llm.max_concurrent_requests` ≥ `benchmark.max_concurrency`.
 Launch:
 
 ```bash
-deplodock bench recipes/<name> --ssh <user@host>
+emmy bench recipes/<name> --ssh <user@host>
 ```
 
 **Always** run this with `run_in_background: true` and a wall-clock cap. The internal subprocess timeout is 10800s (3h) — too generous.
@@ -242,14 +242,14 @@ deplodock bench recipes/<name> --ssh <user@host>
 
 The 20-minute budget covers **only the time from "first request fires" to "last request returns"** — it does **not** include Docker image pull, model weight load, server healthcheck wait, or teardown. Those are setup costs that vary wildly with model size (a 400B model can take 10+ minutes just to load weights) and shouldn't count against the budget. Only the request-issuing phase counts.
 
-To time the benchmark phase only, watch the `deplodock bench` stdout/log for the marker that `vllm bench serve` has actually started firing requests, then start your timer there:
+To time the benchmark phase only, watch the `emmy bench` stdout/log for the marker that `vllm bench serve` has actually started firing requests, then start your timer there:
 
 - **vLLM**: the line `Traffic request rate: ...` followed by `Burstiness factor: ...` and the start of the progress bar (`0%|`) marks request issuance. Tee the bench log on the remote and `tail -f`, or poll `BashOutput` on the local bench process; latch a "started_at" timestamp on the first match of `Traffic request rate` and only then begin the 20-minute clock.
 - **End** marker: `============ Serving Benchmark Result ============` in stdout means the bench finished cleanly (cancel the timer).
 
 Implementation approach:
 
-1. Launch `deplodock bench` with `run_in_background: true`. Note the wall-clock at launch — but **do not** schedule the kill yet.
+1. Launch `emmy bench` with `run_in_background: true`. Note the wall-clock at launch — but **do not** schedule the kill yet.
 2. Poll `BashOutput` until you see `Traffic request rate` (or an explicit progress line). This may take 30s on a small model or 15+ minutes on a large quantized MoE — be patient, that's expected.
 3. Record `started_at = now()`. Now `ScheduleWakeup` for 1200s, OR poll on an `until` loop checking both the result-marker and `(now - started_at) > 1200`.
 4. If the result marker appears first → success.
@@ -277,14 +277,14 @@ When at least one benchmark variant has completed cleanly:
 2. Surface key numbers (request throughput, token throughput, mean TTFT, mean ITL) to the user from the output.
 3. Pin the docker image version in the recipe (no more `:latest` / `:nightly`) — record exactly which tag was used.
 4. Mention the verified max context as a comment in the recipe (one short line — don't pad with explanation).
-5. Tell the user the server is **still up and billed** (unless they used `deplodock bench` without `--ssh`, which auto-tears down). Show the matching teardown command from the `start-remote-server` skill output.
+5. Tell the user the server is **still up and billed** (unless they used `emmy bench` without `--ssh`, which auto-tears down). Show the matching teardown command from the `start-remote-server` skill output.
 6. Per `CLAUDE.md` contribution rules: before any commit, update `STYLE.md`, `README.md`, `CLAUDE.md`, `ARCHITECTURE.md` (only those that need changes — usually none for a new recipe), and run `make test` + `make lint`. Open a feature branch; never commit directly to `main`.
 
 ## Verification Checklist
 
 Before reporting success, verify:
 
-- [ ] `recipes/<name>/recipe.yaml` exists and `deplodock bench --dry-run recipes/<name>` parses it without error.
+- [ ] `recipes/<name>/recipe.yaml` exists and `emmy bench --dry-run recipes/<name>` parses it without error.
 - [ ] At least one benchmark variant produced a `Serving Benchmark Result` block.
 - [ ] If the model has tools, a tool-call request returned structured `tool_calls`.
 - [ ] If the model has reasoning, a request returned a populated `reasoning_content`.
@@ -297,10 +297,10 @@ If any check fails, report the failure and the raw output instead of claiming su
 ## Common Mistakes to Avoid
 
 - **Don't skip the web search.** Models change fast; the right vLLM image for a 6-month-old model is not the right image for a 2-week-old model.
-- **Don't go straight to `deplodock bench` for a new model.** Validate the deploy first — bench will hide the root cause behind a slow timeout.
+- **Don't go straight to `emmy bench` for a new model.** Validate the deploy first — bench will hide the root cause behind a slow timeout.
 - **Don't put named flags in `extra_args`.** `--max-model-len` etc. live as named fields; recipe loader rejects duplicates.
 - **Don't leave `:latest` in a committed recipe** — recipes are reproducibility artifacts; pin the tag once it works.
 - **Don't sleep through a long bench.** Watch it; abort at 20 minutes and re-tune. The user said so explicitly.
-- **Don't ssh in to manually patch the server.** Memory says read-only on CloudRift hosts. If a deploy is broken, fix the recipe and redeploy via `deplodock`, don't paper over it on the host.
+- **Don't ssh in to manually patch the server.** Memory says read-only on CloudRift hosts. If a deploy is broken, fix the recipe and redeploy via `emmy`, don't paper over it on the host.
 - **Don't fall back to a different provider/GPU** silently if the requested combo doesn't work. Stop and ask, like `start-remote-server` does.
 - **Don't claim the model supports its native max context** without running an input that actually fills the context. Boot success ≠ working context.

@@ -8,7 +8,7 @@ output matches the rule-default reference within fp32 tolerance.
 
 The tuner's own ``_bench_terminal_async`` only measures latency, so any
 variant in the search space that produces wrong output gets cached as
-"fast" and later loaded by ``deplodock run``. Each case below
+"fast" and later loaded by ``emmy run``. Each case below
 exercises a code path that previously had a quietly-broken variant:
 
 - ``matmul``: F-replicated body with SPLITK > 1 — atomic-add must
@@ -56,10 +56,10 @@ _CASES: tuple[tuple[str, dict], ...] = (
 
 
 def _build_graph(op: str, dims: dict):
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SdpaOp
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SdpaOp
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
     g = Graph()
 
@@ -120,9 +120,9 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     tune sweep and comparing to the rule-default reference catches that
     drift before the bench-kernels-tuned suite would.
     """
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
-    from deplodock.compiler.pipeline.search import SearchDB, TuningSearch
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
+    from emmy.compiler.pipeline.search import SearchDB, TuningSearch
 
     graph, input_shapes, (out_name, out_shape) = _build_graph(op, dims)
     inputs = _random_inputs(input_shapes)
@@ -170,7 +170,7 @@ def test_tuned_variant_matches_reference(op: str, dims: dict, tmp_path):
     # cooperative paths sum partial products in a non-deterministic
     # order vs the rule-default's single-CTA pairwise sum, so the
     # max-element drift can be a few percent of peak — match the same
-    # 5%-of-peak budget ``deplodock run --bench`` uses.
+    # 5%-of-peak budget ``emmy run --bench`` uses.
     peak = float(np.max(np.abs(ref_out)))
     atol = max(1e-3, 0.05 * peak)
     np.testing.assert_allclose(tuned_out, ref_out, atol=atol, rtol=0.05)

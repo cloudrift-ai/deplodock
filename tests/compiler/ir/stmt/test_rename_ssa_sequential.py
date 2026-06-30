@@ -15,10 +15,10 @@ gather to the wrong row.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Load
-from deplodock.compiler.ir.stmt.normalize import rename_ssa_sequential
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Load
+from emmy.compiler.ir.stmt.normalize import rename_ssa_sequential
 
 
 def _find_load(body, input_buf: str) -> Load:

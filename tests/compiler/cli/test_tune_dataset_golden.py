@@ -1,4 +1,4 @@
-"""CLI tests for ``deplodock tune``'s unified target loop.
+"""CLI tests for ``emmy tune``'s unified target loop.
 
 Golden vs non-golden differ in exactly one place — ``_tune_targets`` (dataset
 construction). Everything else (`handle_tune`'s loop, `_tune_one`, the shared DB /
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deplodock.commands import tune
+from emmy.commands import tune
 
 
 def _args(**over):
@@ -34,7 +34,7 @@ def _args(**over):
         verbose=0,
         bench=False,
         clean=False,
-        bench_backends="eager,deplodock",
+        bench_backends="eager,emmy",
         warmup=10,
         iters=100,
         gpus=None,
@@ -74,7 +74,7 @@ def test_golden_dataset_targets_dedup():
 
 
 def _dyn_golden(name="square.512.dynM"):
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig
 
     return MatmulGoldenConfig(
         name=name,
@@ -82,7 +82,7 @@ def _dyn_golden(name="square.512.dynM"):
         N=512,
         K=512,
         knobs={"BM": 8},
-        deplodock_us=10.0,
+        emmy_us=10.0,
         cublas_us=12.0,
         dynamic={"seq_len": {"input": "x0", "axis": 0}},
     )
@@ -91,9 +91,9 @@ def _dyn_golden(name="square.512.dynM"):
 def test_golden_dataset_target_carries_dynamic_spec(monkeypatch):
     """A dynamic golden expands to a target carrying its own ``--dynamic`` spec; a
     static golden's target carries ``None``."""
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
-    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, deplodock_us=9.0, cublas_us=14.0)
+    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, emmy_us=9.0, cublas_us=14.0)
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
     targets = tune._tune_targets(_args(dataset="golden"))
     by_name = {name: dyn for name, _code, _inp, dyn in targets}
@@ -144,8 +144,8 @@ def _stub_runtime(monkeypatch):
     monkeypatch.setattr(tune, "setup_pipeline_runtime", lambda a: None)
     monkeypatch.setattr(tune, "apply_nvcc_flags", lambda a, default: "-Xcicc -O1")
     monkeypatch.setattr(tune, "resolve_tune_db", lambda: "/tmp/golden_test.db")
-    monkeypatch.setattr("deplodock.compiler.pipeline.search.SearchDB", lambda path: object())
-    monkeypatch.setattr("deplodock.compiler.context.Context.probe", staticmethod(lambda: object()))
+    monkeypatch.setattr("emmy.compiler.pipeline.search.SearchDB", lambda path: object())
+    monkeypatch.setattr("emmy.compiler.context.Context.probe", staticmethod(lambda: object()))
 
     def fake_exit(code):
         raise SystemExit(code)
@@ -177,7 +177,7 @@ def test_loop_sets_dynamic_per_target(monkeypatch):
     """The loop threads each target's dynamic spec onto ``args.dynamic`` before
     ``_tune_one`` (which traces via ``load_or_trace``), so a dynamic golden in the
     sweep traces symbolically and its static neighbors don't inherit the spec."""
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
     _stub_runtime(monkeypatch)
     seen: list[tuple[str, object]] = []
@@ -187,7 +187,7 @@ def test_loop_sets_dynamic_per_target(monkeypatch):
         return SimpleNamespace(best_reward=None, assembled=None), None
 
     monkeypatch.setattr(tune, "_tune_one", capture)
-    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, deplodock_us=9.0, cublas_us=14.0)
+    static = gmod.MatmulGoldenConfig(name="square.512", M=512, N=512, K=512, knobs={"BM": 8}, emmy_us=9.0, cublas_us=14.0)
     monkeypatch.setattr(gmod, "GOLDEN_CONFIGS", [static, _dyn_golden()])
     with pytest.raises(SystemExit) as exc:
         tune.handle_tune(_args(dataset="golden"))

@@ -1,31 +1,31 @@
 # TODO: Deployment & Benchmarking
 
-Issues and improvements for `deplodock deploy` / `deplodock bench` (recipes, cloud provisioning, cache handling).
+Issues and improvements for `emmy deploy` / `emmy bench` (recipes, cloud provisioning, cache handling).
 For matmul/compiler tuning TODOs see [`TODO.md`](TODO.md).
 
 ## Recipe `benchmark.model_dir` is silently ignored; bench vs deploy-ssh cache paths diverge
 
 **Found 2026-06-10 while onboarding DeepSeek-V4-Pro (NVFP4, 1.6T) on 8×B200.**
 
-The model-cache mount path used by `deplodock bench` is read from the **global `config.yaml`**
+The model-cache mount path used by `emmy bench` is read from the **global `config.yaml`**
 (`benchmark.model_dir`, default `/hf_models`), NOT from the recipe's `benchmark.model_dir` block. See
-`deplodock/benchmark/execution.py:115` — `config["benchmark"].get("model_dir", "/hf_models")` where `config` is
+`emmy/benchmark/execution.py:115` — `config["benchmark"].get("model_dir", "/hf_models")` where `config` is
 `load_config(args.config)` = `config.yaml`, not the recipe. Meanwhile `deploy ssh` defaults `--model-dir /mnt/models`
-(`deplodock/commands/deploy/ssh.py`).
+(`emmy/commands/deploy/ssh.py`).
 
 Consequences:
 
 - A recipe that sets `benchmark.model_dir:` is **silently ignored** — no error, no warning, no effect. Confirmed: a
   recipe with `benchmark.model_dir: /mnt/models` still mounted `/hf_models` (per the bench log's `path: /hf_models/hub/...`
   line). It parses fine, so it reads as a working knob but isn't one.
-- `deplodock bench` against a host already provisioned by `deploy ssh` **re-downloads the whole model** (~851 GB for
+- `emmy bench` against a host already provisioned by `deploy ssh` **re-downloads the whole model** (~851 GB for
   DeepSeek-V4-Pro) into `/hf_models`, because it won't reuse the `/mnt/models` cache that `deploy ssh` populated. The
   long single SSH session during that download is also drop-prone on these VMs (saw `Can't assign requested address` /
   broken pipe mid-download).
 
 **Fix options (pick one or combine):**
 
-1. Make `deplodock bench` honor a recipe-level `benchmark.model_dir` (merge recipe over `config.yaml`) so the cache
+1. Make `emmy bench` honor a recipe-level `benchmark.model_dir` (merge recipe over `config.yaml`) so the cache
    path is configurable per model.
 2. Align the defaults so the same path is used by `config.yaml` `benchmark.model_dir` and `deploy ssh --model-dir`
    (both `/hf_models` or both `/mnt/models`), so bench can reuse a deploy-ssh cache.
@@ -38,7 +38,7 @@ http://localhost:8000 ...`), writing results to the persistent mount — immune 
 
 **Re-confirmed 2026-06-10 on DeepSeek-V4-Flash** (base `deepseek-ai/DeepSeek-V4-Flash`, 2×H200): same `/mnt/models`
 (deploy) vs `/hf_models` (bench) divergence. Temporary unblock = set `config.yaml` `benchmark.model_dir: /mnt/models`
-(the global value, since the recipe block is ignored), which made `deplodock bench` reuse the cache ("Fetching 74 files
+(the global value, since the recipe block is ignored), which made `emmy bench` reuse the cache ("Fetching 74 files
 in 0s" instead of a 149 GB re-download).
 
 ## `deploy` reports "Failed to download model" when SSH drops, even though the download completed
@@ -96,7 +96,7 @@ So extrapolating max context from a small-context deploy **under-counts by ~7×*
 the full native 1M look infeasible (696K < 1M) when it actually fits and serves (verified: 1M boots; 128K-input requests
 clean, 4/4). The top-down "try native max, halve on OOM" probe (benchmark-new-model Step 4) still works, but the KV log
 line read at a *small* context is misleading. **Fix/UX:** when sizing context, deploy at/near the target
-`context_length` and read `GPU KV cache size` there — don't trust a 64K reading. A deplodock helper that reports the
+`context_length` and read `GPU KV cache size` there — don't trust a 64K reading. A emmy helper that reports the
 KV-pool-at-target-context (or warns that the figure scales with max-len for sparse-attention models) would prevent
 under-provisioning.
 
@@ -113,7 +113,7 @@ These are SKILL fixes (`.claude/skills/benchmark-new-model/SKILL.md`), recorded 
 - **Add a silent-hang troubleshooting track** (request accepted, no tokens, GPU 0%, workers spinning): `ps` for
   compilers → it's compiling, wait; else search `"<model> <engine> hang|stall|cudagraph"` issues BEFORE tuning flags.
 - **Canonical output is the deliverable.** Don't hand-assemble result files from raw `vllm bench serve` dumps — produce
-  `deplodock bench`'s `<timestamp>_<hash>/<variant>_benchmark.{txt,json}`; fix prerequisites (model_dir, SSH keepalive)
+  `emmy bench`'s `<timestamp>_<hash>/<variant>_benchmark.{txt,json}`; fix prerequisites (model_dir, SSH keepalive)
   rather than working around bench with manual runs.
 - **Document deploy resilience on flaky VMs**: set `ServerAliveInterval` / high `ServerAliveCountMax` in `~/.ssh/config`;
   note that `up -d` and the download container are detached, so an SSH drop ≠ failure — reconnect and poll.

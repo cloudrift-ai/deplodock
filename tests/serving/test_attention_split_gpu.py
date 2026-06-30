@@ -38,12 +38,12 @@ def _compile_wrapper(wrapper, example_args, argnames):
     """Trace ``wrapper`` with axis 0 of every arg bound to a shared ``num_tokens`` Dim,
     compile on the CUDA backend, bind fp32 constants. Returns (program, input_names, output_names)."""
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+    from emmy.compiler.trace.torch import trace_module
 
     specs = [f"num_tokens@{name}:0" for name in argnames]  # shared NAME ties all axes
     graph = trace_module(wrapper, tuple(example_args), dynamic_shapes=build_torch_dynamic_shapes(parse_position_specs(specs)))
@@ -63,7 +63,7 @@ def _compile_wrapper(wrapper, example_args, argnames):
 
 
 def _run(program, input_names, output_names, arrays):
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     t = arrays[0].shape[0]
     feed = {n: a.detach().cpu().numpy().astype(np.float32) for n, a in zip(input_names, arrays, strict=True)}
@@ -81,7 +81,7 @@ def test_pre_wrapper_compiles_and_runs_dynamic():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.compiler.trace.huggingface import build_attention_split_wrapper
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper
 
     config, block = _qwen3_block()
     pre, _ = build_attention_split_wrapper(block)
@@ -105,7 +105,7 @@ def test_post_wrapper_compiles_with_shared_dim():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.compiler.trace.huggingface import build_attention_split_wrapper
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper
 
     config, block = _qwen3_block()
     _, post = build_attention_split_wrapper(block)

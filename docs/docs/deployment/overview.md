@@ -6,7 +6,7 @@ description: Deploy optimized LLM models to GPU servers using vLLM or SGLang.
 
 # Deployment Overview
 
-Once you have a recipe or custom configuration ready, Deplodock handles provisioning the GPU server
+Once you have a recipe or custom configuration ready, Emmy handles provisioning the GPU server
 and launching the inference backend.
 
 ## Backends
@@ -21,6 +21,6 @@ Structured generation engine. Best for complex multi-turn workloads and structur
 ## Deployment flow
 
 1. Select a recipe or custom configuration
-2. Choose a GPU type (or let Deplodock recommend one based on your benchmark results)
-3. Launch — Deplodock provisions the server and starts the inference endpoint
+2. Choose a GPU type (or let Emmy recommend one based on your benchmark results)
+3. Launch — Emmy provisions the server and starts the inference endpoint
 4. Get an OpenAI-compatible API endpoint to send requests to

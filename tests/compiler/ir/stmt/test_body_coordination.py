@@ -5,13 +5,13 @@ materialize-time / render-time coordination decisions.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop import Accum, Assign, Load
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.stmt.leaves import Write
-from deplodock.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.loop import Accum, Assign, Load
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.stmt.leaves import Write
+from emmy.compiler.ir.tile.ir import GridTile, SerialTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Helpers

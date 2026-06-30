@@ -8,8 +8,8 @@ itself rather than some upstream lowering quirk.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.loop import (
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.loop import (
     Accum,
     Assign,
     Axis,

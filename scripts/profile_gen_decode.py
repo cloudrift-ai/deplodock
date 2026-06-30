@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Profile a generative decode step at the runner level (no vLLM server): build
-`DeplodockGenRunner`, run a T=1 decode step through all layers (pre -> fake attn -> post),
+`EmmyGenRunner`, run a T=1 decode step through all layers (pre -> fake attn -> post),
 and decompose the time:
 
   W   = wall per step (kernels + host numpy<->torch I/O + Python/dispatch)
@@ -38,11 +38,11 @@ def main():
     except ImportError:
         sys.exit("torch + numpy required: pip install -e '.[compile,serving]'")
 
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.serving.gen_runner import DeplodockGenRunner
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.serving.gen_runner import EmmyGenRunner
 
     print(f"building runner (bucket={args.bucket}, reads the tuned prior) — compiles all layers, ~minutes ...")
-    runner = DeplodockGenRunner.create(args.model, dtype_str="float16", decode_bucket=args.bucket)
+    runner = EmmyGenRunner.create(args.model, dtype_str="float16", decode_bucket=args.bucket)
     nL = runner.num_layers
     H = runner._embed_weight.shape[1]
     attn_width = runner.num_heads * runner.head_dim

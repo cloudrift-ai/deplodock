@@ -3,7 +3,7 @@ correctness are covered on GPU by ``test_gen_runner_gpu.py`` / ``test_vllm_plugi
 
 import numpy as np
 
-from deplodock.serving.gen_runner import _pad_rows
+from emmy.serving.gen_runner import _pad_rows
 
 
 def test_pad_rows_pads_with_zeros_and_preserves_real_rows():

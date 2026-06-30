@@ -10,12 +10,12 @@ roles + layout off them (``partial_frags`` = ``<c>_frag``, ``accum_frags`` = ``c
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F16, F32
-from deplodock.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign, RegFragment
-from deplodock.compiler.ir.stmt import Assign, Init, Mma
-from deplodock.compiler.ir.tile.ir import Atom
-from deplodock.compiler.ir.twist import MmaTwist
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+from emmy.compiler.dtype import F16, F32
+from emmy.compiler.ir.kernel.ir import FRAG, ROW, UNIFORM, FragmentApply, FragmentMask, FragmentRowReduce, Reassign, RegFragment
+from emmy.compiler.ir.stmt import Assign, Init, Mma
+from emmy.compiler.ir.tile.ir import Atom
+from emmy.compiler.ir.twist import MmaTwist
+from emmy.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 _ATOM = Atom(name="mma_m16n8k16_f16", shape=(16, 8, 16), operand_dtypes=(("a", F16), ("b", F16), ("c", F32)), group_size=32)
 
@@ -115,8 +115,8 @@ def test_scalar_updates_are_row_distributed():
 def test_fragment_mask_builder_masks_each_partial_twist():
     """The generic ``fragment_mask`` builder emits one ``FragmentMask`` per distributed partial
     fragment for an arbitrary coordinate predicate — no causal / boundary / softmax naming."""
-    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-    from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
+    from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+    from emmy.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW
 
     causal = BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW))
     masks = _twist().mask(mask_when=causal, col_bases=(Literal(0, "int"), Literal(8, "int")), row_base=Var("qb"))
@@ -128,9 +128,9 @@ def test_fragment_mask_is_one_generic_node_for_causal_and_boundary():
     """The generic ``FragmentMask`` covers causal + boundary (and any coordinate predicate): the
     render substitutes each element's absolute (row, col) into ``mask_when`` and guards the fill —
     ONE node, not two (the former FragmentCausalMask / FragmentBoundaryMask)."""
-    from deplodock.compiler.ir.expr import BinaryExpr, Var
-    from deplodock.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW, FragmentMask
-    from deplodock.compiler.ir.stmt.base import RenderCtx
+    from emmy.compiler.ir.expr import BinaryExpr, Var
+    from emmy.compiler.ir.kernel.ir import FRAG_COL, FRAG_ROW, FragmentMask
+    from emmy.compiler.ir.stmt.base import RenderCtx
 
     causal = FragmentMask(frag="S", mask_when=BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW)), col_base=Var("kb"), row_base=Var("qb"))
     src = "\n".join(causal.render(RenderCtx(indent=1)))
@@ -149,8 +149,8 @@ def test_fragment_apply_renders_frag_row_and_uniform_args():
     """A FRAG arg indexes per element; a ROW arg broadcasts by row (0/1 suffix); a UNIFORM arg is
     verbatim; ``in_place`` reassigns ``out`` (no ``float`` decl). The three arg kinds are what let
     FragmentApply express every former FragmentExp / FragmentScale shape."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.stmt.base import RenderCtx
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.stmt.base import RenderCtx
 
     mul_row = FragmentApply(out="z", op=ElementwiseImpl("multiply"), args=("x", ("a0", "a1")), kinds=(FRAG, ROW))
     src = "\n".join(mul_row.render(RenderCtx(indent=1)))
@@ -169,7 +169,7 @@ def test_monoid_project_dispatches_by_distribution_role():
     under the distribution (fold = reduce over the distributed axis, pointwise = elementwise,
     scalar, carried-state), with no op cap and no shape knowledge. A recording backend captures
     the calls; ``tanh`` (never in the softmax vocabulary) flows through as a plain pointwise."""
-    from deplodock.compiler.ir.stmt import Assign, Monoid
+    from emmy.compiler.ir.stmt import Assign, Monoid
 
     class _Rec:
         def __init__(self):
@@ -199,8 +199,8 @@ def _carrier_with_generic_op():
     """A twisted ``(m, l, O)`` carrier whose STATS merge applies a generic fragment op (``relu``) to
     the score before the fold — to exercise the realizer's ``frag_apply`` branch with a real
     carrier (the algebra is contrived, only the op vocabulary matters)."""
-    from deplodock.compiler.ir.expr import Literal
-    from deplodock.compiler.ir.stmt import Assign, Monoid
+    from emmy.compiler.ir.expr import Literal
+    from emmy.compiler.ir.stmt import Assign, Monoid
 
     merge = (
         Assign("sq", "relu", ("s",)),  # a generic fragment op (not exp / not a fold)
@@ -228,7 +228,7 @@ def test_frag_layout_is_the_per_atom_geometry_source():
     rather than miscompiling. m16n8 is 4 regs / lane, 2 rows / lane."""
     import pytest
 
-    from deplodock.compiler.ir.kernel.ir import M16N8, frag_layout
+    from emmy.compiler.ir.kernel.ir import M16N8, frag_layout
 
     lay = frag_layout(16, 8)
     assert lay is M16N8

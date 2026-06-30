@@ -2,8 +2,8 @@
 
 import pytest
 
-from deplodock.hardware import GPU_GCP_ZONES
-from deplodock.provisioning.candidates import VmCandidate, iter_candidates
+from emmy.hardware import GPU_GCP_ZONES
+from emmy.provisioning.candidates import VmCandidate, iter_candidates
 
 
 def test_iter_candidates_cloudrift_rtx4090_lists_all_alternates():

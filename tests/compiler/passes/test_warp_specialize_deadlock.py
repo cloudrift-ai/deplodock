@@ -11,7 +11,7 @@ raise ``"not reachable by the producer split"`` when no TMA depth-2 bundle lande
 producer-side.
 
 The block-DAG rewrite **removed** the ``085_warp_specialize`` producer pass and its
-``DEPLODOCK_WARP_SPECIALIZE`` knob entirely, so that producer-side guard is no longer
+``EMMY_WARP_SPECIALIZE`` knob entirely, so that producer-side guard is no longer
 reachable (the regression of pinning WS=1 onto this shape simply cannot be expressed). The
 old WS=1-pinning test is gone (no code path left to exercise); ``test_mlp_slice_never_offers_ws1``
 below is its present-day replacement — see the note there.
@@ -34,21 +34,21 @@ import importlib
 import numpy as np
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import SerialTile, TileOp, WarpSpecialize, WarpTile
+from emmy.compiler import dtype as _dt
+from emmy.compiler import target as target_mod
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.ir.tile.ir import SerialTile, TileOp, WarpSpecialize, WarpTile
 
 from ..conftest import requires_cuda, requires_sm90
 
-_mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
+_mat = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
 
 _S, _H, _I = 32, 1024, 3072  # seq, hidden, intermediate — the Qwen3-Embedding-0.6B MLP slice
 
@@ -92,7 +92,7 @@ def test_mlp_slice_never_offers_ws1(_sm120_target):
     """The fused linear+mean shape lowers with no ``WarpSpecialize`` node and no
     ``WARPSPEC=True`` knob — WS=1 is not in the enumeration, so the deadlock can never
     deploy. Run unpinned: the partition planner's free greedy pick must not surface WS."""
-    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+    from emmy.compiler.pipeline import TILE_PASSES, Pipeline
 
     g2 = Pipeline.build(TILE_PASSES).run(_build_mlp_slice())
     tile_ops = [n.op for n in g2.nodes.values() if isinstance(n.op, TileOp)]
@@ -134,7 +134,7 @@ def test_materializer_rejects_empty_consumer_axes():
 # ---------------------------------------------------------------------------
 #
 # The original suite had a ``test_pinned_ws1_on_mlp_slice_raises`` that pinned
-# ``DEPLODOCK_WARP_SPECIALIZE=1`` and asserted the 085 producer pass raised
+# ``EMMY_WARP_SPECIALIZE=1`` and asserted the 085 producer pass raised
 # "not reachable by the producer split". Both the pass and the knob were removed in the
 # block-DAG rewrite, so there is no code path left to exercise — pinning WS=1 onto this
 # shape can no longer be expressed at all. ``test_mlp_slice_never_offers_ws1`` above is the
@@ -154,8 +154,8 @@ def test_mlp_slice_completes_and_matches():
     """The fused linear+mean shape compiles and runs to completion under the default greedy
     pick (a WS=1 regression would trip the per-launch watchdog's HungKernelError) and matches
     the numpy reference."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
 
     g = _build_mlp_slice()
     rng = np.random.default_rng(0)

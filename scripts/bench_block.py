@@ -4,7 +4,7 @@
 Usage:
     python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32
     python scripts/bench_block.py --model Qwen/Qwen3-Embedding-0.6B --seq-len 2048 --iters 50
-    python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32 --backends eager,deplodock
+    python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32 --backends eager,emmy
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-ALL_BACKENDS = ["eager", "compile", "deplodock", "flash_attn"]
+ALL_BACKENDS = ["eager", "compile", "emmy", "flash_attn"]
 
 
 def main():
@@ -38,7 +38,7 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable per-launch tensor dumps in the Deplodock backend (implies --dump-dir if set).",
+        help="Enable per-launch tensor dumps in the Emmy backend (implies --dump-dir if set).",
     )
     args = parser.parse_args()
 
@@ -98,8 +98,8 @@ def main():
     _log_sanity_stats(block, x, pos_emb)
 
     # Build per-backend closures up-front, then run a single interleaved
-    # measurement loop so eager / torch.compile / Deplodock all see the
-    # same SM clock + cache state. Deplodock's ``benchmark(on_iter=...)``
+    # measurement loop so eager / torch.compile / Emmy all see the
+    # same SM clock + cache state. Emmy's ``benchmark(on_iter=...)``
     # drives the loop; the on_iter callback runs each torch closure and
     # records cuda events for it. Per-launch timings come back in
     # ``bench.per_launch`` so the kernel-stats report is on the same
@@ -113,19 +113,19 @@ def main():
             torch_fns["torch.compile"] = compiled_fn
 
     dd_state = None
-    if "deplodock" in backends:
-        from deplodock.compiler.pipeline.dump import CompilerDump
+    if "emmy" in backends:
+        from emmy.compiler.pipeline.dump import CompilerDump
 
         dump = CompilerDump.resolve(args.dump_dir)
-        dd_state = _build_deplodock(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)
+        dd_state = _build_emmy(block, x, rotary_emb, pos_emb, dump=dump, debug=args.debug)
 
     results: dict[str, float] = {}
     if dd_state is not None:
         results = _bench_interleaved(dd_state, torch_fns, dump, args.warmup, args.iters)
     else:
-        # Pure-torch path (no Deplodock requested): time each torch
+        # Pure-torch path (no Emmy requested): time each torch
         # closure with its own cuda-event window, sequentially. Only used
-        # when ``--backends`` excludes ``deplodock`` — we lose interleave
+        # when ``--backends`` excludes ``emmy`` — we lose interleave
         # fairness but there's no shared driver to interleave through.
         for name, fn in torch_fns.items():
             results[name] = _bench_torch_only(fn, args.warmup, args.iters)
@@ -143,7 +143,7 @@ def main():
     print("-" * 56)
     for name, latency_us in results.items():
         speedup = eager_us / latency_us if latency_us > 0 else 0
-        if "attn" in name.lower() and "deplodock" not in name.lower():
+        if "attn" in name.lower() and "emmy" not in name.lower():
             print(f"{name:<32s} {latency_us:>12.0f} {'(attn only)':>10s}")
         else:
             print(f"{name:<32s} {latency_us:>12.0f} {speedup:>10.2f}x")
@@ -227,13 +227,13 @@ def _make_compiled_fn(block, x, pos_emb, warmup):
     return _fn
 
 
-def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
+def _build_emmy(block, x, rotary_emb, pos_emb, dump=None, debug=False):
     """Trace + compile the block, bind inputs / constants, run once for
     correctness vs eager. Returns ``(backend, compiled_graph)`` ready
     for ``backend.benchmark_async(...)`` — or ``None`` on any failure (a
     warning is logged)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     try:
         graph = trace_module(block.cpu(), (x.cpu(),), kwargs={"position_embeddings": (pos_emb[0].cpu(), pos_emb[1].cpu())})
@@ -246,7 +246,7 @@ def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
 
         import torch
 
-        from deplodock.compiler.ir.base import ConstantOp
+        from emmy.compiler.ir.base import ConstantOp
 
         # Bind input/constant buffers by walking the compiled graph. Inputs come
         # from tracer-assigned node ids; constants match against the block's
@@ -320,12 +320,12 @@ def _build_deplodock(block, x, rotary_emb, pos_emb, dump=None, debug=False):
 
         return backend, compiled
     except Exception as e:
-        logger.warning("Deplodock pipeline failed: %s", e)
+        logger.warning("Emmy pipeline failed: %s", e)
         return None
 
 
 def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
-    """Single interleaved measurement loop. Deplodock's
+    """Single interleaved measurement loop. Emmy's
     ``backend.benchmark_async(on_iter=...)`` drives the iteration; the
     ``on_iter`` callback runs each torch closure and records its
     cuda events. Per-launch timings come back from the same loop —
@@ -351,7 +351,7 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
             torch_events[name].append((start, stop, batch_size))
 
     # capture_graphs=False: this script's torch closures run uncaptured, so the
-    # deplodock side must too — one loop, one timing semantics (wall, incl. dispatch).
+    # emmy side must too — one loop, one timing semantics (wall, incl. dispatch).
     # ``benchmark_async`` is the only bench entry now; this sync script bridges via asyncio.run.
     bench = asyncio.run(backend.benchmark_async(compiled, warmup=warmup, num_iters=iters, on_iter=on_iter, capture_graphs=False))
     torch.cuda.synchronize()
@@ -362,7 +362,7 @@ def _bench_interleaved(dd_state, torch_fns, dump, warmup, iters):
         if measured:
             per_iter_us = [s.elapsed_time(e) / b * 1000 for s, e, b in measured]
             results[name] = sum(per_iter_us) / len(per_iter_us)
-    results["Deplodock (naive attn)"] = bench.time_ms * 1000
+    results["Emmy (naive attn)"] = bench.time_ms * 1000
 
     # Per-kernel timings: log the top offenders and (if dumping) persist
     # the full per-launch table to ``60_benchmark.json`` so the results

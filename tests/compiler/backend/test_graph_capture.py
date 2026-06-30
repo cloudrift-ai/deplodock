@@ -1,7 +1,7 @@
 """CUDA graph capture of the per-kernel bench (``capture_graphs``).
 
 The per-kernel reproducer bench wraps the measured region in CUDA graphs — cupy stream capture for
-deplodock's per-launch batch loop, ``torch.cuda.CUDAGraph`` for the torch closures — so the CUDA
+emmy's per-launch batch loop, ``torch.cuda.CUDAGraph`` for the torch closures — so the CUDA
 event windows measure dense GPU work instead of per-launch dispatch gaps. These tests cover:
 
 - the captured ``benchmark_program`` path returns the same result shape with sane timings,
@@ -16,10 +16,10 @@ event windows measure dense GPU work instead of per-launch dispatch gaps. These 
 
 import asyncio
 
-from deplodock.compiler.backend.cuda.program import GraphCaptureError, benchmark_program
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda import CudaOp
+from emmy.compiler.backend.cuda.program import GraphCaptureError, benchmark_program
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
 from .test_program import EW_ADD_SOURCE, _make_add_graph
@@ -78,7 +78,7 @@ def test_benchmark_program_e2e_none_without_capture():
 
 @requires_cuda
 def test_benchmark_program_e2e_capture_failure_is_nonfatal(monkeypatch):
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.cuda.program import CompiledProgram
 
     def _boom(self):
         raise GraphCaptureError("forced whole-program capture failure")
@@ -104,7 +104,7 @@ def test_benchmark_program_capture_failure_falls_back_in_place(monkeypatch):
     """A capture failure inside ``benchmark_program`` must not raise (the autotune
     sweep would mark the variant bench_fail) — it continues uncaptured and reports
     it via ``result.captured``."""
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.cuda.program import CompiledProgram
 
     def _boom(self, batch_sizes):
         raise GraphCaptureError("forced capture failure")
@@ -128,8 +128,8 @@ def test_captured_replay_matches_plain_launch_outputs():
     ``_allocate`` fills inputs deterministically, so two fresh programs see identical data."""
     import numpy as np
 
-    from deplodock.compiler.backend.cuda.program import CompiledProgram, run_program
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram, run_program
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     reference, _ = run_program(_make_add_graph(8))
 
@@ -144,9 +144,9 @@ def test_captured_replay_matches_plain_launch_outputs():
 def _lowered_rmsnorm():
     """Frontend snapshot + lowered graph for a small torch_ref-runnable op (the pattern the
     per-kernel sweep uses; see ``test_bench_worker_compare``)."""
-    from deplodock.commands.run import _detect_stage, _passes_after_stage
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.pipeline import Pipeline
+    from emmy.commands.run import _detect_stage, _passes_after_stage
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.pipeline import Pipeline
 
     g, _, _ = graph_from_code("torch.nn.RMSNorm(512)(torch.randn(8, 512))")
     fe = g.copy()
@@ -157,25 +157,25 @@ def _lowered_rmsnorm():
 
 @requires_cuda
 def test_bench_lowered_vs_torch_captures():
-    from deplodock.commands.run import bench_lowered_vs_torch
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.commands.run import bench_lowered_vs_torch
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     fe, lowered = _lowered_rmsnorm()
     results, bench, torch_available, captured = asyncio.run(
-        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock")
+        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,emmy")
     )
     assert torch_available
     assert captured is True
     assert results.get("Eager PyTorch", 0) > 0
-    assert results.get("Deplodock", 0) > 0
+    assert results.get("Emmy", 0) > 0
     assert bench is not None
 
 
 @requires_cuda
-def test_deplodock_capture_failure_falls_back_uncaptured(monkeypatch):
-    from deplodock.commands.run import bench_lowered_vs_torch
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
+def test_emmy_capture_failure_falls_back_uncaptured(monkeypatch):
+    from emmy.commands.run import bench_lowered_vs_torch
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
 
     def _boom(self, batch_sizes):
         raise GraphCaptureError("forced capture failure")
@@ -183,36 +183,34 @@ def test_deplodock_capture_failure_falls_back_uncaptured(monkeypatch):
     monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", _boom)
     fe, lowered = _lowered_rmsnorm()
     results, _, torch_available, captured = asyncio.run(
-        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock")
+        bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,emmy")
     )
     assert torch_available
-    assert captured is False, "deplodock-side capture failure must fall the whole bench back to uncaptured"
+    assert captured is False, "emmy-side capture failure must fall the whole bench back to uncaptured"
     assert results.get("Eager PyTorch", 0) > 0
-    assert results.get("Deplodock", 0) > 0
+    assert results.get("Emmy", 0) > 0
 
 
 @requires_cuda
-def test_torch_capture_failure_disables_deplodock_capture(monkeypatch):
-    import deplodock.commands.run as run_mod
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
+def test_torch_capture_failure_disables_emmy_capture(monkeypatch):
+    import emmy.commands.run as run_mod
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
 
     def _boom(fn):
         raise RuntimeError("forced torch capture failure")
 
-    deplodock_captures: list = []
+    emmy_captures: list = []
     orig = CompiledProgram.capture_launch_graphs
     monkeypatch.setattr(run_mod, "_capture_torch_fn", _boom)
-    monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", lambda self, bs: deplodock_captures.append(bs) or orig(self, bs))
+    monkeypatch.setattr(CompiledProgram, "capture_launch_graphs", lambda self, bs: emmy_captures.append(bs) or orig(self, bs))
 
     fe, lowered = _lowered_rmsnorm()
     results, _, torch_available, captured = asyncio.run(
-        run_mod.bench_lowered_vs_torch(
-            fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,deplodock"
-        )
+        run_mod.bench_lowered_vs_torch(fe, lowered, CudaBackend(), seed=0, do_bench=True, warmup=2, iters=5, bench_backends="eager,emmy")
     )
     assert torch_available
     assert captured is False
-    assert not deplodock_captures, "torch-side capture failure must also disable deplodock-side capture"
+    assert not emmy_captures, "torch-side capture failure must also disable emmy-side capture"
     assert results.get("Eager PyTorch", 0) > 0
-    assert results.get("Deplodock", 0) > 0
+    assert results.get("Emmy", 0) > 0

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import BF16, F16, F32, DataType, F16x2, StructuredType, get
+from emmy.compiler.dtype import BF16, F16, F32, DataType, F16x2, StructuredType, get
 
 
 def test_scalars_are_not_structured():

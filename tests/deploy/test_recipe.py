@@ -3,7 +3,7 @@
 import pytest
 import yaml
 
-from deplodock.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_docker_options, validate_extra_args
+from emmy.recipe import Recipe, deep_merge, load_recipe, resolve_for_hardware, validate_docker_options, validate_extra_args
 
 # ── deep_merge ──────────────────────────────────────────────────────
 

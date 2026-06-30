@@ -18,9 +18,9 @@ from ..conftest import requires_cuda
 
 
 def _rendered(op_name: str, n_tiles: int) -> str:
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.kernel.ir import FragmentRowReduce
-    from deplodock.compiler.ir.stmt.base import RenderCtx
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.kernel.ir import FragmentRowReduce
+    from emmy.compiler.ir.stmt.base import RenderCtx
 
     frags = tuple(f"cf{t}" for t in range(n_tiles))
     op = FragmentRowReduce(top="top", bot="bot", frags=frags, op=ElementwiseImpl(op_name), group=4)
@@ -31,7 +31,7 @@ def _rendered(op_name: str, n_tiles: int) -> str:
 def test_fragment_rowmax_and_rowsum_match_numpy():
     import cupy as cp
 
-    from deplodock.compiler.backend.cuda import nvcc
+    from emmy.compiler.backend.cuda import nvcc
 
     BN = 16  # 2 N-atoms of 8
     n_tiles = BN // 8

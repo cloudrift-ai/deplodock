@@ -11,8 +11,8 @@ passes (BN/BM/F_M/F_N/BK selection, TMA on/off, register-tile shape)
 can apply when re-compiled. Load any one with:
 
 ```bash
-deplodock run --bench --warmup 5 --iters 30 --ir <kernel>.json
-DEPLODOCK_TMA=1 deplodock run --bench ... --ir <kernel>.json   # A/B
+emmy run --bench --warmup 5 --iters 30 --ir <kernel>.json
+EMMY_TMA=1 emmy run --bench ... --ir <kernel>.json   # A/B
 ```
 
 Or profile with ncu directly:
@@ -20,7 +20,7 @@ Or profile with ncu directly:
 ```bash
 ncu --metrics sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,...  \
     --kernel-name regex:k_<name> --launch-skip 5 --launch-count 1               \
-    deplodock run --bench --ir <kernel>.json
+    emmy run --bench --ir <kernel>.json
 ```
 
 ## Kernels and shapes
@@ -43,4 +43,4 @@ ncu --metrics sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed,...  
 - Block: `transformers.models.llama.modeling_llama.LlamaDecoderLayer` layer 0
 - Hardware reference: RTX 5090 (sm_120)
 - Compiler stage: `04_loop_fusion` (sub-graph dump via
-  `DEPLODOCK_DUMP_DIR=...`)
+  `EMMY_DUMP_DIR=...`)

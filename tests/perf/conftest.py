@@ -6,11 +6,11 @@ requires_cuda]``. The ``perf`` marker is **deselected by default** —
 plain ``pytest tests/`` skips them so ``make test`` stays fast. Run
 explicitly with ``pytest -m perf`` (or ``make bench-kernels``).
 
-The ``bench_pair`` fixture drives ``deplodock run --bench`` (and
-``--profile`` when ``DEPLODOCK_BENCH_NCU=1``) as a subprocess per
-``Case`` and parses the dump files (``DEPLODOCK_DUMP_DIR``-rooted) to
+The ``bench_pair`` fixture drives ``emmy run --bench`` (and
+``--profile`` when ``EMMY_BENCH_NCU=1``) as a subprocess per
+``Case`` and parses the dump files (``EMMY_DUMP_DIR``-rooted) to
 build a ``PerfRow``. Reusing the CLI's bench infra keeps the
-torch / torch.compile / deplodock comparison and the ncu metrics on
+torch / torch.compile / emmy comparison and the ncu metrics on
 the same code path users invoke directly. Iteration count comes from
 ``case.iters`` (heavy cases at 20, others at 100).
 
@@ -42,12 +42,12 @@ _RESULTS_DIR = Path(__file__).resolve().parent / ".results"
 
 # Cross-process advisory lock around the GPU iter loop in the
 # subprocess-driven bencher. Set on conftest import so every spawned
-# ``deplodock run --bench`` (across xdist workers and inside each
+# ``emmy run --bench`` (across xdist workers and inside each
 # worker's per-case subprocess) coordinates on the same path. Trace,
 # compile, dump-write all run unlocked — only the kernel-launch phase
-# serializes. Override with ``DEPLODOCK_GPU_LOCK`` before invoking
+# serializes. Override with ``EMMY_GPU_LOCK`` before invoking
 # ``make bench-kernels`` if a different path is desired.
-os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
+os.environ.setdefault("EMMY_GPU_LOCK", "/tmp/emmy-gpu.lock")
 
 
 # ---------------------------------------------------------------------------
@@ -62,16 +62,16 @@ class PerfRow:
     shape: str
     dtype: str
     torch_us: float
-    deplodock_us: float
-    ratio: float  # torch_us / deplodock_us — >1 means deplodock wins
+    emmy_us: float
+    ratio: float  # torch_us / emmy_us — >1 means emmy wins
     launches: int
     tags: tuple[str, ...]
     iters: int = 100
     torch_compile_us: float | None = None
     # Per-kernel ncu metrics keyed by kernel name. Populated only when
-    # the optional ncu pass runs (``DEPLODOCK_BENCH_NCU=1``). Each entry
+    # the optional ncu pass runs (``EMMY_BENCH_NCU=1``). Each entry
     # maps metric-name → numeric value (units are baked into the metric
-    # name; see ``deplodock.commands.run._NCU_METRICS``). ``None`` when
+    # name; see ``emmy.commands.run._NCU_METRICS``). ``None`` when
     # not collected.
     ncu: dict[str, dict[str, float]] | None = None
 
@@ -103,9 +103,9 @@ def pytest_collection_modifyitems(config, items):
 
 
 def _ncu_enabled() -> bool:
-    if os.environ.get("DEPLODOCK_NCU_CHILD"):
+    if os.environ.get("EMMY_NCU_CHILD"):
         return False
-    if os.environ.get("DEPLODOCK_BENCH_NCU", "") not in ("1", "true", "True"):
+    if os.environ.get("EMMY_BENCH_NCU", "") not in ("1", "true", "True"):
         return False
     return shutil.which("ncu") is not None
 
@@ -114,12 +114,12 @@ def _ncu_enabled() -> bool:
 def bench_pair(request):
     """Return a callable ``run(case, *, warmup, iters) -> PerfRow``.
 
-    Each call spawns ``deplodock run --code <case.code> --bench
-    [--profile]`` with a fresh ``DEPLODOCK_DUMP_DIR`` and parses the
+    Each call spawns ``emmy run --code <case.code> --bench
+    [--profile]`` with a fresh ``EMMY_DUMP_DIR`` and parses the
     resulting JSON / CSV. The CLI's ``--bench`` path interleaves
-    ``Eager PyTorch`` / ``torch.compile`` / ``Deplodock`` per iter so
+    ``Eager PyTorch`` / ``torch.compile`` / ``Emmy`` per iter so
     all three see the same warm GPU state. ``--profile`` (gated by
-    ``DEPLODOCK_BENCH_NCU=1``) runs ncu once with a curated metric set
+    ``EMMY_BENCH_NCU=1``) runs ncu once with a curated metric set
     and dumps the per-kernel CSV/JSON to the same dir.
 
     Does not assert on the ratio — the suite tracks performance, it
@@ -128,7 +128,7 @@ def bench_pair(request):
 
     def _run(case: Case, *, warmup: int = 10, iters: int | None = None) -> PerfRow | None:
         if _tune_enabled():
-            # Tune-only path: run ``deplodock tune`` per case to
+            # Tune-only path: run ``emmy tune`` per case to
             # populate the autotune DB. Measurement is skipped entirely —
             # run ``make bench-kernels-tuned`` afterwards to measure with
             # the tuned knobs. Search runs until patience or tree
@@ -146,21 +146,21 @@ def bench_pair(request):
 
 
 def _tune_enabled() -> bool:
-    """``DEPLODOCK_TUNE=1`` enables the tune-only path: each case spawns
-    ``deplodock tune`` to populate the autotune DB
-    (``DEPLODOCK_TUNE_DB``). The bench step is skipped — re-run the suite
-    without ``DEPLODOCK_TUNE`` (e.g. ``make bench-kernels-tuned``) to
+    """``EMMY_TUNE=1`` enables the tune-only path: each case spawns
+    ``emmy tune`` to populate the autotune DB
+    (``EMMY_TUNE_DB``). The bench step is skipped — re-run the suite
+    without ``EMMY_TUNE`` (e.g. ``make bench-kernels-tuned``) to
     measure with the tuned knobs."""
-    return os.environ.get("DEPLODOCK_TUNE", "").strip().lower() in ("1", "true", "yes")
+    return os.environ.get("EMMY_TUNE", "").strip().lower() in ("1", "true", "yes")
 
 
 def _tune_via_subprocess(case: Case) -> None:
-    """Spawn ``deplodock tune`` for one case. Writes knob
-    measurements to ``DEPLODOCK_TUNE_DB`` and exits — no bench is run."""
+    """Spawn ``emmy tune`` for one case. Writes knob
+    measurements to ``EMMY_TUNE_DB`` and exits — no bench is run."""
     cmd = [
         sys.executable,
         "-m",
-        "deplodock.deplodock",
+        "emmy.emmy",
         "tune",
         "--code",
         case.code,
@@ -179,12 +179,12 @@ def _tune_via_subprocess(case: Case) -> None:
 
 
 def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool) -> PerfRow:
-    """Spawn ``deplodock run --bench`` for one case and harvest the dumps."""
-    with tempfile.TemporaryDirectory(prefix=f"deplodock_bench_{case.name}_") as tmp:
+    """Spawn ``emmy run --bench`` for one case and harvest the dumps."""
+    with tempfile.TemporaryDirectory(prefix=f"emmy_bench_{case.name}_") as tmp:
         cmd = [
             sys.executable,
             "-m",
-            "deplodock.deplodock",
+            "emmy.emmy",
             "run",
             "--code",
             case.code,
@@ -197,8 +197,8 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         if profile:
             cmd.append("--profile")
         env = dict(os.environ)
-        env["DEPLODOCK_DUMP_DIR"] = tmp
-        env.pop("DEPLODOCK_NCU_CHILD", None)
+        env["EMMY_DUMP_DIR"] = tmp
+        env.pop("EMMY_NCU_CHILD", None)
 
         timeout_s = 900.0
         res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout_s)
@@ -213,7 +213,7 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
                 shape=case.shape_str,
                 dtype=case.dtype,
                 torch_us=0.0,
-                deplodock_us=0.0,
+                emmy_us=0.0,
                 ratio=0.0,
                 launches=0,
                 tags=case.tags,
@@ -223,7 +223,7 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
         bench = json.loads(Path(tmp, "60_bench_compare.json").read_text())
         backends = bench["backends"]
         torch_us = float(backends.get("Eager PyTorch", {}).get("latency_us", 0) or 0)
-        depl_us = float(backends.get("Deplodock", {}).get("latency_us", 0) or 0)
+        depl_us = float(backends.get("Emmy", {}).get("latency_us", 0) or 0)
         tcompile_us_raw = backends.get("torch.compile", {}).get("latency_us")
         tcompile_us = float(tcompile_us_raw) if tcompile_us_raw is not None else None
 
@@ -244,7 +244,7 @@ def _bench_via_subprocess(case: Case, *, warmup: int, iters: int, profile: bool)
             shape=case.shape_str,
             dtype=case.dtype,
             torch_us=torch_us,
-            deplodock_us=depl_us,
+            emmy_us=depl_us,
             ratio=ratio,
             launches=launches,
             tags=case.tags,
@@ -314,7 +314,7 @@ def _format_table(rows: list[PerfRow]) -> str:
         if has_compile:
             base.append(f"{r.torch_compile_us:>8.1f}" if r.torch_compile_us is not None else "—")
         base += [
-            f"{r.deplodock_us:>7.1f}",
+            f"{r.emmy_us:>7.1f}",
             f"{r.ratio:>5.2f}x",
             f"{r.launches:>8d}",
             f"{r.iters:>5d}",
@@ -384,7 +384,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         return
     tw = terminalreporter
 
-    tw.write_sep("=", "perf summary (sorted by ratio; >1.00x means deplodock wins)")
+    tw.write_sep("=", "perf summary (sorted by ratio; >1.00x means emmy wins)")
     tw.write_line(_format_table(rows))
 
     # Persist JSON for cross-run diffing. ncu metrics (when collected)
@@ -396,7 +396,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     out = _RESULTS_DIR / f"{stamp}.json"
     payload = {
         "timestamp_utc": stamp,
-        "git_rev": os.environ.get("DEPLODOCK_GIT_REV", ""),
+        "git_rev": os.environ.get("EMMY_GIT_REV", ""),
         "rows": [
             {
                 **asdict(r),
@@ -416,7 +416,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
     png = plot.with_suffix(".png")
     try:
-        from deplodock.visualize.image import render as render_image
+        from emmy.visualize.image import render as render_image
 
         render_image(html, png, transparent=True)
         tw.write_line(f"perf plot image saved to {png}")
@@ -433,11 +433,11 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 def _render_plot(rows: list[PerfRow], stamp: str) -> str:
     """Render a self-contained HTML page comparing per-case speedup of
-    Deplodock and ``torch.compile`` against the PyTorch-eager baseline.
-    Cases are sorted by Deplodock ratio (wins at top). The shared
-    ``deplodock.visualize.bar_chart`` picks orientation based on case
+    Emmy and ``torch.compile`` against the PyTorch-eager baseline.
+    Cases are sorted by Emmy ratio (wins at top). The shared
+    ``emmy.visualize.bar_chart`` picks orientation based on case
     count — typical perf runs land in horizontal mode."""
-    from deplodock.visualize.bar_chart import Bar, BarChart, render_bar_chart
+    from emmy.visualize.bar_chart import Bar, BarChart, render_bar_chart
 
     rows_sorted = sorted(rows, key=lambda r: r.ratio, reverse=True)
 
@@ -461,7 +461,7 @@ def _render_plot(rows: list[PerfRow], stamp: str) -> str:
                     "",
                     f'<span style="color:#999">■</span> eager: {round(r.torch_us, 1)} µs (1.00×)',
                     (f'<span style="color:{tcomp_color}">■</span> torch.compile: ' + ("—" if t_us is None else f"{t_us} µs ({tr:.2f}×)")),
-                    (f'<span style="color:{depl_color}">■</span> deplodock: {round(r.deplodock_us, 1)} µs ({round(r.ratio, 2):.2f}×)'),
+                    (f'<span style="color:{depl_color}">■</span> emmy: {round(r.emmy_us, 1)} µs ({round(r.ratio, 2):.2f}×)'),
                 ]
             )
         )
@@ -470,7 +470,7 @@ def _render_plot(rows: list[PerfRow], stamp: str) -> str:
         categories=[r.name for r in rows_sorted],
         bars=[
             Bar(
-                name="deplodock / eager",
+                name="emmy / eager",
                 values=[round(r.ratio, 3) for r in rows_sorted],
                 color=depl_color,
             ),
@@ -484,7 +484,7 @@ def _render_plot(rows: list[PerfRow], stamp: str) -> str:
         title=f"Per-kernel speedup vs PyTorch eager — {stamp}",
         subtitle=(
             "FP32 on RTX 5090. Ratio = eager_us / backend_us (higher is faster). "
-            "Eager is the baseline at 1.0 (dashed line). Sorted by deplodock ratio: "
+            "Eager is the baseline at 1.0 (dashed line). Sorted by emmy ratio: "
             "wins at top, losses at bottom."
         ),
         baseline=1.0,

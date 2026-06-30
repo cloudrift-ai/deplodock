@@ -11,7 +11,7 @@ Usage::
         tests/perf/.results/<tuned>.json \\
         /path/to/cloudrift-landing/public/blog/building-gpu-compiler-from-scratch-3
 
-Styling overrides the ``deplodock.visualize.bar_chart`` defaults so:
+Styling overrides the ``emmy.visualize.bar_chart`` defaults so:
 
 - title font is bumped from 14 → 20 (bold) and subtitle 12 → 14
 - legend is pushed below the wrapped subtitle (top: 100)
@@ -33,8 +33,8 @@ from pathlib import Path
 # repo-root on sys.path so this script runs without ``pip install -e``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from deplodock.visualize.bar_chart import Bar, BarChart, _option  # noqa: E402
-from deplodock.visualize.page import render_html  # noqa: E402
+from emmy.visualize.bar_chart import Bar, BarChart, _option  # noqa: E402
+from emmy.visualize.page import render_html  # noqa: E402
 
 CLEAN_COLOR = "#4dabf7"
 TUNED_COLOR = "#ff6b6b"
@@ -50,8 +50,8 @@ def _merge_rows(clean: dict, tuned: dict) -> list[dict]:
         t = by_tuned.get(name)
         eager_us = c["torch_us"] if c else t["torch_us"]
         tcompile = (c or t).get("torch_compile_us")
-        clean_us = c["deplodock_us"] if c else None
-        tuned_us = t["deplodock_us"] if t else None
+        clean_us = c["emmy_us"] if c else None
+        tuned_us = t["emmy_us"] if t else None
         merged.append(
             {
                 "name": name,
@@ -61,8 +61,8 @@ def _merge_rows(clean: dict, tuned: dict) -> list[dict]:
                 "launches": (c or t).get("launches"),
                 "eager_us": eager_us,
                 "torch_compile_us": tcompile,
-                "deplodock_clean_us": clean_us,
-                "deplodock_tuned_us": tuned_us,
+                "emmy_clean_us": clean_us,
+                "emmy_tuned_us": tuned_us,
                 "ratio_clean": (eager_us / clean_us) if clean_us else None,
                 "ratio_tuned": (eager_us / tuned_us) if tuned_us else None,
             }
@@ -92,8 +92,8 @@ def _write_data_files(rows: list[dict], clean: dict, tuned: dict, out_dir: Path)
                 "launches",
                 "eager_us",
                 "torch_compile_us",
-                "deplodock_clean_us",
-                "deplodock_tuned_us",
+                "emmy_clean_us",
+                "emmy_tuned_us",
                 "ratio_clean",
                 "ratio_tuned",
             ]
@@ -107,8 +107,8 @@ def _write_data_files(rows: list[dict], clean: dict, tuned: dict, out_dir: Path)
                     r["launches"],
                     r["eager_us"],
                     r["torch_compile_us"],
-                    r["deplodock_clean_us"],
-                    r["deplodock_tuned_us"],
+                    r["emmy_clean_us"],
+                    r["emmy_tuned_us"],
                     r["ratio_clean"],
                     r["ratio_tuned"],
                 ]
@@ -125,17 +125,17 @@ def _tcomp_ratio(r: dict) -> float | None:
 def _tooltip(r: dict) -> str:
     tcr = _tcomp_ratio(r)
     tc_str = f"{r['torch_compile_us']:.1f} µs ({tcr:.2f}×)" if tcr else "—"
-    clean_str = f"{r['deplodock_clean_us']:.1f} µs ({r['ratio_clean']:.2f}×)"
-    tuned_str = f"{r['deplodock_tuned_us']:.1f} µs ({r['ratio_tuned']:.2f}×)"
-    speedup = r["deplodock_clean_us"] / r["deplodock_tuned_us"] if r["deplodock_tuned_us"] else 0
+    clean_str = f"{r['emmy_clean_us']:.1f} µs ({r['ratio_clean']:.2f}×)"
+    tuned_str = f"{r['emmy_tuned_us']:.1f} µs ({r['ratio_tuned']:.2f}×)"
+    speedup = r["emmy_clean_us"] / r["emmy_tuned_us"] if r["emmy_tuned_us"] else 0
     parts = [
         f"<b>{r['name']}</b>",
         f'<span style="color:#888">{r["shape"]}</span>',
         "",
         f'<span style="color:#999">■</span> eager: {r["eager_us"]:.1f} µs (1.00×)',
         f'<span style="color:{TCOMP_COLOR}">■</span> torch.compile: {tc_str}',
-        f'<span style="color:{CLEAN_COLOR}">■</span> deplodock (clean): {clean_str}',
-        f'<span style="color:{TUNED_COLOR}">■</span> deplodock (tuned): {tuned_str}',
+        f'<span style="color:{CLEAN_COLOR}">■</span> emmy (clean): {clean_str}',
+        f'<span style="color:{TUNED_COLOR}">■</span> emmy (tuned): {tuned_str}',
     ]
     if speedup:
         parts += ["", f"tune speedup: {speedup:.2f}×"]
@@ -150,12 +150,12 @@ def _render_chart(rows: list[dict], out_dir: Path) -> None:
         categories=[r["name"] for r in rows],
         bars=[
             Bar(
-                name="deplodock tuned / eager",
+                name="emmy tuned / eager",
                 values=[round(r["ratio_tuned"], 3) if r["ratio_tuned"] else None for r in rows],
                 color=TUNED_COLOR,
             ),
             Bar(
-                name="deplodock clean / eager",
+                name="emmy clean / eager",
                 values=[round(r["ratio_clean"], 3) if r["ratio_clean"] else None for r in rows],
                 color=CLEAN_COLOR,
             ),
@@ -207,7 +207,7 @@ def _print_stats(rows: list[dict]) -> None:
     gm = statistics.geometric_mean
     rc = [r["ratio_clean"] for r in rows if r["ratio_clean"]]
     rt = [r["ratio_tuned"] for r in rows if r["ratio_tuned"]]
-    sp = [r["deplodock_clean_us"] / r["deplodock_tuned_us"] for r in rows if r["deplodock_clean_us"] and r["deplodock_tuned_us"]]
+    sp = [r["emmy_clean_us"] / r["emmy_tuned_us"] for r in rows if r["emmy_clean_us"] and r["emmy_tuned_us"]]
     print(f"clean: n={len(rc)}  geomean={gm(rc):.3f}  ≥1.0×: {sum(1 for r in rc if r >= 1)}/{len(rc)}  max={max(rc):.2f}")
     print(f"tuned: n={len(rt)}  geomean={gm(rt):.3f}  ≥1.0×: {sum(1 for r in rt if r >= 1)}/{len(rt)}  max={max(rt):.2f}")
     print(f"clean→tuned: geomean={gm(sp):.3f}  best={max(sp):.2f}×  worst={min(sp):.2f}×")

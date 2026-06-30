@@ -2,8 +2,8 @@
 
 import pytest
 
-from deplodock.deploy.scale_out import DataParallelismScaleOutStrategy, ReplicaParallelismScaleOutStrategy
-from deplodock.recipe import Recipe
+from emmy.deploy.scale_out import DataParallelismScaleOutStrategy, ReplicaParallelismScaleOutStrategy
+from emmy.recipe import Recipe
 
 # ── helpers ────────────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ class TestReplicaParallelismScaleOut:
         assert result.deploy.gpu_count == 8
         assert result.engine.llm.data_parallel_size == 1
 
-        from deplodock.deploy import calculate_num_instances
+        from emmy.deploy import calculate_num_instances
 
         assert calculate_num_instances(result) == 4
 

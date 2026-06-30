@@ -18,19 +18,19 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F16
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, is_fused_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.context import Context
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.ir.tile.ir import Buffer, Edge, Placement, Space, StageBundle, TileGraph, TileGraphOp, TileOp, Transport
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, is_fused_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 from tests.compiler.conftest import requires_cuda
 from tests.compiler.passes.test_tile_ir_invariants import _oracle_tilegraph
 
@@ -120,7 +120,7 @@ def test_assemble_fused_builds_compute_phase():
     staged_bufs = {src.buf for b in fused for src in b.sources}
     assert "x" in staged_bufs and "xn" not in staged_bufs
     # the compute phase applies the producer transform (relu) and writes the xn slab
-    from deplodock.compiler.ir.stmt import Assign, Write
+    from emmy.compiler.ir.stmt import Assign, Write
 
     assigns = [s for b in fused for s in b.compute.iter() if isinstance(s, Assign)]
     assert any(getattr(a.op, "name", "") == "relu" for a in assigns)
@@ -143,7 +143,7 @@ def test_fused_map_matmul_runs_correctly(producer, np_ref):
     reference — the matmul reads ``xn`` from smem (the fused edge), no separate producer
     kernel. Covers single-input (relu), multi-input (multiply), and **broadcast-operand**
     (``x·rs[m]·cs[k]`` — the rmsnorm scale-application shape) MAP producers."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     M, K, N = 32, 64, 32  # M != K so the row / col broadcasts are unambiguous
     pg = producer(M, K)
@@ -230,12 +230,12 @@ def test_fused_edge_lowers_through_enumeration_and_assembly(monkeypatch, tier, p
     scalar tier and the **warp (mma.sync) tier** (the cut-beating form — the matmul reads
     the cooperatively-computed ``xn`` from smem via ``ldmatrix``), over a same-shape and a
     **broadcast-operand** (``x·rs[m]·cs[k]`` — the rmsnorm scale shape) producer."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     if tier == "scalar":
-        monkeypatch.setenv("DEPLODOCK_BN", "16")
-        monkeypatch.setenv("DEPLODOCK_BM", "16")
-        monkeypatch.setenv("DEPLODOCK_MMA", "0")
+        monkeypatch.setenv("EMMY_BN", "16")
+        monkeypatch.setenv("EMMY_BM", "16")
+        monkeypatch.setenv("EMMY_MMA", "0")
     M, K, N = 32, 64, 32
     pg = producer(M, K)
     shape_of = {name: tuple(d.as_static() for d in pg.nodes[name].output.shape) for name in pg.inputs}
@@ -267,16 +267,16 @@ def test_fused_rmsnorm_matmul_runs_correctly(monkeypatch):
     feeding the matmul. The reduce over the full row precedes the matmul K-loop. Scalar
     tier here; the live warp-tier path is covered by
     ``test_offering_fork_fused_edge_runs_correctly[warp]``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.algebra import AlgebraKind
-    from deplodock.compiler.ir.stmt import Write
-    from deplodock.compiler.ir.tile.ir import Placement, TileGraphOp
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.algebra import AlgebraKind
+    from emmy.compiler.ir.stmt import Write
+    from emmy.compiler.ir.tile.ir import Placement, TileGraphOp
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._extract import _fission, seed_demoted
     from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
-    monkeypatch.setenv("DEPLODOCK_BM", "16")
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("EMMY_BN", "16")
+    monkeypatch.setenv("EMMY_BM", "16")
+    monkeypatch.setenv("EMMY_MMA", "0")
     M, K, N = 32, 1024, 3072
     g = _norm_linear_graph()
     lo = Pipeline.build(LOOP_PASSES).run(g, ctx=Context.from_target((12, 0)))
@@ -329,7 +329,7 @@ _TILE_PASSES = ["lowering/tile/split", "lowering/tile/enumeration", "lowering/ti
 
 
 def _n_kernels(graph):
-    from deplodock.compiler.ir.loop import LoopOp
+    from emmy.compiler.ir.loop import LoopOp
 
     return sum(1 for n in graph.nodes.values() if isinstance(n.op, (TileOp, LoopOp)))
 
@@ -338,21 +338,21 @@ def test_offering_fork_keeps_fused_by_default_splits_when_pinned(monkeypatch):
     """The offering fork (``split/005`` → ``seed_fused``): a demoted matmul (RMSNorm →
     linear) is a real keep(SMEM)-vs-cut(GMEM) fork. Greedy's "a cold compile never changes
     kernel sets" rule deploys the kernel-set-preserving keep(SMEM) — the **default is now
-    ONE fused kernel** (the RMSNorm cone on-chip, no gmem round-trip). ``DEPLODOCK_SPLIT_CONE
+    ONE fused kernel** (the RMSNorm cone on-chip, no gmem round-trip). ``EMMY_SPLIT_CONE
     =1`` pins the GMEM cut (two kernels); ``=0`` pins the fused edge. The structural half,
     no GPU."""
     from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
-    monkeypatch.setenv("DEPLODOCK_BM", "16")
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("EMMY_BN", "16")
+    monkeypatch.setenv("EMMY_BM", "16")
+    monkeypatch.setenv("EMMY_MMA", "0")
     ctx = Context.from_target((12, 0))
 
     def lower(env_split):
         if env_split is None:
-            monkeypatch.delenv("DEPLODOCK_SPLIT_CONE", raising=False)
+            monkeypatch.delenv("EMMY_SPLIT_CONE", raising=False)
         else:
-            monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", env_split)
+            monkeypatch.setenv("EMMY_SPLIT_CONE", env_split)
         lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)
         return Pipeline.build(_TILE_PASSES).run(lo, ctx=ctx)
 
@@ -371,25 +371,25 @@ def test_offering_fork_fused_edge_runs_correctly(monkeypatch, tier):
     reference — proving ``seed_fused`` wires the demoted matmul into the fused assemble.
     Covers the **warp tier** (the natural greedy pick — the matmul reads the
     cooperatively-reduced per-row scale from smem via ``ldmatrix``) and the scalar tier."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
     from tests.compiler.passes.test_cut_offers import _norm_linear_graph
 
     if tier == "scalar":
-        monkeypatch.setenv("DEPLODOCK_BN", "16")
-        monkeypatch.setenv("DEPLODOCK_BM", "16")
-        monkeypatch.setenv("DEPLODOCK_MMA", "0")
+        monkeypatch.setenv("EMMY_BN", "16")
+        monkeypatch.setenv("EMMY_BM", "16")
+        monkeypatch.setenv("EMMY_MMA", "0")
     else:
         # Pin a small in-budget warp tile: the cold-ranker's smart tile pick is being
         # retired (greedy cold → emission order), so the warp tier must be pinned rather
         # than relying on the prior to avoid the largest-BK smem-overflow emission default.
-        # Legacy env pins route through the ingest mapper (DEPLODOCK_BK → REDUCE@<axis>).
-        monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-        monkeypatch.setenv("DEPLODOCK_WM", "2")
-        monkeypatch.setenv("DEPLODOCK_WN", "2")
-        monkeypatch.setenv("DEPLODOCK_FM", "2")
-        monkeypatch.setenv("DEPLODOCK_FN", "2")
-        monkeypatch.setenv("DEPLODOCK_BK", "2")
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept fused edge
+        # Legacy env pins route through the ingest mapper (EMMY_BK → REDUCE@<axis>).
+        monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+        monkeypatch.setenv("EMMY_WM", "2")
+        monkeypatch.setenv("EMMY_WN", "2")
+        monkeypatch.setenv("EMMY_FM", "2")
+        monkeypatch.setenv("EMMY_FN", "2")
+        monkeypatch.setenv("EMMY_BK", "2")
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "0")  # the kept fused edge
     ctx = Context.from_target((12, 0))
     s, h, i = 32, 1024, 3072
     lo = Pipeline.build(LOOP_PASSES).run(_norm_linear_graph(), ctx=ctx)
@@ -423,11 +423,11 @@ def test_fused_map_producer_warp_tier_live(monkeypatch, expr):
     fully-broadcast operand read straight from gmem, no slab) alongside a unary activation,
     the producer shapes a real model emits before a linear."""
 
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import InputOp
 
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "0")  # the kept SMEM fused edge (warp tier)
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "0")  # the kept SMEM fused edge (warp tier)
     code = (
         "import torch\ntorch.manual_seed(0)\n"
         "x = torch.randn(64, 256, dtype=torch.float16) * 0.3\n"

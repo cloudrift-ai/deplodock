@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import yaml
 
-from deplodock.provisioning.candidates import VmCandidate
-from deplodock.provisioning.cloud import (
+from emmy.provisioning.candidates import VmCandidate
+from emmy.provisioning.cloud import (
     _provision_cloudrift,
     _provision_gcp,
     _ssh_keys_metadata_value,
@@ -15,8 +15,8 @@ from deplodock.provisioning.cloud import (
     read_public_key_files,
     resolve_vm_spec,
 )
-from deplodock.provisioning.types import VMConnectionInfo
-from deplodock.recipe import load_recipe
+from emmy.provisioning.types import VMConnectionInfo
+from emmy.recipe import load_recipe
 
 
 def _load_entries(entries):
@@ -179,7 +179,7 @@ def _cr_cand():
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_cloudrift_billing_exempt(mock_create, tmp_path):
     """billing_exempt in providers_config is forwarded to create_instance."""
     key_file = tmp_path / "id_ed25519"
@@ -198,7 +198,7 @@ async def test_provision_cloudrift_billing_exempt(mock_create, tmp_path):
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_cloudrift_no_billing_exempt(mock_create, tmp_path):
     """billing_exempt defaults to False when not in providers_config."""
     key_file = tmp_path / "id_ed25519"
@@ -215,7 +215,7 @@ async def test_provision_cloudrift_no_billing_exempt(mock_create, tmp_path):
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_cloudrift_network(mock_create, tmp_path):
     """network in providers_config is forwarded to create_instance."""
     key_file = tmp_path / "id_ed25519"
@@ -234,7 +234,7 @@ async def test_provision_cloudrift_network(mock_create, tmp_path):
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_cloudrift_no_network(mock_create, tmp_path):
     """network defaults to None when not in providers_config."""
     key_file = tmp_path / "id_ed25519"
@@ -293,7 +293,7 @@ def test_ssh_keys_metadata_value_multiple():
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_cloudrift_forwards_extra_keys(mock_create, tmp_path):
     """extra_authorized_keys is forwarded to create_instance as extra_public_keys."""
     key_file = tmp_path / "id_ed25519"
@@ -310,7 +310,7 @@ async def test_provision_cloudrift_forwards_extra_keys(mock_create, tmp_path):
     assert mock_create.call_args.kwargs["extra_public_keys"] == extra
 
 
-@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_gcp_disables_oslogin_with_ssh_keys(mock_create, tmp_path):
     """GCP metadata pins enable-oslogin=FALSE alongside the per-VM ssh-keys (one --metadata flag),
     so the instance key is honored on a project that enables OS Login via metadata."""
@@ -328,7 +328,7 @@ async def test_provision_gcp_disables_oslogin_with_ssh_keys(mock_create, tmp_pat
     assert "--metadata=enable-oslogin=FALSE,ssh-keys=deploy:ssh-ed25519 AAAA own@host" in extra
 
 
-@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
 async def test_provision_gcp_warns_when_pubkey_missing(mock_create, tmp_path, caplog):
     """A missing .pub no longer silently omits the key: it warns and adds no ssh-keys metadata."""
     key_file = tmp_path / "id_ed25519"

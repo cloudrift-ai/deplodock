@@ -1,6 +1,6 @@
 """Unit tests for recipe dataclass types."""
 
-from deplodock.recipe import (
+from emmy.recipe import (
     AggregateConfig,
     CommandConfig,
     DeployConfig,

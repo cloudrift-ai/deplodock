@@ -29,14 +29,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F16
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import mma_atom
 
 from .conftest import requires_sm90
 
@@ -92,7 +92,7 @@ def test_symbolic_m_masked_mma_kernel_structure(monkeypatch):
     the codegen (the clamp + the ``+ _g < (seq_len)`` row guards) and the
     ``S_ext_n_symbolic_axis`` shape feature, not a standalone OVERHANG knob."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
@@ -117,8 +117,8 @@ def test_symbolic_m_masked_mma_accuracy(monkeypatch, seq):
     not multiples of the WM·FM·16 = 64-row tile, so the trailing rows straddle the
     bound and exercise the hoist + clamp + per-element guard interplay)."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_symbolic_m_graph())
@@ -142,7 +142,7 @@ def test_symbolic_m_masked_mma_tma_structure(monkeypatch):
     param and stages the A operand with ``cp.async.bulk.tensor`` (the descriptor's
     globalDim is the runtime extent and TMA zero-fills the masked overhang)."""
     for k, v in _TMA_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_symbolic_m_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     placed = [v for k, v in kop.knobs.items() if k.startswith("PLACE@")]
@@ -163,8 +163,8 @@ def test_symbolic_m_masked_mma_tma_accuracy(monkeypatch, seq):
     build (the masked dim must survive even when its runtime extent is 1/31, and
     TMA zero-fills the box overhang past ``seq_len``)."""
     for k, v in _TMA_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_symbolic_m_graph())
@@ -191,8 +191,8 @@ def test_symbolic_mn_masked_mma_accuracy(monkeypatch, seq):
     pair straddles the bound) and the output's ldm resolves from the runtime
     ``seq_len`` kernel arg — one kernel, every runtime size, off-hint included."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("q", (Dim("seq_len"), 128), dtype=F16), node_id="q")
@@ -224,9 +224,9 @@ def test_symbolic_m_masked_mma_residual_epilogue_accuracy(monkeypatch):
     gmem reads too, so a straddling runtime size (seq=100, not a 64-row multiple)
     stays accurate and fault-free."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (Dim("seq_len"), 512), dtype=F16), node_id="a")
@@ -262,8 +262,8 @@ def _demoted_symbolic_n_graph(M=None, N=None, K: int = 128) -> Graph:
     matmul and ``010_split_demoted`` materializes the canonical ``xnb[K, N]``
     producer. M and N default to the same ``Dim('seq_len')`` (the [seq, seq]
     scores)."""
-    from deplodock.compiler.ir.frontend.ir import LinearOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import LinearOp  # noqa: PLC0415
+    from emmy.compiler.ir.tensor.ir import ElementwiseOp  # noqa: PLC0415
 
     M = Dim("seq_len") if M is None else M
     N = Dim("seq_len") if N is None else N
@@ -287,11 +287,11 @@ def test_demoted_symbolic_n_accuracy(monkeypatch, seq):
     at, and above the 512 hint under the GREEDY pick — including straddling sizes
     (31, 130, 700) where the last N tile reads the padded ``[seq, round_up)``
     overhang columns; those garbage columns feed the mma only into store-masked
-    output positions, so the live scores stay correct. (No ``DEPLODOCK_MMA`` pin:
+    output positions, so the live scores stay correct. (No ``EMMY_MMA`` pin:
     the multi-kernel demoted graph's ``map`` producer rejects a global warp pin
     under ``enumeration/_validate.validate_pins`` — greedy lowers it cleanly.)"""
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # force the demotion split
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "1")  # force the demotion split
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_demoted_symbolic_n_graph())
@@ -344,8 +344,8 @@ def test_symbolic_k_masked_mma_accuracy(monkeypatch, seq):
     700 are not multiples of the BK·atom_k = 32-element K tile, so the final K_o
     slab is partial and must be ZERO-filled past seq_len, not edge-clamped)."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_symbolic_k_graph())
@@ -377,7 +377,7 @@ def test_batched_symbolic_mk_reaches_warp(monkeypatch):
     """The batched masked-M + masked-K P@V consumer must reach the mma.sync tier
     (the ``classify_matmul_operands`` batch-aware B test), not stay a LoopOp."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     lowered = Pipeline.build(CUDA_PASSES).run(_batched_symbolic_mk_graph(), ctx=Context(compute_capability=(12, 0)))
     kop = lowered.nodes["o"].op
     assert mma_atom(kop.knobs) == "mma_m16n8k16_f16", "batched symbolic M+K matmul must reach the warp tier"
@@ -394,8 +394,8 @@ def test_batched_symbolic_mk_masked_mma_accuracy(monkeypatch, seq):
     be accurate at runtime sizes around the 512 hint, including the straddling
     cases where both the M tile and the partial K slab are masked."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_batched_symbolic_mk_graph())
@@ -414,7 +414,7 @@ def _pv_softmax_graph(H: int = 16, N: int = 128) -> Graph:
     """Softmax(scores) @ V with the reduce K = ``seq_len`` symbolic (the SDPA P@V
     shape). Fusion demotes the matmul; ``010_split_demoted`` materializes the
     softmax-prob A cone ``xn[H, seq, seq]`` + the clean symbolic-K gemm."""
-    from deplodock.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import SoftmaxOp  # noqa: PLC0415
 
     s = Dim("seq_len")
     g = Graph()
@@ -434,10 +434,10 @@ def test_demoted_masked_k_pv_tma_accuracy(monkeypatch, seq):
     extents (31, 130, 700) where the final K slab is partial and the overhang past
     ``seq_len`` must read 0 (a clamped duplicate would corrupt the reduction)."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    monkeypatch.delenv("DEPLODOCK_TMA", raising=False)
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    monkeypatch.delenv("EMMY_TMA", raising=False)
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "1")
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_pv_softmax_graph())

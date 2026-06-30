@@ -12,7 +12,7 @@ deferred ``c<cta>k``) can't silently break a carrier it wasn't tuned on.
 - **reduction variants** — the cooperative combine stage (native ``REDUCE`` coop field ``t<n>``
   = serial / warp-shuffle / hierarchical smem) for the reduce-carrier ops; the cross-CTA finalize
   fold (the ``REDUCE`` ``c``-letter ``c2a`` / ``c2k``) for the split-K matmul. All pins are the
-  native ``DEPLODOCK_REDUCE`` codec — no legacy ``BR`` / ``SPLITK`` / ``NOATOMIC``.
+  native ``EMMY_REDUCE`` codec — no legacy ``BR`` / ``SPLITK`` / ``NOATOMIC``.
 
 Pure GPU accuracy (no ``-O1`` numerics change), so it runs in the correctness lane.
 """
@@ -85,9 +85,9 @@ _OPS = {
 def _compile_run(code: str, env: dict[str, str], monkeypatch) -> tuple[np.ndarray, list[np.ndarray], str]:
     """Trace + compile ``code`` under the pinned ``env``, run on seeded inputs, and return
     ``(output, ordered_inputs, kernel_source)``."""
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import ConstantOp
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import ConstantOp
 
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -125,7 +125,7 @@ def test_cooperative_combine_accuracy(op, variant, monkeypatch):
     """Every reduce-carrier op stays accurate across the three intra-CTA combine stages
     (serial → warp-shuffle → hierarchical smem), pinned via the native ``REDUCE`` coop field."""
     code, ref_fn = _OPS[op]
-    got, xs, _src = _compile_run(code, {"DEPLODOCK_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch)
+    got, xs, _src = _compile_run(code, {"EMMY_REDUCE": _COOP_VARIANTS[variant]}, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
     assert diff < 1e-3, f"{op}/{variant}: combine mismatch (max abs err {diff})"
@@ -135,7 +135,7 @@ def test_cooperative_combine_accuracy(op, variant, monkeypatch):
 def test_attention_combine_accuracy(variant, monkeypatch):
     """The flash ``(m, d, o)`` twisted-monoid carrier is accurate serially and with a
     cooperative-KV combine (the native ``REDUCE`` coop field over the static KV axis)."""
-    env = {"DEPLODOCK_REDUCE": "t1"} if variant == "serial" else {"DEPLODOCK_REDUCE": "t32"}
+    env = {"EMMY_REDUCE": "t1"} if variant == "serial" else {"EMMY_REDUCE": "t32"}
     code, ref_fn = _OPS["attention"]
     got, xs, _src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
@@ -146,7 +146,7 @@ def test_attention_combine_accuracy(variant, monkeypatch):
 # The carrier-generic cross-CTA producer + finalize, one case per (carrier × finalize). The
 # additive carriers (matmul split-K, ``sum`` split-reduce) take BOTH finalize folds; the twisted
 # flash ``(m, l, O)`` carrier is **kernel-only** (the ``e^{Δm}`` rescale can't be an ``atomicAdd``).
-# ``flash`` flips on the fused streaming flash (``DEPLODOCK_FLASH``); all split the reduce/KV axis
+# ``flash`` flips on the fused streaming flash (``EMMY_FLASH``); all split the reduce/KV axis
 # across 2 CTAs via the native ``REDUCE`` ``c2`` codec, the same knob for matmul / reduce / flash.
 _CROSS_CTA = {
     "matmul": {"op": "matmul", "flash": False, "tol": 1e-2, "finalizes": ("atomic", "kernel")},
@@ -168,9 +168,9 @@ def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatc
     The finalize is the native ``REDUCE`` codec's ``c`` letter — one knob owns split + finalize."""
     spec = _CROSS_CTA[carrier]
     code, ref_fn = _OPS[spec["op"]]
-    env = {"DEPLODOCK_REDUCE": "c2a" if finalize == "atomic" else "c2k"}
+    env = {"EMMY_REDUCE": "c2a" if finalize == "atomic" else "c2k"}
     if spec["flash"]:
-        env["DEPLODOCK_FLASH"] = "1"
+        env["EMMY_FLASH"] = "1"
     got, xs, src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())

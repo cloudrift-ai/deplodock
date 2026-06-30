@@ -1,6 +1,6 @@
 """Unit tests for hardware lookup tables."""
 
-from deplodock.hardware import GPU_INSTANCE_TYPES, GPU_SHORT_NAMES, gpu_short_name, resolve_instance_type
+from emmy.hardware import GPU_INSTANCE_TYPES, GPU_SHORT_NAMES, gpu_short_name, resolve_instance_type
 
 # ── resolve_instance_type ────────────────────────────────────────
 

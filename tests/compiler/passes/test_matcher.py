@@ -1,9 +1,9 @@
 """Tests for the chain-pattern matcher."""
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import Pattern, Pipeline
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import Pattern, Pipeline
 
 
 def _match(g: Graph, pattern: list[Pattern]):

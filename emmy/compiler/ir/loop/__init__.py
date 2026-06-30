@@ -1,0 +1,58 @@
+"""Loop IR — post-fusion kernel representation plus its analysis/normalization.
+
+Submodules:
+- :mod:`.ir` — ``LoopOp`` (one kernel) plus ``LoopMeta`` / ``Scope``
+  helpers. The body statement vocabulary (``Loop``, ``Load``, ``Write``,
+  ``Assign``, ``Accum``, ``Select``, ``SelectBranch``, ``Cond``,
+  ``StridedLoop``, ``Stmt``, ``iter_body``, ``map_body``) lives in
+  ``ir/stmt.py`` and is re-exported here. Construction runs structural
+  normalization (``normalize_body`` in ``ir/stmt.py``) then validation via
+  ``__post_init__``.
+- :mod:`.splicer` — ``splice_*`` helpers used by ``loop/fusion`` to merge
+  adjacent ``LoopOp`` pairs.
+
+The public surface below re-exports the common types so callers use
+``from emmy.compiler.ir.loop import LoopOp, ...``.
+"""
+
+from emmy.compiler.ir.loop.builder import LoopBuilder
+from emmy.compiler.ir.loop.ir import (
+    Accum,
+    Assign,
+    Axis,
+    Cond,
+    Load,
+    Loop,
+    LoopMeta,
+    LoopOp,
+    Scope,
+    Select,
+    SelectBranch,
+    Stmt,
+    Write,
+)
+from emmy.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
+from emmy.compiler.ir.sigma import Sigma
+
+__all__ = [
+    "Accum",
+    "Assign",
+    "Axis",
+    "Cond",
+    "Load",
+    "Loop",
+    "LoopBuilder",
+    "LoopMeta",
+    "LoopOp",
+    "Scope",
+    "Select",
+    "SelectBranch",
+    "Sigma",
+    "Stmt",
+    "Write",
+    "iter_body",
+    "map_body",
+    "splice_graph",
+    "splice_loop_ops",
+    "splice_loops",
+]

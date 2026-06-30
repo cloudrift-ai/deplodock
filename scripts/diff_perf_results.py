@@ -40,8 +40,8 @@ def main() -> None:
 
     rows = []
     for name in common:
-        b_us = base[name].get("deplodock_us")
-        d_us = deg[name].get("deplodock_us")
+        b_us = base[name].get("emmy_us")
+        d_us = deg[name].get("emmy_us")
         if not b_us or not d_us:
             continue
         slowdown = d_us / b_us

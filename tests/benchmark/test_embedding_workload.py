@@ -1,9 +1,9 @@
 """Embedding-recipe bench command + metrics parsing + smoke-response checks."""
 
-from deplodock.benchmark.results import parse_benchmark_metrics
-from deplodock.benchmark.workload import build_bench_command
-from deplodock.deploy.orchestrate import _check_chat_response, _check_embedding_response
-from deplodock.recipe.types import Recipe
+from emmy.benchmark.results import parse_benchmark_metrics
+from emmy.benchmark.workload import build_bench_command
+from emmy.deploy.orchestrate import _check_chat_response, _check_embedding_response
+from emmy.recipe.types import Recipe
 
 
 def _recipe(task: str) -> Recipe:

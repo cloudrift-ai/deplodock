@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from deplodock.detect import _parse_sysfs_output, detect_local_gpus, detect_remote_gpus
+from emmy.detect import _parse_sysfs_output, detect_local_gpus, detect_remote_gpus
 
 # ── _parse_sysfs_output ────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ async def test_detect_remote_gpus():
     mock_proc.communicate.return_value = (b"0x10de 0x2330\n0x10de 0x2330\n", b"")
     mock_proc.returncode = 0
 
-    with patch("deplodock.detect.asyncio.create_subprocess_exec", return_value=mock_proc):
+    with patch("emmy.detect.asyncio.create_subprocess_exec", return_value=mock_proc):
         name, count = await detect_remote_gpus("user@host", "~/.ssh/id_ed25519", 22)
         assert name == "NVIDIA H100 80GB"
         assert count == 2

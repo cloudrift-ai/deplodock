@@ -1,0 +1,31 @@
+"""Decompose MatmulOp into unsqueeze(A) * unsqueeze(B) → reduce_sum [→ add(bias)]."""
+
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
+    broadcast_to,
+    matmul_decompose,
+    open_fragment,
+)
+
+PATTERN = [Pattern("root", MatmulOp)]
+
+
+def rewrite(match: Match, inp_a: Node, inp_b: Node, inp_bias: Node | None, out: Tensor) -> Graph | None:
+    graph = match.graph
+    exts = [inp_a, inp_b] + ([inp_bias] if inp_bias else [])
+    frag = open_fragment(graph, exts)
+
+    matmul_name = f"{out.name}_mm" if inp_bias else out.name
+    mm = matmul_decompose(frag, inp_a, inp_b, name=matmul_name)
+
+    if inp_bias:
+        bias_bc = broadcast_to(frag, inp_bias, out.shape)
+        add_id = frag.add_node(op=ElementwiseOp(op="add"), inputs=[mm, bias_bc], output=Tensor(out.name, out.shape, out.dtype))
+        frag.outputs = [add_id]
+    else:
+        frag.outputs = [mm.id]
+
+    return frag

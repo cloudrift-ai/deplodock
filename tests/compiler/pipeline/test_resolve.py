@@ -13,23 +13,23 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.fork import Fork
-from deplodock.compiler.pipeline.pipeline import Run, _is_structural_option
+from emmy.compiler import dtype as _dt
+from emmy.compiler import target as target_mod
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.fork import Fork
+from emmy.compiler.pipeline.pipeline import Run, _is_structural_option
 
 
 @pytest.fixture(autouse=True)
 def _isolated_prior(monkeypatch, tmp_path):
     """Untrained prior file so any lazy prior load is deterministic; target
     reset after each test."""
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     yield
     target_mod.set_target(None)
 
@@ -98,7 +98,7 @@ def test_option0_decide_matches_no_prior_greedy() -> None:
     """A decide that always takes option-0 reproduces the no-prior greedy
     compile (``greedy_decide(prior=None)`` falls to emission order at every
     fork — the same first leaf)."""
-    from deplodock.compiler.pipeline.search.policy import greedy_decide
+    from emmy.compiler.pipeline.search.policy import greedy_decide
 
     ctx = Context.from_target((8, 0))
     greedy, _ = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_f32_matmul_graph(), greedy_decide(prior=None))
@@ -132,7 +132,7 @@ def test_trace_records_partition_fork() -> None:
         assert d.chosen_kind == "op"
         assert d.score is None
         assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
     thread = next(d for d in part if d.rule_name == "090_thread_tile")
     # The matmul free axes are a0 (M, outer) and a1 (N, inner); the thread fork stamps the
@@ -165,7 +165,7 @@ def test_structural_replay_consulted() -> None:
     replays the first decision read off the graph (``Op.source`` + stamped
     decision knobs), so the decide callback sees one structural fork and the
     terminal carries both splits. Replays are not decisions — no trace entry."""
-    from deplodock.compiler.pipeline.search.two_level import outer_pipeline
+    from emmy.compiler.pipeline.search.two_level import outer_pipeline
 
     g = _norm_linear("b", _norm_linear("a"))
     seen: list[str] = []

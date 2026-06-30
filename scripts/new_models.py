@@ -4,7 +4,7 @@
 Pulls the open-weight models OpenRouter currently hosts (catalog entries that carry a
 `hugging_face_id` — closed models like Claude/GPT/Gemini do not), verifies each one exists on
 HuggingFace, and reports its HF popularity (downloads / likes / trendingScore) and release date.
-By default it drops models deplodock already supports (anything whose base model already appears
+By default it drops models emmy already supports (anything whose base model already appears
 in `recipes/`) and anything older than ~3 months, leaving a ranked shortlist of fresh candidates.
 
 Both APIs are queried keyless and read-only: OpenRouter `GET /api/v1/models` (public) and the HF
@@ -32,11 +32,11 @@ from pathlib import Path
 
 import httpx
 
-# Add project root to path (for deplodock.recipe reuse).
+# Add project root to path (for emmy.recipe reuse).
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from deplodock.recipe.recipe import _load_raw_config  # noqa: E402
+from emmy.recipe.recipe import _load_raw_config  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # silence per-request INFO chatter
@@ -315,7 +315,7 @@ async def main() -> None:
         default=default_since,
         help=f"Keep models with HF createdAt >= this date (YYYY-MM-DD). Use 'any' to disable. Default: {default_since} (~3 months ago).",
     )
-    parser.add_argument("--include-supported", action="store_true", help="Keep models deplodock already supports.")
+    parser.add_argument("--include-supported", action="store_true", help="Keep models emmy already supports.")
     parser.add_argument("--text-only", action="store_true", help="Drop multimodal models (keep text->text only).")
     parser.add_argument("--min-downloads", type=int, default=0, help="Drop models below this HF download count.")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent HF lookups (default 8).")

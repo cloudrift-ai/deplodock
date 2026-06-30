@@ -7,14 +7,14 @@ pin the projections against hand-built blocks so they cannot silently drift.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F16, F32
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.dtype import F16, F32
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.stmt.blocks import Loop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from emmy.compiler.ir.tile.ir import (
     AddrKind,
     Binding,
     Block,

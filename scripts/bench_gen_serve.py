@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Bench a running generative (chat) server: single-stream decode tok/s (TTFT + steady-state)
 and concurrent system throughput. Talks to any OpenAI-compatible `/v1/chat/completions`
-endpoint — e.g. a server started by `deplodock serve <model> --generate` (the deplodock plugin)
+endpoint — e.g. a server started by `emmy serve <model> --generate` (the emmy plugin)
 or `... --generate --stock` (native vLLM baseline).
 
 Usage (start a server in one shell, bench in another):
-    deplodock serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate --max-model-len 2048 \
+    emmy serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate --max-model-len 2048 \
         --gpu-memory-utilization=0.80 --max-num-batched-tokens 1024 --port 8001
     python scripts/bench_gen_serve.py --port 8001 --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """

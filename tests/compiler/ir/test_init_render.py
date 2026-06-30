@@ -8,14 +8,14 @@ outer-loop iteration.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.kernel.ir import KernelOp
-from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, Write
-from deplodock.compiler.ir.stmt import Init
-from deplodock.compiler.ir.tile.ir import ThreadTile
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.ir.kernel.render import render_kernelop
+from emmy.compiler.ir.loop import Accum, Axis, Load, Loop, Write
+from emmy.compiler.ir.stmt import Init
+from emmy.compiler.ir.tile.ir import ThreadTile
 
 
 def _kernel_with_init_then_nested_reduce() -> KernelOp:
@@ -58,7 +58,7 @@ def _kernel_with_fp32_accum_over_fp16_load() -> tuple[KernelOp, dict]:
     """fp16 input + f32 accumulator. Reads ``A`` as ``__half``, accumulates
     in ``float`` with a ``__half2float`` insertion at the combine. Returns
     the kernel plus the ``tensors=`` map render needs to stamp A as F16."""
-    from deplodock.compiler.tensor import Tensor  # noqa: PLC0415
+    from emmy.compiler.tensor import Tensor  # noqa: PLC0415
 
     k = Axis("k", 8)
     inner = (
@@ -71,7 +71,7 @@ def _kernel_with_fp32_accum_over_fp16_load() -> tuple[KernelOp, dict]:
         Write(output="C", index=(), value="acc"),
     )
     encl = ThreadTile(axes=(Axis("t0", 1),), body=body)
-    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+    from emmy.compiler import dtype as _dt  # noqa: PLC0415
 
     kop = KernelOp(body=(encl,), name="k_fp32_acc_fp16")
     tensors = {"A": Tensor("A", (8,), _dt.F16), "C": Tensor("C", (), _dt.F32)}

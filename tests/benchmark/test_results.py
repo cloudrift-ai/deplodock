@@ -2,16 +2,16 @@
 
 from pathlib import Path
 
-from deplodock.benchmark.results import (
+from emmy.benchmark.results import (
     BenchmarkMetrics,
     SystemInfo,
     compose_json_result,
     parse_benchmark_metrics,
     parse_system_info,
 )
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.variant import Variant
-from deplodock.recipe.types import Recipe
+from emmy.planner import BenchmarkTask
+from emmy.planner.variant import Variant
+from emmy.recipe.types import Recipe
 
 # ── Sample benchmark output (from real vLLM bench serve) ──────────
 

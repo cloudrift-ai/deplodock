@@ -1,10 +1,10 @@
-"""``deplodock serve`` command construction + flag routing + dry-run (no vllm/GPU)."""
+"""``emmy serve`` command construction + flag routing + dry-run (no vllm/GPU)."""
 
 import argparse
 
 import pytest
 
-from deplodock.commands.serve import build_bench_cmd, build_serve_cmd, handle_serve, register_serve_command
+from emmy.commands.serve import build_bench_cmd, build_serve_cmd, handle_serve, register_serve_command
 
 MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
@@ -20,7 +20,7 @@ def test_serve_cmd_plugin_defaults():
     assert cmd[:3] == ["vllm", "serve", MODEL]
     assert "--runner" in cmd and "pooling" in cmd
     assert "--enforce-eager" in cmd
-    assert '{"architectures": ["DeplodockEmbedModel"]}' in cmd
+    assert '{"architectures": ["EmmyEmbedModel"]}' in cmd
     assert cmd[cmd.index("--max-model-len") + 1] == "4096"
     assert "--gpu-memory-utilization=0.9" in cmd
 
@@ -66,7 +66,7 @@ def test_bench_cmd_targets_embeddings():
 
 def test_own_flags_after_model_are_extracted(capsys):
     # The argparse-REMAINDER footgun: everything after MODEL lands in
-    # vllm_args, INCLUDING deplodock's own flags. They must still be honored
+    # vllm_args, INCLUDING emmy's own flags. They must still be honored
     # (this exact case once exec'd a real server out of a --dry-run test).
     args = _parse(["serve", MODEL, "--bench", "--dry-run", "--random-input-len", "32", "--gpu-memory-utilization", "0.8"])
     handle_serve(args)
@@ -108,7 +108,7 @@ def test_bench_seed_is_distinct_from_vllm_seed(capsys):
 def test_serve_cmd_generate_branch():
     cmd = build_serve_cmd(MODEL, stock=False, vllm_args=[], generate=True)
     assert cmd[cmd.index("--runner") + 1] == "generate"
-    assert '{"architectures": ["DeplodockGenModel"]}' in cmd
+    assert '{"architectures": ["EmmyGenModel"]}' in cmd
     assert cmd[cmd.index("--dtype") + 1] == "float16"  # forced for seam coherence
     assert cmd[cmd.index("--max-num-batched-tokens") + 1] == "4096"  # capped at the dynamic-dim limit
     assert "--enforce-eager" in cmd

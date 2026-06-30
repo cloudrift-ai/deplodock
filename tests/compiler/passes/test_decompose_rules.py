@@ -8,11 +8,11 @@ from pathlib import Path
 
 import numpy as np
 
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.expr import Literal
-from deplodock.compiler.ir.frontend.ir import (
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.frontend.ir import (
     CatOp,
     LayerNormOp,
     LinearOp,
@@ -26,8 +26,8 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import Pipeline
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import Pipeline
 
 _DECOMP_PASS = "frontend/decomposition"
 
@@ -68,7 +68,7 @@ def _make_pow_graph(exp: float = 2.0, *, broadcast: bool = False):
     g.add_node(op=ConstantOp(name="exp", value=exp), inputs=[], output=Tensor("exp", (1,)), node_id="exp")
     exp_id = "exp"
     if broadcast:
-        from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+        from emmy.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
         g.add_node(
             op=IndexMapOp(out_shape=(4, 128), sources=(IndexSource(input_idx=0, coord_map=(Literal(0, "int"),)),)),
@@ -257,7 +257,7 @@ def test_rms_norm_trace_to_tensor_ir_primitives_only():
     """
     import torch
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.RMSNorm(64), (torch.randn(1, 8, 64),))
     decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
@@ -318,7 +318,7 @@ def test_layer_norm_trace_captures_eps():
     """The tracer peels the trailing eps constant into LayerNormOp.eps."""
     import torch
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.LayerNorm(64, eps=1e-3), (torch.randn(1, 8, 64),))
     ln = [n for n in graph.nodes.values() if isinstance(n.op, LayerNormOp)]
@@ -333,7 +333,7 @@ def test_layer_norm_trace_to_tensor_ir_primitives_only():
     """
     import torch
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.LayerNorm(64), (torch.randn(1, 8, 64),))
     decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
@@ -389,7 +389,7 @@ def test_softmax_trace_to_tensor_ir_primitives_only():
     """End-to-end: torch.nn.Softmax → trace → decomposition yields primitives only."""
     import torch
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(torch.nn.Softmax(dim=-1), (torch.randn(1, 4, 8),))
     decomposed = Pipeline.build(["frontend/decomposition", "frontend/optimization"]).run(graph)
@@ -461,7 +461,7 @@ def test_sdpa_idempotent():
 
 def test_sdpa_output_is_valid():
     """SDPA ends with a squeeze IndexMapOp (after the keepdim reduce)."""
-    from deplodock.compiler.ir.tensor.ir import IndexMapOp
+    from emmy.compiler.ir.tensor.ir import IndexMapOp
 
     result = _apply(_make_sdpa_graph(), "010_sdpa.py")
     assert isinstance(result.nodes[result.outputs[0]].op, (ElementwiseOp, ReduceOp, IndexMapOp))

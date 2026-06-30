@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "deplodock"
+name = "emmy"
 version = "0.1.0"
 description = "Deploy and benchmark LLM inference on GPU servers using vLLM"
 requires-python = ">=3.12"
@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff"]
 compile = ["torch", "transformers>=5.10", "cppyy==3.5.0", "safetensors"]
-# vLLM out-of-tree embedding plugin (deplodock/serving); vllm pins its own torch.
+# vLLM out-of-tree embedding plugin (emmy/serving); vllm pins its own torch.
 # fastapi<0.137 cap: vllm 0.22.1 pins fastapi only as `>=0.115.0` (no upper bound),
 # so a fresh install pulls fastapi>=0.137, whose new `_IncludedRouter` route objects
 # (no `.path`) crash vllm's bundled prometheus-fastapi-instrumentator 8.0.0 on every
@@ -31,16 +31,16 @@ visualize = ["playwright>=1.40"]
 dev = ["pytest", "pytest-asyncio", "pytest-xdist", "ruff", "matplotlib", "graphviz", "torch", "transformers>=5.10", "cupy-cuda12x; sys_platform == 'linux'", "cppyy==3.5.0", "safetensors", "playwright>=1.40"]
 
 [tool.setuptools.packages.find]
-include = ["deplodock*"]
+include = ["emmy*"]
 
 [tool.setuptools.package-data]
-"deplodock.compiler.pipeline.search" = ["goldens/*.yaml"]
+"emmy.compiler.pipeline.search" = ["goldens/*.yaml"]
 
 [project.scripts]
-deplodock = "deplodock.deplodock:main"
+emmy = "emmy.emmy:main"
 
 [project.entry-points."vllm.general_plugins"]
-deplodock_serving = "deplodock.serving:register"
+emmy_serving = "emmy.serving:register"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -56,7 +56,7 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
-"deplodock/compiler/backend/cuda/generators/tiled.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
+"emmy/compiler/backend/cuda/generators/tiled.py" = ["E501"]  # Generated CUDA code has long inline PTX strings
 
 [tool.ruff.format]
 quote-style = "double"

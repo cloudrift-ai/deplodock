@@ -21,20 +21,20 @@ from __future__ import annotations
 
 import importlib
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.stmt import Accum, Body, Init
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.stmt import Accum, Body, Init
+from emmy.compiler.ir.tile.ir import (
     SerialTile,
     TileOp,
     WarpSpecialize,
     WarpTile,
 )
-from deplodock.compiler.pipeline.pipeline import Match
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.pipeline.pipeline import Match
+from emmy.compiler.tensor import Tensor
 
-_place_inits = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.020_place_inits")
+_place_inits = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.020_place_inits")
 
 
 def _tile_op_with_ws_reduce() -> TileOp:

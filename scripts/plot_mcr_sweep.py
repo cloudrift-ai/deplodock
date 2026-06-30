@@ -10,7 +10,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-from deplodock.logging_setup import setup_cli_logging
+from emmy.logging_setup import setup_cli_logging
 
 logger = logging.getLogger(__name__)
 

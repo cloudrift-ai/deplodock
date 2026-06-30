@@ -10,9 +10,9 @@ parallel.
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.frontend.ir import (
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.frontend.ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -23,7 +23,7 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 # ---------- static (tuple[int, ...]) ----------
 

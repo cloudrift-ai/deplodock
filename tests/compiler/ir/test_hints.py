@@ -1,8 +1,8 @@
 """Tests for the hint system."""
 
-from deplodock.compiler.graph import Graph, Hints, Tensor, resolve_hints
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.graph import Graph, Hints, Tensor, resolve_hints
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def _matmul_graph() -> Graph:
@@ -166,7 +166,7 @@ def test_hints_flow_through_lower():
     After fusion, the matmul pair (mul + sum) becomes one LoopOp graph
     node whose ``.hints`` carries the merged hints from all consumed nodes.
     """
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
     g = _matmul_graph()
     ew_id = next(nid for nid, n in g.nodes.items() if isinstance(n.op, ElementwiseOp))
@@ -174,7 +174,7 @@ def test_hints_flow_through_lower():
 
     fused = Pipeline.build(LOOP_PASSES).run(g)
 
-    from deplodock.compiler.ir.loop import LoopOp
+    from emmy.compiler.ir.loop import LoopOp
 
     kernel_nodes = [n for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
     assert len(kernel_nodes) == 1

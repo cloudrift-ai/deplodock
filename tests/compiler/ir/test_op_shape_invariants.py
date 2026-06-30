@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def test_elementwise_rejects_mismatched_shapes():
@@ -51,8 +51,8 @@ def test_decomposition_emits_broadcast_explicit_elementwise():
     """
     import torch
 
-    from deplodock.compiler.pipeline import Pipeline
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.pipeline import Pipeline
+    from emmy.compiler.trace.torch import trace_module
 
     # Exercise each decomp rule: RMSNorm hits decompose_rms_norm + decompose_mean.
     # Softmax hits decompose_softmax. Linear(x) hits decompose_linear +

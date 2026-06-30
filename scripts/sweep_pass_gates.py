@@ -1,7 +1,7 @@
 """Sweep the perf-suite cases under (chunk_reduce, pad_smem) gate matrix.
 
 For each case in ``tests/perf/cases.py`` and each combo of
-``DEPLODOCK_DISABLE_CHUNK_REDUCE`` / ``DEPLODOCK_DISABLE_PAD_SMEM``,
+``EMMY_DISABLE_CHUNK_REDUCE`` / ``EMMY_DISABLE_PAD_SMEM``,
 runs the tile pipeline and sums broadcast-corrected
 ``conflict_events`` across all (Stage, Load) bindings. Used to surface
 cases where one pass dominates the conflict reduction.
@@ -22,18 +22,18 @@ from pathlib import Path
 # Make tests.perf importable when running from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from deplodock.compiler.diagnostics.bank_conflicts import find_all_bindings, lane_bank_distribution  # noqa: E402
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: E402
-from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_deplodock_graph  # noqa: E402
+from emmy.compiler.diagnostics.bank_conflicts import find_all_bindings, lane_bank_distribution  # noqa: E402
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: E402
+from tests.perf.cases import FUSED_CASES, PRIMITIVE_CASES, build_emmy_graph  # noqa: E402
 
 CONFIGS = [
     ("baseline", {}),
-    ("no_chunk_reduce", {"DEPLODOCK_DISABLE_CHUNK_REDUCE": "1"}),
-    ("no_pad_smem", {"DEPLODOCK_DISABLE_PAD_SMEM": "1"}),
-    ("no_chunk_no_pad", {"DEPLODOCK_DISABLE_CHUNK_REDUCE": "1", "DEPLODOCK_DISABLE_PAD_SMEM": "1"}),
+    ("no_chunk_reduce", {"EMMY_DISABLE_CHUNK_REDUCE": "1"}),
+    ("no_pad_smem", {"EMMY_DISABLE_PAD_SMEM": "1"}),
+    ("no_chunk_no_pad", {"EMMY_DISABLE_CHUNK_REDUCE": "1", "EMMY_DISABLE_PAD_SMEM": "1"}),
 ]
 
-GATES = ("DEPLODOCK_DISABLE_CHUNK_REDUCE", "DEPLODOCK_DISABLE_PAD_SMEM")
+GATES = ("EMMY_DISABLE_CHUNK_REDUCE", "EMMY_DISABLE_PAD_SMEM")
 
 
 def with_env(overrides: dict[str, str]):
@@ -84,7 +84,7 @@ def run_case(case, configs=CONFIGS) -> dict:
     for cfg_name, env in configs:
         try:
             with with_env(env):
-                g = build_deplodock_graph(case)
+                g = build_emmy_graph(case)
                 Pipeline.build(TILE_PASSES).run(g)
                 kernels = total_events_per_kernel(g)
                 total = sum(sum(s.values()) for s in kernels.values())

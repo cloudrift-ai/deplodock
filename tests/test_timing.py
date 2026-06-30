@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from deplodock.timing import (
+from emmy.timing import (
     PHASE_CUDA_GRAPH,
     PHASE_IMAGE_PULL,
     PHASE_MODEL_LOAD_AND_WARMUP,

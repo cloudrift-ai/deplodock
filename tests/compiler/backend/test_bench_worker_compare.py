@@ -1,11 +1,11 @@
-"""The deployable eager / torch.compile / deplodock comparison runs in the SIGKILL-able worker.
+"""The deployable eager / torch.compile / emmy comparison runs in the SIGKILL-able worker.
 
 This is what makes ``tune --bench`` / ``run --bench`` survive a hung generated kernel: the whole
-comparison (deplodock + the torch peer-bench, rebuilt in the child from a recipe) runs in the worker,
+comparison (emmy + the torch peer-bench, rebuilt in the child from a recipe) runs in the worker,
 so a non-terminating kernel hangs the *child* and the parent SIGKILLs it on ``wall_timeout_s`` —
 freeing the device and leaving the parent clean, instead of the ~109-minute in-process wedge.
 
-- ``test_compare_in_worker_returns_torch_and_deplodock`` — the happy path: a real frontend graph is
+- ``test_compare_in_worker_returns_torch_and_emmy`` — the happy path: a real frontend graph is
   rebuilt + benched against eager torch in the child, numbers come back.
 - ``test_worker_hang_is_sigkilled_not_wedged`` — a worker that hangs on a real non-terminating GPU
   kernel is SIGKILLed at the wall-timeout and surfaces a ``RuntimeError`` promptly (not a wedge).
@@ -22,11 +22,11 @@ from ..conftest import requires_cuda
 
 
 @requires_cuda
-def test_compare_in_worker_returns_torch_and_deplodock() -> None:
-    from deplodock.commands.run import _detect_stage, _passes_after_stage
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
-    from deplodock.compiler.pipeline import Pipeline
+def test_compare_in_worker_returns_torch_and_emmy() -> None:
+    from emmy.commands.run import _detect_stage, _passes_after_stage
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.backend.cuda.program import benchmark_compare_isolated_async
+    from emmy.compiler.pipeline import Pipeline
 
     # A small torch_ref-runnable op; lowered in-parent (as the per-kernel sweep does), then the
     # frontend snapshot + lowered graph go to the worker, which rebuilds the torch ref and benches.
@@ -39,7 +39,7 @@ def test_compare_in_worker_returns_torch_and_deplodock() -> None:
         benchmark_compare_isolated_async(
             lowered=lowered,
             torch_spec=("frontend_graph", fe),
-            bench_backends="eager,deplodock",
+            bench_backends="eager,emmy",
             wall_timeout_s=180.0,
             warmup=2,
             iters=5,
@@ -48,7 +48,7 @@ def test_compare_in_worker_returns_torch_and_deplodock() -> None:
         )
     )
     assert torch_available, "the worker should have rebuilt the torch reference from the frontend graph"
-    assert results.get("Deplodock", 0) > 0, f"missing deplodock number: {results}"
+    assert results.get("Emmy", 0) > 0, f"missing emmy number: {results}"
     assert results.get("Eager PyTorch", 0) > 0, f"missing eager torch number: {results}"
     assert bench is not None
 
@@ -59,7 +59,7 @@ class _HangWorker:
 
     _CHILD = textwrap.dedent(
         """
-        import deplodock.compiler.backend.cuda._bench_worker as w
+        import emmy.compiler.backend.cuda._bench_worker as w
         import cupy
         def _hang(req):
             spin = cupy.RawKernel(r'extern "C" __global__ void spin(volatile int* f){ while(f[0]==0){} }', 'spin')
@@ -73,7 +73,7 @@ class _HangWorker:
     )
 
     def __init__(self) -> None:
-        from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
+        from emmy.compiler.backend.cuda.program import _AsyncBenchWorker
 
         self._impl = _AsyncBenchWorker()
         # Override _spawn to launch our hanging child instead of ``-m _bench_worker``.
@@ -108,7 +108,7 @@ def test_run_job_send_times_out_on_unresponsive_worker() -> None:
 
     import pytest
 
-    from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
+    from emmy.compiler.backend.cuda.program import _AsyncBenchWorker
 
     worker = _AsyncBenchWorker()
 

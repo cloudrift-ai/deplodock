@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
+from emmy.compiler.pipeline.fork import Fork, Level, build_fork_tree
 
 
 def _row(a: int, b: int, c: int) -> dict:

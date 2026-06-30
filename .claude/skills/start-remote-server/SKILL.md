@@ -6,16 +6,16 @@ version: 0.2.0
 
 # Start Remote Server
 
-Provision a fresh cloud GPU VM on the right provider (GCP or CloudRift) for the requested hardware, leave it running, and report back the SSH connection details so the user can run `deplodock deploy ssh ...` or `deplodock bench --ssh ...` against it later.
+Provision a fresh cloud GPU VM on the right provider (GCP or CloudRift) for the requested hardware, leave it running, and report back the SSH connection details so the user can run `emmy deploy ssh ...` or `emmy bench --ssh ...` against it later.
 
-This skill **does not** deploy a recipe. To deploy + bench + teardown in one shot, use `deplodock deploy cloud` or `deplodock bench` directly — those handle their own VM lifecycle.
+This skill **does not** deploy a recipe. To deploy + bench + teardown in one shot, use `emmy deploy cloud` or `emmy bench` directly — those handle their own VM lifecycle.
 
-## Preferred Path: `deplodock vm create gpu`
+## Preferred Path: `emmy vm create gpu`
 
 For almost every request, use the GPU-name orchestrator command:
 
 ```bash
-deplodock vm create gpu \
+emmy vm create gpu \
   --gpu "<full GPU name>" \
   --gpu-count <N> \
   [--provider cloudrift|gcp] \
@@ -27,7 +27,7 @@ deplodock vm create gpu \
 
 What this command does that the provider-specific commands do **not**:
 
-- Resolves the GPU name to candidates from `deplodock/hardware.py::GPU_INSTANCE_TYPES` automatically — you do not pass an instance type.
+- Resolves the GPU name to candidates from `emmy/hardware.py::GPU_INSTANCE_TYPES` automatically — you do not pass an instance type.
 - Iterates candidates in preference order (every `(provider, base)` pair under the GPU key, all GCP zones from `GPU_GCP_ZONES`).
 - Handles capacity fallback: on `CapacityExhausted` (HTTP 5xx, 409, "no capacity", "out of stock", "Service Unavailable") it advances to the next candidate. On transient errors it retries the same candidate.
 - Cleans up orphans from failed attempts.
@@ -42,7 +42,7 @@ What this command does that the provider-specific commands do **not**:
 
 Before running anything, confirm these with the user (ask only the ones not already given):
 
-1. **GPU model** — must match a key in `deplodock/hardware.py::GPU_INSTANCE_TYPES`. If the user gives a short name ("5090", "H200"), map it to the full name (`"NVIDIA GeForce RTX 5090"`, `"NVIDIA H200 141GB"`, etc.). If the requested GPU is not in `GPU_INSTANCE_TYPES`, stop and tell the user — don't guess.
+1. **GPU model** — must match a key in `emmy/hardware.py::GPU_INSTANCE_TYPES`. If the user gives a short name ("5090", "H200"), map it to the full name (`"NVIDIA GeForce RTX 5090"`, `"NVIDIA H200 141GB"`, etc.). If the requested GPU is not in `GPU_INSTANCE_TYPES`, stop and tell the user — don't guess.
 2. **GPU count** — integer (1, 2, 4, 8). Default to 1 if not specified and the user is just experimenting.
 3. **Provider** — only ask if the GPU is offered by more than one provider (e.g. H200 is on both CloudRift and GCP). Otherwise omit `--provider` and let the hardware-table preference order apply.
    - **If the user explicitly named a provider, it is binding.** Pass `--provider` and never silently fall back to another provider. If the GPU isn't available on that provider, report the mismatch — let the user decide whether to switch GPU, switch provider, or abort.
@@ -52,7 +52,7 @@ Before running anything, confirm these with the user (ask only the ones not alre
 
 ## Sourcing Provider Credentials
 
-`deplodock vm create gpu` reads `CLOUDRIFT_API_KEY` / `CLOUDRIFT_API_URL` from the process environment. The repo does **not** auto-load env files (no `python-dotenv` dependency). The repo root typically has a base `.env`; the user may also keep `.env.*` files that point at different clusters / accounts.
+`emmy vm create gpu` reads `CLOUDRIFT_API_KEY` / `CLOUDRIFT_API_URL` from the process environment. The repo does **not** auto-load env files (no `python-dotenv` dependency). The repo root typically has a base `.env`; the user may also keep `.env.*` files that point at different clusters / accounts.
 
 Pick the file based on what the user said:
 
@@ -61,18 +61,18 @@ Pick the file based on what the user said:
 
 If the user wants a non-default cluster but didn't say which file, **list candidates** (`ls .env.* 2>/dev/null`) and ask. Don't guess.
 
-Source in the **same Bash call** as `deplodock vm create gpu` (Bash sessions don't preserve env across calls). Order matters: base first, overlay second.
+Source in the **same Bash call** as `emmy vm create gpu` (Bash sessions don't preserve env across calls). Order matters: base first, overlay second.
 
 Default (just `.env`):
 
 ```bash
-[ -f .env ] && set -a && . ./.env && set +a && deplodock vm create gpu --gpu "<name>" --gpu-count <N>
+[ -f .env ] && set -a && . ./.env && set +a && emmy vm create gpu --gpu "<name>" --gpu-count <N>
 ```
 
 With a user-specified overlay file `<extra>`:
 
 ```bash
-set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && deplodock vm create gpu --gpu "<name>" --gpu-count <N>
+set -a && [ -f .env ] && . ./.env; . ./<extra> && set +a && emmy vm create gpu --gpu "<name>" --gpu-count <N>
 ```
 
 The `[ -f .env ] && . ./.env;` part lets the base file be optional but fails loudly if the overlay is missing — that's intentional, since a missing user-specified file usually means you're about to hit the wrong target.
@@ -111,7 +111,7 @@ Use the provider-specific commands **only** when the user explicitly asks for a 
 ### CloudRift (single-shot, exact instance type)
 
 ```bash
-deplodock vm create cloudrift \
+emmy vm create cloudrift \
   --instance-type <base>.<gpu_count> \
   --ssh-key ~/.ssh/id_ed25519.pub \
   [--billing-exempt]
@@ -124,7 +124,7 @@ Image is auto-selected from the instance type: `mi*` (AMD Instinct) → ROCm ima
 ### GCP (single-shot, exact machine type)
 
 ```bash
-deplodock vm create gcp \
+emmy vm create gcp \
   --instance <name> \
   --zone <zone> \
   --machine-type <resolved_type> \
@@ -141,11 +141,11 @@ When the command succeeds (last log line `VM ready at <user@host>:<port>` for `v
 1. Capture the SSH connection target from the command output. For `vm create gpu` and `vm create cloudrift`, it's printed as `user@ip` / `user@host:port`. For `vm create gcp` manual mode, use `gcloud compute ssh <instance> --zone <zone>` or pull the external IP from `gcloud compute instances describe`.
 2. Report to the user: provider, instance ID/name, zone (GCP), instance type, SSH target.
 3. Remind the user that the VM is **billed until deleted**. Provide the matching teardown command:
-   - `deplodock vm delete cloudrift --instance-id <id>`
-   - `deplodock vm delete gcp --instance <name> --zone <zone>`
+   - `emmy vm delete cloudrift --instance-id <id>`
+   - `emmy vm delete gcp --instance <name> --zone <zone>`
 4. Offer next steps:
-   - Deploy a recipe: `deplodock deploy ssh --recipe <path> --ssh <user@host>`
-   - Run benchmarks against it: `deplodock bench <recipes> --ssh <user@host>`
+   - Deploy a recipe: `emmy deploy ssh --recipe <path> --ssh <user@host>`
+   - Run benchmarks against it: `emmy bench <recipes> --ssh <user@host>`
 
 Do **not** automatically schedule a teardown — let the user decide when to release the VM. If the user explicitly asks for a deadline, offer to `/schedule` a delete agent for that time.
 
@@ -167,5 +167,5 @@ If any check fails, report the failure and the raw output instead of claiming su
 - Don't wrap `vm create gpu` in a manual retry loop or try other bases yourself — the orchestrator already does both, and a second wrapper just hides the real error.
 - Don't override a user-specified provider. If the GPU isn't available on that provider, abort and ask — never quietly run on a different provider "because that's where it's available."
 - Don't set `--dry-run` when the user asked for a real server. Use it only when the user asks to preview.
-- Don't run `deplodock deploy cloud` for this task — that bundles deploy+teardown and won't leave a server idle for the user.
+- Don't run `emmy deploy cloud` for this task — that bundles deploy+teardown and won't leave a server idle for the user.
 - Don't `git add` `.env*` files — they're gitignored for a reason.

@@ -15,11 +15,11 @@ thread loops (a duplicate ``int aN`` declaration that fails to compile).
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.stmt.normalize import rename_ssa_sequential
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.stmt import Body, Load, Write
+from emmy.compiler.ir.stmt.normalize import rename_ssa_sequential
+from emmy.compiler.ir.tile.ir import (
     GridTile,
     Source,
     StageBundle,

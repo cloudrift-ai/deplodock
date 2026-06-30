@@ -16,16 +16,16 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
-from deplodock.compiler.pipeline.pipeline import _is_structural_option
-from deplodock.compiler.pipeline.search.db import SearchDB
+from emmy.compiler import dtype as _dt
+from emmy.compiler import target as target_mod
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
+from emmy.compiler.pipeline.fork import OptionFork, ThunkFork
+from emmy.compiler.pipeline.pipeline import _is_structural_option
+from emmy.compiler.pipeline.search.db import SearchDB
 from tests.compiler.conftest import drain_tune
 
 _S, _H, _I = 32, 1024, 3072
@@ -35,7 +35,7 @@ _S, _H, _I = 32, 1024, 3072
 def _isolated_prior(monkeypatch, tmp_path):
     """Untrained prior so descents are deterministic regardless of the host's
     checkpoint; target reset after each test."""
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     yield
     target_mod.set_target(None)
 
@@ -102,7 +102,7 @@ def test_split_demoted_fork_pushes_structural(monkeypatch) -> None:
     """005's keep-vs-split offer reads structural=True; every other fork on the
     same drive (partition leaves, stage rebinds) reads False."""
     for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     target_mod.set_target((12, 0))
     search = _drive_one_terminal(_norm_linear_graph(), (12, 0))
     structural_rules = {rule for rule, structural in search.pushes if structural}
@@ -116,7 +116,7 @@ def test_atomic_free_splitk_fork_pushes_structural(monkeypatch) -> None:
     """055's atomic-vs-workspace fork (a sub-partition ``Graph`` splice) reads
     structural=True; the op-variant tiling forks (reduce / thread / register decomp)
     on the same SPLITK=2 drive read False."""
-    monkeypatch.setenv("DEPLODOCK_SPLITK", "2")
+    monkeypatch.setenv("EMMY_SPLITK", "2")
     target_mod.set_target((8, 0))
     search = _drive_one_terminal(_f32_matmul_graph(), (8, 0))
     structural_rules = {rule for rule, structural in search.pushes if structural}

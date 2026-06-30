@@ -1,4 +1,4 @@
-[2026-02-25 13:49:50] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9
+[2026-02-25 13:49:50] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9
 [2026-02-25 13:49:50] [root] 
 [2026-02-25 13:49:50] [root] Running 2 benchmark task(s) in 1 execution group(s)
 [2026-02-25 13:49:50] [root] Parallel mode (max workers: 1)
@@ -42,7 +42,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 14:01:55] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 14:04:01] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_vllm_benchmark.txt
+[2026-02-25 14:04:01] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_vllm_benchmark.txt
 [2026-02-25 14:04:01] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 14:04:01] [orchestrate] Tearing down...
 [2026-02-25 14:04:06] [orchestrate] Teardown complete.
@@ -71,7 +71,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 14:13:25] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 14:19:03] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_sglang_benchmark.txt
+[2026-02-25 14:19:03] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/rtx5090_sglang_benchmark.txt
 [2026-02-25 14:19:03] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 14:19:03] [orchestrate] Tearing down...
 [2026-02-25 14:19:13] [orchestrate] Teardown complete.
@@ -81,7 +81,7 @@ Example curl:
 [2026-02-25 14:19:14] [cloudrift] Instance terminated.
 [2026-02-25 14:19:14] [rtx5090_x_1] VM deleted.
 [2026-02-25 14:19:14] [rtx5090_x_1] Completed group: rtx5090_x_1
-[2026-02-25 14:19:14] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/manifest.json
+[2026-02-25 14:19:14] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/manifest.json
 [2026-02-25 14:19:14] [root] 
 [2026-02-25 14:19:14] [root] SUMMARY
 [2026-02-25 14:19:14] [root] Successful: 2/2
@@ -89,4 +89,4 @@ Example curl:
 [2026-02-25 14:19:14] [root]    - rtx5090_sglang_benchmark.txt
 [2026-02-25 14:19:14] [root] 
 [2026-02-25 14:19:14] [root] All done!
-[2026-02-25 14:19:14] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/benchmark.log
+[2026-02-25 14:19:14] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_13-49-50_6299d5b9/benchmark.log

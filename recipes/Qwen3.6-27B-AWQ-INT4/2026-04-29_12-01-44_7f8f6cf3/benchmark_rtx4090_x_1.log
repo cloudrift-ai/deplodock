@@ -2,46 +2,48 @@
 [2026-04-29 12:01:47] [rtx4090_x_1] Using pre-allocated host: riftuser@211.21.50.85:57032
 [2026-04-29 12:01:56] [rtx4090_x_1.Qwen3.6-27B-AWQ-INT4] Recipe: recipes/Qwen3.6-27B-AWQ-INT4 (variant: rtx4090x1)
 [2026-04-29 12:01:56] [rtx4090_x_1.Qwen3.6-27B-AWQ-INT4] Deploying model...
-[2026-04-29 12:01:59] [deplodock.deploy.orchestrate] Pulling images...
-[2026-04-29 12:02:00] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
-[2026-04-29 12:02:01] [deplodock.provisioning.ssh_transport]  vllm_0 Pulling 
-[2026-04-29 12:02:03] [deplodock.provisioning.ssh_transport]  vllm_0 Pulled 
-[2026-04-29 12:02:03] [deplodock.deploy.orchestrate] Downloading model cyankiwi/Qwen3.6-27B-AWQ-INT4...
-[2026-04-29 12:02:04] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
-[2026-04-29 12:02:07] [deplodock.provisioning.ssh_transport] Fetching 18 files:   0%|          | 0/18 [00:00<?, ?it/s]Fetching 18 files: 100%|██████████| 18/18 [00:00<00:00, 14676.80it/s]
-[2026-04-29 12:02:07] [deplodock.provisioning.ssh_transport] [32m✓ Downloaded[0m
-[2026-04-29 12:02:07] [deplodock.provisioning.ssh_transport]   path: /hf_models/hub/models--cyankiwi--Qwen3.6-27B-AWQ-INT4/snapshots/42cf87020d298736061e41fd2673bc631f1cc4c6
-[2026-04-29 12:02:07] [deplodock.deploy.orchestrate] Cleaning up old containers...
-[2026-04-29 12:02:08] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
-[2026-04-29 12:02:09] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
-[2026-04-29 12:02:14] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
-[2026-04-29 12:02:14] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
-[2026-04-29 12:02:15] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
-[2026-04-29 12:02:15] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Removing
-[2026-04-29 12:02:15] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Removed
-[2026-04-29 12:02:15] [deplodock.deploy.orchestrate] Starting services...
-[2026-04-29 12:02:16] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
-[2026-04-29 12:02:17] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Creating
-[2026-04-29 12:02:17] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Created
-[2026-04-29 12:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
-[2026-04-29 12:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
-[2026-04-29 12:02:17] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
-[2026-04-29 12:02:21] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
-[2026-04-29 12:02:21] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
-[2026-04-29 12:06:42] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
-[2026-04-29 12:06:42] [deplodock.deploy.orchestrate] Waiting for health check...
-[2026-04-29 12:06:43] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
-[2026-04-29 12:06:44] [deplodock.deploy.orchestrate] 
+[2026-04-29 12:01:59] [emmy.deploy.orchestrate] Pulling images...
+[2026-04-29 12:02:00] [emmy.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
+[2026-04-29 12:02:01] [emmy.provisioning.ssh_transport]  vllm_0 Pulling 
+[2026-04-29 12:02:03] [emmy.provisioning.ssh_transport]  vllm_0 Pulled 
+[2026-04-29 12:02:03] [emmy.deploy.orchestrate] Downloading model cyankiwi/Qwen3.6-27B-AWQ-INT4...
+[2026-04-29 12:02:04] [emmy.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
+[2026-04-29 12:02:07] [emmy.provisioning.ssh_transport] 
+Fetching 18 files:   0%|          | 0/18 [00:00<?, ?it/s]
+Fetching 18 files: 100%|██████████| 18/18 [00:00<00:00, 14676.80it/s]
+[2026-04-29 12:02:07] [emmy.provisioning.ssh_transport] [32m✓ Downloaded[0m
+[2026-04-29 12:02:07] [emmy.provisioning.ssh_transport]   path: /hf_models/hub/models--cyankiwi--Qwen3.6-27B-AWQ-INT4/snapshots/42cf87020d298736061e41fd2673bc631f1cc4c6
+[2026-04-29 12:02:07] [emmy.deploy.orchestrate] Cleaning up old containers...
+[2026-04-29 12:02:08] [emmy.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
+[2026-04-29 12:02:09] [emmy.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-04-29 12:02:14] [emmy.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-04-29 12:02:14] [emmy.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-04-29 12:02:15] [emmy.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-04-29 12:02:15] [emmy.provisioning.ssh_transport]  Network emmy_default  Removing
+[2026-04-29 12:02:15] [emmy.provisioning.ssh_transport]  Network emmy_default  Removed
+[2026-04-29 12:02:15] [emmy.deploy.orchestrate] Starting services...
+[2026-04-29 12:02:16] [emmy.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
+[2026-04-29 12:02:17] [emmy.provisioning.ssh_transport]  Network emmy_default  Creating
+[2026-04-29 12:02:17] [emmy.provisioning.ssh_transport]  Network emmy_default  Created
+[2026-04-29 12:02:17] [emmy.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-04-29 12:02:17] [emmy.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-04-29 12:02:17] [emmy.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-04-29 12:02:21] [emmy.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-04-29 12:02:21] [emmy.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-04-29 12:06:42] [emmy.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-04-29 12:06:42] [emmy.deploy.orchestrate] Waiting for health check...
+[2026-04-29 12:06:43] [emmy.provisioning.ssh_transport] Warning: Permanently added '[211.21.50.85]:57032' (ED25519) to the list of known hosts.
+[2026-04-29 12:06:44] [emmy.deploy.orchestrate] 
 Endpoint: http://211.21.50.85:8000/v1
-[2026-04-29 12:06:44] [deplodock.deploy.orchestrate] Model: cyankiwi/Qwen3.6-27B-AWQ-INT4
-[2026-04-29 12:06:44] [deplodock.deploy.orchestrate] Instances: 1
-[2026-04-29 12:06:44] [deplodock.deploy.orchestrate] Status: deployed
-[2026-04-29 12:06:44] [deplodock.deploy.orchestrate] 
+[2026-04-29 12:06:44] [emmy.deploy.orchestrate] Model: cyankiwi/Qwen3.6-27B-AWQ-INT4
+[2026-04-29 12:06:44] [emmy.deploy.orchestrate] Instances: 1
+[2026-04-29 12:06:44] [emmy.deploy.orchestrate] Status: deployed
+[2026-04-29 12:06:44] [emmy.deploy.orchestrate] 
 Running smoke test...
-[2026-04-29 12:06:53] [deplodock.deploy.orchestrate] Smoke test passed.
-[2026-04-29 12:06:53] [deplodock.deploy.orchestrate] 
+[2026-04-29 12:06:53] [emmy.deploy.orchestrate] Smoke test passed.
+[2026-04-29 12:06:53] [emmy.deploy.orchestrate] 
 Example curl:
-[2026-04-29 12:06:53] [deplodock.deploy.orchestrate]   curl http://211.21.50.85:8000/v1/chat/completions \
+[2026-04-29 12:06:53] [emmy.deploy.orchestrate]   curl http://211.21.50.85:8000/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
       "model": "cyankiwi/Qwen3.6-27B-AWQ-INT4",
@@ -49,4 +51,4 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-04-29 12:06:53] [rtx4090_x_1.Qwen3.6-27B-AWQ-INT4] Running benchmark...
-[2026-04-29 12:15:47] [rtx4090_x_1.Qwen3.6-27B-AWQ-INT4] Results saved to: /Users/natalia/Programming/deplodock/recipes/Qwen3.6-27B-AWQ-INT4/2026-04-29_12-01-44_7f8f6cf3/rtx4090x1_vllm_benchmark.txt
+[2026-04-29 12:15:47] [rtx4090_x_1.Qwen3.6-27B-AWQ-INT4] Results saved to: /Users/natalia/Programming/emmy/recipes/Qwen3.6-27B-AWQ-INT4/2026-04-29_12-01-44_7f8f6cf3/rtx4090x1_vllm_benchmark.txt

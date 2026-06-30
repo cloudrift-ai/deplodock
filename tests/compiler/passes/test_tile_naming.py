@@ -1,15 +1,15 @@
 """Provenance-driven kernel naming + name-invariant CudaOp cache key (M3)."""
 
-from deplodock.compiler import provenance as prov
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.frontend.ir import RmsNormOp
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler import provenance as prov
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda.ir import CudaOp
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.frontend.ir import RmsNormOp
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.search.keys import op_cache_key
 
 
 def _pointwise_loop() -> LoopOp:

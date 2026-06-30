@@ -28,18 +28,18 @@ import importlib
 import re
 from pathlib import Path
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.ir import Block, Buffer, Space, TileGraphOp, TileOp
-from deplodock.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-from deplodock.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tile.ir import Block, Buffer, Space, TileGraphOp, TileOp
+from emmy.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.pipeline.search.keys import op_cache_key
 
 # Native ``MOVE@element`` knobs for the matmul oracle: the free axes are ``a0`` (M, outer)
 # and ``a1`` (N, inner), the contraction axis ``a2``. ``SPLIT@<axis>`` packs par×reg
@@ -113,7 +113,7 @@ def test_pipeline_incremental_build_matches_build_dag_oracle(monkeypatch) -> Non
     composes the same moves in one call. Assemble both at the pipeline's own picked
     knobs and assert the same ``op_cache_key`` — so ``build_dag`` is the live oracle for
     the distribution, not a stale duplicate that can drift."""
-    monkeypatch.setenv("DEPLODOCK_STAGE", "none")  # pin staging off so the oracle needn't replay the STAGE fork
+    monkeypatch.setenv("EMMY_STAGE", "none")  # pin staging off so the oracle needn't replay the STAGE fork
     g = _matmul_graph()
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
@@ -128,7 +128,7 @@ def test_assembly_package_imports_no_enumeration_module() -> None:
     """The materialization side (``assembly/``) must not import the search side's
     offer / knob / move vocabulary (``enumeration/``): the dir boundary is the
     "allowed to fork?" guardrail, and a leak would couple lowering to the search."""
-    asm_dir = Path(importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.assembly").__file__).parent
+    asm_dir = Path(importlib.import_module("emmy.compiler.pipeline.passes.lowering.tile.assembly").__file__).parent
     pattern = re.compile(r"lowering\.tile\.enumeration|from\s+\S*enumeration\s+import|import\s+\S*enumeration")
     offenders = [f.name for f in sorted(asm_dir.glob("*.py")) if pattern.search(f.read_text())]
     assert offenders == [], f"assembly/ imports enumeration: {offenders}"

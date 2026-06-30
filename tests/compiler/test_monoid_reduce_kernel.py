@@ -16,12 +16,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F32
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
 
 
 def _has_cuda() -> bool:
@@ -67,7 +67,7 @@ def _reduce_graph(s: int, m: int, n: int) -> Graph:
 def test_monoid_reduce_merges_partition_states(s: int, m: int, n: int) -> None:
     """Merging S per-partition (m_s, l_s) online-softmax states reproduces the
     global denominator l = Σ_s l_s · exp(m_s − max_s m_s)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     rng = np.random.default_rng(3)
     ws_m = (rng.standard_normal((s, m, n)) * 3.0).astype(np.float32)
@@ -86,7 +86,7 @@ def test_monoid_reduce_merges_partition_states(s: int, m: int, n: int) -> None:
 
 
 def _deferred_graph(carrier, *, workspaces, s, m, n, **kw) -> Graph:
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph
 
     tg = deferred_combine_tilegraph(
         carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, out_shape=(m, n), dtype=F32, name="deferred__reduce", **kw
@@ -103,8 +103,8 @@ def _deferred_graph(carrier, *, workspaces, s, m, n, **kw) -> Graph:
 def test_deferred_finalize_additive_carrier_sums_partitions() -> None:
     """The generic selector routes a 1-component additive ``Accum`` to the plain ``Σ_s`` fold —
     the trivial carrier (matmul split-K), same entry point as the twisted monoid below."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.stmt import Accum
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.stmt import Accum
 
     s, m, n = 8, 16, 32
     rng = np.random.default_rng(7)
@@ -123,8 +123,8 @@ def test_deferred_finalize_flash_attention_carrier_merges_states() -> None:
     KERNEL finalize is correct for the attention carrier (atomic would be illegal — non-additive).
     The kernel-level proof of "attention's cross-CTA combine"; the producer that feeds it is the
     remaining flash split-KV work."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
     s, m, n = 8, 16, 32
     rng = np.random.default_rng(13)
@@ -150,7 +150,7 @@ def test_deferred_finalize_flash_attention_carrier_merges_states() -> None:
 def test_deferred_finalize_twisted_monoid_carrier_merges_states() -> None:
     """The SAME selector routes the twisted ``(m, l)`` online-softmax ``Monoid`` to the rescaled
     cross-partition merge — carrier-generic dispatch, not a flash special case."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     s, m, n = 8, 16, 32
     rng = np.random.default_rng(11)

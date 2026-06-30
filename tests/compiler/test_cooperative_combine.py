@@ -15,14 +15,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.loop.ir import LoopOp
+from emmy.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
 
 
 def _has_cuda() -> bool:
@@ -121,9 +121,9 @@ def test_cooperative_combine_softmax_matches_numpy(monkeypatch, br: int) -> None
     """A cooperative-K ``Monoid`` reduce (coop>1) matches numpy softmax — warp-
     shuffle path at coop=32, smem-tree path at coop=128. Native pins: the REDUCE
     coop field ``t<br>`` + a whole-CTA free tile (``SPLIT=1`` ⇒ BN=BM=1)."""
-    monkeypatch.setenv("DEPLODOCK_REDUCE", f"t{br}")
-    monkeypatch.setenv("DEPLODOCK_SPLIT", "1")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    monkeypatch.setenv("EMMY_REDUCE", f"t{br}")
+    monkeypatch.setenv("EMMY_SPLIT", "1")
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     rows, k = 8, 256
     rng = np.random.default_rng(0)
@@ -138,9 +138,9 @@ def test_cooperative_combine_softmax_matches_numpy(monkeypatch, br: int) -> None
 def test_cooperative_combine_emits_monoid_combine(monkeypatch) -> None:
     """With the REDUCE coop field pinned, the kernel carries the cross-thread monoid
     combine (``__shfl_xor_sync`` butterfly over the full state) — not a serial reduce."""
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "t32")
-    monkeypatch.setenv("DEPLODOCK_SPLIT", "1")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    monkeypatch.setenv("EMMY_REDUCE", "t32")
+    monkeypatch.setenv("EMMY_SPLIT", "1")
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     compiled = CudaBackend().compile(_softmax_combine_graph(8, 256))
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if getattr(n.op, "kernel_source", None))

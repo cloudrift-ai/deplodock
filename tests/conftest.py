@@ -14,24 +14,24 @@ import yaml
 # Cross-process GPU lock for CUDA tests. Set on conftest import so every
 # xdist worker (and any subprocess it spawns) coordinates on the same
 # path. With this set, ``CudaBackend.run`` (via
-# :func:`deplodock.compiler.backend.cuda.program.run_program`) holds the
+# :func:`emmy.compiler.backend.cuda.program.run_program`) holds the
 # lock end-to-end across compile + allocate + ``pre_run`` callback +
-# kernel launches + ``.get()``. Tests that compare deplodock against
+# kernel launches + ``.get()``. Tests that compare emmy against
 # torch eager pass ``pre_run=<eager closure>`` so the eager forward
-# and the deplodock launches share one uninterrupted GPU window —
+# and the emmy launches share one uninterrupted GPU window —
 # without this serialization, peer-worker CUDA activity interleaves
 # with our kernels and the per-position fp32 rounding drift breaks
 # the accuracy comparison.
-os.environ.setdefault("DEPLODOCK_GPU_LOCK", "/tmp/deplodock-gpu.lock")
+os.environ.setdefault("EMMY_GPU_LOCK", "/tmp/emmy-gpu.lock")
 
 
 @pytest.fixture(autouse=True)
 def _isolate_prior_file(tmp_path, monkeypatch):
     """Point the learned-prior checkpoint at a per-test temp path so the
     greedy compile driver (which loads the global prior) never picks up a
-    dev machine's ``~/.cache/deplodock/prior.json`` — tests stay deterministic
+    dev machine's ``~/.cache/emmy/prior.json`` — tests stay deterministic
     (empty prior → option-0), and a test that tunes writes only its own file."""
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +131,7 @@ def _is_cuda_item(item) -> bool:
 # xdist_group for every IN-PROCESS CUDA-touching test. The host only has
 # one GPU; running CUDA tests across multiple xdist workers concurrently
 # would mean two processes pushing kernels onto the same device. Even
-# with ``DEPLODOCK_GPU_LOCK`` serializing the kernel-launch window and
+# with ``EMMY_GPU_LOCK`` serializing the kernel-launch window and
 # ``backend.run(pre_run=...)`` pulling the torch eager forward into the
 # same lock, multi-kernel attention schedules still occasionally drift
 # enough across worker contexts (per-context SM scheduling differs, and
@@ -249,11 +249,11 @@ def recipes_dir():
 
 @pytest.fixture(scope="session")
 def run_cli(project_root):
-    """Return a callable that invokes the deplodock CLI as a subprocess."""
+    """Return a callable that invokes the emmy CLI as a subprocess."""
 
     def _run(*args):
         result = subprocess.run(
-            [sys.executable, "-m", "deplodock.deplodock", *args],
+            [sys.executable, "-m", "emmy.emmy", *args],
             capture_output=True,
             text=True,
             cwd=project_root,
@@ -291,7 +291,7 @@ def dump_dir(request):
     safe_name = request.node.name.replace("[", "_").replace("]", "_").replace("/", "_")
     dump_path = Path(PROJECT_ROOT) / "_test_data" / safe_name
 
-    from deplodock.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.pipeline.dump import CompilerDump
 
     return CompilerDump(dir=dump_path)
 

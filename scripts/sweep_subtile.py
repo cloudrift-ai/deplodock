@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sweep (TM, TN) sub-tile choices for the block_matmul rule on representative
 TinyLlama matmul shapes. Mirrors the kernel structure emitted by
-``deplodock/compiler/pipeline/passes/lowering/tile/003_block_matmul.py``:
+``emmy/compiler/pipeline/passes/lowering/tile/003_block_matmul.py``:
 BM_TG=BN_TG=BK=16, threads = 16x16, each thread owns a TM x TN register tile,
 inputs staged via shared memory, sub-tile cells interleaved across threads
 (stride BM_TG / BN_TG, not contiguous).

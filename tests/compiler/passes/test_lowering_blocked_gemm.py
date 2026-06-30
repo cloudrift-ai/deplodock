@@ -16,10 +16,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
 from ..conftest import requires_cuda
 
@@ -30,14 +30,14 @@ def _random(shape: tuple[int, ...], *, seed: int = 0, scale: float = 1.0, dtype=
 
 
 def _reference(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    from deplodock.compiler.backend.numpy import NumpyBackend
+    from emmy.compiler.backend.numpy import NumpyBackend
 
     be = NumpyBackend()
     return be.run(be.compile(graph), input_data=inputs)[0].outputs
 
 
 def _run_cuda(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     be = CudaBackend()
     return be.run(be.compile(graph), input_data=inputs)[0].outputs
@@ -56,7 +56,7 @@ def _assert_close(out: np.ndarray, ref: np.ndarray, *, atol_rel: float = 0.05, a
 
 def _pin_knobs(monkeypatch, **knobs) -> None:
     for key, value in knobs.items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", str(value))
+        monkeypatch.setenv(f"EMMY_{key}", str(value))
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def test_blocked_matmul_fp16_odd_stride_n_no_misalign(monkeypatch):
     matmul-chained-into-mul gives the planner a STAGE=111 enumeration,
     so the test multiplies the matmul output by a scalar broadcast.
     """
-    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+    from emmy.compiler import dtype as _dt  # noqa: PLC0415
 
     f16_dt = _dt.get("f16")
     f16 = np.dtype(np.float16)
@@ -206,8 +206,8 @@ def test_fused_rmsnorm_linear_blocked_prologue(monkeypatch):
     # the matmul body in its own RegisterTile(N_r) at a different staging
     # context would force a SECOND smem allocation (``x_smem_1``). Detect
     # by counting distinct smem decls for the x buffer.
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
     backend = CudaBackend()
     compiled = backend.compile(g)

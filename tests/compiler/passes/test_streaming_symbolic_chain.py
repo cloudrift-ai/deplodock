@@ -26,18 +26,18 @@ from __future__ import annotations
 
 import importlib
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.graph import Tensor
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import Binding, Buffer, Space, TileGraphOp
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F32
+from emmy.compiler.graph import Tensor
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.tile.ir import Binding, Buffer, Space, TileGraphOp
+from emmy.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
-_coop = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.tile.enumeration.070_coop_reduce")
+_coop = importlib.import_module("emmy.compiler.pipeline.passes.lowering.tile.enumeration.070_coop_reduce")
 
 
 def _flash_op(s_dim: Dim) -> TileGraphOp:
@@ -110,11 +110,11 @@ def test_flash_cells_atomize_via_the_generic_unit():
     **canonical-B** ``A=prob-fragment`` cell. ``build_monoid`` (warp tier) σ-tiles + atomizes these into a
     warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
     path that replaced the hand-assembled ``realize_flash``. CPU-only."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
-    from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
-    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma
+    from emmy.compiler.ir.stmt.carrier_algebra import split_carrier
+    from emmy.compiler.ir.tile.ir import ATOM_REGISTRY
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 
     op = _flash_op(Dim(64))
     dag = op.dag
@@ -155,11 +155,11 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     ``flash_pv_smem`` edge. ``carry_scope_from_graph`` (assembly) realizes the fragment-tier phases
     around these cells (GPU-validated by ``e2e/test_flash_tensorcore_generated.py`` under the walk).
     This is the structural check on the build move's output. CPU-only."""
-    from deplodock.compiler.dtype import F16
-    from deplodock.compiler.ir.stmt import Mma
-    from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
-    from deplodock.compiler.ir.twist import MmaTwist
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
+    from emmy.compiler.dtype import F16
+    from emmy.compiler.ir.stmt import Mma
+    from emmy.compiler.ir.stmt.carrier_algebra import split_carrier
+    from emmy.compiler.ir.twist import MmaTwist
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
 
     # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so build_monoid reads the 16-bit atom.
     shp = (Dim(1), Dim(1), Dim(64), Dim(16))

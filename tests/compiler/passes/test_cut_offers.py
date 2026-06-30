@@ -9,15 +9,15 @@ cone keeps it below any buildable tier) and decline a clean matmul / pointwise b
 
 from __future__ import annotations
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._cut import Tier, cut_offers, tier
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler import dtype as _dt
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._cut import Tier, cut_offers, tier
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
 _CC = (12, 0)
 
