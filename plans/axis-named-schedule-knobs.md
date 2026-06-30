@@ -33,6 +33,11 @@ The structural-node vocabulary exists and recognize builds it; the **scheduling/
 - ✅ The `reduce` partition moved off `TileSchedule` onto the `Reduction` node, read via
   `ops.reduce_plan` (falls back to `schedule.reduce` for the two not-yet-node forms: a non-tiled
   contraction's split-K, and flash's legacy loop-in-body `Map`).
+- ✅ **Migration step 1** — the `REDUCE`/`TILE`/`STAGE`/`WSPEC` codec `Knob`s consolidated into `knob.py`.
+- ✅ **Migration step 2** — `Contraction` built recognize-side (`_schedule._contraction_node`, seam #1);
+  `_build_contraction` retired; `Contraction` is now a structural source node `ops.lower`/`reduce_loop`/
+  `axis_role` dispatch on (it synthesizes the mul-add `CONTRACTION` loop). A tiled contraction's
+  `kernel.op` is the `Contraction` node; materialize only synthesizes the bare grid-`Write` + `factorize`s.
 
 ## Structural nodes + field homes (the dissolution, seams resolved)
 
@@ -331,13 +336,17 @@ retire (keep only the within-node scalar-vs-warp OFF, e.g. `TILE@d=""` = "this c
 `reduce`-on-node has landed. The remaining order interleaves the structural moves, the fork-tree emit,
 and the knob schema:
 
-1. **Consolidate knobs in `knob.py`.** Move the `REDUCE`/`TILE`/`STAGE`/`WSPEC` `Knob` definitions from
-   `_schedule.py` into `knob.py`; `_schedule.py` imports them. Mechanical, no behavior change — emitted
-   kernels + features byte-identical.
-2. **Build `Contraction` recognize-side** (seam #1). Move the `_build_contraction` body to the fork-emit
-   side; a tiled-contraction leaf is a `Contraction` node with `tile`+`bind`; materialize only
-   `factorize`s. Emitted-kernel parity over the matmul / fused-epilogue / warp-mma fixture.
-3. **Collapse `Kernel`/`TileSchedule`** (seam #2). `TileOp` holds the structural root + thin
+1. ✅ **Consolidate knobs in `knob.py`** — landed. The `REDUCE`/`TILE`/`STAGE`/`WSPEC` `Knob` definitions
+   moved from `_schedule.py` into `knob.py`; `_schedule.py` imports them, `_walk_modules` still discovers
+   them. Emitted kernels + features byte-identical.
+2. ✅ **Build `Contraction` recognize-side** (seam #1) — landed. The build moved off `010_materialize`'s
+   `_build_contraction` (retired) onto `_schedule._contraction_node` at fork-emit; a tiled-contraction leaf
+   is a `Contraction` node with `tile`+`bind` resolved (the unbindable-atom error surfaces at fork
+   construction). `Contraction` is now a first-class structural source node (`ops.lower`/`reduce_loop`/
+   `axis_role` dispatch on it, synthesizing the mul-add `CONTRACTION` loop on demand). Materialize only
+   synthesizes the bare grid-`Write` + `factorize`s. Emitted kernels byte-identical; `op_cache_key` re-keys
+   onto the `Contraction` structural identity (expected).
+3. **Collapse `Kernel`/`TileSchedule`** (seam #2) — NEXT. `TileOp` holds the structural root + thin
    `place`/`workers`; `tier`/`bind`/`stage` ride the nodes. Repoint the `test_matmul_coverage`
    accessors. Emitted kernels byte-identical.
 4. **The resolver + addressing shim, behavior-preserving.** Land `resolve_axis(family, key, eligible_axes)`
