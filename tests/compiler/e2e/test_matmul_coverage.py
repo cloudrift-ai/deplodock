@@ -608,6 +608,61 @@ def test_mma_batched_qk_matches_torch(B, H, M, N, D, monkeypatch):
     assert "dpl_mma_load_b_gmem_trans" in src, "transposed-B (K last) must use the gmem-direct trans helper"
 
 
+def _mma_pv_graph(B: int, H: int, M: int, KV: int, D: int):
+    """A hand-built **batched, canonical-B** ``O[b,h,m,d] = Σ_kv P[b,h,m,kv]·V[b,h,kv,d]`` over f16
+    operands — the flash P@V contraction (the second mma): leading ``(b, h)`` batch axes, reduce over
+    ``kv``, and V indexed ``[kv, d]`` (``kv`` first, the canonical non-transposed B)."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+
+    b, h, m, d, kv = Axis("b", B), Axis("h", H), Axis("m", M), Axis("d", D), Axis("kv", KV)
+    kv_loop = Loop(
+        axis=kv,
+        body=(
+            Load(name="p_v", input="p", index=(Var("b"), Var("h"), Var("m"), Var("kv"))),
+            Load(name="v_v", input="v", index=(Var("b"), Var("h"), Var("kv"), Var("d"))),
+            Assign(name="pr", op=ElementwiseImpl("multiply"), args=("p_v", "v_v")),
+            Accum(name="acc", value="pr"),
+        ),
+    )
+    # Write the output cell after the kv reduction (inside the d loop), then nest the grid axes.
+    d_loop = Loop(axis=d, body=(kv_loop, Write(output="c", index=(Var("b"), Var("h"), Var("m"), Var("d")), value="acc")))
+    nest = d_loop
+    for ax in (m, h, b):
+        nest = Loop(axis=ax, body=(nest,))
+    op = LoopOp(body=(nest,))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("p", (B, H, M, KV), dtype=F16), node_id="p")
+    g.add_node(InputOp(), [], Tensor("v", (B, H, KV, D), dtype=F16), node_id="v")
+    g.add_node(op, ["p", "v"], Tensor("c", (B, H, M, D), dtype=F32), node_id="c")
+    g.inputs, g.outputs = ["p", "v"], ["c"]
+    return g
+
+
+@pytest.mark.parametrize(("B", "H", "M", "KV", "D"), [(1, 4, 128, 128, 128), (2, 3, 128, 256, 128)])
+@requires_sm90
+@requires_cuda
+def test_mma_batched_pv_matches_torch(B, H, M, KV, D, monkeypatch):
+    """The shared contraction codegen tiles a **batched canonical-B** P@V (flash's second mma:
+    leading ``(b, h)`` axes, reduce over ``kv``, V stored ``[kv, d]``) onto ``mma.sync`` and agrees
+    with torch — the other half of the contraction reuse the warp-flash materializer rides."""
+    import torch  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    rng = np.random.default_rng(0)
+    p = (rng.standard_normal((B, H, M, KV)) * 0.1).astype(np.float16)
+    v = (rng.standard_normal((B, H, KV, D)) * 0.1).astype(np.float16)
+    got, src = _compile_run_mma(_mma_pv_graph(B, H, M, KV, D), {"p": p, "v": v})
+
+    ref = torch.matmul(torch.tensor(p).float(), torch.tensor(v).float()).numpy()
+    diff = float(np.abs(got.reshape(B, H, M, D) - ref).max())
+    assert diff < 1e-2, f"batched P@V {B}x{H}x{M}x{KV}x{D}: mma mismatch (max abs err {diff})"
+    assert "mma.sync.aligned.m16n8k16" in src, "the batched P@V must emit the s16816 mma.sync"
+    assert "dpl_mma_load_b_gmem(" in src, "canonical B (kv first) must use the gmem-direct non-trans helper"
+
+
 # Fused epilogues over the warp tier — a projection ``Map`` (or a causal ``Select``) folds into
 # the ``RegStore`` per fragment element.
 _MMA_EPILOGUES = ("bias", "relu", "residual", "causal")
