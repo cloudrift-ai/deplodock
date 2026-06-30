@@ -63,6 +63,7 @@ from deplodock.compiler.ir.stmt.ir import BodyOp
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.tile.atom import Atom
+    from deplodock.compiler.ir.tile.schedule import TilePlan
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -315,14 +316,15 @@ def _overhangs(axis: Axis, tile: int) -> bool:
 class Contraction(Stmt):
     """A contraction **before** atom factorization — the seam between ``005_contract`` (constructs
     it, before materialize) and ``010_materialize`` (expands it via ``_factor.factorize``). **ONE
-    flat node, binding-driven for both atoms.** It holds the GRID skeleton (the tiled output ``axes``
-    ``(m, n)``, the contraction ``k_axis``, any leading batch ``lead_axes``), the per-CTA **UNIT**
-    grid ``units`` ``(m, n)`` — warps for mma, threads for scalar — + the per-unit **REGISTER**
-    sub-tile ``regs`` ``(m, n)`` (the ``(units, regs, atom)`` triple mirrors the resolved
-    :class:`~deplodock.compiler.ir.tile.schedule.TilePlan`, in m-then-n order), the structured
-    operands (the A/B ``Load``\\ s), the fold accumulator ``acc``, the leaf ``atom`` (a tensor-core
-    :class:`AtomKind` or the ``1×1`` :class:`ScalarAtom`), and the projection ``epilogue`` (which
-    carries the output ``Write``).
+    flat node** that cleanly splits the **algebra params** (what to contract) from the **schedule**
+    (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,
+    the leading batch ``lead_axes``, the structured A/B operand ``Load``\\ s, the fold accumulator
+    ``acc``, and the projection ``epilogue`` (which carries the output ``Write``); the schedule is the
+    one ``tile`` field — a resolved :class:`~deplodock.compiler.ir.tile.schedule.TilePlan` carrying the
+    leaf ``atom`` (tensor-core :class:`AtomKind` or the ``1×1`` :class:`ScalarAtom`), the per-CTA
+    **UNIT** grid + per-unit **REGISTER** sub-tile, and the K-chunk. Keeping the schedule a single
+    swappable field is what lets the same operand/acc params be tiled by a different ``TilePlan`` (the
+    flash inner QK/PV reuse).
 
     The contraction itself is **never stored** — both tiers *synthesize* it from the operands:
     ``_factor.codegen`` lowers the mma atom into ``ldmatrix`` + ``mma.sync`` and the scalar atom into a
@@ -334,23 +336,20 @@ class Contraction(Stmt):
     ``structural_key`` digests (the node IS keyed as an intermediate ``KernelOp``). The atom selects
     the codegen — there is no separate ``Leaf`` / per-atom subclass."""
 
-    axes: tuple[Axis, Axis]  # the tiled output (m_axis, n_axis)
-    k_axis: Axis
-    units: tuple[int, int]  # per-CTA unit grid (units_m, units_n) — warps for mma, threads for scalar
-    regs: tuple[int, int]  # per-unit register sub-tile (reg_m, reg_n)
-    a_load: Load
-    b_load: Load
-    acc: str
-    atom: Atom
-    lead_axes: tuple[Axis, ...] = ()
-    epilogue: Body = field(default_factory=Body)
+    axes: tuple[Axis, Axis]  # the tiled output (m_axis, n_axis) — params
+    k_axis: Axis  # the contraction axis — params
+    a_load: Load  # params
+    b_load: Load  # params
+    acc: str  # params
+    tile: TilePlan  # the schedule: leaf atom + unit/register widths + K-chunk (the only schedule field)
+    lead_axes: tuple[Axis, ...] = ()  # params
+    epilogue: Body = field(default_factory=Body)  # params
 
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
             object.__setattr__(self, "epilogue", Body(self.epilogue))
 
-    # ---- the (m, n) output-axis / unit / register split unpacked (the ``units`` / ``regs`` +
-    # ``units_m`` / … accessor idiom of ``TilePlan``); stored resolved, m-then-n ---------- #
+    # ---- params: the (m, n) output axes unpacked ---------- #
     @property
     def m_axis(self) -> Axis:
         return self.axes[0]
@@ -359,31 +358,37 @@ class Contraction(Stmt):
     def n_axis(self) -> Axis:
         return self.axes[1]
 
+    # ---- schedule: the leaf atom + unit/register widths, read off the ``tile`` (m-then-n,
+    # normalized by ``TilePlan``'s accessors) ---------- #
+    @property
+    def atom(self) -> Atom:
+        return self.tile.atom
+
     @property
     def units_m(self) -> int:
-        return self.units[0]
+        return self.tile.units_m
 
     @property
     def units_n(self) -> int:
-        return self.units[1]
+        return self.tile.units_n
 
     @property
     def reg_m(self) -> int:
-        return self.regs[0]
+        return self.tile.reg_m
 
     @property
     def reg_n(self) -> int:
-        return self.regs[1]
+        return self.tile.reg_n
 
-    # ---- derived tiling geometry (read by ``_factor.factorize``) — from the unit/register widths
-    # + the atom (``tile = units·reg·atom``, ``block_threads = units·units·lanes``) ---------- #
+    # ---- derived geometry (read by ``_factor.factorize``) — the per-CTA tile dims come straight off
+    # the ``tile``; the masks / extents combine the ``tile`` widths with the output axes (params) ---- #
     @property
     def tile_m(self) -> int:
-        return self.units_m * self.reg_m * self.atom.atom_m
+        return self.tile.tile_m
 
     @property
     def tile_n(self) -> int:
-        return self.units_n * self.reg_n * self.atom.atom_n
+        return self.tile.tile_n
 
     @property
     def mask_m(self) -> bool:
@@ -403,7 +408,7 @@ class Contraction(Stmt):
 
     @property
     def block_threads(self) -> int | None:
-        bt = self.units_m * self.units_n * self.atom.lanes
+        bt = self.tile.block_threads
         return bt if bt > 1 else None  # None ⇒ the scalar default block size
 
     @property
@@ -1926,17 +1931,15 @@ def _(s: Tile, rename, sigma, axis_fn):
 @_rewrite.register
 def _(s: Contraction, rename, sigma, axis_fn):
     # Route the operand Loads + accumulator + epilogue through the generic rewrite (SSA / Expr / axis
-    # canonicalization); map the skeleton axes; pass the geometry / atom through. ``b_trans`` is
-    # derived from ``b_load`` (a property), so the rewritten load carries it.
+    # canonicalization); map the skeleton axes; pass the ``tile`` schedule through unchanged.
+    # ``b_trans`` is derived from ``b_load`` (a property), so the rewritten load carries it.
     return Contraction(
         axes=tuple(axis_fn(a) for a in s.axes),
         k_axis=axis_fn(s.k_axis),
-        units=s.units,
-        regs=s.regs,
         a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
         b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
         acc=rename(s.acc),
-        atom=s.atom,
+        tile=s.tile,
         lead_axes=tuple(axis_fn(a) for a in s.lead_axes),
         epilogue=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.epilogue)),
     )

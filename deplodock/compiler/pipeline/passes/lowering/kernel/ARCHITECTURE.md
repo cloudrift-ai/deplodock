@@ -6,23 +6,25 @@ afterwards.
 
 ## `005_contract` — construct the contraction node (before materialize)
 
-A `Semiring` contraction's high-level node is built one pass **before** the materializer. It's **one** `Contraction`
-Stmt (`ir/kernel/ir.py`) holding the shared GRID skeleton (m/n/k axes, output, leading batch axes) + a per-atom `Leaf`
-payload — the ONLY atom-specific part, keyed by **atom** (`ir/tile/atom.py`) — a tensor-core mma cell (`AtomKind`,
-`lanes == 32`) or a scalar fma cell (`ScalarAtom`, `lanes == 1`):
+A `Semiring` contraction's high-level node is built one pass **before** the materializer. It's **one flat**
+`Contraction` Stmt (`ir/kernel/ir.py`) — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
+splits two concerns:
 
-- **mma arm** (`MmaLeaf`) — a warp-tier `SemiringKernel` (its schedule's `tier` carries a tensor-core-atom `TilePlan`): **thin**, the
-  op-tree-dependent part only — capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve
-  the projection epilogue (`_store.with_store`). Binding-driven (structured `a@b` operands + a warp-atom `TilePlan`).
-- **scalar arm** (`ScalarLeaf`) — a register-tiled `SemiringKernel` (its `TILE` plan tiles the output): lower the
-  per-cell body (`lower(op)` + output-store glue) and capture it with the register / parallel widths. Body-driven.
+- **algebra params** (what to contract): the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
+  structured A/B operand `Load`s (read off the atomize binding resolved in `020_schedule`), the fold accumulator `acc`,
+  and the projection `epilogue` (the binding's body, or a synthesized accumulator store via `_store.with_store`).
+- **schedule** (how to tile it): one `tile: TilePlan` field carrying the leaf `atom` (a tensor-core `AtomKind`,
+  `lanes == 32`, or the scalar `ScalarAtom`, `lanes == 1` — `ir/tile/atom.py`) plus the unit/register widths + K-chunk.
+  The atom selects the codegen at materialize; the rest of the per-CTA geometry (`tile_m` / `mask_m` / `block_threads` /
+  …) is **derived** on the node from `tile` × `axes` (`@property`, out of the structural-key fields).
+
+Keeping the schedule a single swappable field is what lets the same operand/`acc` params be tiled by a *different*
+`TilePlan` — the seam the flash inner QK/PV reuse needs.
 
 A non-tiled contraction (per-cell fallback) and the cooperative reduce tier are left untouched here (`RuleSkipped`) and
 bind to threads in `010_materialize`. Homing the construction here keeps the contraction a first-class node that exists
-*before* thread-binding. Both arms ARE `structural_key`-ed as an intermediate `KernelOp` (the kernel-stmt protocol + a
-`_rewrite` handler). Both arms now route through the shared tiling layer with the generic `_b` / `_u` block/unit axis
-naming, so the rendered kernels are *semantically* identical to the old single-pass materialize but their variable names
-(and hence `op_cache_key`) shift — the perf cache / prior re-warm. Correctness is unchanged.
+*before* thread-binding; it IS `structural_key`-ed as an intermediate `KernelOp` (the kernel-stmt protocol + a
+`_rewrite` handler). It routes through the shared tiling layer with the generic `_b` / `_u` block/unit axis naming.
 
 ## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
@@ -72,7 +74,7 @@ carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The
 
 The warp tier's smem **operand-staging** pipeline (the `STAGE` codec's cp.async / TMA slab — formerly `_stage.py` +
 the warp factorizer's `_warp_staged_kloop` / `_warp_tma_staged_kloop`) was **dropped** so both contraction tiers load
-operands gmem-direct (the `MmaLeaf` / `ScalarLeaf` symmetry — neither carries a `stage`). The `STAGE` codec +
+operands gmem-direct (both tiers are symmetric — neither carries a `stage`). The `STAGE` codec +
 `schedule.Stage` field still land (`020_schedule` stamps them — the knob/featurizer path is intact), but they are **not
 materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
 mma-staging structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.

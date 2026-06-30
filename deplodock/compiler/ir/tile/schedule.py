@@ -319,6 +319,16 @@ class TilePlan:
         scalar: ``par_n·par_m·1``)."""
         return self.units[0] * self.units[1] * self.atom.lanes
 
+    @property
+    def tile_m(self) -> int:
+        """The per-CTA output rows = ``units_m · reg_m · atom_m``."""
+        return self.units_m * self.reg_m * self.atom.atom_m
+
+    @property
+    def tile_n(self) -> int:
+        """The per-CTA output cols = ``units_n · reg_n · atom_n``."""
+        return self.units_n * self.reg_n * self.atom.atom_n
+
 
 @dataclass(frozen=True)
 class Placement:

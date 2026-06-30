@@ -67,12 +67,10 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     contraction = Contraction(
         axes=(m_axis, n_axis),
         k_axis=k_axis,
-        units=(tier.units_m, tier.units_n),
-        regs=(tier.reg_m, tier.reg_n),
         a_load=bind.a.load,
         b_load=bind.b.load,
         acc=bind.acc,
-        atom=tier.atom,
+        tile=tier,  # the resolved TilePlan — the whole schedule rides one field
         lead_axes=lead,
         epilogue=Body(tail),
     )
