@@ -32,12 +32,12 @@ from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.stmt.algebra import Monoid
-from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
+from deplodock.compiler.ir.tile import MapKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
+from deplodock.compiler.pipeline.passes.lowering.tile._skeleton import build_skeleton
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -144,42 +144,21 @@ def _pick_coop(extent: int, free: int) -> int:
     return coop if coop >= 2 else 1
 
 
-def _coop_carrier(kernel) -> Monoid | None:
-    """The cooperative-eligible reduce carrier of ``kernel``, or ``None`` (keep serial).
-
-    Eligible: any ``MonoidKernel`` over a cleanly-lifted ``Monoid`` carrier — **degenerate**
-    (plain ``sum`` / ``max`` / ``mean``) AND **twisted** (online-softmax ``(m, d)``, flash
-    ``(m, l, O)``) alike, since the cross-thread combine is carrier-generic (it drives off
-    the carrier's ``combine_states``, which a twisted carrier authors). Both **scalar**
-    outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d`` is a grid axis) and **full-row**
-    outputs (softmax / RMSNorm — the post-reduce sweep is distributed across the coop lanes
-    by the materializer) are handled. The reduce axis may be **symbolic** (dynamic
-    ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len`` bound is the
-    masked tail). A flat-``Map`` fallback (multi / nested-non-flash reduce) is a
-    ``MapKernel`` (``reduce_node`` is ``None``), so it isn't eligible and keeps the serial
-    fold."""
-    if not isinstance(kernel, MonoidKernel):
-        return None
-    inner = kernel.op.reduce_node
-    if not isinstance(inner, Monoid) or inner.axis is None:
-        return None
-    return inner
-
-
-def _reduce_specs(kernel, place) -> list[str]:
-    """The candidate ``REDUCE`` codec strings for ``kernel``, applying the decision
-    hierarchy. A kernel the cooperative tier can't partition (pointwise, or a twisted /
-    full-row / contraction reduce) is the lone scalar fold ``[""]`` — the ``REDUCE`` pin is
-    ignored there, since it only governs the cooperative reduce tier. An eligible reduce
-    offers ``[conservative coop, scalar]`` (a fork the search / prior ranks, option-0 = the
-    conservative pick so a cold greedy compile keeps cooperating), with an env pin
-    (``DEPLODOCK_REDUCE``) authoritative over the candidates (``Knob.narrow``)."""
-    carrier = _coop_carrier(kernel)
-    if carrier is None:
+def _reduce_specs(red, place) -> list[str]:
+    """The candidate ``REDUCE`` codec strings for the skeleton reduce axis ``red``, applying the
+    decision hierarchy. A reduce the cooperative tier can't partition (pointwise — ``red is None``
+    — or a twisted / full-row / contraction reduce that isn't ``coop_eligible``) is the lone
+    scalar fold ``[""]``; the ``REDUCE`` pin is ignored there, since it only governs the
+    cooperative reduce tier. An eligible reduce offers ``[conservative coop, scalar]`` (a fork the
+    search / prior ranks, option-0 = the conservative pick so a cold greedy compile keeps
+    cooperating), with an env pin (``DEPLODOCK_REDUCE``) authoritative over the candidates
+    (``Knob.narrow``). ``coop_eligible`` is the recognized predicate (the old ``_coop_carrier``),
+    now read off the skeleton."""
+    if red is None or not red.coop_eligible:
         return [""]  # not cooperative-eligible — scalar serial fold; the pin doesn't apply
     # A symbolic reduce axis is sized by its ``Dim`` hint for the conservative pick (the
     # kernel deploys at the hint and strides to the runtime extent); a pin overrides it.
-    extent = _hint_extent(carrier.axis)
+    extent = _hint_extent(red.axis)
     # A symbolic free axis (dynamic-grid tier) is sized by its ``Dim`` hint for the occupancy
     # heuristic — the kernel still deploys over the runtime grid.
     free = prod(_hint_extent(a) for a in place.free) if place.free else 1
@@ -260,15 +239,16 @@ def _wspec_workers(sched) -> tuple[WarpSpec | None, str]:
     return ws, pinned
 
 
-def _check_warp_static_k(kernel, wt) -> None:
+def _check_warp_static_k(red, wt) -> None:
     """Reject a warp pin whose **static** contraction K is not a multiple of the inner mma
     K-step (``atom_k · bk``). The warp K-loop has no static-K tail handling — a partial final
     K-step reads past the operand and silently corrupts the result (max error ≫ tol, yet the
     output's *mean* error stays small so the accuracy gate passes it). A **symbolic** K is
     fine: it reaches the masked tier (ceil-div grid + boundary ``Cond`` + zero-filled partial
     slab), so guard only the static case. Raising here surfaces a clean compile error instead
-    of a numerically-wrong kernel."""
-    ext = kernel.op.reduce_node.reduce_axis.extent
+    of a numerically-wrong kernel. ``red`` is the contraction's skeleton reduce axis (its
+    ``axis`` is the K axis)."""
+    ext = red.axis.extent
     if not ext.is_static:
         return
     k = ext.as_static()
@@ -282,18 +262,24 @@ def _check_warp_static_k(kernel, wt) -> None:
         )
 
 
-def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
+def _warp_option(kernel, place, spec: str, name: str, knobs: dict, red, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
     form of the ``TILE`` spec resolved into the schedule's warp-atom :class:`TilePlan` (the ``Warp`` fragment),
     plus an optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The packed
     ``TILE`` codec is the sole on-dict spelling — the learned-prior featurizer parses it directly
-    (no legacy ``WM``/``WN``/``MMA`` explosion)."""
+    (no legacy ``WM``/``WN``/``MMA`` explosion). ``red`` is the contraction's skeleton reduce axis."""
     wt = TilePlan.parse(spec)
-    _check_warp_static_k(kernel, wt)
+    _check_warp_static_k(red, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
-    # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
-    # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
-    bind = semiring_binding(kernel.op, place.grid)
+    # The operand→role atom binding was resolved at recognition (``red.binding``); read it from the
+    # skeleton when it's valid for this grid (the scalar-tier grid is the identity image of the
+    # recognized free axes, so ``grid == free``). Otherwise recompute — covering an unbindable atom
+    # (a non-Load operand: a computed-cone / demoted matmul, ``binding is None``, which raises here
+    # to reject the warp fork at construction) and any future non-identity grid remap.
+    if red.binding is not None and place.grid == place.free:
+        bind = red.binding
+    else:
+        bind = semiring_binding(kernel.op, place.grid)
     sched = replace(kernel.schedule, place=place, tier=wt, stage=stage, bind=bind)
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
     # splits the warps into roles over this fixed pipeline (gated on the stage now set on ``sched``).
@@ -342,6 +328,10 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
         raise RuleSkipped("schedule already mapped")
     kernel = tile.kernel
     place = kernel.schedule.place.on_grid()
+    # The recognized skeleton supplies the structural facts the menus read — the reduce axis
+    # (carrier, extent, cooperative eligibility) and the contraction operand binding. Built at
+    # recognition; the fallback rebuilds it should an upstream path emit a TileOp without one.
+    red = (tile.skeleton or build_skeleton(kernel, place.free)).root.reduce
     # A pointwise / non-cooperative kernel has no reduce decision — just map the grid (the
     # off-default stamps ``REDUCE=""``). A reduction offers its ``REDUCE`` candidate(s): a
     # single option applies directly; multiple options fork for the search / prior to rank.
@@ -358,10 +348,10 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
         stage_spec = _stage_spec(kernel)
         reduce_spec = _semiring_reduce_spec()
         return [
-            _warp_option(kernel, place, spec, tile.name, tile.knobs, stage_spec)
+            _warp_option(kernel, place, spec, tile.name, tile.knobs, red, stage_spec)
             if is_warp_codec(spec)
             else _tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec, stage_spec)
             for spec in _tile_specs(kernel)
         ]
-    specs = _reduce_specs(kernel, place)
+    specs = _reduce_specs(red, place)
     return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]
