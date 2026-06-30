@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Literal
-from deplodock.compiler.ir.stmt import INDENT, Body, Carrier, Load, Loop, RenderCtx, Stmt, pretty_body
+from deplodock.compiler.ir.stmt import INDENT, Accum, Body, Carrier, Load, Loop, RenderCtx, Stmt, pretty_body
 from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan
 
 if TYPE_CHECKING:
@@ -100,8 +100,11 @@ class Reduction:
 
 @dataclass(frozen=True)
 class Contraction(Stmt):
-    """A contraction **before** atom factorization — built and expanded in ``010_materialize``
-    (:func:`_build_contraction` resolves the binding, ``_factor.factorize`` expands it). **ONE
+    """A contraction **before** atom factorization — built **recognize-side** at fork-emit
+    (``_schedule._contraction_node`` resolves the operand→role binding via ``_atomize.semiring_binding``
+    and stamps the resolved ``tile``), then expanded in ``010_materialize`` (``_factor.factorize``).
+    :func:`ops.lower` / ``ops.reduce_loop`` flatten it back to the synthesized mul-add ``CONTRACTION``
+    loop nest (:attr:`loop`), the same generation ``_factor._synth_reduce`` register-tiles. **ONE
     flat node** that cleanly splits the **algebra params** (what to contract) from the **schedule**
     (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,
     the leading batch ``lead_axes``, the structured A/B operand ``Load``\\ s, the fold accumulator
@@ -134,6 +137,34 @@ class Contraction(Stmt):
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
             object.__setattr__(self, "epilogue", Body(self.epilogue))
+
+    @property
+    def out(self) -> str:
+        """The bound output name — the fold accumulator (a bare contraction's grid ``Write`` stores
+        ``acc`` at the cell; a fused-epilogue contraction carries its own ``Write`` in ``epilogue``)."""
+        return self.acc
+
+    @property
+    def loop(self) -> Loop:
+        """The synthesized ``CONTRACTION`` reduce ``Loop`` — the canonical ``for k: v = a*b; acc += v``
+        mul-add form (built by the shared ``ops.contraction_loop``, the same generation
+        ``_factor._synth_reduce`` register-tiles). Lets :func:`ops.lower` / ``ops.reduce_loop`` flatten
+        the node back to the loop nest; the node never stores the loop."""
+        from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+        from deplodock.compiler.ir.tile.ops import contraction_loop  # noqa: PLC0415 — avoid an import cycle
+
+        return contraction_loop(
+            lift=ElementwiseImpl("multiply"),
+            fold=Accum(name=self.acc, value=f"{self.acc}__v", op=ElementwiseImpl("add"), axes=(self.k_axis.name,)),
+            operand_bodies=([self.b_load], [self.a_load]),  # B[k, n], A[m, k] — keep B-then-A load reuse
+            reduce_axis=self.k_axis,
+        )
+
+    def lower(self) -> list[Stmt]:
+        """Flatten to the loop-IR body — the synthesized reduce ``Loop`` followed by the projection
+        ``epilogue`` (a fused-epilogue contraction's own stmts, empty for a bare one). The materializer
+        expands the node through ``_factor.factorize`` instead; this is the structural-key / dump path."""
+        return [self.loop, *self.epilogue]
 
     # ---- params: the (m, n) output axes unpacked ---------- #
     @property

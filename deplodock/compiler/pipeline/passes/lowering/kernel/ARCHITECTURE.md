@@ -4,17 +4,19 @@ This stage turns a scheduled `TileOp` into a `KernelOp` (a thread-bound CUDA-IR 
 Kernel-IR peepholes over it. The CUDA lowering (`lowering/cuda`) renders the `KernelOp` to a `__global__` source string
 afterwards.
 
-## `010_materialize` — bind the schedule to threads (and build + expand the contraction)
+## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
 `010_materialize` dispatches on the kernel kind / its schedule (the article's "schedule separate from combine" thesis —
 the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
 
-- **Tiled `CONTRACTION`** (warp / register tile) — `_build_contraction` resolves the operand→role binding + projection
-  epilogue into a single high-level `Contraction` Stmt (`ir/tile/structural.py`), and `_factor.factorize` **expands it**
-  through the one atom-generic factorizer over the shared tiling layer (below); the leaf type selects the codegen (mma /
-  scalar). An unbindable contraction (a non-`Load` operand / 1-D output) returns `None` and falls through to the scalar
-  tier. (This build was a separate `005_contract` pass before — now folded in so the contraction is constructed where it
-  is expanded.)
+- **Tiled `CONTRACTION`** (warp / register tile) — the high-level `Contraction` Stmt
+  (`ir/tile/structural.py`) was already built **recognize-side** at fork-emit
+  (`lowering/tile/_schedule._contraction_node`, resolving the operand→role binding via `_atomize.semiring_binding`), so
+  materialize only **synthesizes its bare grid-`Write`** (needs `root.output`, so it can't ride the node) and
+  **expands** it through the one atom-generic `_factor.factorize` over the shared tiling layer (below); the leaf type
+  selects the codegen (mma / scalar). An unbindable contraction (a non-`Load` operand) keeps the `Map` form and falls
+  through to the scalar tier here. (This build was a separate `005_contract` pass, then folded into materialize, and now
+  lives recognize-side so the node's `tile` / `bind` exist before scheduling — seam #1.)
 - **Scalar tier** — one thread per output cell (`lower(op)` + an output-store glue).
 - **Reduce tier** (`_reduce`, a `PLANAR` / `TWISTED` reduce whose `ReducePlan` cooperates / register-folds) — the
   reduce axis is partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP),

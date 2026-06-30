@@ -191,7 +191,7 @@ def _synth_reduce(c: Contraction) -> Loop:
     """The scalar contraction reduce loop ``for k: v = a*b; acc += v`` — built by the shared
     ``ops.contraction_loop`` builder (the **same** ``CONTRACTION`` loop generation the flash score
     producer uses, one source of truth, no register-tile special case), then stamping the
-    small-static ``unroll``. ``_build_contraction`` extracted A/B as plain leaf ``Load``\\ s (their
+    small-static ``unroll``. The :class:`Contraction` node carries A/B as plain leaf ``Load``\\ s (their
     indices carry the cell ``m`` / ``n`` + the loop ``k``); the operands keep B-then-A order for the
     load reuse."""
     k = c.k_axis

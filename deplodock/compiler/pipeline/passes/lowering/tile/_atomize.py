@@ -4,18 +4,18 @@ The warp matmul materializer needs to know which operand is the mma ``a`` vs ``b
 axis-in-index), whether ``b`` is transposed, the fold accumulator, and the projection epilogue.
 :func:`semiring_binding` reads them **structurally** off the lowered ``CONTRACTION`` reduce loop
 — the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and builds an
-:class:`AtomBinding` that rides the **schedule** (a sibling of the ``TilePlan`` decision;
-``op_cache_key`` digests ``lower(op.op)``, not the schedule, so the perf / prior cache stays
-byte-identical). Reading off the annotated loop (not an op-tree node) is what let the
-``Semiring`` / ``Monoid`` op-tree node classes retire. The cooperative reduce needs no binding here — its
-accumulator dtype + shuffle/tree mechanism are derived at materialize time (``emit_combine`` off
-the carrier + ``ReduceStage.combine``).
+:class:`AtomBinding` whose facts (the A/B operand ``Load``\\ s, ``acc``, epilogue) are then baked
+onto the :class:`~deplodock.compiler.ir.tile.structural.Contraction` structural node at fork-emit
+(``_schedule._contraction_node``). Reading off the annotated loop (not an op-tree node) is what let
+the ``Semiring`` / ``Monoid`` op-tree node classes retire. The cooperative reduce needs no binding
+here — its accumulator dtype + shuffle/tree mechanism are derived at materialize time
+(``emit_combine`` off the carrier + ``ReduceStage.combine``).
 
-**Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the warp
-option is built (``_warp_option``) — so an atom that **cannot** be bound (e.g. a non-``Load``
-operand: a computed-cone / demoted matmul) is rejected at fork construction, alongside
-``_check_warp_static_k``, instead of failing several passes later. Leading ``_`` so the pass
-loader skips this module.
+**Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the tiled
+contraction leaf is built (``_warp_option`` / the tiled ``_tile_option``) — so an atom that
+**cannot** be bound (e.g. a non-``Load`` operand: a computed-cone / demoted matmul) is rejected at
+fork construction, alongside ``_check_warp_static_k``, instead of failing several passes later.
+Leading ``_`` so the pass loader skips this module.
 
 **Recursion seam (deferred — warp-flash).** Flash is a ``TWISTED`` kv ``Loop`` (online-softmax)
 over a nested ``CONTRACTION`` score ``Loop``, so a recursive atomize would bind the inner QK^T /

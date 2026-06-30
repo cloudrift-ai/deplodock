@@ -19,7 +19,7 @@ from __future__ import annotations
 from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
-from deplodock.compiler.ir.tile.structural import Map, Reduction
+from deplodock.compiler.ir.tile.structural import Contraction, Map, Reduction
 
 
 def reduce_loop(op):
@@ -29,7 +29,7 @@ def reduce_loop(op):
     is read off the top-level body — the annotated reduce loop is a top-level stmt (a
     single-flat-reduce cell); a nested / multi reduce stays un-annotated (flat fallback) and is
     invisible here, so it materializes on the scalar tier."""
-    if isinstance(op, Reduction):
+    if isinstance(op, (Reduction, Contraction)):
         return op.loop
     if getattr(op, "source", None) is not None:
         return reduce_loop(op.source)  # a Map projecting over a Reduction / Contraction source
@@ -68,9 +68,9 @@ def lower(op) -> list[Stmt]:
     if isinstance(op, Map):
         prefix = lower(op.source) if op.source is not None else []
         return [*prefix, *op.body]  # the source's reduce/contract loop nest, then the projection body
-    if isinstance(op, Reduction):
+    if isinstance(op, (Reduction, Contraction)):
         return op.lower()
-    raise TypeError(f"lower: expected a Map lift wrapper or Reduction, got {type(op).__name__}")
+    raise TypeError(f"lower: expected a Map lift wrapper, Reduction, or Contraction, got {type(op).__name__}")
 
 
 def contraction_loop(lift, fold, operand_bodies, reduce_axis) -> Loop:

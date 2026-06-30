@@ -37,11 +37,12 @@ from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.ir.axis import AxisRole
-from deplodock.compiler.ir.tile import Kernel, Map, ReducePlan, Reduction, TileOp, TilePlan
+from deplodock.compiler.ir.tile import Contraction, Kernel, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline.knob import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
+from deplodock.compiler.pipeline.pipeline import LoweringError
 
 # The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) are declared in
 # ``knob.py`` (the single home for the whole tunable surface) and imported here, where they are
@@ -239,18 +240,42 @@ def _check_warp_static_k(kernel, wt) -> None:
         )
 
 
+def _contraction_node(node, place, tile_plan: TilePlan, bind) -> Contraction:
+    """The high-level :class:`Contraction` structural node for a tiled ``CONTRACTION`` leaf, built
+    here at fork-emit (seam #1 — the node must exist recognize-side so its ``tile`` / ``bind`` ride
+    the node, not the ``TileSchedule``; the build moved off ``010_materialize``'s retired
+    ``_build_contraction``). Reads the operand→role ``bind`` (:func:`semiring_binding`) + the
+    resolved ``tile_plan`` from the schedule fork, and the (m, n) output / K axes off the
+    still-``Map`` ``node``. The projection ``epilogue`` is the binding's body verbatim — the
+    synthesized grid-``Write`` for a bare contraction stays a materialize concern (it needs
+    ``root.output``), appended there when the epilogue carries no ``Write``."""
+    grid = list(place.grid)
+    return Contraction(
+        axes=(grid[-2], grid[-1]),
+        k_axis=reduce_loop(node).axis,
+        a_load=bind.a.load,
+        b_load=bind.b.load,
+        acc=bind.acc,
+        tile=tile_plan,
+        lead_axes=tuple(grid[:-2]),
+        epilogue=bind.epilogue,
+    )
+
+
 def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
-    form of the ``TILE`` spec resolved into the schedule's warp-atom :class:`TilePlan` (the ``Warp`` fragment),
-    plus an optional operand ``STAGE`` resolved into the schedule's :class:`Stage`. The packed
-    ``TILE`` codec is the sole on-dict spelling — the learned-prior featurizer parses it directly
-    (no legacy ``WM``/``WN``/``MMA`` explosion)."""
+    form of the ``TILE`` spec resolved into the warp-atom :class:`TilePlan`, plus an optional operand
+    ``STAGE`` resolved into the schedule's :class:`Stage`. The tiled :class:`Contraction` leaf is
+    built here (``op``), so materialize only ``factorize``\\ s. The packed ``TILE`` codec is the sole
+    on-dict spelling — the learned-prior featurizer parses it directly (no legacy ``WM``/``WN``/``MMA``
+    explosion)."""
     wt = TilePlan.parse(spec)
     _check_warp_static_k(kernel, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
     # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
     # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
     bind = semiring_binding(kernel.op, place.grid)
+    op = _contraction_node(kernel.op, place, wt, bind)
     sched = replace(kernel.schedule, place=place, tier=wt, stage=stage, bind=bind)
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
     # splits the warps into roles over this fixed pipeline (gated on the stage now set on ``sched``).
@@ -262,7 +287,7 @@ def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: s
         stamped[STAGE.name] = stage_spec
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
-    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
+    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs=stamped)
 
 
 def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
@@ -282,13 +307,26 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
             f"TILE parallel block {plan.units_n}×{plan.units_m}={block} threads exceeds the "
             f"{_MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
         )
+    # A tiled register-tile leaf (a ``TILE`` pin) becomes a :class:`Contraction` node here, so
+    # materialize only ``factorize``\\ s. An unbindable contraction (a non-``Load`` operand) keeps the
+    # ``Map`` form — materialize's per-cell scalar tier lowers it. The split-K (``reduce_spec``) combo
+    # stays on the ``Map`` too (composing the output tile with a K split is a later step), so
+    # ``030_split`` / ``_reduce`` see the loop form they expect.
+    op = kernel.op
+    if plan.is_tiled and not reduce_spec:
+        try:
+            bind = semiring_binding(kernel.op, place.grid)
+        except LoweringError:
+            bind = None
+        if bind is not None:
+            op = _contraction_node(kernel.op, place, plan, bind)
     sched = replace(kernel.schedule, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)
     stamped = {**knobs, TILE.name: spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec
     if stage_spec:
         stamped[STAGE.name] = stage_spec
-    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
+    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs=stamped)
 
 
 def schedule(kernel: Kernel, name: str, knobs: dict) -> list[TileOp] | TileOp:

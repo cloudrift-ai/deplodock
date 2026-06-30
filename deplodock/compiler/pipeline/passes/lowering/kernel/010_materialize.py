@@ -3,12 +3,13 @@
 Binds the schedule's grid axes to GPU threads and realizes the reduce partition. The step
 dispatches on the kernel kind / its reduce plan.
 
-A ``CONTRACTION`` **contraction** (warp / register-tiled) is **constructed and expanded here**:
-:func:`_build_contraction` resolves the operand→role binding + projection epilogue into a single
-high-level :data:`Contraction` node (the build folded in from the retired ``005_contract`` pass), and
-the one atom-generic ``_factor.factorize`` expands it (mma → the ``RegFragment`` / ``LdmatrixLoad`` /
-``MmaSyncPtx`` / ``RegStore`` fragment soup; scalar → the per-thread register cell tile) through the
-shared four-level ``_tiling`` layer. Every ``TileOp`` root takes one of the thread-binding tiers below:
+A ``CONTRACTION`` **contraction** (warp / register-tiled) is built recognize-side as a high-level
+:class:`Contraction` node (``_schedule._contraction_node`` at fork-emit, seam #1), so this step only
+**synthesizes its bare grid-``Write``** (needs ``root.output``, so it can't ride the node) and
+**expands** it: the one atom-generic ``_factor.factorize`` lowers it (mma → the ``RegFragment`` /
+``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` fragment soup; scalar → the per-thread register cell
+tile) through the shared four-level ``_tiling`` layer. Every ``TileOp`` root takes one of the
+thread-binding tiers below:
 
 - **Scalar tier** (a pointwise ``Map``, or a reduction with a trivial ``ReducePlan``) — one
   thread per output cell. ``lower(op)`` emits the per-cell body (a serial reduce ``Loop``
@@ -54,7 +55,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
+from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_plan
 from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
@@ -63,8 +64,6 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
-from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
-from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -286,43 +285,6 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     return KernelOp(body=Body((bound,)), name=tile.name)
 
 
-def _build_contraction(tile: TileOp, root: Node) -> Contraction | None:
-    """Construct the high-level :class:`Contraction` node for a warp / register-tiled ``CONTRACTION``
-    kernel — the binding-driven build folded in from the retired ``005_contract`` pass. Reads the
-    operand→role binding (already on ``sched.bind`` for the warp tier, stamped by ``020_schedule``;
-    computed here via :func:`semiring_binding` for the scalar register-tile tier), resolves the
-    projection epilogue (the binding's body, or a synthesized accumulator store via ``with_store``),
-    and stamps the per-CTA UNIT grid + per-unit REGISTER sub-tile + leaf ``atom`` (the ``tier``).
-    Returns ``None`` for an unbindable contraction (a non-``Load`` operand / 1-D output) — the
-    caller's per-cell scalar fallback lowers it."""
-    kernel = tile.kernel
-    sched = kernel.schedule
-    node = tile.op
-    grid = list(sched.place.grid)
-    try:
-        bind = sched.bind if sched.bind is not None else semiring_binding(node, grid)
-    except LoweringError:
-        return None
-    m_axis, n_axis = grid[-2], grid[-1]
-    lead = tuple(grid[:-2])
-    k_axis = reduce_loop(node).axis
-    # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized store
-    # of the accumulator at the grid cell.
-    tail = list(bind.epilogue)
-    if not has_write(tail):
-        tail = _with_store(tail, root.output.name, grid, node)
-    return Contraction(
-        axes=(m_axis, n_axis),
-        k_axis=k_axis,
-        a_load=bind.a.load,
-        b_load=bind.b.load,
-        acc=bind.acc,
-        tile=sched.tier,  # the resolved TilePlan — the whole schedule rides one field
-        lead_axes=lead,
-        epilogue=Body(tail),
-    )
-
-
 def rewrite(match: Match, root: Node) -> KernelOp | None:
     tile: TileOp = root.op
     kernel = tile.kernel
@@ -331,18 +293,21 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # request is a bug — the materializer only lowers single-launch kernels.
     rplan = reduce_plan(kernel) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
+    # Output-tiled ``CONTRACTION`` (warp / register tile): the high-level :class:`Contraction` node
+    # was built recognize-side (``_schedule._contraction_node``, seam #1), so materialize only
+    # synthesizes its bare grid-``Write`` (needs ``root.output``, so it can't ride the node) and folds
+    # the atom factorization in — the mma arm into the ``RegFragment`` / ``LdmatrixLoad`` /
+    # ``MmaSyncPtx`` / ``RegStore`` fragment soup, the scalar arm into the per-thread register cell
+    # tile, both via the shared ``_tiling`` layer.
+    if isinstance(tile.op, Contraction):
+        contraction = tile.op
+        tail = list(contraction.epilogue)
+        if not has_write(tail):
+            tail = _with_store(tail, root.output.name, kernel.schedule.place.grid, contraction)
+            contraction = replace(contraction, epilogue=tail)
+        return KernelOp(body=Body((factorize(contraction),)), name=tile.name)
     tier = getattr(kernel.schedule, "tier", None) if kernel is not None else None
     role = axis_role(kernel.op) if kernel is not None else None
-    # Output-tiled ``CONTRACTION`` (warp / register tile): build the high-level :data:`Contraction`
-    # node (the construction folded in from the retired ``005_contract``) and fold the atom
-    # factorization in here — the mma arm into the ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx``
-    # / ``RegStore`` fragment soup, the scalar arm into the per-thread register cell tile, both via
-    # the shared ``_tiling`` layer. An unbindable contraction (a non-``Load`` operand / 1-D output)
-    # returns ``None`` and falls through to the per-cell scalar fallback below.
-    if role is AxisRole.CONTRACTION and tier is not None and tier.is_tiled:
-        contraction = _build_contraction(tile, root)
-        if contraction is not None:
-            return KernelOp(body=Body((factorize(contraction),)), name=tile.name)
     # Cooperative / ILP reduce tier (``_reduce``): a PLANAR / TWISTED monoid reduce, OR a
     # **non-output-tiled** ``CONTRACTION`` whose ``ReducePlan`` cooperates — the carrier-generic
     # K partition (split-K / coop-K matmul). A contraction's reduce composes here because a

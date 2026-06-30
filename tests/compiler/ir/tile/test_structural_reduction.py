@@ -1,11 +1,13 @@
-"""The :class:`Reduction` / :class:`Map` structural tile-IR nodes — their algebra/structure split
-and the round-trip invariant the materializer relies on.
+"""The :class:`Reduction` / :class:`Contraction` / :class:`Map` structural tile-IR nodes — their
+algebra/structure split and the round-trip invariant the materializer relies on.
 
 A ``Reduction`` is the typed successor of the bare annotated reduce ``Loop`` (holding no projection);
 a projected reduce (softmax / RMSNorm) is a ``Map`` whose body IS the projection over a ``Reduction``
-``source``. ``ops.lower`` must flatten either back to the *exact* loop nest, so ``op_cache_key`` and
-the ``_reduce`` expander stay byte-identical to the bare-loop form. These pin that contract plus the
-structural reads (``axis_role`` / ``reduce_loop`` / ``out``) dispatching on the nodes.
+``source``. A ``Contraction`` is the tiled matmul node (built recognize-side at fork-emit), holding
+its operands + ``tile`` + projection ``epilogue``; it synthesizes the canonical mul-add ``CONTRACTION``
+loop on demand so ``ops.lower`` / ``reduce_loop`` flatten it back to the loop nest the materializer
+expands (via ``_factor.factorize``). These pin that contract plus the structural reads (``axis_role`` /
+``reduce_loop`` / ``out``) dispatching on the nodes.
 """
 
 from __future__ import annotations
@@ -15,9 +17,9 @@ from dataclasses import replace
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from deplodock.compiler.ir.tile import Kernel, Map, Placement, ReducePlan, Reduction
+from deplodock.compiler.ir.tile import Contraction, Kernel, Map, Placement, ReducePlan, Reduction
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
-from deplodock.compiler.ir.tile.schedule import TileSchedule
+from deplodock.compiler.ir.tile.schedule import TilePlan, TileSchedule
 
 
 def _sum_loop(role: AxisRole = AxisRole.PLANAR) -> Loop:
@@ -77,8 +79,8 @@ def test_pure_pointwise_map_has_no_reduce() -> None:
     assert node.out == "y"
 
 
-def _kernel(op, schedule_reduce: ReducePlan = ReducePlan()) -> Kernel:
-    return Kernel(op=op, schedule=TileSchedule(place=Placement(), reduce=schedule_reduce))
+def _kernel(op, schedule_reduce: ReducePlan | None = None) -> Kernel:
+    return Kernel(op=op, schedule=TileSchedule(place=Placement(), reduce=schedule_reduce or ReducePlan()))
 
 
 def test_reduce_plan_reads_the_partition_off_the_reduction_node() -> None:
@@ -103,3 +105,43 @@ def test_twisted_role_propagates() -> None:
     assert red.role is AxisRole.TWISTED
     assert axis_role(red) is AxisRole.TWISTED
     assert axis_role(Map(body=Body(()), source=red)) is AxisRole.TWISTED
+
+
+def _contraction(epilogue: Body | None = None) -> Contraction:
+    """A minimal tiled contraction node — ``acc = Σ_k A[m, k]·B[k, n]`` over a scalar tile."""
+    a = Load(name="a_e", input="A", index=(Var("m"), Var("k")))
+    b = Load(name="b_e", input="B", index=(Var("k"), Var("n")))
+    return Contraction(
+        axes=(Axis("m", 128), Axis("n", 128)),
+        k_axis=Axis("k", 256),
+        a_load=a,
+        b_load=b,
+        acc="acc",
+        tile=TilePlan.parse("n2/f2"),
+        epilogue=epilogue or Body(()),
+    )
+
+
+def test_contraction_synthesizes_the_mul_add_loop() -> None:
+    c = _contraction()
+    loop = c.loop
+    assert loop.role is AxisRole.CONTRACTION
+    assert loop.axis == c.k_axis
+    # The shared ``contraction_loop`` builder: B, A loads + the ⊗ lift + the additive fold.
+    assert isinstance(loop.body[-1], Accum) and loop.body[-1].name == "acc"
+    assert isinstance(loop.body[-2], Assign) and loop.body[-2].op.name == "multiply"
+
+
+def test_contraction_dispatches_through_ops() -> None:
+    c = _contraction()
+    assert axis_role(c) is AxisRole.CONTRACTION
+    assert reduce_loop(c) == c.loop
+    assert lower(c) == [c.loop]  # bare: just the synthesized loop (the grid Write is materialize glue)
+    assert c.out == "acc"
+
+
+def test_contraction_lower_appends_the_fused_epilogue() -> None:
+    proj = (Assign(name="y", op="relu", args=("acc",)), Write(output="out", index=(Var("m"), Var("n")), value="y"))
+    c = _contraction(epilogue=Body(proj))
+    assert lower(c) == [c.loop, *proj]
+    assert reduce_loop(c).role is AxisRole.CONTRACTION  # the projection doesn't hide the contraction
