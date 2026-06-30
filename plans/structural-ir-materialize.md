@@ -1,8 +1,28 @@
 # Scheduled structural tile IR — Map / Reduction / Contraction, fork-tree construction, walk-to-emit
 
-**Branch:** TBD (off the current tile-IR line) · **Status:** design — not started. Consolidates and
-supersedes the earlier `schedule-enumeration-tree` note (the fork tree is now *how* recognize builds
-this IR).
+**Branch:** `refactoring/tile-ir-rebuild` · **Status:** in progress — migration steps **1–4 landed**
+(each e2e-green + parity-proven), steps **5–6 remain**. Consolidates and supersedes the earlier
+`schedule-enumeration-tree` note (the fork tree is now *how* recognize builds this IR).
+
+**Progress (see Migration section for the per-step contract):**
+
+- ✅ **Step 1** — `Contraction` lifted to `ir/tile/structural.py` (mechanical move).
+- ✅ **Step 2** — `Reduction` node introduced; recognize builds it for `PLANAR`/`TWISTED`; `_reduce`
+  expands it via `ops.lower`. Byte-identical `op_cache_key` parity proven.
+- ✅ **Step 3** — `Map` moved into `ir/tile/structural.py` and given an optional `source: Reduction
+  | Contraction | None` (`project ∘ reduce`); a projected reduce is `Map(body=sweep, source=Reduction)`,
+  a bare reduce a root `Reduction`. `ops.lower`/`reduce_loop`/`axis_role` recurse through `Map.source`.
+- ✅ **Step 4** — `005_contract` deleted; the `Contraction` build folded into `010_materialize`
+  (`_build_contraction`) — the plan's "lazy resolve in the expander" alternative. `TileOp.op` stays a
+  `Map` this step, so cache keys + `030_split` are untouched.
+- ⏳ **Step 5** — recognize emits the fork tree of structural leaves; **dissolve `TileSchedule`** (move
+  `reduce`→`Reduction`, `place`→`Map`, `tier`/`bind`→`Contraction`). The big one — touches `fork.py`,
+  `search/`, the knob system. Byte-identical parity over the kernel fixture is the bar.
+- ⏳ **Step 6** — compose `Reduction ⊃ Contraction` (flash nesting + split-K warp tier + multi-axis
+  planar); new e2e `test_mma_splitk_finalize` / `sum` over `(H, W)`.
+
+Note: this section records where the migration actually stands; the design below is the target. When
+steps 5–6 land, delete this plan (per the Contribution Instructions).
 
 ## Goal
 
