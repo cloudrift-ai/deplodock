@@ -66,7 +66,6 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
         b_trans=bind.b_trans,
         acc=bind.acc,
         epilogue=Body(tail),
-        stage=sched.stage,
     )
     return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis)
 

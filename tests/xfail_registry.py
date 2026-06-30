@@ -35,6 +35,13 @@ from __future__ import annotations
 
 _R = "tile IR demolished — rebuild in progress"
 
+#: The warp tier's smem operand-staging pipeline (cp.async / TMA) was dropped to restore symmetry
+#: with the scalar tier (both gmem-direct). A symmetric staging mechanism for both tiers will be
+#: (re)introduced; until then the tests that assert staged structure / bit-identity-vs-gmem fail.
+#: (The ``STAGE`` codec + ``schedule.Stage`` still stamp — those tests pass; only the materialization
+#: is gone.) Delete these entries when the symmetric staging lands and the tests are restored.
+_STAGE = "mma operand staging dropped — symmetric staging mechanism reserved"
+
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).
 XFAIL: dict[str, str] = {
@@ -81,6 +88,13 @@ XFAIL: dict[str, str] = {
     # atomic-free split-K (deferred ``c2k`` finalize) on the warp tier still needs its workspace
     # retarget rebuilt; the atomic arm (``c2a``) of the merged test passes.
     "tests/compiler/e2e/test_matmul_coverage.py::test_mma_splitk_finalize[deferred]": _R,
+    # --- mma operand staging dropped (see _STAGE) — these assert staged structure / bit-identity ---
+    "tests/compiler/e2e/test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit": _STAGE,
+    "tests/compiler/e2e/test_matmul_coverage.py::test_register_double_buffer_matches_single_buffer_bit_for_bit": _STAGE,
+    "tests/compiler/e2e/test_matmul_coverage.py::test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit": _STAGE,
+    "tests/compiler/e2e/test_matmul_coverage.py::test_bf16_operands_stage_via_cp_async": _STAGE,
+    "tests/compiler/e2e/test_matmul_coverage.py::test_pinned_transport_and_shape_fire": _STAGE,
+    "tests/compiler/e2e/test_matmul_coverage.py::test_masked_symbolic_m_structure": _STAGE,
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
     # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
     # TileGraph lowering).

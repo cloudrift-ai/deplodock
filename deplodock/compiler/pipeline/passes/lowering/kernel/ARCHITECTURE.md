@@ -54,9 +54,8 @@ itself** (`@property`, computed from the leaf widths + skeleton axes); `factoriz
 selects — the only per-atom difference:
 
 - **mma** (`_warp_factor.mma_codegen`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the codegen emits
-  `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop + operand staging (gmem-direct / cp.async /
-  TMA), and decodes the atom-lane offset at render. The staging decision + fragment naming are computed once in the
-  closure scope. All mma codegen lives in `_warp_factor.py`, the new-atom seam.
+  `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**), and decodes the
+  atom-lane offset at render. All mma codegen lives in `_warp_factor.py`, the new-atom seam.
 - **scalar** (`_scalar_factor.scalar_codegen`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a **single thread** (so
   there is no `_lane` axis); the codegen comes from the lowered per-cell body (split into a `pre` region / the reduce
   `Loop` / a projection `tail`), replicated per register cell with its operand loads deduped (the arithmetic-intensity
@@ -67,52 +66,24 @@ parallel thread-tile are the *same* level, differing only in `lanes`; `block_thr
 carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The store-glue helpers `with_store` /
 `has_write`, shared by the constructor and the thread-binding tiers, live in `_store.py`.)
 
-## Operand staging (`_stage.py`) — the `STAGE` codec
+## Operand staging — reserved
 
-When the schedule carries a `Stage` (the `STAGE` codec `d<depth>/sync|cp|tma[/ring][/p<reg_depth>]`), the warp tier
-stages its A/B operands through a shared-memory slab instead of reading gmem-direct. `_stage.py` assembles the surviving
-Kernel-IR transport leaves — it does **not** resurrect the demolished `StageBundle` / `StagePolicy` orchestration.
+The warp tier's smem **operand-staging** pipeline (the `STAGE` codec's cp.async / TMA slab — formerly `_stage.py` +
+`_warp_factor`'s `_warp_staged_kloop` / `_warp_tma_staged_kloop`) was **dropped** so both contraction tiers load
+operands gmem-direct (the `MmaLeaf` / `ScalarLeaf` symmetry — neither carries a `stage`). The `STAGE` codec +
+`schedule.Stage` field still land (`020_schedule` stamps them — the knob/featurizer path is intact), but they are **not
+materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
+mma-staging structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
 
-**The two-level pipeline.** Staging has two independent buffering levels, each with its own depth (`depth` and
-`reg_depth` are both buffer depths on `Stage`; `WarpTile.bk` is the slab K-*granularity*, kept distinct):
-
-- **`depth` — the gmem→smem ring** (cp.async only today; TMA stays single-buffer). A `depth`-slot slab; a prologue
-  primes the first `depth-1` K-chunks, then each step prefetches the chunk `depth-1` ahead into a free slot while the
-  mma consumes the current one (`CpAsyncWait(group=depth-1)` keeps the prefetches in flight). The tail prefetch is
-  clamped to the last chunk — an in-bounds re-read into a slot that's never consumed — so the commit/wait stays uniform
-  across all CTA threads (the barrier-under-mask invariant). `depth` is clamped to the 48 KB smem cap (a deeper pin
-  falls back to a shallower ring). `depth=1` is the plain single-buffer fill→wait→drain.
-- **`reg_depth` (`/p<n>`) — the smem→register double-buffer.** `_staged_inner_atom_loop` unrolls the inner atom-K loop
-  into a software pipeline that ldmatrixes the next atom-K step into an alternate fragment slot (`_a{i}_s{slot}`)
-  `reg_depth-1` steps ahead, breaking the per-step WAR hazard on the operand fragments. `reg_depth` is capped at the
-  atom-K step count (`bk`).
-
-Both compose (`d3/cp/p2`) and are pure perf transforms — bit-identical to the single-buffer / gmem-direct baseline.
-
-**The `CtaTile` seam.** The fill is written against a small `CtaTile` (the CTA tile-base coords + an independent linear
-intra-CTA thread id + the thread count), NOT a materializer's internal warp/register geometry — so one fill helper drives
-any tier. `mma_codegen` builds the seam from its decoded block / warp / lane axis vars (never a raw `threadIdx.x`,
-whose `free_vars()` would leak into param collection).
-
-**Two producers, one drain.** `cp_async_fill` (the `sync` / `cp.async` thread-stripe) and `tma_fill`
-(`cp.async.bulk.tensor` — one thread issues `MbarrierArriveExpectTx` + the operand box `TmaLoad`s onto a single mbarrier;
-every thread waits the parity) share the slab + the staged `LdmatrixLoad(staged=True)` drain (`_staged_inner_atom_loop`),
-plain row-major NONE-swizzle slabs. The TMA path declares a `TmaDescriptor` per operand (encoded host-side off the bound
-array's device pointer at launch — `backend/cuda/_tma.py`); its slabs are 128 B-aligned. A masked / symbolic **M** rides
-the fill: cp.async clamp-reads the overhang row (`% M`), TMA zero-fills the box past the descriptor's runtime globalDim —
-either way the `RegStore` `m_guard` discards the masked-row stores. A symbolic / non-divisible **K** zero-fills the tail;
-a masked **N** or transposed-B stays gmem-direct.
-
-**Shared-row staging (`_reduce`).** The fused norm→linear prologue is a `MonoidKernel`: an input row folded by the
-cooperative reduce AND re-read per output column of a contraction tail (a free-axis `Loop` over an inner reduce).
-`_reduce` stages that one row into a single `__shared__` slab (cooperatively filled) and rewrites both readers to it. The
-trigger is narrow (`_has_contraction_tail`) so a plain softmax sum or a bare reduction is untouched.
-
-Staging only ever *adds* a faster lowering — an ineligible kernel silently falls back to gmem-direct.
+**Shared-row staging (`_reduce`) — distinct, still present.** The fused norm→linear prologue is a `MonoidKernel`: an
+input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis `Loop` over an
+inner reduce). `_reduce` (in `010_materialize`) stages that one row into a single `__shared__` slab (cooperatively filled)
+and rewrites both readers to it. The trigger is narrow (`_has_contraction_tail`) so a plain softmax sum or a bare
+reduction is untouched. This is the *reduce* tier's shared-row reuse, not the (dropped) warp operand pipeline.
 
 ## Kernel-IR peepholes
 
 `030_stamp_types` / `040_demote_to_write_dtype` resolve element dtypes; `050_vectorize_loads` / `080_vectorize_stores` /
-`095_interleave_loads` pack/reorder memory ops; `110_drop_redundant_syncs` collapses the defensive `Sync`s the staging
-templates emit (body-level only — the slab `Smem` decls flag `smem_seen`, so a load-bearing prologue `Sync` after a
-`Cond(MbarrierInit)` is correctly retained; `with_bodies` preserves the cooperative tile's `block_threads`).
+`095_interleave_loads` pack/reorder memory ops; `110_drop_redundant_syncs` collapses the defensive `Sync`s the
+cooperative / shared-row templates emit (body-level only — a slab `Smem` decl flags `smem_seen`, so a load-bearing
+prologue `Sync` is correctly retained; `with_bodies` preserves the cooperative tile's `block_threads`).

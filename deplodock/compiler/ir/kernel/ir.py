@@ -63,7 +63,6 @@ from deplodock.compiler.ir.stmt.ir import BodyOp
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.tile.atom import AtomKind
-    from deplodock.compiler.ir.tile.schedule import Stage
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -320,8 +319,9 @@ class MmaLeaf(Leaf):
     tensor-core cell. The ``WarpTile`` is embedded directly (the :class:`AtomKind` ``atom`` + the
     K-chunk ``bk``; the warp counts / register sub-tile ride the shared :class:`Leaf` widths). Plus
     the operand ``Load``\\ s + role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
-    accumulator ``acc``, the resolved projection ``epilogue`` (post-``with_store`` — ends in the
-    output ``Write``), and the operand ``stage``.
+    accumulator ``acc``, and the resolved projection ``epilogue`` (post-``with_store`` — ends in the
+    output ``Write``). Operands are loaded gmem-direct (no smem operand ``stage`` — symmetric with
+    :class:`ScalarLeaf`; a symmetric staging mechanism for both tiers is reserved).
 
     The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the epilogue's
     loads + output ``Write`` surface through :meth:`bodies`. The :class:`Stmt`-protocol helpers here
@@ -334,7 +334,6 @@ class MmaLeaf(Leaf):
     b_trans: bool
     acc: str
     epilogue: Body
-    stage: Stage | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
