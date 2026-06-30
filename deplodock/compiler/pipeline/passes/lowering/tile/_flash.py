@@ -65,9 +65,9 @@ from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select, SelectBranch, Semiring, Write
 from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
-from deplodock.compiler.ir.tile.ops import Map, lower
+from deplodock.compiler.ir.tile.ops import Map
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 
 if TYPE_CHECKING:
@@ -234,8 +234,9 @@ def _flash_op(
 ) -> Map:
     """The per-output-element ``(…, m, d)`` compute as the op tree itself: flash is the
     ``O/l`` projection :class:`Map` *over* the ``(m,l,O)`` LSE :class:`Monoid` over ``kv``,
-    whose score partial ``Map`` holds a NESTED contraction ``Σ_dd Q·K`` (scaled, optionally
-    masked). Returns that unlowered ``Map`` (carried on the ``TileOp``). The free
+    whose score partial ``Map`` sources a NESTED ``Semiring`` contraction ``Σ_dd Q·K`` (then scaled,
+    optionally masked in the ``Map`` body) — so the contraction reuses the shared lowering
+    (``ops._lower_semiring``). Returns that unlowered ``Map`` (carried on the ``TileOp``). The free
     ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is
     glue generated at materialize.
 
@@ -254,31 +255,27 @@ def _flash_op(
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
 
     add = ElementwiseImpl("add")
-    # s = Σ_dd Q·K — the inner contraction, reset per kv step. A degenerate (additive)
-    # ``Monoid`` self-contained over ``dd``: its one partial source is the lift ``Map``.
-    score_monoid = replace(
-        Accum(name="sacc", value="qk", op=add).as_monoid(),
-        partial=(
-            Map(
-                body=[
-                    Load(name="q_e", input=q_buf, index=q_idx),
-                    Load(name="k_e", input=k_buf, index=k_idx),
-                    Assign(name="qk", op="multiply", args=("q_e", "k_e")),
-                ]
-            ),
+    # s = Σ_dd Q·K — the inner contraction as a first-class ``Semiring``, so flash **reuses the
+    # shared contraction lowering** (``ops._lower_semiring`` — the same path a standalone matmul
+    # takes; the warp tier will route this very node through ``_factor``) instead of a bespoke
+    # degenerate ``Monoid``. The score ``Map``'s body scales / masks the contraction's ``sacc``
+    # after the dd reduce; ``Map(source=Semiring)`` keeps the contraction a live, recursable node.
+    score_semiring = Semiring(
+        lift=ElementwiseImpl("multiply"),
+        fold=Accum(name="sacc", value="qk", op=add),
+        operands=(
+            Map(body=(Load(name="q_e", input=q_buf, index=q_idx),)),
+            Map(body=(Load(name="k_e", input=k_buf, index=k_idx),)),
         ),
-        axis=Axis(name="dd", extent=Dim(head_dim)),  # out ("sacc") + seeds derived from the carrier
+        reduce_axis=Axis(name="dd", extent=Dim(head_dim)),
     )
-    # The score partial is one Map: the dd contraction, the scale, and the mask — its
-    # last stmt binds ``score_name`` (the carrier's score partial).
-    score_stmts = [
-        *lower(score_monoid),
+    score_post = [
         Load(name="scale_c", input="_flash_scale", index=()),
         Assign(name="s", op="multiply", args=("sacc", "scale_c")),
     ]
     if causal:
         # Causal mask: keep the score where key ≤ query (kv ≤ m), else −inf.
-        score_stmts += [
+        score_post += [
             Load(name="ninf_c", input="_flash_ninf", index=()),
             Select(
                 name="s_masked",
@@ -293,16 +290,16 @@ def _flash_op(
         # Additive bias: leading dims broadcast (indexed to 0), trailing two are the
         # query row m and the streaming key kv.
         mask_idx = (*(Literal(0, "int") for _ in mask_shape[:-2]), Var("m"), Var("kv"))
-        score_stmts += [Load(name="mask_e", input=mask_buf, index=mask_idx), Assign(name="s_masked", op="add", args=("s", "mask_e"))]
+        score_post += [Load(name="mask_e", input=mask_buf, index=mask_idx), Assign(name="s_masked", op="add", args=("s", "mask_e"))]
         score_name = "s_masked"
     else:
         score_name = "s"
-    # the (m,l,O) streaming fold over kv. The partial sources are the score ``Map`` (binds
-    # ``score_name``) and the value ``Map`` (one ``Load`` binding ``v_e``); ``flash_combine``
-    # supplies state + twist.
+    # the (m,l,O) streaming fold over kv. The score partial is the contraction ``Map`` (``source``
+    # = the QK ``Semiring``, ``body`` = the scale / mask binding ``score_name``); the value partial
+    # one ``Load``; ``flash_combine`` supplies state + twist.
     flash_monoid = replace(
         flash_combine("m_i", "l_i", "O_i", score_name, "v_e"),
-        partial=(Map(body=score_stmts), Map(body=[Load(name="v_e", input=v_buf, index=v_idx)])),
+        partial=(Map(source=score_semiring, body=score_post), Map(body=[Load(name="v_e", input=v_buf, index=v_idx)])),
         axis=Axis(name="kv", extent=s_k),
     )
     # φ projection: normalize the streamed (unnormalized) output by the LSE denominator —
