@@ -3,8 +3,8 @@
 Split out of :mod:`.ir`. The whole layer's thesis is that the **schedule is separate
 from the combine**: the combine (the ⊕) lives in the op tree
 (:mod:`deplodock.compiler.ir.stmt.algebra`), and the schedule — which axes are parallel,
-how the reduce axis partitions across hardware levels — lives here, on a typed
-``*Schedule`` paired with the op-tree node in a ``*Kernel``.
+how the reduce axis partitions across hardware levels — lives here, on a kind-free
+:class:`TileSchedule` paired with the op-tree node in a :class:`Kernel`.
 
 A reduction's only freedom is **how the reduce axis is partitioned across hardware
 levels** (:class:`ReducePlan`); the combine *mechanism* at each level is **derived** from
@@ -12,14 +12,15 @@ the level (:meth:`ReduceStage.combine`), and the combine *algebra* rides the car
 ``Twist``). So the same op + the same materializer extend across kernel kinds — only the
 carrier and the partition change.
 
-The schedule is **flat, typed by the outermost algebra kind**: a ``Map`` →
-:class:`MapSchedule`, a reduction ``Monoid`` → :class:`MonoidSchedule`, a contraction
-``Semiring`` → :class:`SemiringSchedule` (flash — a ``Monoid`` over a nested partial
-``Semiring`` — is a :class:`MonoidSchedule`; the op tree nests, the schedule does not).
-The pairing in the ``*Kernel`` types makes a ``Monoid``-with-``MapSchedule`` mismatch
-unrepresentable. Warp specialization is **orthogonal**, not a second schedule kind: it
-rides an optional ``workers: WarpSpec | None`` field on the uniform schedule (``None`` =
-uniform SIMT) — a role→warp-count split *over* the fixed pipeline, not a replacement of it.
+The schedule is **flat and kind-free** — ONE :class:`TileSchedule` whatever the algebra. The
+old per-kind ``MapSchedule`` / ``MonoidSchedule`` / ``SemiringSchedule`` zoo (paired in
+``MapKernel`` / ``MonoidKernel`` / ``SemiringKernel``) is gone: a kernel's structure is read
+from its axes' :class:`~deplodock.compiler.ir.axis.AxisRole` annotations (``ops.axis_role``),
+not its Python type, so a pointwise ``Map``, a ``Monoid`` reduce, and a ``Semiring``
+contraction all carry the same schedule type and use the subset of its fields their axes admit
+(a pointwise kernel only ``place``; a contraction adds ``tier`` / ``bind``). Warp specialization
+is **orthogonal**, not a second schedule kind: it rides an optional ``workers: WarpSpec | None``
+field (``None`` = uniform SIMT) — a role→warp-count split *over* the fixed pipeline.
 
 Every codec here — ``ReducePlan`` / ``TilePlan`` / ``Stage`` / ``WarpSpec`` —
 routes its ``parse`` / ``spell`` through the shared schema engine (:mod:`.codec`), declaring a
@@ -514,45 +515,31 @@ class WarpSpec:
 
 
 # --------------------------------------------------------------------------- #
-# The three uniform (SIMT) schedules — one thread / block / warp mapping per kind.
+# The ONE uniform schedule — kind-free. Detection (``lowering/tile``) annotates each loop
+# axis with its ``AxisRole``; the schedule carries the decisions over those axes with the
+# SAME fields whatever the algebra, so there is no per-kind ``*Schedule`` zoo and no
+# kind/schedule mismatch to guard. Dispatch reads the role structurally (``ops.axis_role``),
+# never a Python type.
 # --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
-class MapSchedule:
-    """A pointwise kernel's schedule — just the free-axis grid binding (no reduce, no
-    warp-spec: pointwise never warp-specializes)."""
+class TileSchedule:
+    """One kernel's schedule — kind-free. The fields are **orthogonal** sub-components, each
+    spelled by its own codec knob (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``); a kernel
+    uses the subset its annotated axes admit (a pointwise kernel only ``place``):
 
-    place: Placement
-
-
-@dataclass(frozen=True)
-class MonoidSchedule:
-    """A reduction (``Monoid``) kernel's schedule.
-
-    Three **orthogonal** reduce-axis fields (kept distinct so they don't become a
-    grab-bag): ``reduce`` (the :class:`ReducePlan` partition), ``warp_tile`` (the mma
-    operand tile — flash's inner QK/PV, a warp-atom :class:`TilePlan`, ``# TODO(warp-flash)``),
-    ``stage`` (operand transport — the :class:`Stage` smem pipeline, ``None`` = gmem-direct).
-    ``block`` are free axes resident in the CTA alongside the cooperative lanes
-    (strided-cooperative rows)."""
-
-    place: Placement
-    block: tuple[Axis, ...] = ()
-    reduce: ReducePlan = field(default_factory=ReducePlan)
-    warp_tile: TilePlan | None = None  # a warp-atom TilePlan; TODO(warp-flash)
-    stage: Stage | None = None  # None = gmem-direct (no smem slab)
-    workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
-
-
-@dataclass(frozen=True)
-class SemiringSchedule:
-    """A contraction (``Semiring``) kernel's schedule — the orthogonal reduce-axis fields
-    (``reduce`` / ``stage`` / ``workers``) plus the output ``tier``: one :class:`TilePlan` whose
-    ``atom`` discriminates the **mutually-exclusive** fragment — a tensor-core mma atom (the warp
-    tile) or the scalar atom (the register sub-tile), OR ``None`` (the per-cell tier). A contraction
-    is warp-tiled or scalar-tiled, never both — the ``a:<atom>`` token in the ``TILE`` knob (decided
-    in ``020_schedule``) picks which. ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
+    - ``place`` — the free-axis → grid binding (:class:`Placement`).
+    - ``block`` — free axes resident in the CTA alongside the cooperative lanes (strided-coop rows).
+    - ``reduce`` — the reduce-axis partition (:class:`ReducePlan`): GRID split / BLOCK coop / REG
+      ILP. Empty = the scalar serial fold. (Phase 5 widens this to a per-axis map for a planar set.)
+    - ``tier`` — the output fragment for a contraction (:class:`TilePlan` whose ``atom`` discriminates
+      the mutually-exclusive scalar register sub-tile vs warp mma tile); ``None`` = the per-cell tier.
+    - ``stage`` — the operand smem pipeline (:class:`Stage`); ``None`` = gmem-direct.
+    - ``workers`` — the warp-specialization split (:class:`WarpSpec`); ``None`` = uniform SIMT.
+    - ``bind`` — the resolved contraction operand→role binding (:class:`AtomBinding`), filled by
+      ``020_schedule`` once the warp tier is chosen / by ``005_contract`` for the scalar tier; else
+      ``None``."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
@@ -560,80 +547,38 @@ class SemiringSchedule:
     tier: TilePlan | None = None  # the output tier (scalar or mma TilePlan, discriminated by atom); None = per-cell
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
     workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
-    bind: AtomBinding | None = None  # the operand→role binding, filled by 020_schedule after
-    # the warp tier is chosen (None until then / on a scalar-tile or split-partial contraction)
-
-
-# --------------------------------------------------------------------------- #
-# The op + schedule pairs — one uniform ``*Schedule`` per kind. Warp specialization
-# is an orthogonal ``workers: WarpSpec | None`` field ON that schedule (None = uniform
-# SIMT), NOT a union arm — it adds a warp split over the fixed pipeline, not a replacement.
-# --------------------------------------------------------------------------- #
+    bind: AtomBinding | None = None  # the contraction operand→role binding; None until the tier is chosen / non-contraction
 
 
 @dataclass(frozen=True)
-class MapKernel:
-    """A pointwise kernel: a ``Map`` op + its :class:`MapSchedule` (no warp-spec — pointwise
-    never warp-specializes)."""
+class Kernel:
+    """A scheduled kernel — the op-tree node (the *combine*, ``ir/stmt/algebra``) paired with its
+    :class:`TileSchedule` (the *schedule*). ONE uniform type: the algebra is read structurally off
+    the op (``ir/tile/ops.axis_role``), never the kernel's Python type, so a ``Map`` / ``Monoid`` /
+    ``Semiring`` op all ride the same ``Kernel``."""
 
-    op: object  # a Map (pure pointwise; the kernel root)
-    schedule: MapSchedule
-
-
-@dataclass(frozen=True)
-class MonoidKernel:
-    """A reduction kernel: a ``Monoid`` op (or a projection ``Map`` *over* one) + its
-    :class:`MonoidSchedule` (whose ``workers`` field carries any warp split)."""
-
-    op: object  # a Monoid, or a Map(source=Monoid) projection
-    schedule: MonoidSchedule
-
-
-@dataclass(frozen=True)
-class SemiringKernel:
-    """A contraction kernel: a ``Semiring`` op (or a projection ``Map`` *over* one) + its
-    :class:`SemiringSchedule` (whose ``workers`` field carries any warp split)."""
-
-    op: object  # a Semiring, or a Map(source=Semiring) projection
-    schedule: SemiringSchedule
-
-
-#: A scheduled kernel — keyed by the op kind (no ``classify_algebra`` tag). The pairing
-#: makes a kind/schedule mismatch unrepresentable.
-Kernel = MapKernel | MonoidKernel | SemiringKernel
+    op: object  # a Map / Monoid / Semiring node (possibly a projection Map over a reduction)
+    schedule: TileSchedule
 
 
 def kernel_for(node, place: Placement) -> Kernel:
-    """Wrap a lifted op-tree ``node`` + its :class:`Placement` in the matching ``*Kernel``,
-    keyed by the (peeled) op kind — a bare reduction or a projection ``Map`` over one is a
-    ``Monoid`` / ``Semiring`` kernel; anything else is a ``MapKernel``. The peel itself is
-    ``node.reduce_node`` (see :mod:`deplodock.compiler.ir.stmt.algebra`)."""
-    from deplodock.compiler.ir.stmt.algebra import Monoid, Semiring  # noqa: PLC0415
-
-    inner = node.reduce_node
-    if isinstance(inner, Monoid):
-        return MonoidKernel(op=node, schedule=MonoidSchedule(place=place))
-    if isinstance(inner, Semiring):
-        return SemiringKernel(op=node, schedule=SemiringSchedule(place=place))
-    return MapKernel(op=node, schedule=MapSchedule(place=place))
+    """Wrap a lifted op-tree ``node`` + its :class:`Placement` in a :class:`Kernel` carrying an
+    UNMAPPED :class:`TileSchedule` (just ``place``). ``020_schedule`` maps the free axes onto the
+    grid and picks the reduce partition / output tile."""
+    return Kernel(op=node, schedule=TileSchedule(place=place))
 
 
 __all__ = [
     "Fold",
     "Kernel",
     "Level",
-    "MapKernel",
-    "MapSchedule",
-    "MonoidKernel",
-    "MonoidSchedule",
     "Placement",
     "ReducePlan",
     "ReduceStage",
     "RoleAlloc",
-    "SemiringKernel",
-    "SemiringSchedule",
     "Stage",
     "TilePlan",
+    "TileSchedule",
     "WarpSpec",
     "kernel_for",
 ]

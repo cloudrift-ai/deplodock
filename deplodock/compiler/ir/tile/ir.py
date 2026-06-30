@@ -8,10 +8,11 @@ It sits between Loop IR (pure iteration) and Kernel IR (threads / smem):
 
 The whole point of the layer is the article's thesis: **the schedule is
 separate from the combine.** A ``TileOp`` carries one :class:`~.schedule.Kernel`
-— a typed pair of the op-tree node (the *combine*, in ``ir/stmt/algebra``) and
-the matching ``*Schedule`` (the *schedule* — the parallel/free axes, the reduce
-partition, the grid binding). The kind is keyed by the op (``MapKernel`` /
-``MonoidKernel`` / ``SemiringKernel``); a mismatch is unrepresentable. See
+— the op-tree node (the *combine*, in ``ir/stmt/algebra``) paired with a kind-free
+:class:`~.schedule.TileSchedule` (the *schedule* — the parallel/free axes, the reduce
+partition, the grid binding). There is no per-kind kernel/schedule type: the algebra is
+read structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
+(``ops.axis_role``), so MAP / MONOID / SEMIRING all ride the same ``Kernel``. See
 :mod:`.schedule`.
 
 The combine lives entirely in the ``op`` tree (``ir/stmt/algebra``): a pointwise

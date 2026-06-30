@@ -1,10 +1,10 @@
 """Tile IR — a map/reduce kernel with its schedule made explicit.
 
 See :mod:`.ir` and :mod:`.schedule`. The layer between Loop IR and Kernel IR: a
-:class:`TileOp` carries a typed :class:`~.schedule.Kernel` (op-tree node + matching
-``*Schedule``) so the *schedule* (free axes, reduce partition, grid binding) stays
-separate from the *combine* (the op tree), and one ``TileOp`` covers MAP / MONOID /
-SEMIRING.
+:class:`TileOp` carries a :class:`~.schedule.Kernel` (op-tree node + a kind-free
+:class:`~.schedule.TileSchedule`) so the *schedule* (free axes, reduce partition, grid
+binding) stays separate from the *combine* (the op tree), and one ``TileOp`` covers
+MAP / MONOID / SEMIRING with no per-kind schedule type (dispatch reads ``ops.axis_role``).
 """
 
 from deplodock.compiler.ir.tile.atom import AtomKind
@@ -15,18 +15,13 @@ from deplodock.compiler.ir.tile.schedule import (
     Fold,
     Kernel,
     Level,
-    MapKernel,
-    MapSchedule,
-    MonoidKernel,
-    MonoidSchedule,
     Placement,
     ReducePlan,
     ReduceStage,
     RoleAlloc,
-    SemiringKernel,
-    SemiringSchedule,
     Stage,
     TilePlan,
+    TileSchedule,
     WarpSpec,
     kernel_for,
 )
@@ -37,10 +32,6 @@ __all__ = [
     "Fold",
     "Kernel",
     "Level",
-    "MapKernel",
-    "MapSchedule",
-    "MonoidKernel",
-    "MonoidSchedule",
     "Operand",
     "Placement",
     "ReducePlan",
@@ -48,11 +39,10 @@ __all__ = [
     "RoleAlloc",
     "RoleKind",
     "Schedule",
-    "SemiringKernel",
-    "SemiringSchedule",
     "Stage",
     "TileOp",
     "TilePlan",
+    "TileSchedule",
     "WarpSpec",
     "kernel_for",
     "role_for",
