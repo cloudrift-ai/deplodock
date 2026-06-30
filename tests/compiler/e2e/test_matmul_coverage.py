@@ -553,6 +553,61 @@ def test_matmul_mma_coverage(M, N, K, out, trans, mode, monkeypatch):
         assert "int seq_len" in src, "the symbolic-M grid must carry the runtime extent arg"
 
 
+def _mma_qk_graph(B: int, H: int, M: int, N: int, D: int):
+    """A hand-built **batched, transposed-B** ``S[b,h,m,kv] = Σ_dd Q[b,h,m,dd]·K[b,h,kv,dd]`` over
+    f16 operands — exactly the score contraction flash's warp materializer constructs (leading
+    ``(b, h)`` batch axes carried verbatim, ``dd`` last in K's index so it's a ``b_trans`` Q@Kᵀ)."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+
+    b, h, m, kv, dd = Axis("b", B), Axis("h", H), Axis("m", M), Axis("kv", N), Axis("dd", D)
+    dd_loop = Loop(
+        axis=dd,
+        body=(
+            Load(name="q_v", input="q", index=(Var("b"), Var("h"), Var("m"), Var("dd"))),
+            Load(name="k_v", input="k", index=(Var("b"), Var("h"), Var("kv"), Var("dd"))),
+            Assign(name="p", op=ElementwiseImpl("multiply"), args=("q_v", "k_v")),
+            Accum(name="acc", value="p"),
+        ),
+    )
+    # Write the score cell after the dd reduction (inside the kv loop), then nest the grid axes.
+    kv_loop = Loop(axis=kv, body=(dd_loop, Write(output="c", index=(Var("b"), Var("h"), Var("m"), Var("kv")), value="acc")))
+    nest = kv_loop
+    for ax in (m, h, b):
+        nest = Loop(axis=ax, body=(nest,))
+    op = LoopOp(body=(nest,))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("q", (B, H, M, D), dtype=F16), node_id="q")
+    g.add_node(InputOp(), [], Tensor("k", (B, H, N, D), dtype=F16), node_id="k")
+    g.add_node(op, ["q", "k"], Tensor("c", (B, H, M, N), dtype=F32), node_id="c")
+    g.inputs, g.outputs = ["q", "k"], ["c"]
+    return g
+
+
+@pytest.mark.parametrize(("B", "H", "M", "N", "D"), [(1, 4, 128, 128, 64), (2, 3, 128, 128, 32)])
+@requires_sm90
+@requires_cuda
+def test_mma_batched_qk_matches_torch(B, H, M, N, D, monkeypatch):
+    """The shared contraction codegen tiles a **batched transposed-B** Q@Kᵀ (flash's score shape:
+    leading ``(b, h)`` axes + ``b_trans``) onto ``mma.sync`` and agrees with torch — the reuse seam
+    the warp-flash materializer rides (a ``Contraction`` whose ``lead_axes`` carry the batch dims)."""
+    import torch  # noqa: PLC0415
+
+    monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((B, H, M, D)) * 0.1).astype(np.float16)
+    k = (rng.standard_normal((B, H, N, D)) * 0.1).astype(np.float16)
+    got, src = _compile_run_mma(_mma_qk_graph(B, H, M, N, D), {"q": q, "k": k})
+
+    ref = torch.matmul(torch.tensor(q).float(), torch.tensor(k).float().transpose(-1, -2)).numpy()
+    diff = float(np.abs(got.reshape(B, H, M, N) - ref).max())
+    assert diff < 1e-2, f"batched QKᵀ {B}x{H}x{M}x{N}x{D}: mma mismatch (max abs err {diff})"
+    assert "mma.sync.aligned.m16n8k16" in src, "the batched Q@Kᵀ must emit the s16816 mma.sync"
+    assert "dpl_mma_load_b_gmem_trans" in src, "transposed-B (K last) must use the gmem-direct trans helper"
+
+
 # Fused epilogues over the warp tier — a projection ``Map`` (or a causal ``Select``) folds into
 # the ``RegStore`` per fragment element.
 _MMA_EPILOGUES = ("bias", "relu", "residual", "causal")

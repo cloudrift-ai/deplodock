@@ -42,6 +42,15 @@ _R = "tile IR demolished — rebuild in progress"
 #: is gone.) Delete these entries when the symmetric staging lands and the tests are restored.
 _STAGE = "mma operand staging dropped — symmetric staging mechanism reserved"
 
+#: A **batched** (leading-axes) transposed-B warp matmul binds ``m_axis`` to the output's *contiguous*
+#: axis and ``n_axis`` to its *row* (strided) axis — the inverse of the mma store's coalescing
+#: invariant (the ``float2`` per-lane fragment store needs ``n_axis`` = the contiguous output dim), so
+#: the per-lane placement transposes and the result is wrong (scalar is immune — it uses real axis
+#: strides throughout). Pinned by ``test_mma_batched_qk_matches_torch`` (the flash QKᵀ score shape).
+#: Fix: order the contraction's free axes / binding so ``n_axis`` is the inner output axis. Blocks the
+#: batched warp QK/PV the warp-flash restoration reuses.
+_BATCH_MMA = "batched warp matmul m/n orientation — n_axis must be the contiguous output axis (mma store coalescing)"
+
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).
 XFAIL: dict[str, str] = {
@@ -88,6 +97,8 @@ XFAIL: dict[str, str] = {
     # atomic-free split-K (deferred ``c2k`` finalize) on the warp tier still needs its workspace
     # retarget rebuilt; the atomic arm (``c2a``) of the merged test passes.
     "tests/compiler/e2e/test_matmul_coverage.py::test_mma_splitk_finalize[deferred]": _R,
+    # Batched transposed-B warp matmul (flash QKᵀ shape) — m/n orientation bug, see _BATCH_MMA.
+    "tests/compiler/e2e/test_matmul_coverage.py::test_mma_batched_qk_matches_torch": _BATCH_MMA,
     # --- mma operand staging dropped (see _STAGE) — these assert staged structure / bit-identity ---
     "tests/compiler/e2e/test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit": _STAGE,
     "tests/compiler/e2e/test_matmul_coverage.py::test_register_double_buffer_matches_single_buffer_bit_for_bit": _STAGE,
