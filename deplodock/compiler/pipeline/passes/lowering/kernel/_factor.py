@@ -46,6 +46,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Se
 from deplodock.compiler.ir.stmt.algebra import Map, Semiring
 from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.ops import lower
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
 from deplodock.compiler.pipeline.pipeline import LoweringError
@@ -287,8 +288,7 @@ def _scalar_cells(c: Contraction, region: list[Stmt], cells, offset, masks, prot
     out: list[Stmt] = []
     for i, j in cells:
         sigma = _scalar_sigma(m_axis, n_axis, offset, i, j, masks)
-        rename = lambda nm, i=i, j=j: nm if nm in protected else f"{nm}__c{i}_{j}"  # noqa: E731
-        cell = [s.rewrite(rename, sigma) for s in region]
+        cell = copy_cell(region, sigma, f"__c{i}_{j}", protected)
         if guard:
             cell = _guard_writes(cell, _scalar_bound(m_axis, n_axis, offset, i, j, masks))
         out.extend(cell)
@@ -316,10 +316,8 @@ def _scalar_store(c: Contraction, i: int, j: int, offset, masks) -> list[Stmt]:
     """Replicate the projection ``tail`` for cell ``(i, j)`` — σ-offset, suffix the SSA names, guard
     the (overhanging) write, dedup shared operand loads."""
     m_axis, n_axis = c.m_axis, c.n_axis
-    protected = _scalar_protected(c)
     sigma = _scalar_sigma(m_axis, n_axis, offset, i, j, masks)
-    rename = lambda nm: nm if nm in protected else f"{nm}__c{i}_{j}"  # noqa: E731
-    cell = [s.rewrite(rename, sigma) for s in c.epilogue]
+    cell = copy_cell(c.epilogue, sigma, f"__c{i}_{j}", _scalar_protected(c))
     cell = _guard_writes(cell, _scalar_bound(m_axis, n_axis, offset, i, j, masks))
     return _dedup_loads(cell)
 

@@ -57,6 +57,7 @@ from deplodock.compiler.ir.tile.ops import lower
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
 
@@ -98,8 +99,7 @@ def _replicate(body: Body, r: int, coop: int, axis: Axis, masked: bool, protecte
     shifted = BinaryExpr("+", Var(axis.name), Literal(offset, "int"))
     index_expr = BinaryExpr("%", shifted, _extent_expr(axis)) if masked else shifted
     sigma = Sigma({axis.name: index_expr})
-    rename = lambda n: n if n in protected else f"{n}__r{r}"  # noqa: E731
-    out = [s.rewrite(rename, sigma) for s in body]
+    out = copy_cell(body, sigma, f"__r{r}", protected)
     return _mask_streamed(out, axis.name, offset, _extent_expr(axis)) if masked else out
 
 

@@ -26,4 +26,15 @@ def shrink_axis(axis: Axis, reg: int) -> Axis:
     return Axis(name=axis.name, extent=axis.extent.ceil_div(reg), source_axis=axis.source_axis or axis)
 
 
-__all__ = ["extent_expr", "shrink_axis"]
+def copy_cell(body, sigma, suffix: str, protected) -> list:
+    """One copy of a tiled reduce ``body``: σ-substitute its indices (``sigma``) and suffix every
+    per-copy SSA name (the shared grid / reduce / lane coordinates in ``protected`` pass through
+    unrenamed). This is the **one** replication mechanic shared by the register tile (``_factor``,
+    one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``010_materialize``
+    ``_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
+    ``sigma`` (the coordinate offset) and ``suffix`` (the SSA tag)."""
+    rename = lambda n: n if n in protected else f"{n}{suffix}"  # noqa: E731
+    return [s.rewrite(rename, sigma) for s in body]
+
+
+__all__ = ["copy_cell", "extent_expr", "shrink_axis"]
