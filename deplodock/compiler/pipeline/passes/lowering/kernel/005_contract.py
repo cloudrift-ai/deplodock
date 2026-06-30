@@ -19,8 +19,9 @@ from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile import SemiringKernel, TileOp
+from deplodock.compiler.ir.tile import SemiringKernel, TileOp, TilePlan
 from deplodock.compiler.ir.tile.atom import SCALAR_ATOM
+from deplodock.compiler.ir.tile.schedule import WarpTile
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -38,8 +39,9 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     sched = kernel.schedule if kernel is not None else None
     if not isinstance(kernel, SemiringKernel):
         raise RuleSkipped("not a contraction")
-    is_warp = getattr(sched, "warp_tile", None) is not None
-    is_tiled = getattr(sched, "tile", None) is not None and sched.tile.is_tiled
+    tier = sched.tier
+    is_warp = isinstance(tier, WarpTile)
+    is_tiled = isinstance(tier, TilePlan) and tier.is_tiled
     if not (is_warp or is_tiled):
         raise RuleSkipped("non-tiled contraction — per-cell fallback in 010")
 
@@ -65,10 +67,10 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # TODO(warp-spec): emit the producer/consumer warp split from sched.workers (the WSPEC role
     # allocation) — reserved this cut; materialization stays uniform SIMT.
     if is_warp:
-        wt = sched.warp_tile
+        wt = tier
         atom, units_m, units_n, reg_m, reg_n = wt.atom, wt.warps[0], wt.warps[1], wt.reg[0], wt.reg[1]
     else:
-        plan = sched.tile  # scalar: the parallel thread-tile IS the UNIT grid (lanes 1×1)
+        plan = tier  # scalar: the parallel thread-tile IS the UNIT grid (lanes 1×1)
         atom, units_m, units_n, reg_m, reg_n = SCALAR_ATOM, plan.par_m, plan.par_n, plan.reg_m, plan.reg_n
 
     contraction = Contraction(

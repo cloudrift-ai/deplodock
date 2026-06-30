@@ -567,21 +567,21 @@ class MonoidSchedule:
 
 @dataclass(frozen=True)
 class SemiringSchedule:
-    """A contraction (``Semiring``) kernel's schedule — the same orthogonal reduce-axis
-    fields as :class:`MonoidSchedule` (``warp_tile`` is the matmul's mma tile), plus the
-    free-axis output :class:`TilePlan` (``tile`` — the scalar register sub-tile, the
-    ``Scalar`` fragment of the matmul, decided by the ``TILE`` knob in ``020_schedule``).
-    ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
+    """A contraction (``Semiring``) kernel's schedule — the orthogonal reduce-axis fields
+    (``reduce`` / ``stage`` / ``workers``) plus the **mutually-exclusive output tier** ``tier``:
+    the matmul's tensor-core :class:`WarpTile`, OR the scalar register sub-tile :class:`TilePlan`
+    (the ``Scalar`` fragment), OR ``None`` (the per-cell tier). A contraction is warp-tiled or
+    scalar-tiled, never both — the ``a:<atom>`` token in the ``TILE`` knob (decided in
+    ``020_schedule``) picks which. ``stage`` is the operand smem pipeline (``None`` = gmem-direct)."""
 
     place: Placement
     block: tuple[Axis, ...] = ()
     reduce: ReducePlan = field(default_factory=ReducePlan)
-    tile: TilePlan = field(default_factory=TilePlan)
-    warp_tile: WarpTile | None = None  # TODO(warp-flash)
+    tier: TilePlan | WarpTile | None = None  # the output tier: scalar TilePlan | tensor-core WarpTile | None (per-cell)
     stage: Stage | None = None  # None = gmem-direct (no smem slab)
     workers: WarpSpec | None = None  # None = uniform SIMT; else the producer/compute warp split (WSPEC)
     bind: AtomBinding | None = None  # the operand→role binding, filled by 020_schedule after
-    # the warp tile is chosen (None until then / on a scalar-tile or split-partial contraction)
+    # the warp tier is chosen (None until then / on a scalar-tile or split-partial contraction)
 
 
 # --------------------------------------------------------------------------- #

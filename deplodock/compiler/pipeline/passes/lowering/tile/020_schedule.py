@@ -294,7 +294,7 @@ def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: s
     # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
     # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
     bind = semiring_binding(kernel.op, place.grid)
-    sched = replace(kernel.schedule, place=place, warp_tile=wt, stage=stage, bind=bind)
+    sched = replace(kernel.schedule, place=place, tier=wt, stage=stage, bind=bind)
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
     # splits the warps into roles over this fixed pipeline (gated on the stage now set on ``sched``).
     workers, wspec_spec = _wspec_workers(sched)
@@ -325,7 +325,7 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
             f"TILE parallel block {plan.par_n}×{plan.par_m}={block} threads exceeds the "
             f"{_MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
         )
-    sched = replace(kernel.schedule, place=place, tile=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)
+    sched = replace(kernel.schedule, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)
     stamped = {**knobs, TILE.name: spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec

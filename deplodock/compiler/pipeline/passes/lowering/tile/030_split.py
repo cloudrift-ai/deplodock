@@ -46,6 +46,7 @@ from deplodock.compiler.ir.tile import (
     ReducePlan,
     SemiringKernel,
     TileOp,
+    TilePlan,
     kernel_for,
 )
 from deplodock.compiler.ir.tile.schedule import Level
@@ -121,17 +122,17 @@ def _carrier_identities(carrier) -> dict[str, float]:
     return {s.name: s.op.identity for s in base.merge if isinstance(s, Accum)}
 
 
-def _mapped(op, grid, *, reduce: ReducePlan | None = None, tile=None):
+def _mapped(op, grid, *, reduce: ReducePlan | None = None, tier=None):
     """A ``*Kernel`` wrapping ``op`` with a **mapped** placement over ``grid`` (so
     ``020_schedule`` skips it). ``reduce`` sets the reduce partition where the schedule has
-    one (``Monoid`` / ``Semiring``; a flat ``Map`` finalize has none); ``tile`` preserves a
-    ``Semiring``'s output tile."""
+    one (``Monoid`` / ``Semiring``; a flat ``Map`` finalize has none); ``tier`` preserves a
+    ``Semiring``'s scalar output tier (:class:`TilePlan`)."""
     k = kernel_for(op, Placement(free=tuple(grid), grid=tuple(grid)))
     sched = k.schedule
     if reduce is not None and hasattr(sched, "reduce"):
         sched = replace(sched, reduce=reduce)
-    if isinstance(k, SemiringKernel) and tile is not None:
-        sched = replace(sched, tile=tile)
+    if isinstance(k, SemiringKernel) and tier is not None:
+        sched = replace(sched, tier=tier)
     return replace(k, schedule=sched)
 
 
@@ -191,7 +192,10 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     cell = _cell_index(op, grid)
     split = Axis(name=_SPLIT, extent=Dim(cta))
     sliced = _slice_carrier(carrier, b)
-    tile_plan = getattr(sched, "tile", None)
+    # Only the scalar output tier survives a split (a warp/None tier doesn't ride the partial
+    # kernels — they materialize scalar); ``getattr`` covers a ``Monoid`` split (no ``tier`` field).
+    tier = getattr(sched, "tier", None)
+    tile_plan = tier if isinstance(tier, TilePlan) else None
 
     # --- atomic finalize: ONE kernel — each CTA atomicAdds its slice's state into the output
     # (zero-init'd per launch). Additive (single-component) carriers only; the GRID stage is
@@ -218,7 +222,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
             atomic_op = Map(source=sliced, body=body)
         else:
             atomic_op = Map(source=sliced, body=Body((Write(output=out.name, index=cell, values=states, atomic=True),)))
-        atomic_kernel = _mapped(atomic_op, (split, *grid), reduce=_strip_grid(plan), tile=tile_plan)
+        atomic_kernel = _mapped(atomic_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
         return TileOp(kernel=atomic_kernel, name=tile.name)
 
     # The ``__partial`` workspace packs every carrier-state component: ``ws[comp, cta, *free]``
@@ -234,7 +238,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
 
     # --- partial kernel: reduce a CTA's slice, write its carrier state to the workspace -----
     partial_op = Map(source=sliced, body=Body(tuple(Write(output=ws_name, index=ws_index(i), value=states[i]) for i in range(n_comp))))
-    partial_kernel = _mapped(partial_op, (split, *grid), reduce=_strip_grid(plan), tile=tile_plan)
+    partial_kernel = _mapped(partial_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
     partial_tile = TileOp(kernel=partial_kernel, name=f"{tile.name}__partial")
 
     # --- finalize kernel: seed the carrier state, then fold each partition's state from the
