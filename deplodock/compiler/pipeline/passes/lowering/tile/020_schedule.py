@@ -32,8 +32,10 @@ from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt.algebra import Monoid
-from deplodock.compiler.ir.tile import MapKernel, MonoidKernel, ReducePlan, SemiringKernel, TileOp, TilePlan
+from deplodock.compiler.ir.tile import ReducePlan, TileOp, TilePlan
+from deplodock.compiler.ir.tile.ops import axis_role
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -156,13 +158,11 @@ def _coop_carrier(kernel) -> Monoid | None:
     by the materializer) are handled. The reduce axis may be **symbolic** (dynamic
     ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len`` bound is the
     masked tail). A flat-``Map`` fallback (multi / nested-non-flash reduce) is a
-    ``MapKernel`` (``reduce_node`` is ``None``), so it isn't eligible and keeps the serial
-    fold."""
-    if not isinstance(kernel, MonoidKernel):
-        return None
+    pointwise fallback (``reduce_node`` is ``None``), so it isn't eligible and keeps the
+    serial fold."""
     inner = kernel.op.reduce_node
     if not isinstance(inner, Monoid) or inner.axis is None:
-        return None
+        return None  # a contraction (Semiring) / pointwise (None) reduce_node — not coop-eligible here
     return inner
 
 
@@ -201,7 +201,7 @@ def _tile_specs(kernel) -> list[str]:
     its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
     pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); the default is the per-cell tier
     (the auto reg-tile fork is a follow-up, wired through the prior alongside the codec)."""
-    if not isinstance(kernel, SemiringKernel):
+    if axis_role(kernel.op) is not AxisRole.CONTRACTION:
         return [""]
     return list(TILE.narrow([""]))
 
@@ -229,7 +229,7 @@ def _stage_spec(kernel) -> str:
     binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
     (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
     codecs follow."""
-    if not isinstance(kernel, SemiringKernel):
+    if axis_role(kernel.op) is not AxisRole.CONTRACTION:
         return ""
     pinned = STAGE.narrow([""])[0]
     if not pinned:
@@ -345,7 +345,8 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # A pointwise / non-cooperative kernel has no reduce decision — just map the grid (the
     # off-default stamps ``REDUCE=""``). A reduction offers its ``REDUCE`` candidate(s): a
     # single option applies directly; multiple options fork for the search / prior to rank.
-    if isinstance(kernel, MapKernel):
+    role = axis_role(kernel.op)
+    if role is AxisRole.FREE:
         return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=tile.name)
     # A contraction picks its free-axis output tile (``TILE``); a reduction picks its reduce
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
@@ -354,7 +355,7 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
     # ``TILE`` is the unified output-fragment knob: a candidate whose codec names an atom
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
-    if isinstance(kernel, SemiringKernel):
+    if role is AxisRole.CONTRACTION:
         stage_spec = _stage_spec(kernel)
         reduce_spec = _semiring_reduce_spec()
         return [

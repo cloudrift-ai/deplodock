@@ -35,7 +35,7 @@ from dataclasses import replace
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
@@ -44,11 +44,11 @@ from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.tile import (
     Placement,
     ReducePlan,
-    SemiringKernel,
     TileOp,
     TilePlan,
     kernel_for,
 )
+from deplodock.compiler.ir.tile.ops import axis_role
 from deplodock.compiler.ir.tile.schedule import Level
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -131,7 +131,7 @@ def _mapped(op, grid, *, reduce: ReducePlan | None = None, tier=None):
     sched = k.schedule
     if reduce is not None and hasattr(sched, "reduce"):
         sched = replace(sched, reduce=reduce)
-    if isinstance(k, SemiringKernel) and tier is not None:
+    if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
         sched = replace(sched, tier=tier)
     return replace(k, schedule=sched)
 

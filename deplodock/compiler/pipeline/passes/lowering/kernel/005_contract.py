@@ -16,10 +16,12 @@ fallback in ``010_materialize`` lowers it. A non-contraction / non-tiled ``TileO
 from __future__ import annotations
 
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile import SemiringKernel, TileOp
+from deplodock.compiler.ir.tile import TileOp
+from deplodock.compiler.ir.tile.ops import axis_role
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -35,7 +37,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     tile: TileOp = root.op
     kernel = tile.kernel
     sched = kernel.schedule if kernel is not None else None
-    if not isinstance(kernel, SemiringKernel):
+    if kernel is None or axis_role(kernel.op) is not AxisRole.CONTRACTION:
         raise RuleSkipped("not a contraction")
     tier = sched.tier
     if tier is None or not tier.is_tiled:

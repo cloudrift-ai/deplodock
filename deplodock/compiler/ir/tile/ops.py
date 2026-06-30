@@ -31,9 +31,26 @@ the lowered tree — no per-kernel builder.
 
 from __future__ import annotations
 
+from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Loop, Map, Monoid, Semiring
 from deplodock.compiler.ir.stmt.algebra import _partial_name
 from deplodock.compiler.ir.stmt.base import INDENT, Stmt, pretty_body
+
+
+def axis_role(node) -> AxisRole:
+    """The reduce :class:`~deplodock.compiler.ir.axis.AxisRole` of an op-tree node's
+    outermost reduction, read **structurally** off the body (no stored kind tag — the
+    successor to the removed ``classify_algebra``): a ``Semiring`` contraction is
+    ``CONTRACTION``; a ``Monoid`` reduce is ``TWISTED`` (an ``exp``-family ψ-rescale —
+    online softmax / flash) or ``PLANAR`` (the degenerate ``id`` twist — plain
+    ``sum`` / ``max`` / ``mean``); a pure pointwise ``Map`` over no reduction is ``FREE``.
+    This is what the schedule pass dispatches on, replacing ``isinstance(kernel, *Kernel)``."""
+    inner = node.reduce_node
+    if isinstance(inner, Semiring):
+        return AxisRole.CONTRACTION
+    if isinstance(inner, Monoid):
+        return AxisRole.TWISTED if inner.twist.family == "exp" else AxisRole.PLANAR
+    return AxisRole.FREE
 
 
 def lower(op) -> list[Stmt]:
@@ -166,4 +183,4 @@ def pretty(op, indent: str = "") -> list[str]:
     return [f"{indent}{op!r}"]
 
 
-__all__ = ["Map", "Monoid", "Semiring", "lower", "pretty"]
+__all__ = ["Map", "Monoid", "Semiring", "axis_role", "lower", "pretty"]

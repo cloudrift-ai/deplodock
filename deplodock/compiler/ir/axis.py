@@ -17,10 +17,40 @@ carry bare ``Axis`` tuples and encode the binding in the flavor's type.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.dim import Dim, to_dim
 from deplodock.compiler.ir.expr import Interval, Literal, SimplifyCtx
+
+
+class AxisRole(enum.Enum):
+    """The scheduling **role** of one iteration axis — read structurally off the loop body,
+    not a stored algebra kind (the removed ``classify_algebra`` tagged the whole *kernel*; this
+    tags each *axis*, and stays re-derivable from the body).
+
+    Detection (``lowering/tile``) stamps each loop with its role so scheduling dispatches on the
+    axis's job, never on a node *type*:
+
+    - ``FREE`` — a parallel / output-grid axis (no fold; one independent cell per value).
+    - ``PLANAR`` — a plain reduce axis (``sum`` / ``max`` / ``mean`` — the degenerate ``id``
+      twist). Several stacked ``PLANAR`` axes form a reduction *plane*.
+    - ``CONTRACTION`` — a reduce axis whose body distributes a ``⊗`` lift over ≥ 2 operands (the
+      matmul K axis).
+    - ``TWISTED`` — a ψ-conjugated reduce carrying an ``exp``-family :class:`Twist` (online
+      softmax / flash).
+
+    Every role but ``FREE`` is a reduce axis (the carrier rides the loop)."""
+
+    FREE = "free"
+    PLANAR = "planar"
+    CONTRACTION = "contraction"
+    TWISTED = "twisted"
+
+    @property
+    def is_reduce(self) -> bool:
+        """True for every fold role (everything but :attr:`FREE`)."""
+        return self is not AxisRole.FREE
 
 # Sentinel upper bound for a symbolic loop axis ``[0, hi]``. Only its ``lo = 0``
 # matters (gives the non-negativity the ``(i*c + …)//c → i`` div fold needs);
@@ -111,4 +141,4 @@ def extend_simplify_ctx(ctx: SimplifyCtx, axis: Axis) -> SimplifyCtx:
     return ctx.extend(axis.name, Interval(0, _SYMBOLIC_AXIS_HI), bound=ext.expr)
 
 
-__all__ = ["Axis", "extend_simplify_ctx"]
+__all__ = ["Axis", "AxisRole", "extend_simplify_ctx"]

@@ -41,7 +41,7 @@ from dataclasses import replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import KernelOp, Tile
 from deplodock.compiler.ir.kernel.ir import (
@@ -52,8 +52,8 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import MonoidKernel, TileOp
-from deplodock.compiler.ir.tile.ops import lower
+from deplodock.compiler.ir.tile import TileOp
+from deplodock.compiler.ir.tile.ops import axis_role, lower
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
@@ -298,8 +298,11 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
     # The warp / register-tiled contraction tiers are built one pass earlier (``005_contract``) and
-    # expanded above; here a ``Semiring`` only reaches the cooperative / per-cell tiers below.
-    plan = getattr(kernel.schedule, "reduce", None) if isinstance(kernel, MonoidKernel) else None
+    # expanded above; here a ``Semiring`` contraction only reaches the per-cell tier below — the
+    # cooperative reduce tier is gated to the PLANAR / TWISTED monoid reduces (composing it with a
+    # contraction's output tile is Phase 4). Read the role structurally, not the kernel kind.
+    coop_eligible = kernel is not None and axis_role(kernel.op) in (AxisRole.PLANAR, AxisRole.TWISTED)
+    plan = getattr(kernel.schedule, "reduce", None) if coop_eligible else None
     # Reduce tier: a Monoid reduction whose plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):
         return _reduce(tile, root)

@@ -12,9 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deplodock.compiler.dtype import F32 as _F32
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.stmt.algebra import Monoid
+from deplodock.compiler.ir.stmt.algebra import Monoid, Twist
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Mma
@@ -57,11 +57,20 @@ class Loop(Stmt):
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
     time. Set by scheduling passes (``mark_unroll``); has no
     effect on the IR's iteration semantics.
+
+    ``role`` is the axis's scheduling :class:`~deplodock.compiler.ir.axis.AxisRole`
+    (``FREE`` / ``PLANAR`` / ``CONTRACTION`` / ``TWISTED``), stamped by tile-lowering
+    detection; ``carrier`` is the :class:`~deplodock.compiler.ir.stmt.algebra.Twist`
+    algebra payload a reduce loop folds through (``None`` on a ``FREE`` loop or a
+    not-yet-annotated reduce). Both default to the unannotated ``FREE`` / ``None`` so
+    every existing construction site keeps working.
     """
 
     axis: Axis
     body: Body
     unroll: bool = False
+    role: AxisRole = AxisRole.FREE
+    carrier: Twist | None = None
 
     def __post_init__(self) -> None:
         # Coerce so ``Loop(body=tuple_value)`` keeps working without
@@ -77,16 +86,18 @@ class Loop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return Loop(axis=self.axis, body=body, unroll=self.unroll)
+        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
 
     @property
     def is_reduce(self) -> bool:
-        """A loop is a reduce-loop iff its immediate body contains a carrier
-        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``)."""
-        return any(isinstance(s, _CARRIERS) for s in self.body)
+        """A loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
+        ``FREE``) OR — for a not-yet-annotated loop — its immediate body contains a carrier
+        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``). The structural
+        fallback keeps recognition working before detection stamps the role."""
+        return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
@@ -270,13 +281,15 @@ class StridedLoop(Stmt):
     loop construct itself rather than via affine indexing in the body.
 
     Reduction detection mirrors ``Loop``: a ``StridedLoop`` is a
-    reduce-loop iff its body contains an ``Accum``."""
+    reduce-loop iff its annotated :attr:`role` folds or its body contains an ``Accum``."""
 
     axis: Axis
     start: Expr
     step: Expr
     body: Body
     unroll: bool = False
+    role: AxisRole = AxisRole.FREE
+    carrier: Twist | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -290,7 +303,9 @@ class StridedLoop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll)
+        return StridedLoop(
+            axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier
+        )
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
@@ -300,9 +315,9 @@ class StridedLoop(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A strided loop is a reduce-loop iff its immediate body contains a carrier
-        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``)."""
-        return any(isinstance(s, _CARRIERS) for s in self.body)
+        """A strided loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
+        ``FREE``) OR its immediate body contains a carrier (``Accum`` / ``Mma`` / ``Monoid``)."""
+        return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()
