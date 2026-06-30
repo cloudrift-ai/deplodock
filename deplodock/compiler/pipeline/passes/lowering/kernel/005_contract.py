@@ -60,7 +60,6 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
         reg_m=wt.reg[0],
         reg_n=wt.reg[1],
         atom=wt.atom,
-        bk=wt.bk,
         a_load=bind.a.load,
         b_load=bind.b.load,
         b_trans=bind.b_trans,

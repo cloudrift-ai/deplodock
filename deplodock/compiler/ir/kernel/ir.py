@@ -342,19 +342,18 @@ class Leaf:
 @dataclass(frozen=True)
 class MmaLeaf(Leaf):
     """A :class:`Contraction`'s **mma** payload — binding-driven structured operands + the
-    tensor-core cell. The ``WarpTile`` is embedded directly (the :class:`AtomKind` ``atom`` + the
-    K-chunk ``bk``; the thread / register widths ride the shared :class:`Leaf`). Plus the operand
-    ``Load``\\ s + role flags (``a_load`` / ``b_load`` / ``b_trans``) and the fold accumulator
-    ``acc`` — the SSA name the synthesized mma produces and the ``body`` (here the projection
-    epilogue) consumes (scalar needs no such link — its accumulator lives entirely inside ``body``).
-    Operands are loaded gmem-direct (no smem operand ``stage`` — symmetric with :class:`ScalarLeaf`;
-    a symmetric staging mechanism for both tiers is reserved).
+    tensor-core cell ``atom`` (the only ``WarpTile`` geometry the leaf needs; the thread / register
+    widths ride the shared :class:`Leaf`). Plus the operand ``Load``\\ s + role flags (``a_load`` /
+    ``b_load`` / ``b_trans``) and the fold accumulator ``acc`` — the SSA name the synthesized mma
+    produces and the ``body`` (here the projection epilogue) consumes (scalar needs no such link —
+    its accumulator lives entirely inside ``body``). Operands are loaded gmem-direct (no smem operand
+    ``stage`` — symmetric with :class:`ScalarLeaf`; a symmetric staging mechanism for both tiers is
+    reserved, and the K-chunk ``WarpTile.bk`` it needs is read back off the schedule then, not here).
 
     The operand buffers ride :meth:`external_reads` (they aren't in ``body``); the epilogue's loads
     + output ``Write`` surface through the base :meth:`bodies`."""
 
     atom: AtomKind
-    bk: int
     a_load: Load
     b_load: Load
     b_trans: bool
