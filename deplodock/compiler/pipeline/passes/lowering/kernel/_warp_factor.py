@@ -92,7 +92,7 @@ def mma_codegen(c: Contraction):
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
     reg_m, reg_n = leaf.reg_m, leaf.reg_n
     pre: list[Stmt] = []
-    tail = list(leaf.epilogue)
+    tail = list(leaf.body)
     write = next(s for s in tail if isinstance(s, Write))
     a_frags = [f"_a{i}" for i in range(reg_m)]
     b_frags = [f"_b{j}" for j in range(reg_n)]

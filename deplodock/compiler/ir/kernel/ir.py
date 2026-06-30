@@ -300,98 +300,32 @@ class Tile(Stmt):
 
 @dataclass(frozen=True)
 class Leaf:
-    """Shared base for a :class:`Contraction`'s atom-specific payload — the **common tiling widths**
-    both arms carry: the per-CTA **thread** grid (``threads_m`` × ``threads_n`` — the same quantity
-    for both tiers) and the per-unit **REGISTER** sub-tile (``reg_m`` × ``reg_n``). The per-CTA UNIT
-    grid (warps for mma, threads for scalar) is **derived** by :class:`Contraction` from the thread
-    extents and the atom's lane extents (``units = threads // atom.lanes``). The atom + the operand
-    payload (binding-driven mma vs body-driven scalar) and the ``Stmt``-protocol helpers
-    :class:`Contraction` delegates to live on the subclasses (:class:`MmaLeaf` / :class:`ScalarLeaf`)."""
+    """Shared base for a :class:`Contraction`'s atom-specific payload — the **common** part both
+    arms carry: the per-CTA **thread** grid (``threads_m`` × ``threads_n``), the per-unit
+    **REGISTER** sub-tile (``reg_m`` × ``reg_n``), and the per-cell compute **``body``** (a Stmt
+    ``Body`` the codegen consumes — the *whole* lowered per-cell body for scalar; just the
+    projection *epilogue* for mma, whose reduce + operands are synthesized from the binding). The
+    per-CTA UNIT grid (warps for mma, threads for scalar) is **derived** by :class:`Contraction`
+    from the thread extents and the atom's lane extents (``units = threads // atom.lanes``).
+
+    The shared :class:`Stmt`-protocol helpers (``bodies`` / ``with_bodies`` / ``rewrite`` over
+    ``body``) live here; the atom + any structured-operand fields and their overrides live on the
+    subclasses (:class:`MmaLeaf` / :class:`ScalarLeaf`)."""
 
     threads_m: int
     threads_n: int
     reg_m: int
     reg_n: int
-
-
-@dataclass(frozen=True)
-class MmaLeaf(Leaf):
-    """A :class:`Contraction`'s **mma** payload — binding-driven structured operands + the
-    tensor-core cell. The ``WarpTile`` is embedded directly (the :class:`AtomKind` ``atom`` + the
-    K-chunk ``bk``; the warp counts / register sub-tile ride the shared :class:`Leaf` widths). Plus
-    the operand ``Load``\\ s + role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
-    accumulator ``acc``, and the resolved projection ``epilogue`` (post-``with_store`` — ends in the
-    output ``Write``). Operands are loaded gmem-direct (no smem operand ``stage`` — symmetric with
-    :class:`ScalarLeaf`; a symmetric staging mechanism for both tiers is reserved).
-
-    The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the epilogue's
-    loads + output ``Write`` surface through :meth:`bodies`. The :class:`Stmt`-protocol helpers here
-    are what :class:`Contraction` delegates to (this is a plain payload, not a ``Stmt``)."""
-
-    atom: AtomKind
-    bk: int
-    a_load: Load
-    b_load: Load
-    b_trans: bool
-    acc: str
-    epilogue: Body
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.epilogue, Body):
-            object.__setattr__(self, "epilogue", Body(self.epilogue))
-
-    def bodies(self) -> tuple[Body, ...]:
-        return (self.epilogue,)
-
-    def with_bodies(self, bodies: tuple[Body, ...]) -> MmaLeaf:
-        (epilogue,) = bodies
-        return replace(self, epilogue=epilogue)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.acc,)  # the accumulator the (still-unexpanded) contraction produces
-
-    def external_reads(self) -> tuple[str, ...]:
-        return (self.a_load.input, self.b_load.input)  # epilogue buffers come via bodies()
-
-    def head(self) -> str:
-        t = " trans" if self.b_trans else ""
-        return f"{self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.atom.name})"
-
-    def rewrite(self, rename, sigma, axis_fn) -> MmaLeaf:
-        return replace(
-            self,
-            a_load=_rewrite(self.a_load, rename, sigma, axis_fn),
-            b_load=_rewrite(self.b_load, rename, sigma, axis_fn),
-            acc=rename(self.acc),
-            epilogue=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.epilogue)),
-        )
-
-
-@dataclass(frozen=True)
-class ScalarLeaf(Leaf):
-    """A :class:`Contraction`'s **scalar** payload — the body-driven form: the lowered per-cell
-    ``body`` (``lower(op)`` + output-store glue — a ``pre`` region, the reduce ``Loop`` over the
-    contraction axis, a projection ``tail``). The tile widths ride the shared :class:`Leaf` (the
-    ``units_m`` × ``units_n`` parallel thread-tile + the ``reg_m`` × ``reg_n`` register sub-tile).
-    :attr:`atom` is the ``1×1`` :class:`ScalarAtom`. The operand ``Load``\\ s ride inside ``body``
-    (so :meth:`external_reads` is empty); the body surfaces through :meth:`bodies`."""
-
     body: Body
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
             object.__setattr__(self, "body", Body(self.body))
 
-    @property
-    def atom(self):
-        from deplodock.compiler.ir.tile.atom import SCALAR_ATOM  # noqa: PLC0415
-
-        return SCALAR_ATOM
-
     def bodies(self) -> tuple[Body, ...]:
         return (self.body,)
 
-    def with_bodies(self, bodies: tuple[Body, ...]) -> ScalarLeaf:
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Leaf:
         (body,) = bodies
         return replace(self, body=body)
 
@@ -401,11 +335,68 @@ class ScalarLeaf(Leaf):
     def external_reads(self) -> tuple[str, ...]:
         return ()
 
+    def rewrite(self, rename, sigma, axis_fn) -> Leaf:
+        return replace(self, body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.body)))
+
+
+@dataclass(frozen=True)
+class MmaLeaf(Leaf):
+    """A :class:`Contraction`'s **mma** payload — binding-driven structured operands + the
+    tensor-core cell. The ``WarpTile`` is embedded directly (the :class:`AtomKind` ``atom`` + the
+    K-chunk ``bk``; the thread / register widths ride the shared :class:`Leaf`). Plus the operand
+    ``Load``\\ s + role flags (``a_load`` / ``b_load`` / ``b_trans``) and the fold accumulator
+    ``acc`` — the SSA name the synthesized mma produces and the ``body`` (here the projection
+    epilogue) consumes (scalar needs no such link — its accumulator lives entirely inside ``body``).
+    Operands are loaded gmem-direct (no smem operand ``stage`` — symmetric with :class:`ScalarLeaf`;
+    a symmetric staging mechanism for both tiers is reserved).
+
+    The operand buffers ride :meth:`external_reads` (they aren't in ``body``); the epilogue's loads
+    + output ``Write`` surface through the base :meth:`bodies`."""
+
+    atom: AtomKind
+    bk: int
+    a_load: Load
+    b_load: Load
+    b_trans: bool
+    acc: str
+
+    def defines(self) -> tuple[str, ...]:
+        return (self.acc,)  # the accumulator the (still-unexpanded) contraction produces
+
+    def external_reads(self) -> tuple[str, ...]:
+        return (self.a_load.input, self.b_load.input)  # body (epilogue) buffers come via bodies()
+
+    def head(self) -> str:
+        t = " trans" if self.b_trans else ""
+        return f"{self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.atom.name})"
+
+    def rewrite(self, rename, sigma, axis_fn) -> MmaLeaf:
+        # The base rewrites ``body``; also route the structured operands + accumulator name.
+        return replace(
+            super().rewrite(rename, sigma, axis_fn),
+            a_load=_rewrite(self.a_load, rename, sigma, axis_fn),
+            b_load=_rewrite(self.b_load, rename, sigma, axis_fn),
+            acc=rename(self.acc),
+        )
+
+
+@dataclass(frozen=True)
+class ScalarLeaf(Leaf):
+    """A :class:`Contraction`'s **scalar** payload — the body-driven form: ``body`` is the *whole*
+    lowered per-cell body (``lower(op)`` + output-store glue — a ``pre`` region, the reduce ``Loop``
+    over the contraction axis, a projection ``tail``), with the operands + accumulator all inside it
+    (so no structured-operand fields, no ``acc``, and an empty :meth:`external_reads`). :attr:`atom`
+    is the ``1×1`` :class:`ScalarAtom`. The thread / register widths + the whole ``Stmt`` protocol
+    ride the shared :class:`Leaf`."""
+
+    @property
+    def atom(self):
+        from deplodock.compiler.ir.tile.atom import SCALAR_ATOM  # noqa: PLC0415
+
+        return SCALAR_ATOM
+
     def head(self) -> str:
         return f"scalar reg={self.reg_m}x{self.reg_n} threads={self.threads_m}x{self.threads_n}"
-
-    def rewrite(self, rename, sigma, axis_fn) -> ScalarLeaf:
-        return replace(self, body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.body)))
 
 
 def _ext_expr(axis: Axis) -> Expr:
