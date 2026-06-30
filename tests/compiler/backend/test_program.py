@@ -3,10 +3,10 @@
 import numpy as np
 import pytest
 
-from deplodock.compiler.backend.cuda.program import _collapse_inert_dims, _Compiled, _resolve_symbolic, benchmark_program, run_program
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda import CudaOp
+from emmy.compiler.backend.cuda.program import _collapse_inert_dims, _Compiled, _resolve_symbolic, benchmark_program, run_program
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda import CudaOp
 
 from ..conftest import requires_cuda
 
@@ -139,8 +139,8 @@ def _make_chain_graph(n: int = 8) -> Graph:
 def test_buffer_reuse_correct_and_slab_managed():
     """A graph with a scratch buffer runs correctly through the reused slab, and
     the intermediate ``T`` is slab-managed while inputs/outputs stay standalone."""
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     graph = _make_chain_graph(8)
     a = np.arange(8, dtype=np.float32)
@@ -173,8 +173,8 @@ def test_iter_once_raises_on_zero_elapsed(monkeypatch):
     import cupy as cp
     import pytest
 
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
 
     monkeypatch.setattr(cp.cuda, "get_elapsed_time", lambda start, stop: 0.0)
 

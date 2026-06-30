@@ -1,8 +1,8 @@
-"""``deplodock generate`` — standalone naive generation oracle (Phase 0 of
+"""``emmy generate`` — standalone naive generation oracle (Phase 0 of
 ``plans/generative-inference-support.md``).
 
-Re-runs the whole growing prefix each step (O(S^2)) on the deplodock CUDA backend with
-**no vLLM** — deplodock controls the loop, so this is the token-for-token correctness
+Re-runs the whole growing prefix each step (O(S^2)) on the emmy CUDA backend with
+**no vLLM** — emmy controls the loop, so this is the token-for-token correctness
 reference every later (vLLM) phase verifies against, and the seed of the eventual
 standalone server. Runs the unquantized fp16 whole-model path.
 
@@ -78,8 +78,8 @@ def handle_generate(args):
         logger.error("torch and transformers are required: pip install torch transformers")
         sys.exit(1)
 
-    from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
-    from deplodock.serving.sampling import Sampler, apply_chat_template
+    from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+    from emmy.serving.sampling import Sampler, apply_chat_template
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
@@ -127,7 +127,7 @@ class _CompiledLM:
     ``[1, S, vocab]``), compiles on the CUDA backend, binds fp16 constants, and re-runs the
     whole prefix each call via the serving ``rebind`` path (one compiled dynamic-seq_len
     program, request after request); ``logits()`` slices the final position on the host.
-    Mirrors ``DeplodockForwardRunner.create``."""
+    Mirrors ``EmmyForwardRunner.create``."""
 
     def __init__(self, program, input_names, output_name):
         self._program = program
@@ -152,13 +152,13 @@ class _CompiledLM:
         import numpy as np
         import torch
 
-        from deplodock.compiler.backend.cuda.backend import CudaBackend
-        from deplodock.compiler.backend.cuda.program import CompiledProgram
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
-        from deplodock.compiler.loader.binder import bind_constants
-        from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
-        from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-        from deplodock.compiler.trace.torch import trace_module
+        from emmy.compiler.backend.cuda.backend import CudaBackend
+        from emmy.compiler.backend.cuda.program import CompiledProgram
+        from emmy.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.loader.binder import bind_constants
+        from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+        from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+        from emmy.compiler.trace.torch import trace_module
 
         dtype = torch.float16
         np_dtype = np.dtype("float16")
@@ -206,8 +206,8 @@ class _CompiledLM:
         whole prefix at its current length and runs the program once (the O(S^2) oracle)."""
         import numpy as np
 
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
-        from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+        from emmy.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 
         s = len(token_ids)
         if not 0 < s <= DYNAMIC_DIM_MAX:

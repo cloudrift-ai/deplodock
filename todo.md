@@ -8,7 +8,7 @@
 - [x] Noop removal → buffer aliases
 - [x] Codegen/IR/Program layering (moved to backend/)
 - [x] Pretty printer for program (40_program.txt in dumps)
-- [x] `--dump-dir` flag on `deplodock bench`
+- [x] `--dump-dir` flag on `emmy bench`
 - [x] `smem` strategy: SIMT shared-memory kernel with splitK support
 - [x] Bench experiment with rectangular shapes and batch sizes
 

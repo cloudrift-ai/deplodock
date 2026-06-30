@@ -1,13 +1,13 @@
 """Recipe loading and configuration."""
 
-from deplodock.recipe.engines import banned_extra_arg_flags, build_engine_args
-from deplodock.recipe.matrix import (
+from emmy.recipe.engines import banned_extra_arg_flags, build_engine_args
+from emmy.recipe.matrix import (
     build_override,
     dot_to_nested,
     expand_matrix,
     filter_combinations,
 )
-from deplodock.recipe.recipe import (
+from emmy.recipe.recipe import (
     _load_raw_config,
     _validate_and_build,
     deep_merge,
@@ -16,7 +16,7 @@ from deplodock.recipe.recipe import (
     validate_docker_options,
     validate_extra_args,
 )
-from deplodock.recipe.types import (
+from emmy.recipe.types import (
     AggregateConfig,
     BenchmarkConfig,
     CommandConfig,

@@ -5,8 +5,8 @@ import logging
 import sys
 from pathlib import Path
 
-from deplodock.planner import ExecutionGroup
-from deplodock.redact import install_redaction
+from emmy.planner import ExecutionGroup
+from emmy.redact import install_redaction
 
 active_run_dir: contextvars.ContextVar[Path | None] = contextvars.ContextVar("active_run_dir", default=None)
 
@@ -30,14 +30,14 @@ class _RunDirFilter(logging.Filter):
 class _BenchConsoleFormatter(logging.Formatter):
     """Console formatter for bench output.
 
-    - ``deplodock.deploy.orchestrate`` → ``[orchestrate]``
+    - ``emmy.deploy.orchestrate`` → ``[orchestrate]``
     - ``rtx5090_x_1.ModelName`` → ``[rtx5090_x_1] [ModelName]``
     - ``root`` → no prefix (plain message)
     """
 
     def format(self, record):
         saved_name = record.name
-        if record.name.startswith("deplodock."):
+        if record.name.startswith("emmy."):
             # Library logger: show last segment only
             record.name = record.name.rsplit(".", 1)[-1]
         elif "." in record.name:
@@ -95,7 +95,7 @@ class _GroupNameFilter(logging.Filter):
 
     Accepts records where:
     - record.name starts with group_label (group logger and its children)
-    - record.name starts with "deplodock." AND active_run_dir matches run_dir
+    - record.name starts with "emmy." AND active_run_dir matches run_dir
       (so deploy/provisioning logs for this group are included)
     """
 
@@ -106,7 +106,7 @@ class _GroupNameFilter(logging.Filter):
     def filter(self, record):
         if record.name.startswith(self.group_label):
             return True
-        if record.name.startswith("deplodock."):
+        if record.name.startswith("emmy."):
             current = active_run_dir.get()
             return current == self.run_dir
         return False
@@ -117,7 +117,7 @@ def add_group_file_handler(run_dir: Path, group_label: str) -> logging.Handler:
 
     Writes to {run_dir}/benchmark_{group_label}.log, capturing only
     log records from loggers whose name starts with group_label
-    or from deplodock.* loggers when active_run_dir matches.
+    or from emmy.* loggers when active_run_dir matches.
 
     Returns:
         The handler, so the caller can remove it later.

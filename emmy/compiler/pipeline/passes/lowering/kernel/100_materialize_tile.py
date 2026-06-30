@@ -34,11 +34,11 @@ passes can pattern-match on it.
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, Builtin, Literal, Var
+from emmy.compiler.ir.kernel.ir import (
     CpAsyncWait,
     KernelOp,
     MbarrierArrive,
@@ -51,8 +51,8 @@ from deplodock.compiler.ir.kernel.ir import (
     TmaDescriptor,
     TmaLoad,
 )
-from deplodock.compiler.ir.stmt import Accum, Cond, Monoid, Stmt
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.stmt import Accum, Cond, Monoid, Stmt
+from emmy.compiler.ir.tile.ir import (
     _SWIZZLE_BY_BYTES,
     BYTES_PER_ELEM,
     AffineAddressing,
@@ -71,13 +71,13 @@ from deplodock.compiler.ir.tile.ir import (
     WarpTile,
     pick_swizzle_atom,
 )
-from deplodock.compiler.pipeline import Pattern
-from deplodock.compiler.pipeline.passes.lowering.kernel._combine import (
+from emmy.compiler.pipeline import Pattern
+from emmy.compiler.pipeline.passes.lowering.kernel._combine import (
     cooperative_combine_geometry,
     emit_combine,
     find_nested_reduce_carriers,
 )
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
+from emmy.compiler.pipeline.passes.lowering.kernel._stage_expand import (
     compute_phase_extents,
     compute_phase_info,
     emit_compute_phase,
@@ -85,7 +85,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import (
     emit_stage,
     smem_cuda_dtype,
 )
-from deplodock.compiler.pipeline.passes.lowering.kernel._tma_groups import partition_tma_groups
+from emmy.compiler.pipeline.passes.lowering.kernel._tma_groups import partition_tma_groups
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -138,7 +138,7 @@ def _materialize_top(top: Stmt, *, warp_size: int, escape=None) -> Stmt:
       the body directly; the kernel renderer's linear-tid path handles
       launch geometry from the ThreadTile's extents.
     """
-    from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
     if isinstance(top, GridTile):
         # The SMEM fused edge's rmsnorm prologue: a CoopReduce sibling of the matmul
@@ -308,7 +308,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         # Name / cache axes / dtype are recovered from the self-describing
         # compute body (its single Write + the cone sources it reads).
         if stmt.compute is not None:
-            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+            from emmy.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
             fused_name, _fused_axes, fused_value_dtype = compute_phase_info(stmt.compute, stmt.sources)
             if fused_name not in declared_smem:
@@ -600,7 +600,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
           references the original axis Vars unshifted; the nested
           ThreadTile rebinds them to the consumer-relative tid range.
         """
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
         # Role axis = the single axis on the enclosing WarpTile.
         role = thread_axes[0]
@@ -676,7 +676,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         bc-1)`` so the first ``bc-1`` iters skip (those slots were
         unfilled by the prologue). The K_o axis name is read off the
         matched ``SerialTile.axis`` (canonical post-normalize)."""
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
         out: list[Stmt] = []
         for s in stmts:
@@ -704,7 +704,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
         ahead of slower consumers still reading the slot's smem; the
         arrive then flips the empty mbarrier and the producer is free
         to overwrite the slot mid-read."""
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
         def _augment(stmt: Stmt) -> Stmt:
             if isinstance(stmt, SerialTile) and stmt.kind == "serial_outer":
@@ -748,7 +748,7 @@ def _materialize(blk: ThreadTile | WarpTile, *, warp_size: int, escape=None) -> 
             # (Pre-WarpSpecialize 085 emitted bare role-split Conds here;
             # left in place because user-emitted Conds and other rules
             # may still reach this point.)
-            from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
+            from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
 
             body_out: list[Stmt] = []
             for inner in stmt.body:

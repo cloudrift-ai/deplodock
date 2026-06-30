@@ -141,7 +141,7 @@ def filter_combinations(
 
 def build_override(combination: dict) -> dict:
     """Convert a flat dot-notation combination into a nested dict for deep_merge."""
-    from deplodock.recipe.recipe import deep_merge
+    from emmy.recipe.recipe import deep_merge
 
     result = {}
     for key, value in combination.items():

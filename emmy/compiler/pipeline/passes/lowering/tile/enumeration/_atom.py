@@ -1,9 +1,9 @@
 """The atom layer — the warp-tier MMA *eligibility gate* + the ``atomize`` body edit.
 
 ``atomize``: the warp-tier MMA fork
-(``020_tensorize``) offers each :class:`~deplodock.compiler.ir.tile.ir.Atom`
+(``020_tensorize``) offers each :class:`~emmy.compiler.ir.tile.ir.Atom`
 the kernel admits, and ``050_warp_build`` fuses the matmul cell into one
-:class:`~deplodock.compiler.ir.stmt.Mma`. Both concerns live here, the
+:class:`~emmy.compiler.ir.stmt.Mma`. Both concerns live here, the
 **atom layer** — provenance-agnostic, naming operands by SSA value:
 
 - :func:`eligible_atoms` / :func:`_atom_eligible` — the gate. A pure query over the
@@ -30,14 +30,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma, Stmt, Write
-from deplodock.compiler.ir.stmt.blocks import Body
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, Atom, SerialTile
-from deplodock.compiler.pipeline.passes.lowering._predicates import (
+from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Mma, Stmt, Write
+from emmy.compiler.ir.stmt.blocks import Body
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY, Atom, SerialTile
+from emmy.compiler.pipeline.passes.lowering._predicates import (
     classify_fragment_epilogue,
     segmentable_k_extent,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, IterDag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, IterDag
 
 
 def classify_matmul_operands(loads, k_name: str, *, out_index=None):

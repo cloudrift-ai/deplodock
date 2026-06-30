@@ -21,15 +21,15 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
-from deplodock.compiler.backend.cuda.dtype import cuda_name
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.backend.cuda.dtype import cuda_name
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F32
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.kernel.ir import (
     FRAG,
     FRAG_COL,
     FRAG_ROW,
@@ -41,9 +41,9 @@ from deplodock.compiler.ir.kernel.ir import (
     Smem,
     Sync,
 )
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
+from emmy.compiler.ir.tile.ir import (
     AffineAddressing,
     AtomTile,
     Binding,
@@ -58,13 +58,13 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
-from deplodock.compiler.ir.twist import MmaTwist
-from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
-from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
-from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.ir.twist import MmaTwist
+from emmy.compiler.pipeline.passes.lowering._addr import add as _fadd
+from emmy.compiler.pipeline.passes.lowering._addr import mul as _fmul
+from emmy.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
+from emmy.compiler.tensor import Tensor
 
 # Schedule ``Binding`` → tower ``Role``. SERIAL has no free-axis use yet (the K
 # re-bracket emits its own SERIAL_OUTER / STAGE_INNER layers); mapped to plain

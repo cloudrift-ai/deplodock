@@ -11,11 +11,11 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.tile.ir import (
     Atom,
     AtomTile,
     GridTile,

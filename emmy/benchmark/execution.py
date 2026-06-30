@@ -7,32 +7,32 @@ import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from deplodock.benchmark.bench_logging import _get_group_logger, active_run_dir, add_group_file_handler
-from deplodock.benchmark.command_workload import run_command_workload
-from deplodock.benchmark.results import compose_json_result
-from deplodock.benchmark.system_info import collect_system_info
-from deplodock.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
-from deplodock.deploy import (
+from emmy.benchmark.bench_logging import _get_group_logger, active_run_dir, add_group_file_handler
+from emmy.benchmark.command_workload import run_command_workload
+from emmy.benchmark.results import compose_json_result
+from emmy.benchmark.system_info import collect_system_info
+from emmy.benchmark.workload import compose_result, extract_benchmark_results, run_benchmark_workload
+from emmy.deploy import (
     DeployParams,
 )
-from deplodock.deploy import (
+from emmy.deploy import (
     deploy as deploy_entry,
 )
-from deplodock.deploy import (
+from emmy.deploy import (
     teardown as teardown_entry,
 )
-from deplodock.deploy.compose import generate_compose
-from deplodock.planner import BenchmarkTask, ExecutionGroup
-from deplodock.provisioning.cloud import (
+from emmy.deploy.compose import generate_compose
+from emmy.planner import BenchmarkTask, ExecutionGroup
+from emmy.provisioning.cloud import (
     delete_cloud_vm,
     provision_cloud_vm,
 )
-from deplodock.provisioning.host import RemoteHost
-from deplodock.provisioning.remote import provision_remote
-from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR, make_run_cmd
-from deplodock.provisioning.staging import stage_to_remote
-from deplodock.redact import register_secret
-from deplodock.timing import (
+from emmy.provisioning.host import RemoteHost
+from emmy.provisioning.remote import provision_remote
+from emmy.provisioning.ssh_transport import REMOTE_DEPLOY_DIR, make_run_cmd
+from emmy.provisioning.staging import stage_to_remote
+from emmy.redact import register_secret
+from emmy.timing import (
     PHASE_BENCHMARK,
     PHASE_COMMAND,
     PHASE_REMOTE_PROVISION,

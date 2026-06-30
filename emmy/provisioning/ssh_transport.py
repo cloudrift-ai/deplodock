@@ -7,7 +7,7 @@ import tempfile
 
 logger = logging.getLogger(__name__)
 
-REMOTE_DEPLOY_DIR = "~/.local/share/deplodock"
+REMOTE_DEPLOY_DIR = "~/.local/share/emmy"
 
 
 def ssh_base_args(server, ssh_key, ssh_port):
@@ -138,7 +138,7 @@ async def scp_from_remote(server, ssh_key, ssh_port, remote_path, local_path, ti
     """Copy a file (or directory) FROM the remote server via SCP.
     ``-r`` is unconditional: harmless on regular files, required when
     ``remote_path`` resolves to a directory (e.g.
-    ``DEPLODOCK_DUMP_DIR``'s ``*.kernels/`` subdirs that would
+    ``EMMY_DUMP_DIR``'s ``*.kernels/`` subdirs that would
     otherwise silently get skipped). Mirror of scp_file()."""
     scp_args = [
         "scp",

@@ -1,7 +1,7 @@
-"""``deplodock serve`` — vLLM embedding serving with deplodock kernels, one command.
+"""``emmy serve`` — vLLM embedding serving with emmy kernels, one command.
 
-Wraps ``vllm serve`` with the ``deplodock/serving`` plugin boilerplate
-(``--runner pooling --enforce-eager --hf-overrides …DeplodockEmbedModel…``,
+Wraps ``vllm serve`` with the ``emmy/serving`` plugin boilerplate
+(``--runner pooling --enforce-eager --hf-overrides …EmmyEmbedModel…``,
 plus ``--max-model-len 4096`` — the dynamic-dim cap — and
 ``--gpu-memory-utilization=0.9`` unless overridden), and passes any
 unrecognized flags through to vLLM verbatim. ``--stock`` drops the
@@ -11,11 +11,11 @@ server, wait for ``/health``, run ``vllm bench serve --backend
 openai-embeddings`` against it, print the result table, and shut the server
 down.
 
-    deplodock serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8
-    deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
-    deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --stock     # baseline
+    emmy serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8
+    emmy serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
+    emmy serve Qwen/Qwen3-Embedding-0.6B --bench --stock     # baseline
 
-Flag routing: deplodock's own flags (``--bench``, ``--stock``, the bench
+Flag routing: emmy's own flags (``--bench``, ``--stock``, the bench
 params, ``--dry-run``) are extracted wherever they appear; everything else is
 forwarded to ``vllm serve``. Tokens after a literal ``--`` are forwarded
 verbatim without extraction (the escape hatch for a hypothetical name clash).
@@ -40,13 +40,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_MODEL_LEN = "4096"
 _DEFAULT_GPU_MEMORY_UTILIZATION = "0.9"
 
-_PLUGIN_ARGS = ["--enforce-eager", "--hf-overrides", '{"architectures": ["DeplodockEmbedModel"]}']
+_PLUGIN_ARGS = ["--enforce-eager", "--hf-overrides", '{"architectures": ["EmmyEmbedModel"]}']
 
 _HEALTH_TIMEOUT_S = 1800  # first boot compiles the whole model; warm cubin cache is much faster
 
 
 def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
-    """The deplodock-side flags, declared twice: on the subparser (for --help
+    """The emmy-side flags, declared twice: on the subparser (for --help
     and flags placed before MODEL) and on the post-MODEL re-parse (with
     SUPPRESS defaults, so only flags actually present override)."""
 
@@ -54,13 +54,13 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
         return argparse.SUPPRESS if suppress_defaults else value
 
     parser.add_argument(
-        "--stock", action="store_true", default=d(False), help="Serve stock vLLM kernels instead of the deplodock plugin (A/B baseline)."
+        "--stock", action="store_true", default=d(False), help="Serve stock vLLM kernels instead of the emmy plugin (A/B baseline)."
     )
     parser.add_argument(
         "--generate",
         action="store_true",
         default=d(False),
-        help="Serve a generative (chat) model via DeplodockGenModel (--runner generate, fp16) instead of embeddings.",
+        help="Serve a generative (chat) model via EmmyGenModel (--runner generate, fp16) instead of embeddings.",
     )
     parser.add_argument(
         "--bench",
@@ -80,8 +80,8 @@ def _add_own_flags(parser, *, suppress_defaults: bool) -> None:
 def register_serve_command(subparsers):
     parser = subparsers.add_parser(
         "serve",
-        help="Serve an embedding model via vLLM with deplodock-compiled kernels (optionally benchmark it)",
-        description="Wraps `vllm serve` with the deplodock plugin flags; unrecognized flags pass through to vLLM "
+        help="Serve an embedding model via vLLM with emmy-compiled kernels (optionally benchmark it)",
+        description="Wraps `vllm serve` with the emmy plugin flags; unrecognized flags pass through to vLLM "
         "(tokens after a literal `--` pass through verbatim).",
         allow_abbrev=False,
     )
@@ -98,7 +98,7 @@ def register_serve_command(subparsers):
 
 def _split_own_flags(args) -> list[str]:
     """argparse REMAINDER swallows *everything* after MODEL — including our own
-    flags. Re-parse the remainder: extract deplodock flags into ``args``
+    flags. Re-parse the remainder: extract emmy flags into ``args``
     (SUPPRESS defaults → only flags actually present override), forward the
     rest; anything after a literal ``--`` forwards without extraction."""
     rem = list(args.vllm_args)
@@ -128,9 +128,9 @@ def _flag_value(vllm_args: list[str], flag: str, default: str) -> str:
 def build_serve_cmd(model: str, *, stock: bool, vllm_args: list[str], generate: bool = False) -> list[str]:
     cmd = ["vllm", "serve", model, "--runner", "generate" if generate else "pooling"]
     if not stock and generate:
-        cmd += ["--enforce-eager", "--hf-overrides", '{"architectures": ["DeplodockGenModel"]}']
-        # Force fp16 across the deplodock↔vLLM seam: vLLM defaults --dtype auto → bf16 for a
-        # bf16 checkpoint, but the deplodock trunk emits fp16. Reject an incompatible override.
+        cmd += ["--enforce-eager", "--hf-overrides", '{"architectures": ["EmmyGenModel"]}']
+        # Force fp16 across the emmy↔vLLM seam: vLLM defaults --dtype auto → bf16 for a
+        # bf16 checkpoint, but the emmy trunk emits fp16. Reject an incompatible override.
         if _has_flag(vllm_args, "--dtype"):
             dt = _flag_value(vllm_args, "--dtype", "")
             if dt not in ("float16", "half", "fp16"):
@@ -181,7 +181,7 @@ def build_bench_cmd(model: str, *, port: str, max_concurrency: int, num_prompts:
 
 def _vllm_bin() -> str:
     """The vllm console script from this interpreter's environment (so the
-    plugin entry point installed alongside deplodock is the one that loads),
+    plugin entry point installed alongside emmy is the one that loads),
     falling back to PATH."""
     candidate = Path(sys.executable).parent / "vllm"
     if candidate.exists():
@@ -228,7 +228,7 @@ def handle_serve(args):
 
 
 def _serve_and_bench(serve_cmd: list[str], bench_cmd: list[str], port: str) -> None:
-    log_file = tempfile.NamedTemporaryFile(mode="wb", prefix="deplodock-serve-", suffix=".log", delete=False)
+    log_file = tempfile.NamedTemporaryFile(mode="wb", prefix="emmy-serve-", suffix=".log", delete=False)
     logger.info("Starting server (logs: %s)...", log_file.name)
     logger.info("  %s", shlex.join(serve_cmd))
     server = subprocess.Popen(serve_cmd, stdout=log_file, stderr=subprocess.STDOUT)

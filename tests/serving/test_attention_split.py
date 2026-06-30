@@ -46,7 +46,7 @@ def test_split_matches_eager_block(arch):
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
 
-    from deplodock.compiler.trace.huggingface import build_attention_split_wrapper, build_causal_mask
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper, build_causal_mask
 
     if arch == "qwen3":
         config = transformers.Qwen3Config(
@@ -103,7 +103,7 @@ def test_pre_emits_2d_seam_shapes():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
 
-    from deplodock.compiler.trace.huggingface import build_attention_split_wrapper
+    from emmy.compiler.trace.huggingface import build_attention_split_wrapper
 
     config = transformers.Qwen3Config(
         vocab_size=64,

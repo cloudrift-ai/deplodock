@@ -1,10 +1,10 @@
 """Decompose MatmulOp into unsqueeze(A) * unsqueeze(B) → reduce_sum [→ add(bias)]."""
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     matmul_decompose,
     open_fragment,

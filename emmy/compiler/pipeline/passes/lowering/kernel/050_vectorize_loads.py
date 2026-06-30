@@ -73,7 +73,7 @@ alignment promise — https://developer.nvidia.com/blog/cuda-pro-tip-increase-pe
 The pass folds the runs anyway so ``--ir kernel`` / ``--ir cuda`` show one
 wide ``Load`` matching the hand-written SGEMM shape. ``VECTORIZE_LOADS`` is
 *not* a search dimension — only ``True`` is enumerated, so the autotuner never
-forks on it. ``DEPLODOCK_VECTORIZE_LOADS=0`` is a manual override for the
+forks on it. ``EMMY_VECTORIZE_LOADS=0`` is a manual override for the
 scalar-load form.
 """
 
@@ -81,13 +81,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
-from deplodock.compiler.ir.stmt import Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import Source, StageBundle, TileOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
+from emmy.compiler.ir.stmt import Body, Load, Stmt
+from emmy.compiler.ir.tile.ir import Source, StageBundle, TileOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -109,7 +109,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match
     if VECTORIZE_LOADS.name in top.knobs:
         raise RuleSkipped("VECTORIZE_LOADS already decided (idempotence via knob)")
     # Only ``True`` is enumerated, so the autotuner never forks on this knob;
-    # ``DEPLODOCK_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
+    # ``EMMY_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
     # pin authoritatively, even when it is not in the candidate set).
     if not VECTORIZE_LOADS.narrow((True,))[0]:
         return TileOp(body=top.body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: False})

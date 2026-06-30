@@ -1,17 +1,17 @@
-"""Tests for fixed-host mode (--local / --ssh) of `deplodock bench`."""
+"""Tests for fixed-host mode (--local / --ssh) of `emmy bench`."""
 
 import os
 
 import pytest
 
-from deplodock.benchmark.fixed_hosts import (
+from emmy.benchmark.fixed_hosts import (
     AllocatedHost,
     parse_ssh_target,
     resolve_fixed_hosts,
     validate_hosts_cover_groups,
 )
-from deplodock.planner import ExecutionGroup
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.planner import ExecutionGroup
+from emmy.provisioning.types import VMConnectionInfo
 
 
 def test_parse_ssh_target_default_port():

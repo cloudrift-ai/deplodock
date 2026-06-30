@@ -16,21 +16,21 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.graph import Graph, Tensor, _fmt_op
-from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
-from deplodock.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
-from deplodock.compiler.pipeline.fork import Fork, OptionFork
-from deplodock.compiler.pipeline.pipeline import Cursor
-from deplodock.compiler.pipeline.rule_diff import display_name, render_rule_diff
+from emmy.compiler.graph import Graph, Tensor, _fmt_op
+from emmy.compiler.ir.base import ConstantOp, InputOp, Op
+from emmy.compiler.pipeline.dump import _inline_scalar_loads, _scalar_constant_inputs
+from emmy.compiler.pipeline.fork import Fork, OptionFork
+from emmy.compiler.pipeline.pipeline import Cursor
+from emmy.compiler.pipeline.rule_diff import display_name, render_rule_diff
 
 # Use the engine logger so the existing debug-emit toggles (rule-
 # skipped lines under ``compile -vv``) keep working without callers
 # having to also bump this module's level.
-_logger = logging.getLogger("deplodock.compiler.pipeline")
+_logger = logging.getLogger("emmy.compiler.pipeline")
 
 if TYPE_CHECKING:
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline.pipeline import Match, Run
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline.pipeline import Match, Run
 
 
 @dataclass
@@ -79,8 +79,8 @@ class Candidate:
         is skipped by the rule's own idempotence guard. The
         multi-option return path is the one exception: the cursor
         advance is left to the eventual fork's apply on resolve."""
-        from deplodock.compiler.pipeline.pipeline import RuleSkipped  # noqa: PLC0415
-        from deplodock.compiler.pipeline.rule_diff import emit, format_skipped  # noqa: PLC0415
+        from emmy.compiler.pipeline.pipeline import RuleSkipped  # noqa: PLC0415
+        from emmy.compiler.pipeline.rule_diff import emit, format_skipped  # noqa: PLC0415
 
         if not match.is_alive():
             # Earlier applies in this batch invalidated the match's
@@ -189,7 +189,7 @@ class Candidate:
             pass_ = match.rule.pass_
             mint_pieces = pass_ is not None and pass_.name.startswith("frontend/decomposition")
             if pass_ is not None and pass_.name.startswith("lowering/"):
-                from deplodock.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
+                from emmy.compiler.pipeline.search.keys import dialect_of  # noqa: PLC0415
 
                 root_op = self.graph.nodes[match.root_node_id].op
                 if dialect_of(root_op) == "loop":
@@ -209,7 +209,7 @@ class Candidate:
         """Render a per-rule diff at DEBUG and route a structured
         record to ``run.dump`` when set. Returns early when
         neither sink is active."""
-        from deplodock.compiler.pipeline.rule_diff import emit  # noqa: PLC0415
+        from emmy.compiler.pipeline.rule_diff import emit  # noqa: PLC0415
 
         rule = match.rule
         pass_ = rule.pass_
@@ -241,7 +241,7 @@ class LazyCandidate:
     Sibling forks at the same rewrite point share ``inner`` by reference
     — only one snapshot is ever held in memory per fork point. Each
     sibling's ``pending`` carries its own :class:`Fork` (branch or leaf;
-    see :class:`deplodock.compiler.pipeline.fork.Fork`).
+    see :class:`emmy.compiler.pipeline.fork.Fork`).
 
     :meth:`from_option` is the supported way to spawn a non-trivial
     LazyCandidate — it lifts concrete ``Op`` / ``Graph`` options into
@@ -361,7 +361,7 @@ def _graph_decision_knobs(graph: Graph) -> dict:
     kernels — the cut's producer/consumer stamp the decision; the graph itself
     has none. Lets the outer prior rank a structural decomposition option (else
     it scores as a knob-less generic row, never preferred)."""
-    from deplodock.compiler.pipeline.search.keys import structural_decision_delta  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.keys import structural_decision_delta  # noqa: PLC0415
 
     for node in graph.nodes.values():
         hit = structural_decision_delta(getattr(node.op, "knobs", None) or {})
@@ -501,8 +501,8 @@ def _validate_reason(op: Op, ctx: Context) -> str:
     try:
         from math import prod  # noqa: PLC0415
 
-        from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+        from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
     except ImportError:
         return ""
     if not isinstance(op, KernelOp):

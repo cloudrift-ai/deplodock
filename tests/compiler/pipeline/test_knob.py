@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-import deplodock.compiler.pipeline.knob as knob_mod
-from deplodock.compiler.pipeline.knob import (
+import emmy.compiler.pipeline.knob as knob_mod
+from emmy.compiler.pipeline.knob import (
     Knob,
     KnobType,
     apply_knobs_env,
@@ -87,8 +87,8 @@ def test_binmask_requires_width():
 
 
 def test_env_property():
-    assert Knob("BN", KnobType.INT).env == "DEPLODOCK_BN"
-    assert Knob("STAGE", KnobType.BINMASK).env == "DEPLODOCK_STAGE"
+    assert Knob("BN", KnobType.INT).env == "EMMY_BN"
+    assert Knob("STAGE", KnobType.BINMASK).env == "EMMY_STAGE"
 
 
 # ---------------------------------------------------------------------------
@@ -98,13 +98,13 @@ def test_env_property():
 
 def test_narrow_unpinned_returns_candidates_unchanged(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    monkeypatch.delenv("EMMY_BN", raising=False)
     assert k.narrow((16, 32, 64)) == (16, 32, 64)
 
 
 def test_narrow_pinned_keeps_matching_candidate(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "32")
+    monkeypatch.setenv("EMMY_BN", "32")
     assert k.narrow((16, 32, 64)) == (32,)
 
 
@@ -113,50 +113,50 @@ def test_narrow_pinned_out_of_set_is_authoritative(monkeypatch):
     # tuple is honored, not silently dropped. Downstream structural gates
     # (divisibility, threads-per-CTA budget, …) still apply.
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "128")
+    monkeypatch.setenv("EMMY_BN", "128")
     assert k.narrow((16, 32, 64)) == (128,)
 
 
 def test_narrow_accepts_arbitrary_iterable(monkeypatch):
     k = Knob("BN", KnobType.INT)
-    monkeypatch.setenv("DEPLODOCK_BN", "16")
+    monkeypatch.setenv("EMMY_BN", "16")
     # generator, not a tuple
     assert k.narrow(x for x in (8, 16, 32)) == (16,)
 
 
 def test_narrow_bool(monkeypatch):
     k = Knob("FLAG", KnobType.BOOL)
-    monkeypatch.setenv("DEPLODOCK_FLAG", "true")
+    monkeypatch.setenv("EMMY_FLAG", "true")
     assert k.narrow((True, False)) == (True,)
-    monkeypatch.setenv("DEPLODOCK_FLAG", "0")
+    monkeypatch.setenv("EMMY_FLAG", "0")
     assert k.narrow((True, False)) == (False,)
 
 
 def test_narrow_binmask_rejected(monkeypatch):
     k = Knob("STAGE", KnobType.BINMASK)
-    monkeypatch.setenv("DEPLODOCK_STAGE", "111")
+    monkeypatch.setenv("EMMY_STAGE", "111")
     with pytest.raises(ValueError, match="BINMASK"):
         k.narrow((0b000, 0b111))
 
 
 def test_raw_alias_fallback(monkeypatch):
-    """``Knob.raw`` reads the primary ``DEPLODOCK_<NAME>`` first, then each
+    """``Knob.raw`` reads the primary ``EMMY_<NAME>`` first, then each
     alias in declaration order (e.g. ``MMA`` accepting ``ATOM_KIND``)."""
     k = Knob("NEWNAME", KnobType.STR, aliases=("OLDNAME",))
-    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
-    monkeypatch.delenv("DEPLODOCK_OLDNAME", raising=False)
+    monkeypatch.delenv("EMMY_NEWNAME", raising=False)
+    monkeypatch.delenv("EMMY_OLDNAME", raising=False)
     assert k.raw() is None
-    monkeypatch.setenv("DEPLODOCK_OLDNAME", "via-alias")
+    monkeypatch.setenv("EMMY_OLDNAME", "via-alias")
     assert k.raw() == "via-alias"
-    monkeypatch.setenv("DEPLODOCK_NEWNAME", "primary")
+    monkeypatch.setenv("EMMY_NEWNAME", "primary")
     assert k.raw() == "primary"
 
 
 def test_narrow_reads_alias(monkeypatch):
     """``Knob.narrow`` honors an alias-spelled env pin."""
     k = Knob("NEWNAME", KnobType.INT, aliases=("OLDNAME",))
-    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
-    monkeypatch.setenv("DEPLODOCK_OLDNAME", "8")
+    monkeypatch.delenv("EMMY_NEWNAME", raising=False)
+    monkeypatch.setenv("EMMY_OLDNAME", "8")
     assert k.narrow((1, 2)) == (8,)
 
 
@@ -217,7 +217,7 @@ def test_warp_tile_features_from_warp_tile():
     ``BM=BN=0`` OFF sentinels never feed a scalar tile. Atom dims (16×8 for
     ``m16n8k16``) come from the MMA featurizer in the real pipeline; here passed
     directly to avoid needing the registry loaded."""
-    from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
 
     wf = _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2, "SPLITK": 1, "S_ext_free_prod": 2048 * 2048}, 16.0, 8.0)
     assert wf["D_threads"] == 128.0  # WM·WN·32
@@ -228,63 +228,63 @@ def test_warp_tile_features_from_warp_tile():
 
 
 # ---------------------------------------------------------------------------
-# DEPLODOCK_KNOBS aggregate env var
+# EMMY_KNOBS aggregate env var
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def _restore_deplodock_env():
-    """``apply_knobs_env`` writes ``DEPLODOCK_<K>`` via ``config.set_knob`` —
+def _restore_emmy_env():
+    """``apply_knobs_env`` writes ``EMMY_<K>`` via ``config.set_knob`` —
     a direct ``os.environ`` write monkeypatch can't undo (``delenv`` on an
     absent var records nothing to restore), so splatted pins used to leak
     into later tests in the same xdist worker (pin-sensitive planner tests
     then enumerate under stray ``BK``/``BM``/``BN`` pins). Snapshot + restore
-    the whole ``DEPLODOCK_*`` namespace around each test."""
+    the whole ``EMMY_*`` namespace around each test."""
     import os  # noqa: PLC0415
 
-    saved = {k: v for k, v in os.environ.items() if k.startswith("DEPLODOCK_")}
+    saved = {k: v for k, v in os.environ.items() if k.startswith("EMMY_")}
     yield
-    for k in [k for k in os.environ if k.startswith("DEPLODOCK_")]:
+    for k in [k for k in os.environ if k.startswith("EMMY_")]:
         if k not in saved:
             del os.environ[k]
     os.environ.update(saved)
 
 
 def test_apply_knobs_env_splats_into_individual_keys(monkeypatch):
-    """Aggregate env var sets ``DEPLODOCK_<K>`` per entry."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BN", raising=False)
+    """Aggregate env var sets ``EMMY_<K>`` per entry."""
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.delenv("EMMY_BM", raising=False)
+    monkeypatch.delenv("EMMY_BN", raising=False)
     applied = apply_knobs_env("BK=2,BM=16,BN=128")
-    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16", "DEPLODOCK_BN": "128"}
+    assert applied == {"EMMY_BK": "2", "EMMY_BM": "16", "EMMY_BN": "128"}
 
 
 def test_apply_knobs_env_individual_takes_precedence(monkeypatch):
-    """An explicit ``DEPLODOCK_<K>`` wins over the aggregate."""
-    monkeypatch.setenv("DEPLODOCK_BK", "4")
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    """An explicit ``EMMY_<K>`` wins over the aggregate."""
+    monkeypatch.setenv("EMMY_BK", "4")
+    monkeypatch.delenv("EMMY_BM", raising=False)
     applied = apply_knobs_env("BK=2,BM=16")
-    assert "DEPLODOCK_BK" not in applied  # not clobbered
-    assert applied == {"DEPLODOCK_BM": "16"}
+    assert "EMMY_BK" not in applied  # not clobbered
+    assert applied == {"EMMY_BM": "16"}
     import os
 
-    assert os.environ["DEPLODOCK_BK"] == "4"
-    assert os.environ["DEPLODOCK_BM"] == "16"
+    assert os.environ["EMMY_BK"] == "4"
+    assert os.environ["EMMY_BM"] == "16"
 
 
 def test_apply_knobs_env_tolerates_whitespace(monkeypatch):
     """Whitespace around keys / values / separators is stripped."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.delenv("DEPLODOCK_BM", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.delenv("EMMY_BM", raising=False)
     applied = apply_knobs_env(" BK = 2 ,  BM=16 ")
-    assert applied == {"DEPLODOCK_BK": "2", "DEPLODOCK_BM": "16"}
+    assert applied == {"EMMY_BK": "2", "EMMY_BM": "16"}
 
 
 def test_apply_knobs_env_skips_empty_entries(monkeypatch):
     """Empty entries (trailing comma, double comma) are skipped."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
     applied = apply_knobs_env("BK=2,,")
-    assert applied == {"DEPLODOCK_BK": "2"}
+    assert applied == {"EMMY_BK": "2"}
 
 
 def test_apply_knobs_env_rejects_missing_equals():
@@ -301,9 +301,9 @@ def test_apply_knobs_env_rejects_empty_key():
 
 def test_parse_knob_spec_grammar():
     """``parse_knob_spec`` is the one owner of the ``K1=V1,K2=V2`` grammar
-    (``DEPLODOCK_KNOBS`` splat + ``run --ab``): uppercased keys in spec order,
+    (``EMMY_KNOBS`` splat + ``run --ab``): uppercased keys in spec order,
     whitespace tolerated, empties skipped, values kept as raw strings."""
-    from deplodock.compiler.pipeline.knob import parse_knob_spec
+    from emmy.compiler.pipeline.knob import parse_knob_spec
 
     assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=110 ") == {"BK": "2", "BM": "16", "STAGE": "110"}
     assert parse_knob_spec("") == {}
@@ -313,9 +313,9 @@ def test_parse_knob_spec_grammar():
 
 def test_apply_knobs_env_uppercases_key(monkeypatch):
     """Lowercased keys round-trip to the upper-case env-var convention."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
+    monkeypatch.delenv("EMMY_BK", raising=False)
     applied = apply_knobs_env("bk=2")
-    assert applied == {"DEPLODOCK_BK": "2"}
+    assert applied == {"EMMY_BK": "2"}
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +350,7 @@ def test_knob_features_typed_knobs(monkeypatch):
 def test_knob_features_mma_expansion():
     # MMA expansion now dispatches through the MMA Knob's ``features`` callable,
     # so the declaring module must be loaded + present in the registry.
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knobs  # noqa: F401, PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knobs  # noqa: F401, PLC0415
 
     knob_mod.reset_registry()
     feats = knob_features({"MMA": "mma_m16n8k16_f16"})
@@ -401,7 +401,7 @@ def test_format_tuning_knobs_skips_struct():
 
 def test_format_tuning_knobs_canonical_order():
     """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
-    alphabetical — shared with the ``deplodock eval`` golden tables. (Uses a
+    alphabetical — shared with the ``emmy eval`` golden tables. (Uses a
     tier-consistent warp dict so the tier-foreign display filter doesn't drop
     anything — a warp variant carries WM/WN/MMA, not BM/BN.)"""
     out = format_tuning_knobs({"SPLITK": 1, "WN": 4, "WM": 2, "BK": 64, "MMA": "x", "FM": 4})
@@ -409,8 +409,8 @@ def test_format_tuning_knobs_canonical_order():
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
-    """With no ``raw`` argument, the function reads ``DEPLODOCK_KNOBS``."""
-    monkeypatch.delenv("DEPLODOCK_BK", raising=False)
-    monkeypatch.setenv("DEPLODOCK_KNOBS", "BK=8")
+    """With no ``raw`` argument, the function reads ``EMMY_KNOBS``."""
+    monkeypatch.delenv("EMMY_BK", raising=False)
+    monkeypatch.setenv("EMMY_KNOBS", "BK=8")
     applied = apply_knobs_env()
-    assert applied == {"DEPLODOCK_BK": "8"}
+    assert applied == {"EMMY_BK": "8"}

@@ -15,7 +15,7 @@ model:
 #     or more concurrency. Short-context throughput (2000-tok) is excellent at any TP.
 #   - TP1 (1 GPU) is INFEASIBLE: resident weights ~149 GB > 141 GB on a single H200 (OOM). 2 GPUs is the floor.
 #     (Weights are not compactly expert-sharded at low TP: ~74 GiB/GPU at TP2 vs ~21 GiB/GPU at TP4.)
-# To deploy this single TP2 instance on a multi-GPU host, pass --gpu-count 2 (else deplodock scale-out adds
+# To deploy this single TP2 instance on a multi-GPU host, pass --gpu-count 2 (else emmy scale-out adds
 # data-parallel replicas to fill all GPUs). The 65,536-ctx short-context benchmark (2000/2000, conc 32, 8xH200
 # DP2xTP4) is recorded under 2026-06-10_15-39-22_6ed122c6/ (3,414 tok/s total, TPOT 15.2 ms).
 engine:
@@ -35,7 +35,7 @@ engine:
       extra_args: "--kv-cache-dtype fp8 --block-size 256 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4"
 
 # Single TP2 instance has --max-num-seqs 16 in-flight slots; keep max_concurrency <= 16.
-# NOTE: `deplodock bench` reads the HF cache path from config.yaml `benchmark.model_dir` (NOT this recipe block);
+# NOTE: `emmy bench` reads the HF cache path from config.yaml `benchmark.model_dir` (NOT this recipe block);
 # on these GCP H200 VMs deploy ssh caches at /mnt/models, so config.yaml is set there to avoid a re-download.
 benchmark:
   max_concurrency: 16

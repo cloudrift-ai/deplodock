@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 
-from deplodock.hardware import gpu_short_name
+from emmy.hardware import gpu_short_name
 
 _KNOWN_ABBREVIATIONS: dict[str, str] = {
     "cache": "cache",

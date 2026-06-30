@@ -28,12 +28,12 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
-from deplodock.compiler.ir.stmt import Accum, Cond, Monoid, Stmt, Write
-from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
+from emmy.compiler.ir.stmt import Accum, Cond, Monoid, Stmt, Write
+from emmy.compiler.ir.tile.ir import RegisterTile, SerialTile, StridedTile
 
 
 class Fold(enum.Enum):
@@ -191,7 +191,7 @@ def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int, barrier_id:
 
     plan = derive_combine_plan(n_threads, warp_size)
 
-    from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
 
     smem_c = _cuda_name(dtype)
     bufs = tuple(f"{st}_smem" for st in state)

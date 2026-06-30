@@ -10,7 +10,7 @@ diagnostics and the per-kernel golden A/B already match on.
 
 It deliberately carries only the extent keys. A *trained* ``CatBoostPrior`` regresses
 on the full ``S_*`` histogram, so the full set is derived (by compiling the snippet)
-and cached on the :class:`~deplodock.compiler.pipeline.search.data.sample.Sample`,
+and cached on the :class:`~emmy.compiler.pipeline.search.data.sample.Sample`,
 not here — see that module's ``compile_s_feats`` path.
 """
 

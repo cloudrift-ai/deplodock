@@ -1,4 +1,4 @@
-"""Online-softmax fusion (``loop/recognize/020_recognize_online_softmax``, ``DEPLODOCK_ONLINE_SOFTMAX``).
+"""Online-softmax fusion (``loop/recognize/020_recognize_online_softmax``, ``EMMY_ONLINE_SOFTMAX``).
 
 The standalone two-pass softmax (row-max reduce + ``Σ exp(x − max)`` reduce + normalize) fuses into a
 single streaming online-softmax ``(m, d)`` ``Monoid`` pass (3 reads of ``x`` → 2). CPU test pins the
@@ -11,18 +11,18 @@ import numpy as np
 import pytest
 import torch
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop, Monoid
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import online_softmax_combine
-from deplodock.compiler.trace.torch import trace_module
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop, Monoid
+from emmy.compiler.pipeline.passes.loop.recognize._flash import online_softmax_combine
+from emmy.compiler.trace.torch import trace_module
 
 from ..conftest import requires_cuda
 
 _fuse = __import__(
-    "deplodock.compiler.pipeline.passes.loop.recognize.020_recognize_online_softmax",
+    "emmy.compiler.pipeline.passes.loop.recognize.020_recognize_online_softmax",
     fromlist=["_fuse"],
 )._fuse
 
@@ -89,9 +89,9 @@ def test_fuse_is_a_noop_on_an_unrelated_reduce_pair() -> None:
 @requires_cuda
 @pytest.mark.parametrize("shape", [(4, 128), (8, 256), (2, 64), (2, 4, 128)])
 def test_online_softmax_matches_torch(monkeypatch, shape) -> None:
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_ONLINE_SOFTMAX", "1")
+    monkeypatch.setenv("EMMY_ONLINE_SOFTMAX", "1")
     torch.manual_seed(0)
     x = torch.randn(*shape)
     graph = trace_module(_Softmax().cpu(), (x,))

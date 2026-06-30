@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Deplodock is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
+Emmy is a Python tool for deploying and benchmarking LLM inference on GPU servers. It supports vLLM and SGLang engines, provides a CLI for local and remote (SSH) deployment of models via Docker Compose, plus automated benchmarking across multiple servers.
 
 The `README.md` is intentionally short — example-driven, no narrative. For details, consult the ARCHITECTURE.md files:
 
-- **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md)
-- **Serving** (vLLM out-of-tree embedding plugin — deplodock-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md)
-- **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`deplodock/recipe/ARCHITECTURE.md`](deplodock/recipe/ARCHITECTURE.md)
-- **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
+- **CLI usage** (deploy local/ssh/cloud, bench, teardown, vm, hardware-aware deploy, fixed-host mode, experiments, CI workflow) → [`emmy/commands/ARCHITECTURE.md`](emmy/commands/ARCHITECTURE.md)
+- **Serving** (vLLM out-of-tree embedding plugin — emmy-compiled kernels behind vLLM's `/v1/embeddings`; `serving` extra) → [`emmy/serving/ARCHITECTURE.md`](emmy/serving/ARCHITECTURE.md)
+- **Recipe format** (matrices/cross/zip combinators, variant filtering, deep merge, named fields, extra_args validation, command recipes, aggregate, docker_options, driver/cuda pinning, SGLang) → [`emmy/recipe/ARCHITECTURE.md`](emmy/recipe/ARCHITECTURE.md)
+- **Compiler** (Graph IR dialects, passes, backends) → [`emmy/compiler/ARCHITECTURE.md`](emmy/compiler/ARCHITECTURE.md) and child docs
 - **Tile lowering** (LoopOp → TileOp: `enumeration` builds the block-DAG `TileGraph` + searches the `Schedule`,
   `assembly` assembles the tower; **purely algebraic moveset — no shape specializations**, dispatch on the carrier
   algebra `MAP`/`SEMIRING`/`MONOID` — flash attention is the `MONOID` algebra on the streaming schedule, a twisted
   monoid is a monoid, selected structurally not as a distinct kind) →
-  [`deplodock/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md)
+  [`emmy/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md`](emmy/compiler/pipeline/passes/lowering/tile/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before answering — they hold details that are no longer in the README.
 
@@ -26,17 +26,17 @@ When the user asks about a CLI flag, recipe field, or matrix combinator, read th
 - `make setup` to create the virtual environment and install dependencies
 - Docker and Docker Compose for local deployments
 - `HF_TOKEN` environment variable for HuggingFace model downloads
-- `DEPLODOCK_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `deplodock run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
-- `DEPLODOCK_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/deplodock/autotune.db`). `deplodock tune` reads from / writes to this path. NOTE: the greedy DB→fork replay (`_best_fork`) that let `compile` / `run` pick a previously-tuned variant was **removed** in the learned-prior work; `compile` / `run` now pick forks from the global `Prior` — a `FallbackPrior` (`search/prior/`) via `Prior.pick`: measured -O3 reservoir evidence first (`evidence_pick` — a config the tune proved fastest at `H_opt=3` beats any unmeasured extrapolation; the evidence ships inside the prior checkpoint, so greedy stays prior-only), the model argmin otherwise (the learned `CatBoostPrior` once trained, the hand-coded `AnalyticPrior` cold — a separate `_W_A_DYN` weight set ranks symbolic-axis masked-tile kernels; option-0 only if no prior loads at all) — not the DB. The learned half is a separate JSON checkpoint (`DEPLODOCK_PRIOR_FILE` → `~/.cache/deplodock/prior.json`); `tune` writes it, `compile` / `run` read it (the `AnalyticPrior` is fixed code, no file).
+- `EMMY_DUMP_DIR` environment variable (optional) — when set, all compiler stages dump intermediate artifacts (graphs, CUDA kernels, execution plans) to this directory for debugging. Per kernel, the dump also writes a `<kname>.torch.json` reproducer — the original PyTorch ops that kernel implements (sliced by op provenance), with an `i/N` coverage header (full vs partial) — runnable via `emmy run --ir <kname>.torch.json --bench` to reproduce accuracy / latency vs torch for that op. Kernels are named after the ops they realize (`k_rms_norm`, `k_sdpa_reduce`)
+- `EMMY_TUNE_DB` environment variable (optional) — overrides the default tuning SQLite cache path (`~/.cache/emmy/autotune.db`). `emmy tune` reads from / writes to this path. NOTE: the greedy DB→fork replay (`_best_fork`) that let `compile` / `run` pick a previously-tuned variant was **removed** in the learned-prior work; `compile` / `run` now pick forks from the global `Prior` — a `FallbackPrior` (`search/prior/`) via `Prior.pick`: measured -O3 reservoir evidence first (`evidence_pick` — a config the tune proved fastest at `H_opt=3` beats any unmeasured extrapolation; the evidence ships inside the prior checkpoint, so greedy stays prior-only), the model argmin otherwise (the learned `CatBoostPrior` once trained, the hand-coded `AnalyticPrior` cold — a separate `_W_A_DYN` weight set ranks symbolic-axis masked-tile kernels; option-0 only if no prior loads at all) — not the DB. The learned half is a separate JSON checkpoint (`EMMY_PRIOR_FILE` → `~/.cache/emmy/prior.json`); `tune` writes it, `compile` / `run` read it (the `AnalyticPrior` is fixed code, no file).
 
-All `DEPLODOCK_*` config env vars (the two above plus `DEPLODOCK_NVCC_FLAGS`, `DEPLODOCK_DEBUG`, `DEPLODOCK_KNOBS`,
-`DEPLODOCK_TUNE_PATIENCE`, `DEPLODOCK_TUNE_EPS`, `DEPLODOCK_O3_TOL`, `DEPLODOCK_ANALYTIC_TILT`, `DEPLODOCK_BENCH_BACKENDS`,
-`DEPLODOCK_CUBIN_CACHE`, `DEPLODOCK_NO_NVCC`, `DEPLODOCK_GPU_LOCK`, `DEPLODOCK_SERVING_STATIC` (static batched serving))
-are read and written through a single module, `deplodock/config.py` — the sole owner of `os.environ` for these vars.
+All `EMMY_*` config env vars (the two above plus `EMMY_NVCC_FLAGS`, `EMMY_DEBUG`, `EMMY_KNOBS`,
+`EMMY_TUNE_PATIENCE`, `EMMY_TUNE_EPS`, `EMMY_O3_TOL`, `EMMY_ANALYTIC_TILT`, `EMMY_BENCH_BACKENDS`,
+`EMMY_CUBIN_CACHE`, `EMMY_NO_NVCC`, `EMMY_GPU_LOCK`, `EMMY_SERVING_STATIC` (static batched serving))
+are read and written through a single module, `emmy/config.py` — the sole owner of `os.environ` for these vars.
 CLI `--flag` overrides (e.g. `--nvcc-flags`) resolve via `config.set_nvcc_flags` inside the library, not in the command
-layer, so programmatic callers and tests get the same precedence. The dynamic `DEPLODOCK_<KNOB>` namespace is owned by
+layer, so programmatic callers and tests get the same precedence. The dynamic `EMMY_<KNOB>` namespace is owned by
 `compiler/pipeline/knob.py` (which borrows `config.knob_var` / `config.knob_raw`); provider/secret vars stay with
-`deplodock/redact.py`.
+`emmy/redact.py`.
 
 ## Running Tests
 
@@ -47,7 +47,7 @@ make test
 `make test` compiles CUDA kernels at **`-Xcicc -O1`** (the suite is `nvcc`/`cicc`-compile-bound, not GPU-bound — `-O1`
 dodges the cicc/LLVM unroll blowup on big register-tile kernels, ~3× faster wall time). This is the **correctness lane**:
 `-O1` changes runtime perf, not numerics, and the deployable perf tests (`tests/perf`, `-m perf`) are skipped here — they
-run at `-O3` via `make bench-kernels`. To re-run the suite at deployable `-O3`, prefix `DEPLODOCK_NVCC_FLAGS=` (empty) or
+run at `-O3` via `make bench-kernels`. To re-run the suite at deployable `-O3`, prefix `EMMY_NVCC_FLAGS=` (empty) or
 run `pytest` directly.
 
 Or for a specific test file:
@@ -67,54 +67,54 @@ same worker.
 
 ## CLI Commands
 
-- `deplodock deploy local ...` — deploy locally via docker compose
-- `deplodock deploy ssh ...` — deploy to remote server via SSH
-- `deplodock deploy cloud ...` — provision a cloud VM and deploy via SSH
-- `deplodock bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
-- `deplodock bench recipes/* --filter "KEY=PATTERN"` — run only variants matching the filter (fnmatch glob, repeatable, AND logic)
-- `deplodock bench experiments/...` — run an experiment (results stored in the experiment dir)
+- `emmy deploy local ...` — deploy locally via docker compose
+- `emmy deploy ssh ...` — deploy to remote server via SSH
+- `emmy deploy cloud ...` — provision a cloud VM and deploy via SSH
+- `emmy bench recipes/* ...` — deploy + benchmark + teardown on cloud VMs (recipe dirs as positional args)
+- `emmy bench recipes/* --filter "KEY=PATTERN"` — run only variants matching the filter (fnmatch glob, repeatable, AND logic)
+- `emmy bench experiments/...` — run an experiment (results stored in the experiment dir)
 - **Timing metrics**: `deploy` and `bench` time each rental/deploy phase (vm/remote provision, image pull, model
-  download, model load + CUDA-graph warmup, smoke test, benchmark, teardown) via `deplodock/timing.py::PhaseTimer`.
+  download, model load + CUDA-graph warmup, smoke test, benchmark, teardown) via `emmy/timing.py::PhaseTimer`.
   `bench` stores them in each task's `.json` (`"timing"` key) + `.txt` (`=== Timing ===` section) and prints a `TIMING`
   summary table; standalone `deploy` commands print the breakdown (display-only). See
-  [`deplodock/commands/ARCHITECTURE.md`](deplodock/commands/ARCHITECTURE.md) → Timing metrics.
-- `deplodock teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
-- `deplodock vm create gpu --gpu NAME --gpu-count N [--provider X] [--provisioning-model {FLEX_START,SPOT,STANDARD}] [--authorized-key PATH ...]` — create a VM by GPU name (orchestrator: retries, candidate fallback, orphan cleanup). `--provisioning-model` overrides the per-GPU hardware-table default (`STANDARD` = on-demand) while keeping the orchestrator's full config.yaml/SSH treatment; GCP-only, ignored for CloudRift. `--authorized-key` (repeatable, also on `deploy cloud`) installs extra SSH public keys in the VM's authorized_keys alongside `--ssh-key`'s own `.pub`
-- `deplodock vm create gcp ...` — create a specific GCP GPU VM (single-shot manual)
-- `deplodock vm create cloudrift ...` — create a specific CloudRift GPU VM (single-shot manual)
-- `deplodock vm delete gcp ...` — delete a GCP GPU VM
-- `deplodock vm delete cloudrift ...` — delete a CloudRift GPU VM
-- `deplodock serve <model> [--stock] [--bench] [vllm flags...]` — serve an embedding model via `vllm serve` with the
-  deplodock plugin flags baked in (`--runner pooling --enforce-eager --hf-overrides …DeplodockEmbedModel…`, default
+  [`emmy/commands/ARCHITECTURE.md`](emmy/commands/ARCHITECTURE.md) → Timing metrics.
+- `emmy teardown <run_dir>` — clean up VMs left running by `bench --no-teardown`
+- `emmy vm create gpu --gpu NAME --gpu-count N [--provider X] [--provisioning-model {FLEX_START,SPOT,STANDARD}] [--authorized-key PATH ...]` — create a VM by GPU name (orchestrator: retries, candidate fallback, orphan cleanup). `--provisioning-model` overrides the per-GPU hardware-table default (`STANDARD` = on-demand) while keeping the orchestrator's full config.yaml/SSH treatment; GCP-only, ignored for CloudRift. `--authorized-key` (repeatable, also on `deploy cloud`) installs extra SSH public keys in the VM's authorized_keys alongside `--ssh-key`'s own `.pub`
+- `emmy vm create gcp ...` — create a specific GCP GPU VM (single-shot manual)
+- `emmy vm create cloudrift ...` — create a specific CloudRift GPU VM (single-shot manual)
+- `emmy vm delete gcp ...` — delete a GCP GPU VM
+- `emmy vm delete cloudrift ...` — delete a CloudRift GPU VM
+- `emmy serve <model> [--stock] [--bench] [vllm flags...]` — serve an embedding model via `vllm serve` with the
+  emmy plugin flags baked in (`--runner pooling --enforce-eager --hf-overrides …EmmyEmbedModel…`, default
   `--max-model-len 4096`); unrecognized flags forward to vLLM (after a literal `--`, verbatim). `--stock` drops the
   plugin for the raw-vLLM baseline (same max-model-len → apples-to-apples A/B in two invocations). `--bench` makes it
   a one-shot benchmark: start server → wait `/health` → `vllm bench serve --backend openai-embeddings`
   (`--max-concurrency`/`--num-prompts`/`--random-input-len`/`--bench-seed`) → print results → shut down. Needs the
   `serving` extra.
-- `deplodock serve <model> --generate [vllm flags...]` — serve a **generative (chat)** model via `DeplodockGenModel`
+- `emmy serve <model> --generate [vllm flags...]` — serve a **generative (chat)** model via `EmmyGenModel`
   (Phase 3 of `plans/generative-inference-support.md`): `--runner generate`, forces `--dtype float16` (seam coherence;
   rejects an incompatible `--dtype`), keeps `--enforce-eager`. vLLM owns the API / sampler / scheduler / paged
-  KV-cache / `lm_head`; deplodock-compiled per-layer kernels (`serving/gen_runner.py::DeplodockGenRunner`) own embed +
+  KV-cache / `lm_head`; emmy-compiled per-layer kernels (`serving/gen_runner.py::EmmyGenRunner`) own embed +
   trunk, with vLLM's `Attention` carved into the per-layer forward. `serving/vllm_model_gen.py`.
-- `deplodock pull <model>` — download a HuggingFace model to local cache
-- `deplodock generate <model> [--prompt T] [--max-new-tokens N] [--temperature/--top-k/--top-p/--seed] [--chat]` —
+- `emmy pull <model>` — download a HuggingFace model to local cache
+- `emmy generate <model> [--prompt T] [--max-new-tokens N] [--temperature/--top-k/--top-p/--seed] [--chat]` —
   **standalone naive generation oracle** (no vLLM; Phase 0 of `plans/generative-inference-support.md`). Re-runs the
-  whole growing prefix each step (O(S²)) on the deplodock fp16 CUDA backend, samples
+  whole growing prefix each step (O(S²)) on the emmy fp16 CUDA backend, samples
   (`serving/sampling.py::Sampler`), and prints the decoded text. The host loop
   (`commands/generate.py::generate`) is pure/unit-testable; `_CompiledLM` compiles the dynamic whole-model graph (full
   logits, last row sliced on the host — the in-graph `slice_last_logits` slice makes lm_head an M=1 demoted matmul that
   doesn't lower cold). The token-for-token reference for the later vLLM phases.
-- `deplodock trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
-- `deplodock trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
-- `deplodock compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.
-- `deplodock compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
-- `deplodock compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
-- `deplodock compile ... --dynamic NAME@INPUT:AXIS` (repeatable) — make axis `AXIS` of the traced input named `INPUT` symbolic. Forwards to `torch.export(..., dynamic_shapes={INPUT: {AXIS: Dim(NAME)}})`; torch's SymInt propagation threads `Dim(NAME)` through every downstream FX tensor. The compiled CUDA kernel signature gains an `int <NAME>` runtime arg per dim; the launch resolves NAME from input array shapes (one cached kernel runs at any seq_len). A symbolic free axis is tiled for its `Dim` hint (`DEFAULT_SEQ_HINT=512`) and emitted as a **masked tile**: a ceil-div grid over the symbolic extent plus an `if (coord < NAME)` boundary guard, so the hint-sized tile shape stays correct at any runtime size (`tune` benches and `compile` picks the hint-sized variant; the backend benches symbolic graphs at the hint when no inputs are supplied). `run` / `tune` `--bench`'s full-model table also tiles the torch closures' example inputs out to the hint (`commands/run._hint_sized_inputs`) so eager / `torch.compile` / Deplodock all bench one shape, and the table prints a `benched at seq_len=… (symbolic hint)` note. Dumped per-kernel `.torch.json` reproducers keep the symbolic dims: `run --ir` / `tune --bench`'s per-kernel pass bench them at the hint against a hint-shaped torch reference — no `--dynamic` flag needed (and `--ir` rejects it). Symbolic M/N axes reach the **warp/MMA tensor-core tier** as masked mma.sync tiles (per-element store guards, clamped slab fills / gmem-direct loads, runtime ldm), and the structural splits (`010_split_demoted`) offer on symbolic-row **and symbolic-N** graphs (the rotary QK^T's symbolic-N key cone materializes canonically into a warp-tier consumer; the dynamic o_proj's collapsed attn-out splits into a contiguizing `xn` producer + warp-tier consumer; a symbolic dim var in a collapsed-reshape stride is a legitimate read, not an unmodeled-scope bail). A symbolic **K** (reduce) axis now ALSO reaches the warp tier as a **masked-K mma tile**: the K is tiled at the hint (`ceil(seq_len/(BK·atom_k))` `K_o` serial steps) and the final partial slab is **zero-filled in smem** — `_stage_expand` clamps the K gmem index for a safe read and zeroes the loaded value where the K coord `>= seq_len` (`(k < seq_len) ? v : 0`), so the mma accumulates zero past the runtime extent (a clamped *duplicate*, the M/N edge-clamp, would corrupt the reduction). A masked-K bundle is pinned to the **SYNC transport** (cp.async / ring buffers can't ternary a copied value — `040_use_ring_buffers` declines the ring); the `010_split_demoted` cut now **offers on symbolic K** too, so the SDPA P@V demotion un-fuses into a softmax-normalizing `xn` producer + a clean symbolic-K consumer that reaches the tensor-core tier (matching its static twin). The SDPA-prologue **fused** P@V (before that split) still keeps the symbolic axis degenerate at `FM=FN=1`; static-K prologue kernels (fused gated-MLP) and cooperative-reduce kernels also keep the symbolic axis degenerate — their staged pipelines can't coexist with the per-row guard (their deployment path is the split). Cooperative-reduce kernels regain CTA parallelism via **strided-cooperative rows**: static free axes thread-bind alongside the `BR` cooperative lanes (BN·BM > 1 with BR > 1; the combine is a segmented warp shuffle over each row's BR lanes, so those rows' BR clips to powers of two ≤ warp_size), so e.g. a symbolic-seq per-head q/k-norm deploys a `BN×BR` CTA instead of an 8-thread degenerate one. The masked-K mma tier (above) covers both a clean symbolic-K matmul and the **batched** P@V split-consumer (16 heads): `classify_matmul_operands` recognizes a B operand `xnb[head, k, n]` whose K dim sits after a leading batch axis (one var dim — the N output — follows K). Only the SDPA-prologue **fused** P@V (before the split) stays degenerate; flash-style fused symbolic-K attention remains future work. Multiple specs sharing a NAME use the same `torch.export.Dim` instance (required so torch recognises e.g. `input_ids:1` and `attention_mask:2` as the same symbol). Examples: `--code` form `--dynamic seq_len@x:1`; whole HF model `--dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1` (the whole-model wrapper switches to `dynamic=True` so mask + position_ids flow in as arg-positions); per-layer (`--layer N`) the single spec `--dynamic seq_len@x:1` (the layer is traced through `trace.huggingface.build_layer_wrapper`, which slices precomputed rotary cos/sin in-graph instead of passing trace-seq-len-specialised `(cos, sin)` kwargs). `--seq-len` only sizes the example tensors handed to `torch.export.export` (defaults to 32); skip it unless you want larger trace inputs. Same flag accepted by `tune` and `run --code`. A **golden config** may record a symbolic M axis itself (YAML `dynamic: {seq_len: {input: x0, axis: 0}}` on a matmul entry; `M` doubles as the hint and must equal `DEFAULT_SEQ_HINT` (512) — the pipeline tiles a symbolic axis at the global hint regardless of trace size, so the schema rejects other values until per-Dim hints are plumbed; `.dynM` name suffix by convention — a dynamic golden is a separate deployment artifact from its static twin, own knobs + latency, never merged): `tune --golden NAME` / `tune --dataset golden` / `run --golden NAME` apply the recorded spec to every (re-)trace automatically, and a CLI `--dynamic` next to `--golden` / `--dataset golden` is rejected (the spec is part of the config, the same way `--ir` rejects it). See `plans/dynamic-shapes.md` and `plans/dynamic-shape-goldens.md`.
-- `deplodock tune` (no model / `--code`) — **offline mode**: refit the global learned prior on its persisted reservoir
+- `emmy trace <model> [--layer N] [--seq-len N]` — trace a transformer layer (or the whole model if `--layer` is omitted) to Graph IR (JSON). Whole-model tracing patches HF's dynamic causal-mask construction via `trace.huggingface.build_full_model_wrapper`.
+- `emmy trace --code "EXPR"` — trace an inline `nn.Module` expression (last stmt must be a call, e.g. `"torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))"`)
+- `emmy compile <model_or_ir> [--layer N] [--seq-len N] [--dump-dir DIR] [--target sm_NN]` — run `decomposition → optimization → fusion` and save the fused `Graph[LoopOp]` (auto-pulls + traces if given a model ID; omit `--layer` for whole-model). `--target sm_NN` (e.g. `sm_80`, `sm_90`, `sm_120`) overrides the live device's compute capability so passes that gate on hardware features (TMA, cp.async) take the target's path.
+- `emmy compile --code "EXPR" [--ir STAGE]` — trace + compile an inline `nn.Module` expression in one step (same grammar as `trace --code`; last stmt must be a call)
+- `emmy compile <ir_file> --ir {torch|tensor|loop|kernel|cuda}` — print the requested IR stage to stdout. `loop` renders fused `LoopOp` bodies (post decomposition+optimization+fusion); `kernel` renders the per-kernel AST (post LoopOp→KernelOp lowering); `cuda` renders the per-kernel CUDA source (post KernelOp→CudaOp lowering).
+- `emmy compile ... --dynamic NAME@INPUT:AXIS` (repeatable) — make axis `AXIS` of the traced input named `INPUT` symbolic. Forwards to `torch.export(..., dynamic_shapes={INPUT: {AXIS: Dim(NAME)}})`; torch's SymInt propagation threads `Dim(NAME)` through every downstream FX tensor. The compiled CUDA kernel signature gains an `int <NAME>` runtime arg per dim; the launch resolves NAME from input array shapes (one cached kernel runs at any seq_len). A symbolic free axis is tiled for its `Dim` hint (`DEFAULT_SEQ_HINT=512`) and emitted as a **masked tile**: a ceil-div grid over the symbolic extent plus an `if (coord < NAME)` boundary guard, so the hint-sized tile shape stays correct at any runtime size (`tune` benches and `compile` picks the hint-sized variant; the backend benches symbolic graphs at the hint when no inputs are supplied). `run` / `tune` `--bench`'s full-model table also tiles the torch closures' example inputs out to the hint (`commands/run._hint_sized_inputs`) so eager / `torch.compile` / Emmy all bench one shape, and the table prints a `benched at seq_len=… (symbolic hint)` note. Dumped per-kernel `.torch.json` reproducers keep the symbolic dims: `run --ir` / `tune --bench`'s per-kernel pass bench them at the hint against a hint-shaped torch reference — no `--dynamic` flag needed (and `--ir` rejects it). Symbolic M/N axes reach the **warp/MMA tensor-core tier** as masked mma.sync tiles (per-element store guards, clamped slab fills / gmem-direct loads, runtime ldm), and the structural splits (`010_split_demoted`) offer on symbolic-row **and symbolic-N** graphs (the rotary QK^T's symbolic-N key cone materializes canonically into a warp-tier consumer; the dynamic o_proj's collapsed attn-out splits into a contiguizing `xn` producer + warp-tier consumer; a symbolic dim var in a collapsed-reshape stride is a legitimate read, not an unmodeled-scope bail). A symbolic **K** (reduce) axis now ALSO reaches the warp tier as a **masked-K mma tile**: the K is tiled at the hint (`ceil(seq_len/(BK·atom_k))` `K_o` serial steps) and the final partial slab is **zero-filled in smem** — `_stage_expand` clamps the K gmem index for a safe read and zeroes the loaded value where the K coord `>= seq_len` (`(k < seq_len) ? v : 0`), so the mma accumulates zero past the runtime extent (a clamped *duplicate*, the M/N edge-clamp, would corrupt the reduction). A masked-K bundle is pinned to the **SYNC transport** (cp.async / ring buffers can't ternary a copied value — `040_use_ring_buffers` declines the ring); the `010_split_demoted` cut now **offers on symbolic K** too, so the SDPA P@V demotion un-fuses into a softmax-normalizing `xn` producer + a clean symbolic-K consumer that reaches the tensor-core tier (matching its static twin). The SDPA-prologue **fused** P@V (before that split) still keeps the symbolic axis degenerate at `FM=FN=1`; static-K prologue kernels (fused gated-MLP) and cooperative-reduce kernels also keep the symbolic axis degenerate — their staged pipelines can't coexist with the per-row guard (their deployment path is the split). Cooperative-reduce kernels regain CTA parallelism via **strided-cooperative rows**: static free axes thread-bind alongside the `BR` cooperative lanes (BN·BM > 1 with BR > 1; the combine is a segmented warp shuffle over each row's BR lanes, so those rows' BR clips to powers of two ≤ warp_size), so e.g. a symbolic-seq per-head q/k-norm deploys a `BN×BR` CTA instead of an 8-thread degenerate one. The masked-K mma tier (above) covers both a clean symbolic-K matmul and the **batched** P@V split-consumer (16 heads): `classify_matmul_operands` recognizes a B operand `xnb[head, k, n]` whose K dim sits after a leading batch axis (one var dim — the N output — follows K). Only the SDPA-prologue **fused** P@V (before the split) stays degenerate; flash-style fused symbolic-K attention remains future work. Multiple specs sharing a NAME use the same `torch.export.Dim` instance (required so torch recognises e.g. `input_ids:1` and `attention_mask:2` as the same symbol). Examples: `--code` form `--dynamic seq_len@x:1`; whole HF model `--dynamic seq_len@input_ids:1 --dynamic seq_len@attention_mask:2 --dynamic seq_len@attention_mask:3 --dynamic seq_len@position_ids:1` (the whole-model wrapper switches to `dynamic=True` so mask + position_ids flow in as arg-positions); per-layer (`--layer N`) the single spec `--dynamic seq_len@x:1` (the layer is traced through `trace.huggingface.build_layer_wrapper`, which slices precomputed rotary cos/sin in-graph instead of passing trace-seq-len-specialised `(cos, sin)` kwargs). `--seq-len` only sizes the example tensors handed to `torch.export.export` (defaults to 32); skip it unless you want larger trace inputs. Same flag accepted by `tune` and `run --code`. A **golden config** may record a symbolic M axis itself (YAML `dynamic: {seq_len: {input: x0, axis: 0}}` on a matmul entry; `M` doubles as the hint and must equal `DEFAULT_SEQ_HINT` (512) — the pipeline tiles a symbolic axis at the global hint regardless of trace size, so the schema rejects other values until per-Dim hints are plumbed; `.dynM` name suffix by convention — a dynamic golden is a separate deployment artifact from its static twin, own knobs + latency, never merged): `tune --golden NAME` / `tune --dataset golden` / `run --golden NAME` apply the recorded spec to every (re-)trace automatically, and a CLI `--dynamic` next to `--golden` / `--dataset golden` is rejected (the spec is part of the config, the same way `--ir` rejects it). See `plans/dynamic-shapes.md` and `plans/dynamic-shape-goldens.md`.
+- `emmy tune` (no model / `--code`) — **offline mode**: refit the global learned prior on its persisted reservoir
   dataset (no GPU, no benching) and print diagnostics — per-op **pick reachability** (does the prior's predicted-fastest
   config recover each op's measured-best config?), median ranking calibration (Spearman), and golden-matmul coverage. Use it to see
   whether the prior can actually reach the best configs it's been tuned on (`compiler/pipeline/search/prior/diagnostics.py`).
-- `deplodock tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--gpus N | --devices 0,1,2] [--bench] [-q]` — **two-level** autotune (see
+- `emmy tune <model_or_ir|--code EXPR> [--patience N] [--ucb-c C] [--explore-eps E] [--gpus N | --devices 0,1,2] [--bench] [-q]` — **two-level** autotune (see
   `compiler/pipeline/search/two_level.py`): an outer SP-MCTS over structural forks (the graph-changing
   `frontend`+`loop` passes plus the pre-partition head of `lowering/tile`, where `010_split_demoted`'s keep-vs-split
   offer branches the outer tree — one terminal per kernel set; identical offer sites replay the trajectory's
@@ -135,13 +135,13 @@ same worker.
   variants it surfaces (the old `op_effort` skip-already-tuned gate, which suppressed that re-exploration, is gone).
   Persists `perf` / `lowering` / inventory rows — plus a `node` row per search-tree node (keyed/deduped,
   keep-min value-of-position latency, full feature dict + `parent_key`; written alongside the prior's reservoir,
-  read by `eval prior --dataset nodes`) — to the SQLite cache (path from `DEPLODOCK_TUNE_DB` or `~/.cache/deplodock/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
+  read by `eval prior --dataset nodes`) — to the SQLite cache (path from `EMMY_TUNE_DB` or `~/.cache/emmy/autotune.db`). The inner MCTS (PUCT over the global learned `CatBoostPrior`) stops on
   patience (N consecutive measured terminals without a new best). `--clean` nukes the tuning DB + cubin/kernel caches
   first. **tune compiles kernels at `-Xcicc -O1`** (fast nvcc compile — dodges a cicc/LLVM blowup on big unrolled
   register-tile kernels, up to ~200×) — but **-O1 is NOT runtime-optimal**: reduction/attention kernels can run 1.5–3×
   slower than -O3, so tuned latencies are a *ranking* signal, not deployable numbers (re-bench the winner with
   `--bench` below, or `run --bench`). To keep the **learned prior** deployable anyway, the engine **re-benches at
-  `-Xcicc -O3`** every config **within `DEPLODOCK_O3_TOL` (default 15%) of the best -O1 so far** — not just a strict new
+  `-Xcicc -O3`** every config **within `EMMY_O3_TOL` (default 15%) of the best -O1 so far** — not just a strict new
   global-best — and feeds each as an extra training row tagged `H_opt=3` (so `compile` / `run`, which run at -O3, rank by
   the deployable numbers — the -O1 sweep alone ties configs that differ at -O3, e.g. a reduction's `FK` or a warp tile's
   `WARPSPEC`). The tolerance band gives the prior an -O3 truth sample for every near-best contender, not only the winner;
@@ -157,17 +157,17 @@ same worker.
   last, so the prefix stays put as the per-variant latency changes (no flicker); `-v` shows the per-`[tune]` INFO
   lines instead, `-q` is quiet (errors only, no bar — the final summary still prints). `--bench` re-benches the tuned
   winner at **-O3** (deployable, not the -O1 ranking pass): the full model **against the real torch module** (eager /
-  `torch.compile` / Deplodock, end-to-end) and each kernel via its provenance `.torch.json` reproducer (re-lowered so
-  the tuned forks are picked) vs eager / `torch.compile` / Deplodock, then prints both comparison tables. The
+  `torch.compile` / Emmy, end-to-end) and each kernel via its provenance `.torch.json` reproducer (re-lowered so
+  the tuned forks are picked) vs eager / `torch.compile` / Emmy, then prints both comparison tables. The
   full-model table and the per-kernel rows are timed under **CUDA graph capture** (pure GPU time — the op-by-op torch
   replay is otherwise dispatch-bound, and per-launch dispatch inflates small kernels everywhere); a bench that fails
   capture falls back to uncaptured timing for all its backends and is flagged in a table note. The
   full-model bench is skipped when the input is an `--ir` JSON file (no module available); the per-kernel table still
-  runs. `--bench-backends` defaults to `eager,tcompile,deplodock` (overrides the `run` default that drops tcompile —
+  runs. `--bench-backends` defaults to `eager,tcompile,emmy` (overrides the `run` default that drops tcompile —
   the ~0.8 s JIT is worth paying for the deployable comparison). `--warmup`/`--iters`/`--seed` mirror `run`. When a
-  dump dir is set (`--dump-dir`/`DEPLODOCK_DUMP_DIR`) it also writes an HTML per-kernel chart to
+  dump dir is set (`--dump-dir`/`EMMY_DUMP_DIR`) it also writes an HTML per-kernel chart to
   `<dump-dir>/kernels.html` (+ best-effort `.png`).
-- `deplodock tune --dataset golden [--kernel SUBSTR] [--clean] [...]` — tune **every golden shape** (the built-in
+- `emmy tune --dataset golden [--kernel SUBSTR] [--clean] [...]` — tune **every golden shape** (the built-in
   equivalent of looping `--golden NAME` over `GOLDEN_CONFIGS`; `--kernel SUBSTR` narrows by name). Single-shape and
   golden-set tune go through the **same** codepath: `handle_tune` builds a list of `(label, code, input)` targets via
   `_tune_targets` — the **only** place the two diverge (one target from `--code`/positional/`--golden NAME`, or the
@@ -180,26 +180,26 @@ same worker.
   re-benches each tuned shape at -O3 (works per target — `os._exit` only fires at process end). `--dataset db` is
   rejected (DB rows have no shape to tune). Reuses the shared `--dataset` vocabulary from `commands/dataset_args.py`;
   drives the `tune-golden` skill's tune step.
-- `deplodock run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock end-to-end against the real torch module. The Deplodock row is a **whole-program** measurement — windows around replays of one CUDA graph holding every launch, the same semantics as the captured torch rows; the kernel table's `TOTAL` (sum of per-launch solo windows, which miss cross-kernel cache effects) prints beside a `whole-program (e2e)` footer. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`. NOTE: greedy `run` / `compile` pick forks from the global `Prior` (`FallbackPrior` via `Prior.pick`: measured -O3 reservoir evidence first, else the model argmin — learned `CatBoostPrior` once trained, cold `AnalyticPrior` otherwise), not the DB — so `run` numbers reflect the evidence + prior a previous `tune` checkpointed (and a sensible analytic cold pick before any `tune`). A `.json` positional behaves like `--ir`.
-- `deplodock run --golden NAME [--bench]` — run the named golden config (shorthand for `--code <its snippet>`, same flag as `tune --golden`; unknown NAME lists the names). With `--bench` each recorded golden for the kernel's shape is **compiled with its knobs pinned and benched live this run** (`_bench_golden_variants`), then printed as a row labeled `golden NAME` in the Kernel column (its own measured µs / grid / block / smem / regs / occ; `%` column `--`, since it's not part of the deplodock TOTAL) right beneath the matching greedy-pick kernel — a real A/B, not the stored number. The knob columns are aligned across rows and colored like `deplodock eval` (shared `commands/table` — the knob name is the column header, cells carry the value only): a golden cell is red where it differs from the greedy pick. A golden NAME may map to **multiple** configs (one shape can carry several knob sets, e.g. a newly found faster variant beside the old); each is benched and shown (each re-traces a fresh graph — a frontend graph can't be re-compiled in place).
-- `deplodock run ... --bench --profile` — re-launch the run under `ncu` (curated counter set,
-  `commands/run.py::_NCU_METRICS`) and print an **`ncu compare`** table: the deplodock `k_*` kernels and the
+- `emmy run <model> [--layer N] [--seq-len N] [--bench] [--target sm_NN]` — trace + compile + execute a whole HuggingFace model (or one `--layer`) on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Emmy end-to-end against the real torch module. The Emmy row is a **whole-program** measurement — windows around replays of one CUDA graph holding every launch, the same semantics as the captured torch rows; the kernel table's `TOTAL` (sum of per-launch solo windows, which miss cross-kernel cache effects) prints beside a `whole-program (e2e)` footer. Same positional / `--layer` / `--seq-len` grammar as `compile` / `tune`. NOTE: greedy `run` / `compile` pick forks from the global `Prior` (`FallbackPrior` via `Prior.pick`: measured -O3 reservoir evidence first, else the model argmin — learned `CatBoostPrior` once trained, cold `AnalyticPrior` otherwise), not the DB — so `run` numbers reflect the evidence + prior a previous `tune` checkpointed (and a sensible analytic cold pick before any `tune`). A `.json` positional behaves like `--ir`.
+- `emmy run --golden NAME [--bench]` — run the named golden config (shorthand for `--code <its snippet>`, same flag as `tune --golden`; unknown NAME lists the names). With `--bench` each recorded golden for the kernel's shape is **compiled with its knobs pinned and benched live this run** (`_bench_golden_variants`), then printed as a row labeled `golden NAME` in the Kernel column (its own measured µs / grid / block / smem / regs / occ; `%` column `--`, since it's not part of the emmy TOTAL) right beneath the matching greedy-pick kernel — a real A/B, not the stored number. The knob columns are aligned across rows and colored like `emmy eval` (shared `commands/table` — the knob name is the column header, cells carry the value only): a golden cell is red where it differs from the greedy pick. A golden NAME may map to **multiple** configs (one shape can carry several knob sets, e.g. a newly found faster variant beside the old); each is benched and shown (each re-traces a fresh graph — a frontend graph can't be re-compiled in place).
+- `emmy run ... --bench --profile` — re-launch the run under `ncu` (curated counter set,
+  `commands/run.py::_NCU_METRICS`) and print an **`ncu compare`** table: the emmy `k_*` kernels and the
   torch/cuBLAS reference kernels side by side in one aligned table (duration, occupancy, SM/DRAM/FMA throughput, LSU
   inst count, smem bank conflicts, regs/thread) — the ncu child launches the eager forward too, so the reference rows
   are in the same capture. With a dump dir the raw CSV + parsed JSON also land in `61_ncu_metrics.{csv,json}`.
   Silently skipped when `ncu` isn't on PATH; typical failure is the NVIDIA perf-counter permission gate.
-- `deplodock run ... --bench --ab "K1=V1,K2=V2"` (repeatable) — bench an extra variant with these knobs pinned (the
-  `DEPLODOCK_KNOBS` grammar, `compiler/pipeline/knob.py::parse_knob_spec`) and print it as a live `ab KNOBS` row in the
+- `emmy run ... --bench --ab "K1=V1,K2=V2"` (repeatable) — bench an extra variant with these knobs pinned (the
+  `EMMY_KNOBS` grammar, `compiler/pipeline/knob.py::parse_knob_spec`) and print it as a live `ab KNOBS` row in the
   kernel table beneath the greedy kernel with the matching `S_*` shape signature (knob cells red where they differ from
   the greedy pick — the same machinery as the `--golden` A/B rows, generalized to ad-hoc knob dicts, so a tune-DB
-  variant from `eval variants` can be A/B'd in one process instead of one `DEPLODOCK_KNOBS=...` run per config). Works
+  variant from `eval variants` can be A/B'd in one process instead of one `EMMY_KNOBS=...` run per config). Works
   with `--code` / `--golden` (fresh re-trace per config) and `--ir` (fresh reload + tail re-lowering per config;
   ignored with a warning on fully-lowered cuda IR — no forks left to pin). Requires `--bench`.
-- `deplodock run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Deplodock. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
-- `deplodock run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Deplodock table as `--code` — timed under CUDA graph capture (pure GPU time; falls back to uncaptured timing with a printed note if capture fails); non-frontend IR (loop/tile/…) benches deplodock-only.
-- `deplodock inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
-- `deplodock compare <dumpA> <dumpB> [--tol 0.10]` — diff two dump dirs' bench results: the full-model backend table
-  (`60_bench_compare.json`), the per-kernel deplodock -O3 latencies (`62_kernel_bench.json`, machine-readable per-kernel
+- `emmy run --code "EXPR" [--bench] [--warmup N] [--iters N] [--target sm_NN]` — compile + execute an inline `nn.Module`/torch expression on the CUDA backend, check accuracy vs eager, and (with `--bench`) print a latency table comparing eager PyTorch / `torch.compile` / Emmy. Same `--code` grammar as `compile --code`. `--target sm_NN` overrides the live device's compute capability (same flag as `compile`), so feature-gated passes take the target's path while the kernel still runs on the live GPU — e.g. `--target sm_80` lowers a matmul through the cp.async transport and `--target sm_70` through plain sync staging, both runnable on a newer card, which makes the TMA / cp.async / double-buffer rungs A/B-benchable on one GPU.
+- `emmy run --ir <file.json> [--bench]` — load a JSON IR dump (any stage), finish lowering, execute on random seeded inputs. For a **frontend-dialect** graph (e.g. a dumped `<kname>.torch.json` reproducer) it also builds a real-torch reference (`compiler/backend/torch_ref.py`) and prints the same accuracy check + eager / `torch.compile` / Emmy table as `--code` — timed under CUDA graph capture (pure GPU time; falls back to uncaptured timing with a printed note if capture fails); non-frontend IR (loop/tile/…) benches emmy-only.
+- `emmy inspect <ir_file>` — display graph IR summary (op counts, inputs, outputs)
+- `emmy compare <dumpA> <dumpB> [--tol 0.10]` — diff two dump dirs' bench results: the full-model backend table
+  (`60_bench_compare.json`), the per-kernel emmy -O3 latencies (`62_kernel_bench.json`, machine-readable per-kernel
   rows `tune --bench` now writes beside `kernels.html`), and the raw per-launch times (`60_benchmark.json`) as fallback.
   Kernels match by exact provenance name first, then base name with the trailing content hash stripped (order of
   appearance), so a re-tuned kernel whose hash moved still pairs and prints as `old -> new`; one-side-only kernels are
@@ -213,11 +213,11 @@ filtering, the DB join, and `knob_features` live in one place (`Dataset.from_nod
 `Sample`s for the leaf metrics). Source is orthogonal to analysis: a degenerate combo (e.g. `eval knobs --dataset golden`)
 fails fast with a specific message.
 
-- `deplodock eval knobs [--dataset db] [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the
+- `emmy eval knobs [--dataset db] [--db PATH] [--min-variants N] [--kernel SUBSTR]` — knob-impact analysis from the
   autotune DB (`--dataset db`, the default; `--dataset golden` is rejected — goldens carry no kernel C identity): the
   registered knob schema, then (with a tune DB) per-knob regret + a knob-interaction matrix sorted by geomean impact
   (joins `perf` with `cuda_op` via `Dataset.from_db().group_by_kernel_name()`) — drives Fork-tree knob ordering.
-- `deplodock eval analytic [--dataset golden] [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the
+- `emmy eval analytic [--dataset golden] [--kernel SUBSTR]` — evaluate the cold-start **`AnalyticPrior`** (the
   hand-coded linear model over `knob.knob_features` that replaced `score_matmul_thread` / the `_priority_matmul_*`
   enumeration sort; the cold half
   of the ONE ranking path — see `compiler/pipeline/search/prior/`) on each `GOLDEN_CONFIGS` shape: the golden's **rank**
@@ -226,10 +226,10 @@ fails fast with a specific message.
   `search/analytic.py` module is now just the golden-eval glue (`evaluate_golden` / `pick_matmul`) around the prior
   (`eval analytic` shows the matmul goldens; the prior also ranks the cooperative-reduce / pointwise goldens). Weights fit
   offline by `scripts/golden_knob_heuristics.py` (jointly over every kernel regime — matmul fp32/fp16, reduce, pointwise — tier-balanced).
-- `deplodock eval prior [--prior PATH] [--dataset {golden,db,nodes}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
+- `emmy eval prior [--prior PATH] [--dataset {golden,db,nodes}] [--db PATH] [--kernel SUBSTR] [--features]` — evaluate the
   learned `CatBoostPrior`. Default `--dataset golden`: the golden's rank under the prior over the full enumeration, then
   the greedy pipeline pick vs golden (per-knob `found/golden`) with a **`vs gold`** perf column — the deployable (-O3)
-  latency of the prior's predicted-best **measured** config over the golden's recorded `deplodock_us`, read from the
+  latency of the prior's predicted-best **measured** config over the golden's recorded `emmy_us`, read from the
   prior's reservoir with **no re-bench** (`diagnostics.golden_deploy_perf`). Both sides are -O3 (tuning re-benches every
   winner at `H_opt=3`), so the ratio is a real deployable comparison (<1.0 = the prior's pick beats golden); a shape with
   no -O3 reservoir row shows `—`. The shape key (`ShapeKey` — the single golden↔measured join key) splits on
@@ -239,7 +239,7 @@ fails fast with a specific message.
   **reachability** over the tune DB's *measured* variants (does the prior recover each op's measured-best leaf?) — the
   orthogonal counterpart to the golden views, reusing `diagnostics.reachability` over `Dataset.from_db().group_by_op()`.
   `--dataset nodes` instead reads the tune DB's search-tree **`node` store** (the value-of-position dataset
-  `deplodock tune` records — partial branches + leaves with a `parent_key`, keyed/grouped by GPU) and reports, **per
+  `emmy tune` records — partial branches + leaves with a `parent_key`, keyed/grouped by GPU) and reports, **per
   card** (`diagnostics.node_report` over `SearchDB.iter_nodes()`): the **fork sibling-ranking** — group nodes by
   `parent_key` and ask whether the prior orders each fork's children (the partial configs it ranks during `_select`) by
   their best-reachable latency (top-1 hit + median per-fork Spearman), the search-faithful metric no other view
@@ -248,17 +248,17 @@ fails fast with a specific message.
   SKUs share cc + SM features but differ in VRAM, captured as the `H_total_mem` feature so the prior can model them —
   and the report blocks per card so same-die SKUs are never compared against each other. `--kernel` filters by **op
   label** (the nodes carry no kernel C-identifier; `--kernel matmul` / `reduce` / `free=512` keeps whole ops atomically
-  since all of an op's nodes share one `S_*` label). Reads the prior JSON (`DEPLODOCK_PRIOR_FILE` or `--prior`;
+  since all of an op's nodes share one `S_*` label). Reads the prior JSON (`EMMY_PRIOR_FILE` or `--prior`;
   option-0 when none loaded). `--features` (golden mode) also
   prints the exact regressor input per golden config (`knob.knob_features`: `S_*` structural/shape + `H_*` regime +
   tuning knobs; the shape enters only as coarse `S_ext_*` products/maxes, so the occupancy/CTA/reuse terms the prior
   needs are added as engineered `D_*` features). The golden `S_*` here is the full histogram (the shape's snippet is
   compiled and cached via `data.Sample.from_golden(compile_s_feats=True)`), matching what a DB-trained prior saw.
-- `deplodock eval golden [--prior PATH] [--dataset golden] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs
+- `emmy eval golden [--prior PATH] [--dataset golden] [--kernel SUBSTR] [--features]` — the greedy pipeline pick vs
   recorded golden, per config (the actionable "did the pipeline reproduce the golden knobs?" table only — no analytic-rank or
   rank-under-prior diagnostics; use `eval analytic` / `eval prior` for those). The view to watch while iteratively
   tuning golden shapes. `--features` still prepends the per-config regressor feature vector.
-- `deplodock eval variants [--dataset db] [--db PATH] [--kernel SUBSTR] [--prior PATH] [--top N]` — per-kernel
+- `emmy eval variants [--dataset db] [--db PATH] [--kernel SUBSTR] [--prior PATH] [--top N]` — per-kernel
   leaderboard of the tune DB's measured variants (leaf configs only, fastest first, knob columns in the shared
   `commands/table` view), with the config the global `Prior` would deploy marked `◄` + ranked (`pick: rank R/N, X.XXx
   of best`, flagged when >1.2x — the per-kernel drill-down behind `eval prior --dataset db`'s aggregate reachability),
@@ -267,21 +267,21 @@ fails fast with a specific message.
   tune's -O1 ranking numbers). `--dataset golden` is rejected (goldens carry no per-variant measurements). The view
   that answers "did the search/prior reach the best measured config for this kernel, and which knobs distinguish it?"
   without hand-written SQL.
-- `deplodock eval failures [--dataset db] [--db PATH] [--kernel SUBSTR]` — the tune DB's `bench_fail` rows clustered by
+- `emmy eval failures [--dataset db] [--db PATH] [--kernel SUBSTR]` — the tune DB's `bench_fail` rows clustered by
   `(kernel, error)`, each cluster with its row count and the tunable knob assignments shared by EVERY failing row (the
   "all 28 failures have `TMA=1`" signal). The failure text comes from the `perf` table's `error` column (recorded by
   `_bench_terminal` on bench failure, whitespace-collapsed + truncated; pre-error-column DBs migrate additively on the
   next writer open and their old rows cluster under `(no error recorded)`) — no more tune-log grepping.
-- `deplodock tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
+- `emmy tune --golden NAME [--clean]` — tune the named golden config (shorthand for `--code <its snippet>`), so
   the learned prior can be built up one shape at a time: `tune --golden square.512 --clean`, then `eval golden`, then
   `tune --golden square.1024` (no `--clean`, to accumulate), then `eval golden` again. An unknown NAME lists the names.
 - Quick test model (ungated, Llama arch): `TinyLlama/TinyLlama-1.1B-Chat-v1.0`
 - GPU benchmark model (ungated, 0.6B): `Qwen/Qwen3-Embedding-0.6B`
 - Block benchmark script: `python scripts/bench_block.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --seq-len 32`
 - Generative decode-bucket post-subgraph bench (vs cuBLAS): `python scripts/bench_gen_post.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` — symbolic@1 vs static decode-bucket M=16 vs eager, CUDA-graph-captured
-- Generative served-throughput bench (tok/s vs a running server): `python scripts/bench_gen_serve.py --port 8001 --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` — single-stream decode (TTFT + tok/s) + concurrent throughput against any OpenAI `/v1/chat/completions` server (`deplodock serve --generate` plugin or `--stock` vLLM); the "End-to-end served validation" reproducer
-- Generative decode-step profiler (W / G / overhead breakdown): `python scripts/profile_gen_decode.py --bucket 16` — builds `DeplodockGenRunner` and decomposes one T=1 decode step into wall vs pure GPU kernel time (CUDA-graph-captured) vs host+dispatch overhead; the "Profiling the tuned step" reproducer (shows the gap is overhead-bound post-tune)
-- Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-runnable — including linear/attention, whose transposed weights are matched via `load_ops`-replayed constants), and renders a per-kernel latency bar chart via `deplodock.visualize`. `--tune` autotunes each kernel first.
+- Generative served-throughput bench (tok/s vs a running server): `python scripts/bench_gen_serve.py --port 8001 --model TinyLlama/TinyLlama-1.1B-Chat-v1.0` — single-stream decode (TTFT + tok/s) + concurrent throughput against any OpenAI `/v1/chat/completions` server (`emmy serve --generate` plugin or `--stock` vLLM); the "End-to-end served validation" reproducer
+- Generative decode-step profiler (W / G / overhead breakdown): `python scripts/profile_gen_decode.py --bucket 16` — builds `EmmyGenRunner` and decomposes one T=1 decode step into wall vs pure GPU kernel time (CUDA-graph-captured) vs host+dispatch overhead; the "Profiling the tuned step" reproducer (shows the gap is overhead-bound post-tune)
+- Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-runnable — including linear/attention, whose transposed weights are matched via `load_ops`-replayed constants), and renders a per-kernel latency bar chart via `emmy.visualize`. `--tune` autotunes each kernel first.
 - New-model discovery: `python scripts/new_models.py [--since YYYY-MM-DD] [--text-only] [--include-supported] [--arena] [--json]` — lists open-weight models OpenRouter hosts (catalog entries with a `hugging_face_id`), verifies each on HuggingFace, and ranks the unsupported, recently-released ones by HF `trendingScore`/downloads/likes. Keyless + read-only (OpenRouter `/api/v1/models` + HF `/api/models/{id}`); excludes families already in `recipes/` (base-model match) and models older than `--since` (default ~90 days) by default. `--arena` adds LMArena Elo/rank from the `lmarena-ai/leaderboard-dataset` HF dataset (`text`/`latest`/`overall`, ~360 models, keyless) by fuzzy name-match, and lists the open arena models it couldn't link (fuzzy misses / outside the window). Triage feed for the `benchmark-new-model` flow.
 
 ## Key Make Targets
@@ -291,7 +291,7 @@ fails fast with a specific message.
   kernels at `-Xcicc -O1` for ~3× faster nvcc (correctness lane; perf tests use `-O3` via `make bench-kernels`)
 - `make lint` — run `ruff check` and `ruff format --check`
 - `make format` — auto-format code and fix lint violations
-- `make bench` — run benchmarks (`deplodock bench recipes/*`)
+- `make bench` — run benchmarks (`emmy bench recipes/*`)
 - `make bench-kernels` — run per-kernel perf comparison vs PyTorch (`tests/perf/`, requires CUDA)
 - `make clean` — remove venv and generated files
 

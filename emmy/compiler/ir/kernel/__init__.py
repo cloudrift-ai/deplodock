@@ -8,8 +8,8 @@
 - :mod:`.render` — ``render_kernelop`` emitting CUDA source.
 """
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.kernel.ir import (
     Accum,
     Assign,
     BinaryExpr,

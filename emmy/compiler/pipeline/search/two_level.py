@@ -1,7 +1,7 @@
 """Two-level autotuning: an outer fusion MCTS whose terminal reward comes from
 an inner, separable, per-op search.
 
-``deplodock tune`` used to run one SP-MCTS tree over the whole graph. Because
+``emmy tune`` used to run one SP-MCTS tree over the whole graph. Because
 the pipeline applies rules sequentially, op-variant forks (tile / pad / stage
 choices for one kernel) and fusion forks (how ops group into kernels) **nest**
 and cross-product under one global patience — so the bottleneck op starves the
@@ -61,15 +61,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
-from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.structural import digest
+from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pass, Pipeline, TuningSearch
+from emmy.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
+from emmy.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.pipeline.search.slice import single_node_graph
+from emmy.compiler.structural import digest
 
 if TYPE_CHECKING:
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.context import Context
+    from emmy.compiler.graph import Graph
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +177,8 @@ def _kernel_nodes(graph: Graph) -> list[tuple[str, object]]:
     producer + consumer ``LoopOp``s (un-built — the inner tiles them). Count both
     ``LoopOp`` and ``TileGraphOp`` so every kernel of either side gets its own inner
     slice."""
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
 
     return [(nid, n.op) for nid, n in graph.nodes.items() if isinstance(n.op, (LoopOp, TileGraphOp))]
 
@@ -200,7 +200,7 @@ def _decomposition_rows(graph: Graph, per_op: list[OpResult], ctx: Context) -> l
     informed instead of uniform. They are estimates for *search ordering*; greedy's
     deploy decision keeps the sharper compositional probe
     (``policy/greedy._pick_structural``)."""
-    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain, structural_decision_delta  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.keys import dialect_of, source_chain, structural_decision_delta  # noqa: PLC0415
 
     best = {r.op_key: r.best_us for r in per_op}
     unique: dict[str, object] = {}
@@ -240,7 +240,7 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
     so they're atomic with no locks. A single-element ``pool`` is the serial case:
     coroutines acquire the lone worker in ``op_idx`` order → strictly sequential.
 
-    ``prior`` (a single shared :class:`~deplodock.compiler.pipeline.search.prior.Prior`,
+    ``prior`` (a single shared :class:`~emmy.compiler.pipeline.search.prior.Prior`,
     or ``None``) drives every inner search's PUCT — ONE **global** model across all
     kernels: each op's search trains it on ``archived + this op's tree``; when the op
     finishes its rows are archived and the prior is checkpointed (keyed by regime), so
@@ -253,14 +253,14 @@ async def _inner_reward_async(fused_graph, *, ctx, db, pool, patience, ucb_c, ex
     nothing while a prior-shifted trajectory benches only its genuinely-new variants.
     Benches scale as ``Σ_k n_k`` (per op), never the product.
 
-    ``progress`` (a duck-typed :class:`~deplodock.commands.tune_progress.TuneProgress`,
+    ``progress`` (a duck-typed :class:`~emmy.commands.tune_progress.TuneProgress`,
     or ``None``) drives the CLI progress bar: one op leaf ticked per *unique* kernel,
     the live tail updated per benched variant. Leaves are deduped by ``op_cache_key``
     before iteration; multiplicity is preserved so ``total_us`` weights each unique
     kernel's best by its node count (order-stable, identical to per-node iteration)."""
     from collections import OrderedDict  # noqa: PLC0415
 
-    from deplodock.compiler.pipeline.pipeline import variant_label  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import variant_label  # noqa: PLC0415
 
     ctx_key = ctx.structural_key()
     backend_name = getattr(pool[0], "name", "cuda")
@@ -428,8 +428,8 @@ async def run_two_level_tune(
     replay the first decision (read off the graph —
     ``pipeline._replay_structural_decision``), and a terminal whose kernels
     are all known is a pure DB read, so extra terminals stay cheap."""
-    from deplodock.compiler import provenance  # noqa: PLC0415
-    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+    from emmy.compiler import provenance  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     provenance.seed(graph)
     # ONE global prior for the whole run — the learned ``CatBoostPrior`` (warm-
@@ -437,7 +437,7 @@ async def run_two_level_tune(
     # fallback, so the first op's inner search is heuristic-guided, not uniform.
     # Training (add_rows / maybe_refit / checkpoint) delegates to the learned half
     # (lazy import keeps catboost off non-tune callers).
-    from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
     prior = load_prior(seed=prior_seed)
     # The global prior drives the outer PUCT too: at a structural fork the

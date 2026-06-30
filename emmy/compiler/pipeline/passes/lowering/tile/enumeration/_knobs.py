@@ -8,7 +8,7 @@ below): the move parameters have the SAME arithmetic role as the
 legacy tile dimensions (legacy ``BN`` IS "CTA thread width along N" = the
 composer's N thread-tile extent; ``FM/FN`` the register cells; ``WM/WN`` the warp
 counts; ``BK/SPLITK/BR/FK/MMA`` identical), so aliasing keeps the tune DB / learned
-prior / golden YAMLs / pinned-knob tests (``DEPLODOCK_BK=…`` etc.) valid across the
+prior / golden YAMLs / pinned-knob tests (``EMMY_BK=…`` etc.) valid across the
 cutover. The greenfield Python names are retained as aliases so the move code
 reads in move terms; the stamped ``op.knobs`` key is the legacy string name.
 
@@ -20,7 +20,7 @@ so the scalar map-reg and warp-reg aliases point at the one ``FM``/``FN``/``BK``
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from emmy.compiler.pipeline.knob import Knob, KnobType
 
 # --- The knob SCHEMA (relocated from the deleted ``_enumeration.py``). The move
 # composer + tune DB + learned prior + golden YAMLs all key on these legacy
@@ -37,7 +37,7 @@ def _mma_features(mma: object) -> dict[str, float]:
     """Learned-prior featurizer for the ``MMA`` knob: expand an atom kind into
     physical cell/dtype properties via ``ATOM_REGISTRY`` (lazy import — avoids an
     import cycle through the tile IR)."""
-    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
 
     atom = ATOM_REGISTRY.get(str(mma))
     if atom is None:

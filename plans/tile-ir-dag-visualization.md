@@ -25,7 +25,7 @@ layout** (no separate layout lib to wire), offers **both nested Combos and overl
 the launch ⊃ scope nesting *and* the cohort grouping that crosses it), and ships as a **single vanilla-JS CDN script** —
 matching the repo's "emit one self-contained HTML file, screenshot via Playwright" pattern. React Flow renders the
 fanciest DOM nodes but drags in React + a bundler, which the repo's HTML-from-CDN convention has no place for; revisit
-only if deplodock ever adopts a JS build pipeline. ECharts stays the engine for the latency/bench bar charts.
+only if emmy ever adopts a JS build pipeline. ECharts stays the engine for the latency/bench bar charts.
 
 G6 v5 confirmed capabilities used below: HTML node (`node.type='html'`, `style.innerHTML:(d)=>htmlString`), layouts
 incl. `antv-dagre`/`dagre`/ELK, Combos (Rect/Circle/Custom), renderers Canvas/SVG/WebGL, and plugins **Minimap,
@@ -123,11 +123,11 @@ derived views + schedule into render-agnostic JSON that G6 consumes directly (en
 `edges` / `carrier` / `atom` come from the IR's **derived properties** (`Block.reads`, `Block.carrier`,
 `TileGraph.edges`) — so the JSON *is* the derived state, no second source of truth. Keep it deterministic (sorted keys,
 stable node/axis order) so goldens are stable. It doubles as the `NN_tilegraph.json` dump artifact and the future input
-to a `deplodock compare` graph-diff (highlight which Schedule entries changed between two tunes).
+to a `emmy compare` graph-diff (highlight which Schedule entries changed between two tunes).
 
 ## Integration
 
-- **`deplodock/visualize/graph.py`** — `TileGraphView` + `render_tile_graph(view, *, theme) -> str`. Builds the G6
+- **`emmy/visualize/graph.py`** — `TileGraphView` + `render_tile_graph(view, *, theme) -> str`. Builds the G6
   `VIEW` object + the card/CSS + the init script, wraps via `page.render_html(body_html=…, scripts_js=…, extra_css=…)`.
   Export from `visualize/__init__`.
 - **Generalize the page shell.** `page.render_html` hardcodes the ECharts `<script>` (`page.py:64`). Add
@@ -137,10 +137,10 @@ to a `deplodock compare` graph-diff (highlight which Schedule entries changed be
   (G6 html-nodes are DOM, captured fine). Just teach the wait to accept `window.graphReady` (set after
   `graph.render()`) alongside `echartsReady`. The `.svg` path stays ECharts-only; for vector export use G6's own
   toolbar "export image" or its SVG renderer.
-- **CLI** — `deplodock viz <model_or_ir> [--png] [--no-schedule]` (sibling of `compile`/`inspect`): trace+compile to a
+- **CLI** — `emmy viz <model_or_ir> [--png] [--no-schedule]` (sibling of `compile`/`inspect`): trace+compile to a
   `TileGraph`, project, write `tilegraph.html` (+ `tilegraph.json`, + optional `.png`). `--ir <file>` renders a dump;
   `--no-schedule` emits the bare algorithm DAG.
-- **Dump dir** — `DEPLODOCK_DUMP_DIR` writes `NN_tilegraph.{json,html}` per compiled kernel (the `kernels.html`
+- **Dump dir** — `EMMY_DUMP_DIR` writes `NN_tilegraph.{json,html}` per compiled kernel (the `kernels.html`
   pattern), plus an `index.html` linking them for a whole-model trace (one page per kernel keeps each graph small).
 
 During migration (before the real `TileGraph` exists), point the projector at the composer's **reference schedule** (the
@@ -156,12 +156,12 @@ badges; transport/distance edge styling; launch Combos; **Minimap**, **Toolbar**
 
 ## Phasing
 
-1. **Projection + the interactive G6 page** — `tile_graph_to_view` + `graph.py` + `deplodock viz` + dump artifact, with
+1. **Projection + the interactive G6 page** — `tile_graph_to_view` + `graph.py` + `emmy viz` + dump artifact, with
    the full Phase-1 interaction list above. → verify: golden the JSON; smoke the HTML includes the G6 CDN + block names
    + the binding legend; eyeball one matmul, one split-K (two launch combos), one fused-prologue (nested scope combos).
 2. **Grouping depth + export + toggles** — BubbleSets cohorts, nested scope Combos, the **schedule-overlay on/off**
    toolbar toggle (re-style to the bare algorithm), **collapse-expand** combos, click-a-node → expand `compute_full`,
-   and `--png` wiring (`graphReady`). Docs: `visualize/ARCHITECTURE.md` + `CLAUDE.md` (`deplodock viz`, dump artifacts).
+   and `--png` wiring (`graphReady`). Docs: `visualize/ARCHITECTURE.md` + `CLAUDE.md` (`emmy viz`, dump artifacts).
 3. **Move animation** — drive G6's data-update transitions to animate a move: render before, apply one Schedule edit
    (`stage` / `retime` / `partition_reduce`), `graph.setData(after)` → watch the edges/combos re-decorate. Turns the
    view into a scheduler explorer and a teaching aid for "scheduling = annotation."
@@ -184,8 +184,8 @@ badges; transport/distance edge styling; launch Combos; **Minimap**, **Toolbar**
 - `tests/test_visualize.py` — golden `tile_graph_to_view` on a small fixture graph (deterministic JSON); assert
   `render_tile_graph` HTML includes the G6 CDN, the block names, the binding legend, a `launch` combo when ≥2 launch
   groups, and a BubbleSets `members` list when a cohort exists.
-- Update `deplodock/visualize/ARCHITECTURE.md` (new `graph.py`, the `head_scripts` shell param, the G6 CDN + UMD
-  global, the `graphReady` flag) and `CLAUDE.md` (`deplodock viz` + the `NN_tilegraph.*` dump artifacts).
+- Update `emmy/visualize/ARCHITECTURE.md` (new `graph.py`, the `head_scripts` shell param, the G6 CDN + UMD
+  global, the `graphReady` flag) and `CLAUDE.md` (`emmy viz` + the `NN_tilegraph.*` dump artifacts).
 
 ## References
 

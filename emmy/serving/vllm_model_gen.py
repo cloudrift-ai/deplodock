@@ -1,18 +1,18 @@
-"""``DeplodockGenModel`` — the vLLM out-of-tree **generative** model class (Phase 3 of
+"""``EmmyGenModel`` — the vLLM out-of-tree **generative** model class (Phase 3 of
 ``plans/generative-inference-support.md``).
 
-Serve a decoder-only chat model (Qwen3 / Llama) through deplodock-compiled per-layer
+Serve a decoder-only chat model (Qwen3 / Llama) through emmy-compiled per-layer
 kernels with vLLM owning the API / sampler / scheduler / paged KV-cache:
 
     vllm serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --runner generate --enforce-eager \\
-      --dtype float16 --hf-overrides '{"architectures":["DeplodockGenModel"]}'
+      --dtype float16 --hf-overrides '{"architectures":["EmmyGenModel"]}'
 
 NOT ``IsAttentionFree``: it constructs real vLLM ``Attention`` layers (one per decoder
 layer, unique ``prefix``) so vLLM allocates a KV-cache spec and runs paged attention. All
 weight-bearing **trunk** compute (embed + per-layer pre/post + final norm) lives in the
-deplodock ``DeplodockGenRunner``; vLLM owns only ``lm_head`` (loaded via ``load_weights``)
+emmy ``EmmyGenRunner``; vLLM owns only ``lm_head`` (loaded via ``load_weights``)
 and applies RoPE through a ``get_rope`` module the model builds (a bare ``Attention`` does
-none). ``forward`` brackets each vLLM attention call with two deplodock replays (``pre`` /
+none). ``forward`` brackets each vLLM attention call with two emmy replays (``pre`` /
 ``post``); RoPE is applied between ``pre`` and ``self.attn`` (A2).
 
 Numpy host I/O at the runner boundary (the per-layer host-sync interleave — Top risk #1);
@@ -32,8 +32,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from deplodock.serving.gen_runner import DeplodockGenRunner
-from deplodock.serving.vllm_model import _trunk_dtype_str
+from emmy.serving.gen_runner import EmmyGenRunner
+from emmy.serving.vllm_model import _trunk_dtype_str
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def _build_rotary(config, head_dim, max_position):
     )
 
 
-class DeplodockGenModel(nn.Module):
+class EmmyGenModel(nn.Module):
     def __init__(self, *, vllm_config, prefix: str = ""):
         super().__init__()
         mc = vllm_config.model_config
@@ -69,17 +69,17 @@ class DeplodockGenModel(nn.Module):
         # Sliding-window / per-layer-sliding / dual-chunk variants would silently miscompute
         # (neither side here is window/chunk aware) — reject rather than mislead.
         if getattr(config, "use_sliding_window", False) and getattr(config, "sliding_window", None):
-            raise NotImplementedError("DeplodockGenModel: sliding-window attention is not supported")
+            raise NotImplementedError("EmmyGenModel: sliding-window attention is not supported")
         layer_types = getattr(config, "layer_types", None)
         if layer_types and any(lt == "sliding_attention" for lt in layer_types):
-            raise NotImplementedError("DeplodockGenModel: per-layer sliding attention is not supported")
+            raise NotImplementedError("EmmyGenModel: per-layer sliding attention is not supported")
         if getattr(config, "dual_chunk_attention_config", None):
-            raise NotImplementedError("DeplodockGenModel: dual-chunk attention is not supported")
+            raise NotImplementedError("EmmyGenModel: dual-chunk attention is not supported")
 
         # The flattened width T = num_tokens is the SUM of newly-scheduled tokens across all
         # requests per step (continuous batching), bounded by max_num_batched_tokens — NOT
         # max_model_len. It must stay within the compiler's dynamic-dim / RoPE-buffer cap.
-        from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+        from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
         if max_batched and max_batched > DYNAMIC_DIM_MAX:
@@ -88,7 +88,7 @@ class DeplodockGenModel(nn.Module):
                 f"serve with --max-num-batched-tokens {DYNAMIC_DIM_MAX} or lower"
             )
 
-        self.runner = DeplodockGenRunner.create(model_id=mc.model, dtype_str=_trunk_dtype_str(mc.dtype))
+        self.runner = EmmyGenRunner.create(model_id=mc.model, dtype_str=_trunk_dtype_str(mc.dtype))
         n_layers = self.runner.num_layers
         head_dim = self.runner.head_dim
 

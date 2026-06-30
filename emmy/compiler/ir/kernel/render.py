@@ -8,13 +8,13 @@ method does the per-line emission.
 
 from __future__ import annotations
 
-from deplodock.compiler.backend.cuda.dtype import cuda_includes, cuda_name
-from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
-from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor, pack_smem
-from deplodock.compiler.ir.stmt import RenderCtx, render_body
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.backend.cuda.dtype import cuda_includes, cuda_name
+from emmy.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
+from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.kernel.ir import KernelOp, Smem, TmaDescriptor, pack_smem
+from emmy.compiler.ir.stmt import RenderCtx, render_body
+from emmy.compiler.tensor import Tensor
 
 # Per-CTA static-smem hard cap on every CUDA arch we target. Above this,
 # PTXAS rejects ``__shared__ T arr[N]`` decls (``uses too much shared
@@ -474,7 +474,7 @@ def render_kernelop(
     # The mma.sync (s16816) tensor-core path is pure inline PTX — its
     # ldmatrix / mma.sync wrappers are emitted in ``_MMA_SYNC_PRELUDE``, so
     # NVRTC needs no ``<mma.h>`` (the legacy ``nvcuda::wmma`` family is gone).
-    from deplodock.compiler.ir.kernel.ir import MmaSyncPtx  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import MmaSyncPtx  # noqa: PLC0415
 
     uses_mma_sync = any(isinstance(s, MmaSyncPtx) for s in kernel_op.body.iter())
     mma_sync_prelude = _MMA_SYNC_PRELUDE if uses_mma_sync else ""
@@ -511,7 +511,7 @@ def _launch_bounds_for(kernel_op: KernelOp) -> int:
     - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
       since launch is flattened across blockIdx + threadIdx.
     """
-    from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
 
     for s in kernel_op.body:
         if isinstance(s, GridTile):

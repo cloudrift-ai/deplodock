@@ -3,23 +3,23 @@
 
 import argparse
 
-from deplodock.commands.bench import register_bench_command
-from deplodock.commands.compare import register_compare_command
-from deplodock.commands.compile import register_compile_command
-from deplodock.commands.deploy.cloud import register_cloud_target
-from deplodock.commands.deploy.local import register_local_target
-from deplodock.commands.deploy.ssh import register_ssh_target
-from deplodock.commands.eval import register_eval_command
-from deplodock.commands.generate import register_generate_command
-from deplodock.commands.inspect_graph import register_inspect_command
-from deplodock.commands.pull import register_pull_command
-from deplodock.commands.run import register_run_command
-from deplodock.commands.serve import register_serve_command
-from deplodock.commands.teardown import register_teardown_command
-from deplodock.commands.trace import register_trace_command
-from deplodock.commands.tune import register_tune_command
-from deplodock.commands.vm import register_vm_command
-from deplodock.logging_setup import setup_cli_logging
+from emmy.commands.bench import register_bench_command
+from emmy.commands.compare import register_compare_command
+from emmy.commands.compile import register_compile_command
+from emmy.commands.deploy.cloud import register_cloud_target
+from emmy.commands.deploy.local import register_local_target
+from emmy.commands.deploy.ssh import register_ssh_target
+from emmy.commands.eval import register_eval_command
+from emmy.commands.generate import register_generate_command
+from emmy.commands.inspect_graph import register_inspect_command
+from emmy.commands.pull import register_pull_command
+from emmy.commands.run import register_run_command
+from emmy.commands.serve import register_serve_command
+from emmy.commands.teardown import register_teardown_command
+from emmy.commands.trace import register_trace_command
+from emmy.commands.tune import register_tune_command
+from emmy.commands.vm import register_vm_command
+from emmy.logging_setup import setup_cli_logging
 
 
 def main():

@@ -39,14 +39,14 @@ byte-identical to today.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F16, F32, F16x2
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Pack, Stmt, Unpack
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.dtype import F16, F32, F16x2
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Pack, Stmt, Unpack
+from emmy.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StageBundle, StridedTile, ThreadTile, TileOp, WarpTile
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

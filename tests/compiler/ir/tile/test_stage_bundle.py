@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Body, Load
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.stmt import Body, Load
+from emmy.compiler.ir.tile.ir import (
     Source,
     StageBundle,
     StagePolicy,
@@ -246,7 +246,7 @@ def test_local_decls_lists_source_names():
 def test_local_decls_includes_compute_output_slab():
     """The compute phase's Write output is a kernel-local smem slab, so it
     rides on local_decls (keeping it off the kernel signature)."""
-    from deplodock.compiler.ir.stmt import Write
+    from emmy.compiler.ir.stmt import Write
 
     compute = Body(
         (
@@ -335,7 +335,7 @@ def test_pretty_tma_header_shows_depth():
 
 
 def test_pretty_renders_compute_phase():
-    from deplodock.compiler.ir.stmt import Write
+    from emmy.compiler.ir.stmt import Write
 
     compute = Body(
         (

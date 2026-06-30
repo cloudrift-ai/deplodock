@@ -15,21 +15,21 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dtype import F16
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
 
 # Native move-knob set: the warp MMA atom on the output cell + a 2×2 warp/register tile on every
 # free axis (WM=WN=FM=FN=2). The reduce decomposition (BK=2 + split-K 2 + the finalize letter) is
-# the per-arm ``DEPLODOCK_REDUCE`` codec value ``s2/c2{a,k}``.
-_WARP_NATIVE = {"DEPLODOCK_ATOM": "mma_m16n8k16_f16", "DEPLODOCK_SPLIT": "2x2"}
+# the per-arm ``EMMY_REDUCE`` codec value ``s2/c2{a,k}``.
+_WARP_NATIVE = {"EMMY_ATOM": "mma_m16n8k16_f16", "EMMY_SPLIT": "2x2"}
 
 
 def _set_warp(monkeypatch, reduce_spec: str) -> None:
     for k, v in _WARP_NATIVE.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.setenv("DEPLODOCK_REDUCE", reduce_spec)
+    monkeypatch.setenv("EMMY_REDUCE", reduce_spec)
 
 
 def _has_cuda() -> bool:
@@ -62,7 +62,7 @@ def _mma_graph(m: int, k: int, n: int) -> Graph:
 def test_mma_atomic_free_splitk_accurate_and_no_atomic(monkeypatch) -> None:
     """fp16 MMA split-K with the deferred ``c2k`` finalize: bit-correct vs numpy and no atomicAdd."""
     _set_warp(monkeypatch, "s2/c2k")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     m, k, n = 128, 512, 128
     rng = np.random.default_rng(4)
@@ -82,7 +82,7 @@ def test_mma_atomic_free_splitk_accurate_and_no_atomic(monkeypatch) -> None:
 def test_mma_atomic_splitk_still_available(monkeypatch) -> None:
     """The atomic finalize arm (``c2a``) stays selectable and is also accurate."""
     _set_warp(monkeypatch, "s2/c2a")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     m, k, n = 128, 512, 128
     rng = np.random.default_rng(5)

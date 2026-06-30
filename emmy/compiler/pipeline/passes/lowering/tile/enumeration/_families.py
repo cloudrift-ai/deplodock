@@ -28,10 +28,10 @@ The implementation reads these keys (or the IR directly) — **never** legacy GE
 names. The legacy names survive only in the ingest mapper (``_knob_legacy``, Step 2) for
 backwards-compatible env pins / golden YAMLs.
 
-**Env spelling.** ``DEPLODOCK_<MOVE>_<ELEMENT>`` (element upper-cased), e.g.
-``DEPLODOCK_REDUCE_KV=s16/f1/c1/t1`` / ``DEPLODOCK_ATOM_OUT=mma_m16n8k16_f16``. A bare
-``DEPLODOCK_<MOVE>`` pins every element of that family (``DEPLODOCK_ATOM=scalar``,
-``DEPLODOCK_REDUCE=s16/f1/c1/t1``) — for coarse pins / tests. The env-var namespace is
+**Env spelling.** ``EMMY_<MOVE>_<ELEMENT>`` (element upper-cased), e.g.
+``EMMY_REDUCE_KV=s16/f1/c1/t1`` / ``EMMY_ATOM_OUT=mma_m16n8k16_f16``. A bare
+``EMMY_<MOVE>`` pins every element of that family (``EMMY_ATOM=scalar``,
+``EMMY_REDUCE=s16/f1/c1/t1``) — for coarse pins / tests. The env-var namespace is
 ``config``'s (``knob_raw``), the same one ``compiler/pipeline/knob.py`` borrows.
 """
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock import config
+from emmy import config
 
 # --- Move families. Plain string tags; the op.knobs key is ``MOVE@element``. ---
 SPLIT = "SPLIT"
@@ -186,13 +186,13 @@ def reduce_finalize_decided(raw: object) -> bool:
     return False
 
 
-# --- Native env pins. ``DEPLODOCK_<MOVE>_<ELEMENT>`` first, bare ``DEPLODOCK_<MOVE>``
-# as the all-elements fallback. ``config.knob_raw`` owns the ``DEPLODOCK_`` join. ---
+# --- Native env pins. ``EMMY_<MOVE>_<ELEMENT>`` first, bare ``EMMY_<MOVE>``
+# as the all-elements fallback. ``config.knob_raw`` owns the ``EMMY_`` join. ---
 
 
 def pin(move: str, element: str) -> str | None:
-    """Live env pin for ``move`` on ``element`` — ``DEPLODOCK_<MOVE>_<ELEMENT>``,
-    falling back to the bare ``DEPLODOCK_<MOVE>`` family pin. ``None`` when unset."""
+    """Live env pin for ``move`` on ``element`` — ``EMMY_<MOVE>_<ELEMENT>``,
+    falling back to the bare ``EMMY_<MOVE>`` family pin. ``None`` when unset."""
     raw = config.knob_raw(f"{move}_{element}")
     return raw if raw is not None else config.knob_raw(move)
 
@@ -200,12 +200,12 @@ def pin(move: str, element: str) -> str | None:
 def split_par(dag, axis: str) -> int | None:
     """The pinned parallel-binding factor for ``SPLIT@axis`` (thread width or warp
     count — the tier is the consuming cell's ``ATOM``, not this value). Native
-    ``DEPLODOCK_SPLIT_<axis>`` first, else the legacy ``BN``/``WN`` (innermost free) /
+    ``EMMY_SPLIT_<axis>`` first, else the legacy ``BN``/``WN`` (innermost free) /
     ``BM``/``WM`` (next-out) ingest."""
     raw = pin(SPLIT, axis)
     if raw is not None:
         return dec_split(raw)[0]
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.split_par(dag, axis)
 
@@ -216,7 +216,7 @@ def split_reg(dag, axis: str) -> int | None:
     raw = pin(SPLIT, axis)
     if raw is not None:
         return dec_split(raw)[1]
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.split_reg(dag, axis)
 
@@ -224,16 +224,16 @@ def split_reg(dag, axis: str) -> int | None:
 def reduce_fields(dag, axis: str) -> tuple[int | None, int | None, int | None, int | None]:
     """The pinned ``(serial, fold, cta, coop)`` REDUCE factors for ``axis`` — each int
     or ``None`` when unpinned (so the offer keeps its full per-field menu). A native
-    ``DEPLODOCK_REDUCE_<axis>`` pin (full spec) wins; otherwise the legacy
-    ``DEPLODOCK_BK``/``FK``/``SPLITK``/``BR`` ingest fills the primary reduce axis (the
+    ``EMMY_REDUCE_<axis>`` pin (full spec) wins; otherwise the legacy
+    ``EMMY_BK``/``FK``/``SPLITK``/``BR`` ingest fills the primary reduce axis (the
     deprecation ramp — see ``_knob_legacy``)."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     raw = pin(REDUCE, axis)
     if raw is not None:
         # A **partial** native pin (only the fields PRESENT in the string) leaves the rest free —
         # the native replacement for the legacy single-field ``BK``/``FK``/``SPLITK``/``BR`` pins.
-        # ``DEPLODOCK_REDUCE=t128`` pins only ``coop`` (the offer still picks ``serial`` so the
+        # ``EMMY_REDUCE=t128`` pins only ``coop`` (the offer still picks ``serial`` so the
         # reduce extent is covered); ``c2k`` pins only ``cta`` (+ the finalize, read by
         # ``pin_finalize``). A full ``s/f/c/t`` spec pins everything (a recorded golden).
         present = {p.strip()[0] for p in str(raw).split("/") if p.strip()}
@@ -252,12 +252,12 @@ def pin_finalize(axis: str) -> str | None:
     (auto). The env override ``140`` honors when narrowing its finalize offer (the codec's
     ``c``-suffix fork). Sourced, in order, from:
 
-    1. the native ``REDUCE@<axis>`` codec pin's ``c``-letter (``DEPLODOCK_REDUCE_<axis>`` /
-       bare ``DEPLODOCK_REDUCE`` carrying e.g. ``c2k`` / ``c2a``) — the finalize lives IN the
+    1. the native ``REDUCE@<axis>`` codec pin's ``c``-letter (``EMMY_REDUCE_<axis>`` /
+       bare ``EMMY_REDUCE`` carrying e.g. ``c2k`` / ``c2a``) — the finalize lives IN the
        reduce codec, so one native knob owns both the split-K width and its finalize;
-    2. a standalone ``DEPLODOCK_FINALIZE_<axis>`` / bare ``DEPLODOCK_FINALIZE`` convenience pin.
+    2. a standalone ``EMMY_FINALIZE_<axis>`` / bare ``EMMY_FINALIZE`` convenience pin.
 
-    Replaces the removed ``DEPLODOCK_NOATOMIC`` pin (``kernel`` ≡ the old ``NOATOMIC=1``)."""
+    Replaces the removed ``EMMY_NOATOMIC`` pin (``kernel`` ≡ the old ``NOATOMIC=1``)."""
     rraw = pin(REDUCE, axis)
     if rraw is not None and reduce_finalize_decided(rraw):
         return dec_reduce(rraw).finalize
@@ -326,12 +326,12 @@ def smem_edges_without_xport(knobs: dict) -> list[str]:
 
 def pin_place_mask(n: int) -> int | None:
     """A pinned staging mask over ``n`` ranked edges, or ``None`` (auto-enumerate).
-    Native bare ``DEPLODOCK_PLACE`` (``smem`` → stage all, ``gmem``/``inline`` → none),
-    else the legacy ``DEPLODOCK_STAGE`` bitmask ingest."""
-    raw = pin(PLACE, "")  # bare DEPLODOCK_PLACE family pin
+    Native bare ``EMMY_PLACE`` (``smem`` → stage all, ``gmem``/``inline`` → none),
+    else the legacy ``EMMY_STAGE`` bitmask ingest."""
+    raw = pin(PLACE, "")  # bare EMMY_PLACE family pin
     if raw is not None:
         return (1 << n) - 1 if place_of(raw) == SMEM else 0
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.stage_mask(n)
 
@@ -342,49 +342,49 @@ def cone_key() -> str:
 
 
 def pin_cut() -> bool | None:
-    """Pinned keep-vs-cut for the demoted cone: native ``DEPLODOCK_PLACE_CONE`` (``cut`` /
-    ``inline``), else legacy ``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE``. ``True`` = cut,
+    """Pinned keep-vs-cut for the demoted cone: native ``EMMY_PLACE_CONE`` (``cut`` /
+    ``inline``), else legacy ``EMMY_CUT`` / ``EMMY_SPLIT_CONE``. ``True`` = cut,
     ``False`` = keep, ``None`` = auto."""
     raw = pin(PLACE, CONE)
     if raw is not None:
         return place_of(raw) == CUT
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.cut_pin()
 
 
 def pin_inline_chain() -> bool:
     """The opt-in for the FA-2 shared-score restructuring — the score edge placed
-    ``inline`` (register fragment). Native bare ``DEPLODOCK_PLACE=inline``, else the legacy
-    ``DEPLODOCK_CHAIN`` ingest."""
+    ``inline`` (register fragment). Native bare ``EMMY_PLACE=inline``, else the legacy
+    ``EMMY_CHAIN`` ingest."""
     raw = pin(PLACE, "")
     if raw is not None:
         return place_of(raw) == INLINE
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.chain_pin()
 
 
 def pin_xport() -> bool | None:
-    """Pinned transport for staged edges: native bare ``DEPLODOCK_PLACE`` carrying a
-    ``:tma`` / ``:sync`` xport, else the legacy ``DEPLODOCK_TMA`` ingest. ``None`` =
+    """Pinned transport for staged edges: native bare ``EMMY_PLACE`` carrying a
+    ``:tma`` / ``:sync`` xport, else the legacy ``EMMY_TMA`` ingest. ``None`` =
     auto."""
     raw = pin(PLACE, "")
     if raw is not None:
         xport = place_xport(raw)
         return None if xport is None else xport == "tma"
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.tma_pin()
 
 
 def atom_raw(cell: str) -> str | None:
-    """The raw atom control for ``cell`` — native ``DEPLODOCK_ATOM_<cell>`` / bare
-    ``DEPLODOCK_ATOM`` first, else the legacy ``DEPLODOCK_MMA`` ingest. The string
+    """The raw atom control for ``cell`` — native ``EMMY_ATOM_<cell>`` / bare
+    ``EMMY_ATOM`` first, else the legacy ``EMMY_MMA`` ingest. The string
     ``mma_decode`` interprets (``scalar`` / auto / a kind name)."""
     raw = pin(ATOM, cell)
     if raw is not None:
         return raw
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knob_legacy  # noqa: PLC0415
 
     return _knob_legacy.atom_raw()

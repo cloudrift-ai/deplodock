@@ -4,9 +4,9 @@ import asyncio
 import logging
 import shlex
 
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.provisioning.shell import run_shell_cmd
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.shell import run_shell_cmd
+from emmy.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
 

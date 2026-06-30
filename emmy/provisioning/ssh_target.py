@@ -1,6 +1,6 @@
 """Shared parser for `USER@HOST[:PORT]` SSH targets.
 
-Used by `deplodock deploy ssh` and `deplodock bench --ssh` so both commands
+Used by `emmy deploy ssh` and `emmy bench --ssh` so both commands
 accept the exact same syntax.
 """
 

@@ -1,11 +1,11 @@
 """Hardware lookup tables: GPU brand -> provider instance types.
 
 Physical GPU facts (PCI ids, compute capability, SM count, VRAM) live in the
-common :mod:`deplodock.gpu` registry; this module owns only the cloud-provisioning
+common :mod:`emmy.gpu` registry; this module owns only the cloud-provisioning
 tables (instance types, zones, provisioning models) keyed by the same GPU name.
 """
 
-from deplodock import gpu
+from emmy import gpu
 
 # GPU brand -> list of (provider, base_instance_type) in preference order.
 #
@@ -68,7 +68,7 @@ GPU_INSTANCE_TYPES = {
 
 
 # Full GPU name -> short name for result filenames. Derived from the common GPU
-# registry (:mod:`deplodock.gpu`), the single source of truth for GPU identity.
+# registry (:mod:`emmy.gpu`), the single source of truth for GPU identity.
 GPU_SHORT_NAMES = gpu.short_names()
 
 

@@ -21,8 +21,8 @@ return with later tiers.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.stmt import Load, Mma
-from deplodock.compiler.ir.tile.ir import AddrKind, Binding, Block, Edge, SerialTile, TileGraph
+from emmy.compiler.ir.stmt import Load, Mma
+from emmy.compiler.ir.tile.ir import AddrKind, Binding, Block, Edge, SerialTile, TileGraph
 
 
 def _has_k_tower(block: Block) -> bool:
@@ -37,7 +37,7 @@ def _stage_k_extent(block: Block) -> int:
     """Per-stage K extent (the slab's K span): the product of the stage-inner
     serial K axis and any reduce ``RegisterTile`` (the ``FK`` strip) extents. Used
     only for byte-ranking the candidates."""
-    from deplodock.compiler.ir.tile.ir import RegisterTile  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import RegisterTile  # noqa: PLC0415
 
     ext = 1
     for s in block.compute.iter():
@@ -89,7 +89,7 @@ def stage_candidates(graph: TileGraph) -> list[Edge]:
     # — neither pays for a slab. Staging a no-reuse operand wastes smem and can blow the
     # budget: a degenerate M-tile (BM·FM = 1) over a wide N register tile makes the
     # ``wl[N, K]`` weight slab 1 MB, which fails ``validate(ctx)`` with no in-budget
-    # fallback when ``DEPLODOCK_STAGE`` pinned it.
+    # fallback when ``EMMY_STAGE`` pinned it.
     ext_of = {a.name: a.extent for a in block.domain}
 
     def _reuse_axes(free: frozenset[str]) -> bool:

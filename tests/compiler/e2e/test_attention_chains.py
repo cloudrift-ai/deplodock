@@ -44,22 +44,22 @@ def _seed(monkeypatch):
     # hard-fail. The tile is irrelevant to these accuracy checks, so pin a fitting one
     # (legacy env pins route through the ingest mapper).
     for k, v in (("BN", "16"), ("BM", "8"), ("FN", "2"), ("FM", "2"), ("BK", "8"), ("BR", "4")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
 
 
 def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Trace + compile ``module``, then run the deplodock kernels and
+    """Trace + compile ``module``, then run the emmy kernels and
     the torch eager reference under one ``backend.run`` GPU-lock window
-    via the ``pre_run`` callback. Returns ``(deplodock_flat, eager_flat)``.
+    via the ``pre_run`` callback. Returns ``(emmy_flat, eager_flat)``.
 
     Keeping both halves under the same lock means peer xdist workers
     can't interleave CUDA work between the eager forward and the
-    deplodock comparison — which used to surface as small numerical
+    emmy comparison — which used to surface as small numerical
     divergence (max_diff ~0.03 on max_eager ~1.2) that flaked the
     accuracy assertion."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(module.cpu(), args)
     backend = CudaBackend()
@@ -72,7 +72,7 @@ def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name:
         if nid in input_set and nid in inputs_by_name:
             feed[nid] = inputs_by_name[nid]
         elif isinstance(node.op, ConstantOp):
-            from deplodock.compiler.loader.binder import apply_load_ops
+            from emmy.compiler.loader.binder import apply_load_ops
 
             n = 1
             for d in node.output.shape:
@@ -104,11 +104,11 @@ def _run_module_with_eager(module: torch.nn.Module, args: tuple, inputs_by_name:
     return dpd, eager
 
 
-def _assert_close(deplodock: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
-    assert deplodock.shape == eager.shape, f"shape: {deplodock.shape} vs {eager.shape}"
-    assert not np.any(np.isnan(deplodock)), "deplodock output has NaN"
-    max_diff = float(np.max(np.abs(deplodock - eager)))
-    mean_diff = float(np.mean(np.abs(deplodock - eager)))
+def _assert_close(emmy: np.ndarray, eager: np.ndarray, threshold: float = 1e-4) -> None:
+    assert emmy.shape == eager.shape, f"shape: {emmy.shape} vs {eager.shape}"
+    assert not np.any(np.isnan(emmy)), "emmy output has NaN"
+    max_diff = float(np.max(np.abs(emmy - eager)))
+    mean_diff = float(np.mean(np.abs(emmy - eager)))
     max_eager = float(np.max(np.abs(eager)))
     assert max_diff < threshold, f"max_diff={max_diff:.6f} >= {threshold} (mean={mean_diff:.6f}, max_eager={max_eager:.3f})"
 
@@ -204,7 +204,7 @@ def test_sdpa_explicit_additive_mask(n_heads: int, seq_len: int):
 
 def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     """Run TinyLlama's ``LlamaAttention`` sub-module at the given seq_len
-    and verify deplodock matches eager within ``threshold``."""
+    and verify emmy matches eager within ``threshold``."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
@@ -219,10 +219,10 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     cos = torch.randn(1, 1, seq_len, head_dim)
     sin = torch.randn(1, 1, seq_len, head_dim)
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.loader.binder import apply_load_ops
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.loader.binder import apply_load_ops
+    from emmy.compiler.trace.torch import trace_module
 
     attn_cpu = attn.cpu()
     graph = trace_module(attn_cpu, (x,), kwargs={"position_embeddings": (cos, sin)})
@@ -257,11 +257,11 @@ def _run_self_attn_tinyllama(seq_len: int, threshold: float = 1e-4) -> None:
     x_cuda, cos_cuda, sin_cuda = x.cuda(), cos.cuda(), sin.cuda()
 
     def eager_pre_run() -> np.ndarray:
-        # Force the math (naive) SDPA backend so eager and deplodock
+        # Force the math (naive) SDPA backend so eager and emmy
         # compare the same algorithm — flash-attention re-orders FMAs
         # and would otherwise drift O(0.5 × max_eager) from naive at
         # seq ≥ 512. Runs inside ``backend.run``'s GPU lock so the
-        # eager forward and the deplodock launches share one
+        # eager forward and the emmy launches share one
         # uninterrupted GPU window.
         with torch.no_grad(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
             out = attn_cuda(x_cuda, position_embeddings=(cos_cuda, sin_cuda))[0]
@@ -303,7 +303,7 @@ def test_full_self_attn_tinyllama_seq512():
     fp32 weights the naive-vs-naive comparison drifts substantially —
     the softmax over 512 random scores plus 2048-K projections are at
     the edge of fp32 precision, and TMA (default on sm_90+) further
-    reorders FMAs vs cp.async (verified via DEPLODOCK_FP64_ACC=1).
+    reorders FMAs vs cp.async (verified via EMMY_FP64_ACC=1).
     The intent is to catch order-of-magnitude regressions (NaN, sign
     flip, off-by-N, structural miscompute), not bit-equivalence; a
     future flash-style fused-attention recipe should let us tighten

@@ -1,27 +1,27 @@
-# deplodock.serving — vLLM out-of-tree embedding plugin
+# emmy.serving — vLLM out-of-tree embedding plugin
 
 Serve an embedding model (Qwen3-Embedding family) with vLLM's serving shell — OpenAI `/v1/embeddings`, tokenizer,
-scheduler, pooling — while the transformer trunk runs on deplodock-compiled CUDA kernels. The point is a clean A/B
-inside one serving stack: stock vLLM kernels vs deplodock kernels, same API, same batching, same pooler.
+scheduler, pooling — while the transformer trunk runs on emmy-compiled CUDA kernels. The point is a clean A/B
+inside one serving stack: stock vLLM kernels vs emmy kernels, same API, same batching, same pooler.
 
 ```
 vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling --enforce-eager \
-  --max-model-len 4096 --hf-overrides '{"architectures":["DeplodockEmbedModel"]}'
+  --max-model-len 4096 --hf-overrides '{"architectures":["EmmyEmbedModel"]}'
 ```
 
-`deplodock serve` (`commands/serve.py`) wraps that boilerplate: `deplodock serve <model> [vllm flags...]`, with
+`emmy serve` (`commands/serve.py`) wraps that boilerplate: `emmy serve <model> [vllm flags...]`, with
 `--stock` for the raw-vLLM baseline at the same max-model-len, and `--bench` for a one-shot start → `/health` →
 `vllm bench serve --backend openai-embeddings` → results → shutdown cycle.
 
 Requires the `serving` extra (`pip install -e ".[compile,serving]"` + cupy). vLLM discovers the plugin through the
-`vllm.general_plugins` entry point (`deplodock.serving:register` in pyproject.toml), which registers
-`DeplodockEmbedModel` by lazy string path; `--hf-overrides` swaps the served repo's `architectures` to it, so the
+`vllm.general_plugins` entry point (`emmy.serving:register` in pyproject.toml), which registers
+`EmmyEmbedModel` by lazy string path; `--hf-overrides` swaps the served repo's `architectures` to it, so the
 checkpoint, tokenizer, and sentence-transformers pooling config still come from the original HF repo.
 
 ## Module map
 
 - `__init__.py` — `register()`, the entry-point hook. Never imports vllm/torch at module level.
-- `vllm_model.py` — `DeplodockEmbedModel` (the only module importing vllm). An `nn.Module` with **no parameters**:
+- `vllm_model.py` — `EmmyEmbedModel` (the only module importing vllm). An `nn.Module` with **no parameters**:
   `is_pooling_model = True`, `IsAttentionFree` (no vLLM `Attention` layers → V1 builds an empty KV-cache spec),
   `attn_type = "encoder_only"` (vLLM disables chunked prefill → every request reaches `forward` whole),
   `pooler = DispatchPooler.for_embedding(...)` (last-token pooling + L2 normalize + matryoshka — identical to stock
@@ -31,10 +31,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `torch.cat`s the torch results back. The only host touch is a small `positions.cpu()` to find span boundaries for
   `split_spans` (a `(num_tokens,)` int vector). With `batch_cap > 1` it hands all spans to
   `runner.forward_hidden_states_batched` (one padded batched forward) instead of looping per span.
-- `runner.py` — `DeplodockForwardRunner`. At engine start: load the `AutoModel` **trunk** (hidden states out — no
+- `runner.py` — `EmmyForwardRunner`. At engine start: load the `AutoModel` **trunk** (hidden states out — no
   lm_head), `build_full_model_wrapper(dynamic=True)`, trace with the canonical 4-spec dynamic seq_len
   (`seq_len@input_ids:1`, `@attention_mask:2`, `@attention_mask:3`, `@position_ids:1`), compile through `CudaBackend`
-  (greedy fork picks from the global prior — benefits from any prior `deplodock tune`), bind weights as graph
+  (greedy fork picks from the global prior — benefits from any prior `emmy tune`), bind weights as graph
   constants (`named_parameters` + `named_buffers`, `remove_duplicate=False`, in the traced dtype), and build ONE
   `CompiledProgram` over a buffer set sized at **`max_seq_len`** (`--max-model-len`). Per
   sequence (`forward_hidden_states`) it takes a **1-D int torch CUDA tensor** and returns an `(S, hidden)` **torch CUDA
@@ -53,7 +53,7 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   → repeated execution + captured replay. Trunk compute dtype follows vLLM's `--dtype` (`mc.dtype`, mapped in
   `vllm_model._trunk_dtype_str`): `float32`→fp32, `float16`→fp16, anything else (e.g. `bfloat16`/`auto`) downcasts to
   fp16 with a warn — the runner's numpy weight carrier can't represent bf16, and only fp16/fp32 trunks are supported.
-  When `DEPLODOCK_SERVING_STATIC=1` (`config.serving_static`), `create` instead traces a **fully-static**
+  When `EMMY_SERVING_STATIC=1` (`config.serving_static`), `create` instead traces a **fully-static**
   `(max_num_seqs, max_seq_len)` graph (no dynamic_shapes — static extents for both batch and seq) and
   `forward_hidden_states_batched` runs each step as one padded batched forward — see "Static mode" below.
 - `packed.py` — `split_spans(positions, max_seq_len)`: vLLM V1 hands pooling models one packed `(num_tokens,)` tensor
@@ -61,10 +61,10 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   batches (index 0 always opens a span; overlong spans are chopped).
 - `sampling.py` — **no vLLM, no CUDA**. Pure-numpy token sampling (`Sampler`: greedy / temperature / top-k / top-p) +
   `apply_chat_template` (delegates to the HF tokenizer). Used by the standalone **generation oracle**
-  (`commands/generate.py`, Phase 0 of `plans/generative-inference-support.md`) — `deplodock generate`'s host loop
+  (`commands/generate.py`, Phase 0 of `plans/generative-inference-support.md`) — `emmy generate`'s host loop
   re-runs the whole fp16 prefix each step on the CUDA backend and samples with this. The generative *vLLM plugin*
-  (`DeplodockGenModel`) is later-phase work tracked in that plan.
-- `gen_runner.py` — `DeplodockGenRunner` (Phase 2; sibling to `DeplodockForwardRunner`). Carves SDPA out of every
+  (`EmmyGenModel`) is later-phase work tracked in that plan.
+- `gen_runner.py` — `EmmyGenRunner` (Phase 2; sibling to `EmmyForwardRunner`). Carves SDPA out of every
   decoder layer (`build_attention_split_wrapper`), compiles **two dynamic-`num_tokens` programs per layer** (`pre` +
   `post`) over the flattened `[num_tokens, H]` layout, and exposes `embed` / `forward_layer_pre(L,…)→(q,k,v)`
   (un-rotated 2-D seam) / `forward_layer_post(L, attn_out, residual)→hidden` / `final_norm`. The caller stitches between
@@ -78,25 +78,25 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode
   M=1; falls back to symbolic above the bucket or if a static compile fails. So
   up to 4 capacity programs/layer — the memory budget the plan flags (Top risk #9).
-- `vllm_model_gen.py` — `DeplodockGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
+- `vllm_model_gen.py` — `EmmyGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
   builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs
   paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.
-  The trunk compute (embed + per-layer pre/post + final norm) is the `DeplodockGenRunner`; vLLM owns only `lm_head`
+  The trunk compute (embed + per-layer pre/post + final norm) is the `EmmyGenRunner`; vLLM owns only `lm_head`
   (`load_weights` claims `lm_head.weight`, or the tied embed alias). `forward` brackets each `self.attn[L](q,k,v)` with
-  two deplodock replays (pre/post), applying RoPE in between (A2). `forward` branches on `num_tokens`: the decode hot
+  two emmy replays (pre/post), applying RoPE in between (A2). `forward` branches on `num_tokens`: the decode hot
   path (`≤ bucket`) runs `_forward_device` (q/k/v + attn_out stay CUDA tensors through RoPE + attention, no host
   hop); prefill keeps the numpy path. Select via `--runner generate` +
-  `--hf-overrides '{"architectures":["DeplodockGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
+  `--hf-overrides '{"architectures":["EmmyGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
   this for seam coherence). Registered in `__init__.py`. Whole-step CUDA-graph capture (drop `--enforce-eager`) is
   Phase B (`plans/generative-device-resident-decode.md`).
 
-## Static mode (`DEPLODOCK_SERVING_STATIC=1`) — static extents for both batch and seq
+## Static mode (`EMMY_SERVING_STATIC=1`) — static extents for both batch and seq
 
-The default path is symbolic-seq, **one sequence per forward** (`batch_cap = 1`). Setting `DEPLODOCK_SERVING_STATIC=1`
+The default path is symbolic-seq, **one sequence per forward** (`batch_cap = 1`). Setting `EMMY_SERVING_STATIC=1`
 switches the runner to a **fully-static `(N, max_seq_len)` program** (static extents for both batch and seq) so a whole
 scheduler step runs as one batched forward. The batch `N` is **vLLM's own `max_num_seqs`**
 (`vllm_config.scheduler_config.max_num_seqs`), read at init — so the batch is sized by the standard `--max-num-seqs`
-flag, not a separate deplodock knob (the toggle is boolean; the size comes from what vLLM hands us). Mind the default
+flag, not a separate emmy knob (the toggle is boolean; the size comes from what vLLM hands us). Mind the default
 `max_num_seqs=256`: pair the opt-in with a sane `--max-num-seqs` or the static `(256, max_seq_len)` program will be huge.
 
 **Measured (RTX 5090, Qwen3-Embedding-0.6B, uniform 512 tokens, concurrency 32):** this is currently a throughput
@@ -133,7 +133,7 @@ structurally trails stock vLLM's packed-batch prefill — that gap measures the 
 Recorded follow-ups, in impact order:
 
 1. **Packed-varlen attention** (cu_seqlens-aware SDPA tiles) — run vLLM's whole packed batch in one launch at *mixed*
-   lengths; the general form of the throughput fix. At concurrency 1 (no batching) deplodock is ~1.5× stock; the rest of
+   lengths; the general form of the throughput fix. At concurrency 1 (no batching) emmy is ~1.5× stock; the rest of
    the concurrency-32 gap is batching. The static batched mode above is the fixed-length stand-in; the remaining work is
    (a) making the masked-tile kernels batch-correct so a symbolic-seq batched program works, then (b) cu_seqlens varlen
    so one launch handles mixed lengths without padding to `max_seq_len`.
@@ -154,7 +154,7 @@ Recorded follow-ups, in impact order:
   rotary buffer (`_SlicedRotary` precomputes `DYNAMIC_DIM_MAX + 1` positions).
 - `--enforce-eager`: vLLM never torch.compiles/cudagraph-captures an undecorated OOT class, but enforce-eager makes
   the whole engine eager so the runner's own kernel launches can't race a capture.
-- Startup compiles the whole model (~1–2 min for 0.6B warm-cubin-cache; first boot pays nvcc). `DEPLODOCK_CUBIN_CACHE`
+- Startup compiles the whole model (~1–2 min for 0.6B warm-cubin-cache; first boot pays nvcc). `EMMY_CUBIN_CACHE`
   persistence across container restarts is what keeps reboots fast.
 - The shared buffer set is allocated at `max_seq_len` (`--max-model-len`); every accepted request (S ≤ `max_seq_len`)
   uses the captured-graph path. The S²-attention scratch dominates that allocation (0.6B at 4096 ≈ 15 GB), so lower
@@ -176,6 +176,6 @@ Recorded follow-ups, in impact order:
   `output_prefix_device` + `torch.from_dlpack`-out) matches eager, the primitive behind the runner's torch I/O.
 - `tests/serving/test_runner_batched_gpu.py` — `perf`-marked: a 1-layer static `(batch, S)` trunk wrapped in a runner;
   `forward_hidden_states_batched` runs several different-length sequences in one padded batched forward and matches
-  eager per row (the causal-independence-under-padding gate for `DEPLODOCK_SERVING_STATIC`).
+  eager per row (the causal-independence-under-padding gate for `EMMY_SERVING_STATIC`).
 - `scripts/compare_embeddings.py` — the accuracy gate against a *server*: embeds a fixed text set through two
-  OpenAI-compatible endpoints (deplodock-backed and stock) and asserts pairwise cosine > 0.99.
+  OpenAI-compatible endpoints (emmy-backed and stock) and asserts pairwise cosine > 0.99.

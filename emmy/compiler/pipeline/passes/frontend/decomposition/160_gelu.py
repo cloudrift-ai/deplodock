@@ -8,10 +8,10 @@ alongside surrounding pointwise ops — the same pattern silu uses.
 
 import math
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import const_bc, open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "gelu"})]
 

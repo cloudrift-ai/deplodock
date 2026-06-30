@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import logging
 
-from deplodock.compiler.ir.stmt import Accum, Body
-from deplodock.compiler.ir.tile.ir import GridTile, ParallelTile, ThreadTile, WarpTile
-from deplodock.compiler.pipeline import RuleSkipped
+from emmy.compiler.ir.stmt import Accum, Body
+from emmy.compiler.ir.tile.ir import GridTile, ParallelTile, ThreadTile, WarpTile
+from emmy.compiler.pipeline import RuleSkipped
 
 _logger = logging.getLogger(__name__)
 

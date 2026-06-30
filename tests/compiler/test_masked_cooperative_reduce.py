@@ -39,8 +39,8 @@ def _supports_shuffle() -> bool:
 
 def _dynamic_softmax_graph():
     """Trace ``softmax(x, dim=1)`` with axis 1 (the reduce axis) symbolic."""
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
 
     ds = build_torch_dynamic_shapes(parse_position_specs(["seq_len@x:1"]))
     graph, _, _ = graph_from_code("torch.softmax(torch.randn(8, 512), dim=1)", dynamic_shapes=ds)
@@ -53,8 +53,8 @@ def test_masked_cooperative_softmax_structure(monkeypatch):
     cooperative combine (``__shfl_xor_sync``) over a hint-tiled, boundary-masked
     K — the runtime ``seq_len`` arg, the per-tile mask, and the clamped read are
     all present (vs the old degenerate per-thread serial reduce)."""
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "t64")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    monkeypatch.setenv("EMMY_REDUCE", "t64")
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     compiled = CudaBackend().compile(_dynamic_softmax_graph())
     src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if getattr(n.op, "kernel_source", None))
@@ -72,8 +72,8 @@ def test_masked_cooperative_softmax_accuracy(monkeypatch, seq):
     below / at / above the 512 hint — the off-hint sizes (1, 31, 513, 700)
     straddle the BR·BK = 512-element tile, exercising the boundary mask (the
     overhang must fold the reduce identity, not garbage past ``seq_len``)."""
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "t64")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    monkeypatch.setenv("EMMY_REDUCE", "t64")
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     graph = _dynamic_softmax_graph()
     be = CudaBackend()

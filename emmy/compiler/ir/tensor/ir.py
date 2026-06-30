@@ -30,9 +30,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from deplodock.compiler.dim import Dim, to_dim
-from deplodock.compiler.ir.base import Op, _keepdim_axis
-from deplodock.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
+from emmy.compiler.dim import Dim, to_dim
+from emmy.compiler.ir.base import Op, _keepdim_axis
+from emmy.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
 
 # ---------------------------------------------------------------------------
 # Elementwise / reduce / scan
@@ -225,7 +225,7 @@ class IndexSource:
 
     ``coord_map[i]`` is an ``Expr`` producing the input's i-th index from
     placeholder vars ``Var("out_coord_0")``, ``Var("out_coord_1")``, ...
-    See ``deplodock.compiler.ir.expr`` for the placeholder convention and
+    See ``emmy.compiler.ir.expr`` for the placeholder convention and
     substitution helpers.
 
     ``select`` is None for single-source ops; for multi-source IndexMaps
@@ -281,7 +281,7 @@ class IndexMapOp(Op):
 
     def is_identity(self, input_shape: tuple) -> bool:
         """True when this IndexMap is a pure pointer alias of its single input."""
-        from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Var
+        from emmy.compiler.ir.expr import PLACEHOLDER_PREFIX, Var
 
         if len(self.sources) != 1:
             return False

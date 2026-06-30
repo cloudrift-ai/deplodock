@@ -4,8 +4,8 @@ import os
 
 import yaml
 
-from deplodock.recipe.engines import banned_extra_arg_flags
-from deplodock.recipe.types import Recipe
+from emmy.recipe.engines import banned_extra_arg_flags
+from emmy.recipe.types import Recipe
 
 
 def deep_merge(base, override):
@@ -127,7 +127,7 @@ def resolve_for_hardware(recipe_dir: str, gpu_name: str, gpu_count: int | None =
     If no matrices section exists, returns the base recipe.
     Raises ValueError if no match is found.
     """
-    from deplodock.recipe.matrix import build_override, expand_matrix
+    from emmy.recipe.matrix import build_override, expand_matrix
 
     config = _load_raw_config(recipe_dir)
     matrices = config.pop("matrices", None)

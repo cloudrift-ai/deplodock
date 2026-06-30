@@ -22,9 +22,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
 cppyy = pytest.importorskip("cppyy")
 
@@ -38,14 +38,14 @@ def _build(fn: str) -> Graph:
 
 
 def _run_loop(graph: Graph, x: np.ndarray) -> np.ndarray:
-    from deplodock.compiler.backend.loop import LoopBackend
+    from emmy.compiler.backend.loop import LoopBackend
 
     be = LoopBackend()
     return be.run(be.compile(graph), input_data={"x": x})[0].outputs["y"]
 
 
 def test_cache_not_keyed_on_object_identity(monkeypatch):
-    from deplodock.compiler.ir.loop import runner
+    from emmy.compiler.ir.loop import runner
 
     # Pin every id() the runner module evaluates to one constant, forcing the
     # exact id-collision the old cache key was vulnerable to.

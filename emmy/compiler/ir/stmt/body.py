@@ -29,10 +29,10 @@ from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.ir.stmt.base import Stmt
+from emmy.compiler.ir.stmt.base import Stmt
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.stmt.leaves import Write
+    from emmy.compiler.ir.stmt.leaves import Write
 
 
 @dataclass(frozen=True)
@@ -329,8 +329,8 @@ class Body(tuple[Stmt, ...]):
                 # become visible at the outer scope with the loop axis
                 # subtracted (Loop) or kept (StridedLoop — partial value
                 # carries the strided axis). Mirrors hoist_loop_invariants.
-                from deplodock.compiler.ir.stmt.blocks import Loop, StridedLoop  # noqa: PLC0415
-                from deplodock.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
+                from emmy.compiler.ir.stmt.blocks import Loop, StridedLoop  # noqa: PLC0415
+                from emmy.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
 
                 if isinstance(s, Loop):
                     for c in s.body:
@@ -557,14 +557,14 @@ class Body(tuple[Stmt, ...]):
         """All ``Load`` stmts in the body (recursive). Replaces the
         per-Op ``loads`` properties on ``LoopOp`` / ``TileOp`` /
         ``KernelOp``. Cached on the instance — Body is immutable."""
-        from deplodock.compiler.ir.stmt.leaves import Load  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.leaves import Load  # noqa: PLC0415
 
         return self.iter_of_type(Load)
 
     @cached_property
     def writes(self) -> tuple[Stmt, ...]:
         """All ``Write`` stmts in the body (recursive)."""
-        from deplodock.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.leaves import Write  # noqa: PLC0415
 
         return self.iter_of_type(Write)
 
@@ -576,21 +576,21 @@ class Body(tuple[Stmt, ...]):
         Validation enforces op-consistency across same-name Accums in
         ``LoopOp.__post_init__``; callers that want a one-per-name view
         can dedup at the call site (``{a.name: a for a in body.accums}``)."""
-        from deplodock.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.leaves import Accum  # noqa: PLC0415
 
         return self.iter_of_type(Accum)
 
     @cached_property
     def loops(self) -> tuple[Stmt, ...]:
         """All ``Loop`` stmts in the body (recursive)."""
-        from deplodock.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
 
         return self.iter_of_type(Loop)
 
     # -- structural identity --------------------------------------------
 
     def structural_key(self) -> str:
-        """Implements :class:`deplodock.compiler.structural.Structural`.
+        """Implements :class:`emmy.compiler.structural.Structural`.
 
         Canonical text rendering used for structural-equivalence
         queries. Two bodies that differ only by SSA / axis names,
@@ -604,7 +604,7 @@ class Body(tuple[Stmt, ...]):
         ``canonical_buffers=True`` (renames ``Load.input`` /
         ``Write.output`` to ``b0, b1, ...``), and ``cluster_ops=True``
         (collapses each op to its compute-unit cluster representative
-        — see :func:`deplodock.compiler.ir.elementwise.cluster_representative`),
+        — see :func:`emmy.compiler.ir.elementwise.cluster_representative`),
         then joining :func:`pretty_body`'s line list. Cached on the
         instance — Body is immutable."""
         return self._cached_structural_key
@@ -658,8 +658,8 @@ class Body(tuple[Stmt, ...]):
         # imports Body from this module). Smem / StageBundle staging buffers
         # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
         # import is needed.
-        from deplodock.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         block_axes: set[str] = set()
         thread_axes: set[str] = set()
@@ -739,8 +739,8 @@ def _shared_structural_key(body: Body) -> str:
     queries but would be a *correctness bug* for any callsite running
     the normalized body.
     """
-    from deplodock.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.base import pretty_body  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.normalize import normalize_body  # noqa: PLC0415
 
     normalized = normalize_body(body, hoist=False, canonical_buffers=True, cluster_ops=True)
     return "\n".join(pretty_body(normalized))

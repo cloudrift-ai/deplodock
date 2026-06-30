@@ -7,13 +7,13 @@ via integer-divide indexing: ``K[b, q_head // group_size, s, d]``.
 
 import math
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
-from deplodock.compiler.ir.frontend.ir import SdpaOp, TransposeOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import ConstantOp
+from emmy.compiler.ir.expr import BinaryExpr, Literal, placeholder
+from emmy.compiler.ir.frontend.ir import SdpaOp, TransposeOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
     gqa_broadcast,

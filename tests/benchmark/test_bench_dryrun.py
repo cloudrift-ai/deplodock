@@ -239,14 +239,14 @@ def test_bench_group_log_captures_provisioning(run_cli, make_bench_config, tmp_p
     assert "Running benchmark..." in log, f"Benchmark start missing.\nLog:\n{log}"
     assert "Tearing down..." in log, f"Teardown missing.\nLog:\n{log}"
 
-    # Cloud provisioning (deplodock.provisioning.cloudrift)
+    # Cloud provisioning (emmy.provisioning.cloudrift)
     assert "Creating CloudRift instance" in log, f"CloudRift provisioning missing.\nLog:\n{log}"
 
-    # Remote provisioning (deplodock.provisioning.remote)
+    # Remote provisioning (emmy.provisioning.remote)
     assert "install docker" in log, f"Remote provisioning missing.\nLog:\n{log}"
     assert "install nvidia-container-toolkit" in log, f"NVIDIA toolkit provisioning missing.\nLog:\n{log}"
 
-    # Deploy orchestration (deplodock.deploy.orchestrate)
+    # Deploy orchestration (emmy.deploy.orchestrate)
     assert "Pulling images" in log, f"Image pull missing.\nLog:\n{log}"
     assert "Downloading model" in log, f"Model download missing.\nLog:\n{log}"
     assert "Cleaning up old containers" in log, f"Container cleanup missing.\nLog:\n{log}"
@@ -254,7 +254,7 @@ def test_bench_group_log_captures_provisioning(run_cli, make_bench_config, tmp_p
     assert "Waiting for health check" in log, f"Health check missing.\nLog:\n{log}"
     assert "Teardown complete." in log, f"Teardown complete missing.\nLog:\n{log}"
 
-    # SSH transport (deplodock.provisioning.ssh_transport)
+    # SSH transport (emmy.provisioning.ssh_transport)
     assert "docker compose pull" in log, f"SSH docker compose pull missing.\nLog:\n{log}"
     assert "docker compose up" in log, f"SSH docker compose up missing.\nLog:\n{log}"
 

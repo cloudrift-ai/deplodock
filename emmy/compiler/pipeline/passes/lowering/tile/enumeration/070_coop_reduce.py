@@ -38,14 +38,14 @@ score coords are a DAG invariant on the inner ``Contraction`` (``out_index``); t
 geometry is walked off the composition at emit time (``_iterdag.chain_free_axes``), so neither
 routing nor the build moves walk the lowered tile to recover them. The v1 realizer's scope ceilings
 (``_warp_chain_buildable`` — no additive mask, ``D≤256``) and the deployment policy
-(``_deploy_warp_chain`` — symbolic-default, static under ``DEPLODOCK_CHAIN``) are named, orthogonal
+(``_deploy_warp_chain`` — symbolic-default, static under ``EMMY_CHAIN``) are named, orthogonal
 guards: what the realizer can build today + an env/extent policy, not graph facts.
 This pass then hands the logical seed to ``_build.build_monoid`` (with ``combiner=MmaTwist``), which
 σ-tiles + atomizes the two chained contractions (stamping the kv-stream ``Schedule.carry`` + the
 score→A handoff edge);
 assembly's generic ``_assemble.carry_scope_from_graph`` walk then realizes the fragment-tier
 online-softmax around those cells (the former ``split/005_warp_chain`` route, folded in here).
-Symbolic is the deployed default (the ~100× win); static is a ``DEPLODOCK_CHAIN`` opt-in.
+Symbolic is the deployed default (the ~100× win); static is a ``EMMY_CHAIN`` opt-in.
 This single fork owns the regime end to end:
 the scalar passes ``090``/``100``/``110`` and ``120_stage`` gate off ``MONOID`` (a monoid
 reduce stays smem-free — each lane reads its own ``K_c``-strided slice, no cross-thread reuse).
@@ -55,17 +55,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import TileGraphOp
-from deplodock.compiler.ir.twist import MmaTwist, ScalarCombiner
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import inner_atomizes
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.tile.ir import TileGraphOp
+from emmy.compiler.ir.twist import MmaTwist, ScalarCombiner
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._atom import inner_atomizes
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_THREADS_PER_CTA
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
     coop_free_thread_knobs,
     coop_reduce_knobs,
@@ -80,7 +80,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import 
 def _streaming_bk(dag) -> int:
     """The KV-tile factor ``BK`` re-bracketing the streaming reduce,
     ``S_k → S_k/BK · BK``. Honored from a
-    ``DEPLODOCK_BK`` pin only when it divides EVERY reduce extent the move tiles (the KV
+    ``EMMY_BK`` pin only when it divides EVERY reduce extent the move tiles (the KV
     stream + the nested QK^T), since ``_rebracket_k`` applies it uniformly; else ``1``
     (the serial-stream default). A symbolic axis (no static extent) stays ``1``.
 
@@ -126,7 +126,7 @@ def _warp_chain_buildable(op: TileGraphOp) -> bool:
 def _deploy_warp_chain(op: TileGraphOp, reduction) -> bool:
     """The warp-tier chain's **deployment policy** — orthogonal to eligibility (it gates on env +
     the runtime extent, not the graph). A **symbolic** KV stream deploys by default (the ~100×
-    win); a **static** stream stays the scalar nest unless ``DEPLODOCK_CHAIN`` opts in, and then
+    win); a **static** stream stays the scalar nest unless ``EMMY_CHAIN`` opts in, and then
     only when it is 16-aligned (the warp tile owns a 16-key slab). The hinge (KV stream) extent IS
     the deployment axis."""
     seq = reduction.hinge.axis.extent
@@ -162,7 +162,7 @@ def reduction_build(ctx: Context, op: TileGraphOp) -> list[TileGraphOp]:
     inner contraction (``reduction.inner``) that independently tensorizes (``inner_atomizes`` — the
     SAME atom-fit the standalone SEMIRING matmul gates on). The realizer scope ceiling
     (``_warp_chain_buildable``) and the deployment policy (``_deploy_warp_chain`` — symbolic-default,
-    static under ``DEPLODOCK_CHAIN``) are explicit, orthogonal guards: what the v1 realizer can build
+    static under ``EMMY_CHAIN``) are explicit, orthogonal guards: what the v1 realizer can build
     today + an env/extent policy, not graph facts. The three regimes are the honest 2×2 of (chained
     pair vs single contraction) × (scalar vs warp) — branches of ONE ``build_monoid``, parametrized by
     the combiner, not three functions (they still produce genuinely different kernels — a cooperative
@@ -203,7 +203,7 @@ def _streaming_leaves(op: TileGraphOp) -> list[TileGraphOp]:
     """Streaming flash: the free-axis THREAD tile × cooperative ``BR`` over the static KV
     axis, with ``FK = SPLITK = 1`` (the coupled ``Monoid`` carrier can't span register
     cells or split-K) and ``BK`` the KV-tile re-bracket of the streaming axis (Phase 1 —
-    default 1, honored from a ``DEPLODOCK_BK`` pin via :func:`_streaming_bk`). ``BR > 1``
+    default 1, honored from a ``EMMY_BK`` pin via :func:`_streaming_bk`). ``BR > 1``
     lays the ``K_c`` lane on the streaming axis (cooperative-KV), constrained by the
     cross-lane combine geometry (whole-CTA tree vs strided intra-warp segment)."""
     bk = _streaming_bk(op.dag)  # Phase 1: KV-tile re-bracket of the streaming axis (pin-honored)

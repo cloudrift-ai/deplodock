@@ -2,10 +2,10 @@
 
 This package owns *all* VM lifecycle logic for the CLI:
 
-* `deplodock deploy cloud` → `provision_cloud_vm()`
-* `deplodock bench` → `provision_cloud_vm()` (via `benchmark/execution.py`)
-* `deplodock vm create gpu` → `provision_cloud_vm()`
-* `deplodock vm create gcp / cloudrift` → provider `create_instance()` directly (single-shot manual)
+* `emmy deploy cloud` → `provision_cloud_vm()`
+* `emmy bench` → `provision_cloud_vm()` (via `benchmark/execution.py`)
+* `emmy vm create gpu` → `provision_cloud_vm()`
+* `emmy vm create gcp / cloudrift` → provider `create_instance()` directly (single-shot manual)
 
 `deploy ssh` and fixed-host `bench` go through `host.py` / `remote.py` and don't touch this orchestrator.
 
@@ -51,7 +51,7 @@ When every candidate is exhausted, the orchestrator returns `None` and logs the 
 **Timing:** `bench` (`benchmark/execution.py`) wraps `provision_cloud_vm()` → `vm_provision` and `provision_remote()`
 → `remote_provision` in a timer. These run once per `ExecutionGroup` (shared VM) but are seeded into each task's timer,
 so every task's result reflects its host's stand-up cost. `vm_provision` is omitted for pre-allocated/fixed/local hosts
-(no VM created). See `deplodock/commands/ARCHITECTURE.md` → Timing metrics.
+(no VM created). See `emmy/commands/ARCHITECTURE.md` → Timing metrics.
 
 ## Error contract
 

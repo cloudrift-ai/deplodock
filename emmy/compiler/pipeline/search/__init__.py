@@ -15,17 +15,17 @@ on-disk inventory + perf store, and the in-memory MCTS tree.
 - :mod:`.keys` — ``op_cache_key`` / ``dialect_of`` / ``source_chain``.
 
 The bench + DB write orchestration lives in
-:func:`deplodock.compiler.pipeline.pipeline._bench_terminal`;
+:func:`emmy.compiler.pipeline.pipeline._bench_terminal`;
 ``Pipeline.tune`` calls it per yielded terminal and passes the
 aggregate :class:`PerfStats` to :meth:`Search.observe` for the policy
 to consume.
 """
 
-from deplodock.compiler.pipeline.search.candidate import Candidate, Cursor, LazyCandidate
-from deplodock.compiler.pipeline.search.db import PerfRow, PerfStats, SearchDB
-from deplodock.compiler.pipeline.search.keys import dialect_of, op_cache_key, source_chain
-from deplodock.compiler.pipeline.search.policy import Search, TuningSearch, greedy_decide
-from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree
+from emmy.compiler.pipeline.search.candidate import Candidate, Cursor, LazyCandidate
+from emmy.compiler.pipeline.search.db import PerfRow, PerfStats, SearchDB
+from emmy.compiler.pipeline.search.keys import dialect_of, op_cache_key, source_chain
+from emmy.compiler.pipeline.search.policy import Search, TuningSearch, greedy_decide
+from emmy.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree
 
 __all__ = [
     "Candidate",

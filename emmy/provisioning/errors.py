@@ -1,6 +1,6 @@
 """Exceptions used by the cloud VM provisioning layer.
 
-The orchestrator in :mod:`deplodock.provisioning.cloud` distinguishes three
+The orchestrator in :mod:`emmy.provisioning.cloud` distinguishes three
 outcomes from a provider's ``create_instance``:
 
 * **success** — returns a ``VMConnectionInfo``.

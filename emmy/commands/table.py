@@ -1,6 +1,6 @@
 """Tiny ANSI-aware console-table helper shared by the CLI tables.
 
-One renderer for every column-aligned table the CLI prints — the ``deplodock eval``
+One renderer for every column-aligned table the CLI prints — the ``emmy eval``
 golden / knob tables and the ``run`` / ``tune`` latency and per-kernel tables. A cell
 is a plain ``str`` or a ``(text, colour)`` tuple; column width is measured by the
 *visible* text length so embedded ANSI colour codes never throw off the alignment.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 
-from deplodock.compiler.pipeline.knob import knob_sort_key
+from emmy.compiler.pipeline.knob import knob_sort_key
 
 # ANSI colours, only when stdout is a tty (piped / logged output stays plain).
 TTY = sys.stdout.isatty()

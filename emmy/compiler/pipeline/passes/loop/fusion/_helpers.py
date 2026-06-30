@@ -12,9 +12,9 @@ it under its own guard set instead of duplicating the assembly.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Accum, Assign, LoopOp, Write, splice_graph
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.loop import Accum, Assign, LoopOp, Write, splice_graph
 
 
 def is_pure_indexmap(loop_op: LoopOp) -> bool:

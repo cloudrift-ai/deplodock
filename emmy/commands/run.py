@@ -1,8 +1,8 @@
-"""Run an inline torch expression through the deplodock CUDA pipeline.
+"""Run an inline torch expression through the emmy CUDA pipeline.
 
 Compiles ``--code`` to CUDA, executes it on real input data, and verifies
 correctness against eager PyTorch. With ``--bench``, also benchmarks all
-backends (eager, torch.compile, deplodock) and prints a comparison table —
+backends (eager, torch.compile, emmy) and prints a comparison table —
 the same shape as ``scripts/bench_block.py`` but for arbitrary inline ops.
 """
 
@@ -16,7 +16,7 @@ import sys
 from collections import namedtuple
 from pathlib import Path
 
-from deplodock import config
+from emmy import config
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ def register_run_command(subparsers):
             "Equivalent to passing the same .json path as the positional input."
         ),
     )
-    from deplodock.commands.compile import add_golden_arg
+    from emmy.commands.compile import add_golden_arg
 
     add_golden_arg(parser)
     parser.add_argument(
@@ -65,15 +65,13 @@ def register_run_command(subparsers):
         default=32,
         help="Sequence length for full-model tracing when the input is a model ID (default: 32).",
     )
-    parser.add_argument(
-        "--bench", "-b", action="store_true", help="Benchmark eager / torch.compile / deplodock and print a comparison table."
-    )
+    parser.add_argument("--bench", "-b", action="store_true", help="Benchmark eager / torch.compile / emmy and print a comparison table.")
     parser.add_argument(
         "--profile",
         action="store_true",
         help="After --bench, re-launch each kernel under ``ncu`` to collect hardware counters "
         "(SM-active %%, FMA pipe util, L1/DRAM bandwidth, smem bank-conflict %%) and print a "
-        "side-by-side table of the deplodock kernels vs the torch/cuBLAS reference kernels. "
+        "side-by-side table of the emmy kernels vs the torch/cuBLAS reference kernels. "
         "Skipped if ncu is not on PATH or the user lacks performance-counter permissions.",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations for --bench (default: 10).")
@@ -84,9 +82,9 @@ def register_run_command(subparsers):
         help=(
             "Comma-separated subset of backends to time under --bench: any of "
             "``eager``, ``tcompile`` (a.k.a. ``torch.compile`` / ``compile``), "
-            "``deplodock``. Falls back to ``DEPLODOCK_BENCH_BACKENDS`` env var, "
-            "then to the default ``eager,deplodock`` (drops the ~0.8 s "
-            "torch.compile JIT from the per-case cost). ``deplodock`` is "
+            "``emmy``. Falls back to ``EMMY_BENCH_BACKENDS`` env var, "
+            "then to the default ``eager,emmy`` (drops the ~0.8 s "
+            "torch.compile JIT from the per-case cost). ``emmy`` is "
             "implicit even if omitted."
         ),
     )
@@ -98,7 +96,7 @@ def register_run_command(subparsers):
         metavar="KNOBS",
         help=(
             "Compile + bench an extra variant with these knobs pinned (``K1=V1,K2=V2`` — the "
-            "``DEPLODOCK_KNOBS`` grammar) and show it as a live A/B row beneath the matching greedy "
+            "``EMMY_KNOBS`` grammar) and show it as a live A/B row beneath the matching greedy "
             "kernel in the --bench kernel table, knob diffs red. Repeatable. Requires --bench and a "
             "re-lowerable input (--code / --golden / --ir)."
         ),
@@ -116,7 +114,7 @@ def register_run_command(subparsers):
         ),
     )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts.")
-    parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the deplodock backend.")
+    parser.add_argument("--debug", action="store_true", help="Per-launch tensor dumps in the emmy backend.")
     parser.add_argument(
         "-v",
         "--verbose",
@@ -128,8 +126,8 @@ def register_run_command(subparsers):
             "-vv: also per-rule application snapshots."
         ),
     )
-    from deplodock.commands.compile import add_nvcc_args
-    from deplodock.compiler.target import add_target_arg
+    from emmy.commands.compile import add_nvcc_args
+    from emmy.compiler.target import add_target_arg
 
     add_nvcc_args(parser)
     add_target_arg(parser)
@@ -137,8 +135,8 @@ def register_run_command(subparsers):
 
 
 def handle_run(args):
-    from deplodock.commands.compile import apply_nvcc_flags
-    from deplodock.compiler.target import apply_target_arg
+    from emmy.commands.compile import apply_nvcc_flags
+    from emmy.compiler.target import apply_target_arg
 
     apply_nvcc_flags(args, default="")  # run uses nvcc default -O3 (representative codegen)
     apply_target_arg(args)  # --target sm_NN gates TMA / cp.async like the target GPU would
@@ -156,9 +154,9 @@ def handle_run(args):
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.commands.compile import load_or_trace, resolve_golden_arg
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.pipeline.dump import CompilerDump
+    from emmy.commands.compile import load_or_trace, resolve_golden_arg
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.pipeline.dump import CompilerDump
 
     resolve_golden_arg(args)  # --golden NAME → --code <snippet>
     if sum(x is not None for x in (args.input, args.code, args.ir)) > 1:
@@ -205,8 +203,8 @@ def handle_run(args):
     if dump:
         dump.dump_input_graph(graph)
 
-    # Backend auto-resolves ``DEPLODOCK_TUNE_DB`` env →
-    # ``~/.cache/deplodock/autotune.db`` (opens if the file exists,
+    # Backend auto-resolves ``EMMY_TUNE_DB`` env →
+    # ``~/.cache/emmy/autotune.db`` (opens if the file exists,
     # silent fall-back to rule defaults otherwise).
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     if backend.tune_db is not None and backend.tune_db.exists():
@@ -217,7 +215,7 @@ def handle_run(args):
 
     # The ncu child of a ``--profile`` invocation skips the accuracy *check*
     # (the parent already verified it) but still launches both sides once —
-    # the deplodock program AND the eager reference — because the comparison
+    # the emmy program AND the eager reference — because the comparison
     # table needs the cuBLAS / aten kernel rows in the captured CSV beside
     # the ``k_*`` rows.
     skip_accuracy = config.ncu_child()
@@ -231,7 +229,7 @@ def handle_run(args):
             eager_out = _eager_output(module, example_args, example_kwargs)
             _check_accuracy(run_result.outputs, eager_out)
         else:
-            # ncu child: one deplodock launch (our metrics) + one eager forward
+            # ncu child: one emmy launch (our metrics) + one eager forward
             # (the reference rows for the comparison table); no accuracy diff.
             backend.run(compiled, input_data=input_data)
             _eager_output(module, example_args, example_kwargs)
@@ -250,14 +248,14 @@ def handle_run(args):
     cuda_module = module.to("cuda")
     cuda_args = tuple(a.to("cuda") if isinstance(a, torch.Tensor) else a for a in example_args)
     cuda_kwargs = _to_cuda_kwargs(example_kwargs)
-    # Symbolic graph: deplodock benches at the hint (synthetic hint-sized
+    # Symbolic graph: emmy benches at the hint (synthetic hint-sized
     # inputs), so tile the torch closures' inputs to the same hint — otherwise
     # the table compares different shapes (trace seq vs hint).
     cuda_args, cuda_kwargs, bench_sym_env = _hint_sized_inputs(compiled, cuda_args, cuda_kwargs)
 
     # Build torch_fns (incl. ~0.8s torch.compile / Inductor JIT when
     # ``tcompile`` is in the selected backends) *outside* the GPU lock
-    # so concurrent ``deplodock run`` workers can do their CPU-bound
+    # so concurrent ``emmy run`` workers can do their CPU-bound
     # JITs in parallel. The few GPU launches the compile-side warmup
     # issues are noisy but go untimed; the measurement loop below
     # holds the lock for accurate iter timing.
@@ -265,7 +263,7 @@ def handle_run(args):
     torch_fns = _build_torch_fns(cuda_module, cuda_args, cuda_kwargs, args.warmup, backends=backends)
 
     # Release the torch GPU state and reset the persisting-L2 window
-    # before the deplodock bench. The eager-accuracy comparison +
+    # before the emmy bench. The eager-accuracy comparison +
     # ``--bench-backends eager`` warmup leave allocated tensors in
     # torch's caching allocator AND cuBLAS-installed
     # ``cudaAccessPolicyWindow`` carveouts in L2; together they steal
@@ -275,7 +273,7 @@ def handle_run(args):
     # after release; same cubin SHA1, ~3 GHz SM clock both runs).
     # Only safe when no torch backends are in ``torch_fns`` — the
     # closures there reference ``cuda_module`` / ``cuda_args``; for
-    # eager/tcompile + deplodock the state has to stay alive and the
+    # eager/tcompile + emmy the state has to stay alive and the
     # comparison absorbs the slowdown intrinsically.
     if not torch_fns:
         # ``_bench_interleaved`` only dereferences ``cuda_module`` /
@@ -377,7 +375,7 @@ def _reset_persisting_l2_cache() -> None:
 
 
 def _dump_bench_compare(dump_dir, results: dict, warmup: int, iters: int) -> None:
-    """Persist the eager / torch.compile / deplodock comparison table
+    """Persist the eager / torch.compile / emmy comparison table
     so downstream tooling (``make bench-kernels``) can parse one file
     per case instead of grepping kernel stdout."""
     import json as _json
@@ -402,7 +400,7 @@ _GoldenBench = namedtuple("_GoldenBench", "sample graph bench")
 
 @contextlib.contextmanager
 def _pinned_knobs(knobs: dict):
-    """Pin ``DEPLODOCK_<KNOB>`` env vars for the duration of one compile, restoring
+    """Pin ``EMMY_<KNOB>`` env vars for the duration of one compile, restoring
     the prior environment on exit. A pinned knob collapses its fork to that value
     (``Knob.narrow``), so ``backend.compile`` lowers exactly these knobs."""
     saved: dict[str, str | None] = {}
@@ -422,14 +420,14 @@ def _pinned_knobs(knobs: dict):
 
 def _ab_samples(specs, dynamic=None):
     """One shapeless pseudo-sample per ``--ab "K1=V1,K2=V2"`` spec: ``.knobs`` to pin
-    (the ``DEPLODOCK_KNOBS`` grammar), ``.name`` the table label, ``.shape None`` —
+    (the ``EMMY_KNOBS`` grammar), ``.name`` the table label, ``.shape None`` —
     the marker :func:`_print_kernel_stats` uses to nest the row by the benched
     kernel's own ``S_*`` signature instead of a golden's matmul shape. ``dynamic``
     stamps the run's own ``--dynamic`` specs on each pseudo-sample so the A/B
     re-trace builds the same symbolic graph as the greedy run."""
     from types import SimpleNamespace  # noqa: PLC0415
 
-    from deplodock.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import parse_knob_spec  # noqa: PLC0415
 
     dyn = tuple(dynamic) if dynamic else None
     return [SimpleNamespace(name=f"ab {raw}", knobs=parse_knob_spec(raw), shape=None, dynamic=dyn) for raw in specs]
@@ -439,7 +437,7 @@ async def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters
     """Compile + bench each recorded golden config with its knobs pinned, returning
     a ``_GoldenBench`` per config so :func:`_print_kernel_stats` can show each as a
     measured row beside the greedy pick. ``golden_configs`` are
-    :class:`~deplodock.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
+    :class:`~emmy.compiler.pipeline.search.data.Sample`s, whose ``knobs`` are
     already the tunable-only set to pin (``S_*`` / ``H_*`` features are not knobs) —
     or the shapeless ``--ab`` pseudo-samples from :func:`_ab_samples` (same duck
     type). Each config re-traces a **fresh** graph from ``code`` — a frontend graph
@@ -449,8 +447,8 @@ async def _bench_golden_variants(backend, code, golden_configs, *, warmup, iters
     symbolically, so the pinned kernel is the same masked-tile artifact the greedy
     run deployed and benches at the same hint. Best-effort: a config whose pinned
     knobs fail to compile / bench for the live device is skipped with a warning."""
-    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
+    from emmy.commands.trace import graph_from_code  # noqa: PLC0415
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     out = []
     for sample in golden_configs or []:
@@ -481,13 +479,13 @@ def _print_kernel_stats(graph, bench, golden_benches=None):
     are each their own live compile+bench of a recorded golden config's pinned
     knobs; their kernels print beneath the greedy kernel of matching shape, labeled
     ``golden NAME`` in the Kernel column — a real A/B, not the recorded number. Their
-    ``%`` column is ``--`` (they're not part of the deplodock TOTAL), and their knob
+    ``%`` column is ``--`` (they're not part of the emmy TOTAL), and their knob
     cells are colored red where they differ from the greedy pick (like ``eval``)."""
-    from deplodock.commands.table import Col, knob_columns, render_table  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp, resolve_dim
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.data import ShapeKey  # noqa: PLC0415
+    from emmy.commands.table import Col, knob_columns, render_table  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp, resolve_dim
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.data import ShapeKey  # noqa: PLC0415
 
     cuda_nodes = [node for _, node in graph.nodes.items() if isinstance(node.op, CudaOp)]
     if not cuda_nodes:
@@ -609,7 +607,7 @@ def _collect_kernel_attrs(graph) -> dict[str, dict]:
     """Compile each kernel via ``cupy.RawKernel`` (cached by source) to
     pull post-PTXAS hardware attributes — register count, static smem,
     spill bytes. Returns ``{kernel_name: attrs_dict}``."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp
+    from emmy.compiler.ir.cuda.ir import CudaOp
 
     try:
         import cupy as cp
@@ -691,16 +689,16 @@ _NCU_METRICS = (
 
 
 def _run_ncu_profile(args, *, dump_dir=None):
-    """Re-launch the same ``deplodock run`` invocation under ``ncu`` to
+    """Re-launch the same ``emmy run`` invocation under ``ncu`` to
     collect a curated set of hardware counters (occupancy, bank
     conflicts, SM/DRAM/FMA throughput, register pressure). Output is
-    captured in CSV form; when ``DEPLODOCK_DUMP_DIR`` (or ``--dump-dir``
+    captured in CSV form; when ``EMMY_DUMP_DIR`` (or ``--dump-dir``
     propagated as ``dump_dir``) is set, the raw CSV and a parsed
     per-kernel JSON are written there. Otherwise the counters print to
     stdout in the same CSV form for one-shot inspection.
 
     Spawns one extra subprocess at minimal iter count — ncu's per-launch
-    overhead is huge (10-100×). The ``DEPLODOCK_NCU_CHILD`` env var
+    overhead is huge (10-100×). The ``EMMY_NCU_CHILD`` env var
     prevents the profiled child from re-spawning ncu recursively.
 
     Skipped silently when ``ncu`` is not on PATH. ncu's own stderr is
@@ -739,7 +737,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
         ",".join(_NCU_METRICS),
         sys.executable,
         "-m",
-        "deplodock.deplodock",
+        "emmy.emmy",
         "run",
     ]
     if args.code is not None:
@@ -758,7 +756,7 @@ def _run_ncu_profile(args, *, dump_dir=None):
         cmd.extend(["--target", args.target])
     # ncu's per-launch overhead means we want one or two launches per
     # kernel — enough for the counters to populate, not so many that
-    # the run drags out. Match ``deplodock run --bench``'s minimal
+    # the run drags out. Match ``emmy run --bench``'s minimal
     # warmup so the profiled launches see a realistic-ish steady state.
     cmd.extend(["--warmup", "2", "--iters", "3"])
 
@@ -835,13 +833,13 @@ _NCU_REF_ROWS_MAX = 12  # eager forwards can launch dozens of tiny aten kernels
 
 
 def _print_ncu_compare(parsed: dict, units: dict[str, str] | None = None) -> None:
-    """One aligned table over the parsed ncu metrics: the deplodock ``k_*``
+    """One aligned table over the parsed ncu metrics: the emmy ``k_*``
     kernels first, then the reference backend's kernels (cuBLAS / cutlass /
     aten) — so the counter deltas (occupancy, SM/DRAM/FMA utilization, smem
     bank conflicts, register pressure) read straight down a column instead of
     across two CSV dumps. Each side sorts by duration; reference rows truncate
     to the :data:`_NCU_REF_ROWS_MAX` slowest with a count of the rest."""
-    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+    from emmy.commands.table import Col, render_table  # noqa: PLC0415
 
     if not parsed:
         return
@@ -866,7 +864,7 @@ def _print_ncu_compare(parsed: dict, units: dict[str, str] | None = None) -> Non
     ]
     data = [row("dep", k) for k in dep] + [row("ref", k) for k in ref]
     print()
-    print("ncu compare — deplodock kernels vs the torch/cuBLAS reference (same counters, one table):")
+    print("ncu compare — emmy kernels vs the torch/cuBLAS reference (same counters, one table):")
     for line in render_table(cols, data, rule=True):
         print(line)
     if hidden_ref:
@@ -896,7 +894,7 @@ def _parse_ncu_csv(csv_text: str) -> dict:
     ``{kernel_name: {metric_name: numeric_value}}`` ready to be merged
     with the bench-comparison JSON downstream.
 
-    Keeps every kernel — the deplodock ``k_*`` rows AND the reference
+    Keeps every kernel — the emmy ``k_*`` rows AND the reference
     backend's (cuBLAS / cutlass / aten) rows the child's eager forward
     contributes — so :func:`_print_ncu_compare` can put the two sides in
     one table. Consumers split the sides on the ``k_*`` naming convention.
@@ -954,7 +952,7 @@ def _detect_stage(graph) -> str:
 
 def _passes_after_stage(stage: str) -> list[str]:
     """Pipeline tail to run after a graph has reached ``stage``."""
-    from deplodock.compiler.pipeline import (
+    from emmy.compiler.pipeline import (
         CUDA_PASSES,
         KERNEL_PASSES,
         LOOP_PASSES,
@@ -980,33 +978,33 @@ async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, 
 
     ``frontend`` is the pristine frontend-dialect snapshot (must be
     ``torch_ref``-runnable); pass ``None`` for a non-frontend / unsupported graph to
-    bench deplodock-only. One random source is drawn per distinct constant
+    bench emmy-only. One random source is drawn per distinct constant
     ``source_path`` and each side replays its own ``load_ops`` (so a weight lowering
     transposed + renamed stays the same underlying tensor on both sides). The lowered
     graph runs once for a non-fatal accuracy check vs the torch eager reference; then,
     when ``do_bench``, the selected backends are timed — interleaved when a torch ref
-    exists (full ``warmup``/``iters``), else deplodock-only at reduced iters.
+    exists (full ``warmup``/``iters``), else emmy-only at reduced iters.
 
     ``capture_graphs`` (default on — this function's callers are the per-kernel
     reproducer paths, where the torch side replays the frontend graph op-by-op and
     would otherwise be dispatch-bound) wraps every timed backend in a CUDA graph so
     the event windows measure pure GPU time. All-or-nothing: if any torch backend
-    or the deplodock launch loop fails to capture, the whole bench retries
+    or the emmy launch loop fails to capture, the whole bench retries
     uncaptured (warning logged) so one table never mixes timing semantics. The
     accuracy check always runs uncaptured, before any capture.
 
     Returns ``(results, bench, torch_available, captured)``: ``results`` is the
     ``{backend: latency_us}`` dict (``None`` when ``do_bench`` is False), ``bench`` the
-    deplodock ``BenchmarkResult`` (``None`` when ``do_bench`` is False),
+    emmy ``BenchmarkResult`` (``None`` when ``do_bench`` is False),
     ``torch_available`` whether an eager/torch.compile reference was built, and
     ``captured`` whether the timings came from graph-captured (pure-GPU) windows.
     Does no printing / dumping — callers own that."""
     import numpy as np
     import torch
 
-    from deplodock.compiler.backend import torch_ref
-    from deplodock.compiler.ir.base import ConstantOp, InputOp
-    from deplodock.compiler.loader.binder import bind_constants
+    from emmy.compiler.backend import torch_ref
+    from emmy.compiler.ir.base import ConstantOp, InputOp
+    from emmy.compiler.loader.binder import bind_constants
 
     rng = np.random.default_rng(seed)
 
@@ -1015,7 +1013,7 @@ async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, 
     # when no inputs are supplied — so the random inputs built here get concrete
     # hint-sized shapes. Atomic dims carry their own hint; composite exprs
     # (e.g. ``S * 2``) eval over the collected env.
-    from deplodock.compiler.dim import Dim
+    from emmy.compiler.dim import Dim
 
     sym_env = _collect_sym_env(([frontend] if frontend is not None else []) + [lowered])
 
@@ -1023,7 +1021,7 @@ async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, 
         return tuple((d.as_static() if d.is_static else int(d.expr.eval(sym_env))) if isinstance(d, Dim) else int(d) for d in shape)
 
     # One random source array per distinct constant ``source_path`` — shared by
-    # deplodock (lowered graph) and the torch ref (frontend graph). ``bind_constants``
+    # emmy (lowered graph) and the torch ref (frontend graph). ``bind_constants``
     # replays each constant's ``load_ops`` on it, so a weight that lowering transposed +
     # renamed (linear: out×in → in×out) stays the same underlying tensor on both sides.
     sources: dict[str, np.ndarray] = {}
@@ -1091,20 +1089,20 @@ async def bench_lowered_vs_torch(frontend, lowered, backend, *, seed, do_bench, 
             )
             captured = False
         return results, bench, True, captured
-    # Deplodock-only: a capture failure falls back inside ``benchmark_program``
+    # Emmy-only: a capture failure falls back inside ``benchmark_program``
     # (warned + reported via ``bench.captured``) — nothing to de-mix.
     bench = await backend.benchmark_async(lowered, warmup=max(3, warmup // 5), num_iters=max(10, iters // 5), capture_graphs=capture_graphs)
-    return {"Deplodock": bench.time_ms * 1000}, bench, False, bench.captured
+    return {"Emmy": bench.time_ms * 1000}, bench, False, bench.captured
 
 
 async def bench_full_model_real(module, args_t, kwargs, lowered, backend, *, warmup, iters, bench_backends):
     """End-to-end full-model bench against the **real torch module** — eager /
-    ``torch.compile`` / Deplodock — using the all-or-nothing CUDA-graph-captured
+    ``torch.compile`` / Emmy — using the all-or-nothing CUDA-graph-captured
     interleaved bench (real modules occasionally resist capture; those fall back
     to uncaptured wall timing, flagged in ``captured``). The module + its
     trace-time inputs come from ``load_or_trace``'s bundle; for a symbolic
     graph the torch closures run on hint-tiled inputs (``_hint_sized_inputs``)
-    so both sides bench the hint shape. Skips the accuracy check (deplodock's
+    so both sides bench the hint shape. Skips the accuracy check (emmy's
     bench uses synthetic activations vs torch's bound inputs, so only latency
     is comparable here — accuracy lives in the per-kernel path).
     Returns ``(results, bench, captured)``."""
@@ -1123,9 +1121,9 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     """Run path: load JSON IR (any stage), finish lowering, execute, bench."""
     import json
 
-    from deplodock.compiler.backend import torch_ref
-    from deplodock.compiler.graph import Graph
-    from deplodock.compiler.pipeline import Pipeline
+    from emmy.compiler.backend import torch_ref
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.pipeline import Pipeline
 
     path = Path(args.ir)
     with open(path) as f:
@@ -1146,13 +1144,13 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
     # Snapshot the pre-lowering frontend graph so we can build a torch
     # reference (eager + torch.compile) and compare accuracy/latency vs torch —
     # the same table the --code path produces, now for a dumped .torch.json.
-    # Non-frontend IR (loop/tile/…) has no torch twin → deplodock-only bench.
+    # Non-frontend IR (loop/tile/…) has no torch twin → emmy-only bench.
     frontend = graph.copy() if torch_ref.is_runnable(graph) else None
 
     backend = CudaBackend(debug=args.debug or None, dump=dump, tune_db="auto")
     db = None
     if backend.tune_db is not None and backend.tune_db.exists():
-        from deplodock.compiler.pipeline.search.db import SearchDB
+        from emmy.compiler.pipeline.search.db import SearchDB
 
         db = SearchDB(path=backend.tune_db)
         logger.info("Using tuning DB: %s", backend.tune_db)
@@ -1183,11 +1181,11 @@ def _handle_run_ir(args, CudaBackend, CompilerDump):
             note = None if captured else "(graph-capture fallback: timings include host launch overhead)"
             _print_table(results, note=note)
         else:
-            # Non-frontend IR (loop/tile/…): no torch twin → deplodock-only.
-            from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+            # Non-frontend IR (loop/tile/…): no torch twin → emmy-only.
+            from emmy.commands.table import Col, render_table  # noqa: PLC0415
 
             print()
-            for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Deplodock", f"{bench.time_ms * 1000:.0f}"]], rule=True):
+            for line in render_table([Col("Backend"), Col("Latency (us)", "r")], [["Emmy", f"{bench.time_ms * 1000:.0f}"]], rule=True):
                 print(line)
         ab_benches = None
         if args.ab:
@@ -1208,8 +1206,8 @@ async def _bench_ab_variants_ir(backend, ir_path, tail, specs, *, warmup, iters,
     compile / bench is skipped with a warning."""
     import json as _json  # noqa: PLC0415
 
-    from deplodock.compiler.graph import Graph  # noqa: PLC0415
-    from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
+    from emmy.compiler.graph import Graph  # noqa: PLC0415
+    from emmy.compiler.pipeline import Pipeline  # noqa: PLC0415
 
     out = []
     for sample in _ab_samples(specs):
@@ -1239,8 +1237,8 @@ def _bind_inputs(compiled, module, example_args, example_kwargs):
     import numpy as np
     import torch
 
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.loader.binder import bind_constants
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.loader.binder import bind_constants
 
     flat_inputs: list[torch.Tensor] = []
     for v in example_args:
@@ -1297,7 +1295,7 @@ def _collect_sym_env(graphs) -> dict[str, int]:
     """Map every symbolic dim var appearing in ``graphs`` to its hint
     (``DEFAULT_SEQ_HINT`` for a bare seq axis) — the size the backend resolves
     a symbolic graph to when benching without supplied inputs."""
-    from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+    from emmy.compiler.dim import DEFAULT_SEQ_HINT, Dim
 
     sym_env: dict[str, int] = {}
     for gph in graphs:
@@ -1337,11 +1335,11 @@ def _map_tensors(value, fn):
 def _hint_sized_inputs(lowered, example_args, example_kwargs):
     """Tile a symbolic graph's example inputs out to its ``Dim`` hints.
 
-    The deplodock side of the full-model bench runs a symbolic graph at each
+    The emmy side of the full-model bench runs a symbolic graph at each
     dim's hint (``backend.benchmark`` builds hint-sized synthetic inputs when
     none are supplied), while the torch closures close over the trace-time
     example tensors — different shapes, so the table would compare e.g. a
-    seq-512 deplodock program against seq-32 eager. Grow every symbolic input
+    seq-512 emmy program against seq-32 eager. Grow every symbolic input
     axis to its hint (positional ``graph.inputs`` ↔ flattened example tensors
     pairing, same as :func:`_bind_inputs`) so both sides run the hint shape.
     Values are tiled repeats of the trace inputs — valid for latency, which is
@@ -1353,7 +1351,7 @@ def _hint_sized_inputs(lowered, example_args, example_kwargs):
     sym_env = _collect_sym_env([lowered])
     if not sym_env:
         return example_args, example_kwargs, {}
-    from deplodock.compiler.dim import Dim
+    from emmy.compiler.dim import Dim
 
     flat: list = []
     for v in example_args:
@@ -1403,7 +1401,7 @@ def _to_cuda_tensor(arr, dtype):
     """numpy array → CUDA torch tensor in the node's dtype (default fp32)."""
     import torch
 
-    from deplodock.compiler.backend.torch_ref import torch_dtype
+    from emmy.compiler.backend.torch_ref import torch_dtype
 
     return torch.from_numpy(arr).to("cuda").to(torch_dtype(dtype) or torch.float32)
 
@@ -1475,7 +1473,7 @@ def _check_accuracy(outputs, eager_out, *, fatal=True):
             # 1024 K-partials that's RMS error on the order of
             # ``peak * 0.3``. The proper fix (f32 scratch for split-K +
             # separate cast pass) is a future architectural change; for
-            # now ``deplodock run --bench`` needs to remain usable on
+            # now ``emmy run --bench`` needs to remain usable on
             # legitimate fp16 graphs, so the rtol budget tracks the
             # achievable accuracy of the current path. Bugs that
             # actually corrupt outputs still fail (whole-row mismatch /
@@ -1504,7 +1502,7 @@ def _check_accuracy(outputs, eager_out, *, fatal=True):
 
 _BACKEND_ALIASES = {
     "eager": "eager",
-    "deplodock": "deplodock",
+    "emmy": "emmy",
     "tcompile": "tcompile",
     "torch.compile": "tcompile",
     "compile": "tcompile",
@@ -1515,17 +1513,17 @@ def _resolve_backends(cli_value: str | None) -> set[str]:
     """Pick which bench backends to time. Precedence:
 
     1. ``--bench-backends`` CLI arg (comma-separated).
-    2. ``DEPLODOCK_BENCH_BACKENDS`` env var (same syntax).
-    3. Default ``eager,deplodock`` — torch.compile is excluded so the
+    2. ``EMMY_BENCH_BACKENDS`` env var (same syntax).
+    3. Default ``eager,emmy`` — torch.compile is excluded so the
        per-case wall time isn't dominated by a ~0.8 s Inductor JIT
        that most users don't need on every run.
 
-    ``deplodock`` is always included even if omitted (the kernel under
+    ``emmy`` is always included even if omitted (the kernel under
     test is the point of the bench). Returns the canonical backend
-    keys ``{"eager", "tcompile", "deplodock"}``.
+    keys ``{"eager", "tcompile", "emmy"}``.
     """
     raw = config.bench_backends_raw(cli_value)
-    selected: set[str] = {"deplodock"}
+    selected: set[str] = {"emmy"}
     for tok in raw.split(","):
         tok = tok.strip().lower()
         if not tok:
@@ -1546,7 +1544,7 @@ def _build_torch_fns(module, args, kwargs, warmup, *, backends: set[str]):
     concurrently — the lock then only wraps the actual measurement
     iters.
 
-    Returns only the torch-side closures; deplodock's bench loop is
+    Returns only the torch-side closures; emmy's bench loop is
     driven separately by ``backend.benchmark`` in ``_bench_interleaved``.
     """
     import torch
@@ -1625,8 +1623,8 @@ async def _bench_interleaved_captured(module, args, kwargs, backend, lowered, wa
     """All-or-nothing CUDA-graph-captured interleaved bench.
 
     Captures every torch closure (``_capture_torch_fns``) and runs the
-    interleaved loop with the deplodock side captured too. If ANY side fails —
-    a torch backend resists capture, or the deplodock launch loop fell back
+    interleaved loop with the emmy side captured too. If ANY side fails —
+    a torch backend resists capture, or the emmy launch loop fell back
     (``bench.captured`` False) — the whole bench re-runs uncaptured with the
     original closures, so one table never mixes timing semantics. Returns
     ``(results, bench, captured)``."""
@@ -1638,9 +1636,9 @@ async def _bench_interleaved_captured(module, args, kwargs, backend, lowered, wa
         if bench.captured:
             return results, bench, True
         if not torch_fns:
-            return results, bench, False  # deplodock-only: nothing to de-mix
+            return results, bench, False  # emmy-only: nothing to de-mix
         # benchmark_program already logged the capture failure; re-run only to de-mix the table.
-        logger.warning("deplodock side fell back to uncaptured timing — re-benching all backends uncaptured")
+        logger.warning("emmy side fell back to uncaptured timing — re-benching all backends uncaptured")
     results, bench = await _bench_interleaved(
         module, args, kwargs, backend, lowered, warmup, iters, torch_fns=torch_fns, capture_graphs=False
     )
@@ -1654,9 +1652,9 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
     — instead of running in sequential phases that each get a
     different steady state.
 
-    Driven by ``backend.benchmark_async(on_iter=...)``: deplodock is the
+    Driven by ``backend.benchmark_async(on_iter=...)``: emmy is the
     backbone, ``on_iter`` runs each torch closure and records its
-    cuda events, and the same call returns per-launch deplodock
+    cuda events, and the same call returns per-launch emmy
     timings — so the kernel-stats breakdown shares the same warm
     state as the comparison numbers.
 
@@ -1669,7 +1667,7 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
     GPU lock so the slow ``torch.compile`` JIT runs concurrently with
     peer workers; the lock then wraps only this measurement loop).
 
-    ``capture_graphs`` forwards to the deplodock side only; the torch
+    ``capture_graphs`` forwards to the emmy side only; the torch
     closures must be pre-captured by the caller to keep one timing
     semantics per table — use :func:`_bench_interleaved_captured`,
     which owns that all-or-nothing pairing.
@@ -1679,7 +1677,7 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
     # Each entry: (start_event, stop_event, batch_size_used). The
     # batch size is propagated by ``benchmark_program``'s ``on_iter``
     # so peer torch backends time the same number of back-to-back
-    # calls deplodock does per CUDA event window — both sides then
+    # calls emmy does per CUDA event window — both sides then
     # measure sustained per-call latency, no warm-vs-cold asymmetry.
     torch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, int]]] = {name: [] for name in torch_fns}
 
@@ -1703,7 +1701,7 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
         if measured:
             # ``elapsed_time`` is in ms across the whole batch; divide
             # by the batch size and multiply by 1000 to get per-call us.
-            # ``min`` (best-case iter) for both torch and deplodock — the
+            # ``min`` (best-case iter) for both torch and emmy — the
             # least-noise latency, matching tune's min-over-variants reporting
             # so tune and run numbers are comparable.
             per_iter_us = [s.elapsed_time(e) * 1000.0 / b for s, e, b in measured]
@@ -1714,12 +1712,12 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
     # end-to-end number (no cross-kernel cache effects) — see finding 6 of
     # plans/qwen3-embedding-layer0-tune-findings.md.
     dep_ms = bench.e2e_min_ms if bench.e2e_min_ms is not None else (bench.min_ms if bench.min_ms is not None else bench.time_ms)
-    results["Deplodock"] = dep_ms * 1000
+    results["Emmy"] = dep_ms * 1000
     return results, bench
 
 
 def _print_table(results, note: str | None = None):
-    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+    from emmy.commands.table import Col, render_table  # noqa: PLC0415
 
     eager_us = results.get("Eager PyTorch", 0)
     cols = [Col("Backend"), Col("Latency (us)", "r"), Col("vs Eager", "r")]

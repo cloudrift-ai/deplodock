@@ -1,5 +1,5 @@
 """Execute a frontend Graph with real PyTorch — the eager / torch.compile
-reference for ``deplodock run --ir``.
+reference for ``emmy run --ir``.
 
 Each frontend / tensor-IR op is mapped to the equivalent torch op (the numpy
 ``forward()`` has a torch twin), so a dumped ``.torch.json`` reproducer can be
@@ -10,7 +10,7 @@ gather over coordinate grids, so HF norms/RoPE (which trace to primitive
 sequences, not fused aten ops) are torch-comparable. Only the data-dependent
 ``GatherOp`` / ``ScatterOp`` (indices come from a runtime tensor, not from the
 output coordinates) stay unsupported: :func:`is_runnable` returns ``False`` and
-the caller falls back to deplodock-only benchmarking.
+the caller falls back to emmy-only benchmarking.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 # Frontend / tensor ops with a torch twin. Everything else (IndexMapOp,
 # GatherOp, ScatterOp, ScanOp, …) makes a graph non-runnable as a torch ref.
@@ -65,7 +65,7 @@ def torch_dtype(dtype) -> torch.dtype | None:
 
 def is_runnable(graph: Graph) -> bool:
     """True if every compute op in ``graph`` has a torch mapping."""
-    from deplodock.compiler.provenance import is_boundary  # noqa: PLC0415
+    from emmy.compiler.provenance import is_boundary  # noqa: PLC0415
 
     return all(is_boundary(n.op) or type(n.op).__name__ in SUPPORTED for n in graph.nodes.values())
 
@@ -265,7 +265,7 @@ def _index_map(op, ins: list, sym_env: dict[str, int] | None = None):
     the common case (broadcast, transpose, reshape, slice)."""
     import torch  # noqa: PLC0415
 
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX  # noqa: PLC0415
+    from emmy.compiler.ir.expr import PLACEHOLDER_PREFIX  # noqa: PLC0415
 
     out_shape = _shape_ints(op.out_shape, sym_env or {})
     # device / dtype from the first tensor-valued source (a source can be a
@@ -325,8 +325,8 @@ def build_callable(graph: Graph, input_tensors: dict[str, torch.Tensor]) -> tupl
     inside the traced function used to trigger a dynamo recompile per distinct
     op (``add`` vs ``multiply`` vs …), hitting the recompile limit on big
     graphs."""
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.provenance import is_boundary  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.provenance import is_boundary  # noqa: PLC0415
 
     order = graph.topological_order()
     tensor_ids = [nid for nid in order if is_boundary(graph.nodes[nid].op) and getattr(graph.nodes[nid].op, "value", None) is None]

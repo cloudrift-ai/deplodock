@@ -12,11 +12,11 @@ Submodules:
   adjacent ``LoopOp`` pairs.
 
 The public surface below re-exports the common types so callers use
-``from deplodock.compiler.ir.loop import LoopOp, ...``.
+``from emmy.compiler.ir.loop import LoopOp, ...``.
 """
 
-from deplodock.compiler.ir.loop.builder import LoopBuilder
-from deplodock.compiler.ir.loop.ir import (
+from emmy.compiler.ir.loop.builder import LoopBuilder
+from emmy.compiler.ir.loop.ir import (
     Accum,
     Assign,
     Axis,
@@ -31,8 +31,8 @@ from deplodock.compiler.ir.loop.ir import (
     Stmt,
     Write,
 )
-from deplodock.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
-from deplodock.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.loop.splicer import splice_graph, splice_loop_ops, splice_loops
+from emmy.compiler.ir.sigma import Sigma
 
 __all__ = [
     "Accum",

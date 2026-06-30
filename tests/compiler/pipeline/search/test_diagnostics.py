@@ -11,8 +11,8 @@ fp16 golden from ``golden_prior_eval``'s rank join (the hidden fp16 lockout).
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline.search.golden import goldens_by_name
-from deplodock.compiler.pipeline.search.prior import diagnostics
+from emmy.compiler.pipeline.search.golden import goldens_by_name
+from emmy.compiler.pipeline.search.prior import diagnostics
 
 
 def _sig(free_prod, reduce_max, *, fp32=True, matmul=True):
@@ -61,7 +61,7 @@ def test_golden_coverage_splits_dynamic_twin(monkeypatch):
     (``S_ext_n_symbolic_axis > 0``, ``free_prod`` excluding the symbolic axis —
     what the 992 stamp emits for a masked-tile kernel); its static twin's group
     does not satisfy it, and vice versa."""
-    from deplodock.compiler.pipeline.search import golden as gmod
+    from emmy.compiler.pipeline.search import golden as gmod
 
     dyn_g = gmod.MatmulGoldenConfig(
         name="square.512.dynM",
@@ -69,7 +69,7 @@ def test_golden_coverage_splits_dynamic_twin(monkeypatch):
         N=512,
         K=512,
         knobs={"BM": 8},
-        deplodock_us=10.0,
+        emmy_us=10.0,
         cublas_us=11.0,
         dynamic={"seq_len": {"input": "x0", "axis": 0}},
     )
@@ -135,14 +135,14 @@ class _BMPrior:
 
 
 def _child(node_key, bm, value_us, *, parent="P"):
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     return NodeRow(node_key, parent, "ctx", "mm", {"BM": bm}, value_us, 2)
 
 
 def _fork_nodes():
     """A root P with three children whose value-of-position falls as BM falls."""
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     return [NodeRow("P", None, "ctx", "mm", {}, 1.0, 1), _child("c8", 8, 1.0), _child("c32", 32, 2.0), _child("c64", 64, 3.0)]
 
@@ -165,7 +165,7 @@ def test_node_sibling_ranking_penalizes_reversed_order():
 def test_node_sibling_ranking_ignores_singletons_and_top_forks():
     """A top fork (parent None) and a single-child parent are not multi-child forks,
     so there is nothing to rank."""
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     nodes = [NodeRow("P", None, "ctx", "mm", {}, 1.0, 1), _child("only", 8, 1.0)]
     assert diagnostics.node_sibling_ranking(_BMPrior(), nodes) is None
@@ -174,7 +174,7 @@ def test_node_sibling_ranking_ignores_singletons_and_top_forks():
 def test_node_report_combines_fork_and_leaf_sections():
     """``node_report`` renders both the fork sibling-ranking and the leaf reachability
     over the node store."""
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     s = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
     nodes = [
@@ -191,7 +191,7 @@ def test_node_report_combines_fork_and_leaf_sections():
 def test_node_report_separates_hardware():
     """The report groups by card, so an H100 op and a same-die H200 op (identical S_*
     signature, different latencies) are evaluated as separate blocks — never mixed."""
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     mm = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
     nodes = [
@@ -211,7 +211,7 @@ def test_node_report_kernel_filter_selects_ops_by_label():
     """``--kernel`` filters the node store by op label (derived from each node's
     ``S_*`` features) — whole ops drop atomically, and a non-matching filter prints
     an explanatory message, not the empty-store one."""
-    from deplodock.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import NodeRow  # noqa: PLC0415
 
     mm = {"S_reduce_add": 1.0, "S_pw_multiply": 1.0, "S_n_distinct_input": 2.0, "S_ext_free_max": 512.0}
     rd = {"S_reduce_add": 1.0, "S_ext_reduce_max": 64.0}  # a reduce op: no pw-multiply / 2nd input

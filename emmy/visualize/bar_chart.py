@@ -1,7 +1,7 @@
 """Generic grouped bar chart. One series per ``Bar``; orientation auto-picks
 horizontal vs vertical based on category count (override with
 ``orientation``). Produces a self-contained HTML page via
-``deplodock.visualize.page.render_html``."""
+``emmy.visualize.page.render_html``."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from deplodock.visualize.page import render_html
-from deplodock.visualize.theme import THEMES
+from emmy.visualize.page import render_html
+from emmy.visualize.theme import THEMES
 
 AUTO_HORIZONTAL_THRESHOLD = 12
 
@@ -189,7 +189,7 @@ if (PAYLOAD.tooltipRows) {{
 chart.setOption(opt);
 window.addEventListener('resize', () => chart.resize());
 """
-    title = chart.title or "deplodock chart"
+    title = chart.title or "emmy chart"
     return render_html(
         body_html=body_html,
         scripts_js=scripts_js,

@@ -31,14 +31,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import Literal
-from deplodock.compiler.ir.kernel.ir import Reassign
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Stmt
-from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.kernel.ir import Reassign
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Stmt
+from emmy.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.kernel._helpers import parallel_tile_of, replace_parallel_tile_body, single_tile
 
 PATTERN = [Pattern("root", TileOp)]
 

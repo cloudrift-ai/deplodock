@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.frontend.ir import ReshapeOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._fold_constant import fold_into_constant
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import ReshapeOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._fold_constant import fold_into_constant
 
 PATTERN = [Pattern("root", ReshapeOp)]
 

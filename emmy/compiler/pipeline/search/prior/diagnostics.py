@@ -1,7 +1,7 @@
 """Offline diagnostics for the learned tuning prior — "can the prior actually
 reach the best configs?", with no GPU.
 
-``deplodock tune`` with no model / ``--code`` refits the prior on its persisted
+``emmy tune`` with no model / ``--code`` refits the prior on its persisted
 reservoir dataset and prints :func:`report`: a dataset summary, per-op **pick
 reachability** (does the prior's predicted-fastest config over an op's *measured*
 configs recover the measured-best leaf?), an in-sample ranking calibration, and
@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import statistics
 
-from deplodock.compiler.pipeline.search.data import Dataset, ShapeKey
+from emmy.compiler.pipeline.search.data import Dataset, ShapeKey
 
 
 def _n_tunable(knobs: dict) -> int:
@@ -87,7 +87,7 @@ def _golden_coverage(groups: dict) -> tuple[int, int]:
     keys*, not per-config rows, so multiple knob sets for one shape — and the same
     shape recurring across per-GPU golden files (``ShapeKey`` is GPU-blind) — count
     once."""
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: PLC0415
 
     have = set()
     for sig in groups:
@@ -117,9 +117,9 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
     ("not decided") to CatBoost, so the two surfaces can disagree (the 2026-06-12
     sweep's finding 6). Deploy reality is ``Prior.pick`` (measured -O3 evidence
     first); the faithful deploy check is ``eval golden``'s real greedy compile."""
-    from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search import analytic  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+    from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline.search import analytic  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
     GOLDEN_CONFIGS = goldens_for_live_gpu()  # live card only — see golden_deploy_perf
 
@@ -184,7 +184,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
     golden shape we take the op group's ``H_opt=3`` rows, pick the one ``Prior.pick``
     deploys (measured -O3 evidence first, model argmin otherwise — the same selection
     greedy ``compile`` / ``run`` make), and divide its measured latency by the golden's
-    recorded ``deplodock_us`` (also -O3 → same regime, so the ratio is a real
+    recorded ``emmy_us`` (also -O3 → same regime, so the ratio is a real
     deployable speed comparison; <1.0 = the prior's pick is faster than golden). Shapes
     with no -O3 reservoir row are omitted (the caller renders ``—``). The reservoir is
     used rather than the raw ``perf`` table because only it carries the ``H_*`` regime
@@ -193,7 +193,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
     Goldens are scoped to the live card (:func:`goldens_for_live_gpu`) so a multi-GPU
     goldens dir doesn't make a name's per-card entries collide on the GPU-blind
     ``ShapeKey`` (e.g. RTX 5090 / RTX PRO 6000 both ``(12, 0)``)."""
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
     GOLDEN_CONFIGS = goldens_for_live_gpu()
 
@@ -213,7 +213,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
 
     out: dict[str, float] = {}
     for g in GOLDEN_CONFIGS:
-        if not isinstance(g, MatmulGoldenConfig) or not g.deplodock_us:
+        if not isinstance(g, MatmulGoldenConfig) or not g.emmy_us:
             continue
         if kernel_filter and kernel_filter not in g.name:
             continue
@@ -221,7 +221,7 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
         if not leaves:
             continue
         best_i, _ = prior.pick([s.all_knobs() for s in leaves])
-        out[g.name] = leaves[best_i].latency_us / g.deplodock_us
+        out[g.name] = leaves[best_i].latency_us / g.emmy_us
     return out
 
 
@@ -231,7 +231,7 @@ def report(prior) -> str:
     groups = Dataset.from_prior(prior).group_by_op()
     lines = [f"[prior] dataset: {len(dataset)} rows, {len(groups)} op-structures, fitted={prior.fitted}"]
     if not prior.fitted:
-        lines.append("  no model — dataset below min_rows; run `deplodock tune <model>` to gather more")
+        lines.append("  no model — dataset below min_rows; run `emmy tune <model>` to gather more")
         return "\n".join(lines)
 
     rr = reachability(prior, groups)
@@ -250,7 +250,7 @@ def report(prior) -> str:
     covered, total = _golden_coverage(groups)
     lines.append(f"[prior] golden coverage: {covered}/{total} golden matmul shapes have data in the dataset")
     if covered == 0:
-        lines.append("  none yet — tune the golden shapes (`deplodock tune --golden NAME`) to validate against them")
+        lines.append("  none yet — tune the golden shapes (`emmy tune --golden NAME`) to validate against them")
     return "\n".join(lines)
 
 
@@ -360,10 +360,10 @@ def node_report(prior, nodes, *, kernel_filter: str | None = None) -> str:
         if kernel_filter and total:
             lines.append(f"  no nodes match --kernel {kernel_filter!r} ({total} in store) — try an op label like 'matmul' / 'reduce'")
         else:
-            lines.append("  empty — run `deplodock tune <model>` to populate the node table")
+            lines.append("  empty — run `emmy tune <model>` to populate the node table")
         return "\n".join(lines)
     if not prior.fitted:
-        lines.append("  no fitted prior — the cold AnalyticPrior ranks by D_* geometry only; run `deplodock tune`")
+        lines.append("  no fitted prior — the cold AnalyticPrior ranks by D_* geometry only; run `emmy tune`")
     for gpu in sorted(by_gpu):
         lines.extend(_node_gpu_block(prior, gpu, by_gpu[gpu]))
     return "\n".join(lines)

@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.provisioning.gcp import _classify_create_failure, create_instance
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.gcp import _classify_create_failure, create_instance
 
 
 def test_classify_zone_exhausted_is_capacity():
@@ -28,9 +28,9 @@ def test_classify_unrelated_error_is_terminal():
     assert isinstance(err, TerminalProvisionError)
 
 
-@patch("deplodock.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
 async def test_create_instance_capacity_error_no_orphan(mock_shell, mock_wait, mock_ssh):
     """When the create command itself fails with a capacity error, no orphan exists yet."""
     mock_shell.return_value = (1, "", "ZONE_RESOURCE_POOL_EXHAUSTED at us-central1-b")
@@ -43,9 +43,9 @@ async def test_create_instance_capacity_error_no_orphan(mock_shell, mock_wait, m
     mock_wait.assert_not_awaited()
 
 
-@patch("deplodock.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
 async def test_create_instance_orphan_cleanup_on_wait_timeout(mock_shell, mock_wait, mock_ssh):
     """When create succeeds but wait_for_status times out, the VM must be deleted before raising."""
     mock_shell.return_value = (0, "Created", "")
@@ -61,9 +61,9 @@ async def test_create_instance_orphan_cleanup_on_wait_timeout(mock_shell, mock_w
     assert "orphan-vm" in delete_cmd
 
 
-@patch("deplodock.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
 async def test_create_instance_orphan_cleanup_on_exception_during_wait(mock_shell, mock_wait, mock_ssh):
     """An unexpected exception during wait_for_status must still trigger orphan cleanup."""
     mock_shell.return_value = (0, "Created", "")
@@ -78,9 +78,9 @@ async def test_create_instance_orphan_cleanup_on_exception_during_wait(mock_shel
     assert "orphan-vm" in delete_cmd
 
 
-@patch("deplodock.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
 async def test_create_instance_orphan_cleanup_on_ssh_failure(mock_shell, mock_wait, mock_ssh):
     """SSH never coming up should still terminate the orphan."""
     # 3 shell calls in success path: create, external-IP, plus delete in cleanup
@@ -100,9 +100,9 @@ async def test_create_instance_orphan_cleanup_on_ssh_failure(mock_shell, mock_wa
     assert "orphan-vm" in delete_cmd
 
 
-@patch("deplodock.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_ssh", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.gcp.run_shell_cmd", new_callable=AsyncMock)
 async def test_create_instance_swallows_cleanup_failure(mock_shell, mock_wait, mock_ssh, caplog):
     """A failed orphan-delete must not mask the original exception."""
     mock_shell.side_effect = [
@@ -111,7 +111,7 @@ async def test_create_instance_swallows_cleanup_failure(mock_shell, mock_wait, m
     ]
     mock_wait.return_value = False  # triggers cleanup path
 
-    with caplog.at_level("ERROR", logger="deplodock.provisioning.gcp"):
+    with caplog.at_level("ERROR", logger="emmy.provisioning.gcp"):
         with pytest.raises(CapacityExhausted):
             await create_instance("orphan-vm", "us-central1-b", "a3-highgpu-8g")
 

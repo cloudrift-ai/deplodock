@@ -17,15 +17,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Assign, Select, SelectBranch
-from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Accum, Assign, Select, SelectBranch
+from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -113,14 +113,14 @@ def test_causal_mask_epilogue_mma(M: int, out_dtype: DataType, shape_mode, monke
     folded per-element ternary matches the masked f32 reference — static M,
     dynamic (symbolic) M, and a straddling M=130 (the per-element guard + the
     per-element causal coords both active)."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.ir.kernel.render import render_kernelop
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "4")
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
     if shape_mode == "static" and M % 16 != 0:
         pytest.skip("static non-divisible M has no fixed MMA tile (masking is symbolic-axis only)")
@@ -135,7 +135,7 @@ def test_causal_mask_epilogue_mma(M: int, out_dtype: DataType, shape_mode, monke
     assert "mma.sync.aligned.m16n8k16" in src
     assert "?" in src, "the causal mask must render as a per-element ternary"
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(3)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)

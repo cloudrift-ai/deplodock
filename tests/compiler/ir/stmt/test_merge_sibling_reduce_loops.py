@@ -11,12 +11,12 @@ then merge must concatenate the bodies into one K-loop.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from deplodock.compiler.ir.stmt.normalize import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt.blocks import Loop
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from emmy.compiler.ir.stmt.normalize import (
     merge_sibling_reduce_loops,
     unify_sibling_reduce_axes,
 )

@@ -13,13 +13,13 @@ The leading-underscore module name keeps the pass loader (which globs
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import to_dim
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
-from deplodock.compiler.ir.stmt import Assign, Body, Load, Select, SelectBranch, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
-from deplodock.compiler.pipeline.passes.lowering._masking import in_bounds, mask_index
+from emmy.compiler.dim import to_dim
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
+from emmy.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync
+from emmy.compiler.ir.stmt import Assign, Body, Load, Select, SelectBranch, Stmt, StridedLoop, Write
+from emmy.compiler.ir.tile.ir import AffineAddressing, StagePolicy, TemplateAddressing
+from emmy.compiler.pipeline.passes.lowering._masking import in_bounds, mask_index
 
 
 def _cp_async_width(elem_size: int, padded_extents: tuple[int, ...], addressing, n_origin_dims: int, gmem_inner: int | Expr | None) -> int:
@@ -126,7 +126,7 @@ def smem_cuda_dtype(src) -> str:  # noqa: ANN001 — Source carries DataType | N
     stamped ``Source.dtype`` (``030_stamp_types``). Defaults to the
     legacy ``"float"`` when unstamped — handwritten test fixtures
     rely on the fallback."""
-    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
     if src.dtype is None:
         return "float"
@@ -209,7 +209,7 @@ def emit_stage(
         smem_index = tuple(coord_for[ax.name] for ax in cache_axes)
         # Per-source source-index reconstruction.
         if isinstance(addressing, TemplateAddressing):
-            from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
+            from emmy.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
 
             cache_sigma = _Sigma({ax.name: coord_for[ax.name] for ax in cache_axes})
             source_index = tuple(cache_sigma.apply(e) for e in addressing.exprs)
@@ -219,7 +219,7 @@ def emit_stage(
             # composite stride here is the *block-scaled* extents).
             # ``affine_decode_per_dim`` with ``block=()`` and the
             # block-scaled axes does exactly that.
-            from deplodock.compiler.ir.tile.ir import affine_decode_per_dim as _decode  # noqa: PLC0415
+            from emmy.compiler.ir.tile.ir import affine_decode_per_dim as _decode  # noqa: PLC0415
 
             decoded_per_dim = _decode(scaled_axes, addressing.dims, coord_for)
             source_index = tuple(
@@ -286,7 +286,7 @@ def emit_stage(
         if cp_v >= 1:
             nbytes = cp_v * elem_size
             if cp_v > 1:
-                from deplodock.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
+                from emmy.compiler.ir.sigma import Sigma as _Sigma  # noqa: PLC0415
 
                 scale = _Sigma({iter_axis.name: Var(iter_axis.name) * Literal(cp_v, "int")})
                 smem_index = tuple(scale.apply(e) for e in smem_index)
@@ -421,7 +421,7 @@ def _recover_degenerate_cache_axes(write, sources):  # noqa: ANN001 — Write, t
                 break
         if ok:
             return tuple(src.cache_axes)
-    from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
     bad = [v for v in write.index if not isinstance(v, Var)]
     raise LoweringError(
@@ -475,7 +475,7 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
     visible; trailing ``Sync`` makes the freshly computed slab CTA-visible to
     the consumer.
     """
-    from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+    from emmy.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
     name, cache_axes, _dtype = compute_phase_info(compute, sources)
     extents = compute_phase_extents(compute, sources)
@@ -516,7 +516,7 @@ def emit_compute_phase(compute, sources, tid_expr, n_threads: int, *, buffer_cou
 
 
 def emit_reduce_phase(cr, tid_expr, n_threads: int) -> list[Stmt]:  # noqa: ANN001 — CoopReduce
-    """Expand a :class:`~deplodock.compiler.ir.tile.ir.CoopReduce` prologue (the SMEM
+    """Expand a :class:`~emmy.compiler.ir.tile.ir.CoopReduce` prologue (the SMEM
     fused edge's rmsnorm reduce) into the cooperative ``StridedLoop`` reduce.
 
     Emits the per-CTA ``leading`` constants once, declares the per-row ``out_slab``, then
@@ -524,8 +524,8 @@ def emit_reduce_phase(cr, tid_expr, n_threads: int) -> list[Stmt]:  # noqa: ANN0
     coord into the per-cell reduce body (a serial reduce over the full row + the
     ``rsqrt`` scalar chain + the ``Write out_slab[cell]``). A trailing ``Sync`` makes the
     freshly computed slab CTA-visible to the matmul's scale-application compute phase."""
-    from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
-    from deplodock.compiler.ir.sigma import Sigma  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+    from emmy.compiler.ir.sigma import Sigma  # noqa: PLC0415
 
     extents = tuple(ax.extent.as_static() for ax in cr.cells)
     total = 1

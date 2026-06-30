@@ -7,9 +7,9 @@ form (``output={old_id: frag_output_id}``) redirects several at once — used to
 inline one producer into all its consumers in a single rewrite.
 """
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
 
 def _make_fanout_graph() -> Graph:

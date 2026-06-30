@@ -29,7 +29,7 @@ Each IR layer adds its own scheduling-specific Stmts on top:
 - Tile IR: ``StageBundle``, plus the shared ``Loop`` / ``StridedLoop``
   constructs from this module and the typed tile flavors (``GridTile``,
   ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) from
-  :mod:`deplodock.compiler.ir.tile.ir`.
+  :mod:`emmy.compiler.ir.tile.ir`.
 - Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
   constructs.
 
@@ -39,7 +39,7 @@ they enforce Loop-IR's invariants (SSA scoping rules, axis uniqueness)
 and produce Loop-IR's canonical form.
 """
 
-from deplodock.compiler.ir.stmt.base import (
+from emmy.compiler.ir.stmt.base import (
     INDENT,
     ReduceCarrier,
     RenderCtx,
@@ -50,15 +50,15 @@ from deplodock.compiler.ir.stmt.base import (
     render_index,
     select_to_ternary,
 )
-from deplodock.compiler.ir.stmt.base import (
+from emmy.compiler.ir.stmt.base import (
     _axis_identity as _axis_identity,  # re-export for ir.tile.ir / ir.kernel.ir
 )
-from deplodock.compiler.ir.stmt.base import (
+from emmy.compiler.ir.stmt.base import (
     _pad as _pad,  # re-export for ir.kernel.ir
 )
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import (
+from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import (
     Accum,
     Assign,
     Init,
@@ -71,7 +71,7 @@ from deplodock.compiler.ir.stmt.leaves import (
     Unpack,
     Write,
 )
-from deplodock.compiler.ir.stmt.normalize import (
+from emmy.compiler.ir.stmt.normalize import (
     canonicalize_buffer_names,
     canonicalize_free_axis_order,
     dedup_loads,

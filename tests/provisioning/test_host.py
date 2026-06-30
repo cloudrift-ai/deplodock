@@ -5,8 +5,8 @@ import asyncio
 import click
 import pytest
 
-from deplodock.provisioning.host import LocalHost, RemoteHost
-from deplodock.provisioning.remote import _ensure_nvidia_versions, _matches
+from emmy.provisioning.host import LocalHost, RemoteHost
+from emmy.provisioning.remote import _ensure_nvidia_versions, _matches
 
 
 def test_matches_prefix():
@@ -105,7 +105,7 @@ def test_ensure_nvidia_install_failure_raises():
     returned `installed=True`, the caller rebooted, and the bench produced
     empty result tables an hour later with no indication why.
     """
-    from deplodock.provisioning.remote import _ensure_nvidia_versions
+    from emmy.provisioning.remote import _ensure_nvidia_versions
 
     class FailingAptHost(LocalHost):
         async def run(self, cmd, *, sudo=False, capture=False, timeout=600, **kwargs):
@@ -134,7 +134,7 @@ def test_ensure_nvidia_cuda_install_silent_failure_raises():
     """Regression: apt-get install of cuda-toolkit-X-Y can return rc=0 yet not
     actually create /usr/local/cuda-X.Y (kept-back packages, etc.). The post-
     install dir check must catch this and raise."""
-    from deplodock.provisioning.remote import _ensure_nvidia_versions
+    from emmy.provisioning.remote import _ensure_nvidia_versions
 
     class SilentlyFailingHost(LocalHost):
         async def run(self, cmd, *, sudo=False, capture=False, timeout=600, **kwargs):
@@ -161,7 +161,7 @@ def test_ensure_nvidia_purges_old_packages_first():
     nvidia-driver-510 from the Ubuntu archive; without a purge step, the
     cuda repo's libnvidia-* (= 595.58.03-1ubuntu1) cannot unpack over the
     older files and the install fails."""
-    from deplodock.provisioning.remote import _ensure_nvidia_versions
+    from emmy.provisioning.remote import _ensure_nvidia_versions
 
     class TrackingHost(LocalHost):
         def __init__(self):

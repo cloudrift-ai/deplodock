@@ -15,13 +15,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.base import ConstantOp, Op
-from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.stmt.base import pretty_body as _pretty_body_stmts
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Load, Write
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.base import ConstantOp, Op
+from emmy.compiler.ir.stmt.base import Stmt
+from emmy.compiler.ir.stmt.base import pretty_body as _pretty_body_stmts
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Load, Write
+from emmy.compiler.tensor import Tensor
 
 
 @dataclass

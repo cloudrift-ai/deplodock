@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Interval, Literal, SimplifyCtx, Var
 
 # Default "expected size" for a symbolic dim when none is supplied explicitly.
 # Atomic symbolic Dims (input axes like ``Dim("seq_len")``) carry this so the

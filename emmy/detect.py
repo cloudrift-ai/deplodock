@@ -3,8 +3,8 @@
 import asyncio
 import logging
 
-from deplodock import gpu
-from deplodock.provisioning.ssh_transport import ssh_base_args
+from emmy import gpu
+from emmy.provisioning.ssh_transport import ssh_base_args
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ NVIDIA_VENDOR = "0x10de"
 AMD_VENDOR = "0x1002"
 
 # PCI device ID (hex, no prefix) -> GPU name, from the common GPU registry
-# (:mod:`deplodock.gpu`) — the single source of truth for PCI ids + names.
+# (:mod:`emmy.gpu`) — the single source of truth for PCI ids + names.
 GPU_PCI_DEVICE_IDS: dict[str, str] = gpu.pci_device_id_to_name()
 
 _SYSFS_SCAN_CMD = (

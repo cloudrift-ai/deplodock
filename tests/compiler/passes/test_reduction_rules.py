@@ -9,17 +9,17 @@ reordering rule files doesn't break these tests.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
-from deplodock.compiler.ir.stmt import Accum, Assign, Load
-from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.ir.tile.ir import StageBundle, ThreadTile
-from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
-from deplodock.compiler.pipeline.passes.lowering.kernel._helpers import accums_independent as _accums_independent
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.kernel.ir import TreeHalve, WarpShuffle
+from emmy.compiler.ir.stmt import Accum, Assign, Load
+from emmy.compiler.ir.tensor.ir import ReduceOp
+from emmy.compiler.ir.tile.ir import StageBundle, ThreadTile
+from emmy.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
+from emmy.compiler.pipeline.passes.lowering.kernel._helpers import accums_independent as _accums_independent
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -169,10 +169,10 @@ def test_block_cooperative_emits_hierarchical_reduce(recording_dump, monkeypatch
     warps): the cold default is now ranked by the ``AnalyticPrior`` (GPU/shape
     dependent — it picks a sub-warp BR for this tiny reduce), so the multi-warp
     code path must be pinned to be exercised deterministically."""
-    monkeypatch.setenv("DEPLODOCK_BN", "1")
-    monkeypatch.setenv("DEPLODOCK_BM", "4")
-    monkeypatch.setenv("DEPLODOCK_BR", "64")
-    monkeypatch.setenv("DEPLODOCK_BK", "4")
+    monkeypatch.setenv("EMMY_BN", "1")
+    monkeypatch.setenv("EMMY_BM", "4")
+    monkeypatch.setenv("EMMY_BR", "64")
+    monkeypatch.setenv("EMMY_BK", "4")
     g = Graph()
     _input(g, "x", (4, 256))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")

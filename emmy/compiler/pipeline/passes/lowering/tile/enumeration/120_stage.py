@@ -25,14 +25,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import TileGraphOp, Transport
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.tile.ir import TileGraphOp, Transport
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -83,7 +83,7 @@ def rewrite(ctx: Context, root: Node, match) -> list[TileGraphOp]:  # noqa: ARG0
     if n == 0:
         raise RuleSkipped("no stageable read-sites (pointwise / no reuse / no K-tower)")
 
-    # Env pin (native bare ``DEPLODOCK_PLACE=smem`` / legacy ``DEPLODOCK_STAGE=11``)
+    # Env pin (native bare ``EMMY_PLACE=smem`` / legacy ``EMMY_STAGE=11``)
     # collapses the fork to one mask and is authoritative (no budget filter); otherwise
     # offer every subset, most-staged-first (option-0 = stage the most, best when smem
     # fits — matches the search's prefer-deeper-first heuristic).

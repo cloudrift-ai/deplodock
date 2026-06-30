@@ -3,7 +3,7 @@
 import logging
 import sys
 
-from deplodock.redact import install_redaction
+from emmy.redact import install_redaction
 
 
 def setup_cli_logging():

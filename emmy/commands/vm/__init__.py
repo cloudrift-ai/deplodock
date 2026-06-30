@@ -3,14 +3,14 @@
 
 def register_vm_command(subparsers):
     """Register the 'vm' command with create/delete action subparsers."""
-    from deplodock.commands.vm.cloudrift import (
+    from emmy.commands.vm.cloudrift import (
         register_create_target as register_cloudrift_create,
     )
-    from deplodock.commands.vm.cloudrift import (
+    from emmy.commands.vm.cloudrift import (
         register_delete_target as register_cloudrift_delete,
     )
-    from deplodock.commands.vm.gcp import register_create_target, register_delete_target
-    from deplodock.commands.vm.gpu import register_create_target as register_gpu_create
+    from emmy.commands.vm.gcp import register_create_target, register_delete_target
+    from emmy.commands.vm.gpu import register_create_target as register_gpu_create
 
     vm_parser = subparsers.add_parser("vm", help="Manage cloud VM instances")
 

@@ -1,7 +1,7 @@
-"""Single source of truth for ``DEPLODOCK_*`` environment-variable handling.
+"""Single source of truth for ``EMMY_*`` environment-variable handling.
 
-Every read or write of a ``DEPLODOCK_*`` config var goes through this module.
-It is intentionally stdlib-only (no ``deplodock`` imports) so that ``knob.py``
+Every read or write of a ``EMMY_*`` config var goes through this module.
+It is intentionally stdlib-only (no ``emmy`` imports) so that ``knob.py``
 — imported transitively by every pipeline pass — can depend on it without a
 cycle.
 
@@ -17,8 +17,8 @@ Design contract:
   (CLI, programmatic, tests) shares it.
 
 Out of scope: provider/secret vars (``HF_TOKEN``, ``CLOUDRIFT_*``, ``GCP_*``,
-``NO_COLOR``) — those stay at their use sites, and ``deplodock/redact.py`` owns
-secret redaction. The dynamic ``DEPLODOCK_<KNOB>`` namespace is owned by
+``NO_COLOR``) — those stay at their use sites, and ``emmy/redact.py`` owns
+secret redaction. The dynamic ``EMMY_<KNOB>`` namespace is owned by
 ``compiler/pipeline/knob.py``; it borrows :data:`PREFIX` / :func:`knob_var` and
 the parse primitives here but keeps its own descriptor logic.
 """
@@ -31,50 +31,50 @@ from pathlib import Path
 
 # --- Var-name constants (the single source of truth for spellings) ---------
 
-PREFIX = "DEPLODOCK_"
-TUNE_DB = "DEPLODOCK_TUNE_DB"
-PRIOR_FILE = "DEPLODOCK_PRIOR_FILE"
-NVCC_FLAGS = "DEPLODOCK_NVCC_FLAGS"
-DEBUG = "DEPLODOCK_DEBUG"
-DUMP_DIR = "DEPLODOCK_DUMP_DIR"
-KNOBS = "DEPLODOCK_KNOBS"
-TUNE_PATIENCE = "DEPLODOCK_TUNE_PATIENCE"
-TUNE_EPS = "DEPLODOCK_TUNE_EPS"
-O3_TOL = "DEPLODOCK_O3_TOL"
-ANALYTIC_TILT = "DEPLODOCK_ANALYTIC_TILT"
-BENCH_BACKENDS = "DEPLODOCK_BENCH_BACKENDS"
-CUBIN_CACHE = "DEPLODOCK_CUBIN_CACHE"
-NO_NVCC = "DEPLODOCK_NO_NVCC"
-GPU_LOCK = "DEPLODOCK_GPU_LOCK"
-NCU_CHILD = "DEPLODOCK_NCU_CHILD"
-SERVING_STATIC = "DEPLODOCK_SERVING_STATIC"
+PREFIX = "EMMY_"
+TUNE_DB = "EMMY_TUNE_DB"
+PRIOR_FILE = "EMMY_PRIOR_FILE"
+NVCC_FLAGS = "EMMY_NVCC_FLAGS"
+DEBUG = "EMMY_DEBUG"
+DUMP_DIR = "EMMY_DUMP_DIR"
+KNOBS = "EMMY_KNOBS"
+TUNE_PATIENCE = "EMMY_TUNE_PATIENCE"
+TUNE_EPS = "EMMY_TUNE_EPS"
+O3_TOL = "EMMY_O3_TOL"
+ANALYTIC_TILT = "EMMY_ANALYTIC_TILT"
+BENCH_BACKENDS = "EMMY_BENCH_BACKENDS"
+CUBIN_CACHE = "EMMY_CUBIN_CACHE"
+NO_NVCC = "EMMY_NO_NVCC"
+GPU_LOCK = "EMMY_GPU_LOCK"
+NCU_CHILD = "EMMY_NCU_CHILD"
+SERVING_STATIC = "EMMY_SERVING_STATIC"
 
-_CACHE_ROOT = Path.home() / ".cache" / "deplodock"
+_CACHE_ROOT = Path.home() / ".cache" / "emmy"
 
 
 def knob_var(name: str) -> str:
-    """The ``DEPLODOCK_<NAME>`` env-var key for a knob named ``name``.
+    """The ``EMMY_<NAME>`` env-var key for a knob named ``name``.
 
     Sole place the knob-name → env-var join lives. Used by
-    :class:`~deplodock.compiler.pipeline.knob.Knob` (via ``Knob.env``) and the
-    ``DEPLODOCK_KNOBS`` splat."""
+    :class:`~emmy.compiler.pipeline.knob.Knob` (via ``Knob.env``) and the
+    ``EMMY_KNOBS`` splat."""
     return f"{PREFIX}{name.upper()}"
 
 
 def knob_raw(name: str) -> str | None:
-    """Raw string value of the knob env var ``DEPLODOCK_<NAME>``, or ``None`` if
+    """Raw string value of the knob env var ``EMMY_<NAME>``, or ``None`` if
     unset. The per-type decode (INT / BOOL / BINMASK) stays in the ``Knob``
     descriptor (``compiler/pipeline/knob.py``); this is just the env read."""
     return os.environ.get(knob_var(name))
 
 
 def knobs_aggregate() -> str:
-    """Raw ``DEPLODOCK_KNOBS`` aggregate string (``""`` if unset)."""
+    """Raw ``EMMY_KNOBS`` aggregate string (``""`` if unset)."""
     return _str(KNOBS)
 
 
 def set_knob(name: str, value: str, *, overwrite: bool = True) -> bool:
-    """Write ``DEPLODOCK_<NAME>=value`` into ``os.environ`` (so pipeline passes
+    """Write ``EMMY_<NAME>=value`` into ``os.environ`` (so pipeline passes
     and bench subprocesses see it). With ``overwrite=False`` only writes when the
     key is absent. Returns ``True`` iff a write happened."""
     key = knob_var(name)
@@ -128,7 +128,7 @@ def _str(name: str, default: str = "") -> str:
 
 
 def tune_db_path() -> Path:
-    """Autotune SQLite cache path: ``DEPLODOCK_TUNE_DB`` → ``~/.cache/deplodock/autotune.db``.
+    """Autotune SQLite cache path: ``EMMY_TUNE_DB`` → ``~/.cache/emmy/autotune.db``.
 
     The shared resolution for ``compile`` / ``run`` / ``tune`` / ``knobs`` and
     for :class:`CudaBackend` constructed with ``tune_db="auto"``. The path is
@@ -138,15 +138,15 @@ def tune_db_path() -> Path:
 
 
 def prior_path() -> Path:
-    """Learned-prior checkpoint file: ``DEPLODOCK_PRIOR_FILE`` →
-    ``~/.cache/deplodock/prior.json``. A single JSON file (not the tune DB)
+    """Learned-prior checkpoint file: ``EMMY_PRIOR_FILE`` →
+    ``~/.cache/emmy/prior.json``. A single JSON file (not the tune DB)
     holding the one global prior; ``tune`` writes it, ``compile`` / ``run`` read it."""
     override = os.environ.get(PRIOR_FILE)
     return Path(override) if override else _CACHE_ROOT / "prior.json"
 
 
 def nvcc_flags() -> str:
-    """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``, ``""`` if unset).
+    """Extra nvcc flags for this compile (``EMMY_NVCC_FLAGS``, ``""`` if unset).
 
     Read fresh each call so a per-invocation override (set via
     :func:`set_nvcc_flags`) and the bench-worker subprocess (which inherits the
@@ -156,7 +156,7 @@ def nvcc_flags() -> str:
 
 @contextmanager
 def nvcc_flags_override(flags: str | None):
-    """Temporarily swap ``DEPLODOCK_NVCC_FLAGS`` for one compile (e.g. re-benching
+    """Temporarily swap ``EMMY_NVCC_FLAGS`` for one compile (e.g. re-benching
     a tune winner at ``-Xcicc -O3``). ``None`` is a no-op. Since ``nvcc_flags`` is
     read fresh and folds into the cubin cache key, this transparently selects the
     right (and separately-cached) cubin. Applied in whichever process compiles —
@@ -176,23 +176,23 @@ def nvcc_flags_override(flags: str | None):
 
 
 def debug_enabled() -> bool:
-    """``DEPLODOCK_DEBUG`` — per-launch debug dump path in the CUDA backend."""
+    """``EMMY_DEBUG`` — per-launch debug dump path in the CUDA backend."""
     return _bool(DEBUG)
 
 
 def dump_dir() -> Path | None:
-    """``DEPLODOCK_DUMP_DIR`` as an expanded ``Path``, or ``None`` when unset."""
+    """``EMMY_DUMP_DIR`` as an expanded ``Path``, or ``None`` when unset."""
     raw = os.environ.get(DUMP_DIR)
     return Path(raw).expanduser() if raw else None
 
 
 def tune_patience(default: int = 50) -> int:
-    """``DEPLODOCK_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
+    """``EMMY_TUNE_PATIENCE`` — inner-MCTS patience fallback for ``tune``."""
     return int_env(TUNE_PATIENCE, default)
 
 
 def tune_eps(default: float = 0.0) -> float:
-    """``DEPLODOCK_TUNE_EPS`` — inner-MCTS ε-greedy exploration fraction: the
+    """``EMMY_TUNE_EPS`` — inner-MCTS ε-greedy exploration fraction: the
     probability a selection step descends a uniformly random child instead of the
     PUCT argmax. Opt-in (default ``0`` = deterministic PUCT): on the fp16 sweep it
     didn't recover the lost configs (the gap is a tune-path eligibility issue, not
@@ -203,14 +203,14 @@ def tune_eps(default: float = 0.0) -> float:
 
 
 def o3_tol(default: float = 0.15) -> float:
-    """``DEPLODOCK_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
+    """``EMMY_O3_TOL`` — tolerance band (fraction of the best -O1 latency)
     within which a tuned config is also re-benched at -O3 for a deployable prior
     sample. ``0.15`` = re-bench everything within 15% of the best -O1."""
     return float_env(O3_TOL, default)
 
 
 def analytic_tilt(default: float = 0.3) -> float:
-    """``DEPLODOCK_ANALYTIC_TILT`` — exponent ``W`` of the cold ``AnalyticPrior``
+    """``EMMY_ANALYTIC_TILT`` — exponent ``W`` of the cold ``AnalyticPrior``
     multiplier in :meth:`FallbackPrior.score` (selection only): the learned µs are
     tilted by ``analytic**W`` so the heuristic's ranking nudges PUCT exploration
     toward configs it favors without overriding the learned scale (``W=0`` =
@@ -219,7 +219,7 @@ def analytic_tilt(default: float = 0.3) -> float:
 
 
 def serving_static(default: bool = False) -> bool:
-    """``DEPLODOCK_SERVING_STATIC`` — opt into the serving plugin's fully-static
+    """``EMMY_SERVING_STATIC`` — opt into the serving plugin's fully-static
     program: **static extents for both batch and seq_len**. Off (default) keeps the
     symbolic-seq, batch-1 path; on builds ONE static ``(max_num_seqs, max_seq_len)``
     program (batch from vLLM's ``--max-num-seqs``, seq from ``--max-model-len``) and
@@ -232,36 +232,36 @@ def serving_static(default: bool = False) -> bool:
 
 def bench_backends_raw(cli_value: str | None) -> str:
     """Raw comma-separated bench-backend selection. Precedence: ``cli_value`` >
-    ``DEPLODOCK_BENCH_BACKENDS`` > ``"eager,deplodock"``. Backend-key
+    ``EMMY_BENCH_BACKENDS`` > ``"eager,emmy"``. Backend-key
     normalization stays at the call site (``run.py:_resolve_backends``)."""
-    return cli_value or os.environ.get(BENCH_BACKENDS) or "eager,deplodock"
+    return cli_value or os.environ.get(BENCH_BACKENDS) or "eager,emmy"
 
 
 def cubin_cache_dir() -> Path:
-    """Content-addressed cubin cache dir: ``DEPLODOCK_CUBIN_CACHE`` → ``~/.cache/deplodock/cubin``."""
+    """Content-addressed cubin cache dir: ``EMMY_CUBIN_CACHE`` → ``~/.cache/emmy/cubin``."""
     override = os.environ.get(CUBIN_CACHE)
     return Path(override) if override else _CACHE_ROOT / "cubin"
 
 
 def nvcc_disabled() -> bool:
-    """``DEPLODOCK_NO_NVCC`` — force the cupy/NVRTC path instead of offline nvcc."""
+    """``EMMY_NO_NVCC`` — force the cupy/NVRTC path instead of offline nvcc."""
     return _bool(NO_NVCC)
 
 
 def gpu_lock_path() -> str | None:
-    """``DEPLODOCK_GPU_LOCK`` path, or ``None`` for the no-op (unset) case."""
+    """``EMMY_GPU_LOCK`` path, or ``None`` for the no-op (unset) case."""
     return os.environ.get(GPU_LOCK)
 
 
 def ncu_child() -> bool:
-    """``DEPLODOCK_NCU_CHILD`` — set in the ncu-profiled child to prevent
+    """``EMMY_NCU_CHILD`` — set in the ncu-profiled child to prevent
     recursive re-spawning of ncu."""
     return _bool(NCU_CHILD)
 
 
-# Note: ``DEPLODOCK_GROUP_M`` (CTA-swizzle row-group size) used to live here as
+# Note: ``EMMY_GROUP_M`` (CTA-swizzle row-group size) used to live here as
 # a bespoke getter. It is now a real ``Knob`` descriptor in its owning rule
-# (``025_swizzle_blocks.py``) so it shows up in ``deplodock knobs`` and reads
+# (``025_swizzle_blocks.py``) so it shows up in ``emmy knobs`` and reads
 # through the descriptor's env path. Env access still routes through this
 # module's ``knob_raw`` / ``int_env`` primitives.
 
@@ -271,7 +271,7 @@ def ncu_child() -> bool:
 
 def set_nvcc_flags(cli_value: str | None, default: str) -> str:
     """Resolve and publish the effective extra nvcc flags via
-    ``DEPLODOCK_NVCC_FLAGS`` (the carrier the cubin compiler, the bench-worker
+    ``EMMY_NVCC_FLAGS`` (the carrier the cubin compiler, the bench-worker
     subprocess, and ``Context.structural_key`` all read).
 
     Precedence: ``cli_value`` (a ``--nvcc-flags`` override, when not ``None``) >

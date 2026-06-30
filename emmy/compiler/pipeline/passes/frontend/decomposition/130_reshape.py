@@ -7,12 +7,12 @@ delinearizes into the input coordinate space using input strides.
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var, placeholder
-from deplodock.compiler.ir.frontend.ir import ReshapeOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, Var, placeholder
+from emmy.compiler.ir.frontend.ir import ReshapeOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", ReshapeOp)]
 

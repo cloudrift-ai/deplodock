@@ -1,4 +1,4 @@
-"""Live single-line progress bar for ``deplodock tune`` (default verbosity, tty only).
+"""Live single-line progress bar for ``emmy tune`` (default verbosity, tty only).
 
 The two-level tune evaluates a small number of outer fusion terminals (one today); each terminal's tuned op leaves
 are its post-fusion kernels (``LoopOp``s), tuned independently by the inner search. We measure progress as

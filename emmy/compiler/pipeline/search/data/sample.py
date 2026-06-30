@@ -26,9 +26,9 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 
-from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX
-from deplodock.compiler.pipeline.search.data.shape import ShapeKey
+from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX
+from emmy.compiler.pipeline.search.data.shape import ShapeKey
 
 # The C identifier of a CUDA kernel, parsed from ``cuda_op.pretty`` — the grouping
 # key for the per-knob regret analysis. Kept here so the DB-row adapter and the
@@ -63,10 +63,10 @@ def compiled_s_features(
     same signature a DB-trained prior saw. Cached (the compile is ~seconds) and
     returned as sorted items so the result is hashable / frozen-friendly. Heavy
     imports are deferred to here so importing this module stays torch-free."""
-    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import matmul_snippet  # noqa: PLC0415
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
+    from emmy.commands.trace import graph_from_code  # noqa: PLC0415
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import matmul_snippet  # noqa: PLC0415
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs(list(dynamic))) if dynamic else None
     graph, _, _ = graph_from_code(matmul_snippet(M, N, K, dtype), dynamic_shapes=dynamic_shapes)
@@ -127,14 +127,14 @@ class Sample:
         """A golden ``MatmulGoldenConfig`` as a ``Sample``. ``compile_s_feats``
         derives the full ``S_*`` histogram (for the learned-prior featurization);
         leave it off for the cold-analytic / grouping / bench paths."""
-        from deplodock.compiler.context import Context  # noqa: PLC0415
+        from emmy.compiler.context import Context  # noqa: PLC0415
 
         tunable, _ctx, _s = _split_by_prefix(cfg.knobs)
         dyn_specs = tuple(cfg.dynamic_specs())
         s_full = dict(compiled_s_features(cfg.M, cfg.N, cfg.K, cfg.dtype, cfg.compute_cap, dyn_specs)) if compile_s_feats else None
         return cls(
             knobs=tunable,
-            latency_us=cfg.deplodock_us,
+            latency_us=cfg.emmy_us,
             shape=cfg.shape_key(),
             name=cfg.name,
             dtype=cfg.dtype,

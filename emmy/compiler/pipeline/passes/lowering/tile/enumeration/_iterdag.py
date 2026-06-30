@@ -19,12 +19,12 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Body, Load, Loop, Monoid, ReduceCarrier, Stmt, Write
-from deplodock.compiler.pipeline.passes.lowering._predicates import is_matmul_reduce
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Expr, Var
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.stmt import Accum, Body, Load, Loop, Monoid, ReduceCarrier, Stmt, Write
+from emmy.compiler.pipeline.passes.lowering._predicates import is_matmul_reduce
 
 
 def _split_leading_non_loops(body: tuple[Stmt, ...]) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...]]:
@@ -453,7 +453,7 @@ def iter_dag(loop_op: LoopOp) -> IterDag:
             # PARALLEL row so the cooperative-reduce regime tiles it as a
             # single-CTA tree reduce — the row var binds nothing in the body (the
             # Write indexes a literal 0), so it costs one grid dim of extent 1.
-            from deplodock.compiler.dim import Dim  # noqa: PLC0415
+            from emmy.compiler.dim import Dim  # noqa: PLC0415
 
             row = Axis("_grow", Dim(1))
             node = AxisNode(loop=Loop(axis=row, body=rest), role=AxisRole.PARALLEL, carrier=None, algebra=None, parent=None, body=rest)

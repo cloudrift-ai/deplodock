@@ -1,5 +1,5 @@
-"""Shared data types for VM providers — re-exported from deplodock.provisioning."""
+"""Shared data types for VM providers — re-exported from emmy.provisioning."""
 
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.provisioning.types import VMConnectionInfo
 
 __all__ = ["VMConnectionInfo"]

@@ -25,7 +25,7 @@ route through here; it shares only the *concept*, not the construction.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr
 
 
 def ext_expr(ext: int | Expr) -> Expr:

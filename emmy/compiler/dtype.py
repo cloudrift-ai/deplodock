@@ -2,7 +2,7 @@
 
 Holds only generic + numpy information. Backend-specific traits (CUDA C
 spelling, cupy dtype, required headers) live in the respective backend
-modules (e.g. ``deplodock/compiler/backend/cuda/dtype.py``).
+modules (e.g. ``emmy/compiler/backend/cuda/dtype.py``).
 
 Naming convention: the class is ``DataType``; every argument, variable,
 and field that carries one is named ``dtype``.

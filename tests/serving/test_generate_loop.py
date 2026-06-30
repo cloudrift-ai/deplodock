@@ -9,8 +9,8 @@ import argparse
 
 import numpy as np
 
-from deplodock.commands.generate import generate, register_generate_command
-from deplodock.serving.sampling import Sampler
+from emmy.commands.generate import generate, register_generate_command
+from emmy.serving.sampling import Sampler
 
 
 def _onehot(token, vocab=16):
@@ -72,7 +72,7 @@ def test_slice_last_logits_wrapper_matches_full_logits():
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
 
-    from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+    from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
 
     config = transformers.LlamaConfig(
         vocab_size=32,
@@ -104,7 +104,7 @@ def test_register_generate_command_parses():
     sub = parser.add_subparsers(dest="command", required=True)
     register_generate_command(sub)
 
-    from deplodock.commands.generate import handle_generate
+    from emmy.commands.generate import handle_generate
 
     args = parser.parse_args(["generate", "some/model", "--max-new-tokens", "5", "--temperature", "0.7", "--chat"])
     assert args.func is handle_generate

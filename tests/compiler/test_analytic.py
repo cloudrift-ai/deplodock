@@ -13,10 +13,10 @@ without re-running the offline weight fit (that lives in
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.search.analytic import pick_matmul
-from deplodock.compiler.pipeline.search.prior import AnalyticPrior
+from emmy.compiler.context import Context
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.search.analytic import pick_matmul
+from emmy.compiler.pipeline.search.prior import AnalyticPrior
 
 
 def _ctx() -> Context:
@@ -73,7 +73,7 @@ def test_dynamic_weight_set_selected_on_symbolic_flag():
     """A symbolic-axis row (``S_ext_n_symbolic_axis > 0``) ranks under the
     dynamic weight set; a static row under the static one. With deliberately
     opposed weight sets the same knobs must score differently across the flag."""
-    from deplodock.compiler.pipeline.search.prior.analytic import AnalyticPrior
+    from emmy.compiler.pipeline.search.prior.analytic import AnalyticPrior
 
     p = AnalyticPrior(weights={"D_l2_bm": 1.0}, weights_dynamic={"D_l2_bm": -1.0})
     static = {"BN": 16, "BM": 8, "FM": 4, "FN": 2, "BK": 64, "SPLITK": 1, "BR": 1, "S_ext_free_prod": 4096.0}

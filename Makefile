@@ -10,22 +10,22 @@ help:
 	@echo "  bench          - Run benchmarks in parallel"
 	@echo "  bench-force    - Run benchmarks in parallel (force re-run, skip cached results)"
 	@echo "  bench-kernels  - Run per-kernel perf comparison vs PyTorch (tests/perf/, requires CUDA)"
-	@echo "  wheel          - Build the deplodock wheel into dist/"
-	@echo "  vllm-deplodock-image - Build the vLLM + deplodock serving image (docker/vllm-deplodock)"
-	@echo "  vllm-deplodock-push  - Push the serving image to Docker Hub (cloudriftai/)"
+	@echo "  wheel          - Build the emmy wheel into dist/"
+	@echo "  vllm-emmy-image - Build the vLLM + emmy serving image (docker/vllm-emmy)"
+	@echo "  vllm-emmy-push  - Push the serving image to Docker Hub (cloudriftai/)"
 	@echo "  clean          - Remove virtual environment and generated files"
 	@echo "  test-compose   - Test docker-compose generation with sample config"
 
 setup:
 	@if [ ! -d "venv" ]; then \
 		echo "Creating virtual environment..."; \
-		python3.12 -m venv venv --prompt "deplodock"; \
+		python3.12 -m venv venv --prompt "emmy"; \
 		echo "Installing Python dependencies..."; \
 		./venv/bin/pip install -e ".[dev]"; \
 	fi
 
 setup-ci:
-	python3.12 -m venv venv --prompt "deplodock"
+	python3.12 -m venv venv --prompt "emmy"
 	./venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
 	./venv/bin/pip install -e ".[compile,test]"
 
@@ -40,46 +40,46 @@ format: setup
 # Compile CUDA kernels at -Xcicc -O1: ~3x faster suite (dodges the cicc/LLVM unroll
 # blowup on big register-tile kernels). This is the CORRECTNESS lane — -O1 changes
 # runtime perf, not numerics, and the deployable perf tests (tests/perf, -m perf) run
-# at -O3 via `make bench-kernels`. Override with DEPLODOCK_NVCC_FLAGS= to test at -O3.
+# at -O3 via `make bench-kernels`. Override with EMMY_NVCC_FLAGS= to test at -O3.
 test: setup
-	DEPLODOCK_NVCC_FLAGS="-Xcicc -O1" ./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
+	EMMY_NVCC_FLAGS="-Xcicc -O1" ./venv/bin/pytest tests/ -v -n auto --dist=loadgroup
 
 bench-kernels-clean: setup
-	@rm -f /tmp/deplodock-gpu.lock
+	@rm -f /tmp/emmy-gpu.lock
 	./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
 
 bench-kernels-tuned: setup
-	@rm -f /tmp/deplodock-gpu.lock
-	@test -f ~/.cache/deplodock/tune-kernels.db || (echo "The kernel tuning DB not foud; run make tune-kernels"; exit 1)
-	DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
+	@rm -f /tmp/emmy-gpu.lock
+	@test -f ~/.cache/emmy/tune-kernels.db || (echo "The kernel tuning DB not foud; run make tune-kernels"; exit 1)
+	EMMY_TUNE_DB=~/.cache/emmy/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
 
 tune-kernels: setup
-	@rm -f /tmp/deplodock-gpu.lock
-	@rm -f ~/.cache/deplodock/tune-kernels.db
-	DEPLODOCK_TUNE=1 DEPLODOCK_TUNE_DB=~/.cache/deplodock/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
+	@rm -f /tmp/emmy-gpu.lock
+	@rm -f ~/.cache/emmy/tune-kernels.db
+	EMMY_TUNE=1 EMMY_TUNE_DB=~/.cache/emmy/tune-kernels.db ./venv/bin/pytest tests/perf/ -m perf -n 4 --dist=loadgroup -v -p no:randomly --no-header
 
-# --- vLLM + deplodock serving image (deplodock/serving, docker/vllm-deplodock) ---
+# --- vLLM + emmy serving image (emmy/serving, docker/vllm-emmy) ---
 VLLM_VERSION ?= v0.22.1
-VLLM_DEPLODOCK_TAG ?= cloudriftai/vllm-deplodock:$(patsubst v%,%,$(VLLM_VERSION))-$(shell git rev-parse --short HEAD)
+VLLM_EMMY_TAG ?= cloudriftai/vllm-emmy:$(patsubst v%,%,$(VLLM_VERSION))-$(shell git rev-parse --short HEAD)
 
 wheel: setup
 	./venv/bin/pip install --quiet build
 	rm -rf dist && ./venv/bin/python -m build --wheel -o dist/ .
 
-vllm-deplodock-image: wheel
-	docker build -f docker/vllm-deplodock/Dockerfile --build-arg VLLM_VERSION=$(VLLM_VERSION) \
-		-t $(VLLM_DEPLODOCK_TAG) .
+vllm-emmy-image: wheel
+	docker build -f docker/vllm-emmy/Dockerfile --build-arg VLLM_VERSION=$(VLLM_VERSION) \
+		-t $(VLLM_EMMY_TAG) .
 
-vllm-deplodock-push: vllm-deplodock-image
-	docker push $(VLLM_DEPLODOCK_TAG)
+vllm-emmy-push: vllm-emmy-image
+	docker push $(VLLM_EMMY_TAG)
 
 bench: setup
 	@echo "Running benchmarks..."
-	./venv/bin/deplodock bench recipes/*
+	./venv/bin/emmy bench recipes/*
 
 bench-force: setup
 	@echo "Running benchmarks (force mode)..."
-	./venv/bin/deplodock bench recipes/* --force
+	./venv/bin/emmy bench recipes/* --force
 
 clean:
 	@echo "Removing virtual environment and generated files..."

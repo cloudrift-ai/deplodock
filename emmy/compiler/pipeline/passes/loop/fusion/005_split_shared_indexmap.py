@@ -35,11 +35,11 @@ broadcast tree per firing until it reaches the non-indexmap leaves.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import Load, LoopOp, splice_loop_ops
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap, rename_write_output
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.loop import Load, LoopOp, splice_loop_ops
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap, rename_write_output
 
 PATTERN = [Pattern("producer", LoopOp)]
 

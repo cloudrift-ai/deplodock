@@ -19,12 +19,12 @@ from __future__ import annotations
 
 from dataclasses import replace as _replace
 
-from deplodock.compiler.ir.axis import extend_simplify_ctx
-from deplodock.compiler.ir.expr import Expr, SimplifyCtx
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import extend_simplify_ctx
+from emmy.compiler.ir.expr import Expr, SimplifyCtx
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt.base import Stmt
+from emmy.compiler.ir.stmt.passes import AxisFn, Rename, _stage_kwargs, rewrite, simplify
+from emmy.compiler.ir.tile.ir import (
     AsyncWait,
     AtomTile,
     CoopReduce,

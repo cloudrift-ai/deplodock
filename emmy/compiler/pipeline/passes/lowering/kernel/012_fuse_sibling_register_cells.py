@@ -52,11 +52,11 @@ depends on the post-fusion shape).
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop
-from deplodock.compiler.ir.tile.ir import SerialTile, StridedTile, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.stmt.blocks import Cond, Loop
+from emmy.compiler.ir.tile.ir import SerialTile, StridedTile, TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 # Both ``SerialTile`` / ``StridedTile`` (Tile IR) and ``Loop`` (Kernel IR
 # generic loop) carry an ``axis`` + a ``body`` and render identically as a

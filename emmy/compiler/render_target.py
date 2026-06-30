@@ -6,13 +6,13 @@ The Kernel-IR ``Stmt.render`` methods produce target-specific source
 stays target-agnostic and the same IR can lower to another C-family
 target by passing a different implementation.
 
-Distinct from :mod:`deplodock.compiler.target`, which represents the
+Distinct from :mod:`emmy.compiler.target`, which represents the
 *hardware* compile target (compute capability — sm_80 / sm_90 / sm_120
 — consulted by the tile-IR passes that gate on hardware features).
 :class:`RenderTarget` is purely about source-text emission shapes.
 
 Today the only implementation is :class:`CudaRenderTarget` in
-``deplodock/compiler/backend/cuda/render_target.py``. Add a new
+``emmy/compiler/backend/cuda/render_target.py``. Add a new
 implementation per backend that wants to share the Stmt renderer.
 """
 

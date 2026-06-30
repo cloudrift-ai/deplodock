@@ -11,13 +11,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import mma_atom
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import warp_geom_knobs, warp_offers
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY, TileGraphOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.knob import mma_atom
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import warp_geom_knobs, warp_offers
 
 PATTERN = [Pattern("root", TileGraphOp)]
 

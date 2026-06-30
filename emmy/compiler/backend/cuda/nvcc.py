@@ -19,7 +19,7 @@ The two halves are split on purpose:
 
 ``nvcc`` is required — there is no NVRTC fallback. Install the CUDA
 toolkit (``nvcc`` on ``$PATH`` or under ``$CUDA_HOME``/``$CUDA_PATH``)
-or set ``DEPLODOCK_NO_NVCC=1`` and accept the resulting hard error on
+or set ``EMMY_NO_NVCC=1`` and accept the resulting hard error on
 any kernel that needs ``<mma.h>``.
 """
 
@@ -34,17 +34,17 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from deplodock import config
+from emmy import config
 
 logger = logging.getLogger(__name__)
 
-# Base nvcc flags deplodock always compiles with (matches ``program._nvrtc_options``).
+# Base nvcc flags emmy always compiles with (matches ``program._nvrtc_options``).
 _BASE_FLAGS = ["--use_fast_math"]
 
 
 def effective_flags() -> list[str]:
     """The full nvcc flag list: the base flags plus any extra flags from the
-    ``DEPLODOCK_NVCC_FLAGS`` env var (space-separated), which the CLI commands
+    ``EMMY_NVCC_FLAGS`` env var (space-separated), which the CLI commands
     set — ``tune`` defaults to ``-Xcicc -O1`` (fast compile; see the O1 note in
     ``compile_to_cubin``), ``compile`` / ``run`` to nvcc's default cicc -O3.
     Read fresh each call so a per-invocation override / the bench-worker
@@ -54,12 +54,12 @@ def effective_flags() -> list[str]:
 
 
 def cubin_cache_dir() -> Path:
-    """Directory holding the content-addressed cubin cache (``DEPLODOCK_CUBIN_CACHE``)."""
+    """Directory holding the content-addressed cubin cache (``EMMY_CUBIN_CACHE``)."""
     return config.cubin_cache_dir()
 
 
 def clear_cubin_cache() -> None:
-    """Delete the entire cubin cache (used by ``deplodock tune --clean``)."""
+    """Delete the entire cubin cache (used by ``emmy tune --clean``)."""
     shutil.rmtree(cubin_cache_dir(), ignore_errors=True)
 
 
@@ -123,8 +123,8 @@ def compile_to_cubin(source: str, name: str, *, arch: str) -> Path:
     ``RuntimeError`` if ``nvcc`` is unavailable; ``CalledProcessError`` on a
     compile error (caller decides whether to fall back).
 
-    ⚠️  The opt level comes from :func:`effective_flags` (``DEPLODOCK_NVCC_FLAGS``).
-    ``deplodock tune`` defaults to ``-Xcicc -O1`` to dodge a cicc/LLVM blowup on
+    ⚠️  The opt level comes from :func:`effective_flags` (``EMMY_NVCC_FLAGS``).
+    ``emmy tune`` defaults to ``-Xcicc -O1`` to dodge a cicc/LLVM blowup on
     big unrolled register-tile kernels (up to ~200× faster compile), but **-O1
     is NOT runtime-optimal** — reduction/attention kernels can run ~1.5–3×
     slower than -O3, so tune-measured latencies are a *ranking* signal, not the
@@ -164,7 +164,7 @@ def load_function(source: str, name: str, options, *, uses_tma: bool):  # noqa: 
 
     if nvcc_path() is None:
         raise RuntimeError(
-            "nvcc unavailable — deplodock requires the CUDA toolkit's "
+            "nvcc unavailable — emmy requires the CUDA toolkit's "
             "nvcc binary on PATH / under $CUDA_HOME (the NVRTC fallback was "
             "dropped for faster, GPU-free, cubin-cacheable compiles)"
         )

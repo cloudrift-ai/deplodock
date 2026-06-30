@@ -1,6 +1,6 @@
 """Knob-pin validation — refuse a force-pinned env knob foreign to the op's tier.
 
-A ``DEPLODOCK_<KNOB>`` env pin is global, but every kernel is lowered on exactly
+A ``EMMY_<KNOB>`` env pin is global, but every kernel is lowered on exactly
 ONE *tier* (the codegen regime its body + pins resolve to): a pointwise ``MAP``, a
 scalar ``SEMIRING`` reduce, a tensor-core ``WARP`` matmul, or a ``MONOID`` reduce (the
 flat cooperative reduce **and** the streaming flash — one tier, since both share the
@@ -12,7 +12,7 @@ never reads used to be **silently dropped** (or overwritten by an OFF sentinel) 
 user pinned a config and got a different one with no warning.
 
 This module makes that a **hard error** (strict per-op policy): given the op's
-:class:`~deplodock.compiler.ir.algebra.AlgebraKind` and the live env pins, it computes
+:class:`~emmy.compiler.ir.algebra.AlgebraKind` and the live env pins, it computes
 the set of tiers that could satisfy *every* force-pinned knob and raises
 :class:`KnobPinError` when that set is empty. It is called once, deterministically, at
 the enumeration seed (``010_build``), so a contradictory pin fails before any tile
@@ -36,10 +36,10 @@ from __future__ import annotations
 
 from enum import Enum
 
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.pipeline.knob import mma_decode
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.pipeline.knob import mma_decode
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     CHAIN,
     MMA,
     STAGE,
@@ -48,7 +48,7 @@ from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import 
 
 
 class KnobPinError(ValueError):
-    """A force-pinned ``DEPLODOCK_<KNOB>`` is foreign to the tier the op lowers on
+    """A force-pinned ``EMMY_<KNOB>`` is foreign to the tier the op lowers on
     (no codegen regime reads it for this op's algebra). Subclasses ``ValueError`` so
     callers already catching config errors keep working."""
 
@@ -119,7 +119,7 @@ _AUDITED = (MMA, STAGE, TMA, CHAIN)
 
 
 def validate_pins(algebra: AlgebraKind) -> None:
-    """Raise :class:`KnobPinError` when the live ``DEPLODOCK_<KNOB>`` pins cannot all be
+    """Raise :class:`KnobPinError` when the live ``EMMY_<KNOB>`` pins cannot all be
     satisfied by any tier an op of ``algebra`` resolves to. No-op when no geometry knob
     is pinned, or every pin is a universal / OFF value, or the pins agree on a tier.
 
@@ -135,7 +135,7 @@ def validate_pins(algebra: AlgebraKind) -> None:
     pinned: list[tuple[str, str, frozenset[Tier]]] = []
     for knob in _AUDITED:
         # The atom selector is the native ``ATOM@<cell>`` family now — audit its pin
-        # (``DEPLODOCK_ATOM`` / legacy ``DEPLODOCK_MMA`` via ingest); the message keeps the
+        # (``EMMY_ATOM`` / legacy ``EMMY_MMA`` via ingest); the message keeps the
         # ``MMA`` label for continuity.
         raw = fam.atom_raw(fam.MATMUL_CELL) if knob is MMA else knob.raw()
         if raw is None or raw == "":

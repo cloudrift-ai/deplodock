@@ -3,7 +3,7 @@
 import re
 from dataclasses import asdict, dataclass
 
-from deplodock.redact import redact_secrets
+from emmy.redact import redact_secrets
 
 
 @dataclass

@@ -3,14 +3,14 @@
 Each ``Knob`` declares one tuning dimension: its name (also the env-var
 key), its type (driving parse + pretty), the autotune candidate hints,
 and a short help string. Rules emit knob values into ``TileOp.knobs``
-dicts; the env layer reads ``DEPLODOCK_<NAME>`` to pin a knob across
+dicts; the env layer reads ``EMMY_<NAME>`` to pin a knob across
 the whole run; pretty-printing routes through the descriptor so
 display matches storage.
 
 Knobs are declared as plain module-level constants inside the rule
 that owns them (e.g. ``BN`` / ``BM`` in ``005_blockify_launch``). The
 :func:`registry` introspects every loaded rule module under
-``deplodock.compiler.pipeline.passes.`` and collects every ``Knob``
+``emmy.compiler.pipeline.passes.`` and collects every ``Knob``
 instance — no ``register(...)`` wrapper, no manual bookkeeping.
 """
 
@@ -24,9 +24,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from deplodock import config
+from emmy import config
 
-# The ``deplodock/`` package dir (knob.py → pipeline → compiler → deplodock).
+# The ``emmy/`` package dir (knob.py → pipeline → compiler → emmy).
 _PKG_ROOT = Path(__file__).resolve().parents[2]
 
 # Reserved prefix for the structural-feature knobs stamped by
@@ -156,11 +156,11 @@ class Knob:
     """Schema for one tunable parameter.
 
     ``name`` is used as the key in ``TileOp.knobs`` dicts and to derive
-    the env override ``DEPLODOCK_<NAME>``. ``hints`` is the autotune
+    the env override ``EMMY_<NAME>``. ``hints`` is the autotune
     candidate list (a guideline, not a constraint — rules apply their
     own structural validity gates). ``help`` is a short docstring shown
-    by future tooling (``deplodock knobs``). ``aliases`` are alternate
-    names whose ``DEPLODOCK_<ALIAS>`` env vars also pin this knob (read
+    by future tooling (``emmy knobs``). ``aliases`` are alternate
+    names whose ``EMMY_<ALIAS>`` env vars also pin this knob (read
     via :meth:`raw`; the primary name wins when both are set)"""
 
     name: str
@@ -189,7 +189,7 @@ class Knob:
         return config.knob_var(self.name)
 
     def raw(self) -> str | None:
-        """Live env pin: the primary ``DEPLODOCK_<NAME>`` first, then each
+        """Live env pin: the primary ``EMMY_<NAME>`` first, then each
         alias in declaration order; ``None`` when nothing is set. Every
         env read of an alias-bearing knob must route through here so the
         alias spelling behaves identically to the primary."""
@@ -203,7 +203,7 @@ class Knob:
         return None
 
     def read_int(self, default: int) -> int:
-        """Read this knob's ``DEPLODOCK_<NAME>`` env pin as an int (empty /
+        """Read this knob's ``EMMY_<NAME>`` env pin as an int (empty /
         unset / unparseable → ``default``).
 
         The heuristic-default path in ``compiler/tuning.py`` uses this to read
@@ -253,7 +253,7 @@ class Knob:
         return str(value)
 
     def narrow(self, candidates: Iterable[Any]) -> tuple:
-        """Override ``candidates`` with the env pin ``DEPLODOCK_<NAME>``.
+        """Override ``candidates`` with the env pin ``EMMY_<NAME>``.
 
         Folds env-driven pinning into the same iteration that produces
         hint-driven candidates, so callers don't enumerate-then-filter:
@@ -287,10 +287,10 @@ _REGISTRY: dict[str, Knob] | None = None
 
 
 def _walk_modules() -> list[ModuleType]:
-    # Every ``Knob`` is declared in a rule module under ``deplodock/`` — but rule
+    # Every ``Knob`` is declared in a rule module under ``emmy/`` — but rule
     # modules are loaded via ``importlib.util.spec_from_file_location`` and registered
     # under their bare file stem (e.g. ``005_blockify_launch``), not the full
-    # ``deplodock.compiler.pipeline.passes.…`` dotted path, so we can't filter on
+    # ``emmy.compiler.pipeline.passes.…`` dotted path, so we can't filter on
     # ``__name__``. Filter on ``__file__`` living under the package instead: this keeps
     # every Knob-bearing module while skipping the thousands of stdlib / third-party
     # modules — which both slows the walk and, for e.g. ``torch.distributed``, emits a
@@ -369,14 +369,14 @@ def apply_off_defaults(knobs: dict, declared: Iterable[Knob]) -> dict:
 
 
 def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
-    """Splat ``DEPLODOCK_KNOBS="K1=V1,K2=V2,..."`` into individual
-    ``DEPLODOCK_<K>=V`` env vars.
+    """Splat ``EMMY_KNOBS="K1=V1,K2=V2,..."`` into individual
+    ``EMMY_<K>=V`` env vars.
 
     Convenience for setting many knobs from one place (CLI invocation,
     Makefile recipe, pytest ``monkeypatch.setenv``). Individual
-    ``DEPLODOCK_<K>`` vars take precedence: this only writes a key when
+    ``EMMY_<K>`` vars take precedence: this only writes a key when
     the per-knob env var is unset, so callers can pin one knob from
-    the command line and supply the rest via ``DEPLODOCK_KNOBS``
+    the command line and supply the rest via ``EMMY_KNOBS``
     without surprise.
 
     Whitespace is tolerant; empty entries are skipped. A malformed
@@ -385,21 +385,21 @@ def apply_knobs_env(raw: str | None = None) -> dict[str, str]:
 
     Runs at module import time on the live process environment. Pass
     ``raw`` explicitly to apply a different aggregate without touching
-    ``DEPLODOCK_KNOBS`` (useful in tests).
+    ``EMMY_KNOBS`` (useful in tests).
     """
     if raw is None:
         raw = config.knobs_aggregate()
     applied: dict[str, str] = {}
     for key, value in parse_knob_spec(raw).items():
         # Individual per-knob env vars win — don't clobber an explicit
-        # ``DEPLODOCK_BK=4`` with whatever the aggregate says.
+        # ``EMMY_BK=4`` with whatever the aggregate says.
         if config.set_knob(key, value, overwrite=False):
             applied[config.knob_var(key)] = value
     return applied
 
 
 def parse_knob_spec(raw: str) -> dict[str, str]:
-    """Parse the shared ``K1=V1,K2=V2`` knob-spec grammar (the ``DEPLODOCK_KNOBS``
+    """Parse the shared ``K1=V1,K2=V2`` knob-spec grammar (the ``EMMY_KNOBS``
     aggregate, ``run --ab``) into an ordered ``{NAME: value}`` dict — names
     uppercased, whitespace tolerated, empty entries skipped. A malformed entry
     (missing ``=`` / empty KEY) raises ``ValueError``."""
@@ -418,9 +418,9 @@ def parse_knob_spec(raw: str) -> dict[str, str]:
     return out
 
 
-# Splat ``DEPLODOCK_KNOBS`` once at import so every later per-knob reader
+# Splat ``EMMY_KNOBS`` once at import so every later per-knob reader
 # (``config.knob_raw`` / ``config.int_env`` — knob.py is imported transitively
-# by every pipeline pass) sees the individual ``DEPLODOCK_<NAME>`` keys.
+# by every pipeline pass) sees the individual ``EMMY_<NAME>`` keys.
 apply_knobs_env()
 
 
@@ -431,7 +431,7 @@ apply_knobs_env()
 # (atomize), then ``PLACE@`` (placement) — each family's keys sorted by element; the
 # legacy exact-name knobs (``STAGE``/``TMA``/``CUT``/… still un-folded, plus any legacy
 # golden/DB row) follow in the historical order, unknown knobs last (alpha). Shared by the
-# ``run --bench`` kernel table and the ``deplodock eval`` tables so columns read stably.
+# ``run --bench`` kernel table and the ``emmy eval`` tables so columns read stably.
 _FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
 KNOB_ORDER = ("BM", "BN", "BK", "BR", "FM", "FN", "FK", "WM", "WN", "SPLITK", "RING", "STAGE", "MMA")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
@@ -603,7 +603,7 @@ def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     pairs: list[tuple[int, int]] = []
     native = [k for k in knobs if k.startswith("SPLIT@")]
     if native:
-        from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+        from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
 
         for k in native:
             par, reg = fam.dec_split(knobs[k])
@@ -641,7 +641,7 @@ def _reduce_decomp(knobs: dict):
     ``REDUCE@<axis>`` value (the deepest-``serial`` axis when a streaming nest has more
     than one) when present, else the legacy ``BK``/``FK``/``SPLITK``/``BR``. Returns a
     :class:`_families.Decomp`."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam  # noqa: PLC0415
 
     native = [knobs[k] for k in knobs if k.startswith("REDUCE@")]
     if native:
@@ -686,7 +686,7 @@ def _geom_feats(
     single featurization the priors rank on. It folds in everything the old
     hand-coded matmul heuristic scored (occupancy waves, tile-area / thread /
     aspect targets, the geometry "bands", K-chunk depth), so a fixed linear model
-    over these features (:class:`~deplodock.compiler.pipeline.search.prior.AnalyticPrior`)
+    over these features (:class:`~emmy.compiler.pipeline.search.prior.AnalyticPrior`)
     reproduces that heuristic and the learned ``CatBoostPrior`` sees the same
     derived signal a tree can't cheaply reconstruct from raw knobs + the *coarse*
     ``S_ext_*`` extents.

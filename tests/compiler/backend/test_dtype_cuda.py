@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler import dtype as dt
-from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name, cuda_name, nbytes_of
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler import dtype as dt
+from emmy.compiler.backend.cuda.dtype import canonical_from_cuda_name, cuda_name, nbytes_of
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp, RmsNormOp, SoftmaxOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
 from ..conftest import requires_cuda
 
@@ -61,13 +61,13 @@ def _fp16_chain_graph() -> Graph:
 
 @requires_cuda
 def test_fp16_elementwise_chain_cuda():
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     graph = _fp16_chain_graph()
     compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(graph))
     # Verify the rendered CUDA source picked up fp16 signature + include
     # for at least one kernel (there will be one after fusion).
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.ir.cuda import CudaOp
 
     cuda_nodes = [n for n in compiled.nodes.values() if isinstance(n.op, CudaOp)]
     assert cuda_nodes, "expected at least one CudaOp after lowering"
@@ -105,8 +105,8 @@ def _fp16_erf_graph() -> Graph:
 
 @requires_cuda
 def test_fp16_fallback_to_float_for_non_native_op():
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
 
     compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(_fp16_erf_graph()))
     sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
@@ -145,8 +145,8 @@ def _fp16_sum_graph() -> Graph:
 
 @requires_cuda
 def test_fp16_reduction_uses_fp32_accumulator_on_cuda():
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
 
     compiled = CudaBackend().compile(Pipeline.build(LOOP_PASSES).run(_fp16_sum_graph()))
     sources = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if isinstance(n.op, CudaOp))
@@ -175,7 +175,7 @@ def test_fp16_matmul_cuda():
     """fp16 matmul: k-reduction with __half loads and f32 accumulator.
     The decomposition expands to a Loop(k) > Loop(...) > Accum chain;
     the Init-placement pass picks F32 because both inputs are fp16."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     m, k, n = 8, 16, 8
     g = Graph()
@@ -202,7 +202,7 @@ def test_fp16_matmul_cuda():
 def test_fp16_softmax_cuda():
     """fp16 softmax along last dim: two reductions (max + sum) on f16
     values with f32 accumulators, then a per-element divide."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     rows, cols = 4, 64
     g = Graph()
@@ -231,7 +231,7 @@ def test_fp16_rmsnorm_cuda():
     """fp16 RMSNorm: ``x * rsqrt(mean(x*x) + eps) * weight``. The
     sum-of-squares reduction needs the f32 accumulator (x^2 in fp16
     can overflow / underflow for typical activation magnitudes)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     rows, cols = 4, 64
     g = Graph()
@@ -261,8 +261,8 @@ def test_fp16_max_reduction_stays_in_fp16():
     """``max`` is a selection (no magnitude accumulation), so it stays in
     the input dtype. The kernel should declare ``__half`` for the
     accumulator and use ``__hmax`` — not promote to float."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.ir.cuda import CudaOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (1024,), dt.F16), node_id="x")

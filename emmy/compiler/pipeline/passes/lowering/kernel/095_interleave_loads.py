@@ -95,7 +95,7 @@ https://forums.developer.nvidia.com/t/ptx-instructions-are-reordered/197973 ).
 
 ``INTERLEAVE_LOADS`` is therefore *not* a search dimension — only ``True`` is
 enumerated, so the autotuner never forks on it and the knob set stays small.
-``DEPLODOCK_INTERLEAVE_LOADS=0`` remains as a manual override for inspecting
+``EMMY_INTERLEAVE_LOADS=0`` remains as a manual override for inspecting
 the flat layout or for a workload where it measures faster.
 
 Idempotent — a body already in interleaved form is a no-op.
@@ -103,12 +103,12 @@ Idempotent — a body already in interleaved form is a no-op.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.stmt.leaves import Assign, Load
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.stmt.leaves import Assign, Load
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.knob import Knob, KnobType
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -128,7 +128,7 @@ def rewrite(root: Node) -> TileOp | None:
     if INTERLEAVE_LOADS.name in op.knobs:
         raise RuleSkipped("INTERLEAVE_LOADS already decided (idempotence via knob)")
     # Only ``True`` is enumerated, so the autotuner never forks on this knob;
-    # ``DEPLODOCK_INTERLEAVE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
+    # ``EMMY_INTERLEAVE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
     # pin authoritatively, even when it is not in the candidate set).
     if not INTERLEAVE_LOADS.narrow((True,))[0]:
         return TileOp(body=op.body, name=op.name, knobs={**op.knobs, INTERLEAVE_LOADS.name: False})

@@ -19,15 +19,15 @@ from __future__ import annotations
 from dataclasses import replace as _replace
 from typing import Any
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering._predicates import reduce_body_has_coupled_accum
 
 PATTERN = [Pattern("root", TileOp)]
 

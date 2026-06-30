@@ -5,10 +5,10 @@ import os
 
 import yaml
 
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.variant import Variant
-from deplodock.recipe.matrix import build_override, expand_matrix, filter_combinations
-from deplodock.recipe.recipe import _validate_and_build, deep_merge
+from emmy.planner import BenchmarkTask
+from emmy.planner.variant import Variant
+from emmy.recipe.matrix import build_override, expand_matrix, filter_combinations
+from emmy.recipe.recipe import _validate_and_build, deep_merge
 
 logger = logging.getLogger(__name__)
 

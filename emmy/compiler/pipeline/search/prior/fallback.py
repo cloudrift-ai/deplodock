@@ -28,10 +28,10 @@ perturb the learned order, not replace it.
 
 from __future__ import annotations
 
-from deplodock import config
-from deplodock.compiler.pipeline.search.prior.analytic import AnalyticPrior
-from deplodock.compiler.pipeline.search.prior.base import Prior
-from deplodock.compiler.pipeline.search.prior.catboost import CatBoostPrior
+from emmy import config
+from emmy.compiler.pipeline.search.prior.analytic import AnalyticPrior
+from emmy.compiler.pipeline.search.prior.base import Prior
+from emmy.compiler.pipeline.search.prior.catboost import CatBoostPrior
 
 
 class FallbackPrior(Prior):

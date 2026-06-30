@@ -4,7 +4,7 @@ When a dump directory is set, captures all intermediate compilation
 artifacts to disk for debugging and performance analysis.
 
 Activation:
-    - DEPLODOCK_DUMP_DIR env var
+    - EMMY_DUMP_DIR env var
     - --dump-dir CLI argument
     - dump_dir pytest fixture (writes to _test_data/<test_name>/)
 """
@@ -17,12 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock import config
+from emmy import config
 
 if TYPE_CHECKING:
-    from deplodock.compiler.backend.base import BenchmarkResult
-    from deplodock.compiler.graph import Graph
-    from deplodock.compiler.pipeline.pipeline import Pass, Rule
+    from emmy.compiler.backend.base import BenchmarkResult
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.pipeline.pipeline import Pass, Rule
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class CompilerDump:
 
     @classmethod
     def from_env(cls) -> CompilerDump | None:
-        """Create from DEPLODOCK_DUMP_DIR env var, or return None."""
+        """Create from EMMY_DUMP_DIR env var, or return None."""
         d = config.dump_dir()
         return cls(dir=d) if d else None
 
@@ -138,7 +138,7 @@ class CompilerDump:
         ``<prefix>.kernels/<kname>.json``. Each sub-graph contains the
         kernel node plus its transitive ``InputOp`` / ``ConstantOp``
         producers, so it can be loaded standalone via
-        ``deplodock run --ir <subgraph>.json --bench`` for per-kernel
+        ``emmy run --ir <subgraph>.json --bench`` for per-kernel
         diagnosis. Also writes ``<prefix>.kernels/<kname>.txt`` with
         the op's pretty-printed body (CUDA source for ``CudaOp``,
         loop / kernel IR for the lower-level dialects) so the readable
@@ -149,11 +149,11 @@ class CompilerDump:
         ``.txt`` side — the body is identical so writing it once is
         enough — but each launch still gets its own ``.json``
         sub-graph since the input bindings differ per node."""
-        from deplodock.compiler.ir.cuda.ir import CudaOp
-        from deplodock.compiler.ir.kernel.ir import KernelOp
-        from deplodock.compiler.ir.loop import LoopOp
-        from deplodock.compiler.ir.tile.ir import TileOp
-        from deplodock.compiler.pipeline.search.slice import single_node_graph
+        from emmy.compiler.ir.cuda.ir import CudaOp
+        from emmy.compiler.ir.kernel.ir import KernelOp
+        from emmy.compiler.ir.loop import LoopOp
+        from emmy.compiler.ir.tile.ir import TileOp
+        from emmy.compiler.pipeline.search.slice import single_node_graph
 
         compute_types = (LoopOp, TileOp, KernelOp, CudaOp)
         compute_nodes = [(nid, n) for nid, n in graph.nodes.items() if isinstance(n.op, compute_types)]
@@ -187,9 +187,9 @@ class CompilerDump:
 
         Sliced from the pristine ``_input_graph`` by the kernel's prov origins,
         so it is always whole Torch ops — runnable via
-        ``deplodock run --ir <f>.torch.json --bench`` to reproduce accuracy /
+        ``emmy run --ir <f>.torch.json --bench`` to reproduce accuracy /
         latency vs torch for exactly those ops."""
-        from deplodock.compiler import provenance  # noqa: PLC0415
+        from emmy.compiler import provenance  # noqa: PLC0415
 
         if self._input_graph is None:
             return
@@ -217,9 +217,9 @@ class CompilerDump:
         random bench data, which is out of domain (``pow(x, random)`` → NaN) and
         breaks the reproducer's accuracy check. Outputs are the sink origins —
         those no other kept node consumes."""
-        from deplodock.compiler.graph import Graph as _Graph  # noqa: PLC0415
-        from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.slice import topo_order  # noqa: PLC0415
+        from emmy.compiler.graph import Graph as _Graph  # noqa: PLC0415
+        from emmy.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.slice import topo_order  # noqa: PLC0415
 
         src = self._input_graph
         keep: set[str] = set(origins)
@@ -260,7 +260,7 @@ class CompilerDump:
         every leaf a ``ConstantOp`` — else ``None``. An ``InputOp`` anywhere in
         the closure means ``root`` carries runtime data and must stay a synthetic
         boundary."""
-        from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+        from emmy.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
 
         closure: set[str] = set()
         stack = [root]
@@ -279,7 +279,7 @@ class CompilerDump:
     def _collect_subgraph(self, graph: Graph, root_id: str) -> set[str]:
         """Transitive-input closure for a compute node: itself + every
         ``ConstantOp`` / ``InputOp`` reachable via ``node.inputs``."""
-        from deplodock.compiler.ir.base import ConstantOp, InputOp
+        from emmy.compiler.ir.base import ConstantOp, InputOp
 
         keep: set[str] = set()
         stack = [root_id]
@@ -366,8 +366,8 @@ def format_kernels(graph: Graph) -> str:
     Behaves like ``RenderCtx.literal_constants`` does for the cuda
     renderer — same idea, applied to the human-readable IR dump.
     """
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.ir.cuda import CudaOp
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.ir.cuda import CudaOp
 
     rename_map = {nid: _canonical_node_id(nid) for nid in graph.nodes if _canonical_node_id(nid) != nid}
 

@@ -18,12 +18,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.stmt import Accum, Loop, ReduceCarrier, Write
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.stmt import Accum, Loop, ReduceCarrier, Write
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, _carrier_of
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import (
     BK_CHOICES,
     BR_CHOICES,
     FK_CHOICES,
@@ -173,7 +173,7 @@ def thread_offers(dag: IterDag, budget: Budget, *, balanced: bool = False) -> li
     budget, best-first (≈``_THREAD_TARGET`` threads, larger to break ties).
     ``thread_m`` is ``1`` for a 1-D nest (no M axis).
 
-    A pinned ``DEPLODOCK_BN``/``BM`` narrows its axis to that single extent (the
+    A pinned ``EMMY_BN``/``BM`` narrows its axis to that single extent (the
     same ``_pin`` idiom :func:`reduce_offers` uses for ``BK``/``FK``/``SPLITK``) so a
     test / golden can force a specific (masked) free-axis tile — without it greedy
     would always take the best-first ≈``_THREAD_TARGET`` offer and silently drop the pin.
@@ -210,7 +210,7 @@ def thread_offers(dag: IterDag, budget: Budget, *, balanced: bool = False) -> li
 def map_reg_offers(dag: IterDag, budget: Budget) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles within the cell budget, best-first
     (fewest cells — a MAP nest is bandwidth bound; prefer tiling the contiguous N
-    axis on ties). A pinned ``DEPLODOCK_FN``/``FM`` narrows its axis (see
+    axis on ties). A pinned ``EMMY_FN``/``FM`` narrows its axis (see
     :func:`thread_offers`)."""
     fn_pin = fam.split_reg(dag, dag.inner_n.axis.name)
     fm_pin = fam.split_reg(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
@@ -304,7 +304,7 @@ def reduce_offers(dag: IterDag) -> list[tuple[int, int, int]]:
 def reduce_reg_offers(dag: IterDag, budget: Budget, fk: int) -> list[tuple[int, int]]:
     """Legal ``(reg_n, reg_m)`` register tiles for a reduce regime under the cell budget
     (``fk·reg_n·reg_m ≤ max_cells``), best-first (≈``_CELL_TARGET`` cells). A pinned
-    ``DEPLODOCK_FN``/``FM`` narrows its axis (see :func:`thread_offers`)."""
+    ``EMMY_FN``/``FM`` narrows its axis (see :func:`thread_offers`)."""
     fn_pin = fam.split_reg(dag, dag.inner_n.axis.name)
     fm_pin = fam.split_reg(dag, dag.outer_m.axis.name) if dag.outer_m is not None else None
     n_choices = (fn_pin,) if fn_pin else REG_CHOICES
@@ -441,7 +441,7 @@ def coop_free_thread_knobs(dag: IterDag) -> dict:
 def streaming_br_offers(dag: IterDag) -> list[int]:
     """Cooperative ``BR`` candidates for the streaming-flash reduce axis
     (e.g. flash attention's streaming KV). ``[1]`` (the serial-stream form) unless
-    ``DEPLODOCK_BR`` is pinned to a ``br`` (``1 < br ≤ 1024``) that evenly splits the
+    ``EMMY_BR`` is pinned to a ``br`` (``1 < br ≤ 1024``) that evenly splits the
     **static** streaming extent — then the axis partitions across ``br`` cooperative
     THREAD lanes whose per-lane online-softmax partials merge via the carrier's
     ``combine_states``. Cooperative streaming is opt-in (pin-only), not yet a default
@@ -500,7 +500,7 @@ def warp_reg_offers(dag: IterDag, atom) -> list[tuple[int, int]]:  # noqa: ARG00
     """Legal ``(fm, fn)`` per-warp register cells under the cell ceiling
     (``fm·fn ≤ _MAX_WARP_CELLS``), best-first (≈``_WARP_CELL_TARGET`` cells).
 
-    A *fully* pinned ``(DEPLODOCK_FM, DEPLODOCK_FN)`` is authoritative and bypasses
+    A *fully* pinned ``(EMMY_FM, EMMY_FN)`` is authoritative and bypasses
     the ceiling: the cell ceiling is a search-pruning heuristic (don't enumerate
     huge register tiles), not a hardware bound, and a user / test pin is
     authoritative everywhere else (the ``_pin`` doctrine). Honoring an over-ceiling

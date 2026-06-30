@@ -1,6 +1,6 @@
-"""Single-player MCTS for ``deplodock tune`` with max-reward propagation and
+"""Single-player MCTS for ``emmy tune`` with max-reward propagation and
 **PUCT** selection — the learned
-:class:`~deplodock.compiler.pipeline.search.prior.Prior` is the *only* selection
+:class:`~emmy.compiler.pipeline.search.prior.Prior` is the *only* selection
 signal (greedy and the ``+∞``-unvisited UCB rule are gone).
 
     select   — descend from root, picking at each level
@@ -34,14 +34,14 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from deplodock import config
-from deplodock.compiler.pipeline.search.candidate import LazyCandidate
-from deplodock.compiler.pipeline.search.db import PerfStats
-from deplodock.compiler.pipeline.search.policy.base import Search
-from deplodock.compiler.structural import digest
+from emmy import config
+from emmy.compiler.pipeline.search.candidate import LazyCandidate
+from emmy.compiler.pipeline.search.db import PerfStats
+from emmy.compiler.pipeline.search.policy.base import Search
+from emmy.compiler.structural import digest
 
 if TYPE_CHECKING:
-    from deplodock.compiler.pipeline.search.prior import Prior
+    from emmy.compiler.pipeline.search.prior import Prior
 
 # Re-bench at -O3 any config whose -O1 latency is within this fraction of the best
 # -O1 so far (not just a strict new best). -O1 is the fast ranking compile but
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 # occupancy split where the -O1 latencies are within ~1% but -O3 differs ~15%.
 # Widening the deployable-sample net to this band feeds the prior -O3 truth for
 # every near-best contender, so it can rank by -O3 cost. Env-overridable via
-# ``DEPLODOCK_O3_TOL`` (a fraction, e.g. ``0.15`` for 15%).
+# ``EMMY_O3_TOL`` (a fraction, e.g. ``0.15`` for 15%).
 O3_REBENCH_TOL = 0.15
 
 

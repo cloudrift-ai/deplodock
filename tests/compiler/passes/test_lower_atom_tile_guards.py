@@ -18,14 +18,14 @@ import importlib
 
 import pytest
 
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import RegStore
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Write
-from deplodock.compiler.ir.stmt.base import RenderCtx
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
-from deplodock.compiler.pipeline import RuleSkipped
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.kernel.ir import RegStore
+from emmy.compiler.ir.stmt import Body, Cond, Load, Write
+from emmy.compiler.ir.stmt.base import RenderCtx
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY
+from emmy.compiler.pipeline import RuleSkipped
 
-_mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.005_lower_atom_tile")
+_mod = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.005_lower_atom_tile")
 
 
 def _store(**kw) -> RegStore:
@@ -119,8 +119,8 @@ def test_emit_chain_clamps_unstaged_gated_operand():
     clean-axis operand keeps the unclamped helper. Every enumerated variant
     must lower — staging declines (smem budget) are legitimate and a greedy
     pick must not crash on the fallback."""
-    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad
-    from deplodock.compiler.ir.stmt.base import RenderCtx
+    from emmy.compiler.ir.kernel.ir import LdmatrixLoad
+    from emmy.compiler.ir.stmt.base import RenderCtx
 
     spec = ATOM_REGISTRY["mma_m16n8k16_f16"]
     a_load = Load(name="a0", input="a", index=(Var("m"), Var("k")))
@@ -152,8 +152,8 @@ def test_masked_shape_c_cell_lowers_through_the_cond():
     loads clamp, the store carries the per-element guards) instead of
     raising and leaving the AtomTile to crash render — which killed a whole
     tune at the first such variant."""
-    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad
-    from deplodock.compiler.ir.stmt import Mma
+    from emmy.compiler.ir.kernel.ir import LdmatrixLoad
+    from emmy.compiler.ir.stmt import Mma
 
     m_expr = Var("mb") * Literal(16, "int")
     n_expr = Var("nb") * Literal(8, "int")
@@ -190,10 +190,10 @@ def test_unstaged_masked_k_gate_detection():
     is the last index dim; B's K is a non-last dim (N is last). M-symbolic-only
     (A's non-last) and fully-static operands stay fine gmem-direct (M is clamped
     by ``gmem_guard``)."""
-    from deplodock.compiler import dtype as _dt
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
+    from emmy.compiler import dtype as _dt
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
 
     f16 = _dt.get("f16")
     g = Graph()
@@ -220,11 +220,11 @@ def test_fragment_output_cell_lowers_without_a_store():
     fragment chain (``RegFragment`` + ``LdmatrixLoad`` + ``MmaSyncPtx``) with **no**
     ``RegStore`` — the C-fragment stays live for a downstream consumer (the flash QK^T
     score, the INLINE edge). The same shared lowering the matmul uses, minus the store."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.axis import Axis
-    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
-    from deplodock.compiler.ir.stmt import Mma
-    from deplodock.compiler.ir.tile.ir import AtomTile
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
+    from emmy.compiler.ir.stmt import Mma
+    from emmy.compiler.ir.tile.ir import AtomTile
 
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
     cell = (
@@ -247,11 +247,11 @@ def test_fragment_a_pv_cell_lowers_b_only_into_carried_accumulator():
     no ``RegFragment`` decl for A or C (they exist already), no A ``LdmatrixLoad``, no
     ``RegStore`` (O accumulates across the kv stream, stored in the epilogue outside the
     cell). Only the B operand is declared + loaded — the kernel-side of Phase 2.2."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.axis import Axis
-    from deplodock.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
-    from deplodock.compiler.ir.stmt import Mma
-    from deplodock.compiler.ir.tile.ir import AtomTile
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.kernel.ir import LdmatrixLoad, MmaSyncPtx, RegFragment
+    from emmy.compiler.ir.stmt import Mma
+    from emmy.compiler.ir.tile.ir import AtomTile
 
     atom = ATOM_REGISTRY["mma_m16n8k16_f16"]
     # P@V: A = P (live fragment, no Load), B = V (loaded), C = O (carried).

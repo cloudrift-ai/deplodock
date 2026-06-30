@@ -1,6 +1,6 @@
 """``serving.packed.split_spans`` — pure logic, no GPU/torch/vllm."""
 
-from deplodock.serving.packed import split_spans
+from emmy.serving.packed import split_spans
 
 
 def test_single_sequence():

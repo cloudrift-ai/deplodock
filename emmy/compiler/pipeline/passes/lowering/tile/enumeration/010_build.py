@@ -13,17 +13,17 @@ here, so the ``LoopOp`` never enters the tile-pass chain.
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.tile.ir import Buffer, Space, TileGraphOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._validate import validate_pins
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.tile.ir import Buffer, Space, TileGraphOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._validate import validate_pins
 
 PATTERN = [Pattern("root", LoopOp)]
 
@@ -36,7 +36,7 @@ _BUILDABLE = (AlgebraKind.MAP, AlgebraKind.SEMIRING, AlgebraKind.MONOID)
 def _is_union_pinned(match) -> bool:
     """True when the graph is a **multi-op kernel set** — a split-produced
     ``xn`` producer + gemm consumer (``split/010_split_demoted``), or a whole-model
-    graph. A global ``DEPLODOCK_<KNOB>`` pin is then a UNION pin: each op takes its
+    graph. A global ``EMMY_<KNOB>`` pin is then a UNION pin: each op takes its
     tier's subset (e.g. ``MMA`` lands on the SEMIRING consumer, the MONOID softmax
     producer ignores it), so a per-op tier-foreign pin is NOT a user contradiction.
     A single-kernel graph keeps the strict ``validate_pins`` check — matching the

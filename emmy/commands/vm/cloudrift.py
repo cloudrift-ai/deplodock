@@ -5,13 +5,13 @@ import logging
 import os
 import sys
 
-from deplodock.provisioning.cloudrift import (
+from emmy.provisioning.cloudrift import (
     DEFAULT_API_URL,
     create_instance,
     delete_instance,
 )
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.redact import register_secret
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.redact import register_secret
 
 logger = logging.getLogger(__name__)
 

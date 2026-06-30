@@ -29,12 +29,12 @@ from __future__ import annotations
 
 import importlib
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.kernel.ir import (
     KernelOp,
     MbarrierArrive,
     MbarrierInit,
@@ -43,8 +43,8 @@ from deplodock.compiler.ir.kernel.ir import (
     Smem,
     Sync,
 )
-from deplodock.compiler.ir.stmt import Body, Cond
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.stmt import Body, Cond
+from emmy.compiler.ir.tile.ir import (
     AsyncWait,
     SerialTile,
     ThreadTile,
@@ -52,9 +52,9 @@ from deplodock.compiler.ir.tile.ir import (
     WarpSpecialize,
     WarpTile,
 )
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.tensor import Tensor
 
-_mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
+_mat = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
 
 
 # ---------------------------------------------------------------------------

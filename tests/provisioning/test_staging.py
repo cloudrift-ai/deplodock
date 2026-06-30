@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from deplodock.provisioning.staging import (
+from emmy.provisioning.staging import (
     build_stage_tar,
     enumerate_staged_files,
 )

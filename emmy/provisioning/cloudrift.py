@@ -7,9 +7,9 @@ import os
 
 import httpx
 
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.provisioning.ssh import wait_for_ssh
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.ssh import wait_for_ssh
+from emmy.provisioning.types import VMConnectionInfo
 
 logger = logging.getLogger(__name__)
 

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
 
 
 def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
@@ -40,7 +40,7 @@ def apply_load_ops(source: np.ndarray, load_ops: tuple) -> np.ndarray:
         cur = nid
     g.outputs.append(cur)
 
-    from deplodock.compiler.backend.base import Backend
+    from emmy.compiler.backend.base import Backend
 
     class _NumpyInterp(Backend):
         def compile(self, graph):

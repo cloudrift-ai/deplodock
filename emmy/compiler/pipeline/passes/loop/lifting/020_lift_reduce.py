@@ -8,14 +8,14 @@ outputs).
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_canon
-from deplodock.compiler.ir.expr import Expr, Literal, Var
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl, reduce_canon
+from emmy.compiler.ir.expr import Expr, Literal, Var
+from emmy.compiler.ir.loop import Accum, Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.tensor.ir import ReduceOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", ReduceOp)]
 

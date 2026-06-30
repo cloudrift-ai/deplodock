@@ -8,8 +8,8 @@ import os
 import sys
 from pathlib import Path
 
-from deplodock import config
-from deplodock.commands.compile import (
+from emmy import config
+from emmy.commands.compile import (
     add_diagnostics_args,
     add_golden_arg,
     add_input_args,
@@ -21,8 +21,8 @@ from deplodock.commands.compile import (
     resolve_tune_db,
     setup_pipeline_runtime,
 )
-from deplodock.commands.dataset_args import add_dataset_args, require_source
-from deplodock.compiler.pipeline import TuningSearch
+from emmy.commands.dataset_args import add_dataset_args, require_source
+from emmy.compiler.pipeline import TuningSearch
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def register_tune_command(subparsers):
         default=None,
         help=(
             "Stop after this many consecutive measured variants haven't beaten the current best latency. "
-            "Falls back to ``DEPLODOCK_TUNE_PATIENCE`` env var, then to 50."
+            "Falls back to ``EMMY_TUNE_PATIENCE`` env var, then to 50."
         ),
     )
     parser.add_argument(
@@ -67,7 +67,7 @@ def register_tune_command(subparsers):
         help=(
             "ε-greedy exploration: probability a selection step descends a uniformly random child "
             "instead of the PUCT argmax, perturbing (not replacing) the heuristic order for shapes "
-            "where it's known-bad. Falls back to ``DEPLODOCK_TUNE_EPS`` env var, then to 0.0 "
+            "where it's known-bad. Falls back to ``EMMY_TUNE_EPS`` env var, then to 0.0 "
             "(deterministic PUCT) — opt-in; see plans/golden-sweep-report.md."
         ),
     )
@@ -83,7 +83,7 @@ def register_tune_command(subparsers):
         help=(
             "After tuning, re-bench the winner at -O3 (deployable numbers, NOT the -O1 ranking pass): the full "
             "compiled model and each individual kernel (via its provenance .torch.json reproducer) vs eager "
-            "PyTorch / torch.compile / Deplodock, then print a comparison table. Writes an HTML per-kernel chart "
+            "PyTorch / torch.compile / Emmy, then print a comparison table. Writes an HTML per-kernel chart "
             "to <dump-dir>/kernels.html when a dump dir is set. Can take minutes on a large model."
         ),
     )
@@ -110,11 +110,11 @@ def register_tune_command(subparsers):
     )
     parser.add_argument(
         "--bench-backends",
-        default="eager,tcompile,deplodock",
+        default="eager,tcompile,emmy",
         help=(
             "Comma-separated subset of backends to time under --bench: any of ``eager``, ``tcompile`` "
-            "(torch.compile), ``deplodock``. Default: all three — tune --bench is the deployable comparison, "
-            "so torch.compile's ~0.8s JIT is worth paying. ``deplodock`` is always included."
+            "(torch.compile), ``emmy``. Default: all three — tune --bench is the deployable comparison, "
+            "so torch.compile's ~0.8s JIT is worth paying. ``emmy`` is always included."
         ),
     )
     add_diagnostics_args(parser)
@@ -123,16 +123,16 @@ def register_tune_command(subparsers):
 
 
 def _tune_offline(args):
-    """``deplodock tune`` with no op: refit the global learned prior on its
+    """``emmy tune`` with no op: refit the global learned prior on its
     persisted reservoir dataset and print offline diagnostics — no GPU, no
     benching. Answers "can the prior reach the best configs?" over everything
     tuned so far."""
-    from deplodock import config
-    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics
+    from emmy import config
+    from emmy.compiler.pipeline.search.prior import CatBoostPrior, diagnostics
 
     prior = CatBoostPrior.load(seed=args.seed)
     if not prior._dataset:
-        logger.error("no prior dataset at %s — run `deplodock tune <model>` first", config.prior_path())
+        logger.error("no prior dataset at %s — run `emmy tune <model>` first", config.prior_path())
         sys.exit(1)
     sys.stderr.write(f"[tune] offline refit on {len(prior._dataset)} rows from {config.prior_path()}\n")
     prior.fit()  # unconditional re-fit on the whole accumulated dataset
@@ -150,7 +150,7 @@ def _tune_backend(device_id: int | None = None):
     compile / 2 s run is ample and the 8 s wall SIGKILLs any runaway (the wall keeps
     a ~2 s margin over compile+run). ``device_id`` pins the async bench worker to a
     physical GPU (multi-GPU tune)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     return CudaBackend(bench_compile_timeout_s=4.0, bench_run_timeout_s=2.0, bench_wall_timeout_s=8.0, device_id=device_id)
 
@@ -209,8 +209,8 @@ def _tune_one(args, *, backends, db, ctx, dump):
     fanning the inner per-kernel search across GPUs."""
     import time
 
-    from deplodock.commands.tune_progress import TuneProgress
-    from deplodock.compiler.pipeline.search.two_level import run_two_level_tune
+    from emmy.commands.tune_progress import TuneProgress
+    from emmy.compiler.pipeline.search.two_level import run_two_level_tune
 
     graph, _, bench_bundle = load_or_trace(args)
     if dump:
@@ -269,7 +269,7 @@ def _tune_targets(args) -> list[tuple[str, str | None, str | None, list[str] | N
     over this list uniformly, so one shape and the whole golden set share one codepath.
     Exits 2 on a degenerate / conflicting source."""
     if getattr(args, "dataset", None):
-        from deplodock.compiler.pipeline.search.data import Dataset
+        from emmy.compiler.pipeline.search.data import Dataset
 
         require_source(args, {"golden"}, "tune --dataset only supports 'golden' (db rows have no shape to tune)")
         if args.code or args.input or getattr(args, "golden", None):
@@ -298,15 +298,15 @@ def _tune_targets(args) -> list[tuple[str, str | None, str | None, list[str] | N
 def _bench_dump(args):
     """Per-target dump dir. ``--bench`` reads the ``.torch.json`` provenance
     reproducers from a dump dir; route through a temp dir when no ``--dump-dir`` was
-    given (HTML is only written for a real ``--dump-dir`` / ``DEPLODOCK_DUMP_DIR``).
+    given (HTML is only written for a real ``--dump-dir`` / ``EMMY_DUMP_DIR``).
     Returns ``(dump, tmp_dir_or_None)``."""
-    from deplodock.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.pipeline.dump import CompilerDump
 
     dump = CompilerDump.resolve(args.dump_dir)
     if args.bench and dump is None:
         import tempfile
 
-        tmp = Path(tempfile.mkdtemp(prefix="deplodock-tune-bench-"))
+        tmp = Path(tempfile.mkdtemp(prefix="emmy-tune-bench-"))
         return CompilerDump(dir=tmp), tmp
     return dump, None
 
@@ -320,15 +320,15 @@ def handle_tune(args):
 
     targets = _tune_targets(args)  # one shape, or the whole golden set — same loop below
 
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline.search import SearchDB
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline.search import SearchDB
 
     setup_pipeline_runtime(args)
     # tune compiles at -Xcicc -O1 by default to dodge a cicc/LLVM blowup on big
     # unrolled register-tile kernels (up to ~200x faster compile). The trade-off:
     # -O1 latencies are a RANKING signal, NOT -O3-optimal — reduction / attention
     # kernels can run 1.5-3x slower. Re-bench the winner at -O3 (``tune --bench``,
-    # or ``deplodock run --bench``) for deployable numbers.
+    # or ``emmy run --bench``) for deployable numbers.
     nvcc_flags = apply_nvcc_flags(args, default="-Xcicc -O1")
     if "-O1" in nvcc_flags or "-O0" in nvcc_flags:
         logger.info(
@@ -336,7 +336,7 @@ def handle_tune(args):
             "-O1" if "-O1" in nvcc_flags else "-O0",
         )
 
-    db_path = resolve_tune_db()  # ``DEPLODOCK_TUNE_DB`` env overrides the default path
+    db_path = resolve_tune_db()  # ``EMMY_TUNE_DB`` env overrides the default path
     if args.clean:  # one shape or many: a fresh sweep clears once, then accumulates
         _clean_caches(db_path)
     db = SearchDB(path=db_path)
@@ -403,10 +403,10 @@ def handle_tune(args):
 
 def _clean_caches(db_path) -> None:
     """``--clean``: nuke the tuning DB (+ WAL/SHM sidecars) and the kernel
-    caches (deplodock's cubin cache + cupy's NVRTC cache) for a fresh sweep."""
+    caches (emmy's cubin cache + cupy's NVRTC cache) for a fresh sweep."""
     import shutil
 
-    from deplodock.compiler.backend.cuda import nvcc
+    from emmy.compiler.backend.cuda import nvcc
 
     removed = []
     if db_path is not None:
@@ -443,16 +443,16 @@ _PER_KERNEL_BENCH_WALL_S = 120.0
 def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     """``tune --bench``: re-bench the tuned winner at -O3 (deployable numbers, NOT the
     -O1 ranking pass) — full model **against the real torch module** (eager /
-    torch.compile / Deplodock) and each per-kernel ``.torch.json`` reproducer against
+    torch.compile / Emmy) and each per-kernel ``.torch.json`` reproducer against
     its torch-ref reconstruction, each in the SIGKILL-able bench worker so a hung kernel
     can't wedge the run. Prints both tables and (when ``html_dir`` is set) writes an HTML
     per-kernel chart. ``bench_bundle = (module, args, kwargs) | None``; when ``None`` (an
     ``--ir`` JSON tune with no module) the full-model bench is skipped and only the
     per-kernel table runs."""
-    from deplodock.commands.run import _collect_sym_env, _print_table, _symbolic_bench_note
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.commands.run import _collect_sym_env, _print_table, _symbolic_bench_note
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import benchmark_compare_isolated_async
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     # Re-bench at -O3 (deployable) unless the user explicitly pinned --nvcc-flags;
     # tune searched at -O1, which is a ranking signal only. The lowering-fork
@@ -462,7 +462,7 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     os.environ[config.NVCC_FLAGS] = bench_flags
     sys.stderr.write(f"\n[tune] --bench: re-benching at -O3 ({bench_flags or 'nvcc default -O3'}) — deployable numbers\n")
 
-    # Build the bench backend with DEPLODOCK_DUMP_DIR cleared: CudaBackend defaults its
+    # Build the bench backend with EMMY_DUMP_DIR cleared: CudaBackend defaults its
     # dump to CompilerDump.from_env(), whose __post_init__ would rmtree the dump dir —
     # destroying the .torch.json reproducers the assembled tuning run just wrote there
     # (and which the per-kernel bench reads). Clearing it also avoids per-launch dump
@@ -478,9 +478,9 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
     db = SearchDB(path=backend.tune_db) if (backend.tune_db is not None and backend.tune_db.exists()) else None
 
     if bench_bundle is not None:
-        sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / deplodock):\n")
+        sys.stderr.write("\n[tune] full-model bench (eager / torch.compile / emmy):\n")
         # The worker rebuilds the real module from these args via ``load_or_trace`` (no live module
-        # crosses the pipe) and runs the comparison in-child — a hung deplodock kernel hangs the
+        # crosses the pipe) and runs the comparison in-child — a hung emmy kernel hangs the
         # child, which the parent SIGKILLs, instead of wedging the run.
         trace_args = {
             "code": args.code,
@@ -527,18 +527,18 @@ def _run_bench(args, bench_bundle, assembled, dump, *, html_dir) -> None:
 
 def _bench_per_kernel(args, dump_dir, db):
     """Bench each kernel's ``.torch.json`` provenance reproducer (re-lowered greedily so the tuned
-    DB-best forks are picked) vs eager / torch.compile / deplodock at -O3 — each in the SIGKILL-able
+    DB-best forks are picked) vs eager / torch.compile / emmy at -O3 — each in the SIGKILL-able
     worker (``benchmark_compare_isolated_async``). Re-lowering runs in the parent (CPU; greedy forks read
     the DB); only the GPU bench is isolated, so a hung / failed kernel skips just that reproducer and
     the sweep continues. Returns ``(rows, fallback)`` — ``rows`` is ``[(label, {backend: us})]``,
     ``fallback`` the labels that benched without CUDA graph capture (dispatch-inclusive timings)."""
     import json
 
-    from deplodock.commands.run import _detect_stage, _passes_after_stage
-    from deplodock.compiler.backend import torch_ref
-    from deplodock.compiler.backend.cuda.program import benchmark_compare_isolated_async
-    from deplodock.compiler.graph import Graph
-    from deplodock.compiler.pipeline import Pipeline
+    from emmy.commands.run import _detect_stage, _passes_after_stage
+    from emmy.compiler.backend import torch_ref
+    from emmy.compiler.backend.cuda.program import benchmark_compare_isolated_async
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.pipeline import Pipeline
 
     repros = final_kernel_repros(dump_dir)
     if not repros:
@@ -547,7 +547,7 @@ def _bench_per_kernel(args, dump_dir, db):
     sys.stderr.write(f"\n[tune] per-kernel bench: {len(repros)} reproducer(s) at -O3\n")
     rows: list[tuple[str, dict]] = []
     fallback: list[str] = []
-    records: list[dict] = []  # persisted as 62_kernel_bench.json — the `deplodock compare` input
+    records: list[dict] = []  # persisted as 62_kernel_bench.json — the `emmy compare` input
     for repro in repros:
         label = _short_kernel(repro.name)
         try:
@@ -576,11 +576,11 @@ def _bench_per_kernel(args, dump_dir, db):
         records.append({"kernel": repro.name.removesuffix(".torch.json"), "label": label, "captured": captured, "backends": results})
         if not captured:
             fallback.append(label)
-        dp = results.get("Deplodock")
-        sys.stderr.write(f"[tune]   {label}: deplodock={dp:.0f}us\n" if dp is not None else f"[tune]   {label}: (no result)\n")
+        dp = results.get("Emmy")
+        sys.stderr.write(f"[tune]   {label}: emmy={dp:.0f}us\n" if dp is not None else f"[tune]   {label}: (no result)\n")
     if records:
         # Per-kernel -O3 bench results in machine-readable form, beside the table /
-        # kernels.html — the per-kernel input `deplodock compare <dumpA> <dumpB>` diffs.
+        # kernels.html — the per-kernel input `emmy compare <dumpA> <dumpB>` diffs.
         (Path(dump_dir) / "62_kernel_bench.json").write_text(json.dumps(records, indent=2, default=str))
     return rows, fallback
 
@@ -604,13 +604,13 @@ def _fmt_us(us) -> str:
 
 
 def _print_per_kernel_table(rows) -> None:
-    from deplodock.commands.table import Col, render_table  # noqa: PLC0415
+    from emmy.commands.table import Col, render_table  # noqa: PLC0415
 
-    cols = [Col("Kernel"), Col("eager", "r"), Col("tcompile", "r"), Col("deplodock", "r"), Col("vs eager", "r")]
+    cols = [Col("Kernel"), Col("eager", "r"), Col("tcompile", "r"), Col("emmy", "r"), Col("vs eager", "r")]
     data = []
-    for label, res in sorted(rows, key=lambda kv: kv[1].get("Deplodock") or 0.0, reverse=True):
+    for label, res in sorted(rows, key=lambda kv: kv[1].get("Emmy") or 0.0, reverse=True):
         eager = res.get("Eager PyTorch")
-        dp = res.get("Deplodock")
+        dp = res.get("Emmy")
         spd = f"{eager / dp:.2f}x" if (eager and dp) else "-"
         data.append([label, _fmt_us(eager), _fmt_us(res.get("torch.compile")), _fmt_us(dp), spd])
     print()
@@ -620,21 +620,21 @@ def _print_per_kernel_table(rows) -> None:
 
 def render_kernel_chart(rows, out_html) -> None:
     """Render the per-kernel latency comparison as a horizontal bar chart (HTML + a
-    best-effort PNG) via :mod:`deplodock.visualize`."""
-    from deplodock.visualize import Bar, BarChart, render_bar_chart
+    best-effort PNG) via :mod:`emmy.visualize`."""
+    from emmy.visualize import Bar, BarChart, render_bar_chart
 
-    rows = sorted(rows, key=lambda kv: kv[1].get("Deplodock") or 0.0, reverse=True)
+    rows = sorted(rows, key=lambda kv: kv[1].get("Emmy") or 0.0, reverse=True)
     n_vs = sum("Eager PyTorch" in res for _, res in rows)
     chart = BarChart(
         categories=[label for label, _ in rows],
         bars=[
-            Bar("Deplodock", [res.get("Deplodock") for _, res in rows], color="#4dabf7"),
+            Bar("Emmy", [res.get("Emmy") for _, res in rows], color="#4dabf7"),
             Bar("Eager PyTorch", [res.get("Eager PyTorch") for _, res in rows], color="#999999"),
             Bar("torch.compile", [res.get("torch.compile") for _, res in rows], color="#ffd166"),
         ],
         value_name="latency (µs) — lower is faster",
         title="tune --bench — per-kernel latency (-O3)",
-        subtitle=f"{len(rows)} kernels benched from their .torch.json reproducers ({n_vs} torch-comparable, rest deplodock-only).",
+        subtitle=f"{len(rows)} kernels benched from their .torch.json reproducers ({n_vs} torch-comparable, rest emmy-only).",
         orientation="horizontal",
     )
     out_html = Path(out_html)
@@ -642,7 +642,7 @@ def render_kernel_chart(rows, out_html) -> None:
     out_html.write_text(render_bar_chart(chart, theme="dark", transparent=True))
     sys.stderr.write(f"[tune]   chart → {out_html}\n")
     try:
-        from deplodock.visualize import render_image
+        from emmy.visualize import render_image
 
         png = out_html.with_suffix(".png")
         render_image(out_html.read_text(), png, height=max(300, 40 * len(rows)))

@@ -7,7 +7,7 @@ the engine; rules that take a ``ctx`` parameter receive it via the same
 dispatcher binding that supplies ``graph`` / ``match`` / ``root``.
 
 This replaces process-global access patterns like the ``_OVERRIDE``
-module state in :mod:`deplodock.compiler.target`: explicit-by-design
+module state in :mod:`emmy.compiler.target`: explicit-by-design
 keeps tests simple (no monkey-patching), keeps compilations independent
 (no cross-thread state), and makes rule dependencies discoverable from
 the signature alone.
@@ -17,9 +17,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock import config, gpu
+from emmy import config, gpu
 
-# GPU hardware facts live in the common :mod:`deplodock.gpu` registry; these are
+# GPU hardware facts live in the common :mod:`emmy.gpu` registry; these are
 # aliases so the long-standing context-local names keep working.
 #
 # ``STATIC_SMEM_CAP`` — per-block static-smem cap (hard hardware limit since
@@ -42,8 +42,8 @@ DEFAULT_SM_COUNT = gpu.DEFAULT_GPU.sm_count
 
 
 def _env_compile_flags() -> str:
-    """Extra nvcc flags for this compile (``DEPLODOCK_NVCC_FLAGS``). Set by the
-    CLI commands (via :func:`deplodock.config.set_nvcc_flags`); folded into
+    """Extra nvcc flags for this compile (``EMMY_NVCC_FLAGS``). Set by the
+    CLI commands (via :func:`emmy.config.set_nvcc_flags`); folded into
     :meth:`Context.structural_key` so the perf cache is partitioned by opt level."""
     return config.nvcc_flags()
 
@@ -60,7 +60,7 @@ def _live_sm_count() -> int:
     :data:`DEFAULT_SM_COUNT` on a GPU-less host. Surfaced onto ``Context`` so the
     occupancy-aware tile heuristics size to the actual device instead of a
     hardcoded constant."""
-    from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+    from emmy.compiler.target import live_device_features  # noqa: PLC0415
 
     return int(live_device_features().get("sm_count") or DEFAULT_SM_COUNT)
 
@@ -125,7 +125,7 @@ class Context:
     # ``"cuda"`` — the canonical autotune target. ``run_autotune`` replaces
     # this when a live :class:`Backend` is supplied.
     backend_name: str = "cuda"
-    # Extra nvcc flags this compile uses (from ``DEPLODOCK_NVCC_FLAGS`` — e.g.
+    # Extra nvcc flags this compile uses (from ``EMMY_NVCC_FLAGS`` — e.g.
     # tune's ``-Xcicc -O1`` vs compile/run's -O3). Folded into
     # ``structural_key`` so the autotune ``perf`` cache is partitioned by opt
     # level: -O1-measured latencies (a fast-compile *ranking* signal) never
@@ -148,7 +148,7 @@ class Context:
     def from_target(cls, cap: tuple[int, int], *, gpu_name: str | None = None) -> Context:
         """A target-derived context. ``gpu_name`` (a PCIe product name) pins the
         device-physical features to that card's **memorized** specs from the
-        :mod:`deplodock.gpu` registry — used to reconstruct a *golden* config's
+        :mod:`emmy.gpu` registry — used to reconstruct a *golden* config's
         context so it featurizes with its own card's SM count / smem (not the live
         device's). Default ``None`` → the live device (the live-compile path)."""
         spec = gpu.by_name(gpu_name) if gpu_name else None
@@ -164,7 +164,7 @@ class Context:
         )
 
     def structural_key(self) -> str:
-        """Implements :class:`deplodock.compiler.structural.Structural`.
+        """Implements :class:`emmy.compiler.structural.Structural`.
 
         Folds in only codegen-affecting fields. ``compute_capability``
         gates hardware-feature passes (TMA, cp.async, dynamic smem cap);
@@ -175,7 +175,7 @@ class Context:
         extend this method explicitly — keep ambient I/O fields out so the
         autotuning cache survives debug-flag flips.
         """
-        from deplodock.compiler.structural import digest  # noqa: PLC0415
+        from emmy.compiler.structural import digest  # noqa: PLC0415
 
         return digest("Context", self.compute_capability, self.compile_flags)
 
@@ -187,7 +187,7 @@ class Context:
         cross-hardware node dataset never collides."""
         if self.gpu_name:
             return self.gpu_name
-        from deplodock.compiler.structural import digest  # noqa: PLC0415
+        from emmy.compiler.structural import digest  # noqa: PLC0415
 
         regime = sorted((k, v) for k, v in self.features().items() if k.startswith("H_"))
         return digest("hw", self.compute_capability, regime)
@@ -213,7 +213,7 @@ class Context:
         """
         import re  # noqa: PLC0415
 
-        from deplodock.compiler.target import live_device_features  # noqa: PLC0415
+        from emmy.compiler.target import live_device_features  # noqa: PLC0415
 
         major, minor = self.compute_capability
         m = re.search(r"-O(\d)", self.compile_flags)
@@ -243,7 +243,7 @@ class Context:
         the launch. Without this distinction, ``--target sm_90`` on an
         sm_86 box would request 227 KB on a 99 KB device.
         """
-        from deplodock.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
+        from emmy.compiler.target import compute_capability, live_compute_capability  # noqa: PLC0415
 
         cap = compute_capability()
         live = live_compute_capability()

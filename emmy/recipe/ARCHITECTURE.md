@@ -79,7 +79,7 @@ The merged result keeps `tensor_parallel_size: 8`, `context_length: 16384`, and 
 
 ### Auto-Generated Run Identifiers (Variant)
 
-Variant naming is handled by `Variant` in `deplodock.planner.variant`. Each matrix combination produces a `Variant(params=combo)` that derives its string representation from the raw params dict:
+Variant naming is handled by `Variant` in `emmy.planner.variant`. Each matrix combination produces a `Variant(params=combo)` that derives its string representation from the raw params dict:
 
 - GPU part: `{gpu_short}x{gpu_count}` (e.g. `rtx5090x1`, `h100x8`)
 - Non-deploy params: abbreviated via first-letter-of-each-word heuristic (`max_concurrency` → `mc`, `num_prompts` → `np`, `max_concurrent_requests` → `mcr`), sorted alphabetically, appended with `_`
@@ -178,8 +178,8 @@ Each key-value pair is rendered as a `- KEY=VALUE` line in the `environment` sec
 downstream: the post-deploy smoke test POSTs `/v1/embeddings` and checks for a finite unit-norm vector
 (`deploy/orchestrate.py`), and the bench workload runs `vllm bench serve --backend openai-embeddings --endpoint
 /v1/embeddings` without `--random-output-len` (`benchmark/workload.py`). Everything else — matrices, images,
-`extra_args`, deploy — is unchanged; serving the deplodock compiler plugin instead of stock vLLM is just a different
-image + `extra_args` pair (see `deplodock/serving/ARCHITECTURE.md` and `recipes/Qwen3-Embedding-*`).
+`extra_args`, deploy — is unchanged; serving the emmy compiler plugin instead of stock vLLM is just a different
+image + `extra_args` pair (see `emmy/serving/ARCHITECTURE.md` and `recipes/Qwen3-Embedding-*`).
 
 ```yaml
 model:
@@ -224,7 +224,7 @@ aggregate:
   timeout: 60
 ```
 
-The `run` template receives `$run_dir` — the local directory containing all pulled-back result files. It runs via `subprocess.run(shell=True)` on the machine executing `deplodock bench`, not on a GPU VM. `AggregateConfig` has two fields: `run` (template) and `timeout` (default 300s).
+The `run` template receives `$run_dir` — the local directory containing all pulled-back result files. It runs via `subprocess.run(shell=True)` on the machine executing `emmy bench`, not on a GPU VM. `AggregateConfig` has two fields: `run` (template) and `timeout` (default 300s).
 
 ### Docker Options
 

@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.stmt import Loop, Monoid, Write
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.stmt import Loop, Monoid, Write
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag
 
 
 @dataclass(frozen=True)

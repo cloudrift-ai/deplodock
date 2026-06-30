@@ -10,16 +10,16 @@ itself (not just descend into its body) to avoid leaving dangling Var refs.
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.stmt import Cond, Load, Write
-from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
-from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
+from emmy.compiler.context import Context
+from emmy.compiler.dim import DEFAULT_SEQ_HINT, Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.stmt import Cond, Load, Write
+from emmy.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
+from emmy.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
 
 def _input(g: Graph, name: str, shape: tuple) -> str:
@@ -41,7 +41,7 @@ def test_planner_admits_non_divisor_n_with_real_extent(recording_dump, monkeypat
     # M-mask Cond that would land first in body iteration order and trip the
     # 'first Cond' lookup below.
     for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "32"), ("SPLITK", "1")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     g = Graph()
     _input(g, "a", (256, 64))
     _input(g, "b", (64, 47))
@@ -165,7 +165,7 @@ def test_planner_masks_symbolic_m_axis_at_hint(recording_dump):
 def test_resolve_dim_evaluates_ceildiv_grid_factor():
     """A grid spec carrying a composite ceil-div Expr resolves at launch from
     ``sym_values`` (one cached kernel, any runtime seq_len)."""
-    from deplodock.compiler.ir.cuda.ir import resolve_dim
+    from emmy.compiler.ir.cuda.ir import resolve_dim
 
     ceil_div = ((Dim("seq_len") + 31) // 32).expr  # (seq_len + 31) // 32
     spec = (4, ceil_div, 2)  # heads * M_blocks * splitk
@@ -176,7 +176,7 @@ def test_resolve_dim_evaluates_ceildiv_grid_factor():
 def test_resolve_symbolic_falls_back_to_hint_without_inputs():
     """Benchmarking a symbolic graph with no input arrays (the autotuner case)
     resolves each symbolic dim to its ``Dim`` hint instead of raising."""
-    from deplodock.compiler.backend.cuda.program import _Compiled, _resolve_symbolic, _symbolic_hints
+    from emmy.compiler.backend.cuda.program import _Compiled, _resolve_symbolic, _symbolic_hints
 
     g = Graph()
     _input(g, "x", (1, Dim("seq_len"), 2048))
@@ -220,7 +220,7 @@ def _n_decode_coeffs(tile_op):
     the stride applied to the N ThreadTile axis and N RegisterTile axis. The
     M tile axes don't appear in the N column (coeff 0), so passing all tile
     axes is safe. ``None`` for an axis that's been inlined (extent 1)."""
-    from deplodock.compiler.ir.expr import affine_form
+    from emmy.compiler.ir.expr import affine_form
 
     n_idx = _n_write_index(tile_op)
     assert n_idx is not None, "no 2D matmul output Write found"
@@ -242,16 +242,16 @@ def test_masked_n_uses_interleaved_thread_minor_decode(recording_dump, monkeypat
     blocked and interleaved share the same coefficient and can't be told
     apart.
 
-    Pinned via ``DEPLODOCK_KNOBS`` to BN=256, FN=8 so the test asserts the
+    Pinned via ``EMMY_KNOBS`` to BN=256, FN=8 so the test asserts the
     register-decode rewrite property independent of which masked variant the
     planner's prior happens to rank first — the smem-fit + TMA-eligibility
     signals can reasonably prefer narrower BN at this shape, but the
     register-decode logic must still emit a thread-minor stride at BN=256.
     """
-    # ``DEPLODOCK_KNOBS`` would be too late (``apply_knobs_env`` runs at module
+    # ``EMMY_KNOBS`` would be too late (``apply_knobs_env`` runs at module
     # import); set the individual per-knob env vars that ``Knob.narrow`` reads.
     for k, v in (("BN", "256"), ("FN", "8"), ("BM", "1"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     g = Graph()
     _input(g, "a", (32, 256))
     _input(g, "b", (256, 8191))  # N=8191: no divisor → masked
@@ -287,11 +287,11 @@ def test_masked_n_clamps_cooperative_load_index(recording_dump, monkeypatch):
     ``b_smem`` slab); cp.async's ``&b[...]`` operand form rides the deferred
     ASYNC transport tier.
     """
-    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
 
     # Pin a masked-N tile with a K-loop big enough to stage the weight.
     for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     g = Graph()
     # K=2048 so the weight stages (the K-loop reduction makes smem pay); N=47
     # is prime → masked, tiled at BN·FN=32 → the boundary tile spans [32, 64).
@@ -320,10 +320,10 @@ def test_clean_divisor_n_skips_cooperative_load_clamp(recording_dump, monkeypatc
     """A clean-divisor N tile never overhangs, so ``021`` leaves
     ``Source.gmem_extents`` unset and the cooperative load carries no clamp
     ternary — no perf cost on the common (non-masked) staging path."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
 
     for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     g = Graph()
     _input(g, "a", (256, 2048))
     _input(g, "b", (2048, 64))  # N=64: clean divisor → not masked
@@ -348,12 +348,12 @@ def test_symbolic_m_cooperative_load_clamps_to_runtime_extent(recording_dump, mo
     size for every seq_len that isn't tile-aligned. The clamp ternary's bound is
     the symbolic ``Var``, rendered against the kernel's ``seq_len`` argument. The
     staged transport is SYNC (a scalar ``a[clamped]`` load + an ``a_smem`` slab)."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.render import render_kernelop  # noqa: PLC0415
 
     # Same staging-friendly knobs as the static clamp test: K=2048 makes the
     # operands stage; the symbolic M is force-masked by the planner.
     for k, v in (("BN", "8"), ("FN", "4"), ("BM", "32"), ("FM", "4"), ("BK", "16"), ("SPLITK", "1")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     g = Graph()
     _input(g, "a", (Dim("seq_len"), 2048))
     _input(g, "b", (2048, 64))  # N=64: clean divisor → only M masks
@@ -402,11 +402,11 @@ def test_hoist_refuses_lift_when_pipeline_reads_guarded_defs():
     in-place wrap (the ``Cond`` stays intact). Defense-in-depth: the planner doesn't
     emit liftable masked prologue Conds today (static-K prologue kernels stay
     degenerate, symbolic-K ones never stage)."""
-    from deplodock.compiler.dtype import F32
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.stmt import Accum, Assign, Body
-    from deplodock.compiler.ir.tile.ir import Buffer, SerialTile
-    from deplodock.compiler.pipeline.passes.lowering.tile.assembly import _slab
+    from emmy.compiler.dtype import F32
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.stmt import Accum, Assign, Body
+    from emmy.compiler.ir.tile.ir import Buffer, SerialTile
+    from emmy.compiler.pipeline.passes.lowering.tile.assembly import _slab
 
     cache_axes = {"a5": Axis("a5", 64)}
     staged_bufs = frozenset({"w"})

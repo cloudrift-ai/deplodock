@@ -14,13 +14,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, Unpack, Write
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Expr, Literal, SimplifyCtx, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt.base import Stmt
+from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Init, Load, Pack, Select, Unpack, Write
 
 # ---------------------------------------------------------------------------
 # Visitor helpers shared by every pass below
@@ -453,7 +453,7 @@ def split_invariant_divides(stmts: Body) -> Body:
     trailing :func:`rename_ssa_sequential` pass renumbers them into
     ``vN`` form.
     """
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
 
     stmts = Body.coerce(stmts)
     closure = stmts.deps_closure
@@ -567,7 +567,7 @@ def simplify_body(body: Body) -> Body:
     """Simplify every Expr inside a body. Seeds ``SimplifyCtx`` from
     ``Loop`` / ``StridedLoop`` / ``Tile`` axis extents as the walker descends.
     Tile-IR Stmt registrations are loaded when ``tile.ir`` is imported."""
-    from deplodock.compiler.ir.stmt.passes import simplify  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.passes import simplify  # noqa: PLC0415
 
     body = Body.coerce(body)
     ctx = SimplifyCtx.empty()
@@ -780,7 +780,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
-    from deplodock.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
+    from emmy.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
         ParallelTile,
         SerialTileBase,
         StageBundle,
@@ -976,7 +976,7 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     """
     from dataclasses import fields, is_dataclass  # noqa: PLC0415
 
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl, cluster_representative  # noqa: PLC0415
+    from emmy.compiler.ir.elementwise import ElementwiseImpl, cluster_representative  # noqa: PLC0415
 
     def fn(s: Stmt) -> Stmt:
         if not is_dataclass(s):

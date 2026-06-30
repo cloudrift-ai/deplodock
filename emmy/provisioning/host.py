@@ -2,7 +2,7 @@
 
 A Host knows how to run a shell command somewhere — either locally or on a
 remote machine over SSH. Privileged commands go through ``run(..., sudo=True)``.
-``LocalHost`` refuses sudo so that ``deplodock deploy local`` cannot silently
+``LocalHost`` refuses sudo so that ``emmy deploy local`` cannot silently
 modify the developer's machine; instead it raises a clear error naming the
 offending command. Provisioning code stays generic: it only ever calls
 ``host.run`` and never branches on local vs remote.
@@ -16,7 +16,7 @@ import shlex
 
 import click
 
-from deplodock.provisioning.ssh_transport import ssh_base_args
+from emmy.provisioning.ssh_transport import ssh_base_args
 
 logger = logging.getLogger(__name__)
 

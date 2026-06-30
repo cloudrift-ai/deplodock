@@ -3,7 +3,7 @@
 import copy
 from abc import ABC, abstractmethod
 
-from deplodock.recipe.types import Recipe
+from emmy.recipe.types import Recipe
 
 
 class ScaleOutStrategy(ABC):

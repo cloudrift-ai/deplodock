@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.expr import Expr
+from emmy.compiler.ir.base import Op
+from emmy.compiler.ir.expr import Expr
 
 
 @dataclass(frozen=True)

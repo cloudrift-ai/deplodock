@@ -1,4 +1,4 @@
-"""Deplodock compiler IR dialects.
+"""Emmy compiler IR dialects.
 
 One subpackage per IR level:
 
@@ -21,13 +21,13 @@ One subpackage per IR level:
                  source + launch geometry).
 
 The ``Graph`` container and rewrite pipeline live outside ``ir/`` — see
-``deplodock.compiler.graph`` and ``deplodock.compiler.pipeline``.
+``emmy.compiler.graph`` and ``emmy.compiler.pipeline``.
 
 See ``ARCHITECTURE.md`` in this directory for stage-by-stage semantics
 and invariants.
 """
 
-from deplodock.compiler.ir.base import ConstantOp, InputOp, Op
+from emmy.compiler.ir.base import ConstantOp, InputOp, Op
 
 __all__ = [
     "ConstantOp",

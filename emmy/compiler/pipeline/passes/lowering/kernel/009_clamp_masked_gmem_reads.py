@@ -30,12 +30,12 @@ from __future__ import annotations
 
 from dataclasses import replace as dc_replace
 
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, TernaryExpr
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Mma, Stmt, Write
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering._masking import mask_index
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.expr import BinaryExpr, Expr, TernaryExpr
+from emmy.compiler.ir.stmt import Body, Cond, Load, Mma, Stmt, Write
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering._masking import mask_index
 
 PATTERN = [Pattern("root", TileOp)]
 

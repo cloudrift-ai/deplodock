@@ -37,13 +37,13 @@ through.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import build_merged_op as _build_merged_op
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap as _is_pure_indexmap
-from deplodock.compiler.pipeline.passes.loop.fusion._helpers import wrap_merge_fragment as _wrap_merge_fragment
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.loop import Accum, Assign, Load, Loop, LoopOp
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.loop.fusion._helpers import build_merged_op as _build_merged_op
+from emmy.compiler.pipeline.passes.loop.fusion._helpers import is_pure_indexmap as _is_pure_indexmap
+from emmy.compiler.pipeline.passes.loop.fusion._helpers import wrap_merge_fragment as _wrap_merge_fragment
 
 _BLOWUP_FACTOR = 8
 

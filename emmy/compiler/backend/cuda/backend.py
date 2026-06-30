@@ -12,15 +12,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock import config
-from deplodock.compiler.backend import Backend, BenchmarkResult, RunResult
-from deplodock.compiler.backend.cuda.program import (
+from emmy import config
+from emmy.compiler.backend import Backend, BenchmarkResult, RunResult
+from emmy.compiler.backend.cuda.program import (
     benchmark_program,
     benchmark_program_isolated_async,
     run_program,
     run_program_debug,
 )
-from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
+from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +35,16 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
-    from deplodock.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.pipeline.dump import CompilerDump
 
 
 def _resolve_tune_db(value: Path | str | None) -> Path | None:
     """Resolve the ``tune_db=`` constructor argument.
 
     - ``None`` → ``None`` (no DB; test-isolation default).
-    - ``"auto"`` → ``DEPLODOCK_TUNE_DB`` env → ``~/.cache/deplodock/autotune.db``
-      (shared resolution in :func:`deplodock.config.tune_db_path`). The result
+    - ``"auto"`` → ``EMMY_TUNE_DB`` env → ``~/.cache/emmy/autotune.db``
+      (shared resolution in :func:`emmy.config.tune_db_path`). The result
       is returned regardless of whether the file exists; ``compile()`` skips
       opening it when missing.
     - Explicit ``Path`` / ``str`` → that path (no env lookup).
@@ -59,7 +59,7 @@ def _resolve_tune_db(value: Path | str | None) -> Path | None:
 class CudaBackend(Backend):
     """CUDA backend.
 
-    When ``debug`` is True (or the ``DEPLODOCK_DEBUG`` env var is set),
+    When ``debug`` is True (or the ``EMMY_DEBUG`` env var is set),
     ``run()`` uses the per-launch debug path that dumps every non-input
     buffer after each kernel launch. ``last_debug_result`` is then
     populated with the per-launch snapshots for the last ``run()`` call.
@@ -81,7 +81,7 @@ class CudaBackend(Backend):
         if debug is None:
             debug = config.debug_enabled()
         if dump is None:
-            from deplodock.compiler.pipeline.dump import CompilerDump as _CD
+            from emmy.compiler.pipeline.dump import CompilerDump as _CD
 
             dump = _CD.from_env()
         self.debug = debug
@@ -100,7 +100,7 @@ class CudaBackend(Backend):
         # Persistent autotune cache. ``None`` → no DB (test-isolation
         # default; tests construct ``CudaBackend()`` without args and
         # expect deterministic rule-defaults compiles). ``"auto"`` →
-        # resolve ``DEPLODOCK_TUNE_DB`` env var → ``~/.cache/deplodock/autotune.db``,
+        # resolve ``EMMY_TUNE_DB`` env var → ``~/.cache/emmy/autotune.db``,
         # open if the file exists. Explicit ``Path`` → use that file
         # (open if it exists; silently skip otherwise).
         self.tune_db = _resolve_tune_db(tune_db)
@@ -112,7 +112,7 @@ class CudaBackend(Backend):
         self._async_worker_obj = None  # lazily spawned on first benchmark_async
 
     def _async_worker(self):
-        from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker  # noqa: PLC0415
+        from emmy.compiler.backend.cuda.program import _AsyncBenchWorker  # noqa: PLC0415
 
         if self._async_worker_obj is None:
             self._async_worker_obj = _AsyncBenchWorker(device_id=self.device_id)
@@ -136,7 +136,7 @@ class CudaBackend(Backend):
         """Lower ``Graph`` → ``Graph[LoopOp]`` → ``Graph[TileOp]`` → ``Graph[CudaOp]``."""
         db = None
         if self.tune_db is not None and self.tune_db.exists():
-            from deplodock.compiler.pipeline.search.db import SearchDB
+            from emmy.compiler.pipeline.search.db import SearchDB
 
             db = SearchDB(path=self.tune_db)
         return Pipeline.build(CUDA_PASSES).run(graph, db=db, dump=self.dump)
@@ -150,7 +150,7 @@ class CudaBackend(Backend):
     ) -> tuple[RunResult, object]:
         # ``run_program`` / ``run_program_debug`` hold the GPU lock end
         # to end (compile + alloc + ``pre_run`` + launches + ``.get()``)
-        # so peer xdist workers / parallel ``deplodock run`` invocations
+        # so peer xdist workers / parallel ``emmy run`` invocations
         # can never interleave a kernel launch with our work on the
         # shared device. The ``pre_run`` callback runs inside that lock
         # so a torch eager reference computed for comparison sees the
@@ -170,7 +170,7 @@ class CudaBackend(Backend):
         # came from. Output dims (possibly composite Dim exprs) then resolve
         # via ``expr.eval(sym_env)`` — one path covers Literal / Var /
         # BinaryExpr uniformly.
-        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
         sym_env: dict[str, int] = {}
         if input_data is not None:
@@ -208,7 +208,7 @@ class CudaBackend(Backend):
           one event loop keeps N GPUs benching concurrently and a wedged kernel never
           dirties the parent's CUDA stream. ``wall_timeout_s`` is the backstop on top of
           the in-worker ``bench_compile_timeout_s`` / ``bench_run_timeout_s`` budgets.
-        - **Otherwise (interactive ``deplodock run --bench``)**: bench in-process via
+        - **Otherwise (interactive ``emmy run --bench``)**: bench in-process via
           :func:`benchmark_program`. Required when ``on_iter`` interleaves peer torch
           closures — they share torch state with this process and can't cross the
           subprocess boundary. The blocking bench runs directly on the event loop (it is

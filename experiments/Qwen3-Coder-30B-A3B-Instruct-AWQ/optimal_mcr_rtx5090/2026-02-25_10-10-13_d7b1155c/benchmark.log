@@ -1,5 +1,5 @@
-[2026-02-25 10:10:13] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c
-[2026-02-25 10:10:13] [root] Run directory: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c
+[2026-02-25 10:10:13] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c
+[2026-02-25 10:10:13] [root] Run directory: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c
 [2026-02-25 10:10:13] [root] 
 [2026-02-25 10:10:13] [root] Running 11 benchmark task(s) in 1 execution group(s)
 [2026-02-25 10:10:13] [root] Parallel mode (max workers: 1)
@@ -43,7 +43,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 10:22:19] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 10:28:48] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c8_mcr8_vllm_benchmark.txt
+[2026-02-25 10:28:48] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c8_mcr8_vllm_benchmark.txt
 [2026-02-25 10:28:48] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 10:28:48] [orchestrate] Tearing down...
 [2026-02-25 10:28:52] [orchestrate] Teardown complete.
@@ -72,7 +72,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 10:35:55] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 10:42:06] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c12_mcr12_vllm_benchmark.txt
+[2026-02-25 10:42:06] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c12_mcr12_vllm_benchmark.txt
 [2026-02-25 10:42:06] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 10:42:06] [orchestrate] Tearing down...
 [2026-02-25 10:42:11] [orchestrate] Teardown complete.
@@ -101,7 +101,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 10:49:14] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 10:54:08] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c16_mcr16_vllm_benchmark.txt
+[2026-02-25 10:54:08] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c16_mcr16_vllm_benchmark.txt
 [2026-02-25 10:54:08] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 10:54:08] [orchestrate] Tearing down...
 [2026-02-25 10:54:13] [orchestrate] Teardown complete.
@@ -130,7 +130,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:01:19] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 11:06:44] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c20_mcr20_vllm_benchmark.txt
+[2026-02-25 11:06:44] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c20_mcr20_vllm_benchmark.txt
 [2026-02-25 11:06:44] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 11:06:44] [orchestrate] Tearing down...
 [2026-02-25 11:06:48] [orchestrate] Teardown complete.
@@ -159,7 +159,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:13:50] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 11:18:49] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c24_mcr24_vllm_benchmark.txt
+[2026-02-25 11:18:49] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c24_mcr24_vllm_benchmark.txt
 [2026-02-25 11:18:49] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 11:18:49] [orchestrate] Tearing down...
 [2026-02-25 11:18:53] [orchestrate] Teardown complete.
@@ -188,7 +188,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:26:00] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 11:31:10] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c28_mcr28_vllm_benchmark.txt
+[2026-02-25 11:31:10] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c28_mcr28_vllm_benchmark.txt
 [2026-02-25 11:31:10] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 11:31:10] [orchestrate] Tearing down...
 [2026-02-25 11:31:14] [orchestrate] Teardown complete.
@@ -217,7 +217,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:38:23] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 11:43:34] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c32_mcr32_vllm_benchmark.txt
+[2026-02-25 11:43:34] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c32_mcr32_vllm_benchmark.txt
 [2026-02-25 11:43:34] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 11:43:34] [orchestrate] Tearing down...
 [2026-02-25 11:43:39] [orchestrate] Teardown complete.
@@ -246,7 +246,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 11:50:41] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 11:55:53] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c36_mcr36_vllm_benchmark.txt
+[2026-02-25 11:55:53] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c36_mcr36_vllm_benchmark.txt
 [2026-02-25 11:55:53] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 11:55:53] [orchestrate] Tearing down...
 [2026-02-25 11:55:58] [orchestrate] Teardown complete.
@@ -275,7 +275,7 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-02-25 12:03:00] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Running benchmark...
-[2026-02-25 12:08:04] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c40_mcr40_vllm_benchmark.txt
+[2026-02-25 12:08:04] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Results saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/rtx5090_c40_mcr40_vllm_benchmark.txt
 [2026-02-25 12:08:04] [rtx5090_x_1] [Qwen3-Coder-30B-A3B-Instruct-AWQ] Tearing down...
 [2026-02-25 12:08:04] [orchestrate] Tearing down...
 [2026-02-25 12:08:09] [orchestrate] Teardown complete.
@@ -285,8 +285,8 @@ Example curl:
 [2026-02-25 13:28:25] [cloudrift] Instance terminated.
 [2026-02-25 13:28:25] [rtx5090_x_1] VM deleted.
 [2026-02-25 13:28:25] [rtx5090_x_1] Completed group: rtx5090_x_1
-[2026-02-25 13:28:25] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/manifest.json
-[2026-02-25 13:28:25] [root] Manifest written to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c/manifest.json
+[2026-02-25 13:28:25] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/manifest.json
+[2026-02-25 13:28:25] [root] Manifest written to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c/manifest.json
 [2026-02-25 13:28:25] [root] 
 [2026-02-25 13:28:25] [root] SUMMARY
 [2026-02-25 13:28:25] [root] Successful: 10/11
@@ -305,5 +305,5 @@ Example curl:
 [2026-02-25 13:28:25] [root]    - rtx5090_sglang_benchmark.txt
 [2026-02-25 13:28:25] [root] 
 [2026-02-25 13:28:25] [root] All done!
-[2026-02-25 13:28:25] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/benchmark.log
-[2026-02-25 13:28:25] [root] Full logs saved to: /Users/dikobraz/Projects/deplodock/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c/benchmark.log
+[2026-02-25 13:28:25] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/2026-02-25_10-10-13_d7b1155c/benchmark.log
+[2026-02-25 13:28:25] [root] Full logs saved to: /Users/dikobraz/Projects/emmy/experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/vllm_vs_sglang_rtx5090/2026-02-25_10-10-13_d7b1155c/benchmark.log

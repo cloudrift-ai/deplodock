@@ -24,11 +24,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Stmt
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Cond, Load, Stmt
+from emmy.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     Binding,
@@ -45,8 +45,8 @@ from deplodock.compiler.ir.tile.ir import (
     _mul_const,
     pick_swizzle_atom,
 )
-from deplodock.compiler.pipeline.passes.lowering._masking import locate_symbolic_k
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import _identity_rename
+from emmy.compiler.pipeline.passes.lowering._masking import locate_symbolic_k
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import _identity_rename
 
 # Double-buffer ring depth for TMA-staged K loops. R5 fixes the depth at 2 (the
 # classical compute-current / fill-next double-buffer); the occupancy ``RING`` fork
@@ -63,7 +63,7 @@ def _cache_axis_names(block: Block, binding: dict) -> dict[str, Axis]:
     non-addressable (excluded) — their per-cell extent rides the cache axes'
     ``AffineAddressing.block`` multiplier instead, derived from the σ coefficients
     in :func:`_source_from_load`."""
-    from deplodock.compiler.ir.tile.ir import Binding  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import Binding  # noqa: PLC0415
 
     out: dict[str, Axis] = {a.name: a for a in block.domain if binding.get(a.name) in (Binding.THREAD, Binding.WARP, Binding.REGISTER)}
     for s in block.compute.iter():

@@ -36,11 +36,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
-from deplodock.compiler.pipeline.passes.loop.stamp._stamp import structure_features
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.knob import STRUCT_PREFIX
+from emmy.compiler.pipeline.passes.loop.stamp._stamp import structure_features
 
 PATTERN = [Pattern("root", LoopOp)]
 

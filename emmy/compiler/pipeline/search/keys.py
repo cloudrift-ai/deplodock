@@ -1,7 +1,7 @@
 """Op-key derivation + source-chain walking for the search package.
 
 Shared by :mod:`.db`, :mod:`.policy`, and the bench-terminal helper
-in :mod:`deplodock.compiler.pipeline.pipeline`.
+in :mod:`emmy.compiler.pipeline.pipeline`.
 
 ``op_cache_key`` keys any kernel-bearing op:
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Literal
 
-from deplodock.compiler.structural import digest
+from emmy.compiler.structural import digest
 
 Dialect = Literal["loop", "tile", "kernel", "cuda"]
 
@@ -59,10 +59,10 @@ def introduces_structural_decision(parent_op: object, child_op: object) -> bool:
 
 def op_cache_key(op: object) -> str | None:
     """Cache key for any kernel-bearing op, or ``None`` if not cacheable."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -91,10 +91,10 @@ def op_cache_key(op: object) -> str | None:
 
 def dialect_of(op: object) -> Dialect | None:
     """Return the dialect tag for any kernel-bearing op, or ``None``."""
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         return "cuda"
@@ -104,7 +104,7 @@ def dialect_of(op: object) -> Dialect | None:
         return "tile"
     if isinstance(op, LoopOp):
         return "loop"
-    from deplodock.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
 
     if isinstance(op, TileGraphOp):
         return "tile"  # the enumeration output, still the tile dialect (pre-assembly)

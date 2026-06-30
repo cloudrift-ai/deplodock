@@ -31,7 +31,7 @@ score per element, ``kv ≤ m`` else −inf — tile-skip is a tensor-core-tier
 follow-up), an optional broadcast additive mask (the HF ``(1,1,S,S)`` float bias),
 and GQA (``q_heads == group · kv_heads``; the K/V head axis read at ``head //
 group`` directly, no materialized broadcast). The tensor-core P@V tier is future
-work. Read from the ``DEPLODOCK_FLASH=1`` env pin; the two-level ``OptionFork``
+work. Read from the ``EMMY_FLASH=1`` env pin; the two-level ``OptionFork``
 offer + ``AnalyticPrior`` cold-start are a follow-up.
 """
 
@@ -39,17 +39,17 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Write
-from deplodock.compiler.ir.stmt.passes import rewrite as rewrite_stmt
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
+from emmy.compiler.ir.loop.ir import LoopOp
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Accum, Assign, Init, Load, Loop, Monoid, Select, SelectBranch, Write
+from emmy.compiler.ir.stmt.passes import rewrite as rewrite_stmt
+from emmy.compiler.pipeline.knob import Knob, KnobType
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Monoid:

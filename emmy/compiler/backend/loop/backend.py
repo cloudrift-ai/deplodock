@@ -4,7 +4,7 @@ Equivalent to ``NumpyBackend`` except that ``compile`` first runs
 decomposition → optimization → fusion so the executed graph contains
 ``LoopOp`` nodes. Execution goes through the default ``Backend.run``
 topo-walk: ``LoopOp.forward`` (defined in
-:mod:`deplodock.compiler.ir.loop.ir`) JIT-compiles each kernel to C++
+:mod:`emmy.compiler.ir.loop.ir`) JIT-compiles each kernel to C++
 via cppyy / Cling and runs it on numpy buffers.
 
 Used as a correctness-triangulation reference: CUDA vs. loop
@@ -16,11 +16,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.backend import Backend
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.backend import Backend
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 
 class LoopBackend(Backend):

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from string import Template
 
-from deplodock.benchmark import (
+from emmy.benchmark import (
     _expand_path,
     _run_groups,
     add_file_handler,
@@ -21,13 +21,13 @@ from deplodock.benchmark import (
     setup_logging,
     validate_config,
 )
-from deplodock.benchmark.execution import _run_groups_on_hosts
-from deplodock.benchmark.fixed_hosts import (
+from emmy.benchmark.execution import _run_groups_on_hosts
+from emmy.benchmark.fixed_hosts import (
     resolve_fixed_hosts,
     validate_hosts_cover_groups,
 )
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
+from emmy.planner import BenchmarkTask
+from emmy.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
 
 # Each summary column aggregates these timing phase keys (seconds). A column is shown
 # only when at least one task has a non-zero value for it, so command-recipe runs (which
@@ -106,20 +106,20 @@ def handle_bench(args):
         root_logger.error("Error: No benchmark tasks found.")
         sys.exit(1)
 
-    # Inject DEPLODOCK_DUMP_DIR / DEPLODOCK_DEBUG into command tasks when
+    # Inject EMMY_DUMP_DIR / EMMY_DEBUG into command tasks when
     # --dump-dir / --debug are set. These are keys in the *remote* command's
     # env (resolved at runtime by the command workload runner via $task_dir),
-    # not local-process env access, so they stay literal (see deplodock/config.py
-    # for the local-process DEPLODOCK_* owner). Artifacts are pulled back via
+    # not local-process env access, so they stay literal (see emmy/config.py
+    # for the local-process EMMY_* owner). Artifacts are pulled back via
     # the result_files glob.
     if args.dump_dir or args.debug:
         for task in tasks:
             if task.recipe.command is not None:
-                task.recipe.command.env["DEPLODOCK_DUMP_DIR"] = "$task_dir/dump"
+                task.recipe.command.env["EMMY_DUMP_DIR"] = "$task_dir/dump"
                 if "dump/*" not in task.recipe.command.result_files:
                     task.recipe.command.result_files.append("dump/*")
                 if args.debug:
-                    task.recipe.command.env["DEPLODOCK_DEBUG"] = "1"
+                    task.recipe.command.env["EMMY_DEBUG"] = "1"
 
     # Create per-recipe run directories
     recipe_run_dirs = {}
@@ -161,7 +161,7 @@ def handle_bench(args):
     # Set up commit callback if requested
     on_task_done = None
     if args.commit_results:
-        from deplodock.commands.bench.committer import GitCommitter
+        from emmy.commands.bench.committer import GitCommitter
 
         root_logger.info("Commit mode enabled: results will be committed after each task")
         on_task_done = GitCommitter(asyncio.Lock())
@@ -207,7 +207,7 @@ def handle_bench(args):
             instances_path = run_dir / "instances.json"
             instances_path.write_text(json.dumps(all_instance_infos, indent=2))
             root_logger.info(f"Instance info saved to: {instances_path}")
-            root_logger.info("Run 'deplodock teardown <run_dir>' to clean up.")
+            root_logger.info("Run 'emmy teardown <run_dir>' to clean up.")
 
     # Run aggregate post-processing for recipes that define it
     for recipe_dir_resolved, run_dir in recipe_run_dirs.items():

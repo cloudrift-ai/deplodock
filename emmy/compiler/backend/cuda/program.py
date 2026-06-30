@@ -25,15 +25,15 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from deplodock.compiler.backend import BenchmarkResult, LaunchTime, RunResult
-from deplodock.compiler.backend.cuda import _tma, nvcc
-from deplodock.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
-from deplodock.compiler.backend.cuda.dtype import cupy_dtype
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import DataType
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
+from emmy.compiler.backend import BenchmarkResult, LaunchTime, RunResult
+from emmy.compiler.backend.cuda import _tma, nvcc
+from emmy.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
+from emmy.compiler.backend.cuda.dtype import cupy_dtype
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import DataType
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -229,7 +229,7 @@ def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
     it carries is bound from an atomic axis somewhere (the slab's own ``seq_q``
     axis, the sibling P operand, …). Only a name that appears *exclusively* in
     composite dims is unrecoverable — that raises."""
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
     bindings: dict[str, tuple[str, int]] = {}
     composite_names: set[str] = set()
@@ -256,7 +256,7 @@ def _symbolic_hints(graph: Graph) -> dict[str, int]:
     walks the same input shapes as ``_symbolic_bindings``. Used by
     ``_resolve_symbolic`` as the fallback bench size when no ``input_data`` is
     supplied (the autotuner case)."""
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
     hints: dict[str, int] = {}
     for nid in graph.inputs:
@@ -431,7 +431,7 @@ def _launch(
     desc_args: dict[str, cp.ndarray] | None = None,
     sym_values: dict[str, int] | None = None,
 ) -> None:
-    from deplodock.compiler.ir.cuda.ir import resolve_dim  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import resolve_dim  # noqa: PLC0415
 
     for zname in launch.zero_outputs:
         arrays[zname].fill(0)
@@ -694,7 +694,7 @@ class CompiledProgram:
     _graph_batch_sizes: list[int] | None = field(default=None, repr=False)
     # One CUDA graph holding EVERY launch in program order (batch 1 each),
     # captured by :meth:`capture_program_graph` for the whole-program (e2e)
-    # timing windows — the deplodock analogue of timing a captured torch
+    # timing windows — the emmy analogue of timing a captured torch
     # forward, so the backend-comparison table is like-for-like.
     _e2e_graph: Any | None = field(default=None, repr=False)
     _e2e_start: Any | None = field(default=None, repr=False)
@@ -1004,7 +1004,7 @@ class CompiledProgram:
         ``pre_iter(max_batch_size)`` runs once before the launch loop
         and inside the GPU lock the caller is holding — that's where
         ``_bench_interleaved`` issues its peer torch backends so they
-        share the same warm GPU state deplodock measures from.
+        share the same warm GPU state emmy measures from.
 
         ``per_launch_hook(i, launch)`` runs after each launch's stop
         event has synced. :func:`run_program_debug` uses it to
@@ -1130,13 +1130,13 @@ def run_program(
 ) -> tuple[RunResult, Any]:
     """Run the lowered graph once, return ``(RunResult, pre_run_result)``.
 
-    ``pre_run`` runs once inside the GPU lock, before deplodock's
+    ``pre_run`` runs once inside the GPU lock, before emmy's
     kernel launches. Its return value flows through as the tuple's
     second element. Tests use this to compute a torch eager reference
-    on the same GPU window the deplodock launches will see, so peer-
+    on the same GPU window the emmy launches will see, so peer-
     worker CUDA activity can't interleave the eager forward with the
-    deplodock comparison."""
-    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
+    emmy comparison."""
+    from emmy.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     with gpu_lock():
         pre_result = pre_run() if pre_run is not None else None
@@ -1161,7 +1161,7 @@ def run_program_debug(
     """Run the graph once, snapshotting every non-input buffer after
     each launch. Returns ``(DebugResult, pre_run_result)`` — same
     ``pre_run`` semantics as :func:`run_program`."""
-    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
+    from emmy.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     per_launch: dict[int, dict[str, np.ndarray]] = {}
     with gpu_lock():
@@ -1210,7 +1210,7 @@ def benchmark_program(
     ``on_iter(batch_size)`` is invoked once at the top of every iter
     inside the GPU lock — that's where ``_bench_interleaved`` runs
     peer torch backends so they time the same number of back-to-back
-    calls deplodock does per CUDA event window, no warm-vs-cold
+    calls emmy does per CUDA event window, no warm-vs-cold
     asymmetry.
 
     ``compile_timeout_s`` bounds NVRTC + alloc + descriptor setup;
@@ -1250,7 +1250,7 @@ def benchmark_program(
     fields stay ``None`` and nothing is measured twice — the common case for
     the autotune sweep's single-node slices); also ``None`` when capture is
     off or fell back."""
-    from deplodock.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
+    from emmy.compiler.backend.gpu_lock import gpu_lock  # noqa: PLC0415
 
     target_total_ms, max_measured, auto = _resolve_iter_budget(num_iters)
 
@@ -1429,7 +1429,7 @@ class _AsyncBenchWorker:
     ``CUDA_VISIBLE_DEVICES=<id>`` (so the child's logical device 0 *is* that
     GPU — every argumentless ``cp.cuda.Device()`` in the child resolves
     correctly with no other call-site change) and, when a base
-    ``DEPLODOCK_GPU_LOCK`` is set, a per-device lock path so workers on
+    ``EMMY_GPU_LOCK`` is set, a per-device lock path so workers on
     different GPUs take distinct ``FileLock``s instead of serialising. The
     env overlay rides the child only — the parent's ``os.environ`` is never
     mutated (it's shared by every slot on the one event-loop thread).
@@ -1437,7 +1437,7 @@ class _AsyncBenchWorker:
     The wall-clock cap is :func:`asyncio.wait_for`; on overrun the child is
     SIGKILLed and respawned on the next bench."""
 
-    _WORKER_MODULE = "deplodock.compiler.backend.cuda._bench_worker"
+    _WORKER_MODULE = "emmy.compiler.backend.cuda._bench_worker"
 
     def __init__(self, *, device_id: int | None = None) -> None:
         self._proc: asyncio.subprocess.Process | None = None
@@ -1447,13 +1447,13 @@ class _AsyncBenchWorker:
         env = dict(_os.environ)
         if self._device_id is not None:
             env["CUDA_VISIBLE_DEVICES"] = str(self._device_id)
-            from deplodock import config  # noqa: PLC0415
+            from emmy import config  # noqa: PLC0415
 
             base = config.gpu_lock_path()
             if base:
                 # Per-device lock so concurrent device-pinned workers don't
                 # serialise on one FileLock (the lock is taken inside the child).
-                env["DEPLODOCK_GPU_LOCK"] = f"{base}-{self._device_id}"
+                env["EMMY_GPU_LOCK"] = f"{base}-{self._device_id}"
         return env
 
     async def _spawn(self) -> None:
@@ -1582,7 +1582,7 @@ async def benchmark_program_isolated_async(
         {
             "graph": graph,
             "nvcc_flags": nvcc_flags,
-            "torch_spec": None,  # no torch comparison — pure deplodock bench
+            "torch_spec": None,  # no torch comparison — pure emmy bench
             "kwargs": {
                 "warmup": warmup,
                 "num_iters": num_iters,
@@ -1620,11 +1620,11 @@ async def benchmark_compare_isolated_async(
     seed: int,
     nvcc_flags: str | None = None,
 ) -> tuple:
-    """Run the deployable eager / torch.compile / deplodock comparison in the
+    """Run the deployable eager / torch.compile / emmy comparison in the
     SIGKILL-able worker, awaiting a fresh one-shot :class:`_AsyncBenchWorker`
     (the one transport).
 
-    Unlike the deplodock-only autotune bench, the deployable comparison interleaves deplodock with
+    Unlike the emmy-only autotune bench, the deployable comparison interleaves emmy with
     real torch in one process and so couldn't be isolated before — a hung generated kernel wedged
     the whole run. This ships the *entire* comparison to the worker: a hung kernel hangs the child,
     which the parent SIGKILLs on ``wall_timeout_s``, freeing the device and leaving the parent clean.
@@ -1635,7 +1635,7 @@ async def benchmark_compare_isolated_async(
     - ``("trace_args", {code, input, layer, seq_len, dynamic})`` → ``load_or_trace`` rebuilds the real
       module (an HF model id or a ``--code`` expression), benched via ``bench_full_model_real``.
     - ``("frontend_graph", Graph | None)`` → ``bench_lowered_vs_torch`` (per-kernel reproducer; ``None``
-      benches deplodock-only when the graph isn't torch-runnable).
+      benches emmy-only when the graph isn't torch-runnable).
 
     Returns ``(results, bench, torch_available, captured)`` — the shape ``bench_lowered_vs_torch``
     returns (``captured``: all backends were timed under CUDA graph capture; False means the

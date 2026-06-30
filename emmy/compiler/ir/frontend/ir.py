@@ -21,8 +21,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.base import Op, _keepdim_axis
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.base import Op, _keepdim_axis
 
 
 def _numel(shape) -> Dim:

@@ -2,10 +2,10 @@
 
 from pathlib import Path
 
-from deplodock.benchmark.workload import compose_result
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.variant import Variant
-from deplodock.recipe.types import Recipe
+from emmy.benchmark.workload import compose_result
+from emmy.planner import BenchmarkTask
+from emmy.planner.variant import Variant
+from emmy.recipe.types import Recipe
 
 
 def _make_task(tmp_path: Path) -> BenchmarkTask:

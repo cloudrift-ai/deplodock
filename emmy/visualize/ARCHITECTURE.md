@@ -1,4 +1,4 @@
-# `deplodock/visualize/`
+# `emmy/visualize/`
 
 Shared ECharts visualization stack. Owns theme tokens, fonts, qualitative
 palettes, the HTML page shell, a generic bar-chart emitter, and HTML→image

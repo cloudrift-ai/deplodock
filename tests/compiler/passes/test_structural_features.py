@@ -10,19 +10,19 @@ attention-like) through the loop passes and checks the stamped features.
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
-from deplodock.compiler.pipeline.passes.loop.stamp._stamp import structure_features
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.stmt.blocks import Loop
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from emmy.compiler.pipeline.knob import STRUCT_PREFIX
+from emmy.compiler.pipeline.passes.loop.stamp._stamp import structure_features
+from emmy.compiler.tensor import Tensor
 
 
 def _rms_body(ext_i: int = 8, ext_k: int = 64) -> Body:
@@ -170,9 +170,9 @@ def test_dtype_multiset_needs_graph():
 def _fused_loops(graph: Graph):
     """Run the loop dialect (incl. the structural-feature stamp) and return
     ``(fused_graph, [LoopOp, ...])``."""
-    from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+    from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
     fused = Pipeline.build(LOOP_PASSES).run(graph, ctx=Context(compute_capability=(8, 0)), db=SearchDB())
     return fused, [n.op for n in fused.nodes.values() if isinstance(n.op, LoopOp)]
@@ -181,7 +181,7 @@ def _fused_loops(graph: Graph):
 def _matmul_chain(shapes: list[tuple[str, tuple[int, int]]], mms: list[tuple[str, str, str, tuple[int, int]]]) -> Graph:
     """Build a frontend matmul graph: ``shapes`` are (id, shape) inputs; ``mms``
     are (out_id, lhs_id, rhs_id, out_shape) MatmulOps applied in order."""
-    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
 
     g = Graph()
     for nid, shape in shapes:

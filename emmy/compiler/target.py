@@ -5,7 +5,7 @@ TMA, ``060_use_async_copy`` for cp.async) read the target via
 :func:`compute_capability`. By default that probes the live CUDA device
 through cupy. Callers can override the target via :func:`set_target` so
 the compiler emits code for a different architecture than the host —
-useful for ``deplodock compile`` on a CPU box that wants to see the
+useful for ``emmy compile`` on a CPU box that wants to see the
 sm_120 codegen path, or for cross-compiling for a benchmark target.
 
 CLI commands attach the ``--target`` flag with :func:`add_target_arg`
@@ -102,12 +102,12 @@ def live_device_features() -> dict[str, float]:
     hardware-regime features (see :meth:`Context.features`). These are SKU facts
     CUDA reports but compute-capability alone doesn't fix (an sm_120 laptop and an
     sm_120 RTX 5090 differ in SM count). Delegates to
-    :func:`deplodock.gpu.probe_live_features`, which probes the live device via
+    :func:`emmy.gpu.probe_live_features`, which probes the live device via
     cupy and, when none is visible (GPU-less CI / offline eval), falls back to the
-    **memorized** specs of :data:`deplodock.gpu.DEFAULT_GPU` — so offline hosts get
+    **memorized** specs of :data:`emmy.gpu.DEFAULT_GPU` — so offline hosts get
     faithful per-SKU features instead of none. Cached — physical and
     target-independent, so :func:`set_target` need not clear it."""
-    from deplodock import gpu  # noqa: PLC0415
+    from emmy import gpu  # noqa: PLC0415
 
     return gpu.probe_live_features()
 

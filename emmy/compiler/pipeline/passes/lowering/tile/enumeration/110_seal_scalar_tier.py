@@ -18,12 +18,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import TileGraphOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.tile.ir import TileGraphOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
 PATTERN = [Pattern("root", TileGraphOp)]
 

@@ -1,4 +1,4 @@
-"""CLI tests for ``deplodock compare`` — diffing two dump dirs' bench artifacts.
+"""CLI tests for ``emmy compare`` — diffing two dump dirs' bench artifacts.
 
 Each test writes the synthetic dump JSONs inline (the three artifacts the
 command reads: ``60_bench_compare.json``, ``62_kernel_bench.json``,
@@ -23,7 +23,7 @@ def _full_model(**backends):
 
 
 def _kernel_bench(rows):
-    return [{"kernel": k, "label": k.rsplit("_", 1)[0], "captured": True, "backends": {"Deplodock": us}} for k, us in rows]
+    return [{"kernel": k, "label": k.rsplit("_", 1)[0], "captured": True, "backends": {"Emmy": us}} for k, us in rows]
 
 
 def test_compare_full_model_and_kernels(run_cli, tmp_path):
@@ -34,7 +34,7 @@ def test_compare_full_model_and_kernels(run_cli, tmp_path):
         tmp_path,
         "a",
         **{
-            "60_bench_compare__json": _full_model(**{"Eager PyTorch": 96.0, "Deplodock": 193.0}),
+            "60_bench_compare__json": _full_model(**{"Eager PyTorch": 96.0, "Emmy": 193.0}),
             "62_kernel_bench__json": _kernel_bench([("k_mean_aaaaaa", 2.0), ("k_linear_reduce_111111", 29.0)]),
         },
     )
@@ -42,7 +42,7 @@ def test_compare_full_model_and_kernels(run_cli, tmp_path):
         tmp_path,
         "b",
         **{
-            "60_bench_compare__json": _full_model(**{"Eager PyTorch": 95.0, "Deplodock": 138.0}),
+            "60_bench_compare__json": _full_model(**{"Eager PyTorch": 95.0, "Emmy": 138.0}),
             # same hash for k_mean (exact match); k_linear_reduce re-tuned → new hash (base-name match)
             "62_kernel_bench__json": _kernel_bench([("k_mean_aaaaaa", 2.1), ("k_linear_reduce_222222", 8.0)]),
         },
@@ -50,8 +50,8 @@ def test_compare_full_model_and_kernels(run_cli, tmp_path):
     rc, stdout, stderr = run_cli("compare", a, b)
     assert rc == 0, f"stderr: {stderr}"
     assert "Full model" in stdout
-    assert "0.72x" in stdout  # Deplodock 138/193
-    assert "Per-kernel deplodock -O3" in stdout
+    assert "0.72x" in stdout  # Emmy 138/193
+    assert "Per-kernel emmy -O3" in stdout
     assert "k_linear_reduce_111111 -> k_linear_reduce_222222" in stdout  # hash moved, base-matched
     assert "0.28x" in stdout  # 8/29
     assert "TOTAL (matched)" in stdout
@@ -89,7 +89,7 @@ def test_compare_per_launch_fallback(run_cli, tmp_path):
     b = _dump(tmp_path, "b", **{"60_benchmark__json": bench([0.005, 0.020])})
     rc, stdout, stderr = run_cli("compare", a, b)
     assert rc == 0, f"stderr: {stderr}"
-    assert "Per-launch deplodock" in stdout
+    assert "Per-launch emmy" in stdout
     assert "0.50x" in stdout  # 5us / 10us
 
 

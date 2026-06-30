@@ -13,13 +13,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.loop.ir import LoopOp
+from emmy.compiler.ir.stmt import Assign, Init, Load, Loop, Monoid, Write
+from emmy.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
 def _online_softmax_steps(m: str, ll: str, s: str) -> tuple:

@@ -6,7 +6,7 @@ graph, as the per-buffer descriptor on ``KernelOp`` (kernel signature),
 and as the render-time ``tensors`` map for index flattening.
 
 ``dtype`` accepts a :class:`DataType` directly or any string spelling
-that :func:`deplodock.compiler.dtype.get` resolves (canonical name,
+that :func:`emmy.compiler.dtype.get` resolves (canonical name,
 PyTorch alias, etc.); ``__post_init__`` coerces to the canonical
 :class:`DataType` so downstream code never sees a bare string.
 """
@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.dim import Dim, to_dim
-from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.dtype import get as _get_dtype
+from emmy.compiler.dim import Dim, to_dim
+from emmy.compiler.dtype import F32, DataType
+from emmy.compiler.dtype import get as _get_dtype
 
 
 @dataclass

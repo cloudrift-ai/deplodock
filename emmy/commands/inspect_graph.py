@@ -14,7 +14,7 @@ def register_inspect_command(subparsers):
 
 
 def handle_inspect(args):
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
     path = Path(args.ir_file)
     if not path.exists():

@@ -35,9 +35,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Accum,
     Assign,
     Body,
@@ -52,7 +52,7 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Write,
     pretty_body,
 )
-from deplodock.compiler.ir.stmt.ir import BodyOp
+from emmy.compiler.ir.stmt.ir import BodyOp
 
 # ---------------------------------------------------------------------------
 # Scope — a path of enclosing axes
@@ -100,7 +100,7 @@ class LoopOp(BodyOp):
     """
 
     def __post_init__(self) -> None:
-        from deplodock.compiler.ir.stmt import normalize_body
+        from emmy.compiler.ir.stmt import normalize_body
 
         # Body is a tuple subclass; coerce so ``Op(body=tuple_value)``
         # construction shape keeps working without forcing wrapping at
@@ -209,7 +209,7 @@ class LoopOp(BodyOp):
         """
         import numpy as np
 
-        from deplodock.compiler.ir.loop.runner import execute_loop_op_cpp
+        from emmy.compiler.ir.loop.runner import execute_loop_op_cpp
 
         bufs = tuple(self.inputs)
         if len(inputs) != len(bufs):
@@ -259,7 +259,7 @@ def _bind_symbolic_axes(loop: LoopOp, input_arrays: dict) -> dict[str, int]:
     body ``Load`` index. Each input array's actual shape is the source of
     truth; a symbolic axis seen at index position ``d`` of input ``buf``
     binds to ``input_arrays[buf].shape[d]``."""
-    from deplodock.compiler.ir.expr import Var
+    from emmy.compiler.ir.expr import Var
 
     env: dict[str, int] = {}
     symbolic_axis_names = {ax.name for ax in loop.axes if not ax.extent.is_static}

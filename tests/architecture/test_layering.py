@@ -36,9 +36,9 @@ def test_lowering_tile_does_not_import_kernel_ir() -> None:
     2. you're in the wrong directory — Kernel-IR-emitting passes live
        under ``lowering/kernel/``.
     """
-    tile_dir = _REPO_ROOT / "deplodock" / "compiler" / "pipeline" / "passes" / "lowering" / "tile"
+    tile_dir = _REPO_ROOT / "emmy" / "compiler" / "pipeline" / "passes" / "lowering" / "tile"
     assert tile_dir.is_dir(), f"lowering/tile/ not found at {tile_dir}"
-    forbidden = "from deplodock.compiler.ir.kernel"
+    forbidden = "from emmy.compiler.ir.kernel"
     offenders: list[str] = []
     for py in sorted(tile_dir.glob("*.py")):
         text = py.read_text()
@@ -63,9 +63,9 @@ def test_lowering_tile_does_not_import_kernel_passes() -> None:
     If this fires: move the shared helper into ``lowering/_predicates`` and import
     it there from both layers, rather than reaching down into ``lowering/kernel``.
     """
-    tile_dir = _REPO_ROOT / "deplodock" / "compiler" / "pipeline" / "passes" / "lowering" / "tile"
+    tile_dir = _REPO_ROOT / "emmy" / "compiler" / "pipeline" / "passes" / "lowering" / "tile"
     assert tile_dir.is_dir(), f"lowering/tile/ not found at {tile_dir}"
-    forbidden = "deplodock.compiler.pipeline.passes.lowering.kernel"
+    forbidden = "emmy.compiler.pipeline.passes.lowering.kernel"
     offenders: list[str] = []
     for py in sorted(tile_dir.rglob("*.py")):
         for lineno, line in enumerate(py.read_text().splitlines(), start=1):
@@ -88,7 +88,7 @@ def test_lowering_tile_does_not_import_kernel_passes() -> None:
 # block-DAG refactor removed upstream.
 # ---------------------------------------------------------------------------
 
-_KERNEL_DIR = _REPO_ROOT / "deplodock" / "compiler" / "pipeline" / "passes" / "lowering" / "kernel"
+_KERNEL_DIR = _REPO_ROOT / "emmy" / "compiler" / "pipeline" / "passes" / "lowering" / "kernel"
 
 # The enumeration / split move-composer layer: where the *forks* live — offer
 # enumeration, knob schema, the algebra classifiers, the edge-placement cut. A
@@ -181,7 +181,7 @@ def test_materialized_tile_flavors_stamp_schedule_facts() -> None:
     Drop one of these to an implicit tree shape and a kernel pass would have to
     classify the body to recover it — the brittleness this firewall forbids.
     """
-    from deplodock.compiler.ir.tile.ir import AtomTile, SerialTile, StageBundle, WarpSpecialize
+    from emmy.compiler.ir.tile.ir import AtomTile, SerialTile, StageBundle, WarpSpecialize
 
     required: dict[type, set[str]] = {
         StageBundle: {"policy", "buffer_count", "phase", "pipeline_depth"},

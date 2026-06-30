@@ -2,9 +2,9 @@
 
 A *candidate* is one concrete attempt: a provider, a resolved instance
 type, and (for GCP) a specific zone. The orchestrator in
-:mod:`deplodock.provisioning.cloud` iterates these in priority order,
+:mod:`emmy.provisioning.cloud` iterates these in priority order,
 falling back to the next candidate when one reports
-:class:`~deplodock.provisioning.errors.CapacityExhausted`.
+:class:`~emmy.provisioning.errors.CapacityExhausted`.
 
 Order:
 
@@ -24,7 +24,7 @@ first hardware-table entry), candidates stay within that provider.
 
 from dataclasses import dataclass
 
-from deplodock.hardware import (
+from emmy.hardware import (
     DEFAULT_GCP_ZONE,
     GPU_GCP_ZONES,
     GPU_INSTANCE_TYPES,

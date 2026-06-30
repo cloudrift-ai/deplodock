@@ -26,11 +26,11 @@ gate_proj.s512 (qwen) ~1430µs → ~1320µs. Env vars override per-axis.
 
 Env vars:
 
-- ``DEPLODOCK_BN``, ``DEPLODOCK_BM`` — per-CTA tile (innermost N, outer M).
-- ``DEPLODOCK_FN``, ``DEPLODOCK_FM`` — per-thread output cells.
-- ``DEPLODOCK_BK`` — K-split size (subject to ``K % BK == 0 and K > BK``).
+- ``EMMY_BN``, ``EMMY_BM`` — per-CTA tile (innermost N, outer M).
+- ``EMMY_FN``, ``EMMY_FM`` — per-thread output cells.
+- ``EMMY_BK`` — K-split size (subject to ``K % BK == 0 and K > BK``).
   Default is M-adaptive.
-- ``DEPLODOCK_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
+- ``EMMY_SPLITK`` — force a cross-CTA split-K factor (>0 wins).
 
 ## API
 
@@ -46,11 +46,11 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from deplodock import config
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import BM, BN, FM, FN
+from emmy import config
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import BM, BN, FM, FN
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.stmt.body import Body
+    from emmy.compiler.ir.stmt.body import Body
 
 
 # Per-CTA matmul tile defaults. Three classes, picked from logical output
@@ -136,7 +136,7 @@ _DTYPE_BYTES = 4
 
 # CTA inner-axis width default for paths that produce a single THREAD
 # axis (non-matmul kernels). Mutually exclusive with the matmul path,
-# so it shares the ``DEPLODOCK_BN`` env namespace.
+# so it shares the ``EMMY_BN`` env namespace.
 _NON_MATMUL_BN_DEFAULT = 256
 
 # Cross-CTA split-K target.
@@ -180,8 +180,8 @@ def _has_matmul_reduce(stmts) -> bool:
     distinct buffers — the structural signature of a matmul. Recurses
     through wrapper loops / conds so chunked or output-loop-wrapped
     matmuls (SDPA V-projection) are still detected."""
-    from deplodock.compiler.ir.stmt import Load, Loop
-    from deplodock.compiler.ir.stmt.body import Body
+    from emmy.compiler.ir.stmt import Load, Loop
+    from emmy.compiler.ir.stmt.body import Body
 
     return any(
         isinstance(s, Loop) and s.is_reduce and len({ld.input for ld in s.body.of_type(Load)}) >= 2 for s in Body.coerce(stmts).iter()
@@ -196,8 +196,8 @@ def _has_fused_prologue(stmts) -> bool:
     have exactly 2 buffer Loads inside the K-reduce; the residual /
     bias of ``matmul_add`` is loaded *outside* the reduce loop and
     doesn't push register pressure inside it."""
-    from deplodock.compiler.ir.stmt import Load, Loop
-    from deplodock.compiler.ir.stmt.body import Body
+    from emmy.compiler.ir.stmt import Load, Loop
+    from emmy.compiler.ir.stmt.body import Body
 
     for s in Body.coerce(stmts).iter():
         if isinstance(s, Loop) and s.is_reduce:
@@ -215,9 +215,9 @@ def _external_input_count(stmts) -> int:
     Pure ``matmul`` = 2 (a, b). ``matmul_add`` = 3 (a, b, residual).
     ``silu_mul_matmul`` = 3 (g, u, w). The default-large class is
     gated on ``count == 2``."""
-    from deplodock.compiler.ir.stmt import Load
-    from deplodock.compiler.ir.stmt.body import Body
-    from deplodock.compiler.ir.tile.ir import Stage, StageBundle
+    from emmy.compiler.ir.stmt import Load
+    from emmy.compiler.ir.stmt.body import Body
+    from emmy.compiler.ir.tile.ir import Stage, StageBundle
 
     body = Body.coerce(stmts)
     # Collect smem decl names so we skip Loads that read from staged smem
@@ -256,7 +256,7 @@ def recover_logical_extents(body: Body) -> tuple[int, ...]:
 
     Used after the planner has σ-split output axes so heuristics still
     see logical extents."""
-    from deplodock.compiler.ir.stmt import Loop
+    from emmy.compiler.ir.stmt import Loop
 
     chain_extents: list[tuple[str, int]] = []
     cur = tuple(body)
@@ -387,18 +387,18 @@ def forced_bk(
     smem cap at the active tile shape.
 
     ``static_smem_cap`` defaults to ``Context.static_smem_cap`` (48 KB)."""
-    forced = config.int_env(config.knob_var("BK"), 0)  # legacy DEPLODOCK_BK pin (heuristic-defaults UI)
+    forced = config.int_env(config.knob_var("BK"), 0)  # legacy EMMY_BK pin (heuristic-defaults UI)
     if forced > 0:
         return forced
     if not body_info.has_matmul:
         return None
     m = output_extents[1] if len(output_extents) >= 2 else 0
-    from deplodock.compiler.target import compute_capability  # noqa: PLC0415
+    from emmy.compiler.target import compute_capability  # noqa: PLC0415
 
     tma_path = compute_capability() >= (9, 0)
     bk = _BK_SMALL_M if m <= _M_THRESHOLD else (_BK_LARGE_M_TMA if tma_path else _BK_LARGE_M_DEFAULT)
     if static_smem_cap is None:
-        from deplodock.compiler.context import STATIC_SMEM_CAP  # noqa: PLC0415
+        from emmy.compiler.context import STATIC_SMEM_CAP  # noqa: PLC0415
 
         static_smem_cap = STATIC_SMEM_CAP
     return _bk_fits_smem(output_extents, body_info, bk, static_smem_cap)
@@ -430,11 +430,11 @@ def auto_splitk(
 ) -> int:
     """Auto-pick a cross-CTA split-K factor.
 
-    ``DEPLODOCK_SPLITK`` env wins when set. Otherwise: target
+    ``EMMY_SPLITK`` env wins when set. Otherwise: target
     ``waves_target * num_sms`` total CTAs, divide by the current
     M-N grid count, clamp to the largest divisor of ``k_o_extent``
     that is ≤ the target. Returns 1 when no useful split exists."""
-    forced = config.int_env(config.knob_var("SPLITK"), 0)  # legacy DEPLODOCK_SPLITK pin (heuristic-defaults UI)
+    forced = config.int_env(config.knob_var("SPLITK"), 0)  # legacy EMMY_SPLITK pin (heuristic-defaults UI)
     if forced > 0:
         return forced
     if not body_info.has_matmul:
@@ -477,5 +477,5 @@ def _splitk_target_waves(output_extents: tuple[int, ...], body_info: BodyInfo) -
 
 def cooperative_block_size() -> int:
     """Threads/CTA for synthetic-thread axes in non-matmul paths.
-    Shares the matmul ``DEPLODOCK_BN`` env namespace."""
+    Shares the matmul ``EMMY_BN`` env namespace."""
     return BN.read_int(_NON_MATMUL_BN_DEFAULT)

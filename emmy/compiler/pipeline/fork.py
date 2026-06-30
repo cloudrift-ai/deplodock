@@ -42,8 +42,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
-    from deplodock.compiler.ir.base import Op
+    from emmy.compiler.graph import Graph
+    from emmy.compiler.ir.base import Op
 
 
 class Fork(ABC):
@@ -68,7 +68,7 @@ class Fork(ABC):
     perf DB and the learned prior key on, read without expanding). Ranking
     is SEARCH policy: the engine hands unranked siblings to ``Search.push``
     and the policy ranks them with the learned
-    :class:`~deplodock.compiler.pipeline.search.prior.Prior` (greedy
+    :class:`~emmy.compiler.pipeline.search.prior.Prior` (greedy
     ``mean_score`` argmin; MCTS PUCT). Forks carry no score of their own —
     the analytic per-fork scorer was removed when the learned prior replaced
     it; siblings are emitted in grouping order and the cold/no-prior fallback

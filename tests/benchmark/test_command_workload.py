@@ -2,8 +2,8 @@
 
 import pytest
 
-from deplodock.benchmark.command_workload import build_substitution_map, render_command
-from deplodock.planner.variant import Variant
+from emmy.benchmark.command_workload import build_substitution_map, render_command
+from emmy.planner.variant import Variant
 
 
 def _variant(params):

@@ -26,12 +26,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from deplodock.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.stmt import Cond, Load
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.backend.cuda.dtype import nbytes_of as _nbytes_of
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Expr
+from emmy.compiler.ir.stmt import Cond, Load
+from emmy.compiler.ir.tile.ir import (
     GridTile,
     ParallelTile,
     RegisterTile,
@@ -411,8 +411,8 @@ def simulate_graph(
     the full-sweep cell maps fold every iteration regardless. ``warp_id``
     selects the warp within the CTA.
     """
-    from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
-    from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
+    from emmy.compiler.ir.kernel.ir import KernelOp, Smem
+    from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
 
     g = Pipeline.build(KERNEL_PASSES).run(graph.copy())
 

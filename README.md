@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="logo.png" alt="DeploDock" width="300">
+  <img src="logo.png" alt="Emmy" width="300">
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/deplodock/"><img src="https://img.shields.io/pypi/v/deplodock" alt="PyPI"></a>
-  <a href="https://github.com/cloudrift-ai/deplodock/actions/workflows/tests.yml"><img src="https://github.com/cloudrift-ai/deplodock/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://pypi.org/project/emmy/"><img src="https://img.shields.io/pypi/v/emmy" alt="PyPI"></a>
+  <a href="https://github.com/cloudrift-ai/emmy/actions/workflows/tests.yml"><img src="https://github.com/cloudrift-ai/emmy/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="https://discord.gg/cloudrift"><img src="https://img.shields.io/discord/1150997934113030174?label=Discord" alt="Discord"></a>
 </p>
 
@@ -13,8 +13,8 @@
 ## Install
 
 ```bash
-git clone https://github.com/cloudrift-ai/deplodock.git
-cd deplodock && make setup
+git clone https://github.com/cloudrift-ai/emmy.git
+cd emmy && make setup
 ```
 
 ## Compile
@@ -23,17 +23,17 @@ A hackable PyTorch → Graph IR → CUDA compiler. Trace any `nn.Module`, fuse i
 
 ```bash
 # Compile a single layer
-deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))"
+emmy compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))"
 # Benchmark, profile and optimize kernels locally
-deplodock run --bench --profile -c "torch.nn.Softmax(dim=-1)(torch.randn(1, 28, 2048, 2048))"
+emmy run --bench --profile -c "torch.nn.Softmax(dim=-1)(torch.randn(1, 28, 2048, 2048))"
 # Compile full model from HuggingFace (will download weights)
-deplodock compile Qwen/Qwen3-Embedding-0.6B
+emmy compile Qwen/Qwen3-Embedding-0.6B
 ```
 
 Layer-norm-style reduction (two reductions, broadcast subtract, elementwise chain) fused into two kernels:
 
 ```bash
-deplodock compile -c "
+emmy compile -c "
 class LN(torch.nn.Module):
     def forward(self, x):
         m = x.mean(-1, keepdim=True)
@@ -52,7 +52,7 @@ Principled compilation stack with six IR stages, each printable on demand via `-
 6. **CUDA** — optimized CUDA code ready for `nvcc`
 
 
-**Readable Schedule**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir tile`
+**Readable Schedule**: `emmy compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir tile`
 ```
 kernel k_rms_norm_reduce  inputs: rms_norm_mean_count, rms_norm_eps, x, p_weight  outputs: rms_norm
     in0 = load rms_norm_mean_count[0]
@@ -75,7 +75,7 @@ kernel k_rms_norm_reduce  inputs: rms_norm_mean_count, rms_norm_eps, x, p_weight
             rms_norm[0, a1, a3] = v5
 ```
 
-**Optimized CUDA kernel**: `deplodock compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir cuda`
+**Optimized CUDA kernel**: `emmy compile -c "nn.RMSNorm(2048)(torch.randn(1,32,2048))" --ir cuda`
 
 ```c
 extern "C" __global__
@@ -144,12 +144,12 @@ __launch_bounds__(256) void k_rms_norm_reduce(const float* x, const float* p_wei
 ## Benchmark
 
 ```bash
-deplodock bench recipes/*                                    # All recipes
-deplodock bench experiments/.../optimal_mcr_rtx5090          # An experiment
-deplodock bench recipes/* --filter "deploy.gpu=*5090*"       # Subset
-deplodock bench recipes/* --gpu-concurrency 4                # Parallel VMs per GPU
-deplodock bench recipes/* --local                            # On this machine
-deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated hosts
+emmy bench recipes/*                                    # All recipes
+emmy bench experiments/.../optimal_mcr_rtx5090          # An experiment
+emmy bench recipes/* --filter "deploy.gpu=*5090*"       # Subset
+emmy bench recipes/* --gpu-concurrency 4                # Parallel VMs per GPU
+emmy bench recipes/* --local                            # On this machine
+emmy bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated hosts
 ```
 
 External contributors: open a PR with an experiment under `experiments/{model}/{name}/`, then a maintainer triggers a cloud run by commenting `/run-experiment` on the PR.
@@ -158,47 +158,47 @@ External contributors: open a PR with an experiment under `experiments/{model}/{
 
 ```bash
 # Remote server via SSH
-deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host
+emmy deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host
 
 # Local Docker Compose
-deplodock deploy local --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ
+emmy deploy local --recipe recipes/Qwen3-Coder-30B-A3B-Instruct-AWQ
 
 # Cloud (auto-provisions a VM)
-deplodock deploy cloud --recipe recipes/GLM-4.6-FP8 --gpu "NVIDIA H200 141GB" --gpu-count 8
+emmy deploy cloud --recipe recipes/GLM-4.6-FP8 --gpu "NVIDIA H200 141GB" --gpu-count 8
 
 # Teardown / preview
-deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --teardown
-deplodock deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --dry-run
+emmy deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --teardown
+emmy deploy ssh --recipe recipes/GLM-4.6-FP8 --ssh user@host --dry-run
 ```
 
 ## Serve (compiled embeddings via vLLM)
 
 ```bash
-# vLLM's OpenAI shell (/v1/embeddings, tokenizer, scheduler, pooler) over deplodock-compiled kernels
+# vLLM's OpenAI shell (/v1/embeddings, tokenizer, scheduler, pooler) over emmy-compiled kernels
 pip install -e ".[compile,serving]"
-deplodock serve Qwen/Qwen3-Embedding-0.6B                  # extra flags pass through to vllm serve
+emmy serve Qwen/Qwen3-Embedding-0.6B                  # extra flags pass through to vllm serve
 
 curl localhost:8000/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"model":"Qwen/Qwen3-Embedding-0.6B","input":"Hello"}'
 
 # One-shot benchmark (vllm bench serve against the started server), and the raw-vLLM baseline
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32 --stock
+emmy serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32
+emmy serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32 --stock
 ```
 
-See [`deplodock/serving/ARCHITECTURE.md`](deplodock/serving/ARCHITECTURE.md); embedding recipes
-(`recipes/Qwen3-Embedding-*`) A/B this against stock vLLM via `deplodock bench`.
+See [`emmy/serving/ARCHITECTURE.md`](emmy/serving/ARCHITECTURE.md); embedding recipes
+(`recipes/Qwen3-Embedding-*`) A/B this against stock vLLM via `emmy bench`.
 
 ## Generate (chat) — experimental
 
 ```bash
 # Standalone generation oracle (no vLLM) — re-runs the whole prefix each step, O(S²); the
 # token-for-token reference (matches HF eager greedy, e.g. on TinyLlama-1.1B-Chat).
-deplodock generate TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "The capital of France is" --max-new-tokens 10
+emmy generate TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "The capital of France is" --max-new-tokens 10
 
-# Serve a chat model through deplodock-compiled per-layer kernels (vLLM owns the OpenAI API /
-# sampler / scheduler / paged KV-cache / lm_head; deplodock owns embed + the trunk).
-deplodock serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate
+# Serve a chat model through emmy-compiled per-layer kernels (vLLM owns the OpenAI API /
+# sampler / scheduler / paged KV-cache / lm_head; emmy owns embed + the trunk).
+emmy serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --generate
 curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"TinyLlama/TinyLlama-1.1B-Chat-v1.0","messages":[{"role":"user","content":"Hi"}]}'
 ```
@@ -262,12 +262,12 @@ matrices:
 
 ```bash
 # GCP
-deplodock vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
-deplodock vm delete gcp --instance my-vm --zone us-central1-a
+emmy vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
+emmy vm delete gcp --instance my-vm --zone us-central1-a
 
 # CloudRift
-deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
-deplodock vm delete cloudrift --instance-id <id>
+emmy vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
+emmy vm delete cloudrift --instance-id <id>
 ```
 
 ## Development
@@ -280,41 +280,41 @@ make format    # auto-fix
 
 ## Project Structure
 
-- [deplodock/](deplodock/) — Python package
-  - [deplodock.py](deplodock/deplodock.py) — CLI entrypoint
-  - [logging_setup.py](deplodock/logging_setup.py) — CLI logging configuration
-  - [hardware.py](deplodock/hardware.py) — GPU specs and instance type mapping
-  - [detect.py](deplodock/detect.py) — GPU detection via PCI sysfs (local and remote)
-  - [redact.py](deplodock/redact.py) — Secret redaction for logs and dumps
-  - [commands/](deplodock/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](deplodock/commands/ARCHITECTURE.md))
-    - [deploy/](deplodock/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
-    - [bench/](deplodock/commands/bench/) — `bench` command
-    - [vm/](deplodock/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
-    - [teardown.py](deplodock/commands/teardown.py) — `teardown` command
-    - [pull.py](deplodock/commands/pull.py) — `pull` command (download HF model)
-    - [trace.py](deplodock/commands/trace.py) — `trace` command (PyTorch → Graph IR)
-    - [compile.py](deplodock/commands/compile.py) — `compile` command (decomposition → optimization → fusion → kernel/CUDA lowering)
-    - [run.py](deplodock/commands/run.py) — `run` command (compile + execute on CUDA backend, optional benchmarks)
-    - [inspect_graph.py](deplodock/commands/inspect_graph.py) — `inspect` command (graph summary)
-  - [compiler/](deplodock/compiler/) — PyTorch → Graph IR → CUDA compiler (see [ARCHITECTURE.md](deplodock/compiler/ARCHITECTURE.md))
-    - [graph.py](deplodock/compiler/graph.py) — `Graph`, `Node`, `Tensor`, `Hints` container
-    - [ir/](deplodock/compiler/ir/) — per-dialect op definitions (torch / tensor / loop / kernel / cuda) (see [ARCHITECTURE.md](deplodock/compiler/ir/ARCHITECTURE.md))
-    - [trace/](deplodock/compiler/trace/) — PyTorch/HuggingFace → Graph IR capture (see [ARCHITECTURE.md](deplodock/compiler/trace/ARCHITECTURE.md))
-    - [pipeline/](deplodock/compiler/pipeline/) — rewrite engine + passes + dump hooks (see [ARCHITECTURE.md](deplodock/compiler/pipeline/ARCHITECTURE.md))
-    - [rules/](deplodock/compiler/rules/) — rewrite rules (decomposition, optimization, fusion, lowering)
-    - [program/](deplodock/compiler/program/) — kernel program assembly (LoopOp → KernelOp → CudaOp)
-    - [cuda/](deplodock/compiler/cuda/) — CUDA source rendering and runtime helpers
-    - [backend/](deplodock/compiler/backend/) — numpy / loop / CUDA execution (see [ARCHITECTURE.md](deplodock/compiler/backend/ARCHITECTURE.md))
-      - [cuda/](deplodock/compiler/backend/cuda/) — CUDA backend internals (see [ARCHITECTURE.md](deplodock/compiler/backend/cuda/ARCHITECTURE.md))
-    - [tuning.py](deplodock/compiler/tuning.py) — autotuning utilities
-  - [recipe/](deplodock/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](deplodock/recipe/ARCHITECTURE.md))
-  - [serving/](deplodock/serving/) — vLLM out-of-tree embedding plugin (see [ARCHITECTURE.md](deplodock/serving/ARCHITECTURE.md))
-  - [deploy/](deplodock/deploy/) — Compose generation, deploy orchestration
-  - [provisioning/](deplodock/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
-  - [benchmark/](deplodock/benchmark/) — Benchmark tracking, config, task enumeration, execution
-  - [planner/](deplodock/planner/) — Groups benchmark tasks into execution groups for VM allocation
+- [emmy/](emmy/) — Python package
+  - [emmy.py](emmy/emmy.py) — CLI entrypoint
+  - [logging_setup.py](emmy/logging_setup.py) — CLI logging configuration
+  - [hardware.py](emmy/hardware.py) — GPU specs and instance type mapping
+  - [detect.py](emmy/detect.py) — GPU detection via PCI sysfs (local and remote)
+  - [redact.py](emmy/redact.py) — Secret redaction for logs and dumps
+  - [commands/](emmy/commands/) — CLI layer (thin argparse handlers, see [ARCHITECTURE.md](emmy/commands/ARCHITECTURE.md))
+    - [deploy/](emmy/commands/deploy/) — `deploy local`, `deploy ssh`, `deploy cloud` commands
+    - [bench/](emmy/commands/bench/) — `bench` command
+    - [vm/](emmy/commands/vm/) — `vm create/delete` commands (GCP, CloudRift)
+    - [teardown.py](emmy/commands/teardown.py) — `teardown` command
+    - [pull.py](emmy/commands/pull.py) — `pull` command (download HF model)
+    - [trace.py](emmy/commands/trace.py) — `trace` command (PyTorch → Graph IR)
+    - [compile.py](emmy/commands/compile.py) — `compile` command (decomposition → optimization → fusion → kernel/CUDA lowering)
+    - [run.py](emmy/commands/run.py) — `run` command (compile + execute on CUDA backend, optional benchmarks)
+    - [inspect_graph.py](emmy/commands/inspect_graph.py) — `inspect` command (graph summary)
+  - [compiler/](emmy/compiler/) — PyTorch → Graph IR → CUDA compiler (see [ARCHITECTURE.md](emmy/compiler/ARCHITECTURE.md))
+    - [graph.py](emmy/compiler/graph.py) — `Graph`, `Node`, `Tensor`, `Hints` container
+    - [ir/](emmy/compiler/ir/) — per-dialect op definitions (torch / tensor / loop / kernel / cuda) (see [ARCHITECTURE.md](emmy/compiler/ir/ARCHITECTURE.md))
+    - [trace/](emmy/compiler/trace/) — PyTorch/HuggingFace → Graph IR capture (see [ARCHITECTURE.md](emmy/compiler/trace/ARCHITECTURE.md))
+    - [pipeline/](emmy/compiler/pipeline/) — rewrite engine + passes + dump hooks (see [ARCHITECTURE.md](emmy/compiler/pipeline/ARCHITECTURE.md))
+    - [rules/](emmy/compiler/rules/) — rewrite rules (decomposition, optimization, fusion, lowering)
+    - [program/](emmy/compiler/program/) — kernel program assembly (LoopOp → KernelOp → CudaOp)
+    - [cuda/](emmy/compiler/cuda/) — CUDA source rendering and runtime helpers
+    - [backend/](emmy/compiler/backend/) — numpy / loop / CUDA execution (see [ARCHITECTURE.md](emmy/compiler/backend/ARCHITECTURE.md))
+      - [cuda/](emmy/compiler/backend/cuda/) — CUDA backend internals (see [ARCHITECTURE.md](emmy/compiler/backend/cuda/ARCHITECTURE.md))
+    - [tuning.py](emmy/compiler/tuning.py) — autotuning utilities
+  - [recipe/](emmy/recipe/) — Recipe loading, dataclass types, engine flag mapping (see [ARCHITECTURE.md](emmy/recipe/ARCHITECTURE.md))
+  - [serving/](emmy/serving/) — vLLM out-of-tree embedding plugin (see [ARCHITECTURE.md](emmy/serving/ARCHITECTURE.md))
+  - [deploy/](emmy/deploy/) — Compose generation, deploy orchestration
+  - [provisioning/](emmy/provisioning/) — Cloud provisioning, SSH transport, VM lifecycle
+  - [benchmark/](emmy/benchmark/) — Benchmark tracking, config, task enumeration, execution
+  - [planner/](emmy/planner/) — Groups benchmark tasks into execution groups for VM allocation
 - [recipes/](recipes/) — Model deploy recipes (YAML configs per model)
-- [docker/](docker/) — Custom image builds ([vllm-deplodock](docker/vllm-deplodock/) — vLLM + the deplodock plugin)
+- [docker/](docker/) — Custom image builds ([vllm-emmy](docker/vllm-emmy/) — vLLM + the emmy plugin)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [kernels/](kernels/) — Standalone CUDA kernel sources
 - [docs/](docs/) — Technical notes and engine-specific guides

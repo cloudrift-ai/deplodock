@@ -3,8 +3,8 @@
 import asyncio
 import logging
 
-from deplodock.planner import BenchmarkTask
-from deplodock.provisioning.shell import run_shell_cmd
+from emmy.planner import BenchmarkTask
+from emmy.provisioning.shell import run_shell_cmd
 
 logger = logging.getLogger(__name__)
 

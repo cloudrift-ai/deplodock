@@ -18,7 +18,7 @@ a branch carries only a *partial* tile, and ``knob.knob_features`` can't compute
 the tile's area / occupancy until ``FM/FN`` are pinned — so the prior is blind at
 the ``BM/BN`` choice and defaults to ``BN=16`` for every shape. Instead greedy
 **flattens** each fork point to its complete leaves
-(:func:`~deplodock.compiler.pipeline.fork.flatten_leaves` — cheap, ``expand``
+(:func:`~emmy.compiler.pipeline.fork.flatten_leaves` — cheap, ``expand``
 builds only knob dicts; materialization stays deferred to the one chosen leaf)
 and picks the one with the lowest :meth:`Prior.mean_scores` over the
 full feature vector the prior trained on: the ``H_*`` host/hardware regime + the
@@ -34,19 +34,19 @@ from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.pipeline.fork import Fork, flatten_leaves
+from emmy.compiler.graph import Graph
+from emmy.compiler.pipeline.fork import Fork, flatten_leaves
 
 if TYPE_CHECKING:
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline.pipeline import ForkPoint
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline.pipeline import ForkPoint
 
 
 @lru_cache(maxsize=1)
 def _tile_pipeline():
     """The ``lowering/tile``-only pipeline the structural price probes drive —
     frozen and shareable, so one load serves every nested descent."""
-    from deplodock.compiler.pipeline import Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline import Pipeline  # noqa: PLC0415
 
     return Pipeline.build(["lowering/tile/enumeration"])
 
@@ -101,7 +101,7 @@ def _load_prior_safe():
     ``AnalyticPrior`` cold-start fallback). Best-effort: any load failure →
     ``None`` → emission order — a bad/missing prior must never break compile."""
     try:
-        from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
         return load_prior()
     except Exception:  # noqa: BLE001
@@ -130,7 +130,7 @@ def _leaf_op(leaf: object):
     """The concrete ``Op`` behind a flattened leaf, or ``None``. Reads
     ``OptionFork.option`` rather than firing ``expand()`` — a planner tree
     ``_Leaf``'s thunk would materialize a TileOp just to inspect it."""
-    from deplodock.compiler.ir.base import Op  # noqa: PLC0415
+    from emmy.compiler.ir.base import Op  # noqa: PLC0415
 
     if isinstance(leaf, Op):
         return leaf
@@ -152,9 +152,9 @@ def _price_kernel(graph: Graph, nid: str, ctx: Context, prior, memo: dict[str, f
     ``op_cache_key`` so 28 identical per-layer kernels price once.
     Best-effort: any resolve failure prices as ``None`` (→ the caller keeps
     the op-variant path)."""
-    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
 
     key = op_cache_key(graph.nodes[nid].op)
     if key in memo:
@@ -174,7 +174,7 @@ def _price_graph(graph: Graph, ctx: Context, prior, memo: dict[str, float | None
     """Σ of per-kernel predicted-best µs over ``graph``'s kernel-bearing
     nodes, or ``None`` when any kernel is unpriceable (no partition fork —
     e.g. a pre-tiled combine ``TileOp`` — or a failed nested resolve)."""
-    from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
     prices = [_price_kernel(graph, nid, ctx, prior, memo) for nid, n in graph.nodes.items() if op_cache_key(n.op) is not None]
     if not prices or any(p is None for p in prices):
@@ -185,7 +185,7 @@ def _price_graph(graph: Graph, ctx: Context, prior, memo: dict[str, float | None
 def _price_op_leaf(fp: ForkPoint, leaf: object, prior, memo: dict[str, float | None]) -> float | None:
     """The keep-fused side's price: the leaf's ``Op`` rebound into a
     single-node slice of the current graph, priced like any kernel."""
-    from deplodock.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.slice import single_node_graph  # noqa: PLC0415
 
     option = _leaf_op(leaf)
     if option is None:
@@ -210,7 +210,7 @@ def _pick_structural(fp: ForkPoint, leaves: list, prior, memo: dict[str, float |
     are unvalidated, and a cold compile must never change kernel sets. Greedy
     is prior-only by design — the price never reads the DB (the learned-prior
     work removed ``_best_fork`` replay deliberately)."""
-    from deplodock.compiler.pipeline.pipeline import _is_structural_option  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import _is_structural_option  # noqa: PLC0415
 
     if not price_structural or prior is None or not getattr(prior, "fitted", False):
         return None
@@ -261,7 +261,7 @@ def greedy_decide(
     the nested pricing probes themselves (no recursive splitting inside a
     price probe). The price memo is per-factory-call (one compile attempt),
     keyed by ``op_cache_key``."""
-    from deplodock.compiler.pipeline.pipeline import _is_structural_option  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import _is_structural_option  # noqa: PLC0415
 
     memo: dict[str, float | None] = {}  # op_cache_key → predicted µs (None = unpriceable)
     loaded = prior is not _LOAD_PRIOR

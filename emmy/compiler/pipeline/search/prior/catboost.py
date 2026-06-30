@@ -28,8 +28,8 @@ import tempfile
 
 import numpy as np
 
-from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.search.prior.base import Prior
+from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.search.prior.base import Prior
 
 
 class CatBoostPrior(Prior):
@@ -162,7 +162,7 @@ class CatBoostPrior(Prior):
         fresh — bound so :meth:`checkpoint` saves it back. ``path`` defaults to
         ``config.prior_path()``. Best-effort: an unreadable / incompatible
         checkpoint falls back to a fresh prior rather than failing the compile."""
-        from deplodock import config, storage  # noqa: PLC0415
+        from emmy import config, storage  # noqa: PLC0415
 
         path = path or config.prior_path()
         obj = storage.read_json(path)

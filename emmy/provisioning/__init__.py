@@ -1,14 +1,14 @@
 """VM and cloud provisioning: types, SSH polling, shell helpers, providers."""
 
-from deplodock.provisioning.cloud import (
+from emmy.provisioning.cloud import (
     delete_cloud_vm,
     provision_cloud_vm,
     resolve_vm_spec,
 )
-from deplodock.provisioning.remote import provision_remote
-from deplodock.provisioning.shell import run_shell_cmd
-from deplodock.provisioning.ssh import wait_for_ssh
-from deplodock.provisioning.ssh_transport import (
+from emmy.provisioning.remote import provision_remote
+from emmy.provisioning.shell import run_shell_cmd
+from emmy.provisioning.ssh import wait_for_ssh
+from emmy.provisioning.ssh_transport import (
     REMOTE_DEPLOY_DIR,
     make_run_cmd,
     make_write_file,
@@ -16,12 +16,12 @@ from deplodock.provisioning.ssh_transport import (
     scp_from_remote,
     ssh_base_args,
 )
-from deplodock.provisioning.staging import (
+from emmy.provisioning.staging import (
     build_stage_tar,
     enumerate_staged_files,
     stage_to_remote,
 )
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.provisioning.types import VMConnectionInfo
 
 __all__ = [
     "VMConnectionInfo",

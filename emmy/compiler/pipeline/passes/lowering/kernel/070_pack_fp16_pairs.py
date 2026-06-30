@@ -59,11 +59,11 @@ warp Smem, etc.) still see the original scalar names.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F16, F16x2
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Pack, Stmt, Unpack
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.dtype import F16, F16x2
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import Accum, Body, Cond, Init, Pack, Stmt, Unpack
+from emmy.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

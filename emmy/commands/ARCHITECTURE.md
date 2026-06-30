@@ -12,23 +12,23 @@ commands/vm ────► provisioning (create/delete instances)
 ```
 
 **Dependency rule:** `commands/` is the CLI-only layer. All reusable business logic lives in top-level library packages:
-- `deplodock/recipe/` — recipe loading, dataclass types (`Recipe`, `LLMConfig`, etc.), engine flag mapping
-- `deplodock/deploy/` — compose generation, deploy orchestration
-- `deplodock/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
-- `deplodock/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
-- `deplodock/config.py` — the single owner of `os.environ` for all `DEPLODOCK_*` config vars. Typed getters
+- `emmy/recipe/` — recipe loading, dataclass types (`Recipe`, `LLMConfig`, etc.), engine flag mapping
+- `emmy/deploy/` — compose generation, deploy orchestration
+- `emmy/provisioning/` — VM types, SSH polling, shell helpers, cloud providers
+- `emmy/logging_setup.py` — CLI logging setup (`setup_cli_logging()`)
+- `emmy/config.py` — the single owner of `os.environ` for all `EMMY_*` config vars. Typed getters
   (`tune_db_path`, `nvcc_flags`, `debug_enabled`, `dump_dir`, `tune_patience`, `bench_backends_raw`, `cubin_cache_dir`,
   …) read the env live; `set_nvcc_flags(cli_value, default)` holds the `--nvcc-flags` > env > command-default precedence
   that used to live in this CLI layer, so every callsite (CLI, programmatic, tests) shares it. The thin
   `compile.apply_nvcc_flags` / `compile.resolve_tune_db` wrappers just adapt argparse to it. (Provider/secret vars stay
-  with `redact.py`; the dynamic `DEPLODOCK_<KNOB>` namespace stays with `compiler/pipeline/knob.py`, which borrows
+  with `redact.py`; the dynamic `EMMY_<KNOB>` namespace stays with `compiler/pipeline/knob.py`, which borrows
   `config.knob_var` / `config.knob_raw`.)
-- `deplodock/redact.py` — `redact_secrets()`, `SecretRedactingFilter`, `install_redaction()` (attach the filter to a handler — must be a handler, not a logger, so child-logger records that propagate up are still redacted), `register_secret()` (call after resolving any secret from a CLI flag — `--hf-token`, `--api-key` — or env var so its value is added to the redaction set)
-- `deplodock/benchmark/` — config, logging, workload, tasks, execution, structured JSON results
+- `emmy/redact.py` — `redact_secrets()`, `SecretRedactingFilter`, `install_redaction()` (attach the filter to a handler — must be a handler, not a logger, so child-logger records that propagate up are still redacted), `register_secret()` (call after resolving any secret from a CLI flag — `--hf-token`, `--api-key` — or env var so its value is added to the redaction set)
+- `emmy/benchmark/` — config, logging, workload, tasks, execution, structured JSON results
 
 ## Layers
 
-### `deplodock/recipe/` — Recipe Library
+### `emmy/recipe/` — Recipe Library
 
 Recipe loading, configuration dataclasses, and engine flag mapping.
 
@@ -39,7 +39,7 @@ Recipe loading, configuration dataclasses, and engine flag mapping.
 
 `load_recipe()` returns a `Recipe` dataclass. All consumers use attribute access (e.g. `recipe.engine.llm.tensor_parallel_size`).
 
-### `deplodock/deploy/` — Deploy Library
+### `emmy/deploy/` — Deploy Library
 
 The central orchestration layer. Provides a single entry point for deploying recipes to servers.
 
@@ -59,7 +59,7 @@ The central orchestration layer. Provides a single entry point for deploying rec
 
 **GPU visibility:** `generate_compose()` accepts a `gpu_device_ids` parameter to restrict GPU visibility via `device_ids: [...]` instead of `count: all`. Used by bench when a task needs fewer GPUs than the VM has.
 
-### `deplodock/provisioning/` — Provisioning Library
+### `emmy/provisioning/` — Provisioning Library
 
 VM lifecycle management and cloud provisioning.
 
@@ -73,7 +73,7 @@ VM lifecycle management and cloud provisioning.
 - `cloudrift.py` — CloudRift REST API provider
 - `gcp.py` — GCP gcloud provider
 
-### `deplodock/benchmark/` — Benchmark Library
+### `emmy/benchmark/` — Benchmark Library
 
 Benchmark configuration, task enumeration, and execution.
 
@@ -161,7 +161,7 @@ delete_cloud_vm(conn.delete_info) (skipped with --no-teardown; writes instances.
 
 ## Timing metrics
 
-`deplodock/timing.py` provides `PhaseTimer` — an ordered collector of `phase -> seconds` durations, threaded by
+`emmy/timing.py` provides `PhaseTimer` — an ordered collector of `phase -> seconds` durations, threaded by
 mutation through the async deploy/bench chain (so `run_deploy()` keeps its `bool` return). Each phase is wrapped in
 `async with timer.ameasure(name)` (sync `measure()` also exists); the elapsed is recorded even if the body raises,
 and a `[timing] <name>: 12.3s` line is logged. Phase-name constants live in `timing.py`.
@@ -206,13 +206,13 @@ fast no-op while bare VMs (e.g. straight from `vm create`) get set up on first u
 ## CLI Command Tree
 
 ```
-deplodock
+emmy
 +-- deploy
 |   +-- local    -- deploy locally via docker compose
 |   +-- ssh      -- deploy to remote server via SSH
 |   +-- cloud    -- provision cloud VM + deploy via SSH
 +-- bench        -- deploy + benchmark + teardown on cloud VMs
-+-- serve        -- vllm serve with the deplodock embedding plugin (optional one-shot bench)
++-- serve        -- vllm serve with the emmy embedding plugin (optional one-shot bench)
 +-- teardown     -- clean up VMs left by bench --no-teardown
 +-- vm
     +-- create
@@ -225,47 +225,47 @@ deplodock
 
 ## CLI Reference
 
-### `deplodock deploy local`
+### `emmy deploy local`
 
 Runs `docker compose` directly on the current machine. Auto-detects the local GPU via PCI sysfs and selects the matching `matrices` entry from the recipe.
 
 ```bash
-deplodock deploy local --recipe <path> [--dry-run] [--teardown]
-deplodock deploy local --recipe <path> --gpu "..." --gpu-count N    # override detection
+emmy deploy local --recipe <path> [--dry-run] [--teardown]
+emmy deploy local --recipe <path> --gpu "..." --gpu-count N    # override detection
 ```
 
-### `deplodock deploy ssh`
+### `emmy deploy ssh`
 
 Deploys to a remote server via SSH + SCP. Auto-detects the remote GPU and resolves the matrix the same way as `deploy local`. The remote host is responsible for having Docker + NVIDIA toolkit installed (or supplying `deploy.driver_version` / `deploy.cuda_version` in the recipe — see Recipe ARCHITECTURE).
 
 ```bash
-deplodock deploy ssh --recipe <path> --ssh user@host[:port] [--ssh-key ~/.ssh/id_ed25519] [--dry-run] [--teardown]
+emmy deploy ssh --recipe <path> --ssh user@host[:port] [--ssh-key ~/.ssh/id_ed25519] [--dry-run] [--teardown]
 ```
 
-### `deplodock deploy cloud`
+### `emmy deploy cloud`
 
 Provisions a cloud VM and deploys via SSH. Requires `--gpu` and `--gpu-count` to select the matching matrix entry from the recipe (no auto-detection — there is no host yet). When a GPU is offered by more than one provider, the first provider in `hardware.py`'s `GPU_INSTANCE_TYPES` table is chosen by default; pass `--provider {gcp,cloudrift}` to override.
 
 ```bash
-deplodock deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 8 [--provider gcp] [--name prefix]
+emmy deploy cloud --recipe <path> --gpu "NVIDIA H200 141GB" --gpu-count 8 [--provider gcp] [--name prefix]
 ```
 
 ### Hardware-Aware Deploy (Local / SSH)
 
 Both `deploy local` and `deploy ssh` auto-detect the target GPU by scanning PCI sysfs device IDs (locally or over SSH) and select the matching `matrices` entry. If more GPUs are available than the recipe's base configuration needs, a scale-out strategy is applied (`--scale-out-strategy {data-parallelism,replica-parallelism}`, default `data-parallelism`).
 
-### `deplodock serve`
+### `emmy serve`
 
-Serves an embedding model through vLLM with the deplodock plugin flags baked in (`serving/` plugin; needs the
-`serving` extra). Unrecognized flags forward to `vllm serve`; tokens after a literal `--` forward verbatim (deplodock's
+Serves an embedding model through vLLM with the emmy plugin flags baked in (`serving/` plugin; needs the
+`serving` extra). Unrecognized flags forward to `vllm serve`; tokens after a literal `--` forward verbatim (emmy's
 own flags are otherwise extracted wherever they appear — argparse REMAINDER swallows everything after MODEL, so the
 handler re-parses it; see `commands/serve.py::_split_own_flags`). `--max-model-len 4096` (the dynamic-dim cap) is
 applied for both engines unless overridden, so `--stock` is an apples-to-apples baseline.
 
 ```bash
-deplodock serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8   # plugin server (Ctrl-C to stop)
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32  # start → bench → results → shutdown
-deplodock serve Qwen/Qwen3-Embedding-0.6B --bench --stock                # raw-vLLM baseline of the same bench
+emmy serve Qwen/Qwen3-Embedding-0.6B --gpu-memory-utilization 0.8   # plugin server (Ctrl-C to stop)
+emmy serve Qwen/Qwen3-Embedding-0.6B --bench --random-input-len 32  # start → bench → results → shutdown
+emmy serve Qwen/Qwen3-Embedding-0.6B --bench --stock                # raw-vLLM baseline of the same bench
 ```
 
 Without `--bench` the process execs `vllm serve` (signals flow to vLLM directly). With `--bench` the server runs as a
@@ -273,18 +273,18 @@ subprocess (logs to a temp file), `/health` is polled (up to 30 min — first bo
 `vllm bench serve --backend openai-embeddings --endpoint /v1/embeddings` runs against it
 (`--max-concurrency` / `--num-prompts` / `--random-input-len` / `--bench-seed`) and the server is torn down.
 
-### `deplodock bench`
+### `emmy bench`
 
 Loads each recipe, provisions cloud VMs, deploys the model, runs `vllm bench serve`, captures results, and tears down. Recipes sharing the same model and GPU type are grouped onto the same VM (see `GroupByModelAndGpuPlanner`).
 
 ```bash
-deplodock bench recipes/*                                    # All recipes
-deplodock bench experiments/.../optimal_mcr_rtx5090          # An experiment
-deplodock bench recipes/* --filter "deploy.gpu=*5090*"       # Subset (fnmatch glob, AND across multiple --filter)
-deplodock bench recipes/* --gpu-concurrency 4                # Split each (model, GPU) group across up to N VMs
-deplodock bench recipes/* --no-teardown                      # Skip teardown; writes instances.json for later cleanup
-deplodock bench recipes/* --local                            # Run on this machine via ssh to 127.0.0.1
-deplodock bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated host pool (no provisioning, no teardown)
+emmy bench recipes/*                                    # All recipes
+emmy bench experiments/.../optimal_mcr_rtx5090          # An experiment
+emmy bench recipes/* --filter "deploy.gpu=*5090*"       # Subset (fnmatch glob, AND across multiple --filter)
+emmy bench recipes/* --gpu-concurrency 4                # Split each (model, GPU) group across up to N VMs
+emmy bench recipes/* --no-teardown                      # Skip teardown; writes instances.json for later cleanup
+emmy bench recipes/* --local                            # Run on this machine via ssh to 127.0.0.1
+emmy bench recipes/* --ssh user@host1 --ssh user@host2  # Pre-allocated host pool (no provisioning, no teardown)
 ```
 
 Results are stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directory holds its own run directories alongside `recipe.yaml`.
@@ -293,17 +293,17 @@ Results are stored in `{recipe_dir}/{timestamp}_{hash}/` — each recipe directo
 
 **Fixed-host mode:** when `--local` and/or `--ssh` are supplied, `bench` detects each host's GPU and verifies that every planned execution group can run on at least one host (matching `deploy.gpu` and sufficient `deploy.gpu_count`). Unsatisfied groups abort the run before any work starts. Fixed hosts are never deleted at the end of the run.
 
-### `deplodock teardown`
+### `emmy teardown`
 
 Cleans up VMs left running by `bench --no-teardown`. Reads `instances.json` from the run directory.
 
 ```bash
-deplodock teardown <run_dir> [--ssh-key ~/.ssh/id_ed25519]
+emmy teardown <run_dir> [--ssh-key ~/.ssh/id_ed25519]
 ```
 
-### `deplodock vm create / delete`
+### `emmy vm create / delete`
 
-Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `deplodock vm create {gpu,gcp,cloudrift} --help` for full flag lists.
+Manages cloud GPU VM lifecycles directly. Instances are ephemeral — `delete` removes them entirely. Run `emmy vm create {gpu,gcp,cloudrift} --help` for full flag lists.
 
 There are two `vm create` modes:
 
@@ -312,20 +312,20 @@ There are two `vm create` modes:
 
 ```bash
 # GPU-based (uses orchestrator: retries, candidate fallback, orphan cleanup)
-deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 \
+emmy vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 \
   --ssh-key ~/.ssh/id_ed25519 --provider cloudrift
 
 # Manual single-shot
-deplodock vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
-deplodock vm delete gcp --instance my-vm --zone us-central1-a
+emmy vm create gcp --instance my-vm --zone us-central1-a --machine-type a2-highgpu-1g
+emmy vm delete gcp --instance my-vm --zone us-central1-a
 
-deplodock vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
-deplodock vm delete cloudrift --instance-id <id>
+emmy vm create cloudrift --instance-type rtx4090.1 --ssh-key ~/.ssh/id_ed25519.pub
+emmy vm delete cloudrift --instance-id <id>
 ```
 
 CloudRift attach to a specific network with `--network <name>` (on `vm create cloudrift`, `vm create gpu`, `deploy cloud`, and `bench`). The name must exist in the target datacenter; omit to let CloudRift pick a public network.
 
-**Extra authorized keys.** `--ssh-key` is the *private* key deplodock connects with; its `.pub` is always installed in
+**Extra authorized keys.** `--ssh-key` is the *private* key emmy connects with; its `.pub` is always installed in
 the VM's `authorized_keys`. To grant additional people access, pass `--authorized-key PATH` (repeatable, on `vm create
 gpu` and `deploy cloud`) — each points to one public key file. The authorized set becomes `[ssh-key's .pub] + [every
 --authorized-key]` (CloudRift via the rent payload's `PublicKeys` list; GCP via newline-joined `ssh-keys` metadata).
@@ -334,7 +334,7 @@ Missing or empty `--authorized-key` files fail fast before any VM is provisioned
 
 **GCP OS Login.** On GCP the `ssh-keys` metadata above is **instance-level** (temporary — it dies with the VM, no
 project-wide key needed). But a project whose common metadata sets `enable-oslogin=TRUE` makes GCP **ignore** instance
-`ssh-keys` entirely, so deplodock also pins `enable-oslogin=FALSE` in the **same** `--metadata` flag (a second
+`ssh-keys` entirely, so emmy also pins `enable-oslogin=FALSE` in the **same** `--metadata` flag (a second
 `--metadata` would overwrite the first; `enable-oslogin` goes first so the multi-line `ssh-keys` value stays last). The
 instance value overrides the project one — *unless* an org policy **enforces** `constraints/compute.requireOsLogin`, in
 which case instance metadata can't turn OS Login off and keys must be registered through OS Login
@@ -343,7 +343,7 @@ compute.requireOsLogin --effective --project=PROJECT`: `booleanPolicy: {}` (or a
 `enable-oslogin=FALSE` path works.
 
 ```bash
-deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 --provider cloudrift \
+emmy vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 --provider cloudrift \
   --authorized-key ~/.ssh/alice.pub --authorized-key ~/.ssh/bob.pub
 ```
 
@@ -354,12 +354,12 @@ deplodock vm create gpu --gpu "NVIDIA H200 141GB" --gpu-count 2 --provider cloud
 path does not. GCP-only; ignored for CloudRift candidates.
 
 ```bash
-deplodock vm create gpu --gpu "NVIDIA B200" --gpu-count 8 --provider gcp --provisioning-model STANDARD
+emmy vm create gpu --gpu "NVIDIA B200" --gpu-count 8 --provider gcp --provisioning-model STANDARD
 ```
 
 #### Allocation strategy (shared by `deploy cloud`, `bench`, `vm create gpu`)
 
-All three commands go through `provision_cloud_vm()` in `deplodock/provisioning/cloud.py`. It enumerates *candidates* from `hardware.GPU_INSTANCE_TYPES` (preference-ordered) and, for GCP, fans out across the zones listed in `GPU_GCP_ZONES`. For each candidate it makes up to `SAME_CANDIDATE_RETRIES` attempts on transient failures, then advances. Providers signal "no capacity, try next" by raising `CapacityExhausted`; non-retryable errors raise `TerminalProvisionError` and abort. Fallback never silently crosses provider boundaries — `--provider` (or the first hardware-table entry) bounds the search.
+All three commands go through `provision_cloud_vm()` in `emmy/provisioning/cloud.py`. It enumerates *candidates* from `hardware.GPU_INSTANCE_TYPES` (preference-ordered) and, for GCP, fans out across the zones listed in `GPU_GCP_ZONES`. For each candidate it makes up to `SAME_CANDIDATE_RETRIES` attempts on transient failures, then advances. Providers signal "no capacity, try next" by raising `CapacityExhausted`; non-retryable errors raise `TerminalProvisionError` and abort. Fallback never silently crosses provider boundaries — `--provider` (or the first hardware-table entry) bounds the search.
 
 Capacity-class signals recognized today: CloudRift HTTP 503/429 on rent, CloudRift `Inactive` terminal status / readiness timeout, GCP `ZONE_RESOURCE_POOL_EXHAUSTED` / `QUOTA_EXCEEDED` / `STOCKOUT` in `gcloud` stderr, and GCP `RUNNING`-status timeout. Both providers terminate VMs they created but couldn't bring to readiness, so orchestrator fallback does not leak orphan instances.
 
@@ -380,7 +380,7 @@ experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090/
 ```
 
 ```bash
-deplodock bench experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
+emmy bench experiments/Qwen3-Coder-30B-A3B-Instruct-AWQ/optimal_mcr_rtx5090
 ```
 
 ## CI Benchmark Workflow
@@ -397,7 +397,7 @@ Only users with **write** or **admin** access can trigger benchmarks. For fork P
 
 ## Adding a New VM Provider
 
-1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`. The function must raise `CapacityExhausted` on no-capacity errors and `TerminalProvisionError` on auth/malformed-request errors, and terminate any VM it created but couldn't bring to readiness before re-raising (see `deplodock/provisioning/errors.py`).
+1. Create `provisioning/<provider>.py` with `create_instance()` -> `VMConnectionInfo | None` and `delete_instance()`. The function must raise `CapacityExhausted` on no-capacity errors and `TerminalProvisionError` on auth/malformed-request errors, and terminate any VM it created but couldn't bring to readiness before re-raising (see `emmy/provisioning/errors.py`).
 2. Add CLI handlers in `commands/vm/<provider>.py` (the single-shot manual subcommand).
 3. Register CLI in `commands/vm/__init__.py`.
 4. Add entries to `hardware.py` `GPU_INSTANCE_TYPES` table. If the provider has zone-affinity, add `GPU_<provider>_ZONES` and teach `iter_candidates` in `provisioning/candidates.py` to fan out across them.

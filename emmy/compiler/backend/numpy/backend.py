@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.backend import Backend
+from emmy.compiler.backend import Backend
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 
 class NumpyBackend(Backend):

@@ -7,7 +7,7 @@ tuning data exists. It replaces the old hand-coded matmul heuristic
 features, now expressed as a fixed linear model over the one shared feature dict
 ``knob.knob_features`` produces, so there is a SINGLE ranking path: a config is
 scored by a ``Prior`` (this one cold, ``CatBoostPrior`` once trained), composed
-behind :class:`~deplodock.compiler.pipeline.search.prior.fallback.FallbackPrior`.
+behind :class:`~emmy.compiler.pipeline.search.prior.fallback.FallbackPrior`.
 
 ``score`` returns a positive latency *proxy* (``exp(-scale · wᵀfeatures)``),
 **lower is better** — matching ``CatBoostPrior``'s polarity. The proxy is not
@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.search.prior.base import Prior
+from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.search.prior.base import Prior
 
 # Linear weights over ``knob.knob_features`` (``D_*`` geometry keys + ``MMA_tier``),
 # fit offline by ``scripts/golden_knob_heuristics.py`` jointly over ALL kernel

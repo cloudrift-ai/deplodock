@@ -13,7 +13,7 @@ import logging
 import tarfile
 from pathlib import Path
 
-from deplodock.provisioning.ssh_transport import ssh_base_args
+from emmy.provisioning.ssh_transport import ssh_base_args
 
 logger = logging.getLogger(__name__)
 

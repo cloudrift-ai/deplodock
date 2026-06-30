@@ -95,7 +95,7 @@ class _ExprOps:
         """Emit a target-language (C / CUDA) expression string.
 
         Concrete subclasses override. The ``ctx`` is duck-typed against
-        :class:`deplodock.compiler.ir.stmt.RenderCtx` (intrinsic /
+        :class:`emmy.compiler.ir.stmt.RenderCtx` (intrinsic /
         builtin spelling tables, optional shape map). ``parent_prec``
         drives parenthesization in nested ``BinaryExpr`` chains.
         """
@@ -490,7 +490,7 @@ class FuncCallExpr(_ExprOps):
     args: tuple[Expr, ...]
 
     def eval(self, env: dict[str, object]) -> object:
-        from deplodock.compiler.ir.elementwise import ElementwiseImpl
+        from emmy.compiler.ir.elementwise import ElementwiseImpl
 
         try:
             op = ElementwiseImpl(self.name)

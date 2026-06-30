@@ -12,7 +12,7 @@ import sqlite3
 
 import pytest
 
-from deplodock.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
+from emmy.compiler.pipeline.search.db import NodeRow, PerfStats, SearchDB
 
 
 def _stats(median: float) -> PerfStats:

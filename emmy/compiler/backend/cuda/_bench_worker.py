@@ -7,8 +7,8 @@ Protocol (length-prefixed pickle on stdin/stdout):
 - Parent writes ``<8-byte little-endian length><pickled request>``.
 - One request shape, handled by :func:`_run_job`: ``{"graph": Graph, "nvcc_flags": str|None,
   "torch_spec": None | (...), ...}``. ``torch_spec`` selects the work — ``None`` is a pure
-  deplodock bench (the autotune sweep, ``kwargs`` carries warmup / num_iters / timeouts), otherwise
-  the deployable eager / torch.compile / deplodock comparison (``tune --bench`` / ``run --bench``),
+  emmy bench (the autotune sweep, ``kwargs`` carries warmup / num_iters / timeouts), otherwise
+  the deployable eager / torch.compile / emmy comparison (``tune --bench`` / ``run --bench``),
   rebuilt and run *here* so a hung kernel hangs this child (SIGKILL-recoverable).
 - Response: ``{"ok": True, "result": BenchmarkResult, "results": dict|None, "torch_available": bool}``
   or ``{"ok": False, "error": str, "traceback": str}`` on exception.
@@ -54,7 +54,7 @@ def _hung(exc: BaseException) -> bool:
     resident on the device, so :func:`_context_dirty`'s ``deviceSynchronize`` probe would block
     on it forever — treat it as dirty without probing, so the worker exits promptly and process
     teardown kills the kernel."""
-    from deplodock.compiler.backend.cuda.program import HungKernelError
+    from emmy.compiler.backend.cuda.program import HungKernelError
 
     return isinstance(exc, HungKernelError)
 
@@ -64,34 +64,34 @@ async def _run_job(req: dict) -> dict:
     "torch_available": bool, "captured": bool}`` (``captured``: timings came from
     CUDA-graph-captured windows; False = the all-or-nothing uncaptured fallback ran).
 
-    ``req["torch_spec"]`` picks the work — a pure deplodock bench is just the comparison with a
+    ``req["torch_spec"]`` picks the work — a pure emmy bench is just the comparison with a
     no-op torch request:
 
-    - ``None`` → the deplodock-only autotune bench (``benchmark_program``), no torch comparison.
+    - ``None`` → the emmy-only autotune bench (``benchmark_program``), no torch comparison.
     - ``("trace_args", {code/input/layer/seq_len/dynamic})`` → ``load_or_trace`` rebuilds the real
       module here (HF model id or ``--code`` expr) → ``bench_full_model_real``.
     - ``("frontend_graph", Graph | None)`` → ``bench_lowered_vs_torch`` (per-kernel reproducer).
 
-    Rebuilding the torch side **here** (not pickling a live module) means a hung deplodock kernel
+    Rebuilding the torch side **here** (not pickling a live module) means a hung emmy kernel
     hangs *this* child, which the parent SIGKILLs — recovering the device. ``nvcc_flags`` re-points
     the compile at a given opt level (the cubin cache key folds it in)."""
-    from deplodock import config
+    from emmy import config
 
     with config.nvcc_flags_override(req.get("nvcc_flags")):
         spec = req.get("torch_spec")
         if spec is None:
-            from deplodock.compiler.backend.cuda.program import benchmark_program
+            from emmy.compiler.backend.cuda.program import benchmark_program
 
             result = benchmark_program(req["graph"], **req["kwargs"])
             return {"result": result, "results": None, "torch_available": False, "captured": result.captured}
 
-        from deplodock.compiler.backend.cuda.backend import CudaBackend
+        from emmy.compiler.backend.cuda.backend import CudaBackend
 
         # In-process within this child — the parent's SIGKILL is the wall-timeout backstop.
         backend = CudaBackend(bench_compile_timeout_s=60.0, bench_run_timeout_s=60.0)
         kind, payload = spec
         if kind == "frontend_graph":
-            from deplodock.commands.run import bench_lowered_vs_torch
+            from emmy.commands.run import bench_lowered_vs_torch
 
             results, bench, avail, captured = await bench_lowered_vs_torch(
                 payload,
@@ -106,8 +106,8 @@ async def _run_job(req: dict) -> dict:
         elif kind == "trace_args":
             import types
 
-            from deplodock.commands.compile import load_or_trace
-            from deplodock.commands.run import bench_full_model_real
+            from emmy.commands.compile import load_or_trace
+            from emmy.commands.run import bench_full_model_real
 
             _, _, bundle = load_or_trace(types.SimpleNamespace(**payload))
             if bundle is None:

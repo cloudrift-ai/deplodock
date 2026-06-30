@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.tile.ir import Placement, Schedule, Transport
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._extract import seed_demoted
+from emmy.compiler.context import Context
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.tile.ir import Placement, Schedule, Transport
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._extract import seed_demoted
 from tests.compiler.passes.test_cut_offers import _f32_matmul_graph, _norm_linear_graph, _pointwise_graph
 
 _CC = (12, 0)

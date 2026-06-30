@@ -1,4 +1,4 @@
-"""Deplodock package init.
+"""Emmy package init.
 
 Patches cppyy's bundled ``libCling.so`` once on macOS so its hard-coded
 MacPorts ``/opt/local/lib/libzstd.1.dylib`` dependency is rewritten to

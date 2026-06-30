@@ -13,15 +13,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import BF16, F32, DataType
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, Write
-from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import BF16, F32, DataType
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, TernaryExpr, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Monoid, Select, SelectBranch, Stmt, Write
+from emmy.compiler.ir.stmt.carrier_algebra import split_carrier
+from emmy.compiler.ir.tile.ir import (
     ATOM_REGISTRY,
     Atom,
     AtomTile,
@@ -34,13 +34,13 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraph,
     Transport,
 )
-from deplodock.compiler.ir.twist import MmaTwist
-from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
-from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, chain_free_axes
+from emmy.compiler.ir.twist import MmaTwist
+from emmy.compiler.pipeline.passes.lowering._addr import add as _fadd
+from emmy.compiler.pipeline.passes.lowering._addr import mul as _fmul
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, chain_free_axes
 
 
 def _free_axes(dag: IterDag) -> tuple[Axis, Axis | None, tuple[Loop, ...]]:

@@ -1,10 +1,10 @@
 """Decompose layer_norm(x [, w [, b]]) into (x - mean(x)) * rsqrt(mean((x - mean(x))^2) + eps) [* w] [+ b]."""
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.frontend.ir import LayerNormOp, MeanOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import LayerNormOp, MeanOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
     open_fragment,

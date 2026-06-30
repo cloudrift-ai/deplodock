@@ -14,9 +14,9 @@ whatever the optional ``pre_run`` callback returned; with no callback
 it is ``None``. ``pre_run`` runs once before the backend executes the
 graph and inside whatever serialization the backend uses
 (``gpu_lock()`` on the CUDA backend) — accuracy tests use this to
-compute a torch eager reference on the same GPU window the deplodock
+compute a torch eager reference on the same GPU window the emmy
 launches will see, so peer-worker CUDA activity can't interleave
-between the eager forward and the deplodock comparison.
+between the eager forward and the emmy comparison.
 
 Individual backends may do different internal lowerings: the CUDA backend
 calls ``run_pipeline`` through the full chain (decomposition →
@@ -35,10 +35,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from deplodock.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.base import ConstantOp, InputOp
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 
 @dataclass
@@ -123,7 +123,7 @@ class Backend(ABC):
     # busy past the in-process per-launch / per-iter budgets (those
     # budgets rely on ``cupy.cuda.Event.done`` which never trips on
     # some hangs). Set this for autotune sweeps; leave ``None`` for
-    # interactive ``deplodock run`` so on-iter callbacks and the
+    # interactive ``emmy run`` so on-iter callbacks and the
     # parent's torch instance can be shared in-process.
     bench_wall_timeout_s: float | None = None
 
@@ -142,7 +142,7 @@ class Backend(ABC):
 
         ``pre_run`` runs once before the backend executes the graph and
         inside whatever serialization the backend uses (the GPU lock on
-        :class:`~deplodock.compiler.backend.cuda.backend.CudaBackend`).
+        :class:`~emmy.compiler.backend.cuda.backend.CudaBackend`).
         Its return value flows through as the tuple's second element.
         With no callback the second element is ``None``.
 
@@ -163,7 +163,7 @@ class Backend(ABC):
         # ``CudaBackend.run``): each atomic symbolic input dim records its
         # runtime size; downstream node shapes — possibly composite Dim
         # exprs — resolve via ``expr.eval(sym_env)``.
-        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
         sym_env: dict[str, int] = {}
         for nid in input_set:

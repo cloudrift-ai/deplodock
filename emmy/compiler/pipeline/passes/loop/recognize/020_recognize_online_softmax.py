@@ -3,14 +3,14 @@
 A standalone ``softmax(x, dim=-1)`` decomposes into THREE loops over the reduce axis: a row-max
 reduce, a ``Σ exp(x − max)`` reduce, then a normalize. This recognizer fuses the first two — the only
 ones that re-read ``x`` to recompute the same `exp` — into a single streaming **online-softmax**
-:class:`~deplodock.compiler.ir.stmt.Monoid` pass (the flash softmax-stats trick applied standalone):
+:class:`~emmy.compiler.ir.stmt.Monoid` pass (the flash softmax-stats trick applied standalone):
 
     for kv: m = max(m, x);  d = d·exp(m_old − m) + exp(x − m);   (one pass)
 
 The carried states keep the original Accum names (``m`` = the rowmax acc, ``d`` = the sum acc), so the
 downstream ``reciprocal(d)`` + normalize loop are untouched — 3 passes over ``x`` become 2. The
 resulting flat ``Monoid`` flows through the MONOID regime like any reduce; its serial realization is
-the carrier-generic :class:`~deplodock.compiler.ir.twist.ScalarCombiner`.
+the carrier-generic :class:`~emmy.compiler.ir.twist.ScalarCombiner`.
 
 A pattern-recognition pass (sibling of ``010_recognize_flash``): runs after the ``loop/fusion``
 fixpoint, gated by the ``ONLINE_SOFTMAX`` knob (off → untouched). The matcher anchors on an adjacent
@@ -22,11 +22,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Init, Load, Loop, LoopOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import ONLINE_SOFTMAX, online_softmax_combine
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.loop.ir import Accum, Assign, Body, Init, Load, Loop, LoopOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.loop.recognize._flash import ONLINE_SOFTMAX, online_softmax_combine
 
 PATTERN = [Pattern("root", LoopOp)]
 

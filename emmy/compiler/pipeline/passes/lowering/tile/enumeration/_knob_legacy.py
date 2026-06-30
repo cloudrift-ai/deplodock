@@ -5,7 +5,7 @@ The native ``MOVE@element`` schema (``_families``) is the source of truth everyw
 the pipeline faces inward — storage, ``eval`` display, new goldens, new tests all speak
 native. The legacy names (``BN``/``BM``/``BK``/``WM``/``MMA``/…) survive only as an
 **ingest-only** translation at the read boundary, so an existing env pin
-(``DEPLODOCK_BK=16``) or a legacy-recorded golden YAML still resolves. There is
+(``EMMY_BK=16``) or a legacy-recorded golden YAML still resolves. There is
 deliberately **no** reverse (``project``): nothing ever maps native → legacy.
 
 The bridge is the **element-resolution rule** — the canonical DAG ranking the move
@@ -24,11 +24,11 @@ This module is the ONE place the canonical ranking is named for the legacy bridg
 
 from __future__ import annotations
 
-from deplodock import config
+from emmy import config
 
 
 def _int_pin(name: str) -> int | None:
-    """A legacy ``DEPLODOCK_<NAME>`` env pin as an int, or ``None`` when unset /
+    """A legacy ``EMMY_<NAME>`` env pin as an int, or ``None`` when unset /
     unparseable."""
     raw = config.knob_raw(name)
     if raw is None or raw == "":
@@ -75,7 +75,7 @@ def split_reg(dag, axis_name: str) -> int | None:
 
 
 def stage_mask(n: int) -> int | None:
-    """Legacy ``DEPLODOCK_STAGE`` bitmask over ``n`` ranked staged read-sites
+    """Legacy ``EMMY_STAGE`` bitmask over ``n`` ranked staged read-sites
     (``"11"`` / ``"all"`` / ``"none"`` / int), ingested as the placement pin. ``None``
     when unset (auto-enumerate)."""
     raw = config.knob_raw("STAGE")
@@ -95,7 +95,7 @@ def stage_mask(n: int) -> int | None:
 
 
 def tma_pin() -> bool | None:
-    """Legacy ``DEPLODOCK_TMA`` transport pin (ingested as the ``:tma`` vs ``:sync``
+    """Legacy ``EMMY_TMA`` transport pin (ingested as the ``:tma`` vs ``:sync``
     xport for staged ``PLACE@<edge>``). ``None`` when unset."""
     raw = config.knob_raw("TMA")
     if raw is None or raw == "":
@@ -104,7 +104,7 @@ def tma_pin() -> bool | None:
 
 
 def cut_pin() -> bool | None:
-    """Legacy ``DEPLODOCK_CUT`` / ``DEPLODOCK_SPLIT_CONE`` (a width-1 bitmask; any non-zero
+    """Legacy ``EMMY_CUT`` / ``EMMY_SPLIT_CONE`` (a width-1 bitmask; any non-zero
     bit = cut), ingested as the demoted-cone keep-vs-cut decision. ``None`` when unset."""
     raw = config.knob_raw("CUT")
     if raw is None:
@@ -125,20 +125,20 @@ def cut_pin() -> bool | None:
 
 
 def chain_pin() -> bool:
-    """Legacy ``DEPLODOCK_CHAIN`` opt-in (ingested as ``PLACE@<score>=inline`` — the
+    """Legacy ``EMMY_CHAIN`` opt-in (ingested as ``PLACE@<score>=inline`` — the
     FA-2 shared-score warp-chain). ``False`` when unset."""
     raw = config.knob_raw("CHAIN")
     return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def atom_raw() -> str | None:
-    """The legacy ``DEPLODOCK_MMA`` env pin (``0``/``scalar`` / a kind / auto), ingested
+    """The legacy ``EMMY_MMA`` env pin (``0``/``scalar`` / a kind / auto), ingested
     as the atom control for the matmul cell. ``None`` when unset."""
     return config.knob_raw("MMA")
 
 
 def reduce_fields(dag, axis_name: str) -> tuple[int | None, int | None, int | None, int | None]:
-    """Legacy ``DEPLODOCK_BK`` / ``FK`` / ``SPLITK`` / ``BR`` → the native
+    """Legacy ``EMMY_BK`` / ``FK`` / ``SPLITK`` / ``BR`` → the native
     ``(serial, fold, cta, coop)`` REDUCE factors, applied to the **primary** reduce
     axis only (rank-0 = ``dag.k_node``). Each field is the pinned int or ``None``
     (unpinned → the offer keeps its full menu). A non-primary reduce axis (a streaming

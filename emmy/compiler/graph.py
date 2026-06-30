@@ -24,8 +24,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from deplodock.compiler.ir.base import InputOp, Op
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.ir.base import InputOp, Op
+from emmy.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
 # Hints
@@ -126,13 +126,13 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     Used by ``Graph.from_dict`` to reconstruct nodes. Lazy-imports each
     module to avoid pulling them all in at graph import time.
     """
-    from deplodock.compiler.ir import base as _base
-    from deplodock.compiler.ir.cuda import ir as _cuda
-    from deplodock.compiler.ir.frontend import ir as _frontend
-    from deplodock.compiler.ir.kernel import ir as _kernel
-    from deplodock.compiler.ir.loop import ir as _loop
-    from deplodock.compiler.ir.tensor import ir as _tensor
-    from deplodock.compiler.ir.tile import ir as _tile
+    from emmy.compiler.ir import base as _base
+    from emmy.compiler.ir.cuda import ir as _cuda
+    from emmy.compiler.ir.frontend import ir as _frontend
+    from emmy.compiler.ir.kernel import ir as _kernel
+    from emmy.compiler.ir.loop import ir as _loop
+    from emmy.compiler.ir.tensor import ir as _tensor
+    from emmy.compiler.ir.tile import ir as _tile
 
     for module in (_base, _tensor, _frontend, _loop, _tile, _kernel, _cuda):
         cls = getattr(module, name, None)
@@ -158,10 +158,10 @@ def _serialize_field(v):
     Everything else passes through. ``_deserialize_field`` reverses
     this on load.
     """
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.stmt import Body
-    from deplodock.compiler.ir.tensor.ir import IndexSource
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.stmt import Body
+    from emmy.compiler.ir.tensor.ir import IndexSource
 
     # ``IndexSource`` (IndexMapOp.sources) is a plain dataclass holding ``Expr``
     # objects — serialize as eval-able repr strings, the same round-trip the
@@ -199,7 +199,7 @@ def _deserialize_field(k, v):
     Stmt instances. Nested-op dicts (``{"__op__": ..., "fields": ...}``)
     are reconstructed via ``_lookup_op_class``. The eval scope mirrors
     the IR's ``__all__`` exports — same classes the Stmt reprs reference."""
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
 
     if k == "op" and isinstance(v, str):
         return ElementwiseImpl(v)
@@ -241,11 +241,11 @@ def _stmt_eval_scope() -> dict:
         return _STMT_EVAL_SCOPE
     import numpy as _np
 
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.dtype import DataType
-    from deplodock.compiler.ir.axis import Axis
-    from deplodock.compiler.ir.elementwise import ElementwiseImpl
-    from deplodock.compiler.ir.expr import (
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.dtype import DataType
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.elementwise import ElementwiseImpl
+    from emmy.compiler.ir.expr import (
         BinaryExpr,
         Builtin,
         CastExpr,
@@ -254,8 +254,8 @@ def _stmt_eval_scope() -> dict:
         TernaryExpr,
         Var,
     )
-    from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
-    from deplodock.compiler.ir.stmt import (
+    from emmy.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
+    from emmy.compiler.ir.stmt import (
         Accum,
         Assign,
         Cond,
@@ -269,8 +269,8 @@ def _stmt_eval_scope() -> dict:
         Unpack,
         Write,
     )
-    from deplodock.compiler.ir.tensor.ir import IndexSource
-    from deplodock.compiler.ir.tile.ir import (
+    from emmy.compiler.ir.tensor.ir import IndexSource
+    from emmy.compiler.ir.tile.ir import (
         AffineAddressing,
         AsyncWait,
         GridTile,
@@ -508,12 +508,12 @@ class Graph:
           the dissolved shared producer) are dropped.
 
         ``mint_pieces`` selects how op provenance threads through (see
-        :mod:`deplodock.compiler.provenance`): ``True`` for decomposition (each
+        :mod:`emmy.compiler.provenance`): ``True`` for decomposition (each
         new fragment node is a fresh piece of the consumed origins), ``False``
         for fusion / lifting / folds (fragment outputs aggregate the consumed
         pieces). The prov hint is overwritten after the generic hint merge so
         union semantics win over last-writer."""
-        from deplodock.compiler import provenance  # noqa: PLC0415
+        from emmy.compiler import provenance  # noqa: PLC0415
 
         consumed = list(consumed)
         consumed_prov = {nid: provenance.get(self.nodes[nid]) for nid in consumed if nid in self.nodes}
@@ -635,7 +635,7 @@ class Graph:
         return list(self._users.get(node_id, ()))
 
     def structural_key(self) -> str:
-        """Implements :class:`deplodock.compiler.structural.Structural`.
+        """Implements :class:`emmy.compiler.structural.Structural`.
 
         Merkle-style structural digest of the graph. Two graphs that
         compute the same dataflow — same op kinds, same canonicalized op
@@ -664,9 +664,9 @@ class Graph:
         """
         from dataclasses import fields as dc_fields  # noqa: PLC0415
 
-        from deplodock.compiler.dim import Dim  # noqa: PLC0415
-        from deplodock.compiler.ir.stmt.body import Body  # noqa: PLC0415
-        from deplodock.compiler.structural import digest  # noqa: PLC0415
+        from emmy.compiler.dim import Dim  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
+        from emmy.compiler.structural import digest  # noqa: PLC0415
 
         def _unwrap_dims(v: object) -> object:
             """Unwrap ``Dim`` to its ``int | str`` value (recursively into
@@ -791,7 +791,7 @@ class Graph:
 
     def pretty_print(self) -> str:
         """Render the graph as readable text (topological order + sections)."""
-        from deplodock.compiler.ir.base import ConstantOp, InputOp
+        from emmy.compiler.ir.base import ConstantOp, InputOp
 
         order = self.topological_order()
         lines: list[str] = [
@@ -854,11 +854,11 @@ class Graph:
                 "output": {
                     "name": node.output.name,
                     # JSON dump preserves atomic Dims (int / Var name) so the
-                    # round-trip ``deplodock run --ir <json>`` flow reconstructs
+                    # round-trip ``emmy run --ir <json>`` flow reconstructs
                     # them via ``Dim(value)``. Composite Dims (BinaryExpr-backed,
                     # e.g. a CatOp output or the demoted symbolic-N B operand's
                     # ``round_up(seq_len, 64)`` TMA-padded inner extent) serialize
-                    # to their pretty expr string so a ``DEPLODOCK_DUMP_DIR`` dump
+                    # to their pretty expr string so a ``EMMY_DUMP_DIR`` dump
                     # of a dynamic-attention graph doesn't crash; they don't
                     # round-trip back through ``run --ir`` (the string isn't
                     # re-parsed) — a debug-dump artifact only, matching the prior
@@ -901,7 +901,7 @@ def _rename_buf_in_op(op, old: str, new: str):
     the decomposition attribution link (``Candidate.apply`` stamps the
     pre-split op as each fragment kernel's ``source``; the two-level tuner's
     composed Σ rows group by it)."""
-    from deplodock.compiler.ir.loop import Load, LoopOp, Write
+    from emmy.compiler.ir.loop import Load, LoopOp, Write
 
     if not isinstance(op, LoopOp):
         return op
@@ -976,7 +976,7 @@ def _fmt_indexmap(node: Node, graph: Graph) -> str:
     visually distinct from scalar slices. Everything else (multi-source,
     selected reads, many dims) falls back to ``indexmap(src0, src1, ...)``.
     """
-    from deplodock.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
+    from emmy.compiler.ir.expr import PLACEHOLDER_PREFIX, Literal, Var
 
     op = node.op
     sources = op.sources

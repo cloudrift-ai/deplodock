@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 
-from deplodock.compiler.pipeline.search.data.sample import Sample
+from emmy.compiler.pipeline.search.data.sample import Sample
 
 
 class Dataset:
@@ -51,7 +51,7 @@ class Dataset:
         ``live_gpu`` scopes to the live card's goldens (:func:`goldens_for_live_gpu`)
         — so a multi-GPU goldens dir doesn't return another card's config under the
         same name (cards with no recorded golden fall back to the full set)."""
-        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
         source = goldens_for_live_gpu() if live_gpu else GOLDEN_CONFIGS
         configs = [g for g in source if isinstance(g, MatmulGoldenConfig)]
@@ -73,7 +73,7 @@ class Dataset:
         filters on the parsed C identifier. ``status`` selects the row status
         (``bench_fail`` rows carry the watchdog-timeout sentinel latency, so the
         default ``min_latency`` admits them)."""
-        from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
 
         db = SearchDB.open_readonly(path)
         try:

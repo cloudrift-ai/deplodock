@@ -29,14 +29,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dim import to_dim
-from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Monoid, Stmt, Write
-from deplodock.compiler.ir.tile.ir import Binding, Block, Buffer, Schedule, SerialTile, Space, TileGraph, TileGraphOp
+from emmy.compiler.dim import to_dim
+from emmy.compiler.dtype import F32, DataType
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Monoid, Stmt, Write
+from emmy.compiler.ir.tile.ir import Binding, Block, Buffer, Schedule, SerialTile, Space, TileGraph, TileGraphOp
 
 # Fixed combine schedule — bandwidth-bound at any realistic shape, so per-shape
 # autotune would only re-discover it (the deleted 017's _BM_RED / _BN_RED).

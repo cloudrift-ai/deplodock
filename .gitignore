@@ -10,7 +10,7 @@ __pycache__/
 *.cubin
 
 # Python egg-info
-deplodock.egg-info/
+emmy.egg-info/
 
 # Build and run artifacts
 dist/

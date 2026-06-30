@@ -17,11 +17,11 @@ and is honored by the loader regardless of how a chain got recorded.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.pipeline import RuleSkipped
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
-from deplodock.compiler.target import compute_capability
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import ConstantOp
+from emmy.compiler.pipeline import RuleSkipped
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
+from emmy.compiler.target import compute_capability
 
 
 def fold_into_constant(graph: Graph, root: Node, inp_x: Node, out: Tensor) -> Graph | None:

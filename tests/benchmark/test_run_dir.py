@@ -2,7 +2,7 @@
 
 import re
 
-from deplodock.planner import BenchmarkTask
+from emmy.planner import BenchmarkTask
 
 
 def test_run_dir_created(tmp_path):

@@ -12,12 +12,12 @@ consistent across a normalize round-trip.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra, contains_matmul_reduce
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.loop import Accum, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Assign, Mma, Monoid
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
+from emmy.compiler.ir.algebra import AlgebraKind, classify_algebra, contains_matmul_reduce
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.loop import Accum, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Assign, Mma, Monoid
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY
 
 
 def _matmul_loop(k_ext: int = 8) -> Loop:

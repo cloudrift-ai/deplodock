@@ -22,14 +22,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 
 def _kernel_compute_types() -> tuple[type, ...]:
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-    from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
 
     # ``TileGraphOp`` is a kernel-bearing op too: an outer two-level terminal slices
     # partially-tiled ``TileGraphOp`` seeds (the structural-fork producer/consumer), so a
@@ -42,7 +42,7 @@ def collect_kernel_ancestors(graph: Graph, root_id: str, compute_types: tuple[ty
     ancestors. Compute-op ancestors (another kernel feeding this one) are
     returned in the ``synthetic`` set — they become synthetic ``InputOp``
     boundaries in the slice and their own producers are NOT walked."""
-    from deplodock.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
+    from emmy.compiler.ir.base import ConstantOp, InputOp  # noqa: PLC0415
 
     keep: set[str] = {root_id}
     synthetic: set[str] = set()
@@ -88,8 +88,8 @@ def single_node_graph(graph: Graph, node_id: str) -> Graph:
     ``node_id`` and whose ``inputs`` list its synthetic boundaries + real
     graph inputs — sized identically to the full graph (partition
     enumeration depends on the producers' extents)."""
-    from deplodock.compiler.graph import Graph as _Graph  # noqa: PLC0415
-    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
+    from emmy.compiler.graph import Graph as _Graph  # noqa: PLC0415
+    from emmy.compiler.ir.base import InputOp  # noqa: PLC0415
 
     keep, synthetic = collect_kernel_ancestors(graph, node_id, _kernel_compute_types())
     sub = _Graph()

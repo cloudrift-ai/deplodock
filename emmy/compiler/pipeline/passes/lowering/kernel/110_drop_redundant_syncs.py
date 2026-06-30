@@ -14,8 +14,8 @@ where the syncs are load-bearing.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.kernel.ir import (
     CpAsyncCommit,
     CpAsyncCopy,
     CpAsyncWait,
@@ -29,9 +29,9 @@ from deplodock.compiler.ir.kernel.ir import (
     TreeHalve,
     WarpShuffle,
 )
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
 

@@ -26,8 +26,8 @@ class _Sdpa(torch.nn.Module):
 
 
 def _compile(q, k, v):
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(_Sdpa().cpu(), (q, k, v))
     backend = CudaBackend()
@@ -42,8 +42,8 @@ def _compile(q, k, v):
 def test_cooperative_flash_matches_torch(monkeypatch, br, B, H, S, D):
     """A cooperative-KV flash (BR>1) fuses to one kernel carrying the monoid
     cross-thread combine and matches torch SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_BR", br)
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_BR", br)
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
     backend, compiled, kernels = _compile(q, k, v)

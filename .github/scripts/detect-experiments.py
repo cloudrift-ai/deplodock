@@ -5,7 +5,7 @@ Two modes:
 - Explicit: /run-experiment experiments/Foo/bar experiments/Baz/qux [--flags]
 - Auto-detect: /run-experiment (no args) [--flags] — finds changed experiments via git diff
 
-Any --flags in the comment are passed through to `deplodock bench` as-is.
+Any --flags in the comment are passed through to `emmy bench` as-is.
 Outputs a complete bench command that the workflow appends --dry-run or
 --commit-results to.
 """
@@ -80,8 +80,8 @@ def main():
         print(f"Error: No experiments found ({mode} mode)", file=sys.stderr)
         sys.exit(1)
 
-    # Build the full bench command: deplodock bench <dirs> [flags]
-    bench_command = " ".join(["deplodock", "bench", *experiments, *extra_tokens])
+    # Build the full bench command: emmy bench <dirs> [flags]
+    bench_command = " ".join(["emmy", "bench", *experiments, *extra_tokens])
 
     print(f"Detected experiments ({mode}):")
     for exp in experiments:

@@ -6,7 +6,7 @@ type names (``float`` / ``__half``), conversion intrinsics
 (``expf`` / ``hexp``, ``fmaxf`` / ``__hmax``, ...), and the set of
 ops with native fp16 forms.
 
-The Stmt renderer in :mod:`deplodock.compiler.ir.stmt` calls into a
+The Stmt renderer in :mod:`emmy.compiler.ir.stmt` calls into a
 :class:`CudaRenderTarget` instance attached to ``RenderCtx``; the
 hardcoded ``__half2``/``__float2half`` strings that used to live next
 to ``Load`` / ``Assign`` / ``Write`` are gone.
@@ -14,7 +14,7 @@ to ``Load`` / ``Assign`` / ``Write`` are gone.
 
 from __future__ import annotations
 
-from deplodock.compiler import dtype as _dtype
+from emmy.compiler import dtype as _dtype
 
 _TYPE_NAME: dict[str, str] = {"f32": "float", "f16": "__half", "f16x2": "__half2"}
 
@@ -92,7 +92,7 @@ class CudaRenderTarget:
 
     Stateless; safe to share across render calls. The Kernel-IR
     renderer constructs one per ``render_kernelop`` invocation (see
-    ``deplodock/compiler/ir/kernel/render.py``).
+    ``emmy/compiler/ir/kernel/render.py``).
     """
 
     def type_name(self, dtype: str) -> str:

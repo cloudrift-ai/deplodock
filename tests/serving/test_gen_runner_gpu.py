@@ -1,10 +1,10 @@
-"""Phase-2 multi-layer host-stitch test for ``DeplodockGenRunner`` (no vLLM).
+"""Phase-2 multi-layer host-stitch test for ``EmmyGenRunner`` (no vLLM).
 
 ``perf``-marked: needs CUDA + cupy. Builds a tiny multi-layer Qwen3, then runs a whole-model
-Python stitch — ``embed`` → per layer (deplodock ``pre`` kernels → reconstruct RoPE →
-reference causal GQA torch SDPA → deplodock ``post`` kernels) → ``final_norm`` → lm_head —
+Python stitch — ``embed`` → per layer (emmy ``pre`` kernels → reconstruct RoPE →
+reference causal GQA torch SDPA → emmy ``post`` kernels) → ``final_norm`` → lm_head —
 and checks the stitched logits against eager. This is the dress rehearsal for the vLLM
-forward (Phase 3) without vLLM's runner, isolating the deplodock↔attention interleave.
+forward (Phase 3) without vLLM's runner, isolating the emmy↔attention interleave.
 fp32 (carve correctness is dtype-independent; the fp16 path is covered by the Phase-0 oracle).
 """
 
@@ -48,8 +48,8 @@ def test_gen_runner_stitch_matches_eager():
 
     from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
-    from deplodock.compiler.trace.huggingface import build_causal_mask
-    from deplodock.serving.gen_runner import DeplodockGenRunner
+    from emmy.compiler.trace.huggingface import build_causal_mask
+    from emmy.serving.gen_runner import EmmyGenRunner
 
     config = transformers.Qwen3Config(
         vocab_size=64,
@@ -65,7 +65,7 @@ def test_gen_runner_stitch_matches_eager():
     torch.manual_seed(0)
     model = transformers.Qwen3ForCausalLM(config).eval()  # fp32; build_attention_split_wrapper does NOT mutate it
 
-    runner = DeplodockGenRunner.from_model(model, dtype_str="float32")
+    runner = EmmyGenRunner.from_model(model, dtype_str="float32")
     assert runner.num_layers == config.num_hidden_layers
 
     t = 7
@@ -74,7 +74,7 @@ def test_gen_runner_stitch_matches_eager():
     mask = build_causal_mask(t, torch.float32)  # [1, 1, T, T]
     cos, sin = model.model.rotary_emb(torch.zeros(1, t, config.hidden_size), position_ids)
 
-    # --- deplodock host stitch ---
+    # --- emmy host stitch ---
     hidden = runner.embed(input_ids)  # np [T, H]
     for layer in range(runner.num_layers):
         residual = hidden
@@ -106,7 +106,7 @@ def test_gen_runner_device_path_matches_host():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from deplodock.serving.gen_runner import DeplodockGenRunner
+    from emmy.serving.gen_runner import EmmyGenRunner
 
     config = transformers.Qwen3Config(
         vocab_size=64,
@@ -121,7 +121,7 @@ def test_gen_runner_device_path_matches_host():
     )
     torch.manual_seed(0)
     model = transformers.Qwen3ForCausalLM(config).eval()
-    runner = DeplodockGenRunner.from_model(model, dtype_str="float32", decode_bucket=16)
+    runner = EmmyGenRunner.from_model(model, dtype_str="float32", decode_bucket=16)
     if not runner.has_device_decode:
         pytest.skip("decode-bucket programs unavailable for this shape")
 

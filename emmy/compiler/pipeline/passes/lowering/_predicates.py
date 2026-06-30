@@ -17,9 +17,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.algebra import matmul_reduce
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.ir import Block, SerialTile, StridedTile
+from emmy.compiler.ir.algebra import matmul_reduce
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, StridedLoop, Write
+from emmy.compiler.ir.tile.ir import Block, SerialTile, StridedTile
 
 _EPILOGUE_LEAF_DTYPES = frozenset({"f16", "bf16", "f32"})
 
@@ -60,7 +60,7 @@ def segmentable_k_extent(load: Load, k_name: str) -> int | None:
 
     Returns ``None`` for a single-K-dim load (already stageable) or a fold whose
     inner dim isn't a literal-modulus contiguous run (not safely C-alignable)."""
-    from deplodock.compiler.ir.expr import BinaryExpr, Literal  # noqa: PLC0415
+    from emmy.compiler.ir.expr import BinaryExpr, Literal  # noqa: PLC0415
 
     if not load.index:
         return None
@@ -229,7 +229,7 @@ def classify_fragment_epilogue(
     kernels. An outer leaf passes the same produced / dtype / per-dim role
     checks as an in-slice one (its indices carry no cell axes by construction
     — they're not in scope at the root — so it folds as a ``fixed`` load)."""
-    from deplodock.compiler.ir.stmt import Assign, Load, Write  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Assign, Load, Write  # noqa: PLC0415
 
     # One deep walk in body order: stmts with their inside-a-reduce-loop flag,
     # plus the reduce axis names (for the index check).
@@ -265,8 +265,8 @@ def classify_fragment_epilogue(
     # Renderability probe: the fold translates each chain op exactly like the
     # scalar Assign render does (``op_to_expr``) — an op that translation
     # doesn't cover (or with the wrong arity) is an ineligible operation.
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
 
     for a in slice_assigns:
         try:
@@ -295,7 +295,7 @@ def classify_fragment_epilogue(
     # dims give the M (second-to-last) / N (last) motions. Computed here (before
     # leaf classification) because a folded Select's predicate is checked
     # against these coordinate vars.
-    from deplodock.compiler.ir.stmt import Select  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Select  # noqa: PLC0415
 
     w_var_dims = [d for d, e in enumerate(write.index) if e.free_vars()]
     if not w_var_dims:

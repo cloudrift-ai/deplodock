@@ -64,12 +64,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget
-from deplodock.compiler.dtype import F16, F32
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Stmt, Write
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
+from emmy.compiler.dtype import F16, F32
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Stmt, Write
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

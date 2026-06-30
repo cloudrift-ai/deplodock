@@ -10,15 +10,15 @@ kernel_op.outputs`` keys — matches the kernel signature emitted by
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.cuda import CudaOp, TmaDescMeta
-from deplodock.compiler.ir.cuda.ir import GridDimSpec
-from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import TmaDescriptor
-from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
+from emmy.compiler.ir.cuda.ir import GridDimSpec
+from emmy.compiler.ir.kernel import KernelOp
+from emmy.compiler.ir.kernel.ir import TmaDescriptor
+from emmy.compiler.ir.kernel.render import render_kernelop
+from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.tensor import Tensor
 
 PATTERN = [Pattern("root", KernelOp)]
 
@@ -104,7 +104,7 @@ def _launch_geometry(
     seen = _collect_symbolic_axis_names(kernel_op)
 
     def _axes_spec(axes) -> GridDimSpec:
-        from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
         factors: list = []
         for a in axes:
@@ -152,7 +152,7 @@ def _launch_geometry(
             # Symbolic flattened pointwise: grid = ceil_div(prod(extents), _BLOCK).
             # ``Dim`` arithmetic folds the static factors and carries the
             # symbolic ones; the launch resolver evals the Expr per launch.
-            from deplodock.compiler.dim import Dim  # noqa: PLC0415
+            from emmy.compiler.dim import Dim  # noqa: PLC0415
 
             nthreads = Dim(1)
             for a in s.axes:
@@ -170,8 +170,8 @@ def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
     ``Axis.extent.as_atom_name()``) referenced by any tile or loop. Dict
     (not set) so insertion order matches first-seen order — kernel param
     signature is stable across runs of the same kernel."""
-    from deplodock.compiler.ir.axis import Axis  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt.base import Stmt  # noqa: PLC0415
+    from emmy.compiler.ir.axis import Axis  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.base import Stmt  # noqa: PLC0415
 
     seen: dict[str, None] = {}
 

@@ -1,20 +1,20 @@
 """torch_ref: the Graph→torch evaluator used as the eager reference for
-``deplodock run --ir``. Validated against each op's numpy ``forward()`` on
+``emmy run --ir``. Validated against each op's numpy ``forward()`` on
 CPU (no GPU needed)."""
 
 import numpy as np
 import pytest
 
-from deplodock.compiler.backend import torch_ref
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp, SoftmaxOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
+from emmy.compiler.backend import torch_ref
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import BinaryExpr, Literal, placeholder
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp, SoftmaxOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
 
 # torch is only needed to build reference tensors / call the evaluator; the
-# deplodock imports above are torch-free, so gate after them.
+# emmy imports above are torch-free, so gate after them.
 torch = pytest.importorskip("torch")
 
 
@@ -61,7 +61,7 @@ def test_declared_dtype_cast_is_enforced():
     back to fp16) into each node's declared output dtype; ``build_callable``
     must cast accordingly — torch promotion alone would carry the f16×f32 mix
     forward at fp32 and ``F.linear`` would reject the f32×f16 operands."""
-    from deplodock.compiler.dtype import F16, F32
+    from emmy.compiler.dtype import F16, F32
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("x", (4, 8), F16), node_id="x")
@@ -140,8 +140,8 @@ def test_symbolic_shapes_resolve_from_input_tensors():
     concrete tensors: ``build_callable`` binds ``seq_len`` from the supplied
     tensor's shape, and shape-resolving ops (``ReshapeOp`` target) eval through
     that env instead of raising on ``as_static``."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.frontend.ir import ReshapeOp
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.frontend.ir import ReshapeOp
 
     s = Dim("seq_len")
     g = Graph()

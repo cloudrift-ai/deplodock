@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from deplodock.recipe.types import Recipe
+from emmy.recipe.types import Recipe
 
 
 @dataclass

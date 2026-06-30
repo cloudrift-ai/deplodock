@@ -1,22 +1,22 @@
 """Golden-config evaluation harness — reconstructs a matmul shape's enumeration
 and ranks it with a ``Prior``.
 
-Ranking itself now lives in :mod:`deplodock.compiler.pipeline.search.prior`: the
+Ranking itself now lives in :mod:`emmy.compiler.pipeline.search.prior`: the
 hand-coded :class:`AnalyticPrior` (the cold-start linear model over
 ``knob.knob_features``) and the learned ``CatBoostPrior`` are the ONE ranking
 path. This module is just the offline *evaluation* glue — given a recorded golden
 it enumerates the shape's candidate rows and reports the golden's rank under a
 scorer (the ``AnalyticPrior`` by default; ``eval prior`` passes the learned one).
-Used by ``deplodock eval analytic`` / ``eval prior`` and the prior diagnostics.
+Used by ``emmy eval analytic`` / ``eval prior`` and the prior diagnostics.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.context import Context
+from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
 # Free-axis knobs the thread-tier / warp-tier enumeration decides — the projection a
 # golden is matched on (the reduce decomposition is now the native ``REDUCE@<axis>``
@@ -56,15 +56,15 @@ def _matmul_dag(M: int, N: int, K: int, dtype: str, ctx: Context):
     Reuses the real frontend → loop lowering (``LOOP_PASSES``, option-0 greedy
     resolve, no GPU) so the dag's axes / extents / carrier match what the live
     pipeline tiles. Returns ``None`` if nothing lowers (a degenerate shape)."""
-    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
-    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
-    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
-    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
-    from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
-    from deplodock.compiler.pipeline.fork import Fork  # noqa: PLC0415
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
-    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+    from emmy.compiler import dtype as _dt  # noqa: PLC0415
+    from emmy.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from emmy.compiler.ir.base import InputOp  # noqa: PLC0415
+    from emmy.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.pipeline.fork import Fork  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
+    from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     dt = _dt.get({"fp32": "f32", "fp16": "f16", "bf16": "bf16"}.get(dtype, dtype))
     g = Graph()
@@ -92,7 +92,7 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
     warp tier for ``fp16``/``bf16`` (atom × warp counts × register cells × K-chunk).
     Rows are in enumeration (construction) order; ranking is the caller's
     ``scorer`` (the :class:`AnalyticPrior` by default), not an enumeration sort."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
 
     dag = _matmul_dag(M, N, K, dtype, ctx)
     if dag is None:
@@ -115,7 +115,7 @@ def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[d
         gated = [r for r in rows if _matmul_thread_gate(r, dag, rk)]
         return (gated or rows), THREAD_KNOBS
 
-    from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import ATOM_REGISTRY  # noqa: PLC0415
 
     atom = ATOM_REGISTRY.get({"fp16": "mma_m16n8k16_f16", "bf16": "mma_m16n8k16_bf16"}.get(dtype, ""))
     if atom is None:
@@ -141,7 +141,7 @@ def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = Fa
     the 992 stamp for a symbolic-M shape: M drops out of the free-dim product and
     ``S_ext_n_symbolic_axis`` is set — the flag the prior selects its masked-tier
     weight set on."""
-    from deplodock.compiler.pipeline.search.prior import AnalyticPrior  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import AnalyticPrior  # noqa: PLC0415
 
     ap = AnalyticPrior()
     free = float(N) if dynamic else float(M * N)

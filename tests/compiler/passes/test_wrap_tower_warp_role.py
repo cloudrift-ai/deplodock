@@ -10,15 +10,15 @@ tier without revisiting the tower mechanics. These tests poke
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Write
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Write
+from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 
 # ``Role`` / ``_wrap_tower`` / ``_layer_kind_for`` were extracted from the
 # partition planner into the shared ``partition._tower`` module (the legacy
 # planner imports them back); the move composer reuses the same mechanics.
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _layer_kind_for, _wrap_tower
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _layer_kind_for, _wrap_tower
 
 
 def _stub_inner() -> tuple:

@@ -1,18 +1,18 @@
 """Deploy library: compose generation, deploy orchestration, scale-out strategies."""
 
-from deplodock.deploy.compose import (
+from emmy.deploy.compose import (
     calculate_num_instances,
     generate_compose,
     generate_nginx_conf,
 )
-from deplodock.deploy.orchestrate import (
+from emmy.deploy.orchestrate import (
     deploy,
     run_deploy,
     run_teardown,
     teardown,
 )
-from deplodock.deploy.params import DeployParams
-from deplodock.deploy.scale_out import (
+from emmy.deploy.params import DeployParams
+from emmy.deploy.scale_out import (
     DEFAULT_STRATEGY,
     STRATEGIES,
     DataParallelismScaleOutStrategy,

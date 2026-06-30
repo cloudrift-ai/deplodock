@@ -1,7 +1,7 @@
 """Generic JSON file I/O with numpy-array support and atomic writes.
 
 A small utility shared by anything that needs to persist a plain-data artifact
-(today: the learned tuning prior in :mod:`deplodock.compiler.pipeline.search.prior`).
+(today: the learned tuning prior in :mod:`emmy.compiler.pipeline.search.prior`).
 :func:`write_json` / :func:`read_json` round-trip nested dicts/lists of JSON
 scalars **plus** ``numpy`` arrays — each array is stored as a base64 blob with
 its dtype + shape (``{"__ndarray__": <b64>, "dtype": ..., "shape": ...}``), so

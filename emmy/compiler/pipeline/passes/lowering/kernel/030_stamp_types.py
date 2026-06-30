@@ -37,9 +37,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import (
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import (
     Accum,
     Assign,
     Body,
@@ -50,9 +50,9 @@ from deplodock.compiler.ir.stmt import (
     Unpack,
     Write,
 )
-from deplodock.compiler.ir.stmt.base import dtype_promote
-from deplodock.compiler.ir.tile.ir import Source, StageBundle, TileOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.ir.stmt.base import dtype_promote
+from emmy.compiler.ir.tile.ir import Source, StageBundle, TileOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -173,14 +173,14 @@ def _stamp_assign(s: Assign, ctx: _StampCtx) -> Assign:
     result_name = dtype_promote(s.op.name, arg_dtypes)
     # Resolve canonical name back to a DataType. F32 / F16 are the only
     # ones promote returns today; lazy import to avoid cycle with dtype.get.
-    from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
+    from emmy.compiler.dtype import get as _get  # noqa: PLC0415
 
     result_dt = _get(result_name)
     # Overflow guard: a square (``x * x``) or a ``pow`` of an fp16 value can
     # blow past fp16's 65504 ceiling (x² reaches ~4.3e9), giving inf → a
     # garbage reduction (RMSNorm's mean-of-squares: inf → rsqrt(inf)=0, or a
     # near-zero mean → huge rsqrt). torch sidesteps this by computing the
-    # reduction in fp32 (the ``x.float()`` in RMSNorm/variance); deplodock
+    # reduction in fp32 (the ``x.float()`` in RMSNorm/variance); emmy
     # drops that cast, so compute these exploding ops in fp32 here. The render
     # then upcasts the half operands (``__half2float``) and accumulates in f32.
     # Matmul — ``multiply`` of *distinct* args — is untouched, preserving its

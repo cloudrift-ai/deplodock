@@ -14,12 +14,12 @@ from collections.abc import Callable
 from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
-from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
-from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
-from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
-from deplodock.compiler.ir.stmt.leaves import (
+from emmy.compiler.ir.axis import Axis, extend_simplify_ctx
+from emmy.compiler.ir.expr import Expr, SimplifyCtx, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt.base import Stmt, _axis_identity
+from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
+from emmy.compiler.ir.stmt.leaves import (
     Accum,
     Assign,
     Init,
@@ -320,6 +320,6 @@ def _(s: Cond, ctx: SimplifyCtx) -> Stmt:
 
 
 # Tile-IR Stmt registrations (Stage / AsyncWait / Monoid) live in
-# ``deplodock.compiler.ir.tile.passes`` — that module is imported from the
+# ``emmy.compiler.ir.tile.passes`` — that module is imported from the
 # bottom of ``tile/ir.py`` so loading any Tile-IR symbol auto-registers the
 # handlers without a circular import.

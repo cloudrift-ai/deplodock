@@ -1,10 +1,10 @@
 """Lower UnsqueezeOp(x, dim=k) → IndexMapOp."""
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.expr import placeholder
-from deplodock.compiler.ir.frontend.ir import UnsqueezeOp
-from deplodock.compiler.pipeline import Match, Pattern
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.expr import placeholder
+from emmy.compiler.ir.frontend.ir import UnsqueezeOp
+from emmy.compiler.pipeline import Match, Pattern
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", UnsqueezeOp)]
 

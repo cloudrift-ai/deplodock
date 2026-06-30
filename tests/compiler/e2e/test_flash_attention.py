@@ -31,8 +31,8 @@ class _Sdpa(torch.nn.Module):
 
 
 def _compile_sdpa(q, k, v):
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(_Sdpa().cpu(), (q, k, v))
     backend = CudaBackend()
@@ -44,7 +44,7 @@ def _compile_sdpa(q, k, v):
 @requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
 def test_flash_sdpa_matches_torch(monkeypatch, B, H, S, D):
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
 
@@ -71,13 +71,13 @@ def test_flash_sdpa_matches_torch(monkeypatch, B, H, S, D):
 @requires_cuda
 @pytest.mark.parametrize("bk", [2, 4])
 def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
-    """KV tiling: a ``DEPLODOCK_BK``
+    """KV tiling: a ``EMMY_BK``
     pin re-brackets the streaming reduce ``S_k → S_k/BK · BK`` (serial within the tile). The
     fused flash kernel must still match torch — BN=1 is degenerate-identical, BN>1 the
     re-bracketed serial fold. ``S=32`` / ``D=16`` are divisible by both 2 and 4, so the pin
     is honored (``_streaming_bk`` requires every reduce extent divisible)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_BK", str(bk))
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_BK", str(bk))
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 3, 32, 16) for _ in range(3))
 
@@ -98,14 +98,14 @@ def test_flash_sdpa_kv_tile_matches_torch(monkeypatch, bk):
 @requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
 def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
-    """``DEPLODOCK_CHAIN=1``
+    """``EMMY_CHAIN=1``
     restructures the streaming flash into the FA-2 **shared-score** form — the P@V output
     ``d`` rides a register vector ``O[BM, D]``, the QK^T score is computed once per KV step
     and shared across ``d`` (the INLINE score edge), the twisted carrier splits into a
     scalar stats cell + a register-tiled accumulation cell. Still one kernel, still matches
     torch (scalar FMA P@V — the first accuracy check of the crux)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
     backend, compiled, kernels = _compile_sdpa(q, k, v)
@@ -125,11 +125,11 @@ def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
 def test_flash_chain_causal_and_gqa_match_torch(monkeypatch):
     """The chain form keeps the causal / GQA masks in the ``d``-invariant score prefix, so
     masked + grouped-head flash also shares the score and matches torch."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(0)
 
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
@@ -164,8 +164,8 @@ def test_flash_chain_default_off_keeps_scalar_stream(monkeypatch):
     """Greedy default (no ``CHAIN`` pin) keeps the scalar streaming nest — the
     restructuring is opt-in until the search-fork integration (Phase 6), so the deployed
     flash kernel is unchanged."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.delenv("DEPLODOCK_CHAIN", raising=False)
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.delenv("EMMY_CHAIN", raising=False)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
     _backend, compiled, kernels = _compile_sdpa(q, k, v)
@@ -177,10 +177,10 @@ def test_flash_sdpa_dynamic_matches_torch(monkeypatch):
     """Symbolic ``seq_len`` (Q/K/V dim -2): ONE cached kernel carrying ``int
     seq_len`` serves every runtime size — flash's single dynamic axis lands on
     BOTH the query (masked-row M) and KV (reduce) positions."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     B, H, D = 1, 2, 8
     seq = torch.export.Dim("seq_len", min=4, max=4096)
@@ -214,7 +214,7 @@ def test_flash_off_keeps_decomposition(monkeypatch):
     kernels: QK^T, softmax, P@V), proving the knob gates the Loop-IR recognition
     and the default is unchanged. The move composer implies flash only for
     SYMBOLIC-seq SDPA, so this static case decomposes under the composer too."""
-    monkeypatch.delenv("DEPLODOCK_FLASH", raising=False)
+    monkeypatch.delenv("EMMY_FLASH", raising=False)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
     _backend, _compiled, kernels = _compile_sdpa(q, k, v)
@@ -222,7 +222,7 @@ def test_flash_off_keeps_decomposition(monkeypatch):
 
 
 def _run_flash(backend, compiled, inputs: dict, ref_fn) -> float:
-    """Compile-then-run helper: returns max|deplodock − torch| for a fused flash
+    """Compile-then-run helper: returns max|emmy − torch| for a fused flash
     kernel. ``inputs`` keys must match the traced graph's input names."""
     run_result, eager = backend.run(compiled, input_data=inputs, pre_run=ref_fn)
     got = list(run_result.outputs.values())[0].flatten()
@@ -237,7 +237,7 @@ def test_flash_causal_matches_torch(monkeypatch):
     (the lifted causal IndexMapOp ``Select``) and build the masked nest — building
     an unmasked nest was a silent-correctness trap (wrong output, not a fall-
     through)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
     backend, compiled, kernels = _compile_causal(q, k, v)
@@ -257,8 +257,8 @@ class _Causal(torch.nn.Module):
 
 
 def _compile_causal(q, k, v):
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(_Causal().cpu(), (q, k, v))
     backend = CudaBackend()
@@ -282,10 +282,10 @@ class _Gqa(torch.nn.Module):
 def test_flash_gqa_matches_torch(monkeypatch, Hq, Hkv, S, D):
     """GQA flash: K/V read at ``head // group`` directly (no materialized
     broadcast). Traces as GQA+causal (see ``_Gqa``)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     q = torch.randn(1, Hq, S, D)
     k, v = (torch.randn(1, Hkv, S, D) for _ in range(2))
@@ -318,10 +318,10 @@ def test_flash_additive_mask_matches_torch(monkeypatch):
     """Explicit additive ``(1,1,S,S)`` bias (the HF whole-model mask path): the
     recognizer detects the ``add(score, Load(mask))`` and loads the bias per
     ``(m, kv)`` in the nest. ``-inf`` entries zero out via ``exp``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     S, D = 16, 8
     q, k, v = (torch.randn(1, 2, S, D) for _ in range(3))
@@ -350,10 +350,10 @@ def test_flash_additive_mask_matches_torch(monkeypatch):
 def test_flash_gqa_dynamic_matches_torch(monkeypatch):
     """GQA+causal over symbolic ``seq_len`` — one cached kernel, the dynamic axis
     on the masked-row M, the symbolic reduce, AND the causal guard at once."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     Hq, Hkv, D = 4, 2, 8
     seq = torch.export.Dim("seq_len", min=4, max=4096)
@@ -388,10 +388,10 @@ def test_flash_gqa_dynamic_matches_torch(monkeypatch):
 def test_flash_additive_mask_dynamic_matches_torch(monkeypatch):
     """Symbolic-seq additive mask ``(1,1,seq,seq)``: the masked final KV tile
     zero-fills past the runtime extent, consistent with the mask's own ``-inf``."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
     torch.manual_seed(0)
     D = 8
     seq = torch.export.Dim("seq_len", min=4, max=4096)

@@ -1,4 +1,4 @@
-"""``deplodock eval <knobs|prior|analytic|golden|variants|failures>`` — evaluate the tuning machinery.
+"""``emmy eval <knobs|prior|analytic|golden|variants|failures>`` — evaluate the tuning machinery.
 
 Six subcommands:
 
@@ -51,19 +51,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 
-from deplodock.commands.compile import resolve_tune_db
-from deplodock.commands.dataset_args import add_dataset_args, require_source, resolve_prior_arg
-from deplodock.commands.table import GREEN as _GREEN
-from deplodock.commands.table import RED as _RED
-from deplodock.commands.table import YELLOW as _YELLOW
-from deplodock.commands.table import Col, col_widths, knob_columns, render_table
-from deplodock.compiler.pipeline.search.data import Dataset
+from emmy.commands.compile import resolve_tune_db
+from emmy.commands.dataset_args import add_dataset_args, require_source, resolve_prior_arg
+from emmy.commands.table import GREEN as _GREEN
+from emmy.commands.table import RED as _RED
+from emmy.commands.table import YELLOW as _YELLOW
+from emmy.commands.table import Col, col_widths, knob_columns, render_table
+from emmy.compiler.pipeline.search.data import Dataset
 
 logger = logging.getLogger(__name__)
 
 
 def register_eval_command(subparsers) -> None:
-    """``deplodock eval <knobs|prior|analytic>`` — evaluate the tuning knobs, the
+    """``emmy eval <knobs|prior|analytic>`` — evaluate the tuning knobs, the
     learned prior, or the cold-start AnalyticPrior against the golden configs."""
     parser = subparsers.add_parser(
         "eval",
@@ -88,8 +88,8 @@ def register_eval_command(subparsers) -> None:
     )
     pp.add_argument(
         "--prior",
-        help="Path to the learned-prior JSON to load. Default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json. "
-        "(`deplodock tune` writes this file; it is NOT the tune DB.)",
+        help="Path to the learned-prior JSON to load. Default: EMMY_PRIOR_FILE or ~/.cache/emmy/prior.json. "
+        "(`emmy tune` writes this file; it is NOT the tune DB.)",
     )
     add_dataset_args(pp, default="golden")
     pp.add_argument(
@@ -103,7 +103,7 @@ def register_eval_command(subparsers) -> None:
         "golden",
         help="Greedy pipeline pick vs recorded golden, per golden config (the reproduction check; no heuristic/rank diagnostics)",
     )
-    pg.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
+    pg.add_argument("--prior", help="Learned-prior JSON to load (default: EMMY_PRIOR_FILE or ~/.cache/emmy/prior.json).")
     add_dataset_args(pg, default="golden")
     pg.add_argument("--features", action="store_true", help="Also print the prior's regressor feature vector per golden config.")
     pg.set_defaults(func=handle_eval_golden)
@@ -112,7 +112,7 @@ def register_eval_command(subparsers) -> None:
         "variants",
         help="Per-kernel leaderboard of the tune DB's measured variants, with the prior's deployed pick marked and ranked",
     )
-    pv.add_argument("--prior", help="Learned-prior JSON to load (default: DEPLODOCK_PRIOR_FILE or ~/.cache/deplodock/prior.json).")
+    pv.add_argument("--prior", help="Learned-prior JSON to load (default: EMMY_PRIOR_FILE or ~/.cache/emmy/prior.json).")
     add_dataset_args(pv, default="db")
     pv.add_argument(
         "--top",
@@ -195,7 +195,7 @@ def handle_eval_prior(args) -> None:
 def handle_eval_golden(args) -> None:
     """``eval golden`` — the greedy pipeline pick vs recorded golden per config (the
     actionable "did the pipeline reproduce the golden knobs?" view). Watch it while
-    iteratively tuning golden shapes one at a time (``deplodock tune --golden
+    iteratively tuning golden shapes one at a time (``emmy tune --golden
     <name>``). Use ``eval analytic`` / ``eval prior`` for the analytic-prior rank and
     the learned rank-under-prior diagnostics."""
     require_source(args, {"golden"}, "eval golden compares against recorded golden knobs — --dataset db has no golden to compare to.")
@@ -215,12 +215,12 @@ def handle_eval_variants(args) -> None:
     it?" drill-down view."""
     require_source(args, {"db"}, "eval variants lists measured tune-DB rows — --dataset golden has no per-variant measurements.")
     resolve_prior_arg(args)
-    from deplodock import config  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
+    from emmy import config  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import load_prior  # noqa: PLC0415
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
-        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        logger.error("no tune DB at %s — pass --db or run `emmy tune` first.", db_path)
         return
     groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_kernel_name()
     if not groups:
@@ -245,7 +245,7 @@ def handle_eval_failures(args) -> None:
     require_source(args, {"db"}, "eval failures reads tune-DB bench_fail rows — --dataset golden records no failures.")
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
-        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        logger.error("no tune DB at %s — pass --db or run `emmy tune` first.", db_path)
         return
     fails = [s for s in Dataset.from_db(db_path, kernel=args.kernel, status="bench_fail") if s.name]
     n_ok = len(Dataset.from_db(db_path, kernel=args.kernel))
@@ -279,12 +279,12 @@ def _variant_key(s) -> tuple:
 
 def _o3_reservoir_index(prior) -> dict[tuple, float]:
     """Deployable (-O3) latencies from the prior's reservoir, keyed by
-    :func:`_variant_key`. Tuning re-benches every config within ``DEPLODOCK_O3_TOL``
+    :func:`_variant_key`. Tuning re-benches every config within ``EMMY_O3_TOL``
     of the running -O1 best at ``-Xcicc -O3`` and feeds it to the prior as an
     ``H_opt=3`` row WITHOUT writing a ``perf`` row — so the reservoir, not the DB,
     is the only -O3 source (the same reasoning as
     :func:`diagnostics.golden_deploy_perf`)."""
-    from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.data import Sample  # noqa: PLC0415
 
     out: dict[tuple, float] = {}
     for knobs, us in getattr(prior, "_dataset", None) or []:
@@ -304,7 +304,7 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
     table renders). Non-leaf rows (partial-knob fork nodes) are dropped,
     mirroring ``diagnostics.reachability``; the ``-O3 us`` column appears only
     when the reservoir holds any -O3 row at all."""
-    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
 
     kmax = max(len(s.knobs) for s in samples)
     leaves = sorted((s for s in samples if len(s.knobs) == kmax), key=lambda s: s.latency_us)
@@ -344,10 +344,10 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
 
 
 def _emit_registry() -> None:
-    """List every registered :class:`~deplodock.compiler.pipeline.knob.Knob` — the
+    """List every registered :class:`~emmy.compiler.pipeline.knob.Knob` — the
     canonical tuning schema (name, type, candidate hints, aliases, help) collected
     by ``knob.registry`` from all loaded passes, regardless of any DB."""
-    from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline, knob  # noqa: PLC0415
+    from emmy.compiler.pipeline import CUDA_PASSES, Pipeline, knob  # noqa: PLC0415
 
     # ``registry`` only sees passes already imported into ``sys.modules``; build
     # the full pipeline once so every Knob-bearing rule module is loaded first.
@@ -390,7 +390,7 @@ def _ratio_color(matched: int, total: int) -> str:
 
 def _knob_cells(entry: tuple) -> dict[str, tuple[str, bool]]:
     """``{knob: (value_text, red?)}`` for one renderable entry (no ``NAME=`` prefix —
-    :func:`~deplodock.commands.table.knob_columns` puts the name in the column header).
+    :func:`~emmy.commands.table.knob_columns` puts the name in the column header).
     A ``("row", lead, gold, got)`` entry renders ``found/golden`` per knob, red where the
     two differ; a ``("total", lead, cells)`` entry carries its cells pre-built."""
     if entry[0] == "total":
@@ -431,9 +431,9 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
     terms that drive matmul perf (the engineered ``D_*`` features) are NOT here."""
     import logging as _logging  # noqa: PLC0415
 
-    from deplodock.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.data import Sample  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import CTX_PREFIX, STRUCT_PREFIX  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.data import Sample  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
     configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
@@ -441,7 +441,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
 
     logger.info("")
     logger.info("Learned-prior feature vector (knob.knob_features) — the CatBoost regressor's input per golden config:")
-    quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
+    quiet = [_logging.getLogger(n) for n in ("emmy.compiler", "emmy.commands.trace")]
     prev = [lg.level for lg in quiet]
     for lg in quiet:
         lg.setLevel(_logging.WARNING)
@@ -473,7 +473,7 @@ def _golden_configs(kernel_filter: str | None):
     views about the card in hand when a multi-GPU goldens dir is checked in — a name
     recurs once per card and the GPU-blind ``ShapeKey`` join would otherwise mix
     cards (5090 / PRO 6000 even share ``compute_cap``)."""
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig, goldens_for_live_gpu  # noqa: PLC0415
 
     configs = [g for g in goldens_for_live_gpu() if isinstance(g, MatmulGoldenConfig)]
     if kernel_filter:
@@ -489,8 +489,8 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     ``found/golden`` (mismatches red), summarized as median + top-k coverage."""
     from statistics import median  # noqa: PLC0415
 
-    from deplodock.compiler.context import Context  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
+    from emmy.compiler.context import Context  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
 
     configs = _golden_configs(kernel_filter)
     ranks: list[int] = []
@@ -521,16 +521,16 @@ def _emit_prior_eval(kernel_filter: str | None) -> None:
     """``eval prior`` body: the learned ``CatBoostPrior`` on the golden configs —
     the golden's rank under the prior over the full enumeration (offline) followed
     by the greedy tile-pipeline pick vs golden (the real selection). Reads the
-    prior JSON (``DEPLODOCK_PRIOR_FILE`` / ``--prior``; option-0 when none loaded)."""
-    from deplodock import config  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.prior import CatBoostPrior, diagnostics  # noqa: PLC0415
+    prior JSON (``EMMY_PRIOR_FILE`` / ``--prior``; option-0 when none loaded)."""
+    from emmy import config  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import CatBoostPrior, diagnostics  # noqa: PLC0415
 
     prior = CatBoostPrior.load()
     logger.info("")
     if prior.fitted:
         logger.info(diagnostics.golden_prior_eval(prior, kernel_filter))
     else:
-        logger.info("No fitted prior at %s — greedy falls to option-0 (run `deplodock tune`).", config.prior_path())
+        logger.info("No fitted prior at %s — greedy falls to option-0 (run `emmy tune`).", config.prior_path())
 
     configs = _golden_configs(kernel_filter)
     # Deployable (-O3) perf of the prior's pick vs golden, read from the reservoir (no
@@ -546,12 +546,12 @@ def _emit_prior_db_reachability(args) -> None:
     to the golden views: it scores the same prior over the DB rows instead of the
     curated goldens. Reuses the diagnostics machinery (the prior's ``_dataset`` is
     irrelevant here — the groups come from the DB)."""
-    from deplodock import config  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.prior import diagnostics, load_prior  # noqa: PLC0415
+    from emmy import config  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import diagnostics, load_prior  # noqa: PLC0415
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
-        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        logger.error("no tune DB at %s — pass --db or run `emmy tune` first.", db_path)
         return
     # FallbackPrior: the learned CatBoost when fitted, else the cold AnalyticPrior — the same ranking compile/run use.
     prior = load_prior()
@@ -560,7 +560,7 @@ def _emit_prior_db_reachability(args) -> None:
     groups = Dataset.from_db(db_path, kernel=args.kernel).group_by_op()
     logger.info("")
     if not prior.fitted:
-        logger.info("No fitted prior at %s — run `deplodock tune`; the cold AnalyticPrior ranks by D_* geometry only.", config.prior_path())
+        logger.info("No fitted prior at %s — run `emmy tune`; the cold AnalyticPrior ranks by D_* geometry only.", config.prior_path())
     rr = diagnostics.reachability(prior, groups)
     if not rr:
         logger.info("No op structure has ≥2 measured leaf configs in the DB — nothing to score.")
@@ -580,12 +580,12 @@ def _emit_prior_nodes(args) -> None:
     search — by their best-reachable latency?) plus leaf reachability / calibration
     on the persistent, deduped store. The search-faithful counterpart to
     ``--dataset db`` (which only scores fully-decided leaf variants)."""
-    from deplodock.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.prior import diagnostics, load_prior  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import SearchDB  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.prior import diagnostics, load_prior  # noqa: PLC0415
 
     db_path = Path(args.db) if args.db else resolve_tune_db()
     if not db_path.exists():
-        logger.error("no tune DB at %s — pass --db or run `deplodock tune` first.", db_path)
+        logger.error("no tune DB at %s — pass --db or run `emmy tune` first.", db_path)
         return
     db = SearchDB.open_readonly(db_path)
     try:
@@ -628,7 +628,7 @@ def _perf_cell(perf: dict | None, name: str) -> tuple[str, str] | None:
 
 def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | None = None) -> None:
     """Greedy fork pick through the tile pipeline vs recorded golden. The pick reads
-    the learned-prior JSON (``config.prior_path()``: ``DEPLODOCK_PRIOR_FILE`` /
+    the learned-prior JSON (``config.prior_path()``: ``EMMY_PRIOR_FILE`` /
     ``--prior``); option-0 with no fitted prior. Stops at the tile dialect (every
     knob fork resolves there: no codegen / nvcc). One row per shape (configs sharing a
     name share a snippet → one greedy pick): the pick is scored against the shape's
@@ -640,10 +640,10 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
     passes ``title=False`` for just the table."""
     import logging as _logging  # noqa: PLC0415
 
-    from deplodock import config  # noqa: PLC0415
-    from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
-    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
+    from emmy import config  # noqa: PLC0415
+    from emmy.commands.trace import graph_from_code  # noqa: PLC0415
+    from emmy.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs  # noqa: PLC0415
 
     def tunable(knobs: dict) -> dict:
         return {k: v for k, v in knobs.items() if not k.startswith(("S_", "H_"))}
@@ -672,7 +672,7 @@ def _emit_prior_golden_check(configs: list, *, title: bool = True, perf: dict | 
         )
     # Silence the trace/compile chatter (different logger subtrees) so this
     # function's own ``logger`` can stream one clean result line per config.
-    quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
+    quiet = [_logging.getLogger(n) for n in ("emmy.compiler", "emmy.commands.trace")]
     prev = [lg.level for lg in quiet]
     for lg in quiet:
         lg.setLevel(_logging.WARNING)

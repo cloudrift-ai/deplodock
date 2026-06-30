@@ -1,7 +1,7 @@
 """Lower the tensor-core matmul cell to the kernel-IR MMA fragment chain.
 
 The matmul cell arrives in tensor-core form: ``tile/enumeration/050_warp_build`` fused
-the compute into an :class:`~deplodock.compiler.ir.stmt.Mma` (which names its A
+the compute into an :class:`~emmy.compiler.ir.stmt.Mma` (which names its A
 / B operands by SSA value and carries the ``Atom`` spec) and left the operand
 ``Load``s **plain**, and the staging passes carried both through (the loads
 staged like any other, the ``Mma`` keeping its reduce loop ``is_reduce``). The
@@ -67,7 +67,7 @@ operand-shape masked-K detection. When the ``Mma`` carries any guard,
 :func:`_emit_chain` uses them verbatim (A row clamp / B col clamp / B reduce-row
 zero-fill) and skips the auto masked-K detection (the ``explicit_guards`` param).
 
-Each cell's :class:`~deplodock.compiler.ir.tile.ir.Atom` spec (shape + operand
+Each cell's :class:`~emmy.compiler.ir.tile.ir.Atom` spec (shape + operand
 dtypes) is read straight off its ``Mma`` — no ``ATOM_KIND`` knob lookup. The
 ``rewrite`` entry point and its lowering helpers all live in this one module.
 Eligibility: an ``AtomTile`` in the body (scalar TileOps have none → skip).
@@ -79,12 +79,12 @@ from __future__ import annotations
 
 from dataclasses import replace as dc_replace
 
-from deplodock.compiler.dtype import DataType
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Mma, Stmt, Write
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.dtype import DataType
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
+from emmy.compiler.ir.kernel.ir import EpilogueLoad, LdmatrixLoad, MmaSyncPtx, RegEpilogue, RegFragment, RegStore
+from emmy.compiler.ir.stmt import Body, Cond, Load, Mma, Stmt, Write
+from emmy.compiler.ir.tile.ir import (
     AffineAddressing,
     Atom,
     AtomTile,
@@ -94,8 +94,8 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     map_staged,
 )
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -137,7 +137,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
 def lower_atom_cells(body: Body, *, smem_sources: dict[str, Source], graph: Graph | None = None) -> tuple[Body, bool]:
     """For each ``AtomTile`` in ``body``, lower its matmul cell to the kernel-IR
     fragment chain and strip the wrapper. Runs through the shared
-    :func:`~deplodock.compiler.ir.tile.ir.map_staged` traversal, which threads
+    :func:`~emmy.compiler.ir.tile.ir.map_staged` traversal, which threads
     the in-scope ``Source`` table from enclosing ``StageBundle`` /
     ``WarpSpecialize`` scopes so each operand's slab addressing resolves from the
     live ``Source``. The atom spec is read off each cell's ``Mma`` (no knob
@@ -422,7 +422,7 @@ def _replace_subexprs(e, pairs):
     becomes its ``replacement``. Recurses through ``BinaryExpr`` (leaves pass
     through). Used to swap a Select predicate's M / N coordinate expressions for
     the ``__M__`` / ``__N__`` placeholders without touching their internal vars."""
-    from deplodock.compiler.ir.expr import BinaryExpr  # noqa: PLC0415
+    from emmy.compiler.ir.expr import BinaryExpr  # noqa: PLC0415
 
     for tgt, rep in pairs:
         if e == tgt:
@@ -446,8 +446,8 @@ def _scan_epilogue(
     The gate admits a shape only when the classifier reports no blocker, so a
     blocker here means the gate and this fold disagree — fail loud rather than
     emit a kernel referencing the undefined scalar accumulator."""
-    from deplodock.compiler.ir.stmt import Write  # noqa: PLC0415
-    from deplodock.compiler.pipeline.passes.lowering._predicates import classify_fragment_epilogue  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Write  # noqa: PLC0415
+    from emmy.compiler.pipeline.passes.lowering._predicates import classify_fragment_epilogue  # noqa: PLC0415
 
     produced = {w.output for w in body.iter_of_type(Write)}
 
@@ -468,7 +468,7 @@ def _scan_epilogue(
     # (``a1*128 + a3*64 + …``), so replacing its vars one-by-one would corrupt
     # the arithmetic. The predicate's coordinate operands are struct-equal to the
     # Write's M / N index dims (same partition σ) — the last two var-bearing dims.
-    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
 
     w_var_dims = [e for e in slice_.write.index if e.free_vars()]
     pairs = []
@@ -652,7 +652,7 @@ def _emit_chain(
         else:
             b_kz = _masked_k_zero(b_load, b_src_index, "b", graph) if (not b_staged and not b_trans) else None
             if not b_staged and not b_trans and b_kz is None and _unstaged_masked_k(b_load, "b", graph):
-                from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+                from emmy.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
                 raise LoweringError("masked-K (symbolic reduce) fragment-A mma operand can't lower gmem-direct — needs staging")
             b_guard = n_guard if (n_guard is not None and not b_staged) else None
@@ -714,7 +714,7 @@ def _emit_chain(
             # The masked-K extent isn't a single symbol → can't build the ``*_kzero``
             # bound. Bail (LoweringError) so greedy retries / the search picks a staged
             # or scalar variant rather than emit an un-zero-filled gmem-direct read.
-            from deplodock.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
+            from emmy.compiler.pipeline.pipeline import LoweringError  # noqa: PLC0415
 
             raise LoweringError(
                 "masked-K (symbolic reduce) mma operand can't lower gmem-direct — reduce extent "

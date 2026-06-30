@@ -1,13 +1,13 @@
 command:
   stage:
-    - deplodock
+    - emmy
     - scripts
     - pyproject.toml
     - requirements.txt
     - Makefile
   run: |
     export PATH=/usr/local/cuda/bin:$$PATH
-    export DEPLODOCK_GIT_REV="$git_rev"
+    export EMMY_GIT_REV="$git_rev"
     cd $repo_dir
     [ -d venv ] || make setup
     ./venv/bin/python -c "import torch, cupy" 2>/dev/null || ./venv/bin/pip install -e ".[compile]"
@@ -31,9 +31,9 @@ matrices:
     git_rev: "feature/transformer-compiler@local"
     hf_model: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     dtype:
-      - fp32        # Deplodock currently generates FP32 only
+      - fp32        # Emmy currently generates FP32 only
       - fp16        # Real-world comparison (eager/compile use half + tensor cores)
     seq_len: [32, 128, 512]
     batch: 1
     iterations: 10
-    backends: "eager,compile,deplodock"
+    backends: "eager,compile,emmy"

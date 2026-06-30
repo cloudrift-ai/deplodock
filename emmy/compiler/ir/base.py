@@ -6,7 +6,7 @@ anything — they appear unchanged from the frontend stage all the way through
 to fusion, and the numpy backend supplies their values at runtime.
 
 The shared base for body-carrying ops (``LoopOp`` / ``KernelOp`` /
-``TileOp``) lives in :mod:`deplodock.compiler.ir.body_op` — split out to
+``TileOp``) lives in :mod:`emmy.compiler.ir.body_op` — split out to
 avoid a circular import with the ``ir.stmt`` package (which imports
 ``Stage`` from ``ir.tile.ir`` for normalization).
 
@@ -23,8 +23,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph, Node
-    from deplodock.compiler.tensor import Tensor
+    from emmy.compiler.graph import Graph, Node
+    from emmy.compiler.tensor import Tensor
 
 
 @dataclass

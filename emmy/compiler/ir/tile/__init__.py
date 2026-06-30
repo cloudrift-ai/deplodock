@@ -11,8 +11,8 @@ Loop-IR → Tile-IR lowering is owned by ``passes/lowering/tile/010_partition_lo
 of Kernel IR to CUDA source lives under ``ir.kernel``.
 """
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.tile.ir import (
     Accum,
     Assign,
     BinaryExpr,

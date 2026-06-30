@@ -24,7 +24,7 @@ eligible**, so a cold / greedy compile takes it: the bulk-async ring is 1.3-1.9x
 than SYNC on every eligible tile and the choice is then deterministic regardless of the
 loaded prior (the old SYNC-first default let a pinned config's transport flip with the
 prior — see ``rewrite``). The tuner still explores SYNC (the second offer) for any tile
-where it wins; a ``DEPLODOCK_TMA=0`` pin forces it directly. An ineligible tile stays SYNC.
+where it wins; a ``EMMY_TMA=0`` pin forces it directly. An ineligible tile stays SYNC.
 Cooperative-reduce / pointwise tiers stage nothing ringable, so they fall out via the empty
 ``schedule.staged`` / no-ringable-K-loop guards (``RuleSkipped`` → ``apply_off_defaults``
 stamps ``TMA=False``).
@@ -40,10 +40,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.expr import BinaryExpr, Literal
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.expr import BinaryExpr, Literal
+from emmy.compiler.ir.tile.ir import (
     BYTES_PER_ELEM,
     AffineAddressing,
     SerialTile,
@@ -51,9 +51,9 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraphOp,
     Transport,
 )
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._slab import prospective_sources
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
 PATTERN = [Pattern("root", TileGraphOp)]
 

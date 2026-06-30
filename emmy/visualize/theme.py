@@ -1,5 +1,5 @@
 """Theme tokens, fonts, and qualitative palettes shared by every chart in
-``deplodock.visualize``. Generic by design — palettes are named by hue
+``emmy.visualize``. Generic by design — palettes are named by hue
 character (not by use site) so any chart can pick whichever fits."""
 
 from __future__ import annotations

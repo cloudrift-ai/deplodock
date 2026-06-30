@@ -15,7 +15,7 @@ consumer ``LoopOp`` pieces):
   ``Graph`` of separate ``LoopOp`` nodes the engine splices (two kernels, each
   re-seeded by ``010_build``). The proven path the accuracy tests pin.
 - :func:`seed_demoted` — the **block-DAG seed**: seeds each piece as a logical
-  :class:`~deplodock.compiler.ir.tile.ir.Block` and returns one multi-block
+  :class:`~emmy.compiler.ir.tile.ir.Block` and returns one multi-block
   ``TileGraph`` (the MONOID/MAP producer ``--xn-->`` SEMIRING consumer DAG), so the
   *edge placement* (``GMEM`` cut vs the future ``SMEM``/``INLINE`` fused edge) becomes
   an explicit ``Schedule`` choice over one block-DAG rather than a graph-surgery pass.
@@ -87,26 +87,26 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from string import ascii_lowercase
 
-from deplodock.compiler import dtype as dtype_mod
-from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.algebra import AlgebraKind, contains_matmul_reduce
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
-from deplodock.compiler.ir.stmt.body import Cone
-from deplodock.compiler.ir.tile.ir import Block, Buffer, Placement, Schedule, Space, TileGraph, TileGraphOp
-from deplodock.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
-from deplodock.compiler.pipeline.passes.lowering._predicates import (
+from emmy.compiler import dtype as dtype_mod
+from emmy.compiler.dim import DEFAULT_SEQ_HINT, Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.algebra import AlgebraKind, contains_matmul_reduce
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
+from emmy.compiler.ir.stmt.body import Cone
+from emmy.compiler.ir.tile.ir import Block, Buffer, Placement, Schedule, Space, TileGraph, TileGraphOp
+from emmy.compiler.pipeline.passes.loop.stamp._stamp import restamp_structural_features
+from emmy.compiler.pipeline.passes.lowering._predicates import (
     is_matmul_reduce,
     map_transform,
     segmentable_k_extent,
     split_monoid_producer,
 )
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import seed_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
 # Element-count multiple a symbolic N (inner) extent is padded up to so the
 # materialized B operand's above-inner gmem stride stays 16 B-aligned for TMA

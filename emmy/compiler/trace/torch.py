@@ -2,7 +2,7 @@
 
 The tracer creates one graph node per FX op, using PyTorch's exact shapes.
 No decomposition, no skipping, no shape overrides.  Decomposition into
-primitive Deplodock IR ops happens in separate rewriter passes.
+primitive Emmy IR ops happens in separate rewriter passes.
 
 Requires PyTorch (optional dependency). All torch imports are guarded.
 """
@@ -12,11 +12,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.frontend.ir import (
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Literal, placeholder
+from emmy.compiler.ir.frontend.ir import (
     CatOp,
     LayerNormOp,
     LinearOp,
@@ -30,7 +30,7 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, IndexMapOp, IndexSource, ReduceOp
 
 if TYPE_CHECKING:
     import torch
@@ -245,7 +245,7 @@ def _wrap_shape(raw_shape, sym_rename: dict[str, str] | None = None):
     — the existing IR construction path coerces those to ``Dim(int)`` via
     ``Tensor.__post_init__``.
     """
-    from deplodock.compiler.dim import Dim
+    from emmy.compiler.dim import Dim
 
     if sym_rename is None:
         sym_rename = {}
@@ -309,7 +309,7 @@ def _dim_tuple_to_op_shape(shape):
     ``SliceOp.shape`` carry. Atomic ``Dim`` wrappers unwrap via ``.value``
     (Literal → int, Var → name); composite Dims aren't emitted by the
     tracer here so the int|str form is sufficient."""
-    from deplodock.compiler.dim import Dim
+    from emmy.compiler.dim import Dim
 
     return tuple(d.value if isinstance(d, Dim) else d for d in shape)
 
@@ -504,7 +504,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
         "erf",
     }
     if op_name in _ELEMENTWISE_SOURCES:
-        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+        from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         canonical = _ATEN_TO_NUMPY.get(op_name, op_name)
         # Disambiguate gelu's tanh approximation from the default erf form
@@ -671,7 +671,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
         # (repeat_kv's ``(kv,1,...)->(kv,n_rep,...)`` then reshape gives a wrong
         # ``q_head % kv`` index instead of ``q_head // n_rep``). Emit a broadcast
         # IndexMapOp so each broadcast dim reads coord 0.
-        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+        from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         node_map[name] = broadcast_to(g, input_ids[0], shape).id
         return
@@ -803,7 +803,7 @@ def _handle_call_function(g: Graph, fx_node: Any, node_map: dict[str, str], *, s
     # --- Fallback: unknown op becomes ElementwiseOp by torch-aten name ---
     logger.debug("Fallback elementwise for %s (%s)", op_name, fx_node.target)
     if input_ids:
-        from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
+        from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to
 
         input_ids = [broadcast_to(g, inp, shape) for inp in input_ids]
         nid = g.add_node(

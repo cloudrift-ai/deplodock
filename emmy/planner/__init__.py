@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from deplodock.hardware import gpu_short_name
-from deplodock.planner.variant import Variant
-from deplodock.recipe.types import Recipe
+from emmy.hardware import gpu_short_name
+from emmy.planner.variant import Variant
+from emmy.recipe.types import Recipe
 
 
 @dataclass
@@ -95,7 +95,7 @@ class BenchmarkTask:
 
     @staticmethod
     def compute_code_hash() -> str:
-        """SHA256 hash of all .py files under deplodock/, sorted by relative path."""
+        """SHA256 hash of all .py files under emmy/, sorted by relative path."""
         pkg_dir = Path(__file__).parent.parent
         hasher = hashlib.sha256()
         for py_file in sorted(pkg_dir.rglob("*.py")):

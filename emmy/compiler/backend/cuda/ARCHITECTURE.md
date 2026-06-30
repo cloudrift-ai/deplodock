@@ -34,16 +34,16 @@ arg_order).
   pays on a cold compile — ~3× faster on the complex tile-search kernels that
   dominate autotune, and the compile step is GPU-free so the cubin cache can be
   warmed by a parallel pool (planned). Falls back to `cupy.RawKernel` (NVRTC)
-  when `nvcc` is absent or a compile fails (`DEPLODOCK_NO_NVCC=1` forces the
+  when `nvcc` is absent or a compile fails (`EMMY_NO_NVCC=1` forces the
   fallback). Kernels are emitted with `extern "C" __global__` so neither
   toolchain name-mangles them (and the cubin symbol loads by `kernel_name`).
   Compile vs load is split (`compile_to_cubin` / `load_function`) so the
   GPU-free compile can run off-process; the loaded `Function` is launch- and
   smem-attr-compatible with `RawKernel`.
-- **Opt level** comes from `DEPLODOCK_NVCC_FLAGS` (`nvcc.effective_flags`, which
-  delegates to `config.nvcc_flags()` — `deplodock/config.py` is the single owner
-  of `os.environ` for `DEPLODOCK_*` vars, incl. `DEPLODOCK_NO_NVCC` /
-  `DEPLODOCK_CUBIN_CACHE`). The CLI sets the flags via `config.set_nvcc_flags`
+- **Opt level** comes from `EMMY_NVCC_FLAGS` (`nvcc.effective_flags`, which
+  delegates to `config.nvcc_flags()` — `emmy/config.py` is the single owner
+  of `os.environ` for `EMMY_*` vars, incl. `EMMY_NO_NVCC` /
+  `EMMY_CUBIN_CACHE`). The CLI sets the flags via `config.set_nvcc_flags`
   (override logic, no longer in the command layer) — `tune` → `-Xcicc -O1`,
   `compile`/`run` → nvcc default -O3, `--nvcc-flags` overrides. -O1 dodges a cicc/LLVM front-end blowup on big
   unrolled register-tile kernels (cicc, not ptxas, is the cost: a tall-thin
@@ -153,7 +153,7 @@ therefore also captures **one** CUDA graph holding every launch in program order
 `replays` back-to-back whole-program replays (`time_program_window`, replays calibrated to
 `_BATCH_TARGET_MS`) — the same semantics the captured torch closures get in the interleaved bench, so the
 backend table compares like-for-like. Reported as `BenchmarkResult.e2e_ms`/`e2e_min_ms`; `run --bench`'s
-comparison table prefers `e2e_min_ms` for the Deplodock row and the kernel table prints a
+comparison table prefers `e2e_min_ms` for the Emmy row and the kernel table prints a
 `whole-program (e2e)` footer beside the per-launch `TOTAL`. Automatic — no flag: a single-launch program's
 solo window already IS the program time (the autotune sweep's usual single-node slice — fields stay `None`,
 nothing is measured twice), and multi-launch programs get it whenever capture holds (a program-graph capture
@@ -163,12 +163,12 @@ e2e scalar can't — so for its multi-launch slices (split-K fixups) the e2e fie
 (~1 ms/iter); pricing those variants by slice-e2e instead is a possible future tune-semantics change.
 
 **One worker, two jobs.** `_bench_worker.py`'s `_run_job` dispatches on `torch_spec`: `None` is the
-deplodock-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
-torch.compile / deplodock comparison — `("trace_args", {code/input/layer/seq_len/dynamic})` →
+emmy-only autotune bench (`benchmark_program`); otherwise it's the deployable eager /
+torch.compile / emmy comparison — `("trace_args", {code/input/layer/seq_len/dynamic})` →
 `load_or_trace` rebuilds the real module (HF id or `--code` expr) → `bench_full_model_real` (for a
 symbolic graph the torch closures run on hint-**tiled** example inputs — `commands/run._hint_sized_inputs`
 grows every symbolic input axis to its `Dim` hint by repeating the trace values, the same size the
-deplodock side resolves to when benching without inputs, so the full-model table compares one shape; the
+emmy side resolves to when benching without inputs, so the full-model table compares one shape; the
 printed table carries a `benched at seq_len=… (symbolic hint)` note);
 `("frontend_graph", Graph|None)` → `bench_lowered_vs_torch`. Rebuilding the torch side **in the
 child** (not pickling a live module) is what lets the interleaved comparison — which couldn't cross a
@@ -194,7 +194,7 @@ concurrently (`tune --gpus`, see `pipeline/ARCHITECTURE.md` → *Per-kernel GPU 
   the single benchmarking entry point: the isolated-worker path when `bench_wall_timeout_s` is set and no `on_iter`,
   else the in-process `benchmark_program` path (interactive `run --bench` interleaving). The device pin is a **per-worker spawn-env overlay** —
   `CUDA_VISIBLE_DEVICES=<id>` (so the child's logical device 0 *is* that GPU; every argumentless `cp.cuda.Device()`
-  resolves correctly) plus, when a base `DEPLODOCK_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on
+  resolves correctly) plus, when a base `EMMY_GPU_LOCK` is set, a per-device `…-<id>` lock path so workers on
   different GPUs take distinct `FileLock`s instead of serialising. The overlay rides the child only — the parent's
   `os.environ` is never mutated (all slots share one event-loop thread).
 - **Deployable `--bench`** awaits `benchmark_compare_isolated_async`, which uses `_run_job_oneshot` (spawn → run →

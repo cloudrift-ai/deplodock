@@ -50,7 +50,7 @@ symbolic slice end strictly below the sliced extent). Beware that an accuracy ch
 catch a degenerate RoPE or wrong attention scores — identical value rows make the attention output independent of the
 attention weights; `tests/compiler/ir/test_dynamic_shapes.py::test_qwen_whole_model_dynamic_compiles_and_matches_eager`
 checks with non-zero ids for exactly that reason. The model passed in is **not** restricted to `CausalLM` — wrapping
-an `AutoModel` trunk yields hidden states instead of logits (the serving plugin's embedding path, `deplodock/serving`).
+an `AutoModel` trunk yields hidden states instead of logits (the serving plugin's embedding path, `emmy/serving`).
 
 - `build_layer_wrapper(block, rotary_emb, hidden_size, dtype, layer_type=None) → nn.Module` is the per-layer dynamic
   analogue: `forward(x)` slices precomputed cos/sin buffers (out to `DYNAMIC_DIM_MAX + 1`, same `+1` guard) by
@@ -69,7 +69,7 @@ decompose via the constant-input fallback.
 - Whole-model trace: `trace_module(build_full_model_wrapper(model, …), (input_ids,))`.
 - Single-layer trace: `trace_module(model.model.layers[N], (x,), kwargs={…})` (static); with `--dynamic`,
   `trace_module(build_layer_wrapper(block, …), (x,), dynamic_shapes={"x": {1: Dim("seq_len")}})`.
-- Inline expression: `graph_from_code("torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))")` (used by `deplodock compile --code` and `deplodock trace --code`).
+- Inline expression: `graph_from_code("torch.nn.RMSNorm(2048)(torch.randn(1,32,2048))")` (used by `emmy compile --code` and `emmy trace --code`).
 
 ## Rule
 

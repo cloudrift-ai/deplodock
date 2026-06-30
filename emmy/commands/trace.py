@@ -66,7 +66,7 @@ def _handle_trace_model(args):
         logger.error("torch and transformers are required: pip install torch transformers")
         sys.exit(1)
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     logger.info("Loading %s...", args.model)
     dtype = torch.float32 if args.layer is None else torch.float16
@@ -75,7 +75,7 @@ def _handle_trace_model(args):
     seq_len = args.seq_len
 
     if args.layer is None:
-        from deplodock.compiler.trace.huggingface import build_full_model_wrapper
+        from emmy.compiler.trace.huggingface import build_full_model_wrapper
 
         logger.info("Tracing full model (seq_len=%d)...", seq_len)
         wrapper = build_full_model_wrapper(model, seq_len, dtype)
@@ -117,7 +117,7 @@ def graph_from_code(code: str, dynamic_shapes: dict | None = None):
     (used by ``tune --bench`` / ``run --bench`` to time eager / ``torch.compile``
     against the lowered graph).
 
-    Shared by ``deplodock trace --code`` and ``deplodock compile --code``.
+    Shared by ``emmy trace --code`` and ``emmy compile --code``.
     ``dynamic_shapes`` flows through to ``torch.export.export`` so the resulting
     graph can carry symbolic dims from the SymInt pass.
     """
@@ -130,7 +130,7 @@ def trace_inline_code(code: str, dynamic_shapes: dict | None = None) -> dict:
 
     Returns a dict with ``graph``, ``slug``, ``module``, ``args``, ``kwargs``,
     and ``const_targets`` (placeholder→attribute path for parameters/buffers).
-    Used by ``deplodock run --code`` to compile, execute, and benchmark
+    Used by ``emmy run --code`` to compile, execute, and benchmark
     against the original PyTorch module.
     """
     try:
@@ -140,7 +140,7 @@ def trace_inline_code(code: str, dynamic_shapes: dict | None = None) -> dict:
         logger.error("torch is required: pip install torch")
         sys.exit(1)
 
-    from deplodock.compiler.trace.torch import trace_module_with_constants
+    from emmy.compiler.trace.torch import trace_module_with_constants
 
     try:
         tree = ast.parse(code, mode="exec")

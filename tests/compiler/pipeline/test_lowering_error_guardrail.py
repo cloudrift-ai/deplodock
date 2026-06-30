@@ -25,14 +25,14 @@ import inspect
 
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.kernel.ir import KernelOp, Smem
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import LoweringError
-from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.kernel.ir import KernelOp, Smem
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import LoweringError
+from emmy.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
 from tests.compiler.conftest import drain_tune
 
 
@@ -127,8 +127,8 @@ def test_greedy_run_raises_lowering_error():
 
 
 def test_tuning_does_not_raise_and_prunes_branch():
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     pipeline = _build_pipeline()
     terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
@@ -174,8 +174,8 @@ def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
     prior can rank them top and the blocklist retry engages per tile identity
     (``BN``). Pass 0 ``RuleSkipped``-guards on the BN marker so it never
     re-fires on its own (already-tiled) output."""
-    from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
-    from deplodock.compiler.pipeline.pipeline import RuleSkipped
+    from emmy.compiler.pipeline.fork import OptionFork, ThunkFork
+    from emmy.compiler.pipeline.pipeline import RuleSkipped
 
     def _tile_leaf(bn: int) -> TileOp:
         return TileOp(body=Body(()), name="k_test", knobs={"BN": bn})
@@ -216,7 +216,7 @@ def test_greedy_run_falls_back_to_option0_when_prior_overflows(monkeypatch):
     # the blocklist retry can never reach it within its budget. Before the
     # option-0 fallback this raised LoweringError; now ``Pipeline.run`` takes
     # the conservative emission-order pick (option-0 = the in-budget tile).
-    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+    import emmy.compiler.pipeline.search.policy.greedy as greedy_mod
 
     monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
     terminal = _two_pass_tile_pipeline(n_over_budget=12).run(_graph_with_tile(), ctx=_small_smem_ctx())
@@ -229,7 +229,7 @@ def test_greedy_run_still_raises_when_no_in_budget_option(monkeypatch):
     # The fallback must not paper over a genuinely un-lowerable shape: when
     # EVERY tile is over-budget, option-0 overflows too and the loud
     # LoweringError still fires (no in-budget leaf exists to recover).
-    import deplodock.compiler.pipeline.search.policy.greedy as greedy_mod
+    import emmy.compiler.pipeline.search.policy.greedy as greedy_mod
 
     monkeypatch.setattr(greedy_mod, "_load_prior_safe", lambda: _BiggestBNFirstPrior())
     # Drop the in-budget option-0: shift all leaves over budget by tuning the
@@ -293,11 +293,11 @@ def test_compute_phase_info_raises_on_collapsed_index():
     # single-Write materializer — ``compute_phase_info`` flags it as a
     # ``LoweringError`` (caught + pruned under tune by the containment above)
     # instead of an opaque ``AttributeError`` mid-tune.
-    from deplodock.compiler.ir.axis import Axis
-    from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.stmt import Write
-    from deplodock.compiler.ir.tile.ir import Source
-    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
+    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.expr import Literal, Var
+    from emmy.compiler.ir.stmt import Write
+    from emmy.compiler.ir.tile.ir import Source
+    from emmy.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
 
     sources = (Source(name="slab", buf="x", cache_axes=(Axis("a2", 4), Axis("a4", 8)), origin=(Literal(0, "int"), Literal(0, "int"))),)
     # Clean all-Var index → recovers the two cache axes.
@@ -317,11 +317,11 @@ def test_tuning_contains_raising_lowering_pass(caplog):
     # so a single un-lowerable fork can't abort the whole tune.
     import logging
 
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     pipeline = _build_raising_pipeline()
-    with caplog.at_level(logging.WARNING, logger="deplodock.compiler.pipeline"):
+    with caplog.at_level(logging.WARNING, logger="emmy.compiler.pipeline"):
         terminals = drain_tune(pipeline, _graph_with_tile(), search=TuningSearch(patience=10**6), ctx=_small_smem_ctx(), db=SearchDB())
     # The only lowering option raised, so no terminal is benchable — the search
     # ends cleanly with zero terminals instead of crashing.

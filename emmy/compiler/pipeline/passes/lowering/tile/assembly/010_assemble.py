@@ -12,11 +12,11 @@ does the register/thread replication (``_wrap_tower``) + slab synthesis from the
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.tile.ir import TileGraphOp, TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.tile.ir import TileGraphOp, TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block, assembly_ready
 
 PATTERN = [Pattern("root", TileGraphOp)]
 

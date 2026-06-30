@@ -21,8 +21,8 @@
   rule modules picked up by ``Pass.load``.
 """
 
-from deplodock.compiler.pipeline.dump import CompilerDump
-from deplodock.compiler.pipeline.pipeline import (
+from emmy.compiler.pipeline.dump import CompilerDump
+from emmy.compiler.pipeline.pipeline import (
     LoweringError,
     Match,
     Pass,
@@ -32,7 +32,7 @@ from deplodock.compiler.pipeline.pipeline import (
     RuleSkipped,
     _strip_rule_prefix,
 )
-from deplodock.compiler.pipeline.search import (
+from emmy.compiler.pipeline.search import (
     Candidate,
     Search,
     TuningSearch,

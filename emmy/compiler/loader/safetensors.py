@@ -21,9 +21,9 @@ from pathlib import Path
 
 import numpy as np
 
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.loader.binder import apply_load_ops
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.base import ConstantOp
+from emmy.compiler.loader.binder import apply_load_ops
 
 logger = logging.getLogger(__name__)
 

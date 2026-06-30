@@ -11,15 +11,15 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
-from deplodock.compiler.ir.sigma import Sigma
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import BinaryExpr, CastExpr, Expr, FuncCallExpr, Literal, SimplifyCtx, TernaryExpr, Var
+from emmy.compiler.ir.sigma import Sigma
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.stmt.body import Body
-    from deplodock.compiler.ir.stmt.leaves import Select
-    from deplodock.compiler.render_target import RenderTarget
+    from emmy.compiler.ir.stmt.body import Body
+    from emmy.compiler.ir.stmt.leaves import Select
+    from emmy.compiler.render_target import RenderTarget
 
 
 def _default_render_target():
@@ -28,7 +28,7 @@ def _default_render_target():
     legacy "everything is CUDA" behavior for tests / golden output.
 
     Lazy to avoid importing the backend at IR-module load time."""
-    from deplodock.compiler.backend.cuda.render_target import CudaRenderTarget  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.render_target import CudaRenderTarget  # noqa: PLC0415
 
     return CudaRenderTarget()
 
@@ -147,7 +147,7 @@ class RenderCtx:
         literal in ``dtype``, wrapping with the target's dtype cast if
         needed (e.g. ``__float2half(0.0f)`` for fp16). Accepts a
         :class:`DataType`, a canonical-name string, or ``None`` (F32)."""
-        from deplodock.compiler.ir.expr import _float_lit  # noqa: PLC0415
+        from emmy.compiler.ir.expr import _float_lit  # noqa: PLC0415
 
         return self.target.literal(_float_lit(float(identity)), _canonical_dtype_name(dtype))
 
@@ -425,10 +425,10 @@ class Stmt:
         type + introspection walker for the Stage hierarchy). This method
         is a thin shim so existing call sites (``s.rewrite(...)``) keep
         working. Tile-IR Stmt registrations are loaded by importing
-        ``deplodock.compiler.ir.tile.ir`` (which any caller passing a
+        ``emmy.compiler.ir.tile.ir`` (which any caller passing a
         Tile-IR Stmt has done already).
         """
-        from deplodock.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
 
         return rewrite(self, rename_ssa, sigma, axis_fn)
 
@@ -603,7 +603,7 @@ class ReduceCarrier(Stmt):
 
     def project(self, program, *, distributed_inputs, dist) -> None:
         """Project this carrier's ``program`` (a ``merge`` forward-step / ``combine_states``
-        body) onto a :class:`~deplodock.compiler.ir.stmt.carrier_algebra.Distribution` backend
+        body) onto a :class:`~emmy.compiler.ir.stmt.carrier_algebra.Distribution` backend
         — the **magic method** that takes the carrier algebra to a target distribution by the
         distribution law. Taints the distributed values (seeded by ``distributed_inputs``), then
         dispatches each ``Assign`` to the backend's fold (a reduce over the distributed axis →
@@ -613,7 +613,7 @@ class ReduceCarrier(Stmt):
         stateful backend, mutated in place. Default keyed off :meth:`carried_names` — the one
         ``project`` every carrier (``Accum`` / ``Mma`` / ``Monoid``) shares. See
         ``ir/stmt/carrier_algebra``."""
-        from deplodock.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
 
         interpret(program, distributed_inputs=distributed_inputs, state_names=self.carried_names(), dist=dist)
 
@@ -637,7 +637,7 @@ def render_body(body: Body, ctx: RenderCtx) -> list[str]:
     their ``Var(name)`` uses inline as float literals instead of
     materializing a named local.
     """
-    from deplodock.compiler.ir.stmt.leaves import Load  # local — avoid cycle
+    from emmy.compiler.ir.stmt.leaves import Load  # local — avoid cycle
 
     # Pre-pass: register every literal-constant Load's SSA name in the ctx
     # so subsequent ``Var(name)`` references render as the literal value.

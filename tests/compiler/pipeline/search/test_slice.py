@@ -14,21 +14,21 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.search.db import SearchDB
-from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import LOWERING_PASSES
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda.ir import CudaOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.search.db import SearchDB
+from emmy.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.pipeline.search.slice import single_node_graph
+from emmy.compiler.pipeline.search.two_level import LOWERING_PASSES
 
 
 @pytest.fixture(autouse=True)
 def _force_target():
-    from deplodock.compiler import target as target_mod
+    from emmy.compiler import target as target_mod
 
     target_mod.set_target((8, 0))
     yield

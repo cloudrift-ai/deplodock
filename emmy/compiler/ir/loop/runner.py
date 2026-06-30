@@ -28,10 +28,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from deplodock.compiler.ir.stmt import RenderCtx, render_body
+from emmy.compiler.ir.stmt import RenderCtx, render_body
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.loop.ir import LoopOp
+    from emmy.compiler.ir.loop.ir import LoopOp
 
 logger = logging.getLogger(__name__)
 

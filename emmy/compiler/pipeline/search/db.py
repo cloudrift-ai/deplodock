@@ -167,7 +167,7 @@ class SearchDB:
 
     Pass ``path=None`` for an in-memory database (default — keeps tests
     hermetic; tuning runs pass an explicit path like
-    ``~/.cache/deplodock/autotune.db``).
+    ``~/.cache/emmy/autotune.db``).
     """
 
     # Bumped whenever the fork-tree topology shifts in ways that change

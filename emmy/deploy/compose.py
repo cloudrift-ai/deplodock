@@ -4,8 +4,8 @@ from typing import Any
 
 import yaml
 
-from deplodock.recipe.engines import build_engine_args
-from deplodock.recipe.types import Recipe
+from emmy.recipe.engines import build_engine_args
+from emmy.recipe.types import Recipe
 
 
 def _render_docker_options(docker_options: dict[str, Any]) -> str:

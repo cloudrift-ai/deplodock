@@ -5,14 +5,14 @@ import logging
 import os
 import sys
 
-from deplodock.deploy import DEFAULT_STRATEGY, STRATEGIES, run_deploy, run_teardown
-from deplodock.deploy.local import make_run_cmd, make_write_file
-from deplodock.detect import detect_local_gpus
-from deplodock.provisioning.host import LocalHost
-from deplodock.provisioning.remote import provision_remote
-from deplodock.recipe import resolve_for_hardware
-from deplodock.redact import register_secret
-from deplodock.timing import PhaseTimer
+from emmy.deploy import DEFAULT_STRATEGY, STRATEGIES, run_deploy, run_teardown
+from emmy.deploy.local import make_run_cmd, make_write_file
+from emmy.detect import detect_local_gpus
+from emmy.provisioning.host import LocalHost
+from emmy.provisioning.remote import provision_remote
+from emmy.recipe import resolve_for_hardware
+from emmy.redact import register_secret
+from emmy.timing import PhaseTimer
 
 logger = logging.getLogger(__name__)
 

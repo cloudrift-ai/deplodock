@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.dim import Dim, to_dim
-from deplodock.compiler.ir.expr import Interval, Literal, SimplifyCtx
+from emmy.compiler.dim import Dim, to_dim
+from emmy.compiler.ir.expr import Interval, Literal, SimplifyCtx
 
 # Sentinel upper bound for a symbolic loop axis ``[0, hi]``. Only its ``lo = 0``
 # matters (gives the non-negativity the ``(i*c + …)//c → i`` div fold needs);

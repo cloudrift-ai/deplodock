@@ -13,13 +13,13 @@ the Qwen3 attention-mask precompute path.
 
 from __future__ import annotations
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.kernel.ir import KernelOp
-from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.loop import Axis, Load, Write
-from deplodock.compiler.ir.tile.ir import ThreadTile
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.ir.kernel.render import render_kernelop
+from emmy.compiler.ir.loop import Axis, Load, Write
+from emmy.compiler.ir.tile.ir import ThreadTile
+from emmy.compiler.tensor import Tensor
 
 
 def _broadcast_zero_kernel(width: int) -> tuple[KernelOp, dict]:

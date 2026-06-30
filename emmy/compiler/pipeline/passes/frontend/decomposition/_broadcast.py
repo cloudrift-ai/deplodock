@@ -13,10 +13,10 @@ have shape equal to its output.
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.expr import Literal, placeholder
+from emmy.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
 
 def _is_symbolic(d) -> bool:

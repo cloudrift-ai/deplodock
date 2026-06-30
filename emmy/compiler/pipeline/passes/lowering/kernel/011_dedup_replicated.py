@@ -42,10 +42,10 @@ correct when the index pretty-prints the same.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Assign, Body, Load, Stmt
-from deplodock.compiler.ir.tile.ir import TileOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import Assign, Body, Load, Stmt
+from emmy.compiler.ir.tile.ir import TileOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

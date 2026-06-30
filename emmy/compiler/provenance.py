@@ -27,8 +27,8 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph, Node
-    from deplodock.compiler.ir.loop import LoopOp
+    from emmy.compiler.graph import Graph, Node
+    from emmy.compiler.ir.loop import LoopOp
 
 PROV = "prov"
 
@@ -228,7 +228,7 @@ def name_for(loop: LoopOp, base_name: str, node_prov: dict, all_totals: dict[str
 
     Local import for ``ReduceCarrier`` avoids a top-of-module cycle through
     ``ir.loop`` (which imports ``provenance`` for graph utilities)."""
-    from deplodock.compiler.ir.stmt import ReduceCarrier
+    from emmy.compiler.ir.stmt import ReduceCarrier
 
     suffix = "reduce" if any(isinstance(s, ReduceCarrier) for s in loop) else "pointwise"
     strong = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS | _WEAK_KINDS]

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.stmt import Cond, Stmt
-from deplodock.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, WarpSpecialize
+from emmy.compiler.ir.stmt import Cond, Stmt
+from emmy.compiler.ir.tile.ir import AsyncWait, SerialTile, StageBundle, StagePolicy, WarpSpecialize
 
 
 def _is_tma_bundle(s) -> bool:

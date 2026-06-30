@@ -4,8 +4,8 @@ import asyncio
 import logging
 import sys
 
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.provisioning.gcp import (
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.gcp import (
     create_instance,
     delete_instance,
 )

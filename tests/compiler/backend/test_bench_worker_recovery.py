@@ -66,7 +66,7 @@ def test_worker_exits_after_context_corruption() -> None:
     # the first request with the error, and exit — so the *second* request gets
     # no response (EOF), proving it won't serve from the poisoned context.
     child = """
-        import deplodock.compiler.backend.cuda.program as program
+        import emmy.compiler.backend.cuda.program as program
         def _corrupt(graph, **kw):
             import cupy
             k = cupy.RawKernel(r'extern "C" __global__ void oob(float* p){ p[268435456] = 1.0f; }', 'oob')
@@ -75,7 +75,7 @@ def test_worker_exits_after_context_corruption() -> None:
             cupy.cuda.runtime.deviceSynchronize()  # surfaces the sticky error
             raise RuntimeError('unreached')
         program.benchmark_program = _corrupt
-        from deplodock.compiler.backend.cuda._bench_worker import main
+        from emmy.compiler.backend.cuda._bench_worker import main
         main()
     """
     proc = _spawn(child)
@@ -96,7 +96,7 @@ def test_worker_exits_after_context_corruption() -> None:
 
 def test_kill_idempotent_when_no_proc() -> None:
     """``_kill()`` on a worker that was never spawned must be a silent no-op."""
-    from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
+    from emmy.compiler.backend.cuda.program import _AsyncBenchWorker
 
     w = _AsyncBenchWorker()
     assert w._proc is None
@@ -112,7 +112,7 @@ def test_kill_releases_already_dead_subprocess() -> None:
     (a dead proc has ``returncode`` set, so no SIGKILL is attempted)."""
     import asyncio
 
-    from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
+    from emmy.compiler.backend.cuda.program import _AsyncBenchWorker
 
     async def _run() -> None:
         proc = await asyncio.create_subprocess_exec(
@@ -138,8 +138,8 @@ def test_bench_retries_after_broken_pipe_on_first_write(monkeypatch) -> None:
     respawn and retry the send once before surfacing the failure."""
     import asyncio
 
-    from deplodock.compiler.backend import BenchmarkResult
-    from deplodock.compiler.backend.cuda import program as P
+    from emmy.compiler.backend import BenchmarkResult
+    from emmy.compiler.backend.cuda import program as P
 
     response_body = pickle.dumps(
         {"ok": True, "result": BenchmarkResult(time_ms=42.0, num_launches=0)},
@@ -209,11 +209,11 @@ def test_worker_survives_benign_error() -> None:
     # context healthy — the worker must stay alive and keep serving so the
     # autotune sweep doesn't pay a respawn per rejected config.
     child = """
-        import deplodock.compiler.backend.cuda.program as program
+        import emmy.compiler.backend.cuda.program as program
         def _benign(graph, **kw):
             raise ValueError('benign compile-like failure')
         program.benchmark_program = _benign
-        from deplodock.compiler.backend.cuda._bench_worker import main
+        from emmy.compiler.backend.cuda._bench_worker import main
         main()
     """
     proc = _spawn(child)

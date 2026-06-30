@@ -1,7 +1,7 @@
-"""``DeplodockGenRunner`` — per-layer attention-split runner (Phase 2 of
+"""``EmmyGenRunner`` — per-layer attention-split runner (Phase 2 of
 ``plans/generative-inference-support.md``).
 
-Sibling to ``DeplodockForwardRunner`` (the embedding runner). Carves SDPA out of every
+Sibling to ``EmmyForwardRunner`` (the embedding runner). Carves SDPA out of every
 decoder layer (``build_attention_split_wrapper``), compiles **two programs per layer**
 (``pre`` + ``post``) over the flattened ``[num_tokens, H]`` layout with ``num_tokens``
 symbolic, and exposes the per-token, everything-but-attention compute:
@@ -37,7 +37,7 @@ class _Program:
     def run(self, arrays):
         """arrays: numpy arrays aligned to ``input_names`` (each ``[T, …]``). Returns the
         outputs in ``output_names`` order, sliced to the runtime ``T``."""
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.backend.gpu_lock import gpu_lock
 
         t = arrays[0].shape[0]
         feed = dict(zip(self.input_names, arrays, strict=True))
@@ -58,7 +58,7 @@ class _Program:
         import cupy as cp
         import torch
 
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.backend.gpu_lock import gpu_lock
 
         t = arrays[0].shape[0]
         with gpu_lock(), cp.cuda.Stream.from_external(torch.cuda.current_stream()):
@@ -92,15 +92,15 @@ def _compile_split(wrapper, example_args, argnames, np_dtype):
     pathological at decode)."""
     import torch
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
-    from deplodock.compiler.backend.gpu_lock import gpu_lock
-    from deplodock.compiler.loader.binder import bind_constants
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.gpu_lock import gpu_lock
+    from emmy.compiler.loader.binder import bind_constants
+    from emmy.compiler.trace.torch import trace_module
 
     dynamic_shapes = None
     if argnames:
-        from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+        from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
 
         dynamic_shapes = build_torch_dynamic_shapes(parse_position_specs([f"num_tokens@{n}:0" for n in argnames]))
     graph = trace_module(wrapper, tuple(example_args), dynamic_shapes=dynamic_shapes)
@@ -119,7 +119,7 @@ def _compile_split(wrapper, example_args, argnames, np_dtype):
     return _Program(program, list(compiled.inputs), list(compiled.outputs))
 
 
-class DeplodockGenRunner:
+class EmmyGenRunner:
     def __init__(self, *, embed_weight, norm, pre, post, attn_meta, np_dtype, pre_decode=None, post_decode=None, decode_bucket=16):
         self._embed_weight = embed_weight  # numpy [vocab, H]
         self._norm = norm  # torch module
@@ -162,7 +162,7 @@ class DeplodockGenRunner:
         import numpy as np
         import torch
 
-        from deplodock.compiler.trace.huggingface import build_attention_split_wrapper
+        from emmy.compiler.trace.huggingface import build_attention_split_wrapper
 
         dtype = getattr(torch, dtype_str)
         np_dtype = np.dtype(dtype_str)
@@ -264,7 +264,7 @@ class DeplodockGenRunner:
 
     # --- Device-resident decode path (Phase A of plans/generative-device-resident-decode.md) ---
     # Used by the vLLM plugin for the decode hot path (T <= decode_bucket); the numpy methods
-    # above stay for prefill / the standalone ``deplodock generate`` oracle.
+    # above stay for prefill / the standalone ``emmy generate`` oracle.
 
     def _ensure_device(self):
         """Lazily build CUDA copies of the embed table + final norm (once) for the device path.

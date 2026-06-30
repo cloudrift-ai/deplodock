@@ -10,13 +10,13 @@ exact include/exclude list.
 
 Implementers today:
 
-- :class:`deplodock.compiler.graph.Graph` — Merkle digest over op kinds,
+- :class:`emmy.compiler.graph.Graph` — Merkle digest over op kinds,
   body structure, output shapes/dtypes, input wiring; excludes node ids,
   Tensor names, and Hints.
-- :class:`deplodock.compiler.ir.stmt.body.Body` — canonicalized body
+- :class:`emmy.compiler.ir.stmt.body.Body` — canonicalized body
   rendering with SSA / axis / commutative-arg / external-buffer names
   normalized away.
-- :class:`deplodock.compiler.context.Context` — codegen-affecting
+- :class:`emmy.compiler.context.Context` — codegen-affecting
   compilation knobs (compute capability today; tuning overrides as they
   land). Excludes ambient I/O fields (dump dirs, verbosity).
 

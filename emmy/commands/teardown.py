@@ -6,9 +6,9 @@ import logging
 import sys
 from pathlib import Path
 
-from deplodock.deploy.orchestrate import run_teardown
-from deplodock.provisioning.cloud import delete_cloud_vm
-from deplodock.provisioning.ssh_transport import make_run_cmd
+from emmy.deploy.orchestrate import run_teardown
+from emmy.provisioning.cloud import delete_cloud_vm
+from emmy.provisioning.ssh_transport import make_run_cmd
 
 logger = logging.getLogger(__name__)
 

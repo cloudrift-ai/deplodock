@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from deplodock.compiler.ir.expr import Expr, SimplifyCtx
+from emmy.compiler.ir.expr import Expr, SimplifyCtx
 
 
 @dataclass(frozen=True, eq=False)

@@ -14,12 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, placeholder
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
-from deplodock.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
-from deplodock.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.expr import BinaryExpr, Literal, placeholder
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, IndexMapOp, IndexSource, ReduceOp
+from emmy.compiler.pipeline.passes.frontend.decomposition._broadcast import broadcast_to, squeeze_axis
+from emmy.compiler.pipeline.passes.frontend.decomposition._matmul_helpers import matmul_unsqueeze
 
 __all__ = [
     "broadcast_to",

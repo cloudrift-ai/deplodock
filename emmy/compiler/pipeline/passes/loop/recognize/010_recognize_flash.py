@@ -46,12 +46,12 @@ heads) fails a check and the score-matrix path stands.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop.ir import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import (
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop.ir import LoopOp
+from emmy.compiler.ir.stmt import Accum, Assign, Load, Loop, Select, Stmt, Write
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.loop.recognize._flash import (
     build_flash_frag,
     build_flash_recovered,
     flash_enabled,

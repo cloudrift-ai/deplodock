@@ -8,18 +8,18 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock import config
-from deplodock.compiler.pipeline import (
+from emmy import config
+from emmy.compiler.pipeline import (
     CUDA_PASSES,
     KERNEL_PASSES,
     LOOP_PASSES,
     TENSOR_PASSES,
     TILE_PASSES,
 )
-from deplodock.compiler.pipeline.rule_diff import PASS_SHORTHAND
+from emmy.compiler.pipeline.rule_diff import PASS_SHORTHAND
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +50,8 @@ _PASS_SHORTCUTS = {short: full for full, short in PASS_SHORTHAND.items()}
 
 
 def resolve_tune_db() -> Path:
-    """Resolve the autotune SQLite cache path: ``DEPLODOCK_TUNE_DB``
-    env var → ``~/.cache/deplodock/autotune.db``. Same resolution used
+    """Resolve the autotune SQLite cache path: ``EMMY_TUNE_DB``
+    env var → ``~/.cache/emmy/autotune.db``. Same resolution used
     by every CLI command (``compile`` / ``run`` / ``tune``) and by
     :class:`CudaBackend` when constructed with ``tune_db="auto"``.
 
@@ -71,7 +71,7 @@ def add_input_args(parser) -> None:
             "Inline Python expression whose last statement is a call. 'torch', 'nn' and 'F' "
             "(torch.nn.functional) are already in scope — no import needed. The callable may be an "
             "nn.Module or a torch function. Full runnable example (SDPA): "
-            'deplodock compile -c "F.scaled_dot_product_attention('
+            'emmy compile -c "F.scaled_dot_product_attention('
             'torch.randn(1,8,128,64), torch.randn(1,8,128,64), torch.randn(1,8,128,64), is_causal=True)". '
             "Traces the expression and compiles it in one step. Mutually exclusive with the positional input."
         ),
@@ -110,7 +110,7 @@ def add_input_args(parser) -> None:
     )
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
 
-    from deplodock.compiler.target import add_target_arg
+    from emmy.compiler.target import add_target_arg
 
     add_target_arg(parser)
 
@@ -124,7 +124,7 @@ def add_golden_arg(parser) -> None:
         metavar="NAME",
         help=(
             "Tune / run the named golden config from GOLDEN_CONFIGS (shorthand for --code <its snippet>) — lets you "
-            "build the learned prior up one shape at a time and `deplodock eval golden` between runs. An unknown NAME "
+            "build the learned prior up one shape at a time and `emmy eval golden` between runs. An unknown NAME "
             "lists the available names. Mutually exclusive with --code / positional input / --ir."
         ),
     )
@@ -143,7 +143,7 @@ def resolve_golden_arg(args) -> None:
     args.golden_configs = []
     if not name:
         return
-    from deplodock.compiler.pipeline.search.data import Dataset
+    from emmy.compiler.pipeline.search.data import Dataset
 
     if args.code or args.input or getattr(args, "ir", None):
         logger.error("--golden is mutually exclusive with --code / positional input / --ir")
@@ -157,7 +157,7 @@ def resolve_golden_arg(args) -> None:
     # their own fall back to the full set (the seed / transfer flow).
     matches = Dataset.from_golden(name=name, live_gpu=True).samples
     if not matches:
-        from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
+        from emmy.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 
         names = ", ".join(sorted({g.name for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)}))
         logger.error("unknown golden config %r.\nAvailable: %s", name, names)
@@ -227,7 +227,7 @@ def add_nvcc_args(parser) -> None:
             "Override the extra nvcc compile flags (space-separated), e.g. "
             '"-Xcicc -O3" or "-Xcicc -O1". Defaults: tune uses "-Xcicc -O1" (fast compile — but latencies are a '
             "RANKING signal, NOT -O3-optimal: reductions/attention can run 1.5-3x slower); compile/run use nvcc's "
-            "default -O3. Folded into the cubin + perf cache keys. Equivalent to setting DEPLODOCK_NVCC_FLAGS."
+            "default -O3. Folded into the cubin + perf cache keys. Equivalent to setting EMMY_NVCC_FLAGS."
         ),
     )
 
@@ -236,7 +236,7 @@ def apply_nvcc_flags(args, default: str) -> str:
     """Resolve and publish the effective extra nvcc flags. Thin CLI adapter that
     extracts ``--nvcc-flags`` from ``args`` and delegates the override/precedence
     (``--nvcc-flags`` > pre-set env > command ``default``) to
-    :func:`deplodock.config.set_nvcc_flags`, so every callsite (CLI, programmatic,
+    :func:`emmy.config.set_nvcc_flags`, so every callsite (CLI, programmatic,
     tests) shares one implementation. Must run before any compile/bench. Returns
     the effective string."""
     return config.set_nvcc_flags(getattr(args, "nvcc_flags", None), default)
@@ -244,8 +244,8 @@ def apply_nvcc_flags(args, default: str) -> str:
 
 def setup_pipeline_runtime(args) -> None:
     """Apply verbosity, diff-render config, and target overrides from parsed args."""
-    from deplodock.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
-    from deplodock.compiler.target import apply_target_arg
+    from emmy.compiler.pipeline.rule_diff import RuleRenderConfig, set_config, should_use_color
+    from emmy.compiler.target import apply_target_arg
 
     verbose = getattr(args, "verbose", 0)
     if getattr(args, "quiet", False):
@@ -305,9 +305,9 @@ def handle_compile(args):
         logger.error("either a positional model ID / IR file or --code is required")
         sys.exit(2)
 
-    from deplodock.compiler.pipeline import Pipeline
-    from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline import Pipeline
+    from emmy.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     setup_pipeline_runtime(args)
     apply_nvcc_flags(args, default="")  # compile uses nvcc default -O3 (representative codegen)
@@ -322,7 +322,7 @@ def handle_compile(args):
     # Pick tuned forks from the DB when one is reachable; otherwise the
     # engine falls back to rule defaults (single-shot option-0). Compile never
     # errors on a missing DB — that's only a hint, not a requirement.
-    # ``DEPLODOCK_TUNE_DB`` env var overrides the default path.
+    # ``EMMY_TUNE_DB`` env var overrides the default path.
     tune_db_path = resolve_tune_db()
     db = SearchDB(path=tune_db_path) if tune_db_path.exists() else None
     if db is not None:
@@ -357,7 +357,7 @@ def resolve_passes(args) -> list[str]:
 
 
 def format_stage(graph, stage: str) -> str:
-    from deplodock.compiler.pipeline.dump import format_kernels
+    from emmy.compiler.pipeline.dump import format_kernels
 
     formatter = _IR_STAGES[stage][1]
     if formatter == "graph":
@@ -366,7 +366,7 @@ def format_stage(graph, stage: str) -> str:
 
 
 def _is_boundary(op) -> bool:
-    from deplodock.compiler.ir.base import ConstantOp, InputOp
+    from emmy.compiler.ir.base import ConstantOp, InputOp
 
     return isinstance(op, (InputOp, ConstantOp))
 
@@ -377,7 +377,7 @@ def load_or_trace(args) -> tuple[Graph, str, tuple | None]:
     timing), or ``None`` when no module is available (``--ir`` JSON path)."""
     dynamic_shapes = _resolve_dynamic_shapes(args)
     if args.code:
-        from deplodock.commands.trace import graph_from_code
+        from emmy.commands.trace import graph_from_code
 
         return graph_from_code(args.code, dynamic_shapes=dynamic_shapes)
 
@@ -400,7 +400,7 @@ def _resolve_dynamic_shapes(args) -> dict | None:
     specs_raw = getattr(args, "dynamic", None)
     if not specs_raw:
         return None
-    from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+    from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
 
     try:
         specs = parse_position_specs(specs_raw)
@@ -411,7 +411,7 @@ def _resolve_dynamic_shapes(args) -> dict | None:
 
 
 def _load_graph(path: Path) -> Graph:
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.graph import Graph
 
     with open(path) as f:
         data = json.load(f)
@@ -430,7 +430,7 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
         logger.error("torch and transformers are required: pip install torch transformers")
         sys.exit(1)
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     logger.info("Pulling %s...", model_id)
     dtype = torch.float32 if layer is None else torch.float16
@@ -438,7 +438,7 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
     model.eval()
 
     if layer is None:
-        from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+        from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
 
         logger.info("Tracing full model (seq_len=%d)...", seq_len)
         if dynamic_shapes:
@@ -477,7 +477,7 @@ def _trace_model(model_id: str, layer: int | None, seq_len: int, *, dynamic_shap
         # Dynamic mode: concrete (cos, sin) kwargs would specialise rotary to
         # the trace seq_len, so wrap the block with in-graph sliced rotary
         # instead. The wrapper's input is ``x`` → spec ``--dynamic seq_len@x:1``.
-        from deplodock.compiler.trace.huggingface import build_layer_wrapper
+        from emmy.compiler.trace.huggingface import build_layer_wrapper
 
         wrapper = build_layer_wrapper(block, decoder.rotary_emb, hidden_size, dtype, layer_type=layer_type)
         graph = trace_module(wrapper, (x,), dynamic_shapes=dynamic_shapes)

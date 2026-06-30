@@ -25,14 +25,14 @@ All CPU — no CUDA, no lowering.
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_CELLS_PER_THREAD
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ReduceOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAX_CELLS_PER_THREAD
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import (
     Budget,
     coop_reduce_offers,
     reduce_offers,

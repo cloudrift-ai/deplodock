@@ -23,12 +23,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F16
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline
+from emmy.compiler.context import Context
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.pipeline import CUDA_PASSES, Pipeline
 
 from .conftest import dyn_M, requires_sm90
 
@@ -84,8 +84,8 @@ def transport(request, monkeypatch) -> str:
     """Pin the warp tile + force the transport (``TMA=1`` = cp.async.bulk.tensor,
     ``TMA=0`` = cp.async). The "pinned knobs" fixture."""
     for k, v in _WARP_KNOBS.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
-    monkeypatch.setenv("DEPLODOCK_TMA", "1" if request.param == "tma" else "0")
+        monkeypatch.setenv(f"EMMY_{k}", v)
+    monkeypatch.setenv("EMMY_TMA", "1" if request.param == "tma" else "0")
     return request.param
 
 
@@ -122,7 +122,7 @@ def test_static_dynamic_mma_parity(shape_mode, transport, M):
     ``test_matmul_mma_masked.py``."""
     if transport == "tma" and not _supports_tma():
         pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     be = CudaBackend()
     compiled = be.compile(_mma_graph(shape_mode, M=M))

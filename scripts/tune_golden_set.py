@@ -3,18 +3,18 @@
 golden (or better) config?
 
 Pipeline, all on an isolated prior + tune DB so the user's caches are untouched
-(``DEPLODOCK_PRIOR_FILE`` / ``DEPLODOCK_TUNE_DB`` default to /tmp paths here):
+(``EMMY_PRIOR_FILE`` / ``EMMY_TUNE_DB`` default to /tmp paths here):
 
-  1. TUNE — for each ``GOLDEN_CONFIGS`` matmul, ``deplodock tune --code <snippet>``
+  1. TUNE — for each ``GOLDEN_CONFIGS`` matmul, ``emmy tune --code <snippet>``
      (idempotent: ops already tuned to >= patience are skipped, and per-op results
      transfer across shapes that share kernel structure). This trains the one
      global learned prior.
-  2. BENCH — for each shape, ``deplodock run --code <snippet> --bench`` does the
+  2. BENCH — for each shape, ``emmy run --code <snippet> --bench`` does the
      greedy single-shot pick *from the trained prior* and benches it at -O3.
-     Parse the Deplodock latency and compare to the recorded golden ``deplodock_us``
+     Parse the Emmy latency and compare to the recorded golden ``emmy_us``
      (same kernel path, same device → apples-to-apples). "golden or better" ==
      greedy_us <= golden_us.
-  3. KNOBS — a final ``deplodock knobs --golden`` shows the greedy-with-prior knob
+  3. KNOBS — a final ``emmy knobs --golden`` shows the greedy-with-prior knob
      pick vs the recorded golden, per knob.
 
 Results stream to stdout and a JSON sidecar so a kill leaves partial data.
@@ -34,13 +34,13 @@ import subprocess
 import time
 from pathlib import Path
 
-os.environ.setdefault("DEPLODOCK_PRIOR_FILE", "/tmp/golden_exp_prior.json")
-os.environ.setdefault("DEPLODOCK_TUNE_DB", "/tmp/golden_exp_autotune.db")
+os.environ.setdefault("EMMY_PRIOR_FILE", "/tmp/golden_exp_prior.json")
+os.environ.setdefault("EMMY_TUNE_DB", "/tmp/golden_exp_autotune.db")
 
-from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: E402
+from emmy.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig  # noqa: E402
 
-_DD = "./venv/bin/deplodock"
-_DEPLODOCK_US = re.compile(r"Deplodock\s+([\d.]+)")
+_DD = "./venv/bin/emmy"
+_EMMY_US = re.compile(r"Emmy\s+([\d.]+)")
 _EAGER_US = re.compile(r"Eager PyTorch\s+([\d.]+)")
 _RESULTS = Path("/tmp/tune_golden_results.json")
 
@@ -62,8 +62,8 @@ def main() -> None:
     args = ap.parse_args()
 
     configs = [g for g in GOLDEN_CONFIGS if isinstance(g, MatmulGoldenConfig)]
-    print(f"Prior:  {os.environ['DEPLODOCK_PRIOR_FILE']}")
-    print(f"DB:     {os.environ['DEPLODOCK_TUNE_DB']}")
+    print(f"Prior:  {os.environ['EMMY_PRIOR_FILE']}")
+    print(f"DB:     {os.environ['EMMY_TUNE_DB']}")
     print(f"{len(configs)} golden shapes | patience={args.patience}\n", flush=True)
 
     # ---- Phase 1: tune ---- #
@@ -80,17 +80,17 @@ def main() -> None:
     rows = []
     for g in configs:
         rc, out = _run([_DD, "run", "--code", g.snippet(), "--bench"], args.bench_timeout)
-        m = _DEPLODOCK_US.search(out)
+        m = _EMMY_US.search(out)
         greedy = float(m.group(1)) if m else None
         eager = float(me.group(1)) if (me := _EAGER_US.search(out)) else None
-        ratio = greedy / g.deplodock_us if greedy else None
-        # "golden or better": greedy within 5% of the recorded golden deplodock latency.
+        ratio = greedy / g.emmy_us if greedy else None
+        # "golden or better": greedy within 5% of the recorded golden emmy latency.
         verdict = "—" if greedy is None else ("GOLDEN+" if ratio <= 1.05 else f"{ratio:.2f}x slower")
         rows.append(
             {
                 "name": g.name,
                 "dtype": g.dtype,
-                "golden_us": g.deplodock_us,
+                "golden_us": g.emmy_us,
                 "golden_cublas_us": g.cublas_us,
                 "greedy_us": greedy,
                 "eager_us": eager,
@@ -101,7 +101,7 @@ def main() -> None:
         _RESULTS.write_text(json.dumps(rows, indent=2))
         rs = f"{ratio:.2f}" if ratio else "  —"
         gs = f"{greedy:9.1f}" if greedy else "      err"
-        print(f"  {g.name:24s} {g.dtype:5s} {g.deplodock_us:9.1f} {gs} {rs:>6s}  {verdict}", flush=True)
+        print(f"  {g.name:24s} {g.dtype:5s} {g.emmy_us:9.1f} {gs} {rs:>6s}  {verdict}", flush=True)
 
     hits = sum(1 for r in rows if r["ratio"] is not None and r["ratio"] <= 1.05)
     print(f"\n  greedy found golden-or-better (<=1.05x): {hits}/{len(rows)}", flush=True)

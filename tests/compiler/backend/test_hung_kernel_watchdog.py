@@ -36,7 +36,7 @@ def test_wait_for_event_raises_hungkernelerror_promptly() -> None:
     child = """
         import os, sys
         import cupy
-        from deplodock.compiler.backend.cuda.program import _wait_for_event, HungKernelError
+        from emmy.compiler.backend.cuda.program import _wait_for_event, HungKernelError
 
         spin = cupy.RawKernel(r'extern "C" __global__ void spin(volatile int* f) { while (f[0] == 0) {} }', 'spin')
         flag = cupy.zeros(1, dtype=cupy.int32)   # never set → the loop never exits

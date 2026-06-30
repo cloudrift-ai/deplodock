@@ -1,6 +1,6 @@
 """Trace + compile + per-sequence execution of an embedding-model trunk.
 
-``DeplodockForwardRunner`` owns the deplodock side of the vLLM plugin: at
+``EmmyForwardRunner`` owns the emmy side of the vLLM plugin: at
 server start it traces the HuggingFace ``AutoModel`` trunk (hidden states out,
 no lm_head) with a dynamic seq_len, compiles it through the CUDA backend
 (greedy fork picks from the global prior — no GPU tuning), and builds ONE
@@ -13,7 +13,7 @@ graph is captured at its EXACT seq_len, so every kernel runs at its exact grid (
 oversized-grid masking); the buffers are allocated once at ``max_seq_len`` and each
 request's inputs upload into their contiguous prefix.
 
-No vllm imports here — the class is driven by ``vllm_model.DeplodockEmbedModel``
+No vllm imports here — the class is driven by ``vllm_model.EmmyEmbedModel``
 but is independently testable with torch + cupy alone.
 """
 
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from deplodock.compiler.backend.cuda.program import CompiledProgram
+    from emmy.compiler.backend.cuda.program import CompiledProgram
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def _causal_mask_np(s: int, np_dtype) -> np.ndarray:
     return mask.astype(np_dtype)[None, None, :, :]
 
 
-class DeplodockForwardRunner:
+class EmmyForwardRunner:
     """One compiled dynamic-seq_len trunk + its per-sequence execution."""
 
     def __init__(
@@ -72,21 +72,21 @@ class DeplodockForwardRunner:
         self._mask_cache: dict = {}
 
     @classmethod
-    def create(cls, model_id: str, max_seq_len: int, dtype_str: str = "float16", batch: int = 1) -> DeplodockForwardRunner:
+    def create(cls, model_id: str, max_seq_len: int, dtype_str: str = "float16", batch: int = 1) -> EmmyForwardRunner:
         import torch
         from transformers import AutoModel
 
-        from deplodock.compiler.backend.cuda.backend import CudaBackend
-        from deplodock.compiler.backend.cuda.program import CompiledProgram
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
-        from deplodock.compiler.loader.binder import bind_constants
-        from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX, build_torch_dynamic_shapes, parse_position_specs
-        from deplodock.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
-        from deplodock.compiler.trace.torch import trace_module
+        from emmy.compiler.backend.cuda.backend import CudaBackend
+        from emmy.compiler.backend.cuda.program import CompiledProgram
+        from emmy.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.loader.binder import bind_constants
+        from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX, build_torch_dynamic_shapes, parse_position_specs
+        from emmy.compiler.trace.huggingface import build_causal_mask, build_full_model_wrapper
+        from emmy.compiler.trace.torch import trace_module
 
         if max_seq_len > DYNAMIC_DIM_MAX:
             raise ValueError(
-                f"max_seq_len={max_seq_len} exceeds deplodock's dynamic-dim max ({DYNAMIC_DIM_MAX}); "
+                f"max_seq_len={max_seq_len} exceeds emmy's dynamic-dim max ({DYNAMIC_DIM_MAX}); "
                 f"serve with --max-model-len {DYNAMIC_DIM_MAX} or lower"
             )
         dtype = getattr(torch, dtype_str)
@@ -217,7 +217,7 @@ class DeplodockForwardRunner:
         import cupy as cp  # noqa: PLC0415
         import torch
 
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.backend.gpu_lock import gpu_lock
 
         s = int(token_ids.shape[0])
         if s > self.max_seq_len:
@@ -249,7 +249,7 @@ class DeplodockForwardRunner:
         import cupy as cp  # noqa: PLC0415
         import torch
 
-        from deplodock.compiler.backend.gpu_lock import gpu_lock
+        from emmy.compiler.backend.gpu_lock import gpu_lock
 
         B, S = self.batch_cap, self.max_seq_len
         results: list = [None] * len(token_ids_list)

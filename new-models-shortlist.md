@@ -13,7 +13,7 @@
 | Model (`hf_id`) | Size (total / active) | Arch / format novelty | HF trend / Elo (rank) | Demand read |
 |---|---|---|---|---|
 | `deepseek-ai/DeepSeek-V4-Flash` | 284B / 13B MoE | CSA+HCA hybrid attn; **native FP4-experts + FP8-attn** (deploy-ready), MIT, 1M ctx | 95 / **1428** (#55) | **Strong** — "beats all open models in Math/STEM/Coding"; best size-for-value flagship |
-| `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | 550B / 55B MoE | **Hybrid Mamba-Transformer + Latent MoE, NVFP4-pretrained** | **160 (#1)** / — (too new) | **Strong (momentum)** — fastest US open frontier model, 5× throughput; most novel arch for deplodock |
+| `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | 550B / 55B MoE | **Hybrid Mamba-Transformer + Latent MoE, NVFP4-pretrained** | **160 (#1)** / — (too new) | **Strong (momentum)** — fastest US open frontier model, 5× throughput; most novel arch for emmy |
 | `google/gemma-4-26B-A4B-it` | 25.2B / 3.8B MoE | multimodal (text+img+video), Apache 2.0, 256K ctx | 45 / **1435** (#49) | **Strong (small)** — #1 downloads (12M); near-31B quality on one consumer/Pro card |
 | `MiniMaxAI/MiniMax-M2.7` | 230B / 10B MoE | agentic; **official FP8 + NVIDIA NVFP4** | 20 / 1400 (#106) | **Moderate-strong** — open-weight agent model, clean mid-tier fit |
 | `ibm-granite/granite-4.1-8b` | 8B dense | Apache 2.0, 131K ctx, enterprise | 5 / 1296 (#197) | **Moderate** — 8B matches IBM's own 32B; reliable consumer-card filler |

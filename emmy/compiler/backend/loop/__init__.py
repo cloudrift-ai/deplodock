@@ -7,6 +7,6 @@ reference/debugging backend — sits between the ``NumpyBackend``
 fusion vs codegen.
 """
 
-from deplodock.compiler.backend.loop.backend import LoopBackend
+from emmy.compiler.backend.loop.backend import LoopBackend
 
 __all__ = ["LoopBackend"]

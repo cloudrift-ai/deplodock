@@ -4,19 +4,19 @@ Each carries a child body (or two, for ``Cond``) and overrides
 ``Stmt.nested`` so :func:`iter_body` can recurse uniformly. Tile-axis
 decode helpers (``_render_grid_axis_decode``, ``_render_thread_axis_decode``,
 ``_body_uses_lane_warp``) live alongside and are consumed by the typed
-tile flavors in :mod:`deplodock.compiler.ir.tile.ir`.
+tile flavors in :mod:`emmy.compiler.ir.tile.ir`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from deplodock.compiler.dtype import F32 as _F32
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.stmt.base import INDENT, ReduceCarrier, RenderCtx, Stmt, _pad, pretty_body, render_body
-from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.stmt.leaves import Accum
+from emmy.compiler.dtype import F32 as _F32
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Expr, Var
+from emmy.compiler.ir.stmt.base import INDENT, ReduceCarrier, RenderCtx, Stmt, _pad, pretty_body, render_body
+from emmy.compiler.ir.stmt.body import Body
+from emmy.compiler.ir.stmt.leaves import Accum
 
 
 def _source_suffix(axis: Axis) -> str:
@@ -91,7 +91,7 @@ class Loop(Stmt):
         reads as ``MONOID``. A computed read (never stored, never in
         ``op_cache_key``), so it can never contradict the body's algebra. See
         ``ir/algebra.py``."""
-        from deplodock.compiler.ir.algebra import classify_algebra  # noqa: PLC0415 — break blocks↔algebra cycle
+        from emmy.compiler.ir.algebra import classify_algebra  # noqa: PLC0415 — break blocks↔algebra cycle
 
         return classify_algebra(self)
 
@@ -145,7 +145,7 @@ def _body_uses_lane_warp(body: Body) -> bool:
     references either helper.
     """
     # Local import — kernel-IR primitives sit in a downstream module.
-    from deplodock.compiler.ir.kernel.ir import SetMaxNReg, TreeHalve, WarpShuffle
+    from emmy.compiler.ir.kernel.ir import SetMaxNReg, TreeHalve, WarpShuffle
 
     return bool(body.iter_of_type(WarpShuffle, TreeHalve, SetMaxNReg))
 

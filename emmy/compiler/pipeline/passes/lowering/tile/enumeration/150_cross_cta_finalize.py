@@ -25,7 +25,7 @@ pass completes it to ``a``/``k`` (idempotent: ``fam.reduce_finalize_decided`` gu
 ATOMIC's legality (additive ``Accum`` + atomicAdd dtype, ``_predicates.atomic_finalize_legal``)
 narrows the offer to KERNEL-only when illegal — the gate the twisted (non-additive ``Monoid``)
 split-KV finalize trips (its ``e^{Δm}`` rescale can't be an ``atomicAdd``, so attention has only
-a kernel arm by construction). A ``DEPLODOCK_FINALIZE`` pin narrows it explicitly (replacing the
+a kernel arm by construction). A ``EMMY_FINALIZE`` pin narrows it explicitly (replacing the
 removed ``NOATOMIC`` knob — ``kernel`` ≡ old ``NOATOMIC=1``). The warp / MMA tier is ``cta=1``
 today (R4), so this fires only on the scalar tier.
 """
@@ -34,21 +34,21 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import to_dim
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Monoid, Stmt, Write
-from deplodock.compiler.ir.tile.ir import TileGraphOp
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import mma_atom
-from deplodock.compiler.pipeline.passes.lowering._predicates import atomic_finalize_legal
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _build
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.context import Context
+from emmy.compiler.dim import to_dim
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Monoid, Stmt, Write
+from emmy.compiler.ir.tile.ir import TileGraphOp
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.knob import mma_atom
+from emmy.compiler.pipeline.passes.lowering._predicates import atomic_finalize_legal
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _build
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
+from emmy.compiler.tensor import Tensor
 
 PATTERN = [Pattern("root", TileGraphOp)]
 
@@ -139,7 +139,7 @@ def _rewrite_writes_to_state_workspaces(
             if new_bodies != bodies:
                 s = s.with_bodies(new_bodies)
         if isinstance(s, Write) and s.output == out_name:
-            from deplodock.compiler.ir.expr import Literal  # noqa: PLC0415
+            from emmy.compiler.ir.expr import Literal  # noqa: PLC0415
 
             new_stmts.extend(
                 replace(s, output=workspace, index=(Var(k_s_name), Literal(c, "int"), *s.index), values=(st,)) for c, st in enumerate(state)
@@ -244,7 +244,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     # an additive ``Accum`` over an atomicAdd-capable dtype (``_predicates.atomic_finalize_legal``)
     # — always true here (the SEMIRING matmul's combine is a plain sum), but the gate is the
     # explicit legality the twisted (non-additive ``Monoid``) split-KV finalize will trip. A
-    # ``DEPLODOCK_FINALIZE`` pin narrows the offer (the removed ``NOATOMIC`` env pin's successor).
+    # ``EMMY_FINALIZE`` pin narrows the offer (the removed ``NOATOMIC`` env pin's successor).
     # The cross-partition **carrier** drives the combine (carrier-generic): a SEMIRING matmul's
     # additive ``Accum`` (read off the body), or a MONOID reduce's carrier off ``dag.reduction``
     # (an additive ``Accum`` for a plain ``sum``, a twisted ``Monoid`` for the flash ``(m, l, O)``
@@ -264,7 +264,7 @@ def rewrite(ctx: Context, root: Node, match) -> list:  # noqa: ARG001
     if pin is not None:
         choices = [c for c in choices if c == pin]
     if not choices:
-        raise RuleSkipped("DEPLODOCK_FINALIZE pin matches no legal finalize (e.g. pinned the illegal ATOMIC)")
+        raise RuleSkipped("EMMY_FINALIZE pin matches no legal finalize (e.g. pinned the illegal ATOMIC)")
     variants: list = []
     for finalize in choices:
         if finalize is fam.KERNEL:

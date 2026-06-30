@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.expr import placeholder
-from deplodock.compiler.ir.tensor.ir import IndexMapOp, IndexSource
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.expr import placeholder
+from emmy.compiler.ir.tensor.ir import IndexMapOp, IndexSource
 
 
 def matmul_unsqueeze(a_shape: tuple, b_shape: tuple) -> tuple[IndexMapOp, IndexMapOp, tuple, int]:

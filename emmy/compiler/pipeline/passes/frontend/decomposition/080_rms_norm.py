@@ -1,10 +1,10 @@
 """Decompose rms_norm(x, weight [, eps]) into x * rsqrt(mean(x*x, -1, keepdim) + eps) * weight."""
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.frontend.ir import MeanOp, RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import (
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import MeanOp, RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import (
     broadcast_to,
     const_bc,
     open_fragment,

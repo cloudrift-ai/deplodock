@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from deplodock.compiler import dtype as dt
-from deplodock.compiler.backend.numpy import NumpyBackend
-from deplodock.compiler.dtype import DataType
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler import dtype as dt
+from emmy.compiler.backend.numpy import NumpyBackend
+from emmy.compiler.dtype import DataType
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
 
 
 def test_datatype_resolution_aliases():

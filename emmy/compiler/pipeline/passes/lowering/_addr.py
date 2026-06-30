@@ -7,7 +7,7 @@ assembly layers import it without crossing the enumeration↔assembly boundary.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal
 
 
 def add(*terms) -> Expr:

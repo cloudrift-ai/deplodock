@@ -1,9 +1,9 @@
 """Decompose softmax(x, dim) into max → sub → exp → sum → div."""
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.frontend.ir import SoftmaxOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, softmax_decompose
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.frontend.ir import SoftmaxOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, softmax_decompose
 
 PATTERN = [Pattern("root", SoftmaxOp)]
 

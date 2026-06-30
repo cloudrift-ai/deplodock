@@ -5,20 +5,20 @@ import logging
 import os
 import sys
 
-from deplodock.deploy import DEFAULT_STRATEGY, STRATEGIES, DeployParams
-from deplodock.deploy import (
+from emmy.deploy import DEFAULT_STRATEGY, STRATEGIES, DeployParams
+from emmy.deploy import (
     deploy as deploy_entry,
 )
-from deplodock.deploy import (
+from emmy.deploy import (
     teardown as teardown_entry,
 )
-from deplodock.detect import detect_remote_gpus
-from deplodock.provisioning.host import RemoteHost
-from deplodock.provisioning.remote import provision_remote
-from deplodock.provisioning.ssh_target import parse_ssh_target
-from deplodock.recipe import resolve_for_hardware
-from deplodock.redact import register_secret
-from deplodock.timing import PHASE_REMOTE_PROVISION, PhaseTimer
+from emmy.detect import detect_remote_gpus
+from emmy.provisioning.host import RemoteHost
+from emmy.provisioning.remote import provision_remote
+from emmy.provisioning.ssh_target import parse_ssh_target
+from emmy.recipe import resolve_for_hardware
+from emmy.redact import register_secret
+from emmy.timing import PHASE_REMOTE_PROVISION, PhaseTimer
 
 logger = logging.getLogger(__name__)
 

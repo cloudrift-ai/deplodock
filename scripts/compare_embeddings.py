@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Accuracy gate for the deplodock vLLM embedding plugin.
+"""Accuracy gate for the emmy vLLM embedding plugin.
 
 Embeds a fixed text set through two OpenAI-compatible ``/v1/embeddings``
-endpoints (e.g. the deplodock-backed server and a stock vLLM server) and
+endpoints (e.g. the emmy-backed server and a stock vLLM server) and
 asserts per-text cosine similarity, plus agreement of the pairwise-similarity
 matrices (the quantity retrieval quality actually depends on).
 
@@ -45,7 +45,7 @@ def embed(base_url: str, model: str, texts: list[str]) -> np.ndarray:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--a", required=True, help="first server base URL (e.g. the deplodock-backed one)")
+    ap.add_argument("--a", required=True, help="first server base URL (e.g. the emmy-backed one)")
     ap.add_argument("--b", required=True, help="second server base URL (e.g. stock vLLM)")
     ap.add_argument("--model", required=True)
     ap.add_argument("--min-cosine", type=float, default=0.99)

@@ -14,11 +14,11 @@ broadcast, so it fell through and squared *every* pow — silently miscompiling
 ``pow(x, -0.5)`` (rsqrt) into ``x * x``.
 """
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import ConstantOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment
 
 PATTERN = [Pattern("root", ElementwiseOp, {"fn": "pow"})]
 

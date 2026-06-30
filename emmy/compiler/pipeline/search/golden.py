@@ -1,9 +1,9 @@
 """Golden matmul configs — known-good ``knobs`` per shape, measured vs cuBLAS.
 
 A *golden config* records, for one matmul shape on one GPU, the autotuned knob
-set and the latencies of the deplodock kernel vs cuBLAS (``torch.matmul``). A
-config is ``golden`` when deplodock lands within 95% of cuBLAS (or better),
-i.e. ``ratio = cublas_us / deplodock_us >= 0.95``.
+set and the latencies of the emmy kernel vs cuBLAS (``torch.matmul``). A
+config is ``golden`` when emmy lands within 95% of cuBLAS (or better),
+i.e. ``ratio = cublas_us / emmy_us >= 0.95``.
 
 The set is a ground truth for the tuning **prior**: it pins down what the
 planner's first guess *should* land on for canonical shapes, and gives a
@@ -19,10 +19,10 @@ under ``goldens/`` (e.g. ``goldens/rtx5090_sm120.yaml``): a ``gpu_name`` /
 ``compute_cap`` header plus a ``configs`` list, each tagged with a ``kernel``
 discriminator (``matmul`` / ``reduce`` / ``pointwise``). :func:`_load_goldens`
 concatenates every file into :data:`GOLDEN_CONFIGS`. The set is hand-maintained via
-the CLI golden workflow — ``deplodock tune --golden NAME --bench`` records the
-winning knobs / latencies into the GPU's YAML, ``deplodock eval golden`` validates.
+the CLI golden workflow — ``emmy tune --golden NAME --bench`` records the
+winning knobs / latencies into the GPU's YAML, ``emmy eval golden`` validates.
 For the **fp32** configs the reference is
-pinned to **true fp32** (``allow_tf32 = False``) so the ratio compares deplodock's
+pinned to **true fp32** (``allow_tf32 = False``) so the ratio compares emmy's
 CUDA-core FMA kernel against a real SGEMM, not the ~5-10x faster TF32 tensor-core
 path. The **fp16** squares (``*.fp16``) instead ride the warp-tier tensor-core path
 and compare against cuBLAS HGEMM (torch's default fp16 matmul) — same tensor-core
@@ -46,7 +46,7 @@ from pathlib import Path
 
 import yaml
 
-from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
+from emmy.compiler.pipeline.knob import STRUCT_PREFIX
 
 # Qwen3-Embedding-0.6B linear dims (mirrors ``tests/perf/cases.py``).
 QWEN3_06B_HIDDEN = 1024  # hidden_size
@@ -71,7 +71,7 @@ def matmul_snippet(M: int, N: int, K: int, dtype: str = "fp32") -> str:
 
 
 def _knobs_env(knobs: dict) -> str:
-    """Render a knobs dict as a ``DEPLODOCK_KNOBS`` value: ``BM=8,BN=32,...``.
+    """Render a knobs dict as a ``EMMY_KNOBS`` value: ``BM=8,BN=32,...``.
 
     Structural-feature knobs (``STRUCT_PREFIX``) are dropped — a repro command
     pins tuning decisions, not the kernel's structural identity."""
@@ -90,13 +90,13 @@ class GoldenConfig:
     gpu_name: str = "NVIDIA GeForce RTX 5090"
     compute_cap: tuple[int, int] = (12, 0)
     knobs: dict = field(default_factory=dict)  # dict(cuda_op.knobs), verbatim
-    deplodock_us: float = 0.0
+    emmy_us: float = 0.0
     cublas_us: float = 0.0
 
     @property
     def ratio(self) -> float:
-        """cuBLAS latency / deplodock latency — 1.0 means parity, >1 means faster."""
-        return self.cublas_us / self.deplodock_us if self.deplodock_us else 0.0
+        """cuBLAS latency / emmy latency — 1.0 means parity, >1 means faster."""
+        return self.cublas_us / self.emmy_us if self.emmy_us else 0.0
 
     @property
     def golden(self) -> bool:
@@ -111,7 +111,7 @@ class GoldenConfig:
         = 188 SMs); :meth:`~...data.sample.Sample.from_golden` threads it into the
         reconstructed context so the golden featurizes with its own card's regime,
         not the live device's."""
-        from deplodock import gpu  # noqa: PLC0415
+        from emmy import gpu  # noqa: PLC0415
 
         spec = gpu.by_name(self.gpu_name)
         return spec.sm_count if spec else None
@@ -144,7 +144,7 @@ class MatmulGoldenConfig(GoldenConfig):
             raise ValueError(f"{self.name}: dynamic must be a non-empty mapping of NAME -> {{input, axis}}")
         if self.M < 1:
             raise ValueError(f"{self.name}: M doubles as the symbolic-axis hint and must be >= 1, got {self.M}")
-        from deplodock.compiler.dim import DEFAULT_SEQ_HINT  # noqa: PLC0415 — int constant, import stays light
+        from emmy.compiler.dim import DEFAULT_SEQ_HINT  # noqa: PLC0415 — int constant, import stays light
 
         if self.M != DEFAULT_SEQ_HINT:
             # The pipeline tiles/benches a symbolic axis at the GLOBAL Dim hint, not
@@ -176,11 +176,11 @@ class MatmulGoldenConfig(GoldenConfig):
         return matmul_snippet(self.M, self.N, self.K, self.dtype)
 
     def shape_key(self):
-        """This config's :class:`~deplodock.compiler.pipeline.search.data.ShapeKey` —
+        """This config's :class:`~emmy.compiler.pipeline.search.data.ShapeKey` —
         the single golden-side join key (``Sample.from_golden`` and every
         diagnostics join build it here, so the dynamic flag can't be forgotten at
         a call site). Import deferred to keep this module import-light."""
-        from deplodock.compiler.pipeline.search.data.shape import ShapeKey  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.data.shape import ShapeKey  # noqa: PLC0415
 
         return ShapeKey.from_matmul(self.M, self.N, self.K, self.dtype, dynamic=bool(self.dynamic))
 
@@ -191,12 +191,12 @@ class MatmulGoldenConfig(GoldenConfig):
         return [f"{name}@{loc['input']}:{loc['axis']}" for name, loc in (self.dynamic or {}).items()]
 
     def repro_command(self, ir: str = "cuda") -> str:
-        """A runnable ``deplodock`` command that rebuilds this config's kernel.
+        """A runnable ``emmy`` command that rebuilds this config's kernel.
 
-        e.g. ``DEPLODOCK_KNOBS="BM=8,..." deplodock compile -c "torch.matmul(...)" --ir cuda``
+        e.g. ``EMMY_KNOBS="BM=8,..." emmy compile -c "torch.matmul(...)" --ir cuda``
         """
         dyn = "".join(f" --dynamic {s}" for s in self.dynamic_specs())
-        return f'DEPLODOCK_KNOBS="{_knobs_env(self.knobs)}" deplodock compile -c "{self.snippet()}"{dyn} --ir {ir}'
+        return f'EMMY_KNOBS="{_knobs_env(self.knobs)}" emmy compile -c "{self.snippet()}"{dyn} --ir {ir}'
 
 
 @dataclass(frozen=True, kw_only=True)

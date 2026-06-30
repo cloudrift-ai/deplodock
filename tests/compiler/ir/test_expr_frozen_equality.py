@@ -11,7 +11,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from deplodock.compiler.ir.expr import (
+from emmy.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
     CastExpr,

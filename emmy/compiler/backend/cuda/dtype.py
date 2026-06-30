@@ -1,6 +1,6 @@
 """CUDA-backend dtype traits.
 
-Augments :class:`deplodock.compiler.dtype.DataType` with CUDA-specific
+Augments :class:`emmy.compiler.dtype.DataType` with CUDA-specific
 information: the C type name used in kernel source, any header that
 must be ``#include``'d, and the cupy dtype used for device allocations.
 
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from deplodock.compiler import dtype as _dtype
-from deplodock.compiler.dtype import DataType
+from emmy.compiler import dtype as _dtype
+from emmy.compiler.dtype import DataType
 
 _CUDA_NAME: dict[DataType, str] = {
     _dtype.F32: "float",

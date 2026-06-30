@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.kernel.ir import KernelOp
-from deplodock.compiler.ir.kernel.render import render_kernelop
-from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.tile.ir import GridTile, WarpTile
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.ir.kernel.render import render_kernelop
+from emmy.compiler.ir.stmt import Body, Load, Write
+from emmy.compiler.ir.tile.ir import GridTile, WarpTile
 
 # A scalar literal-constant input ``one`` resolves the Load to a 1.0f
 # literal at render time (``Load.is_literal`` path); the Write then
@@ -131,12 +131,12 @@ def test_warp_kernel_nvrtc_compiles():
 
 import importlib  # noqa: E402
 
-from deplodock.compiler.context import Context  # noqa: E402
-from deplodock.compiler.graph import Graph  # noqa: E402
-from deplodock.compiler.ir.tile.ir import TileOp  # noqa: E402
-from deplodock.compiler.tensor import Tensor  # noqa: E402
+from emmy.compiler.context import Context  # noqa: E402
+from emmy.compiler.graph import Graph  # noqa: E402
+from emmy.compiler.ir.tile.ir import TileOp  # noqa: E402
+from emmy.compiler.tensor import Tensor  # noqa: E402
 
-_mat = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
+_mat = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.100_materialize_tile")
 
 
 def _materialize(tile_op: TileOp) -> KernelOp:

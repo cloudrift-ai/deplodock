@@ -1,4 +1,4 @@
-"""Render an HTML page (typically one produced by ``deplodock.visualize``)
+"""Render an HTML page (typically one produced by ``emmy.visualize``)
 to an image file. Format is auto-detected from the output path's suffix.
 Backed by Playwright headless Chromium — installed via the optional
 ``[visualize]`` extra (``pip install -e '.[visualize]' && playwright install

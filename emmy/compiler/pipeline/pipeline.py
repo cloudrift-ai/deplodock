@@ -32,19 +32,19 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.pipeline.fork import Fork, OptionFork
-from deplodock.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.pipeline.fork import Fork, OptionFork
+from emmy.compiler.pipeline.knob import Knob, apply_off_defaults, format_tuning_knobs
 
 if TYPE_CHECKING:
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.base import Op
-    from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.pipeline.search.candidate import Candidate
-    from deplodock.compiler.pipeline.search.db import SearchDB
-    from deplodock.compiler.pipeline.search.policy import Search
+    from emmy.compiler.context import Context
+    from emmy.compiler.ir.base import Op
+    from emmy.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.pipeline.search.candidate import Candidate
+    from emmy.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline.search.policy import Search
 
-logger = logging.getLogger("deplodock.compiler.pipeline")
+logger = logging.getLogger("emmy.compiler.pipeline")
 
 # Greedy compile validity-fallback cap: how many times ``Pipeline.run``
 # re-resolves blocklisting a tile that failed ``validate(ctx)``. Each retry
@@ -460,7 +460,7 @@ class Pipeline:
     ) -> Graph:
         """Single-shot greedy compile — a deterministic resolution
         (:meth:`Run.resolve`) with the greedy pick
-        (:func:`~deplodock.compiler.pipeline.search.policy.greedy.greedy_decide`):
+        (:func:`~emmy.compiler.pipeline.search.policy.greedy.greedy_decide`):
         at every fork point, flatten to complete leaves and take the
         ``Prior``'s ``mean_scores`` argmin. Not a search — no frontier,
         no tree, no benching (it can only *use* a prior trained earlier
@@ -505,9 +505,9 @@ class Pipeline:
         :func:`_raise_on_unlowered` turns a recorded rejection that left
         its node un-lowered into a loud :class:`LoweringError` instead
         of a downstream ``CudaBackend`` mystery."""
-        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.policy.greedy import greedy_decide  # noqa: PLC0415
+        from emmy.compiler.context import Context as _Context  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.policy.greedy import greedy_decide  # noqa: PLC0415
 
         if ctx is None:
             ctx = _Context.probe()
@@ -558,9 +558,9 @@ class Pipeline:
         """Build the :class:`Run` shared by :meth:`tune_async` (and the deterministic
         :meth:`run`):
         seed provenance, probe / align ``ctx``, and wire the run-scoped sinks."""
-        from deplodock.compiler import provenance  # noqa: PLC0415
-        from deplodock.compiler.context import Context as _Context  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
+        from emmy.compiler import provenance  # noqa: PLC0415
+        from emmy.compiler.context import Context as _Context  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import SearchDB as _SearchDB  # noqa: PLC0415
 
         # Seed op provenance on the input graph before any pass runs — the one
         # universal entry both ``run`` and ``tune`` funnel through. Idempotent,
@@ -791,8 +791,8 @@ class Run:
         accumulated policy state. Inline replays of an already-decided
         structural offer site (see :meth:`_step`) are not decisions and
         don't trace."""
-        from deplodock.compiler import provenance  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
+        from emmy.compiler import provenance  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.candidate import Candidate  # noqa: PLC0415
 
         provenance.seed(graph)
         cand = Candidate(run=self, graph=graph, cursor=Cursor(run=self))
@@ -848,7 +848,7 @@ class Run:
         batches that produced no live matches. The ``structural`` flag
         rides ``Search.push`` so policies can treat kernel-set decisions
         specially."""
-        from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.candidate import Candidate, LazyCandidate  # noqa: PLC0415
 
         search = self.search
         assert search is not None, "Run.drive needs a search policy; use Run.resolve for deterministic resolution"
@@ -977,7 +977,7 @@ def _replay_structural_decision(graph: Graph, root_op, options: list) -> object 
     to this offer (same ``op_cache_key``), and replay the option whose delta
     matches its stamped values. Matching by decision-knob agreement (not a
     stored option index) survives rules reordering their emissions."""
-    from deplodock.compiler.pipeline.search.keys import op_cache_key, source_chain  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.keys import op_cache_key, source_chain  # noqa: PLC0415
 
     key = op_cache_key(root_op)
     if key is None:
@@ -1009,9 +1009,9 @@ def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> di
     blocklists so the greedy retry falls back to the next prior-ranked sibling."""
     if not rejections:
         return {}
-    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
-    from deplodock.compiler.pipeline.search.policy.greedy import tile_identity  # noqa: PLC0415
+    from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.policy.greedy import tile_identity  # noqa: PLC0415
 
     out: dict[str, frozenset] = {}
     for nid, _pass_label, _reason in rejections:
@@ -1034,8 +1034,8 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
     / tile stage (no lowering pass to drop anything) never trip this."""
     if not rejections:
         return
-    from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     # Last recorded reason / pass wins (the final pass that tried to lower it).
     reason_by_node: dict[str, str] = {}
@@ -1052,7 +1052,7 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
         f"compile: {len(stuck)} node(s) left un-lowered — the chosen tile shape produced a kernel that "
         f"failed validate(ctx) and the deterministic compile had no fallback:\n"
         + "\n".join(lines)
-        + "\nPin a fitting tile via DEPLODOCK_KNOBS, raise the smem budget, or adjust tile-geometry "
+        + "\nPin a fitting tile via EMMY_KNOBS, raise the smem budget, or adjust tile-geometry "
         "scoring so an in-budget variant ranks first."
     )
 
@@ -1103,7 +1103,7 @@ async def _rebench_o3_async(cand, backend):
     median latency in µs, or ``None`` when the sweep is already at -O3 or the bench
     errors (best-effort — a re-bench hiccup must never abort the sweep). The winner
     already benched OK at -O1, so the only added cost is one -O3 compile (cubin-cached)."""
-    from deplodock import config  # noqa: PLC0415
+    from emmy import config  # noqa: PLC0415
 
     if "-O3" in config.nvcc_flags():
         return None
@@ -1123,7 +1123,7 @@ class _TerminalBench:
     :meth:`finalize_exc`) live here, so the only awaited step is the device bench."""
 
     def __init__(self, cand, *, backend, db) -> None:
-        from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+        from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
         self.backend = backend
         self.db = db
@@ -1134,7 +1134,7 @@ class _TerminalBench:
 
     @staticmethod
     def _point_stats(us: float):
-        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
 
         return PerfStats(median=us, min=us, max=us, mean=us, variance=0.0, n_samples=0)
 
@@ -1142,7 +1142,7 @@ class _TerminalBench:
     def _stats_from_launch(cls, lt):
         import statistics as _statistics  # noqa: PLC0415
 
-        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
 
         if lt.samples and len(lt.samples) >= 1:
             us = [s * 1000.0 for s in lt.samples]
@@ -1170,11 +1170,11 @@ class _TerminalBench:
         )
 
     def _record_op_inventory(self, op) -> None:
-        from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
-        from deplodock.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
-        from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-        from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
-        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+        from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+        from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
+        from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
         key = op_cache_key(op)
         if key is None:
@@ -1197,7 +1197,7 @@ class _TerminalBench:
             self.db.record_loop_op(key, self._body_json(op, "loop"), op.pretty_body())
 
     def _persist(self, cuda_op, *, stats, status: str, captured: bool = False, error: str | None = None) -> None:
-        from deplodock.compiler.pipeline.search.keys import (  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.keys import (  # noqa: PLC0415
             _is_kernel_bearing,
             dialect_of,
             introduces_structural_decision,
@@ -1258,7 +1258,7 @@ class _TerminalBench:
         logger.info("[tune]   %s @ %.2f us  (%s)", getattr(cuda_op, "kernel_name", "?"), stats.median, status)
 
     def _accumulate(self, acc, s):
-        from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
 
         if acc is None:
             return s
@@ -1276,7 +1276,7 @@ class _TerminalBench:
         status))`` when no measurement is needed (no CudaOps / full cache hit /
         stub backend), else ``("bench", None)`` — the caller obtains a
         ``BenchmarkResult`` and calls :meth:`finalize_result` / :meth:`finalize_exc`."""
-        from deplodock.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
+        from emmy.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
         if not self.cuda_nodes:
             return "done", (self._point_stats(0.0), "ok")
@@ -1308,7 +1308,7 @@ class _TerminalBench:
             # No real measurement → do NOT persist. Writing the 1.0us stub
             # to a shared DB used to clobber tuned ``best_median_us`` values
             # (record_lowering / record_perf keep the minimum), so any plain
-            # ``deplodock run`` (which routes through ``Pipeline.run`` without
+            # ``emmy run`` (which routes through ``Pipeline.run`` without
             # a backend) was overwriting real autotune rows with 1.0us stubs.
             # Tests that need lowering edges in stub mode should pass an
             # explicit stub backend.

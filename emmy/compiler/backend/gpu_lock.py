@@ -3,14 +3,14 @@
 Every entry point that issues CUDA work (NVRTC compile, kernel launch,
 bench loop) acquires this lock so that concurrent worker processes —
 ``make bench-kernels``, ``make bench-kernels-tune``, parallel
-``deplodock run`` invocations from xdist — never interleave kernels on
+``emmy run`` invocations from xdist — never interleave kernels on
 the same GPU. Without it, two processes' kernels share clocks / caches /
 thermal state and timings turn into noise (we saw 2× variance on tiny
 ops like ``rmsnorm`` and ``silu_mul`` at small seqlens).
 
-Activated when ``DEPLODOCK_GPU_LOCK`` is set to a path (the perf
-conftest exports ``/tmp/deplodock-gpu.lock``); otherwise the context
-manager is a no-op so ad-hoc ``deplodock run`` invocations don't pay
+Activated when ``EMMY_GPU_LOCK`` is set to a path (the perf
+conftest exports ``/tmp/emmy-gpu.lock``); otherwise the context
+manager is a no-op so ad-hoc ``emmy run`` invocations don't pay
 any coordination overhead.
 
 Re-entrant within a single process: the same thread can ``with
@@ -25,7 +25,7 @@ import contextlib
 from collections.abc import Iterator
 from pathlib import Path
 
-from deplodock import config
+from emmy import config
 
 _LOCK_CACHE: dict[str, object] = {}
 
@@ -50,7 +50,7 @@ def _resolve_lock():
 def gpu_lock() -> Iterator[None]:
     """Hold the cross-process GPU lock for the duration of the block.
 
-    No-op when ``DEPLODOCK_GPU_LOCK`` is unset. Otherwise wraps the
+    No-op when ``EMMY_GPU_LOCK`` is unset. Otherwise wraps the
     shared ``FileLock`` so any code inside is guaranteed sole access
     to the device across processes."""
     lock = _resolve_lock()

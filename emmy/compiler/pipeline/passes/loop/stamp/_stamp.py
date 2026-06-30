@@ -16,13 +16,13 @@ from collections import Counter
 from math import prod
 from typing import TYPE_CHECKING
 
-from deplodock.compiler import provenance
-from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
+from emmy.compiler import provenance
+from emmy.compiler.pipeline.knob import STRUCT_PREFIX
 
 if TYPE_CHECKING:
-    from deplodock.compiler.graph import Graph, Node
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.ir.stmt.body import Body
+    from emmy.compiler.graph import Graph, Node
+    from emmy.compiler.ir.loop import LoopOp
+    from emmy.compiler.ir.stmt.body import Body
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +66,8 @@ def restamp_structural_features(op: LoopOp, graph: Graph | None = None) -> None:
 def _skeleton(body: Body, graph: Graph | None) -> dict[str, float]:
     """Extent-free histogram: stmt-type counts + pointwise/reduce op multisets
     + loop-nest roles/depth + operand dtype multiset."""
-    from deplodock.compiler.ir.stmt.blocks import Cond  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt.leaves import Assign, Mma  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.blocks import Cond  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.leaves import Assign, Mma  # noqa: PLC0415
 
     feats: Counter[str] = Counter()
     loads = body.loads
@@ -99,7 +99,7 @@ def _skeleton(body: Body, graph: Graph | None) -> dict[str, float]:
 def _loop_depth(body: Body) -> int:
     """Max ``Loop`` nesting depth along any path (non-Loop wrappers like
     ``Cond`` recurse without incrementing)."""
-    from deplodock.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
+    from emmy.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
 
     best = 0
     for s in body:

@@ -9,8 +9,8 @@
   to rank — see ``plans/resolve-trace-driver.md``).
 """
 
-from deplodock.compiler.pipeline.search.policy.base import Search
-from deplodock.compiler.pipeline.search.policy.greedy import greedy_decide
-from deplodock.compiler.pipeline.search.policy.mcts import TuningSearch
+from emmy.compiler.pipeline.search.policy.base import Search
+from emmy.compiler.pipeline.search.policy.greedy import greedy_decide
+from emmy.compiler.pipeline.search.policy.mcts import TuningSearch
 
 __all__ = ["Search", "TuningSearch", "greedy_decide"]

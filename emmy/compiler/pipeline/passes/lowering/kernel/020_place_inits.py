@@ -28,10 +28,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.stmt import Accum, Cond, Init, Stmt, Write
-from deplodock.compiler.ir.tile.ir import (
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.stmt import Accum, Cond, Init, Stmt, Write
+from emmy.compiler.ir.tile.ir import (
     GridTile,
     RegisterTile,
     SerialTile,
@@ -42,7 +42,7 @@ from deplodock.compiler.ir.tile.ir import (
     WarpSpecialize,
     WarpTile,
 )
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

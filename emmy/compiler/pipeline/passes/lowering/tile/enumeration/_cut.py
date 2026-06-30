@@ -56,11 +56,11 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import eligible_atoms
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._atom import eligible_atoms
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
 
 
 class Tier(enum.IntEnum):

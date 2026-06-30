@@ -5,19 +5,19 @@ import logging
 import os
 import sys
 
-from deplodock.deploy import DeployParams
-from deplodock.deploy import (
+from emmy.deploy import DeployParams
+from emmy.deploy import (
     deploy as deploy_entry,
 )
-from deplodock.provisioning.cloud import (
+from emmy.provisioning.cloud import (
     provision_cloud_vm,
     read_public_key_files,
 )
-from deplodock.provisioning.host import RemoteHost
-from deplodock.provisioning.remote import provision_remote
-from deplodock.recipe import resolve_for_hardware
-from deplodock.redact import register_secret
-from deplodock.timing import PHASE_REMOTE_PROVISION, PHASE_VM_PROVISION, PhaseTimer
+from emmy.provisioning.host import RemoteHost
+from emmy.provisioning.remote import provision_remote
+from emmy.recipe import resolve_for_hardware
+from emmy.redact import register_secret
+from emmy.timing import PHASE_REMOTE_PROVISION, PHASE_VM_PROVISION, PhaseTimer
 
 logger = logging.getLogger(__name__)
 

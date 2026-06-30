@@ -1,4 +1,4 @@
-[2026-04-01 16:28:01] [root] Run directory: /home/runner/work/deplodock/deplodock/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-28-01_6164ec8c
+[2026-04-01 16:28:01] [root] Run directory: /home/runner/work/emmy/emmy/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-28-01_6164ec8c
 [2026-04-01 16:28:01] [root] 
 [2026-04-01 16:28:01] [root] Running 6 benchmark task(s) in 1 execution group(s)
 [2026-04-01 16:28:01] [root] Parallel mode (max workers: 1)
@@ -6,7 +6,7 @@
 [2026-04-01 16:28:01] [root] Commit mode enabled: results will be committed after each task
 [2026-04-01 16:28:01] [pro6000_x_8] Starting group: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition x8 (6 tasks)
 [2026-04-01 16:28:01] [pro6000_x_8] GPU: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition x8 -> cloudrift rtxpro6000-11-50-500-1l.8
-[2026-04-01 16:28:01] [deplodock.provisioning.cloudrift] Creating CloudRift instance (type=rtxpro6000-11-50-500-1l.8)...
+[2026-04-01 16:28:01] [emmy.provisioning.cloudrift] Creating CloudRift instance (type=rtxpro6000-11-50-500-1l.8)...
 [2026-04-01 16:28:02] [httpx] HTTP Request: POST https://api.cloudrift.ai/api/v1/instances/rent "HTTP/1.1 503 Service Unavailable"
 [2026-04-01 16:28:02] [root] Group 0 generated an exception: Server error '503 Service Unavailable' for url 'https://api.cloudrift.ai/api/v1/instances/rent'
 For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503
@@ -23,4 +23,4 @@ For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/St
 [2026-04-01 16:28:02] [root]    - optimal_ctx_rtx4090/pro6000x8_cl262144
 [2026-04-01 16:28:02] [root] 
 [2026-04-01 16:28:02] [root] All done!
-[2026-04-01 16:28:02] [root] Full logs saved to: /home/runner/work/deplodock/deplodock/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-28-01_6164ec8c/benchmark.log
+[2026-04-01 16:28:02] [root] Full logs saved to: /home/runner/work/emmy/emmy/experiments/Qwen3.5/Qwen3.5-35B-A3B/optimal_ctx_rtx4090/2026-04-01_16-28-01_6164ec8c/benchmark.log

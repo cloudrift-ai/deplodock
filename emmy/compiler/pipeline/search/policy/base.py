@@ -26,8 +26,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from deplodock.compiler.pipeline.search.candidate import LazyCandidate
-from deplodock.compiler.pipeline.search.db import PerfStats
+from emmy.compiler.pipeline.search.candidate import LazyCandidate
+from emmy.compiler.pipeline.search.db import PerfStats
 
 
 class Search(ABC):

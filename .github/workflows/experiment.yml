@@ -215,8 +215,8 @@ jobs:
         env:
           APP_PRIVATE_KEY: ${{ secrets.EXPERIMENT_APP_PRIVATE_KEY }}
         run: |
-          git config user.name "deplodock-experiment-bot"
-          git config user.email "deplodock-experiment-bot[bot]@users.noreply.github.com"
+          git config user.name "emmy-experiment-bot"
+          git config user.email "emmy-experiment-bot[bot]@users.noreply.github.com"
 
           # Store app key for credential helper
           echo "$APP_PRIVATE_KEY" > /tmp/app-key.pem

@@ -16,8 +16,8 @@ producers after) — that's what the fusion splicer does.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.loop.ir import Axis, Loop, Scope, Stmt
-from deplodock.compiler.ir.stmt import Body
+from emmy.compiler.ir.loop.ir import Axis, Loop, Scope, Stmt
+from emmy.compiler.ir.stmt import Body
 
 
 class LoopBuilder:

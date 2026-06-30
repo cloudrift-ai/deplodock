@@ -14,12 +14,12 @@ from tests.compiler.conftest import matmul_graph
 
 
 def test_oracle_matches_kernel_analyzer_on_small_matmul():
-    from deplodock.compiler.diagnostics.bank_conflicts import (
+    from emmy.compiler.diagnostics.bank_conflicts import (
         find_all_bindings,
         lane_bank_distribution,
         simulate_graph,
     )
-    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+    from emmy.compiler.pipeline import TILE_PASSES, Pipeline
 
     tile_graph = Pipeline.build(TILE_PASSES).run(matmul_graph(256, 64, 256))
 

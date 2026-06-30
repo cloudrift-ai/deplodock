@@ -1,6 +1,6 @@
 """Engine flag mapping and CLI argument building."""
 
-from deplodock.recipe.types import LLMConfig
+from emmy.recipe.types import LLMConfig
 
 # Maps (recipe field name → CLI flag) for each engine.
 # Used to generate command-line args and to derive the banned-flags set.

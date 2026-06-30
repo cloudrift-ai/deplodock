@@ -5,11 +5,11 @@ from dataclasses import asdict
 
 import yaml
 
-from deplodock.deploy.compose import calculate_num_instances
-from deplodock.planner import BenchmarkTask
-from deplodock.recipe.types import Recipe, VllmConfig
-from deplodock.redact import redact_secrets
-from deplodock.timing import format_timing
+from emmy.deploy.compose import calculate_num_instances
+from emmy.planner import BenchmarkTask
+from emmy.recipe.types import Recipe, VllmConfig
+from emmy.redact import redact_secrets
+from emmy.timing import format_timing
 
 SECTION_DELIMITER = "=" * 50
 

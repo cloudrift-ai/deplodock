@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from deplodock.compiler.ir.stmt.leaves import Assign, Monoid
+from emmy.compiler.ir.stmt.leaves import Assign, Monoid
 
 # Associative+commutative ops whose presence over a distributed operand marks a reduction
 # (rowmax / rowsum). Disambiguates ``max(m, s)`` (a FOLD, ``s`` distributed) from a purely

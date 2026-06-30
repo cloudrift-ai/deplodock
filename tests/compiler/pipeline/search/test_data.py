@@ -9,9 +9,9 @@ silently.
 
 from __future__ import annotations
 
-from deplodock.compiler.pipeline import knob
-from deplodock.compiler.pipeline.search.data import Dataset, Sample, ShapeKey
-from deplodock.compiler.pipeline.search.db import PerfSample, PerfStats, SearchDB
+from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.search.data import Dataset, Sample, ShapeKey
+from emmy.compiler.pipeline.search.db import PerfSample, PerfStats, SearchDB
 
 
 def _stats(median: float) -> PerfStats:
@@ -75,7 +75,7 @@ def test_golden_dynamic_compile_s_feats_mirror() -> None:
     and ``S_ext_n_symbolic_axis`` is set — and the cheap arith fallback is a
     consistent subset of it, so grouping and featurization agree across tiers.
     The op-side constructor closes the join on the full histogram."""
-    from deplodock.compiler.pipeline.search.golden import MatmulGoldenConfig
+    from emmy.compiler.pipeline.search.golden import MatmulGoldenConfig
 
     g = MatmulGoldenConfig(name="square.512.dynM", M=512, N=512, K=512, dynamic={"seq_len": {"input": "x0", "axis": 0}})
     s = Sample.from_golden(g, compile_s_feats=True)
@@ -134,11 +134,11 @@ def test_golden_compile_s_feats_matches_inline(monkeypatch) -> None:
     ``Sample.from_golden(compile_s_feats=True)`` equals the old inline
     compile-and-scrape (eval's ``_emit_golden_features``), and the cheap arithmetic
     extents are a subset that agrees on the shared keys."""
-    from deplodock.commands.trace import graph_from_code
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-    from deplodock.compiler.pipeline.knob import STRUCT_PREFIX
-    from deplodock.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
+    from emmy.commands.trace import graph_from_code
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+    from emmy.compiler.pipeline.knob import STRUCT_PREFIX
+    from emmy.compiler.pipeline.search.golden import GOLDEN_CONFIGS, MatmulGoldenConfig
 
     g = next(c for c in GOLDEN_CONFIGS if isinstance(c, MatmulGoldenConfig) and c.name == "square.512")
 
@@ -164,7 +164,7 @@ def test_golden_features_use_own_cards_sm_count() -> None:
     """A golden featurizes with its OWN card's SM count (from the gpu registry via
     gpu_name), not the live device's — the fix that makes same-compute_cap cards
     (RTX 5090 = 170 vs RTX PRO 6000 = 188 SMs) distinguishable in the model."""
-    from deplodock.compiler.pipeline.search.golden import goldens_by_name
+    from emmy.compiler.pipeline.search.golden import goldens_by_name
 
     by_gpu = {g.gpu_name: Sample.from_golden(g).context["H_sm_count"] for g in goldens_by_name("square.512")}
     assert by_gpu["NVIDIA GeForce RTX 4090"] == 128.0

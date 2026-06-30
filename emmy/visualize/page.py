@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from deplodock.visualize.theme import FONTS, PALETTE_1, PALETTE_2, STATUS, THEMES
+from emmy.visualize.theme import FONTS, PALETTE_1, PALETTE_2, STATUS, THEMES
 
 ECHARTS_CDN = "https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"
 

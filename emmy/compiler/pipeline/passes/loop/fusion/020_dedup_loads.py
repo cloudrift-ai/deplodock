@@ -14,10 +14,10 @@ fuses multiple ``x`` loads into one).
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Node
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import dedup_loads
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.graph import Graph, Node
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.stmt import dedup_loads
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", LoopOp)]
 

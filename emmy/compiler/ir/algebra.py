@@ -35,9 +35,9 @@ from __future__ import annotations
 
 from enum import Enum
 
-from deplodock.compiler.ir.stmt.base import ReduceCarrier
-from deplodock.compiler.ir.stmt.blocks import Loop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma
+from emmy.compiler.ir.stmt.base import ReduceCarrier
+from emmy.compiler.ir.stmt.blocks import Loop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Mma
 
 
 class AlgebraKind(Enum):

@@ -50,12 +50,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Literal as _Lit
 
-from deplodock.compiler.dtype import BF16, F16, F32, DataType
-from deplodock.compiler.ir.algebra import AlgebraKind, classify_algebra
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import (
+from emmy.compiler.dtype import BF16, F16, F32, DataType
+from emmy.compiler.ir.algebra import AlgebraKind, classify_algebra
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import Op
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
     CastExpr,
@@ -65,7 +65,7 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.stmt import (
+from emmy.compiler.ir.stmt import (
     INDENT,
     Accum,
     Assign,
@@ -84,16 +84,16 @@ from deplodock.compiler.ir.stmt import (
 
 # `render_body` is the per-Stmt body renderer used by the new tile flavors'
 # render methods. Local import below to keep top-of-file imports tidy.
-from deplodock.compiler.ir.stmt import render_body as _render_body  # noqa: E402
-from deplodock.compiler.ir.stmt.base import RenderCtx, _pad
-from deplodock.compiler.ir.stmt.blocks import (
+from emmy.compiler.ir.stmt import render_body as _render_body  # noqa: E402
+from emmy.compiler.ir.stmt.base import RenderCtx, _pad
+from emmy.compiler.ir.stmt.blocks import (
     _body_uses_lane_warp,
     _render_grid_axis_decode,
     _render_swizzled_grid_decode,
     _render_thread_axis_decode,
 )
-from deplodock.compiler.ir.stmt.ir import BodyOp
-from deplodock.compiler.ir.stmt.leaves import Mma
+from emmy.compiler.ir.stmt.ir import BodyOp
+from emmy.compiler.ir.stmt.leaves import Mma
 
 # ===========================================================================
 # ENUMERATION — the block-DAG Tile IR (algorithm + Schedule)
@@ -373,7 +373,7 @@ class Block:
         """The ``ReduceCarrier`` in ``compute`` (+ derived ``kind`` / ``mask``),
         else ``None``. The reduce axis (and any symbolic ``mask`` bound) is read
         off the enclosing reduce ``Loop`` in the body."""
-        from deplodock.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.blocks import Loop  # noqa: PLC0415
 
         for lp in self.compute.iter_of_type(Loop):
             if not lp.is_reduce:
@@ -697,7 +697,7 @@ class Atom:
     """Hardware-instruction spec for one matmul atom kind — the cell a single
     tensor-core instruction realises (``C[M×N] += A[M×K] · B[K×N]``).
 
-    Carried directly on the :class:`~deplodock.compiler.ir.stmt.Mma` op (and
+    Carried directly on the :class:`~emmy.compiler.ir.stmt.Mma` op (and
     keyed by ``name`` in :data:`ATOM_REGISTRY`), so ``kernel/005_lower_atom_tile``
     reads the cell shape + operand dtypes straight off the ``Mma`` — no registry
     lookup at lowering.
@@ -890,7 +890,7 @@ class CoopReduce(Stmt):
 # budget redistribution, and the producer/consumer ``Cond`` wrapper.
 #
 # The pass that emits this (``085_warp_specialize``) keeps all Tile-IR
-# vocabulary — no ``from deplodock.compiler.ir.kernel.ir import …``.
+# vocabulary — no ``from emmy.compiler.ir.kernel.ir import …``.
 # Companion to 080's ``AsyncWait``: where ``AsyncWait`` lets the pass
 # declare "wait for an async chunk, materializer picks the primitive",
 # ``WarpSpecialize`` lets the pass declare "split this ThreadTile body
@@ -1769,7 +1769,7 @@ class SerialTile(SerialTileBase):
     def render(self, ctx: RenderCtx) -> list[str]:
         """Per-Loop accumulator-init prelude (same as ``Loop.render``) +
         ``for (int axis = 0; axis < extent; axis++) { body }``."""
-        from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
+        from emmy.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
         out: list[str] = []
@@ -1838,7 +1838,7 @@ class StridedTile(SerialTileBase):
     def render(self, ctx: RenderCtx) -> list[str]:
         """``for (int axis = start; axis < extent; axis += step)`` with the
         same per-Loop accumulator-init prelude as ``SerialTile.render``."""
-        from deplodock.compiler.dtype import F32 as _F32  # noqa: PLC0415
+        from emmy.compiler.dtype import F32 as _F32  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
         out: list[str] = []
@@ -2135,7 +2135,7 @@ class TileOp(BodyOp):
     """
 
     def __post_init__(self) -> None:
-        from deplodock.compiler.ir.stmt import normalize_body
+        from emmy.compiler.ir.stmt import normalize_body
 
         coerced = Body.coerce(self.body)
         normalized = normalize_body(coerced, hoist=False)
@@ -2242,7 +2242,7 @@ class TileOp(BodyOp):
 # Tile uses BIND_THREAD axes from a cooperative strategy.
 # ---------------------------------------------------------------------------
 
-from deplodock.compiler.tuning import cooperative_block_size as _coop_block_size  # noqa: E402
+from emmy.compiler.tuning import cooperative_block_size as _coop_block_size  # noqa: E402
 
 BLOCK_SIZE = _coop_block_size()
 
@@ -2302,4 +2302,4 @@ __all__ = [
 ]
 
 # Register Tile-IR stmts with the shared rewrite/simplify dispatch.
-from deplodock.compiler.ir.tile import passes as _passes  # noqa: E402, F401
+from emmy.compiler.ir.tile import passes as _passes  # noqa: E402, F401

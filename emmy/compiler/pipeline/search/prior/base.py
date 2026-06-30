@@ -42,7 +42,7 @@ REFIT_SCHEDULE = ((1_000, 100), (10_000, 1_000), (100_000, 10_000))
 MAX_ROWS = 100_000
 
 # ``H_opt`` stamp of the deployable -O3 re-bench rows (``tune`` re-benches every
-# config within ``DEPLODOCK_O3_TOL`` of the -O1 best at -O3 and feeds the row in
+# config within ``EMMY_O3_TOL`` of the -O1 best at -O3 and feeds the row in
 # with this tag) — the measured ground truth :meth:`Prior.evidence_pick` ranks by.
 _O3_OPT = 3.0
 
@@ -229,7 +229,7 @@ class Prior(ABC):
         obj = self.to_json()
         if obj is None:
             return
-        from deplodock import storage  # noqa: PLC0415
+        from emmy import storage  # noqa: PLC0415
 
         storage.write_json(self._path, obj)
 

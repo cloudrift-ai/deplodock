@@ -5,16 +5,16 @@ import json
 import logging
 import math
 
-from deplodock.deploy.compose import (
+from emmy.deploy.compose import (
     calculate_num_instances,
     generate_compose,
     generate_nginx_conf,
 )
-from deplodock.deploy.log_phases import decompose_model_load, parse_engine_load_phases
-from deplodock.deploy.params import DeployParams
-from deplodock.provisioning.ssh_transport import make_run_cmd, make_write_file
-from deplodock.recipe.types import Recipe
-from deplodock.timing import (
+from emmy.deploy.log_phases import decompose_model_load, parse_engine_load_phases
+from emmy.deploy.params import DeployParams
+from emmy.provisioning.ssh_transport import make_run_cmd, make_write_file
+from emmy.recipe.types import Recipe
+from emmy.timing import (
     PHASE_IMAGE_PULL,
     PHASE_MODEL_DOWNLOAD,
     PHASE_MODEL_LOAD_AND_WARMUP,
@@ -75,7 +75,7 @@ async def run_deploy(
 
     # Step 1: Pull images. --ignore-pull-failures keeps a locally-built image
     # usable before it's pushed to a registry (e.g. testing a fresh
-    # vllm-deplodock build with `bench --local`); a genuinely missing image
+    # vllm-emmy build with `bench --local`); a genuinely missing image
     # still fails clearly at `docker compose up`.
     logger.info("Pulling images...")
     async with timer.ameasure(PHASE_IMAGE_PULL):

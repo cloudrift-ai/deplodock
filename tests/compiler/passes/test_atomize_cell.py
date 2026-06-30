@@ -14,12 +14,12 @@ its register-fragment inner contractions.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Write
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY, SerialTile
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Mma, Write
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY, SerialTile
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._atom import atomize_cell
 
 _ATOM = ATOM_REGISTRY["mma_m16n8k16_f16"]
 

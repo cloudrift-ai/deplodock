@@ -1,9 +1,9 @@
-"""Tests for deplodock.redact — secret redaction in text and log records."""
+"""Tests for emmy.redact — secret redaction in text and log records."""
 
 import logging
 
-import deplodock.redact as redact_module
-from deplodock.redact import SecretRedactingFilter, install_redaction, redact_secrets, register_secret
+import emmy.redact as redact_module
+from emmy.redact import SecretRedactingFilter, install_redaction, redact_secrets, register_secret
 
 
 def _reset_cache():
@@ -124,7 +124,7 @@ def test_install_redaction_through_file_handler(monkeypatch, tmp_path):
     root.addHandler(handler)
     try:
         # Emit from a *child* logger to exercise propagation through callHandlers.
-        child = logging.getLogger("deplodock.provisioning.ssh_transport")
+        child = logging.getLogger("emmy.provisioning.ssh_transport")
         child.info("[dry-run] ssh host: docker run -e HUGGING_FACE_HUB_TOKEN=hf_PropagationTestToken123 ...")
         handler.flush()
     finally:
@@ -198,7 +198,7 @@ def test_register_secret_propagates_through_file_handler(monkeypatch, tmp_path):
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     try:
-        child = logging.getLogger("deplodock.provisioning.cloudrift")
+        child = logging.getLogger("emmy.provisioning.cloudrift")
         child.info("X-API-Key: cr_cli_flag_secret_CCCCCC")
         handler.flush()
     finally:

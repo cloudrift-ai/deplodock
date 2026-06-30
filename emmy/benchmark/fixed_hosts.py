@@ -1,4 +1,4 @@
-"""Fixed-host mode for `deplodock bench`.
+"""Fixed-host mode for `emmy bench`.
 
 Resolves a user-provided pool of pre-allocated hosts (`--local`, `--ssh`)
 into AllocatedHost records with detected GPU type/count, and validates
@@ -9,9 +9,9 @@ import logging
 import os
 from dataclasses import dataclass
 
-from deplodock.detect import detect_local_gpus, detect_remote_gpus
-from deplodock.provisioning.ssh_target import parse_ssh_target
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.detect import detect_local_gpus, detect_remote_gpus
+from emmy.provisioning.ssh_target import parse_ssh_target
+from emmy.provisioning.types import VMConnectionInfo
 
 __all__ = [
     "AllocatedHost",

@@ -15,7 +15,7 @@ GPU-less hosts (CI, offline golden ranking, cross-target compiles) get faithful
 per-SKU regime features instead of a single hardcoded constant.
 
 Cloud-provisioning facts (instance types, zones, provisioning models) stay in
-:mod:`deplodock.hardware` — those are provider/account specifics, not physical
+:mod:`emmy.hardware` — those are provider/account specifics, not physical
 properties of the silicon; this module owns only the hardware itself.
 """
 
@@ -275,13 +275,13 @@ def by_pci_device_id(device_id: str) -> GpuSpec | None:
 
 def pci_device_id_to_name() -> dict[str, str]:
     """``{pci_device_id: canonical_name}`` over the registry — the back-compat map
-    :mod:`deplodock.detect` exposes as ``GPU_PCI_DEVICE_IDS``."""
+    :mod:`emmy.detect` exposes as ``GPU_PCI_DEVICE_IDS``."""
     return {pid: g.name for g in KNOWN_GPUS for pid in g.pci_device_ids}
 
 
 def short_names() -> dict[str, str]:
     """``{canonical_name: short_name}`` over the registry (back-compat for
-    :data:`deplodock.hardware.GPU_SHORT_NAMES`)."""
+    :data:`emmy.hardware.GPU_SHORT_NAMES`)."""
     return {g.name: g.short_name for g in KNOWN_GPUS if g.short_name}
 
 

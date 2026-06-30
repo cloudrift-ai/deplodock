@@ -6,9 +6,9 @@ Submodules:
   ``__global__`` source string.
 
 The public surface below re-exports the types so callers use
-``from deplodock.compiler.ir.cuda import CudaOp``.
+``from emmy.compiler.ir.cuda import CudaOp``.
 """
 
-from deplodock.compiler.ir.cuda.ir import CudaOp, TmaDescMeta
+from emmy.compiler.ir.cuda.ir import CudaOp, TmaDescMeta
 
 __all__ = ["CudaOp", "TmaDescMeta"]

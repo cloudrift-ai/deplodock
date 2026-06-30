@@ -1,4 +1,4 @@
-"""Frontend capture: PyTorch FX / HuggingFace → deplodock Graph IR.
+"""Frontend capture: PyTorch FX / HuggingFace → emmy Graph IR.
 
 Two modules:
 

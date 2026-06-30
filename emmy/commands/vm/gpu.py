@@ -1,7 +1,7 @@
 """GPU-based `vm create` handler.
 
 Provisions a cloud VM by GPU name rather than by exact instance type.
-Goes through :func:`deplodock.provisioning.cloud.provision_cloud_vm` so it
+Goes through :func:`emmy.provisioning.cloud.provision_cloud_vm` so it
 shares the same candidate iteration, retry, fallback, and orphan-cleanup
 behavior as ``deploy cloud`` and ``bench``.
 
@@ -16,9 +16,9 @@ import logging
 import os
 import sys
 
-from deplodock.benchmark.config import load_config
-from deplodock.provisioning.cloud import provision_cloud_vm, read_public_key_files
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.benchmark.config import load_config
+from emmy.provisioning.cloud import provision_cloud_vm, read_public_key_files
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
 
 logger = logging.getLogger(__name__)
 

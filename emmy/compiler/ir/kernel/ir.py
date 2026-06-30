@@ -26,10 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cached_property
 
-from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
-from deplodock.compiler.ir.expr import (
+from emmy.compiler.dtype import F32, DataType
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import _REDUCE_SPELLING, ElementwiseImpl
+from emmy.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
     CastExpr,
@@ -39,7 +39,7 @@ from deplodock.compiler.ir.expr import (
     TernaryExpr,
     Var,
 )
-from deplodock.compiler.ir.stmt import (
+from emmy.compiler.ir.stmt import (
     Accum,
     Assign,
     Cond,
@@ -53,9 +53,9 @@ from deplodock.compiler.ir.stmt import (
     Write,
     _pad,
 )
-from deplodock.compiler.ir.stmt.base import render_merge_program
-from deplodock.compiler.ir.stmt.ir import BodyOp
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
+from emmy.compiler.ir.stmt.base import render_merge_program
+from emmy.compiler.ir.stmt.ir import BodyOp
+from emmy.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -101,7 +101,7 @@ class Smem(Stmt):
         renderer falls back to the dynamic path when total per-CTA smem
         would exceed the 48 KB static cap.
         """
-        from deplodock.compiler.backend.cuda.dtype import canonical_from_cuda_name  # noqa: PLC0415
+        from emmy.compiler.backend.cuda.dtype import canonical_from_cuda_name  # noqa: PLC0415
 
         total = 1
         for e in self.extents:
@@ -189,7 +189,7 @@ class CpAsyncCopy(Stmt):
         return [f"{indent}cp.async[{self.nbytes}B] {self.smem}[{smem_idx}] <- {self.src}[{src_idx}]"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.stmt import render_index
+        from emmy.compiler.ir.stmt import render_index
 
         smem_flat = render_index(self.smem, self.smem_index, ctx)
         src_flat = render_index(self.src, self.src_index, ctx)
@@ -293,7 +293,7 @@ class TmaLoad(Stmt):
         return [f"{indent}TmaLoad {self.smem}[{smem_idx}] <- {self.desc}({coords}) mbar={self.mbar}{s}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.stmt import render_index
+        from emmy.compiler.ir.stmt import render_index
 
         smem_flat = render_index(self.smem, self.smem_index, ctx)
         rank = len(self.coords)
@@ -699,7 +699,7 @@ class FragmentApply(Stmt):
         return Var(str(name))  # UNIFORM — verbatim
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
 
         pad = _pad(ctx.indent)
         lines = [] if self.in_place else [f"{pad}float {self.out}[{self.layout.n_elems}];"]
@@ -979,7 +979,7 @@ class LdmatrixLoad(Stmt):
         return [f"{indent}LdmatrixLoad {self.frag} <- {self.src_buffer}[{idx}] ({variant}{guard}, ldm={self.ldm or 'auto'})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+        from emmy.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.src_buffer, self.src_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.src_buffer, ctx)
@@ -1216,9 +1216,9 @@ class RegStore(Stmt):
         accesses coalesce regardless."""
         if self.epilogue is None:
             return [[], [], [], []], [f"{self.frag}[{i}]" for i in range(4)]
-        from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var  # noqa: PLC0415
-        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
-        from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+        from emmy.compiler.ir.expr import BinaryExpr, Literal, Var  # noqa: PLC0415
+        from emmy.compiler.ir.stmt import render_index  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
 
         epi = self.epilogue
         conv = {"f16": "__half2float({})", "bf16": "__bfloat162float({})"}
@@ -1279,7 +1279,7 @@ class RegStore(Stmt):
         return per_elem, vals
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        from deplodock.compiler.ir.stmt import render_index  # noqa: PLC0415
+        from emmy.compiler.ir.stmt import render_index  # noqa: PLC0415
 
         flat = render_index(self.dst_buffer, self.dst_index, ctx)
         ldm = self.ldm if self.ldm else _resolve_ldm(self.dst_buffer, ctx)
@@ -1471,7 +1471,7 @@ def pack_smem(smems) -> tuple[dict[str, int], int]:  # noqa: ANN001 — smems: I
     e.g. a 512/1024 B swizzle-atom-aligned operand)."""
     from math import prod  # noqa: PLC0415
 
-    from deplodock.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.dtype import nbytes_of  # noqa: PLC0415
 
     offsets: dict[str, int] = {}
     cursor = 0
@@ -1537,7 +1537,7 @@ class KernelOp(BodyOp):
           hatch; better to drop them at the rule level before benching)."""
         from math import prod  # noqa: PLC0415
 
-        from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
+        from emmy.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
 
         for s in self.body:
             if isinstance(s, GridTile):
@@ -1619,7 +1619,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 #
 # ``Body.structural_key()`` runs ``normalize_body``, which dispatches
-# :func:`deplodock.compiler.ir.stmt.passes.rewrite` over every stmt. The
+# :func:`emmy.compiler.ir.stmt.passes.rewrite` over every stmt. The
 # default dispatch raises ``NotImplementedError``, so we register a handler
 # per Kernel-IR stmt here. Buffer names (``Smem.name``, mbarriers, TMA
 # descriptors, etc.) are *not* SSA — the ``rename`` callback only canon-
@@ -1628,7 +1628,7 @@ __all__ = [
 # / ``CpAsyncWait``) are stateless and return themselves.
 
 
-from deplodock.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
+from emmy.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
 
 
 @_rewrite.register

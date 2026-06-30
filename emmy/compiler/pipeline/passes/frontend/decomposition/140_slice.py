@@ -8,12 +8,12 @@ coord_map (orphan constants get cleaned up by the rewriter). The slice end is
 never needed — ``out.shape`` carries the extent, symbolic or static.
 """
 
-from deplodock.compiler.graph import Graph, Node, Tensor
-from deplodock.compiler.ir.base import ConstantOp
-from deplodock.compiler.ir.expr import Literal, placeholder
-from deplodock.compiler.ir.frontend.ir import SliceOp
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
+from emmy.compiler.graph import Graph, Node, Tensor
+from emmy.compiler.ir.base import ConstantOp
+from emmy.compiler.ir.expr import Literal, placeholder
+from emmy.compiler.ir.frontend.ir import SliceOp
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.frontend.decomposition._helpers import open_fragment, single_indexmap
 
 PATTERN = [Pattern("root", SliceOp)]
 

@@ -12,8 +12,8 @@ import shlex
 from pathlib import Path
 from string import Template
 
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.variant import Variant
+from emmy.planner import BenchmarkTask
+from emmy.planner.variant import Variant
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ async def run_command_workload(
     Returns (success, info) where info contains the rendered command and a
     list of locally-pulled result paths.
     """
-    from deplodock.provisioning.ssh_transport import scp_from_remote
+    from emmy.provisioning.ssh_transport import scp_from_remote
 
     cmd_cfg = task.recipe.command
     assert cmd_cfg is not None, "run_command_workload requires a command recipe"

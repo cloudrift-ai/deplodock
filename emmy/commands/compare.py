@@ -1,16 +1,16 @@
-"""``deplodock compare <dumpA> <dumpB>`` — diff the bench results two compiler
+"""``emmy compare <dumpA> <dumpB>`` — diff the bench results two compiler
 dump dirs recorded.
 
 Three sections, each present when both dumps carry the artifact:
 
 - **Full model** (``60_bench_compare.json``): per backend, A vs B latency + ratio.
 - **Per-kernel, torch-comparable** (``62_kernel_bench.json``, written by
-  ``tune --bench``): each kernel's deplodock latency A vs B, matched by
+  ``tune --bench``): each kernel's emmy latency A vs B, matched by
   provenance name — exact (hash-suffixed) name first, then base name (hash
   stripped) in order of appearance, so a re-tuned kernel whose content hash
   moved still pairs up. Kernels present on one side only are listed as
   added / removed — the kernel-set-change (structural fork / fusion) signal.
-- **Per-launch deplodock** (``60_benchmark.json``): the same matching over the
+- **Per-launch emmy** (``60_benchmark.json``): the same matching over the
   raw per-launch times — the fallback when a dump has no per-kernel bench.
 
 Ratios outside ``--tol`` are colored (green faster, red slower) and flagged, so
@@ -27,9 +27,9 @@ import re
 from collections import defaultdict, deque
 from pathlib import Path
 
-from deplodock.commands.table import GREEN as _GREEN
-from deplodock.commands.table import RED as _RED
-from deplodock.commands.table import Col, render_table
+from emmy.commands.table import GREEN as _GREEN
+from emmy.commands.table import RED as _RED
+from emmy.commands.table import Col, render_table
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +169,9 @@ def _compare_kernel_bench(a: Path, b: Path, tol: float) -> bool:
         return False
 
     def rows(d) -> list[tuple[str, float | None]]:
-        return [(r["kernel"], (r.get("backends") or {}).get("Deplodock")) for r in d]
+        return [(r["kernel"], (r.get("backends") or {}).get("Emmy")) for r in d]
 
-    _emit_kernel_diff("Per-kernel deplodock -O3 (62_kernel_bench.json, tune --bench):", rows(da), rows(db), tol)
+    _emit_kernel_diff("Per-kernel emmy -O3 (62_kernel_bench.json, tune --bench):", rows(da), rows(db), tol)
     return True
 
 
@@ -183,5 +183,5 @@ def _compare_per_launch(a: Path, b: Path, tol: float) -> bool:
     def rows(d) -> list[tuple[str, float | None]]:
         return [(lt["kernel_name"], lt["time_ms"] * 1000.0 if lt.get("time_ms") is not None else None) for lt in d["per_launch"]]
 
-    _emit_kernel_diff("Per-launch deplodock (60_benchmark.json):", rows(da), rows(db), tol)
+    _emit_kernel_diff("Per-launch emmy (60_benchmark.json):", rows(da), rows(db), tol)
     return True

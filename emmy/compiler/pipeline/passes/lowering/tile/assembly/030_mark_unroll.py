@@ -25,11 +25,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Node
-from deplodock.compiler.ir.stmt import Body, Stmt
-from deplodock.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
-from deplodock.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.stmt import Body, Stmt
+from emmy.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile, TileOp, WarpTile
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
 

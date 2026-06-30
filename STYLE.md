@@ -34,7 +34,7 @@ Two logging configurations:
 - **Standalone CLI** (`setup_cli_logging()` in `logging_setup.py`): `%(message)s` format — output identical to `print()`.
 - **Bench** (`setup_logging()` in `bench_logging.py`): `[%(name)s] %(message)s` — prefixed output with module/group names.
 
-The bench formatter shows short module names for library loggers (`deplodock.deploy.orchestrate` → `[orchestrate]`) and split group loggers (`rtx5090_x_1.ModelName` → `[rtx5090_x_1] [ModelName]`).
+The bench formatter shows short module names for library loggers (`emmy.deploy.orchestrate` → `[orchestrate]`) and split group loggers (`rtx5090_x_1.ModelName` → `[rtx5090_x_1] [ModelName]`).
 
 ### Error Handling
 
@@ -69,7 +69,7 @@ are non-obvious.
 - `__init__.py` files contain only re-exports. No classes, functions, interfaces, or business logic.
 - ABCs and interfaces go in explicitly named files (e.g., `backend/base.py`, not `backend/__init__.py`).
 - Business logic goes in named modules (e.g., `recipe.py`, `compose.py`).
-- `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`deplodock/deploy/`, `deplodock/provisioning/`, `deplodock/benchmark/`).
+- `commands/` layer: CLI code only (argparse registration + `handle_*` handlers). Reusable logic lives in top-level domain packages (`emmy/deploy/`, `emmy/provisioning/`, `emmy/benchmark/`).
 
 ### Imports
 
@@ -77,7 +77,7 @@ Group imports in this order, separated by blank lines:
 
 1. Standard library (`os`, `sys`, `subprocess`, etc.)
 2. Third-party packages (`yaml`, `pandas`, `pytest`)
-3. Local imports (`from deplodock.deploy import ...`)
+3. Local imports (`from emmy.deploy import ...`)
 
 ### Formatting
 

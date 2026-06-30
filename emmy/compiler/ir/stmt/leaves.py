@@ -10,10 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.dtype import F32, DataType
-from deplodock.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
-from deplodock.compiler.ir.stmt.base import (
+from emmy.compiler.dtype import F32, DataType
+from emmy.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
+from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
+from emmy.compiler.ir.stmt.base import (
     ReduceCarrier,
     RenderCtx,
     Stmt,
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     # on this stmt layer). The annotation is lazy (``from __future__ import
     # annotations``) and ``Mma`` never calls the class at runtime — it just
     # holds an instance — so this stays a type-only import, no stmt↔tile cycle.
-    from deplodock.compiler.ir.tile.ir import Atom
+    from emmy.compiler.ir.tile.ir import Atom
 
 
 def _resolve_value(name: str, ctx: RenderCtx) -> str:
@@ -52,7 +52,7 @@ def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt:
     target's conversion intrinsic (e.g. ``__half2float(name)``) by
     parsing ``target.convert``'s output back into a ``FuncCallExpr`` so
     it composes with the Expr renderer."""
-    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
     out: list[Expr] = []
     for a, dt in zip(args, arg_dtypes, strict=True):
@@ -76,7 +76,7 @@ def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -
     Returns an ``Expr`` list, with conversions threaded through a
     ``FuncCallExpr``-style ``Cast``: we synthesize a no-op
     :class:`Var` for f32 args and an inline-rendered cast for others."""
-    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
     out: list[Expr] = []
     for a, dt in zip(args, arg_dtypes, strict=True):
@@ -104,7 +104,7 @@ def _dtype_intrinsics(target, result_dt: str, expr: Expr) -> dict[str, str]:
     when resolving ``FuncCallExpr.name`` to a target spelling; we patch
     in the dtype-specific spellings while rendering the fp16-native
     path."""
-    from deplodock.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
 
     overrides: dict[str, str] = {}
 
@@ -594,7 +594,7 @@ class Mma(ReduceCarrier):
       fragment at lowering); read-and-written, like ``Accum.name``.
     - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
       B = K×N); the lowering matches each Load by these names.
-    - ``atom`` — the :class:`~deplodock.compiler.ir.tile.ir.Atom` spec itself
+    - ``atom`` — the :class:`~emmy.compiler.ir.tile.ir.Atom` spec itself
       (cell shape + per-operand dtypes + group size); a hashable frozen record,
       so it rides on this frozen ``Mma`` Stmt.
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
@@ -868,7 +868,7 @@ class Init(Stmt):
         if isinstance(self.op, str):
             object.__setattr__(self, "op", ElementwiseImpl(self.op))
         if isinstance(self.dtype, str):
-            from deplodock.compiler.dtype import get as _get  # noqa: PLC0415
+            from emmy.compiler.dtype import get as _get  # noqa: PLC0415
 
             object.__setattr__(self, "dtype", _get(self.dtype))
 

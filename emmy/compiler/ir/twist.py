@@ -27,10 +27,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Expr
-from deplodock.compiler.ir.kernel.ir import (
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Expr
+from emmy.compiler.ir.kernel.ir import (
     FRAG,
     ROW,
     FragmentApply,
@@ -40,7 +40,7 @@ from deplodock.compiler.ir.kernel.ir import (
     RegFragment,
     frag_layout,
 )
-from deplodock.compiler.ir.stmt import Assign, Init, Mma, Monoid, Stmt
+from emmy.compiler.ir.stmt import Assign, Init, Mma, Monoid, Stmt
 
 _SUBTRACT = ElementwiseImpl("subtract")
 _EXP = ElementwiseImpl("exp")
@@ -214,7 +214,7 @@ class Combiner(ABC):
         The merge body is pure carrier projection (no softmax knowledge); only the tier-specific
         emission lives in the backend hooks. ``combine(carrier, backend)`` is spelled
         ``backend.combine(carrier)``."""
-        from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier  # noqa: PLC0415
+        from emmy.compiler.ir.stmt.carrier_algebra import split_carrier  # noqa: PLC0415
 
         self._reset()
         twisted = len(carrier.partial) > 1  # a value partial → an embedded contraction to accumulate
@@ -357,7 +357,7 @@ class MmaTwist(Combiner):
         """Generate the fragment mask — neutralize each distributed partial fragment to the carrier
         fold identity where ``mask_when`` holds, before the fold. ONE method for any coordinate
         predicate: ``mask_when`` is a predicate ``Expr`` over the reserved
-        :data:`~deplodock.compiler.ir.kernel.ir.FRAG_COL` / :data:`~deplodock.compiler.ir.kernel.ir.FRAG_ROW`
+        :data:`~emmy.compiler.ir.kernel.ir.FRAG_COL` / :data:`~emmy.compiler.ir.kernel.ir.FRAG_ROW`
         coordinate vars; ``col_bases`` the per-N-atom column origins (+ ``row_base`` when the predicate
         references the row). Knows nothing about causal / boundary / softmax — those are coordinate
         predicates the caller builds (``__fcol > __frow`` / ``__fcol >= seq_len`` / a windowed band /
@@ -380,7 +380,7 @@ class ScalarCombiner(Combiner):
     IR statements split into the carrier-generic :class:`CombinePhases` so the scalar streaming reduce
     and the fragment flash share one ``combine`` orchestration. Because these are loose statements (not
     a ``Monoid`` rendered through ``render_merge_program``, which keys reassign-vs-declare off
-    ``state_names``), a carried-state update must be a :class:`~deplodock.compiler.ir.kernel.ir.Reassign`
+    ``state_names``), a carried-state update must be a :class:`~emmy.compiler.ir.kernel.ir.Reassign`
     (``Assign`` always *declares*, which would shadow the enclosing ``Init``'s carried value): every
     carried state is declared once by an ``Init`` (``seed_state`` / ``declare_accum``) and rebound by a
     ``Reassign`` (via a fresh temp for op-valued updates), never re-``Assign``ed."""

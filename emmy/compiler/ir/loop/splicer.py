@@ -45,7 +45,7 @@ before-use. The exception is the dedup case: when a stmt's operand
 hits an existing binding emitted earlier in the worklist, the new stmt
 still prepends above the existing one — landing above its own dep.
 That sibling inversion is fixed up by the generic
-``topo_sort_siblings`` pass in :mod:`deplodock.compiler.ir.stmt.normalize`,
+``topo_sort_siblings`` pass in :mod:`emmy.compiler.ir.stmt.normalize`,
 which runs inside ``LoopOp.__post_init__`` — so the splicer doesn't
 need its own ordering pass; constructing the ``LoopOp`` is enough.
 """
@@ -56,9 +56,9 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 
-from deplodock.compiler.ir.expr import Expr, Literal, Var
-from deplodock.compiler.ir.loop.builder import LoopBuilder
-from deplodock.compiler.ir.loop.ir import (
+from emmy.compiler.ir.expr import Expr, Literal, Var
+from emmy.compiler.ir.loop.builder import LoopBuilder
+from emmy.compiler.ir.loop.ir import (
     Accum,
     Assign,
     Axis,
@@ -71,7 +71,7 @@ from deplodock.compiler.ir.loop.ir import (
     Stmt,
     Write,
 )
-from deplodock.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.sigma import Sigma
 
 logger = logging.getLogger(__name__)
 

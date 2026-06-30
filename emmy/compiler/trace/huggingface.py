@@ -124,7 +124,7 @@ def build_full_model_wrapper(model, seq_len: int, dtype, *, dynamic: bool = Fals
                     cos, sin = rotary(sample, self.position_ids)
                 inner.rotary_emb = _PassThroughRotary(cos, sin)
             elif rotary is not None:
-                from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX  # noqa: PLC0415
+                from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX  # noqa: PLC0415
 
                 # +1: torch.export guards a symbolic slice end STRICTLY below
                 # the sliced extent (``cos[:, :S]`` with S == extent would
@@ -206,7 +206,7 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
     import torch
     import torch.nn as nn
 
-    from deplodock.compiler.trace.dynamic import DYNAMIC_DIM_MAX
+    from emmy.compiler.trace.dynamic import DYNAMIC_DIM_MAX
 
     # +1: torch.export guards a symbolic slice end STRICTLY below the sliced
     # extent (``cos[:, :s]`` with s == extent would specialize) — same as the

@@ -9,7 +9,7 @@ sub-groups via round-robin, each provisioning its own VM. This trades
 weight-cache reuse for wall-clock time.
 """
 
-from deplodock.planner import BenchmarkPlanner, ExecutionGroup
+from emmy.planner import BenchmarkPlanner, ExecutionGroup
 
 
 class GroupByModelAndGpuPlanner(BenchmarkPlanner):

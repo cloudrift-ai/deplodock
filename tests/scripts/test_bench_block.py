@@ -1,4 +1,4 @@
-"""CLI smoke test for scripts/bench_block.py and deplodock bench orchestration.
+"""CLI smoke test for scripts/bench_block.py and emmy bench orchestration.
 
 The full benchmark requires CUDA + a real transformer download, which isn't
 viable in CI. These tests cover the CLI surface: argument parsing, module
@@ -30,15 +30,15 @@ def test_bench_block_help():
 
 
 def test_bench_block_imports_compiler():
-    """The script's Deplodock path imports the current backend/Graph API.
+    """The script's Emmy path imports the current backend/Graph API.
 
-    Guards against API drift: ``_bench_deplodock`` walks ``compiled.inputs`` and
+    Guards against API drift: ``_bench_emmy`` walks ``compiled.inputs`` and
     ``compiled.nodes`` — if either name changes on ``Graph``, this import will
     still pass but a later attribute access would fail at benchmark time. We
     sanity-check the attributes exist on a freshly-built empty Graph here.
     """
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.graph import Graph
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.graph import Graph
 
     g = Graph()
     assert hasattr(g, "inputs")
@@ -50,7 +50,7 @@ def test_bench_block_imports_compiler():
 
 
 def test_bench_dry_run_tinyllama_block(run_cli, tmp_path):
-    """`deplodock bench experiments/tinyllama-block/ --dry-run --local` works end-to-end.
+    """`emmy bench experiments/tinyllama-block/ --dry-run --local` works end-to-end.
 
     The command-style recipe expands variants, stages files, and prints the
     ``scripts/bench_block.py`` invocation that would run on the target host —

@@ -1,4 +1,4 @@
-"""Tests for op provenance (``deplodock.compiler.provenance``).
+"""Tests for op provenance (``emmy.compiler.provenance``).
 
 Two surfaces in one file: the data model + seeding (``seed`` / ``put`` /
 ``get`` / ``union`` / ``mint`` / ``totals``), and propagation through the
@@ -7,11 +7,11 @@ aggregates pieces across origins via the ``Graph.splice`` hook). Same
 ``_graph`` fixture serves both.
 """
 
-from deplodock.compiler import provenance as prov
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import RmsNormOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler import provenance as prov
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import RmsNormOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 
 def _graph() -> tuple[Graph, str, str, str, str]:
@@ -126,7 +126,7 @@ def _rms_graph() -> Graph:
 def test_decomposition_mints_pieces_under_one_origin():
     """RmsNormOp decomposes (recursively, incl. its inner mean) into many
     primitives, all distinct pieces of the single ``rms_norm_0`` origin."""
-    from deplodock.compiler.pipeline import Pipeline
+    from emmy.compiler.pipeline import Pipeline
 
     out = Pipeline.build(["frontend/decomposition"]).run(_rms_graph())
 
@@ -145,8 +145,8 @@ def test_decomposition_mints_pieces_under_one_origin():
 
 def test_fusion_aggregates_origins():
     """mul + sum fuse into one LoopOp whose prov covers both source origins."""
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+    from emmy.compiler.ir.loop import LoopOp
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
     g, _, _, ew, c = _graph()
     fused = Pipeline.build(LOOP_PASSES).run(g)
@@ -167,10 +167,10 @@ def test_constant_fold_strands_no_prov_on_boundary():
     constant, inflating ``totals`` so the matmul kernel read partial coverage
     (the spurious ``k_linear_reduce`` instead of ``k_linear``). No boundary node
     may carry prov, and ``totals`` must equal the union over compute nodes."""
-    from deplodock.compiler import target as target_mod
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.ir.frontend.ir import LinearOp
-    from deplodock.compiler.pipeline import Pipeline
+    from emmy.compiler import target as target_mod
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.ir.frontend.ir import LinearOp
+    from emmy.compiler.pipeline import Pipeline
 
     g = Graph()
     x = g.add_node(InputOp(), [], Tensor("x", (8, 16)))
@@ -203,8 +203,8 @@ def test_constant_fold_strands_no_prov_on_boundary():
 def test_rms_norm_fully_covered_after_full_pipeline():
     """Through decompose→lift→fuse, the rms_norm origin's pieces survive; the
     kernels that carry it collectively realize every piece (full coverage)."""
-    from deplodock.compiler.ir.loop import LoopOp
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
+    from emmy.compiler.ir.loop import LoopOp
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
 
     fused = Pipeline.build(LOOP_PASSES).run(_rms_graph())
 

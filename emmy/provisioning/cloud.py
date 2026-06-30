@@ -5,21 +5,21 @@ Bridge between the deploy layer and VM providers. All VM-related logic for
 module so the three paths share retry, fallback, and orphan-cleanup
 semantics.
 
-Allocation model — see :mod:`deplodock.provisioning.candidates`:
+Allocation model — see :mod:`emmy.provisioning.candidates`:
 
 * The orchestrator enumerates *candidates* (provider + instance type +
   optional zone) in preference order from the hardware table.
 * For each candidate, it makes up to :data:`SAME_CANDIDATE_RETRIES`
   attempts on transient errors.
-* On :class:`~deplodock.provisioning.errors.CapacityExhausted`, it
+* On :class:`~emmy.provisioning.errors.CapacityExhausted`, it
   advances to the next candidate immediately (no same-candidate retry).
-* On :class:`~deplodock.provisioning.errors.TerminalProvisionError`, it
+* On :class:`~emmy.provisioning.errors.TerminalProvisionError`, it
   aborts and propagates to the caller.
 
 Provider orphans (VMs that were created but never reached a usable
 state) are terminated inside each provider's ``create_instance`` before
-it raises — see :mod:`deplodock.provisioning.cloudrift` and
-:mod:`deplodock.provisioning.gcp`.
+it raises — see :mod:`emmy.provisioning.cloudrift` and
+:mod:`emmy.provisioning.gcp`.
 """
 
 import asyncio
@@ -29,15 +29,15 @@ import secrets
 import shlex
 from datetime import datetime
 
-from deplodock.hardware import (
+from emmy.hardware import (
     DEFAULT_GCP_PROVISIONING_MODEL,
     GPU_GCP_PROVISIONING_MODEL,
 )
-from deplodock.provisioning import cloudrift as cr_provider
-from deplodock.provisioning import gcp as gcp_provider
-from deplodock.provisioning.candidates import VmCandidate, iter_candidates
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.redact import register_secret
+from emmy.provisioning import cloudrift as cr_provider
+from emmy.provisioning import gcp as gcp_provider
+from emmy.provisioning.candidates import VmCandidate, iter_candidates
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.redact import register_secret
 
 # How many times to retry the *same* candidate on a transient (non-capacity,
 # non-terminal) error before moving on to the next candidate.

@@ -2,8 +2,8 @@
 
 from unittest.mock import MagicMock
 
-from deplodock.planner import BenchmarkTask
-from deplodock.planner.variant import Variant
+from emmy.planner import BenchmarkTask
+from emmy.planner.variant import Variant
 
 
 def _make_task(variant, gpu_name, gpu_count, model_name, recipe_dir="/recipes/TestModel", run_dir=None):
