@@ -53,7 +53,6 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
-from deplodock.compiler.ir.stmt.algebra import Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import axis_role, lower
@@ -188,21 +187,19 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a cooperative / ILP reduce (see module docstring)."""
     kernel = tile.kernel
     op = kernel.op
-    carrier = op.reduce_node
-    # A ``Semiring`` contraction folds through the SAME carrier-generic reduce machinery as any
-    # monoid — a contraction is a monoid with a ⊗ lift (``as_monoid``: state = the additive
-    # accumulator, single partial = the operand ⊗ product). Its ``lower`` is byte-identical, so the
-    # reduce loop below is found by the same axis name; the cooperative combine / REG tree read the
-    # ``Monoid`` API (``state`` / ``as_state_merge`` / ``combine_states``) the contraction now exposes.
-    if isinstance(carrier, Semiring):
-        carrier = carrier.as_monoid()
     plan = kernel.schedule.reduce
     coop, reg = plan.coop, plan.reg
     grid = kernel.schedule.place.grid
     stmts = lower(op)
 
-    ridx = next(i for i, s in enumerate(stmts) if isinstance(s, Loop) and s.axis.name == carrier.axis.name)
+    # The cooperative / cross-thread combine reads its :class:`Carrier` off the annotated reduce
+    # loop (``loop.carrier``, stamped by ``lower``), NOT an op-tree node — a contraction's K loop
+    # and a monoid's reduce loop both carry their carrier here. (A contraction is a monoid with a
+    # ⊗ lift, so the same carrier-generic machinery — ``state`` / ``as_state_merge`` /
+    # ``combine_states`` — folds it; the ⊗ lift already sits in the loop body.)
+    ridx = next(i for i, s in enumerate(stmts) if isinstance(s, Loop) and s.carrier is not None)
     rloop = stmts[ridx]
+    carrier = rloop.carrier
     axis = rloop.axis
     stride = coop * reg
     masked = reg > 1 and not (axis.extent.is_static and axis.extent.as_static() % stride == 0)

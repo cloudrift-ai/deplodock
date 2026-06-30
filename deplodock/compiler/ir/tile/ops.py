@@ -124,7 +124,11 @@ def _lower_monoid(m: Monoid) -> list[Stmt]:
     for p in m.partial:
         body += _lower_partial(p)
     body += m.dissolve()
-    return [Loop(axis=m.axis, body=Body(tuple(body)))]
+    # Stamp the reduce role + the decoupled ``Carrier`` onto the loop: a downstream pass reads
+    # the combine off the annotated loop (``loop.carrier``) instead of re-deriving it from an
+    # op-tree node. ``exp`` is the twisted (online-softmax / flash) carrier; ``id`` the plain reduce.
+    role = AxisRole.TWISTED if m.twist.family == "exp" else AxisRole.PLANAR
+    return [Loop(axis=m.axis, body=Body(tuple(body)), role=role, carrier=m.carrier)]
 
 
 def _lower_semiring(s: Semiring) -> list[Stmt]:
@@ -139,7 +143,9 @@ def _lower_semiring(s: Semiring) -> list[Stmt]:
         names.append(_partial_name(opnd))
     body.append(Assign(name=s.fold.value, op=s.lift, args=tuple(names)))
     body.append(s.fold)
-    return [Loop(axis=s.reduce_axis, body=Body(tuple(body)))]
+    # A contraction is a monoid with a ⊗ lift: stamp ``CONTRACTION`` + the degenerate ``id``
+    # carrier (``as_monoid().carrier`` — the additive fold) so the K loop carries its combine.
+    return [Loop(axis=s.reduce_axis, body=Body(tuple(body)), role=AxisRole.CONTRACTION, carrier=s.as_monoid().carrier)]
 
 
 def pretty(op, indent: str = "") -> list[str]:
