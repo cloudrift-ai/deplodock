@@ -1,15 +1,15 @@
 """Atomize — resolve the algebra→hardware-atom binding structurally.
 
-The warp matmul materializer used to ``lower()`` the ``Semiring`` to flat loop-IR and then
-re-recognize which operand is the mma ``a`` vs ``b`` (by axis-in-index), whether ``b`` is
-transposed, the fold accumulator, and the projection epilogue. Every one of those facts is
-already first-class on the ``Semiring`` node (``operands`` / ``fold`` / ``reduce_axis`` /
-``out``) and the grid. :func:`semiring_binding` reads them **structurally** — off each
-operand's own leaf ``Load`` index, never a flattened loop — and builds an :class:`AtomBinding`
-that rides the **schedule** (a sibling of the ``TilePlan`` decision; ``op_cache_key`` digests
-``lower(op.op)``, not the schedule, so the perf / prior cache stays byte-identical). The
-cooperative reduce needs no binding here — its accumulator dtype + shuffle/tree mechanism are
-derived at materialize time (``emit_combine`` off the carrier + ``ReduceStage.combine``).
+The warp matmul materializer needs to know which operand is the mma ``a`` vs ``b`` (by
+axis-in-index), whether ``b`` is transposed, the fold accumulator, and the projection epilogue.
+:func:`semiring_binding` reads them **structurally** off the lowered ``CONTRACTION`` reduce loop
+— the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and builds an
+:class:`AtomBinding` that rides the **schedule** (a sibling of the ``TilePlan`` decision;
+``op_cache_key`` digests ``lower(op.op)``, not the schedule, so the perf / prior cache stays
+byte-identical). Reading off the annotated loop (not an op-tree node) is what lets the
+``Semiring`` / ``Monoid`` node classes retire. The cooperative reduce needs no binding here — its
+accumulator dtype + shuffle/tree mechanism are derived at materialize time (``emit_combine`` off
+the carrier + ``ReduceStage.combine``).
 
 **Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the warp
 option is built (``_warp_option``) — so an atom that **cannot** be bound (e.g. a non-``Load``
@@ -28,8 +28,8 @@ nothing, so it is intentionally absent."""
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.stmt import Load
-from deplodock.compiler.ir.stmt.algebra import Map
+from deplodock.compiler.ir.axis import AxisRole
+from deplodock.compiler.ir.stmt import Accum, Load, Loop
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.tile import AtomBinding, Operand
 from deplodock.compiler.pipeline.pipeline import LoweringError
@@ -40,43 +40,45 @@ def _idx_vars(index) -> set[str]:
     return {v for e in index for v in e.free_vars()}
 
 
-def _operand_leaf(operand) -> Load:
-    """The buffer ``Load`` of a one-``Load`` operand ``Map`` — Phase-1's gmem-direct
-    contraction operand. A non-``Load`` leaf (a nested reduction / staged-fill prologue) is
-    out of scope here (it bails, matching the materializer's gmem-direct guard)."""
-    leaf = operand.body[-1] if isinstance(operand, Map) and operand.body else None
-    if not isinstance(leaf, Load):
-        raise LoweringError("warp tier: a contraction compute prologue isn't supported (gmem-direct, no staging)")
-    return leaf
+def bind_contraction(loop: Loop, m_name: str, n_name: str, epilogue: Body) -> AtomBinding:
+    """Resolve the operand→role :class:`AtomBinding` for a ``CONTRACTION`` reduce ``loop`` (the
+    lowered ``Accum``-in-``Loop`` form) whose output is indexed by grid axes ``m_name`` /
+    ``n_name``, with projection ``epilogue``.
 
-
-def bind_contraction(semi, m_name: str, n_name: str, epilogue: Body) -> AtomBinding:
-    """Resolve the operand→role :class:`AtomBinding` for a contraction ``semi`` whose output is
-    indexed by grid axes ``m_name`` / ``n_name``, with projection ``epilogue``.
-
-    **Node-addressable** — it binds any ``Semiring`` node, not just a kernel root — so warp-flash
-    can reuse it on flash's nested QK^T / PV contractions (the recursion seam in the module
-    docstring). A/B are bound by which output axis each operand's OWN leaf ``Load`` index carries
-    (Phase 1: each operand is a one-``Load`` ``Map``); ``b_trans`` from B's last index component."""
-    k_name = semi.reduce_axis.name
-    leaves = [_operand_leaf(o) for o in semi.operands]
-    a_leaf = next((ld for ld in leaves if m_name in _idx_vars(ld.index)), None)
-    b_leaf = next((ld for ld in leaves if n_name in _idx_vars(ld.index)), None)
+    Reads the facts straight off the loop body — no op-tree node: the contraction operands are the
+    ``Load``\\ s in the loop indexed over the reduce (K) axis; A/B are bound by which output axis
+    each one's index carries; ``b_trans`` from B's last index component; the fold accumulator is the
+    loop body's ``Accum`` target. A clean gmem-direct contraction has plain-``Load`` operands (a
+    computed-cone / demoted matmul never reaches CONTRACTION — recognition leaves it a flat reduce),
+    so an unbindable body (no m/n-bearing K-load) raises, matching the warp gmem-direct guard."""
+    k_name = loop.axis.name
+    loads = [s for s in loop.body if isinstance(s, Load) and k_name in _idx_vars(s.index)]
+    a_leaf = next((ld for ld in loads if m_name in _idx_vars(ld.index)), None)
+    b_leaf = next((ld for ld in loads if n_name in _idx_vars(ld.index)), None)
     if a_leaf is None or b_leaf is None:
         raise LoweringError("warp tier: could not bind A/B operands by grid (m, n) axis")
+    acc = next((s.name for s in loop.body if isinstance(s, Accum)), None)
+    if acc is None:
+        raise LoweringError("warp tier: contraction loop has no fold accumulator")
     b_trans = k_name in b_leaf.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
-    return AtomBinding(a=Operand(a_leaf, "a"), b=Operand(b_leaf, "b"), b_trans=b_trans, acc=semi.out, epilogue=epilogue)
+    return AtomBinding(a=Operand(a_leaf, "a"), b=Operand(b_leaf, "b"), b_trans=b_trans, acc=acc, epilogue=epilogue)
 
 
 def semiring_binding(node, grid) -> AtomBinding:
-    """The root contraction's :class:`AtomBinding`: extract the ``Semiring`` + output grid +
-    projection epilogue (the ``Map`` body, or empty for a bare contraction) and delegate to
-    :func:`bind_contraction`. ``node`` is the kernel op (a ``Semiring`` / ``Map``), ``grid`` the
-    placement's output axes."""
+    """The root contraction's :class:`AtomBinding`: lower ``node`` to loop-IR, find its
+    ``CONTRACTION`` reduce loop, take the projection ``epilogue`` (the stmts after the loop — the
+    ``Map`` body, or empty for a bare contraction), and delegate to :func:`bind_contraction`.
+    ``node`` is the kernel op, ``grid`` the placement's output axes."""
     if len(grid) < 2:
         raise LoweringError("warp tier: contraction output needs an (m, n) grid")
-    epilogue = node.body if isinstance(node, Map) else Body(())
-    return bind_contraction(node.reduce_node, grid[-2].name, grid[-1].name, epilogue)
+    from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415 — avoid an import cycle
+
+    stmts = lower(node)
+    ridx = next((i for i, s in enumerate(stmts) if isinstance(s, Loop) and s.role is AxisRole.CONTRACTION), None)
+    if ridx is None:
+        raise LoweringError("warp tier: no contraction loop to bind")
+    epilogue = Body(tuple(stmts[ridx + 1 :]))
+    return bind_contraction(stmts[ridx], grid[-2].name, grid[-1].name, epilogue)
 
 
 __all__ = ["bind_contraction", "semiring_binding"]
