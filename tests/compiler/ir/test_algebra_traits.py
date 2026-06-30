@@ -160,3 +160,31 @@ def test_np_scan_matches(name: str, expected) -> None:
     a = np.array([1.0, 2.0, 3.0])
     np_scan = _REDUCE_SPELLING[reduce_canon(name)].np_scan
     np.testing.assert_allclose(np_scan(a, axis=0), expected)
+
+
+def test_semiring_as_monoid_lowers_identically() -> None:
+    """A SEMIRING contraction is a MONOID with a ⊗ lift: lowering ``Semiring.as_monoid()`` (the
+    degenerate ``id``-twist carrier whose partial is the operand product) reproduces the direct
+    ``_lower_semiring`` byte-for-byte — the carrier bridge that lets a contraction flow through the
+    shared carrier-generic reduce machinery rather than a contraction special case."""
+    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.ir.expr import Var
+    from deplodock.compiler.ir.stmt import Accum, Load
+    from deplodock.compiler.ir.stmt.algebra import Map, Semiring
+    from deplodock.compiler.ir.stmt.base import pretty_body
+    from deplodock.compiler.ir.tile.ops import lower
+
+    dd = Axis("dd", 64)
+    semi = Semiring(
+        lift=ElementwiseImpl("multiply"),
+        fold=Accum(name="sacc", value="qk", op=ElementwiseImpl("add")),
+        operands=(
+            Map(body=[Load(name="q_e", input="q", index=(Var("m"), Var("dd")))]),
+            Map(body=[Load(name="k_e", input="k", index=(Var("kv"), Var("dd")))]),
+        ),
+        reduce_axis=dd,
+    )
+    direct = "\n".join(pretty_body(lower(semi)))
+    via_monoid = "\n".join(pretty_body(lower(semi.as_monoid())))
+    assert direct == via_monoid, f"as_monoid diverges:\n--- direct ---\n{direct}\n--- monoid ---\n{via_monoid}"

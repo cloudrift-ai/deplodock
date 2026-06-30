@@ -136,6 +136,25 @@ class Semiring:
             return None
         return Semiring(lift=lift.op, fold=fold, operands=tuple(Map(body=[ld]) for ld in loads), reduce_axis=loop.axis)
 
+    def as_monoid(self) -> Monoid:
+        """This contraction AS the degenerate ``Monoid`` it is — the carrier-algebra fact that a
+        **SEMIRING is a MONOID with a ⊗ lift**. State = the additive ``fold`` accumulator; the single
+        ``partial`` source is a ``Map`` that loads the operands and computes their ``lift`` ⊗ product;
+        an ``id``-family ``Twist`` whose channel is the ``fold`` ⊕. Lowering it reproduces
+        :func:`~deplodock.compiler.ir.tile.ops._lower_semiring` exactly, so a contraction flows through
+        the **same** carrier-generic reduce machinery (``Monoid.render`` / the cooperative ``_reduce``
+        tier) as any monoid reduce — no contraction special case. (The mirror of
+        :meth:`~deplodock.compiler.ir.stmt.leaves.Accum.as_monoid` for a scalar fold, but the ``⊗``
+        product is the partial rather than a sibling ``value``.)"""
+        lift = Assign(name=self.fold.value, op=self.lift, args=tuple(o.out for o in self.operands))
+        product = Map(body=Body((*(s for o in self.operands for s in o.body), lift)))
+        return Monoid(
+            state=State(names=(self.fold.name,)),
+            partial=(product,),
+            twist=Twist(family="id", channels=(Channel(fold=self.fold.op, term=self.fold.value, dtype=self.fold.dtype),)),
+            axis=self.reduce_axis,
+        )
+
 
 def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
     return Assign(name=a.name, op=a.op, args=tuple(sub.get(x, x) for x in a.args), dtype=a.dtype)
