@@ -1,17 +1,18 @@
-"""Tile-IR lowering: ``LoopOp`` → ``TileOp``, in three rules.
+"""Tile-IR lowering: ``LoopOp`` → ``TileOp``, in two rules.
 
-1. **Recognize** (``010_recognize``) — the Loop-IR → Tile-IR boundary. ALL recognition
-   lives here (no separate flash / softmax rule): fuse flash attention, fuse online
-   softmax, normalize plain ``Accum``\\ s to twisted ``Monoid``s, then **lift** the kernel
-   to a ``TileOp`` carrying ONE op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``)
-   with an **unmapped** ``Schedule`` (its parallel ``free`` axes, on the ``TileOp`` not the
-   node). After this nothing downstream traffics in ``LoopOp``. The ``_flash`` / ``_softmax``
-   helper modules hold the flash / online-softmax pattern matchers the rule calls.
-2. **Schedule** (``020_schedule``) — geometry + the reduce partition: map the schedule's
-   ``free`` axes onto ``grid`` (the per-cell tier) and pick the reduce-axis partition (the
-   ``REDUCE`` codec → ``ReducePlan``; a cross-CTA ``g`` split pin flows onto both ``Monoid``
-   and ``Semiring`` schedules) and a contraction's output tile (the ``TILE`` codec).
-3. **Split** (``030_split``) — consume a cross-CTA ``GRID`` stage (``ReducePlan.needs_split``)
+1. **Recognize + Schedule** (``010_recognize``) — the Loop-IR → Tile-IR boundary, both halves
+   in ONE rewrite. **Recognition**: fuse flash attention, fuse online softmax, normalize plain
+   ``Accum``\\ s to twisted ``Monoid``s, then **lift** the kernel to a ``Kernel`` carrying ONE
+   op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``) with an **unmapped** placement
+   (its parallel ``free`` axes). **Scheduling** (the ``_schedule`` helper, called inline): map the
+   ``free`` axes onto ``grid`` and offer the per-axis scheduling forks — the reduce-axis partition
+   (the ``REDUCE`` codec → ``ReducePlan``) and a contraction's output tile (the ``TILE`` codec) —
+   dispatched on the axes' ``AxisRole``, never a kernel kind. After this nothing downstream
+   traffics in ``LoopOp``. (Flash recognition is a *graph rewrite*, so its fused ``TileOp`` is
+   scheduled when it re-enters the rule — the rule matches ``LoopOp`` AND an unmapped ``TileOp``.)
+   The ``_flash`` / ``_softmax`` helpers hold the pattern matchers; ``_schedule`` holds the
+   geometry + reduce-partition logic and the ``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC`` knobs.
+2. **Split** (``030_split``) — consume a cross-CTA ``GRID`` stage (``ReducePlan.needs_split``)
    as a **graph rewrite**: a partial kernel reduces each CTA's slice of the reduce axis and
    either ``atomicAdd``\\ s its (additive) state into the output (one kernel) or writes it to a
    ``__partial`` workspace folded by a sibling finalize kernel (the carrier's

@@ -1,10 +1,15 @@
-"""Schedule a lifted ``TileOp`` onto the thread grid (+ pick the reduce partition).
+"""Schedule a lifted kernel onto the thread grid (+ pick the reduce partition / output tile).
 
-Second of the two tile-lowering steps — ``010_recognize`` lifted the kernel to a
-``TileOp`` carrying a typed :class:`~deplodock.compiler.ir.tile.schedule.Kernel` (op-tree
-node + a ``*Schedule`` with an UNMAPPED :class:`~...schedule.Placement`). Scheduling binds
-the placement's ``free`` axes onto the grid (``Placement.on_grid``) and, for a reduction,
-picks the reduce-axis **partition** (:class:`~...schedule.ReducePlan`).
+The scheduling **half** of the merged ``010_recognize`` tile-lowering pass — recognition
+builds the :class:`~deplodock.compiler.ir.tile.schedule.Kernel` (op-tree node + a kind-free
+:class:`~...schedule.TileSchedule` with an UNMAPPED :class:`~...schedule.Placement`) and calls
+:func:`schedule` here in the same rewrite (no separate ``020`` pass). Scheduling binds the
+placement's ``free`` axes onto the grid (``Placement.on_grid``) and offers the per-axis
+scheduling forks — the reduce-axis **partition** (:class:`~...schedule.ReducePlan`, the
+``REDUCE`` codec) for a reduce axis and the output **tile** (:class:`~...schedule.TilePlan`,
+the ``TILE`` codec) for a contraction — read off the axes' :class:`~...axis.AxisRole`, never a
+kernel kind. This is a helper module (``_``-prefixed, not a standalone rule); its knob
+constants still register (``knob._walk_modules`` walks every imported module under the package).
 
 This cut picks a **whole-CTA cooperative** partition for a **static, scalar-output,
 degenerate-monoid** reduce (plain ``sum`` / ``max`` / ``mean``) when the reduce axis is
@@ -31,17 +36,13 @@ from dataclasses import replace
 from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
-from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt.algebra import Monoid
-from deplodock.compiler.ir.tile import ReducePlan, TileOp, TilePlan
+from deplodock.compiler.ir.tile import Kernel, ReducePlan, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
-from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
-
-PATTERN = [Pattern("root", TileOp)]
 
 # The reduce-axis partition is decided HERE, by the single ``REDUCE`` codec knob — the
 # decision hierarchy (env pin via ``Knob.narrow`` > the search/prior fork > the conservative
@@ -336,24 +337,25 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
     return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs=stamped)
 
 
-def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
-    tile: TileOp = root.op
-    if tile.kernel is None or tile.kernel.schedule.place.is_mapped:
-        # Already mapped (grid set), or nothing to map (a scalar-output kernel materializes
-        # on an empty grid), or a placeholder node — leave it for materialize.
-        raise RuleSkipped("schedule already mapped")
-    kernel = tile.kernel
+def schedule(kernel: Kernel, name: str, knobs: dict) -> list[TileOp] | TileOp:
+    """Map a freshly-recognized (UNMAPPED) ``kernel`` onto the grid and offer its scheduling
+    forks — the scheduling half of ``010_recognize``, called inline once recognition has built
+    the kernel. Returns a single scheduled ``TileOp`` (no fork) or a list of candidate
+    ``TileOp``\\ s (the search / prior ranks them). ``knobs`` is the recognized kernel's knob
+    base (empty for a fresh kernel)."""
     place = kernel.schedule.place.on_grid()
-    # A pointwise / non-cooperative kernel has no reduce decision — just map the grid (the
-    # off-default stamps ``REDUCE=""``). A reduction offers its ``REDUCE`` candidate(s): a
-    # single option applies directly; multiple options fork for the search / prior to rank.
+    # Dispatch on the axes' role, not a kernel kind: a pointwise (FREE) kernel has no reduce
+    # decision — just map the grid (the off-default stamps ``REDUCE=""``). A reduction offers its
+    # ``REDUCE`` candidate(s); a contraction offers its output ``TILE``. One candidate applies
+    # directly; multiple fork for the search / prior to rank.
     role = axis_role(kernel.op)
     if role is AxisRole.FREE:
-        return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=tile.name)
+        return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=name)
     # A contraction picks its free-axis output tile (``TILE``); a reduction picks its reduce
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
-    # A ``Semiring`` ALSO honors a cross-CTA split-K (``g``) ``REDUCE`` pin — orthogonal to the
-    # output tile (``reduce`` = the K partition, consumed by ``030_split``).
+    # A contraction ALSO honors a cross-CTA split-K (``g``) / cooperative (``b``/``r``) ``REDUCE``
+    # pin — orthogonal to the output tile (``reduce`` = the K partition; ``g`` is consumed by
+    # ``030_split``, ``b``/``r`` by ``010_materialize``'s ``_reduce`` on the non-tiled scalar tier).
     # ``TILE`` is the unified output-fragment knob: a candidate whose codec names an atom
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
@@ -361,10 +363,10 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | None:
         stage_spec = _stage_spec(kernel)
         reduce_spec = _semiring_reduce_spec()
         return [
-            _warp_option(kernel, place, spec, tile.name, tile.knobs, stage_spec)
+            _warp_option(kernel, place, spec, name, knobs, stage_spec)
             if is_warp_codec(spec)
-            else _tile_option(kernel, place, spec, tile.name, tile.knobs, reduce_spec, stage_spec)
+            else _tile_option(kernel, place, spec, name, knobs, reduce_spec, stage_spec)
             for spec in _tile_specs(kernel)
         ]
     specs = _reduce_specs(kernel, place)
-    return [_option(kernel, place, spec, tile.name, tile.knobs) for spec in specs]
+    return [_option(kernel, place, spec, name, knobs) for spec in specs]

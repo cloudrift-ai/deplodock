@@ -1,12 +1,16 @@
-"""Recognize a ``LoopOp``'s algebraic structure → lift it to a ``TileOp`` carrying a
-single op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``) with an **empty
-schedule**.
+"""Recognize a ``LoopOp``'s algebraic structure, lift it to a ``TileOp``, AND schedule it —
+the merged Loop-IR → Tile-IR pass (recognition + scheduling in one rewrite, no separate
+``020`` step).
 
-This is the Loop-IR → Tile-IR boundary: after this pass nothing downstream traffics
-in ``LoopOp``. Recognition (here) reads the algebra and lifts; scheduling
-(``020_schedule``) only moves the lifted node's ``free`` axes onto the thread grid;
-materialization back to loop IR happens in ``lowering/kernel`` — so the tile passes
-work purely with algebra primitives.
+This is the Loop-IR → Tile-IR boundary: after this pass nothing downstream traffics in
+``LoopOp``. **Recognition** (here) reads the algebra off the body and lifts the per-cell
+compute into one op-tree ``AlgebraNode`` (``Map`` / ``Monoid`` / ``Semiring``) on a ``Kernel``
+with an UNMAPPED placement; the final step hands that kernel to **scheduling**
+(:func:`~deplodock.compiler.pipeline.passes.lowering.tile._schedule.schedule`, the
+``_schedule`` helper) which maps the free axes onto the grid and offers the per-axis
+scheduling forks (``REDUCE`` partition / ``TILE`` output tile), dispatched on the axes'
+:class:`~deplodock.compiler.ir.axis.AxisRole`. Materialization back to loop IR happens in
+``lowering/kernel``.
 
 All recognition lives in THIS one rule (no separate flash / softmax pass), in order (each
 step unconditional — no knobs):
@@ -57,9 +61,10 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
+from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
 
-PATTERN = [Pattern("root", LoopOp)]
+PATTERN = [Pattern("root", (LoopOp, TileOp))]
 
 
 def _normalize(stmts: list[Stmt]) -> tuple[list[Stmt], bool]:
@@ -244,7 +249,17 @@ def _order_free_by_output(node: AlgebraNode, free: list) -> tuple:
     return tuple(sorted(free, key=lambda ax: pos[ax.name]))
 
 
-def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
+def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
+    # (0) Schedule an UNMAPPED ``TileOp`` — a kernel that recognition emitted as a *graph
+    # rewrite* (flash's fused fragment, ``try_flash``) rather than scheduling inline, because a
+    # graph fragment can't embed a scheduling fork. The fused ``TileOp`` re-enters this same pass
+    # and is scheduled here, the same ``_schedule.schedule`` the inline path uses. A mapped /
+    # kernel-less ``TileOp`` (already scheduled, or ``030_split``'s output) is left for materialize.
+    if isinstance(root.op, TileOp):
+        tile: TileOp = root.op
+        if tile.kernel is None or tile.kernel.schedule.place.is_mapped:
+            raise RuleSkipped("TileOp already scheduled / nothing to map")
+        return schedule(tile.kernel, tile.name, tile.knobs)
     # (1) Flash attention — a graph rewrite that fuses a softmax-then-P@V kernel with its
     # scaled-QK producer. Tried first on every node; flash precedes online-softmax precedes
     # normalize, each consuming the Accums the next would match.
@@ -268,7 +283,8 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # output-sweep axis is likewise supported (the reduce loop strides to the runtime extent,
     # the ``< seq_len`` cap masking the tail). Register-tiled symbolic axes mask their tail
     # cell (clamp-read + guarded write) in ``lowering/kernel``.
-    # Wrap the lifted node + its unmapped placement in the matching ``*Kernel`` (keyed by
-    # the op kind — a bare reduction / projection over one is a Monoid/Semiring kernel,
-    # else a MapKernel). ``020_schedule`` maps the free axes + picks the reduce partition.
-    return TileOp(kernel=kernel_for(node, Placement(free=free)), name=loop.name)
+    # Wrap the lifted node + its unmapped placement in a ``Kernel``, then schedule it inline
+    # (the merged second half, ``_schedule.schedule``): map the free axes onto the grid and offer
+    # the per-axis scheduling forks (``REDUCE`` partition / ``TILE`` output tile), dispatched on
+    # the axes' ``AxisRole``. Returns the scheduled ``TileOp`` (or a fork list of candidates).
+    return schedule(kernel_for(node, Placement(free=free)), loop.name, {})
