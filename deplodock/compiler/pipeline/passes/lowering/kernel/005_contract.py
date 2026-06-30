@@ -53,13 +53,19 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
     tail = list(bind.epilogue)
     if not has_write(tail):
         tail = with_store(tail, root.output.name, grid, node)
+    wt = sched.warp_tile
     leaf = MmaLeaf(
+        units_m=wt.warps[0],
+        units_n=wt.warps[1],
+        reg_m=wt.reg[0],
+        reg_n=wt.reg[1],
+        atom=wt.atom,
+        bk=wt.bk,
         a_load=bind.a.load,
         b_load=bind.b.load,
         b_trans=bind.b_trans,
         acc=bind.acc,
         epilogue=Body(tail),
-        warp_tile=sched.warp_tile,
         stage=sched.stage,
     )
     return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis)
@@ -77,11 +83,11 @@ def _scalar_contraction(tile: TileOp, sched, root: Node) -> Contraction:
     k_axis = node.reduce_node.reduce_axis
     plan = sched.tile
     leaf = ScalarLeaf(
-        body=Body(with_store(lower(node), root.output.name, grid, node)),
+        units_m=plan.par_m if m_axis is not None else 1,
+        units_n=plan.par_n,
         reg_m=plan.reg_m if m_axis is not None else 1,
         reg_n=plan.reg_n,
-        par_m=plan.par_m if m_axis is not None else 1,
-        par_n=plan.par_n,
+        body=Body(with_store(lower(node), root.output.name, grid, node)),
     )
     return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis, lead_axes=lead)
 

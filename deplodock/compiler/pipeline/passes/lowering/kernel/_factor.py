@@ -1,55 +1,55 @@
 """The one contraction factorizer — atom-generic.
 
 Both leaf arms of a ``Contraction`` (``MmaLeaf`` / ``ScalarLeaf``) expand through the *same*
-four-level tiling pipeline (``atomize → register_tile → unit_tile → grid_tile``); they differ only
-in the :class:`~._tiling.Unit` the leaf selects (``AtomUnit`` for the tensor-core mma cell,
-``ScalarUnit`` for the scalar fma cell) and the geometry that unit exposes. :func:`factorize` builds
-the right unit and runs the pipeline once — there is no per-atom factorizer.
-
-Every unit exposes the same canonical tiling-geometry interface the pipeline reads: ``atom_m`` /
-``atom_n`` (leaf cell), ``reg_m`` / ``reg_n`` (REGISTER sub-tile), ``units_m`` / ``units_n`` +
-``m_uvar`` / ``n_uvar`` (the UNIT grid — warps for mma, threads for scalar), ``m_axis`` / ``n_axis``
-+ ``m_b`` / ``n_b`` + ``tile_m`` / ``tile_n`` + ``lead_axes`` (the GRID), ``block_threads``,
-``lanes`` (``atom.lanes``), and ``mask_m`` / ``mask_n`` / ``m_ext`` / ``n_ext``. Leading ``_`` so the
-pass loader skips this module."""
+four-level tiling pipeline (``atomize → register_tile → unit_tile → grid_tile``). :func:`factorize`
+reads the tiling **geometry straight off the** ``Contraction`` **node** (``tile_m`` / ``mask_m`` /
+``m_b`` / ``m_uvar`` / ``units_m`` / ``block_threads`` / ``lanes`` / …, all derived there from the
+leaf widths + the skeleton axes — there is no per-atom geometry object) and dispatches the
+atom-specific codegen (``mma_codegen`` / ``scalar_codegen``, which return the
+``state_decls`` / ``reduce_region`` / ``store`` callables ``grid_tile`` splices). The leaf is the
+only thing that varies. Leading ``_`` so the pass loader skips this module."""
 
 from __future__ import annotations
 
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.kernel.ir import Contraction, MmaLeaf, ScalarLeaf
-from deplodock.compiler.pipeline.passes.lowering.kernel._scalar_factor import ScalarUnit
-from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Unit, atomize, grid_tile, register_tile, unit_tile
-from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import AtomUnit
+from deplodock.compiler.pipeline.passes.lowering.kernel._scalar_factor import scalar_codegen
+from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
+from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import mma_codegen
 
 
-def unit_for(c: Contraction) -> Unit:
-    """The leaf :class:`~._tiling.Unit` for a contraction, selected by its :data:`~...ir.Leaf` arm."""
+def _codegen_for(c: Contraction):
+    """The ``(state_decls, reduce_region, store)`` codegen callables for a contraction, selected by
+    its :data:`~...ir.Leaf` arm."""
     if isinstance(c.leaf, MmaLeaf):
-        return AtomUnit(c)
+        return mma_codegen(c)
     if isinstance(c.leaf, ScalarLeaf):
-        return ScalarUnit(c)
-    raise TypeError(f"no Unit for contraction leaf {type(c.leaf).__name__}")
+        return scalar_codegen(c)
+    raise TypeError(f"no codegen for contraction leaf {type(c.leaf).__name__}")
 
 
 def factorize(c: Contraction) -> Tile:
     """Expand a :data:`Contraction` into its tiled ``Tile`` — the one pipeline for both atoms. The
-    unit (``AtomUnit`` / ``ScalarUnit``) supplies the per-level geometry; the layer owns the offset,
-    the axes, and the splice."""
-    u = unit_for(c)
-    masks = (u.mask_m, u.mask_n, u.m_ext, u.n_ext)
-    t = atomize(u, u.atom_m, u.atom_n)
-    t = register_tile(t, u.reg_m, u.reg_n)
-    t = unit_tile(t, u.units_m, u.units_n, u.m_uvar, u.n_uvar)
+    node supplies the per-level geometry; the leaf's codegen supplies the per-cell emission; the
+    layer owns the offset, the axes, and the splice."""
+    state_decls, reduce_region, store = _codegen_for(c)
+    masks = (c.mask_m, c.mask_n, c.m_ext, c.n_ext)
+    t = atomize(c.atom_m, c.atom_n)
+    t = register_tile(t, c.reg_m, c.reg_n)
+    t = unit_tile(t, c.units_m, c.units_n, c.m_uvar, c.n_uvar)
     return grid_tile(
         t,
         masks,
-        n_axis=u.n_axis,
-        n_b=u.n_b,
-        tile_n=u.tile_n,
-        m_axis=u.m_axis,
-        m_b=u.m_b,
-        tile_m=u.tile_m,
-        lead_axes=u.lead_axes,
-        block_threads=u.block_threads,
-        lanes=u.lanes,
+        n_axis=c.n_axis,
+        n_b=c.n_b,
+        tile_n=c.tile_n,
+        m_axis=c.m_axis,
+        m_b=c.m_b,
+        tile_m=c.tile_m,
+        lead_axes=c.lead_axes,
+        block_threads=c.block_threads,
+        lanes=c.lanes,
+        state_decls=state_decls,
+        reduce_region=reduce_region,
+        store=store,
     )

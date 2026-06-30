@@ -62,7 +62,8 @@ from deplodock.compiler.ir.stmt.base import render_merge_program
 from deplodock.compiler.ir.stmt.ir import BodyOp
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.tile.schedule import Stage, WarpTile
+    from deplodock.compiler.ir.tile.atom import AtomKind
+    from deplodock.compiler.ir.tile.schedule import Stage
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -299,32 +300,45 @@ class Tile(Stmt):
 
 
 @dataclass(frozen=True)
-class MmaLeaf:
-    """A :class:`Contraction`'s **mma** payload — the binding-driven structured operands + warp
-    geometry the tensor-core leaf needs: the operand ``Load``\\ s + their role flags (``a_load`` /
-    ``b_load`` / ``b_trans``), the fold accumulator ``acc``, the resolved projection ``epilogue``
-    (post-``with_store`` — ends in the output ``Write``), the ``warp_tile`` geometry, and the
-    operand ``stage``. :attr:`atom` is the ``WarpTile``'s :class:`AtomKind`.
+class Leaf:
+    """Shared base for a :class:`Contraction`'s atom-specific payload — the **common tiling widths**
+    both arms carry: the per-CTA **UNIT** grid (``units_m`` × ``units_n`` — warps for mma, threads
+    for scalar) and the per-unit **REGISTER** sub-tile (``reg_m`` × ``reg_n`` — identical in meaning
+    for both). The atom + the operand payload (binding-driven mma vs body-driven scalar) and the
+    ``Stmt``-protocol helpers :class:`Contraction` delegates to live on the subclasses
+    (:class:`MmaLeaf` / :class:`ScalarLeaf`)."""
+
+    units_m: int
+    units_n: int
+    reg_m: int
+    reg_n: int
+
+
+@dataclass(frozen=True)
+class MmaLeaf(Leaf):
+    """A :class:`Contraction`'s **mma** payload — binding-driven structured operands + the
+    tensor-core cell. The ``WarpTile`` is embedded directly (the :class:`AtomKind` ``atom`` + the
+    K-chunk ``bk``; the warp counts / register sub-tile ride the shared :class:`Leaf` widths). Plus
+    the operand ``Load``\\ s + role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
+    accumulator ``acc``, the resolved projection ``epilogue`` (post-``with_store`` — ends in the
+    output ``Write``), and the operand ``stage``.
 
     The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the epilogue's
-    loads + output ``Write`` surface through :meth:`bodies`. The few :class:`Stmt`-protocol helpers
-    here are what :class:`Contraction` delegates to (this is a plain payload, not a ``Stmt``)."""
+    loads + output ``Write`` surface through :meth:`bodies`. The :class:`Stmt`-protocol helpers here
+    are what :class:`Contraction` delegates to (this is a plain payload, not a ``Stmt``)."""
 
+    atom: AtomKind
+    bk: int
     a_load: Load
     b_load: Load
     b_trans: bool
     acc: str
     epilogue: Body
-    warp_tile: WarpTile
     stage: Stage | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
             object.__setattr__(self, "epilogue", Body(self.epilogue))
-
-    @property
-    def atom(self):
-        return self.warp_tile.atom
 
     def bodies(self) -> tuple[Body, ...]:
         return (self.epilogue,)
@@ -354,19 +368,15 @@ class MmaLeaf:
 
 
 @dataclass(frozen=True)
-class ScalarLeaf:
-    """A :class:`Contraction`'s **scalar** payload — the body-driven form the scalar (register-tile)
-    leaf needs: the lowered per-cell ``body`` (``lower(op)`` + output-store glue — a ``pre`` region,
-    the reduce ``Loop`` over the contraction axis, a projection ``tail``) + the register
-    (``reg_m``/``reg_n``) and parallel (``par_m``/``par_n``) widths. :attr:`atom` is the ``1×1``
-    :class:`ScalarAtom`. The operand ``Load``\\ s ride inside ``body`` (so :meth:`external_reads` is
-    empty); the body surfaces through :meth:`bodies`."""
+class ScalarLeaf(Leaf):
+    """A :class:`Contraction`'s **scalar** payload — the body-driven form: the lowered per-cell
+    ``body`` (``lower(op)`` + output-store glue — a ``pre`` region, the reduce ``Loop`` over the
+    contraction axis, a projection ``tail``). The tile widths ride the shared :class:`Leaf` (the
+    ``units_m`` × ``units_n`` parallel thread-tile + the ``reg_m`` × ``reg_n`` register sub-tile).
+    :attr:`atom` is the ``1×1`` :class:`ScalarAtom`. The operand ``Load``\\ s ride inside ``body``
+    (so :meth:`external_reads` is empty); the body surfaces through :meth:`bodies`."""
 
     body: Body
-    reg_m: int
-    reg_n: int
-    par_m: int
-    par_n: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -392,17 +402,23 @@ class ScalarLeaf:
         return ()
 
     def head(self) -> str:
-        return f"scalar reg={self.reg_m}x{self.reg_n} par={self.par_m}x{self.par_n}"
+        return f"scalar reg={self.reg_m}x{self.reg_n} units={self.units_m}x{self.units_n}"
 
     def rewrite(self, rename, sigma, axis_fn) -> ScalarLeaf:
         return replace(self, body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.body)))
 
 
-#: A :class:`Contraction`'s atom-specific payload — the ONE genuinely-divergent part. The mma arm is
-#: binding-driven (:class:`MmaLeaf`: structured ``a@b`` operands + ``WarpTile``), the scalar arm
-#: body-driven (:class:`ScalarLeaf`: the lowered per-cell body + tile widths); the two can't merge,
-#: so they ride here while everything else (the GRID skeleton + the ``Stmt`` protocol) is shared.
-Leaf = MmaLeaf | ScalarLeaf
+def _ext_expr(axis: Axis) -> Expr:
+    """The axis extent as an ``Expr`` — a literal int (static) or the symbolic ``Dim`` expr."""
+    return Literal(axis.extent.as_static(), "int") if axis.extent.is_static else axis.extent.expr
+
+
+def _overhangs(axis: Axis, tile: int) -> bool:
+    """True iff a ``tile``-wide CTA block overhangs ``axis`` (symbolic or non-divisible extent) —
+    so its tail must be masked."""
+    if tile <= 1:
+        return False
+    return not (axis.extent.is_static and axis.extent.as_static() % tile == 0)
 
 
 @dataclass(frozen=True)
@@ -416,9 +432,12 @@ class Contraction(Stmt):
     :data:`Leaf` (:class:`MmaLeaf` / :class:`ScalarLeaf`), which the node's :class:`Stmt` protocol
     (``nested`` / ``with_bodies`` / ``defines`` / ``external_reads`` / ``rewrite``) delegates to.
 
-    ``010_materialize`` expands it (via the atom's leaf → its ``Unit``) into the ``Tile`` of the
-    four-way GRID/UNIT/REGISTER/ATOM split. It IS ``structural_key``-ed as an intermediate
-    ``KernelOp`` (the kernel-stmt protocol + a ``_rewrite`` handler)."""
+    ``010_materialize`` expands it into the ``Tile`` of the four-way GRID/UNIT/REGISTER/ATOM split
+    (``_factor.factorize`` reads the **derived tiling geometry** below — ``tile_m``/``mask_m``/
+    ``m_b``/``m_uvar``/``block_threads``/``lanes``/… — straight off this node, computed once from the
+    leaf widths + the skeleton axes; there is no separate per-atom geometry object). It IS
+    ``structural_key``-ed as an intermediate ``KernelOp`` (the kernel-stmt protocol + ``_rewrite``);
+    the geometry is derived (``@property``), so it stays out of the fields the key digests."""
 
     leaf: Leaf
     n_axis: Axis
@@ -431,6 +450,83 @@ class Contraction(Stmt):
     def atom(self):
         """The contraction leaf atom (the ``WarpTile``'s ``AtomKind`` / the scalar ``ScalarAtom``)."""
         return self.leaf.atom
+
+    # ---- derived tiling geometry (read by ``_factor.factorize`` — see class docstring) ---------- #
+    @property
+    def atom_m(self) -> int:
+        return self.leaf.atom.atom_m
+
+    @property
+    def atom_n(self) -> int:
+        return self.leaf.atom.atom_n
+
+    @property
+    def lanes(self) -> int:
+        return self.leaf.atom.lanes
+
+    @property
+    def reg_m(self) -> int:
+        return self.leaf.reg_m
+
+    @property
+    def reg_n(self) -> int:
+        return self.leaf.reg_n
+
+    @property
+    def units_m(self) -> int:
+        return self.leaf.units_m
+
+    @property
+    def units_n(self) -> int:
+        return self.leaf.units_n
+
+    @property
+    def tile_m(self) -> int:
+        return self.units_m * self.reg_m * self.atom_m
+
+    @property
+    def tile_n(self) -> int:
+        return self.units_n * self.reg_n * self.atom_n
+
+    @property
+    def mask_m(self) -> bool:
+        return self.m_axis is not None and _overhangs(self.m_axis, self.tile_m)
+
+    @property
+    def mask_n(self) -> bool:
+        return _overhangs(self.n_axis, self.tile_n)
+
+    @property
+    def m_ext(self) -> Expr | None:
+        return _ext_expr(self.m_axis) if self.m_axis is not None else None
+
+    @property
+    def n_ext(self) -> Expr:
+        return _ext_expr(self.n_axis)
+
+    @property
+    def block_threads(self) -> int | None:
+        bt = self.units_m * self.units_n * self.lanes
+        return bt if bt > 1 else None  # None ⇒ the scalar default block size
+
+    # The bound GRID-block / UNIT axis names — the original m/n axis names live in the body
+    # pre-σ, so the bound axes take a fresh ``_b`` (block) / ``_u`` (unit) suffix (one convention
+    # for both atoms; the suffix only has to keep the three names distinct).
+    @property
+    def m_b(self) -> str:
+        return self.m_axis.name + "_b" if self.m_axis is not None else ""
+
+    @property
+    def n_b(self) -> str:
+        return self.n_axis.name + "_b"
+
+    @property
+    def m_uvar(self) -> str:
+        return self.m_axis.name + "_u" if self.m_axis is not None else "_m_u"
+
+    @property
+    def n_uvar(self) -> str:
+        return self.n_axis.name + "_u"
 
     def nested(self) -> tuple[Body, ...]:
         return self.leaf.bodies()
