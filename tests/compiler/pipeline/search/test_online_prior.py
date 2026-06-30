@@ -12,8 +12,8 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-from deplodock.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch
-from deplodock.compiler.pipeline.search.prior import CatBoostPrior, prior_from_json
+from emmy.compiler.pipeline.search.policy.mcts import SearchNode, SearchTree, TuningSearch
+from emmy.compiler.pipeline.search.prior import CatBoostPrior, prior_from_json
 
 
 def _node(knobs: dict, parent: SearchNode) -> SearchNode:
@@ -159,7 +159,7 @@ def test_load_tolerates_stale_checkpoint(tmp_path):
     """A pre-CatBoost checkpoint (sklearn estimator-state ``model`` dict +
     legacy ``archived_rows`` key) migrates instead of crashing: the unusable
     model is dropped, the rows are salvaged, and the next refit rebuilds it."""
-    from deplodock import storage
+    from emmy import storage
 
     path = tmp_path / "prior.json"
     stale = {
@@ -179,8 +179,8 @@ def test_load_tolerates_stale_checkpoint(tmp_path):
 def test_diagnostics_report_reachability():
     """``diagnostics.report`` groups by op and reports argmax reachability — on a
     perfectly-rankable synthetic op the prior recovers the best (ratio 1.0)."""
-    from deplodock.compiler.pipeline.search.data import Dataset
-    from deplodock.compiler.pipeline.search.prior import diagnostics
+    from emmy.compiler.pipeline.search.data import Dataset
+    from emmy.compiler.pipeline.search.prior import diagnostics
 
     # one op-structure (S_kind), bigger BM = lower latency (label = µs)
     rows = [({"S_kind": 1.0, "BM": bm}, 100.0 / bm) for bm in (2, 4, 8, 16, 32, 64) for _ in range(6)]
@@ -322,16 +322,16 @@ def test_node_key_folds_gpu():
 
 
 def _stats(median: float):
-    from deplodock.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.db import PerfStats  # noqa: PLC0415
 
     return PerfStats(median=median, min=median, max=median, mean=median, variance=0.0, n_samples=1)
 
 
 def test_o3_worthy_within_tolerance_band_and_dedup(monkeypatch):
     """``observe`` flags ``last_o3_worthy`` for the new best AND any later config
-    within ``DEPLODOCK_O3_TOL`` of the best -O1 — not just strict improvements —
+    within ``EMMY_O3_TOL`` of the best -O1 — not just strict improvements —
     and dedups so each config is -O3'd at most once."""
-    monkeypatch.setenv("DEPLODOCK_O3_TOL", "0.10")
+    monkeypatch.setenv("EMMY_O3_TOL", "0.10")
     tree = SearchTree()
     best = _node({"WM": 1, "WN": 4}, tree.root)  # the fast one
     near = _node({"WM": 2, "WN": 2}, tree.root)  # within 10%
@@ -489,7 +489,7 @@ def test_fallback_pick_uses_learned_evidence_when_cold():
     """FallbackPrior.pick consults the learned half's reservoir even before the
     model is fitted (a freshly-seeded reservoir holds real measurements), and
     falls through to the analytic ranking when no evidence matches."""
-    from deplodock.compiler.pipeline.search.prior import FallbackPrior
+    from emmy.compiler.pipeline.search.prior import FallbackPrior
 
     learned = CatBoostPrior(seed=0)
     learned.add_rows([_o3_row({"FM": 6}, 24.0)])

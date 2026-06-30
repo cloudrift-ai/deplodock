@@ -21,20 +21,20 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.ir.tile.ir import Buffer, Space, StageBundle, StagePolicy, TileOp, Transport
-from deplodock.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.ir.tile.ir import Buffer, Space, StageBundle, StagePolicy, TileOp, Transport
+from emmy.compiler.pipeline import LOOP_PASSES, TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import build_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._stage import stage_candidates
 
 from ..conftest import requires_cuda
 
@@ -107,7 +107,7 @@ def test_assemble_synthesizes_smem_slabs() -> None:
     assert int(np.prod([ax.extent.as_static() for ax in a.cache_axes])) == 16 * 16
     assert a.dtype is not None and a.dtype.nbytes == 4
     # Every cache-axis Var is bound by a tile layer in the tower (no dangling symbol).
-    from deplodock.compiler.ir.axis import Axis
+    from emmy.compiler.ir.axis import Axis
 
     cache_vars = {ax.name for s in bundle.sources for ax in s.cache_axes}
     bound: set[str] = set()
@@ -121,9 +121,9 @@ def test_assemble_synthesizes_smem_slabs() -> None:
 
 def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     """The full ``TILE_PASSES`` chain (greedy) stages a scalar matmul when
-    ``DEPLODOCK_STAGE`` pins the all-staged mask (ingested as ``PLACE@<edge>=smem``): the
+    ``EMMY_STAGE`` pins the all-staged mask (ingested as ``PLACE@<edge>=smem``): the
     emitted ``TileOp`` carries the native ``PLACE@<edge>`` placement and a ``StageBundle``."""
-    monkeypatch.setenv("DEPLODOCK_STAGE", "all")
+    monkeypatch.setenv("EMMY_STAGE", "all")
     out = Pipeline.build(TILE_PASSES).run(_matmul_graph(), ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     placed = {k: v for k, v in tile_op.knobs.items() if k.startswith("PLACE@")}
@@ -137,14 +137,14 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
 def test_staged_scalar_matmul_matches_reference(monkeypatch, stage_mask, shape) -> None:
     """Every stage subset (both / A-only / B-only / none) lowers to a kernel that
     matches a numpy matmul, including a masked (non-divisor) output axis."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
-    monkeypatch.setenv("DEPLODOCK_STAGE", stage_mask)
+    monkeypatch.setenv("EMMY_STAGE", stage_mask)
     # Pin a small in-budget scalar tile: the cold ranker's smart tile pick is retired
     # (greedy cold → emission order), so the deep-BK emission default can overflow the
     # staged smem slab on the larger shape. Legacy env pins route through the ingest mapper.
     for k, v in (("BN", "16"), ("BM", "16"), ("FN", "2"), ("FM", "2"), ("BK", "16")):
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     M, N, K = shape
     rng = np.random.default_rng(0)
     a = rng.standard_normal((M, K), dtype=np.float32)

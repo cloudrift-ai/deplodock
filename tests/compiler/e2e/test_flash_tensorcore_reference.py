@@ -126,7 +126,7 @@ def test_fused_tensorcore_flash_reference_matches_torch(S):
     import cupy as cp
     import torch
 
-    from deplodock.compiler.backend.cuda import nvcc
+    from emmy.compiler.backend.cuda import nvcc
 
     fn = nvcc.load_function(_KERNEL, "fa2", "", uses_tma=False)
     torch.manual_seed(S)

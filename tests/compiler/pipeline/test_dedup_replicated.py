@@ -20,15 +20,15 @@ import importlib
 
 import pytest
 
-from deplodock.compiler.graph import Graph
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt import Assign, Body, Cond, Load, Write
-from deplodock.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
-from deplodock.compiler.pipeline import RuleSkipped
-from deplodock.compiler.tensor import Tensor
+from emmy.compiler.graph import Graph
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.stmt import Assign, Body, Cond, Load, Write
+from emmy.compiler.ir.tile.ir import RegisterTile, ThreadTile, TileOp
+from emmy.compiler.pipeline import RuleSkipped
+from emmy.compiler.tensor import Tensor
 
-_dedup = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.011_dedup_replicated")
+_dedup = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.011_dedup_replicated")
 
 
 def _run_rule(op: TileOp) -> TileOp:

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.elementwise import ElementwiseImpl, cluster_representative
+from emmy.compiler.ir.elementwise import ElementwiseImpl, cluster_representative
 
 
 @pytest.mark.parametrize(

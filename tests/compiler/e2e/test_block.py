@@ -32,7 +32,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(42)
     config = from_pretrained_or_skip(AutoConfig.from_pretrained, model_id)
@@ -50,19 +50,19 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
     # Trace + compile from the CPU copy first so the trace doesn't see
     # CUDA tensors. The eager forward (cuda lane) moves the module to
     # CUDA only after, inside ``eager_pre_run``, so the lock window
-    # covers the eager forward and the deplodock launches together.
+    # covers the eager forward and the emmy launches together.
     graph = trace_module(block, (x,), kwargs={"position_embeddings": (cos, sin)})
 
     eager_pre_run = None
     if backend_kind == "cuda":
-        from deplodock.compiler.backend.cuda.backend import CudaBackend
+        from emmy.compiler.backend.cuda.backend import CudaBackend
 
         backend = CudaBackend()
 
         def eager_pre_run():
             # Compute the eager reference INSIDE ``backend.run``'s GPU
             # lock so peer xdist workers can't interleave their CUDA
-            # kernels between the eager forward and the deplodock
+            # kernels between the eager forward and the emmy
             # comparison run. The returned ndarray flows through
             # ``backend.run``'s tuple second element. Move to CUDA
             # here (not at module scope) so the param-extraction loop
@@ -73,7 +73,7 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
                 out = block_eager(x_eager, position_embeddings=(cos_eager, sin_eager))[0]
             return out.cpu().flatten().tolist()
     elif backend_kind == "loop":
-        from deplodock.compiler.backend.loop.backend import LoopBackend
+        from emmy.compiler.backend.loop.backend import LoopBackend
 
         with torch.no_grad():
             eager_out = block(x, position_embeddings=(cos, sin))[0]
@@ -84,8 +84,8 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
 
     compiled = backend.compile(graph)
 
-    from deplodock.compiler.ir.base import ConstantOp
-    from deplodock.compiler.loader.binder import apply_load_ops
+    from emmy.compiler.ir.base import ConstantOp
+    from emmy.compiler.loader.binder import apply_load_ops
 
     input_set = set(compiled.inputs)
 
@@ -117,33 +117,33 @@ def _compile_and_run_block(model_id: str, seq_len: int = 32, backend_kind: str =
                 input_data[nid] = np.array([node.op.value], dtype=np.float32)
 
     run_result, pre_result = backend.run(compiled, input_data=input_data, pre_run=eager_pre_run)
-    deplodock_flat = list(run_result.outputs.values())[0].flatten().tolist()
+    emmy_flat = list(run_result.outputs.values())[0].flatten().tolist()
     if pre_result is not None:
         eager_flat = pre_result
 
-    return deplodock_flat, eager_flat
+    return emmy_flat, eager_flat
 
 
-def _assert_accuracy(deplodock, eager, max_threshold=3.0, mean_threshold=0.4):
+def _assert_accuracy(emmy, eager, max_threshold=3.0, mean_threshold=0.4):
     """Cumulative-fp32-drift check. Form B (cp.async pipelined loads) rearranges per-CTA load
     timing so the warp scheduler picks different FMA orderings; this compounds fp32 rounding
     through long-K matmuls and across the ~11 chained kernels in a block, yielding diffs that
     are benign reordering drift, not miscompute.
 
     Thresholds are loose because TMA (default on sm_90+) reorders FMAs further than cp.async
-    — confirmed via DEPLODOCK_FP64_ACC=1, which closes the gap entirely. Bound is ~22% of
+    — confirmed via EMMY_FP64_ACC=1, which closes the gap entirely. Bound is ~22% of
     max_eager (TinyLlama, max_eager≈5.9 → drift ~1.3); Qwen3-Embedding-0.6B is much smaller
     (max_eager≈5.0, drift ~2e-6) so the bound is far from binding for it. Still tight enough
     to catch sign flips, NaNs, off-by-N indexing bugs, layout miscompute (which produces
     drift comparable to max_eager itself, not 20%)."""
-    assert len(deplodock) == len(eager), f"output length mismatch: {len(deplodock)} vs {len(eager)}"
-    assert not any(v != v for v in deplodock), "deplodock output contains NaN"
-    assert sum(1 for v in deplodock if abs(v) > 1e-12) > len(deplodock) // 2, "deplodock output is mostly zeros"
+    assert len(emmy) == len(eager), f"output length mismatch: {len(emmy)} vs {len(eager)}"
+    assert not any(v != v for v in emmy), "emmy output contains NaN"
+    assert sum(1 for v in emmy if abs(v) > 1e-12) > len(emmy) // 2, "emmy output is mostly zeros"
     # Output magnitude sanity: eager should span a real range (not all tiny).
     max_eager = max(abs(e) for e in eager)
     assert max_eager > 0.1, f"eager output is suspiciously small (max_abs={max_eager}); threshold would be trivial"
-    max_diff = max(abs(a - e) for a, e in zip(deplodock, eager, strict=True))
-    mean_diff = sum(abs(a - e) for a, e in zip(deplodock, eager, strict=True)) / len(deplodock)
+    max_diff = max(abs(a - e) for a, e in zip(emmy, eager, strict=True))
+    mean_diff = sum(abs(a - e) for a, e in zip(emmy, eager, strict=True)) / len(emmy)
     assert max_diff < max_threshold, (
         f"max_diff={max_diff:.6f} >= {max_threshold:.6f} (mean_diff={mean_diff:.6f}, max_eager={max_eager:.3f})"
     )
@@ -163,13 +163,13 @@ def _assert_accuracy(deplodock, eager, max_threshold=3.0, mean_threshold=0.4):
     ],
 )
 def test_tinyllama_block_accuracy(backend_kind, seq_len):
-    """TinyLlama block: deplodock output matches PyTorch eager within tolerance."""
-    deplodock, eager = _compile_and_run_block("TinyLlama/TinyLlama-1.1B-Chat-v1.0", seq_len=seq_len, backend_kind=backend_kind)
-    _assert_accuracy(deplodock, eager)
+    """TinyLlama block: emmy output matches PyTorch eager within tolerance."""
+    emmy, eager = _compile_and_run_block("TinyLlama/TinyLlama-1.1B-Chat-v1.0", seq_len=seq_len, backend_kind=backend_kind)
+    _assert_accuracy(emmy, eager)
 
 
 @requires_cuda
 def test_qwen_block_accuracy():
-    """Qwen3-Embedding-0.6B block on CUDA: deplodock output matches PyTorch eager within tolerance."""
-    deplodock, eager = _compile_and_run_block("Qwen/Qwen3-Embedding-0.6B", seq_len=32, backend_kind="cuda")
-    _assert_accuracy(deplodock, eager)
+    """Qwen3-Embedding-0.6B block on CUDA: emmy output matches PyTorch eager within tolerance."""
+    emmy, eager = _compile_and_run_block("Qwen/Qwen3-Embedding-0.6B", seq_len=32, backend_kind="cuda")
+    _assert_accuracy(emmy, eager)

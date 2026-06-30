@@ -1,4 +1,4 @@
-"""Smoke tests for ``deplodock.visualize``. Asserts that the shared theme
+"""Smoke tests for ``emmy.visualize``. Asserts that the shared theme
 exposes the expected token surface, that ``BarChart`` renders self-contained
 HTML for both orientations, and that the page shell injects the JS globals
 that downstream charts rely on."""
@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.visualize import Bar, BarChart, render_bar_chart, render_html
-from deplodock.visualize.bar_chart import AUTO_HORIZONTAL_THRESHOLD
-from deplodock.visualize.theme import FONTS, PALETTE_1, PALETTE_2, STATUS, THEMES
+from emmy.visualize import Bar, BarChart, render_bar_chart, render_html
+from emmy.visualize.bar_chart import AUTO_HORIZONTAL_THRESHOLD
+from emmy.visualize.theme import FONTS, PALETTE_1, PALETTE_2, STATUS, THEMES
 
 _REQUIRED_TOKENS = {
     "fg",
@@ -116,7 +116,7 @@ def test_image_render_missing_playwright_raises_importerror(monkeypatch: pytest.
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    from deplodock.visualize.image import render
+    from emmy.visualize.image import render
 
     with pytest.raises(ImportError, match="playwright is required"):
         render("<html></html>", tmp_path / "x.png")

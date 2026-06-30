@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from deplodock.provisioning.cloudrift import (
+from emmy.provisioning.cloudrift import (
     API_VERSION,
     DEFAULT_CLOUDINIT_URL,
     DEFAULT_IMAGE_URL_AMD,
@@ -26,7 +26,7 @@ from deplodock.provisioning.cloudrift import (
     select_image_url,
     wait_for_status,
 )
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
 
 API_KEY = "test-api-key"
 API_URL = "https://api.test.cloudrift.ai"
@@ -113,7 +113,7 @@ async def test_api_request_sends_correct_payload():
     mock_client_instance.__aenter__ = AsyncMock(return_value=mock_client_instance)
     mock_client_instance.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("deplodock.provisioning.cloudrift.httpx.AsyncClient", return_value=mock_client_instance):
+    with patch("emmy.provisioning.cloudrift.httpx.AsyncClient", return_value=mock_client_instance):
         result = await _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL)
 
     mock_client_instance.request.assert_called_once_with(
@@ -127,7 +127,7 @@ async def test_api_request_sends_correct_payload():
 
 
 async def test_api_request_dry_run(caplog):
-    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+    with caplog.at_level("INFO", logger="emmy.provisioning.cloudrift"):
         result = await _api_request("POST", "/api/v1/test", {"foo": "bar"}, API_KEY, API_URL, dry_run=True)
 
     assert result is None
@@ -139,7 +139,7 @@ async def test_api_request_dry_run(caplog):
 # ── _rent_instance ────────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_payload(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -166,7 +166,7 @@ async def test_rent_instance_payload(mock_api):
     assert result["instance_ids"] == ["c4bf5e16-1063-11f1-9096-5f6ae8f8983f"]
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_no_ports(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -177,7 +177,7 @@ async def test_rent_instance_no_ports(mock_api):
     assert call_data["with_public_ip"] is True
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_billing_exempt(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -194,7 +194,7 @@ async def test_rent_instance_billing_exempt(mock_api):
     assert call_data["billing_exempt"] is True
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_no_billing_exempt_by_default(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -204,7 +204,7 @@ async def test_rent_instance_no_billing_exempt_by_default(mock_api):
     assert "billing_exempt" not in call_data
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_network(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -221,7 +221,7 @@ async def test_rent_instance_network(mock_api):
     assert call_data["network"] == "public"
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_rent_instance_no_network_by_default(mock_api):
     mock_api.return_value = RENT_RESPONSE
 
@@ -234,7 +234,7 @@ async def test_rent_instance_no_network_by_default(mock_api):
 # ── _terminate_instance ───────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_terminate_instance_payload(mock_api):
     mock_api.return_value = TERMINATE_RESPONSE
 
@@ -253,7 +253,7 @@ async def test_terminate_instance_payload(mock_api):
 # ── _get_instance_info ────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_get_instance_info_found(mock_api):
     mock_api.return_value = INSTANCE_ACTIVE_RESPONSE
 
@@ -268,7 +268,7 @@ async def test_get_instance_info_found(mock_api):
     }
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_get_instance_info_not_found(mock_api):
     mock_api.return_value = {"instances": []}
 
@@ -279,7 +279,7 @@ async def test_get_instance_info_not_found(mock_api):
 # ── _list_ssh_keys / _add_ssh_key ─────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_list_ssh_keys(mock_api):
     mock_api.return_value = SSH_KEYS_LIST_RESPONSE
 
@@ -289,7 +289,7 @@ async def test_list_ssh_keys(mock_api):
     assert len(result["keys"]) == 2
 
 
-@patch("deplodock.provisioning.cloudrift._api_request", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._api_request", new_callable=AsyncMock)
 async def test_add_ssh_key(mock_api):
     mock_api.return_value = {"ssh_key": {"id": "key-new"}}
 
@@ -309,8 +309,8 @@ async def test_add_ssh_key(mock_api):
 # ── _ensure_ssh_key ───────────────────────────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
 async def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID37 user@example.com\n")
@@ -323,8 +323,8 @@ async def test_ensure_ssh_key_already_registered(mock_list, mock_add, tmp_path):
     mock_add.assert_not_called()
 
 
-@patch("deplodock.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._add_ssh_key", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._list_ssh_keys", new_callable=AsyncMock)
 async def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
     key_file = tmp_path / "id_ed25519.pub"
     key_file.write_text("ssh-ed25519 BBBB test@host\n")
@@ -344,7 +344,7 @@ async def test_ensure_ssh_key_registers_new(mock_list, mock_add, tmp_path):
 def test_log_connection_info_with_port_mappings(caplog):
     """Test with real response: shared IP + port mappings + VM credentials."""
     instance = INSTANCE_ACTIVE_RESPONSE["instances"][0]
-    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+    with caplog.at_level("INFO", logger="emmy.provisioning.cloudrift"):
         _log_connection_info(instance)
     assert "211.21.50.85" in caplog.text
     assert "riftuser" in caplog.text
@@ -370,7 +370,7 @@ def test_log_connection_info_no_port_mappings(caplog):
             }
         ],
     }
-    with caplog.at_level("INFO", logger="deplodock.provisioning.cloudrift"):
+    with caplog.at_level("INFO", logger="emmy.provisioning.cloudrift"):
         _log_connection_info(instance)
     assert "ssh riftuser@1.2.3.4" in caplog.text
     assert "abc123" not in caplog.text  # password must not be logged
@@ -383,7 +383,7 @@ def test_default_api_url_env_var_override(monkeypatch):
     """DEFAULT_API_URL honors CLOUDRIFT_API_URL env var at import time."""
     import importlib
 
-    from deplodock.provisioning import cloudrift
+    from emmy.provisioning import cloudrift
 
     monkeypatch.setenv("CLOUDRIFT_API_URL", "https://api.staging.cloudrift.ai")
     try:
@@ -470,7 +470,7 @@ def test_default_api_url_fallback(monkeypatch):
     """DEFAULT_API_URL falls back to https://api.cloudrift.ai when env var unset."""
     import importlib
 
-    from deplodock.provisioning import cloudrift
+    from emmy.provisioning import cloudrift
 
     monkeypatch.delenv("CLOUDRIFT_API_URL", raising=False)
     importlib.reload(cloudrift)
@@ -493,8 +493,8 @@ def _active_response(ready=True, host="1.2.3.4", ports=None):
     }
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_polls_until_ready(mock_get, mock_sleep):
     """wait_for_status must keep polling while status is Active but networking is missing."""
     mock_get.side_effect = [
@@ -508,8 +508,8 @@ async def test_wait_for_status_polls_until_ready(mock_get, mock_sleep):
     assert mock_get.await_count == 3
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_timeout_logs_readiness_components(mock_get, mock_sleep, caplog):
     """At timeout, the log message must identify the readiness components that blocked us."""
     mock_get.return_value = {
@@ -519,7 +519,7 @@ async def test_wait_for_status_timeout_logs_readiness_components(mock_get, mock_
         "port_mappings": None,
         "virtual_machines": [{"ready": False}],
     }
-    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+    with caplog.at_level("ERROR", logger="emmy.provisioning.cloudrift"):
         info = await wait_for_status(API_KEY, "inst-123", "Active", timeout=20, interval=10)
     assert info is None
     assert "never became ready" in caplog.text
@@ -528,8 +528,8 @@ async def test_wait_for_status_timeout_logs_readiness_components(mock_get, mock_
     assert "vm_ready=False" in caplog.text
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_returns_none_on_fail_status(mock_get, mock_sleep):
     """fail_statuses must short-circuit polling."""
     mock_get.return_value = {"id": "inst-123", "status": "Inactive"}
@@ -537,8 +537,8 @@ async def test_wait_for_status_returns_none_on_fail_status(mock_get, mock_sleep)
     assert info is None
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_returns_none_on_failed_status(mock_get, mock_sleep, caplog):
     """The v059 'Failed' status short-circuits without the caller listing it, and logs the reason."""
     mock_get.return_value = {
@@ -552,8 +552,8 @@ async def test_wait_for_status_returns_none_on_failed_status(mock_get, mock_slee
     assert "image pull failed: unauthorized" in caplog.text
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_target_wins_over_fail_for_same_string(mock_get, mock_sleep):
     """If a status appears in both target_status and fail_statuses, success takes precedence."""
     mock_get.return_value = _active_response(ready=True)
@@ -565,9 +565,9 @@ async def test_wait_for_status_target_wins_over_fail_for_same_string(mock_get, m
 # ── create_instance orphan termination ───────────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait, mock_terminate, tmp_path):
     """When wait_for_status fails, the rented instance must be terminated and CapacityExhausted raised."""
     import pytest
@@ -586,9 +586,9 @@ async def test_create_instance_terminates_orphan_on_timeout(mock_rent, mock_wait
     assert args.args[1] == "inst-orphan"
 
 
-@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait, mock_terminate, tmp_path, caplog):
     """A failed terminate during orphan cleanup must not mask the original CapacityExhausted."""
     import pytest
@@ -600,16 +600,16 @@ async def test_create_instance_swallows_termination_errors(mock_rent, mock_wait,
     mock_wait.return_value = None
     mock_terminate.side_effect = RuntimeError("network down")
 
-    with caplog.at_level("ERROR", logger="deplodock.provisioning.cloudrift"):
+    with caplog.at_level("ERROR", logger="emmy.provisioning.cloudrift"):
         with pytest.raises(CapacityExhausted):
             await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
     assert "Failed to terminate orphaned instance inst-orphan" in caplog.text
 
 
-@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_terminates_orphan_on_exception(mock_rent, mock_wait, mock_terminate, tmp_path):
     """When wait_for_status raises, the rented instance must be terminated and the exception re-raised."""
     import pytest
@@ -636,8 +636,8 @@ def _http_status_error(code, body=""):
     return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=response)
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_retries_transient_5xx(mock_get, mock_sleep):
     """A transient 5xx during polling must be retried, not propagated."""
     mock_get.side_effect = [
@@ -650,8 +650,8 @@ async def test_wait_for_status_retries_transient_5xx(mock_get, mock_sleep):
     assert mock_get.await_count == 3
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_propagates_4xx(mock_get, mock_sleep):
     """A 4xx (auth, bad request) is terminal and must propagate."""
     import pytest
@@ -661,8 +661,8 @@ async def test_wait_for_status_propagates_4xx(mock_get, mock_sleep):
         await wait_for_status(API_KEY, "inst-123", "Active", timeout=120, interval=10)
 
 
-@patch("deplodock.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._get_instance_info", new_callable=AsyncMock)
 async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
     """httpx network errors (timeout, connection refused, etc.) must be retried."""
     mock_get.side_effect = [
@@ -673,9 +673,9 @@ async def test_wait_for_status_retries_network_error(mock_get, mock_sleep):
     assert info is not None
 
 
-@patch("deplodock.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._terminate_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift.wait_for_status", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_appends_extra_public_keys(mock_rent, mock_wait, mock_terminate, tmp_path):
     """extra_public_keys are installed alongside the key from ssh_key_path."""
     key_file = tmp_path / "id_ed25519.pub"
@@ -699,7 +699,7 @@ async def test_create_instance_appends_extra_public_keys(mock_rent, mock_wait, m
 # ── create_instance HTTP-code classification ────────────────────
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_503_raises_capacity_exhausted(mock_rent, tmp_path):
     """HTTP 503 on rent must be classified as CapacityExhausted for orchestrator fallback."""
     import pytest
@@ -713,7 +713,7 @@ async def test_create_instance_503_raises_capacity_exhausted(mock_rent, tmp_path
         await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_429_raises_capacity_exhausted(mock_rent, tmp_path):
     """HTTP 429 (rate limit) is also capacity-class."""
     import pytest
@@ -727,7 +727,7 @@ async def test_create_instance_429_raises_capacity_exhausted(mock_rent, tmp_path
         await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_400_instance_not_found_raises_capacity(mock_rent, tmp_path):
     """400 'Instance X not found' is a per-datacenter availability signal; advance candidates."""
     import pytest
@@ -741,7 +741,7 @@ async def test_create_instance_400_instance_not_found_raises_capacity(mock_rent,
         await create_instance(API_KEY, "h200-8-generic.1", str(key_file), api_url=API_URL)
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_400_other_raises_terminal(mock_rent, tmp_path):
     """A 400 whose body is not a not-found signal must stay terminal (e.g. malformed body)."""
     import pytest
@@ -755,7 +755,7 @@ async def test_create_instance_400_other_raises_terminal(mock_rent, tmp_path):
         await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_401_raises_terminal(mock_rent, tmp_path):
     """HTTP 401/403 must surface as TerminalProvisionError so the orchestrator aborts."""
     import pytest
@@ -769,7 +769,7 @@ async def test_create_instance_401_raises_terminal(mock_rent, tmp_path):
         await create_instance(API_KEY, "rtx49-7c-kn.1", str(key_file), api_url=API_URL)
 
 
-@patch("deplodock.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloudrift._rent_instance", new_callable=AsyncMock)
 async def test_create_instance_empty_instance_ids_raises_capacity(mock_rent, tmp_path):
     """Rent succeeding HTTP-wise but returning no instance is still no-capacity."""
     import pytest

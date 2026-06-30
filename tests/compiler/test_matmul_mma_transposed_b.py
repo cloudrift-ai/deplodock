@@ -17,15 +17,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Accum, Assign
+from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -113,14 +113,14 @@ def _qkt_graph(*, M: int, N: int, K: int, out_dtype: DataType) -> Graph:
 def test_transposed_b_mma_matches_reference(M: int, N: int, K: int, out_dtype: DataType, shape_mode, monkeypatch):
     """A transposed-B (Q@K^T) F16×F16 matmul compiled via mma.sync agrees with
     the ``a @ b.T`` f32 reference, for STATIC and DYNAMIC (masked) M."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.ir.kernel.render import render_kernelop
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "4")
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
     Mg = dyn_M(shape_mode, M)
     g = _qkt_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
@@ -133,7 +133,7 @@ def test_transposed_b_mma_matches_reference(M: int, N: int, K: int, out_dtype: D
     assert "mma.sync.aligned.m16n8k16" in src, "the s16816 mma.sync instruction must be emitted"
     assert "ldmatrix.sync.aligned" in src, "mma.sync operands must load via ldmatrix"
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
@@ -159,15 +159,15 @@ def test_transposed_b_mma_symbolic_mn(seq: int, out_dtype: DataType, monkeypatch
     masked-tile clamps the divisor sizes above never trigger: A's staged-slab M
     clamp AND the transposed-B operand's gmem-direct ``dpl_mma_load_b_gmem_trans_nclamp``
     on the symbolic N. Compiled once (symbolic), run at each runtime seq."""
-    from deplodock.compiler.dim import Dim
-    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.dim import Dim
+    from emmy.compiler.ir.kernel.render import render_kernelop
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "4")
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
     K = 128
     s = Dim("seq_len")  # one Dim instance → M and N are the same symbol
@@ -179,7 +179,7 @@ def test_transposed_b_mma_symbolic_mn(seq: int, out_dtype: DataType, monkeypatch
     src = render_kernelop(kop, tensors=tensors)
     assert "dpl_mma_load_b_gmem_trans" in src, "transposed-B must use the gmem-direct trans helper"
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(7)
     a = (np.random.randn(seq, K) * 0.1).astype(np.float16)

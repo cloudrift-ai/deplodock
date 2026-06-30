@@ -18,11 +18,11 @@ long-context prefill at TP2 (GPU 0%, workers spin) across all cudagraph modes (d
 
 ### Deployable benchmarks at the recommended config (TP2, 2×H200, 1M ctx, nightly)
 
-Canonical `deplodock bench` (short-context throughput, the standard result file):
+Canonical `emmy bench` (short-context throughput, the standard result file):
 - **`../2026-06-10_19-06-58_56e5c44d/h200x2_vllm_benchmark.{txt,json}`** — conc 16, 64 prompts, 2000/2000:
   **900 tok/s output, TPOT 16.9 ms, mean TTFT 1.66 s (P99 4.0 s), 0/64 failed, 142 s.**
 
-Long-context characterization (manual `vllm bench serve` probes — deplodock bench runs one short-context block,
+Long-context characterization (manual `vllm bench serve` probes — emmy bench runs one short-context block,
 so these aren't canonical result files; numbers recorded here):
 - 200K input, conc 1: TTFT **24.2 s**, decode TPOT **7.67 ms** (0/1 fail).
 - 200K input, conc 4 (8 prompts): TTFT **29.7 s** (P99 55 s), TPOT **112 ms**, peak GPU 100%, 0/8 fail —
@@ -32,6 +32,6 @@ so these aren't canonical result files; numbers recorded here):
 Earlier short-context throughput on 8×H200 (DP2×TP4, 65,536 ctx, conc 32): 3,414 tok/s total, TPOT 15.2 ms
 (see ../2026-06-10_15-39-22_6ed122c6/).
 
-Note: `deplodock bench` reads the HF cache path from `config.yaml` `benchmark.model_dir` (not the recipe). On these
+Note: `emmy bench` reads the HF cache path from `config.yaml` `benchmark.model_dir` (not the recipe). On these
 GCP H200 VMs `deploy ssh` caches the model at `/mnt/models`, so `config.yaml` was set to `/mnt/models` (temporary)
 to avoid a 149 GB re-download — revert once deploy/bench agree on the cache path.

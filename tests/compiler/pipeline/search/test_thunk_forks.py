@@ -16,10 +16,10 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp, Op
-from deplodock.compiler.pipeline.fork import ThunkFork
-from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp, Op
+from emmy.compiler.pipeline.fork import ThunkFork
+from emmy.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
 from tests.compiler.conftest import drain_tune
 
 
@@ -120,8 +120,8 @@ def test_two_level_fork_chain_resolves_leaf() -> None:
 def test_tuning_enumerates_thunk_leaves() -> None:
     """Under TuningSearch, every leaf of a 2-level thunk chain must
     materialize. With ``patience=10**6`` the search exhausts the tree."""
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     def rewrite(root):  # noqa: ARG001
         def make_inner(outer_v: int):
@@ -146,8 +146,8 @@ def test_mixed_fork_and_concrete_op_siblings() -> None:
     """One rule batch returns a mix of Forks and concrete Ops. Single-shot
     picks option 0 (a Fork that expands to a leaf), but both branches
     must be valid for tune to enumerate."""
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     direct_leaf = _StubOp(tag="direct", knobs={"K": 99})
 
@@ -175,7 +175,7 @@ def test_mixed_fork_and_concrete_op_siblings() -> None:
 def test_is_expandable_discriminates_fork_vs_op() -> None:
     """Unit check on LazyCandidate.is_expandable: True only when pending's
     option is a Fork."""
-    from deplodock.compiler.pipeline.search.candidate import Candidate, LazyCandidate
+    from emmy.compiler.pipeline.search.candidate import Candidate, LazyCandidate
 
     # Build a real Candidate and reach into LazyCandidate construction
     # to verify is_expandable() against three pending shapes.
@@ -184,10 +184,10 @@ def test_is_expandable_discriminates_fork_vs_op() -> None:
     # We don't need to actually run; just construct a Match-shaped tuple
     # via Pipeline.match to get a real Match.
     cur = pipeline.passes[0].rules[0]
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.pipeline import TuningSearch
-    from deplodock.compiler.pipeline.pipeline import Run
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.context import Context
+    from emmy.compiler.pipeline import TuningSearch
+    from emmy.compiler.pipeline.pipeline import Run
+    from emmy.compiler.pipeline.search.db import SearchDB
 
     run = Run(pipeline=pipeline, ctx=Context.probe(), search=TuningSearch(), db=SearchDB())
     cand = Candidate(run=run, graph=graph, cursor=None)  # cursor unused for these calls

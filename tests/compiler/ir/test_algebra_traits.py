@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.ir.elementwise import (
+from emmy.compiler.ir.elementwise import (
     _REDUCE_SPELLING,
     ElementwiseImpl,
     reduce_canon,

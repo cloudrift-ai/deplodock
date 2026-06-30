@@ -13,15 +13,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import is_warp, mma_atom
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Accum, Assign
+from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import is_warp, mma_atom
 
 from .conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -132,14 +132,14 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     tile (``WM=2 WN=2 FM=4 FN=8 BK=2`` — N-tile = WN·FN·atom_n = 2·8·8 = 128,
     M-tile = WM·FM·atom_m = 2·4·16 = 128). Single-warp mma.sync is pruned
     (ldmatrix is smem→register only), so the pin forces the staged path."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.ir.kernel.render import render_kernelop
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "4")
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
     Mg = dyn_M(shape_mode, M)
     g = _matmul_graph(M=Mg, N=N, K=K, out_dtype=out_dtype)
@@ -169,7 +169,7 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
     # gmem-direct — launches correctly. The render+source asserts above still
     # cover the KERNEL-stage IR; this only fixes the execution path. The dynamic
     # graph resolves ``seq_len`` from the (M, K) input array shape.
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     np.random.seed(42)
     a = (np.random.randn(M, K) * 0.1).astype(np.float16)
@@ -189,13 +189,13 @@ def test_mma_matmul_matches_f32_reference(M: int, N: int, K: int, out_dtype: Dat
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_mma_default_on_picks_warp_variant(monkeypatch):
-    """With DEPLODOCK_MMA defaulted ON (the MMA knob reads default True),
+    """With EMMY_MMA defaulted ON (the MMA knob reads default True),
     a no-env run of an MMA-eligible multi-warp F16 matmul still emits the
     warp variant. Guards against accidental default flips and confirms
     priority ordering (warp variants outrank scalar in the fork tree).
     mma.sync auto-enumerates on sm_90+; the 128² shape is multi-warp so it
     survives the single-warp prune."""
-    monkeypatch.delenv("DEPLODOCK_MMA", raising=False)
+    monkeypatch.delenv("EMMY_MMA", raising=False)
 
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
@@ -205,16 +205,16 @@ def test_mma_default_on_picks_warp_variant(monkeypatch):
 
 @pytest.mark.skipif(not _supports_mma_sync(), reason="mma.sync.m16n8k16 needs CUDA + sm_80+")
 def test_mma_disabled_falls_back_to_scalar(monkeypatch):
-    """When DEPLODOCK_MMA=0 is set explicitly, the planner drops the
+    """When EMMY_MMA=0 is set explicitly, the planner drops the
     warp-tier branch and emits only scalar register-tile variants."""
-    monkeypatch.setenv("DEPLODOCK_MMA", "0")
+    monkeypatch.setenv("EMMY_MMA", "0")
 
     g = _matmul_graph(M=128, N=128, K=128, out_dtype=F16)
     g = Pipeline.build(KERNEL_PASSES).run(g)
     kop = g.nodes["c"].op
     # Scalar fallback: the leaf carries the MMA OFF sentinel ("0"), not a real
     # atom kind — ``is_warp`` is False (no warp-tier variant emitted).
-    assert not is_warp(kop.knobs) and mma_atom(kop.knobs) is None, "warp variant should not be emitted when DEPLODOCK_MMA=0"
+    assert not is_warp(kop.knobs) and mma_atom(kop.knobs) is None, "warp variant should not be emitted when EMMY_MMA=0"
     # Scalar path should stamp the native free-axis SPLIT@<axis> tiles (par×reg) for both axes.
     assert sum(1 for k in kop.knobs if k.startswith("SPLIT@")) >= 2, kop.knobs
 
@@ -228,16 +228,16 @@ def test_atom_cell_carries_through_staging(monkeypatch):
     to emit the ``ldmatrix`` + ``mma.sync`` chain. Run the tile chain, confirm
     the ``Mma`` survives staging and still names its two operand Loads, then the
     full chain confirms the kernel still emits the s16816 instruction."""
-    from deplodock.compiler.ir.kernel.render import render_kernelop
-    from deplodock.compiler.ir.stmt import Load, Mma
-    from deplodock.compiler.pipeline import TILE_PASSES
+    from emmy.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.ir.stmt import Load, Mma
+    from emmy.compiler.pipeline import TILE_PASSES
 
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "4")
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "4")
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
     # After the full tile chain (partition + lower-atom-cell + staging) the cell
     # is an Mma whose A/B names resolve to two (plain) Loads of the staged smem.

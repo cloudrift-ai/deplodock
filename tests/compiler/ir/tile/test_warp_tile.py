@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.stmt import Body, Write
-from deplodock.compiler.ir.tile.ir import GridTile, ThreadTile, TileOp, WarpTile
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.stmt import Body, Write
+from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, TileOp, WarpTile
 
 
 def _stub_write() -> Write:

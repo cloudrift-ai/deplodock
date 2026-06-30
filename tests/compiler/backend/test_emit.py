@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.backend.cuda.backend import CudaBackend
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda import CudaOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
+from emmy.compiler.backend.cuda.backend import CudaBackend
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda import CudaOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp  # noqa: F401
 
 from ..conftest import matmul_graph, requires_cuda
 
@@ -46,7 +46,7 @@ def _matmul_graph() -> Graph:
 
 def _softmax_graph() -> Graph:
     """A 2-axis softmax graph, reduced on axis=1."""
-    from deplodock.compiler.ir.frontend.ir import SoftmaxOp
+    from emmy.compiler.ir.frontend.ir import SoftmaxOp
 
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (4, 8)), node_id="x")

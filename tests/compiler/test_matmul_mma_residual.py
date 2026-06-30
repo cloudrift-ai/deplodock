@@ -28,16 +28,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler import target as target_mod
-from deplodock.compiler.dtype import F16, F32, DataType
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Assign, Stmt
-from deplodock.compiler.pipeline import KERNEL_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from emmy.compiler import target as target_mod
+from emmy.compiler.dtype import F16, F32, DataType
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Var
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Accum, Assign, Stmt
+from emmy.compiler.pipeline import KERNEL_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import mma_atom
 
 from .conftest import requires_cuda, requires_sm90
 
@@ -125,12 +125,12 @@ def _sm120_target():
 
 
 def _pin_warp(monkeypatch, *, FM: int = 1) -> None:
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", str(FM))
-    monkeypatch.setenv("DEPLODOCK_FN", "8")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", str(FM))
+    monkeypatch.setenv("EMMY_FN", "8")
+    monkeypatch.setenv("EMMY_BK", "2")
 
 
 def _compile(g: Graph):
@@ -138,7 +138,7 @@ def _compile(g: Graph):
 
 
 def _render(g2_op, g: Graph | None = None) -> str:
-    from deplodock.compiler.ir.kernel.render import render_kernelop
+    from emmy.compiler.ir.kernel.render import render_kernelop
 
     # Tensors resolve from the kernel op's own populated I/O.
     tensors = {**g2_op.inputs, **g2_op.outputs}
@@ -209,9 +209,9 @@ def test_epilogue_warp_rows_stay_splitk_one(monkeypatch, _sm120_target):
     residual gate of ``015_gate_splitk_residual`` is a scalar-tier-only shape):
     even a pinned SPLITK=2 keeps the warp row at SPLITK = 1."""
     _pin_warp(monkeypatch)
-    monkeypatch.setenv("DEPLODOCK_SPLITK", "2")
+    monkeypatch.setenv("EMMY_SPLITK", "2")
     kop = _compile(_epilogue_graph(M=32, N=1024, K=3072, epilogue=_residual_add()))
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
 
     assert mma_atom(kop.knobs) == "mma_m16n8k16_f16"
     rk = next(k for k in kop.knobs if k.startswith("REDUCE@"))
@@ -318,7 +318,7 @@ def test_escaping_epilogue_value_blocks_fold(monkeypatch, _sm120_target):
 )
 def test_residual_mma_matches_reference(M: int, N: int, K: int, FM: int, out_dtype: DataType, monkeypatch):
     """The fused matmul+residual on the mma.sync path matches the f32 reference."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     _pin_warp(monkeypatch, FM=FM)
     np.random.seed(42)
@@ -346,7 +346,7 @@ def test_chain_epilogue_mma_matches_reference(FM: int, monkeypatch):
     """``c = relu(acc) * s[j] + r[i,j]`` — multi-op chain with a broadcast leaf
     and a residual, on the mma.sync path, matches the f32 reference (also at
     FM>1, where the per-cell replication offsets every leaf index)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     M, N, K = 128, 256, 128
     epilogue = (
@@ -383,7 +383,7 @@ def test_chain_epilogue_mma_matches_reference(FM: int, monkeypatch):
 def test_transposed_residual_mma_matches_reference(monkeypatch):
     """``c = acc + r[j, i]`` — the swapped dim roles apply the row / col motion
     at the transposed operand's own strides."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     M = N = K = 128
     _pin_warp(monkeypatch, FM=4)

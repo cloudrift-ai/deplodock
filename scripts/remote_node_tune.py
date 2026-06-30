@@ -5,7 +5,7 @@ ONE backgrounded tool call instead of ~20 verbose ssh polls.
 
 Given an SSH target it: ensures the Python 3.12 venv/dev packages + ``nvcc``, rsyncs
 the local working tree, runs ``make setup`` (output to a remote logfile — only a tail
-comes back on failure), launches ``deplodock tune --dataset golden`` detached, then
+comes back on failure), launches ``emmy tune --dataset golden`` detached, then
 **polls the remote log internally** until the tune finishes. All the per-poll ssh
 chatter happens inside this process, so it never reaches the agent's context.
 
@@ -14,13 +14,13 @@ takes ~30–45 min, well past a foreground tool timeout; the harness re-invokes 
 agent with just the final summary when this exits.
 
     ./venv/bin/python scripts/remote_node_tune.py --remote user@host \
-        [--ssh-key ~/.ssh/id_ed25519] [--port 57006] [--repo /path/to/deplodock] \
+        [--ssh-key ~/.ssh/id_ed25519] [--port 57006] [--repo /path/to/emmy] \
         [--poll 60] [--timeout 7200]
 
 Then (separately) merge the node rows home with ``scripts/merge_node_db.py --remote``.
 
 Robustness baked in (the four traps the first run hit): all ssh goes through argv
-lists (no shell word-splitting / zsh quirks); liveness uses the ``[d]eplodock tune``
+lists (no shell word-splitting / zsh quirks); liveness uses the ``[e]mmy tune``
 bracket-pgrep so it never self-matches; each poll is its own short ssh (no long-held
 session that broken-pipes); and venv/dev are always installed before ``make setup``.
 """
@@ -34,9 +34,9 @@ import sys
 import time
 from pathlib import Path
 
-from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR
+from emmy.provisioning.ssh_transport import REMOTE_DEPLOY_DIR
 
-# Matches deplodock/provisioning/ssh_transport.py::ssh_base_args.
+# Matches emmy/provisioning/ssh_transport.py::ssh_base_args.
 _SSH_OPTS = [
     "-o",
     "StrictHostKeyChecking=no",
@@ -51,10 +51,10 @@ _SSH_OPTS = [
 ]
 
 _CUDA_EXPORT = "export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda"
-# Nest under the repo's established remote layout (REMOTE_DEPLOY_DIR = ~/.local/share/deplodock) —
+# Nest under the repo's established remote layout (REMOTE_DEPLOY_DIR = ~/.local/share/emmy) —
 # the same base the deploy/bench paths use (they already clone a repo under it).
 _BASE = f"{REMOTE_DEPLOY_DIR}/node-tune"
-_REMOTE_DIR = f"{_BASE}/repo"  # rsync target — the deplodock checkout we tune from
+_REMOTE_DIR = f"{_BASE}/repo"  # rsync target — the emmy checkout we tune from
 _SETUP_LOG = f"{_BASE}/setup.log"
 _TUNE_LOG = f"{_BASE}/tune.log"
 _DONE_RE = re.compile(r"done: (\d+)/(\d+) shape")
@@ -181,26 +181,26 @@ def main() -> int:
     #    channel (`< /dev/null` + `> <tune log> 2>&1`) and use ssh -n (detach=True),
     #    else ssh holds the channel open past the `&` and this call times out *after*
     #    a successful launch.
-    _log(f"launching `deplodock tune --dataset golden` (detached -> {_TUNE_LOG}) ...")
+    _log(f"launching `emmy tune --dataset golden` (detached -> {_TUNE_LOG}) ...")
     launch = (
         f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && "
-        f"nohup ./venv/bin/deplodock tune --dataset golden > {_TUNE_LOG} 2>&1 < /dev/null & echo tune_launched"
+        f"nohup ./venv/bin/emmy tune --dataset golden > {_TUNE_LOG} 2>&1 < /dev/null & echo tune_launched"
     )
     rc, out = _run(remote, key, port, launch, timeout=60, detach=True)
     if "tune_launched" not in out:
         # Belt-and-suspenders: if the launch ssh still didn't confirm, the tune may
         # have started anyway — verify the process before declaring failure.
         time.sleep(5)
-        _, chk = _run(remote, key, port, "pgrep -f '[d]eplodock tune' >/dev/null 2>&1 && echo ALIVE || echo DEAD")
+        _, chk = _run(remote, key, port, "pgrep -f '[e]mmy tune' >/dev/null 2>&1 && echo ALIVE || echo DEAD")
         if "ALIVE" not in chk:
             return _fail(remote, key, port, f"launch (rc={rc})", _TUNE_LOG)
         _log("launch ssh did not confirm but the tune process is alive — continuing")
 
-    # 5. poll the remote log internally until done / dead / timeout. The `[d]eplodock tune`
+    # 5. poll the remote log internally until done / dead / timeout. The `[e]mmy tune`
     #    bracket pattern is what stops pgrep from matching this very poll command's own argv.
     poll = (
         f"echo \"DONE_MARK=$(grep -aoE 'done: [0-9]+/[0-9]+ shape' {_TUNE_LOG} 2>/dev/null | tail -1)\"; "
-        "pgrep -f '[d]eplodock tune' >/dev/null 2>&1 && echo PROC=ALIVE || echo PROC=DEAD"
+        "pgrep -f '[e]mmy tune' >/dev/null 2>&1 && echo PROC=ALIVE || echo PROC=DEAD"
     )
     start = time.monotonic()
     dead_streak = 0
@@ -250,10 +250,10 @@ def main() -> int:
             if merged == 0:
                 # The tune finished but nothing came home — the remote wrote its node store
                 # somewhere other than the snapshot's default path (e.g. a remote
-                # DEPLODOCK_TUNE_DB), so don't claim success.
+                # EMMY_TUNE_DB), so don't claim success.
                 print(
                     f"merge brought back 0 node rows — the remote node store wasn't at the expected "
-                    f"path; tune data is on {remote}. Check the remote DEPLODOCK_TUNE_DB and re-run "
+                    f"path; tune data is on {remote}. Check the remote EMMY_TUNE_DB and re-run "
                     f"`{manual} --remote-db <path>`.",
                     flush=True,
                 )

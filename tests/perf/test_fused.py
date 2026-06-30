@@ -1,8 +1,8 @@
 """Fused-kernel perf comparisons (currently SDPA).
 
-The Deplodock graph contains the high-level frontend op (``SdpaOp``);
+The Emmy graph contains the high-level frontend op (``SdpaOp``);
 the compiler decomposes + fuses it however it can. The ``launches``
-column in the summary table records how many kernels Deplodock emitted —
+column in the summary table records how many kernels Emmy emitted —
 launches=1 means full fusion into a single kernel, launches>1 means
 the chain was emitted as multiple launches. The PyTorch reference uses
 ``F.scaled_dot_product_attention``.

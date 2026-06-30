@@ -7,16 +7,16 @@
 | Date | 2026-06-29 |
 | Commit | `bc5ae6dae0a241c95189dacc6a89eb80b27e9896` (`bc5ae6da`) — "Fold the node merge into remote_node_tune.py so the run completes in one step" |
 | Branch | `feature/collect-node-data` |
-| **Prior evaluated** | **cold `AnalyticPrior`** (hand-coded; `fitted=False`) — no `~/.cache/deplodock/prior.json` present, so no learned `CatBoostPrior` was loaded |
-| Tune DB | `~/.cache/deplodock/autotune.db` (40 MB) — `node` table only (merged via `scripts/merge_node_db.py`) |
+| **Prior evaluated** | **cold `AnalyticPrior`** (hand-coded; `fitted=False`) — no `~/.cache/emmy/prior.json` present, so no learned `CatBoostPrior` was loaded |
+| Tune DB | `~/.cache/emmy/autotune.db` (40 MB) — `node` table only (merged via `scripts/merge_node_db.py`) |
 | Dataset | search-tree `node` store: 23,971 nodes across 2 cards (RTX 4090: 12,742 · RTX 5090: 11,229), 29 op_sigs each |
-| Cards' node data tuned on | CloudRift RTX 4090 + RTX 5090, `deplodock tune --dataset golden` (29/29 shapes each), -O1 ranking + -O3 rebench |
+| Cards' node data tuned on | CloudRift RTX 4090 + RTX 5090, `emmy tune --dataset golden` (29/29 shapes each), -O1 ranking + -O3 rebench |
 
 Reproduce:
 
 ```bash
-deplodock eval prior --dataset nodes      # per-card AnalyticPrior scoring on the node store
-deplodock eval analytic                   # AnalyticPrior vs recorded goldens (golden-based; ignores the node DB)
+emmy eval prior --dataset nodes      # per-card AnalyticPrior scoring on the node store
+emmy eval analytic                   # AnalyticPrior vs recorded goldens (golden-based; ignores the node DB)
 ```
 
 ## `eval prior --dataset nodes` — AnalyticPrior scored on the collected node data (per card)
@@ -76,5 +76,5 @@ could not locate that golden config in its enumeration).
   lands further from the 5090's absolute optimum (leaf reachability median 2.19× vs the 4090's 1.43×) — exactly the
   divergence the GPU-keyed cross-hardware node store was built to expose.
 - Next step (not done here): to fit + evaluate the learned `CatBoostPrior` on this data, the prior's reservoir
-  (`prior.json`) is needed — only the `node` table was merged back, so an offline `deplodock tune` refit has no local
+  (`prior.json`) is needed — only the `node` table was merged back, so an offline `emmy tune` refit has no local
   training data yet.

@@ -11,10 +11,10 @@ they are different deployment artifacts with different variant spaces.
 
 from __future__ import annotations
 
-from deplodock.commands.trace import graph_from_code
-from deplodock.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
+from emmy.commands.trace import graph_from_code
+from emmy.compiler.pipeline import CUDA_PASSES, LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.trace.dynamic import build_torch_dynamic_shapes, parse_position_specs
 
 SNIPPET = "torch.matmul(torch.randn(64,64), torch.randn(64,64))"
 

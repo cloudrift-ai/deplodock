@@ -6,11 +6,11 @@ point at the pass itself rather than upstream lowering.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.stmt.blocks import Loop, StridedLoop
-from deplodock.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
-from deplodock.compiler.ir.stmt.normalize import hoist_loop_invariants
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.stmt.blocks import Loop, StridedLoop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Load, Write
+from emmy.compiler.ir.stmt.normalize import hoist_loop_invariants
 
 
 def test_hoists_invariant_load_above_loop() -> None:

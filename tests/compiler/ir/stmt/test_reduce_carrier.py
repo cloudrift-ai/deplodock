@@ -9,13 +9,13 @@ contract.
 
 from __future__ import annotations
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Loop, Mma, Monoid, ReduceCarrier, StridedLoop
-from deplodock.compiler.ir.tile.ir import ATOM_REGISTRY
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Accum, Assign, Loop, Mma, Monoid, ReduceCarrier, StridedLoop
+from emmy.compiler.ir.tile.ir import ATOM_REGISTRY
 
 # --------------------------------------------------------------------------- #
 # ElementwiseImpl traits
@@ -114,7 +114,7 @@ def test_mma_combine_partials_is_additive_fold():
 def _combine() -> Monoid:
     # A minimal monoid: state (m, l) folding a partial (s) — the merge program is
     # the operation as data (state-targeting Assigns are the updates).
-    from deplodock.compiler.ir.expr import Literal
+    from emmy.compiler.ir.expr import Literal
 
     return Monoid(
         state=("m_i", "l_i"),
@@ -170,7 +170,7 @@ def test_combine_rewrite_renames_state_partial_and_merge():
 def test_combine_rewrite_threads_axis_split():
     # A σ that splits the KV axis (kv → kv_o*BK + kv_i) re-targets the carrier's
     # reduction axes onto the sub-axes, exactly like Accum/Mma.
-    from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+    from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 
     sigma = Sigma({"kv": BinaryExpr("+", BinaryExpr("*", Var("kv_o"), Literal(8, "int")), Var("kv_i"))})
     renamed = _combine().rewrite(lambda n: n, sigma)
@@ -208,6 +208,6 @@ def test_loop_is_reduce_for_combine():
 
 
 def test_non_carrier_loop_is_not_reduce():
-    from deplodock.compiler.ir.stmt import Load
+    from emmy.compiler.ir.stmt import Load
 
     assert not _kloop(Load(name="x", input="buf", index=(Var("k"),))).is_reduce

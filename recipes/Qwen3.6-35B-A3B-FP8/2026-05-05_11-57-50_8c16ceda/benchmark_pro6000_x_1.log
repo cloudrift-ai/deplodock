@@ -2,46 +2,73 @@
 [2026-05-05 11:57:52] [pro6000_x_1] Using pre-allocated host: riftuser@38.108.83.78:60027
 [2026-05-05 11:57:57] [pro6000_x_1.Qwen3.6-35B-A3B-FP8] Recipe: recipes/Qwen3.6-35B-A3B-FP8 (variant: pro6000x1)
 [2026-05-05 11:57:57] [pro6000_x_1.Qwen3.6-35B-A3B-FP8] Deploying model...
-[2026-05-05 11:57:59] [deplodock.deploy.orchestrate] Pulling images...
-[2026-05-05 11:57:59] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
-[2026-05-05 11:58:00] [deplodock.provisioning.ssh_transport]  vllm_0 Pulling 
-[2026-05-05 11:58:00] [deplodock.provisioning.ssh_transport]  vllm_0 Pulled 
-[2026-05-05 11:58:00] [deplodock.deploy.orchestrate] Downloading model Qwen/Qwen3.6-35B-A3B-FP8...
-[2026-05-05 11:58:01] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
-[2026-05-05 11:58:57] [deplodock.provisioning.ssh_transport] [32m✓ Downloaded[0m
-[2026-05-05 11:58:57] [deplodock.provisioning.ssh_transport]   path: /hf_models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8/snapshots/95a723d08a9490559dae23d0cff1d9466213d989
-[2026-05-05 11:58:57] [deplodock.provisioning.ssh_transport] Fetching 56 files:   0%|          | 0/56 [00:00<?, ?it/s]Fetching 56 files:   4%|▎         | 2/56 [00:00<00:04, 11.65it/s]Fetching 56 files:  14%|█▍        | 8/56 [00:13<01:27,  1.83s/it]Fetching 56 files:  23%|██▎       | 13/56 [00:13<00:40,  1.05it/s]Fetching 56 files:  29%|██▊       | 16/56 [00:14<00:28,  1.39it/s]Fetching 56 files:  32%|███▏      | 18/56 [00:18<00:36,  1.03it/s]Fetching 56 files:  34%|███▍      | 19/56 [00:18<00:35,  1.05it/s]Fetching 56 files:  36%|███▌      | 20/56 [00:26<01:15,  2.09s/it]Fetching 56 files:  45%|████▍     | 25/56 [00:28<00:34,  1.11s/it]Fetching 56 files:  46%|████▋     | 26/56 [00:29<00:34,  1.14s/it]Fetching 56 files:  52%|█████▏    | 29/56 [00:30<00:24,  1.11it/s]Fetching 56 files:  54%|█████▎    | 30/56 [00:32<00:25,  1.03it/s]Fetching 56 files:  55%|█████▌    | 31/56 [00:32<00:22,  1.12it/s]Fetching 56 files:  59%|█████▉    | 33/56 [00:36<00:26,  1.16s/it]Fetching 56 files:  61%|██████    | 34/56 [00:38<00:30,  1.39s/it]Fetching 56 files:  62%|██████▎   | 35/56 [00:39<00:26,  1.26s/it]Fetching 56 files:  66%|██████▌   | 37/56 [00:40<00:18,  1.03it/s]Fetching 56 files:  68%|██████▊   | 38/56 [00:42<00:20,  1.14s/it]Fetching 56 files:  70%|██████▉   | 39/56 [00:42<00:16,  1.05it/s]Fetching 56 files:  73%|███████▎  | 41/56 [00:43<00:11,  1.30it/s]Fetching 56 files:  75%|███████▌  | 42/56 [00:45<00:13,  1.01it/s]Fetching 56 files:  77%|███████▋  | 43/56 [00:48<00:20,  1.61s/it]Fetching 56 files:  79%|███████▊  | 44/56 [00:49<00:15,  1.32s/it]Fetching 56 files:  82%|████████▏ | 46/56 [00:50<00:10,  1.03s/it]Fetching 56 files:  84%|████████▍ | 47/56 [00:50<00:07,  1.15it/s]Fetching 56 files:  91%|█████████ | 51/56 [00:53<00:04,  1.24it/s]Fetching 56 files: 100%|██████████| 56/56 [00:53<00:00,  1.04it/s]
-[2026-05-05 11:58:57] [deplodock.deploy.orchestrate] Cleaning up old containers...
-[2026-05-05 11:58:57] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
-[2026-05-05 11:58:59] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopping
-[2026-05-05 11:59:03] [deplodock.provisioning.ssh_transport]  Container vllm_0  Stopped
-[2026-05-05 11:59:03] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removing
-[2026-05-05 11:59:03] [deplodock.provisioning.ssh_transport]  Container vllm_0  Removed
-[2026-05-05 11:59:03] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Removing
-[2026-05-05 11:59:03] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Removed
-[2026-05-05 11:59:03] [deplodock.deploy.orchestrate] Starting services...
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Creating
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport]  Network deplodock_default  Created
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport]  Container vllm_0  Creating
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport]  Container vllm_0  Created
-[2026-05-05 11:59:04] [deplodock.provisioning.ssh_transport]  Container vllm_0  Starting
-[2026-05-05 11:59:08] [deplodock.provisioning.ssh_transport]  Container vllm_0  Started
-[2026-05-05 11:59:08] [deplodock.provisioning.ssh_transport]  Container vllm_0  Waiting
-[2026-05-05 12:03:56] [deplodock.provisioning.ssh_transport]  Container vllm_0  Healthy
-[2026-05-05 12:03:56] [deplodock.deploy.orchestrate] Waiting for health check...
-[2026-05-05 12:03:57] [deplodock.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
-[2026-05-05 12:03:58] [deplodock.deploy.orchestrate] 
+[2026-05-05 11:57:59] [emmy.deploy.orchestrate] Pulling images...
+[2026-05-05 11:57:59] [emmy.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-05-05 11:58:00] [emmy.provisioning.ssh_transport]  vllm_0 Pulling 
+[2026-05-05 11:58:00] [emmy.provisioning.ssh_transport]  vllm_0 Pulled 
+[2026-05-05 11:58:00] [emmy.deploy.orchestrate] Downloading model Qwen/Qwen3.6-35B-A3B-FP8...
+[2026-05-05 11:58:01] [emmy.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-05-05 11:58:57] [emmy.provisioning.ssh_transport] [32m✓ Downloaded[0m
+[2026-05-05 11:58:57] [emmy.provisioning.ssh_transport]   path: /hf_models/hub/models--Qwen--Qwen3.6-35B-A3B-FP8/snapshots/95a723d08a9490559dae23d0cff1d9466213d989
+[2026-05-05 11:58:57] [emmy.provisioning.ssh_transport] 
+Fetching 56 files:   0%|          | 0/56 [00:00<?, ?it/s]
+Fetching 56 files:   4%|▎         | 2/56 [00:00<00:04, 11.65it/s]
+Fetching 56 files:  14%|█▍        | 8/56 [00:13<01:27,  1.83s/it]
+Fetching 56 files:  23%|██▎       | 13/56 [00:13<00:40,  1.05it/s]
+Fetching 56 files:  29%|██▊       | 16/56 [00:14<00:28,  1.39it/s]
+Fetching 56 files:  32%|███▏      | 18/56 [00:18<00:36,  1.03it/s]
+Fetching 56 files:  34%|███▍      | 19/56 [00:18<00:35,  1.05it/s]
+Fetching 56 files:  36%|███▌      | 20/56 [00:26<01:15,  2.09s/it]
+Fetching 56 files:  45%|████▍     | 25/56 [00:28<00:34,  1.11s/it]
+Fetching 56 files:  46%|████▋     | 26/56 [00:29<00:34,  1.14s/it]
+Fetching 56 files:  52%|█████▏    | 29/56 [00:30<00:24,  1.11it/s]
+Fetching 56 files:  54%|█████▎    | 30/56 [00:32<00:25,  1.03it/s]
+Fetching 56 files:  55%|█████▌    | 31/56 [00:32<00:22,  1.12it/s]
+Fetching 56 files:  59%|█████▉    | 33/56 [00:36<00:26,  1.16s/it]
+Fetching 56 files:  61%|██████    | 34/56 [00:38<00:30,  1.39s/it]
+Fetching 56 files:  62%|██████▎   | 35/56 [00:39<00:26,  1.26s/it]
+Fetching 56 files:  66%|██████▌   | 37/56 [00:40<00:18,  1.03it/s]
+Fetching 56 files:  68%|██████▊   | 38/56 [00:42<00:20,  1.14s/it]
+Fetching 56 files:  70%|██████▉   | 39/56 [00:42<00:16,  1.05it/s]
+Fetching 56 files:  73%|███████▎  | 41/56 [00:43<00:11,  1.30it/s]
+Fetching 56 files:  75%|███████▌  | 42/56 [00:45<00:13,  1.01it/s]
+Fetching 56 files:  77%|███████▋  | 43/56 [00:48<00:20,  1.61s/it]
+Fetching 56 files:  79%|███████▊  | 44/56 [00:49<00:15,  1.32s/it]
+Fetching 56 files:  82%|████████▏ | 46/56 [00:50<00:10,  1.03s/it]
+Fetching 56 files:  84%|████████▍ | 47/56 [00:50<00:07,  1.15it/s]
+Fetching 56 files:  91%|█████████ | 51/56 [00:53<00:04,  1.24it/s]
+Fetching 56 files: 100%|██████████| 56/56 [00:53<00:00,  1.04it/s]
+[2026-05-05 11:58:57] [emmy.deploy.orchestrate] Cleaning up old containers...
+[2026-05-05 11:58:57] [emmy.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-05-05 11:58:59] [emmy.provisioning.ssh_transport]  Container vllm_0  Stopping
+[2026-05-05 11:59:03] [emmy.provisioning.ssh_transport]  Container vllm_0  Stopped
+[2026-05-05 11:59:03] [emmy.provisioning.ssh_transport]  Container vllm_0  Removing
+[2026-05-05 11:59:03] [emmy.provisioning.ssh_transport]  Container vllm_0  Removed
+[2026-05-05 11:59:03] [emmy.provisioning.ssh_transport]  Network emmy_default  Removing
+[2026-05-05 11:59:03] [emmy.provisioning.ssh_transport]  Network emmy_default  Removed
+[2026-05-05 11:59:03] [emmy.deploy.orchestrate] Starting services...
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport]  Network emmy_default  Creating
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport]  Network emmy_default  Created
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport]  Container vllm_0  Creating
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport]  Container vllm_0  Created
+[2026-05-05 11:59:04] [emmy.provisioning.ssh_transport]  Container vllm_0  Starting
+[2026-05-05 11:59:08] [emmy.provisioning.ssh_transport]  Container vllm_0  Started
+[2026-05-05 11:59:08] [emmy.provisioning.ssh_transport]  Container vllm_0  Waiting
+[2026-05-05 12:03:56] [emmy.provisioning.ssh_transport]  Container vllm_0  Healthy
+[2026-05-05 12:03:56] [emmy.deploy.orchestrate] Waiting for health check...
+[2026-05-05 12:03:57] [emmy.provisioning.ssh_transport] Warning: Permanently added '[38.108.83.78]:60027' (ED25519) to the list of known hosts.
+[2026-05-05 12:03:58] [emmy.deploy.orchestrate] 
 Endpoint: http://38.108.83.78:8000/v1
-[2026-05-05 12:03:58] [deplodock.deploy.orchestrate] Model: Qwen/Qwen3.6-35B-A3B-FP8
-[2026-05-05 12:03:58] [deplodock.deploy.orchestrate] Instances: 1
-[2026-05-05 12:03:58] [deplodock.deploy.orchestrate] Status: deployed
-[2026-05-05 12:03:58] [deplodock.deploy.orchestrate] 
+[2026-05-05 12:03:58] [emmy.deploy.orchestrate] Model: Qwen/Qwen3.6-35B-A3B-FP8
+[2026-05-05 12:03:58] [emmy.deploy.orchestrate] Instances: 1
+[2026-05-05 12:03:58] [emmy.deploy.orchestrate] Status: deployed
+[2026-05-05 12:03:58] [emmy.deploy.orchestrate] 
 Running smoke test...
-[2026-05-05 12:04:41] [deplodock.deploy.orchestrate] Smoke test passed.
-[2026-05-05 12:04:41] [deplodock.deploy.orchestrate] 
+[2026-05-05 12:04:41] [emmy.deploy.orchestrate] Smoke test passed.
+[2026-05-05 12:04:41] [emmy.deploy.orchestrate] 
 Example curl:
-[2026-05-05 12:04:41] [deplodock.deploy.orchestrate]   curl http://38.108.83.78:8000/v1/chat/completions \
+[2026-05-05 12:04:41] [emmy.deploy.orchestrate]   curl http://38.108.83.78:8000/v1/chat/completions \
     -H 'Content-Type: application/json' \
     -d '{
       "model": "Qwen/Qwen3.6-35B-A3B-FP8",
@@ -49,4 +76,4 @@ Example curl:
       "max_tokens": 64
     }'
 [2026-05-05 12:04:41] [pro6000_x_1.Qwen3.6-35B-A3B-FP8] Running benchmark...
-[2026-05-05 12:06:58] [pro6000_x_1.Qwen3.6-35B-A3B-FP8] Results saved to: /Users/natalia/Programming/deplodock/recipes/Qwen3.6-35B-A3B-FP8/2026-05-05_11-57-50_8c16ceda/pro6000x1_vllm_benchmark.txt
+[2026-05-05 12:06:58] [pro6000_x_1.Qwen3.6-35B-A3B-FP8] Results saved to: /Users/natalia/Programming/emmy/recipes/Qwen3.6-35B-A3B-FP8/2026-05-05_11-57-50_8c16ceda/pro6000x1_vllm_benchmark.txt

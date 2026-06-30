@@ -1,4 +1,4 @@
-"""End-to-end accuracy tests: verify deplodock output on canonical patterns.
+"""End-to-end accuracy tests: verify emmy output on canonical patterns.
 
 Parametrized over backends (numpy / loop / cuda) via the ``run_graph``
 fixture in ``conftest.py``, AND over dtypes (``f32`` / ``f16``) via the
@@ -9,9 +9,9 @@ Expected values are computed with numpy directly — no torch dependency.
 
 import numpy as np
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, ReduceOp
 
 from ..conftest import dtype_input_scale, dtype_tol
 
@@ -111,7 +111,7 @@ def test_e2e_reduce_max_cooperative(run_graph, dtype):
 
 
 def test_e2e_matmul(run_graph, dtype):
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (4, 8), dtype), node_id="a")
@@ -133,7 +133,7 @@ def test_e2e_matmul_blockify(run_graph, dtype):
     block-tiled SGEMM path: per-block BM·BN tile cooperatively walks K
     in BK-sized chunks, with A/B operand caching in smem and an Init-at-
     Tile-scope accumulator persisting across the K_o loop."""
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     # Sized to the production matmul tile (BN=128, BM=64): both axes
     # ≥ tile so blockify actually splits each into BLOCK + THREAD
@@ -158,7 +158,7 @@ def test_e2e_matmul_blockify(run_graph, dtype):
 def test_e2e_matmul_blockify_rectangular(run_graph, dtype):
     """Non-square matmul through the blockify path — verifies M, N split
     independently and per-buffer cache axes derive correctly when M≠N."""
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
 
     M, N, K = 256, 128, 128  # rectangular; both axes ≥ matmul tile (BN=128, BM=64)
     g = Graph()

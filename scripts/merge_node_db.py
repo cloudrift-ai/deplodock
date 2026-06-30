@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Merge the ``node`` table from another deplodock autotune DB into the local one.
+"""Merge the ``node`` table from another emmy autotune DB into the local one.
 
 The autotune ``node`` table is a **cross-hardware** dataset — its key folds the GPU
 identity (``digest(context_key, gpu, op_sig, knobs)``) — so node rows measured on a
@@ -15,10 +15,10 @@ Two input modes:
 
     # fetch a WAL-safe snapshot from a remote host over SSH, then merge
     ./venv/bin/python scripts/merge_node_db.py --remote user@host \
-        [--ssh-key ~/.ssh/id_ed25519] [--port 22] [--remote-db ~/.cache/deplodock/autotune.db]
+        [--ssh-key ~/.ssh/id_ed25519] [--port 22] [--remote-db ~/.cache/emmy/autotune.db]
 
-The destination defaults to the local tune DB (``DEPLODOCK_TUNE_DB`` or
-``~/.cache/deplodock/autotune.db``); override with ``--db``.
+The destination defaults to the local tune DB (``EMMY_TUNE_DB`` or
+``~/.cache/emmy/autotune.db``); override with ``--db``.
 """
 
 from __future__ import annotations
@@ -31,10 +31,10 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from deplodock.commands.compile import resolve_tune_db
-from deplodock.compiler.pipeline.search.db import SearchDB
+from emmy.commands.compile import resolve_tune_db
+from emmy.compiler.pipeline.search.db import SearchDB
 
-# Same hardening as deplodock/provisioning/ssh_transport.py::ssh_base_args (kept
+# Same hardening as emmy/provisioning/ssh_transport.py::ssh_base_args (kept
 # inline because that helper appends the server and uses ssh's ``-p`` — scp needs ``-P``).
 _SSH_OPTS = [
     "-o",
@@ -80,14 +80,14 @@ def _fetch_remote_snapshot(server: str, *, ssh_key: str | None, port: int | None
     file, returning that local path. The remote snapshot path is per-process (pid) so
     two merges against one host don't clobber each other, and is removed after the fetch."""
     key = _key_opts(ssh_key)
-    remote_snap = f"/tmp/deplodock_nodes_snapshot_{os.getpid()}.db"
+    remote_snap = f"/tmp/emmy_nodes_snapshot_{os.getpid()}.db"
     port_ssh = ["-p", str(port)] if port else []
     ssh_cmd = ["ssh", *_SSH_OPTS, *key, *port_ssh, server, "python3 -"]
     code = _REMOTE_SNAPSHOT_PY.format(remote_db=remote_db, snapshot=remote_snap)
     print(f"[merge_node_db] snapshotting {server}:{remote_db} ...")
     subprocess.run(ssh_cmd, input=code, text=True, check=True)
 
-    fd, local = tempfile.mkstemp(prefix="deplodock_nodes_", suffix=".db")
+    fd, local = tempfile.mkstemp(prefix="emmy_nodes_", suffix=".db")
     os.close(fd)
     scp_cmd = ["scp", *_SSH_OPTS, *key, *(["-P", str(port)] if port else []), f"{server}:{remote_snap}", local]
     print(f"[merge_node_db] fetching snapshot -> {local}")
@@ -119,7 +119,7 @@ def fetch_and_merge(
     *,
     ssh_key: str | None = None,
     port: int | None = None,
-    remote_db: str = "~/.cache/deplodock/autotune.db",
+    remote_db: str = "~/.cache/emmy/autotune.db",
     dest: str | None = None,
 ) -> int:
     """Snapshot the remote autotune DB, scp it back, keep-min merge its node rows into
@@ -142,10 +142,10 @@ def main() -> None:
     p.add_argument("--port", type=int, help="SSH port for --remote (default 22).")
     p.add_argument(
         "--remote-db",
-        default="~/.cache/deplodock/autotune.db",
-        help="Remote autotune DB path for --remote (default ~/.cache/deplodock/autotune.db).",
+        default="~/.cache/emmy/autotune.db",
+        help="Remote autotune DB path for --remote (default ~/.cache/emmy/autotune.db).",
     )
-    p.add_argument("--db", help="Destination DB (default: DEPLODOCK_TUNE_DB or ~/.cache/deplodock/autotune.db).")
+    p.add_argument("--db", help="Destination DB (default: EMMY_TUNE_DB or ~/.cache/emmy/autotune.db).")
     args = p.parse_args()
 
     if args.remote:

@@ -4,10 +4,10 @@
 set -u
 KNOBS="$1"
 M="torch.randn(2048,2048,dtype=torch.float16,device='cuda')"
-export DEPLODOCK_KNOBS="$KNOBS"
+export EMMY_KNOBS="$KNOBS"
 out=$(ncu --target-processes all -k "regex:k_matmul" -c 1 \
   --metrics sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,sm__cycles_elapsed.avg,sm__cycles_elapsed.avg.per_second,sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active \
-  ./venv/bin/deplodock run --code "a=$M;b=$M;torch.matmul(a,b)" 2>&1)
+  ./venv/bin/emmy run --code "a=$M;b=$M;torch.matmul(a,b)" 2>&1)
 if ! echo "$out" | grep -q "k_matmul"; then
   echo "FAILED: $KNOBS"
   echo "$out" | tail -5

@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from collections import Counter
 
-from deplodock.compiler.ir.expr import Literal
-from deplodock.compiler.ir.kernel.ir import Reassign
-from deplodock.compiler.ir.stmt import Assign, Init, Monoid
-from deplodock.compiler.ir.twist import ScalarCombiner
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import flash_combine
+from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.kernel.ir import Reassign
+from emmy.compiler.ir.stmt import Assign, Init, Monoid
+from emmy.compiler.ir.twist import ScalarCombiner
+from emmy.compiler.pipeline.passes.loop.recognize._flash import flash_combine
 
 
 def _carrier():

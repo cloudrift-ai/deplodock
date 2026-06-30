@@ -2,9 +2,9 @@
 
 End-to-end exercise of op provenance: compile the model with a dump (so every
 kernel gets a prov name + a ``<kname>.torch.json`` reproducer of the original
-Torch ops it implements), then for each kernel run ``deplodock run --ir
+Torch ops it implements), then for each kernel run ``emmy run --ir
 <repro> --bench`` to time it against eager PyTorch and ``torch.compile``, and
-render a per-kernel bar chart with the shared ``deplodock.visualize`` plotting
+render a per-kernel bar chart with the shared ``emmy.visualize`` plotting
 (same path the perf tests use).
 
     # one-shot latency chart (uses whatever's in the autotune DB):
@@ -29,15 +29,15 @@ import sys
 from pathlib import Path
 
 _BIN = Path(sys.executable).parent
-_ROW = re.compile(r"^(Eager PyTorch|torch\.compile|Deplodock)\s+([\d.]+)")
+_ROW = re.compile(r"^(Eager PyTorch|torch\.compile|Emmy)\s+([\d.]+)")
 
 
 def _run(args: list[str], timeout: int | None = None, extra_env: dict | None = None) -> subprocess.CompletedProcess:
-    # Inherits os.environ (where main sets DEPLODOCK_TUNE_DB). DEPLODOCK_DUMP_DIR
+    # Inherits os.environ (where main sets EMMY_TUNE_DB). EMMY_DUMP_DIR
     # is passed only to compile — never to bench/tune, whose run --ir would
     # otherwise create a CompilerDump that rmtree's the reproducer dir.
     env = {**os.environ, **extra_env} if extra_env else None
-    return subprocess.run([str(_BIN / "deplodock"), *args], capture_output=True, text=True, timeout=timeout, env=env)
+    return subprocess.run([str(_BIN / "emmy"), *args], capture_output=True, text=True, timeout=timeout, env=env)
 
 
 def _final_kernels(dump_dir: Path) -> list[Path]:
@@ -49,7 +49,7 @@ def _final_kernels(dump_dir: Path) -> list[Path]:
 def _bench(repro: Path, backends: str, timeout: int = 600) -> dict[str, float] | None:
     """Bench one reproducer; parse the latency table to ``{backend: us}``.
 
-    Always has ``Deplodock``; ``Eager PyTorch`` / ``torch.compile`` only when the
+    Always has ``Emmy``; ``Eager PyTorch`` / ``torch.compile`` only when the
     reproducer is torch-runnable. ``None`` if the kernel failed to run."""
     proc = _run(["run", "--ir", str(repro), "--bench", "--bench-backends", backends], timeout=timeout)
     out: dict[str, float] = {}
@@ -57,7 +57,7 @@ def _bench(repro: Path, backends: str, timeout: int = 600) -> dict[str, float] |
         m = _ROW.match(line)
         if m:
             out[m.group(1)] = float(m.group(2))
-    return out if "Deplodock" in out else None
+    return out if "Emmy" in out else None
 
 
 def _tune(repro: Path, patience: int, timeout: int = 1200) -> None:
@@ -77,8 +77,8 @@ def main() -> None:
     ap.add_argument("--tune", action="store_true", help="autotune each kernel before benching (one-shot mode)")
     ap.add_argument("--compare-tuning", action="store_true", help="bench → tune each → bench again, with a comparison table")
     ap.add_argument("--patience", type=int, default=8)
-    ap.add_argument("--backends", default="eager,tcompile,deplodock")
-    ap.add_argument("--dump-dir", default="/tmp/deplodock-model-kernels")
+    ap.add_argument("--backends", default="eager,tcompile,emmy")
+    ap.add_argument("--dump-dir", default="/tmp/emmy-model-kernels")
     ap.add_argument("--out", default=None, help="chart path (.html); a .png + .md table are written alongside")
     args = ap.parse_args()
 
@@ -88,14 +88,14 @@ def main() -> None:
         # Sibling of the dump dir — not inside it (compile rmtree's the dump dir).
         tune_db = dump_dir.parent / f"{dump_dir.name}-tune.db"
         tune_db.unlink(missing_ok=True)
-        os.environ["DEPLODOCK_TUNE_DB"] = str(tune_db)
+        os.environ["EMMY_TUNE_DB"] = str(tune_db)
 
     compile_args = ["compile", args.model, "--seq-len", str(args.seq_len)]
     if args.layer is not None:
         compile_args += ["--layer", str(args.layer)]
     print(f"[1/4] compiling {args.model} (dump → {dump_dir}) …", flush=True)
-    # DEPLODOCK_DUMP_DIR only here — bench/tune must not dump (they'd rmtree it).
-    proc = _run(compile_args, timeout=3600, extra_env={"DEPLODOCK_DUMP_DIR": str(dump_dir)})
+    # EMMY_DUMP_DIR only here — bench/tune must not dump (they'd rmtree it).
+    proc = _run(compile_args, timeout=3600, extra_env={"EMMY_DUMP_DIR": str(dump_dir)})
     if proc.returncode != 0:
         print(f"compile failed:\n{proc.stderr[-2000:]}", file=sys.stderr)
         sys.exit(1)
@@ -122,8 +122,8 @@ def _one_shot(repros: list[Path], args) -> None:
         if res is None:
             print(f"  - {label}: skipped (kernel failed to run)")
             continue
-        vs = f" eager={res['Eager PyTorch']:.0f}us" if "Eager PyTorch" in res else " (deplodock-only)"
-        print(f"  - {label}: deplodock={res['Deplodock']:.0f}us{vs}")
+        vs = f" eager={res['Eager PyTorch']:.0f}us" if "Eager PyTorch" in res else " (emmy-only)"
+        print(f"  - {label}: emmy={res['Emmy']:.0f}us{vs}")
         rows.append((label, res))
     if not rows:
         print("no kernels produced a benchmark", file=sys.stderr)
@@ -139,7 +139,7 @@ def _compare_tuning(repros: list[Path], args) -> None:
         res = _bench(r, args.backends)
         if res is not None:
             before[_short(r.name)] = res
-            print(f"  - {_short(r.name)}: deplodock={res['Deplodock']:.0f}us", flush=True)
+            print(f"  - {_short(r.name)}: emmy={res['Emmy']:.0f}us", flush=True)
 
     print(f"[3/4] tuning {len(repros)} kernels (patience={args.patience}) …", flush=True)
     for i, r in enumerate(repros, 1):
@@ -152,12 +152,10 @@ def _compare_tuning(repros: list[Path], args) -> None:
         res = _bench(r, args.backends)
         if res is not None:
             after[_short(r.name)] = res
-            print(f"  - {_short(r.name)}: deplodock={res['Deplodock']:.0f}us", flush=True)
+            print(f"  - {_short(r.name)}: emmy={res['Emmy']:.0f}us", flush=True)
 
     labels = [k for k in before if k in after]
-    rows = [
-        (k, before[k]["Deplodock"], after[k]["Deplodock"], before[k].get("Eager PyTorch"), before[k].get("torch.compile")) for k in labels
-    ]
+    rows = [(k, before[k]["Emmy"], after[k]["Emmy"], before[k].get("Eager PyTorch"), before[k].get("torch.compile")) for k in labels]
     rows.sort(key=lambda t: t[1], reverse=True)
     _render_comparison(rows, args)
 
@@ -167,7 +165,7 @@ def _fmt(v: float | None) -> str:
 
 
 def _render_comparison(rows, args) -> None:
-    from deplodock.visualize.bar_chart import Bar, BarChart, render_bar_chart
+    from emmy.visualize.bar_chart import Bar, BarChart, render_bar_chart
 
     out = Path(args.out) if args.out else Path(args.dump_dir) / "kernels.html"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -194,8 +192,8 @@ def _render_comparison(rows, args) -> None:
     chart = BarChart(
         categories=[k for k, *_ in rows],
         bars=[
-            Bar("Deplodock (before)", [b for _, b, *_ in rows], color="#868e96"),
-            Bar("Deplodock (tuned)", [a for _, _, a, *_ in rows], color="#4dabf7"),
+            Bar("Emmy (before)", [b for _, b, *_ in rows], color="#868e96"),
+            Bar("Emmy (tuned)", [a for _, _, a, *_ in rows], color="#4dabf7"),
             Bar("Eager PyTorch", [eager for *_, eager, _ in rows], color="#51cf66"),
         ],
         value_name="latency (µs) — lower is faster",
@@ -210,9 +208,9 @@ def _render_comparison(rows, args) -> None:
 
 
 def _render_latency(rows: list[tuple[str, dict[str, float]]], args) -> None:
-    from deplodock.visualize.bar_chart import Bar, BarChart, render_bar_chart
+    from emmy.visualize.bar_chart import Bar, BarChart, render_bar_chart
 
-    rows.sort(key=lambda kv: kv[1]["Deplodock"], reverse=True)
+    rows.sort(key=lambda kv: kv[1]["Emmy"], reverse=True)
     n_vs = sum("Eager PyTorch" in res for _, res in rows)
 
     def series(key):
@@ -221,13 +219,13 @@ def _render_latency(rows: list[tuple[str, dict[str, float]]], args) -> None:
     chart = BarChart(
         categories=[label for label, _ in rows],
         bars=[
-            Bar("Deplodock", series("Deplodock"), color="#4dabf7"),
+            Bar("Emmy", series("Emmy"), color="#4dabf7"),
             Bar("Eager PyTorch", series("Eager PyTorch"), color="#999999"),
             Bar("torch.compile", series("torch.compile"), color="#ffd166"),
         ],
         value_name="latency (µs) — lower is faster",
         title=f"{args.model} — per-kernel latency",
-        subtitle=(f"Each kernel benched from its dumped .torch.json ({len(rows)} kernels; {n_vs} torch-comparable, rest deplodock-only)."),
+        subtitle=(f"Each kernel benched from its dumped .torch.json ({len(rows)} kernels; {n_vs} torch-comparable, rest emmy-only)."),
         orientation="horizontal",
     )
     html = render_bar_chart(chart, theme="dark", transparent=True)
@@ -241,7 +239,7 @@ def _render_latency(rows: list[tuple[str, dict[str, float]]], args) -> None:
 def _write_png(html: str, out: Path, n: int) -> None:
     png = out.with_suffix(".png")
     try:
-        from deplodock.visualize.image import render as render_image
+        from emmy.visualize.image import render as render_image
 
         render_image(html, png, height=max(300, 40 * n))
         print(f"        png → {png}")

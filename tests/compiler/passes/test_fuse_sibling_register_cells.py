@@ -18,23 +18,23 @@ import importlib
 import numpy as np
 import pytest
 
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.frontend.ir import LinearOp, RmsNormOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Write
-from deplodock.compiler.ir.stmt.blocks import Cond
-from deplodock.compiler.ir.tile.ir import SerialTile, TileOp
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.frontend.ir import LinearOp, RmsNormOp
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Write
+from emmy.compiler.ir.stmt.blocks import Cond
+from emmy.compiler.ir.tile.ir import SerialTile, TileOp
 
 from ..conftest import requires_cuda
 
 # Importlib gymnastics: the rule module name starts with a digit, which is
 # not a valid Python identifier, so ``from … import …`` is rejected. Use
 # ``importlib.import_module`` instead.
-_fuse_mod = importlib.import_module("deplodock.compiler.pipeline.passes.lowering.kernel.012_fuse_sibling_register_cells")
+_fuse_mod = importlib.import_module("emmy.compiler.pipeline.passes.lowering.kernel.012_fuse_sibling_register_cells")
 
 
 def _ax(name: str, extent: int) -> Axis:
@@ -159,7 +159,7 @@ def test_qwen_lmhead_variant_compiles_within_budget(monkeypatch):
     budget. We pin a smaller M+N here so the test stays CI-friendly; the
     structural pattern is identical."""
     for key, value in {"BK": "64", "BM": "1", "BN": "64", "BR": "1", "FM": "1", "FN": "64", "SPLITK": "1", "STAGE": "1"}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", value)
+        monkeypatch.setenv(f"EMMY_{key}", value)
 
     # M=2 (tiny batch), K=1024 (RMSNorm range), N=64 × 64 + 3 = 4099 — N is
     # deliberately a non-multiple of BN·FN to trigger the masked-overhang
@@ -181,9 +181,9 @@ def test_qwen_lmhead_variant_compiles_within_budget(monkeypatch):
         "wl": (rng.standard_normal((N, K), dtype=np.float32) * 0.02).astype(np.float32),
     }
 
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-    from deplodock.compiler.backend.numpy import NumpyBackend  # noqa: PLC0415
-    from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+    from emmy.compiler.backend.numpy import NumpyBackend  # noqa: PLC0415
+    from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
     ref = NumpyBackend().run(NumpyBackend().compile(g), input_data=inputs)[0].outputs["o"]
 

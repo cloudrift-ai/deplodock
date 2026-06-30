@@ -12,15 +12,15 @@ bandwidth-bound wide-N order. All CPU — no CUDA, no lowering past the loop dia
 
 from __future__ import annotations
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, thread_offers
+from emmy.compiler import dtype as _dt
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import Budget, thread_offers
 
 _CC = (12, 0)
 

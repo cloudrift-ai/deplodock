@@ -2,9 +2,9 @@
 
 - **GPU**: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, `compute_cap (12, 0)` (sm_120), driver/runtime
   CUDA 12.9 (nvcc 12.9), torch 2.12.1+cu130. Golden file:
-  `deplodock/compiler/pipeline/search/goldens/rtxpro6000_sm120.yaml` (29 matmul shapes).
-- **Sweep command**: `deplodock tune --dataset golden --clean` (re-fit the prior from scratch on the 29-shape
-  reservoir), then per-shape `deplodock run --bench --golden NAME` A/B, each confirmed over **3 runs** for the 18
+  `emmy/compiler/pipeline/search/goldens/rtxpro6000_sm120.yaml` (29 matmul shapes).
+- **Sweep command**: `emmy tune --dataset golden --clean` (re-fit the prior from scratch on the 29-shape
+  reservoir), then per-shape `emmy run --bench --golden NAME` A/B, each confirmed over **3 runs** for the 18
   non-identical-knob shapes.
 - **Wall time**: tune ≈ 72 min (sum of per-shape inner search, serial single-GPU); A/B + 2× confirmation re-runs
   ≈ 18 min; `eval` evidence ≈ 5 min. Plus a one-time ≈ 20 min environment repair (see Workflow notes — the venv shipped
@@ -23,12 +23,12 @@
 
 The live eager/cuBLAS reference matched each shape's recorded `cublas_us` within ~1–2 % across the board (e.g.
 `square.2048` 321 vs 324.8, `square.4096` 2399 vs 2426, `kv_proj.s512` 38 vs 39.5), so the environment is consistent
-and greedy's live -O3 number is directly comparable to the **recorded** `deplodock_us` — not just to the live golden
+and greedy's live -O3 number is directly comparable to the **recorded** `emmy_us` — not just to the live golden
 row. That cross-check also exposed a wrinkle: a few recorded golden **configs** no longer bench at their recorded
-latency when re-run with the same knobs (cuBLAS is stable, so this is deplodock-side codegen/flag drift since the
+latency when re-run with the same knobs (cuBLAS is stable, so this is emmy-side codegen/flag drift since the
 2026-06-13 seed on torch 2.12.0): `square.2048` 357.6 → **445** (+24 %), `square.4096.fp16` 524 → **655** (+25 %),
 `o_proj.s512.dynM` 86.9 → 68 (−22 %), `gate_up_proj.s512.dynM` 89.7 → 110 (+23 %). Recording decisions used the
-recorded `deplodock_us` as the bar and never wrote a number worse than what was already on file.
+recorded `emmy_us` as the bar and never wrote a number worse than what was already on file.
 
 ## Per-shape outcome (greedy = deployed -O3 pick; golden = recorded knobs re-benched live this run)
 
@@ -96,7 +96,7 @@ Greedy `{BM:8, FM:8, RING:2}` at **3603 µs** vs golden `{BM:16, FM:6, RING:3}` 
 - Read: the prior ranks golden near the top, but the **greedy enumeration argmin** over the full (largely unmeasured)
   space still diverges, and the -O3 re-bench tolerance band never sampled a golden-class config for the 4096³ square, so
   there is no deployable evidence to anchor the pick.
-- **Recommendation (P2)**: widen the -O3 re-bench band (`DEPLODOCK_O3_TOL`) or bump patience for the largest fp32
+- **Recommendation (P2)**: widen the -O3 re-bench band (`EMMY_O3_TOL`) or bump patience for the largest fp32
   square so the tolerance sweep actually re-benches the `BM:16/FM:6` neighbourhood at -O3 and gives `evidence_pick`
   something to deploy.
 
@@ -129,13 +129,13 @@ Greedy `{BN:16, SPLITK:1, …}` at **33.3 µs** vs golden `{BN:32, SPLITK:2}` at
 Two problems compound here. (1) `eval analytic` ranks golden **72/1008** and `eval prior --dataset golden` ranks it
 **551/1008** — the deepest mis-rank in the entire set; the prior simply does not know this shape. (2) The recorded
 golden config (`BM:16, BN:32, BK:32, FM:12`) re-benches at **445 µs**, +24 % over its recorded **357.6** (stable across
-3 runs), while cuBLAS is unchanged — a deplodock-side config-reproduction drift since the 2026-06-13 seed. Greedy (392)
+3 runs), while cuBLAS is unchanged — a emmy-side config-reproduction drift since the 2026-06-13 seed. Greedy (392)
 beats the live golden (445) but is still 10 % over the recorded number, so recording it would write a regression.
 
 - **Decision**: left untouched (the recorded 357.6 stays as the aspirational best; no current config reproduces it).
 - **Recommendation (P2)**: re-seed `square.2048` from a fresh higher-patience tune and, separately, investigate the
   large-square / masked-tile codegen drift between torch 2.12.0 (seed) and 2.12.1 (now) — `square.4096.fp16` shows the
-  same +25 % config drift. The drift is real (3-run-stable, cuBLAS-anchored), so a golden's stored `deplodock_us` is not
+  same +25 % config drift. The drift is real (3-run-stable, cuBLAS-anchored), so a golden's stored `emmy_us` is not
   a durable contract for these shapes across toolchain bumps.
 
 ## Status of the 2026-06-13 seed report's findings
@@ -157,7 +157,7 @@ beats the live golden (445) but is still 10 % over the recorded number, so recor
 - **Environment was not provisioned** — the `venv/` existed but had no pip and zero packages, so `make setup`'s
   `[ ! -d venv ]` guard skipped it silently; bootstrapping needed `ensurepip`, then the `cppyy` build failed on a
   missing `Python.h` (`python3.12-dev`), and `nvcc` was off PATH (system CUDA at `/usr/local/cuda/bin`). ≈ 20 min lost.
-  *Improvement*: add a step-0 preflight to the skill — `deplodock run -c "<tiny matmul>"` must succeed (it transitively
+  *Improvement*: add a step-0 preflight to the skill — `emmy run -c "<tiny matmul>"` must succeed (it transitively
   checks torch/CUDA/cppyy/nvcc) before tuning, with the `ensurepip` / `python3.12-dev` / `PATH=/usr/local/cuda/bin`
   fixes noted as the common failure modes.
 - **`eval variants --kernel <golden-name>` can't drill into a single shape** — the `--kernel` filter matches the
@@ -165,10 +165,10 @@ beats the live golden (445) but is still 10 % over the recorded number, so recor
   variants". The per-shape reachability the Finding template asks for had to come from `eval prior --dataset golden`'s
   `vs gold` column instead. *Improvement*: let `eval variants` accept a golden NAME or `ShapeKey` signature and resolve
   it to the matching `S_*` group, or document that matmul variants must be sliced by shape signature, not name.
-- **Recorded golden config not reproducing its `deplodock_us`** made greedy-vs-recorded ambiguous for `square.2048` /
+- **Recorded golden config not reproducing its `emmy_us`** made greedy-vs-recorded ambiguous for `square.2048` /
   `square.4096.fp16` / two dynM shapes; disambiguating env-shift from config-drift required a hand-rolled cuBLAS-vs-
   `cublas_us` cross-check across all shapes. *Improvement*: `run --bench --golden` should print the recorded
-  `deplodock_us` beside the live golden row and flag a >5 % divergence ("golden no longer reproduces") so the operator
+  `emmy_us` beside the live golden row and flag a >5 % divergence ("golden no longer reproduces") so the operator
   doesn't reconstruct it by hand.
 - **The step-4 noise-floor re-runs were unnecessary here** — 3-run variance was < 1 % on every shape (vs the skill's
   warned 10–13 %), so two extra passes over 18 shapes (≈ 12 min) changed no category. *Improvement*: gate the

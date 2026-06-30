@@ -4,16 +4,16 @@
 Traces the model via ``build_full_model_wrapper`` (static causal mask +
 precomputed rotary cos/sin), compiles it to CUDA, binds every weight /
 buffer from the live wrapper, checks accuracy against eager, and times
-eager / torch.compile / Deplodock in one interleaved loop.
+eager / torch.compile / Emmy in one interleaved loop.
 
 Unlike ``scripts/bench_block.py`` (one transformer layer) this runs the
 full stack: embedding → N decoder layers → final norm → lm_head. Pass a
-tuned ``DEPLODOCK_TUNE_DB`` to bench the autotuned kernels.
+tuned ``EMMY_TUNE_DB`` to bench the autotuned kernels.
 
 Usage:
     python scripts/bench_full_model.py --model Qwen/Qwen3-Embedding-0.6B --seq-len 32
-    DEPLODOCK_TUNE_DB=/tmp/qwen.db python scripts/bench_full_model.py \
-        --model Qwen/Qwen3-Embedding-0.6B --seq-len 32 --backends eager,compile,deplodock
+    EMMY_TUNE_DB=/tmp/qwen.db python scripts/bench_full_model.py \
+        --model Qwen/Qwen3-Embedding-0.6B --seq-len 32 --backends eager,compile,emmy
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=32, help="Sequence length (default: 32)")
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations (default: 10)")
     parser.add_argument("--iters", type=int, default=50, help="Measurement iterations (default: 50)")
-    parser.add_argument("--backends", default="eager,compile,deplodock", help="Comma-separated: eager,compile,deplodock")
+    parser.add_argument("--backends", default="eager,compile,emmy", help="Comma-separated: eager,compile,emmy")
     parser.add_argument("--dump-dir", default=None, help="Directory to dump intermediate compilation artifacts")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for the input token ids (default: 0)")
     parser.add_argument(
@@ -58,12 +58,12 @@ def main() -> None:
         logger.error("CUDA GPU required for benchmarking")
         sys.exit(1)
 
-    from deplodock.commands.run import _bench_interleaved, _build_torch_fns, _print_kernel_stats, _print_table, _resolve_backends
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.loader import bind_constants_from_module
-    from deplodock.compiler.pipeline.dump import CompilerDump
-    from deplodock.compiler.trace.huggingface import build_full_model_wrapper
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.commands.run import _bench_interleaved, _build_torch_fns, _print_kernel_stats, _print_table, _resolve_backends
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.loader import bind_constants_from_module
+    from emmy.compiler.pipeline.dump import CompilerDump
+    from emmy.compiler.trace.huggingface import build_full_model_wrapper
+    from emmy.compiler.trace.torch import trace_module
 
     dtype = torch.float32
     logger.info("Loading %s (fp32)...", args.model)
@@ -83,7 +83,7 @@ def main() -> None:
     if dump:
         dump.dump_input_graph(graph)
 
-    # ``tune_db="auto"`` resolves DEPLODOCK_TUNE_DB → the autotuned kernel
+    # ``tune_db="auto"`` resolves EMMY_TUNE_DB → the autotuned kernel
     # variants; falls back to rule defaults if the DB is absent.
     backend = CudaBackend(
         dump=dump, tune_db="auto", bench_run_timeout_s=args.bench_timeout, bench_compile_timeout_s=max(10.0, args.bench_timeout / 4)

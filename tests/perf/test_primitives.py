@@ -6,7 +6,7 @@ records the result; ``pytest_terminal_summary`` prints the table.
 
 These tests do not assert on ratios — the perf suite tracks performance,
 it doesn't gate on it. Failures here mean the compile or run path
-errored, not that deplodock is slow.
+errored, not that emmy is slow.
 """
 
 from __future__ import annotations

@@ -14,12 +14,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.expr import Literal
-from deplodock.compiler.ir.stmt import Body, Load, Write
-from deplodock.compiler.ir.tile.ir import Block, Buffer, Space, TileGraph, TileOp
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.stmt import Body, Load, Write
+from emmy.compiler.ir.tile.ir import Block, Buffer, Space, TileGraph, TileOp
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._assemble import assemble_block
 from tests.compiler.passes.test_tile_ir_invariants import _MM_KNOBS, _matmul_graph, _oracle_tilegraph
 
 

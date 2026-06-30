@@ -21,16 +21,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.lowering.kernel._combine import cooperative_combine_geometry
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import coop_reduce_offers
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.tensor.ir import ReduceOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.lowering.kernel._combine import cooperative_combine_geometry
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import IterDag, iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import coop_reduce_offers
 
 from ..conftest import requires_cuda
 
@@ -68,7 +68,7 @@ def test_strided_rows_clip_br_to_segmented_shuffle(monkeypatch):
     """A pinned ``BN > 1`` (free-axis threads alongside) clips every cooperative
     ``BR`` to a power of two ≤ ``warp_size`` — the segmented warp-shuffle combine's
     validity window."""
-    monkeypatch.setenv("DEPLODOCK_BN", "8")
+    monkeypatch.setenv("EMMY_BN", "8")
     offers = coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP)
     assert offers, "strided-cooperative reduce produced no offers"
     for _, _, br, _ in offers:
@@ -78,7 +78,7 @@ def test_strided_rows_clip_br_to_segmented_shuffle(monkeypatch):
 
 def test_strided_rows_respect_thread_cap(monkeypatch):
     """``bn·br`` stays within the CTA thread budget (1024) on strided rows."""
-    monkeypatch.setenv("DEPLODOCK_BN", "8")
+    monkeypatch.setenv("EMMY_BN", "8")
     for _, _, br, _ in coop_reduce_offers(_reduce_dag((64, 256)), warp_size=_WARP):
         assert 8 * br <= 1024, f"bn·br exceeds CTA thread budget: 8·{br}"
 
@@ -134,7 +134,7 @@ def test_symbolic_row_strided_offers(monkeypatch):
     """A symbolic leading axis (``seq_len``, 8, 128) with a pinned ``BN=8`` still
     offers strided-cooperative ``BR`` clipped to the segmented-shuffle window —
     the form the dynamic q/k-norm kernels deploy."""
-    monkeypatch.setenv("DEPLODOCK_BN", "8")
+    monkeypatch.setenv("EMMY_BN", "8")
     offers = coop_reduce_offers(_reduce_dag((Dim("seq_len"), 8, 128)), warp_size=_WARP)
     assert offers, "symbolic-row strided cooperative reduce produced no offers"
     for _, _, br, _ in offers:
@@ -148,10 +148,10 @@ def test_symbolic_row_strided_offers(monkeypatch):
 def test_2d_coop_reduce_accuracy_cuda(monkeypatch):
     """A pinned 2D row (BN=8, BR=16) computes the same per-row sums as numpy —
     the segmented shuffle combines each row independently."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.backend.cuda.backend import CudaBackend
 
     for key, val in dict(BN=8, BR=16, FN=1, FK=1, BK=2).items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", str(val))
+        monkeypatch.setenv(f"EMMY_{key}", str(val))
     g = _reduce_graph((64, 128))
     rng = np.random.default_rng(0)
     x = rng.standard_normal((64, 128)).astype(np.float32)

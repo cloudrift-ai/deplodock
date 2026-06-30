@@ -13,26 +13,26 @@ recognizer's ``build_flash_frag`` (the same body the GPU flash tests compile).""
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import F32
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.algebra import AlgebraKind
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Load, Monoid
-from deplodock.compiler.ir.tensor.ir import ReduceOp
-from deplodock.compiler.ir.tile.ir import Binding, RegisterTile, TileGraphOp
-from deplodock.compiler.ir.twist import ScalarCombiner
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-from deplodock.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid, seed_graph
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_M_THREAD, MAP_N_THREAD
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._moves import legal_decomps
+from emmy.compiler.context import Context
+from emmy.compiler.dim import Dim
+from emmy.compiler.dtype import F32
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.algebra import AlgebraKind
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.ir.stmt import Load, Monoid
+from emmy.compiler.ir.tensor.ir import ReduceOp
+from emmy.compiler.ir.tile.ir import Binding, RegisterTile, TileGraphOp
+from emmy.compiler.ir.twist import ScalarCombiner
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+from emmy.compiler.pipeline.passes.loop.recognize._flash import build_flash_frag
+from emmy.compiler.pipeline.passes.lowering.tile.assembly._tower import Role
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid, seed_graph
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._classify import classify
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import MAP_M_THREAD, MAP_N_THREAD
+from emmy.compiler.pipeline.passes.lowering.tile.enumeration._moves import legal_decomps
 
 
 def _flash_loop(*, causal: bool = False, group: int = 1) -> LoopOp:
@@ -96,7 +96,7 @@ def test_chain_is_a_monoid_over_semiring_composition():
     composed over an inner SEMIRING :class:`Contraction`. The carried-chain invariant is the shared
     hinge — the inner contraction's free-output column IS the carrier's reduced hinge — and it is
     enforced by construction, so a malformed composition is unrepresentable."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
 
     dag = iter_dag(_flash_loop())
     chain = dag.reduction
@@ -116,9 +116,9 @@ def test_standalone_matmul_is_a_contraction():
     ``(M, N)`` coords off the ``Write`` (not re-derived in the atom gate) — so the matmul tier and
     the flash chain share one SEMIRING-contraction abstraction and one ``contraction_atomizes`` call
     (the warp-tier behavior itself is covered end to end by the GPU matmul/flash e2e suites)."""
-    from deplodock.compiler.dtype import F16
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
+    from emmy.compiler.dtype import F16
+    from emmy.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction
 
     g = Graph()
     g.add_node(InputOp(), [], Tensor("a", (128, 64), F16), node_id="a")
@@ -139,7 +139,7 @@ def test_chain_free_axes_walks_the_composition():
     chain: the query row ``m`` is the inner contraction's own free output (``out_index[-2]``), the
     head output ``d`` is the carrier's value operand's own free output, ``grid`` the shared batch /
     head axes — each read from the composition level that defines it."""
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import chain_free_axes
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import chain_free_axes
 
     dag = iter_dag(_flash_loop())
     chain = dag.reduction
@@ -156,8 +156,8 @@ def test_chain_post_init_enforces_the_hinge_invariant():
     unrepresentable."""
     import pytest
 
-    from deplodock.compiler.ir.expr import Var
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, MonoidReduction, chain_free_axes
+    from emmy.compiler.ir.expr import Var
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import Contraction, MonoidReduction, chain_free_axes
 
     dag = iter_dag(_flash_loop())
     good = dag.reduction
@@ -174,7 +174,7 @@ def test_partition_free_axes_is_a_role_neutral_three_way_split():
     composition reuses it; the both-or-neither lumping is what the chain reads as ``grid``."""
     from types import SimpleNamespace
 
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import partition_free_axes
+    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import partition_free_axes
 
     nodes = tuple(SimpleNamespace(axis=SimpleNamespace(name=n)) for n in ("m", "d", "both", "neither"))
     a_only, b_only, rest = partition_free_axes(nodes, footprint_a={"m", "both"}, footprint_b={"d", "both"})
@@ -275,7 +275,7 @@ def _build_chain(causal: bool = False):
 
 
 def _monoids(body):
-    from deplodock.compiler.ir.stmt import Monoid as _M  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Monoid as _M  # noqa: PLC0415
 
     return [s for s in body.iter() if isinstance(s, _M)]
 
@@ -287,8 +287,8 @@ def test_chain_build_realizes_the_split_carrier_as_scalar_phases():
     value is generated once, inside the combiner). No ``Monoid`` survives in the block: each carried
     state (the 2 stats + the 1 accumulator) is declared once by an ``Init`` and rebound by a
     ``Reassign`` — never re-``Assign``ed (which would shadow the carried value)."""
-    from deplodock.compiler.ir.kernel.ir import Reassign  # noqa: PLC0415
-    from deplodock.compiler.ir.stmt import Assign, Init  # noqa: PLC0415
+    from emmy.compiler.ir.kernel.ir import Reassign  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Assign, Init  # noqa: PLC0415
 
     tg, dag = _build_chain()
     block = tg.blocks[0]

@@ -33,8 +33,8 @@ engine:
       extra_args: "--kv-cache-dtype fp8 --tokenizer-mode deepseek_v4 --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4"
 
 benchmark:
-  # deplodock bench defaults the HF cache mount to /hf_models, but deploy ssh uses /mnt/models — align
-  # them so `deplodock bench` reuses the existing 851 GB cache instead of re-downloading (execution.py).
+  # emmy bench defaults the HF cache mount to /hf_models, but deploy ssh uses /mnt/models — align
+  # them so `emmy bench` reuses the existing 851 GB cache instead of re-downloading (execution.py).
   model_dir: /mnt/models
   max_concurrency: 16
   num_prompts: 64

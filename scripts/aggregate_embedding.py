@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Aggregate embedding-recipe bench results into a stock-vs-deplodock report.
+"""Aggregate embedding-recipe bench results into a stock-vs-emmy report.
 
-Reads every ``*.json`` result in the run dir (written by ``deplodock bench``),
+Reads every ``*.json`` result in the run dir (written by ``emmy bench``),
 groups variants by (GPU, random_input_len), pairs the stock-vLLM row with the
-deplodock-plugin row by image name, and emits a markdown table per group:
+emmy-plugin row by image name, and emits a markdown table per group:
 request throughput, token throughput, mean/p99 E2E latency, the
-deplodock/stock throughput ratio, and each variant's model_load_and_warmup
-time (which contains the deplodock startup compile).
+emmy/stock throughput ratio, and each variant's model_load_and_warmup
+time (which contains the emmy startup compile).
 
     python scripts/aggregate_embedding.py <run_dir> --output <run_dir>/report.md
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 
 def _engine_label(result: dict) -> str:
     image = result.get("recipe", {}).get("engine", {}).get("llm", {}).get("vllm", {}).get("image", "")
-    return "deplodock" if "deplodock" in image else "stock vllm"
+    return "emmy" if "emmy" in image else "stock vllm"
 
 
 def _fmt(v, suffix="") -> str:
@@ -52,13 +52,13 @@ def main() -> int:
         print(f"no benchmark result JSONs found in {args.run_dir}", file=sys.stderr)
         return 1
 
-    lines = ["# Embedding serving: stock vLLM vs deplodock plugin", ""]
+    lines = ["# Embedding serving: stock vLLM vs emmy plugin", ""]
     for (gpu, input_len), rows in sorted(groups.items()):
         lines.append(f"## {gpu} — {input_len} tokens/request")
         lines.append("")
         lines.append("| engine | req/s | tok/s | mean E2EL (ms) | p99 E2EL (ms) | load+warmup (s) |")
         lines.append("|---|---|---|---|---|---|")
-        for label in ("stock vllm", "deplodock"):
+        for label in ("stock vllm", "emmy"):
             r = rows.get(label)
             if r is None:
                 lines.append(f"| {label} | — | — | — | — | — |")
@@ -69,12 +69,12 @@ def main() -> int:
                 f"| {label} | {_fmt(m.get('request_throughput'))} | {_fmt(m.get('total_token_throughput'))} "
                 f"| {_fmt(m.get('mean_e2el_ms'))} | {_fmt(m.get('p99_e2el_ms'))} | {_fmt(load)} |"
             )
-        a, b = rows.get("deplodock"), rows.get("stock vllm")
+        a, b = rows.get("emmy"), rows.get("stock vllm")
         if a and b:
             ra, rb = a["metrics"].get("request_throughput"), b["metrics"].get("request_throughput")
             if ra and rb:
                 lines.append("")
-                lines.append(f"deplodock/stock request-throughput ratio: **{ra / rb:.2f}x**")
+                lines.append(f"emmy/stock request-throughput ratio: **{ra / rb:.2f}x**")
         lines.append("")
 
     report = "\n".join(lines)

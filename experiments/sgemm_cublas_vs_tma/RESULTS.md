@@ -2,7 +2,7 @@
 
 Three GPU-prefixed run directories. Each contains the JSON traces, markdown
 reports, and (where available) `ncu` diagnostic dumps that back the numbers
-in the [companion blog post](https://github.com/cloudrift-ai/deplodock/tree/main/scripts/diagnostics).
+in the [companion blog post](https://github.com/cloudrift-ai/emmy/tree/main/scripts/diagnostics).
 
 | Directory                      | GPU                                                   | Run date   | Notes                                                                                                                                                                                      |
 |--------------------------------|-------------------------------------------------------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -34,9 +34,9 @@ ncu data captured by [`scripts/diagnostics/ncu_compare.sh`](../../scripts/diagno
 ## Reproducing
 
 ```bash
-deplodock bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*"              # RTX 5090 only
-deplodock bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*" --filter "size=4096"  # single point
-deplodock bench recipes/sgemm_cublas_vs_tma --ssh user@host --filter "deploy.gpu=*PRO 6000*"  # Remote Pro 6000
+emmy bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*"              # RTX 5090 only
+emmy bench recipes/sgemm_cublas_vs_tma --local --filter "deploy.gpu=*5090*" --filter "size=4096"  # single point
+emmy bench recipes/sgemm_cublas_vs_tma --ssh user@host --filter "deploy.gpu=*PRO 6000*"  # Remote Pro 6000
 ```
 
 The recipe produces 84 variants (3 GPUs × 7 sizes × 4 batches). Each variant

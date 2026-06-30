@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import os
 
-from deplodock import config
-from deplodock.compiler.backend.cuda.program import _AsyncBenchWorker
+from emmy import config
+from emmy.compiler.backend.cuda.program import _AsyncBenchWorker
 
 from ..conftest import requires_cuda
 
@@ -31,24 +31,24 @@ def test_child_env_unpinned_is_passthrough() -> None:
     worker = _AsyncBenchWorker(device_id=None)
     env = worker._child_env()
     assert env.get("CUDA_VISIBLE_DEVICES") == os.environ.get("CUDA_VISIBLE_DEVICES")
-    assert "DEPLODOCK_GPU_LOCK" not in env or env["DEPLODOCK_GPU_LOCK"] == os.environ.get("DEPLODOCK_GPU_LOCK")
+    assert "EMMY_GPU_LOCK" not in env or env["EMMY_GPU_LOCK"] == os.environ.get("EMMY_GPU_LOCK")
 
 
 def test_child_env_per_device_gpu_lock(monkeypatch) -> None:
-    monkeypatch.setenv(config.GPU_LOCK, "/tmp/deplodock-gpu.lock")
+    monkeypatch.setenv(config.GPU_LOCK, "/tmp/emmy-gpu.lock")
     env = _AsyncBenchWorker(device_id=2)._child_env()
     # Distinct devices take distinct lock files so they don't serialise on one FileLock.
-    assert env["DEPLODOCK_GPU_LOCK"] == "/tmp/deplodock-gpu.lock-2"
+    assert env["EMMY_GPU_LOCK"] == "/tmp/emmy-gpu.lock-2"
     env0 = _AsyncBenchWorker(device_id=0)._child_env()
-    assert env0["DEPLODOCK_GPU_LOCK"] == "/tmp/deplodock-gpu.lock-0"
-    assert env["DEPLODOCK_GPU_LOCK"] != env0["DEPLODOCK_GPU_LOCK"]
+    assert env0["EMMY_GPU_LOCK"] == "/tmp/emmy-gpu.lock-0"
+    assert env["EMMY_GPU_LOCK"] != env0["EMMY_GPU_LOCK"]
 
 
 def test_child_env_no_lock_suffix_when_base_unset(monkeypatch) -> None:
     monkeypatch.delenv(config.GPU_LOCK, raising=False)
     env = _AsyncBenchWorker(device_id=1)._child_env()
     # No base lock → no per-device suffix (one worker per GPU has its own context).
-    assert "DEPLODOCK_GPU_LOCK" not in env
+    assert "EMMY_GPU_LOCK" not in env
 
 
 @requires_cuda
@@ -58,13 +58,13 @@ def test_async_worker_real_roundtrip_single_gpu() -> None:
     + framed-pickle protocol + ``asyncio.wait_for`` wall cap), producing a measured
     per-op best. The transport mirrors the proven sync worker; this confirms the
     asyncio I/O round-trips on real hardware. ``prior=None`` keeps it off catboost."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.graph import Graph, Tensor
-    from deplodock.compiler.ir.base import InputOp
-    from deplodock.compiler.ir.frontend.ir import MatmulOp
-    from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline
-    from deplodock.compiler.pipeline.search.db import SearchDB
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.context import Context
+    from emmy.compiler.graph import Graph, Tensor
+    from emmy.compiler.ir.base import InputOp
+    from emmy.compiler.ir.frontend.ir import MatmulOp
+    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline
+    from emmy.compiler.pipeline.search.db import SearchDB
     from tests.compiler.conftest import run_inner_reward
 
     g = Graph()

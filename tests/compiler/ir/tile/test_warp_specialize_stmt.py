@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.expr import Literal, Var
-from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond
-from deplodock.compiler.ir.tile.ir import AsyncWait, WarpSpecialize
+from emmy.compiler.ir.expr import Literal, Var
+from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt import Body, Cond
+from emmy.compiler.ir.tile.ir import AsyncWait, WarpSpecialize
 
 
 def _ws(**overrides):

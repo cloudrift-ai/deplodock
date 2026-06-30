@@ -13,17 +13,17 @@ chasing the milestone history finds it here.
 
 from __future__ import annotations
 
-from deplodock.compiler.context import Context
-from deplodock.compiler.dtype import F16
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
-from deplodock.compiler.ir.stmt import Accum, Assign
-from deplodock.compiler.ir.tile.ir import StageBundle
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from emmy.compiler.context import Context
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write
+from emmy.compiler.ir.stmt import Accum, Assign
+from emmy.compiler.ir.tile.ir import StageBundle
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.pipeline.knob import mma_atom
 
 
 def _mma_matmul_graph(*, M: int = 64, N: int = 64, K: int = 64) -> Graph:
@@ -88,12 +88,12 @@ def test_mma_matmul_stages_through_smem(monkeypatch):
     # (ldmatrix is smem→register only), and an ``MMA=<kind>`` pin enumerates
     # the kind at any arch. 64²: WM=2 FM=2 → M-tile 64, WN=2 FN=4 → N-tile
     # 2·4·atom_n(8)=64, BK=2 → K-stage 32.
-    monkeypatch.setenv("DEPLODOCK_MMA", "mma_m16n8k16_f16")
-    monkeypatch.setenv("DEPLODOCK_WM", "2")
-    monkeypatch.setenv("DEPLODOCK_WN", "2")
-    monkeypatch.setenv("DEPLODOCK_FM", "2")
-    monkeypatch.setenv("DEPLODOCK_FN", "4")
-    monkeypatch.setenv("DEPLODOCK_BK", "2")
+    monkeypatch.setenv("EMMY_MMA", "mma_m16n8k16_f16")
+    monkeypatch.setenv("EMMY_WM", "2")
+    monkeypatch.setenv("EMMY_WN", "2")
+    monkeypatch.setenv("EMMY_FM", "2")
+    monkeypatch.setenv("EMMY_FN", "4")
+    monkeypatch.setenv("EMMY_BK", "2")
     g = _mma_matmul_graph()
     out = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((8, 0)))
     kop = out.nodes["c"].op

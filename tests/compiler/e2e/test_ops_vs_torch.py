@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.frontend.ir import (
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import ConstantOp, InputOp
+from emmy.compiler.ir.frontend.ir import (
     CatOp,
     LinearOp,
     MatmulOp,
@@ -23,7 +23,7 @@ from deplodock.compiler.ir.frontend.ir import (
     TransposeOp,
     UnsqueezeOp,
 )
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp, GatherOp, ReduceOp
 
 rng = np.random.default_rng(42)
 

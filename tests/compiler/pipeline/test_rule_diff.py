@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 
-from deplodock.compiler.pipeline.rule_diff import (
+from emmy.compiler.pipeline.rule_diff import (
     PASS_SHORTHAND,
     RuleRenderConfig,
     display_name,
@@ -68,7 +68,7 @@ def test_display_name_prefixes_known_pass():
 def test_pass_shorthand_matches_cli_shortcut_inverse():
     # Single source of truth: commands/compile.py builds its --passes
     # shortcut expander by inverting PASS_SHORTHAND.
-    from deplodock.commands.compile import _PASS_SHORTCUTS
+    from emmy.commands.compile import _PASS_SHORTCUTS
 
     assert _PASS_SHORTCUTS == {short: full for full, short in PASS_SHORTHAND.items()}
 

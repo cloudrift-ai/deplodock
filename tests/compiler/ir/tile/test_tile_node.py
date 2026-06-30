@@ -6,11 +6,11 @@ Tile-IR ``TileOp``) live in ``tests/compiler/passes/test_partition_planner_rules
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop import Accum, Axis, Load, Loop
-from deplodock.compiler.ir.stmt import Body
-from deplodock.compiler.ir.tile.ir import ThreadTile
+from emmy.compiler.ir.elementwise import ElementwiseImpl
+from emmy.compiler.ir.expr import Var
+from emmy.compiler.ir.loop import Accum, Axis, Load, Loop
+from emmy.compiler.ir.stmt import Body
+from emmy.compiler.ir.tile.ir import ThreadTile
 
 
 def test_iter_body_walks_into_tile():

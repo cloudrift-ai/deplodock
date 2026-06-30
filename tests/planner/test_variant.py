@@ -1,6 +1,6 @@
 """Unit tests for the Variant class."""
 
-from deplodock.planner.variant import Variant, _abbreviate, _compact_value
+from emmy.planner.variant import Variant, _abbreviate, _compact_value
 
 # ── _abbreviate ──────────────────────────────────────────────────
 

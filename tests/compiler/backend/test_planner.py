@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
+from emmy.compiler.backend.cuda._planner import compute_live_intervals, plan_offsets
 
 
 class _Launch:

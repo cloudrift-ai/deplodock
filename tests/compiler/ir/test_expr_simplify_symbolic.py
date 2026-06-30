@@ -16,8 +16,8 @@ axes. These tests pin the fold and its safety guards.
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
-from deplodock.compiler.ir.expr import BinaryExpr, Interval, Literal, SimplifyCtx, Var
+from emmy.compiler.ir.axis import Axis, extend_simplify_ctx
+from emmy.compiler.ir.expr import BinaryExpr, Interval, Literal, SimplifyCtx, Var
 
 
 def _flat_seq_coord(stride: int) -> BinaryExpr:
@@ -100,7 +100,7 @@ def test_segmented_k_collapses_oproj_delinearized_read():
         dim  = (a0*2048 + a2) % 128
     Split a2 = a2_o*128 + a2_i (a2_o = head 0..15, a2_i = within 0..127); with
     axis ranges/bounds the three coords fold to a2_o / a0 / a2_i."""
-    from deplodock.compiler.ir.sigma import Sigma
+    from emmy.compiler.ir.sigma import Sigma
 
     a0, a2 = Var("a0"), Var("a2")
     flat = BinaryExpr("+", BinaryExpr("*", a0, Literal(2048, "int")), a2)

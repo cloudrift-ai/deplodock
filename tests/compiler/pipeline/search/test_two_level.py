@@ -17,19 +17,19 @@ import zlib
 
 import pytest
 
-from deplodock.compiler import dtype as _dt
-from deplodock.compiler.backend.base import BenchmarkResult, LaunchTime
-from deplodock.compiler.context import Context
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.cuda.ir import CudaOp
-from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
-from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.search.db import SearchDB
-from deplodock.compiler.pipeline.search.keys import op_cache_key
-from deplodock.compiler.pipeline.search.slice import single_node_graph
-from deplodock.compiler.pipeline.search.two_level import (
+from emmy.compiler import dtype as _dt
+from emmy.compiler.backend.base import BenchmarkResult, LaunchTime
+from emmy.compiler.context import Context
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.cuda.ir import CudaOp
+from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.loop import LoopOp
+from emmy.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
+from emmy.compiler.pipeline.search.db import SearchDB
+from emmy.compiler.pipeline.search.keys import op_cache_key
+from emmy.compiler.pipeline.search.slice import single_node_graph
+from emmy.compiler.pipeline.search.two_level import (
     LOWERING_PASSES,
     OpResult,
     _decomposition_rows,
@@ -46,12 +46,12 @@ _PATIENCE = 8
 
 @pytest.fixture(autouse=True)
 def _force_target(monkeypatch, tmp_path):
-    from deplodock.compiler import target as target_mod
+    from emmy.compiler import target as target_mod
 
     # Isolate the learned-prior checkpoint: ``run_two_level_tune`` trains and
     # checkpoints the global prior, and these fake-backend rows must never
-    # pollute the host's real ``~/.cache/deplodock/prior.json``.
-    monkeypatch.setenv("DEPLODOCK_PRIOR_FILE", str(tmp_path / "prior.json"))
+    # pollute the host's real ``~/.cache/emmy/prior.json``.
+    monkeypatch.setenv("EMMY_PRIOR_FILE", str(tmp_path / "prior.json"))
     target_mod.set_target((8, 0))
     yield
     target_mod.set_target(None)
@@ -367,11 +367,11 @@ def test_outer_branches_on_structural_fork(monkeypatch) -> None:
     denominator), not sub-explorations inside the fused kernel's slice. Each
     terminal also feeds the prior one composed Σ row per structural decision —
     the kernel-set cost of the side it realized."""
-    from deplodock.compiler import target as target_mod
-    from deplodock.compiler.pipeline.search import prior as prior_pkg
+    from emmy.compiler import target as target_mod
+    from emmy.compiler.pipeline.search import prior as prior_pkg
 
     for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", v)
+        monkeypatch.setenv(f"EMMY_{k}", v)
     target_mod.set_target((12, 0))
     rec = _RecordingPrior()
     monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: rec)
@@ -412,7 +412,7 @@ def _kernels(graph: Graph) -> list:
     """Outer-terminal kernel ops. A terminal sits past ``010_build``, so its
     kernels are ``TileGraphOp`` seeds (the keep(SMEM) fused kernel + the cut's
     producer/consumer); a ``LoopOp`` survives only when ``010_build`` skipped it."""
-    from deplodock.compiler.ir.tile.ir import TileGraphOp
+    from emmy.compiler.ir.tile.ir import TileGraphOp
 
     return [n.op for n in graph.nodes.values() if isinstance(n.op, (LoopOp, TileGraphOp))]
 
@@ -421,7 +421,7 @@ def _site(op):
     """The pre-decision offer site — the deepest ``S_*``-stamped loop ancestor,
     mirroring ``two_level._decomposition_rows`` (the original demoted matmul,
     before the fission re-stamped each fragment's own shallower ``S_*``)."""
-    from deplodock.compiler.pipeline.search.keys import dialect_of, source_chain
+    from emmy.compiler.pipeline.search.keys import dialect_of, source_chain
 
     site = None
     for anc in source_chain(op):

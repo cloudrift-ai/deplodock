@@ -25,7 +25,7 @@ providers:
   cloudrift:
     # API key: defaults to $CLOUDRIFT_API_KEY env var
     # API URL: defaults to $CLOUDRIFT_API_URL env var, else https://api.cloudrift.ai
-    # image_url: override the OS image. By default deplodock auto-picks ROCm for
+    # image_url: override the OS image. By default emmy auto-picks ROCm for
     # mi* instance types and NVIDIA otherwise (see provisioning/cloudrift.py).
     # billing_exempt: true  # admin-only, skip billing
     # network: public  # CloudRift network name (must exist in the target datacenter)

@@ -1,25 +1,25 @@
 ---
 name: collect-node-data
-description: Use this skill when the user wants to populate or refresh the autotune DB's node table (the cross-hardware search-tree node store) with data measured on a SPECIFIC GPU — e.g. "collect node data for an H200", "tune the goldens on a rented <GPU> and merge the nodes back", "gather cross-hardware node-store data", "populate / update the node table from <hardware>", "run the golden node sweep on a remote <GPU>". Rents a fresh single-GPU server (via start-remote-server; --billing-exempt for CloudRift), rsyncs + sets up deplodock there, runs `deplodock tune --dataset golden`, then merges the remote node rows into the local `~/.cache/deplodock/autotune.db` (nodes table only, keep-min, GPU-keyed so cards never collide), and tears the server down.
+description: Use this skill when the user wants to populate or refresh the autotune DB's node table (the cross-hardware search-tree node store) with data measured on a SPECIFIC GPU — e.g. "collect node data for an H200", "tune the goldens on a rented <GPU> and merge the nodes back", "gather cross-hardware node-store data", "populate / update the node table from <hardware>", "run the golden node sweep on a remote <GPU>". Rents a fresh single-GPU server (via start-remote-server; --billing-exempt for CloudRift), rsyncs + sets up emmy there, runs `emmy tune --dataset golden`, then merges the remote node rows into the local `~/.cache/emmy/autotune.db` (nodes table only, keep-min, GPU-keyed so cards never collide), and tears the server down.
 version: 0.1.0
 ---
 
 # Collect node-store data from specific hardware
 
-The autotune `node` table (`SearchDB`, default `~/.cache/deplodock/autotune.db`) is a **cross-hardware** dataset of
+The autotune `node` table (`SearchDB`, default `~/.cache/emmy/autotune.db`) is a **cross-hardware** dataset of
 search-tree value-of-position rows — every partial branch + leaf of each per-kernel search, with the full feature dict
-the prior sees. It is read by `deplodock eval prior --dataset nodes` (per-card fork sibling-ranking + leaf reachability)
+the prior sees. It is read by `emmy eval prior --dataset nodes` (per-card fork sibling-ranking + leaf reachability)
 and feeds prior diagnostics. Because your dev box (and most of the fleet) has no local CUDA GPU, the data for any given
 card must be **measured on that card** and brought back.
 
-This skill does exactly that for one GPU: rent it → set up deplodock → `deplodock tune --dataset golden` → merge the new
+This skill does exactly that for one GPU: rent it → set up emmy → `emmy tune --dataset golden` → merge the new
 card's node rows into the local DB → tear the server down.
 
 **Why merging into the single local DB is safe (read this once).** The node store is keyed by GPU:
 `node_key = digest(context_key, gpu, op_sig, tunable-knobs)` and the `node` table carries a `gpu` column
 (`Context.hardware_id()` — the canonicalized PCIe product name). Different cards therefore **never collide** — keep-min
 only collapses rows *within one card*. So accumulating many GPUs' node rows in the one canonical
-`~/.cache/deplodock/autotune.db` is the intended design (that is what makes it a cross-hardware dataset). Do **not** keep
+`~/.cache/emmy/autotune.db` is the intended design (that is what makes it a cross-hardware dataset). Do **not** keep
 per-GPU DB files.
 
 **Scope: nodes table only.** This skill copies back the `node` table and nothing else (not `perf`, `cuda_op`,
@@ -33,7 +33,7 @@ no models** — but it **does** need `nvcc` (it compiles CUDA kernels). Budget ~
 
 Ask only for what the user hasn't already given:
 
-1. **GPU model** — must map to a key in `deplodock/hardware.py::GPU_INSTANCE_TYPES` (e.g. "H200" → `"NVIDIA H200
+1. **GPU model** — must map to a key in `emmy/hardware.py::GPU_INSTANCE_TYPES` (e.g. "H200" → `"NVIDIA H200
    141GB"`). If it isn't in the table, stop and say so — don't guess. This card's identity is what the node rows are
    keyed by.
 2. **Provider** — only ask if the GPU is offered by more than one (e.g. H200 is on CloudRift and GCP). A user-named
@@ -54,7 +54,7 @@ candidate fallback, capacity handling, the binding `--provider` rule). The comma
 
 ```bash
 [ -f .env ] && set -a && . ./.env && set +a && \
-deplodock vm create gpu --gpu "<full GPU name>" --gpu-count 1 [--provider cloudrift|gcp] [--billing-exempt]
+emmy vm create gpu --gpu "<full GPU name>" --gpu-count 1 [--provider cloudrift|gcp] [--billing-exempt]
 ```
 
 Capture from the final `VM ready at <user@host[:port]>` line:
@@ -67,12 +67,12 @@ Do not wrap the command in a retry loop — the orchestrator handles fallback it
 ## Step 2 — Set up, tune, and merge on the remote (one backgrounded script)
 
 `scripts/remote_node_tune.py` does the whole core in **one process**: ensures the Python 3.12 venv/dev packages +
-`nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes) to `~/.local/share/deplodock/node-tune/`
+`nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes) to `~/.local/share/emmy/node-tune/`
 (the repo's `REMOTE_DEPLOY_DIR` layout), runs `make setup` (output to `setup.log` in that dir — only a tail returns on
-failure), launches `deplodock tune --dataset golden` detached, **polls the remote log internally** until it finishes,
+failure), launches `emmy tune --dataset golden` detached, **polls the remote log internally** until it finishes,
 then **fetches the node rows back and merges them** into the local
-`~/.cache/deplodock/autotune.db` (keep-min, `node` table only, GPU-keyed so other cards are untouched) and prints the
-per-card receipt. The robustness traps are baked in: argv-list ssh (no zsh word-split), `[d]eplodock tune` bracket-pgrep
+`~/.cache/emmy/autotune.db` (keep-min, `node` table only, GPU-keyed so other cards are untouched) and prints the
+per-card receipt. The robustness traps are baked in: argv-list ssh (no zsh word-split), `[e]mmy tune` bracket-pgrep
 (no self-match), one short ssh per poll (no broken-pipe), venv/dev always installed, and a non-tty-safe detached launch.
 
 Run it in the **background** (Bash `run_in_background: true`) — the tune is ~30–60 min, past a foreground tool timeout,
@@ -100,14 +100,14 @@ semantics.
 **Manual debugging** (only if the script fails and you need to poke the box): the harness shell is zsh, so pass ssh
 options as an **array** — `SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i
 "$HOME/.ssh/id_ed25519")` (a plain string var fails: zsh doesn't word-split it). Then `ssh "${SSH_OPTS[@]}" "$REMOTE"
-'tail -n 40 ~/.local/share/deplodock/node-tune/tune.log'`; check liveness with `pgrep -f "[d]eplodock tune"` (bracket
+'tail -n 40 ~/.local/share/emmy/node-tune/tune.log'`; check liveness with `pgrep -f "[e]mmy tune"` (bracket
 trick — a plain pattern self-matches
 the poll's own argv); never run a multi-minute loop inside one ssh session.
 
 ## Step 3 — Verify
 
 ```bash
-./venv/bin/deplodock eval prior --dataset nodes
+./venv/bin/emmy eval prior --dataset nodes
 ```
 
 `node_report` groups by card — confirm a block headed with the rented GPU's name appears (`[<gpu>] <n> nodes`, with fork
@@ -119,8 +119,8 @@ The VM bills until deleted, and this skill's job is done once the merge verifies
 (never delete a VM without an explicit go-ahead):
 
 ```bash
-deplodock vm delete cloudrift --instance-id <id>           # CloudRift
-deplodock vm delete gcp --instance <name> --zone <zone>    # GCP
+emmy vm delete cloudrift --instance-id <id>           # CloudRift
+emmy vm delete gcp --instance <name> --zone <zone>    # GCP
 ```
 
 If the user wants to keep the box for more tuning, leave it up and report the SSH target + the exact teardown command.
@@ -139,7 +139,7 @@ If any check fails, report the failure + raw output instead of claiming success.
 
 ## Common mistakes to avoid
 
-- **Don't keep per-GPU DB files.** The node key includes `gpu`, so the single `~/.cache/deplodock/autotune.db` is the
+- **Don't keep per-GPU DB files.** The node key includes `gpu`, so the single `~/.cache/emmy/autotune.db` is the
   correct cross-hardware accumulator. Splitting it defeats the design and breaks the per-card `eval` views.
 - **Don't `scp` over the local DB / merge the whole DB.** That clobbers other cards' node rows (and the unrelated
   `perf`/`cuda_op`/`lowering` tables). Use `scripts/merge_node_db.py` — keep-min, `node` table only.
@@ -150,7 +150,7 @@ If any check fails, report the failure + raw output instead of claiming success.
 - **Don't auto-delete the VM** — confirm teardown with the user first (and never modify a CloudRift server beyond the
   tune we explicitly started).
 - **Don't hand-roll the remote setup/poll loop** — `scripts/remote_node_tune.py` (Step 2) already handles it correctly:
-  argv-list ssh (zsh doesn't word-split a string var), the `[d]eplodock tune` bracket-pgrep (a plain pattern self-matches
+  argv-list ssh (zsh doesn't word-split a string var), the `[e]mmy tune` bracket-pgrep (a plain pattern self-matches
   the poll's own argv and reports the tune alive forever), one short ssh per poll, and venv/dev install. Only drop to
   manual ssh for debugging — and then keep the same precautions (array ssh opts; never name a var `status`/`path`, which
   are read-only in zsh).

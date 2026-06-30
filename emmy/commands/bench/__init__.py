@@ -1,0 +1,368 @@
+"""Bench command: deploy + benchmark + teardown on cloud VMs.
+
+Accepts recipe directories as positional args. A Planner groups tasks into
+ExecutionGroups that share VMs; groups run in parallel via asyncio.
+"""
+
+import asyncio
+import json
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from string import Template
+
+from emmy.benchmark import (
+    _expand_path,
+    _run_groups,
+    add_file_handler,
+    enumerate_tasks,
+    load_config,
+    setup_logging,
+    validate_config,
+)
+from emmy.benchmark.execution import _run_groups_on_hosts
+from emmy.benchmark.fixed_hosts import (
+    resolve_fixed_hosts,
+    validate_hosts_cover_groups,
+)
+from emmy.planner import BenchmarkTask
+from emmy.planner.group_by_model_and_gpu import GroupByModelAndGpuPlanner
+
+# Each summary column aggregates these timing phase keys (seconds). A column is shown
+# only when at least one task has a non-zero value for it, so command-recipe runs (which
+# only record `command`) and deploy+bench runs render the columns that apply to them.
+_TIMING_COLUMNS = [
+    ("provision", ("vm_provision", "remote_provision")),
+    ("deploy", ("image_pull", "model_download", "model_load_and_warmup", "smoke_test")),
+    ("bench", ("benchmark",)),
+    ("teardown", ("teardown",)),
+    ("command", ("command",)),
+]
+
+
+def _format_timing_table(rows: list[tuple[BenchmarkTask, dict]]) -> str:
+    """Render a per-task timing breakdown (seconds) as an aligned table.
+
+    Returns '' when there are no rows. Columns with no data across all rows are dropped.
+    """
+    if not rows:
+        return ""
+    columns: list[tuple[str, list[float]]] = []
+    for name, keys in _TIMING_COLUMNS:
+        vals = [sum(tm.get(k, 0.0) for k in keys) for _, tm in rows]
+        if any(v > 0 for v in vals):
+            columns.append((name, vals))
+    columns.append(("total", [tm.get("total", 0.0) for _, tm in rows]))
+
+    id_width = max(len("task"), max(len(t.task_id) for t, _ in rows))
+    col_width = 11
+    header = "task".ljust(id_width) + "".join(name.rjust(col_width) for name, _ in columns)
+    lines = [header]
+    for i, (t, _) in enumerate(rows):
+        lines.append(t.task_id.ljust(id_width) + "".join(f"{vals[i]:>{col_width}.1f}" for _, vals in columns))
+    return "\n".join(lines)
+
+
+def handle_bench(args):
+    """Handle the bench command."""
+    setup_logging()
+    root_logger = logging.getLogger()
+
+    config = load_config(args.config)
+    validate_config(config)
+
+    if args.billing_exempt or args.network:
+        providers = config.setdefault("providers", {})
+        # `cloudrift:` in config.yaml can parse to None when it has only commented children.
+        if providers.get("cloudrift") is None:
+            providers["cloudrift"] = {}
+        if args.billing_exempt:
+            providers["cloudrift"]["billing_exempt"] = True
+        if args.network:
+            providers["cloudrift"]["network"] = args.network
+
+    ssh_key = _expand_path(args.ssh_key)
+    dry_run = args.dry_run
+    no_teardown = args.no_teardown
+    use_local = getattr(args, "local", False)
+    ssh_targets = list(getattr(args, "ssh", None) or [])
+    fixed_host_mode = use_local or bool(ssh_targets)
+
+    # Parse --filter flags
+    parsed_filters = None
+    if args.filters:
+        parsed_filters = []
+        for f in args.filters:
+            if "=" not in f:
+                root_logger.error(f"Invalid filter format: {f!r} (expected KEY=PATTERN)")
+                sys.exit(1)
+            key, pattern = f.split("=", 1)
+            parsed_filters.append((key, pattern))
+
+    # Enumerate tasks from recipe dirs
+    tasks = enumerate_tasks(args.recipes, filters=parsed_filters)
+    if not tasks:
+        root_logger.error("Error: No benchmark tasks found.")
+        sys.exit(1)
+
+    # Inject EMMY_DUMP_DIR / EMMY_DEBUG into command tasks when
+    # --dump-dir / --debug are set. These are keys in the *remote* command's
+    # env (resolved at runtime by the command workload runner via $task_dir),
+    # not local-process env access, so they stay literal (see emmy/config.py
+    # for the local-process EMMY_* owner). Artifacts are pulled back via
+    # the result_files glob.
+    if args.dump_dir or args.debug:
+        for task in tasks:
+            if task.recipe.command is not None:
+                task.recipe.command.env["EMMY_DUMP_DIR"] = "$task_dir/dump"
+                if "dump/*" not in task.recipe.command.result_files:
+                    task.recipe.command.result_files.append("dump/*")
+                if args.debug:
+                    task.recipe.command.env["EMMY_DEBUG"] = "1"
+
+    # Create per-recipe run directories
+    recipe_run_dirs = {}
+    for recipe_dir in args.recipes:
+        resolved = str(Path(recipe_dir).resolve())
+        if resolved not in recipe_run_dirs:
+            recipe_run_dirs[resolved] = BenchmarkTask.create_run_dir(resolved)
+
+    # Assign run_dir to each task and copy recipe files
+    for task in tasks:
+        resolved = str(Path(task.recipe_dir).resolve())
+        task.setup_run_dir(recipe_run_dirs[resolved])
+
+    # Write tasks.json per run_dir
+    for resolved, run_dir in recipe_run_dirs.items():
+        run_tasks = [t for t in tasks if str(Path(t.recipe_dir).resolve()) == resolved]
+        BenchmarkTask.write_tasks_json(run_dir, run_tasks)
+
+    # Attach file handlers for each run directory
+    log_file_paths = []
+    for run_dir in recipe_run_dirs.values():
+        log_file_paths.append(add_file_handler(run_dir))
+
+    for run_dir in recipe_run_dirs.values():
+        root_logger.info(f"Run directory: {run_dir}")
+    root_logger.info("")
+
+    # Plan execution groups
+    gpu_concurrency = args.gpu_concurrency
+    planner = GroupByModelAndGpuPlanner(gpu_concurrency=gpu_concurrency)
+    groups = planner.plan(tasks)
+
+    root_logger.info(f"Running {len(tasks)} benchmark task(s) in {len(groups)} execution group(s)")
+    if gpu_concurrency > 1:
+        root_logger.info(f"GPU concurrency: {gpu_concurrency} (groups split across multiple VMs)")
+    root_logger.info(f"Parallel mode (max workers: {args.max_workers or len(groups)})")
+    root_logger.info("")
+
+    # Set up commit callback if requested
+    on_task_done = None
+    if args.commit_results:
+        from emmy.commands.bench.committer import GitCommitter
+
+        root_logger.info("Commit mode enabled: results will be committed after each task")
+        on_task_done = GitCommitter(asyncio.Lock())
+
+    # Run groups
+    if fixed_host_mode:
+        try:
+            allocated = asyncio.run(resolve_fixed_hosts(use_local, ssh_targets, ssh_key, dry_run))
+        except Exception as e:
+            root_logger.error(f"Failed to resolve fixed hosts: {e}")
+            sys.exit(1)
+
+        if not dry_run:
+            try:
+                validate_hosts_cover_groups(allocated, groups)
+            except Exception as e:
+                root_logger.error(str(e))
+                sys.exit(1)
+
+        root_logger.info(f"Fixed-host mode: {len(allocated)} host(s), running {len(groups)} group(s)")
+        raw_results = asyncio.run(_run_groups_on_hosts(groups, allocated, config, ssh_key, dry_run, on_task_done, provider=args.provider))
+    else:
+        raw_results = asyncio.run(
+            _run_groups(groups, config, ssh_key, dry_run, args.max_workers, no_teardown, on_task_done, provider=args.provider)
+        )
+
+    # Flatten results, handling exceptions
+    all_results: list[tuple[BenchmarkTask, bool, dict]] = []
+    all_instance_infos = []
+    for i, r in enumerate(raw_results):
+        if isinstance(r, Exception):
+            root_logger.error(f"Group {i} generated an exception: {r}")
+            all_results.extend((t, False, {}) for t in groups[i].tasks)
+        else:
+            task_results, instance_info = r
+            all_results.extend(task_results)
+            if instance_info is not None:
+                all_instance_infos.append(instance_info)
+
+    # Write instances.json for --no-teardown (cloud-provisioned VMs only)
+    if all_instance_infos and not fixed_host_mode:
+        for run_dir in recipe_run_dirs.values():
+            instances_path = run_dir / "instances.json"
+            instances_path.write_text(json.dumps(all_instance_infos, indent=2))
+            root_logger.info(f"Instance info saved to: {instances_path}")
+            root_logger.info("Run 'emmy teardown <run_dir>' to clean up.")
+
+    # Run aggregate post-processing for recipes that define it
+    for recipe_dir_resolved, run_dir in recipe_run_dirs.items():
+        recipe = next(
+            (t.recipe for t in tasks if str(Path(t.recipe_dir).resolve()) == recipe_dir_resolved),
+            None,
+        )
+        if recipe is None or recipe.aggregate is None:
+            continue
+
+        subs = {"run_dir": str(run_dir)}
+        rendered = Template(recipe.aggregate.run).safe_substitute(subs)
+
+        if dry_run:
+            root_logger.info(f"[dry-run] aggregate: {rendered}")
+            continue
+
+        root_logger.info(f"Running aggregate for {Path(recipe_dir_resolved).name}...")
+        try:
+            result = subprocess.run(
+                rendered,
+                shell=True,
+                timeout=recipe.aggregate.timeout,
+            )
+            if result.returncode != 0:
+                root_logger.error(f"Aggregate failed (rc={result.returncode})")
+        except subprocess.TimeoutExpired:
+            root_logger.error(f"Aggregate timed out after {recipe.aggregate.timeout}s")
+
+    # Print summary
+    root_logger.info("")
+    root_logger.info("SUMMARY")
+
+    successful = [t for t, ok, _ in all_results if ok]
+    failed = [t for t, ok, _ in all_results if not ok]
+
+    root_logger.info(f"Successful: {len(successful)}/{len(all_results)}")
+    if successful:
+        for t in successful:
+            root_logger.info(f"   - {t.task_id}")
+
+    if failed:
+        root_logger.info("")
+        root_logger.info(f"Failed: {len(failed)}/{len(all_results)}")
+        for t in failed:
+            root_logger.info(f"   - {t.task_id}")
+
+    # Timing breakdown table (successful tasks that recorded timing)
+    timing_table = _format_timing_table([(t, tm) for t, ok, tm in all_results if ok and tm])
+    if timing_table:
+        root_logger.info("")
+        root_logger.info("TIMING")
+        for line in timing_table.splitlines():
+            root_logger.info(line)
+
+    root_logger.info("")
+    root_logger.info("All done!")
+    for p in log_file_paths:
+        root_logger.info(f"Full logs saved to: {p}")
+
+
+def register_bench_command(subparsers):
+    """Register the bench subcommand."""
+    parser = subparsers.add_parser(
+        "bench",
+        help="Run LLM benchmarks on cloud VMs",
+    )
+    parser.add_argument(
+        "recipes",
+        nargs="+",
+        help="Recipe directories to benchmark",
+    )
+    parser.add_argument(
+        "--ssh-key",
+        default="~/.ssh/id_ed25519",
+        help="SSH private key path (default: ~/.ssh/id_ed25519)",
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of parallel execution groups (default: number of groups)",
+    )
+    parser.add_argument(
+        "--gpu-concurrency",
+        type=int,
+        default=1,
+        help="Split each (model, GPU) group across up to N VMs (default: 1)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without executing",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Run benchmarks on the local machine (skips cloud provisioning; uses ssh to 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--ssh",
+        action="append",
+        default=None,
+        metavar="USER@HOST[:PORT]",
+        help="Pre-allocated SSH host to run benchmarks on (repeatable). Skips cloud provisioning.",
+    )
+    parser.add_argument(
+        "--no-teardown",
+        action="store_true",
+        help="Skip teardown and VM deletion after benchmarks (save instance info for later cleanup)",
+    )
+    parser.add_argument(
+        "--commit-results",
+        action="store_true",
+        help="Git commit and push result files after each task completes",
+    )
+    parser.add_argument(
+        "--billing-exempt",
+        action="store_true",
+        help="Skip billing for CloudRift instances (admin-only)",
+    )
+    parser.add_argument(
+        "--network",
+        default=None,
+        help="CloudRift network name (must exist in target datacenter; default: provider picks a public network)",
+    )
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=None,
+        dest="filters",
+        metavar="KEY=PATTERN",
+        help="Filter variants by parameter value (fnmatch glob, repeatable, AND logic)",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["gcp", "cloudrift"],
+        default=None,
+        help="Force cloud provider for all groups (default: first listed for the GPU in the hardware table)",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        action="store_true",
+        default=False,
+        help="Dump compiler artifacts (graphs, kernels, plans) into the results directory",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable per-launch tensor dumps in the compiled CUDA program (implies --dump-dir).",
+    )
+    parser.set_defaults(func=handle_bench)

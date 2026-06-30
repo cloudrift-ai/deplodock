@@ -5,10 +5,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from deplodock.hardware import GPU_GCP_ZONES
-from deplodock.provisioning.cloud import provision_cloud_vm
-from deplodock.provisioning.errors import CapacityExhausted, TerminalProvisionError
-from deplodock.provisioning.types import VMConnectionInfo
+from emmy.hardware import GPU_GCP_ZONES
+from emmy.provisioning.cloud import provision_cloud_vm
+from emmy.provisioning.errors import CapacityExhausted, TerminalProvisionError
+from emmy.provisioning.types import VMConnectionInfo
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def ssh_key(tmp_path):
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_fallback_to_next_cloudrift_type_on_capacity_exhausted(mock_create, ssh_key):
     """RTX 4090 has 4 CloudRift candidates; first 503s, second succeeds."""
     success = VMConnectionInfo(host="1.2.3.4", username="riftuser", ssh_port=22222)
@@ -46,7 +46,7 @@ async def test_fallback_to_next_cloudrift_type_on_capacity_exhausted(mock_create
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_orchestrator_returns_none_when_all_candidates_capacity_exhausted(mock_create, ssh_key):
     """If every candidate raises CapacityExhausted, the orchestrator returns None."""
     mock_create.side_effect = CapacityExhausted("no capacity")
@@ -64,7 +64,7 @@ async def test_orchestrator_returns_none_when_all_candidates_capacity_exhausted(
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_terminal_error_aborts_immediately(mock_create, ssh_key):
     """TerminalProvisionError must propagate and stop trying further candidates."""
     mock_create.side_effect = TerminalProvisionError("bad credentials")
@@ -81,7 +81,7 @@ async def test_terminal_error_aborts_immediately(mock_create, ssh_key):
     assert mock_create.await_count == 1
 
 
-@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
 async def test_gcp_iterates_zones_before_giving_up(mock_create, ssh_key):
     """B200 lists multiple GCP zones; the orchestrator must try the second after the first fails."""
     success = VMConnectionInfo(host="10.0.0.1", username="", ssh_port=22)
@@ -102,7 +102,7 @@ async def test_gcp_iterates_zones_before_giving_up(mock_create, ssh_key):
     assert zones_tried == GPU_GCP_ZONES["NVIDIA B200"][:2]
 
 
-@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
 async def test_provisioning_model_override_flows_to_gcp(mock_create, ssh_key):
     """An explicit --provisioning-model override reaches gcp_provider.create_instance."""
     mock_create.return_value = VMConnectionInfo(host="10.0.0.1", username="", ssh_port=22)
@@ -116,7 +116,7 @@ async def test_provisioning_model_override_flows_to_gcp(mock_create, ssh_key):
     assert mock_create.await_args_list[0].kwargs["provisioning_model"] == "STANDARD"
 
 
-@patch("deplodock.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.gcp_provider.create_instance", new_callable=AsyncMock)
 async def test_provisioning_model_defaults_to_hardware_table(mock_create, ssh_key):
     """Without an override, B200 falls back to the hardware-table default (FLEX_START)."""
     mock_create.return_value = VMConnectionInfo(host="10.0.0.1", username="", ssh_port=22)
@@ -125,8 +125,8 @@ async def test_provisioning_model_defaults_to_hardware_table(mock_create, ssh_ke
 
 
 @patch.dict("os.environ", {"CLOUDRIFT_API_KEY": "test-key"})
-@patch("deplodock.provisioning.cloud.asyncio.sleep", new_callable=AsyncMock)
-@patch("deplodock.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.asyncio.sleep", new_callable=AsyncMock)
+@patch("emmy.provisioning.cloud.cr_provider.create_instance", new_callable=AsyncMock)
 async def test_transient_error_retries_same_candidate_then_advances(mock_create, mock_sleep, ssh_key, caplog):
     """A generic exception is treated as transient: retry same candidate, then advance."""
     success = VMConnectionInfo(host="1.2.3.4", username="riftuser", ssh_port=22222)

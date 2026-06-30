@@ -1,6 +1,6 @@
 """The compiler GENERATES the fused tensor-core flash.
 
-End-to-end: a fp16 SDPA traced + compiled with ``DEPLODOCK_CHAIN=1`` lowers — via the
+End-to-end: a fp16 SDPA traced + compiled with ``EMMY_CHAIN=1`` lowers — via the
 ``070_coop_reduce`` warp-flash fork — to a single ``mma.sync`` kernel (``_build.warp_chain_build``
 σ-tiles + atomizes the two contractions, ``_assemble.carry_scope_from_graph`` realizes the
 fragment softmax via ``FragmentRowReduce``, generalized over ``(B,H,S,D)``), and matches torch SDPA. The
@@ -28,8 +28,8 @@ class _Sdpa(torch.nn.Module):
 
 
 def _compile(q, k, v):
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     graph = trace_module(_Sdpa().cpu(), (q, k, v))
     backend = CudaBackend()
@@ -41,8 +41,8 @@ def _compile(q, k, v):
 @requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (2, 3, 64, 32), (1, 4, 128, 64), (1, 1, 16, 16)])
 def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(S + D)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.float16) for _ in range(3))
     backend, compiled, graph, kernels = _compile(q, k, v)
@@ -69,8 +69,8 @@ def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
 def test_generated_tensorcore_flash_bf16_matches_torch(monkeypatch, B, H, S, D):
     """Phase 4 — bf16 in, f32 accumulate. Same fused warp-chain as fp16 (the 16-bit
     operand dtype only swaps the mma atom / PTX dtype field); validated vs torch SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(S + D + 1)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
     backend, compiled, graph, kernels = _compile(q, k, v)
@@ -99,13 +99,13 @@ def test_generated_tensorcore_flash_causal_bf16_matches_torch(monkeypatch, B, H,
     """The cross-product: bf16 operands AND the fragment causal mask, together. The
     softmax realizer is dtype-agnostic (f32 algebra) and causal is a score-partial mask,
     so the two compose with no special-casing — validated vs torch's bf16 is_causal SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(S + D + 2)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
     graph = _CausalSdpa().cpu()
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     g = trace_module(graph, (q, k, v))
     backend = CudaBackend()
@@ -144,10 +144,10 @@ def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D
     """Phase 5 — causal masking at the fragment tier. The fused warp-chain inserts a
     per-element ``FragmentMask`` (causal) on the score fragment (strict upper triangle →
     ``-1e30`` before the rowmax), matching torch's ``is_causal=True`` SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
     torch.manual_seed(S + D)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.float16) for _ in range(3))
@@ -193,11 +193,11 @@ def test_warp_chain_dynamic_matches_torch(monkeypatch, seq):
     output store guarded. Non-causal, equal-head, ``D % 16 == 0``. Matches torch SDPA
     at seq ∈ {8, 16, 37, 64} (37 is the partial-tile oracle that caught the
     materialized-path −inf bug)."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     B, H, D = 1, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     graph = trace_module(
@@ -240,11 +240,11 @@ def test_warp_chain_causal_dynamic_matches_torch(monkeypatch, seq):
     symbolic boundary mask (``kv_col >= seq_len`` → ``-1e30``): both write the soft −inf
     before the rowmax, so emitting them in sequence is the AND of the keep predicates.
     Matches torch ``is_causal=True`` SDPA at seq ∈ {8, 16, 37, 64}."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     B, H, D = 1, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     graph = trace_module(
@@ -298,11 +298,11 @@ def test_warp_chain_gqa_static_matches_torch(monkeypatch, Hq, Hkv, S, D):
     """Phase 2 — STATIC ``S`` warp-chain flash with GQA (``head // group`` K/V indexing).
     ``_GqaSdpa`` traces as GQA+causal; the fused warp-chain reads K/V at the kv-head with no
     materialized broadcast and matches torch."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     torch.manual_seed(S + D)
     q = torch.randn(1, Hq, S, D, dtype=torch.float16)
     k, v = (torch.randn(1, Hkv, S, D, dtype=torch.float16) for _ in range(2))
@@ -338,11 +338,11 @@ def test_warp_chain_gqa_dynamic_matches_torch(monkeypatch, seq):
     traces as GQA+causal, so this also exercises the causal mask composed with the symbolic
     boundary mask (both write ``-1e30`` before the rowmax). ONE cached kernel carrying ``int
     seq_len``; matches torch GQA+causal SDPA at seq ∈ {8, 16, 37, 64}."""
-    from deplodock.compiler.backend.cuda.backend import CudaBackend
-    from deplodock.compiler.trace.torch import trace_module
+    from emmy.compiler.backend.cuda.backend import CudaBackend
+    from emmy.compiler.trace.torch import trace_module
 
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_CHAIN", "1")
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.setenv("EMMY_CHAIN", "1")
     B, Hq, Hkv, D = 1, 4, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     graph = trace_module(
@@ -387,8 +387,8 @@ def test_warp_chain_gqa_dynamic_matches_torch(monkeypatch, seq):
 def test_default_path_is_not_the_warp_chain(monkeypatch):
     """Without the ``CHAIN`` pin, a fp16 SDPA does NOT take the warp-chain — the deployed
     default (scalar streaming flash / materialized) is unchanged."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.delenv("DEPLODOCK_CHAIN", raising=False)
+    monkeypatch.setenv("EMMY_FLASH", "1")
+    monkeypatch.delenv("EMMY_CHAIN", raising=False)
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 32, 16, dtype=torch.float16) for _ in range(3))
     _backend, compiled, _graph, kernels = _compile(q, k, v)

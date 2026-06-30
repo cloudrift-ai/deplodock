@@ -7,11 +7,11 @@ reordering rule files doesn't break these tests.
 
 from __future__ import annotations
 
-from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.base import InputOp
-from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tensor.ir import ElementwiseOp
-from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
+from emmy.compiler.graph import Graph, Tensor
+from emmy.compiler.ir.base import InputOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
+from emmy.compiler.ir.tensor.ir import ElementwiseOp
+from emmy.compiler.pipeline import TILE_PASSES, Pipeline
 from tests.compiler.passes.conftest import strip_rule_prefix
 
 
@@ -84,7 +84,7 @@ def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump, monkeypatc
     # An elementwise-LHS matmul is a demoted matmul: the default keep(SMEM) fused edge
     # pre-seeds the consumer (``seed_fused``, no ``build``); SPLIT_CONE=1 pins the GMEM cut,
     # whose split pieces re-seed through ``build`` — the split path this test guards.
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "1")
     Pipeline.build(TILE_PASSES).run(_make_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile/enumeration")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
@@ -92,7 +92,7 @@ def test_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump, monkeypatc
 
 
 def test_two_elwise_lhs_matmul_fires_split_k_and_blockify(recording_dump, monkeypatch):
-    monkeypatch.setenv("DEPLODOCK_SPLIT_CONE", "1")  # pin the GMEM cut (see above)
+    monkeypatch.setenv("EMMY_SPLIT_CONE", "1")  # pin the GMEM cut (see above)
     Pipeline.build(TILE_PASSES).run(_make_two_elwise_lhs_matmul(), dump=recording_dump)
     fired = recording_dump.fired_rules("lowering/tile/enumeration")
     # M14: planner owns matmul partition; ``launch_geometry`` (004) skips matmul.
@@ -142,11 +142,11 @@ def test_rule_skipped_logs_reason_and_continues(capsys):
     # Pure elementwise → ``006a_register_tile_planned`` raises RuleSkipped
     # (no REG axes in body). The engine's ``debug_on`` gate keys off the
     # engine logger's level — bump that to DEBUG so ``emit`` fires.
-    logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.DEBUG)
+    logging.getLogger("emmy.compiler.pipeline").setLevel(logging.DEBUG)
     try:
         Pipeline.build(TILE_PASSES).run(g)
     finally:
-        logging.getLogger("deplodock.compiler.pipeline").setLevel(logging.NOTSET)
+        logging.getLogger("emmy.compiler.pipeline").setLevel(logging.NOTSET)
 
     out = capsys.readouterr().out
     skip_messages = [ln for ln in out.splitlines() if ln.startswith("--- ") and "skipped" in ln]
