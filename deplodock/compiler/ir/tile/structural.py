@@ -45,35 +45,34 @@ class Reduction:
     ``Loop`` (``ir/stmt/algebra``). It splits the reduce's **algebra** (the loop-carried
     :class:`~deplodock.compiler.ir.stmt.algebra.Carrier` — degenerate ``id`` for a plain
     ``sum`` / ``max`` / ``mean``, twisted ``exp`` for online-softmax / flash) from its **structure**
-    (the reduce ``axis``, the per-element ``partial`` it folds, the post-reduce ``projection``). The
-    fold ``Loop`` is **synthesized on demand** (:attr:`loop`), never stored — so the same node tiles
-    under any :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition stays on
-    the schedule this cut; it moves onto the node when ``TileSchedule`` dissolves).
+    (the reduce ``axis`` + the per-element ``partial`` it folds). The fold ``Loop`` is **synthesized on
+    demand** (:attr:`loop`), never stored — so the same node tiles under any
+    :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition stays on the
+    schedule this cut; it moves onto the node when ``TileSchedule`` dissolves).
 
-    It is NOT a ``Stmt`` — like :class:`~deplodock.compiler.ir.stmt.algebra.Map` it is an op-tree
-    node a :class:`~deplodock.compiler.ir.tile.ir.TileOp` holds; :func:`ops.lower` flattens it back to
-    the annotated loop nest verbatim (``[loop, *projection]``), so ``op_cache_key`` and the
-    materializer's ``_reduce`` expander stay byte-identical to the bare-loop form."""
+    It holds **no projection**: a bare reduce (``sum`` / ``max``) is the kernel root (its grid ``Write``
+    is glue); a reduce with a post-fold sweep (softmax / RMSNorm) is the ``source`` of a wrapping
+    :class:`~deplodock.compiler.ir.tile.structural.Map` whose body IS that projection. It is NOT a ``Stmt``
+    — like ``Map`` it is an op-tree node a :class:`~deplodock.compiler.ir.tile.ir.TileOp` holds;
+    :func:`ops.lower` flattens it to the synthesized loop (``[loop]``), so ``op_cache_key`` and the
+    ``_reduce`` expander stay byte-identical to the bare-loop form."""
 
     carrier: Carrier  # the loop-carried ⊕ algebra (degenerate id / twisted exp)
     axis: Axis  # the reduce axis
     partial: Body = field(default_factory=Body)  # the per-cell fold body (the reduce Loop's body)
-    projection: Body = field(default_factory=Body)  # post-reduce stmts; empty for a bare reduce (glue Write)
     role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
     unroll: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.partial, Body):
             object.__setattr__(self, "partial", Body.coerce(self.partial))
-        if not isinstance(self.projection, Body):
-            object.__setattr__(self, "projection", Body.coerce(self.projection))
 
     @classmethod
-    def from_loop(cls, loop: Loop, projection) -> Reduction:
+    def from_loop(cls, loop: Loop) -> Reduction:
         """Build a :class:`Reduction` from an already-annotated reduce ``Loop`` (its ``carrier`` /
-        ``role`` / ``axis`` / body) plus its post-reduce ``projection`` stmts — the recognize-side
-        constructor. :attr:`loop` reconstructs the exact same ``Loop``."""
-        return cls(carrier=loop.carrier, axis=loop.axis, partial=loop.body, projection=Body(projection), role=loop.role, unroll=loop.unroll)
+        ``role`` / ``axis`` / body) — the recognize-side constructor. :attr:`loop` reconstructs the
+        exact same ``Loop`` (any post-fold projection rides the wrapping ``Map``, not here)."""
+        return cls(carrier=loop.carrier, axis=loop.axis, partial=loop.body, role=loop.role, unroll=loop.unroll)
 
     @property
     def loop(self) -> Loop:
@@ -83,16 +82,14 @@ class Reduction:
 
     @property
     def out(self) -> str:
-        """The bound output name — the carrier state's primary component for a bare reduce (the grid
-        ``Write`` is glue), else the projection's last def (mirrors ``Map.out``)."""
-        if len(self.projection) == 0:
-            return self.carrier.out
-        return self.projection[-1].defines()[-1]
+        """The bound output name — the carrier state's primary component (a bare reduce's grid
+        ``Write`` is glue; a projected reduce's output name lives on the wrapping ``Map``)."""
+        return self.carrier.out
 
     def lower(self) -> list[Stmt]:
-        """Flatten to the loop-IR body the materializer expands — the synthesized reduce ``Loop``
-        followed by the projection (identical to the bare-loop ``Map`` body)."""
-        return [self.loop, *self.projection]
+        """Flatten to the loop-IR body the materializer expands — just the synthesized reduce
+        ``Loop`` (a wrapping ``Map`` appends its projection)."""
+        return [self.loop]
 
 
 @dataclass(frozen=True)
@@ -264,4 +261,41 @@ def _(s: Contraction, rename, sigma, axis_fn):
     )
 
 
-__all__ = ["Contraction", "Reduction"]
+@dataclass(frozen=True)
+class Map:
+    """A pointwise lift / projection wrapper around a :class:`Body` of loop-IR stmts, optionally over
+    a reduction / contraction ``source``.
+
+    ``body`` is the per-cell pointwise / projection compute: operand ``Load``\\ s, the lift
+    ``Assign``\\ s, and — at the kernel root — the output ``Write``. ``source`` is the structural node
+    it projects over (a :class:`Reduction` / :class:`Contraction` — ``project ∘ reduce``) or ``None``
+    for a pure pointwise map. A pure pointwise cell is a ``Map`` of plain stmts (``source=None``);
+    softmax / RMSNorm is a ``Map`` whose ``body`` is the post-fold sweep over a ``Reduction`` source.
+    (A not-yet-migrated reduce / contraction may still sit *inside* ``body`` as an annotated ``Loop``
+    — that legacy form lowers the same way via :func:`ops.lower`.) ``out`` is the bound output name
+    (the body's last def, or the source's carried state for an empty-body wrap). It HAS a Body, not IS
+    one."""
+
+    body: Body = field(default_factory=Body)
+    source: Reduction | Contraction | None = None  # the project∘reduce source, or None (pure pointwise)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body.coerce(self.body))
+
+    @property
+    def out(self) -> str:
+        """The bound output name. With no projection body it is the ``source``'s carried state; when
+        the body's last stmt is an annotated reduce ``Loop`` (a legacy bare reduction whose grid-cell
+        ``Write`` is glue), the carried state's primary component (``loop.carrier.out``); otherwise the
+        last defining stmt's name (a pointwise lift / a post-reduce projection)."""
+        if len(self.body) == 0 and self.source is not None:
+            return self.source.out
+        last = self.body[-1]
+        carrier = getattr(last, "carrier", None)
+        if carrier is not None:
+            return carrier.out
+        return last.defines()[-1]
+
+
+__all__ = ["Contraction", "Map", "Reduction"]

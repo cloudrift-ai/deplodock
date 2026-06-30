@@ -42,8 +42,8 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
-from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.tile import (
+    Map,
     Placement,
     ReducePlan,
     TileOp,

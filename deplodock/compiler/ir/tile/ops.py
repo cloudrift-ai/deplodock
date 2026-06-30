@@ -1,6 +1,6 @@
 """The geometry-free compute layer — the lift wrapper and its lowering.
 
-A kernel's compute is a :class:`~deplodock.compiler.ir.stmt.algebra.Map` (re-exported here) — a
+A kernel's compute is a :class:`~deplodock.compiler.ir.tile.structural.Map` (re-exported here) — a
 :class:`~deplodock.compiler.ir.stmt.body.Body` of loop-IR stmts holding the per-cell compute. A
 reduction is a ``Map`` whose body contains the **annotated reduce ``Loop``** (its
 :class:`~deplodock.compiler.ir.axis.AxisRole` + :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`
@@ -17,9 +17,9 @@ the carriers already dissolved into loose folds at recognition) plus the structu
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import AxisRole
-from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, StridedLoop
+from deplodock.compiler.ir.stmt import Assign, Body, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
-from deplodock.compiler.ir.tile.structural import Reduction
+from deplodock.compiler.ir.tile.structural import Map, Reduction
 
 
 def reduce_loop(op):
@@ -31,6 +31,8 @@ def reduce_loop(op):
     invisible here, so it materializes on the scalar tier."""
     if isinstance(op, Reduction):
         return op.loop
+    if getattr(op, "source", None) is not None:
+        return reduce_loop(op.source)  # a Map projecting over a Reduction / Contraction source
     for s in op.body:
         if isinstance(s, (Loop, StridedLoop)) and s.carrier is not None:
             return s
@@ -53,7 +55,8 @@ def lower(op) -> list[Stmt]:
     carrier) at recognition, and the reduce ``Loop``\\ s carry their role/carrier annotations, so
     one ``lower`` call emits the kernel's per-cell body with nothing left to expand."""
     if isinstance(op, Map):
-        return list(op.body)
+        prefix = lower(op.source) if op.source is not None else []
+        return [*prefix, *op.body]  # the source's reduce/contract loop nest, then the projection body
     if isinstance(op, Reduction):
         return op.lower()
     raise TypeError(f"lower: expected a Map lift wrapper or Reduction, got {type(op).__name__}")
@@ -87,7 +90,8 @@ def pretty(op, indent: str = "") -> list[str]:
         head = f"{indent}Reduction[{op.axis.name}] {op.role.name.lower()}"
         return [head, *pretty_body(Body(op.lower()), indent + "    ")]
     if isinstance(op, Map):
-        return list(pretty_body(op.body, indent))
+        src = pretty(op.source, indent) if op.source is not None else []
+        return [*src, *pretty_body(op.body, indent)]
     if isinstance(op, Stmt):
         return list(op.pretty(indent))
     return [f"{indent}{op!r}"]

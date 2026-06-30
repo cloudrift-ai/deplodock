@@ -4,7 +4,7 @@ the merged Loop-IR → Tile-IR pass (recognition + scheduling in one rewrite, no
 
 This is the Loop-IR → Tile-IR boundary: after this pass nothing downstream traffics in
 ``LoopOp``. **Recognition** (here) reads the algebra off the body and lifts the per-cell
-compute into a :class:`~deplodock.compiler.ir.stmt.algebra.Map` whose body is the **annotated
+compute into a :class:`~deplodock.compiler.ir.tile.structural.Map` whose body is the **annotated
 loop nest** (the reduce ``Loop`` stamped with its
 :class:`~deplodock.compiler.ir.axis.AxisRole` + :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`)
 on a ``Kernel`` with an UNMAPPED placement; the final step hands that kernel to **scheduling**
@@ -53,9 +53,8 @@ from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
-from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import Placement, Reduction, TileOp, kernel_for
+from deplodock.compiler.ir.tile import Map, Placement, Reduction, TileOp, kernel_for
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
@@ -198,7 +197,10 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map | Reduction:
     # out, the fold loop synthesized on demand); a ``CONTRACTION`` keeps the flat ``Map`` form (it
     # becomes a ``Contraction`` node in a later step). ``lower`` flattens either back identically.
     if annotated.role in (AxisRole.PLANAR, AxisRole.TWISTED):
-        return Reduction.from_loop(annotated, projection)
+        reduction = Reduction.from_loop(annotated)
+        # A bare reduce is the kernel root (its grid ``Write`` is glue); a projected reduce
+        # (softmax / RMSNorm) is the ``source`` of a ``Map`` whose body IS that projection.
+        return reduction if bare else Map(body=Body(projection), source=reduction)
     return Map(body=(annotated, *projection))
 
 

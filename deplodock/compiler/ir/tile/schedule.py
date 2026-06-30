@@ -553,7 +553,7 @@ class TileSchedule:
 
 @dataclass(frozen=True)
 class Kernel:
-    """A scheduled kernel — the op (the *combine*, a :class:`~deplodock.compiler.ir.stmt.algebra.Map`
+    """A scheduled kernel — the op (the *combine*, a :class:`~deplodock.compiler.ir.tile.structural.Map`
     wrapping the annotated loop nest from ``ir/stmt/algebra``) paired with its :class:`TileSchedule`
     (the *schedule*). ONE uniform type: the algebra is read structurally off the annotated reduce
     loop (``ir/tile/ops.axis_role``), never a stored node kind."""

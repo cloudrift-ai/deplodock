@@ -1,27 +1,26 @@
-"""The carrier algebra — the lift wrapper and the decoupled reduce carrier.
+"""The carrier algebra — the decoupled reduce carrier.
 
-The algebra of a kernel is **in the body**: the lift is a :class:`Map` (a typed :class:`Body`
-of pointwise stmts), and the fold ``⊕`` is a :class:`Carrier` (state + a ψ-conjugated
-:class:`Twist`) that rides on the reduce ``Loop`` it folds through (``loop.carrier``). A
-contraction (matmul) is just a reduce ``Loop`` whose ``AxisRole`` is ``CONTRACTION`` — the ``⊗``
+The algebra of a kernel is **in the body**: the fold ``⊕`` is a :class:`Carrier` (state + a
+ψ-conjugated :class:`Twist`) that rides on the reduce ``Loop`` it folds through (``loop.carrier``).
+A contraction (matmul) is just a reduce ``Loop`` whose ``AxisRole`` is ``CONTRACTION`` — the ``⊗``
 lift sits in the loop body, recognized structurally on demand, never stored as a node kind. The
 old ``Monoid`` / ``Semiring`` op-tree node *wrappers* are retired; passes read the structure
 (the annotated loop + its carrier) directly. These primitives are consolidated here so the
 algebra lives in one place:
 
-- :class:`Map` — the lift wrapper: a :class:`Body` of loop-IR stmts (the per-cell compute,
-  including any annotated reduce ``Loop`` and the projection after it).
 - :class:`State` / :class:`Twist` / :class:`Carrier` — the loop-carried associative combine (⊕).
 - :class:`StateMerge` — the renderable cross-partition state⊕state combine a carrier emits.
+
+The lift / projection wrapper itself — :class:`~deplodock.compiler.ir.tile.structural.Map` — is a
+*tile-IR* op-tree node (it carries the kernel's schedule), so it lives in ``ir/tile/structural.py``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 
 from deplodock.compiler.ir.stmt.base import RenderCtx, Stmt, render_merge_program
-from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.carrier import (
     Channel,  # noqa: F401 — re-exported for the carrier builders / tests
     exp_combine_states,
@@ -31,36 +30,6 @@ from deplodock.compiler.ir.stmt.carrier import (
     id_merge,
 )
 from deplodock.compiler.ir.stmt.leaves import Accum, Assign
-
-
-@dataclass(frozen=True)
-class Map:
-    """A pointwise lift wrapper around a :class:`Body` of loop-IR stmts.
-
-    ``body`` is the per-cell compute: operand ``Load``\\ s, the lift ``Assign``\\ s, an optional
-    annotated reduce ``Loop`` (its ``role`` + ``Carrier`` set by recognition), the post-reduce
-    projection, and — at the kernel root — the output ``Write``. A pure pointwise cell is a
-    ``Map`` of plain stmts; a reduction is a ``Map`` whose body holds the annotated reduce
-    ``Loop`` followed by its projection. ``out`` is the bound output name (the carried state of
-    the trailing reduce ``Loop``, or the body's last def). It HAS a Body, not IS one."""
-
-    body: Body = field(default_factory=Body)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.body, Body):
-            object.__setattr__(self, "body", Body.coerce(self.body))
-
-    @property
-    def out(self) -> str:
-        """The bound output name. When the body's last stmt is an annotated reduce ``Loop`` (a
-        bare reduction whose grid-cell ``Write`` is glue synthesized at materialize), the
-        carried state's primary component (``loop.carrier.out``); otherwise the last defining
-        stmt's name (a pointwise lift / a post-reduce projection)."""
-        last = self.body[-1]
-        carrier = getattr(last, "carrier", None)
-        if carrier is not None:
-            return carrier.out
-        return last.defines()[-1]
 
 
 def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
@@ -261,4 +230,4 @@ def _merge_reads(merge: tuple[Stmt, ...], state_names: tuple[str, ...]) -> tuple
     return tuple(reads)
 
 
-__all__ = ["Carrier", "Map", "State", "StateMerge", "Twist"]
+__all__ = ["Carrier", "State", "StateMerge", "Twist"]

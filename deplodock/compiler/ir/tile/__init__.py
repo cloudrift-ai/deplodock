@@ -25,7 +25,7 @@ from deplodock.compiler.ir.tile.schedule import (
     WarpSpec,
     kernel_for,
 )
-from deplodock.compiler.ir.tile.structural import Contraction, Reduction
+from deplodock.compiler.ir.tile.structural import Contraction, Map, Reduction
 
 __all__ = [
     "AtomBinding",
@@ -34,6 +34,7 @@ __all__ = [
     "Fold",
     "Kernel",
     "Level",
+    "Map",
     "Operand",
     "Placement",
     "ReducePlan",

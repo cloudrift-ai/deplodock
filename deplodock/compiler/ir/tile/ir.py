@@ -16,7 +16,7 @@ read structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
 :mod:`.schedule`.
 
 The combine lives entirely in the ``op`` wrapper (``ir/stmt/algebra``): a
-:class:`~deplodock.compiler.ir.stmt.algebra.Map` whose body is the per-cell loop nest — its reduce
+:class:`~deplodock.compiler.ir.tile.structural.Map` whose body is the per-cell loop nest — its reduce
 ``Loop`` carrying the role (``AxisRole``) + the decoupled ``Carrier`` (the ⊕ algebra). The algebra
 is **not stored as a node kind**; the role/carrier are read off the annotated loop where a pass
 needs them (``ops.axis_role`` / ``ops.reduce_loop``). ``lower(op)`` is the body verbatim (the
@@ -61,7 +61,7 @@ class TileOp(Op):
 
     @property
     def op(self):
-        """The kernel op — a :class:`~deplodock.compiler.ir.stmt.algebra.Map` wrapping the per-cell
+        """The kernel op — a :class:`~deplodock.compiler.ir.tile.structural.Map` wrapping the per-cell
         annotated loop nest; ``None`` for a placeholder node carrying no kernel."""
         return self.kernel.op if self.kernel is not None else None
 

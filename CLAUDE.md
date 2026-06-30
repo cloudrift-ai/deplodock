@@ -15,14 +15,16 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Pipeline / autotune** (pass framework, knob/fork system, learned-prior search, two-level tune) →
   [`deplodock/compiler/pipeline/ARCHITECTURE.md`](deplodock/compiler/pipeline/ARCHITECTURE.md)
 - **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**. The stored tile IR is
-  growing into a tree of **structural nodes** (`ir/tile/structural.py`): a `PLANAR`/`TWISTED` reduce lifts to a typed
-  `Reduction` (its `Carrier` + reduce `axis` + `partial`/`projection` split out, the fold `Loop` synthesized on demand);
-  a contraction is a `Contraction`; pointwise / not-yet-migrated cells stay a `Map` (a `Body` wrapper) whose annotated
-  reduce `Loop` carries its `AxisRole` (`FREE`/`PLANAR`/`CONTRACTION`/`TWISTED`) + a `Carrier`. Dispatch reads the
-  role/carrier off the node (`ops.axis_role`/`reduce_loop`), and `ops.lower` flattens any node back to the same loop nest
-  — there is no stored `Monoid`/`Semiring` node kind (those wrappers were retired). Flash attention is the `TWISTED`
-  reduce on the streaming schedule, a twisted monoid is a monoid, selected structurally not as a distinct kind) →
-  [`deplodock/compiler/pipeline/passes/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/ARCHITECTURE.md)
+  growing into a tree of **structural nodes** (all in `ir/tile/structural.py`): a `PLANAR`/`TWISTED` reduce lifts to a
+  typed `Reduction` (its `Carrier` + reduce `axis` + `partial` split out, the fold `Loop` synthesized on demand, holding
+  no projection); a contraction is a `Contraction`; the lift / projection wrapper is a `Map` (`body` + an optional
+  `source: Reduction | Contraction | None` — `project ∘ reduce`). A bare reduce is the root `Reduction`; softmax/RMSNorm
+  is a `Map(body=sweep, source=Reduction)`; a pure pointwise cell is a `Map(source=None)`; a not-yet-migrated
+  contraction still rides an annotated `Loop` inside a `Map.body`. Dispatch reads the role/carrier off the node
+  (`ops.axis_role`/`reduce_loop` recurse through `Map.source`), and `ops.lower` flattens any node back to the same loop
+  nest — there is no stored `Monoid`/`Semiring` node kind (those wrappers were retired). Flash attention is the
+  `TWISTED` reduce on the streaming schedule, a twisted monoid is a monoid, selected structurally not as a distinct
+  kind) → [`deplodock/compiler/pipeline/passes/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before
 answering — they hold the detail that is no longer in this file or the README.
