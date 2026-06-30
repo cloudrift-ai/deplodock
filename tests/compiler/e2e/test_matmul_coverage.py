@@ -135,6 +135,41 @@ def test_matmul_tile_coverage(variant, mode, monkeypatch):
         assert "int seq_len" in src, f"{variant}/dynamic: symbolic grid must carry the runtime extent arg"
 
 
+# The contraction's reduce-axis partition (the ``REDUCE`` codec) composes onto the SEMIRING exactly
+# like a plain monoid reduce — a contraction is a monoid with a ⊗ lift (``Semiring.as_monoid``), so
+# its K axis folds cooperatively (``b`` BLOCK, warp-shuffle butterfly), across ILP register chains
+# (``r`` REG), or both, through the same ``_reduce`` materializer. A non-``g`` ``REDUCE`` pin was
+# silently ignored on a contraction before. (Output is per-cell here — composing the partition WITH
+# an output TILE is the remaining step.)
+_REDUCE_VARIANTS = {
+    "coop": ("b4", "__shfl"),  # 4 threads cooperatively fold K
+    "ilp": ("r4", None),  # 4 ILP register-accumulator chains, one thread
+    "coop_ilp": ("r2/b4", "__shfl"),  # composed: 2 ILP chains × 4 coop threads
+}
+
+
+@pytest.mark.parametrize("variant", list(_REDUCE_VARIANTS))
+@requires_cuda
+def test_matmul_reduce_partition(variant, monkeypatch):
+    """A non-output-tiled contraction honours a cooperative / ILP ``REDUCE`` pin (silently ignored
+    before): the K axis partitions across threads / register chains and still matches numpy."""
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    spec, marker = _REDUCE_VARIANTS[variant]
+    monkeypatch.delenv("DEPLODOCK_TILE", raising=False)
+    monkeypatch.setenv("DEPLODOCK_REDUCE", spec)
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal((1, _M, _K), dtype=np.float32)
+    b = rng.standard_normal((_K, _N), dtype=np.float32)
+    be = CudaBackend()
+    compiled = be.compile(_matmul_graph("static"))
+    got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["c"])
+    np.testing.assert_allclose(got.reshape(_M, _N), (a @ b)[0], atol=1e-3, rtol=1e-3)
+    if marker is not None:
+        src = "\n".join(n.op.kernel_source for n in compiled.nodes.values() if getattr(n.op, "kernel_source", None))
+        assert marker in src, f"{variant}: expected the cooperative combine ({marker}) in the lowered kernel"
+
+
 # Fused epilogues — a projection ``Map`` over the ``Semiring`` (``project ∘ contract``): the
 # pointwise op folds into the contraction kernel's tail, replicated per register cell. Each is a
 # distinct tail shape: a broadcast scalar, a per-``n`` bias (shared across the ``m`` cells), a

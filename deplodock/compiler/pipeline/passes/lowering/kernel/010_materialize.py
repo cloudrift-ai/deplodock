@@ -10,12 +10,14 @@ atom-generic ``_factor.factorize`` (mma → the ``RegFragment`` / ``LdmatrixLoad
 ``RegStore`` fragment soup; scalar → the per-thread register cell tile) through the shared four-level
 ``_tiling`` layer. Every ``TileOp`` root takes one of the thread-binding tiers below:
 
-- **Scalar tier** (``MapKernel``, or a reduction with a trivial ``ReducePlan``) — one
+- **Scalar tier** (a pointwise ``Map``, or a reduction with a trivial ``ReducePlan``) — one
   thread per output cell. ``lower(op)`` emits the per-cell body (a serial reduce ``Loop``
   sits inside it, run by that one thread); the body is wrapped in a single :class:`Tile`.
 
-- **Reduce tier** (a ``MonoidKernel`` whose ``ReducePlan`` carries a BLOCK ``coop`` and/or a
-  REG ``reg`` stage) — :func:`_reduce`. The reduce axis is partitioned ``coop`` ways across
+- **Reduce tier** (a reduce axis — PLANAR / TWISTED monoid OR a non-output-tiled CONTRACTION,
+  read off ``ops.axis_role``, not the kernel type — whose ``ReducePlan`` carries a BLOCK ``coop``
+  and/or a REG ``reg`` stage) — :func:`_reduce`. A contraction folds here carrier-generically (a
+  ``Semiring`` is a ``Monoid`` with a ⊗ lift — ``as_monoid``). The reduce axis is partitioned ``coop`` ways across
   the CTA's threads (cooperation) and ``reg`` ways across per-thread **register
   accumulators** (ILP — independent chains that hide the fold/load latency). The serial
   reduce ``Loop`` becomes a :class:`StridedLoop` of step ``coop·reg``; for ``reg > 1`` its
@@ -51,6 +53,7 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
+from deplodock.compiler.ir.stmt.algebra import Semiring
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
 from deplodock.compiler.ir.tile.ops import axis_role, lower
@@ -186,6 +189,13 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     kernel = tile.kernel
     op = kernel.op
     carrier = op.reduce_node
+    # A ``Semiring`` contraction folds through the SAME carrier-generic reduce machinery as any
+    # monoid — a contraction is a monoid with a ⊗ lift (``as_monoid``: state = the additive
+    # accumulator, single partial = the operand ⊗ product). Its ``lower`` is byte-identical, so the
+    # reduce loop below is found by the same axis name; the cooperative combine / REG tree read the
+    # ``Monoid`` API (``state`` / ``as_state_merge`` / ``combine_states``) the contraction now exposes.
+    if isinstance(carrier, Semiring):
+        carrier = carrier.as_monoid()
     plan = kernel.schedule.reduce
     coop, reg = plan.coop, plan.reg
     grid = kernel.schedule.place.grid
@@ -297,13 +307,20 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # request is a bug — the materializer only lowers single-launch kernels.
     rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
-    # The warp / register-tiled contraction tiers are built one pass earlier (``005_contract``) and
-    # expanded above; here a ``Semiring`` contraction only reaches the per-cell tier below — the
-    # cooperative reduce tier is gated to the PLANAR / TWISTED monoid reduces (composing it with a
-    # contraction's output tile is Phase 4). Read the role structurally, not the kernel kind.
-    coop_eligible = kernel is not None and axis_role(kernel.op) in (AxisRole.PLANAR, AxisRole.TWISTED)
+    # Cooperative / ILP reduce tier (``_reduce``): a PLANAR / TWISTED monoid reduce, OR a
+    # **non-output-tiled** ``CONTRACTION`` whose ``ReducePlan`` cooperates — the carrier-generic
+    # K partition (split-K / coop-K matmul). A contraction's reduce composes here because a
+    # ``Semiring`` IS a ``Monoid`` with a ⊗ lift (``as_monoid`` — applied in ``_reduce``), so the
+    # same machinery folds its K axis. An **output-tiled** contraction is built one pass earlier
+    # (``005_contract`` → ``factorize``); composing the output tile WITH a reduce partition is the
+    # remaining step. Read the role structurally, not the kernel kind.
+    tier = getattr(kernel.schedule, "tier", None) if kernel is not None else None
+    role = axis_role(kernel.op) if kernel is not None else None
+    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (
+        role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled)
+    )
     plan = getattr(kernel.schedule, "reduce", None) if coop_eligible else None
-    # Reduce tier: a Monoid reduction whose plan cooperates (BLOCK) and/or register-folds (REG).
+    # Reduce tier: the plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):
         return _reduce(tile, root)
 

@@ -207,18 +207,20 @@ def _tile_specs(kernel) -> list[str]:
 
 
 def _semiring_reduce_spec() -> str:
-    """The ``REDUCE`` spec a ``Semiring`` contraction honors today — only a **cross-CTA split**
-    (``g``) pin (split-K). The K-axis coop / reg reduce tiers aren't built for the scalar
-    contraction, so a non-``g`` ``REDUCE`` pin is ignored here; the split partition is
-    orthogonal to the output ``TILE``. Returns the pinned spec when it carries a GRID stage,
-    else ``""`` (no split). A pin in another tier's codec (e.g. the warp/MMA ``s``/``c`` split
-    spelling) doesn't parse as ``g``/``b``/``r`` — it's not ours, so ignore it rather than fail."""
+    """The ``REDUCE`` spec a **scalar** (non-output-tiled) ``Semiring`` contraction honors — the
+    full K-axis codec: a cross-CTA split (``g``, consumed by ``030_split``) AND the cooperative
+    (``b``) / ILP (``r``) partitions (consumed by ``010_materialize``'s ``_reduce``, since a
+    contraction is a monoid with a ⊗ lift — ``as_monoid``). Only the scalar tier reaches here
+    (``_tile_option``); the warp tier ignores ``REDUCE`` (composing the mma tile with a K
+    partition is the remaining step). Returns the pinned spec when it parses to a non-trivial
+    partition (split / coop / reg), else ``""`` (serial). A pin in another tier's codec doesn't
+    parse as ``g``/``b``/``r`` — not ours, so ignore it rather than fail."""
     pinned = REDUCE.narrow([""])[0]
     try:
         plan = ReducePlan.parse(pinned)
     except ValueError:
         return ""
-    return pinned if plan.needs_split else ""
+    return pinned if (plan.needs_split or plan.coop > 1 or plan.reg > 1) else ""
 
 
 def _stage_spec(kernel) -> str:
