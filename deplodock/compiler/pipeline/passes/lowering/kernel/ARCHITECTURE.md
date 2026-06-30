@@ -51,10 +51,10 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 object**. It expands any `Contraction` by tiling a **leaf atom** four ways through the layer in `_tiling.py`:
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The tiling
 geometry (`tile_m` / `mask_m` / `m_b` / `m_uvar` / `block_threads` / `lanes` / …) is **derived on the `Contraction` node
-itself** (`@property`, computed from the leaf widths + skeleton axes); `factorize` reads it straight off `c` and hands
-`grid_tile` the atom-specific **codegen callables** (`state_decls` / `reduce_region` / `store`). The single
-`_factor.codegen` is a thin seam: it **dispatches that triple off the atom** (`isinstance(c.atom, AtomKind)`) and binds
-the `Contraction` — the only per-atom difference:
+itself** (`@property`, from the `tile` schedule × the output axes); `factorize` reads it straight off `c` and hands
+`grid_tile` the codegen in two halves: `_factor.reduce_codegen` — the reusable, **sink-agnostic** `(state_decls,
+reduce_region)` (operand fragments + the K-loop, dispatched off the atom) — and a per-cell **sink** `store`. The
+default is the matmul `_factor.store_sink`; `factorize(c, store=…)` swaps it (the flash QK/PV sink). Per-atom diff:
 
 - **mma** (`_mma_state` / `_mma_reduce` / `_mma_store`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the
   codegen emits `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**),

@@ -4,18 +4,22 @@ Both atoms of a :class:`~...ir.Contraction` (a tensor-core :class:`AtomKind` or 
 :class:`ScalarAtom`) expand through the *same* four-level tiling pipeline (``atomize →
 register_tile → unit_tile → grid_tile``). :func:`factorize` reads the tiling **geometry straight off
 the** ``Contraction`` **node** (``tile_m`` / ``mask_m`` / ``m_b`` / ``m_uvar`` / ``units_m`` /
-``block_threads`` / …, derived there from the unit / register widths + the atom) and calls
-:func:`codegen` for the ``state_decls`` / ``reduce_region`` / ``store`` callables ``grid_tile``
-splices.
+``block_threads`` / …, derived there from the ``tile`` schedule + the output axes) and splices two
+codegen halves into ``grid_tile``:
 
-:func:`codegen` is one thin seam: it **dispatches the three callables off the atom** — the tensor-core
-mma triple (:func:`_mma_state` / :func:`_mma_reduce` / :func:`_mma_store`) vs the scalar fma triple
-(:func:`_scalar_state` / :func:`_scalar_reduce` / :func:`_scalar_store`) — and binds the
-``Contraction``. Both tiers **synthesize** the contraction from the binding's operands and read the
-geometry off ``c``; the mma tier loads operands **gmem-direct** (``LdmatrixLoad`` + ``MmaSyncPtx``;
-the reuse comes from the register tile) and projects through a :class:`RegEpilogue`, the scalar tier
-synthesizes a ``for k: acc += a*b`` reduce loop (:func:`_synth_reduce`) and replicates it + the
-projection ``epilogue`` per register cell (operand loads deduped — the arithmetic-intensity reuse).
+- :func:`reduce_codegen` — the reusable, **sink-agnostic** ``(state_decls, reduce_region)``: the
+  operand fragments + the contraction K-loop, dispatched off the atom (the tensor-core mma pair
+  :func:`_mma_state` / :func:`_mma_reduce` vs the scalar fma pair :func:`_scalar_state` /
+  :func:`_scalar_reduce`). The mma tier loads operands **gmem-direct** (``LdmatrixLoad`` +
+  ``MmaSyncPtx``; reuse from the register tile); the scalar tier synthesizes ``for k: acc += a*b``
+  (:func:`_synth_reduce`) replicated per register cell (loads deduped). Both leave the accumulator
+  (mma ``_c{i}_{j}`` fragments / scalar ``acc__c{i}_{j}``) for the sink.
+- the **sink** ``store(i, j, offset, masks)`` — the per-cell consumer of that accumulator.
+  :func:`store_sink` is the default **matmul** sink (an mma ``RegStore`` / the replicated scalar
+  ``epilogue`` tail, projecting to the output). ``factorize(c, store=…)`` swaps it — the flash inner
+  QK/PV pass a sink that bridges the accumulator into the streaming-softmax twist, reusing the same
+  :func:`reduce_codegen`.
+
 The smem operand-staging pipeline (cp.async / TMA) was dropped to keep the two tiers symmetric (the
 ``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/tile/schedule``). Leading ``_`` so the pass
 loader skips this module."""
@@ -317,25 +321,41 @@ def _scalar_store(c: Contraction, i: int, j: int, offset, masks) -> list[Stmt]:
     return _dedup_loads(cell)
 
 
-#: The ``(state_decls, reduce_region, store)`` rendering triples, keyed by atom kind — the only
-#: per-atom variation; :func:`codegen` selects one and binds the ``Contraction``.
-_MMA = (_mma_state, _mma_reduce, _mma_store)
-_SCALAR = (_scalar_state, _scalar_reduce, _scalar_store)
+#: The reusable ``(state_decls, reduce_region)`` pair, keyed by atom kind — the operand fragments +
+#: the K-loop, **sink-agnostic**: both leave the accumulator a sink consumes (mma ``_c{i}_{j}``
+#: register fragments / scalar ``acc__c{i}_{j}`` per cell). :func:`reduce_codegen` binds the node.
+_MMA_REDUCE = (_mma_state, _mma_reduce)
+_SCALAR_REDUCE = (_scalar_state, _scalar_reduce)
 
 
-def codegen(c: Contraction):
-    """The one contraction leaf codegen — returns the ``(state_decls, reduce_region, store)``
-    callables ``factorize`` hands to ``grid_tile``, **dispatching the rendering off the atom** (the
-    tensor-core mma triple vs the scalar fma triple) and binding the ``Contraction``."""
-    state, reduce_region, store = _MMA if isinstance(c.atom, AtomKind) else _SCALAR
-    return partial(state, c), partial(reduce_region, c), partial(store, c)
+def reduce_codegen(c: Contraction):
+    """The reusable ``(state_decls, reduce_region)`` — operand fragments + the contraction K-loop
+    (``ldmatrix`` + ``mma.sync`` / the synthesized scalar fma), dispatched off the atom and bound to
+    ``c``. **Sink-agnostic**: it leaves the accumulator the :func:`store_sink` (or a flash sink) then
+    consumes, so the same K-loop emission is reused wherever a contraction is tiled."""
+    state, reduce_region = _MMA_REDUCE if isinstance(c.atom, AtomKind) else _SCALAR_REDUCE
+    return partial(state, c), partial(reduce_region, c)
 
 
-def factorize(c: Contraction) -> Tile:
+def store_sink(c: Contraction):
+    """The default **matmul sink** — the per-cell ``store(i, j, offset, masks)`` callable that writes
+    each accumulator cell to the output through the projection ``epilogue`` (an mma ``RegStore`` /
+    the replicated scalar epilogue tail), dispatched off the atom. The flash branch swaps a sink that
+    instead feeds the accumulator fragments into the streaming-softmax twist, reusing
+    :func:`reduce_codegen`."""
+    store = _mma_store if isinstance(c.atom, AtomKind) else _scalar_store
+    return partial(store, c)
+
+
+def factorize(c: Contraction, store=None) -> Tile:
     """Expand a :class:`Contraction` into its tiled ``Tile`` — the one pipeline for both atoms. The
-    node supplies the per-level geometry; :func:`codegen` synthesizes the contraction + per-cell
-    emission; the layer owns the offset, the axes, and the splice."""
-    state_decls, reduce_region, store = codegen(c)
+    node supplies the per-level geometry; :func:`reduce_codegen` synthesizes the operand load + K-loop
+    and ``store`` is the **per-cell sink** (default: the matmul :func:`store_sink`; the flash inner
+    QK/PV pass a sink that bridges the accumulator into the softmax twist); the layer owns the offset,
+    the axes, and the splice."""
+    state_decls, reduce_region = reduce_codegen(c)
+    if store is None:
+        store = store_sink(c)
     masks = (c.mask_m, c.mask_n, c.m_ext, c.n_ext)
     t = atomize(c.atom.atom_m, c.atom.atom_n)
     t = register_tile(t, c.reg_m, c.reg_n)

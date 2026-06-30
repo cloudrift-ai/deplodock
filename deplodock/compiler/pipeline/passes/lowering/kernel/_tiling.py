@@ -6,7 +6,8 @@ parallel thread footprint (``atom.lanes``) — a warp (32 lanes) for mma, a sing
 so the tensor-core warp tile and the scalar parallel thread-tile are the same level, differing only
 in ``lanes``. This module owns that nesting (the per-cell coordinate :class:`OffsetFn`, the bound
 ``Tile`` axes, the splice); the atom-specific codegen is supplied to :func:`grid_tile` as three
-callables (``state_decls`` / ``reduce_region`` / ``store``) — see ``_factor.codegen``. The geometry
+callables (``state_decls`` / ``reduce_region`` / ``store``) — see ``_factor.reduce_codegen`` (the
+shared K-loop) + ``_factor.store_sink`` (the per-cell sink). The geometry
 (``tile_m`` / ``mask`` / axis names / ``block_threads`` / …) is
 read off the :class:`~deplodock.compiler.ir.kernel.ir.Contraction` node, not recomputed here.
 
@@ -128,7 +129,7 @@ def grid_tile(
     term ``block·tile``, append any leading (e.g. batch) grid axes verbatim and — when the atom is
     warp-cooperative (``lanes > 1``) — the atom ``_lane`` axis, then splice the codegen callables'
     state + reduce-region + per-cell stores into the ``Tile``. This is the outermost stage — it
-    emits. The three callables (atom-specific, from ``_factor.codegen``) are the
+    emits. The three callables (atom-specific, from ``_factor.reduce_codegen`` + the ``store`` sink) are the
     only per-atom variation; the splice is shared.
 
     ``m_axis is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.

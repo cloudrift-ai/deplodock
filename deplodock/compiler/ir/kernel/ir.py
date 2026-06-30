@@ -327,7 +327,7 @@ class Contraction(Stmt):
     flash inner QK/PV reuse).
 
     The contraction itself is **never stored** — both tiers *synthesize* it from the operands:
-    ``_factor.codegen`` lowers the mma atom into ``ldmatrix`` + ``mma.sync`` and the scalar atom into a
+    ``_factor.reduce_codegen`` lowers the mma atom into ``ldmatrix`` + ``mma.sync`` and the scalar atom into a
     ``for k: acc += a*b`` register-tiled loop — then run the ``epilogue`` (``acc`` is the SSA name the
     synthesized reduce produces and the epilogue consumes). The operand buffers ride
     :meth:`external_reads`; the epilogue is the only nested ``Body``. ``_factor.factorize`` reads the
