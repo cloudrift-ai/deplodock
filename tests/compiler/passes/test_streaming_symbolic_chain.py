@@ -1,21 +1,21 @@
-"""Symbolic streaming flash routes through ``chain_build`` (the FA-2 shared-score form).
+"""Symbolic streaming flash routes through ``build_monoid``'s FA-2 shared-score geometry.
 
 A streaming-flash nest whose KV (stream) axis is **symbolic** (``seq_len``) can't be
-cooperatively tiled (``BR=BK=1``), so ``monoid_build`` would emit a fully-serial stream
+cooperatively tiled (``BR=BK=1``), so the serial-stream geometry would emit a fully-serial stream
 that recomputes the QK^T score per P@V output ``d`` — O(D) redundant, catastrophically
-slow (Finding 1, ``plans/qwen3-embedding-0.6b-layer0-tune-findings.md``). ``chain_build``
-restructures it: ``d`` rides a REGISTER vector ``O[d]`` and the score is computed ONCE per
-KV step and shared across ``d``. The KV stream stays a serial runtime-bounded loop (no
-tiling → no masking), so ``chain_build`` covers a symbolic hinge. ``070_coop_reduce``
-therefore makes ``chain_build`` the **enumeration default** for a symbolic streaming flash
+slow (Finding 1, ``plans/qwen3-embedding-0.6b-layer0-tune-findings.md``). The FA-2 geometry
+(``build_monoid`` with the score placed INLINE) restructures it: ``d`` rides a REGISTER vector
+``O[d]`` and the score is computed ONCE per KV step and shared across ``d``. The KV stream stays a
+serial runtime-bounded loop (no tiling → no masking), so the FA-2 geometry covers a symbolic hinge.
+``070_coop_reduce`` therefore makes it the **enumeration default** for a symbolic streaming flash
 (it stays a pin-gated opt-in for a static stream — greedy keeps the scalar nest there).
 This is the **fallback** for the symbolic shapes the tensor-core warp chain declines: as of
 Phase 3 of ``plans/smem-tiled-symbolic-flash.md``, an *eligible* symbolic flash (fp16/bf16,
 ``D%16==0``, equal-head or GQA) is intercepted **before** enumeration by
 the ``070_coop_reduce`` warp-flash fork and deployed as the smem-tiled tensor-core warp chain (the perf
-win); ``chain_build`` then serves only the non-eligible symbolic flashes (fp32, odd ``D``,
+win); the FA-2 geometry then serves only the non-eligible symbolic flashes (fp32, odd ``D``,
 additive mask). These tests seed the enumeration directly (the buffers are **fp32**, so the
-warp chain doesn't apply) — they pin the ``chain_build`` fallback routing.
+warp chain doesn't apply) — they pin the FA-2 fallback routing.
 
 Accuracy of the symbolic chain path is guarded end-to-end by the ``*_dynamic_matches_torch``
 flash tests in ``tests/compiler/e2e/test_flash_attention.py`` (SDPA / GQA+causal / additive
@@ -68,8 +68,8 @@ def _flash_op(s_dim: Dim) -> TileGraphOp:
 
 
 def _has_shared_score_register(leaf: TileGraphOp) -> bool:
-    """A chain_build leaf carries exactly one non-degenerate REGISTER domain axis — the P@V
-    output ``d`` the score is shared across (``O[d]``). A monoid_build leaf has none
+    """An FA-2 (INLINE-score) leaf carries exactly one non-degenerate REGISTER domain axis — the P@V
+    output ``d`` the score is shared across (``O[d]``). A serial-stream leaf has none
     (register forced to 1)."""
     binding = leaf.tilegraph.schedule.binding
     block = leaf.tilegraph.blocks[0]
@@ -78,7 +78,7 @@ def _has_shared_score_register(leaf: TileGraphOp) -> bool:
 
 
 def test_symbolic_stream_routes_to_chain_build():
-    """A symbolic KV stream routes EVERY streaming leaf through chain_build: the score edge
+    """A symbolic KV stream routes EVERY streaming leaf through the FA-2 shared-score geometry: the score edge
     is placed INLINE and the P@V output ``d`` rides a register vector — the shared-score
     form, not the per-``d``-recompute serial stream."""
     op = _flash_op(Dim("seq_len"))
@@ -92,7 +92,7 @@ def test_symbolic_stream_routes_to_chain_build():
 
 
 def test_static_stream_stays_scalar_monoid_by_default():
-    """A static KV stream (no ``CHAIN`` pin) keeps the scalar ``monoid_build`` streaming nest
+    """A static KV stream (no ``CHAIN`` pin) keeps the scalar serial-stream geometry
     — the chain restructuring stays a pin-gated opt-in there, so the deployed static flash is
     unchanged."""
     op = _flash_op(Dim(64))
@@ -107,7 +107,7 @@ def test_flash_cells_atomize_via_the_generic_unit():
     """The foundation of the warp-flash dissolution: the two flash cells in the **logical seed**
     atomize to the correct warp-tier ``Mma``s via the *generic* ``atomize_cell`` — the QK^T
     (``out_index`` fragment-output) to a **transposed-B** Q@K^T, and the P@V (``frag_a``) to a
-    **canonical-B** ``A=prob-fragment`` cell. ``warp_chain_build`` σ-tiles + atomizes these into a
+    **canonical-B** ``A=prob-fragment`` cell. ``build_monoid`` (warp tier) σ-tiles + atomizes these into a
     warp-streaming ``TileGraph`` and ``carry_scope_from_graph`` realizes the fragment phases — the
     path that replaced the hand-assembled ``realize_flash``. CPU-only."""
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
@@ -149,7 +149,7 @@ def test_flash_cells_atomize_via_the_generic_unit():
 
 
 def test_warp_chain_build_produces_atomized_streaming_graph():
-    """``warp_chain_build`` σ-tiles the warp-tier flash into a streaming ``TileGraph``: the two
+    """``build_monoid`` (warp tier) σ-tiles the warp-tier flash into a streaming ``TileGraph``: the two
     atomized cells (QK^T transposed-B, P@V ``frag_a`` canonical-B) over the kv-stream
     ``Schedule.carry`` axis (the split stream block ``<hinge>_b``) + the score→A handoff as a staged
     ``flash_pv_smem`` edge. ``carry_scope_from_graph`` (assembly) realizes the fragment-tier phases
@@ -158,21 +158,22 @@ def test_warp_chain_build_produces_atomized_streaming_graph():
     from deplodock.compiler.dtype import F16
     from deplodock.compiler.ir.stmt import Mma
     from deplodock.compiler.ir.stmt.carrier_algebra import split_carrier
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import warp_chain_build
+    from deplodock.compiler.ir.twist import MmaTwist
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._build import build_monoid
 
-    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so warp_chain_build reads the 16-bit atom.
+    # D=16 (one QK^T K-tile, two P@V N-atoms), fp16 buffers so build_monoid reads the 16-bit atom.
     shp = (Dim(1), Dim(1), Dim(64), Dim(16))
     loop = build_flash_frag("q", "k", "v", shp, shp, shp, Tensor("o", shp, F32), causal=False).nodes["o"].op
     dag = iter_dag(loop)
     # The synthetic recognizer fragment carries no input shapes (the real pipeline gets 4D shapes
-    # from the trace); supply the (B,H,S,D) fp16 buffers `warp_chain_build` reads the operand dtype off.
+    # from the trace); supply the (B,H,S,D) fp16 buffers `build_monoid` reads the operand dtype off.
     buffers = {n: Buffer(name=n, shape=shp, dtype=F16, space=Space.GMEM) for n in ("q", "k", "v", "o")}
     op = TileGraphOp(name=loop.name, tilegraph=seed_graph(dag, kernel_name=loop.name, buffers=buffers), dag=dag, buffers=buffers)
     chain = dag.reduction
     _stats, accum, d_state = split_carrier(chain.carrier, chain.carrier.partial[1])
     prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
 
-    tg = warp_chain_build(op)
+    tg = build_monoid(op, op.knobs, combiner=MmaTwist)
     assert tg.schedule.carry == frozenset({f"{chain.hinge_name}_b"}), "the σ-tiled kv stream block must be marked Schedule.carry"
     assert any(e.buffer == "flash_pv_smem" for e in tg.schedule.staged), "the score→A handoff must be a staged smem edge"
     mmas = [s for s in tg.blocks[0].compute.iter() if isinstance(s, Mma)]

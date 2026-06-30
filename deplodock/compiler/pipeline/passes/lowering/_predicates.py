@@ -97,15 +97,15 @@ _ATOMICADD_DTYPES = frozenset({"f16", "bf16", "f32", "f64"})
 def atomic_finalize_legal(carrier, dtype) -> bool:
     """Whether the cross-CTA **ATOMIC** finalize (in-place ``atomicAdd`` of each partition's
     partial) is legal for ``carrier`` over ``dtype`` — the cross-CTA combine stage's one policy
-    knob (``enumeration/140_atomic_free_splitk``'s ``NOATOMIC=False``).
+    knob (``enumeration/150_cross_cta_finalize``'s ``NOATOMIC=False``).
 
     Legal only for an **additive** ``Accum`` (the cross-partition combine is a plain sum, which
     ``atomicAdd`` realizes directly) over an atomicAdd-capable element type. A non-additive
     ``Accum`` (``max`` / ``min`` / ``mul``), a twisted ``Monoid`` (flash's online ``(m, l)`` —
     the cross-partition merge carries an ``e^{Δm}`` rescale, not a sum), or a non-atomicAdd
     ``dtype`` must use the **deferred** ``kernel_boundary`` finalize (a fresh combine kernel,
-    always legal — ``enumeration/_partition.additive_reduce_tilegraph`` /
-    ``monoid_reduce_tilegraph``)."""
+    always legal — ``enumeration/_partition.deferred_combine_tilegraph``, an ``Accum`` folded as a
+    degenerate ``Monoid`` via ``Accum.as_monoid``)."""
     return isinstance(carrier, Accum) and carrier.op.name == "add" and getattr(dtype, "name", None) in _ATOMICADD_DTYPES
 
 

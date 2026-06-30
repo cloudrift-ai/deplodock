@@ -27,8 +27,20 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.base import InputOp
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
-from deplodock.compiler.ir.kernel.ir import FragmentScale, LdmatrixLoad, RegFragment, RegStore, Smem, Sync
+from deplodock.compiler.ir.kernel.ir import (
+    FRAG,
+    FRAG_COL,
+    FRAG_ROW,
+    UNIFORM,
+    FragmentApply,
+    LdmatrixLoad,
+    RegFragment,
+    RegStore,
+    Smem,
+    Sync,
+)
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Load, Loop, Mma, Monoid, Select, Stmt, Write
 from deplodock.compiler.ir.tile.ir import (
@@ -46,15 +58,10 @@ from deplodock.compiler.ir.tile.ir import (
     TileOp,
     Transport,
 )
+from deplodock.compiler.ir.twist import MmaTwist
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering._predicates import map_transform, split_monoid_producer
-from deplodock.compiler.pipeline.passes.lowering.tile.assembly._frag_softmax import (
-    FragGeom,
-    realize_boundary_mask,
-    realize_fragment_softmax,
-    realize_score_mask,
-)
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._slab import synthesize_staging
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import CarryScope, Role, _wrap_tower
 from deplodock.compiler.tensor import Tensor
@@ -253,7 +260,7 @@ def _relabel_tile(tile: AtomTile, *, c: str, sfx: str, a: str | None = None, gua
 
 def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     """The warp-tier-flash branch of :func:`assemble_block` — NOT a separate assembly entry. Reads
-    the ``warp_chain_build`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
+    the ``build_monoid`` atomized streaming ``TileGraph`` (the QK^T / P@V cells already fused by
     the generic ``atomize_cell``, σ-tiled to the warp geometry) and assembles the warp-chain
     ``CarryScope``: the produce / consume ``Mma`` cells come from the graph (no hand-authored
     ``Mma``), and only the fragment-tier phases (softmax via ``realize_fragment_softmax`` / scale /
@@ -266,7 +273,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     out = block.writes[0].buffer  # the output buffer — the RegStore target
 
     # The kv-stream serial-outer carry + its full twisted carrier (the online-softmax Monoid that
-    # ``warp_chain_build`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
+    # ``build_monoid`` placed) + the produce (QK^T, transposed-B) / consume (P@V) AtomTiles.
     kv_loop = next(s for s in block.compute if isinstance(s, SerialTile) and s.kind == "serial_outer")
     carrier = next(s for s in kv_loop.body if isinstance(s, Monoid))
     causal = any(isinstance(s, Select) for s in kv_loop.body)  # the score-mask Select — structural, not a flag
@@ -279,7 +286,7 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     # the P@V output-atom count (``nd·atom_n``); the seq extent off the kv-stream axis (its
     # ``source_axis`` carries the un-tiled extent — static ``S`` or the symbolic ``seq_len``).
     atom = produce_tiles[0].atom
-    atom_m, atom_n, _atom_k = atom.shape
+    _atom_m, atom_n, _atom_k = atom.shape
     ab_dt = atom.operand_dtype("a")
     nd = len(consume_tiles)
     D = nd * atom_n
@@ -295,50 +302,53 @@ def carry_scope_from_graph(graph: TileGraph, *, kernel_name: str) -> TileOp:
     qload = next(s for s in produce_tiles[0].body.iter() if isinstance(s, Load))
     bh_dims = tuple(qload.index[:2])  # (batch, head) — the leading 4D dims, shared with the output
 
-    geom = FragGeom(
-        atom_m=atom_m,
-        atom_n=atom_n,
-        score_frags=tuple(f"Sf{nt}_frag" for nt in range(nt_count)),
-        prob_frags=tuple(f"Pf{nt}" for nt in range(nt_count)),
-        accum_frags=tuple(f"Of{n}" for n in range(nd)),
-    )
-    fs = realize_fragment_softmax(carrier, geom=geom)
-
-    init: list = list(fs.init)
-    init += [RegFragment(name=f"Of{n}", role="c", shape=atom.shape, dtype=F32) for n in range(nd)]
-    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
-
     def _qk_guards(nt: int) -> dict:
         if not symbolic:
             return {}
         return {"m_guard": (_fmul(qb, 16), seq), "n_guard": (_fadd(_fmul(kv, 16), nt * atom_n), seq)}
 
-    # Realize the score fragments + their fragment-tier transforms. The causal mask fires off the
-    # graph's ``Select`` (``causal`` above), the boundary mask off the symbolic ``seq`` — both are
-    # structural facts (a graph op / a shape extent), never an attention flag; the scale is keyed on
-    # the shape fact ``D``.
+    pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
+
+    # Relabel the graph cells to the carry-scope fragment scheme (``Sf{nt}`` / ``Of{n}``, P@V A =
+    # the handoff ``pa``) + symbolic edge guards, then build the ``Twist`` FROM the produce / consume
+    # ``Mma`` cells — it derives the C-fragment register roles (``partial_frags`` = ``<c>_frag``,
+    # ``accum_frags`` = ``c``, atom → layout) off them, so the geometry isn't re-specified.
     produce: list = [_relabel_tile(t, c=f"Sf{nt}", sfx=f"q{nt}", guards=_qk_guards(nt)) for nt, t in enumerate(produce_tiles)]
-    produce += [FragmentScale(frag=f"Sf{nt}_frag", top=scale, bot=scale) for nt in range(nt_count)]
+    consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]
+    produce_mmas = tuple(next(s for s in t.body.iter() if isinstance(s, Mma)) for t in produce)
+    consume_mmas = tuple(next(s for s in t.body.iter() if isinstance(s, Mma)) for t in consume)
+    twist = MmaTwist(produce=produce_mmas, consume=consume_mmas)
+    fs = twist.combine(carrier)  # ``fs.init`` carries the carried-state seeds + the accum RegFragment decls
+
+    init: list = list(fs.init)
+    init.append(Smem(name="flash_pv_smem", extents=(16, 16), dtype=cuda_name(ab_dt), align=16))
+
+    # The score scale (``1/√D``, keyed on the shape fact ``D``) + the masks: coordinate predicates
+    # over the generic ``FragmentMask`` node. This assembler is the attention realizer, so it builds
+    # them off structural facts — the causal ``Select``'s presence and the symbolic ``seq`` — while
+    # ``Twist`` knows no causal / boundary: causal = key col > query row (strict upper triangle);
+    # boundary = key col >= seq_len (the symbolic partial-final-tile padding keys).
+    produce += [
+        FragmentApply(out=pf, op=ElementwiseImpl("multiply"), args=(pf, scale), kinds=(FRAG, UNIFORM), in_place=True)
+        for pf in twist.partial_frags
+    ]
     kv_col_bases = tuple(_fadd(_fmul(kv, 16), nt * atom_n) for nt in range(nt_count))
     if causal:
-        produce += realize_score_mask(geom, q_row_base=_fmul(qb, 16), kv_col_bases=kv_col_bases)
+        produce += twist.mask(mask_when=BinaryExpr(">", Var(FRAG_COL), Var(FRAG_ROW)), col_bases=kv_col_bases, row_base=_fmul(qb, 16))
     if symbolic:
-        produce += realize_boundary_mask(geom, kv_col_bases=kv_col_bases, bound=seq)
+        produce += twist.mask(mask_when=BinaryExpr(">=", Var(FRAG_COL), seq), col_bases=kv_col_bases)
 
     merge: list = list(fs.merge)
     rescale: list = list(fs.rescale)
-    handoff = synthesize_frag_handoff(geom.prob_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
-
-    pv_kzero = {"k_zero": (_fmul(kv, 16), seq)} if symbolic else {}
-    consume: list = [_relabel_tile(t, c=f"Of{n}", a="pa", sfx=f"v{n}", guards=pv_kzero) for n, t in enumerate(consume_tiles)]
+    handoff = synthesize_frag_handoff(twist.weight_frags, slab="flash_pv_smem", slab_dtype=ab_dt, a_frag="pa", shape=atom.shape)
     consume.append(Sync())
 
     store_mguard = (_fmul(qb, 16), seq) if symbolic else None
     epilogue: list = []
-    for n in range(nd):
+    for n, accum in enumerate(twist.accum_frags):
         epilogue.append(fs.epilogue[n])
         out_idx = (*bh_dims, _fmul(qb, 16), Literal(n * atom_n, "int"))
-        epilogue.append(RegStore(dst_buffer=out, dst_index=out_idx, frag=f"Of{n}", shape=atom.shape, ldm=D, m_guard=store_mguard))
+        epilogue.append(RegStore(dst_buffer=out, dst_index=out_idx, frag=accum, shape=atom.shape, ldm=D, m_guard=store_mguard))
 
     carry = CarryScope(
         axis=kv_loop.axis,

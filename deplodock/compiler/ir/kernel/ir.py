@@ -578,61 +578,135 @@ class Reassign(Stmt):
         return [f"{_pad(ctx.indent)}{self.name} = {self.value};"]
 
 
-@dataclass(frozen=True)
-class FragmentExp(Stmt):
-    """Per-element ``exp(in − row_sub)`` over an ``mma.sync`` ``m16n8`` C-fragment — the
-    flash ``P = exp(S − m)``.
+#: The per-arg distribution kinds of a :class:`FragmentApply` operand.
+FRAG = "frag"  # a C-fragment operand — indexed per element (``arg[i]``)
+ROW = "row"  # a per-row scalar — broadcast by row (suffix ``0`` for rows g, ``1`` for rows g+8)
+UNIFORM = "uniform"  # a cell-uniform scalar / literal — the same value for all 4 elements
 
-    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g=lane/4``): elements ``[0,1]``
-    are row ``g`` (subtract ``top_sub``), ``[2,3]`` are row ``g+8`` (subtract ``bot_sub``)
-    — the per-row online-softmax max in fragment-distributed form. Writes the result to
-    ``out`` (declared as ``float out[4]``)."""
+
+@dataclass(frozen=True)
+class FragLayout:
+    """The **per-atom** mma C-fragment register layout — the one place the fragment-tier nodes read
+    their geometry instead of hard-coding m16n8 magic numbers. Lifting it into a descriptor is the
+    "geometry generality" seam: a second atom plugs in by adding a :func:`frag_layout` entry, not by
+    editing each node.
+
+    - ``n_elems`` — f32 registers per lane in the C-fragment.
+    - ``elem_row`` — the row index (``0 .. rows_per_lane-1``) each element belongs to; ``rows_per_lane``
+      derives from it.
+    - ``reduce_group`` — the row-reduce ``__shfl_xor`` butterfly lane span.
+    - ``lane_decl`` — the per-kernel lane preamble the coordinate ``Expr``s below reference.
+    - ``row_off`` / ``col_off`` — the per-element coordinate **offsets as ``Expr``s** (over the
+      ``lane_decl`` locals): ``row_off[r]`` the in-tile row of row-index ``r``, ``col_off[i]`` the
+      in-N-atom column of element ``i``. :class:`FragmentMask` adds the tile origin and substitutes
+      these into its coordinate predicate (so the mask is a generic ``Expr``, not hard-coded CUDA).
+
+    Only m16n8 is modeled today (both the QK^T and P@V atoms); ``frag_layout`` raises for any other,
+    so an unmodeled atom fails loudly rather than miscompiling."""
+
+    n_elems: int
+    elem_row: tuple[int, ...]
+    reduce_group: int
+    lane_decl: str
+    row_off: tuple[Expr, ...]
+    col_off: tuple[Expr, ...]
+
+    @property
+    def rows_per_lane(self) -> int:
+        return max(self.elem_row) + 1
+
+
+def _m16n8_col(b: int) -> Expr:
+    """The in-N-atom column of an m16n8 C-fragment element with col-bit ``b``: ``_t * 2 + b``."""
+    return BinaryExpr("+", BinaryExpr("*", Var("_t"), Literal(2, "int")), Literal(b, "int"))
+
+
+#: The standard ``mma.sync.m16n8`` D/C-fragment layout — 4 f32 / lane: elements ``[0,1]`` are row
+#: ``g = lane/4`` (cols ``(lane%4)*2 + {0,1}``), ``[2,3]`` are row ``g+8``; a row's 8 cols span the
+#: 4 lanes differing in ``lane%4`` (the ``reduce_group = 4`` butterfly).
+M16N8 = FragLayout(
+    n_elems=4,
+    elem_row=(0, 0, 1, 1),
+    reduce_group=4,
+    lane_decl="const int _g = (threadIdx.x & 31) >> 2, _t = (threadIdx.x & 31) & 3;",
+    row_off=(Var("_g"), BinaryExpr("+", Var("_g"), Literal(8, "int"))),
+    col_off=(_m16n8_col(0), _m16n8_col(1), _m16n8_col(0), _m16n8_col(1)),
+)
+
+
+def frag_layout(atom_m: int, atom_n: int) -> FragLayout:
+    """The :class:`FragLayout` for an mma atom — the single per-atom geometry source. Raises for any
+    atom not modeled (only m16n8 today), so the fragment realizer fails loudly on a new tier."""
+    if (atom_m, atom_n) == (16, 8):
+        return M16N8
+    raise NotImplementedError(f"no fragment C-layout modeled for atom m{atom_m}n{atom_n}")
+
+
+@dataclass(frozen=True)
+class FragmentApply(Stmt):
+    """Generic per-element pointwise op over ``mma.sync`` ``m16n8`` C-fragments — the
+    **carrier-generic** fragment-tier sibling of the scalar ``Assign``, and the ONE fragment
+    pointwise node (it subsumes the former hard-coded ``FragmentExp`` / ``FragmentScale``).
+
+    Writes ``out`` (a ``float[4]`` C-fragment) ``= op(args…)`` per element ``i`` via the same
+    ``op_to_expr`` translation the scalar ``Assign`` uses — so ANY elementwise op reaches the
+    tensor-core tier, not just softmax's ``exp`` / scale. Each arg is one of three
+    :data:`FRAG` / :data:`ROW` / :data:`UNIFORM` ``kinds``:
+
+    - ``FRAG`` — a C-fragment, indexed ``arg[i]``;
+    - ``ROW`` — a per-row scalar, broadcast by row (suffix ``0`` for rows ``g`` = elements
+      ``[0,1]``, ``1`` for rows ``g+8`` = elements ``[2,3]`` — the m16n8 2-rows/lane layout);
+    - ``UNIFORM`` — a cell-uniform scalar / literal, the same value for all 4 elements.
+
+    Realizations: ``exp(s − m)`` = a ``subtract`` (FRAG, ROW) then an ``exp`` (FRAG); ``O *= α`` =
+    an in-place ``multiply`` (FRAG, ROW); ``O /= l`` = an in-place ``divide`` (FRAG, ROW); ``S *=
+    scale`` = an in-place ``multiply`` (FRAG, UNIFORM). ``in_place`` reassigns ``out`` (no ``float
+    out[4]`` decl — ``out`` must be the first FRAG arg).
+
+    Each ``args`` entry is a ``str`` for a FRAG / UNIFORM operand, or a ``(row0, row1)`` pair of
+    SSA names for a ROW operand (the two per-row scalars stored explicitly — so SSA rename keeps
+    them consistent with their definitions; a bare name + render-time suffix would diverge under
+    rename)."""
 
     out: str
-    src: str
-    top_sub: str  # the per-row max for rows g (an SSA scalar)
-    bot_sub: str  # the per-row max for rows g+8
+    op: ElementwiseImpl
+    args: tuple[object, ...]  # str (FRAG / UNIFORM) | per-row name tuple (ROW)
+    kinds: tuple[str, ...]  # per-arg: FRAG | ROW | UNIFORM
+    in_place: bool = False
+    layout: FragLayout = M16N8  # the per-atom C-fragment geometry (n_elems + elem→row)
 
     def deps(self) -> tuple[str, ...]:
-        return (self.src, self.top_sub, self.bot_sub)
+        out: list[str] = []
+        for a, k in zip(self.args, self.kinds, strict=True):
+            out += list(a) if k == ROW else [a]
+        return tuple(out)
 
     def defines(self) -> tuple[str, ...]:
         return (self.out,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentExp({self.out} <- exp({self.src} - [{self.top_sub},{self.bot_sub}]))"]
+        def _show(a: object, k: str) -> str:
+            return f"{a}[]" if k == FRAG else (f"{list(a)}" if k == ROW else str(a))
+
+        shown = ", ".join(_show(a, k) for a, k in zip(self.args, self.kinds, strict=True))
+        return [f"{indent}FragmentApply({self.out} {'*=' if self.in_place else '<-'} {self.op.name}({shown}))"]
+
+    def _arg(self, name: object, kind: str, i: int) -> Var:
+        if kind == FRAG:
+            return Var(f"{name}[{i}]")
+        if kind == ROW:
+            return Var(name[self.layout.elem_row[i]])  # the per-row scalar for element i's row
+        return Var(str(name))  # UNIFORM — verbatim
 
     def render(self, ctx: RenderCtx) -> list[str]:
+        from deplodock.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
+
         pad = _pad(ctx.indent)
-        exp = ctx.target.intrinsic("exp", "f32")
-        subs = (self.top_sub, self.top_sub, self.bot_sub, self.bot_sub)
-        return [f"{pad}float {self.out}[4];"] + [f"{pad}{self.out}[{i}] = {exp}({self.src}[{i}] - {subs[i]});" for i in range(4)]
-
-
-@dataclass(frozen=True)
-class FragmentScale(Stmt):
-    """Per-row in-place scale of an ``mma.sync`` ``m16n8`` C-fragment — the flash
-    accumulator rescale ``O *= α`` and the epilogue ``O /= l`` (Phase 3). Elements
-    ``[0,1]`` (rows ``g``) scale by ``top``, ``[2,3]`` (rows ``g+8``) by ``bot`` (SSA
-    scalars or literals). A uniform scale (``top == bot``) is the score ``S *= scale``."""
-
-    frag: str
-    top: str
-    bot: str
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.frag, self.top, self.bot)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentScale({self.frag} *= [{self.top},{self.bot}])"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        scales = (self.top, self.top, self.bot, self.bot)
-        return [f"{pad}{self.frag}[{i}] *= {scales[i]};" for i in range(4)]
+        lines = [] if self.in_place else [f"{pad}float {self.out}[{self.layout.n_elems}];"]
+        for i in range(self.layout.n_elems):
+            argvars = [self._arg(a, k, i) for a, k in zip(self.args, self.kinds, strict=True)]
+            lines.append(f"{pad}{self.out}[{i}] = {op_to_expr(self.op.name, argvars).render(ctx)};")
+        return lines
 
 
 @dataclass(frozen=True)
@@ -695,26 +769,36 @@ class FragmentRowReduce(Stmt):
         return out
 
 
-@dataclass(frozen=True)
-class FragmentCausalMask(Stmt):
-    """Per-element causal ``-inf`` mask over an ``mma.sync`` ``m16n8`` score C-fragment.
-    Sets ``frag[i]`` to the
-    softmax max-identity (``-1e30``, the same soft ``-inf`` the carrier's ``m`` is seeded
-    with — avoids ``-inf − -inf = nan`` when a whole row is masked) wherever the element's
-    absolute key column exceeds its absolute query row (the strict upper triangle), so the
-    masked key contributes nothing to the online-softmax (``max(m, -1e30) = m``,
-    ``exp(-1e30 − m) = 0``). Applied to the scaled score before the rowmax.
+#: The reserved coordinate Vars a :class:`FragmentMask` predicate is written over — the element's
+#: ABSOLUTE query row / key column; the render substitutes each element's coords (tile origin +
+#: layout offset) for these.
+FRAG_ROW = "__frow"
+FRAG_COL = "__fcol"
 
-    The fragment's 4 elements are rows ``g`` / ``g+8`` (``g = lane/4``), cols
-    ``(lane%4)*2 + {0,1}`` within the N-atom. ``q_row_base`` is the absolute row of element
-    ``(0,0)`` (the query-tile origin ``qb*16``); ``kv_col_base`` the absolute col of
-    element ``(0,0)`` (the kv-tile + N-atom origin ``kv*16 + nt*8``). Because the predicate
-    is over absolute coordinates, the same op is a no-op on fully-below-diagonal tiles and
-    masks everything on fully-above-diagonal tiles — correct on every kv tile."""
+
+@dataclass(frozen=True)
+class FragmentMask(Stmt):
+    """Generic per-element **coordinate-predicated fill** over an mma C-fragment — the ONE fragment
+    mask node (it subsumes the former ``FragmentCausalMask`` / ``FragmentBoundaryMask``). Writes
+    ``fill`` (the carrier's fold identity — the soft ``-1e30`` so ``max(m, fill) = m`` and
+    ``exp(fill − m) = 0``) to every element whose absolute coordinates satisfy ``mask_when``, a
+    predicate ``Expr`` over the reserved coordinate vars :data:`FRAG_ROW` (``__frow``, absolute
+    query row) / :data:`FRAG_COL` (``__fcol``, absolute key column).
+
+    The render adds the tile origin (``row_base`` / ``col_base``) to the layout's per-element offset
+    and substitutes the result for ``__frow`` / ``__fcol``, then emits a guarded write — so the
+    predicate is a generic ``Expr``, not hard-coded CUDA. Causal = ``__fcol > __frow``; symbolic
+    boundary = ``__fcol >= seq_len``; any coordinate predicate (windowed, banded, …) is a different
+    ``mask_when`` over the same node. Applied to the scaled score before the rowmax; emitting two
+    masks in sequence ANDs their keep-predicates (both write ``fill``). ``row_base`` is required iff
+    ``mask_when`` references ``__frow``."""
 
     frag: str
-    q_row_base: Expr
-    kv_col_base: Expr
+    mask_when: Expr
+    col_base: Expr
+    row_base: Expr | None = None
+    fill: float = -1e30
+    layout: FragLayout = M16N8
 
     def deps(self) -> tuple[str, ...]:
         return (self.frag,)
@@ -723,66 +807,23 @@ class FragmentCausalMask(Stmt):
         return (self.frag,)
 
     def exprs(self) -> tuple[Expr, ...]:
-        return (self.q_row_base, self.kv_col_base)
+        base = (self.mask_when, self.col_base)
+        return base + ((self.row_base,) if self.row_base is not None else ())
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentCausalMask({self.frag} where col {self.kv_col_base.pretty()} > row {self.q_row_base.pretty()})"]
+        return [f"{indent}FragmentMask({self.frag} where {self.mask_when.pretty()})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        lane = "(threadIdx.x & 31)"
-        qb, kb = self.q_row_base.render(ctx), self.kv_col_base.render(ctx)
-        ninf = ctx.identity_literal(-1e30, "f32")
-        lines = [f"{pad}{{ const int _g = {lane} >> 2, _t = {lane} & 3;"]
-        for i in range(4):
-            row = "_g" if i < 2 else "(_g + 8)"
-            col = f"(_t * 2 + {i & 1})"
-            lines.append(f"{pad}  if (({kb}) + {col} > ({qb}) + {row}) {self.frag}[{i}] = {ninf};")
-        lines.append(f"{pad}}}")
-        return lines
-
-
-@dataclass(frozen=True)
-class FragmentBoundaryMask(Stmt):
-    """Per-element **symbolic-boundary** ``-inf`` mask over an ``mma.sync`` ``m16n8`` score
-    C-fragment — the symbolic-``seq_len`` sibling of :class:`FragmentCausalMask`. The final
-    KV tile of a symbolic streaming flash straddles the runtime extent: its columns
-    ``kv_col >= seq_len`` are padding keys whose scaled QK^T score must be neutralized to the
-    softmax max-identity (``-1e30``) BEFORE the rowmax / exp, so the online-softmax
-    denominator excludes them (``exp(0) = 1`` would corrupt it — the same −inf-vs-0 trap the
-    materialized decomposition fell into). Column-only (no ``q_row`` term), so it composes
-    with the causal mask by ANDing the keep predicates — both just write ``-1e30``, so
-    emitting both in sequence is the AND.
-
-    ``kv_col_base`` is the absolute col of element ``(0,0)`` (``kv*16 + nt*8``); ``bound`` is
-    the runtime extent ``Var("seq_len")``. The fragment's 4 elements are cols ``(lane%4)*2 +
-    {0,1}`` (rows are irrelevant to a column predicate)."""
-
-    frag: str
-    kv_col_base: Expr
-    bound: Expr
-
-    def deps(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def defines(self) -> tuple[str, ...]:
-        return (self.frag,)
-
-    def exprs(self) -> tuple[Expr, ...]:
-        return (self.kv_col_base, self.bound)
-
-    def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}FragmentBoundaryMask({self.frag} where col {self.kv_col_base.pretty()} >= {self.bound.pretty()})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        pad = _pad(ctx.indent)
-        lane = "(threadIdx.x & 31)"
-        kb, bd = self.kv_col_base.render(ctx), self.bound.render(ctx)
-        ninf = ctx.identity_literal(-1e30, "f32")
-        lines = [f"{pad}{{ const int _t = {lane} & 3;"]
-        for i in range(4):
-            col = f"(_t * 2 + {i & 1})"
-            lines.append(f"{pad}  if (({kb}) + {col} >= ({bd})) {self.frag}[{i}] = {ninf};")
+        lay = self.layout
+        fill = ctx.identity_literal(self.fill, "f32")
+        lines = [f"{pad}{{ {lay.lane_decl}"]
+        for i in range(lay.n_elems):
+            sub: dict[str, Expr] = {FRAG_COL: BinaryExpr("+", self.col_base, lay.col_off[i])}
+            if self.row_base is not None:
+                sub[FRAG_ROW] = BinaryExpr("+", self.row_base, lay.row_off[lay.elem_row[i]])
+            pred = self.mask_when.substitute(sub).render(ctx)
+            lines.append(f"{pad}  if ({pred}) {self.frag}[{i}] = {fill};")
         lines.append(f"{pad}}}")
         return lines
 
@@ -1800,13 +1841,9 @@ def _(s: Reassign, rename, sigma, axis_fn):
 
 
 @_rewrite.register
-def _(s: FragmentExp, rename, sigma, axis_fn):
-    return FragmentExp(out=rename(s.out), src=rename(s.src), top_sub=rename(s.top_sub), bot_sub=rename(s.bot_sub))
-
-
-@_rewrite.register
-def _(s: FragmentScale, rename, sigma, axis_fn):
-    return FragmentScale(frag=rename(s.frag), top=rename(s.top), bot=rename(s.bot))
+def _(s: FragmentApply, rename, sigma, axis_fn):
+    args = tuple((rename(a[0]), rename(a[1])) if k == ROW else rename(a) for a, k in zip(s.args, s.kinds, strict=True))
+    return FragmentApply(out=rename(s.out), op=s.op, args=args, kinds=s.kinds, in_place=s.in_place, layout=s.layout)
 
 
 @_rewrite.register
@@ -1817,15 +1854,16 @@ def _(s: FragmentRowReduce, rename, sigma, axis_fn):
 
 
 @_rewrite.register
-def _(s: FragmentCausalMask, rename, sigma, axis_fn):
-    # ``frag`` is SSA (the score fragment); the base coords σ-substitute so the
-    # canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``).
-    return FragmentCausalMask(frag=rename(s.frag), q_row_base=sigma.apply(s.q_row_base), kv_col_base=sigma.apply(s.kv_col_base))
-
-
-@_rewrite.register
-def _(s: FragmentBoundaryMask, rename, sigma, axis_fn):
-    # ``frag`` is SSA (the score fragment); the kv-col base + runtime bound σ-substitute
-    # so the canonicalizer renames the kv axis var (the ``seq_len`` bound is a free runtime
-    # symbol — untouched by σ over the local axes).
-    return FragmentBoundaryMask(frag=rename(s.frag), kv_col_base=sigma.apply(s.kv_col_base), bound=sigma.apply(s.bound))
+def _(s: FragmentMask, rename, sigma, axis_fn):
+    # ``frag`` is SSA (the score fragment); the tile-origin bases + the predicate σ-substitute so
+    # the canonicalizer renames the query / kv axis vars (``qb``→``a1``, ``kv``→``a3``). The
+    # reserved ``__frow`` / ``__fcol`` coordinate vars + any free runtime symbol (``seq_len``) are
+    # untouched by σ over the local axes.
+    return FragmentMask(
+        frag=rename(s.frag),
+        mask_when=sigma.apply(s.mask_when),
+        col_base=sigma.apply(s.col_base),
+        row_base=sigma.apply(s.row_base) if s.row_base is not None else None,
+        fill=s.fill,
+        layout=s.layout,
+    )

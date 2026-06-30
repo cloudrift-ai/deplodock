@@ -525,6 +525,22 @@ class Accum(ReduceCarrier):
         ``Monoid.combine_states``."""
         return (Assign(name=self.name, op=self.op, args=(self.name, f"{self.name}__o"), dtype=self.dtype),)
 
+    def as_monoid(self) -> Monoid:
+        """This additive/associative ``Accum`` AS the degenerate 1-component ``Monoid`` it already is —
+        state ``(name,)``, partial ``(value,)``, ``merge`` = ``name = op(name, value)``, identity the
+        op's. The carrier-algebra fact that a SEMIRING / scalar reduce is the trivial monoid: it lets an
+        ``Accum`` lower through the **same** ``Combiner`` / cross-partition path as a general ``Monoid``,
+        with no additive special-case. The auto-derived ``combine_states`` (``name = op(name, name__o)``)
+        equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
+        return Monoid(
+            state=(self.name,),
+            partial=(self.value,),
+            merge=(Assign(name=self.name, op=self.op, args=(self.name, self.value), dtype=self.dtype),),
+            identity=(self.init,),
+            commutative=self.op.commutative,
+            axes=self.axes,
+        )
+
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
     # ``sum`` Accum differ, and ``self.op`` is the source of truth.
     @property
@@ -791,6 +807,9 @@ class Monoid(ReduceCarrier):
         realization-agnostic cross-partition combine the cooperative-tree /
         split-KV / split-K reductions fold through."""
         return self.combine_states
+
+    # ``project`` is the shared ``ReduceCarrier`` default (keyed off ``carried_names()`` ==
+    # ``state``) — the one magic method every carrier inherits; no Monoid-specific override.
 
     # A monoid is associative with identity by construction; commutativity is the
     # extra property (the ``commutative`` field) split-KV / split reordering needs.

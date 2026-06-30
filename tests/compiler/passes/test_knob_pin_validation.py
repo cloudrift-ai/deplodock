@@ -6,7 +6,7 @@ to the tier an op resolves to used to be silently dropped (or overwritten by an 
 sentinel); the validator turns that into a hard :class:`KnobPinError`.
 
 A twisted monoid is the MONOID algebra (transport of structure), and the streaming flash
-shares the cooperative reduce's ``monoid_build`` move + knob slice — so it is the SAME
+shares the cooperative reduce's ``build_monoid`` move + knob slice — so it is the SAME
 ``MONOID`` tier, not a separate one. ``BK``/``FK`` are therefore legal on a flash nest
 (split-KV / serial re-bracketing is associativity-licensed), whether or not a given shape
 realizes them (the pipeline's job, like ``SPLITK`` on a non-linear matmul).
@@ -74,7 +74,7 @@ _ALLOWED = [
     (AlgebraKind.SEMIRING, {"MMA": 0, "BN": 16, "BM": 16, "SPLITK": 4}),
     # A full warp matmul pin (atom + warp counts + register cells + atom-K chunk).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2}),
-    # Warp-tier split-K (the atomic-free combine, 140_atomic_free_splitk) is supported.
+    # Warp-tier split-K (the atomic-free combine, 150_cross_cta_finalize) is supported.
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "WM": 2, "WN": 2, "FM": 2, "FN": 2, "BK": 2, "SPLITK": 2}),
     # Universal / OFF values are inert next to a warp pin (the value-aware table).
     (AlgebraKind.SEMIRING, {"MMA": _ATOM, "SPLITK": 1, "FK": 1, "BR": 1, "FM": 1, "FN": 1}),
@@ -100,7 +100,7 @@ def test_allows_tier_native_pins(algebra, pins, monkeypatch):
 
 
 # --- The streaming flash IS the MONOID tier (no separate streaming tier) -------
-# Flash shares the cooperative reduce's ``monoid_build`` move + knob slice, so it lowers
+# Flash shares the cooperative reduce's ``build_monoid`` move + knob slice, so it lowers
 # on the same ``MONOID`` tier. Warp / split-K / tensor-core / staging knobs are foreign to
 # it (identical to the cooperative-reduce ``_REFUSED`` rows above), but the K-chunk knobs
 # ``BK``/``FK`` are now LEGAL on it (split-KV / serial re-bracketing is associativity-

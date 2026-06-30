@@ -8,7 +8,7 @@ default path (no ``CHAIN`` pin) is unchanged — the scalar streaming flash / ma
 path still deploys, so this only fires under the explicit opt-in.
 
 v1 scope: fp16 / bf16, causal or non-causal, equal-head, ``D % 16 == 0``, ``S % 16 == 0``.
-The softmax is generated from the carrier by the fragment realizer (``_frag_softmax``), so
+The softmax is generated from the carrier by the fragment realizer (``ir/kernel/ir.Fragment``), so
 dtype (f32 algebra) and causal (a score-partial mask) are orthogonal — this file covers
 their cross-product. Out of scope falls back cleanly.
 """
@@ -142,7 +142,7 @@ class _CausalSdpa(torch.nn.Module):
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (2, 3, 64, 32), (1, 4, 128, 64), (1, 1, 16, 16)])
 def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D):
     """Phase 5 — causal masking at the fragment tier. The fused warp-chain inserts a
-    per-element ``FragmentCausalMask`` on the score fragment (strict upper triangle →
+    per-element ``FragmentMask`` (causal) on the score fragment (strict upper triangle →
     ``-1e30`` before the rowmax), matching torch's ``is_causal=True`` SDPA."""
     monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     monkeypatch.setenv("DEPLODOCK_CHAIN", "1")

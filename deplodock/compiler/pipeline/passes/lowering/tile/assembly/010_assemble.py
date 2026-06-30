@@ -35,13 +35,13 @@ def rewrite(ctx: Context, root: Node, match) -> TileOp | Graph:  # noqa: ARG001
     fused ``TileOp`` (the producer folds into the consumer's slab ``compute`` phase, so only
     the consumer must be tiled — ``assembly_ready`` exempts the logical producers); a
     multi-launch ``TileGraph`` (the ``GMEM`` cut, R7) → a ``Graph`` of ``TileOp`` kernels the
-    engine splices, the same shape the structural forks (``140_atomic_free_splitk``)
+    engine splices, the same shape the structural forks (``150_cross_cta_finalize``)
     return."""
     op: TileGraphOp = root.op
     if op.tilegraph is None:
         raise RuleSkipped("TileGraphOp not yet fully tiled (still a logical seed)")
     tg = op.tilegraph
-    # ``Schedule.carry`` (the warp-tier streaming flash) is ready by construction — ``warp_chain_build``
+    # ``Schedule.carry`` (the warp-tier streaming flash) is ready by construction — ``build_monoid``
     # σ-tiled it; ``assemble_block`` dispatches it to the fragment-tier carrier branch. Every other
     # graph must have a populated ``domain`` (``assembly_ready``) before materializing.
     if not tg.schedule.carry and not assembly_ready(tg):

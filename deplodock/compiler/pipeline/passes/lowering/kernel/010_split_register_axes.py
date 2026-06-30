@@ -33,6 +33,7 @@ from collections.abc import Callable
 
 from deplodock.compiler.graph import Graph, Node
 from deplodock.compiler.ir.expr import Literal
+from deplodock.compiler.ir.kernel.ir import Reassign
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Stmt
 from deplodock.compiler.ir.tile.ir import RegisterTile, SerialTile, StageBundle, TileOp
@@ -185,6 +186,17 @@ def _build_accum_fold(tile: RegisterTile) -> list[Stmt]:
     return folds
 
 
+def _repl_defs(s: Stmt) -> tuple[str, ...]:
+    """The SSA names ``s`` binds **for replication dataflow**. A :class:`Reassign` rebinds an
+    already-declared carried name (its global ``Stmt.defines()`` stays ``()`` to keep SSA-uniqueness
+    analyses happy), but for register-axis replication it must count as defining that name — otherwise
+    a carried state rebound by a ``Reassign`` and dependent on the replicated axis (the FA-2 ``O[d]``
+    accumulator a ``ScalarCombiner`` rebinds) never propagates ``keep`` and stays a single scalar."""
+    if isinstance(s, Reassign):
+        return (s.name,)
+    return s.defines()
+
+
 def _iter_accums(body: Body) -> list[Accum]:
     """All ``Accum``s reachable in ``body`` (recursing through nested block
     stmts). For an FK reduce tile the body is the flat innermost reduce
@@ -270,7 +282,7 @@ def _replicate_along_axis(
         return own
 
     deps = body.fold(fn)
-    keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in s.defines()}
+    keep: dict[str, bool] = {n: axis in deps[id(s)] for s in body.iter() for n in _repl_defs(s)}
 
     # SSA def-use propagation: if any SSA name a stmt reads has keep=True,
     # then everything it defines must also be marked keep. The fold above
@@ -289,7 +301,7 @@ def _replicate_along_axis(
                 reads.update(e.free_vars())
             reads &= defined_names
             if any(keep.get(r, False) for r in reads):
-                for n in s.defines():
+                for n in _repl_defs(s):
                     if not keep.get(n, False):
                         keep[n] = True
                         changed = True
@@ -359,4 +371,4 @@ def _needs_replication(s, axis: str, deps: dict, keep: dict[str, bool]) -> bool:
     *some* definer reads the axis) covers the missed case."""
     if axis in deps.get(id(s), frozenset()):
         return True
-    return any(keep.get(n, False) for n in s.defines())
+    return any(keep.get(n, False) for n in _repl_defs(s))

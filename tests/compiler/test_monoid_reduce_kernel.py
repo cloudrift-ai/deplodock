@@ -1,14 +1,14 @@
 """Carrier-general cross-partition reduce kernel.
 
 The atomic-free split-K combine block, rebuilt against the block-DAG Tile IR:
-``enumeration/_partition.monoid_reduce_tilegraph`` builds a combine kernel driven by a
-``Monoid`` carrier — per-partition state slabs in a ``workspace[S, M, N]``,
-``identity``-seeded, folded along ``S`` via the carrier's ``combine_states`` (the new-IR
-successor of the deleted ``017``'s ``build_monoid_reduce_tileop``). The additive matmul
-split-K rides the bit-identical ``Accum`` sum (:func:`additive_reduce_tilegraph`); this
-test exercises the NON-additive ``(m, l)`` online-softmax monoid through the builder
-directly — a hand-built scalar monoid split that merges S partition states and matches
-numpy.
+``enumeration/_partition.deferred_combine_tilegraph`` builds a combine kernel for any carrier
+(the additive ``Accum`` lowered as a degenerate ``Monoid`` via ``Accum.as_monoid``, folded by
+``deferred_combine_tilegraph``) — for a
+``Monoid`` carrier, per-partition state slabs in a ``workspace[S, M, N]``, ``identity``-seeded,
+folded along ``S`` via the carrier's ``combine_states`` (the new-IR successor of the deleted
+``017``'s ``build_monoid_reduce_tileop``). This test exercises the NON-additive ``(m, l)``
+online-softmax monoid through the builder directly — a hand-built scalar monoid split that
+merges S partition states and matches numpy.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
-from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import monoid_reduce_tilegraph, reduce_tilegraphop
+from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph, reduce_tilegraphop
 
 
 def _has_cuda() -> bool:
@@ -41,14 +41,13 @@ def _ml_carrier():
 
 def _reduce_graph(s: int, m: int, n: int) -> Graph:
     carrier = _ml_carrier()
-    tg = monoid_reduce_tilegraph(
-        carrier=carrier,
+    tg = deferred_combine_tilegraph(
+        carrier,
         init_ops=(ElementwiseImpl("maximum"), ElementwiseImpl("add")),
         workspaces=("ws_m", "ws_l"),
         out_name="out",
         s_extent=s,
-        m_extent=m,
-        n_extent=n,
+        out_shape=(m, n),
         dtype=F32,
         out_value="l",  # the merged denominator l_global
         name="monoid_ml__reduce",
@@ -90,7 +89,7 @@ def _deferred_graph(carrier, *, workspaces, s, m, n, **kw) -> Graph:
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._partition import deferred_combine_tilegraph
 
     tg = deferred_combine_tilegraph(
-        carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, m_extent=m, n_extent=n, dtype=F32, name="deferred__reduce", **kw
+        carrier, workspaces=tuple(workspaces), out_name="out", s_extent=s, out_shape=(m, n), dtype=F32, name="deferred__reduce", **kw
     )
     g = Graph()
     for w in workspaces:

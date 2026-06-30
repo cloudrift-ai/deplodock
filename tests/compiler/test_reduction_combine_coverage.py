@@ -63,6 +63,10 @@ def _ref_matmul(xs):
     return xs[0] @ xs[1]
 
 
+def _ref_sum(xs):
+    return xs[0].sum(axis=1, keepdims=True)
+
+
 # (label, code, ref_fn). The reduce axis is sized 1024 (reduction/softmax) so coop=128 reaches
 # the 4-warp hierarchical smem combine; attention's KV is 64 (coop ≤ 64).
 _OPS = {
@@ -74,6 +78,7 @@ _OPS = {
         _ref_attention,
     ),
     "matmul": ("torch.matmul(torch.randn(8, 1024), torch.randn(1024, 16))", _ref_matmul),
+    "sum": ("torch.randn(4, 1024).sum(dim=1, keepdim=True)", _ref_sum),
 }
 
 
@@ -138,19 +143,38 @@ def test_attention_combine_accuracy(variant, monkeypatch):
     assert diff < 2e-3, f"attention/{variant}: flash mismatch (max abs err {diff})"
 
 
-@pytest.mark.parametrize("finalize", ["atomic", "kernel"])
-def test_cross_cta_finalize_accuracy_and_structure(finalize, monkeypatch):
-    """The split-K matmul is accurate under BOTH cross-CTA finalize folds, and each emits the
-    expected kernel set: ATOMIC (``c<cta>a``) = one kernel with ``atomicAdd``; deferred KERNEL
-    (``c<cta>k``) = a second ``__global__`` combine kernel and no ``atomicAdd``. The finalize is
-    the native ``REDUCE`` codec's ``c`` letter (``c2a`` / ``c2k``) — one knob owns split-K +
-    finalize."""
-    code, ref_fn = _OPS["matmul"]
-    reduce_pin = "c2a" if finalize == "atomic" else "c2k"
-    got, xs, src = _compile_run(code, {"DEPLODOCK_REDUCE": reduce_pin}, monkeypatch)
+# The carrier-generic cross-CTA producer + finalize, one case per (carrier × finalize). The
+# additive carriers (matmul split-K, ``sum`` split-reduce) take BOTH finalize folds; the twisted
+# flash ``(m, l, O)`` carrier is **kernel-only** (the ``e^{Δm}`` rescale can't be an ``atomicAdd``).
+# ``flash`` flips on the fused streaming flash (``DEPLODOCK_FLASH``); all split the reduce/KV axis
+# across 2 CTAs via the native ``REDUCE`` ``c2`` codec, the same knob for matmul / reduce / flash.
+_CROSS_CTA = {
+    "matmul": {"op": "matmul", "flash": False, "tol": 1e-2, "finalizes": ("atomic", "kernel")},
+    "sum": {"op": "sum", "flash": False, "tol": 1e-2, "finalizes": ("atomic", "kernel")},
+    "flash": {"op": "attention", "flash": True, "tol": 2e-3, "finalizes": ("kernel",)},
+}
+_CROSS_CTA_CASES = [(carrier, fin) for carrier, spec in _CROSS_CTA.items() for fin in spec["finalizes"]]
+
+
+@pytest.mark.parametrize("carrier,finalize", _CROSS_CTA_CASES)
+def test_cross_cta_finalize_accuracy_and_structure(carrier, finalize, monkeypatch):
+    """The **carrier-generic cross-CTA producer + finalize**, one matrix over (carrier × finalize):
+    a SEMIRING matmul split-K, an additive ``Accum`` ``sum`` split-reduce, and the twisted flash
+    ``(m, l, O)`` split-KV (Flash-Decoding) all split their contraction axis across CTAs through
+    the SAME fork — the matmul is the 1-component instantiation, flash the N-component twisted one.
+    Each is accurate vs torch and emits the matching kernel set: ATOMIC (``c2a``) = one kernel with
+    ``atomicAdd`` (additive only — illegal for the twisted carrier); deferred KERNEL (``c2k``) = a
+    second ``__global__`` combine kernel writing/reading a ``__partial`` workspace, no ``atomicAdd``.
+    The finalize is the native ``REDUCE`` codec's ``c`` letter — one knob owns split + finalize."""
+    spec = _CROSS_CTA[carrier]
+    code, ref_fn = _OPS[spec["op"]]
+    env = {"DEPLODOCK_REDUCE": "c2a" if finalize == "atomic" else "c2k"}
+    if spec["flash"]:
+        env["DEPLODOCK_FLASH"] = "1"
+    got, xs, src = _compile_run(code, env, monkeypatch)
     want = ref_fn(xs).reshape(got.shape)
     diff = float(np.abs(got - want).max())
-    assert diff < 1e-2, f"matmul/{finalize}: split-K mismatch (max abs err {diff})"
+    assert diff < spec["tol"], f"{carrier}/{finalize}: cross-CTA mismatch (max abs err {diff})"
     n_global = src.count("__global__")
     if finalize == "atomic":
         assert "atomicAdd" in src, "the atomic finalize must emit atomicAdd"
@@ -158,3 +182,4 @@ def test_cross_cta_finalize_accuracy_and_structure(finalize, monkeypatch):
     else:
         assert "atomicAdd" not in src, "the deferred kernel finalize must not emit atomicAdd"
         assert n_global == 2, f"deferred finalize splices a second combine kernel, got {n_global}"
+        assert "__partial" in src, "the producer writes its partial state to a workspace"

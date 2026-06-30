@@ -34,6 +34,7 @@ from deplodock.compiler.ir.tile.ir import (
     TileGraph,
     Transport,
 )
+from deplodock.compiler.ir.twist import MmaTwist
 from deplodock.compiler.pipeline.passes.lowering._addr import add as _fadd
 from deplodock.compiler.pipeline.passes.lowering._addr import mul as _fmul
 from deplodock.compiler.pipeline.passes.lowering.tile.assembly._tower import Role, _identity_rename, _wrap_tower
@@ -149,13 +150,18 @@ def _rebracket_k(
         is_primary = coop_axis is None or kn == coop_axis
         u = unit if is_primary else 1
         kc = thread if (thread is not None and is_primary) else None
+        # The cross-CTA split-K ``K_s`` GRID partition rides the PRIMARY axis only — the
+        # one cross-execution-unit partition (the matmul's single K, the flash KV stream),
+        # never an inner contraction (the QK^T D-reduce of a streaming flash, which is the
+        # carrier's hinge, not a partitionable axis).
+        kg = grid if (grid is not None and is_primary) else None
         stride = u * bk * fk
         ext = s.axis.extent
         symbolic = not ext.is_static
         if symbolic:
             k_o_ext = ext.ceil_div(stride)
-        elif grid is not None:
-            k_o_ext = ext.as_static() // (grid[1] * stride)
+        elif kg is not None:
+            k_o_ext = ext.as_static() // (kg[1] * stride)
         else:
             k_o_ext = ext.as_static() // stride
         k_o = Axis(f"{kn}_o", k_o_ext, source_axis=src)
@@ -168,8 +174,8 @@ def _rebracket_k(
         expr = expr + _scaled(k_i.name, u)
         if kc is not None:
             expr = expr + Var(kc.name)
-        if grid is not None:
-            expr = Var(grid[0].name) * Literal(k_o_ext * stride, "int") + expr
+        if kg is not None:
+            expr = Var(kg[0].name) * Literal(k_o_ext * stride, "int") + expr
         sigma_k = Sigma({kn: expr})
         inner = _rebracket_k(
             tuple(s.body), target_names, bk=bk, fk=fk, unit=unit, coop_axis=coop_axis, grid=grid, thread=thread, masking=masking
@@ -202,6 +208,24 @@ def _apply_masked_guards(body: tuple, bounds: list, sigma_outer: Sigma) -> tuple
         pred = sigma_outer.reduce(Var(name), SimplifyCtx({}))
         body = (Cond(cond=BinaryExpr("<", pred, bound), body=Body(body)),)
     return body
+
+
+def _lay_domain(layers: list[tuple[Axis, Binding]]) -> tuple[tuple[Axis, ...], dict[str, Binding]]:
+    """Build a block's ``(domain, binding)`` from innermost-first ``(axis, binding)`` layers — the
+    shared domain construction of ``warp_build`` / ``build_monoid`` (each tier lays
+    its own σ-split axes + a GRID trail). ``domain`` order is load-bearing (the tower nests
+    inner→outer); the ``binding`` dict is keyed by name (``structural_key`` sorts it)."""
+    return tuple(a for a, _ in layers), {a.name: b for a, b in layers}
+
+
+def _stream_compute(compute, new_kv: Stmt) -> Body:
+    """Wrap a kv-stream carry loop between the carrier-state ``Init`` seeds (above) and the epilogue
+    ``Assign`` / ``Write`` (below) — the identical postamble of both chain geometries of
+    ``build_monoid`` (the scalar FA-2 and warp branches). The register-replication / fragment realizer derives
+    which seeds / epilogue depend on ``d``; the chain restructure only relocates the stream loop."""
+    head_inits = tuple(s for s in compute if isinstance(s, Init))
+    epilogue = tuple(s for s in compute if isinstance(s, (Assign, Write)))
+    return Body((*head_inits, new_kv, *epilogue))
 
 
 def _k_s_axis(dag: IterDag, knobs: dict, target_names: frozenset[str]) -> Axis | None:
@@ -362,38 +386,188 @@ def _mask_carrier(body: tuple[Stmt, ...], pred: object) -> tuple[Stmt, ...]:
     return tuple(out)
 
 
-def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: frozenset[str]) -> TileGraph:
-    """The MONOID build move — one move for the cooperative reduce (softmax / rmsnorm
-    / mean / max) AND the streaming flash (online-softmax over a nested QK^T). Apply
-    the reduce-decomposition tower to **each** contraction axis the DAG exposes
-    (``_rebracket_k`` with ``masking="carrier"``, recursive for a nested stream) with the cooperative ``K_c``
-    THREAD lane on the primary axis, then σ-split the free axes (``free_tile``, register
-    forced to 1 by the caller). The ``K_c`` axis is laid FIRST in ``Block.domain`` so it
-    sits innermost in the THREAD tier (fastest threadIdx bits); ``assemble`` reconstructs
-    the tower from ``domain`` + ``Schedule.binding`` and the downstream combine rides the
-    carrier's ``axes``.
+def _realize_serial_monoid(stmts: tuple[Stmt, ...], carrier: Monoid, combiner) -> tuple[Stmt, ...]:  # noqa: ANN001
+    """Replace the ``carrier`` ``Monoid`` (matched by its carried state) wherever it sits in ``stmts``
+    — recursing into ``Loop`` bodies — with the ``ScalarCombiner``-projected serial merge (the fold as
+    ``Assign`` / ``Reassign`` statements). The carried-state ``Init`` seeds live above the reduce loop
+    already (the recognizer placed them), so only the per-iteration merge is realized here."""
+    merge = combiner.combine(carrier).merge
 
-    The caller pins the knobs per regime: a flat cooperative reduce searches ``(bk, fk,
-    br)``; a streaming flash defaults ``bk = fk = 1`` and ``br`` over the static KV axis
-    (cooperative-KV). ``BR > 1`` lays the cooperative lane — for the flat reduce the
-    carrier's commutative partition, for the stream each lane's strided slice into its own
-    online-softmax partial, merged at materialize via the carrier's ``combine_states``."""
+    def walk(body: tuple[Stmt, ...]) -> list[Stmt]:
+        out: list[Stmt] = []
+        for s in body:
+            if isinstance(s, Monoid) and s.state == carrier.state:
+                out.extend(merge)
+            elif isinstance(s, Loop):
+                out.append(replace(s, body=Body(tuple(walk(tuple(s.body))))))
+            else:
+                out.append(s)
+        return out
+
+    return tuple(walk(stmts))
+
+
+def build_monoid(op, knobs: dict, *, combiner: type) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
+    """The ONE MONOID build move — cooperative reduce, scalar FA-2 stream, OR warp tensor-core flash —
+    parametrized by the carrier ``Combiner`` *tier* (the existing ``ir/twist`` combiners, never a
+    per-case subclass). ``combiner`` is the only thing that varies between the tiers:
+
+    - ``MmaTwist`` → the **warp tier**: σ-tile + atomize the two chained contractions; the fragment
+      online-softmax combine is realized later by assembly's ``carry_scope_from_graph`` FROM the cells
+      emitted here (so this move never calls ``combine`` — the tier defers it).
+    - ``ScalarCombiner`` → the **scalar tier**: the carrier's ``combine`` is realized in-body. The
+      score's placement knob then picks the geometry — an ``INLINE`` score is the FA-2 shared-score
+      restructuring (``d`` rides a register vector ``O[d]``, the score computed ONCE per KV step and
+      shared across ``d``); otherwise the cooperative ``_rebracket_k`` tower over each contraction axis
+      (a flat reduce, or a serial stream).
+
+    The three are the honest 2×2 of (chained pair vs single contraction) × (scalar vs warp), dispatched
+    off ``MonoidReduction`` + the combiner — one composition, not three hand-written moves.
+
+    The caller pins the knobs per regime: a flat cooperative reduce searches ``(bk, fk, br)``; a
+    streaming flash defaults ``bk = fk = 1`` and ``br`` over the static KV axis (cooperative-KV).
+    ``BR > 1`` lays the cooperative ``K_c`` lane (the carrier's commutative partition for the flat
+    reduce; each lane's strided online-softmax partial for the stream, merged via ``combine_states``)."""
+    dag = op.dag
+    reduction = dag.reduction
+    carrier = reduction.carrier if reduction is not None else None
+
+    # === warp tier (``combiner is MmaTwist``): σ-tile + atomize the two chained contractions to the
+    # warp geometry (16 query rows / warp, the kv stream a 16-key serial-outer carry, D re-bracketed at
+    # ``atom_k``) via the generic ``atomize_cell``. The QK^T D-reduce → transposed-B ``Mma`` cells over
+    # the INLINE score; the split-carrier P@V → ``frag_a`` canonical-B cells. The fragment combine is
+    # realized later by ``carry_scope_from_graph`` FROM these cells (the MmaTwist tier defers it). ===
+    if combiner is MmaTwist:
+        tg = op.tilegraph
+        block = tg.blocks[0]
+        kv = reduction.hinge_name
+        kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
+        qkt_loop = next(s for s in kv_loop.body if isinstance(s, Loop))  # the QK^T D-reduce loop
+        qkt_body, a3_name = tuple(qkt_loop.body), qkt_loop.axis.name
+        # Geometry off the graph, no flash descriptor: ``D`` is the QK^T reduce extent; the operand
+        # dtype (→ which 16-bit mma atom) is read off a QK^T load's gmem buffer.
+        D = qkt_loop.axis.extent.as_static()
+        dtype = op.buffers[next(s for s in qkt_body if isinstance(s, Load)).input].dtype
+        atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if dtype == BF16 else "mma_m16n8k16_f16"]
+        atom_m, atom_n, atom_k = atom.shape
+        value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == reduction.carrier.partial[1])
+        m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry
+        m_b, _m_a, m_expr, m_bound = _split_axis(m_axis, [("a", atom_m, False)])
+        kv_b, _kv_a, kv_expr, kv_bound = _split_axis(kv_loop.axis, [("a", 16, False)])
+        nt_count, nd, kt = 16 // atom_n, D // atom_n, D // atom_k
+        # The score-masking ``Select`` the recognizer placed (the causal mask's structural form) is
+        # carried THROUGH so assembly reads causality off its presence, not off a flag.
+        score_mask = next((s for s in kv_loop.body if isinstance(s, Select)), None)
+        # produce — the QK^T D-reduce, σ-tiled per N-atom (nt) → a transposed-B Mma over the INLINE
+        # score (m, kv·16 + nt·atom_n). The D reduce becomes a ``ko`` K-tile loop of ``kt`` atom_k steps.
+        ko = "ko"
+        produce: list[Stmt] = []
+        for nt in range(nt_count):
+            n_base = _fadd(kv_expr, nt * atom_n)
+            sig = Sigma({m_axis.name: m_expr, kv: n_base, a3_name: _fmul(Var(ko), atom_k)})
+            cell = tuple(s.rewrite(_identity_rename, sig) for s in qkt_body)
+            axes = (Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n)))
+            produce.append(_atom_cell(cell, atom=atom, k_name=ko, kt=kt, axes=axes, out_index=(m_expr, n_base)))
+        # consume — the split-carrier P@V cell, σ-tiled per output N-atom (n) → a frag_a canonical-B Mma
+        # (A = the probability fragment, B = V), accumulating O[d]. The kv tile (16 keys) is one atom_k.
+        _stats, accum, d_state = split_carrier(reduction.carrier, reduction.carrier.partial[1])
+        prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
+        kpv = "kpv"
+        consume: list[Stmt] = []
+        for n in range(nd):
+            sig = Sigma({d_axis.name: Literal(n * atom_n, "int"), kv: _fadd(kv_expr, _fmul(Var(kpv), atom_k))})
+            vload = replace(value_load.rewrite(_identity_rename, sig), names=("vv",))
+            cell = (vload, Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")), Accum(name=d_state, value="pv"))
+            axes = (Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n)))
+            consume.append(_atom_cell(cell, atom=atom, k_name=kpv, kt=1, axes=axes, frag_a=True))
+        # The streaming carry body: produce cells → (the score-mask, when causal) → the full twisted
+        # carrier (the walk splits it via realize_fragment_softmax) → consume cells, in the kv carry.
+        mask = (score_mask,) if score_mask is not None else ()
+        new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, reduction.carrier, *consume)), kind="serial_outer")
+        compute = _stream_compute(block.compute, new_kv)  # the shared chain postamble (also the scalar FA-2 path)
+        domain, binding = _lay_domain([(m_b, Binding.GRID), *[(lp.axis, Binding.GRID) for lp in reversed(grid)]])
+        handoff_edge = Edge(src=block.name, dst=block.name, buffer="flash_pv_smem")
+        schedule = replace(
+            tg.schedule,
+            binding={**tg.schedule.binding, **binding},
+            carry=frozenset({kv_b.name}),
+            staged={**tg.schedule.staged, handoff_edge: Transport.SYNC},
+        )
+        return replace(tg, blocks=(replace(block, domain=domain, compute=compute), *tg.blocks[1:]), schedule=schedule)
+
+    # === scalar tier (``combiner is ScalarCombiner``): realize the carrier's combine in-body. ===
+    graph, target_names = op.tilegraph, op.target_names
+    sc = combiner()
+
+    # FA-2 shared-score stream: a real carried-contraction chain whose score is placed INLINE — ``d``
+    # rides a REGISTER vector ``O[d]`` and the score is computed ONCE per KV step (shared across ``d``).
+    # ``ScalarCombiner.combine`` realizes the online-softmax split (stats fold → rescale ``O·α`` →
+    # consume ``p·v`` → normalize ``O/l``) — the SAME combine the warp tier drives at the fragment tier.
+    if reduction is not None and reduction.inner is not None and knobs.get(fam.place_key(reduction.score)) == fam.INLINE:
+        block = graph.blocks[0]
+        body = tuple(block.compute)
+        value_name = carrier.partial[1]
+        kv_loop = next(s for s in body if isinstance(s, Loop) and s.axis.name == reduction.hinge_name)
+        kv_body = tuple(kv_loop.body)
+        value_load = next(s for s in kv_body if isinstance(s, Load) and s.name == value_name)
+        monoid = next(s for s in kv_body if isinstance(s, Monoid))
+        prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
+        fs = sc.combine(carrier)
+        m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry
+        # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
+        d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
+        m_split = knobs.get(fam.split_key(m_axis.name))
+        m_thread = fam.dec_split(m_split)[0] if m_split is not None else 1
+        m_b, (m_t, m_r), m_expr, m_bound = _split_axis(m_axis, [("t", m_thread, True), ("r", 1, True)], interleave_when_masked=True)
+        # ``010_split_register_axes`` replicates the d-dependent rescale/consume over ``O[d]``.
+        new_kv = replace(kv_loop, body=Body((*prefix, *fs.merge, value_load, *fs.rescale, *fs.consume)))
+        compute = tuple(_stream_compute(body, new_kv))
+        sigma = Sigma({d_axis.name: Var(d_r.name), m_axis.name: m_expr})
+        compute = tuple(s.rewrite(_identity_rename, sigma) for s in compute)
+        if m_bound is not None:
+            compute = _apply_masked_guards(compute, [(m_axis.name, m_bound)], sigma)
+        # Domain register..thread..grid (inner→outer); ``d_r`` is the innermost register.
+        domain, binding = _lay_domain(
+            [
+                (d_r, Binding.REGISTER),
+                (m_r, Binding.REGISTER),
+                (m_t, Binding.THREAD),
+                (m_b, Binding.GRID),
+                *[(lp.axis, Binding.GRID) for lp in reversed(grid)],
+            ]
+        )
+        new_block = Block(name=block.name, domain=domain, compute=Body(compute))
+        return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
+
+    # === cooperative reduce / serial stream: the ``_rebracket_k`` tower over each contraction axis,
+    # with the cooperative ``K_c`` THREAD lane (``BR`` lanes per row) on the primary axis, then the
+    # free-axis σ-split. ``K_c`` is laid FIRST in ``Block.domain`` (innermost THREAD bits). ===
     d = fam.dec_reduce(knobs[fam.reduce_key(dag.k_node.loop.axis.name)])
     bk, fk, br = d.serial, d.fold, d.coop
     targets = target_names or frozenset({dag.k_node.loop.axis.name})
-
     kax = dag.k_node.loop.axis
-    # The cooperative lane rides the primary axis only. A symbolic streaming axis stays
-    # serial (the offer set already returns ``br = 1`` for it); a flat symbolic reduce
-    # tiles the masked K at the hint and may carry ``br`` (ceil-div, masked fill).
     k_c = Axis(f"{kax.name}_c", br, source_axis=kax.source_axis or kax) if br > 1 else None
-
+    # Cross-CTA split-K: thread the ``K_s`` GRID partition through the re-bracket when ``cta > 1``.
+    k_s = _k_s_axis(dag, knobs, targets)
     block = graph.blocks[0]
-    compute = _rebracket_k(tuple(block.compute), targets, bk=bk, fk=fk, unit=br, coop_axis=kax.name, thread=k_c, masking="carrier")
+    compute_in = tuple(block.compute)
+    # A serial (br=1, single-CTA), non-twisted ``Monoid`` reduce realizes through the scalar combine
+    # (the SAME ``combine()`` the flash tiers drive); cooperative / split-K Monoids keep the carrier.
+    if br == 1 and k_s is None and isinstance(carrier, Monoid) and len(carrier.partial) == 1:
+        compute_in = _realize_serial_monoid(compute_in, carrier, sc)
+    compute = _rebracket_k(
+        compute_in,
+        targets,
+        bk=bk,
+        fk=fk,
+        unit=br,
+        coop_axis=kax.name,
+        thread=k_c,
+        grid=(k_s, d.cta) if k_s is not None else None,
+        masking="carrier",
+    )
     g = free_tile(replace(graph, blocks=(replace(block, compute=Body(compute)),)), dag, knobs, target_names=target_names)
     if k_c is not None:
-        # Lay K_c FIRST in domain (innermost THREAD bits), so the segmented cross-lane
-        # combine stays an aligned intra-warp segment.
         nb = g.blocks[0]
         g = replace(
             g,
@@ -403,202 +577,20 @@ def monoid_build(graph: TileGraph, dag: IterDag, knobs: dict, *, target_names: f
     return g
 
 
-# === The carried-contraction-chain build move (the shared-axis reduce_decomp) ===
-# A ``MONOID(SEMIRING)``
-# nest — a twisted carrier streaming over a nested contraction whose combine embeds a
-# SECOND contraction (flash: online softmax over QK^T, with P@V embedded in
-# ``O = O·α + p·v``) — is restructured so the **P@V free output ``d``** rides a register
-# vector ``O[BM, D]`` *inside* the stream and the score is computed ONCE per KV step and
-# **shared** across ``d`` (the INLINE score edge), instead of being recomputed per ``d``
-# block. This is the FA-2 nest the warp tier needs: the score becomes a register
-# fragment, the inner QK^T and the embedded P@V become two cells, and the twisted
-# carrier splits into a **scalar stats carrier** (row max / denom, ``d``-invariant) +
-# a **register-tiled accumulation carrier** (``O[d]``, reading the stats' rescale ``α``
-# and probability ``p``). Not flash-specific: it dispatches on the compositional
-# ``MONOID(SEMIRING)`` algebra the chain view exposes (``IterDag.chain``), the
-# ``MONOID(SEMIRING)`` analog of ``monoid_build``.
-
-
-def chain_build(graph: TileGraph, dag: IterDag, knobs: dict) -> TileGraph:
-    """The shared-axis reduce_decomp (Phase 1c): restructure a ``MONOID(SEMIRING)``
-    chain nest into the FA-2 form — the P@V output ``d`` as a register vector ``O[d]``
-    inside the stream, the score computed once per KV step (the INLINE score edge,
-    shared across ``d``), the twisted carrier split into a scalar stats carrier + a
-    register-tiled accumulation carrier.
-
-    ``d`` becomes a **REGISTER domain axis** (so the tower wraps the whole block once);
-    the register-replication pass (``kernel/010_split_register_axes``) then replicates
-    ONLY the statements that depend on the ``d`` var — the value load + the accumulation
-    carrier ``O[d]`` — while the score + the scalar stats carrier (which the split made
-    ``d``-independent) pass through shared, once per KV step. ``m`` binds THREAD, the
-    shared axes GRID. The reduce axes stay serial (``BN=1`` per step — the per-KV online
-    fold)."""
-    reduction = dag.reduction
-    if reduction is None or reduction.inner is None:
-        raise ValueError("chain_build requires a streaming MONOID(SEMIRING) reduction (inner contraction present)")
-    block = graph.blocks[0]
-    body = tuple(block.compute)
-    carrier = reduction.carrier
-    value_name = carrier.partial[1]
-
-    # Locate the KV stream loop + its carrier / value load.
-    kv_loop = next(s for s in body if isinstance(s, Loop) and s.axis.name == reduction.hinge_name)
-    kv_body = tuple(kv_loop.body)
-    value_load = next(s for s in kv_body if isinstance(s, Load) and s.name == value_name)
-    monoid = next(s for s in kv_body if isinstance(s, Monoid))
-    prefix = tuple(s for s in kv_body if s is not value_load and s is not monoid)  # d-invariant score chain
-
-    stats, accum, _d_state = split_carrier(carrier, value_name)
-    m_axis, d_axis, grid = chain_free_axes(reduction, dag)  # walk the composition for the geometry — no stored view
-
-    # ``d`` -> a REGISTER domain axis; ``m`` -> a THREAD tile (reg forced to 1).
-    d_r = Axis(f"{d_axis.name}_r", d_axis.extent, source_axis=d_axis.source_axis or d_axis)
-    m_split = knobs.get(fam.split_key(m_axis.name))
-    m_thread = fam.dec_split(m_split)[0] if m_split is not None else 1
-    m_b, (m_t, m_r), m_expr, m_bound = _split_axis(m_axis, [("t", m_thread, True), ("r", 1, True)], interleave_when_masked=True)
-
-    # The carrier-state Inits + epilogue stay where they are; the register-replication
-    # pass derives which (the ``O`` init / normalize / write) depend on ``d``.
-    head_inits = tuple(s for s in body if isinstance(s, Init))
-    epilogue = tuple(s for s in body if isinstance(s, (Assign, Write)))
-    new_kv = replace(kv_loop, body=Body((*prefix, stats, value_load, accum)))
-    compute: tuple[Stmt, ...] = (*head_inits, new_kv, *epilogue)
-
-    # σ-rewrite: ``d`` -> the register axis var; ``m`` -> its block/thread split.
-    sigma = Sigma({d_axis.name: Var(d_r.name), m_axis.name: m_expr})
-    compute = tuple(s.rewrite(_identity_rename, sigma) for s in compute)
-    if m_bound is not None:
-        compute = _apply_masked_guards(compute, [(m_axis.name, m_bound)], sigma)
-
-    # Domain ordered register..thread..grid (inner→outer) so the tower groups
-    # GridTile > ThreadTile > RegisterTile cleanly; ``d_r`` is the innermost register.
-    domain: list[Axis] = [d_r, m_r, m_t, m_b]
-    binding: dict[str, Binding] = {
-        d_r.name: Binding.REGISTER,
-        m_r.name: Binding.REGISTER,
-        m_t.name: Binding.THREAD,
-        m_b.name: Binding.GRID,
-    }
-    for lp in reversed(grid):
-        domain.append(lp.axis)
-        binding[lp.axis.name] = Binding.GRID
-    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(compute))
-    return replace(graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding=binding))
-
-
-# === Warp-tier flash build move (σ-tile + atomize the two chained contractions). ===
-# ``warp_chain_build`` produces the warp-tier flash as an **atomized streaming TileGraph** the
-# generic ``assembly._assemble.carry_scope_from_graph`` walk realizes (the fragment-tier softmax /
-# scale / mask / C→A handoff / epilogue). It σ-tiles + atomizes the QK^T cell (``out_index``
-# fragment output, transposed-B) and the P@V cell (``frag_a``, canonical-B) via the generic
-# ``atomize_cell`` — no hand-authored ``Mma``, no flat 1-D authoring (the render flattens the 4D
-# loads via the buffer strides). The kv-stream is the ``Schedule.carry`` axis; the score→P→A handoff
-# is a staged ``flash_pv_smem`` edge. This is the deployed warp-flash path (it replaced the
-# hand-assembled ``realize_flash``).
-
-
-def warp_chain_build(op) -> TileGraph:  # noqa: ANN001 — op: TileGraphOp (avoid the ir↔passes import)
-    """σ-tile the warp-tier flash's two chained contractions into an **atomized streaming**
-    ``TileGraph`` the generic ``carry_scope_from_graph`` walk realizes.
-
-    The seed's logical 4D cells are σ-tiled to the warp geometry (16 query rows / warp, the kv
-    stream a 16-key serial-outer carry, D re-bracketed at ``atom_k``) and fused via the generic
-    ``atomize_cell`` (the render flattens the 4D loads via the buffer strides — no flat 1-D
-    authoring). The QK^T inner D-reduce → ``2`` transposed-B ``Mma`` cells (the 16-col score =
-    ``16/atom_n`` N-atoms, ``out_index`` = the INLINE score ``(m, kv)``); the split-carrier P@V →
-    ``D/atom_n`` ``frag_a`` canonical-B ``Mma`` cells (``A`` = the probability fragment, ``B`` = V).
-    The kv stream is ``Schedule.carry``; the score→A handoff is a staged ``flash_pv_smem`` edge. The
-    block ``domain`` lays the warp tile (query block GRID, the grid axes GRID);
-    ``carry_scope_from_graph`` reads these AtomTiles + the carrier and assembles the ``CarryScope``
-    (softmax / scale / mask / handoff / epilogue) — the path that replaced ``realize_flash``."""
-    tg = op.tilegraph
-    block = tg.blocks[0]
-    reduction = op.dag.reduction
-    kv = reduction.hinge_name
-    kv_loop = next(s for s in block.compute if isinstance(s, Loop) and s.axis.name == kv)
-    qkt_loop = next(s for s in kv_loop.body if isinstance(s, Loop))  # the QK^T D-reduce loop
-    qkt_body, a3_name = tuple(qkt_loop.body), qkt_loop.axis.name
-
-    # Geometry off the graph, no flash descriptor: the head dim ``D`` is the QK^T reduce extent; the
-    # operand dtype (→ which 16-bit mma atom) is read off a QK^T load's gmem buffer.
-    D = qkt_loop.axis.extent.as_static()
-    dtype = op.buffers[next(s for s in qkt_body if isinstance(s, Load)).input].dtype
-    atom = ATOM_REGISTRY["mma_m16n8k16_bf16" if dtype == BF16 else "mma_m16n8k16_f16"]
-    atom_m, atom_n, atom_k = atom.shape
-
-    value_load = next(s for s in kv_loop.body if isinstance(s, Load) and s.names[0] == reduction.carrier.partial[1])
-    m_axis, d_axis, grid = chain_free_axes(reduction, op.dag)  # walk the composition for the geometry — no stored view
-
-    # σ-tile geometry. m (query row) → m_b·atom_m (GRID block, atom owns the 16 lane); kv (stream)
-    # → kv_b·16 (serial-outer carry, the 16-key tile owned by atom_n/atom_k); the QK^T 16-col score
-    # = ``16/atom_n`` N-atoms (nt); the P@V output D = ``D/atom_n`` N-atoms (n).
-    m_b, _m_a, m_expr, m_bound = _split_axis(m_axis, [("a", atom_m, False)])
-    kv_b, _kv_a, kv_expr, kv_bound = _split_axis(kv_loop.axis, [("a", 16, False)])
-    nt_count, nd, kt = 16 // atom_n, D // atom_n, D // atom_k
-    # The score-masking ``Select`` the recognizer placed (``v2 = select(col<=row, score, -inf)``) —
-    # the causal mask's structural representation. Carried THROUGH to the graph (below) so assembly
-    # reads causality off its presence, not off a flag. It is the score mask's analog of the carrier
-    # ``Monoid`` (the softmax's structural representation).
-    score_mask = next((s for s in kv_loop.body if isinstance(s, Select)), None)
-
-    # produce — the QK^T D-reduce, σ-tiled per N-atom (nt) → a transposed-B Mma over the INLINE
-    # score (m, kv·16 + nt·atom_n). The D reduce becomes a ``ko`` K-tile loop (the load's K base is
-    # ``ko·atom_k``, the atom spans the atom_k lane) — a degenerate 1-trip loop at D==atom_k keeps
-    # ``ko`` a *defined* runtime var (vs a raw D var the render can't strip into the fragment).
-    ko = "ko"
-    produce: list[Stmt] = []
-    for nt in range(nt_count):
-        n_base = _fadd(kv_expr, nt * atom_n)
-        sig = Sigma({m_axis.name: m_expr, kv: n_base, a3_name: _fmul(Var(ko), atom_k)})
-        cell = tuple(s.rewrite(_identity_rename, sig) for s in qkt_body)
-        fused = atomize_cell(cell, atom=atom, k_name=ko, write=None, out_index=(m_expr, n_base))
-        # kt>1: a real K_o serial loop (the atom spans atom_k per step). kt==1: the whole D is one
-        # atom — strip ``ko`` to 0 and emit the cell directly (the form 005_lower_atom_tile lowers).
-        if kt > 1:
-            body: tuple[Stmt, ...] = (SerialTile(axis=Axis(ko, Dim(kt)), body=Body(fused), kind="plain"),)
-        else:
-            body = tuple(s.rewrite(_identity_rename, Sigma({ko: Literal(0, "int")})) for s in fused)
-        produce.append(AtomTile(axes=(Axis("qm", Dim(atom_m)), Axis("qn", Dim(atom_n))), body=Body(body), atom=atom))
-
-    # consume — the split-carrier P@V cell, σ-tiled per output N-atom (n) → a frag_a canonical-B Mma
-    # (A = the probability fragment, B = V), accumulating O[d]. The kv tile (16 keys) is one atom_k:
-    # a 1-trip ``kpv`` K loop (load K base ``a3_b·16 + kpv·atom_k``, the atom spans the 16 keys).
-    _stats, accum, d_state = split_carrier(reduction.carrier, reduction.carrier.partial[1])
-    prob = next(a.args[0] for a in accum.merge if a.op.name == "multiply" and d_state not in a.args)  # p in p·v
-    kpv = "kpv"
-    consume: list[Stmt] = []
-    for n in range(nd):
-        # ``kpv`` is only the K var atomize needs to fuse the frag_a cell; the 16 keys are one atom,
-        # so strip it to 0 post-fuse (the atom spans them) → the Mma+V-load form 005 lowers.
-        sig = Sigma({d_axis.name: Literal(n * atom_n, "int"), kv: _fadd(kv_expr, _fmul(Var(kpv), atom_k))})
-        vload = replace(value_load.rewrite(_identity_rename, sig), names=("vv",))
-        cell = (vload, Assign(name="pv", op=ElementwiseImpl("multiply"), args=(prob, "vv")), Accum(name=d_state, value="pv"))
-        fused = atomize_cell(cell, atom=atom, k_name=kpv, write=None, frag_a=True)
-        body = tuple(s.rewrite(_identity_rename, Sigma({kpv: Literal(0, "int")})) for s in fused)
-        consume.append(AtomTile(axes=(Axis("am", Dim(atom_m)), Axis("an", Dim(atom_n))), body=Body(body), atom=atom))
-
-    # The streaming carry body: produce QK^T cells → (the score-mask ``Select``, when causal) → the
-    # full twisted carrier (the online-softmax Monoid — the walk splits it via
-    # realize_fragment_softmax) → consume P@V cells, wrapped in the kv-stream serial-outer carry.
-    # carry_scope_from_graph realizes the fragment phases (softmax / scale / mask / C→A handoff /
-    # epilogue) around these AtomTiles, reading causality off the ``Select``'s presence.
-    mask = (score_mask,) if score_mask is not None else ()
-    new_kv = SerialTile(axis=kv_b, body=Body((*produce, *mask, reduction.carrier, *consume)), kind="serial_outer")
-    head_inits = tuple(s for s in block.compute if isinstance(s, Init))
-    epilogue = tuple(s for s in block.compute if isinstance(s, (Assign, Write)))
-    compute = (*head_inits, new_kv, *epilogue)
-
-    domain = (m_b, *(lp.axis for lp in reversed(grid)))
-    binding = {m_b.name: Binding.GRID, **{lp.axis.name: Binding.GRID for lp in grid}}
-    handoff_edge = Edge(src=block.name, dst=block.name, buffer="flash_pv_smem")
-    schedule = replace(
-        tg.schedule,
-        binding={**tg.schedule.binding, **binding},
-        carry=frozenset({kv_b.name}),
-        staged={**tg.schedule.staged, handoff_edge: Transport.SYNC},
-    )
-    new_block = replace(block, domain=domain, compute=Body(compute))
-    return replace(tg, blocks=(new_block, *tg.blocks[1:]), schedule=schedule)
+def _atom_cell(cell, *, atom, k_name, kt, axes, out_index=None, frag_a=False) -> AtomTile:
+    """Build ONE warp-tier contraction cell — the shared per-cell atomization the flash produce
+    (QK^T) and consume (P@V) both perform: fuse the σ-tiled ``cell`` into an ``Mma`` via the generic
+    ``atomize_cell``, then wrap its K in a ``ko`` serial loop (``kt`` atom_k steps) or, at ``kt == 1``
+    (the whole reduce is one atom), strip the K var to 0 so ``005_lower_atom_tile`` lowers the bare
+    ``Mma``. ``out_index`` (the produce's INLINE score coords) / ``frag_a`` (the consume's
+    probability-fragment A operand) select the produce vs consume shape; the cell is wrapped in an
+    ``AtomTile`` over ``axes``."""
+    fused = atomize_cell(cell, atom=atom, k_name=k_name, write=None, out_index=out_index, frag_a=frag_a)
+    if kt > 1:
+        body: tuple[Stmt, ...] = (SerialTile(axis=Axis(k_name, Dim(kt)), body=Body(fused), kind="plain"),)
+    else:
+        body = tuple(s.rewrite(_identity_rename, Sigma({k_name: Literal(0, "int")})) for s in fused)
+    return AtomTile(axes=axes, body=Body(body), atom=atom)
 
 
 # === Warp-tier (tensor-core ``atomize``) build move. ===
@@ -638,21 +630,16 @@ def warp_build(graph: TileGraph, dag: IterDag, knobs: dict, *, atom: Atom) -> Ti
     bounds = [(n, b) for n, b in ((inner_n.name, n_bound), (outer_m.name, m_bound)) if b is not None]
     new_inner = _apply_masked_guards(new_inner, bounds, sigma_outer)
 
-    # Domain: N then M, each split b/w/r/a. ``_free_layers`` orders the tiers
-    # (ATOM innermost … GRID outermost) for ``assemble``; extra-outer trail GRID.
-    domain: list[Axis] = []
-    binding: dict[str, Binding] = {}
-    for a_b, a_w, a_r, a_a in ((n_b, n_w, n_r, n_a), (m_b, m_w, m_r, m_a)):
-        domain.extend((a_b, a_w, a_r, a_a))
-        binding[a_b.name] = Binding.GRID
-        binding[a_w.name] = Binding.WARP
-        binding[a_r.name] = Binding.REGISTER
-        binding[a_a.name] = Binding.ATOM
-    for lp in reversed(extra_outer):
-        domain.append(lp.axis)
-        binding[lp.axis.name] = Binding.GRID
-
-    new_block = Block(name=block.name, domain=tuple(domain), compute=Body(new_inner))
+    # Domain: N then M, each split b/w/r/a (GRID/WARP/REGISTER/ATOM); extra-outer trail GRID.
+    # ``_free_layers`` orders the tiers (ATOM innermost … GRID outermost) for ``assemble``.
+    tiers = (Binding.GRID, Binding.WARP, Binding.REGISTER, Binding.ATOM)
+    domain, binding = _lay_domain(
+        [
+            *[(ax, b) for axes in ((n_b, n_w, n_r, n_a), (m_b, m_w, m_r, m_a)) for ax, b in zip(axes, tiers, strict=True)],
+            *[(lp.axis, Binding.GRID) for lp in reversed(extra_outer)],
+        ]
+    )
+    new_block = Block(name=block.name, domain=domain, compute=Body(new_inner))
     return replace(
         graph, blocks=(new_block, *graph.blocks[1:]), schedule=replace(graph.schedule, binding={**graph.schedule.binding, **binding})
     )
