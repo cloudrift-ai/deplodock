@@ -315,12 +315,14 @@ def _overhangs(axis: Axis, tile: int) -> bool:
 class Contraction(Stmt):
     """A contraction **before** atom factorization — the seam between ``005_contract`` (constructs
     it, before materialize) and ``010_materialize`` (expands it via ``_factor.factorize``). **ONE
-    flat node, binding-driven for both atoms.** It holds the GRID skeleton (the tiled output
-    ``m_axis`` / ``n_axis``, the contraction ``k_axis``, any leading batch ``lead_axes``), the per-CTA
-    **UNIT** grid (``units_m`` × ``units_n`` — warps for mma, threads for scalar) + the per-unit
-    **REGISTER** sub-tile (``reg_m`` × ``reg_n``), the structured operands (the A/B ``Load``\\ s), the
-    fold accumulator ``acc``, the leaf ``atom`` (a tensor-core :class:`AtomKind` or the ``1×1``
-    :class:`ScalarAtom`), and the projection ``epilogue`` (which carries the output ``Write``).
+    flat node, binding-driven for both atoms.** It holds the GRID skeleton (the tiled output ``axes``
+    ``(m, n)``, the contraction ``k_axis``, any leading batch ``lead_axes``), the per-CTA **UNIT**
+    grid ``units`` ``(m, n)`` — warps for mma, threads for scalar — + the per-unit **REGISTER**
+    sub-tile ``regs`` ``(m, n)`` (the ``(units, regs, atom)`` triple mirrors the resolved
+    :class:`~deplodock.compiler.ir.tile.schedule.TilePlan`, in m-then-n order), the structured
+    operands (the A/B ``Load``\\ s), the fold accumulator ``acc``, the leaf ``atom`` (a tensor-core
+    :class:`AtomKind` or the ``1×1`` :class:`ScalarAtom`), and the projection ``epilogue`` (which
+    carries the output ``Write``).
 
     The contraction itself is **never stored** — both tiers *synthesize* it from the operands:
     ``_factor.codegen`` lowers the mma atom into ``ldmatrix`` + ``mma.sync`` and the scalar atom into a
@@ -332,13 +334,10 @@ class Contraction(Stmt):
     ``structural_key`` digests (the node IS keyed as an intermediate ``KernelOp``). The atom selects
     the codegen — there is no separate ``Leaf`` / per-atom subclass."""
 
-    m_axis: Axis
-    n_axis: Axis
+    axes: tuple[Axis, Axis]  # the tiled output (m_axis, n_axis)
     k_axis: Axis
-    units_m: int
-    units_n: int
-    reg_m: int
-    reg_n: int
+    units: tuple[int, int]  # per-CTA unit grid (units_m, units_n) — warps for mma, threads for scalar
+    regs: tuple[int, int]  # per-unit register sub-tile (reg_m, reg_n)
     a_load: Load
     b_load: Load
     acc: str
@@ -349,6 +348,32 @@ class Contraction(Stmt):
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
             object.__setattr__(self, "epilogue", Body(self.epilogue))
+
+    # ---- the (m, n) output-axis / unit / register split unpacked (the ``units`` / ``regs`` +
+    # ``units_m`` / … accessor idiom of ``TilePlan``); stored resolved, m-then-n ---------- #
+    @property
+    def m_axis(self) -> Axis:
+        return self.axes[0]
+
+    @property
+    def n_axis(self) -> Axis:
+        return self.axes[1]
+
+    @property
+    def units_m(self) -> int:
+        return self.units[0]
+
+    @property
+    def units_n(self) -> int:
+        return self.units[1]
+
+    @property
+    def reg_m(self) -> int:
+        return self.regs[0]
+
+    @property
+    def reg_n(self) -> int:
+        return self.regs[1]
 
     # ---- derived tiling geometry (read by ``_factor.factorize``) — from the unit/register widths
     # + the atom (``tile = units·reg·atom``, ``block_threads = units·units·lanes``) ---------- #
@@ -1904,13 +1929,10 @@ def _(s: Contraction, rename, sigma, axis_fn):
     # canonicalization); map the skeleton axes; pass the geometry / atom through. ``b_trans`` is
     # derived from ``b_load`` (a property), so the rewritten load carries it.
     return Contraction(
-        m_axis=axis_fn(s.m_axis),
-        n_axis=axis_fn(s.n_axis),
+        axes=tuple(axis_fn(a) for a in s.axes),
         k_axis=axis_fn(s.k_axis),
-        units_m=s.units_m,
-        units_n=s.units_n,
-        reg_m=s.reg_m,
-        reg_n=s.reg_n,
+        units=s.units,
+        regs=s.regs,
         a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
         b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
         acc=rename(s.acc),

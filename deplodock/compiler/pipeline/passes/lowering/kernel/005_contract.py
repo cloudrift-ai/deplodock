@@ -65,13 +65,10 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # selects the codegen (a tensor-core mma cell / the scalar fma cell); the unit / register widths
     # read off it in normalized (m, n) order — for scalar the UNIT grid IS the parallel thread-tile.
     contraction = Contraction(
-        m_axis=m_axis,
-        n_axis=n_axis,
+        axes=(m_axis, n_axis),
         k_axis=k_axis,
-        units_m=tier.units_m,
-        units_n=tier.units_n,
-        reg_m=tier.reg_m,
-        reg_n=tier.reg_n,
+        units=(tier.units_m, tier.units_n),
+        regs=(tier.reg_m, tier.reg_n),
         a_load=bind.a.load,
         b_load=bind.b.load,
         acc=bind.acc,
