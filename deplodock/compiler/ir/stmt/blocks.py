@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.stmt.algebra import Monoid, Twist
+from deplodock.compiler.ir.stmt.algebra import Carrier, Monoid
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Mma
@@ -60,9 +60,9 @@ class Loop(Stmt):
 
     ``role`` is the axis's scheduling :class:`~deplodock.compiler.ir.axis.AxisRole`
     (``FREE`` / ``PLANAR`` / ``CONTRACTION`` / ``TWISTED``), stamped by tile-lowering
-    detection; ``carrier`` is the :class:`~deplodock.compiler.ir.stmt.algebra.Twist`
-    algebra payload a reduce loop folds through (``None`` on a ``FREE`` loop or a
-    not-yet-annotated reduce). Both default to the unannotated ``FREE`` / ``None`` so
+    detection; ``carrier`` is the :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`
+    algebra payload (state + twist) a reduce loop folds through (``None`` on a ``FREE`` loop
+    or a not-yet-annotated reduce). Both default to the unannotated ``FREE`` / ``None`` so
     every existing construction site keeps working.
     """
 
@@ -70,7 +70,7 @@ class Loop(Stmt):
     body: Body
     unroll: bool = False
     role: AxisRole = AxisRole.FREE
-    carrier: Twist | None = None
+    carrier: Carrier | None = None
 
     def __post_init__(self) -> None:
         # Coerce so ``Loop(body=tuple_value)`` keeps working without
@@ -289,7 +289,7 @@ class StridedLoop(Stmt):
     body: Body
     unroll: bool = False
     role: AxisRole = AxisRole.FREE
-    carrier: Twist | None = None
+    carrier: Carrier | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):

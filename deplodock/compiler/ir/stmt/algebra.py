@@ -208,6 +208,127 @@ class Twist:
 
 
 @dataclass(frozen=True)
+class Carrier:
+    """The carrier **algebra** of a reduce — its carried :class:`State` plus the ψ-conjugated
+    :class:`Twist` combine — decoupled from any op-tree node or loop position.
+
+    This is the pure-algebra half of the (retiring) :class:`Monoid`: it knows how to derive the
+    streaming fold (:attr:`merge`), the cross-partition fold (:attr:`combine_states`), the
+    degenerate ``Accum`` form (:meth:`as_accums`), and the one-shot cross-partition combine
+    (:meth:`as_state_merge`) from ``(state, twist)`` — exactly as ``Monoid`` did — but it is NOT a
+    ``Stmt`` and carries no ``partial`` / ``axis``. A reduce ``Loop`` carries one
+    (``loop.carrier``) so the cooperative / cross-CTA materializers read the combine off the loop,
+    not a node. ``Monoid`` delegates every algebra method here during the transition."""
+
+    state: State
+    twist: Twist
+
+    @property
+    def out(self) -> str:
+        """The bound output name — the primary carried state component."""
+        return self.state.names[0]
+
+    @property
+    def state_b(self) -> tuple[str, ...]:
+        """The second-operand state names for the cross-partition combine — derived
+        (``"<n>__o"``) in spec mode, the stored value in bound mode."""
+        tw = self.twist
+        return self.state.other if tw.family is not None else tw.state_b
+
+    @cached_property
+    def merge(self) -> tuple[Stmt, ...]:
+        """The streaming single-element fold program — generated from the channel spec in spec
+        mode, the stored program in bound mode."""
+        tw = self.twist
+        if tw.family == "exp":
+            return exp_merge(self.state.names, tw.channels, key=self.state.names[0])
+        if tw.family == "id":
+            return id_merge(self.state.names, tw.channels)
+        return tw.merge
+
+    @cached_property
+    def combine_states(self) -> tuple[Assign, ...]:
+        """The cross-partition state⊕state fold program."""
+        tw = self.twist
+        if tw.family == "exp":
+            return exp_combine_states(self.state.names, self.state_b, key=self.state_b[0])
+        if tw.family == "id":
+            return id_combine_states(self.state.names, self.state_b, tw.channels)
+        return tw.combine_states
+
+    def partial_names(self) -> tuple[str, ...]:
+        """The bound name of each partial the merge folds in (its external reads)."""
+        return _merge_reads(self.merge, self.state.names)
+
+    def dissolve(self) -> list[Stmt]:
+        """The loose fold stmts this carrier lowers to — bare ``Accum``\\ s for a degenerate
+        carrier (:meth:`as_accums`), else the streaming ``merge``."""
+        accums = self.as_accums()
+        return list(accums) if accums is not None else list(self.merge)
+
+    def as_accums(self) -> list[Accum] | None:
+        """If this is a **degenerate** carrier (the identity twist — each state component folded
+        by its own self-op, no rescale temps), the equivalent ``Accum`` folds; else ``None``."""
+        if self.twist.family == "id":  # the degenerate family IS the bare folds
+            return id_accums(self.state.names, self.twist.channels)
+        if self.twist.family is not None:  # a twisted family (exp) is never degenerate
+            return None
+        merge = self.merge
+        names = set(self.state.names)
+        if len(merge) != len(self.state.names):
+            return None
+        accums: list[Accum] = []
+        for a in merge:
+            if a.name not in names or len(a.args) != 2 or a.args[0] != a.name:
+                return None
+            accums.append(Accum(name=a.name, value=a.args[1], op=a.op, dtype=a.dtype))
+        return accums
+
+    def as_state_merge(self, other: tuple[str, ...]) -> StateMerge:
+        """A one-shot :class:`StateMerge` stmt that folds this carrier's ``state`` with a second
+        fully-reduced state named ``other`` (the cross-partition combine's right operand). The
+        merge program IS ``combine_states`` with ``state_b`` renamed to ``other``, so the
+        cooperative-tree / cross-CTA reduce renders it through the same machinery as a streaming
+        step."""
+        if self.twist.family == "exp":
+            merged = exp_combine_states(self.state.names, other, key=other[0])
+        else:
+            sub = dict(zip(self.state_b, other, strict=True))
+            merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
+        return StateMerge(state=self.state, merge=merged, state_b=other)
+
+
+@dataclass(frozen=True)
+class StateMerge(Stmt):
+    """The cross-partition state⊕state combine, as a **renderable** loop-IR stmt (its right
+    operand is a second fully-reduced state named :attr:`state_b`). Emitted by
+    :meth:`Carrier.as_state_merge` for the REG tree / cooperative-tree / cross-CTA finalize; it
+    renders the ψ-rescale state reassignment via ``render_merge_program`` (the same path
+    ``Monoid.render`` took for a bound-mode state-merge). Unlike ``Accum`` it is not a fold
+    carrier — it sits in a combine region, not a streaming fold loop, so it never makes its
+    enclosing loop ``is_reduce``."""
+
+    state: State
+    merge: tuple[Stmt, ...]
+    state_b: tuple[str, ...]
+
+    def deps(self) -> tuple[str, ...]:
+        return self.state_b
+
+    def defines(self) -> tuple[str, ...]:
+        return self.state.names
+
+    def pretty(self, indent: str = "") -> list[str]:
+        lines = [f"{indent}({', '.join(self.state.names)}) <- combine_states({', '.join(self.state_b)})"]
+        for a in self.merge:
+            lines += a.pretty(indent + "    ")
+        return lines
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        return render_merge_program(self.merge, self.state.names, ctx)
+
+
+@dataclass(frozen=True)
 class Monoid(Stmt):
     """A loop-carried **monoid** combine — a general associative reduce over
     internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
@@ -278,14 +399,17 @@ class Monoid(Stmt):
     # ``Loop`` and clears ``partial`` on the in-loop carrier it leaves.
     axis: Axis | None = None
 
+    @cached_property
+    def carrier(self) -> Carrier:
+        """The decoupled algebra payload (:class:`Carrier`) — ``(state, twist)``. The op-tree
+        ``Monoid`` delegates every algebra query here; a reduce ``Loop`` stores one directly
+        (``loop.carrier``). Cached — ``Monoid`` is frozen with a ``__dict__`` (never ``slots``)."""
+        return Carrier(self.state, self.twist)
+
     @property
     def out(self) -> str:
-        """The bound output name — the primary carried state (the φ projection, if any, is
-        a :class:`Map` *over* this Monoid, not a field here). Derived, not stored: we
-        always know what a monoid accumulates (and an mma-fragment output won't fit a
-        stored ``str``). Seeds at lowering ride on the carrier's fold ``Accum``\\ s
-        (``op.identity``), derived by ``Loop.render`` — no explicit ``Init``."""
-        return self.state.names[0]
+        """The bound output name — the primary carried state component."""
+        return self.carrier.out
 
     @property
     def reduce_node(self) -> Monoid:
@@ -294,77 +418,34 @@ class Monoid(Stmt):
 
     @property
     def state_b(self) -> tuple[str, ...]:
-        """The second-operand state names for the cross-partition combine. Derived from the
-        carrier ``State`` in spec mode (``"<n>__o"``); the stored value in bound mode."""
-        tw = self.twist
-        return self.state.other if tw.family is not None else tw.state_b
+        """The second-operand state names for the cross-partition combine."""
+        return self.carrier.state_b
 
-    @cached_property
+    @property
     def merge(self) -> tuple[Stmt, ...]:
-        """The streaming single-element fold program. Generated from the channel spec in spec
-        mode (``family`` set), the stored program in bound mode. Cached on the instance —
-        ``Monoid`` is frozen with a ``__dict__`` (never give it ``slots=True``)."""
-        tw = self.twist
-        if tw.family == "exp":
-            return exp_merge(self.state.names, tw.channels, key=self.state.names[0])
-        if tw.family == "id":
-            return id_merge(self.state.names, tw.channels)
-        return tw.merge
+        """The streaming single-element fold program (delegated to :attr:`carrier`)."""
+        return self.carrier.merge
 
-    @cached_property
+    @property
     def combine_states(self) -> tuple[Assign, ...]:
-        """The cross-partition state⊕state fold program. Generated in spec mode (temps keyed on
-        ``state_b[0]`` so distinct REG-tier folds never collide), the stored program in bound
-        mode."""
-        tw = self.twist
-        if tw.family == "exp":
-            return exp_combine_states(self.state.names, self.state_b, key=self.state_b[0])
-        if tw.family == "id":
-            return id_combine_states(self.state.names, self.state_b, tw.channels)
-        return tw.combine_states
+        """The cross-partition state⊕state fold program (delegated to :attr:`carrier`)."""
+        return self.carrier.combine_states
 
     def partial_names(self) -> tuple[str, ...]:
-        """The bound name of each partial the merge folds in — the merge's external reads (args
-        that are neither carried state nor merge-internal temps), in first-use order. Derived
-        from the merge (its source of truth), so it holds whether ``partial`` carries op-tree
-        source nodes or is the empty loop-IR carrier."""
-        return _merge_reads(self.merge, self.state.names)
+        """The bound name of each partial the merge folds in (the merge's external reads)."""
+        return self.carrier.partial_names()
 
     def dissolve(self) -> list[Stmt]:
         """The loose fold stmts this carrier lowers to — bare ``Accum``\\ s for a degenerate
-        carrier (:meth:`as_accums`), else the streaming ``merge`` (ψ-rescale ``Assign``\\ s +
-        ``base``-``Accum`` folds). The ``Monoid`` stmt is a recognition-time grouping; once the
-        schedule is realized it dissolves into these folds, so seeding always goes through the
-        fold ``Accum``\\ s (ONE placement path — ``Loop.render`` never special-cases a carrier)
-        and no ``Monoid`` stmt reaches a rendered loop body."""
-        accums = self.as_accums()
-        return list(accums) if accums is not None else list(self.merge)
+        carrier, else the streaming ``merge`` (delegated to :attr:`carrier`). The ``Monoid`` stmt
+        is a recognition-time grouping; once the schedule is realized it dissolves into these
+        folds (seeding via the fold ``Accum``\\ s' ``op.identity`` in ``Loop.render``), so no
+        ``Monoid`` stmt reaches a rendered loop body."""
+        return self.carrier.dissolve()
 
     def as_accums(self) -> list[Accum] | None:
-        """If this is a **degenerate** carrier (the identity twist — each state
-        component folded by its own self-op, ``state_i = op_i(state_i, partial_i)``,
-        no rescale temps), return the equivalent list of ``Accum`` folds; else
-        ``None``. A plain reduce (``sum`` / ``max`` / ``min``) is degenerate; a
-        twisted carrier (online softmax / flash) is not (its merge reads sibling
-        components + rescale temps). Lets ``ir.tile.ops.lower`` emit a degenerate
-        reduce as bare ``Accum``\\ s — seed derived from ``op.identity`` by
-        ``Loop.render``, no explicit ``Init`` — instead of a ``Monoid`` carrier."""
-        if self.twist.family == "id":  # the degenerate family IS the bare folds
-            return id_accums(self.state.names, self.twist.channels)
-        if self.twist.family is not None:  # a twisted family (exp) is never degenerate
-            return None
-        merge = self.merge
-        names = set(self.state.names)
-        if len(merge) != len(self.state.names):
-            return None
-        accums: list[Accum] = []
-        for a in merge:
-            # identity-twist shape: ``state = op(state, partial)`` — target is a state
-            # component, left operand is that same component, one partial right operand.
-            if a.name not in names or len(a.args) != 2 or a.args[0] != a.name:
-                return None
-            accums.append(Accum(name=a.name, value=a.args[1], op=a.op, dtype=a.dtype))
-        return accums
+        """The degenerate-carrier ``Accum`` folds, or ``None`` (delegated to :attr:`carrier`)."""
+        return self.carrier.as_accums()
 
     def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
         """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
@@ -461,4 +542,4 @@ def _merge_reads(merge: tuple[Stmt, ...], state_names: tuple[str, ...]) -> tuple
     return tuple(reads)
 
 
-__all__ = ["AlgebraNode", "Map", "Semiring", "State", "Twist", "Monoid"]
+__all__ = ["AlgebraNode", "Carrier", "Map", "Semiring", "State", "StateMerge", "Twist", "Monoid"]
