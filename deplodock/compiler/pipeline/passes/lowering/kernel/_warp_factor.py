@@ -17,7 +17,6 @@ from deplodock.compiler.ir.kernel.ir import (
     Contraction,
     EpilogueLoad,
     LdmatrixLoad,
-    MmaLeaf,
     MmaSyncPtx,
     RegEpilogue,
     RegFragment,
@@ -85,14 +84,13 @@ def mma_codegen(c: Contraction):
     comes from the register tile). The smem operand-staging pipeline (cp.async / TMA) was dropped to
     restore symmetry with the scalar tier — a symmetric staging mechanism for both tiers is reserved
     (the ``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/tile/schedule``)."""
-    leaf: MmaLeaf = c.leaf
-    atom = leaf.atom
+    atom = c.atom
     atom_k = atom.atom_k
-    a_load, b_load, b_trans, acc = leaf.a_load, leaf.b_load, leaf.b_trans, leaf.acc
+    a_load, b_load, b_trans, acc = c.a_load, c.b_load, c.b_trans, c.acc
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    reg_m, reg_n = leaf.reg_m, leaf.reg_n
+    reg_m, reg_n = c.reg_m, c.reg_n
     pre: list[Stmt] = []
-    tail = list(leaf.body)
+    tail = list(c.epilogue)
     write = next(s for s in tail if isinstance(s, Write))
     a_frags = [f"_a{i}" for i in range(reg_m)]
     b_frags = [f"_b{j}" for j in range(reg_n)]

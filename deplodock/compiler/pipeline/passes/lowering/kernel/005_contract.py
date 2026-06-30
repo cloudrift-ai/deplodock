@@ -1,107 +1,91 @@
-"""Construct the high-level :data:`Contraction` node for a ``Semiring`` contraction — **before**
+"""Construct the high-level :class:`Contraction` node for a ``Semiring`` contraction — **before**
 materialize.
 
-A contraction kernel is captured here as a single :class:`Contraction` ``KernelOp`` that
-``010_materialize`` then expands — ONE node carrying the shared GRID skeleton + a per-atom
-:data:`Leaf` payload (see ``ir/tile/atom``). Two arms, one per leaf:
+ONE binding-driven node for both tiers. 005 reads the operand→role binding — already on
+``sched.bind`` for the warp tier (stamped by ``020_schedule``), computed here via
+:func:`semiring_binding` for the scalar register-tile tier — resolves the projection epilogue, and
+stamps the per-CTA **UNIT** grid (warps for mma, threads for scalar) + the per-unit **REGISTER**
+sub-tile + the leaf ``atom``. ``010_materialize`` expands it; the contraction itself is *synthesized*
+per atom (``mma.sync`` / a scalar register-tile loop), so the node stores only the operands + the
+epilogue.
 
-- **mma arm** (:class:`MmaLeaf`) — a warp-tier ``SemiringKernel`` (its schedule carries a
-  ``WarpTile``): the op-tree-dependent part only — capture the m/n/k axes, read the ``020_schedule``
-  operand→role binding, resolve the projection epilogue. Tensor-core ``AtomKind`` leaf.
-- **scalar arm** (:class:`ScalarLeaf`) — a register-tiled ``SemiringKernel`` (its ``TILE``
-  plan tiles the output): lower the per-cell body (``lower(op)`` + output-store glue) and capture it
-  with the register / parallel widths + tiled axes. Scalar ``1×1`` fma leaf.
-
-The expansion (the four-way GRID/UNIT/REGISTER/ATOM tiling, via the shared ``_tiling`` layer) is
-folded into ``010_materialize`` (which runs next). Splitting the construction out keeps the
-contraction a first-class node that exists *before* thread-binding; the per-cell scalar fallback and
-the cooperative reduce tier stay in ``010_materialize`` (a non-contraction / non-tiled ``TileOp`` is
-skipped here and passes through). The node IS ``structural_key``-ed as an intermediate ``KernelOp``."""
+A contraction whose operands aren't plain ``Load``\\ s (a computed-cone / demoted matmul) or whose
+output is 1-D is **not bindable** — it's skipped here (``RuleSkipped``) and the per-cell scalar
+fallback in ``010_materialize`` lowers it. A non-contraction / non-tiled ``TileOp`` is skipped too."""
 
 from __future__ import annotations
 
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import Contraction, MmaLeaf, ScalarLeaf
+from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile import SemiringKernel, TileOp
-from deplodock.compiler.ir.tile.ops import lower
+from deplodock.compiler.ir.tile.atom import SCALAR_ATOM
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
+from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 PATTERN = [Pattern("root", TileOp)]
 
 
-def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
-    """The mma arm: read the ``020_schedule`` binding + warp geometry into an :class:`MmaLeaf` and
-    resolve the projection epilogue (``with_store`` needs the op's ``out`` + grid). The exact atom
-    factorization is expanded from the node by ``010_materialize`` (:func:`_factor.factorize`)."""
-    node = tile.op
-    grid = list(sched.place.grid)
-    if len(grid) < 2:
-        raise LoweringError("warp tier: contraction output needs an (m, n) grid")
-    m_axis, n_axis = grid[-2], grid[-1]
-    k_axis = node.reduce_node.reduce_axis
-    bind = sched.bind
-    assert bind is not None, "warp tier: 020_schedule did not stamp a binding"
-    # TODO(warp-spec): emit the producer/consumer warp split from sched.workers (the WSPEC
-    # role allocation) — dedicate producer warps to the Stage load half, compute warps to the mma.
-    # Reserved this cut: the codec + schedule field land, but materialization stays uniform SIMT.
-    # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized
-    # store of the accumulator (``with_store`` needs ``node.out`` / the grid, so it stays here).
-    tail = list(bind.epilogue)
-    if not has_write(tail):
-        tail = with_store(tail, root.output.name, grid, node)
-    wt = sched.warp_tile
-    leaf = MmaLeaf(
-        threads_m=wt.warps[0] * wt.atom.lanes_m,  # warps × the cell's lane grid = the CTA thread grid
-        threads_n=wt.warps[1] * wt.atom.lanes_n,
-        reg_m=wt.reg[0],
-        reg_n=wt.reg[1],
-        atom=wt.atom,
-        a_load=bind.a.load,
-        b_load=bind.b.load,
-        b_trans=bind.b_trans,
-        acc=bind.acc,
-        body=Body(tail),
-    )
-    return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis)
-
-
-def _scalar_contraction(tile: TileOp, sched, root: Node) -> Contraction:
-    """The scalar arm: lower the per-cell body (``lower(op)`` + output-store glue) into a
-    :class:`ScalarLeaf` with the register / parallel widths. Cell tiling is expanded from the node
-    by ``010_materialize`` (:func:`_factor.factorize`)."""
-    node = tile.op
-    grid = list(sched.place.grid)
-    n_axis = grid[-1]
-    m_axis = grid[-2] if len(grid) >= 2 else None
-    lead = tuple(grid[:-2]) if m_axis is not None else tuple(grid[:-1])
-    k_axis = node.reduce_node.reduce_axis
-    plan = sched.tile
-    leaf = ScalarLeaf(
-        threads_m=plan.par_m if m_axis is not None else 1,  # scalar lanes = 1×1, so threads == units
-        threads_n=plan.par_n,
-        reg_m=plan.reg_m if m_axis is not None else 1,
-        reg_n=plan.reg_n,
-        body=Body(with_store(lower(node), root.output.name, grid, node)),
-    )
-    return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis, lead_axes=lead)
-
-
 def rewrite(match: Match, root: Node) -> KernelOp | None:
-    """Build the :data:`Contraction` node for a warp / register-tiled ``Semiring`` kernel; skip
-    every other tier (it materializes in ``010``)."""
+    """Build the :class:`Contraction` for a warp / register-tiled ``Semiring`` kernel; skip every
+    other tier (it materializes in ``010``), and skip an unbindable contraction (the per-cell
+    fallback in ``010`` lowers it)."""
     tile: TileOp = root.op
     kernel = tile.kernel
     sched = kernel.schedule if kernel is not None else None
     if not isinstance(kernel, SemiringKernel):
         raise RuleSkipped("not a contraction")
-    if getattr(sched, "warp_tile", None) is not None:
-        node = _warp_contraction(tile, sched, root)
-    elif getattr(sched, "tile", None) is not None and sched.tile.is_tiled:
-        node = _scalar_contraction(tile, sched, root)
+    is_warp = getattr(sched, "warp_tile", None) is not None
+    is_tiled = getattr(sched, "tile", None) is not None and sched.tile.is_tiled
+    if not (is_warp or is_tiled):
+        raise RuleSkipped("non-tiled contraction — per-cell fallback in 010")
+
+    node = tile.op
+    grid = list(sched.place.grid)
+    # The operand→role binding: stamped on the warp schedule by 020_schedule; computed here for the
+    # scalar tier. An unbindable contraction (a non-Load operand, or a 1-D output grid) raises — it
+    # falls through to the per-cell fallback in 010.
+    try:
+        bind = sched.bind if sched.bind is not None else semiring_binding(node, grid)
+    except LoweringError:
+        raise RuleSkipped("contraction not bindable — per-cell fallback in 010") from None
+
+    m_axis, n_axis = grid[-2], grid[-1]
+    lead = tuple(grid[:-2])
+    k_axis = node.reduce_node.reduce_axis
+    # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized store
+    # of the accumulator (``with_store`` needs ``node.out`` / the grid, so it stays here).
+    tail = list(bind.epilogue)
+    if not has_write(tail):
+        tail = with_store(tail, root.output.name, grid, node)
+
+    # TODO(warp-spec): emit the producer/consumer warp split from sched.workers (the WSPEC role
+    # allocation) — reserved this cut; materialization stays uniform SIMT.
+    if is_warp:
+        wt = sched.warp_tile
+        atom, units_m, units_n, reg_m, reg_n = wt.atom, wt.warps[0], wt.warps[1], wt.reg[0], wt.reg[1]
     else:
-        raise RuleSkipped("non-tiled contraction — per-cell fallback in 010")  # scalar fallback
-    return KernelOp(body=Body((node,)), name=tile.name)
+        plan = sched.tile  # scalar: the parallel thread-tile IS the UNIT grid (lanes 1×1)
+        atom, units_m, units_n, reg_m, reg_n = SCALAR_ATOM, plan.par_m, plan.par_n, plan.reg_m, plan.reg_n
+
+    contraction = Contraction(
+        m_axis=m_axis,
+        n_axis=n_axis,
+        k_axis=k_axis,
+        output=root.output.name,
+        units_m=units_m,
+        units_n=units_n,
+        reg_m=reg_m,
+        reg_n=reg_n,
+        a_load=bind.a.load,
+        b_load=bind.b.load,
+        b_trans=bind.b_trans,
+        acc=bind.acc,
+        atom=atom,
+        lead_axes=lead,
+        epilogue=Body(tail),
+    )
+    return KernelOp(body=Body((contraction,)), name=tile.name)

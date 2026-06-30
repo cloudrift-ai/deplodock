@@ -10,23 +10,47 @@ of output cells; the reduce-loop body is replicated per cell (its operand loads 
 arithmetic-intensity reuse), the small inner reduce unrolled, and each cell writes its own (guarded)
 output.
 
-The body comes from the contraction's lowered per-cell body (``lower(op)``, captured in
-``005_contract`` on the ``ScalarLeaf``), split into a ``pre`` region / the reduce ``Loop`` / a
-projection ``tail``. Leading ``_`` so the pass loader skips this module."""
+The reduce loop is **synthesized** from the binding's operands (``for k: acc += a*b`` — the scalar
+counterpart of ``mma.sync``), then replicated per register cell + the projection ``epilogue``. The
+contraction is never stored as a body. Leading ``_`` so the pass loader skips this module."""
 
 from __future__ import annotations
 
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr
-from deplodock.compiler.ir.kernel.ir import Contraction, ScalarLeaf
+from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Stmt, Write
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
+
+#: The contraction semiring — multiply ⊗ then accumulate ⊕ (add). The same multiply-add ``mma.sync``
+#: realizes; here it is a plain scalar fma loop.
+_MUL = ElementwiseImpl("multiply")
+_ADD = ElementwiseImpl("add")
 
 
 def _unroll_inner(axis) -> bool:
     """Mark the inner contraction loop for ``#pragma unroll`` when it's a small static reduce
     (≤ 64 trips) — register-resident operand reuse + ILP, the scalar-SGEMM lever."""
     return axis.extent.is_static and axis.extent.as_static() <= 64
+
+
+def _synth_reduce(c: Contraction) -> Loop:
+    """Synthesize the scalar contraction reduce loop ``for k: v = a*b; acc += v`` from the binding's
+    operand ``Load``\\ s — the register-tile counterpart of the warp tier's ``mma.sync`` (and the
+    body ``lower(op)`` used to produce). ``005_contract`` extracted A/B as plain leaf ``Load``\\ s, so
+    the loop reuses them directly (their indices carry the cell ``m`` / ``n`` + the loop ``k``)."""
+    k, a, b = c.k_axis, c.a_load, c.b_load
+    v = f"{c.acc}__v"
+    body = Body(
+        (
+            b,  # B[k, n]
+            a,  # A[m, k]
+            Assign(name=v, op=_MUL, args=(b.name, a.name)),
+            Accum(name=c.acc, value=v, op=_ADD, axes=(k.name,)),
+        )
+    )
+    return Loop(axis=k, body=body, unroll=_unroll_inner(k))
 
 
 def _dedup_loads(stmts: list[Stmt]) -> list[Stmt]:
@@ -89,20 +113,17 @@ def _scalar_bound(m_axis, n_axis, offset, i: int, j: int, masks):
 
 def scalar_codegen(c: Contraction):
     """The scalar leaf codegen — returns the ``(state_decls, reduce_region, store)`` callables
-    ``_factor.factorize`` hands to ``grid_tile``. Splits the captured per-cell body **once** (a
-    ``pre`` region / the reduce ``Loop`` over the contraction axis / a projection ``tail``) and
-    replicates it per register cell (operand loads deduped — the arithmetic-intensity reuse); the
-    tiling geometry (tile / mask / axis names) is read off ``c``.
-
-    (This is the scalar tier's whole codegen — the body split + protected-name set that used to live
-    on a ``ScalarUnit`` object now live in this closure scope, so there is no per-atom object beside
-    the ``Contraction``.)"""
-    leaf: ScalarLeaf = c.leaf
+    ``_factor.factorize`` hands to ``grid_tile``. **Synthesizes** the reduce loop from the binding's
+    operands (:func:`_synth_reduce`) and replicates it + the projection ``epilogue`` per register cell
+    (operand loads deduped — the arithmetic-intensity reuse); the tiling geometry (tile / mask / axis
+    names) is read off ``c``. There is no stored body and no per-atom object beside the
+    ``Contraction``."""
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    # Split the lowered per-cell body: the ``pre`` region, the reduce ``Loop``, and the ``tail``.
-    full = list(leaf.body)
-    ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == k_axis.name)
-    pre, rloop, tail = full[:ridx], full[ridx], full[ridx + 1 :]
+    # The reduce loop is synthesized from the operands; the projection ``tail`` is the epilogue. There
+    # is no pre-loop region — any loop-invariant operand reads ride in the epilogue.
+    pre: list[Stmt] = []
+    rloop = _synth_reduce(c)
+    tail = list(c.epilogue)
     # The shared iteration coordinates — excluded from the per-cell SSA rename.
     prot = {c.n_b, c.n_uvar, k_axis.name}
     if m_axis is not None:
