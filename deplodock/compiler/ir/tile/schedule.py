@@ -539,7 +539,7 @@ class TileSchedule:
     - ``stage`` — the operand smem pipeline (:class:`Stage`); ``None`` = gmem-direct.
     - ``workers`` — the warp-specialization split (:class:`WarpSpec`); ``None`` = uniform SIMT.
     - ``bind`` — the resolved contraction operand→role binding (:class:`AtomBinding`), filled by
-      ``020_schedule`` once the warp tier is chosen / by ``005_contract`` for the scalar tier; else
+      ``020_schedule`` once the warp tier is chosen / by ``010_materialize`` for the scalar tier; else
       ``None``."""
 
     place: Placement

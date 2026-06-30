@@ -48,8 +48,8 @@ is rejected at fork construction, alongside `_check_warp_static_k`, instead of f
 
 - a warp / register-tiled `CONTRACTION` contraction → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to
   roles by which output grid axis each operand's OWN leaf `Load` index carries (structural — read off the annotated loop,
-  not a flattened-loop scan), plus `b_trans`, the fold accumulator, and the projection epilogue. `005_contract` / `_warp`
-  read the binding instead of `lower()`-ing the contraction and pattern-matching the result.
+  not a flattened-loop scan), plus `b_trans`, the fold accumulator, and the projection epilogue. `010_materialize`'s
+  `_build_contraction` / `_warp` read the binding instead of `lower()`-ing the contraction and pattern-matching the result.
 - a cooperative / ILP reduce (`PLANAR` / `TWISTED`, or a non-output-tiled `CONTRACTION`) needs **no** binding here — its
   accumulator dtype + the shuffle/tree fold mechanism are **derived** at materialize time (`emit_combine` off the carrier
   + `ReduceStage.combine`), never stored.

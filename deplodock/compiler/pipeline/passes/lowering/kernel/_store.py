@@ -1,10 +1,10 @@
 """Shared output-store glue for the kernel materializer + the contraction constructor.
 
 The two tiny helpers that decide whether a lowered body already writes its output and, if
-not, append the grid-cell ``Write``. Used by both ``005_contract`` (the warp/mma contraction
-node) and ``010_materialize`` (the scalar / reduce / register-tile tiers), so they live here
-rather than in either rule module. Leading ``_`` so the pass loader (globs ``*.py``, skips
-``_``-prefixed) skips this module."""
+not, append the grid-cell ``Write``. Used by ``010_materialize`` for both the contraction
+build (``_build_contraction``, the warp/mma contraction node's epilogue) and the scalar /
+reduce / register-tile tiers, so they live here rather than in the rule module. Leading ``_``
+so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips this module."""
 
 from __future__ import annotations
 

@@ -94,8 +94,8 @@ class Reduction:
 
 @dataclass(frozen=True)
 class Contraction(Stmt):
-    """A contraction **before** atom factorization — the seam between ``005_contract`` (constructs
-    it, before materialize) and ``010_materialize`` (expands it via ``_factor.factorize``). **ONE
+    """A contraction **before** atom factorization — built and expanded in ``010_materialize``
+    (:func:`_build_contraction` resolves the binding, ``_factor.factorize`` expands it). **ONE
     flat node** that cleanly splits the **algebra params** (what to contract) from the **schedule**
     (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,
     the leading batch ``lead_axes``, the structured A/B operand ``Load``\\ s, the fold accumulator

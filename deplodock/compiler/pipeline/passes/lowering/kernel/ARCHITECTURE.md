@@ -4,44 +4,31 @@ This stage turns a scheduled `TileOp` into a `KernelOp` (a thread-bound CUDA-IR 
 Kernel-IR peepholes over it. The CUDA lowering (`lowering/cuda`) renders the `KernelOp` to a `__global__` source string
 afterwards.
 
-## `005_contract` — construct the contraction node (before materialize)
-
-A `CONTRACTION` contraction's high-level node is built one pass **before** the materializer. It's **one flat**
-`Contraction` Stmt (`ir/tile/structural.py`) — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
-splits two concerns:
-
-- **algebra params** (what to contract): the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
-  structured A/B operand `Load`s (read off the atomize binding resolved in `020_schedule`), the fold accumulator `acc`,
-  and the projection `epilogue` (the binding's body, or a synthesized accumulator store via `_store.with_store`).
-- **schedule** (how to tile it): one `tile: TilePlan` field carrying the leaf `atom` (a tensor-core `AtomKind`,
-  `lanes == 32`, or the scalar `ScalarAtom`, `lanes == 1` — `ir/tile/atom.py`) plus the unit/register widths + K-chunk.
-  The atom selects the codegen at materialize; the rest of the per-CTA geometry (`tile_m` / `mask_m` / `block_threads` /
-  …) is **derived** on the node from `tile` × `axes` (`@property`, out of the structural-key fields).
-
-Keeping the schedule a single swappable field is what lets the same operand/`acc` params be tiled by a *different*
-`TilePlan` — the seam the flash inner QK/PV reuse needs.
-
-A non-tiled contraction (per-cell fallback) and the cooperative reduce tier are left untouched here (`RuleSkipped`) and
-bind to threads in `010_materialize`. Homing the construction here keeps the contraction a first-class node that exists
-*before* thread-binding; it IS `structural_key`-ed as an intermediate `KernelOp` (the kernel-stmt protocol + a
-`_rewrite` handler). It routes through the shared tiling layer with the generic `_b` / `_u` block/unit axis naming.
-
-## `010_materialize` — bind the schedule to threads (and expand the contraction)
+## `010_materialize` — bind the schedule to threads (and build + expand the contraction)
 
 `010_materialize` dispatches on the kernel kind / its schedule (the article's "schedule separate from combine" thesis —
 the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
 
+- **Tiled `CONTRACTION`** (warp / register tile) — `_build_contraction` resolves the operand→role binding + projection
+  epilogue into a single high-level `Contraction` Stmt (`ir/tile/structural.py`), and `_factor.factorize` **expands it**
+  through the one atom-generic factorizer over the shared tiling layer (below); the leaf type selects the codegen (mma /
+  scalar). An unbindable contraction (a non-`Load` operand / 1-D output) returns `None` and falls through to the scalar
+  tier. (This build was a separate `005_contract` pass before — now folded in so the contraction is constructed where it
+  is expanded.)
 - **Scalar tier** — one thread per output cell (`lower(op)` + an output-store glue).
 - **Reduce tier** (`_reduce`, a `PLANAR` / `TWISTED` reduce whose `ReducePlan` cooperates / register-folds) — the
   reduce axis is partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP),
   then a REG-tree
   fold, the cross-thread combine (`_combine`), and the projection.
 
-The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(Contraction)`
-root that `005_contract` produced — **expands the contraction** through the one atom-generic `_factor.factorize` over the
-shared tiling layer (below); the leaf type selects the codegen (mma / scalar). The pass's `PATTERN` matches `(TileOp,
-KernelOp)` so the single rule covers both; at this point in the kernel pass the only `KernelOp`s are the contraction
-nodes.
+The `Contraction` node is **one flat** Stmt — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
+splits the **algebra params** (what to contract: the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
+structured A/B operand `Load`s read off the atomize binding, the fold accumulator `acc`, and the projection `epilogue`)
+from the **schedule** (one `tile: TilePlan` field carrying the leaf `atom` — a tensor-core `AtomKind` / the scalar
+`ScalarAtom`, `ir/tile/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (`tile_m` / `mask_m` /
+`block_threads` / …) is **derived** on the node from `tile` × `axes` (`@property`). Keeping the schedule a single swappable
+field is what lets the same operand/`acc` params be tiled by a *different* `TilePlan` — the seam the flash inner QK/PV
+reuse needs.
 
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
