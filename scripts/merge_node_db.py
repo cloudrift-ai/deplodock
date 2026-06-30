@@ -70,8 +70,6 @@ snap.close()
 print("remote snapshot node rows:", n)
 """
 
-_REMOTE_SNAPSHOT_PATH = "/tmp/deplodock_nodes_snapshot.db"
-
 
 def _key_opts(ssh_key: str | None) -> list[str]:
     return ["-i", os.path.expanduser(ssh_key)] if ssh_key else []
@@ -79,18 +77,23 @@ def _key_opts(ssh_key: str | None) -> list[str]:
 
 def _fetch_remote_snapshot(server: str, *, ssh_key: str | None, port: int | None, remote_db: str) -> Path:
     """Snapshot the remote autotune DB (VACUUM INTO) and scp it back to a local temp
-    file, returning that local path."""
+    file, returning that local path. The remote snapshot path is per-process (pid) so
+    two merges against one host don't clobber each other, and is removed after the fetch."""
     key = _key_opts(ssh_key)
-    ssh_cmd = ["ssh", *_SSH_OPTS, *key, *(["-p", str(port)] if port else []), server, "python3 -"]
-    code = _REMOTE_SNAPSHOT_PY.format(remote_db=remote_db, snapshot=_REMOTE_SNAPSHOT_PATH)
+    remote_snap = f"/tmp/deplodock_nodes_snapshot_{os.getpid()}.db"
+    port_ssh = ["-p", str(port)] if port else []
+    ssh_cmd = ["ssh", *_SSH_OPTS, *key, *port_ssh, server, "python3 -"]
+    code = _REMOTE_SNAPSHOT_PY.format(remote_db=remote_db, snapshot=remote_snap)
     print(f"[merge_node_db] snapshotting {server}:{remote_db} ...")
     subprocess.run(ssh_cmd, input=code, text=True, check=True)
 
     fd, local = tempfile.mkstemp(prefix="deplodock_nodes_", suffix=".db")
     os.close(fd)
-    scp_cmd = ["scp", *_SSH_OPTS, *key, *(["-P", str(port)] if port else []), f"{server}:{_REMOTE_SNAPSHOT_PATH}", local]
+    scp_cmd = ["scp", *_SSH_OPTS, *key, *(["-P", str(port)] if port else []), f"{server}:{remote_snap}", local]
     print(f"[merge_node_db] fetching snapshot -> {local}")
     subprocess.run(scp_cmd, check=True)
+    # Drop the remote throwaway copy (best-effort — the VM is usually torn down anyway).
+    subprocess.run(["ssh", *_SSH_OPTS, *key, *port_ssh, server, f"rm -f {remote_snap}"], check=False)
     return Path(local)
 
 
@@ -99,14 +102,16 @@ def _merge_and_report(src_path: Path | str, dest: str | None) -> int:
     local tune DB) and print the per-card receipt. Returns the rows merged."""
     dest_path = Path(dest).expanduser() if dest else resolve_tune_db()
     db = SearchDB(dest_path)  # creates/migrates the node table + gpu column on the destination
-    merged = db.merge_nodes(src_path)
-    print(f"[merge_node_db] merged {merged} node rows from {src_path} into {dest_path}")
-    counts = Counter(n.gpu for n in db.iter_nodes())
-    print("[merge_node_db] node rows per card now:")
-    for gpu, count in sorted(counts.items()):
-        print(f"    {gpu or '(unknown card)'}: {count}")
-    db.close()
-    return merged
+    try:
+        merged = db.merge_nodes(src_path)
+        print(f"[merge_node_db] merged {merged} node rows from {src_path} into {dest_path}")
+        counts = Counter(n.gpu for n in db.iter_nodes())
+        print("[merge_node_db] node rows per card now:")
+        for gpu, count in sorted(counts.items()):
+            print(f"    {gpu or '(unknown card)'}: {count}")
+        return merged
+    finally:
+        db.close()
 
 
 def fetch_and_merge(
@@ -122,7 +127,10 @@ def fetch_and_merge(
     rows merged. The reusable entry point shared by this CLI and the folded-in merge
     step of ``remote_node_tune.py``."""
     src = _fetch_remote_snapshot(remote, ssh_key=ssh_key, port=port, remote_db=remote_db)
-    return _merge_and_report(src, dest)
+    try:
+        return _merge_and_report(src, dest)
+    finally:
+        src.unlink(missing_ok=True)  # drop the ~40MB local snapshot copy once merged
 
 
 def main() -> None:

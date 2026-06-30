@@ -109,7 +109,13 @@ def main() -> int:
     args = ap.parse_args()
 
     remote, key, port = args.remote, args.ssh_key, args.port
-    repo = args.repo or subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
+    repo = args.repo
+    if not repo:
+        gp = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if gp.returncode != 0:
+            print("error: not inside a git repo and --repo not given; pass --repo <path>", flush=True)
+            return 2
+        repo = gp.stdout.strip()
 
     # 1. make the remote base dir (so the logs + rsync target exist), then deps: always
     #    install the venv/dev packages (the image ships 3.12 without them); install the CUDA
@@ -126,7 +132,11 @@ def main() -> int:
     )
     rc, out = _run(remote, key, port, deps, timeout=1800)
     if rc != 0 or "NVCC_OK" not in out:
-        return _fail(remote, key, port, f"deps/nvcc (rc={rc}, {out.strip().splitlines()[-1:] or ''})", _SETUP_LOG)
+        # rc==0 with NVCC_OK absent means the apt steps ran but nvcc is still missing
+        # (the chain ends in an echo, so rc reflects only that last command); rc!=0 means
+        # the ssh/apt command itself failed. The setup-log tail below carries the detail.
+        reason = "nvcc not found after toolkit install" if rc == 0 else f"ssh/apt rc={rc}"
+        return _fail(remote, key, port, f"deps/nvcc ({reason})", _SETUP_LOG)
 
     # 2. rsync the working tree (exact local code, incl. uncommitted changes).
     _log(f"rsyncing {repo} -> {remote}:{_REMOTE_DIR} ...")
@@ -199,6 +209,10 @@ def main() -> int:
             return _fail(remote, key, port, f"timeout after {args.timeout}s", _TUNE_LOG)
         time.sleep(args.poll)
         rc, out = _run(remote, key, port, poll)
+        # The poll always echoes a ``PROC=`` marker when it actually ran on the remote;
+        # its absence means the ssh itself failed (timeout / connection reset), which is
+        # NOT evidence the tune died — only a confirmed ``PROC=DEAD`` is.
+        reachable = "PROC=" in out
         done_mark = next((ln[len("DONE_MARK=") :] for ln in out.splitlines() if ln.startswith("DONE_MARK=")), "")
         alive = "PROC=ALIVE" in out
         m = _DONE_RE.search(done_mark)
@@ -229,15 +243,31 @@ def main() -> int:
                 sys.path.insert(0, str(Path(__file__).resolve().parent))
                 import merge_node_db  # noqa: PLC0415  (sibling script in scripts/)
 
-                merge_node_db.fetch_and_merge(remote, ssh_key=key, port=port)
+                merged = merge_node_db.fetch_and_merge(remote, ssh_key=key, port=port)
             except Exception as exc:  # noqa: BLE001 — report any merge failure, don't crash the run
                 print(f"merge FAILED: {exc!r}; tune data is safe on {remote} — re-run `{manual}`", flush=True)
                 return 1
+            if merged == 0:
+                # The tune finished but nothing came home — the remote wrote its node store
+                # somewhere other than the snapshot's default path (e.g. a remote
+                # DEPLODOCK_TUNE_DB), so don't claim success.
+                print(
+                    f"merge brought back 0 node rows — the remote node store wasn't at the expected "
+                    f"path; tune data is on {remote}. Check the remote DEPLODOCK_TUNE_DB and re-run "
+                    f"`{manual} --remote-db <path>`.",
+                    flush=True,
+                )
+                return 1
             print("\nstatus: COMPLETE (tune + merge done)", flush=True)
             return 0
+        if not reachable:
+            # Transient ssh/network failure this cycle — keep waiting (still bounded by
+            # --timeout); don't mistake an unreachable host for a crashed tune.
+            _log(f"poll ssh failed (rc={rc}) — host unreachable this cycle, retrying")
+            continue
         if not alive:
             dead_streak += 1
-            if dead_streak >= 2:  # two consecutive DEADs without a done marker ⇒ it crashed
+            if dead_streak >= 2:  # two consecutive confirmed DEADs without a done marker ⇒ it crashed
                 return _fail(remote, key, port, "tune process died without a done marker", _TUNE_LOG)
         else:
             dead_streak = 0

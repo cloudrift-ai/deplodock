@@ -586,7 +586,18 @@ class SearchDB:
             rows = list(src.iter_nodes())
         finally:
             src.close()
-        self.record_nodes(rows)
+        # One transaction around the whole batch. ``record_nodes`` runs row-at-a-time on
+        # this autocommit connection (``isolation_level=None``), which for a cross-card
+        # merge of 10k+ rows would mean one fsync per row; an explicit BEGIN/COMMIT
+        # collapses it to a single commit (keep-min within the batch still sees prior
+        # inserts on the same connection).
+        self._conn.execute("BEGIN")
+        try:
+            self.record_nodes(rows)
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
         return len(rows)
 
     # ------------------------------------------------------------------

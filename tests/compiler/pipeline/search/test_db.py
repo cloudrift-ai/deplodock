@@ -389,14 +389,17 @@ def test_iter_nodes_pre_gpu_column_readonly_degrades(tmp_path) -> None:
 
 
 def test_merge_nodes_keeps_min_and_coexists_across_cards(tmp_path) -> None:
-    """``merge_nodes`` upserts another DB's ``node`` rows with keep-min semantics: a
-    shared ``node_key`` keeps the faster ``value_us``, while a different card's rows
-    (distinct ``gpu`` ⇒ distinct ``node_key``) merge in alongside without clobbering —
-    the cross-hardware accumulation that backs ``scripts/merge_node_db.py``."""
+    """``merge_nodes`` upserts another DB's ``node`` rows keyed on ``node_key`` with
+    keep-min semantics, in both directions: a shared key takes the faster source row but
+    a *slower* source row never clobbers a faster dest row. Rows under distinct
+    ``node_key``s — which different cards always produce, since ``_node_key`` folds the
+    ``gpu`` (proven in ``test_online_prior.test_node_key_folds_gpu``) — merge in
+    alongside untouched. The cross-hardware accumulation behind ``scripts/merge_node_db.py``."""
     dst = SearchDB(tmp_path / "dst.db")
     dst.record_nodes(
         [
             _node_row("shared", 5.0, gpu="NVIDIA H100 80GB"),  # same key as src, slower here
+            _node_row("faster_here", 1.0, gpu="NVIDIA H100 80GB"),  # same key as src, FASTER here
             _node_row("dst_only", 7.0, gpu="NVIDIA H100 80GB"),  # untouched by the merge
         ]
     )
@@ -404,16 +407,18 @@ def test_merge_nodes_keeps_min_and_coexists_across_cards(tmp_path) -> None:
     src.record_nodes(
         [
             _node_row("shared", 2.0, gpu="NVIDIA H100 80GB"),  # improves the shared node
+            _node_row("faster_here", 9.0, gpu="NVIDIA H100 80GB"),  # slower — must NOT overwrite dest
             _node_row("h200_only", 3.0, gpu="NVIDIA H200 141GB"),  # a different card's row
         ]
     )
     src.close()  # flush the on-disk file before the read-only open inside merge
 
     merged = dst.merge_nodes(tmp_path / "src.db")
-    assert merged == 2  # source rows processed
+    assert merged == 3  # source rows processed
     by_key = {n.node_key: n for n in dst.iter_nodes()}
-    assert set(by_key) == {"shared", "dst_only", "h200_only"}  # both cards coexist
+    assert set(by_key) == {"shared", "faster_here", "dst_only", "h200_only"}  # both cards coexist
     assert by_key["shared"].value_us == 2.0  # keep-min took the faster source row
+    assert by_key["faster_here"].value_us == 1.0  # slower source row did NOT overwrite the faster dest
     assert by_key["dst_only"].value_us == 7.0  # other rows untouched
     assert by_key["h200_only"].gpu == "NVIDIA H200 141GB"  # cross-card row carried its gpu
 
