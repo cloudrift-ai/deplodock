@@ -383,9 +383,13 @@ provenance reproducer, vs eager / `torch.compile` / Deplodock.
 A **`Knob`** (`knob.py`) is the canonical schema for one tuning dimension: name, type (`INT` / `BOOL` / `BINMASK` /
 `STR`), candidate `hints` (advisory — the rule still validates structural fit), and a help string. Rules declare them as
 module-level constants and stamp values into `TileOp.knobs` dicts; the autotuner reads those back as the per-hop knob
-delta in the `lowering` table. The registry (`knob.registry()`) auto-collects every `Knob` instance in every loaded rule
-module — no manual registration. `knob.py` also owns the `DEPLODOCK_<KNOB>` env namespace (decode per `Knob` type;
-`config.py` remains the sole owner of `os.environ`).
+delta in the `lowering` table. The schedule codec knobs (`TILE` / `REDUCE` / `STAGE` / `WSPEC`) are declared **in
+`knob.py` itself** — the single home for the whole tunable surface — and imported by the rule
+(`lowering/tile/_schedule`) that resolves them; the native-moveset knobs are declared in their owning rule modules. The
+registry (`knob.registry()`)
+auto-collects every `Knob` instance in every loaded module (rule modules and `knob.py` alike) — no manual registration.
+`knob.py` also owns the `DEPLODOCK_<KNOB>` env namespace (decode per `Knob` type; `config.py` remains the sole owner of
+`os.environ`).
 
 **Pinning knobs from the environment.** Two equivalent forms:
 
@@ -408,8 +412,8 @@ silently-dropped level); a warp `TILE` pin needs its **static** contraction K to
 zero-filled tier); a scalar `TILE` parallel block (`par_n·par_m`) is capped at the 1024-thread/CTA hardware limit; and a
 `BOOL` knob rejects an unrecognized value instead of coercing a typo (`ture`) to `False`.
 
-**Registered knobs** (declared across `passes/lowering/tile/*.py`; see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)
-for the per-rule mechanics):
+**Registered knobs** (the schedule codecs `TILE`/`REDUCE`/`STAGE`/`WSPEC` are declared in `knob.py`; the rest across
+`passes/lowering/tile/*.py`; see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md) for the per-rule mechanics):
 
 | Knob     | Type    | Owning rule                       | What it controls                                                        |
 |----------|---------|-----------------------------------|-------------------------------------------------------------------------|

@@ -40,75 +40,13 @@ from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.tile import Kernel, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.knob import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 
-# The reduce-axis partition is decided HERE, by the single ``REDUCE`` codec knob — the
-# decision hierarchy (env pin via ``Knob.narrow`` > the search/prior fork > the conservative
-# constant default below). The knob is **ephemeral**: it's resolved here into the schedule's
-# ``ReducePlan`` (the materialized form ``kernel/010_materialize`` reads); the knob value
-# also rides on ``TileOp.knobs`` so the learned prior featurizes / tunes the decision.
-# ``off=""`` (the scalar serial fold) is auto-stamped on kernels this pass doesn't cooperate.
-REDUCE = Knob(
-    "REDUCE",
-    KnobType.STR,
-    help="Reduce-axis partition codec (g<n> cta / b<n> coop / r<n> reg; empty=serial). "
-    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
-    off="",
-)
-
-# The free-axis output tile is decided HERE too, by the single ``TILE`` codec knob (the
-# output-fragment sibling of ``REDUCE``). ``TILE`` is the **unified output-fragment** knob — a
-# contraction's output tile is *either* the scalar register sub-tile (``n<N>[x<M>]`` parallel
-# thread-tile / ``f<fn>[x<fm>]`` register sub-tile) *or* the tensor-core warp mma tile
-# (``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>``), never both. The value self-discriminates: an
-# ``a:<atom>`` token selects the warp fragment (a tensor-core-atom :class:`TilePlan`); otherwise scalar
-# fragment (:class:`TilePlan`) — see ``schedule.is_warp_codec``. Same decision hierarchy: env pin
-# via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``CONTRACTION``
-# contraction tiles its output today; ``off=""`` auto-stamps everything else. The codec is the
-# sole on-dict spelling — the learned-prior featurizer (``knob.py``: ``mma_atom`` / ``is_warp`` /
-# ``_free_slots`` / ``tile_signature``) parses it directly (no legacy ``WM``/``WN``/``MMA`` keys).
-TILE = Knob(
-    "TILE",
-    KnobType.STR,
-    help="Output-fragment codec — scalar tile (n<N>[x<M>]/f<fn>[x<fm>]) OR warp mma tile "
-    "(a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>, selected by the a:<atom> token); empty=per-cell. "
-    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
-    off="",
-)
-
-# Operand staging is decided HERE too, by the single ``STAGE`` codec knob — the reused gmem
-# operands (matmul A/B, a fused prologue's read) ride a shared-memory slab + double-buffered
-# producer (``sync`` plain copy / ``cp.async`` / ``tma``) over the serial reduce loop, instead
-# of the gmem-direct register baseline. Resolved here into the schedule's :class:`Stage`
-# (``None`` = gmem-direct); the codec also rides on ``TileOp.knobs`` for the prior. ``STAGE`` is
-# pin-only this cut (the prior auto-fork is a follow-up, as ``TILE``'s is). Composes with both
-# fragments of the unified ``TILE`` knob (the scalar register-tile and the warp mma tile).
-STAGE = Knob(
-    "STAGE",
-    KnobType.STR,
-    help="Operand-staging codec (d<depth>/sync|cp|tma[/ring][/p<reg_depth>]; empty=gmem-direct). "
-    "Decided in lowering/tile/020_schedule, materialized in lowering/kernel/010_materialize.",
-    off="",
-)
-
-# Warp specialization is decided HERE too, by the single ``WSPEC`` codec knob — the worker-mapping
-# sibling of ``REDUCE``/``TILE``/``STAGE`` and ORTHOGONAL to all three: the pipeline (what's staged,
-# the mma tile, the reduce partition) is fixed by those pins; ``WSPEC`` only splits the warps that
-# run it into roles (``p<np>`` producer warps drive the ``STAGE`` load half; the compute warps stay
-# on the mma). ``off=""`` is uniform SIMT (every warp does both halves). Resolved here into the
-# schedule's :class:`WarpSpec` (``workers``; ``None`` = uniform); the codec also rides on
-# ``TileOp.knobs``. **Pin-only this cut, and gated** on a warp ``TILE`` + a ``STAGE`` (no mma
-# consumer / nothing to hand off ⇒ nothing to specialize); the producer/consumer materialization is
-# a follow-up (``# TODO(warp-spec)`` in 010_materialize).
-WSPEC = Knob(
-    "WSPEC",
-    KnobType.STR,
-    help="Warp-specialization codec — role→warp split over the fixed pipeline "
-    "(p<np> producer[:q<window>], s<ns> sfu, …; compute warps implicit = TilePlan.units; empty=uniform SIMT). "
-    "Decided in lowering/tile/020_schedule; materialization reserved (TODO).",
-    off="",
-)
+# The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) are declared in
+# ``knob.py`` (the single home for the whole tunable surface) and imported here, where they are
+# resolved into the schedule slices. The decision hierarchy for each is the env pin (via
+# ``Knob.narrow``) > the search/prior fork > the conservative default below.
 
 # Conservative cooperative-reduce selection constants (the default when REDUCE is unpinned).
 _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this wide
