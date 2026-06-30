@@ -57,3 +57,21 @@ The atom spec is subtyped by kind (`ir/tile/atom.py`: `AtomKind` is the fixed mm
 is the spec-less cooperative combine — its realization is derived, so it carries only a dtype). The Semiring binder
 (`bind_contraction`) is node-addressable so warp-flash can later reuse it on flash's nested QK^T / PV; that recursion is
 deferred until those inner contractions are structural `Semiring` nodes carrying geometry (see the pass docstring).
+
+## Recognize the schedulable structure once — the tile skeleton
+
+The same "resolve once, never re-recognize" invariant governs the recognize→schedule boundary *inside* tile lowering.
+`010_recognize` stamps a **`Skeleton`** (`ir/tile/skeleton.py`) onto the `TileOp` alongside the op tree: a nested tree of
+`Scope`s mirroring the carrier, each owning its parallel axes and at most one `ReduceAxis`. The `ReduceAxis` records the
+recognized facts a schedule is chosen over — the fold `carrier`, cooperative eligibility, and (for a contraction) the
+operand→role binding — so `020_schedule` *reads* them instead of pattern-matching the algebra on every call (it no longer
+keeps a `_coop_carrier` predicate or an `isinstance(... Monoid)` re-derivation). Structural facts live on the skeleton;
+the menus, occupancy heuristics, and legality filters stay in the scheduler. The skeleton is a schedule-side index, not a
+second source of truth: the op tree still owns the combine, and `op_cache_key` digests `lower(op.op)`, never the skeleton
+(`TileOp.skeleton` is `compare=False`).
+
+The enabling **normalization**: a contraction's reduce (K) axis carries `carrier = Semiring.as_monoid()` — the
+carrier-algebra fact that a SEMIRING is a MONOID with a `⊗` lift — so a contraction's K is structurally identical to any
+`Monoid` reduce axis and the Semiring↔Monoid duality never reaches scheduling. Flash (a `Monoid` over a nested `Semiring`)
+nests the inner score contraction as a child scope. The builder is **total** (an unbindable contraction stores
+`binding=None` rather than raising), so the walk never fails a recognition that the per-cell fallback handles downstream.
