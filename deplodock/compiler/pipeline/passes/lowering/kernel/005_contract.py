@@ -1,13 +1,14 @@
 """Construct the high-level :data:`Contraction` node for a ``Semiring`` contraction — **before**
 materialize.
 
-A contraction kernel is captured here as a single :data:`Contraction` ``KernelOp`` that
-``010_materialize`` then expands. Two arms, one per atom (see ``ir/tile/atom``):
+A contraction kernel is captured here as a single :class:`Contraction` ``KernelOp`` that
+``010_materialize`` then expands — ONE node carrying the shared GRID skeleton + a per-atom
+:data:`Leaf` payload (see ``ir/tile/atom``). Two arms, one per leaf:
 
-- **mma arm** (:class:`MmaContraction`) — a warp-tier ``SemiringKernel`` (its schedule carries a
+- **mma arm** (:class:`MmaLeaf`) — a warp-tier ``SemiringKernel`` (its schedule carries a
   ``WarpTile``): the op-tree-dependent part only — capture the m/n/k axes, read the ``020_schedule``
   operand→role binding, resolve the projection epilogue. Tensor-core ``AtomKind`` leaf.
-- **scalar arm** (:class:`ScalarContraction`) — a register-tiled ``SemiringKernel`` (its ``TILE``
+- **scalar arm** (:class:`ScalarLeaf`) — a register-tiled ``SemiringKernel`` (its ``TILE``
   plan tiles the output): lower the per-cell body (``lower(op)`` + output-store glue) and capture it
   with the register / parallel widths + tiled axes. Scalar ``1×1`` fma leaf.
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 from deplodock.compiler.graph import Node
 from deplodock.compiler.ir.kernel import KernelOp
-from deplodock.compiler.ir.kernel.ir import MmaContraction, ScalarContraction
+from deplodock.compiler.ir.kernel.ir import Contraction, MmaLeaf, ScalarLeaf
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile import SemiringKernel, TileOp
 from deplodock.compiler.ir.tile.ops import lower
@@ -32,10 +33,10 @@ from deplodock.compiler.pipeline.pipeline import LoweringError
 PATTERN = [Pattern("root", TileOp)]
 
 
-def _warp_contraction(tile: TileOp, sched, root: Node) -> MmaContraction:
-    """The mma arm: read the ``020_schedule`` binding + warp geometry and resolve the projection
-    epilogue (``with_store`` needs the op's ``out`` + grid). The exact atom factorization is
-    expanded from the node by ``010_materialize`` (:func:`_factor.factorize`)."""
+def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
+    """The mma arm: read the ``020_schedule`` binding + warp geometry into an :class:`MmaLeaf` and
+    resolve the projection epilogue (``with_store`` needs the op's ``out`` + grid). The exact atom
+    factorization is expanded from the node by ``010_materialize`` (:func:`_factor.factorize`)."""
     node = tile.op
     grid = list(sched.place.grid)
     if len(grid) < 2:
@@ -52,7 +53,7 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> MmaContraction:
     tail = list(bind.epilogue)
     if not has_write(tail):
         tail = with_store(tail, root.output.name, grid, node)
-    return MmaContraction(
+    leaf = MmaLeaf(
         a_load=bind.a.load,
         b_load=bind.b.load,
         b_trans=bind.b_trans,
@@ -60,17 +61,14 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> MmaContraction:
         epilogue=Body(tail),
         warp_tile=sched.warp_tile,
         stage=sched.stage,
-        m_axis=m_axis,
-        n_axis=n_axis,
-        k_axis=k_axis,
-        output=root.output.name,
     )
+    return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis)
 
 
-def _scalar_contraction(tile: TileOp, sched, root: Node) -> ScalarContraction:
-    """The scalar arm: lower the per-cell body (``lower(op)`` + output-store glue) and capture it
-    with the tiled output axes + the register / parallel widths. Cell tiling is expanded from the
-    node by ``010_materialize`` (:func:`_factor.factorize`)."""
+def _scalar_contraction(tile: TileOp, sched, root: Node) -> Contraction:
+    """The scalar arm: lower the per-cell body (``lower(op)`` + output-store glue) into a
+    :class:`ScalarLeaf` with the register / parallel widths. Cell tiling is expanded from the node
+    by ``010_materialize`` (:func:`_factor.factorize`)."""
     node = tile.op
     grid = list(sched.place.grid)
     n_axis = grid[-1]
@@ -78,18 +76,14 @@ def _scalar_contraction(tile: TileOp, sched, root: Node) -> ScalarContraction:
     lead = tuple(grid[:-2]) if m_axis is not None else tuple(grid[:-1])
     k_axis = node.reduce_node.reduce_axis
     plan = sched.tile
-    return ScalarContraction(
+    leaf = ScalarLeaf(
         body=Body(with_store(lower(node), root.output.name, grid, node)),
-        n_axis=n_axis,
-        k_axis=k_axis,
         reg_m=plan.reg_m if m_axis is not None else 1,
         reg_n=plan.reg_n,
         par_m=plan.par_m if m_axis is not None else 1,
         par_n=plan.par_n,
-        output=root.output.name,
-        m_axis=m_axis,
-        lead_axes=lead,
     )
+    return Contraction(leaf=leaf, n_axis=n_axis, k_axis=k_axis, output=root.output.name, m_axis=m_axis, lead_axes=lead)
 
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:

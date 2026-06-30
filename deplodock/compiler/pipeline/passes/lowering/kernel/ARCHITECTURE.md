@@ -6,15 +6,16 @@ afterwards.
 
 ## `005_contract` — construct the contraction node (before materialize)
 
-A `Semiring` contraction's high-level node is built one pass **before** the materializer. The node is one of two arms of
-the `Contraction` family (`ir/kernel/ir.py`), keyed by its **atom** (`ir/tile/atom.py`) — a tensor-core mma cell
-(`AtomKind`, `lanes == 32`) or a scalar fma cell (`ScalarAtom`, `lanes == 1`):
+A `Semiring` contraction's high-level node is built one pass **before** the materializer. It's **one** `Contraction`
+Stmt (`ir/kernel/ir.py`) holding the shared GRID skeleton (m/n/k axes, output, leading batch axes) + a per-atom `Leaf`
+payload — the ONLY atom-specific part, keyed by **atom** (`ir/tile/atom.py`) — a tensor-core mma cell (`AtomKind`,
+`lanes == 32`) or a scalar fma cell (`ScalarAtom`, `lanes == 1`):
 
-- **mma arm** (`MmaContraction`) — a warp-tier `SemiringKernel` (its schedule carries a `WarpTile`): **thin**, the
+- **mma arm** (`MmaLeaf`) — a warp-tier `SemiringKernel` (its schedule carries a `WarpTile`): **thin**, the
   op-tree-dependent part only — capture the m/n/k axes, read the atomize binding (resolved in `020_schedule`), resolve
-  the projection epilogue (`_store.with_store`).
-- **scalar arm** (`ScalarContraction`) — a register-tiled `SemiringKernel` (its `TILE` plan tiles the output): lower the
-  per-cell body (`lower(op)` + output-store glue) and capture it with the tiled axes + register / parallel widths.
+  the projection epilogue (`_store.with_store`). Binding-driven (structured `a@b` operands + `WarpTile`).
+- **scalar arm** (`ScalarLeaf`) — a register-tiled `SemiringKernel` (its `TILE` plan tiles the output): lower the
+  per-cell body (`lower(op)` + output-store glue) and capture it with the register / parallel widths. Body-driven.
 
 A non-tiled contraction (per-cell fallback) and the cooperative reduce tier are left untouched here (`RuleSkipped`) and
 bind to threads in `010_materialize`. Homing the construction here keeps the contraction a first-class node that exists

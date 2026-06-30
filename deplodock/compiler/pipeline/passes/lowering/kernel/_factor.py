@@ -1,8 +1,8 @@
 """The one contraction factorizer — atom-generic.
 
-Both contraction arms (``MmaContraction`` / ``ScalarContraction``) expand through the *same*
+Both leaf arms of a ``Contraction`` (``MmaLeaf`` / ``ScalarLeaf``) expand through the *same*
 four-level tiling pipeline (``atomize → register_tile → unit_tile → grid_tile``); they differ only
-in the leaf :class:`~._tiling.Unit` their atom selects (``AtomUnit`` for the tensor-core mma cell,
+in the :class:`~._tiling.Unit` the leaf selects (``AtomUnit`` for the tensor-core mma cell,
 ``ScalarUnit`` for the scalar fma cell) and the geometry that unit exposes. :func:`factorize` builds
 the right unit and runs the pipeline once — there is no per-atom factorizer.
 
@@ -16,19 +16,19 @@ pass loader skips this module."""
 from __future__ import annotations
 
 from deplodock.compiler.ir.kernel import Tile
-from deplodock.compiler.ir.kernel.ir import Contraction, MmaContraction, ScalarContraction
+from deplodock.compiler.ir.kernel.ir import Contraction, MmaLeaf, ScalarLeaf
 from deplodock.compiler.pipeline.passes.lowering.kernel._scalar_factor import ScalarUnit
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import Unit, atomize, grid_tile, register_tile, unit_tile
 from deplodock.compiler.pipeline.passes.lowering.kernel._warp_factor import AtomUnit
 
 
 def unit_for(c: Contraction) -> Unit:
-    """The leaf :class:`~._tiling.Unit` for a contraction, selected by its atom arm."""
-    if isinstance(c, MmaContraction):
+    """The leaf :class:`~._tiling.Unit` for a contraction, selected by its :data:`~...ir.Leaf` arm."""
+    if isinstance(c.leaf, MmaLeaf):
         return AtomUnit(c)
-    if isinstance(c, ScalarContraction):
+    if isinstance(c.leaf, ScalarLeaf):
         return ScalarUnit(c)
-    raise TypeError(f"no Unit for contraction {type(c).__name__}")
+    raise TypeError(f"no Unit for contraction leaf {type(c.leaf).__name__}")
 
 
 def factorize(c: Contraction) -> Tile:

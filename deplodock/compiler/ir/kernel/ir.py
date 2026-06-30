@@ -299,24 +299,16 @@ class Tile(Stmt):
 
 
 @dataclass(frozen=True)
-class MmaContraction(Stmt):
-    """A tensor-core contraction **before** atom factorization — the mma-atom arm of the
-    :data:`Contraction` family (its :attr:`atom` is the ``WarpTile``'s :class:`AtomKind`), the
-    high-level seam between ``005_contract`` (which constructs it, before materialize) and
-    ``010_materialize`` (which expands it). The scalar (register-tile) arm is
-    :class:`ScalarContraction`.
+class MmaLeaf:
+    """A :class:`Contraction`'s **mma** payload — the binding-driven structured operands + warp
+    geometry the tensor-core leaf needs: the operand ``Load``\\ s + their role flags (``a_load`` /
+    ``b_load`` / ``b_trans``), the fold accumulator ``acc``, the resolved projection ``epilogue``
+    (post-``with_store`` — ends in the output ``Write``), the ``warp_tile`` geometry, and the
+    operand ``stage``. :attr:`atom` is the ``WarpTile``'s :class:`AtomKind`.
 
-    ``005_contract`` emits this single node, capturing everything the factorization needs:
-    the operand ``Load``\\ s + their role flags (``a_load`` / ``b_load`` / ``b_trans``), the fold
-    accumulator name ``acc``, the resolved projection ``epilogue`` (post-``with_store`` — it
-    always ends in the output ``Write``), the ``warp_tile`` geometry + operand ``stage``, the
-    captured ``m_axis`` / ``n_axis`` / ``k_axis``, and the ``output`` buffer. ``010_materialize``
-    expands it into the ``Tile`` of ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
-    ``RegStore`` (the four-way GRID/WARP/REGISTER/ATOM split). It IS ``structural_key``-ed as an
-    intermediate ``KernelOp``, so it carries the kernel-stmt protocol + a ``_rewrite`` handler.
-
-    The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the
-    epilogue's loads + output ``Write`` surface automatically through :meth:`nested`."""
+    The operand buffers ride :meth:`external_reads` (they aren't in a nested body); the epilogue's
+    loads + output ``Write`` surface through :meth:`bodies`. The few :class:`Stmt`-protocol helpers
+    here are what :class:`Contraction` delegates to (this is a plain payload, not a ``Stmt``)."""
 
     a_load: Load
     b_load: Load
@@ -325,10 +317,6 @@ class MmaContraction(Stmt):
     epilogue: Body
     warp_tile: WarpTile
     stage: Stage | None
-    m_axis: Axis
-    n_axis: Axis
-    k_axis: Axis
-    output: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.epilogue, Body):
@@ -336,72 +324,49 @@ class MmaContraction(Stmt):
 
     @property
     def atom(self):
-        """The contraction leaf — the ``WarpTile``'s tensor-core :class:`AtomKind`."""
         return self.warp_tile.atom
 
-    def nested(self) -> tuple[Body, ...]:
+    def bodies(self) -> tuple[Body, ...]:
         return (self.epilogue,)
 
-    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+    def with_bodies(self, bodies: tuple[Body, ...]) -> MmaLeaf:
         (epilogue,) = bodies
-        return MmaContraction(
-            a_load=self.a_load,
-            b_load=self.b_load,
-            b_trans=self.b_trans,
-            acc=self.acc,
-            epilogue=epilogue,
-            warp_tile=self.warp_tile,
-            stage=self.stage,
-            m_axis=self.m_axis,
-            n_axis=self.n_axis,
-            k_axis=self.k_axis,
-            output=self.output,
-        )
+        return replace(self, epilogue=epilogue)
 
     def defines(self) -> tuple[str, ...]:
         return (self.acc,)  # the accumulator the (still-unexpanded) contraction produces
 
     def external_reads(self) -> tuple[str, ...]:
-        return (self.a_load.input, self.b_load.input)  # epilogue buffers come via nested()
+        return (self.a_load.input, self.b_load.input)  # epilogue buffers come via bodies()
 
-    def pretty(self, indent: str = "") -> list[str]:
+    def head(self) -> str:
         t = " trans" if self.b_trans else ""
-        head = f"{indent}MmaContraction {self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.warp_tile.atom.name})"
-        return [head, *pretty_body(self.epilogue, indent + INDENT)]
+        return f"{self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.atom.name})"
 
-    def render(self, ctx: RenderCtx) -> list[str]:
-        raise AssertionError("MmaContraction must be expanded by 010_materialize before render")
+    def rewrite(self, rename, sigma, axis_fn) -> MmaLeaf:
+        return replace(
+            self,
+            a_load=_rewrite(self.a_load, rename, sigma, axis_fn),
+            b_load=_rewrite(self.b_load, rename, sigma, axis_fn),
+            acc=rename(self.acc),
+            epilogue=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.epilogue)),
+        )
 
 
 @dataclass(frozen=True)
-class ScalarContraction(Stmt):
-    """A scalar (register-tile) contraction **before** cell factorization — the scalar-atom arm of
-    the :data:`Contraction` family (:attr:`atom` is the ``1×1`` :class:`ScalarAtom`), the
-    sibling of :class:`MmaContraction`.
-
-    ``005_contract`` lowers the contraction's per-cell body (``lower(op)`` + the output-store glue)
-    and captures it here as ``body`` — a ``pre`` region, the reduce ``Loop`` over ``k_axis``, and a
-    projection ``tail`` — together with the tiled output axes (``m_axis`` is ``None`` for a 1-D
-    output), any leading (batch) grid ``lead_axes``, the register (``reg_m``/``reg_n``) + parallel
-    (``par_m``/``par_n``) widths, and the ``output`` buffer. ``010_materialize`` expands it into the
-    per-thread ``reg_m × reg_n`` cell ``Tile`` via the shared ``_factor.factorize`` (the SAME
-    generic ``atomize → register_tile → unit_tile → grid_tile`` layer the mma arm uses, with the
-    scalar atom = 1×1, lanes = 1, so the UNIT level is the parallel thread-tile).
-
-    Unlike :class:`MmaContraction`, the operand ``Load``\\ s ride inside ``body`` (surfaced through
-    :meth:`nested`), so there are no operand fields / :meth:`external_reads`. Like its sibling it IS
-    ``structural_key``-ed as an intermediate ``KernelOp`` (the kernel-stmt protocol + ``_rewrite``)."""
+class ScalarLeaf:
+    """A :class:`Contraction`'s **scalar** payload — the body-driven form the scalar (register-tile)
+    leaf needs: the lowered per-cell ``body`` (``lower(op)`` + output-store glue — a ``pre`` region,
+    the reduce ``Loop`` over the contraction axis, a projection ``tail``) + the register
+    (``reg_m``/``reg_n``) and parallel (``par_m``/``par_n``) widths. :attr:`atom` is the ``1×1``
+    :class:`ScalarAtom`. The operand ``Load``\\ s ride inside ``body`` (so :meth:`external_reads` is
+    empty); the body surfaces through :meth:`bodies`."""
 
     body: Body
-    n_axis: Axis
-    k_axis: Axis
     reg_m: int
     reg_n: int
     par_m: int
     par_n: int
-    output: str
-    m_axis: Axis | None = None
-    lead_axes: tuple[Axis, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -409,33 +374,83 @@ class ScalarContraction(Stmt):
 
     @property
     def atom(self):
-        """The contraction leaf — the singleton ``1×1`` scalar fma :class:`ScalarAtom`."""
         from deplodock.compiler.ir.tile.atom import SCALAR_ATOM  # noqa: PLC0415
 
         return SCALAR_ATOM
 
-    def nested(self) -> tuple[Body, ...]:
+    def bodies(self) -> tuple[Body, ...]:
         return (self.body,)
 
-    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+    def with_bodies(self, bodies: tuple[Body, ...]) -> ScalarLeaf:
         (body,) = bodies
         return replace(self, body=body)
 
+    def defines(self) -> tuple[str, ...]:
+        return ()
+
+    def external_reads(self) -> tuple[str, ...]:
+        return ()
+
+    def head(self) -> str:
+        return f"scalar reg={self.reg_m}x{self.reg_n} par={self.par_m}x{self.par_n}"
+
+    def rewrite(self, rename, sigma, axis_fn) -> ScalarLeaf:
+        return replace(self, body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.body)))
+
+
+#: A :class:`Contraction`'s atom-specific payload — the ONE genuinely-divergent part. The mma arm is
+#: binding-driven (:class:`MmaLeaf`: structured ``a@b`` operands + ``WarpTile``), the scalar arm
+#: body-driven (:class:`ScalarLeaf`: the lowered per-cell body + tile widths); the two can't merge,
+#: so they ride here while everything else (the GRID skeleton + the ``Stmt`` protocol) is shared.
+Leaf = MmaLeaf | ScalarLeaf
+
+
+@dataclass(frozen=True)
+class Contraction(Stmt):
+    """A contraction **before** atom factorization — the high-level seam between ``005_contract``
+    (which constructs it, before materialize) and ``010_materialize`` (which expands it via
+    ``_factor.factorize``). ONE node for both atoms: the shared GRID **skeleton** (the tiled output
+    ``m_axis`` / ``n_axis`` — ``m_axis is None`` is a 1-D output — the contraction ``k_axis``, any
+    leading batch ``lead_axes``, and the ``output`` buffer) is held here, and the only atom-specific
+    part — the binding-driven mma payload vs the body-driven scalar payload — rides in the
+    :data:`Leaf` (:class:`MmaLeaf` / :class:`ScalarLeaf`), which the node's :class:`Stmt` protocol
+    (``nested`` / ``with_bodies`` / ``defines`` / ``external_reads`` / ``rewrite``) delegates to.
+
+    ``010_materialize`` expands it (via the atom's leaf → its ``Unit``) into the ``Tile`` of the
+    four-way GRID/UNIT/REGISTER/ATOM split. It IS ``structural_key``-ed as an intermediate
+    ``KernelOp`` (the kernel-stmt protocol + a ``_rewrite`` handler)."""
+
+    leaf: Leaf
+    n_axis: Axis
+    k_axis: Axis
+    output: str
+    m_axis: Axis | None = None
+    lead_axes: tuple[Axis, ...] = ()
+
+    @property
+    def atom(self):
+        """The contraction leaf atom (the ``WarpTile``'s ``AtomKind`` / the scalar ``ScalarAtom``)."""
+        return self.leaf.atom
+
+    def nested(self) -> tuple[Body, ...]:
+        return self.leaf.bodies()
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        return replace(self, leaf=self.leaf.with_bodies(bodies))
+
+    def defines(self) -> tuple[str, ...]:
+        return self.leaf.defines()
+
+    def external_reads(self) -> tuple[str, ...]:
+        return self.leaf.external_reads()
+
     def pretty(self, indent: str = "") -> list[str]:
         m = self.m_axis.name if self.m_axis is not None else "-"
-        tile = f"reg={self.reg_m}x{self.reg_n} par={self.par_m}x{self.par_n}"
-        head = f"{indent}ScalarContraction [{m}, {self.n_axis.name}] {tile} -> {self.output}"
-        return [head, *pretty_body(self.body, indent + INDENT)]
+        head = f"{indent}Contraction [{m}, {self.n_axis.name}] {self.leaf.head()}"
+        return [head, *pretty_body(self.nested()[0], indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        raise AssertionError("ScalarContraction must be expanded by 010_materialize before render")
-
-
-#: A pre-factorization contraction node — either the tensor-core mma arm
-#: (:class:`MmaContraction`) or the scalar register-tile arm (:class:`ScalarContraction`). Both
-#: carry an :attr:`~MmaContraction.atom` and expand in ``010_materialize`` through the shared
-#: tiling layer; ``005_contract`` builds whichever the schedule selects.
-Contraction = MmaContraction | ScalarContraction
+        raise AssertionError("Contraction must be expanded by 010_materialize before render")
 
 
 @dataclass(frozen=True)
@@ -1908,36 +1923,13 @@ def _(s: Tile, rename, sigma, axis_fn):
 
 
 @_rewrite.register
-def _(s: MmaContraction, rename, sigma, axis_fn):
-    # Route the operand Loads + epilogue body through the generic rewrite (SSA / Expr / axis
-    # canonicalization); map the captured axes; pass the geometry objects + output through.
-    return MmaContraction(
-        a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
-        b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
-        b_trans=s.b_trans,
-        acc=rename(s.acc),
-        epilogue=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.epilogue)),
-        warp_tile=s.warp_tile,
-        stage=s.stage,
-        m_axis=axis_fn(s.m_axis),
+def _(s: Contraction, rename, sigma, axis_fn):
+    # Route the atom-specific payload through its own rewrite (the leaf's operand Loads / epilogue
+    # / body — SSA / Expr / axis canonicalization); map the skeleton axes; pass the output through.
+    return Contraction(
+        leaf=s.leaf.rewrite(rename, sigma, axis_fn),
         n_axis=axis_fn(s.n_axis),
         k_axis=axis_fn(s.k_axis),
-        output=s.output,
-    )
-
-
-@_rewrite.register
-def _(s: ScalarContraction, rename, sigma, axis_fn):
-    # Route the captured per-cell body through the generic rewrite (SSA / Expr / axis
-    # canonicalization); map the tiled + leading axes; pass the widths + output through.
-    return ScalarContraction(
-        body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.body)),
-        n_axis=axis_fn(s.n_axis),
-        k_axis=axis_fn(s.k_axis),
-        reg_m=s.reg_m,
-        reg_n=s.reg_n,
-        par_m=s.par_m,
-        par_n=s.par_n,
         output=s.output,
         m_axis=axis_fn(s.m_axis) if s.m_axis is not None else None,
         lead_axes=tuple(axis_fn(a) for a in s.lead_axes),

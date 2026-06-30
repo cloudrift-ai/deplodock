@@ -5,17 +5,18 @@
 ``RegStore`` four-way GRID/UNIT/REGISTER/ATOM split — it owns the K-loop + operand-staging decision
 (cp.async / TMA / gmem-direct) and the per-cell projection epilogue, and exposes the canonical
 tiling-geometry interface ``factorize`` reads. All atom geometry lives here, out of the node
-constructor (``005_contract`` emits only the high-level ``MmaContraction``). Leading ``_`` so the
-pass loader skips this module."""
+constructor (``005_contract`` emits only a ``Contraction`` with an ``MmaLeaf``). Leading ``_`` so
+the pass loader skips this module."""
 
 from __future__ import annotations
 
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import (
+    Contraction,
     EpilogueLoad,
     LdmatrixLoad,
-    MmaContraction,
+    MmaLeaf,
     MmaSyncPtx,
     RegEpilogue,
     RegFragment,
@@ -469,8 +470,9 @@ class AtomUnit(Unit):
     the generic tiling layer assembles it. The staging decision (gmem-direct / cp.async / TMA)
     + fragment naming are computed up front: they drive BOTH the state decls and the K-loop."""
 
-    def __init__(self, mma: MmaContraction):
-        wt = mma.warp_tile
+    def __init__(self, c: Contraction):
+        leaf: MmaLeaf = c.leaf
+        wt = leaf.warp_tile
         atom = wt.atom
         # The shared tiling geometry (tile / mask / axis-name / block / extents) is derived by the
         # base from the atom + axes + widths; the warp tier's UNIT is the warp (``lanes == 32``),
@@ -478,8 +480,8 @@ class AtomUnit(Unit):
         # fragments, staging) is set here.
         super().__init__(
             atom=atom,
-            m_axis=mma.m_axis,
-            n_axis=mma.n_axis,
+            m_axis=c.m_axis,
+            n_axis=c.n_axis,
             reg_m=wt.reg[0],
             reg_n=wt.reg[1],
             units_m=wt.warps[0],
@@ -487,12 +489,12 @@ class AtomUnit(Unit):
             b_suffix="_wb",
             u_suffix="_ww",
         )
-        self.mma, self.wt, self.atom_k = mma, wt, atom.atom_k
-        self.k_axis = mma.k_axis
-        self.a_load, self.b_load, self.b_trans, self.acc = mma.a_load, mma.b_load, mma.b_trans, mma.acc
-        self.stage = mma.stage
+        self.wt, self.atom_k = wt, atom.atom_k
+        self.k_axis = c.k_axis
+        self.a_load, self.b_load, self.b_trans, self.acc = leaf.a_load, leaf.b_load, leaf.b_trans, leaf.acc
+        self.stage = leaf.stage
         self.pre: list[Stmt] = []
-        self.tail = list(mma.epilogue)
+        self.tail = list(leaf.epilogue)
         self.write = next(s for s in self.tail if isinstance(s, Write))
         # The operand-staging decision (TMA > cp.async > gmem-direct) drives the operand-fragment
         # naming + the K-loop, so it is computed once here and read by state_decls + reduce_region.

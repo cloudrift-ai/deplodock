@@ -16,10 +16,9 @@ Leading ``_`` so the pass loader skips this module."""
 from __future__ import annotations
 
 from deplodock.compiler.ir.expr import BinaryExpr
-from deplodock.compiler.ir.kernel.ir import ScalarContraction
+from deplodock.compiler.ir.kernel.ir import Contraction, ScalarLeaf
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Body, Cond, Load, Loop, Stmt, Write
-from deplodock.compiler.ir.tile.atom import SCALAR_ATOM
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import OffsetFn, Unit
 
@@ -66,15 +65,16 @@ class ScalarUnit(Unit):
     into a ``pre`` region, the reduce ``Loop`` over the contraction axis, and a projection ``tail``,
     and supplies the four leaf methods."""
 
-    def __init__(self, c: ScalarContraction):
+    def __init__(self, c: Contraction):
+        leaf: ScalarLeaf = c.leaf
         super().__init__(
-            atom=SCALAR_ATOM,
+            atom=c.atom,
             m_axis=c.m_axis,
             n_axis=c.n_axis,
-            reg_m=c.reg_m,
-            reg_n=c.reg_n,
-            units_m=c.par_m,  # the scalar parallel thread-tile IS the UNIT grid
-            units_n=c.par_n,
+            reg_m=leaf.reg_m,
+            reg_n=leaf.reg_n,
+            units_m=leaf.par_m,  # the scalar parallel thread-tile IS the UNIT grid
+            units_n=leaf.par_n,
             b_suffix="_b",
             u_suffix="_u",
             lead_axes=c.lead_axes,
@@ -82,7 +82,7 @@ class ScalarUnit(Unit):
         self.k_axis = c.k_axis
         # Split the lowered per-cell body: everything before the reduce loop (``pre``), the reduce
         # ``Loop`` itself, and the projection ``tail`` (the finalize + output ``Write``).
-        full = list(c.body)
+        full = list(leaf.body)
         ridx = next(i for i, s in enumerate(full) if isinstance(s, Loop) and s.axis.name == self.k_axis.name)
         self.pre, self.rloop, self.tail = full[:ridx], full[ridx], full[ridx + 1 :]
         # The shared iteration coordinates — excluded from the per-cell SSA rename.
