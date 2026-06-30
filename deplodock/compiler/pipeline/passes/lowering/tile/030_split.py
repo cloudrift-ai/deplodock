@@ -50,7 +50,7 @@ from deplodock.compiler.ir.tile import (
     TilePlan,
     kernel_for,
 )
-from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
+from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Level
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -73,10 +73,11 @@ def _slice_loop(rloop: Loop, b: int) -> Loop:
     return Loop(axis=new_ax, body=Body(new_body), unroll=rloop.unroll, role=rloop.role, carrier=rloop.carrier)
 
 
-def _cell_index(op, grid) -> tuple:
+def _cell_index(stmts, grid) -> tuple:
     """The output-cell index the original kernel writes (the projection ``Write``'s index,
-    or — for a bare carrier whose grid-cell store is glue — the grid-axis vars)."""
-    for s in op.body:
+    or — for a bare carrier whose grid-cell store is glue — the grid-axis vars). Read off the
+    kernel's lowered body (``ops.lower`` — the annotated loop nest, ``Map`` / ``Reduction`` alike)."""
+    for s in stmts:
         if isinstance(s, Write):
             return s.index
     return tuple(Var(ax.name) for ax in grid)
@@ -166,14 +167,18 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
 
     out = root.output
     grid = sched.place.grid
-    cell = _cell_index(op, grid)
+    # The lowered loop nest (``Map`` / ``Reduction`` alike) — find the carrier-bearing reduce loop
+    # in it by position (``reduce_loop`` returns a fresh synthesized loop for a ``Reduction``, so key
+    # off the lowered list, not object identity).
+    stmts = lower(op)
+    cell = _cell_index(stmts, grid)
     split = Axis(name=_SPLIT, extent=Dim(cta))
-    sliced_loop = _slice_loop(rloop, b)
+    idx = next(i for i, s in enumerate(stmts) if isinstance(s, Loop) and s.carrier is not None)
+    sliced_loop = _slice_loop(stmts[idx], b)
     # The stmts before / after the reduce loop: ``before`` is the (typically empty) prologue, ``after``
     # the projection epilogue (its own loads + computes + the output ``Write``).
-    idx = next(i for i, s in enumerate(op.body) if s is rloop)
-    before = tuple(op.body[:idx])
-    after = list(op.body[idx + 1 :])
+    before = tuple(stmts[:idx])
+    after = list(stmts[idx + 1 :])
     # Only the scalar output tier survives a split (a warp/None tier doesn't ride the partial
     # kernels — they materialize scalar); ``getattr`` covers a non-contraction split (no ``tier``).
     tier = getattr(sched, "tier", None)

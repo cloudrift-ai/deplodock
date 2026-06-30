@@ -19,14 +19,18 @@ from __future__ import annotations
 from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, Map, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
+from deplodock.compiler.ir.tile.structural import Reduction
 
 
 def reduce_loop(op):
     """The kernel's outermost **annotated** reduce ``Loop`` (its ``carrier`` set by recognition),
-    or ``None`` for a pure pointwise / flat-fallback ``Map`` (no annotated reduce). Read off the
-    top-level body — the annotated reduce loop is a top-level stmt (a single-flat-reduce cell);
-    a nested / multi reduce stays un-annotated (flat fallback) and is invisible here, so it
-    materializes on the scalar tier."""
+    or ``None`` for a pure pointwise / flat-fallback ``Map`` (no annotated reduce). A
+    :class:`~deplodock.compiler.ir.tile.structural.Reduction` synthesizes its loop directly; a ``Map``
+    is read off the top-level body — the annotated reduce loop is a top-level stmt (a
+    single-flat-reduce cell); a nested / multi reduce stays un-annotated (flat fallback) and is
+    invisible here, so it materializes on the scalar tier."""
+    if isinstance(op, Reduction):
+        return op.loop
     for s in op.body:
         if isinstance(s, (Loop, StridedLoop)) and s.carrier is not None:
             return s
@@ -50,7 +54,9 @@ def lower(op) -> list[Stmt]:
     one ``lower`` call emits the kernel's per-cell body with nothing left to expand."""
     if isinstance(op, Map):
         return list(op.body)
-    raise TypeError(f"lower: expected a Map lift wrapper, got {type(op).__name__}")
+    if isinstance(op, Reduction):
+        return op.lower()
+    raise TypeError(f"lower: expected a Map lift wrapper or Reduction, got {type(op).__name__}")
 
 
 def contraction_loop(lift, fold, operand_bodies, reduce_axis) -> Loop:
@@ -73,8 +79,13 @@ def contraction_loop(lift, fold, operand_bodies, reduce_axis) -> Loop:
 
 
 def pretty(op, indent: str = "") -> list[str]:
-    """Structurally pretty-print a kernel op (for dumps) — the ``Map``'s body (its annotated reduce
-    ``Loop`` + projection), or a bare stmt's own pretty."""
+    """Structurally pretty-print a kernel op (for dumps) — a
+    :class:`~deplodock.compiler.ir.tile.structural.Reduction` as a typed header over its synthesized
+    loop nest, the ``Map``'s body (its annotated reduce ``Loop`` + projection), or a bare stmt's own
+    pretty."""
+    if isinstance(op, Reduction):
+        head = f"{indent}Reduction[{op.axis.name}] {op.role.name.lower()}"
+        return [head, *pretty_body(Body(op.lower()), indent + "    ")]
     if isinstance(op, Map):
         return list(pretty_body(op.body, indent))
     if isinstance(op, Stmt):

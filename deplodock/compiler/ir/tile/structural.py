@@ -17,9 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Literal
-from deplodock.compiler.ir.stmt import INDENT, Body, Load, RenderCtx, Stmt, pretty_body
+from deplodock.compiler.ir.stmt import INDENT, Body, Carrier, Load, Loop, RenderCtx, Stmt, pretty_body
 from deplodock.compiler.ir.tile.schedule import TilePlan
 
 if TYPE_CHECKING:
@@ -37,6 +37,62 @@ def _overhangs(axis: Axis, tile: int) -> bool:
     if tile <= 1:
         return False
     return not (axis.extent.is_static and axis.extent.as_static() % tile == 0)
+
+
+@dataclass(frozen=True)
+class Reduction:
+    """A scheduled ``PLANAR`` / ``TWISTED`` reduce — the typed successor of the bare annotated reduce
+    ``Loop`` (``ir/stmt/algebra``). It splits the reduce's **algebra** (the loop-carried
+    :class:`~deplodock.compiler.ir.stmt.algebra.Carrier` — degenerate ``id`` for a plain
+    ``sum`` / ``max`` / ``mean``, twisted ``exp`` for online-softmax / flash) from its **structure**
+    (the reduce ``axis``, the per-element ``partial`` it folds, the post-reduce ``projection``). The
+    fold ``Loop`` is **synthesized on demand** (:attr:`loop`), never stored — so the same node tiles
+    under any :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition stays on
+    the schedule this cut; it moves onto the node when ``TileSchedule`` dissolves).
+
+    It is NOT a ``Stmt`` — like :class:`~deplodock.compiler.ir.stmt.algebra.Map` it is an op-tree
+    node a :class:`~deplodock.compiler.ir.tile.ir.TileOp` holds; :func:`ops.lower` flattens it back to
+    the annotated loop nest verbatim (``[loop, *projection]``), so ``op_cache_key`` and the
+    materializer's ``_reduce`` expander stay byte-identical to the bare-loop form."""
+
+    carrier: Carrier  # the loop-carried ⊕ algebra (degenerate id / twisted exp)
+    axis: Axis  # the reduce axis
+    partial: Body = field(default_factory=Body)  # the per-cell fold body (the reduce Loop's body)
+    projection: Body = field(default_factory=Body)  # post-reduce stmts; empty for a bare reduce (glue Write)
+    role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
+    unroll: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.partial, Body):
+            object.__setattr__(self, "partial", Body.coerce(self.partial))
+        if not isinstance(self.projection, Body):
+            object.__setattr__(self, "projection", Body.coerce(self.projection))
+
+    @classmethod
+    def from_loop(cls, loop: Loop, projection) -> Reduction:
+        """Build a :class:`Reduction` from an already-annotated reduce ``Loop`` (its ``carrier`` /
+        ``role`` / ``axis`` / body) plus its post-reduce ``projection`` stmts — the recognize-side
+        constructor. :attr:`loop` reconstructs the exact same ``Loop``."""
+        return cls(carrier=loop.carrier, axis=loop.axis, partial=loop.body, projection=Body(projection), role=loop.role, unroll=loop.unroll)
+
+    @property
+    def loop(self) -> Loop:
+        """The synthesized annotated reduce ``Loop`` — reconstructed from the params (byte-identical
+        to the loop :meth:`from_loop` captured)."""
+        return Loop(axis=self.axis, body=self.partial, unroll=self.unroll, role=self.role, carrier=self.carrier)
+
+    @property
+    def out(self) -> str:
+        """The bound output name — the carrier state's primary component for a bare reduce (the grid
+        ``Write`` is glue), else the projection's last def (mirrors ``Map.out``)."""
+        if len(self.projection) == 0:
+            return self.carrier.out
+        return self.projection[-1].defines()[-1]
+
+    def lower(self) -> list[Stmt]:
+        """Flatten to the loop-IR body the materializer expands — the synthesized reduce ``Loop``
+        followed by the projection (identical to the bare-loop ``Map`` body)."""
+        return [self.loop, *self.projection]
 
 
 @dataclass(frozen=True)
@@ -208,4 +264,4 @@ def _(s: Contraction, rename, sigma, axis_fn):
     )
 
 
-__all__ = ["Contraction"]
+__all__ = ["Contraction", "Reduction"]

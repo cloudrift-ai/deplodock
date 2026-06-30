@@ -55,7 +55,7 @@ from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
+from deplodock.compiler.ir.tile import Placement, Reduction, TileOp, kernel_for
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
@@ -152,7 +152,7 @@ def _annotate_reduce(rloop: Loop, pre_reduce: tuple[Stmt, ...]) -> Loop | None:
     return Loop(axis=rloop.axis, body=Body(body), unroll=rloop.unroll, role=AxisRole.PLANAR, carrier=accs[0].as_carrier())
 
 
-def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map:
+def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map | Reduction:
     """Lift the per-cell stmts into a ``Map`` whose body is the annotated loop nest. A pure
     pointwise cell (no reduce) is a flat ``Map`` of its stmts; a single flat reduce annotates that
     reduce ``Loop`` in place (``CONTRACTION`` / ``PLANAR`` / pre-annotated ``TWISTED``), its body
@@ -192,12 +192,17 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map:
         and after[0].output == output
         and after[0].index == grid_index
     )
-    if bare:
-        return Map(body=(annotated,))  # materialize writes ``carrier.out`` at the grid cell
-    return Map(body=(annotated, *pre_epilogue, *after))
+    # ``bare`` ⇒ materialize writes ``carrier.out`` at the grid cell (empty projection).
+    projection = () if bare else (*pre_epilogue, *after)
+    # A PLANAR / TWISTED reduce lifts to a typed ``Reduction`` node (its ⊕ carrier + structure split
+    # out, the fold loop synthesized on demand); a ``CONTRACTION`` keeps the flat ``Map`` form (it
+    # becomes a ``Contraction`` node in a later step). ``lower`` flattens either back identically.
+    if annotated.role in (AxisRole.PLANAR, AxisRole.TWISTED):
+        return Reduction.from_loop(annotated, projection)
+    return Map(body=(annotated, *projection))
 
 
-def _lift(stmts: list[Stmt], output: str) -> tuple[Map, tuple]:
+def _lift(stmts: list[Stmt], output: str) -> tuple[Map | Reduction, tuple]:
     """Peel the free axes and lift the per-cell compute, returning ``(root node, free
     axes)``. The free axes are the schedule's (carried on the ``TileOp``, not the node);
     ``020_schedule`` maps them onto the grid."""
@@ -206,7 +211,7 @@ def _lift(stmts: list[Stmt], output: str) -> tuple[Map, tuple]:
     return node, _order_free_by_output(node, free)
 
 
-def _order_free_by_output(node: Map, free: list) -> tuple:
+def _order_free_by_output(node: Map | Reduction, free: list) -> tuple:
     """Order the free (grid) axes to match the **output Write's index order**, so the innermost
     grid axis is the output's *contiguous* dim. The contraction tier needs ``n_axis == grid[-1] ==``
     the contiguous output axis — the mma fragment store coalesces a ``float2`` along it, and the
@@ -214,7 +219,7 @@ def _order_free_by_output(node: Map, free: list) -> tuple:
     diverge from the output layout (e.g. a batched ``Q@Kᵀ`` whose ``kv`` got named before ``m``).
     A node with no explicit output ``Write`` (a bare contraction whose grid-cell store is synthesized
     at materialize, already in free order) is left as-is."""
-    body = getattr(node, "body", ())
+    body = node.lower() if isinstance(node, Reduction) else getattr(node, "body", ())
     write = next((s for s in body if isinstance(s, Write)), None)
     if write is None:
         return tuple(free)
