@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="logo.png" alt="Emmy" width="300">
-</p>
-
-<p align="center">
   <a href="https://pypi.org/project/emmy/"><img src="https://img.shields.io/pypi/v/emmy" alt="PyPI"></a>
   <a href="https://github.com/cloudrift-ai/emmy/actions/workflows/tests.yml"><img src="https://github.com/cloudrift-ai/emmy/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
   <a href="https://discord.gg/cloudrift"><img src="https://img.shields.io/discord/1150997934113030174?label=Discord" alt="Discord"></a>
