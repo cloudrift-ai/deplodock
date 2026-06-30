@@ -54,7 +54,7 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop
+from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
 from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
@@ -190,7 +190,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a cooperative / ILP reduce (see module docstring)."""
     kernel = tile.kernel
     op = kernel.op
-    plan = kernel.schedule.reduce
+    plan = reduce_plan(kernel)
     coop, reg = plan.coop, plan.reg
     grid = kernel.schedule.place.grid
     stmts = lower(op)
@@ -329,7 +329,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # By the kernel pass, ``030_split`` has consumed every cross-CTA ``GRID`` stage (the
     # partial's plan is stripped, the finalize is a fresh ``ReducePlan``). A surviving split
     # request is a bug — the materializer only lowers single-launch kernels.
-    rplan = getattr(kernel.schedule, "reduce", None) if kernel is not None else None
+    rplan = reduce_plan(kernel) if kernel is not None else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
     tier = getattr(kernel.schedule, "tier", None) if kernel is not None else None
     role = axis_role(kernel.op) if kernel is not None else None
@@ -350,7 +350,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # same machinery folds its K axis. Composing the output tile WITH a reduce partition is the
     # remaining step. Read the role structurally, not the kernel kind.
     coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
-    plan = getattr(kernel.schedule, "reduce", None) if coop_eligible else None
+    plan = reduce_plan(kernel) if (coop_eligible and kernel is not None) else None
     # Reduce tier: the plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):
         return _reduce(tile, root)

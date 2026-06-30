@@ -50,7 +50,7 @@ from deplodock.compiler.ir.tile import (
     TilePlan,
     kernel_for,
 )
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop
+from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
 from deplodock.compiler.ir.tile.schedule import Level
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -147,7 +147,9 @@ def _projection_distributes(body, states: tuple[str, ...]) -> bool:
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     tile: TileOp = root.op
     sched = tile.kernel.schedule if tile.kernel is not None else None
-    plan = getattr(sched, "reduce", None)
+    # The reduce partition lives on the Reduction node (off the schedule) — ``reduce_plan`` reads
+    # it there, falling back to the schedule for a non-tiled contraction's split-K (still a Map).
+    plan = reduce_plan(tile.kernel) if tile.kernel is not None else None
     if plan is None or not plan.needs_split:
         raise RuleSkipped("no cross-CTA split stage — nothing to split")
 

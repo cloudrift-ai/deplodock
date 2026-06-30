@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Literal
 from deplodock.compiler.ir.stmt import INDENT, Body, Carrier, Load, Loop, RenderCtx, Stmt, pretty_body
-from deplodock.compiler.ir.tile.schedule import TilePlan
+from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.tile.atom import Atom
@@ -55,13 +55,19 @@ class Reduction:
     :class:`~deplodock.compiler.ir.tile.structural.Map` whose body IS that projection. It is NOT a ``Stmt``
     — like ``Map`` it is an op-tree node a :class:`~deplodock.compiler.ir.tile.ir.TileOp` holds;
     :func:`ops.lower` flattens it to the synthesized loop (``[loop]``), so ``op_cache_key`` and the
-    ``_reduce`` expander stay byte-identical to the bare-loop form."""
+    ``_reduce`` expander stay byte-identical to the bare-loop form.
+
+    The **scheduling param** is the ``reduce`` partition (:class:`ReducePlan` — GRID split / BLOCK coop
+    / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here**, off the
+    ``TileSchedule`` — read via ``ops.reduce_plan``). ``lower`` ignores it (it's metadata the
+    materializer / ``030_split`` read), so adding it leaves ``op_cache_key`` byte-identical."""
 
     carrier: Carrier  # the loop-carried ⊕ algebra (degenerate id / twisted exp)
     axis: Axis  # the reduce axis
     partial: Body = field(default_factory=Body)  # the per-cell fold body (the reduce Loop's body)
     role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
     unroll: bool = False
+    reduce: ReducePlan = field(default_factory=ReducePlan)  # the reduce partition (schedule slice), stamped by 020_schedule
 
     def __post_init__(self) -> None:
         if not isinstance(self.partial, Body):

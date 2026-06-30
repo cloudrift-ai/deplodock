@@ -10,11 +10,14 @@ structural reads (``axis_role`` / ``reduce_loop`` / ``out``) dispatching on the 
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
-from deplodock.compiler.ir.tile import Map, Reduction
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop
+from deplodock.compiler.ir.tile import Kernel, Map, Placement, ReducePlan, Reduction
+from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
+from deplodock.compiler.ir.tile.schedule import TileSchedule
 
 
 def _sum_loop(role: AxisRole = AxisRole.PLANAR) -> Loop:
@@ -72,6 +75,27 @@ def test_pure_pointwise_map_has_no_reduce() -> None:
     assert reduce_loop(node) is None
     assert axis_role(node) is AxisRole.FREE
     assert node.out == "y"
+
+
+def _kernel(op, schedule_reduce: ReducePlan = ReducePlan()) -> Kernel:
+    return Kernel(op=op, schedule=TileSchedule(place=Placement(), reduce=schedule_reduce))
+
+
+def test_reduce_plan_reads_the_partition_off_the_reduction_node() -> None:
+    plan = ReducePlan.of(coop=128)
+    red = replace(Reduction.from_loop(_sum_loop()), reduce=plan)
+    # A bare reduce root and a projecting Map both surface the node's partition.
+    assert reduce_plan(_kernel(red)) is plan
+    wrapped = Map(body=Body((Assign(name="rms", op="sqrt", args=("acc",)),)), source=red)
+    assert reduce_plan(_kernel(wrapped)) is plan
+    # The partition rides the node, not the schedule.
+    assert _kernel(red).schedule.reduce == ReducePlan()
+
+
+def test_reduce_plan_falls_back_to_schedule_for_a_legacy_loop_in_body_map() -> None:
+    sched_plan = ReducePlan.of(coop=64)
+    legacy = Map(body=(_sum_loop(),))  # loop in the body, no Reduction source (flash's form)
+    assert reduce_plan(_kernel(legacy, sched_plan)) is sched_plan
 
 
 def test_twisted_role_propagates() -> None:

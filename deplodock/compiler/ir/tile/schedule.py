@@ -533,7 +533,10 @@ class TileSchedule:
     - ``place`` — the free-axis → grid binding (:class:`Placement`).
     - ``block`` — free axes resident in the CTA alongside the cooperative lanes (strided-coop rows).
     - ``reduce`` — the reduce-axis partition (:class:`ReducePlan`): GRID split / BLOCK coop / REG
-      ILP. Empty = the scalar serial fold. (Phase 5 widens this to a per-axis map for a planar set.)
+      ILP. Empty = the scalar serial fold. A ``PLANAR`` / ``TWISTED`` reduce now carries its partition
+      on its :class:`~deplodock.compiler.ir.tile.structural.Reduction` node (read via
+      ``ops.reduce_plan``); this field holds it only for a non-tiled contraction's split-K / coop-K and
+      a legacy loop-in-body ``Map`` (flash). (Phase 5 widens this to a per-axis map for a planar set.)
     - ``tier`` — the output fragment for a contraction (:class:`TilePlan` whose ``atom`` discriminates
       the mutually-exclusive scalar register sub-tile vs warp mma tile); ``None`` = the per-cell tier.
     - ``stage`` — the operand smem pipeline (:class:`Stage`); ``None`` = gmem-direct.

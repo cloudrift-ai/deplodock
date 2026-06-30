@@ -37,7 +37,7 @@ from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.ir.axis import AxisRole
-from deplodock.compiler.ir.tile import Kernel, ReducePlan, TileOp, TilePlan
+from deplodock.compiler.ir.tile import Kernel, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline.knob import Knob, KnobType
@@ -188,12 +188,29 @@ def _reduce_specs(kernel, place) -> list[str]:
     return list(REDUCE.narrow(cands))
 
 
+def _with_reduce(op, plan: ReducePlan):
+    """Stamp the chosen ``ReducePlan`` onto the op's :class:`Reduction` node (bare, or wrapped under a
+    projecting :class:`Map`). The reduce partition lives **on the node**, not the ``TileSchedule`` —
+    read back via ``ops.reduce_plan``."""
+    if isinstance(op, Reduction):
+        return replace(op, reduce=plan)
+    if isinstance(op, Map) and isinstance(op.source, Reduction):
+        return replace(op, source=replace(op.source, reduce=plan))
+    return op  # a reduce kernel's op is always a Reduction / Map(source=Reduction)
+
+
 def _option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
-    """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec
-    resolved into the schedule's ``ReducePlan`` (the ephemeral knob → materialized plan),
-    with the spec stamped on ``knobs`` for the prior."""
-    sched = replace(kernel.schedule, place=place, reduce=ReducePlan.parse(spec))
-    return TileOp(kernel=replace(kernel, schedule=sched), name=name, knobs={**knobs, REDUCE.name: spec})
+    """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec resolved into the
+    :class:`Reduction` node's ``ReducePlan`` (the ephemeral knob → materialized plan stamped **on the
+    node**), with the spec stamped on ``knobs`` for the prior. A reduce whose op is still a legacy
+    ``Map`` (the loop in the body — flash, not yet a ``Reduction``) keeps the plan on the schedule
+    (``ops.reduce_plan`` falls back there)."""
+    plan = ReducePlan.parse(spec)
+    op = _with_reduce(kernel.op, plan)
+    # ``_with_reduce`` returns the op unchanged when there is no ``Reduction`` node to stamp (a legacy
+    # loop-in-body ``Map``); keep its plan on the schedule so ``reduce_plan`` still finds it.
+    sched = replace(kernel.schedule, place=place, reduce=plan if op is kernel.op else ReducePlan())
+    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs={**knobs, REDUCE.name: spec})
 
 
 def _tile_specs(kernel) -> list[str]:
