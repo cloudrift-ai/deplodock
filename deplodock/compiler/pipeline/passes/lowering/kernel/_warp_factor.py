@@ -86,11 +86,11 @@ def mma_codegen(c: Contraction):
     restore symmetry with the scalar tier — a symmetric staging mechanism for both tiers is reserved
     (the ``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/tile/schedule``)."""
     leaf: MmaLeaf = c.leaf
-    atom = c.atom
+    atom = leaf.atom
     atom_k = atom.atom_k
     a_load, b_load, b_trans, acc = leaf.a_load, leaf.b_load, leaf.b_trans, leaf.acc
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    reg_m, reg_n = c.reg_m, c.reg_n
+    reg_m, reg_n = leaf.reg_m, leaf.reg_n
     pre: list[Stmt] = []
     tail = list(leaf.epilogue)
     write = next(s for s in tail if isinstance(s, Write))

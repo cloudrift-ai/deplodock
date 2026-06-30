@@ -33,9 +33,10 @@ def factorize(c: Contraction) -> Tile:
     node supplies the per-level geometry; the leaf's codegen supplies the per-cell emission; the
     layer owns the offset, the axes, and the splice."""
     state_decls, reduce_region, store = _codegen_for(c)
+    atom, leaf = c.leaf.atom, c.leaf
     masks = (c.mask_m, c.mask_n, c.m_ext, c.n_ext)
-    t = atomize(c.atom_m, c.atom_n)
-    t = register_tile(t, c.reg_m, c.reg_n)
+    t = atomize(atom.atom_m, atom.atom_n)
+    t = register_tile(t, leaf.reg_m, leaf.reg_n)
     t = unit_tile(t, c.units_m, c.units_n, c.m_uvar, c.n_uvar)
     return grid_tile(
         t,
@@ -48,7 +49,7 @@ def factorize(c: Contraction) -> Tile:
         tile_m=c.tile_m,
         lead_axes=c.lead_axes,
         block_threads=c.block_threads,
-        lanes=c.lanes,
+        lanes=atom.lanes,
         state_decls=state_decls,
         reduce_region=reduce_region,
         store=store,

@@ -301,14 +301,15 @@ class Tile(Stmt):
 @dataclass(frozen=True)
 class Leaf:
     """Shared base for a :class:`Contraction`'s atom-specific payload — the **common tiling widths**
-    both arms carry: the per-CTA **UNIT** grid (``units_m`` × ``units_n`` — warps for mma, threads
-    for scalar) and the per-unit **REGISTER** sub-tile (``reg_m`` × ``reg_n`` — identical in meaning
-    for both). The atom + the operand payload (binding-driven mma vs body-driven scalar) and the
-    ``Stmt``-protocol helpers :class:`Contraction` delegates to live on the subclasses
-    (:class:`MmaLeaf` / :class:`ScalarLeaf`)."""
+    both arms carry: the per-CTA **thread** grid (``threads_m`` × ``threads_n`` — the same quantity
+    for both tiers) and the per-unit **REGISTER** sub-tile (``reg_m`` × ``reg_n``). The per-CTA UNIT
+    grid (warps for mma, threads for scalar) is **derived** by :class:`Contraction` from the thread
+    extents and the atom's lane extents (``units = threads // atom.lanes``). The atom + the operand
+    payload (binding-driven mma vs body-driven scalar) and the ``Stmt``-protocol helpers
+    :class:`Contraction` delegates to live on the subclasses (:class:`MmaLeaf` / :class:`ScalarLeaf`)."""
 
-    units_m: int
-    units_n: int
+    threads_m: int
+    threads_n: int
     reg_m: int
     reg_n: int
 
@@ -401,7 +402,7 @@ class ScalarLeaf(Leaf):
         return ()
 
     def head(self) -> str:
-        return f"scalar reg={self.reg_m}x{self.reg_n} units={self.units_m}x{self.units_n}"
+        return f"scalar reg={self.reg_m}x{self.reg_n} threads={self.threads_m}x{self.threads_n}"
 
     def rewrite(self, rename, sigma, axis_fn) -> ScalarLeaf:
         return replace(self, body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in self.body)))
@@ -432,11 +433,12 @@ class Contraction(Stmt):
     (``nested`` / ``with_bodies`` / ``defines`` / ``external_reads`` / ``rewrite``) delegates to.
 
     ``010_materialize`` expands it into the ``Tile`` of the four-way GRID/UNIT/REGISTER/ATOM split
-    (``_factor.factorize`` reads the **derived tiling geometry** below — ``tile_m``/``mask_m``/
-    ``m_b``/``m_uvar``/``block_threads``/``lanes``/… — straight off this node, computed once from the
-    leaf widths + the skeleton axes; there is no separate per-atom geometry object). It IS
-    ``structural_key``-ed as an intermediate ``KernelOp`` (the kernel-stmt protocol + ``_rewrite``);
-    the geometry is derived (``@property``), so it stays out of the fields the key digests."""
+    (``_factor.factorize`` reads the **derived tiling geometry** below — ``units_m``/``tile_m``/
+    ``mask_m``/``m_b``/``m_uvar``/``block_threads``/… — straight off this node, computed from the
+    leaf's thread extents + register widths + atom; the raw atom / widths / thread extents are read
+    straight off ``leaf``, not re-forwarded here). It IS ``structural_key``-ed as an intermediate
+    ``KernelOp`` (the kernel-stmt protocol + ``_rewrite``); the geometry is derived (``@property``),
+    so it stays out of the fields the key digests."""
 
     leaf: Leaf
     n_axis: Axis
@@ -445,47 +447,25 @@ class Contraction(Stmt):
     m_axis: Axis | None = None
     lead_axes: tuple[Axis, ...] = ()
 
-    @property
-    def atom(self):
-        """The contraction leaf atom (the ``WarpTile``'s ``AtomKind`` / the scalar ``ScalarAtom``)."""
-        return self.leaf.atom
-
-    # ---- derived tiling geometry (read by ``_factor.factorize`` — see class docstring) ---------- #
-    @property
-    def atom_m(self) -> int:
-        return self.leaf.atom.atom_m
-
-    @property
-    def atom_n(self) -> int:
-        return self.leaf.atom.atom_n
-
-    @property
-    def lanes(self) -> int:
-        return self.leaf.atom.lanes
-
-    @property
-    def reg_m(self) -> int:
-        return self.leaf.reg_m
-
-    @property
-    def reg_n(self) -> int:
-        return self.leaf.reg_n
-
+    # ---- derived tiling geometry (read by ``_factor.factorize``; the raw atom / widths / thread
+    # extents live on ``leaf`` and are read straight off it) ---------- #
+    # The UNIT grid (warps for mma, threads for scalar) — derived: a thread extent factors into a
+    # unit extent by the atom's lane extent (``threads_m // lanes_m == units_m``).
     @property
     def units_m(self) -> int:
-        return self.leaf.units_m
+        return self.leaf.threads_m // self.leaf.atom.lanes_m
 
     @property
     def units_n(self) -> int:
-        return self.leaf.units_n
+        return self.leaf.threads_n // self.leaf.atom.lanes_n
 
     @property
     def tile_m(self) -> int:
-        return self.units_m * self.reg_m * self.atom_m
+        return self.units_m * self.leaf.reg_m * self.leaf.atom.atom_m
 
     @property
     def tile_n(self) -> int:
-        return self.units_n * self.reg_n * self.atom_n
+        return self.units_n * self.leaf.reg_n * self.leaf.atom.atom_n
 
     @property
     def mask_m(self) -> bool:
@@ -505,7 +485,7 @@ class Contraction(Stmt):
 
     @property
     def block_threads(self) -> int | None:
-        bt = self.units_m * self.units_n * self.lanes
+        bt = self.leaf.threads_m * self.leaf.threads_n  # == units_m · units_n · lanes
         return bt if bt > 1 else None  # None ⇒ the scalar default block size
 
     # The bound GRID-block / UNIT axis names — the original m/n axis names live in the body

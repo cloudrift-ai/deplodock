@@ -55,8 +55,8 @@ def _warp_contraction(tile: TileOp, sched, root: Node) -> Contraction:
         tail = with_store(tail, root.output.name, grid, node)
     wt = sched.warp_tile
     leaf = MmaLeaf(
-        units_m=wt.warps[0],
-        units_n=wt.warps[1],
+        threads_m=wt.warps[0] * wt.atom.lanes_m,  # warps × the cell's lane grid = the CTA thread grid
+        threads_n=wt.warps[1] * wt.atom.lanes_n,
         reg_m=wt.reg[0],
         reg_n=wt.reg[1],
         atom=wt.atom,
@@ -82,8 +82,8 @@ def _scalar_contraction(tile: TileOp, sched, root: Node) -> Contraction:
     k_axis = node.reduce_node.reduce_axis
     plan = sched.tile
     leaf = ScalarLeaf(
-        units_m=plan.par_m if m_axis is not None else 1,
-        units_n=plan.par_n,
+        threads_m=plan.par_m if m_axis is not None else 1,  # scalar lanes = 1×1, so threads == units
+        threads_n=plan.par_n,
         reg_m=plan.reg_m if m_axis is not None else 1,
         reg_n=plan.reg_n,
         body=Body(with_store(lower(node), root.output.name, grid, node)),

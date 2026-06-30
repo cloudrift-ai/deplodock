@@ -36,13 +36,16 @@ class AtomKind:
     """One tensor-core mma cell: a fixed ``(m, n, k)`` shape + per-operand dtypes.
 
     ``operand_dtypes`` maps each role (``"a"`` / ``"b"`` / ``"c"``) to its element dtype;
-    ``a``/``b`` are the multiplicands (f16 or bf16), ``c`` the f32 accumulator. Frozen +
-    hashable so it rides on a frozen ``WarpTile`` / ``Contraction``. :attr:`lanes` is 32 — an
-    mma is warp-cooperative."""
+    ``a``/``b`` are the multiplicands (f16 or bf16), ``c`` the f32 accumulator. ``lane_shape`` is the
+    cell's **lane grid** (``lanes_m`` × ``lanes_n``) — the 2-D arrangement of the warp's lanes over
+    the cell, e.g. ``(8, 4)`` for m16n8 (8 lane-rows × 4 lane-cols = 32 lanes, each owning a 2×2
+    fragment block). It's how a thread extent factors into a warp extent: ``units = threads //
+    lanes``. Frozen + hashable so it rides on a frozen ``WarpTile`` / ``Contraction``."""
 
     name: str
     shape: tuple[int, int, int]
     operand_dtypes: tuple[tuple[str, DataType], ...]
+    lane_shape: tuple[int, int]
 
     def operand_dtype(self, role: str) -> DataType:
         """The element dtype of operand ``role`` (``"a"`` / ``"b"`` / ``"c"``)."""
@@ -64,9 +67,19 @@ class AtomKind:
         return self.shape[2]
 
     @property
+    def lanes_m(self) -> int:
+        """Lanes spanning the cell's m (row) direction — ``threads_m // lanes_m == units_m``."""
+        return self.lane_shape[0]
+
+    @property
+    def lanes_n(self) -> int:
+        """Lanes spanning the cell's n (col) direction — ``threads_n // lanes_n == units_n``."""
+        return self.lane_shape[1]
+
+    @property
     def lanes(self) -> int:
-        """The atom's parallel thread footprint — 32 (one warp executes an mma.sync cell)."""
-        return 32
+        """The atom's parallel thread footprint = ``lanes_m · lanes_n`` (32 — one warp per cell)."""
+        return self.lane_shape[0] * self.lane_shape[1]
 
     @property
     def ab_dtype(self) -> str:
@@ -98,6 +111,14 @@ class ScalarAtom:
         return 1
 
     @property
+    def lanes_m(self) -> int:
+        return 1
+
+    @property
+    def lanes_n(self) -> int:
+        return 1
+
+    @property
     def lanes(self) -> int:
         """The atom's parallel thread footprint — 1 (one thread folds a scalar cell)."""
         return 1
@@ -115,8 +136,8 @@ Atom = AtomKind | ScalarAtom
 #: The registered mma atoms, keyed by the name the ``TILE`` codec (``a:<name>``) spells.
 #: The s16816 mma.sync family — one cell shape, f16 / bf16 multiplicands, f32 accumulator.
 ATOM_REGISTRY: dict[str, AtomKind] = {
-    "mma_m16n8k16_f16": AtomKind("mma_m16n8k16_f16", (16, 8, 16), (("a", F16), ("b", F16), ("c", F32))),
-    "mma_m16n8k16_bf16": AtomKind("mma_m16n8k16_bf16", (16, 8, 16), (("a", BF16), ("b", BF16), ("c", F32))),
+    "mma_m16n8k16_f16": AtomKind("mma_m16n8k16_f16", (16, 8, 16), (("a", F16), ("b", F16), ("c", F32)), lane_shape=(8, 4)),
+    "mma_m16n8k16_bf16": AtomKind("mma_m16n8k16_bf16", (16, 8, 16), (("a", BF16), ("b", BF16), ("c", F32)), lane_shape=(8, 4)),
 }
 
 
