@@ -30,10 +30,12 @@ from deplodock.compiler.ir.tile.schedule import (
     WarpSpec,
     kernel_for,
 )
+from deplodock.compiler.ir.tile.skeleton import AxisRole, ReduceAxis, Scope, Skeleton
 
 __all__ = [
     "AtomBinding",
     "AtomKind",
+    "AxisRole",
     "Fold",
     "Kernel",
     "Level",
@@ -43,13 +45,16 @@ __all__ = [
     "MonoidSchedule",
     "Operand",
     "Placement",
+    "ReduceAxis",
     "ReducePlan",
     "ReduceStage",
     "RoleAlloc",
     "RoleKind",
     "Schedule",
+    "Scope",
     "SemiringKernel",
     "SemiringSchedule",
+    "Skeleton",
     "Stage",
     "TileOp",
     "TilePlan",
