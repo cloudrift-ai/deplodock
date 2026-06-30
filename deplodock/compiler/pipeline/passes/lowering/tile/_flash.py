@@ -69,6 +69,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Load, Loop, Monoid, Select
 from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.ir.tile.ops import Map
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
+from deplodock.compiler.pipeline.passes.lowering.tile._skeleton import build_skeleton
 
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
@@ -190,8 +191,10 @@ def build_flash_frag(
     # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid. Flash is a
     # ``Monoid`` over a nested partial ``Semiring`` (the schedule is typed by the OUTERMOST
     # kind), so ``kernel_for`` wraps it as a ``MonoidKernel``; its cooperative-KV / warp tier
-    # is future work, so it keeps the scalar (serial) reduce partition.
-    tile = TileOp(kernel=kernel_for(flash_op, Placement(free=grid)))
+    # is future work, so it keeps the scalar (serial) reduce partition. The recognized
+    # ``skeleton`` nests the inner score ``Semiring`` as a child scope (flash's K contraction).
+    kernel = kernel_for(flash_op, Placement(free=grid))
+    tile = TileOp(kernel=kernel, skeleton=build_skeleton(kernel, grid))
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):

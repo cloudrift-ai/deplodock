@@ -30,10 +30,14 @@ only the carrier (the ⊕) and the schedule's reduce partition change.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.base import Op
 from deplodock.compiler.ir.tile.schedule import Kernel, Placement
+
+if TYPE_CHECKING:
+    from deplodock.compiler.ir.tile.skeleton import Skeleton
 
 #: Back-compat alias: the old two-field ``Schedule`` (``free`` / ``grid``) is now
 #: :class:`~.schedule.Placement`. Kept re-exported during the transition.
@@ -58,6 +62,11 @@ class TileOp(Op):
 
     kernel: Kernel | None = None
     name: str = ""
+    #: The recognized axis-typed :class:`~.skeleton.Skeleton` — the schedule-side index
+    #: ``020_schedule`` enumerates over. Built at recognition; ``compare=False`` so it stays out
+    #: of equality / hashing (the cache key digests ``lower(op.op)``, not this). ``None`` for a
+    #: placeholder node or a TileOp built before the skeleton was wired.
+    skeleton: Skeleton | None = field(default=None, compare=False)
 
     @property
     def op(self):

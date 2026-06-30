@@ -57,6 +57,7 @@ from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
+from deplodock.compiler.pipeline.passes.lowering.tile._skeleton import build_skeleton
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
 
 PATTERN = [Pattern("root", LoopOp)]
@@ -270,5 +271,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # cell (clamp-read + guarded write) in ``lowering/kernel``.
     # Wrap the lifted node + its unmapped placement in the matching ``*Kernel`` (keyed by
     # the op kind — a bare reduction / projection over one is a Monoid/Semiring kernel,
-    # else a MapKernel). ``020_schedule`` maps the free axes + picks the reduce partition.
-    return TileOp(kernel=kernel_for(node, Placement(free=free)), name=loop.name)
+    # else a MapKernel). ``020_schedule`` maps the free axes + picks the reduce partition,
+    # reading the recognized ``skeleton`` (axis roles, the reduce carrier, the operand binding).
+    kernel = kernel_for(node, Placement(free=free))
+    return TileOp(kernel=kernel, name=loop.name, skeleton=build_skeleton(kernel, free))
