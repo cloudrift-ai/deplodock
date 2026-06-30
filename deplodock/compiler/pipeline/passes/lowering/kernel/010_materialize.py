@@ -3,7 +3,7 @@
 Binds the schedule's grid axes to GPU threads and realizes the reduce partition. The step
 dispatches on the kernel kind / its reduce plan.
 
-A ``Semiring`` **contraction** (warp / register-tiled) is constructed one pass earlier —
+A ``CONTRACTION`` **contraction** (warp / register-tiled) is constructed one pass earlier —
 ``005_contract`` turns it into a ``KernelOp`` holding a single high-level :data:`Contraction` node.
 Materialize **folds in its expansion**: a ``KernelOp(Contraction)`` root is expanded via the one
 atom-generic ``_factor.factorize`` (mma → the ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` /
@@ -17,7 +17,7 @@ atom-generic ``_factor.factorize`` (mma → the ``RegFragment`` / ``LdmatrixLoad
 - **Reduce tier** (a reduce axis — PLANAR / TWISTED monoid OR a non-output-tiled CONTRACTION,
   read off ``ops.axis_role``, not the kernel type — whose ``ReducePlan`` carries a BLOCK ``coop``
   and/or a REG ``reg`` stage) — :func:`_reduce`. A contraction folds here carrier-generically (a
-  ``Semiring`` is a ``Monoid`` with a ⊗ lift — ``as_monoid``). The reduce axis is partitioned ``coop`` ways across
+  contraction is the degenerate carrier of its additive fold). The reduce axis is partitioned ``coop`` ways across
   the CTA's threads (cooperation) and ``reg`` ways across per-thread **register
   accumulators** (ILP — independent chains that hide the fold/load latency). The serial
   reduce ``Loop`` becomes a :class:`StridedLoop` of step ``coop·reg``; for ``reg > 1`` its
@@ -246,7 +246,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
     strided = StridedLoop(axis=axis, start=start, step=Literal(stride, "int"), body=Body(tuple(copies)), unroll=rloop.unroll)
 
     # REG tree: fold each register copy into the survivor (copy 0's names), carrier-generic —
-    # ``as_state_merge`` is the one-shot ``Monoid`` whose ``render`` reassigns the survivor
+    # ``as_state_merge`` is the one-shot ``StateMerge`` whose ``render`` reassigns the survivor
     # state in place from the copy's renamed state (the same state-merge the cross-partition
     # combine uses; emitted as a stmt so ``render_merge_program`` handles the reassignment, not
     # a shadowing ``float`` redeclare).
@@ -284,7 +284,7 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:
-    # Contraction expansion: ``005_contract`` already turned a warp / register-tiled ``Semiring``
+    # Contraction expansion: ``005_contract`` already turned a warp / register-tiled ``CONTRACTION``
     # contraction into a ``KernelOp`` holding a single high-level :data:`Contraction` node. Fold the
     # exact atom factorization in here — the mma arm into the ``RegFragment`` / ``LdmatrixLoad`` /
     # ``MmaSyncPtx`` / ``RegStore`` fragment soup, the scalar arm into the per-thread register cell
@@ -307,15 +307,13 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # Cooperative / ILP reduce tier (``_reduce``): a PLANAR / TWISTED monoid reduce, OR a
     # **non-output-tiled** ``CONTRACTION`` whose ``ReducePlan`` cooperates — the carrier-generic
     # K partition (split-K / coop-K matmul). A contraction's reduce composes here because a
-    # ``Semiring`` IS a ``Monoid`` with a ⊗ lift (``as_monoid`` — applied in ``_reduce``), so the
+    # contraction is the degenerate carrier of its additive fold (applied in ``_reduce``), so the
     # same machinery folds its K axis. An **output-tiled** contraction is built one pass earlier
     # (``005_contract`` → ``factorize``); composing the output tile WITH a reduce partition is the
     # remaining step. Read the role structurally, not the kernel kind.
     tier = getattr(kernel.schedule, "tier", None) if kernel is not None else None
     role = axis_role(kernel.op) if kernel is not None else None
-    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (
-        role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled)
-    )
+    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
     plan = getattr(kernel.schedule, "reduce", None) if coop_eligible else None
     # Reduce tier: the plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):

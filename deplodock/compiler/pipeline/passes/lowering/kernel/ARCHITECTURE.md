@@ -6,7 +6,7 @@ afterwards.
 
 ## `005_contract` — construct the contraction node (before materialize)
 
-A `Semiring` contraction's high-level node is built one pass **before** the materializer. It's **one flat**
+A `CONTRACTION` contraction's high-level node is built one pass **before** the materializer. It's **one flat**
 `Contraction` Stmt (`ir/kernel/ir.py`) — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
 splits two concerns:
 
@@ -32,8 +32,9 @@ bind to threads in `010_materialize`. Homing the construction here keeps the con
 the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
 
 - **Scalar tier** — one thread per output cell (`lower(op)` + an output-store glue).
-- **Reduce tier** (`_reduce`, a `MonoidKernel` whose `ReducePlan` cooperates / register-folds) — the reduce axis is
-  partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP), then a REG-tree
+- **Reduce tier** (`_reduce`, a `PLANAR` / `TWISTED` reduce whose `ReducePlan` cooperates / register-folds) — the
+  reduce axis is partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP),
+  then a REG-tree
   fold, the cross-thread combine (`_combine`), and the projection.
 
 The materializer takes one of the thread-binding tiers above for a `TileOp` root, OR — for a `KernelOp(Contraction)`
@@ -79,7 +80,7 @@ operands gmem-direct (both tiers are symmetric — neither carries a `stage`). T
 materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
 mma-staging structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
 
-**Shared-row staging (`_reduce`) — distinct, still present.** The fused norm→linear prologue is a `MonoidKernel`: an
+**Shared-row staging (`_reduce`) — distinct, still present.** The fused norm→linear prologue is a cooperative reduce: an
 input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis `Loop` over an
 inner reduce). `_reduce` (in `010_materialize`) stages that one row into a single `__shared__` slab (cooperatively filled)
 and rewrites both readers to it. The trigger is narrow (`_has_contraction_tail`) so a plain softmax sum or a bare

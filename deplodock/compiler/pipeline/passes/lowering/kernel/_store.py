@@ -25,10 +25,10 @@ def has_write(stmts: list[Stmt]) -> bool:
 
 
 def with_store(stmts: list[Stmt], output: str, grid, op) -> list[Stmt]:
-    """Append the output-store glue when the body has none — a bare reduction (``op`` a
-    ``Monoid`` / ``Semiring``) produces its finalized value as an SSA name (``op.out``) that
-    must be written to the output buffer at the grid cell. A body that already carries a
-    ``Write`` needs no glue (and ``op.out`` is left unread)."""
+    """Append the output-store glue when the body has none — a bare reduction (``op`` a ``Map``
+    whose trailing stmt is the annotated reduce ``Loop``) produces its finalized value as an SSA
+    name (``op.out`` = the carrier state) that must be written to the output buffer at the grid
+    cell. A body that already carries a ``Write`` needs no glue (and ``op.out`` is left unread)."""
     if has_write(stmts):
         return stmts
     index = tuple(Var(ax.name) for ax in grid)

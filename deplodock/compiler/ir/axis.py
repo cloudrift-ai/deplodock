@@ -52,6 +52,7 @@ class AxisRole(enum.Enum):
         """True for every fold role (everything but :attr:`FREE`)."""
         return self is not AxisRole.FREE
 
+
 # Sentinel upper bound for a symbolic loop axis ``[0, hi]``. Only its ``lo = 0``
 # matters (gives the non-negativity the ``(i*c + …)//c → i`` div fold needs);
 # the finite ``hi`` never enables a wrong fold (``_div_mod_decompose``'s

@@ -15,13 +15,12 @@ read structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
 (``ops.axis_role``), so MAP / MONOID / SEMIRING all ride the same ``Kernel``. See
 :mod:`.schedule`.
 
-The combine lives entirely in the ``op`` tree (``ir/stmt/algebra``): a pointwise
-``Map`` of leaf compute (optionally OVER a nested node — a ``Map`` over a
-``Monoid`` is the φ projection ``project ∘ reduce``), a ``Monoid`` folding through
-its carrier (``Twist``), or a ``Semiring`` contraction. The algebra is **not
-stored as a tag**; the carriers and partial structure are read directly where a
-pass needs them. There is no stored per-cell body — ``lower(op)`` generates it at
-materialize (and on demand for the dump / cache key).
+The combine lives entirely in the ``op`` wrapper (``ir/stmt/algebra``): a
+:class:`~deplodock.compiler.ir.stmt.algebra.Map` whose body is the per-cell loop nest — its reduce
+``Loop`` carrying the role (``AxisRole``) + the decoupled ``Carrier`` (the ⊕ algebra). The algebra
+is **not stored as a node kind**; the role/carrier are read off the annotated loop where a pass
+needs them (``ops.axis_role`` / ``ops.reduce_loop``). ``lower(op)`` is the body verbatim (the
+carriers already dissolved into loose folds at recognition).
 
 ``op`` / ``schedule`` are **read-only projections** of ``kernel`` (preserving
 ``keys.op_cache_key``, ``dialect_of``, ``pretty_body``, and the materialize call
@@ -62,8 +61,8 @@ class TileOp(Op):
 
     @property
     def op(self):
-        """The op-tree node (``Map`` / ``Monoid`` / ``Semiring``, possibly a projection
-        ``Map``); ``None`` for a placeholder node carrying no kernel."""
+        """The kernel op — a :class:`~deplodock.compiler.ir.stmt.algebra.Map` wrapping the per-cell
+        annotated loop nest; ``None`` for a placeholder node carrying no kernel."""
         return self.kernel.op if self.kernel is not None else None
 
     @property

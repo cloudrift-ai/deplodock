@@ -43,9 +43,8 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.stmt.algebra import Map, Semiring
 from deplodock.compiler.ir.tile.atom import AtomKind
-from deplodock.compiler.ir.tile.ops import lower
+from deplodock.compiler.ir.tile.ops import contraction_loop
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
@@ -189,20 +188,19 @@ def _unroll_inner(axis) -> bool:
 
 
 def _synth_reduce(c: Contraction) -> Loop:
-    """The scalar contraction reduce loop ``for k: v = a*b; acc += v`` — built by lowering the
-    contraction as a :class:`Semiring` through the carrier-generic ``ops.lower`` (``_lower_semiring``),
-    the **same** reduce-body generation the ``Monoid`` / cooperative ``_reduce`` tier uses (one source
-    of truth, no register-tile special case), then stamping the small-static ``unroll``. ``005_contract``
-    extracted A/B as plain leaf ``Load``\\ s (their indices carry the cell ``m`` / ``n`` + the loop
-    ``k``); the operands keep B-then-A order for the load reuse."""
+    """The scalar contraction reduce loop ``for k: v = a*b; acc += v`` — built by the shared
+    ``ops.contraction_loop`` builder (the **same** ``CONTRACTION`` loop generation the flash score
+    producer uses, one source of truth, no register-tile special case), then stamping the
+    small-static ``unroll``. ``005_contract`` extracted A/B as plain leaf ``Load``\\ s (their indices
+    carry the cell ``m`` / ``n`` + the loop ``k``); the operands keep B-then-A order for the load
+    reuse."""
     k = c.k_axis
-    semi = Semiring(
+    loop = contraction_loop(
         lift=_MUL,
         fold=Accum(name=c.acc, value=f"{c.acc}__v", op=_ADD, axes=(k.name,)),
-        operands=(Map(body=[c.b_load]), Map(body=[c.a_load])),  # B[k, n], A[m, k]
+        operand_bodies=([c.b_load], [c.a_load]),  # B[k, n], A[m, k]
         reduce_axis=k,
     )
-    (loop,) = lower(semi)
     return replace(loop, unroll=_unroll_inner(k))
 
 

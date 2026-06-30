@@ -215,7 +215,7 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     (``<ty> t = …;``). Statement order is load-bearing — a state update must follow
     every read of that state's old value (the carrier builder guarantees it).
 
-    Shared by ``Monoid.render`` (the streaming step, fp32) and the kernel-IR
+    Shared by ``StateMerge.render`` (the streaming step, fp32) and the kernel-IR
     cross-thread combine primitives ``WarpShuffle`` / ``TreeHalve`` (the
     state-merges-state step, at the carrier's dtype — fp32 for monoids, the
     accumulator dtype for a degenerate scalar reduce), so all spell the carrier's

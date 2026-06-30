@@ -1,4 +1,4 @@
-"""Construct the high-level :class:`Contraction` node for a ``Semiring`` contraction — **before**
+"""Construct the high-level :class:`Contraction` node for a ``CONTRACTION`` contraction — **before**
 materialize.
 
 ONE binding-driven node for both tiers. 005 reads the operand→role binding — already on
@@ -21,7 +21,7 @@ from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.kernel.ir import Contraction
 from deplodock.compiler.ir.stmt import Body
 from deplodock.compiler.ir.tile import TileOp
-from deplodock.compiler.ir.tile.ops import axis_role
+from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -31,7 +31,7 @@ PATTERN = [Pattern("root", TileOp)]
 
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:
-    """Build the :class:`Contraction` for a warp / register-tiled ``Semiring`` kernel; skip every
+    """Build the :class:`Contraction` for a warp / register-tiled ``CONTRACTION`` kernel; skip every
     other tier (it materializes in ``010``), and skip an unbindable contraction (the per-cell
     fallback in ``010`` lowers it)."""
     tile: TileOp = root.op
@@ -55,7 +55,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
 
     m_axis, n_axis = grid[-2], grid[-1]
     lead = tuple(grid[:-2])
-    k_axis = node.reduce_node.reduce_axis
+    k_axis = reduce_loop(node).axis
     # The projection epilogue: the binding's body, or — for a bare contraction — a synthesized store
     # of the accumulator (``with_store`` needs ``node.out`` / the grid, so it stays here).
     tail = list(bind.epilogue)

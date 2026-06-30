@@ -228,9 +228,9 @@ def name_for(loop: LoopOp, base_name: str, node_prov: dict, all_totals: dict[str
 
     Local import for the carriers avoids a top-of-module cycle through
     ``ir.loop`` (which imports ``provenance`` for graph utilities)."""
-    from deplodock.compiler.ir.stmt import Accum, Mma, Monoid
+    from deplodock.compiler.ir.stmt import Accum, Mma
 
-    suffix = "reduce" if any(isinstance(s, (Accum, Mma, Monoid)) for s in loop) else "pointwise"
+    suffix = "reduce" if any(isinstance(s, (Accum, Mma)) for s in loop) else "pointwise"
     strong = [oid for oid, e in node_prov.items() if e["kind"] not in _GENERIC_KINDS | _WEAK_KINDS]
     meaningful = strong or [oid for oid, e in node_prov.items() if e["kind"] in _WEAK_KINDS]
     if not meaningful:

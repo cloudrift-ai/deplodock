@@ -529,7 +529,7 @@ def hoist_loop_invariants(stmts: Body) -> Body:
 
     def _hoistable(s: Stmt, axis: str) -> bool:
         # Accum / Init are scope-bound to their enclosing Loop's reduction (an Init seeds an
-        # Accum or a Monoid carrier's state per output cell) — they can't move alone, but the
+        # Accum or a Carrier's state per output cell) — they can't move alone, but the
         # whole enclosing block can. Side-effecting stmts (Write, or any block containing a
         # Write) pin their iteration count and stay put.
         if isinstance(s, (Accum, Init)) or s.has_side_effects():
@@ -936,7 +936,7 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     ``dataclasses.fields`` to locate any field currently holding an
     ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
     ``Accum.op`` without coupling this module to those IR dialects). A
-    monoid carrier (``Monoid``) and the kernel-IR cross-thread combine
+    carrier (``Carrier``) and the kernel-IR cross-thread combine
     stmts (``WarpShuffle`` / ``TreeHalve``) carry their op inside an
     ``Assign`` program (``merge`` / ``combine_states``), already
     canonicalized at the carrier before lowering. The replacement is

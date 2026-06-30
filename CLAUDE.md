@@ -14,10 +14,12 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Compiler** (Graph IR dialects, passes, backends) → [`deplodock/compiler/ARCHITECTURE.md`](deplodock/compiler/ARCHITECTURE.md) and child docs
 - **Pipeline / autotune** (pass framework, knob/fork system, learned-prior search, two-level tune) →
   [`deplodock/compiler/pipeline/ARCHITECTURE.md`](deplodock/compiler/pipeline/ARCHITECTURE.md)
-- **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**, dispatch on the carrier
-  algebra `MAP`/`SEMIRING`/`MONOID` — flash attention is the `MONOID` algebra on the streaming schedule, a twisted
-  monoid is a monoid, selected structurally not as a distinct kind) →
-  [`deplodock/compiler/pipeline/passes/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/ARCHITECTURE.md)
+- **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**. The stored tile IR is the
+  **annotated loop nest** itself: a kernel op is a `Map` (a `Body` wrapper) whose reduce `Loop` carries its `AxisRole`
+  (`FREE`/`PLANAR`/`CONTRACTION`/`TWISTED`) + a `Carrier` (the decoupled algebra payload). Dispatch reads the role/carrier
+  off the annotated loop — there is no stored `Monoid`/`Semiring` node kind (those wrappers were retired). Flash attention
+  is the `TWISTED` reduce on the streaming schedule, a twisted monoid is a monoid, selected structurally not as a distinct
+  kind) → [`deplodock/compiler/pipeline/passes/ARCHITECTURE.md`](deplodock/compiler/pipeline/passes/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before
 answering — they hold the detail that is no longer in this file or the README.

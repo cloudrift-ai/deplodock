@@ -6,8 +6,8 @@ axis-in-index), whether ``b`` is transposed, the fold accumulator, and the proje
 — the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and builds an
 :class:`AtomBinding` that rides the **schedule** (a sibling of the ``TilePlan`` decision;
 ``op_cache_key`` digests ``lower(op.op)``, not the schedule, so the perf / prior cache stays
-byte-identical). Reading off the annotated loop (not an op-tree node) is what lets the
-``Semiring`` / ``Monoid`` node classes retire. The cooperative reduce needs no binding here — its
+byte-identical). Reading off the annotated loop (not an op-tree node) is what let the
+``Semiring`` / ``Monoid`` op-tree node classes retire. The cooperative reduce needs no binding here — its
 accumulator dtype + shuffle/tree mechanism are derived at materialize time (``emit_combine`` off
 the carrier + ``ReduceStage.combine``).
 
@@ -17,14 +17,13 @@ operand: a computed-cone / demoted matmul) is rejected at fork construction, alo
 ``_check_warp_static_k``, instead of failing several passes later. Leading ``_`` so the pass
 loader skips this module.
 
-**Recursion seam (deferred — warp-flash).** Flash is a ``Monoid`` (online-softmax) over a
-nested contraction, so a kind-recursive atomize would bind the inner QK^T / PV with the same
-:func:`bind_contraction` the root uses — that function is node-addressable for exactly this
-reuse. It is **not wired yet** because flash's inner contractions are not structural
-``Semiring`` nodes today (``_flash._flash_op`` ``lower()``-s the QK score straight into loop-IR
-and carries no per-node ``TilePlan``). Wiring it requires warp-flash to first keep the inner
-contractions as ``Semiring`` nodes + attach inner geometry; until then a tree-walk would bind
-nothing, so it is intentionally absent."""
+**Recursion seam (deferred — warp-flash).** Flash is a ``TWISTED`` kv ``Loop`` (online-softmax)
+over a nested ``CONTRACTION`` score ``Loop``, so a recursive atomize would bind the inner QK^T /
+PV with the same :func:`bind_contraction` the root uses — that function is loop-addressable for
+exactly this reuse. The inner score ``Loop`` IS now a structural ``CONTRACTION`` (built by
+``ops.contraction_loop``, the same builder a standalone matmul uses), but it is **not wired yet**:
+it carries no per-loop ``TilePlan`` / inner geometry, so a tree-walk would bind nothing. Wiring it
+requires warp-flash to first attach that inner geometry; until then it is intentionally absent."""
 
 from __future__ import annotations
 

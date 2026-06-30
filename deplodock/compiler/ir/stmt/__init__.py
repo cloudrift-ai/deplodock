@@ -37,7 +37,7 @@ they enforce Loop-IR's invariants (SSA scoping rules, axis uniqueness)
 and produce Loop-IR's canonical form.
 """
 
-from deplodock.compiler.ir.stmt.algebra import Carrier, Map, Monoid, Semiring, State, StateMerge, Twist
+from deplodock.compiler.ir.stmt.algebra import Carrier, Map, State, StateMerge, Twist
 from deplodock.compiler.ir.stmt.base import (
     INDENT,
     RenderCtx,
@@ -88,7 +88,6 @@ __all__ = [
     "Assign",
     "Body",
     "Carrier",
-    "Monoid",
     "StateMerge",
     "Cond",
     "Init",
@@ -97,7 +96,6 @@ __all__ = [
     "Map",
     "Mma",
     "Pack",
-    "Semiring",
     "RenderCtx",
     "Select",
     "SelectBranch",

@@ -79,7 +79,7 @@ def _stamp_stmt(s: Stmt, ctx: _StampCtx) -> Stmt:
         ctx.ssa_dtypes[s.low_name] = s.lane_dtype
         ctx.ssa_dtypes[s.high_name] = s.lane_dtype
         return s
-    # Block-structured stmts (Tile / Loop / StridedLoop / Cond / Monoid, …):
+    # Block-structured stmts (Tile / Loop / StridedLoop / Cond, …):
     # recurse through children via the generic ``nested()`` / ``with_bodies()``
     # protocol — no isinstance ladder.
     nested = s.nested()

@@ -5,7 +5,7 @@ materializers used to re-recognize from lowered loop-IR: which contracted operan
 mma ``a`` vs ``b`` (by which grid output axis its index carries), whether ``b`` is
 transposed, the fold accumulator, and the fused-projection epilogue. The result rides the
 **schedule** (a sibling of :class:`~.schedule.TilePlan`), NOT the op tree — so the
-``Semiring`` combine stays the single source of truth and ``op_cache_key`` (which digests
+contraction's combine stays the single source of truth and ``op_cache_key`` (which digests
 ``lower(op.op)``, not the schedule) is untouched.
 
 These are tile-tier, abstract: they reference the algebra's leaf :class:`Load` exprs, never
@@ -32,17 +32,17 @@ class Operand:
 
 @dataclass(frozen=True)
 class AtomBinding:
-    """The atom-tier operand→role binding ``020_schedule`` resolves off the ``Semiring`` —
-    the structural facts the warp materializer used to re-discover from lowered loop-IR.
-    The forward sibling of :class:`~.schedule.TilePlan` (which carries the *atom geometry*
-    decision); read only by ``_warp``. Carries NO ``atom`` (that's ``TilePlan.atom``) and no
-    ``reduce_axis`` / ``m_axis`` / ``n_axis`` (those stay on the ``Semiring`` / the grid) —
+    """The atom-tier operand→role binding ``020_schedule`` resolves off the annotated
+    ``CONTRACTION`` loop — the structural facts the warp materializer used to re-discover from
+    lowered loop-IR. The forward sibling of :class:`~.schedule.TilePlan` (which carries the *atom
+    geometry* decision); read only by ``_warp``. Carries NO ``atom`` (that's ``TilePlan.atom``) and no
+    ``reduce_axis`` / ``m_axis`` / ``n_axis`` (those stay on the annotated loop / the grid) —
     only what isn't already on the schedule or the still-present combine."""
 
     a: Operand  # the m-bearing operand (A)
     b: Operand  # the n-bearing operand (B)
     b_trans: bool  # B[n,k] (K last in index) vs canonical B[k,n]
-    acc: str  # the fold accumulator name (== Semiring.out / fold.name)
+    acc: str  # the fold accumulator name (the additive fold's accumulator)
     epilogue: Body = field(default_factory=Body)  # the projection Map body (scale/bias/relu/
     # residual + the output Write + any loop-invariant scalar Loads); empty Body = a bare
     # contraction (_warp emits the accumulator Write itself).

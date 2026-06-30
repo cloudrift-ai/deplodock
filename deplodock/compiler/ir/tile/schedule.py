@@ -14,10 +14,11 @@ carrier and the partition change.
 
 The schedule is **flat and kind-free** — ONE :class:`TileSchedule` whatever the algebra. The
 old per-kind ``MapSchedule`` / ``MonoidSchedule`` / ``SemiringSchedule`` zoo (paired in
-``MapKernel`` / ``MonoidKernel`` / ``SemiringKernel``) is gone: a kernel's structure is read
-from its axes' :class:`~deplodock.compiler.ir.axis.AxisRole` annotations (``ops.axis_role``),
-not its Python type, so a pointwise ``Map``, a ``Monoid`` reduce, and a ``Semiring``
-contraction all carry the same schedule type and use the subset of its fields their axes admit
+``MapKernel`` / ``MonoidKernel`` / ``SemiringKernel``) is gone, as are the ``Monoid`` / ``Semiring``
+op-tree node kinds: a kernel's structure is read from its annotated reduce loop's
+:class:`~deplodock.compiler.ir.axis.AxisRole` (``ops.axis_role``), not a Python type, so a pointwise
+kernel, a ``PLANAR`` / ``TWISTED`` reduce, and a ``CONTRACTION`` contraction all carry the same
+schedule type and use the subset of its fields their axes admit
 (a pointwise kernel only ``place``; a contraction adds ``tier`` / ``bind``). Warp specialization
 is **orthogonal**, not a second schedule kind: it rides an optional ``workers: WarpSpec | None``
 field (``None`` = uniform SIMT) — a role→warp-count split *over* the fixed pipeline.
@@ -380,7 +381,7 @@ _STAGE_SCHEMA = Schema(
 @dataclass(frozen=True)
 class Stage:
     """One operand-transport pipeline over the serial reduce loop — one ``Stage`` per reduce
-    loop (a ``Monoid`` / ``Semiring`` ⇒ one reduce axis ⇒ one pipeline). The schedule's
+    loop (a reduce ``Loop`` ⇒ one reduce axis ⇒ one pipeline). The schedule's
     operand-staging knob, decided in ``020_schedule`` and materialized in
     ``010_materialize``.
 
@@ -552,12 +553,12 @@ class TileSchedule:
 
 @dataclass(frozen=True)
 class Kernel:
-    """A scheduled kernel — the op-tree node (the *combine*, ``ir/stmt/algebra``) paired with its
-    :class:`TileSchedule` (the *schedule*). ONE uniform type: the algebra is read structurally off
-    the op (``ir/tile/ops.axis_role``), never the kernel's Python type, so a ``Map`` / ``Monoid`` /
-    ``Semiring`` op all ride the same ``Kernel``."""
+    """A scheduled kernel — the op (the *combine*, a :class:`~deplodock.compiler.ir.stmt.algebra.Map`
+    wrapping the annotated loop nest from ``ir/stmt/algebra``) paired with its :class:`TileSchedule`
+    (the *schedule*). ONE uniform type: the algebra is read structurally off the annotated reduce
+    loop (``ir/tile/ops.axis_role``), never a stored node kind."""
 
-    op: object  # a Map / Monoid / Semiring node (possibly a projection Map over a reduction)
+    op: object  # a Map wrapping the per-cell loop nest (its reduce Loop carries role + Carrier)
     schedule: TileSchedule
 
 

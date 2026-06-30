@@ -242,7 +242,7 @@ def _stmt_eval_scope() -> dict:
 
     from deplodock.compiler.dim import Dim
     from deplodock.compiler.dtype import DataType
-    from deplodock.compiler.ir.axis import Axis
+    from deplodock.compiler.ir.axis import Axis, AxisRole
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
     from deplodock.compiler.ir.expr import (
         BinaryExpr,
@@ -257,6 +257,7 @@ def _stmt_eval_scope() -> dict:
     from deplodock.compiler.ir.stmt import (
         Accum,
         Assign,
+        Carrier,
         Cond,
         Init,
         Load,
@@ -264,10 +265,14 @@ def _stmt_eval_scope() -> dict:
         Pack,
         Select,
         SelectBranch,
+        State,
+        StateMerge,
         StridedLoop,
+        Twist,
         Unpack,
         Write,
     )
+    from deplodock.compiler.ir.stmt.carrier import Channel
     from deplodock.compiler.ir.tensor.ir import IndexSource
 
     _STMT_EVAL_SCOPE = {
@@ -292,6 +297,12 @@ def _stmt_eval_scope() -> dict:
         "Loop": Loop,
         "StridedLoop": StridedLoop,
         "Cond": Cond,
+        "AxisRole": AxisRole,
+        "Carrier": Carrier,
+        "State": State,
+        "Twist": Twist,
+        "StateMerge": StateMerge,
+        "Channel": Channel,
         "Smem": Smem,
         "Sync": Sync,
         "TreeHalve": TreeHalve,

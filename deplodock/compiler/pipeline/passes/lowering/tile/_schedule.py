@@ -37,9 +37,8 @@ from math import prod
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.ir.axis import AxisRole
-from deplodock.compiler.ir.stmt.algebra import Monoid
 from deplodock.compiler.ir.tile import Kernel, ReducePlan, TileOp, TilePlan
-from deplodock.compiler.ir.tile.ops import axis_role
+from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline.knob import Knob, KnobType
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -65,7 +64,7 @@ REDUCE = Knob(
 # (``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>``), never both. The value self-discriminates: an
 # ``a:<atom>`` token selects the warp fragment (a tensor-core-atom :class:`TilePlan`); otherwise scalar
 # fragment (:class:`TilePlan`) — see ``schedule.is_warp_codec``. Same decision hierarchy: env pin
-# via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``Semiring``
+# via ``Knob.narrow`` > the (future) prior fork > the per-cell default. Only a ``CONTRACTION``
 # contraction tiles its output today; ``off=""`` auto-stamps everything else. The codec is the
 # sole on-dict spelling — the learned-prior featurizer (``knob.py``: ``mma_atom`` / ``is_warp`` /
 # ``_free_slots`` / ``tile_signature``) parses it directly (no legacy ``WM``/``WN``/``MMA`` keys).
@@ -147,24 +146,24 @@ def _pick_coop(extent: int, free: int) -> int:
     return coop if coop >= 2 else 1
 
 
-def _coop_carrier(kernel) -> Monoid | None:
-    """The cooperative-eligible reduce carrier of ``kernel``, or ``None`` (keep serial).
+def _coop_carrier(kernel):
+    """The cooperative-eligible reduce ``Loop`` of ``kernel`` (read for its ``axis``), or ``None``
+    (keep serial).
 
-    Eligible: any ``MonoidKernel`` over a cleanly-lifted ``Monoid`` carrier — **degenerate**
-    (plain ``sum`` / ``max`` / ``mean``) AND **twisted** (online-softmax ``(m, d)``, flash
-    ``(m, l, O)``) alike, since the cross-thread combine is carrier-generic (it drives off
-    the carrier's ``combine_states``, which a twisted carrier authors). Both **scalar**
-    outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d`` is a grid axis) and **full-row**
-    outputs (softmax / RMSNorm — the post-reduce sweep is distributed across the coop lanes
-    by the materializer) are handled. The reduce axis may be **symbolic** (dynamic
-    ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len`` bound is the
-    masked tail). A flat-``Map`` fallback (multi / nested-non-flash reduce) is a
-    pointwise fallback (``reduce_node`` is ``None``), so it isn't eligible and keeps the
-    serial fold."""
-    inner = kernel.op.reduce_node
-    if not isinstance(inner, Monoid) or inner.axis is None:
-        return None  # a contraction (Semiring) / pointwise (None) reduce_node — not coop-eligible here
-    return inner
+    Eligible: a ``PLANAR`` / ``TWISTED`` reduce loop — **degenerate** (plain ``sum`` / ``max`` /
+    ``mean``) AND **twisted** (online-softmax ``(m, d)``, flash ``(m, l, O)``) alike, since the
+    cross-thread combine is carrier-generic (it drives off the carrier's ``combine_states``, which
+    a twisted carrier authors). Both **scalar** outputs (flash's ``O/l`` per ``(m, d)`` cell — ``d``
+    is a grid axis) and **full-row** outputs (softmax / RMSNorm — the post-reduce sweep is
+    distributed across the coop lanes by the materializer) are handled. The reduce axis may be
+    **symbolic** (dynamic ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len``
+    bound is the masked tail). A ``CONTRACTION`` (handled by ``_semiring_reduce_spec``) or a
+    flat-``Map`` fallback (multi / nested-non-flash reduce — no annotated reduce loop) is not
+    eligible here and keeps the serial fold."""
+    rl = reduce_loop(kernel.op)
+    if rl is None or rl.role not in (AxisRole.PLANAR, AxisRole.TWISTED):
+        return None
+    return rl
 
 
 def _reduce_specs(kernel, place) -> list[str]:
@@ -198,7 +197,7 @@ def _option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
 
 
 def _tile_specs(kernel) -> list[str]:
-    """Candidate ``TILE`` codec strings for ``kernel`` — only a ``Semiring`` contraction tiles
+    """Candidate ``TILE`` codec strings for ``kernel`` — only a ``CONTRACTION`` contraction tiles
     its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
     pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); the default is the per-cell tier
     (the auto reg-tile fork is a follow-up, wired through the prior alongside the codec)."""
@@ -208,10 +207,10 @@ def _tile_specs(kernel) -> list[str]:
 
 
 def _semiring_reduce_spec() -> str:
-    """The ``REDUCE`` spec a **scalar** (non-output-tiled) ``Semiring`` contraction honors — the
+    """The ``REDUCE`` spec a **scalar** (non-output-tiled) ``CONTRACTION`` contraction honors — the
     full K-axis codec: a cross-CTA split (``g``, consumed by ``030_split``) AND the cooperative
     (``b``) / ILP (``r``) partitions (consumed by ``010_materialize``'s ``_reduce``, since a
-    contraction is a monoid with a ⊗ lift — ``as_monoid``). Only the scalar tier reaches here
+    contraction is the degenerate carrier of its additive fold). Only the scalar tier reaches here
     (``_tile_option``); the warp tier ignores ``REDUCE`` (composing the mma tile with a K
     partition is the remaining step). Returns the pinned spec when it parses to a non-trivial
     partition (split / coop / reg), else ``""`` (serial). A pin in another tier's codec doesn't
@@ -225,7 +224,7 @@ def _semiring_reduce_spec() -> str:
 
 
 def _stage_spec(kernel) -> str:
-    """The pinned ``STAGE`` codec for ``kernel`` — only a ``Semiring`` contraction stages its
+    """The pinned ``STAGE`` codec for ``kernel`` — only a ``CONTRACTION`` contraction stages its
     operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
     returns the authoritative ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (gmem-direct,
     ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a legacy operand
@@ -271,7 +270,7 @@ def _check_warp_static_k(kernel, wt) -> None:
     fine: it reaches the masked tier (ceil-div grid + boundary ``Cond`` + zero-filled partial
     slab), so guard only the static case. Raising here surfaces a clean compile error instead
     of a numerically-wrong kernel."""
-    ext = kernel.op.reduce_node.reduce_axis.extent
+    ext = reduce_loop(kernel.op).axis.extent
     if not ext.is_static:
         return
     k = ext.as_static()

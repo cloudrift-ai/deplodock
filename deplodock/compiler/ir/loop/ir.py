@@ -45,7 +45,6 @@ from deplodock.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init_
     Init,
     Load,
     Loop,
-    Monoid,
     Select,
     SelectBranch,
     Stmt,
@@ -395,8 +394,6 @@ def _validate(loop: LoopOp) -> None:
         for stmt in stmts:
             if isinstance(stmt, Accum):
                 defined.add(stmt.name)
-            elif isinstance(stmt, Monoid):
-                defined.update(stmt.state.names)
         exported_accs: set[str] = set()
         for stmt in stmts:
             if isinstance(stmt, Assign):
@@ -434,21 +431,10 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Init):
                 # Explicit accumulator seed at this scope — a binding site for the
-                # carried name (a Monoid's carried state is declared here, before
+                # carried name (a Carrier's carried state is declared here, before
                 # the streaming Loop, so a post-loop sweep can read it).
                 defined.add(stmt.name)
                 exported_accs.add(stmt.name)
-            elif isinstance(stmt, Monoid):
-                # Monoid carrier: its ``partial`` (this iteration's contribution)
-                # must be in scope; its ``state`` is loop-carried (seeded by an
-                # enclosing Init, like Accum's implicit declare) and exports to the
-                # enclosing scope.
-                for pdep in stmt.partial_names():
-                    if pdep not in defined:
-                        raise ValueError(f"Monoid: partial dep {pdep!r} not defined")
-                for nm in stmt.state.names:
-                    defined.add(nm)
-                    exported_accs.add(nm)
             elif isinstance(stmt, Write):
                 if stmt.value not in defined:
                     raise ValueError(f"Write: value {stmt.value!r} not defined")

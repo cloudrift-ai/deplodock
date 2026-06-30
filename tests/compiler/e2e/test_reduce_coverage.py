@@ -28,10 +28,10 @@ import pytest
 import torch
 
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.ir.axis import Axis
+from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import Var
-from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop, Monoid
+from deplodock.compiler.ir.loop.ir import Accum, Assign, Body, Load, Loop
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse, online_softmax_combine
 from deplodock.compiler.trace.torch import trace_module
 
@@ -418,10 +418,11 @@ def test_fuse_collapses_only_the_online_softmax_pair(kind, should_fuse) -> None:
     fused, changed = _fuse(body)
     assert changed == should_fuse
     if should_fuse:
-        monoids = [s for s in fused.iter() if isinstance(s, Monoid)]
         loops = [s for s in fused if isinstance(s, Loop)]
         assert len(loops) == 1, "the two reduce loops fuse into one online-softmax loop"
-        assert len(monoids) == 1 and monoids[0].state.names == ("acc0", "acc1"), "carrier keeps the original acc names"
+        fused_loop = loops[0]
+        assert fused_loop.role is AxisRole.TWISTED and fused_loop.carrier is not None, "the fused loop is a TWISTED carrier"
+        assert fused_loop.carrier.state.names == ("acc0", "acc1"), "carrier keeps the original acc names"
 
 
 @requires_cuda

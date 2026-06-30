@@ -2,7 +2,9 @@
 
 A reduce partition with a ``GRID`` stage (``ReducePlan.needs_split``) splits the reduce
 axis across CTAs. This pass realizes that split as a **graph rewrite** — the schedule
-carries the partition, the graph carries the kernel count:
+carries the partition, the graph carries the kernel count. It reads the reduce structure
+off the kernel's annotated reduce ``Loop`` (``loop.carrier`` / ``loop.axis``), never an
+op-tree node:
 
 - **partial kernel** — the ``cta`` stage becomes an extra grid axis (``_ksplit``); each CTA
   reduces its **contiguous slice** ``[s·B, (s+1)·B)`` of the reduce axis (``B =
@@ -10,10 +12,10 @@ carries the partition, the graph carries the kernel count:
 - **finalize** — two arms, picked by the ``GRID`` stage's finalize letter
   (``ReducePlan.finalize``):
   - ``"kernel"`` — the partial writes its state to a ``ws[cta, *free]`` ``__partial``
-    workspace; a sibling **finalize kernel** reduces the workspace over the split axis via
-    ``carrier.as_state_merge`` (the cross-partition combine) and projects the output. **2
-    nodes.** The only legal arm for a twisted carrier (flash's ``e^{Δm}`` rescale can't be
-    an atomic).
+    workspace; a sibling **finalize kernel** seeds the carrier state then folds the
+    workspace over the split axis via ``carrier.as_state_merge`` (the cross-partition
+    combine, a renderable :class:`StateMerge`) and projects the output. **2 nodes.** The only
+    legal arm for a twisted carrier (flash's ``e^{Δm}`` rescale can't be an atomic).
   - ``"atomic"`` — the partial ``atomicAdd``\\ s its (additive) state into the output (applying
     the kernel's projection epilogue per-partition first, when that epilogue *distributes* over
     the add — ``mean``'s ``×1/N``; a non-distributive one like ``l2``'s ``sqrt`` is refused, use
@@ -23,8 +25,8 @@ So the schedule's GRID stage is **consumed** here (the partial's plan is strippe
 the finalize is a fresh ``ReducePlan``); ``lowering/kernel`` only ever sees single-launch
 kernels (``assert not needs_split``).
 
-This cut handles **additive** carriers — a degenerate ``Monoid`` reduce (``sum``) and a
-``Semiring`` contraction (split-K matmul), one carrier-state component each. A twisted
+This cut handles **additive** carriers — a degenerate ``PLANAR`` reduce (``sum``) and a
+``CONTRACTION`` contraction (split-K matmul), one carrier-state component each. A twisted
 multi-component carrier (flash split-KV) is the remaining step.
 """
 
@@ -39,7 +41,7 @@ from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Monoid, Semiring, Write
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from deplodock.compiler.ir.stmt.algebra import Map
 from deplodock.compiler.ir.tile import (
     Placement,
@@ -48,7 +50,7 @@ from deplodock.compiler.ir.tile import (
     TilePlan,
     kernel_for,
 )
-from deplodock.compiler.ir.tile.ops import axis_role
+from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Level
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
@@ -57,50 +59,26 @@ PATTERN = [Pattern("root", TileOp)]
 _SPLIT = "_ksplit"  # the cross-CTA split grid axis
 
 
-def _reduce_axis(carrier) -> Axis:
-    """The carrier's reduce :class:`Axis` — ``Monoid.axis`` or ``Semiring.reduce_axis``."""
-    return carrier.axis if isinstance(carrier, Monoid) else carrier.reduce_axis
-
-
-def _state_names(carrier) -> tuple[str, ...]:
-    """The carrier-state component names — a ``Monoid``'s ``state.names``, a ``Semiring``'s
-    single accumulator (``out``)."""
-    return carrier.state.names if isinstance(carrier, Monoid) else (carrier.out,)
-
-
-def _apply_sigma(node, sigma: Sigma):
-    """Rewrite an op-tree ``node`` (``Map`` / ``Monoid`` / ``Semiring``) under ``sigma`` —
-    substitutes the reduce-axis var inside every operand / partial load index (recurse into
-    sources; the partial bodies' nested loop-IR is handled by ``Stmt.rewrite``)."""
-    ident = lambda n: n  # noqa: E731
-    if isinstance(node, Map):
-        src = _apply_sigma(node.source, sigma) if node.source is not None else None
-        return replace(node, source=src, body=Body(tuple(s.rewrite(ident, sigma) for s in node.body)))
-    if isinstance(node, Monoid):
-        return replace(node, partial=tuple(_apply_sigma(p, sigma) for p in node.partial))
-    if isinstance(node, Semiring):
-        return replace(node, operands=tuple(_apply_sigma(o, sigma) for o in node.operands))
-    raise TypeError(f"_apply_sigma: unexpected node {type(node).__name__}")
-
-
-def _slice_carrier(carrier, b: int):
-    """Slice the carrier's reduce axis to a CTA's contiguous block: offset every reduce-axis
-    load by ``_ksplit · B`` and shrink the axis extent to ``B`` (so the loop walks ``[0, B)``
-    while reading ``[s·B, (s+1)·B)``)."""
-    rax = _reduce_axis(carrier)
+def _slice_loop(rloop: Loop, b: int) -> Loop:
+    """Slice the reduce ``Loop`` to a CTA's contiguous block: offset every reduce-axis load by
+    ``_ksplit · B`` (σ on the loop body) and shrink the axis extent to ``B`` (so the loop walks
+    ``[0, B)`` while reading ``[s·B, (s+1)·B)``). The carrier (state algebra) rides through
+    unchanged — only the operand load indices move."""
+    rax = rloop.axis
     offset = BinaryExpr("+", Var(rax.name), BinaryExpr("*", Var(_SPLIT), Literal(b, "int")))
-    sliced = _apply_sigma(carrier, Sigma({rax.name: offset}))
+    sigma = Sigma({rax.name: offset})
+    ident = lambda n: n  # noqa: E731
+    new_body = tuple(s.rewrite(ident, sigma) for s in rloop.body)
     new_ax = replace(rax, extent=Dim(b))
-    return replace(sliced, axis=new_ax) if isinstance(sliced, Monoid) else replace(sliced, reduce_axis=new_ax)
+    return Loop(axis=new_ax, body=Body(new_body), unroll=rloop.unroll, role=rloop.role, carrier=rloop.carrier)
 
 
 def _cell_index(op, grid) -> tuple:
     """The output-cell index the original kernel writes (the projection ``Write``'s index,
-    or — for a bare carrier — the grid-axis vars)."""
-    if isinstance(op, Map):
-        for s in op.body:
-            if isinstance(s, Write):
-                return s.index
+    or — for a bare carrier whose grid-cell store is glue — the grid-axis vars)."""
+    for s in op.body:
+        if isinstance(s, Write):
+            return s.index
     return tuple(Var(ax.name) for ax in grid)
 
 
@@ -115,18 +93,16 @@ def _carrier_identities(carrier) -> dict[str, float]:
     folding the partitions). A degenerate carrier reads it off its dissolved ``Accum``\\ s; a
     twisted carrier (flash) off the ``Accum`` folds in its streaming ``merge`` (``l``/``O`` →
     add → 0, ``m`` → maximum → −inf)."""
-    base = carrier if isinstance(carrier, Monoid) else carrier.fold.as_monoid()
-    accums = base.as_accums()
+    accums = carrier.as_accums()
     if accums is not None:
         return {a.name: a.op.identity for a in accums}
-    return {s.name: s.op.identity for s in base.merge if isinstance(s, Accum)}
+    return {s.name: s.op.identity for s in carrier.merge if isinstance(s, Accum)}
 
 
 def _mapped(op, grid, *, reduce: ReducePlan | None = None, tier=None):
-    """A ``*Kernel`` wrapping ``op`` with a **mapped** placement over ``grid`` (so
-    ``020_schedule`` skips it). ``reduce`` sets the reduce partition where the schedule has
-    one (``Monoid`` / ``Semiring``; a flat ``Map`` finalize has none); ``tier`` preserves a
-    ``Semiring``'s scalar output tier (:class:`TilePlan`)."""
+    """A ``Kernel`` wrapping ``op`` with a **mapped** placement over ``grid`` (so ``_schedule``
+    skips it). ``reduce`` sets the reduce partition; ``tier`` preserves a contraction's scalar
+    output tier (:class:`TilePlan`)."""
     k = kernel_for(op, Placement(free=tuple(grid), grid=tuple(grid)))
     sched = k.schedule
     if reduce is not None and hasattr(sched, "reduce"):
@@ -175,25 +151,31 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
         raise RuleSkipped("no cross-CTA split stage — nothing to split")
 
     op = tile.op
-    carrier = op.reduce_node
+    rloop = reduce_loop(op)
+    carrier = rloop.carrier
     cta = plan.cta
-    rax = _reduce_axis(carrier)
+    rax = rloop.axis
     if not rax.extent.is_static:
         raise NotImplementedError("cross-CTA split of a symbolic reduce axis is not built yet")
     extent = rax.extent.as_static()
     if extent % cta != 0:
         raise NotImplementedError(f"cross-CTA split needs a divisible reduce axis (extent {extent} % cta {cta})")
     b = extent // cta
-    states = _state_names(carrier)
+    states = carrier.state.names
     n_comp = len(states)
 
     out = root.output
     grid = sched.place.grid
     cell = _cell_index(op, grid)
     split = Axis(name=_SPLIT, extent=Dim(cta))
-    sliced = _slice_carrier(carrier, b)
+    sliced_loop = _slice_loop(rloop, b)
+    # The stmts before / after the reduce loop: ``before`` is the (typically empty) prologue, ``after``
+    # the projection epilogue (its own loads + computes + the output ``Write``).
+    idx = next(i for i, s in enumerate(op.body) if s is rloop)
+    before = tuple(op.body[:idx])
+    after = list(op.body[idx + 1 :])
     # Only the scalar output tier survives a split (a warp/None tier doesn't ride the partial
-    # kernels — they materialize scalar); ``getattr`` covers a ``Monoid`` split (no ``tier`` field).
+    # kernels — they materialize scalar); ``getattr`` covers a non-contraction split (no ``tier``).
     tier = getattr(sched, "tier", None)
     tile_plan = tier if isinstance(tier, TilePlan) and not tier.is_warp else None
 
@@ -203,25 +185,25 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     if plan.finalize == "atomic":
         if n_comp != 1:
             raise NotImplementedError("atomic finalize needs an additive (1-component) carrier; the twisted carrier is kernel-only")
-        # The kernel's projection epilogue (``mean``'s ``×1/N``, a fused bias/activation, …)
-        # rides on ``op.body`` when ``op`` is a ``Map``; a bare carrier (``sum`` / a ``Semiring``
-        # matmul) has none. Atomic finalize applies the projection PER-PARTITION before the
-        # ``atomicAdd``, so it must distribute over the add — else each CTA's contribution is
-        # mis-scaled (the ``mean`` bug: writing raw partial sums dropped the ``×1/N``). When it
-        # doesn't distribute, refuse loudly: the deferred-kernel finalize (``g<n>k``) projects
-        # once after the combine and is always correct.
-        proj = list(op.body) if isinstance(op, Map) else []
-        if proj:
-            if not _projection_distributes(proj, states):
+        # The kernel's projection epilogue (``mean``'s ``×1/N``, a fused bias/activation, …) rides
+        # on ``after``; a bare carrier (``sum`` / a contraction matmul) has just the output ``Write``.
+        # Atomic finalize applies the projection PER-PARTITION before the ``atomicAdd``, so it must
+        # distribute over the add — else each CTA's contribution is mis-scaled. When it doesn't
+        # distribute, refuse loudly: the deferred-kernel finalize (``g<n>k``) projects once after the
+        # combine and is always correct.
+        if after:
+            if not _projection_distributes(after, states):
                 raise NotImplementedError(
                     "atomic finalize can't carry a non-distributive projection epilogue "
                     "(e.g. a fused bias / activation on a split reduce); pin the deferred-kernel "
                     "finalize instead (REDUCE=…g<n>k)"
                 )
-            body = Body(tuple(replace(s, atomic=True) if isinstance(s, Write) else s for s in proj))
-            atomic_op = Map(source=sliced, body=body)
+            atomic_proj = tuple(replace(s, atomic=True) if isinstance(s, Write) else s for s in after)
         else:
-            atomic_op = Map(source=sliced, body=Body((Write(output=out.name, index=cell, values=states, atomic=True),)))
+            # A bare carrier (``sum`` / a contraction matmul) — its grid-cell store is glue; synthesize
+            # the atomic ``Write`` of the carrier state directly.
+            atomic_proj = (Write(output=out.name, index=cell, values=states, atomic=True),)
+        atomic_op = Map(body=Body((*before, sliced_loop, *atomic_proj)))
         atomic_kernel = _mapped(atomic_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
         return TileOp(kernel=atomic_kernel, name=tile.name)
 
@@ -237,32 +219,26 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
         return (*lead, *cell)
 
     # --- partial kernel: reduce a CTA's slice, write its carrier state to the workspace -----
-    partial_op = Map(source=sliced, body=Body(tuple(Write(output=ws_name, index=ws_index(i), value=states[i]) for i in range(n_comp))))
+    ws_writes = tuple(Write(output=ws_name, index=ws_index(i), value=states[i]) for i in range(n_comp))
+    partial_op = Map(body=Body((*before, sliced_loop, *ws_writes)))
     partial_kernel = _mapped(partial_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
     partial_tile = TileOp(kernel=partial_kernel, name=f"{tile.name}__partial")
 
     # --- finalize kernel: seed the carrier state, then fold each partition's state from the
-    # workspace over the split axis via the carrier's ``combine_states`` (the ``partial=()``
-    # state-merge Monoid stays a stmt inside the split loop, rendered by ``render_merge_program``
-    # — the same realizer the cooperative combine uses). A flat ``Map`` of loop-IR: ``Init``
-    # seeds, the split ``Loop`` (loads + the combine), then the original projection + store.
-    fin_base = carrier if isinstance(carrier, Monoid) else carrier.fold.as_monoid()
-    state = fin_base.state.names
-    other = tuple(f"{nm}__p" for nm in state)
-    combine = fin_base.as_state_merge(other)
-    # A twisted state-merge (kept as a Monoid stmt, rendered by render_merge_program) must seed
-    # the state explicitly; a degenerate one dissolves to ``Accum``\\ s whose seed ``Loop.render``
-    # derives — an ``Init`` there would double-declare the accumulator.
-    kept = combine.as_accums() is None and not any(isinstance(s, Accum) for s in combine.merge)
+    # workspace over the split axis via the carrier's ``as_state_merge`` (a renderable
+    # :class:`StateMerge`, the same combine the cooperative tier uses). A flat ``Map`` of loop-IR:
+    # ``Init`` seeds, the split ``Loop`` (loads + the combine), then the original projection + store.
+    other = tuple(f"{nm}__p" for nm in states)
+    combine = carrier.as_state_merge(other)
     ids = _carrier_identities(carrier)
-    seeds = tuple(Init(name=state[i], identity=ids[state[i]], dtype=F32) for i in range(n_comp)) if kept else ()
+    seeds = tuple(Init(name=states[i], identity=ids[states[i]], dtype=F32) for i in range(n_comp))
     loads = tuple(Load(name=other[i], input=ws_name, index=ws_index(i)) for i in range(n_comp))
-    loop = Loop(axis=split, body=Body((*loads, combine)))
-    proj = list(op.body) if isinstance(op, Map) else []
-    if not any(isinstance(s, Write) for s in proj):
-        out_val = proj[-1].defines()[-1] if proj else state[0]
-        proj.append(Write(output=out.name, index=cell, value=out_val))
-    fin_op = Map(body=Body((*seeds, loop, *proj)))
+    fin_loop = Loop(axis=split, body=Body((*loads, combine)))
+    fin_proj = list(after)
+    if not any(isinstance(s, Write) for s in fin_proj):
+        out_val = fin_proj[-1].defines()[-1] if fin_proj else states[0]
+        fin_proj.append(Write(output=out.name, index=cell, value=out_val))
+    fin_op = Map(body=Body((*seeds, fin_loop, *fin_proj)))
     fin_kernel = _mapped(fin_op, grid)
     fin_tile = TileOp(kernel=fin_kernel, name=tile.name)
 

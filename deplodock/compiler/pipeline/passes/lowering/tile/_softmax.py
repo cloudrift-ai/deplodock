@@ -4,15 +4,16 @@ standalone two-pass softmax into it.
 The classic softmax reads its input three times: a row-max reduce, a ``Σ exp(x − max)``
 reduce, then a normalize. The **online-softmax** trick (flash's softmax-stats half,
 without the P@V value accumulator) collapses the two reduces into ONE streaming pass
-over a ``(m, d)`` log-sum-exp :class:`Monoid` — running row-max ``m`` and exp-sum
+over a ``(m, d)`` log-sum-exp ``TWISTED`` :class:`Carrier` — running row-max ``m`` and exp-sum
 denominator ``d`` — so only two reads of ``x`` remain (the normalize pass downstream is
 untouched, reading the final ``m`` + ``1/d``).
 
 ``online_softmax_combine`` builds the ``(m, d)`` carrier; :func:`try_online_softmax`
 recognizes an adjacent ``(rowmax, Σexp)`` reduce pair over the same input + reduce
 extent in a ``LoopOp`` body and rewrites it to the fused streaming loop. The carried
-``(m, d)`` states fold through ``base``-``Accum``\\ s, so when the cell is lifted to an
-op-tree ``Monoid`` the seed is derived from ``op.identity`` by ``Loop.render``; explicit
+``(m, d)`` states fold through ``base``-``Accum``\\ s, so when the cell is lifted (the reduce
+``Loop`` annotated ``TWISTED`` with its ``Carrier``) the seed is derived from ``op.identity`` by
+``Loop.render``; explicit
 ``Init`` stmts are emitted before the loop as well, load-bearing only on the flat-``Map``
 fallback (a cell kept as loop-IR verbatim). Recognition is called from
 ``lowering/tile/010_recognize``
@@ -25,13 +26,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 from deplodock.compiler.graph import Node
+from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.loop import LoopOp
-from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Monoid
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Carrier, Load, Loop
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist
 
 
-def online_softmax_combine(m: str, d: str, s: str) -> Monoid:
-    """The standalone **online-softmax** :class:`Monoid` — flash's softmax-stats half without the
+def online_softmax_combine(m: str, d: str, s: str) -> Carrier:
+    """The standalone **online-softmax** :class:`Carrier` — flash's softmax-stats half without the
     P@V accumulator (``expect`` channel). State ``(m, d)`` (running row max / exp-sum denominator)
     folds this element's score partial ``s`` in ONE streaming pass::
 
@@ -75,8 +77,10 @@ def _sumexp(loop: Loop, maxacc: str, input_buf: str) -> str | None:
 
 def _fuse(body: Body) -> tuple[Body, bool]:
     """Recurse into nested ``Loop`` bodies; fuse any adjacent ``(rowmax, sum-of-exp)``
-    reduce pair over the same input + reduce extent into one online-softmax ``Monoid``
-    loop (+ the carried-state seeds)."""
+    reduce pair over the same input + reduce extent into one streaming online-softmax loop —
+    a ``TWISTED`` reduce ``Loop`` carrying the exp-family :class:`Carrier`, its body the score
+    ``Load`` + the carrier's dissolved streaming ``merge`` (``base``-``Accum`` folds + ψ
+    rescales)."""
     stmts = list(body)
     out: list = []
     changed = False
@@ -91,14 +95,17 @@ def _fuse(body: Body) -> tuple[Body, bool]:
                 sumacc = _sumexp(nxt, maxacc, input_buf)
                 if sumacc is not None:
                     src = f"{maxacc}__osin"
-                    mono = online_softmax_combine(maxacc, sumacc, src)
+                    carrier = online_softmax_combine(maxacc, sumacc, src)
+                    # The carrier's streaming ``merge`` (``base``-``Accum`` folds + ψ rescales) sits
+                    # in the loop body directly; the loop is stamped TWISTED + the carrier. No
+                    # explicit ``Init`` seeds — ``Loop.render`` seeds each fold ``Accum`` from
+                    # ``op.identity`` ((−inf, 0)).
                     fused = Loop(
                         axis=s.axis,
-                        body=Body.coerce((Load(name=src, input=input_buf, index=index), mono)),
+                        body=Body.coerce((Load(name=src, input=input_buf, index=index), *carrier.dissolve())),
+                        role=AxisRole.TWISTED,
+                        carrier=carrier,
                     )
-                    # No explicit ``Init`` seeds — the carrier dissolves into its fold
-                    # ``base``-``Accum``\\ s (lifted, or the flat-``Map`` fallback at lowering),
-                    # and ``Loop.render`` seeds those from ``op.identity`` ((−inf, 0)).
                     out.append(fused)
                     changed = True
                     i += 2
@@ -115,7 +122,7 @@ def _fuse(body: Body) -> tuple[Body, bool]:
 
 def try_online_softmax(root: Node) -> LoopOp | None:
     """Fuse any ``(rowmax, Σexp)`` reduce pair in ``root``'s body into one streaming
-    online-softmax ``Monoid`` loop. Returns the rewritten ``LoopOp``, or ``None`` if
+    online-softmax ``TWISTED`` ``Loop``. Returns the rewritten ``LoopOp``, or ``None`` if
     there is nothing to fuse."""
     new_body, changed = _fuse(root.op.body)
     if not changed:

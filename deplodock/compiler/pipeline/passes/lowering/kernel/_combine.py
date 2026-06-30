@@ -30,7 +30,7 @@ from deplodock.compiler.ir.tile import Fold, Level, ReduceStage
 
 
 def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmented: bool = False) -> list[Stmt]:
-    """Build the cross-thread combine of a cooperative reduce ``carrier`` (a ``Monoid``)
+    """Build the cross-thread combine of a cooperative reduce ``carrier`` (a :class:`Carrier`)
     over ``n_threads`` cooperating threads, reassigning the carried state in place.
 
     The mechanism per level is derived by :meth:`ReduceStage.combine`:

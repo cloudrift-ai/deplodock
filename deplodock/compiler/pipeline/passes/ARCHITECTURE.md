@@ -46,14 +46,15 @@ the *schedule* (never the op tree, so `op_cache_key`, which digests `lower(op.op
 option-build time means an atom that **cannot** be bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul)
 is rejected at fork construction, alongside `_check_warp_static_k`, instead of failing several passes later:
 
-- a warp `SemiringKernel` → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to roles by which output
-  grid axis each operand's OWN leaf `Load` index carries (structural — not a flattened-loop scan), plus `b_trans`, the
-  fold accumulator, and the projection epilogue. `_warp` reads the binding instead of `lower()`-ing the `Semiring` and
-  pattern-matching the result.
-- a cooperative/ILP `MonoidKernel` → a `ReduceBinding`: the `MonoidAtom` (accumulator dtype) + partition widths, with the
-  shuffle/tree fold mechanism left **derived** (`ReduceStage.combine`), never stored.
+- a warp / register-tiled `CONTRACTION` contraction → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to
+  roles by which output grid axis each operand's OWN leaf `Load` index carries (structural — read off the annotated loop,
+  not a flattened-loop scan), plus `b_trans`, the fold accumulator, and the projection epilogue. `005_contract` / `_warp`
+  read the binding instead of `lower()`-ing the contraction and pattern-matching the result.
+- a cooperative / ILP reduce (`PLANAR` / `TWISTED`, or a non-output-tiled `CONTRACTION`) needs **no** binding here — its
+  accumulator dtype + the shuffle/tree fold mechanism are **derived** at materialize time (`emit_combine` off the carrier
+  + `ReduceStage.combine`), never stored.
 
-The atom spec is subtyped by kind (`ir/tile/atom.py`: `AtomKind` is the fixed mma cell selected by name; `MonoidAtom`
-is the spec-less cooperative combine — its realization is derived, so it carries only a dtype). The Semiring binder
-(`bind_contraction`) is node-addressable so warp-flash can later reuse it on flash's nested QK^T / PV; that recursion is
-deferred until those inner contractions are structural `Semiring` nodes carrying geometry (see the pass docstring).
+The atom spec is subtyped by kind (`ir/tile/atom.py`: `AtomKind` is the fixed mma cell selected by name; `ScalarAtom`
+is the plain scalar fma cell). The contraction binder (`bind_contraction`) is loop-addressable so warp-flash can later
+reuse it on flash's nested QK^T / PV; that recursion is deferred — flash's inner score loop IS now a structural
+`CONTRACTION` loop (built by `ops.contraction_loop`) but carries no per-loop geometry yet (see the pass docstring).

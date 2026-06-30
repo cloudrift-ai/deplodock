@@ -14,14 +14,14 @@ from dataclasses import dataclass
 from deplodock.compiler.dtype import F32 as _F32
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Var
-from deplodock.compiler.ir.stmt.algebra import Carrier, Monoid
+from deplodock.compiler.ir.stmt.algebra import Carrier
 from deplodock.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from deplodock.compiler.ir.stmt.body import Body
 from deplodock.compiler.ir.stmt.leaves import Accum, Mma
 
 # The loop-carried reduce accumulators — a Loop is a *reduce* loop iff its immediate
 # body holds one of these (the predicate `is_reduce` keys off, see below).
-_CARRIERS = (Accum, Mma, Monoid)
+_CARRIERS = (Accum, Mma)
 
 
 def _source_suffix(axis: Axis) -> str:
@@ -95,8 +95,8 @@ class Loop(Stmt):
     def is_reduce(self) -> bool:
         """A loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
         ``FREE``) OR — for a not-yet-annotated loop — its immediate body contains a carrier
-        (``Accum``, its tensor-core form ``Mma``, or the general ``Monoid``). The structural
-        fallback keeps recognition working before detection stamps the role."""
+        (``Accum`` or its tensor-core form ``Mma``). The structural fallback keeps recognition
+        working before detection stamps the role."""
         return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
@@ -111,9 +111,9 @@ class Loop(Stmt):
         # immediate body — the seed rides on the fold, derived here from ``op.identity`` at
         # the fold's ``dtype`` (so fp32-over-fp16 declares ``float acc = 0.0f;``, a fp16
         # ``max`` declares ``__half acc = __float2half(0.0f);``), no explicit ``Init``. This
-        # is the SINGLE seed-placement path: a carrier (``Monoid``) dissolves into its loose
-        # fold ``Accum``\\ s before it reaches here (``ir.tile.ops`` lowering), so there is
-        # never a ``Monoid`` stmt to special-case. A nested fold re-declares per enclosing
+        # is the SINGLE seed-placement path: a reduce ``Loop`` carries its ``Carrier`` but its
+        # body already holds the loose fold ``Accum``\\ s (dissolved at recognition), so there
+        # is never a carrier stmt to special-case here. A nested fold re-declares per enclosing
         # iteration (scope-local shadowing), so a same-named outer carrier is harmless. This
         # is the *serial* schedule's placement; a cooperative / cross-CTA realization reads
         # the same fold ``Accum``\\ s' ``op.identity`` to seed its partials.
@@ -316,7 +316,7 @@ class StridedLoop(Stmt):
     @property
     def is_reduce(self) -> bool:
         """A strided loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
-        ``FREE``) OR its immediate body contains a carrier (``Accum`` / ``Mma`` / ``Monoid``)."""
+        ``FREE``) OR its immediate body contains a carrier (``Accum`` / ``Mma``)."""
         return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:

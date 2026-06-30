@@ -11,13 +11,13 @@ silent-drop bug).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import fields, is_dataclass
 from functools import singledispatch
 
 from deplodock.compiler.ir.axis import Axis, extend_simplify_ctx
 from deplodock.compiler.ir.expr import Expr, SimplifyCtx, Var
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt.algebra import Monoid, State, Twist
+from deplodock.compiler.ir.stmt.algebra import State, StateMerge
 from deplodock.compiler.ir.stmt.base import Stmt, _axis_identity
 from deplodock.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.leaves import (
@@ -154,41 +154,26 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    tw = s.twist
-    new_state = tuple(rename(n) for n in s.state.names)
-    new_axis = axis_fn(s.axis) if s.axis is not None else None
-    if tw.family is not None:
-        # SPEC mode: the combine programs are derived, so only the state names and the channel
-        # terms (the partial SSA reads — score / value) need renaming; the programs regenerate
-        # from the renamed spec with fresh temps (keyed on the new state), so there is no shared
-        # temp to uniquify.
-        channels = tuple(replace(c, term=rename(c.term)) if isinstance(c.term, str) else c for c in tw.channels)
-        return Monoid(state=State(names=new_state), partial=s.partial, twist=replace(tw, channels=channels), axis=new_axis)
-    # BOUND mode: rename the stored programs. They reference state / partial / state_b (all in
-    # the rename map) PLUS carrier-internal temps NOT surfaced via ``defines()`` — so a
-    # register-tile replicator that renames the state per cell leaves the temps shared, colliding
-    # across replicas. Uniquify the temps with a suffix derived from the renamed first state name
+def _(s: StateMerge, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # The renderable cross-partition combine: rename the state / state_b (in the rename map)
+    # PLUS the carrier-internal temps NOT surfaced via ``defines()`` — so a register-tile
+    # replicator that renames the state per cell leaves the temps shared, colliding across
+    # replicas. Uniquify the temps with a suffix derived from the renamed first state name
     # whenever the state actually moves (identity rename / pure σ-split leaves them untouched).
     names = s.state.names
     new_state0 = rename(names[0]) if names else None
-    carried = set(names) | set(tw.state_b)
-    temps = {a.name for a in (*tw.merge, *tw.combine_states)} - carried
+    carried = set(names) | set(s.state_b)
+    temps = {a.name for a in s.merge} - carried
     overlay = {t: f"{t}__{new_state0}" for t in temps} if new_state0 is not None and new_state0 != names[0] else {}
 
     def rn(name: str) -> str:
         r = rename(name)
         return r if r != name else overlay.get(name, name)
 
-    return Monoid(
+    return StateMerge(
         state=State(names=tuple(rn(n) for n in names)),
-        partial=s.partial,
-        twist=Twist(
-            merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in tw.merge),
-            combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in tw.combine_states),
-            state_b=tuple(rn(n) for n in tw.state_b),
-        ),
-        axis=new_axis,
+        merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
+        state_b=tuple(rn(n) for n in s.state_b),
     )
 
 
@@ -212,7 +197,7 @@ def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
 @rewrite.register
 def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
     # ``identity`` is a constant scalar — only the name moves. Renamed in lockstep with
-    # the carrier's ``Accum`` / ``Monoid.state`` (registered above) so the seed stays paired.
+    # the carrier's ``Accum`` / ``Carrier.state`` (registered above) so the seed stays paired.
     return Init(name=rename(s.name), identity=s.identity, dtype=s.dtype)
 
 
@@ -237,10 +222,15 @@ def _(s: Select, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Loop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # Preserve the reduce annotation (``role`` / ``carrier``): a σ-offset / axis-rename of an
+    # annotated reduce loop (030_split's slice) leaves the carried-state algebra unchanged — only
+    # the loop's operand load indices move — so the carrier rides through verbatim.
     return Loop(
         axis=axis_fn(s.axis),
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
@@ -253,6 +243,8 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         step=step,
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
@@ -272,7 +264,7 @@ def _(s: Cond, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @singledispatch
 def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    # Default: no Expr fields to simplify (Assign / Accum / Init / Monoid).
+    # Default: no Expr fields to simplify (Assign / Accum / Init / StateMerge).
     return stmt
 
 
@@ -300,7 +292,7 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
     inner = extend_simplify_ctx(ctx, s.axis)
-    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
+    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll, role=s.role, carrier=s.carrier)
 
 
 @simplify.register
@@ -313,6 +305,8 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         step=step,
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
