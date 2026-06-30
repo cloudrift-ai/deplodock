@@ -222,7 +222,26 @@ def _lift(stmts: list[Stmt], output: str) -> tuple[AlgebraNode, tuple]:
     axes)``. The free axes are the schedule's (carried on the ``TileOp``, not the node);
     ``020_schedule`` maps them onto the grid."""
     free, cell = _peel(Body(tuple(stmts)))
-    return _lift_cell(cell, free, output), tuple(free)
+    node = _lift_cell(cell, free, output)
+    return node, _order_free_by_output(node, free)
+
+
+def _order_free_by_output(node: AlgebraNode, free: list) -> tuple:
+    """Order the free (grid) axes to match the **output Write's index order**, so the innermost
+    grid axis is the output's *contiguous* dim. The contraction tier needs ``n_axis == grid[-1] ==``
+    the contiguous output axis — the mma fragment store coalesces a ``float2`` along it, and the
+    cuda lowering's ``ldm`` is the output's inner extent — but the peel / loop-naming order can
+    diverge from the output layout (e.g. a batched ``Q@Kᵀ`` whose ``kv`` got named before ``m``).
+    A node with no explicit output ``Write`` (a bare contraction whose grid-cell store is synthesized
+    at materialize, already in free order) is left as-is."""
+    body = getattr(node, "body", ())
+    write = next((s for s in body if isinstance(s, Write)), None)
+    if write is None:
+        return tuple(free)
+    pos = {e.name: i for i, e in enumerate(write.index) if isinstance(e, Var)}
+    if not all(ax.name in pos for ax in free):
+        return tuple(free)  # a free axis absent from the output index — leave the peel order
+    return tuple(sorted(free, key=lambda ax: pos[ax.name]))
 
 
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
