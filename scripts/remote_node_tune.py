@@ -34,6 +34,8 @@ import sys
 import time
 from pathlib import Path
 
+from deplodock.provisioning.ssh_transport import REMOTE_DEPLOY_DIR
+
 # Matches deplodock/provisioning/ssh_transport.py::ssh_base_args.
 _SSH_OPTS = [
     "-o",
@@ -49,7 +51,12 @@ _SSH_OPTS = [
 ]
 
 _CUDA_EXPORT = "export PATH=/usr/local/cuda/bin:$PATH CUDA_HOME=/usr/local/cuda"
-_REMOTE_DIR = "~/deplodock"
+# Nest under the repo's established remote layout (REMOTE_DEPLOY_DIR = ~/.local/share/deplodock) —
+# the same base the deploy/bench paths use (they already clone a repo under it).
+_BASE = f"{REMOTE_DEPLOY_DIR}/node-tune"
+_REMOTE_DIR = f"{_BASE}/repo"  # rsync target — the deplodock checkout we tune from
+_SETUP_LOG = f"{_BASE}/setup.log"
+_TUNE_LOG = f"{_BASE}/tune.log"
 _DONE_RE = re.compile(r"done: (\d+)/(\d+) shape")
 
 
@@ -104,20 +111,22 @@ def main() -> int:
     remote, key, port = args.remote, args.ssh_key, args.port
     repo = args.repo or subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
 
-    # 1. deps: always install the venv/dev packages (the image ships 3.12 without them);
-    #    install the CUDA toolkit only if nvcc is genuinely absent. All noisy output → ~/setup.log.
-    _log(f"ensuring deps on {remote} (apt; output to ~/setup.log) ...")
+    # 1. make the remote base dir (so the logs + rsync target exist), then deps: always
+    #    install the venv/dev packages (the image ships 3.12 without them); install the CUDA
+    #    toolkit only if nvcc is genuinely absent. All noisy output → the setup log.
+    _log(f"ensuring deps on {remote} (apt; output to {_SETUP_LOG}) ...")
     deps = (
-        "sudo apt-get update -qq >> ~/setup.log 2>&1; "
-        "sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev >> ~/setup.log 2>&1; "
+        f"mkdir -p {_BASE}; "
+        f"sudo apt-get update -qq >> {_SETUP_LOG} 2>&1; "
+        f"sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev >> {_SETUP_LOG} 2>&1; "
         "if ! command -v nvcc >/dev/null 2>&1 && ! ls /usr/local/cuda*/bin/nvcc >/dev/null 2>&1; then "
-        "sudo apt-get install -y -qq cuda-toolkit-12-9 >> ~/setup.log 2>&1; fi; "
+        f"sudo apt-get install -y -qq cuda-toolkit-12-9 >> {_SETUP_LOG} 2>&1; fi; "
         "if command -v nvcc >/dev/null 2>&1 || ls /usr/local/cuda*/bin/nvcc >/dev/null 2>&1; "
         "then echo NVCC_OK; else echo NVCC_MISSING; fi"
     )
     rc, out = _run(remote, key, port, deps, timeout=1800)
     if rc != 0 or "NVCC_OK" not in out:
-        return _fail(remote, key, port, f"deps/nvcc (rc={rc}, {out.strip().splitlines()[-1:] or ''})", "~/setup.log")
+        return _fail(remote, key, port, f"deps/nvcc (rc={rc}, {out.strip().splitlines()[-1:] or ''})", _SETUP_LOG)
 
     # 2. rsync the working tree (exact local code, incl. uncommitted changes).
     _log(f"rsyncing {repo} -> {remote}:{_REMOTE_DIR} ...")
@@ -147,25 +156,25 @@ def main() -> int:
         _log(f"rsync failed: {(rp.stderr or rp.stdout).strip()}")
         return 1
 
-    # 3. make setup (output → ~/setup.log); on failure rebuild a clean venv once.
-    _log("running make setup (output to ~/setup.log) ...")
-    setup = f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && make setup >> ~/setup.log 2>&1 && echo SETUP_OK || echo SETUP_FAIL"
+    # 3. make setup (output → the setup log); on failure rebuild a clean venv once.
+    _log(f"running make setup (output to {_SETUP_LOG}) ...")
+    setup = f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && make setup >> {_SETUP_LOG} 2>&1 && echo SETUP_OK || echo SETUP_FAIL"
     rc, out = _run(remote, key, port, setup, timeout=2400)
     if "SETUP_OK" not in out:
         _log("make setup failed; wiping venv and retrying once ...")
-        setup2 = f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && rm -rf venv && make setup >> ~/setup.log 2>&1 && echo SETUP_OK || echo SETUP_FAIL"
+        setup2 = f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && rm -rf venv && make setup >> {_SETUP_LOG} 2>&1 && echo SETUP_OK || echo SETUP_FAIL"
         rc, out = _run(remote, key, port, setup2, timeout=2400)
         if "SETUP_OK" not in out:
-            return _fail(remote, key, port, "make setup", "~/setup.log")
+            return _fail(remote, key, port, "make setup", _SETUP_LOG)
 
     # 4. launch the tune detached. Redirect ALL three std streams away from the ssh
-    #    channel (`< /dev/null` + `> ~/tune.log 2>&1`) and use ssh -n (detach=True),
+    #    channel (`< /dev/null` + `> <tune log> 2>&1`) and use ssh -n (detach=True),
     #    else ssh holds the channel open past the `&` and this call times out *after*
     #    a successful launch.
-    _log("launching `deplodock tune --dataset golden` (detached -> ~/tune.log) ...")
+    _log(f"launching `deplodock tune --dataset golden` (detached -> {_TUNE_LOG}) ...")
     launch = (
         f"cd {_REMOTE_DIR} && {_CUDA_EXPORT} && "
-        "nohup ./venv/bin/deplodock tune --dataset golden > ~/tune.log 2>&1 < /dev/null & echo tune_launched"
+        f"nohup ./venv/bin/deplodock tune --dataset golden > {_TUNE_LOG} 2>&1 < /dev/null & echo tune_launched"
     )
     rc, out = _run(remote, key, port, launch, timeout=60, detach=True)
     if "tune_launched" not in out:
@@ -174,20 +183,20 @@ def main() -> int:
         time.sleep(5)
         _, chk = _run(remote, key, port, "pgrep -f '[d]eplodock tune' >/dev/null 2>&1 && echo ALIVE || echo DEAD")
         if "ALIVE" not in chk:
-            return _fail(remote, key, port, f"launch (rc={rc})", "~/tune.log")
+            return _fail(remote, key, port, f"launch (rc={rc})", _TUNE_LOG)
         _log("launch ssh did not confirm but the tune process is alive — continuing")
 
     # 5. poll the remote log internally until done / dead / timeout. The `[d]eplodock tune`
     #    bracket pattern is what stops pgrep from matching this very poll command's own argv.
     poll = (
-        "echo \"DONE_MARK=$(grep -aoE 'done: [0-9]+/[0-9]+ shape' ~/tune.log 2>/dev/null | tail -1)\"; "
+        f"echo \"DONE_MARK=$(grep -aoE 'done: [0-9]+/[0-9]+ shape' {_TUNE_LOG} 2>/dev/null | tail -1)\"; "
         "pgrep -f '[d]eplodock tune' >/dev/null 2>&1 && echo PROC=ALIVE || echo PROC=DEAD"
     )
     start = time.monotonic()
     dead_streak = 0
     while True:
         if time.monotonic() - start > args.timeout:
-            return _fail(remote, key, port, f"timeout after {args.timeout}s", "~/tune.log")
+            return _fail(remote, key, port, f"timeout after {args.timeout}s", _TUNE_LOG)
         time.sleep(args.poll)
         rc, out = _run(remote, key, port, poll)
         done_mark = next((ln[len("DONE_MARK=") :] for ln in out.splitlines() if ln.startswith("DONE_MARK=")), "")
@@ -196,14 +205,14 @@ def main() -> int:
         if m:
             shapes = f"{m.group(1)}/{m.group(2)}"
             elapsed = int(time.monotonic() - start)
-            _, bf = _run(remote, key, port, "grep -aEc 'bench_fail|bench worker exceeded' ~/tune.log 2>/dev/null || echo 0")
+            _, bf = _run(remote, key, port, f"grep -aEc 'bench_fail|bench worker exceeded' {_TUNE_LOG} 2>/dev/null || echo 0")
             bench_fails = (bf.strip().splitlines() or ["0"])[0]
             print("\n=== remote_node_tune summary ===", flush=True)
             print("status: ok", flush=True)
             print(f"shapes: {shapes}", flush=True)
             print(f"bench_fails: {bench_fails}", flush=True)
             print(f"elapsed (wait only): {elapsed}s", flush=True)
-            print(f"remote log: {remote}:~/tune.log", flush=True)
+            print(f"remote log: {remote}:{_TUNE_LOG}", flush=True)
             manual = (
                 f"./venv/bin/python scripts/merge_node_db.py --remote {remote}"
                 + (f" --ssh-key {key}" if key else "")
@@ -229,7 +238,7 @@ def main() -> int:
         if not alive:
             dead_streak += 1
             if dead_streak >= 2:  # two consecutive DEADs without a done marker ⇒ it crashed
-                return _fail(remote, key, port, "tune process died without a done marker", "~/tune.log")
+                return _fail(remote, key, port, "tune process died without a done marker", _TUNE_LOG)
         else:
             dead_streak = 0
             _log(f"tuning... ({int(time.monotonic() - start)}s elapsed)")

@@ -67,9 +67,10 @@ Do not wrap the command in a retry loop — the orchestrator handles fallback it
 ## Step 2 — Set up, tune, and merge on the remote (one backgrounded script)
 
 `scripts/remote_node_tune.py` does the whole core in **one process**: ensures the Python 3.12 venv/dev packages +
-`nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes), runs `make setup` (output to the remote
-`~/setup.log` — only a tail returns on failure), launches `deplodock tune --dataset golden` detached, **polls the remote
-log internally** until it finishes, then **fetches the node rows back and merges them** into the local
+`nvcc`, rsyncs your working tree (exact local code, incl. uncommitted changes) to `~/.local/share/deplodock/node-tune/`
+(the repo's `REMOTE_DEPLOY_DIR` layout), runs `make setup` (output to `setup.log` in that dir — only a tail returns on
+failure), launches `deplodock tune --dataset golden` detached, **polls the remote log internally** until it finishes,
+then **fetches the node rows back and merges them** into the local
 `~/.cache/deplodock/autotune.db` (keep-min, `node` table only, GPU-keyed so other cards are untouched) and prints the
 per-card receipt. The robustness traps are baked in: argv-list ssh (no zsh word-split), `[d]eplodock tune` bracket-pgrep
 (no self-match), one short ssh per poll (no broken-pipe), venv/dev always installed, and a non-tty-safe detached launch.
@@ -88,7 +89,7 @@ When it exits you get one compact result:
   merge done)`. The rented card appears as its own line in `node rows per card now: …`; cards already present are
   unchanged. Because merge is folded in, there is **no separate merge step to launch** — the local DB is already updated.
 - **failure** → `status: FAILED (<phase>)` or `merge FAILED: …` plus the last 40 lines of the relevant remote log
-  (`~/setup.log` / `~/tune.log`). Fix and re-run — the script is idempotent (rsync + `make setup` no-op when already
+  (`setup.log` / `tune.log` in that dir). Fix and re-run — the script is idempotent (rsync + `make setup` no-op when already
   done; the keep-min merge is safe to repeat). `--no-merge` runs the tune only.
 
 **Re-merge / manual fallback.** If the merge step failed (or you used `--no-merge`), merge the rented card's rows without
@@ -99,7 +100,8 @@ semantics.
 **Manual debugging** (only if the script fails and you need to poke the box): the harness shell is zsh, so pass ssh
 options as an **array** — `SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i
 "$HOME/.ssh/id_ed25519")` (a plain string var fails: zsh doesn't word-split it). Then `ssh "${SSH_OPTS[@]}" "$REMOTE"
-'tail -n 40 ~/tune.log'`; check liveness with `pgrep -f "[d]eplodock tune"` (bracket trick — a plain pattern self-matches
+'tail -n 40 ~/.local/share/deplodock/node-tune/tune.log'`; check liveness with `pgrep -f "[d]eplodock tune"` (bracket
+trick — a plain pattern self-matches
 the poll's own argv); never run a multi-minute loop inside one ssh session.
 
 ## Step 3 — Verify

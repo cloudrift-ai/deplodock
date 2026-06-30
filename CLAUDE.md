@@ -290,7 +290,8 @@ fails fast with a specific message.
 - Remote node-tune driver: `python scripts/remote_node_tune.py --remote user@host [--ssh-key PATH] [--port N] [--repo
   DIR] [--poll S] [--timeout S] [--no-merge]` — the setup+tune+**merge** core of the `collect-node-data` skill, extracted
   so the agent makes one **backgrounded** call instead of ~20 ssh polls: ensures the python3.12 venv/dev pkgs + `nvcc`,
-  rsyncs the working tree, runs `make setup` (output to the remote `~/setup.log`), launches `deplodock tune --dataset
+  rsyncs the working tree to `~/.local/share/deplodock/node-tune/` (the repo's `REMOTE_DEPLOY_DIR` layout), runs `make
+  setup` (output to `setup.log` there), launches `deplodock tune --dataset
   golden` detached, polls the remote log **internally** until done, then (unless `--no-merge`) reuses
   `merge_node_db.fetch_and_merge` to fetch + keep-min merge the node rows into the local DB and print the per-card
   receipt — ending `status: COMPLETE (tune + merge done)`. One compact summary; a log tail only on failure. Robustness
