@@ -491,3 +491,45 @@ def test_display_collapses_single_axis_but_keeps_multi():
     # single-axis ``REDUCE`` (only ``sk`` carries a reduce partition) still bares out.
     flash = dict(tuning_knob_items({"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "REDUCE@sk": "b8"}))
     assert set(flash) == {"TILE@d", "TILE@sk", "REDUCE"}
+
+
+# --- Per-node featurizer (multi-node pool) -----------------------------------
+
+
+def test_multinode_flash_keys_apart_and_pools_per_node():
+    """A flash kernel addresses two contractions by their k-axis (QK@d, PV@sk) + the online reduce
+    (REDUCE@sk); the two ``TILE`` keys are distinct flat entries (no collision), and the schedule
+    geometry featurizes **per node** and sum-pools — ``D_threads`` = QK threads + PV threads, and
+    ``MMA_tier`` = 2.0 over the two warp nodes. This is the case the flat one-key schema can't express."""
+    from deplodock.compiler.pipeline.knob import _node_axes, _node_slice, _schedule_node_features
+
+    qk_tile = "a:mma_m16n8k16_f16/w4x1/f2x2/k2"  # WM·WN·32 = 128 threads
+    pv_tile = "a:mma_m16n8k16_f16/w2x2/f4x1/k2"  # WM·WN·32 = 128 threads
+    knobs = {
+        "TILE@d": qk_tile,
+        "STAGE@d": "d2/cp",
+        "REDUCE@sk": "b8",
+        "TILE@sk": pv_tile,
+        "STAGE@sk": "d2/cp",
+        "S_ext_free_prod": 4096.0,
+    }
+    assert knobs["TILE@d"] != knobs["TILE@sk"]  # the two tiles key apart in the flat dict
+    assert _node_axes(knobs) == ["d", "sk"]
+    qk = _schedule_node_features(_node_slice(knobs, "d"))
+    pv = _schedule_node_features(_node_slice(knobs, "sk"))
+    feats = knob_features(knobs)
+    assert feats["D_threads"] == qk["D_threads"] + pv["D_threads"] == 256.0
+    assert feats["MMA_tier"] == 2.0  # both nodes are warp-tier → pooled tier count
+
+
+def test_node_slice_addresses_per_node_struct():
+    """Each node reads its OWN reduce extent: an addressed ``S_ext_reduce_prod@<axis>`` overrides the
+    shared bare value in that node's slice (so QK@d and PV@sk featurize with different K depths), while
+    a one-node kernel with a bare ``S_ext_reduce_prod`` featurizes byte-identically (bare fallback)."""
+    from deplodock.compiler.pipeline.knob import _node_slice
+
+    knobs = {"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "S_ext_reduce_prod": 8.0, "S_ext_reduce_prod@sk": 512.0}
+    assert _node_slice(knobs, "d")["S_ext_reduce_prod"] == 8.0  # no @d override → bare fallback
+    assert _node_slice(knobs, "sk")["S_ext_reduce_prod"] == 512.0  # addressed override wins
+    # One-node bare stamp: the slice for the sole node is the whole dict (byte-identical featurizer).
+    assert _node_slice({"TILE": "n4/f2", "S_ext_reduce_prod": 8.0}, None) == {"TILE": "n4/f2", "S_ext_reduce_prod": 8.0}

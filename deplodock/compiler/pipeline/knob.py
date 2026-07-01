@@ -658,9 +658,96 @@ def _stage_features(knobs: dict) -> dict[str, float]:
     }
 
 
+# Per-node structural features the featurizer reads per axis-group (``S_ext_reduce_prod@<axis>`` etc):
+# the reduce/free extents + masking that a node's geometry featurizer needs. On a **one-node** kernel
+# these are stamped bare (one reduce axis → one ``S_ext_*``); a multi-node kernel (flash) stamps them
+# addressed so each node reads its own extents. The slice builder reads ``@<axis>`` first, falling back
+# to the bare key — so a one-node kernel (bare stamp) featurizes byte-identically.
+_NODE_STRUCT_BASES = (
+    "S_ext_reduce_prod",
+    "S_ext_reduce_max",
+    "S_ext_free_prod",
+    "S_masked_m",
+    "S_masked_n",
+    "S_masked_k",
+)
+
+
+def _node_axes(knobs: dict) -> list[str | None]:
+    """The schedule-bearing nodes' axes, in first-seen order — one per distinct ``@<axis>`` element
+    across the per-node schedule families (``TILE`` / ``REDUCE`` / ``STAGE``). ``[None]`` (one bare
+    node) when a schedule family is present bare (goldens / pins / the single-node canonical-collapse);
+    ``[]`` when the kernel carries no schedule codec at all (a pure pointwise ``Map``)."""
+    axes: list[str] = []
+    seen: set[str] = set()
+    has_bare = False
+    for k in knobs:
+        if family_of(k) not in _AXIS_FAMILIES:
+            continue
+        ax = axis_of(k)
+        if ax is None:
+            has_bare = True
+        elif ax not in seen:
+            seen.add(ax)
+            axes.append(ax)
+    if axes:
+        return list(axes)
+    return [None] if has_bare else []
+
+
+def _node_slice(knobs: dict, axis: str | None) -> dict:
+    """The single-node ``knobs`` sub-dict the geometry featurizers see for the node keyed ``axis``:
+    that node's ``FAMILY@<axis>`` schedule codecs plus the shared ``S_*`` / ``H_*`` / ``PLACE`` context,
+    with any addressed per-node structural feature (``S_ext_reduce_prod@<axis>``) substituted in bare so
+    ``_geom_feats`` reads the node's own extents. ``axis is None`` (the bare single node) returns
+    ``knobs`` unchanged — the whole dict is that one node (byte-identical to the pre-loop featurizer)."""
+    if axis is None:
+        return knobs
+    # The shared structural / regime context (bare ``S_*`` / ``H_*``); ``PLACE@cone`` is a root-global
+    # cut cost read once in :func:`knob_features`, not per node, so it stays out of the slice.
+    sub: dict = {k: v for k, v in knobs.items() if k.startswith((STRUCT_PREFIX, CTX_PREFIX)) and "@" not in k}
+    for fam in _AXIS_FAMILIES:
+        key = f"{fam}@{axis}"
+        if key in knobs:
+            sub[key] = knobs[key]
+    for base in _NODE_STRUCT_BASES:  # addressed per-node override; bare fallback already copied above
+        addressed = knobs.get(f"{base}@{axis}")
+        if addressed is not None:
+            sub[base] = addressed
+    return sub
+
+
+def _schedule_node_features(node_knobs: dict) -> dict[str, float]:
+    """The per-node schedule-geometry ``D_*`` / ``MMA_*`` feature block for ONE node's ``knobs`` slice
+    (its ``TILE`` / ``REDUCE`` / ``STAGE`` codecs + the node's structural context). Reads every codec
+    via :func:`family_value`, so a bare and a suffixed key featurize identically. ``MMA_tier`` is left
+    unset for a scalar node (the caller defaults it to ``0.0`` once, after pooling)."""
+    from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
+
+    feats: dict[str, float] = {}
+    # Atom (tensor-core cell) features. The warp fragment names its atom on the ``TILE`` codec
+    # (``a:<atom>``); expand its physical cell / dtype properties into the ``MMA_*`` family the priors
+    # rank on. A scalar ``TILE`` names no atom → no ``MMA_tier`` here (the caller's default fills it).
+    tile_spec = family_value(node_knobs, "TILE")
+    if is_warp_codec(tile_spec):
+        try:
+            feats.update(_atom_features(TilePlan.parse(tile_spec).atom))
+        except ValueError:
+            pass
+    feats.update(_tile_features(node_knobs))
+    # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread tile (``BN·BM``) and
+    # skips warp rows, so compute the SAME ``D_*`` family from the warp tile geometry instead — using
+    # the atom cell dims read off the parsed warp ``TILE`` codec. Shared ``D_*`` names across tiers let
+    # the prior learn occupancy / CTA-count uniformly.
+    if is_warp(node_knobs):
+        feats.update(_warp_tile_features(node_knobs))
+    feats.update(_stage_features(node_knobs))  # operand-staging pipeline (STAGE codec); {} when gmem-direct
+    return feats
+
+
 def knob_features(knobs: dict) -> dict[str, float]:
-    """Convert a knob dict into a flat numeric feature vector for the (future)
-    learned planner prior — the single featurizer over the whole dict.
+    """Convert a knob dict into a flat numeric feature vector for the learned planner prior — the single
+    featurizer over the whole dict.
 
     - ``STRUCT_PREFIX`` (``S_``) structural-feature knobs and ``CTX_PREFIX``
       (``H_``) host/hardware-regime knobs pass through as floats: they already
@@ -672,7 +759,14 @@ def knob_features(knobs: dict) -> dict[str, float]:
       per-knob special-casing here.
     - Unregistered, non-structural knobs are best-effort float-coerced (skipped
       when non-numeric); other ``STR`` knobs have no generic encoding.
-    """
+
+    The schedule-geometry block (``D_*`` / ``MMA_*``) is featurized **per node** and **sum-pooled**: a
+    multi-node kernel (flash) groups its ``FAMILY@<axis>`` codecs by axis (:func:`_node_axes`), slices
+    each node's schedule + own structural extents (:func:`_node_slice`), featurizes it
+    (:func:`_schedule_node_features`), and sums the blocks into the fixed-width vector. A single-node
+    kernel has one group, so the sum is that one node's block — **byte-identical** to the pre-loop
+    singleton featurizer (the migration is invisible until a kernel actually has two nodes). Per-node
+    attribution / transfer is the gated per-node-predict follow-up; pool is the smallest change."""
     feats: dict[str, float] = {}
     for name, val in knobs.items():
         if name.startswith(STRUCT_PREFIX) or name.startswith(CTX_PREFIX):
@@ -698,27 +792,11 @@ def knob_features(knobs: dict) -> dict[str, float]:
             feats[f"{name}_width"] = float(len(s))
             feats[f"{name}_frac"] = pop / len(s) if s else 0.0
         # STR knobs with no custom featurizer: no generic numeric encoding.
-    # Atom (tensor-core cell) features. The warp fragment names its atom on the ``TILE`` codec
-    # (``a:<atom>``); expand its physical cell / dtype properties into the ``MMA_*`` family the
-    # priors rank on. A scalar ``TILE`` names no atom → only the ``MMA_tier=0`` default below.
-    from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
-
-    tile_spec = family_value(knobs, "TILE")
-    if is_warp_codec(tile_spec):
-        try:
-            feats.update(_atom_features(TilePlan.parse(tile_spec).atom))
-        except ValueError:
-            pass
-    feats.setdefault("MMA_tier", 0.0)  # scalar tier = no warp atom
-    feats.update(_tile_features(knobs))
-    # Warp-tier occupancy: the scalar ``_tile_features`` above models the thread tile (``BN·BM``)
-    # and skips warp rows, so compute the SAME ``D_*`` family from the warp tile geometry instead —
-    # using the atom cell dims read off the parsed warp ``TILE`` codec. Shared ``D_*`` names across
-    # tiers let the prior learn occupancy / CTA-count uniformly (the signal that picks the
-    # skewed-vs-square warp tile per shape — the fp16 mis-pick).
-    if is_warp(knobs):
-        feats.update(_warp_tile_features(knobs))
-    feats.update(_stage_features(knobs))  # operand-staging pipeline (STAGE codec); {} when gmem-direct
+    # Per-node schedule geometry: featurize each schedule-bearing node's slice and sum-pool the blocks.
+    for axis in _node_axes(knobs):
+        for name, val in _schedule_node_features(_node_slice(knobs, axis)).items():
+            feats[name] = feats.get(name, 0.0) + val
+    feats.setdefault("MMA_tier", 0.0)  # scalar tier / no schedule node = no warp atom
     if "PLACE@cone" in knobs:  # the demoted-matmul cut's round-trip cost axis (only at offer sites)
         feats.update(_cut_features(knobs))
     return feats

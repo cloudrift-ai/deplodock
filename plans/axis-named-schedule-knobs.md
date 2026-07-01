@@ -368,11 +368,15 @@ and the knob schema:
    `tuning_knob_items` collapses `TILE@d`→`TILE` for a single eligible axis. Byte-identical feature vector
    on one-node kernels; every existing bare pin keeps resolving; `op_cache_key` re-keys (per seam #3).
    `REDUCE` stays bare (deferred to step 6). `_FAMILY_ORDER` gains `TILE@` / `STAGE@`.
-5. **Per-node featurizer loop** — the `TILE`/`STAGE`/`REDUCE` singleton reads are `family_value`
-   (byte-identical pool for one node). The group-by-axis loop + per-node `S_*` (addressed) is genuinely
-   invisible until a kernel has two nodes (its own note: "**pool == today**"), and per-node `S_*` renaming
-   would break the byte-identical feature-vector bar with no multi-node consumer to exercise it — so this
-   is **folded into step 8**, built together with the flash two-node kernel that first needs it.
+5. ✅ **Per-node featurizer loop** — landed. `knob_features` groups the schedule codecs by `@<axis>`
+   (`_node_axes`), slices each node's schedule + its own structural extents (`_node_slice`, reading
+   `S_ext_reduce_prod@<axis>` with a bare fallback), featurizes it (`_schedule_node_features`), and
+   **sum-pools** the `D_*` / `MMA_*` blocks into the fixed-width vector. A one-node kernel has one group,
+   so the sum is byte-identical to the pre-loop singleton featurizer (prior/search/eval suite green);
+   `MMA_tier` pools to 2.0 over flash's two warp nodes, `D_threads` sums QK+PV. The **addressed** per-node
+   `S_*` **stamp** (`020_stamp_structural_features` emitting `S_ext_reduce_prod@<axis>` only for a genuine
+   multi-node kernel) is wired in step 8, where flash first produces two nodes — the featurizer already
+   reads it via the `@<axis>`→bare fallback, so one-node kernels stay bare / byte-identical.
 6. ✅ **Reconcile `REDUCE@`** — landed. The schedule reduce partition is now stored `REDUCE@<axis>`
    (`_schedule._option` keys it by the reduce axis, split-K by the `k_axis`), joining `TILE`/`STAGE` on the
    axis-named keying; `_COLLAPSE_FAMILIES` gains `REDUCE` so a one-node table bares out to `REDUCE=…` and
