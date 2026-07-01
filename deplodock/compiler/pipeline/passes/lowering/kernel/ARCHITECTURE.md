@@ -22,8 +22,25 @@ are shared across kinds; only the partition changes):
 - **Reduce tier** (`_factorize_reduce`, a `PLANAR` / `TWISTED` reduce — or a non-output-tiled `CONTRACTION` — whose
   `ReducePlan` cooperates / register-folds) — the reduce axis is partitioned `coop` ways across the CTA's threads and
   `reg` ways across per-thread accumulators (ILP), then a REG-tree fold, the cross-thread combine (`_combine`), and the
-  projection.
-- **Scalar tier** — one thread per output cell (`lower(op)` + an output-store glue).
+  projection. It reads the reduce straight off the `Reduction` node (no `lower`-then-refind) and builds its per-cell body
+  via the recursion (`_emit`, below).
+- **Scalar tier** — one thread per output cell (`_emit(op)` + an output-store glue).
+
+### The recursive node walk (`_emit`) — one hierarchical emitter
+
+`factorize` drives a recursive walk, `_emit(op, ctx) -> Frag`, over the `Map` / `Reduction` / `Contraction` node tree —
+through **`source` AND `partial`** — threading a `Ctx` **down** (the ambient cell environment: the grid axes, operand
+`inputs`, `stage`, output buffer) and returning a `Frag` **up** (the per-cell loop-IR `body` this node contributes, the
+produced `Handle` wire, and the reduce `carrier` when it folds one). The two ROOT binders consume the recursion:
+`_factorize_contraction` (the `grid_tile` output-tiling pipeline) for an output-tiled `Contraction` root, and
+`_factorize_reduce` (the reduce partitioner) for a cooperative / scalar reduce — the latter builds its per-cell reduce
+loop and projection tail via `_emit`, so a **nested** `Contraction` (flash's Q@K / P@V) is reached AS A NODE. This is the
+tile-IR-rebuild mandate's *one hierarchical emitter, no divergent codegen path*: `_emit(node).body` is byte-identical to
+`ir/tile/ops.lower(node)` for a scalar-nested (block=1) node today. `Handle` carries `name` + `residence` (a scalar
+register value); the **tensor-core seam** is the `Contraction` case in `_emit` — an output-warp-tiled contraction (an mma
+`TilePlan`) emits through the register-tile pipeline + the accumulator→operand fragment recast there, where the rebuild
+extends `Handle` with the mma fragment descriptor `(mma_role, shape, dtype)` and `_emit`'s `Ctx` grows the warp binding +
+the inbound `wires` (flash's score fragment feeding P@V's A operand).
 
 The `Contraction` node is **one flat** Stmt — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
 splits the **algebra params** (what to contract: the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
@@ -42,16 +59,18 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 ### The one factorizer — dispatch + reduce tier (`_factor.py`), atom strategies + tiling (`_atom.py` / `_factor.py`)
 
 `_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind off
-`tile.op` and routes to one of **two** paths, split only on whether the OUTPUT is tiled: `_factorize_contraction` (a
-tiled `Contraction` — register / warp tile), else `_factorize_reduce` (everything else — a `PLANAR` / `TWISTED` reduce,
-a non-output-tiled `CONTRACTION`, or a pointwise `Map`). `_factorize_reduce` partitions the reduce axis when the
-`ReducePlan` cooperates (BLOCK `coop` / REG `reg`) and otherwise folds serially one thread per output cell (the
-degenerate `lower(op)` + `with_store`) — there is **no** separate "scalar tier" branch. Both paths, plus the shared-row
-staging helpers, live in `_factor.py`. **There is no kind-specific path — no flash / attention special case.** Flash is
-the two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through
-those same two routes (scalar block=1 today). A tensor-core flash tier is a matter of the contractions carrying an mma
-`TilePlan` (a schedule field on the node) and routing through `_factorize_contraction` like any other mma matmul —
-**never** a bespoke emitter, which would be a divergent codegen path the mandate forbids.
+`tile.op` and routes to one of **two** ROOT binders, split only on whether the OUTPUT is tiled: `_factorize_contraction`
+(a tiled `Contraction` — register / warp tile), else `_factorize_reduce` (everything else — a `PLANAR` / `TWISTED`
+reduce, a non-output-tiled `CONTRACTION`, or a pointwise `Map`). Both binders consume the recursive node walk `_emit`
+(above): `_factorize_reduce` builds its per-cell reduce loop / projection via `_emit` off the `Reduction` node,
+partitions the reduce axis when the `ReducePlan` cooperates (BLOCK `coop` / REG `reg`), and otherwise folds serially one
+thread per output cell (the degenerate `_emit(op)` + `with_store`) — there is **no** separate "scalar tier" branch. Both
+binders, the recursion, and the shared-row staging helpers live in `_factor.py`. **There is no kind-specific path — no
+flash / attention special case.** Flash is the two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and
+its streaming reduce factorize through this one recursion (scalar block=1 today). A tensor-core flash tier is a matter of
+the contractions carrying an mma `TilePlan` (a schedule field on the node) and routing through the `_emit` `Contraction`
+warp seam like any other mma matmul — **never** a bespoke emitter, which would be a divergent codegen path the mandate
+forbids.
 
 **The contraction factorization — two atoms.** `_factorize_contraction` is the atom-generic path — there is no per-atom
 variant, and **no per-atom geometry object**. It expands any `Contraction` by tiling a **leaf atom** four ways through
