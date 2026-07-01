@@ -14,9 +14,10 @@ plus a thin set of **root-global schedule fields** — the free-axis → grid
 per-node schedule slices ride the structural nodes themselves (a
 :class:`~.structural.Contraction`'s ``tile``, a :class:`~.structural.Reduction`'s
 ``reduce``); the residual root fields (``reduce`` / ``tier`` / ``stage`` /
-``bind``) hold the schedule for the not-yet-nodified forms (flash's legacy
-loop-in-body ``Map``, a non-tiled contraction's split-K, the pin-only ``STAGE``
-/ ``WSPEC``). There is no per-kind kernel/schedule type: the algebra is read
+``bind``) hold the schedule for the not-yet-nodified forms (a non-tiled
+contraction's split-K, the pin-only ``STAGE`` / ``WSPEC``; flash is now a
+``Map(source=Reduction(source=Contraction))`` node tree, so its partition rides
+the node). There is no per-kind kernel/schedule type: the algebra is read
 structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
 (``ops.axis_role``), so MAP / MONOID / SEMIRING all ride the same ``TileOp``.
 
@@ -61,9 +62,9 @@ class TileOp(Op):
     - ``workers`` — the warp-specialization split (:class:`~.schedule.WarpSpec`); root-global, ``None`` =
       uniform SIMT.
     - ``reduce`` — the reduce-axis partition (:class:`~.schedule.ReducePlan`) for a not-yet-nodified
-      reduce (flash's legacy loop-in-body ``Map``, a non-tiled contraction's split-K); a
-      ``Reduction`` node carries its own partition (read via ``ops.reduce_plan``, which falls back
-      here).
+      reduce (a non-tiled contraction's split-K); a ``Reduction`` node (a plain reduce, softmax, **or
+      flash** — now a ``Map(source=Reduction)``) carries its own partition (read via
+      ``ops.reduce_plan``, which falls back here).
     - ``tier`` — the output fragment (:class:`~.schedule.TilePlan`) for a non-tiled / split-partial
       contraction; a tiled contraction rides its ``tile`` on the ``Contraction`` node. ``None`` = per-cell.
     - ``stage`` — the operand smem pipeline (:class:`~.schedule.Stage`); ``None`` = gmem-direct (pin-only).

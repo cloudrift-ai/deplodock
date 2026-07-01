@@ -68,6 +68,13 @@ class Reduction:
     role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
     unroll: bool = False
     reduce: ReducePlan = field(default_factory=ReducePlan)  # the reduce partition (schedule slice), stamped by 020_schedule
+    # An OPTIONAL nested structural node the per-element ``partial`` folds over — the ``Reduction ⊃
+    # Contraction`` composition. Flash is ``Reduction(role=TWISTED, source=Contraction(QK))``: the
+    # streaming KV reduce whose per-step partial is a nested ``Σ Q·K`` contraction; a split-K matmul is
+    # ``Reduction(source=Contraction, reduce=g<n>)``. ``None`` for a bare reduce (``sum`` / ``max`` /
+    # softmax's PLANAR row reduce), whose ``partial`` is plain loop-IR stmts. :attr:`loop` splices the
+    # source's lowered loop nest ahead of the ``partial`` inside the synthesized reduce ``Loop``.
+    source: Reduction | Contraction | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.partial, Body):
@@ -82,9 +89,13 @@ class Reduction:
 
     @property
     def loop(self) -> Loop:
-        """The synthesized annotated reduce ``Loop`` — reconstructed from the params (byte-identical
-        to the loop :meth:`from_loop` captured)."""
-        return Loop(axis=self.axis, body=self.partial, unroll=self.unroll, role=self.role, carrier=self.carrier)
+        """The synthesized annotated reduce ``Loop`` — reconstructed from the params. With no
+        :attr:`source` it is byte-identical to the loop :meth:`from_loop` captured; a ``source``
+        (the ``Reduction ⊃ Contraction`` composition) splices the source's lowered loop nest ahead
+        of the ``partial`` inside the loop body (so flash's kv loop holds the nested ``Σ Q·K``
+        contraction loop, exactly the loop-in-body form the scalar tier expands)."""
+        body = self.partial if self.source is None else Body((*self.source.lower(), *self.partial))
+        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier)
 
     @property
     def out(self) -> str:

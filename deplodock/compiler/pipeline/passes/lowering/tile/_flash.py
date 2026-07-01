@@ -8,14 +8,17 @@ halves:
   emits the fused fragment.
 - **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
-  hand-assemble a kernel body — it builds the high-level op tree (``ir/tile/ops``): flash
-  is a ``Map`` whose body is the ``(m,l,O)`` LSE ``TWISTED`` reduce ``Loop`` over kv — its
-  nested ``CONTRACTION`` score ``Loop`` holds the ``Σ Q·K`` — then the ``O/l`` projection.
-  ``build_flash_frag`` returns that
-  ``Map`` UNLOWERED, on a ``TileOp`` with an UNMAPPED ``Schedule`` — the free
-  ``(batch…, m, d)`` axes are the schedule's (like every recognizer), and ``020_schedule``
-  maps them onto the grid; ``materialize`` lowers the node + generates the output-store
-  glue (the ``Write`` at the grid cell — not stored).
+  hand-assemble a kernel body — it builds the high-level **structural-node tree**
+  (``ir/tile/structural``): flash is ``Map(body=[O/l projection], source=Reduction(role=TWISTED,
+  axis=kv, source=Contraction(Σ Q·K)))`` — the ``(m,l,O)`` LSE streaming reduce over kv whose
+  per-step partial folds a nested ``Σ_dd Q·K`` :class:`Contraction` node (the ``Reduction ⊃
+  Contraction`` composition), projected ``O/l`` after the loop. ``build_flash_frag`` returns that
+  ``Map`` UNLOWERED, on a ``TileOp`` with an UNMAPPED ``Placement`` — the free ``(batch…, m, d)``
+  axes are the schedule's (like every recognizer), and ``_schedule`` maps them onto the grid;
+  ``materialize`` lowers the nodes (``Reduction.loop`` splices the contraction's ``Σ Q·K`` loop
+  ahead of the partial, the scalar tier expanding the same loop nest) + generates the output-store
+  glue (the ``Write`` at the grid cell — not stored). Warp-flash is just the inner ``Contraction``
+  gaining a warp ``TilePlan`` (routed through ``_factor``) — no new path, the nesting carries it.
 
 ``is_flash_score_producer`` lets ``010_recognize`` defer the general lift of a scaled-QK
 score producer until its softmax-then-P@V consumer has fused (the fusion reads the
@@ -62,12 +65,11 @@ from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import ConstantOp, InputOp
-from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Carrier, Load, Loop, Select, SelectBranch, Write
-from deplodock.compiler.ir.tile import Placement, TileOp
-from deplodock.compiler.ir.tile.ops import Map, contraction_loop
+from deplodock.compiler.ir.tile import Contraction, Placement, Reduction, TileOp, TilePlan
+from deplodock.compiler.ir.tile.ops import Map
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 
 if TYPE_CHECKING:
@@ -180,7 +182,9 @@ def build_flash_frag(
     scale = 1.0 / math.sqrt(head_dim)
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
-    flash_op = _flash_op(q_id, k_id, v_id, batch, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape)
+    flash_op = _flash_op(
+        q_id, k_id, v_id, batch, s_q_dim, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
+    )
     grid = (
         *(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch)),
         Axis(name="m", extent=s_q_dim),
@@ -223,6 +227,7 @@ def _flash_op(
     k_buf: str,
     v_buf: str,
     batch: list[int],
+    s_q: Dim,
     s_k: Dim,
     head_dim: int,
     *,
@@ -231,13 +236,16 @@ def _flash_op(
     mask_buf: str | None = None,
     mask_shape: tuple | None = None,
 ) -> Map:
-    """The per-output-element ``(…, m, d)`` compute as the annotated loop nest itself: flash is a
-    :class:`Map` whose body is the ``(m,l,O)`` LSE ``TWISTED`` reduce ``Loop`` over ``kv`` then the
-    ``O/l`` projection. The kv loop's body holds a NESTED ``CONTRACTION`` reduce ``Loop`` ``Σ_dd
-    Q·K`` (then scaled, optionally masked) — built by the shared ``ops.contraction_loop`` (the same
-    builder a standalone matmul uses). Returns that ``Map`` (carried on the ``TileOp``). The free
-    ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is
-    glue generated at materialize.
+    """The per-output-element ``(…, m, d)`` compute as the structural-node tree: flash is
+    ``Map(body=[O/l projection], source=Reduction(role=TWISTED, axis=kv, source=Contraction(QK)))`` —
+    the ``(m,l,O)`` LSE streaming reduce over ``kv`` whose per-step **partial** folds a NESTED
+    ``Σ_dd Q·K`` :class:`Contraction` node (then scaled, optionally masked, the value read + the
+    carrier's dissolved merge), projected ``O/l`` after the loop. The ``Reduction ⊃ Contraction``
+    composition: :meth:`Reduction.loop` splices the contraction's synthesized ``Σ Q·K`` loop ahead of
+    the partial, so the scalar tier expands the same loop-in-body nest as before — and warp-flash is
+    just the inner ``Contraction`` gaining a warp ``TilePlan`` (routed through ``_factor``), no new path.
+    The free ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is glue
+    generated at materialize.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
     ``//group`` the upstream ``IndexMapOp`` encodes, moved into the load index so the
@@ -253,19 +261,18 @@ def _flash_op(
     k_idx = (*kv_bvars, Var("kv"), Var("dd"))
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
 
-    add = ElementwiseImpl("add")
-    # s = Σ_dd Q·K — the inner contraction as a ``CONTRACTION`` reduce ``Loop`` (the shared
-    # ``ops.contraction_loop`` — the same builder a standalone matmul's ``_synth_reduce`` uses; the
-    # warp tier will route this very loop through ``_factor``), nested inside the kv streaming loop.
-    # The score scale / mask reads the contraction's ``sacc`` after the dd reduce.
-    score_loop = contraction_loop(
-        lift=ElementwiseImpl("multiply"),
-        fold=Accum(name="sacc", value="qk", op=add),
-        operand_bodies=[
-            [Load(name="q_e", input=q_buf, index=q_idx)],
-            [Load(name="k_e", input=k_buf, index=k_idx)],
-        ],
-        reduce_axis=Axis(name="dd", extent=Dim(head_dim)),
+    # s = Σ_dd Q·K — the inner contraction as a high-level :class:`Contraction` structural node, the
+    # ``source`` of the streaming kv :class:`Reduction`. Per-cell scalar (``TilePlan()``) today — the
+    # redundant one-dot-per-output-element score; a warp ``TilePlan`` here is warp-flash (the same
+    # ``_factor`` a standalone matmul takes). Its output axes are the score matrix ``[m, kv]`` (untiled
+    # today; the m/kv geometry is only read by the warp expander). The scale / mask reads ``sacc``.
+    score_contraction = Contraction(
+        axes=(Axis(name="m", extent=s_q), Axis(name="kv", extent=s_k)),
+        k_axis=Axis(name="dd", extent=Dim(head_dim)),
+        a_load=Load(name="q_e", input=q_buf, index=q_idx),
+        b_load=Load(name="k_e", input=k_buf, index=k_idx),
+        acc="sacc",
+        tile=TilePlan(),
     )
     score_post = [
         Load(name="scale_c", input="_flash_scale", index=()),
@@ -292,16 +299,23 @@ def _flash_op(
         score_name = "s_masked"
     else:
         score_name = "s"
-    # The (m,l,O) streaming fold over kv, as a ``TWISTED`` reduce ``Loop``: its body is the nested
-    # score contraction loop, the scale / mask binding ``score_name``, the value ``Load``, then the
-    # carrier's dissolved streaming ``merge`` (``flash_combine`` supplies state + twist).
+    # The (m,l,O) streaming fold over kv, as a ``TWISTED`` :class:`Reduction` node: its per-step
+    # ``partial`` is the scale / mask binding ``score_name``, the value ``Load``, then the carrier's
+    # dissolved streaming ``merge`` (``flash_combine`` supplies state + twist); the nested ``Σ Q·K``
+    # contraction rides on ``source`` (``Reduction.loop`` splices its loop ahead of the partial).
     carrier = flash_combine("m_i", "l_i", "O_i", score_name, "v_e")
-    kv_body = [score_loop, *score_post, Load(name="v_e", input=v_buf, index=v_idx), *carrier.dissolve()]
-    kv_loop = Loop(axis=Axis(name="kv", extent=s_k), body=Body(tuple(kv_body)), role=AxisRole.TWISTED, carrier=carrier)
+    partial = [*score_post, Load(name="v_e", input=v_buf, index=v_idx), *carrier.dissolve()]
+    reduction = Reduction(
+        carrier=carrier,
+        axis=Axis(name="kv", extent=s_k),
+        partial=Body(tuple(partial)),
+        role=AxisRole.TWISTED,
+        source=score_contraction,
+    )
     # φ projection: normalize the streamed (unnormalized) output by the LSE denominator —
-    # O_i / l_i after the kv loop, a stmt in the ``Map`` body.
+    # O_i / l_i after the kv loop, the ``Map`` body over the reduction ``source``.
     proj = Assign(name="O_i__proj", op="divide", args=("O_i", "l_i"))
-    return Map(body=Body((kv_loop, proj)))
+    return Map(body=Body((proj,)), source=reduction)
 
 
 # --------------------------------------------------------------------------- #

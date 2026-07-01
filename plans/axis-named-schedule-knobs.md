@@ -389,11 +389,22 @@ and the knob schema:
 7. **Fork `Level`s per node + emit structural leaves.** Restructure `build_fork_tree`'s levels to
    root-global-then-per-node; the recognize emit produces the move catalog → structural leaves.
    Structural-coverage test: the leaf set over a matmul fixture equals the hand-computed legal product.
-8. **Compose `Reduction ⊃ Contraction` (flash + split-K) — the real multi-node test.** Convert flash to
-   `Map(source=Reduction(source=Contraction(QK)))` (retiring the `reduce_plan` legacy-`Map` fallback);
-   build split-K (`g<n>` wraps the `Contraction` in a `Reduction`). Add the coupling legality `Level`.
-   New e2e `test_mma_splitk_finalize` / `sum` over `(H, W)`, and a `{TILE@d, TILE@sk, REDUCE@sk}`
-   parse/spell + DB-key round-trip asserting the two tiles key apart.
+8. **Compose `Reduction ⊃ Contraction` (flash + split-K) — the real multi-node test.**
+   - ✅ **Flash composition** — landed. `Reduction` gained an optional `source: Reduction | Contraction
+     | None` field (the `Reduction ⊃ Contraction` nesting); `Reduction.loop` splices the source's
+     lowered loop ahead of the `partial`, so a `source=None` reduce (sum / max / softmax) stays
+     byte-identical while flash becomes `Map(source=Reduction(role=TWISTED, axis=kv,
+     source=Contraction(Σ Q·K)))`. `_flash_op` builds the nested tree (the QK score is a per-cell
+     `Contraction(tile=TilePlan())` today; a warp `TilePlan` is warp-flash — no new path). This retired
+     flash's legacy loop-in-body `Map`: `ops.reduce_plan` now reads the `Reduction` node (the
+     `tile.reduce` fallback is dead for flash), `_option` stamps `REDUCE@kv` on the node. The scalar
+     tier expands the same loop nest — flash accuracy vs torch unchanged (attention coverage green,
+     21 passed / 34 xfail). The `{TILE@d, TILE@sk, REDUCE@sk}` featurize-per-node round-trip landed with
+     step 5 (`test_multinode_flash_keys_apart_and_pools_per_node`).
+   - **Remaining:** build split-K (`g<n>` wraps the non-tiled `Contraction` in a `Reduction`, retiring
+     the `_tile_option` split-K `Map`); add the flash QK/PV warp-budget coupling legality `Level`; the
+     addressed per-node `S_*` stamp (only once warp-flash produces two tiled contractions — until then
+     flash keys one node, `kv`); a `test_mma_splitk_finalize` structural assertion.
 9. **Per-node prior (optional, gated).** If we commit to per-node predict, add the per-node feature block +
    compose step; otherwise stop at pool. Decide via an A/B of prior rank on a flash fixture.
 

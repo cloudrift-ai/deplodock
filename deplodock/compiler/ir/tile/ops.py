@@ -43,7 +43,8 @@ def reduce_plan(tile):
     """The tile's reduce partition (:class:`~deplodock.compiler.ir.tile.schedule.ReducePlan`) — read
     off the :class:`~deplodock.compiler.ir.tile.structural.Reduction` node when ``tile.op`` is (or wraps
     via ``Map.source``) one, else off the ``TileOp``'s residual ``reduce`` field (a non-tiled
-    contraction's split-K / coop-K reduce, or flash's legacy loop-in-body ``Map``, neither yet a node).
+    contraction's split-K / coop-K reduce, not yet a node). Flash is now a ``Map(source=Reduction)`` too,
+    so its partition rides the node — the residual fallback is only the split-K matmul.
     The single accessor the materializer / ``030_split`` read so the reduce partition can live on the
     node instead of a root schedule field."""
     op = tile.op
