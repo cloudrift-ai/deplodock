@@ -953,40 +953,31 @@ def store_sink(c: Contraction):
 def factorize(tile, root, store=None) -> Tile:
     """The single node-kind dispatcher — expand a ``TileOp``'s ``op`` into its bound ``Tile``.
 
-    Reads the structural node off ``tile.op`` (its kind + role + reduce plan) and picks the emitter:
+    Two routes, split only on whether the OUTPUT is tiled into a register/warp tile:
 
     - a :class:`Contraction` (warp / register tile) → :func:`_factorize_contraction`, the atom-generic
       four-level pipeline. The bare grid-``Write`` is synthesized here (it needs ``root.output``, so it
       can't ride the node) into the projection ``epilogue`` before the tiling.
-    - a cooperative / ILP reduce — a ``PLANAR`` / ``TWISTED`` reduce (or a non-output-tiled
-      ``CONTRACTION``) whose :class:`ReducePlan` cooperates (BLOCK ``coop``) and/or register-folds (REG
-      ``reg``) → :func:`_factorize_reduce`.
-    - anything else (a pointwise ``Map``, or a reduction with a trivial :class:`ReducePlan`) → the
-      **scalar tier**: one thread per output cell. ``lower(op)`` emits the per-cell body (a serial
-      reduce ``Loop`` sits inside it), the output-store glue is appended if the body has none, and the
-      body is wrapped in a single :class:`Tile` bound to ``place.grid``.
+    - everything else → :func:`_factorize_reduce`: a ``PLANAR`` / ``TWISTED`` reduce, a non-output-tiled
+      ``CONTRACTION``, or a pure pointwise ``Map``. That one path partitions the reduce axis when the
+      :class:`ReducePlan` cooperates (BLOCK ``coop`` / REG ``reg``) and otherwise folds serially,
+      one thread per output cell (the degenerate ``lower(op)`` + store) — the same fold either way.
 
-    There is **no** flash / attention special case: flash is the two-``Contraction`` ``TWISTED``
-    reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through the same
-    three routes below (scalar block=1 today). A fourth, bespoke emitter would be a divergent codegen
-    path — forbidden by the mandate."""
+    There is **no** flash / attention special case, and **no** separate "scalar tier": flash is the
+    two-``Contraction`` ``TWISTED`` reduce tree, so its Q@K / P@V contractions and its streaming reduce
+    factorize through these same two routes (scalar block=1 today). A third, bespoke emitter would be a
+    divergent codegen path — forbidden by the mandate."""
     op = tile.op
     if isinstance(op, Contraction):
         tail = list(op.epilogue)
         if not has_write(tail):
             op = replace(op, epilogue=with_store(tail, root.output.name, tile.place.grid, op))
         return _factorize_contraction(op, tile.stage, store, tile.inputs)
-    # Cooperative / ILP reduce tier: a PLANAR / TWISTED reduce, OR a non-output-tiled CONTRACTION
-    # whose ReducePlan cooperates — read the role structurally, not the kernel kind. A contraction
-    # folds here carrier-generically (a contraction is the degenerate carrier of its additive fold).
-    role = axis_role(op) if op is not None else AxisRole.FREE
-    tier = tile.tier
-    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
-    plan = reduce_plan(tile) if coop_eligible else None
-    if plan is not None and (plan.coop > 1 or plan.reg > 1):
-        return _factorize_reduce(tile, root)
-    stmts = with_store(lower(op), root.output.name, tile.place.grid, op)
-    return Tile(axes=tuple(tile.place.grid), body=Body(tuple(stmts)))
+    # Everything else is ONE path — a PLANAR / TWISTED reduce, a non-output-tiled CONTRACTION, or a
+    # pure pointwise Map. They differ only in whether the reduce axis is partitioned (cooperative /
+    # ILP) or folded serially one-thread-per-cell; `_factorize_reduce` owns both. There is no separate
+    # "scalar tier" branch here — the degenerate no-partition case is that path's trivial arm.
+    return _factorize_reduce(tile, root)
 
 
 def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=None, inputs=None) -> Tile:
@@ -1139,11 +1130,27 @@ def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_var
 
 
 def _factorize_reduce(tile, root) -> Tile:
-    """Materialize a cooperative / ILP reduce into its bound ``Tile`` (see the section header)."""
+    """Materialize the non-output-tiled path into its bound ``Tile`` (see the section header): a
+    ``PLANAR`` / ``TWISTED`` reduce, a non-tiled ``CONTRACTION``, or a pointwise ``Map``.
+
+    **Degenerate arm (no partition).** A pointwise ``Map`` (no reduce axis), or any reduce / contraction
+    whose :class:`ReducePlan` is trivial (``coop == reg == 1``), is one thread per output cell: ``lower``
+    emits the per-cell body (a serial reduce ``Loop`` sits inside it) and the store glue is appended.
+    **Partitioned arm.** Otherwise partition the reduce axis ``coop`` ways across threads and/or ``reg``
+    ways across register accumulators, as the section header describes."""
     op = tile.op
-    plan = reduce_plan(tile)
-    coop, reg = plan.coop, plan.reg
     grid = tile.place.grid
+    # Eligible to partition only when the reduce axis has a cooperating plan: a PLANAR / TWISTED reduce,
+    # or a non-output-tiled CONTRACTION — read structurally, not by kernel kind.
+    role = axis_role(op) if op is not None else AxisRole.FREE
+    tier = tile.tier
+    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
+    plan = reduce_plan(tile) if coop_eligible else None
+    if plan is None or (plan.coop <= 1 and plan.reg <= 1):
+        # One thread per output cell — the degenerate fold, no cross-thread / ILP partition.
+        stmts = with_store(lower(op), root.output.name, grid, op)
+        return Tile(axes=tuple(grid), body=Body(tuple(stmts)))
+    coop, reg = plan.coop, plan.reg
     stmts = lower(op)
 
     # The cooperative / cross-thread combine reads its :class:`Carrier` off the annotated reduce

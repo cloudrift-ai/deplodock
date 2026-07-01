@@ -40,13 +40,15 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 
 ### The one factorizer — dispatch, atoms, and the reduce tier (`_factor.py` / `_tiling.py`)
 
-`_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind +
-role + reduce plan off `tile.op` and routes to exactly one of three tiers — `_factorize_contraction` (a tiled
-`Contraction`), `_factorize_reduce` (a cooperative / ILP `PLANAR` / `TWISTED` reduce), or the inline **scalar tier**
-(`lower(op)` + `with_store`, one thread per output cell). All three tiers, plus the shared-row staging helpers, live in
-`_factor.py`. **There is no fourth, kind-specific path — no flash / attention special case.** Flash is the
-two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through those
-same three routes (scalar block=1 today). A tensor-core flash tier is a matter of the contractions carrying an mma
+`_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind off
+`tile.op` and routes to one of **two** paths, split only on whether the OUTPUT is tiled: `_factorize_contraction` (a
+tiled `Contraction` — register / warp tile), else `_factorize_reduce` (everything else — a `PLANAR` / `TWISTED` reduce,
+a non-output-tiled `CONTRACTION`, or a pointwise `Map`). `_factorize_reduce` partitions the reduce axis when the
+`ReducePlan` cooperates (BLOCK `coop` / REG `reg`) and otherwise folds serially one thread per output cell (the
+degenerate `lower(op)` + `with_store`) — there is **no** separate "scalar tier" branch. Both paths, plus the shared-row
+staging helpers, live in `_factor.py`. **There is no kind-specific path — no flash / attention special case.** Flash is
+the two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through
+those same two routes (scalar block=1 today). A tensor-core flash tier is a matter of the contractions carrying an mma
 `TilePlan` (a schedule field on the node) and routing through `_factorize_contraction` like any other mma matmul —
 **never** a bespoke emitter, which would be a divergent codegen path the mandate forbids.
 

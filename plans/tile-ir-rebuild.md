@@ -94,6 +94,93 @@ tier that differs **only in the schedule's partition/tiling**, never in the alge
 `Map` / `Reduction` / `Contraction` sub-schedule. **If a phase needs its own emitter, the node model is wrong — fix
 the model, do not fork the codegen.**
 
+### The target — atom-as-descriptor: one pipeline, reduce/contract uniform over it
+
+The invariant above is currently under-delivered: `_factor.py` still carries **two atom triples** (`_mma_state` /
+`_mma_reduce` / `_mma_store` vs `_scalar_state` / `_scalar_reduce` / `_scalar_store`), **two staging drivers**
+(`_warp_staged_kloop` / `_scalar_staged_kloop` + their two `*_stage_plan`s), and a hard split between output-tiled
+(`_factorize_contraction`) and reduce-partitioned (`_factorize_reduce`) kernels. That surface area is an **artifact, not
+a hardware necessity.** The real dataflow is one pipeline:
+
+```
+read (transport + layout)  →  ⊗ at atom granularity, if contracting  →  fold (+ a data-move per axis placement)  →  write
+```
+
+and the *atom* is a small **descriptor**, not a code path — it carries exactly four things:
+
+- the operand **read** primitive + slab layout (`ldmatrix`-swizzled vs a flat plain-`Load` slab),
+- the **⊗ instruction at its (M, N, K) granularity** — `mma.sync` is the lift at `16×8×16` (it fuses 16 K-steps into one
+  instruction); scalar `fma` is the lift at `1×1×1`. The K-loop strides by `atom_k` and does one atom-multiply per step,
+  so "contract" is uniform, parameterized by the atom shape — **not** a separate emitter;
+- **lane count / ownership** (who holds which output cell — one thread per cell for scalar, a warp collectively owning a
+  tile for mma; already a `unit_tile` / `lanes` parameter);
+- the **output fragment layout** — the lane→(row, col) map. This is the ONE genuinely atom-specific datum, and it is
+  **data** (the `FragLayout` / `M16N8` descriptor — the right instinct, deleted with the flash purge, to return as this
+  parameter), consumed by the write and by any within-fragment reduction — never a fork.
+
+Crucially, **reduce does not branch on atom.** A reduction is one **fold** plus an *optional data-move*, and the move is
+keyed on **where the reduced axis sits** — within-lane (no move), within-warp (`__shfl`), within-block (smem) — a
+*placement* property, which is the transport dimension, not the atom. Folding fragments and folding scalars are the same
+algebra; "reduce atoms or scalars — it doesn't matter." Likewise the output-tiled vs reduce-partitioned split is just
+*which axis is tiled* (the output `(m, n)` or the reduce `k`/`kv`), not two kinds of kernel.
+
+**End-state:** collapse the six `_mma_*` / `_scalar_*` functions + the two staging drivers into **one** pipeline whose
+only atom-dependent input is the descriptor above; `reduce` / `contract` / `read` / `write` are uniform over it. The bar
+for the reopened **tensor-core flash** is therefore stronger than "no bespoke emitter" — it must **collapse into this
+pipeline**: contract QK → fold the softmax over the score fragment (a within-fragment `__shfl` move, placement-keyed) →
+contract PV → write, reusing the one contraction path with the mma atom descriptor (the returning `FragLayout` supplies
+the score/PV fragment geometry). If flash — or any phase — cannot be written as a descriptor + this pipeline, the atom
+model is still wrong; widen the descriptor, do not fork.
+
+#### The skeleton to keep, and the deviations to demolish
+
+**The skeleton (survives as the one pipeline).** `_factorize_contraction` + `_tiling.py` is the base — it is *already*
+atom-agnostic (it branches nowhere on the atom; it threads the `(state_decls, reduce_region, store)` callables through
+`atomize → register_tile → unit_tile → grid_tile`). It sits on the substrate that is *already* uniform and stays:
+
+- the **algebra spine** — `ops.lower` + `ops.contraction_loop` + the `Carrier` machinery (`as_state_merge` /
+  `emit_combine`): a contraction is a fold with a `⊗` lift, a reduction is the bare fold, one builder for both;
+- the **geometry engine** — `_tiling.py`'s four levels, generalized to tile *whichever axis the schedule names* (the
+  output `(m, n)` for a matmul, the reduce axis for a cooperative reduction — "which axis is tiled," not two kernels);
+- the **transport module** — `_stage.py`;
+- the node / schedule model — `Contraction` / `Reduction` / `Map` + `TilePlan` / `Stage`, plus the atom **descriptor**
+  (read primitive + slab layout, `⊗` instruction at its (M, N, K) granularity, lanes / ownership, `FragLayout`).
+
+**The tell that the rest is artifact, not hardware:** a cooperative-K **contraction** already routes to
+`_factorize_reduce`, not `_factorize_contraction` — the *same node* lowers through two different tiers depending only on
+its schedule. That is one kernel with two emitters: the definition of a divergent path.
+
+**Deviations to demolish (fold each into the skeleton):**
+
+1. **`factorize`'s three routes → one.** `_factorize_reduce` and the inline scalar tier (`lower` + `with_store`) are the
+   skeleton with the *reduce* axis tiled instead of the output, and/or a trivial atom (no `⊗`). Merge them: the pipeline
+   tiles the scheduled axis and folds; pointwise is the degenerate "no reduce axis," per-cell reduce is "trivial
+   partition," matmul is "tile the output." One `factorize`, no `isinstance`/role fork choosing an emitter.
+2. **The `_mma_*` / `_scalar_*` triples → one descriptor-driven `read → ⊗ → fold → store`.** `reduce_codegen` /
+   `store_sink`'s `isinstance(c.atom, AtomKind)` branch becomes a **descriptor read**; the six functions collapse to one
+   loop builder + one store that consume the atom descriptor (the scalar atom is `1×1×1`, identity layout).
+3. **The two staging drivers → one.** `_warp_staged_kloop` / `_warp_tma_staged_kloop` / `_mma_stage_plan` vs
+   `_scalar_staged_kloop` / `_scalar_stage_plan` become **one `Stage`-driven fill/drain** keyed on slab layout (swizzled
+   for `ldmatrix` vs flat for plain-`Load`) — already the Phase-2/3 purge target, now the *whole* staging story.
+4. **The fold's data-move → one placement-keyed primitive.** `emit_combine` (cross-thread), the deleted fragment
+   `__shfl` (cross-lane), and `030_split`'s cross-CTA combine are the *same* "fold + move" at different placements
+   (within-lane = none, within-warp = `__shfl`, within-block = smem, cross-CTA = the split finalize). One move selector
+   keyed on where the reduced axis sits.
+
+**Order (each step e2e-green):** (2) collapse the atom into a descriptor + unify the triples → (3) fold the staging
+drivers onto the one `Stage` → (4) make the fold move placement-keyed → (1) merge `_factorize_reduce` + the inline scalar
+tier into the skeleton, at which point `factorize` is a single pipeline call. The reopened tensor-core flash lands *on
+top of this*, not before it — flash is the acceptance test that the collapse is real.
+
+**Progress.** ✅ **Deviation 1, first cut — `factorize`'s three routes collapsed to two** (byte-identical, full compiler
+e2e green). The inline scalar tier is gone as a separate branch: `factorize` is now `if Contraction →
+_factorize_contraction; else → _factorize_reduce`, and `_factorize_reduce` owns both the cooperative/ILP partition and
+the degenerate one-thread-per-cell fold (a pointwise `Map` or trivial `ReducePlan`). Remaining: (2) the atom-triple
+unification — the big one, a uniform-node-family redesign so `_mma_*` / `_scalar_*` collapse to one descriptor-driven
+`read → ⊗ → fold → store` (the mma path emits `Ldmatrix`/`MmaSyncPtx` fragment nodes, the scalar path `Load`/`Assign`
+element nodes, so this needs the kernel-IR to carry the atom granularity + `FragLayout` as data); (3) staging-driver
+unification; (4) placement-keyed fold move (lands with the tensor-core flash, which needs the returning fragment shuffle).
+
 ## The recovery contract
 
 `tests/compiler/e2e/` is the **only** thing the rebuild must satisfy. Every file there is black-box: it builds a graph,
@@ -538,7 +625,14 @@ Phase 3  pipelining        cp.async ring · smem→reg double-buffer · TMA — 
    │  purge → collapse single-buffer into depth=1 · delete unreachable transport renderers
    ▼
 Phase 4  warp spec         WarpSpec roles bottoming out in Map / Reduction / Contraction
-      purge → unify Channel/Stage transport · demolish xfail registry + conftest hook + guarded imports · delete this plan
+      purge → unify Channel/Stage transport · demolish xfail registry + conftest hook + guarded imports
+
+Consolidation  atom-as-descriptor: collapse the _mma_*/_scalar_* triples + the 2 staging drivers + _factorize_reduce +
+   │            the inline scalar tier into ONE placement-keyed pipeline; `factorize` becomes a single call. Skeleton =
+   │            _factorize_contraction + _tiling; deviations demolished per "The demolition" above. Steps: (2) descriptor
+   ▼            + unify triples → (3) one Stage fill/drain → (4) placement-keyed fold move → (1) merge the reduce tiers.
+Tensor-core flash  the reopened Phase-1 mma flash lands ON the collapse — its acceptance test (contract QK → fold
+      softmax over the score fragment → contract PV → write, through the one pipeline). Then delete this plan.
 ```
 
 - **Per phase:** delete the flipped xfail entries; `./venv/bin/pytest tests/compiler/e2e/ -p no:randomly -n auto
