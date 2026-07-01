@@ -17,8 +17,8 @@ splices two codegen halves into ``grid_tile``:
   accumulator/operand declarations + the contraction K-loop. The K-loop shares **one skeleton**,
   :func:`_contract_kloop` (read each register row's A + each col's B once, contract every ``(row,
   col)`` pair, wrap in the reduce loop); the atom supplies only the leaf constructors — the mma pair
-  (:func:`_mma_state` / :func:`_mma_reduce`: ``ldmatrix`` fragment reads + ``mma.sync``) vs the scalar
-  pair (:func:`_scalar_state` / :func:`_scalar_reduce`: plain ``Load``\\ s + an ``fma`` cell). Under a
+  (:meth:`_MmaOps.state` / :meth:`_MmaOps.reduce`: ``ldmatrix`` fragment reads + ``mma.sync``) vs the scalar
+  pair (:meth:`_ScalarOps.state` / :meth:`_ScalarOps.reduce`: plain ``Load``\\ s + an ``fma`` cell). Under a
   :class:`Stage` the operands instead ride an smem slab (cp.async / TMA fill + drain, a pure
   bit-identical perf transform): the single-buffer path shares one skeleton, :func:`_staged_slab_kloop`
   (fill → barrier → drain → ``Sync``), across both atoms + both transports — the atom supplies the
@@ -571,7 +571,7 @@ def _warp_tma_staged_kloop(
 
 def _mma_stage_plan(c: Contraction, stage: Stage | None) -> tuple[str, int, int]:
     """The operand-staging decision for the mma contraction ``c`` under ``stage`` — read once and
-    shared by :func:`_mma_state` (which slots the fragments) and :func:`_mma_reduce` (which emits the
+    shared by :meth:`_MmaOps.state` (which slots the fragments) and :meth:`_MmaOps.reduce` (which emits the
     K-loop). Returns ``(mode, gmem_depth, reg_depth)`` where ``mode`` is ``"tma"`` / ``"cp"`` /
     ``"gmem"`` (TMA > cp.async > gmem-direct). ``gmem`` forces both depths to 1 (no slab)."""
     if stage is None or c.a_computed:
@@ -612,123 +612,6 @@ def _contract_kloop(c, cells, offset, masks, *, read_row, read_col, contract, wr
     for i, j in cells:
         body += contract(i, j)
     return [], wrap(body)
-
-
-def _mma_state(c: Contraction, stage: Stage | None, cells) -> list[Stmt]:
-    """The mma operand/accumulator register fragments — one ``_a``/``_b`` per register row/col and
-    one ``_c`` accumulator per cell (held across the K-loop). A staged ``reg_depth >= 2`` slots the
-    operand fragments (``_a{i}_s{slot}``) for the smem→register double-buffer's ping-pong."""
-    atom = c.atom
-    _mode, _gmem_depth, reg_depth = _mma_stage_plan(c, stage)
-    a_frags = [f"_a{i}_s{s}" for i in range(c.reg_m) for s in range(reg_depth)] if reg_depth >= 2 else [f"_a{i}" for i in range(c.reg_m)]
-    b_frags = [f"_b{j}_s{s}" for j in range(c.reg_n) for s in range(reg_depth)] if reg_depth >= 2 else [f"_b{j}" for j in range(c.reg_n)]
-    decls: list[Stmt] = []
-    for name in a_frags:
-        decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
-    for name in b_frags:
-        decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
-    for i in range(c.reg_m):
-        for j in range(c.reg_n):
-            decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
-    return decls
-
-
-def _mma_reduce(c: Contraction, stage: Stage | None, cells, offset, masks) -> tuple[list[Stmt], list[Stmt]]:
-    """The mma K-loop, dispatched on the staging decision (TMA > cp.async > gmem-direct). Staged:
-    cooperatively fill an smem slab then ``ldmatrix``-drain it (:func:`_warp_tma_staged_kloop` /
-    :func:`_warp_staged_kloop`) — a pure perf transform, bit-identical to gmem-direct. Gmem-direct:
-    ``ldmatrix`` each operand fragment straight from gmem, then ``mma.sync`` every cell (a symbolic /
-    non-divisible K zero-fills the masked-K tail via the ``k_zero`` helper variants — canonical and
-    transposed-B both have gmem-direct K zero-fill helpers)."""
-    atom = c.atom
-    m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    assert not c.a_computed, "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
-    a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
-    mode, gmem_depth, reg_depth = _mma_stage_plan(c, stage)
-    if mode != "gmem":
-        slab_dtype = cuda_name(atom.operand_dtype("a"))
-        elem_bytes = atom.operand_dtype("a").nbytes
-        common = dict(
-            a_load=a_load,
-            b_load=b_load,
-            k_axis=k_axis,
-            m_b=c.m_b,
-            n_b=c.n_b,
-            m_w=c.m_uvar,
-            n_w=c.n_uvar,
-            wm=c.units_m,
-            wn=c.units_n,
-            fm=c.reg_m,
-            fn=c.reg_n,
-            atom=atom,
-            bk=c.tile.bk,
-            tile_m=c.tile_m,
-            tile_n=c.tile_n,
-            slab_dtype=slab_dtype,
-            elem_bytes=elem_bytes,
-            reg_depth=reg_depth,
-        )
-        if mode == "tma":
-            return _warp_tma_staged_kloop(**common)
-        return _warp_staged_kloop(m_axis=m_axis, n_axis=n_axis, mask_m=c.mask_m, depth=gmem_depth, **common)
-    mask_m, mask_n, m_ext, n_ext = masks
-    k_static = k_axis.extent.is_static
-    k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
-
-    def read_row(i):
-        idx = tuple(Sigma({m_axis.name: offset.base("m", i)}).apply(e) for e in a_load.index)
-        guard = (offset.base("m", i), m_ext) if mask_m else None
-        return [
-            LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero)
-        ]
-
-    def read_col(j):
-        idx = tuple(Sigma({n_axis.name: offset.base("n", j)}).apply(e) for e in b_load.index)
-        guard = (offset.base("n", j), n_ext) if mask_n else None
-        return [
-            LdmatrixLoad(
-                frag=f"_b{j}",
-                src_buffer=b_load.input,
-                src_index=idx,
-                role="b",
-                staged=False,
-                b_trans=b_trans,
-                gmem_guard=guard,
-                k_zero=k_zero,
-            )
-        ]
-
-    def contract(i, j):
-        return [MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype)]
-
-    def wrap(body):
-        return [
-            StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom.atom_k, "int"), body=Body(tuple(body)), unroll=k_static)
-        ]
-
-    return _contract_kloop(c, cells, offset, masks, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
-
-
-def _mma_store(c: Contraction, i: int, j: int, offset, masks) -> list[Stmt]:
-    """Store cell ``(i, j)``'s ``_c`` fragment to the output, folding the projection ``tail`` into a
-    :class:`RegEpilogue` and guarding overhanging M/N rows."""
-    atom = c.atom
-    m_axis, n_axis = c.m_axis, c.n_axis
-    mask_m, mask_n, m_ext, n_ext = masks
-    tail = list(c.epilogue)
-    write = next(s for s in tail if isinstance(s, Write))
-    sigma = Sigma({m_axis.name: offset.base("m", i), n_axis.name: offset.base("n", j)})
-    return [
-        RegStore(
-            dst_buffer=write.output,
-            dst_index=tuple(sigma.apply(e) for e in write.index),
-            frag=f"_c{i}_{j}",
-            shape=atom.shape,
-            epilogue=_warp_epilogue(tail, c.acc, m_axis.name, n_axis.name, sigma),
-            m_guard=(offset.base("m", i), m_ext) if mask_m else None,
-            n_guard=(offset.base("n", j), n_ext) if mask_n else None,
-        )
-    ]
 
 
 # ---- scalar (register-tile) tier --------------------------------------------------------------- #
@@ -813,70 +696,6 @@ def _scalar_protected(c: Contraction) -> frozenset[str]:
     return frozenset(prot)
 
 
-def _scalar_state(c: Contraction, stage: Stage | None, inputs, cells) -> list[Stmt]:
-    """The scalar accumulator seeds. Gmem-direct (unstaged): none — the accumulators are seeded
-    inside the reduce ``Loop`` (the dissolved fold ``Accum``\\ s + ``Loop.render``). **Staged**: a
-    per-cell ``Init(acc__c{i}_{j} = 0)`` emitted here, **outside** the outer slab loop, so the
-    carrier-less :func:`_scalar_drain` folds across every slab without re-seeding (the nested-loop
-    accumulator-lifetime split — the scalar analogue of ``_mma_state`` declaring the ``_c`` fragments
-    outside the mma K-loop)."""
-    mode, _bk = _scalar_stage_plan(c, stage, inputs)
-    if mode == "gmem":
-        return []
-    return [Init(name=f"{c.acc}__c{i}_{j}", identity=_ADD.identity, dtype=F32) for i, j in cells]
-
-
-def _scalar_reduce(c: Contraction, stage: Stage | None, inputs, cells, offset, masks) -> tuple[list[Stmt], list[Stmt]]:
-    """The scalar contraction K-loop, through the shared :func:`_contract_kloop` skeleton with scalar
-    leaf constructors: each register ROW reads its A operand once (a gmem ``Load`` — or the computed
-    register-resident body, e.g. flash PV's ``P``), each COL its B ``Load`` once, and each ``(i, j)``
-    cell folds ``acc__c{i}_{j} += b·a`` in a unit ``Loop`` (``Loop.render`` seeds the accumulators; the
-    store reads them). A masked axis wraps its read in-bounds (``% extent``) and the overhanging store
-    is guarded (:func:`_scalar_store`). Under a ``STAGE`` pin the eligible contraction routes to
-    :func:`_scalar_staged_kloop` (smem operand slab); unstaged is this path."""
-    mode, bk_elems = _scalar_stage_plan(c, stage, inputs)
-    if mode != "gmem":
-        return _scalar_staged_kloop(c, inputs, cells, offset, masks, mode, bk_elems)
-    k_axis = c.k_axis
-    mask_m, mask_n, m_ext, n_ext = masks
-    prot = _scalar_protected(c)
-    m_name = c.m_axis.name if c.m_axis is not None else None
-    n_name = c.n_axis.name
-    b_name, a_name = c.b_load.names[0], c.a_name
-
-    def read_row(i):
-        if m_name is None:
-            return copy_cell(c.a_body, Sigma({}), f"__ar{i}", prot)
-        bm = offset.base("m", i)
-        return copy_cell(c.a_body, Sigma({m_name: BinaryExpr("%", bm, m_ext) if mask_m else bm}), f"__ar{i}", prot)
-
-    def read_col(j):
-        bn = offset.base("n", j)
-        return copy_cell([c.b_load], Sigma({n_name: BinaryExpr("%", bn, n_ext) if mask_n else bn}), f"__bc{j}", prot)
-
-    def contract(i, j):
-        v = f"{c.acc}__v__c{i}_{j}"
-        return [
-            Assign(name=v, op=_MUL, args=(f"{b_name}__bc{j}", f"{a_name}__ar{i}")),
-            Accum(name=f"{c.acc}__c{i}_{j}", value=v, op=_ADD, axes=(k_axis.name,)),
-        ]
-
-    def wrap(body):
-        return [Loop(axis=k_axis, body=Body(tuple(body)), unroll=_unroll_inner(k_axis))]
-
-    return _contract_kloop(c, cells, offset, masks, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
-
-
-def _scalar_store(c: Contraction, i: int, j: int, offset, masks) -> list[Stmt]:
-    """Replicate the projection ``tail`` for cell ``(i, j)`` — σ-offset, suffix the SSA names, guard
-    the (overhanging) write, dedup shared operand loads."""
-    m_axis, n_axis = c.m_axis, c.n_axis
-    sigma = _scalar_sigma(m_axis, n_axis, offset, i, j, masks)
-    cell = copy_cell(c.epilogue, sigma, f"__c{i}_{j}", _scalar_protected(c))
-    cell = _guard_writes(cell, _scalar_bound(m_axis, n_axis, offset, i, j, masks))
-    return _dedup_loads(cell)
-
-
 def _scalar_stage_plan(c: Contraction, stage: Stage | None, inputs) -> tuple[str, int]:
     """The scalar-tier operand-staging decision — ``(mode, bk_elems)``, ``mode`` one of ``"tma"`` /
     ``"cp"`` / ``"gmem"`` (gmem = no slab). Staging is **opt-in behind a ``STAGE`` pin**: a scalar
@@ -908,7 +727,7 @@ def _scalar_drain(c: Contraction, cells, offset, a_slab: str, b_slab: str, ki: s
     base`` (``m_uvar·reg_m + i`` ∈ [0, tile_m), always in-slab), so an overhanging cell reads a
     clamped / zero-filled slab row and its store is discarded by the guard. ``_dedup_loads`` still
     shares A across the n-cells and B across the m-cells exactly as gmem-direct does. **Carrier-less**
-    (no ``Loop.carrier``): the accumulators are pre-seeded once by :func:`_scalar_state` outside the
+    (no ``Loop.carrier``): the accumulators are pre-seeded once by :meth:`_ScalarOps.state` outside the
     outer slab loop, so the drain folds into them without re-seeding."""
     b_name, a_name = c.b_load.names[0], c.a_name
     body: list[Stmt] = []
@@ -922,7 +741,7 @@ def _scalar_drain(c: Contraction, cells, offset, a_slab: str, b_slab: str, ki: s
         body.append(Assign(name=vn, op=_MUL, args=(bn, an)))
         body.append(Accum(name=cn, value=vn, op=_ADD, axes=(ki,)))
     body = _dedup_loads(body)
-    # seed=False: the accumulators are pre-seeded once by _scalar_state outside the outer slab loop, so
+    # seed=False: the accumulators are pre-seeded once by _ScalarOps.state outside the outer slab loop, so
     # this inner drain must NOT re-declare (re-zero) them each slab iteration.
     return Loop(axis=Axis(name=ki, extent=bk_elems), body=Body(tuple(body)), unroll=bk_elems <= 64, seed=False)
 
@@ -996,26 +815,195 @@ class _MmaOps(_AtomOps):
     """Tensor-core atom — ``ldmatrix`` fragment reads + ``mma.sync``, a ``RegStore`` sink."""
 
     def state(self, cells):
-        return _mma_state(self.c, self.stage, cells)
+        """The mma operand/accumulator register fragments — one ``_a``/``_b`` per register row/col and
+        one ``_c`` accumulator per cell (held across the K-loop). A staged ``reg_depth >= 2`` slots the
+        operand fragments (``_a{i}_s{slot}``) for the smem→register double-buffer's ping-pong."""
+        c, stage = self.c, self.stage
+        atom = c.atom
+        _mode, _gmem_depth, reg_depth = _mma_stage_plan(c, stage)
+        a_frags = (
+            [f"_a{i}_s{s}" for i in range(c.reg_m) for s in range(reg_depth)] if reg_depth >= 2 else [f"_a{i}" for i in range(c.reg_m)]
+        )
+        b_frags = (
+            [f"_b{j}_s{s}" for j in range(c.reg_n) for s in range(reg_depth)] if reg_depth >= 2 else [f"_b{j}" for j in range(c.reg_n)]
+        )
+        decls: list[Stmt] = []
+        for name in a_frags:
+            decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
+        for name in b_frags:
+            decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
+        for i in range(c.reg_m):
+            for j in range(c.reg_n):
+                decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
+        return decls
 
     def reduce(self, cells, offset, masks):
-        return _mma_reduce(self.c, self.stage, cells, offset, masks)
+        """The mma K-loop, dispatched on the staging decision (TMA > cp.async > gmem-direct). Staged:
+        cooperatively fill an smem slab then ``ldmatrix``-drain it (:func:`_warp_tma_staged_kloop` /
+        :func:`_warp_staged_kloop`) — a pure perf transform, bit-identical to gmem-direct. Gmem-direct:
+        ``ldmatrix`` each operand fragment straight from gmem, then ``mma.sync`` every cell (a symbolic /
+        non-divisible K zero-fills the masked-K tail via the ``k_zero`` helper variants — canonical and
+        transposed-B both have gmem-direct K zero-fill helpers)."""
+        c, stage = self.c, self.stage
+        atom = c.atom
+        m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
+        assert not c.a_computed, (
+            "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
+        )
+        a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
+        mode, gmem_depth, reg_depth = _mma_stage_plan(c, stage)
+        if mode != "gmem":
+            slab_dtype = cuda_name(atom.operand_dtype("a"))
+            elem_bytes = atom.operand_dtype("a").nbytes
+            common = dict(
+                a_load=a_load,
+                b_load=b_load,
+                k_axis=k_axis,
+                m_b=c.m_b,
+                n_b=c.n_b,
+                m_w=c.m_uvar,
+                n_w=c.n_uvar,
+                wm=c.units_m,
+                wn=c.units_n,
+                fm=c.reg_m,
+                fn=c.reg_n,
+                atom=atom,
+                bk=c.tile.bk,
+                tile_m=c.tile_m,
+                tile_n=c.tile_n,
+                slab_dtype=slab_dtype,
+                elem_bytes=elem_bytes,
+                reg_depth=reg_depth,
+            )
+            if mode == "tma":
+                return _warp_tma_staged_kloop(**common)
+            return _warp_staged_kloop(m_axis=m_axis, n_axis=n_axis, mask_m=c.mask_m, depth=gmem_depth, **common)
+        mask_m, mask_n, m_ext, n_ext = masks
+        k_static = k_axis.extent.is_static
+        k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
+
+        def read_row(i):
+            idx = tuple(Sigma({m_axis.name: offset.base("m", i)}).apply(e) for e in a_load.index)
+            guard = (offset.base("m", i), m_ext) if mask_m else None
+            return [
+                LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero)
+            ]
+
+        def read_col(j):
+            idx = tuple(Sigma({n_axis.name: offset.base("n", j)}).apply(e) for e in b_load.index)
+            guard = (offset.base("n", j), n_ext) if mask_n else None
+            return [
+                LdmatrixLoad(
+                    frag=f"_b{j}",
+                    src_buffer=b_load.input,
+                    src_index=idx,
+                    role="b",
+                    staged=False,
+                    b_trans=b_trans,
+                    gmem_guard=guard,
+                    k_zero=k_zero,
+                )
+            ]
+
+        def contract(i, j):
+            return [MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype)]
+
+        def wrap(body):
+            return [
+                StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom.atom_k, "int"), body=Body(tuple(body)), unroll=k_static)
+            ]
+
+        return _contract_kloop(c, cells, offset, masks, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
 
     def store(self, i, j, offset, masks):
-        return _mma_store(self.c, i, j, offset, masks)
+        """Store cell ``(i, j)``'s ``_c`` fragment to the output, folding the projection ``tail`` into a
+        :class:`RegEpilogue` and guarding overhanging M/N rows."""
+        c = self.c
+        atom = c.atom
+        m_axis, n_axis = c.m_axis, c.n_axis
+        mask_m, mask_n, m_ext, n_ext = masks
+        tail = list(c.epilogue)
+        write = next(s for s in tail if isinstance(s, Write))
+        sigma = Sigma({m_axis.name: offset.base("m", i), n_axis.name: offset.base("n", j)})
+        return [
+            RegStore(
+                dst_buffer=write.output,
+                dst_index=tuple(sigma.apply(e) for e in write.index),
+                frag=f"_c{i}_{j}",
+                shape=atom.shape,
+                epilogue=_warp_epilogue(tail, c.acc, m_axis.name, n_axis.name, sigma),
+                m_guard=(offset.base("m", i), m_ext) if mask_m else None,
+                n_guard=(offset.base("n", j), n_ext) if mask_n else None,
+            )
+        ]
 
 
 class _ScalarOps(_AtomOps):
     """Scalar fma atom — plain ``Load``\\ s + an ``fma`` cell, the replicated-``epilogue`` sink."""
 
     def state(self, cells):
-        return _scalar_state(self.c, self.stage, self.inputs, cells)
+        """The scalar accumulator seeds. Gmem-direct (unstaged): none — the accumulators are seeded
+        inside the reduce ``Loop`` (the dissolved fold ``Accum``\\ s + ``Loop.render``). **Staged**: a
+        per-cell ``Init(acc__c{i}_{j} = 0)`` emitted here, **outside** the outer slab loop, so the
+        carrier-less :func:`_scalar_drain` folds across every slab without re-seeding (the nested-loop
+        accumulator-lifetime split — the scalar analogue of :meth:`_MmaOps.state` declaring the ``_c``
+        fragments outside the mma K-loop)."""
+        c, stage, inputs = self.c, self.stage, self.inputs
+        mode, _bk = _scalar_stage_plan(c, stage, inputs)
+        if mode == "gmem":
+            return []
+        return [Init(name=f"{c.acc}__c{i}_{j}", identity=_ADD.identity, dtype=F32) for i, j in cells]
 
     def reduce(self, cells, offset, masks):
-        return _scalar_reduce(self.c, self.stage, self.inputs, cells, offset, masks)
+        """The scalar contraction K-loop, through the shared :func:`_contract_kloop` skeleton with scalar
+        leaf constructors: each register ROW reads its A operand once (a gmem ``Load`` — or the computed
+        register-resident body, e.g. flash PV's ``P``), each COL its B ``Load`` once, and each ``(i, j)``
+        cell folds ``acc__c{i}_{j} += b·a`` in a unit ``Loop`` (``Loop.render`` seeds the accumulators; the
+        store reads them). A masked axis wraps its read in-bounds (``% extent``) and the overhanging store
+        is guarded (:meth:`_ScalarOps.store`). Under a ``STAGE`` pin the eligible contraction routes to
+        :func:`_scalar_staged_kloop` (smem operand slab); unstaged is this path."""
+        c, stage, inputs = self.c, self.stage, self.inputs
+        mode, bk_elems = _scalar_stage_plan(c, stage, inputs)
+        if mode != "gmem":
+            return _scalar_staged_kloop(c, inputs, cells, offset, masks, mode, bk_elems)
+        k_axis = c.k_axis
+        mask_m, mask_n, m_ext, n_ext = masks
+        prot = _scalar_protected(c)
+        m_name = c.m_axis.name if c.m_axis is not None else None
+        n_name = c.n_axis.name
+        b_name, a_name = c.b_load.names[0], c.a_name
+
+        def read_row(i):
+            if m_name is None:
+                return copy_cell(c.a_body, Sigma({}), f"__ar{i}", prot)
+            bm = offset.base("m", i)
+            return copy_cell(c.a_body, Sigma({m_name: BinaryExpr("%", bm, m_ext) if mask_m else bm}), f"__ar{i}", prot)
+
+        def read_col(j):
+            bn = offset.base("n", j)
+            return copy_cell([c.b_load], Sigma({n_name: BinaryExpr("%", bn, n_ext) if mask_n else bn}), f"__bc{j}", prot)
+
+        def contract(i, j):
+            v = f"{c.acc}__v__c{i}_{j}"
+            return [
+                Assign(name=v, op=_MUL, args=(f"{b_name}__bc{j}", f"{a_name}__ar{i}")),
+                Accum(name=f"{c.acc}__c{i}_{j}", value=v, op=_ADD, axes=(k_axis.name,)),
+            ]
+
+        def wrap(body):
+            return [Loop(axis=k_axis, body=Body(tuple(body)), unroll=_unroll_inner(k_axis))]
+
+        return _contract_kloop(c, cells, offset, masks, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
 
     def store(self, i, j, offset, masks):
-        return _scalar_store(self.c, i, j, offset, masks)
+        """Replicate the projection ``tail`` for cell ``(i, j)`` — σ-offset, suffix the SSA names, guard
+        the (overhanging) write, dedup shared operand loads."""
+        c = self.c
+        m_axis, n_axis = c.m_axis, c.n_axis
+        sigma = _scalar_sigma(m_axis, n_axis, offset, i, j, masks)
+        cell = copy_cell(c.epilogue, sigma, f"__c{i}_{j}", _scalar_protected(c))
+        cell = _guard_writes(cell, _scalar_bound(m_axis, n_axis, offset, i, j, masks))
+        return _dedup_loads(cell)
 
 
 def _atom_ops(c: Contraction, stage: Stage | None = None, inputs=None) -> _AtomOps:

@@ -161,7 +161,7 @@ class Contraction(Stmt):
     (``_schedule._contraction_node`` resolves the operand→role binding via ``_atomize.semiring_binding``
     and stamps the resolved ``tile``), then expanded in ``010_materialize`` (``_factor.factorize``).
     :func:`ops.lower` / ``ops.reduce_loop`` flatten it back to the synthesized mul-add ``CONTRACTION``
-    loop nest (:attr:`loop`), the same ``for k: v = a·b; acc += v`` form ``_factor._scalar_reduce``
+    loop nest (:attr:`loop`), the same ``for k: v = a·b; acc += v`` form ``_factor._ScalarOps.reduce``
     register-tiles through the shared ``_contract_kloop`` skeleton. **ONE
     flat node** that cleanly splits the **algebra params** (what to contract) from the **schedule**
     (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,

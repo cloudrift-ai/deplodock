@@ -62,14 +62,14 @@ itself** (`@property`, from the `tile` schedule × the output axes); `factorize`
 reduce_region)` (operand fragments + the K-loop, dispatched off the atom) — and a per-cell **sink** `store`. The
 default is the matmul `_factor.store_sink`; `factorize(c, store=…)` swaps it. Per-atom diff:
 
-- **mma** (`_mma_state` / `_mma_reduce` / `_mma_store`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the
+- **mma** (`_MmaOps.state` / `.reduce` / `.store`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the
   codegen emits `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**),
   and decodes the atom-lane offset at render.
-- **scalar** (`_scalar_state` / `_scalar_reduce` / `_scalar_store`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a
+- **scalar** (`_ScalarOps.state` / `.reduce` / `.store`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a
   **single thread** (so there is no `_lane` axis); the codegen **synthesizes** the reduce `Loop` from the operands and
   replicates it + a projection `tail` per register cell with its operand loads deduped (the arithmetic-intensity reuse).
 
-Both triples are free functions in `_factor.py`, the new-atom seam.
+Both triples are methods on the `_MmaOps` / `_ScalarOps` strategy classes in `_factor.py`, the new-atom seam.
 
 The **unit** is the atom's parallel thread footprint (`atom.lanes`) — so the tensor-core warp tile and the scalar
 parallel thread-tile are the *same* level, differing only in `lanes`; `block_threads = units · lanes`. `grid_tile` also
@@ -83,11 +83,12 @@ The warp (mma) tier stages its reused gmem operands through an smem slab, driven
 mbarrier handshakes) live in **`_stage.py`**; the K-loop that schedules them onto the `Contraction` geometry lives in
 `_factor.py` (`_warp_staged_kloop` / `_warp_tma_staged_kloop`, plus the shared inner `ldmatrix` drain
 `_staged_inner_atom_loop`). `_mma_stage_plan` decodes the `Stage` once (TMA > cp.async > gmem-direct, with the
-eligibility rules `_can_stage_warp[_tma]`) and both `_mma_state` (which slots the operand fragments) and `_mma_reduce`
-(which emits the loop) read it. The `Stage` spells two buffering levels: `d<depth>` is the gmem→smem ring (cp.async /
-TMA prefetch over the K-slab loop), `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix` ping-pong over the
-inner atom-K steps). Staging is a **pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic /
-non-divisible K, or a computed-A flash operand) silently falls back to gmem-direct, and a staged kernel is
+eligibility rules `_can_stage_warp[_tma]`) and both `_MmaOps.state` (which slots the operand fragments) and
+`_MmaOps.reduce` (which emits the loop) read it. The `Stage` spells two buffering levels: `d<depth>` is the gmem→smem
+ring (cp.async / TMA prefetch over the K-slab loop), `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix`
+ping-pong over the inner atom-K steps). Staging is a **pure perf transform** — an ineligible kernel (transposed-B,
+masked N, symbolic / non-divisible K, or a computed-A flash operand) silently falls back to gmem-direct, and a staged
+kernel is
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
 follow-up.
 
@@ -95,8 +96,9 @@ The **scalar** contraction tier stages too, under the same `STAGE` pin (`_scalar
 `_scalar_drain` in `_factor.py`): the STAGE-pinned scalar contraction fills the A / B operand slabs via the **same**
 `_stage.py` `cp_async_fill` / `tma_fill` (a scalar `CtaTile`, `block_threads` threads) and drains them with a plain-`Load`
 inner loop over the derived K-chunk (`bk_elems` fit-to-smem, not a codec field). The nested outer-slab / inner-drain
-accumulator lifetime is handled by seeding the per-cell accumulators once in `_scalar_state` (outside the outer loop) and
-marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA zero-fills /
+accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer loop)
+and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA
+zero-fills /
 cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged (no pin) is byte-identical gmem-direct.
 
 **Shared-row staging (`_factorize_reduce`) — the reduce tier's `sync` transport.** The fused norm→linear prologue is a
