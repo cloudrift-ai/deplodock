@@ -10,11 +10,12 @@ halves:
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
   hand-assemble a kernel body — it builds the high-level **structural-node tree**
   (``ir/tile/ir``): flash is the **two-``Contraction`` tree** ``Map(body=[O/l projection],
-  source=Reduction(role=TWISTED, axis=kv, source=Contraction(Σ_dd Q·K)))`` — the ``(m,l,O)`` LSE
-  streaming reduce over kv whose ``source`` is the ``Σ_dd Q·K`` score :class:`Contraction` and whose
-  per-step ``partial`` splices the **P@V** ``Σ_j P·V`` :class:`Contraction` (its A operand the
-  register-resident softmax weight ``P``; ``_split_pv`` redirects the carrier's expectation-fold value
-  through it), projected ``O/l`` after the loop. Both Q@K and P@V factorize through the one
+  source=Reduction(role=TWISTED, axis=kv, partial=[Contraction(Σ_dd Q·K), …, Contraction(Σ_j P·V)]))``
+  — the ``(m,l,O)`` LSE streaming reduce over kv whose per-step ``partial`` holds BOTH the ``Σ_dd Q·K``
+  score :class:`Contraction` (at its head) and the **P@V** ``Σ_j P·V`` :class:`Contraction` (its A
+  operand the register-resident softmax weight ``P``; ``_split_pv`` redirects the carrier's
+  expectation-fold value through it), projected ``O/l`` after the loop. Both Q@K and P@V ride the
+  single walked ``partial`` edge (no ``source`` asymmetry) and factorize through the one
   ``_factor`` contraction path; block=1 is the scalar streaming degenerate (``j`` a singleton reduce).
   ``build_flash_frag`` returns that ``Map`` UNLOWERED, on a ``TileOp`` with an UNMAPPED ``Placement``
   — the free ``(batch…, m, d)`` axes are the schedule's (like every recognizer), and ``_schedule``
@@ -282,12 +283,12 @@ def _flash_op(
     mask_shape: tuple | None = None,
 ) -> Map:
     """The per-output-element ``(…, m, d)`` compute as the structural-node tree: flash is
-    ``Map(body=[O/l projection], source=Reduction(role=TWISTED, axis=kv, source=Contraction(QK)))`` —
-    the ``(m,l,O)`` LSE streaming reduce over ``kv`` whose per-step **partial** folds a NESTED
-    ``Σ_dd Q·K`` :class:`Contraction` node (then scaled, optionally masked, the value read + the
-    carrier's dissolved merge), projected ``O/l`` after the loop. The ``Reduction ⊃ Contraction``
-    composition: :meth:`Reduction.loop` splices the contraction's synthesized ``Σ Q·K`` loop ahead of
-    the partial, so the scalar tier expands the same loop-in-body nest as before. The free
+    ``Map(body=[O/l projection], source=Reduction(role=TWISTED, axis=kv, partial=[Contraction(QK), …,
+    Contraction(PV)]))`` — the ``(m,l,O)`` LSE streaming reduce over ``kv`` whose per-step **partial**
+    holds the NESTED ``Σ_dd Q·K`` :class:`Contraction` node at its head (then scaled, optionally
+    masked, the value read + the carrier's dissolved merge with the PV contraction), projected ``O/l``
+    after the loop. :meth:`Reduction.loop` flattens the head QK node the same way it flattens the
+    embedded PV, so the scalar tier expands the same loop-in-body nest as before. The free
     ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is glue
     generated at materialize.
 
@@ -350,13 +351,18 @@ def _flash_op(
     carrier = flash_combine("m_i", "l_i", "O_i", score_name, "v_e")
     m_axis = Axis(name="m", extent=s_q)
     d_axis = Axis(name="d", extent=Dim(d_v))
-    partial = [*score_post, *_split_pv(carrier.dissolve(), "O_i", "v_e", v_buf, v_idx, m_axis, d_axis)]
+    # Both contractions ride the single walked edge — ``partial``: the ``Σ_dd Q·K`` score at its head,
+    # then the scale / mask binding ``score_name``, then the carrier's dissolved streaming ``merge``
+    # with the **PV split out as a real Contraction**. ``Reduction.loop`` flattens the head QK node the
+    # same way it flattens the embedded PV, so the scalar tier expands the identical loop-in-body nest
+    # — but the recursion can now reach BOTH contractions as nodes on ``partial`` (no ``source``
+    # asymmetry between QK and PV).
+    partial = [score_contraction, *score_post, *_split_pv(carrier.dissolve(), "O_i", "v_e", v_buf, v_idx, m_axis, d_axis)]
     reduction = Reduction(
         carrier=carrier,
         axis=Axis(name="kv", extent=s_k),
         partial=Body(tuple(partial)),
         role=AxisRole.TWISTED,
-        source=score_contraction,
     )
     # φ projection: normalize the streamed (unnormalized) output by the LSE denominator —
     # O_i / l_i after the kv loop, the ``Map`` body over the reduction ``source``.

@@ -17,8 +17,8 @@ per-node schedule slices ride the structural nodes themselves (a
 ``reduce``); the residual root fields (``reduce`` / ``tier`` / ``stage``)
 hold the schedule for the not-yet-nodified forms (a non-tiled
 contraction's split-K, the pin-only ``STAGE`` / ``WSPEC``; flash is now a
-``Map(source=Reduction(source=Contraction))`` node tree, so its partition rides
-the node). There is no per-kind kernel/schedule type: the algebra is read
+``Map(source=Reduction(partial=[Contraction(QK), …, Contraction(PV)]))`` node tree, so its
+partition rides the node). There is no per-kind kernel/schedule type: the algebra is read
 structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
 (``ops.axis_role``), so MAP / MONOID / SEMIRING all ride the same ``TileOp``.
 
@@ -67,14 +67,19 @@ def _overhangs(axis: Axis, tile: int) -> bool:
 
 
 def _flatten_nodes(body: Body) -> tuple[Stmt, ...]:
-    """Flatten any nested :class:`Contraction` that sits as a stmt in ``body`` to its own lowered
-    loop nest (``Contraction`` is a ``Stmt``, so it can ride inside a reduce ``partial`` — the flash
-    PV ``Σ_j P·V``); plain stmts pass through. One recursion rule for a reduce whose per-step partial
-    composes a contraction, mirroring the ``Reduction.source`` splice."""
+    """Flatten any nested **structural node** — a :class:`Contraction`, :class:`Reduction`, or
+    :class:`Map` — that sits as a stmt in ``body`` to its own lowered loop nest; plain stmts pass
+    through. ``Contraction`` is a ``Stmt``, so it can ride inside a reduce ``partial`` (the flash QK
+    ``Σ_dd Q·K`` score AND the flash PV ``Σ_j P·V``); ``Reduction`` / ``Map`` ride here too once a
+    per-step partial composes them. This is the single **node-walk** the ``.loop`` splice and the
+    kernel materializer's recursion share: ``partial`` is a ``Body`` that may carry nodes, and the
+    walk yields the same loop nest whether a node was pre-flattened or reached structurally."""
+    from deplodock.compiler.ir.tile.ops import lower  # noqa: PLC0415 — avoid an import cycle
+
     out: list[Stmt] = []
     for s in body:
-        if isinstance(s, Contraction):
-            out.extend(s.lower())
+        if isinstance(s, (Contraction, Reduction, Map)):
+            out.extend(lower(s))
         else:
             out.append(s)
     return tuple(out)
@@ -109,12 +114,13 @@ class Reduction:
     role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
     unroll: bool = False
     reduce: ReducePlan = field(default_factory=ReducePlan)  # the reduce partition (schedule slice), stamped by 020_schedule
-    # An OPTIONAL nested structural node the per-element ``partial`` folds over — the ``Reduction ⊃
-    # Contraction`` composition. Flash is ``Reduction(role=TWISTED, source=Contraction(QK))``: the
-    # streaming KV reduce whose per-step partial is a nested ``Σ Q·K`` contraction; a split-K matmul is
-    # ``Reduction(source=Contraction, reduce=g<n>)``. ``None`` for a bare reduce (``sum`` / ``max`` /
-    # softmax's PLANAR row reduce), whose ``partial`` is plain loop-IR stmts. :attr:`loop` splices the
-    # source's lowered loop nest ahead of the ``partial`` inside the synthesized reduce ``Loop``.
+    # An OPTIONAL nested structural node whose lowered loop nest is spliced AHEAD of the ``partial`` —
+    # the split-K ``Reduction ⊃ Contraction`` composition, where ``axis`` (``ksplit``) differs from the
+    # inner contraction's ``k_axis`` (``kslice``), so no double-reduce: ``Reduction(source=Contraction,
+    # reduce=g<n>)``. Flash does NOT use ``source`` — both its contractions ride the ``partial`` edge
+    # (QK at the head, PV embedded), reached by the same :func:`_flatten_nodes` node-walk. ``None`` for
+    # a bare reduce (``sum`` / ``max`` / softmax's PLANAR row reduce), whose ``partial`` is plain
+    # loop-IR stmts. :attr:`loop` splices the source's lowered loop nest ahead of the ``partial``.
     source: Reduction | Contraction | None = None
 
     def __post_init__(self) -> None:
@@ -132,13 +138,13 @@ class Reduction:
     def loop(self) -> Loop:
         """The synthesized annotated reduce ``Loop`` — reconstructed from the params. With no
         :attr:`source` and a plain ``partial`` it is byte-identical to the loop :meth:`from_loop`
-        captured; a ``source`` (the ``Reduction ⊃ Contraction`` composition) splices the source's
-        lowered loop nest ahead of the ``partial`` inside the loop body (so flash's kv loop holds the
-        nested ``Σ Q·K`` contraction loop, exactly the loop-in-body form the scalar tier expands). A
-        **nested structural node inside the ``partial``** — the flash PV ``Contraction`` (``Σ_j P·V``)
-        that folds the block into the carrier — is flattened to its own loop nest in place, the same
-        recursion the ``source`` splice does: one structural rule for a reduce whose per-step partial
-        composes a contraction."""
+        captured; a ``source`` (the split-K ``Reduction ⊃ Contraction`` composition) splices the
+        source's lowered loop nest ahead of the ``partial`` inside the loop body. Any **nested
+        structural node inside the ``partial``** — a :class:`Contraction` / :class:`Reduction` /
+        :class:`Map` — is flattened to its own loop nest in place by the shared :func:`_flatten_nodes`
+        node-walk (so flash's kv loop holds the head ``Σ Q·K`` score contraction loop and the embedded
+        ``Σ_j P·V`` PV contraction loop, exactly the loop-in-body form the scalar tier expands): one
+        structural rule for a reduce whose per-step partial composes contractions."""
         prefix = self.source.lower() if self.source is not None else ()
         body = Body((*prefix, *_flatten_nodes(self.partial)))
         return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier)
