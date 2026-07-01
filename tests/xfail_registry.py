@@ -82,7 +82,6 @@ XFAIL: dict[str, str] = {
     # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
     # dynamic, by test_matmul_coverage.
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
-    "tests/compiler/e2e/test_knob_pinning.py::test_unstaged_atom_lowers_gmem_direct": _R,
     # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
     # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts). The
     # atomic-free split-K (deferred ``c2k`` finalize) on the warp tier still needs its workspace
@@ -143,14 +142,9 @@ XFAIL: dict[str, str] = {
     "tests/compiler/pipeline/search/test_structural_push.py::test_split_demoted_fork_pushes_structural": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_identical_offer_sites_take_the_same_side": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_inner_reward_deeper_patience_benches_new_variants": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_inner_reward_is_separable_not_a_product": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_outer_branches_on_structural_fork": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_outer_descends_prior_preferred_branch_first": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_split_kernels_attribute_to_pre_decision_op": _R,
-    "tests/compiler/pipeline/test_knob.py::test_knob_features_mma_expansion": _R,
-    "tests/compiler/pipeline/test_resolve.py::test_decide_score_lands_on_trace": _R,
-    "tests/compiler/pipeline/test_resolve.py::test_resolve_applies_in_place": _R,
     "tests/compiler/pipeline/test_resolve.py::test_structural_replay_consulted": _R,
     "tests/compiler/pipeline/test_resolve.py::test_trace_records_partition_fork": _R,
     "tests/serving/test_generate_gpu.py::test_generate_loop_runs_end_to_end": _R,

@@ -386,9 +386,26 @@ and the knob schema:
    family — nothing to collide with. `family_value` reads it, `tile_signature` matches the bare goldens,
    feature vector byte-identical on one-node kernels; `op_cache_key` re-keys (seam #3). Full e2e suite
    green (reduce/matmul/knob-pinning/search/eval).
-7. **Fork `Level`s per node + emit structural leaves.** Restructure `build_fork_tree`'s levels to
-   root-global-then-per-node; the recognize emit produces the move catalog → structural leaves.
-   Structural-coverage test: the leaf set over a matmul fixture equals the hand-computed legal product.
+7. ✅ **Move catalog → structural leaves** — landed (first slice). The demolished tile enumeration
+   (`search/analytic._enumerate`, the `100_register_tile` rule — all `raise NotImplementedError`) is
+   rebuilt as a **permitted-move catalog** (`lowering/tile/_catalog.py`) keyed on `AxisRole`:
+   `scalar_tile_moves()` enumerates the legality-guarded scalar register-tile product (`par × reg`,
+   `block_threads ≤ 1024`) with per-cell `""` as the conservative option-0. `_schedule._tile_specs`
+   returns it (unpinned) so an unpinned `compile` / `tune` explores the tile space — each spec becomes a
+   structural leaf (a `Contraction`-node `TileOp`) under the axis-named `TILE@<k_axis>` key; an env pin
+   still wins via `Knob.narrow`. **Structural-coverage test** (`tests/compiler/passes/test_move_catalog.py`):
+   the catalog equals the hand-computed literal product AND the scheduler's emitted leaf set over a
+   matmul fixture equals it (keyed `TILE@<k_axis>`). Restoring the enumeration flipped **6 registry
+   xfails to hard-passing** (register-tile / mma-expansion / resolve-trace / inner-reward tests) — the
+   registry shrank by 6. Full `make test` green (1983 passed). One search test pinned to per-cell
+   (`test_inner_reward_parallel_matches_serial`): the larger candidate set makes its exact
+   parallel==serial total order-sensitive under the small patience window, so the tile is fixed to
+   isolate the orchestration invariant it targets.
+   - **Remaining (next slices):** fold the **warp** (tensor-core atom) tiles, the **reduce** partition
+     moves (`b<n>`/`r<n>`/`g<n>`), and the **stage** moves into the catalog; the **hierarchical
+     `build_fork_tree` Levels** (root-global `PLACE`/`WSPEC` then per-node, the MCTS laziness + the
+     multi-node flash warp QK+PV bundling) — a flat list suffices for the single-node scalar product
+     today (per `fork.py`'s "flat forks stay a bare list" guidance).
 8. **Compose `Reduction ⊃ Contraction` (flash + split-K) — the real multi-node test.**
    - ✅ **Flash composition** — landed. `Reduction` gained an optional `source: Reduction | Contraction
      | None` field (the `Reduction ⊃ Contraction` nesting); `Reduction.loop` splices the source's

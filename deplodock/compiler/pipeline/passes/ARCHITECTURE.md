@@ -58,5 +58,13 @@ bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul) is reject
 
 The atom spec is subtyped by kind (`ir/tile/atom.py`: `AtomKind` is the fixed mma cell selected by name; `ScalarAtom`
 is the plain scalar fma cell). The contraction binder (`bind_contraction`) is loop-addressable so warp-flash can later
-reuse it on flash's nested QK^T / PV; that recursion is deferred — flash's inner score loop IS now a structural
-`CONTRACTION` loop (built by `ops.contraction_loop`) but carries no per-loop geometry yet (see the pass docstring).
+reuse it on flash's nested QK^T / PV; flash's inner score IS now a structural `Contraction` **node** (per-cell
+`TilePlan()` today, `source` of the streaming `Reduction` — the `Reduction ⊃ Contraction` composition), so warp-flash is
+just that node gaining a warp `TilePlan` — no new path.
+
+**The move catalog** (`lowering/tile/_catalog.py`) is the permitted-move enumeration the schedule emit forks over, keyed
+on `AxisRole`: `scalar_tile_moves()` is the legality-guarded scalar register-tile product (`par × reg`, `block_threads ≤
+1024`) with per-cell `""` as the conservative option-0, returned by `_schedule._tile_specs` for an unpinned contraction
+so `compile` / `tune` explores the tile space (each spec → a structural `Contraction`-node leaf under `TILE@<k_axis>`; an
+env pin wins via `Knob.narrow`). Warp / reduce / stage move families and the hierarchical `build_fork_tree` levels (the
+MCTS laziness + multi-node flash bundling) fold in next; a flat list suffices for today's single-node scalar product.

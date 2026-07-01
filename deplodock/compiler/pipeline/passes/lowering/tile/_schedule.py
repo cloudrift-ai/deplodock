@@ -43,6 +43,7 @@ from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline.knob import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
+from deplodock.compiler.pipeline.passes.lowering.tile._catalog import scalar_tile_moves
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 # The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) are declared in
@@ -165,11 +166,15 @@ def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
 def _tile_specs(kernel) -> list[str]:
     """Candidate ``TILE`` codec strings for ``kernel`` — only a ``CONTRACTION`` contraction tiles
     its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
-    pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); the default is the per-cell tier
-    (the auto reg-tile fork is a follow-up, wired through the prior alongside the codec)."""
+    pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); unpinned, the default is the
+    **permitted-move catalog** (:func:`_catalog.scalar_tile_moves` — per-cell option-0 then the
+    legality-guarded scalar register-tile grid), so an unpinned ``compile`` / ``tune`` explores the
+    tile space ranked by the prior. Warp (tensor-core) tiles stay pin-driven (a pinned ``a:<atom>``
+    codec routes to ``_warp_option``); folding the warp / reduce / stage moves into the catalog is the
+    next slice."""
     if axis_role(kernel.op) is not AxisRole.CONTRACTION:
         return [""]
-    return list(TILE.narrow([""]))
+    return list(TILE.narrow(scalar_tile_moves()))
 
 
 def _semiring_reduce_spec() -> str:
