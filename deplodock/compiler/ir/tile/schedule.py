@@ -36,8 +36,8 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
+from deplodock.compiler.ir.atom import SCALAR_ATOM, Atom, AtomKind
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.atom import SCALAR_ATOM, Atom, AtomKind
 from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode, field_default
 from deplodock.compiler.ir.tile.role import ROLE_REGISTRY, RoleKind
 
@@ -247,7 +247,7 @@ def is_warp_codec(spec: str | None) -> bool:
 class TilePlan:
     """The contraction's output tile — **one descriptor for both tiers**, discriminated by
     :attr:`atom`: a tensor-core :class:`AtomKind` (the warp mma tile) or the scalar
-    :class:`~deplodock.compiler.ir.tile.atom.ScalarAtom` (the register sub-tile, the ``Scalar``
+    :class:`~deplodock.compiler.ir.atom.ScalarAtom` (the register sub-tile, the ``Scalar``
     fragment). Each tiled output axis splits into a **unit** width (warps for mma / parallel threads
     for scalar — :attr:`units`) and a **register** width (atom sub-cells / register cells per unit —
     :attr:`regs`); ``bk`` chunks the K (contraction) axis (mma only). The all-``1`` scalar tile (a

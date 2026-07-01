@@ -23,7 +23,7 @@ from deplodock.compiler.ir.stmt import INDENT, Accum, Body, Carrier, Load, Loop,
 from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan
 
 if TYPE_CHECKING:
-    from deplodock.compiler.ir.tile.atom import Atom
+    from deplodock.compiler.ir.atom import Atom
 
 
 def _ext_expr(axis: Axis) -> Expr:

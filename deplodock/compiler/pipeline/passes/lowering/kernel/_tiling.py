@@ -1,7 +1,7 @@
 """Generic tiling-construction layer — ``atomize → register_tile → unit_tile → grid_tile``.
 
 A contraction is lowered by tiling a **leaf atom** (a tensor-core mma cell or a scalar fma cell —
-see ``ir/tile/atom``) four ways: GRID block / UNIT / REGISTER / ATOM. The **UNIT** is the atom's
+see ``ir/atom``) four ways: GRID block / UNIT / REGISTER / ATOM. The **UNIT** is the atom's
 parallel thread footprint (``atom.lanes``) — a warp (32 lanes) for mma, a single thread for scalar —
 so the tensor-core warp tile and the scalar parallel thread-tile are the same level, differing only
 in ``lanes``. This module owns that nesting (the per-cell coordinate :class:`OffsetFn`, the bound

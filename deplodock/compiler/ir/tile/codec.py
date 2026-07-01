@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from deplodock.compiler.ir.tile.atom import AtomKind, atom_for
+from deplodock.compiler.ir.atom import AtomKind, atom_for
 
 _TOKEN_RE = re.compile(r"^([A-Za-z]+)(.*)$")
 

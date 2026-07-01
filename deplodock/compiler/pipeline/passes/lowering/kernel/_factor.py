@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import partial
 
+from deplodock.compiler.ir.atom import AtomKind
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
@@ -42,7 +43,6 @@ from deplodock.compiler.ir.kernel.ir import (
 )
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Write
-from deplodock.compiler.ir.tile.atom import AtomKind
 from deplodock.compiler.ir.tile.ops import contraction_loop
 from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell

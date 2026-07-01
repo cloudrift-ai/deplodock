@@ -27,7 +27,7 @@ The `Contraction` node is **one flat** Stmt — binding-driven for both atoms, w
 splits the **algebra params** (what to contract: the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
 structured A/B operand `Load`s read off the atomize binding, the fold accumulator `acc`, and the projection `epilogue`)
 from the **schedule** (one `tile: TilePlan` field carrying the leaf `atom` — a tensor-core `AtomKind` / the scalar
-`ScalarAtom`, `ir/tile/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (`tile_m` / `mask_m` /
+`ScalarAtom`, `ir/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (`tile_m` / `mask_m` /
 `block_threads` / …) is **derived** on the node from `tile` × `axes` (`@property`). Keeping the schedule a single swappable
 field is what lets the same operand/`acc` params be tiled by a *different* `TilePlan` — the seam the flash inner QK/PV
 reuse needs.

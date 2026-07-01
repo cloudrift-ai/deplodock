@@ -8,7 +8,7 @@ reduce partition, grid binding) stays separate from the *combine*, and one ``Til
 MAP / MONOID / SEMIRING with no per-kind schedule type (dispatch reads ``ops.axis_role``).
 """
 
-from deplodock.compiler.ir.tile.atom import AtomKind
+from deplodock.compiler.ir.atom import AtomKind
 from deplodock.compiler.ir.tile.binding import AtomBinding, Operand
 from deplodock.compiler.ir.tile.ir import Schedule, TileOp
 from deplodock.compiler.ir.tile.role import RoleKind, role_for
