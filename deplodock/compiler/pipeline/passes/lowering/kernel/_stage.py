@@ -8,9 +8,11 @@ surviving kernel-IR transport leaf nodes (``Smem`` / ``CpAsyncCopy`` / ``CpAsync
 ``CpAsyncWait`` / ``Sync`` — and the TMA quartet ``TmaDescriptor`` / ``TmaLoad`` /
 ``Mbarrier*``).
 
-The fill is written against a small :class:`CtaTile` seam (the CTA tile-base + a linear
-intra-CTA thread id + the thread count), NOT a materializer's internal warp/register
-geometry — so one fill helper drives any tier that stages. The staged K-loop itself is ONE
+The fill is written against a small :class:`CtaTile` thread-striping seam (a linear intra-CTA
+thread id + the thread count), NOT a materializer's internal warp/register geometry — so one fill
+helper drives any tier that stages; the per-operand gmem tile-base rides the :class:`Operand`. The
+A/B operands themselves ride as an ``(a, b)`` :class:`Operand` pair, so a transport loops over the
+pair instead of spelling A then B. The staged K-loop itself is ONE
 skeleton, :func:`staged_kloop` (``fill → commit → wait → drain → Sync``, ``depth`` the sole
 buffering knob), driven by a :class:`Transport` strategy (:class:`CpAsyncTransport` /
 :class:`TmaTransport`) — the two producers put behind one ``fill``/``commit``/``wait`` seam. The
@@ -57,13 +59,11 @@ def _lit(n: int) -> Expr:
 
 @dataclass(frozen=True)
 class CtaTile:
-    """The tile-agnostic seam a cooperative fill indexes off — the CTA's tile-base
-    coordinates, a linear intra-CTA thread id, and the CTA thread count. Built from
-    a materializer's decoded grid vars (the warp tier's ``m_b``/``n_b`` block axes +
-    ``(m_w·WN + n_w)·32 + lane`` linear id), so the tier's geometry never leaks into the fill."""
+    """The tile-agnostic thread-striping seam a cooperative fill indexes off — a linear intra-CTA
+    thread id + the CTA thread count. Built from a materializer's decoded grid vars (the warp tier's
+    ``(m_w·WN + n_w)·32 + lane`` linear id), so the tier's geometry never leaks into the fill. The
+    per-operand gmem tile-base rides the :class:`Operand` instead."""
 
-    row_base: Expr  # global row of the CTA tile's top-left cell
-    col_base: Expr  # global col of the CTA tile's top-left cell
     linear_tid: Expr  # intra-CTA linear thread id (0 .. n_threads-1)
     n_threads: int
 
@@ -191,11 +191,6 @@ def tma_descriptor(name: str, src: str, box: tuple[int, int], dtype: str) -> Tma
 # a gmem→smem prefetch ring.
 # --------------------------------------------------------------------------- #
 
-# The A slab is ``ring·tile_m`` rows (slot s at row ``s·tile_m``); the B slab is
-# ``ring·bk_elems`` rows (slot s at row ``s·bk_elems``). Both are plain row-major /
-# NONE-swizzle, feeding the same staged ``LdmatrixLoad`` (mma) / scalar ``Load`` drain.
-_A_SLAB, _B_SLAB = "_a_smem", "_b_smem"
-
 
 def _slot_row(slot: Expr, rows_per_slot: int) -> Expr | None:
     """The row offset of ring ``slot`` — ``slot·rows_per_slot``, or ``None`` for a literal
@@ -207,60 +202,67 @@ def _slot_row(slot: Expr, rows_per_slot: int) -> Expr | None:
 
 
 @dataclass(frozen=True)
+class Operand:
+    """One staged operand — A or B — the per-operand slab geometry both transports index off. The two
+    ride as an ``(a, b)`` pair so :meth:`CpAsyncTransport.fill` / ``slab_decls`` loop over them instead
+    of spelling A then B. ``shape`` is ``(rows, cols)`` of one ring slot (A ``(tile_m, bk)`` / B
+    ``(bk, tile_n)``); each slab is ``ring·rows`` rows (slot ``s`` at row ``s·rows``), plain row-major /
+    NONE-swizzle, feeding the same staged ``LdmatrixLoad`` (mma) / scalar ``Load`` drain. ``index`` maps
+    a K-chunk offset ``k0`` to the cp.async ``(row, col) → gmem-index`` closure; ``coords`` maps ``k0`` to
+    the TMA box origin. Each transport reads only the one it needs."""
+
+    tag: str  # "a" / "b" — the cp.async fill name + the smem-slab / descriptor suffix
+    buf: str  # gmem source buffer
+    shape: tuple[int, int]  # (rows, cols) of one ring slot
+    index: Callable[[Expr], Callable]  # k0 -> ((row, col) -> gmem index)   (cp.async)
+    coords: Callable[[Expr], tuple]  # k0 -> gmem box origin                (TMA)
+
+    @property
+    def slab(self) -> str:
+        return f"_{self.tag}_smem"
+
+    @property
+    def desc(self) -> str:
+        return f"_desc_{self.tag}"
+
+    def slot_row(self, slot: Expr) -> Expr | None:
+        """The ring-slot row offset into this operand's multi-slot slab (``None`` for slot 0)."""
+        return _slot_row(slot, self.shape[0])
+
+
+@dataclass(frozen=True)
 class CpAsyncTransport:
     """The cp.async producer: cooperative gmem→smem fills committed into groups, drained by
-    ``CpAsyncWait(group=in_flight)``. ``a_index`` / ``b_index`` map a K-chunk offset ``k0`` to the
-    per-cell ``(row, col) → gmem-index`` closure (each tier bakes in its own masked-axis clamp)."""
+    ``CpAsyncWait(group=in_flight)``. ``operands`` is the ``(A, B)`` :class:`Operand` pair; each
+    ``operand.index(k0)`` is the per-cell ``(row, col) → gmem-index`` closure (its tier bakes in the
+    masked-axis clamp)."""
 
-    a_buf: str
-    b_buf: str
-    a_index: Callable[[Expr], Callable]
-    b_index: Callable[[Expr], Callable]
-    tile_m: int
-    tile_n: int
-    bk_elems: int
+    operands: tuple[Operand, Operand]
     slab_dtype: str
     elem_bytes: int
     cta: CtaTile
 
-    def a_row(self, slot: Expr) -> Expr | None:
-        return _slot_row(slot, self.tile_m)
-
-    def b_row(self, slot: Expr) -> Expr | None:
-        return _slot_row(slot, self.bk_elems)
-
     def slab_decls(self, ring: int) -> list[Stmt]:
-        return [
-            slab_smem(_A_SLAB, ring * self.tile_m, self.bk_elems, self.slab_dtype),
-            slab_smem(_B_SLAB, ring * self.bk_elems, self.tile_n, self.slab_dtype),
-        ]
+        return [slab_smem(op.slab, ring * op.shape[0], op.shape[1], self.slab_dtype) for op in self.operands]
 
     def prologue(self, ring: int) -> list[Stmt]:
         return []
 
     def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:
-        out = cp_async_fill(
-            slab=_A_SLAB,
-            slab_rows=self.tile_m,
-            slab_cols=self.bk_elems,
-            src=self.a_buf,
-            gmem_index=self.a_index(k0),
-            cta=self.cta,
-            elem_bytes=self.elem_bytes,
-            name="a",
-            row_offset=self.a_row(slot),
-        )
-        out += cp_async_fill(
-            slab=_B_SLAB,
-            slab_rows=self.bk_elems,
-            slab_cols=self.tile_n,
-            src=self.b_buf,
-            gmem_index=self.b_index(k0),
-            cta=self.cta,
-            elem_bytes=self.elem_bytes,
-            name="b",
-            row_offset=self.b_row(slot),
-        )
+        out: list[Stmt] = []
+        for op in self.operands:
+            rows, cols = op.shape
+            out += cp_async_fill(
+                slab=op.slab,
+                slab_rows=rows,
+                slab_cols=cols,
+                src=op.buf,
+                gmem_index=op.index(k0),
+                cta=self.cta,
+                elem_bytes=self.elem_bytes,
+                name=op.tag,
+                row_offset=op.slot_row(slot),
+            )
         return out
 
     def commit(self) -> list[Stmt]:
@@ -272,28 +274,16 @@ class CpAsyncTransport:
 
 @dataclass(frozen=True)
 class TmaTransport:
-    """The TMA (``cp.async.bulk.tensor``) producer: one thread issues an ``arrive.expect_tx`` + the
-    A/B box copies onto a **per-slot mbarrier array**; every thread waits on the slot's parity. The
-    multi-slot mbarrier is what makes ``depth`` a free knob for TMA — ``wait(slot, phase)`` gates the
-    ring slot the same way ``CpAsyncWait(in_flight)`` gates a commit group."""
+    """The TMA (``cp.async.bulk.tensor``) producer: one thread issues an ``arrive.expect_tx`` + a box
+    copy per :class:`Operand` onto a **per-slot mbarrier array**; every thread waits on the slot's
+    parity. The multi-slot mbarrier is what makes ``depth`` a free knob for TMA — ``wait(slot, phase)``
+    gates the ring slot the same way ``CpAsyncWait(in_flight)`` gates a commit group."""
 
-    a_buf: str
-    b_buf: str
-    tile_m: int
-    tile_n: int
-    bk_elems: int
+    operands: tuple[Operand, Operand]
     slab_dtype: str
     elem_bytes: int
     cta: CtaTile
-    desc_a: str = "_desc_a"
-    desc_b: str = "_desc_b"
     mbar: str = "_mbar"
-
-    def a_row(self, slot: Expr) -> Expr | None:
-        return _slot_row(slot, self.tile_m)
-
-    def b_row(self, slot: Expr) -> Expr | None:
-        return _slot_row(slot, self.bk_elems)
 
     @property
     def _tid0(self) -> Expr:
@@ -301,17 +291,14 @@ class TmaTransport:
 
     @property
     def _total_bytes(self) -> int:
-        return (self.tile_m * self.bk_elems + self.bk_elems * self.tile_n) * self.elem_bytes
+        return sum(rows * cols for rows, cols in (op.shape for op in self.operands)) * self.elem_bytes
 
     def slab_decls(self, ring: int) -> list[Stmt]:
         # TMA destination smem must be 128 B-aligned; one mbarrier per ring slot.
-        return [
-            tma_descriptor(self.desc_a, self.a_buf, (self.tile_m, self.bk_elems), self.slab_dtype),
-            tma_descriptor(self.desc_b, self.b_buf, (self.bk_elems, self.tile_n), self.slab_dtype),
-            slab_smem(_A_SLAB, ring * self.tile_m, self.bk_elems, self.slab_dtype, align=TMA_SLAB_ALIGN),
-            slab_smem(_B_SLAB, ring * self.bk_elems, self.tile_n, self.slab_dtype, align=TMA_SLAB_ALIGN),
-            Smem(name=self.mbar, extents=(ring,), dtype="unsigned long long"),
-        ]
+        decls: list[Stmt] = [tma_descriptor(op.desc, op.buf, op.shape, self.slab_dtype) for op in self.operands]
+        decls += [slab_smem(op.slab, ring * op.shape[0], op.shape[1], self.slab_dtype, align=TMA_SLAB_ALIGN) for op in self.operands]
+        decls.append(Smem(name=self.mbar, extents=(ring,), dtype="unsigned long long"))
+        return decls
 
     def prologue(self, ring: int) -> list[Stmt]:
         # Init every ring slot's mbarrier (one producer ``arrive`` per phase), then a CTA barrier so
@@ -320,16 +307,18 @@ class TmaTransport:
         return [Cond(cond=self._tid0, body=inits), Sync()]
 
     def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:
-        row_a, row_b = self.a_row(slot) or _lit(0), self.b_row(slot) or _lit(0)
-        body: list[Stmt] = [
-            MbarrierArriveExpectTx(mbar=self.mbar, bytes_=self._total_bytes, slot=slot),
-            TmaLoad(
-                smem=_A_SLAB, smem_index=(row_a, _lit(0)), desc=self.desc_a, coords=(self.cta.row_base, k0), mbar=self.mbar, mbar_slot=slot
-            ),
-            TmaLoad(
-                smem=_B_SLAB, smem_index=(row_b, _lit(0)), desc=self.desc_b, coords=(k0, self.cta.col_base), mbar=self.mbar, mbar_slot=slot
-            ),
-        ]
+        body: list[Stmt] = [MbarrierArriveExpectTx(mbar=self.mbar, bytes_=self._total_bytes, slot=slot)]
+        for op in self.operands:
+            body.append(
+                TmaLoad(
+                    smem=op.slab,
+                    smem_index=(op.slot_row(slot) or _lit(0), _lit(0)),
+                    desc=op.desc,
+                    coords=op.coords(k0),
+                    mbar=self.mbar,
+                    mbar_slot=slot,
+                )
+            )
         return [Cond(cond=self._tid0, body=tuple(body))]
 
     def commit(self) -> list[Stmt]:

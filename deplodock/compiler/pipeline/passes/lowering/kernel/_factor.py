@@ -76,6 +76,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     CpAsyncTransport,
     CtaTile,
+    Operand,
     TmaTransport,
     staged_kloop,
     sync_row_fill,
@@ -303,7 +304,40 @@ def _slab_index(operand_index, *, tile: Side, tile_base, k_axis, tile_is_row: bo
     return at
 
 
-def _mma_staged(*, a_load, b_load, m: Side, n: Side, k_axis, atom, bk, slab_dtype, elem_bytes, reg_depth: int, depth: int, mode: str):
+def _tile_base(mn: tuple[Side, Side]) -> tuple[Expr, Expr]:
+    """The CTA tile's ``(row_base, col_base)`` top-left origin — ``(m_b·tile_m, n_b·tile_n)``."""
+    m, n = mn
+    return (BinaryExpr("*", Var(m.block), Literal(m.tile, "int")), BinaryExpr("*", Var(n.block), Literal(n.tile, "int")))
+
+
+def _slab_operands(
+    *, a_index_src, b_index_src, bufs: tuple[str, str], mn: tuple[Side, Side], k_axis, bk_elems: int, base: tuple[Expr, Expr]
+):
+    """The staged ``(A, B)`` :class:`Operand` pair — the one operand-geometry factory both tiers build.
+    A is ``(tile_m × bk)`` indexed by the M tile axis (the slab ROW), B is ``(bk × tile_n)`` by the N
+    tile axis (the slab COL); ``base`` is the ``(row_base, col_base)`` CTA tile origin. ``a_index_src`` /
+    ``b_index_src`` are the operands' gmem index expressions (``load.index``)."""
+    m, n = mn
+    a_buf, b_buf = bufs
+    row_base, col_base = base
+    a = Operand(
+        tag="a",
+        buf=a_buf,
+        shape=(m.tile, bk_elems),
+        coords=lambda k0: (row_base, k0),
+        index=_slab_index(a_index_src, tile=m, tile_base=row_base, k_axis=k_axis, tile_is_row=True),
+    )
+    b = Operand(
+        tag="b",
+        buf=b_buf,
+        shape=(bk_elems, n.tile),
+        coords=lambda k0: (k0, col_base),
+        index=_slab_index(b_index_src, tile=n, tile_base=col_base, k_axis=k_axis, tile_is_row=False),
+    )
+    return (a, b)
+
+
+def _mma_staged(*, a_load, b_load, mn: tuple[Side, Side], k_axis, atom, bk, slab_dtype, elem_bytes, reg_depth: int, depth: int, mode: str):
     """The warp tier's STAGED K-loop — build the operand :class:`Transport` (a cp.async prefetch ring
     or the TMA box-copy producer) + the shared ``ldmatrix`` drain leaf, then run the one
     :func:`staged_kloop`. A pure perf transform, bit-identical to gmem-direct. ``depth == 1`` is the
@@ -311,53 +345,49 @@ def _mma_staged(*, a_load, b_load, m: Side, n: Side, k_axis, atom, bk, slab_dtyp
     composes the inner smem→register double-buffer. ``mask_m``: the cp.async A fill clamps the
     overhanging gmem row in-bounds; TMA zero-fills the box overhang instead (both leave the discard to
     the ``RegStore`` ``m_guard``)."""
+    m, n = mn
     bk_elems = bk * atom.shape[2]
-    tile_m, tile_n = m.tile, n.tile
     K = k_axis.extent.as_static()  # static K (the staging eligibility rule)
-    n_chunks = K // bk_elems
-    row_base = BinaryExpr("*", Var(m.block), Literal(tile_m, "int"))  # CTA tile base row
-    col_base = BinaryExpr("*", Var(n.block), Literal(tile_n, "int"))  # CTA tile base col
+    base = _tile_base(mn)
     # intra-CTA linear thread id from the decoded warp / lane axis vars (never a raw threadIdx.x).
     linear_tid = BinaryExpr(
         "+",
         BinaryExpr("*", BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit)), Literal(32, "int")),
         Var("_lane"),
     )
-    cta = CtaTile(row_base=row_base, col_base=col_base, linear_tid=linear_tid, n_threads=m.units * n.units * 32)
-    common = dict(
-        a_buf=a_load.input,
-        b_buf=b_load.input,
-        tile_m=tile_m,
-        tile_n=tile_n,
+    operands = _slab_operands(
+        a_index_src=a_load.index,
+        b_index_src=b_load.index,
+        bufs=(a_load.input, b_load.input),
+        mn=mn,
+        k_axis=k_axis,
         bk_elems=bk_elems,
+        base=base,
+    )
+    common = dict(
+        operands=operands,
         slab_dtype=slab_dtype,
         elem_bytes=elem_bytes,
-        cta=cta,
+        cta=CtaTile(linear_tid=linear_tid, n_threads=m.units * n.units * 32),
     )
-    if mode == "tma":
-        transport = TmaTransport(**common)
-    else:
-        transport = CpAsyncTransport(
-            a_index=_slab_index(a_load.index, tile=m, tile_base=row_base, k_axis=k_axis, tile_is_row=True),
-            b_index=_slab_index(b_load.index, tile=n, tile_base=col_base, k_axis=k_axis, tile_is_row=False),
-            **common,
-        )
+    transport = TmaTransport(**common) if mode == "tma" else CpAsyncTransport(**common)
 
     def drain(slot):  # the ldmatrix + mma.sync leaf, reading ring `slot`
+        a_op, b_op = operands
         return _staged_inner_atom_loop(
-            a_slab="_a_smem",
-            b_slab="_b_smem",
+            a_slab=a_op.slab,
+            b_slab=b_op.slab,
             m=m,
             n=n,
             atom=atom,
             bk_elems=bk_elems,
             ki="_ki",
             reg_depth=reg_depth,
-            a_slab_off=transport.a_row(slot),
-            b_slab_off=transport.b_row(slot),
+            a_slab_off=a_op.slot_row(slot),
+            b_slab_off=b_op.slot_row(slot),
         )
 
-    return staged_kloop(transport=transport, drain=drain, depth=depth, bk_elems=bk_elems, n_chunks=n_chunks, k_extent=K)
+    return staged_kloop(transport=transport, drain=drain, depth=depth, bk_elems=bk_elems, n_chunks=K // bk_elems, k_extent=K)
 
 
 def _mma_stage_plan(c: Contraction, stage: Stage | None) -> tuple[str, int, int]:
@@ -507,7 +537,7 @@ def _scalar_stage_plan(c: Contraction, stage: Stage | None, inputs) -> tuple[str
     return ("tma" if stage.transport == "tma" else "cp"), bk_elems
 
 
-def _scalar_drain(c: Contraction, cells, offset, a_slab: str, b_slab: str, ki: str, bk_elems: int, row_base, col_base) -> Loop:
+def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str, bk_elems: int, base: tuple[Expr, Expr]) -> Loop:
     """The inner slab-drain reduce loop ``for ki: b = b_slab[ki, n_local]; a = a_slab[m_local, ki];
     v = a·b; acc += v`` — the scalar counterpart of the mma ``ldmatrix`` drain. Built per-cell directly
     (NOT via the masked gmem-direct σ, whose ``% extent`` wrap would corrupt the slab index for an
@@ -517,6 +547,7 @@ def _scalar_drain(c: Contraction, cells, offset, a_slab: str, b_slab: str, ki: s
     shares A across the n-cells and B across the m-cells exactly as gmem-direct does. **Carrier-less**
     (no ``Loop.carrier``): the accumulators are pre-seeded once by :meth:`_ScalarOps.state` outside the
     outer slab loop, so the drain folds into them without re-seeding."""
+    (a_slab, b_slab), (row_base, col_base) = slabs, base
     b_name, a_name = c.b_load.names[0], c.a_name
     body: list[Stmt] = []
     for i, j in cells:
@@ -540,35 +571,24 @@ def _scalar_staged(c: Contraction, inputs, cells, offset, mode: str, bk_elems: i
     :func:`staged_kloop` (single-buffer, ``depth == 1``). The scalar :class:`CtaTile` (``block_threads``
     threads, the ``m.unit·n.units + n.unit`` linear id) is the only per-tier seam; a pure perf transform,
     numerically identical to gmem-direct."""
-    m, n, k_axis = c.m, c.n, c.k_axis
-    tile_m, tile_n, K = m.tile, n.tile, k_axis.extent.as_static()
-    a_buf, b_buf = c.a_operand.input, c.b_load.input
-    slab_dtype, elem_bytes = cuda_name(inputs[a_buf].dtype), inputs[a_buf].dtype.nbytes
-    row_base = BinaryExpr("*", Var(m.block), Literal(tile_m, "int"))
-    col_base = BinaryExpr("*", Var(n.block), Literal(tile_n, "int"))
+    mn, k_axis = c.mn, c.k_axis
+    m, n = mn
+    K = k_axis.extent.as_static()
+    bufs = (c.a_operand.input, c.b_load.input)
+    slab_dtype, elem_bytes = cuda_name(inputs[bufs[0]].dtype), inputs[bufs[0]].dtype.nbytes
+    base = _tile_base(mn)
     linear_tid = BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit))
-    cta = CtaTile(row_base=row_base, col_base=col_base, linear_tid=linear_tid, n_threads=c.block_threads)
-    common = dict(
-        a_buf=a_buf,
-        b_buf=b_buf,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        bk_elems=bk_elems,
-        slab_dtype=slab_dtype,
-        elem_bytes=elem_bytes,
-        cta=cta,
+    operands = _slab_operands(
+        a_index_src=c.a_operand.index, b_index_src=c.b_load.index, bufs=bufs, mn=mn, k_axis=k_axis, bk_elems=bk_elems, base=base
     )
-    if mode == "tma":
-        transport = TmaTransport(**common)
-    else:
-        transport = CpAsyncTransport(
-            a_index=_slab_index(c.a_operand.index, tile=m, tile_base=row_base, k_axis=k_axis, tile_is_row=True),
-            b_index=_slab_index(c.b_load.index, tile=n, tile_base=col_base, k_axis=k_axis, tile_is_row=False),
-            **common,
-        )
+    common = dict(
+        operands=operands, slab_dtype=slab_dtype, elem_bytes=elem_bytes, cta=CtaTile(linear_tid=linear_tid, n_threads=c.block_threads)
+    )
+    transport = TmaTransport(**common) if mode == "tma" else CpAsyncTransport(**common)
 
     def drain(_slot):  # single-buffer: the scalar slab drain reads by local tile coords (no ring slot)
-        return [_scalar_drain(c, cells, offset, "_a_smem", "_b_smem", "_ki", bk_elems, row_base, col_base)]
+        a_op, b_op = operands
+        return [_scalar_drain(c, cells, offset, (a_op.slab, b_op.slab), "_ki", bk_elems, base)]
 
     return staged_kloop(transport=transport, drain=drain, depth=1, bk_elems=bk_elems, n_chunks=K // bk_elems, k_extent=K)
 
@@ -630,8 +650,7 @@ class _MmaOps(_AtomOps):
             return _mma_staged(
                 a_load=a_load,
                 b_load=b_load,
-                m=m,
-                n=n,
+                mn=mn,
                 k_axis=k_axis,
                 atom=atom,
                 bk=c.tile.bk,
