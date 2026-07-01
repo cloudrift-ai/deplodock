@@ -185,16 +185,68 @@ Ordered as requested. Each phase adds config the `factorize` path already struct
 
 ### Phase 1 — finish mma (tensor-core flash + symbolic-K masked edges)
 
-**Build.** Two mma capabilities remain, both reusing the existing `Contraction` mma codegen through the node hierarchy:
+**Build.** Two mma capabilities remain, both reusing the existing `Contraction` mma codegen through the node hierarchy.
 
-- **Tensor-core flash** — give the flash tree's **inner** `Contraction` an mma `TilePlan` (an `AtomKind`, not today's
-  scalar `TilePlan()` in `_flash._flash_op`). The `Map(source=Reduction(TWISTED, source=Contraction(QK)))` factorizes
-  the QK / PV contractions through the **same** `_factorize_contraction` a standalone matmul takes, with a flash `store`
-  **sink** (the existing `factorize(store=…)` seam) that bridges the mma C-fragment into the streaming-softmax twist.
-  Genuinely new primitive: the score `S` fragment as the next matmul's operand **without a gmem round-trip**, and the
-  twisted carrier over in-register fragments. Requires wiring the recursive inner geometry (`_atomize.bind_contraction`
-  on the inner loop). Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
-  `test_attention_coverage.py::test_cooperative_flash_matches_torch`.
+#### Tensor-core flash — RE-PLANNED: two `Contraction` nodes over a blocked kv (architecture first)
+
+The original plan said "give the flash tree's **inner** `Contraction` an mma `TilePlan`," as if flash already had the
+right shape. It does not, and the gap is architectural, not a wiring oversight. The current flash op tree
+(`_flash._flash_op`) is:
+
+```
+Map(body=[O_i / l_i],
+    source=Reduction(role=TWISTED, axis=kv,
+        carrier=flash_combine(m_i, l_i, O_i, score, v),   # (max, denom, EXPECT=O) twist
+        source=Contraction(QK: S = Σ_dd Q·K),             # the ONLY contraction node
+        partial=[scale/mask S, load V, carrier.dissolve()]))
+```
+
+Only **QK** is a `Contraction`. **PV is dissolved into the twisted carrier's expectation channel** — `O_i` folds
+`O_i·α + p·v` **per single kv element**, so the "P@V" is a rank-1 FMA whose reduce axis *is* the streaming `kv` axis, not
+a separate contraction. And `d` (the value dim) is a **grid axis** — one output column per thread, the score recomputed
+redundantly for every `d`. mma needs the opposite: `d` inside a PV output **tile**, and `P@V` as a real tiled
+contraction. So the scalar tree cannot be "given an mma TilePlan"; it must be **restructured**.
+
+**The clean architecture the user asked for — both QK and PV are `Contraction` nodes, over a *blocked* kv.** Split the
+streaming axis into `(kv_block, j)`; stream over `kv_block`, contract within the block:
+
+```
+Map(body=[O_i / l_i],
+    source=Reduction(role=TWISTED, axis=kv_block,
+        carrier=<(m_i, l_i) softmax stats + the O_i rescale>,   # O is NO LONGER a carrier expectation channel
+        source=Contraction(QK: S[m, j] = Σ_dd Q·K),             # reduce dd → score tile  (b_trans)
+        partial=[<softmax on S → P[m, j], α, rowsum>,
+                 Contraction(PV: Oblk[m, d] = Σ_j P·V),         # reduce j → output tile
+                 <carrier merge: O_i = O_i·α + Oblk>]))
+```
+
+Now QK reduces `dd` and PV reduces the intra-block `j` — **different axes** from the streaming `kv_block`, so neither
+duplicates the streaming reduce. The `expect(v)` channel's `lift` (already carried on `Channel` for exactly this — see
+its docstring, "a future fragment realizer can lower ⊗ to a contraction (mma)") is **realized as the PV `Contraction`**:
+its per-element `p·v` term becomes the PV output `Oblk`, so the carrier keeps its `(m_i, l_i)` stats **and** the O-fold
+`O_i = O_i·α + Oblk` (α still generated internally), but the ⊗ is now a tiled contraction node instead of a scalar FMA.
+Both contractions factorize through the **same** `_factorize_contraction`; the tier is chosen by each node's `TilePlan`,
+never a divergent path.
+
+**Consolidation steps (architecture first, each kept green by the non-xfailed *scalar* flash e2e):**
+
+1. **Structural seam — let a reduce `partial` carry a nested `Contraction`.** Today `Reduction.source` holds one node;
+   flash needs the QK on `source` **and** the PV inside `partial`. Teach `ops.lower` / `ops.reduce_loop` /
+   `factorize` to recurse into a `Contraction` sitting in a reduce partial (the same recursion `_atomize`'s deferred
+   "warp-flash seam" note anticipates). One structural rule, both tiers.
+2. **Rebuild `_flash._flash_op` to the blocked two-`Contraction` tree** with `kv_block = 1` (degenerate `j`) so the
+   **scalar** tier lowers to today's per-element nest — accuracy-identical, the guardrail. The carrier stays
+   `flash_combine(m_i, l_i, O_i, …)`, but the expect channel's per-element `p·v` is replaced by the PV `Contraction`'s
+   output `Oblk` (block=1 ⇒ `Oblk = p·v`, so byte-identical). Verify the scalar flash e2e stays green **before** any mma.
+3. **Layer mma** — QK and PV get mma `TilePlan`s (`kv_block` = the mma tile); `_factorize_contraction` tiles both; a
+   flash `store` **sink** (the existing `factorize(store=…)` seam) bridges the QK C-fragment into the softmax twist and
+   feeds the resulting `P` fragment straight into PV as an operand **without a gmem round-trip** (the one genuinely new
+   primitive); the twisted `(m_i, l_i)` carrier + `O_i` rescale run over in-register fragments.
+
+Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
+`test_attention_coverage.py::test_cooperative_flash_matches_torch`. Scalar-parity risk is real (step 2 changes the
+scalar tree); the non-xfailed scalar flash cases are the gate — do not proceed to mma until they are green.
+
 - **Symbolic-K masked mma edges** ✅ **landed.** The transposed-B symbolic-K guard is gone; two gmem-direct
   zero-fill helpers (`dpl_mma_load_b_gmem_trans_kzero` / `…_trans_nclamp_kzero`, the (n,k)-swapped mirror of the
   canonical-B ones) zero the masked-K tail, and the `LdmatrixLoad` renderer dispatches them off `b_trans`. Proven by
