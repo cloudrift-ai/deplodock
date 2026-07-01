@@ -56,7 +56,18 @@ partition record + reduce codegen.
 
 ---
 
-## Part I — Dissolve duplicates (behavior-preserving)
+## Part I — Dissolve duplicates (behavior-preserving)  — ✅ LANDED
+
+`factorize(tile, root)` in `_factor.py` is now the single node-kind dispatcher `010_materialize` calls once per kernel;
+it routes to `_factorize_contraction`, `_factorize_reduce`, or the inline scalar tier. `_reduce` and the inline scalar
+tier are gone from `010_materialize` (a thin wrapper now). The reduce lowering moved **intact** into `_factor.py`
+(byte-identical output) rather than being re-expressed through `grid_tile`/`OffsetFn` — the reduce partitions the
+*reduce* axis (coop lanes + reg ILP) with the free axes bound directly, a different regime from `grid_tile`'s m/n
+output-tiling, so routing it through that layer would have renamed/reshaped the grid axes (breaking the
+byte-equivalent combine-structure parity bar) and added conditional complexity. `test_reduce_coverage` + the full
+suite stay green. The role-keyed `OffsetFn`/`reduce_tile` refactor of `_tiling.py` (D2 as originally sketched) was
+therefore **not** done; it is unnecessary for the "one emitter" end state and is left to Part II if a genuine need
+arises.
 
 ### D1 — Fold scalar + pointwise into a degenerate factorize  [lowest risk; IR-identical target]
 
