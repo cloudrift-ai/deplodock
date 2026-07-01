@@ -180,7 +180,7 @@ def _tile_specs(kernel) -> list[str]:
 def _semiring_reduce_spec() -> str:
     """The ``REDUCE`` spec a **scalar** (non-output-tiled) ``CONTRACTION`` contraction honors — the
     full K-axis codec: a cross-CTA split (``g``, consumed by ``030_split``) AND the cooperative
-    (``b``) / ILP (``r``) partitions (consumed by ``010_materialize``'s ``_reduce``, since a
+    (``b``) / ILP (``r``) partitions (consumed by ``_factor._factorize_reduce``, since a
     contraction is the degenerate carrier of its additive fold). Only the scalar tier reaches here
     (``_tile_option``); the warp tier ignores ``REDUCE`` (composing the mma tile with a K
     partition is the remaining step). Returns the pinned spec when it parses to a non-trivial
@@ -327,7 +327,7 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # materialize only ``factorize``\\ s. An unbindable contraction (a non-``Load`` operand) keeps the
     # ``Map`` form — materialize's per-cell scalar tier lowers it. The split-K (``reduce_spec``) combo
     # stays on the ``Map`` too (composing the output tile with a K split is a later step), so
-    # ``030_split`` / ``_reduce`` see the loop form they expect.
+    # ``030_split`` / ``_factor._factorize_reduce`` see the loop form they expect.
     op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
@@ -363,7 +363,7 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
     # A contraction ALSO honors a cross-CTA split-K (``g``) / cooperative (``b``/``r``) ``REDUCE``
     # pin — orthogonal to the output tile (``reduce`` = the K partition; ``g`` is consumed by
-    # ``030_split``, ``b``/``r`` by ``010_materialize``'s ``_reduce`` on the non-tiled scalar tier).
+    # ``030_split``, ``b``/``r`` by ``_factor._factorize_reduce`` on the non-tiled scalar tier).
     # ``TILE`` is the unified output-fragment knob: a candidate whose codec names an atom
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).

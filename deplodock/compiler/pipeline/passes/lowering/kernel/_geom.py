@@ -1,9 +1,9 @@
 """Shared axis-geometry helpers for the kernel materializer + the contraction factorizer.
 
-Tiny, dependency-light functions used by both ``010_materialize`` (scalar / reg / reduce
-tiers) and ``_factor`` (the atom-generic mma/scalar factorization), lifted here so the warp
-geometry can move out of the materializer without duplicating them. Leading ``_`` so the pass
-loader (globs ``*.py``, skips ``_``-prefixed) skips this module."""
+Tiny, dependency-light functions used across ``_factor`` (the atom-generic mma/scalar
+factorization AND the cooperative / ILP reduce tier), lifted here so the shared geometry has
+one home. Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips this
+module."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ def copy_cell(body, sigma, suffix: str, protected) -> list:
     """One copy of a tiled reduce ``body``: σ-substitute its indices (``sigma``) and suffix every
     per-copy SSA name (the shared grid / reduce / lane coordinates in ``protected`` pass through
     unrenamed). This is the **one** replication mechanic shared by the register tile (``_factor``,
-    one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``010_materialize``
-    ``_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
+    one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``_factor``
+    ``_factorize_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
     ``sigma`` (the coordinate offset) and ``suffix`` (the SSA tag)."""
     rename = lambda n: n if n in protected else f"{n}{suffix}"  # noqa: E731
     return [s.rewrite(rename, sigma) for s in body]

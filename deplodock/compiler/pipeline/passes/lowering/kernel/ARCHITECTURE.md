@@ -6,22 +6,24 @@ afterwards.
 
 ## `010_materialize` — bind the schedule to threads (and expand the contraction)
 
-`010_materialize` dispatches on the kernel kind / its schedule (the article's "schedule separate from combine" thesis —
-the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
+`010_materialize` is a thin wrapper: after the split-survivor assert it makes **one** call to
+`_factor.factorize(tile, root)`, the single node-kind dispatcher. `factorize` reads the node kind + role + reduce plan
+off `tile.op` and picks the tier (the article's "schedule separate from combine" thesis — the op tree + `ir/tile/ops.lower`
+are shared across kinds; only the partition changes):
 
 - **Tiled `CONTRACTION`** (warp / register tile) — the high-level `Contraction` Stmt
   (`ir/tile/ir.py`) was already built **recognize-side** at fork-emit
   (`lowering/tile/_schedule._contraction_node`, resolving the operand→role binding via `_atomize.semiring_binding`), so
-  materialize only **synthesizes its bare grid-`Write`** (needs `root.output`, so it can't ride the node) and
-  **expands** it through the one atom-generic `_factor.factorize` over the shared tiling layer (below); the leaf type
-  selects the codegen (mma / scalar). An unbindable contraction (a non-`Load` operand) keeps the `Map` form and falls
-  through to the scalar tier here. (This build was a separate `005_contract` pass, then folded into materialize, and now
-  lives recognize-side so the node's `tile` / `bind` exist before scheduling — seam #1.)
+  `factorize` only **synthesizes its bare grid-`Write`** (needs `root.output`, so it can't ride the node) and
+  **expands** it (`_factorize_contraction`) through the shared tiling layer (below); the leaf type selects the codegen
+  (mma / scalar). An unbindable contraction (a non-`Load` operand) keeps the `Map` form and falls through to the scalar
+  tier here. (This build was a separate `005_contract` pass, then folded into materialize, and now lives recognize-side
+  so the node's `tile` / `bind` exist before scheduling — seam #1.)
+- **Reduce tier** (`_factorize_reduce`, a `PLANAR` / `TWISTED` reduce — or a non-output-tiled `CONTRACTION` — whose
+  `ReducePlan` cooperates / register-folds) — the reduce axis is partitioned `coop` ways across the CTA's threads and
+  `reg` ways across per-thread accumulators (ILP), then a REG-tree fold, the cross-thread combine (`_combine`), and the
+  projection.
 - **Scalar tier** — one thread per output cell (`lower(op)` + an output-store glue).
-- **Reduce tier** (`_reduce`, a `PLANAR` / `TWISTED` reduce whose `ReducePlan` cooperates / register-folds) — the
-  reduce axis is partitioned `coop` ways across the CTA's threads and `reg` ways across per-thread accumulators (ILP),
-  then a REG-tree
-  fold, the cross-thread combine (`_combine`), and the projection.
 
 The `Contraction` node is **one flat** Stmt — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
 splits the **algebra params** (what to contract: the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
@@ -35,10 +37,16 @@ reuse needs.
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
 
-### The atom factorization — one factorizer, two atoms (`_factor.py` / `_tiling.py`)
+### The one factorizer — dispatch, atoms, and the reduce tier (`_factor.py` / `_tiling.py`)
 
-`_factor.factorize` is the **single** contraction factorizer — there is no per-atom variant, and **no per-atom geometry
-object**. It expands any `Contraction` by tiling a **leaf atom** four ways through the layer in `_tiling.py`:
+`_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind +
+role + reduce plan off `tile.op` and routes to `_factorize_contraction` (a tiled `Contraction`), `_factorize_reduce`
+(a cooperative / ILP `PLANAR` / `TWISTED` reduce), or the inline **scalar tier** (`lower(op)` + `with_store`, one
+thread per output cell). All three tiers, plus the shared-row staging helpers, live in `_factor.py`.
+
+**The contraction factorization — two atoms.** `_factorize_contraction` is the atom-generic path — there is no per-atom
+variant, and **no per-atom geometry object**. It expands any `Contraction` by tiling a **leaf atom** four ways through
+the layer in `_tiling.py`:
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The tiling
 geometry (`tile_m` / `mask_m` / `m_b` / `m_uvar` / `block_threads` / `lanes` / …) is **derived on the `Contraction` node
 itself** (`@property`, from the `tile` schedule × the output axes); `factorize` reads it straight off `c` and hands
@@ -69,10 +77,11 @@ operands gmem-direct (both tiers are symmetric — neither carries a `stage`). T
 materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
 mma-staging structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
 
-**Shared-row staging (`_reduce`) — distinct, still present.** The fused norm→linear prologue is a cooperative reduce: an
-input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis `Loop` over an
-inner reduce). `_reduce` (in `010_materialize`) stages that one row into a single `__shared__` slab (cooperatively filled)
-and rewrites both readers to it. The trigger is narrow (`_has_contraction_tail`) so a plain softmax sum or a bare
+**Shared-row staging (`_factorize_reduce`) — distinct, still present.** The fused norm→linear prologue is a cooperative
+reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis
+`Loop` over an inner reduce). `_factorize_reduce` (in `_factor.py`) stages that one row into a single `__shared__` slab
+(cooperatively filled) and rewrites both readers to it. The trigger is narrow (`_has_contraction_tail`) so a plain
+softmax sum or a bare
 reduction is untouched. This is the *reduce* tier's shared-row reuse, not the (dropped) warp operand pipeline.
 
 ## Kernel-IR peepholes
