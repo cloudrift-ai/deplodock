@@ -43,9 +43,9 @@ from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.schedule import Stage
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop
-from deplodock.compiler.ir.tile.ir import Contraction, Map, Side
-from deplodock.compiler.ir.tile.ops import lower, reduce_plan
+from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction, Side
+from deplodock.compiler.ir.tile.ops import reduce_plan
 from deplodock.compiler.pipeline.passes.lowering.kernel._atom import reduce_codegen, store_sink
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import combine_tail
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
@@ -153,22 +153,138 @@ def grid_tile(
     return Tile(axes=axes, body=Body((*state, *top_decls, *kstmts, *stores)), block_threads=block_threads)
 
 
+# ---- the recursive node walk: Ctx down, Frag up ------------------------------------------------ #
+# The hierarchical emitter (the tile-IR-rebuild mandate: ONE recursion over the node tree, no
+# divergent codegen path). :func:`_emit` walks a ``Map`` / ``Reduction`` / ``Contraction`` tree —
+# through ``source`` AND ``partial`` — threading a :class:`Ctx` down (the ambient cell environment)
+# and returning a :class:`Frag` up (the per-cell loop-IR body + the produced :class:`Handle` wire +
+# the reduce ``carrier`` when the node folds one). The two ROOT binders consume the recursion:
+# :func:`_factorize_contraction` (the ``grid_tile`` output-tiling pipeline) for an output-tiled
+# ``Contraction`` root, and :func:`_factorize_reduce` (the reduce partitioner) for a cooperative /
+# scalar reduce — the latter builds its per-cell reduce loop via :func:`_emit`, so a nested
+# ``Contraction`` (flash's Q@K / P@V) is reached AS A NODE. Scalar-nested today (block=1); the
+# per-node warp tile that routes a nested contraction through the mma path is the tensor-core seam
+# marked in :func:`_emit` (a ``Contraction`` case).
+
+
+@dataclass(frozen=True)
+class Handle:
+    """A produced tensor a parent wires up — "a value that needs wiring." ``name`` is the SSA name
+    holding it; ``residence`` is HOW a consumer reads it (``reg`` = a scalar register value today;
+    the tensor-core rebuild adds ``reg_frag`` — an mma fragment — plus a fragment descriptor
+    ``(mma_role, shape, dtype)`` and the accumulator→operand recast at a node boundary)."""
+
+    name: str
+    residence: str = "reg"
+
+
+@dataclass(frozen=True)
+class Frag:
+    """What a node contributes UP the recursion: the per-cell loop-IR ``body`` it emits (the reduce /
+    contraction loop nest / the projection sweep), the produced :class:`Handle` ``out`` (the wire a
+    parent connects to), and the reduce ``carrier`` — set iff this node folds a reduce whose
+    cross-partition combine a root binder must emit (``None`` for a pure pointwise map / a scalar
+    per-cell contraction)."""
+
+    body: list[Stmt]
+    out: Handle
+    carrier: object | None = None
+
+
+@dataclass(frozen=True)
+class Ctx:
+    """The ambient cell environment threaded DOWN the recursion — established once for the whole
+    kernel and passed unchanged so every node reads/writes at the same output cell. ``grid`` is the
+    kernel's grid axes; ``inputs`` the operand buffer table (dtype/shape); ``stage`` the operand smem
+    pipeline; ``output`` the root output buffer name. (The tensor-core rebuild adds the warp
+    ``bind``/``cell`` register tile — owned per-node by a ``Contraction``'s ``tile`` — and the
+    inbound ``wires`` handles, e.g. flash's score fragment feeding P@V's A operand.)"""
+
+    grid: tuple
+    inputs: dict | None = None
+    stage: Stage | None = None
+    output: str = ""
+
+
+def _emit(op, ctx: Ctx) -> Frag:
+    """Recurse over a structural node, returning its :class:`Frag` (per-cell body + wire + carrier).
+    The single node-kind dispatch every kernel's compute flows through — walking ``source`` AND
+    ``partial`` so flash's Q@K / P@V contractions are reached as nodes. Scalar-nested: a node's body
+    is its lowered loop-IR (byte-identical to ``ops.lower``); the tensor-core tier adds the per-node
+    warp-tile branch in the ``Contraction`` case."""
+    if isinstance(op, Map):
+        src = _emit(op.source, ctx) if op.source is not None else None
+        prefix = list(src.body) if src is not None else []
+        return Frag(body=[*prefix, *_emit_body(op.body, ctx)], out=_map_wire(op), carrier=src.carrier if src is not None else None)
+    if isinstance(op, Reduction):
+        prefix = list(_emit(op.source, ctx).body) if op.source is not None else []
+        loop = Loop(
+            axis=op.axis, body=Body((*prefix, *_emit_body(op.partial, ctx))), unroll=op.unroll, role=op.role, carrier=op.carrier
+        )
+        return Frag(body=[loop], out=Handle(op.out), carrier=op.carrier)
+    if isinstance(op, Contraction):
+        # Scalar / block=1: the synthesized ``CONTRACTION`` loop nest + fused epilogue — byte-identical
+        # to ``op.lower()``. Tensor-core seam: an output-warp-tiled ``Contraction`` (an mma ``TilePlan``)
+        # emits through the register-tile pipeline + the fragment recast here instead.
+        return Frag(body=list(op.lower()), out=Handle(op.acc))
+    raise TypeError(f"_emit: expected a Map / Reduction / Contraction node, got {type(op).__name__}")
+
+
+def _map_wire(op: Map) -> Handle:
+    """The :class:`Handle` a parent wires to for a ``Map`` node — computed robustly (unlike the
+    fragile ``Map.out``, which raises for a body ending in a stmt that defines no register value, e.g.
+    a bare reduce ``Loop`` or a ``Write``). Scan backward for the last DEFINING stmt; a ``Write``-
+    terminated body is a ROOT sink (stored to gmem, never wired to a parent), so surface the written
+    value at ``gmem`` residence; an empty-body wrap surfaces the ``source``'s wire; otherwise ``""``
+    (a don't-care — nothing consumes a root sink's wire in the scalar tier)."""
+    for s in reversed(op.body):
+        if isinstance(s, Write):
+            return Handle(s.values[-1], residence="gmem")
+        defs = s.defines()
+        if defs:
+            return Handle(defs[-1])
+    return _emit_wire(op.source) if op.source is not None else Handle("")
+
+
+def _emit_wire(op) -> Handle:
+    """The produced-value :class:`Handle` of any node — a ``Reduction`` / ``Contraction`` names its
+    carrier / accumulator; a ``Map`` scans for its last defining stmt (:func:`_map_wire`)."""
+    if isinstance(op, Map):
+        return _map_wire(op)
+    return Handle(op.out)  # Reduction.out (carrier state) / Contraction.out (acc) — always safe
+
+
+def _emit_body(body, ctx: Ctx) -> list[Stmt]:
+    """Walk a ``Body`` of loop-IR stmts, recursing into any nested structural node (a
+    :class:`Contraction` / :class:`Reduction` / :class:`Map`) via :func:`_emit` and passing plain
+    stmts through — the codegen-layer node-walk (the dispatch seam ``ir._flatten_nodes`` cannot host,
+    since a warp-tiled nested contraction lowers to mma, not a scalar loop)."""
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, (Contraction, Reduction, Map)):
+            out.extend(_emit(s, ctx).body)
+        else:
+            out.append(s)
+    return out
+
+
 def factorize(tile, root, store=None) -> Tile:
     """The single node-kind dispatcher — expand a ``TileOp``'s ``op`` into its bound ``Tile``.
 
-    Two routes, split only on whether the OUTPUT is tiled into a register/warp tile:
+    Two ROOT binders consume the recursive node walk (:func:`_emit`), split only on whether the
+    OUTPUT is tiled into a register / warp tile:
 
     - a :class:`Contraction` (warp / register tile) → :func:`_factorize_contraction`, the atom-generic
-      four-level pipeline. The bare grid-``Write`` is synthesized here (it needs ``root.output``, so it
-      can't ride the node) into the projection ``epilogue`` before the tiling.
+      four-level ``grid_tile`` pipeline. The bare grid-``Write`` is synthesized here (it needs
+      ``root.output``, so it can't ride the node) into the projection ``epilogue`` before the tiling.
     - everything else → :func:`_factorize_reduce`: a ``PLANAR`` / ``TWISTED`` reduce, a non-output-tiled
-      ``CONTRACTION``, or a pure pointwise ``Map``. That one path partitions the reduce axis when the
-      :class:`ReducePlan` cooperates (BLOCK ``coop`` / REG ``reg``) and otherwise folds serially,
-      one thread per output cell (the degenerate ``lower(op)`` + store) — the same fold either way.
+      ``CONTRACTION``, or a pure pointwise ``Map``. It builds its per-cell body via :func:`_emit`
+      (walking ``source`` / ``partial``), partitions the reduce axis when the :class:`ReducePlan`
+      cooperates (BLOCK ``coop`` / REG ``reg``), and otherwise folds serially one thread per cell.
 
     There is **no** flash / attention special case, and **no** separate "scalar tier": flash is the
     two-``Contraction`` ``TWISTED`` reduce tree, so its Q@K / P@V contractions and its streaming reduce
-    factorize through these same two routes (scalar block=1 today). A third, bespoke emitter would be a
+    factorize through this one recursion (scalar block=1 today). A third, bespoke emitter would be a
     divergent codegen path — forbidden by the mandate."""
     op = tile.op
     if isinstance(op, Contraction):
@@ -180,7 +296,8 @@ def factorize(tile, root, store=None) -> Tile:
     # pure pointwise Map. They differ only in whether the reduce axis is partitioned (cooperative /
     # ILP) or folded serially one-thread-per-cell; `_factorize_reduce` owns both. There is no separate
     # "scalar tier" branch here — the degenerate no-partition case is that path's trivial arm.
-    return _factorize_reduce(tile, root)
+    ctx = Ctx(grid=tuple(tile.place.grid), inputs=tile.inputs, stage=tile.stage, output=root.output.name)
+    return _factorize_reduce(tile, root, ctx)
 
 
 def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=None, inputs=None) -> Tile:
@@ -326,15 +443,16 @@ def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_var
     return out
 
 
-def _factorize_reduce(tile, root) -> Tile:
+def _factorize_reduce(tile, root, ctx: Ctx) -> Tile:
     """Materialize the non-output-tiled path into its bound ``Tile`` (see the section header): a
-    ``PLANAR`` / ``TWISTED`` reduce, a non-tiled ``CONTRACTION``, or a pointwise ``Map``.
+    ``PLANAR`` / ``TWISTED`` reduce, a non-tiled ``CONTRACTION``, or a pointwise ``Map``. The reduce
+    partitioner root binder — it drives the recursion (:func:`_emit`) for the per-cell body.
 
     **Degenerate arm (no partition).** A pointwise ``Map`` (no reduce axis), or any reduce / contraction
-    whose :class:`ReducePlan` is trivial (``coop == reg == 1``), is one thread per output cell: ``lower``
-    emits the per-cell body (a serial reduce ``Loop`` sits inside it) and the store glue is appended.
-    **Partitioned arm.** Otherwise partition the reduce axis ``coop`` ways across threads and/or ``reg``
-    ways across register accumulators, as the section header describes."""
+    whose :class:`ReducePlan` is trivial (``coop == reg == 1``), is one thread per output cell:
+    :func:`_emit` emits the per-cell body (a serial reduce ``Loop`` sits inside it) and the store glue
+    is appended. **Partitioned arm.** Otherwise partition the reduce axis ``coop`` ways across threads
+    and/or ``reg`` ways across register accumulators, as the section header describes."""
     op = tile.op
     grid = tile.place.grid
     # The reduce partition rides the :class:`Reduction` node (``reduce_plan``); ``None`` for a pure
@@ -343,18 +461,19 @@ def _factorize_reduce(tile, root) -> Tile:
     plan = reduce_plan(tile) if op is not None else None
     if plan is None or (plan.coop <= 1 and plan.reg <= 1):
         # One thread per output cell — the degenerate fold, no cross-thread / ILP partition.
-        stmts = with_store(lower(op), root.output.name, grid, op)
+        stmts = with_store(_emit(op, ctx).body, root.output.name, grid, op)
         return Tile(axes=tuple(grid), body=Body(tuple(stmts)))
     coop, reg = plan.coop, plan.reg
 
-    # Read the reduce straight off the :class:`Reduction` **node** (bare, or wrapped under a
-    # projecting ``Map``) — no ``lower(op)``-then-refind. The node's synthesized ``loop`` carries the
-    # :class:`Carrier` (a contraction's K loop and a monoid's reduce loop both carry it here — the ⊗
-    # lift already sits in the loop body, so the carrier-generic ``state`` / ``as_state_merge`` /
-    # ``combine_states`` machinery folds either). A ``Reduction`` has no prologue ahead of its loop
-    # (``pre`` empty); a wrapping ``Map``'s body IS the post-reduce projection tail.
+    # Build the per-cell reduce loop via the recursion (:func:`_emit`) off the :class:`Reduction`
+    # **node** (bare, or wrapped under a projecting ``Map``) — the walk reaches any nested contraction
+    # (flash Q@K / P@V) as a node. The synthesized ``loop`` carries the :class:`Carrier` (a
+    # contraction's K loop and a monoid's reduce loop both carry it here — the ⊗ lift already sits in
+    # the loop body, so the carrier-generic ``state`` / ``as_state_merge`` / ``combine_states``
+    # machinery folds either). A ``Reduction`` has no prologue ahead of its loop (``pre`` empty); a
+    # wrapping ``Map``'s body IS the post-reduce projection tail (walked for nested nodes too).
     red = op.source if isinstance(op, Map) else op
-    rloop = red.loop
+    (rloop,) = _emit(red, ctx).body
     carrier = rloop.carrier
     axis = rloop.axis
     stride = coop * reg
@@ -370,7 +489,7 @@ def _factorize_reduce(tile, root) -> Tile:
     # once (cooperatively) and rewrite both readers to the slab — one ``__shared__`` row shared
     # by the prologue + the matmul body. Only the cooperative tier (coop > 1) stages.
     pre: list[Stmt] = []
-    tail_src = list(op.body) if isinstance(op, Map) else []
+    tail_src = _emit_body(op.body, ctx) if isinstance(op, Map) else []
     fill_stmts: list[Stmt] = []
     if lane is not None:
         grid_vars = tuple(Var(a.name) for a in grid)
