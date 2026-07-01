@@ -55,8 +55,8 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, StridedLoop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import TileOp
+from deplodock.compiler.ir.tile.ir import Contraction
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_plan
-from deplodock.compiler.ir.tile.structural import Contraction
 from deplodock.compiler.pipeline import Match, Pattern
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
 from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize

@@ -4,7 +4,7 @@ the merged Loop-IR → Tile-IR pass (recognition + scheduling in one rewrite, no
 
 This is the Loop-IR → Tile-IR boundary: after this pass nothing downstream traffics in
 ``LoopOp``. **Recognition** (here) reads the algebra off the body and lifts the per-cell
-compute into a :class:`~deplodock.compiler.ir.tile.structural.Map` whose body is the **annotated
+compute into a :class:`~deplodock.compiler.ir.tile.ir.Map` whose body is the **annotated
 loop nest** (the reduce ``Loop`` stamped with its
 :class:`~deplodock.compiler.ir.axis.AxisRole` + :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`)
 on an UNMAPPED :class:`~deplodock.compiler.ir.tile.ir.TileOp`; the final step hands that tile op to

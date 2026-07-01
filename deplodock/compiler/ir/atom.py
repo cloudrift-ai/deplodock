@@ -1,6 +1,6 @@
 """The contraction **atom** — one leaf multiply-accumulate the contraction tier tiles over.
 
-An atom is the smallest cell a :class:`~deplodock.compiler.ir.tile.structural.Contraction` tiles four
+An atom is the smallest cell a :class:`~deplodock.compiler.ir.tile.ir.Contraction` tiles four
 ways (GRID / UNIT / REGISTER / ATOM). Two kinds, one interface (``shape`` + :attr:`lanes`):
 
 - :class:`AtomKind` — a tensor-core ``mma.sync`` cell: a fixed ``(m, n, k)`` shape, per-operand

@@ -15,7 +15,7 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Pipeline / autotune** (pass framework, knob/fork system, learned-prior search, two-level tune) →
   [`deplodock/compiler/pipeline/ARCHITECTURE.md`](deplodock/compiler/pipeline/ARCHITECTURE.md)
 - **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**. The stored tile IR is
-  growing into a tree of **structural nodes** (all in `ir/tile/structural.py`): a `PLANAR`/`TWISTED` reduce lifts to a
+  growing into a tree of **structural nodes** (all in `ir/tile/ir.py`): a `PLANAR`/`TWISTED` reduce lifts to a
   typed `Reduction` (its `Carrier` + reduce `axis` + `partial` split out, the fold `Loop` synthesized on demand, holding
   no projection); a contraction is a `Contraction`; the lift / projection wrapper is a `Map` (`body` + an optional
   `source: Reduction | Contraction | None` — `project ∘ reduce`). A bare reduce is the root `Reduction`; softmax/RMSNorm

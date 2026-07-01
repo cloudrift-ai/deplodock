@@ -9,7 +9,7 @@ halves:
 - **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
   hand-assemble a kernel body — it builds the high-level **structural-node tree**
-  (``ir/tile/structural``): flash is ``Map(body=[O/l projection], source=Reduction(role=TWISTED,
+  (``ir/tile/ir``): flash is ``Map(body=[O/l projection], source=Reduction(role=TWISTED,
   axis=kv, source=Contraction(Σ Q·K)))`` — the ``(m,l,O)`` LSE streaming reduce over kv whose
   per-step partial folds a nested ``Σ_dd Q·K`` :class:`Contraction` node (the ``Reduction ⊃
   Contraction`` composition), projected ``O/l`` after the loop. ``build_flash_frag`` returns that

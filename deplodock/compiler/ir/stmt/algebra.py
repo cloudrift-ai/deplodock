@@ -11,8 +11,8 @@ algebra lives in one place:
 - :class:`State` / :class:`Twist` / :class:`Carrier` — the loop-carried associative combine (⊕).
 - :class:`StateMerge` — the renderable cross-partition state⊕state combine a carrier emits.
 
-The lift / projection wrapper itself — :class:`~deplodock.compiler.ir.tile.structural.Map` — is a
-*tile-IR* op-tree node (it carries the kernel's schedule), so it lives in ``ir/tile/structural.py``.
+The lift / projection wrapper itself — :class:`~deplodock.compiler.ir.tile.ir.Map` — is a
+*tile-IR* op-tree node (it carries the kernel's schedule), so it lives in ``ir/tile/ir.py``.
 """
 
 from __future__ import annotations

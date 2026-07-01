@@ -1,6 +1,6 @@
 """The geometry-free compute layer — the lift wrapper and its lowering.
 
-A kernel's compute is a :class:`~deplodock.compiler.ir.tile.structural.Map` (re-exported here) — a
+A kernel's compute is a :class:`~deplodock.compiler.ir.tile.ir.Map` (re-exported here) — a
 :class:`~deplodock.compiler.ir.stmt.body.Body` of loop-IR stmts holding the per-cell compute. A
 reduction is a ``Map`` whose body contains the **annotated reduce ``Loop``** (its
 :class:`~deplodock.compiler.ir.axis.AxisRole` + :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`
@@ -19,13 +19,13 @@ from __future__ import annotations
 from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
-from deplodock.compiler.ir.tile.structural import Contraction, Map, Reduction
+from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction
 
 
 def reduce_loop(op):
     """The kernel's outermost **annotated** reduce ``Loop`` (its ``carrier`` set by recognition),
     or ``None`` for a pure pointwise / flat-fallback ``Map`` (no annotated reduce). A
-    :class:`~deplodock.compiler.ir.tile.structural.Reduction` synthesizes its loop directly; a ``Map``
+    :class:`~deplodock.compiler.ir.tile.ir.Reduction` synthesizes its loop directly; a ``Map``
     is read off the top-level body — the annotated reduce loop is a top-level stmt (a
     single-flat-reduce cell); a nested / multi reduce stays un-annotated (flat fallback) and is
     invisible here, so it materializes on the scalar tier."""
@@ -41,7 +41,7 @@ def reduce_loop(op):
 
 def reduce_plan(tile):
     """The tile's reduce partition (:class:`~deplodock.compiler.ir.schedule.ReducePlan`) — read
-    off the :class:`~deplodock.compiler.ir.tile.structural.Reduction` node when ``tile.op`` is (or wraps
+    off the :class:`~deplodock.compiler.ir.tile.ir.Reduction` node when ``tile.op`` is (or wraps
     via ``Map.source``) one, else off the ``TileOp``'s residual ``reduce`` field (a non-tiled
     contraction's split-K / coop-K reduce, not yet a node). Flash is now a ``Map(source=Reduction)`` too,
     so its partition rides the node — the residual fallback is only the split-K matmul.
@@ -96,7 +96,7 @@ def contraction_loop(lift, fold, operand_bodies, reduce_axis) -> Loop:
 
 def pretty(op, indent: str = "") -> list[str]:
     """Structurally pretty-print a kernel op (for dumps) — a
-    :class:`~deplodock.compiler.ir.tile.structural.Reduction` as a typed header over its synthesized
+    :class:`~deplodock.compiler.ir.tile.ir.Reduction` as a typed header over its synthesized
     loop nest, the ``Map``'s body (its annotated reduce ``Loop`` + projection), or a bare stmt's own
     pretty."""
     if isinstance(op, Reduction):

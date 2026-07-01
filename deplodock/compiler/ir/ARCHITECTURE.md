@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` holding the structural-IR root `op` (`tile/structural`: `Map` / `Reduction` / `Contraction`) + thin schedule fields (free→grid `Placement`, `workers`, residual `ReducePlan`/`tier`/`stage`) |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` holding the structural-IR root `op` (`tile/ir`: `Map` / `Reduction` / `Contraction`) + thin schedule fields (free→grid `Placement`, `workers`, residual `ReducePlan`/`tier`/`stage`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -28,7 +28,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `Accum.op` (`ElementwiseOp` only — `ReduceOp` is not a valid body
   op; reductions are `Accum` statements inside a reduce `Loop`).
 - **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
-  `TileOp` holding the structural-IR root `op` directly (`tile/structural` —
+  `TileOp` holding the structural-IR root `op` directly (`tile/ir` —
   a `Map` / `Reduction` / `Contraction`) plus thin schedule fields
   (`place` / `workers` + residual reduce/tier/stage); a kernel's structure
   is read off its annotated reduce loop's `AxisRole`, not a Python
@@ -384,9 +384,9 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 ## `tile/`
 
-Tile IR (`tile/ir.py`, `tile/structural.py`, `tile/ops.py`) carries the scheduling decisions on the
+Tile IR (`tile/ir.py`, `tile/ops.py`) carries the scheduling decisions on the
 op tree + thin root fields rather than re-deriving them from the body. A `TileOp` holds the structural-IR root `op`
-directly — a `Map` / `Reduction` / `Contraction` (`tile/structural.py`, over the `ir/stmt/algebra.py` annotated loop
+directly — a `Map` / `Reduction` / `Contraction` (defined in `tile/ir.py`, over the `ir/stmt/algebra.py` annotated loop
 nest) — plus thin schedule fields: the root-global free→grid `Placement` (`place`) and warp split (`workers`), and the
 residual `ReducePlan` / `tier` / `stage` / `bind` for the not-yet-nodified forms (per-node slices ride the structural
 nodes: a `Contraction`'s `tile`, a `Reduction`'s `reduce`). The `Kernel` / `TileSchedule` wrapper is gone. A kernel's

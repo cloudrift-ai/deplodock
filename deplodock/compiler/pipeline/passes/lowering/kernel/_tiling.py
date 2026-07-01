@@ -9,7 +9,7 @@ in ``lanes``. This module owns that nesting (the per-cell coordinate :class:`Off
 callables (``state_decls`` / ``reduce_region`` / ``store``) — see ``_factor.reduce_codegen`` (the
 shared K-loop) + ``_factor.store_sink`` (the per-cell sink). The geometry
 (``tile_m`` / ``mask`` / axis names / ``block_threads`` / …) is
-read off the :class:`~deplodock.compiler.ir.tile.structural.Contraction` node, not recomputed here.
+read off the :class:`~deplodock.compiler.ir.tile.ir.Contraction` node, not recomputed here.
 
 Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips this module."""
 

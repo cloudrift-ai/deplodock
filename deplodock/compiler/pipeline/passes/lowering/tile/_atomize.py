@@ -5,7 +5,7 @@ axis-in-index), the fold accumulator, and the projection epilogue.
 :func:`semiring_binding` reads them **structurally** off the lowered ``CONTRACTION`` reduce loop
 — the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and returns them as
 the ``(a_load, b_load, acc, epilogue)`` facts that ``_schedule._contraction_node`` stamps onto the
-:class:`~deplodock.compiler.ir.tile.structural.Contraction` structural node at fork-emit (the node
+:class:`~deplodock.compiler.ir.tile.ir.Contraction` structural node at fork-emit (the node
 is then the single source of truth — it re-derives ``b_trans`` off ``b_load`` itself). Reading off
 the annotated loop (not an op-tree node) is what let the ``Semiring`` / ``Monoid`` op-tree node
 classes retire. The cooperative reduce needs no binding here — its accumulator dtype + shuffle/tree

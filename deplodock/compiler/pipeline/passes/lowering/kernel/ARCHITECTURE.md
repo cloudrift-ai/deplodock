@@ -10,7 +10,7 @@ afterwards.
 the op tree + `ir/tile/ops.lower` are shared across kinds; only the partition changes):
 
 - **Tiled `CONTRACTION`** (warp / register tile) — the high-level `Contraction` Stmt
-  (`ir/tile/structural.py`) was already built **recognize-side** at fork-emit
+  (`ir/tile/ir.py`) was already built **recognize-side** at fork-emit
   (`lowering/tile/_schedule._contraction_node`, resolving the operand→role binding via `_atomize.semiring_binding`), so
   materialize only **synthesizes its bare grid-`Write`** (needs `root.output`, so it can't ride the node) and
   **expands** it through the one atom-generic `_factor.factorize` over the shared tiling layer (below); the leaf type
