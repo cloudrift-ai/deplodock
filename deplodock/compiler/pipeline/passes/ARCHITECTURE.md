@@ -47,11 +47,12 @@ and feeds it into the `Contraction` structural node (`_schedule._contraction_nod
 bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul) is rejected at fork construction, alongside
 `_check_warp_static_k`, instead of failing several passes later:
 
-- a warp / register-tiled `CONTRACTION` contraction → an `AtomBinding` (`ir/tile/binding.py`): the A/B operands bound to
-  roles by which output grid axis each operand's OWN leaf `Load` index carries (structural — read off the annotated loop,
-  not a flattened-loop scan), plus `b_trans`, the fold accumulator, and the projection epilogue. The binding's facts are
-  baked onto the `Contraction` node at fork-emit; `_factor.factorize` reads them off the node instead of `lower()`-ing
-  the contraction and pattern-matching the result.
+- a warp / register-tiled `CONTRACTION` contraction → the `(a_load, b_load, acc, epilogue)` operand→role facts
+  (`_atomize.semiring_binding`): the A/B operands bound to roles by which output grid axis each operand's OWN leaf `Load`
+  index carries (structural — read off the annotated loop, not a flattened-loop scan), plus the fold accumulator and the
+  projection epilogue. Those facts are stamped straight onto the `Contraction` node at fork-emit (the node is the single
+  source of truth — it re-derives `b_trans` off `b_load`); `_factor.factorize` reads them off the node instead of
+  `lower()`-ing the contraction and pattern-matching the result.
 - a cooperative / ILP reduce (`PLANAR` / `TWISTED`, or a non-output-tiled `CONTRACTION`) needs **no** binding here — its
   accumulator dtype + the shuffle/tree fold mechanism are **derived** at materialize time (`emit_combine` off the carrier
   + `ReduceStage.combine`), never stored.

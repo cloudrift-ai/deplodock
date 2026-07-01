@@ -1,15 +1,15 @@
 """Atomize — resolve the algebra→hardware-atom binding structurally.
 
 The warp matmul materializer needs to know which operand is the mma ``a`` vs ``b`` (by
-axis-in-index), whether ``b`` is transposed, the fold accumulator, and the projection epilogue.
+axis-in-index), the fold accumulator, and the projection epilogue.
 :func:`semiring_binding` reads them **structurally** off the lowered ``CONTRACTION`` reduce loop
-— the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and builds an
-:class:`AtomBinding` whose facts (the A/B operand ``Load``\\ s, ``acc``, epilogue) are then baked
-onto the :class:`~deplodock.compiler.ir.tile.structural.Contraction` structural node at fork-emit
-(``_schedule._contraction_node``). Reading off the annotated loop (not an op-tree node) is what let
-the ``Semiring`` / ``Monoid`` op-tree node classes retire. The cooperative reduce needs no binding
-here — its accumulator dtype + shuffle/tree mechanism are derived at materialize time
-(``emit_combine`` off the carrier + ``ReduceStage.combine``).
+— the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and returns them as
+the ``(a_load, b_load, acc, epilogue)`` facts that ``_schedule._contraction_node`` stamps onto the
+:class:`~deplodock.compiler.ir.tile.structural.Contraction` structural node at fork-emit (the node
+is then the single source of truth — it re-derives ``b_trans`` off ``b_load`` itself). Reading off
+the annotated loop (not an op-tree node) is what let the ``Semiring`` / ``Monoid`` op-tree node
+classes retire. The cooperative reduce needs no binding here — its accumulator dtype + shuffle/tree
+mechanism are derived at materialize time (``emit_combine`` off the carrier + ``ReduceStage.combine``).
 
 **Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the tiled
 contraction leaf is built (``_warp_option`` / the tiled ``_tile_option``) — so an atom that
@@ -30,7 +30,6 @@ from __future__ import annotations
 from deplodock.compiler.ir.axis import AxisRole
 from deplodock.compiler.ir.stmt import Accum, Load, Loop
 from deplodock.compiler.ir.stmt.body import Body
-from deplodock.compiler.ir.tile import AtomBinding, Operand
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 
@@ -39,17 +38,18 @@ def _idx_vars(index) -> set[str]:
     return {v for e in index for v in e.free_vars()}
 
 
-def bind_contraction(loop: Loop, m_name: str, n_name: str, epilogue: Body) -> AtomBinding:
-    """Resolve the operand→role :class:`AtomBinding` for a ``CONTRACTION`` reduce ``loop`` (the
-    lowered ``Accum``-in-``Loop`` form) whose output is indexed by grid axes ``m_name`` /
-    ``n_name``, with projection ``epilogue``.
+def bind_contraction(loop: Loop, m_name: str, n_name: str, epilogue: Body) -> tuple[Load, Load, str, Body]:
+    """Resolve the ``(a_load, b_load, acc, epilogue)`` operand→role facts for a ``CONTRACTION``
+    reduce ``loop`` (the lowered ``Accum``-in-``Loop`` form) whose output is indexed by grid axes
+    ``m_name`` / ``n_name``, with projection ``epilogue``.
 
     Reads the facts straight off the loop body — no op-tree node: the contraction operands are the
     ``Load``\\ s in the loop indexed over the reduce (K) axis; A/B are bound by which output axis
-    each one's index carries; ``b_trans`` from B's last index component; the fold accumulator is the
-    loop body's ``Accum`` target. A clean gmem-direct contraction has plain-``Load`` operands (a
-    computed-cone / demoted matmul never reaches CONTRACTION — recognition leaves it a flat reduce),
-    so an unbindable body (no m/n-bearing K-load) raises, matching the warp gmem-direct guard."""
+    each one's index carries; the fold accumulator is the loop body's ``Accum`` target. A clean
+    gmem-direct contraction has plain-``Load`` operands (a computed-cone / demoted matmul never
+    reaches CONTRACTION — recognition leaves it a flat reduce), so an unbindable body (no m/n-bearing
+    K-load) raises, matching the warp gmem-direct guard. ``b_trans`` is not returned — the
+    ``Contraction`` node re-derives it off ``b_load``."""
     k_name = loop.axis.name
     loads = [s for s in loop.body if isinstance(s, Load) and k_name in _idx_vars(s.index)]
     a_leaf = next((ld for ld in loads if m_name in _idx_vars(ld.index)), None)
@@ -59,14 +59,13 @@ def bind_contraction(loop: Loop, m_name: str, n_name: str, epilogue: Body) -> At
     acc = next((s.name for s in loop.body if isinstance(s, Accum)), None)
     if acc is None:
         raise LoweringError("warp tier: contraction loop has no fold accumulator")
-    b_trans = k_name in b_leaf.index[-1].free_vars()  # B[n,k] (K last) vs canonical B[k,n]
-    return AtomBinding(a=Operand(a_leaf, "a"), b=Operand(b_leaf, "b"), b_trans=b_trans, acc=acc, epilogue=epilogue)
+    return a_leaf, b_leaf, acc, epilogue
 
 
-def semiring_binding(node, grid) -> AtomBinding:
-    """The root contraction's :class:`AtomBinding`: lower ``node`` to loop-IR, find its
-    ``CONTRACTION`` reduce loop, take the projection ``epilogue`` (the stmts after the loop — the
-    ``Map`` body, or empty for a bare contraction), and delegate to :func:`bind_contraction`.
+def semiring_binding(node, grid) -> tuple[Load, Load, str, Body]:
+    """The root contraction's ``(a_load, b_load, acc, epilogue)`` facts: lower ``node`` to loop-IR,
+    find its ``CONTRACTION`` reduce loop, take the projection ``epilogue`` (the stmts after the loop
+    — the ``Map`` body, or empty for a bare contraction), and delegate to :func:`bind_contraction`.
     ``node`` is the kernel op, ``grid`` the placement's output axes."""
     if len(grid) < 2:
         raise LoweringError("warp tier: contraction output needs an (m, n) grid")

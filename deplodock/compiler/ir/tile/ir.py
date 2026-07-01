@@ -13,8 +13,8 @@ plus a thin set of **root-global schedule fields** — the free-axis → grid
 :class:`~.schedule.Placement` (``place``) and the warp split (``workers``). The
 per-node schedule slices ride the structural nodes themselves (a
 :class:`~.structural.Contraction`'s ``tile``, a :class:`~.structural.Reduction`'s
-``reduce``); the residual root fields (``reduce`` / ``tier`` / ``stage`` /
-``bind``) hold the schedule for the not-yet-nodified forms (a non-tiled
+``reduce``); the residual root fields (``reduce`` / ``tier`` / ``stage``)
+hold the schedule for the not-yet-nodified forms (a non-tiled
 contraction's split-K, the pin-only ``STAGE`` / ``WSPEC``; flash is now a
 ``Map(source=Reduction(source=Contraction))`` node tree, so its partition rides
 the node). There is no per-kind kernel/schedule type: the algebra is read
@@ -36,7 +36,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.tile.binding import AtomBinding
 from deplodock.compiler.ir.tile.schedule import Placement, ReducePlan, Stage, TilePlan, WarpSpec
 
 #: Back-compat alias: the old two-field ``Schedule`` (``free`` / ``grid``) is now
@@ -68,8 +67,10 @@ class TileOp(Op):
     - ``tier`` — the output fragment (:class:`~.schedule.TilePlan`) for a non-tiled / split-partial
       contraction; a tiled contraction rides its ``tile`` on the ``Contraction`` node. ``None`` = per-cell.
     - ``stage`` — the operand smem pipeline (:class:`~.schedule.Stage`); ``None`` = gmem-direct (pin-only).
-    - ``bind`` — the resolved contraction operand→role binding (:class:`AtomBinding`), surfaced for the
-      ``--ir tile`` dump; ``None`` for a non-contraction / once folded onto the ``Contraction`` node."""
+
+    The contraction operand→role binding is not a ``TileOp`` field — a tiled contraction carries its
+    A/B operands / accumulator / epilogue on its ``Contraction`` node (``op``), the single source of
+    truth; ``_schedule._contraction_node`` resolves them via ``_atomize.semiring_binding``."""
 
     op: object = None
     name: str = ""
@@ -78,15 +79,11 @@ class TileOp(Op):
     tier: TilePlan | None = None
     stage: Stage | None = None
     workers: WarpSpec | None = None
-    bind: AtomBinding | None = None
 
     def pretty_body(self) -> str:
-        """Render the ``op`` tree structurally (the dump view) — no lowering. Prefixes the
-        atomize ``bind:`` line when the node carries one (the resolved operand→role binding,
-        surfaced so ``compile --ir tile`` shows it above the combine)."""
+        """Render the ``op`` tree structurally (the dump view) — no lowering."""
         from deplodock.compiler.ir.tile.ops import pretty  # noqa: PLC0415
 
         if self.op is None:
             return ""
-        body = "\n".join(pretty(self.op, "    "))
-        return f"    {self.bind.pretty()}\n{body}" if self.bind is not None else body
+        return "\n".join(pretty(self.op, "    "))

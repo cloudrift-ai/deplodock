@@ -9,7 +9,6 @@ MAP / MONOID / SEMIRING with no per-kind schedule type (dispatch reads ``ops.axi
 """
 
 from deplodock.compiler.ir.atom import AtomKind
-from deplodock.compiler.ir.tile.binding import AtomBinding, Operand
 from deplodock.compiler.ir.tile.ir import Schedule, TileOp
 from deplodock.compiler.ir.tile.role import RoleKind, role_for
 from deplodock.compiler.ir.tile.schedule import (
@@ -26,13 +25,11 @@ from deplodock.compiler.ir.tile.schedule import (
 from deplodock.compiler.ir.tile.structural import Contraction, Map, Reduction
 
 __all__ = [
-    "AtomBinding",
     "AtomKind",
     "Contraction",
     "Fold",
     "Level",
     "Map",
-    "Operand",
     "Placement",
     "ReducePlan",
     "ReduceStage",

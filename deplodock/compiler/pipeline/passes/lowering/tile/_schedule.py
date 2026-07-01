@@ -255,25 +255,27 @@ def _check_warp_static_k(kernel, wt) -> None:
         )
 
 
-def _contraction_node(node, place, tile_plan: TilePlan, bind) -> Contraction:
+def _contraction_node(node, place, tile_plan: TilePlan) -> Contraction:
     """The high-level :class:`Contraction` structural node for a tiled ``CONTRACTION`` leaf, built
-    here at fork-emit (seam #1 — the node must exist recognize-side so its ``tile`` / ``bind`` ride
-    the node, not a root schedule field; the build moved off ``010_materialize``'s retired
-    ``_build_contraction``). Reads the operand→role ``bind`` (:func:`semiring_binding`) + the
-    resolved ``tile_plan`` from the schedule fork, and the (m, n) output / K axes off the
+    here at fork-emit (seam #1 — the node must exist recognize-side so its ``tile`` rides the node,
+    not a root schedule field; the build moved off ``010_materialize``'s retired
+    ``_build_contraction``). Resolves the ``(a_load, b_load, acc, epilogue)`` operand→role facts
+    structurally (:func:`semiring_binding`) — raising ``LoweringError`` on an unbindable atom — plus
+    the resolved ``tile_plan`` from the schedule fork, and the (m, n) output / K axes off the
     still-``Map`` ``node``. The projection ``epilogue`` is the binding's body verbatim — the
     synthesized grid-``Write`` for a bare contraction stays a materialize concern (it needs
     ``root.output``), appended there when the epilogue carries no ``Write``."""
     grid = list(place.grid)
+    a_load, b_load, acc, epilogue = semiring_binding(node, place.grid)
     return Contraction(
         axes=(grid[-2], grid[-1]),
         k_axis=reduce_loop(node).axis,
-        a_load=bind.a.load,
-        b_load=bind.b.load,
-        acc=bind.acc,
+        a_load=a_load,
+        b_load=b_load,
+        acc=acc,
         tile=tile_plan,
         lead_axes=tuple(grid[:-2]),
-        epilogue=bind.epilogue,
+        epilogue=epilogue,
     )
 
 
@@ -286,10 +288,10 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     wt = TilePlan.parse(spec)
     _check_warp_static_k(tile, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
-    # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
-    # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
-    bind = semiring_binding(tile.op, place.grid)
-    op = _contraction_node(tile.op, place, wt, bind)
+    # Build the tiled Contraction node here — it resolves the operand→role facts internally, so an
+    # unbindable atom (a non-Load operand: a computed-cone / demoted matmul) raises and is rejected
+    # at fork construction, like the static-K check.
+    op = _contraction_node(tile.op, place, wt)
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
     # splits the warps into roles over this fixed pipeline (gated on the ``stage``).
     workers, wspec_spec = _wspec_workers(stage)
@@ -301,7 +303,7 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
         stamped[_at(STAGE, kaxis)] = stage_spec
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
-    return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, bind=bind, knobs=stamped)
+    return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, knobs=stamped)
 
 
 def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
@@ -329,11 +331,9 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
-            bind = semiring_binding(tile.op, place.grid)
+            op = _contraction_node(tile.op, place, plan)
         except LoweringError:
-            bind = None
-        if bind is not None:
-            op = _contraction_node(tile.op, place, plan, bind)
+            pass  # an unbindable contraction (a non-Load operand) keeps the Map form
     # ``TILE`` / ``STAGE`` / the split-K ``REDUCE`` all key ``@<k_axis>`` (the contraction axis this
     # node schedules), unifying the schedule reduce partition onto the axis-named reduce family.
     kaxis = reduce_loop(tile.op).axis.name
