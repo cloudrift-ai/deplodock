@@ -1,10 +1,37 @@
-# Recursive `factorize` with a wiring context — Phase 0 (design)
+# Recursive `factorize` with a wiring context
 
-**Status: DESIGN — stress-tested, needs revision before build.** Phase 0 of the recursive-emitter direction of the
-tile-IR refactor (the `tile-ir-rebuild.md` mandate: *one hierarchical emitter, no divergent codegen paths*). It replaces
-the flat dispatch (`_factorize_contraction` vs `_factorize_reduce` + `lower(op)`-then-refind) with a recursion over the
-node tree `Map(Reduction(Contraction))`, threading a **context** down and returning a **wiring handle** up. The payoff is
+**Status: the pure refactor (Changes A + B, Steps 1 + 2) is LANDED, bit-identical, full suite green. Step 3 (tensor-core
+flash — the payoff) is the remaining work; its seam is in place.** The recursive-emitter direction of the tile-IR
+refactor (the `tile-ir-rebuild.md` mandate: *one hierarchical emitter, no divergent codegen paths*). It replaced the flat
+dispatch (`_factorize_contraction` vs `_factorize_reduce` + `lower(op)`-then-refind) with a recursion over the node tree
+`Map(Reduction(Contraction))`, threading a **context** down and returning a **wiring handle** up. The payoff is
 tensor-core flash (register-tiled QK/PV inside the streaming reduce) falling out of the same emitter.
+
+## Progress (landed)
+
+- **Change A** — flash's Q@K moved off `Reduction.source` onto the single walked `partial` edge (QK at the head, PV
+  embedded); `ir._flatten_nodes` generalized to a node-walk over `Contraction` / `Reduction` / `Map`. `source` now serves
+  only the split-K composition. Bit-identical.
+- **Change B** — a coop-K / ILP contraction (and the `030_split` residual) is nodified to a `Reduction` node carrying the
+  K partition, via the shared `ops.nodify_reduce`; the `TileOp.reduce` residual field and `reduce_plan`'s fallback are
+  deleted. Bit-identical.
+- **Step 1** — `_factorize_reduce` reads its reduce loop / carrier / axis straight off the `Reduction` node (no
+  `lower`-then-refind); unconditional after B. Bit-identical.
+- **Step 2** — `factorize` drives a recursive walk `_emit(op, ctx) -> Frag` over the `Map` / `Reduction` / `Contraction`
+  tree (through `source` AND `partial`), threading a `Ctx` down and returning a `Frag` (per-cell body + `Handle` wire +
+  carrier) up. The two root binders (`_factorize_contraction`, the reduce partitioner) consume it; the reduce
+  partitioner builds its per-cell loop / tail via `_emit`, so flash's nested Q@K / P@V are reached AS NODES.
+  `_emit(node).body == ops.lower(node)` for every scalar node. Bit-identical.
+
+## Step 3 (remaining) — the tensor-core seam
+
+The seam is the **`Contraction` case in `_factor._emit`**: an output-warp-tiled `Contraction` (an mma `TilePlan`) must
+emit through the register-tile pipeline + the fragment recast there, instead of `op.lower()` (scalar). The remaining
+pieces (all interlocked — none lands in isolation) are Change C + P2 below, plus the fragment-level online-softmax
+codegen (the rowmax / rowsum butterflies on the score C-fragment) and the per-node warp tiles + schedule fork that give
+Q@K / P@V their mma `TilePlan`s. The executable spec is `test_fused_tensorcore_flash_reference_matches_torch`'s
+hand-written FA-2 kernel; the `test_generated_tensorcore_flash_*` cases stay xfailed until the kernel reproduces it
+through the one emitter.
 
 Five adversarial agents stress-tested the load-bearing claims (**Verification findings** below). The direction survives,
 but the **naive form is wrong in three structural ways**: the binding is NOT a single ambient thing threaded down (each
