@@ -754,17 +754,27 @@ def _scalar_cells(c: Contraction, region: list[Stmt], cells, offset, masks, prot
     return _dedup_loads(out)
 
 
-def _scalar_state(c: Contraction, stage: Stage | None, cells) -> list[Stmt]:
-    """No separate state decls — the scalar accumulators are seeded inside the reduce ``Loop``
-    (the dissolved fold ``Accum``\\ s + ``Loop.render``). ``stage`` is ignored (the scalar
-    register-tile tier is gmem-direct; operand staging is the mma tier's lever)."""
-    return []
+def _scalar_state(c: Contraction, stage: Stage | None, inputs, cells) -> list[Stmt]:
+    """The scalar accumulator seeds. Gmem-direct (unstaged): none — the accumulators are seeded
+    inside the reduce ``Loop`` (the dissolved fold ``Accum``\\ s + ``Loop.render``). **Staged**: a
+    per-cell ``Init(acc__c{i}_{j} = 0)`` emitted here, **outside** the outer slab loop, so the
+    carrier-less :func:`_scalar_drain` folds across every slab without re-seeding (the nested-loop
+    accumulator-lifetime split — the scalar analogue of ``_mma_state`` declaring the ``_c`` fragments
+    outside the mma K-loop)."""
+    mode, _bk = _scalar_stage_plan(c, stage, inputs)
+    if mode == "gmem":
+        return []
+    return [Init(name=f"{c.acc}__c{i}_{j}", identity=_ADD.identity, dtype=F32) for i, j in cells]
 
 
-def _scalar_reduce(c: Contraction, stage: Stage | None, cells, offset, masks) -> tuple[list[Stmt], list[Stmt]]:
+def _scalar_reduce(c: Contraction, stage: Stage | None, inputs, cells, offset, masks) -> tuple[list[Stmt], list[Stmt]]:
     """**Synthesize** the scalar reduce loop (:func:`_synth_reduce`) and replicate its body per
     register cell (loads deduped). There is no pre-loop region — any loop-invariant operand reads
-    ride in the projection ``tail`` (the store's epilogue)."""
+    ride in the projection ``tail`` (the store's epilogue). Under a ``STAGE`` pin the eligible
+    contraction routes to :func:`_scalar_staged_kloop` (smem operand slab); unstaged is unchanged."""
+    mode, bk_elems = _scalar_stage_plan(c, stage, inputs)
+    if mode != "gmem":
+        return _scalar_staged_kloop(c, inputs, cells, offset, masks, mode, bk_elems)
     k_axis = c.k_axis
     rloop = _synth_reduce(c)
     loop_body = _scalar_cells(c, rloop.body, cells, offset, masks, _scalar_protected(c), guard=False)
@@ -782,6 +792,136 @@ def _scalar_store(c: Contraction, i: int, j: int, offset, masks) -> list[Stmt]:
     return _dedup_loads(cell)
 
 
+def _scalar_stage_plan(c: Contraction, stage: Stage | None, inputs) -> tuple[str, int]:
+    """The scalar-tier operand-staging decision — ``(mode, bk_elems)``, ``mode`` one of ``"tma"`` /
+    ``"cp"`` / ``"gmem"`` (gmem = no slab). Staging is **opt-in behind a ``STAGE`` pin**: a scalar
+    contraction with no ``stage`` (every default scalar matmul) is ``"gmem"``, byte-identical. Eligible
+    when ``stage`` is set with a ``tma`` / ``cp.async`` transport, K is static, and the operands are
+    plain gmem ``Load``\\ s (not a computed-A flash body). A masked (overhanging) M / N is fine — the
+    drain reads the slab by LOCAL tile coords and the overhanging store is guarded, so TMA zero-fills
+    the box overhang and cp.async clamps the gmem read. The slab K-chunk ``bk_elems`` is **derived** to
+    fit a single ``tile_m×bk + bk×tile_n`` operand slab in 48 KiB (largest power-of-two dividing K) —
+    not spelled by a codec, so no schema change."""
+    if stage is None or c.a_computed or not c.k_axis.extent.is_static:
+        return "gmem", 0
+    if inputs is None or c.a_operand.input not in inputs or stage.transport not in ("tma", "cp.async"):
+        return "gmem", 0
+    K = c.k_axis.extent.as_static()
+    elem_bytes = inputs[c.a_operand.input].dtype.nbytes
+    cap = (48 * 1024) // (max(1, c.tile_m + c.tile_n) * elem_bytes)
+    bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
+    if bk_elems < 4:
+        return "gmem", 0
+    return ("tma" if stage.transport == "tma" else "cp"), bk_elems
+
+
+def _scalar_drain(c: Contraction, cells, offset, a_slab: str, b_slab: str, ki: str, bk_elems: int, row_base, col_base) -> Loop:
+    """The inner slab-drain reduce loop ``for ki: b = b_slab[ki, n_local]; a = a_slab[m_local, ki];
+    v = a·b; acc += v`` — the scalar counterpart of the mma ``ldmatrix`` drain. Built per-cell directly
+    (NOT via the masked ``_scalar_cells`` σ, whose ``% extent`` wrap would corrupt the slab index for an
+    overhanging cell): the slab is indexed by the **local** tile coordinate ``offset.base(...) −
+    base`` (``m_uvar·reg_m + i`` ∈ [0, tile_m), always in-slab), so an overhanging cell reads a
+    clamped / zero-filled slab row and its store is discarded by the guard. ``_dedup_loads`` still
+    shares A across the n-cells and B across the m-cells exactly as gmem-direct does. **Carrier-less**
+    (no ``Loop.carrier``): the accumulators are pre-seeded once by :func:`_scalar_state` outside the
+    outer slab loop, so the drain folds into them without re-seeding."""
+    b_name, a_name = c.b_load.names[0], c.a_name
+    body: list[Stmt] = []
+    for i, j in cells:
+        sfx = f"__c{i}_{j}"
+        bn, an, vn, cn = f"{b_name}{sfx}", f"{a_name}{sfx}", f"{c.acc}__v{sfx}", f"{c.acc}{sfx}"
+        m_local = BinaryExpr("-", offset.base("m", i), row_base)
+        n_local = BinaryExpr("-", offset.base("n", j), col_base)
+        body.append(Load(names=(bn,), input=b_slab, index=(Var(ki), n_local)))
+        body.append(Load(names=(an,), input=a_slab, index=(m_local, Var(ki))))
+        body.append(Assign(name=vn, op=_MUL, args=(bn, an)))
+        body.append(Accum(name=cn, value=vn, op=_ADD, axes=(ki,)))
+    body = _dedup_loads(body)
+    # seed=False: the accumulators are pre-seeded once by _scalar_state outside the outer slab loop, so
+    # this inner drain must NOT re-declare (re-zero) them each slab iteration.
+    return Loop(axis=Axis(name=ki, extent=bk_elems), body=Body(tuple(body)), unroll=bk_elems <= 64, seed=False)
+
+
+def _scalar_staged_kloop(c: Contraction, inputs, cells, offset, masks, mode: str, bk_elems: int) -> tuple[list[Stmt], list[Stmt]]:
+    """The scalar tier's STAGED K loop (single-buffer): an outer K-slab loop that cooperatively fills
+    the A ``[tile_m×bk_elems]`` + B ``[bk_elems×tile_n]`` smem slabs (``tma`` box copy or ``cp.async``),
+    barriers, then drains them with :func:`_scalar_drain`. Reuses the tier-agnostic ``_stage.py`` fill
+    primitives via a scalar :class:`CtaTile` (``block_threads`` threads, the ``m_uvar·units_n + n_uvar``
+    linear id). A pure perf transform — the K order ``k0+ki`` = 0..K matches gmem-direct, so it is
+    numerically identical. Returns ``(pre_decls, [loop_stmts])``; the per-cell accumulator seeds ride
+    :func:`_scalar_state`."""
+    m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
+    tile_m, tile_n, K = c.tile_m, c.tile_n, k_axis.extent.as_static()
+    a_buf, b_buf = c.a_operand.input, c.b_load.input
+    slab_dtype = cuda_name(inputs[a_buf].dtype)
+    elem_bytes = inputs[a_buf].dtype.nbytes
+    a_slab, b_slab, k0, ki = "_a_smem", "_b_smem", "_ks", "_ki"
+    row_base = BinaryExpr("*", Var(c.m_b), Literal(tile_m, "int"))
+    col_base = BinaryExpr("*", Var(c.n_b), Literal(tile_n, "int"))
+    linear_tid = BinaryExpr("+", BinaryExpr("*", Var(c.m_uvar), Literal(c.units_n, "int")), Var(c.n_uvar))
+    cta = CtaTile(row_base=row_base, col_base=col_base, linear_tid=linear_tid, n_threads=c.block_threads)
+    drain = _scalar_drain(c, cells, offset, a_slab, b_slab, ki, bk_elems, row_base, col_base)
+
+    if mode == "tma":
+        desc_a, desc_b, mbar = "_desc_a", "_desc_b", "_mbar"
+        tid0 = BinaryExpr("==", linear_tid, Literal(0, "int"))
+        total_bytes = (tile_m * bk_elems + bk_elems * tile_n) * elem_bytes
+        phase = BinaryExpr("%", BinaryExpr("/", Var(k0), Literal(bk_elems, "int")), Literal(2, "int"))
+        fill = tma_fill(
+            loads=[(desc_a, a_slab, (row_base, Var(k0))), (desc_b, b_slab, (Var(k0), col_base))],
+            mbar=mbar,
+            tid0=tid0,
+            phase=phase,
+            total_bytes=total_bytes,
+        )
+        outer = StridedLoop(
+            axis=Axis(name=k0, extent=K),
+            start=Literal(0, "int"),
+            step=Literal(bk_elems, "int"),
+            body=Body((*fill, drain, Sync())),
+            unroll=False,
+        )
+        slab_decls = [
+            tma_descriptor(desc_a, a_buf, (tile_m, bk_elems), slab_dtype),
+            tma_descriptor(desc_b, b_buf, (bk_elems, tile_n), slab_dtype),
+            slab_smem(a_slab, tile_m, bk_elems, slab_dtype, align=TMA_SLAB_ALIGN),
+            slab_smem(b_slab, bk_elems, tile_n, slab_dtype, align=TMA_SLAB_ALIGN),
+        ]
+        return slab_decls, [*tma_mbar_prologue(mbar, tid0), outer]
+
+    mask_m, mask_n, m_ext, n_ext = masks
+
+    def _clamp(idx, ext):  # clamp an overhanging gmem coord to the last valid one (the store is guarded)
+        return TernaryExpr(cond=BinaryExpr("<", idx, ext), if_true=idx, if_false=BinaryExpr("-", ext, Literal(1, "int")))
+
+    def a_gmem(row, col):  # slab[row][col] = A[row_base + row][k0 + col]
+        m = BinaryExpr("+", row_base, row)
+        sig = Sigma({m_axis.name: _clamp(m, m_ext) if mask_m else m, k_axis.name: BinaryExpr("+", Var(k0), col)})
+        return tuple(sig.apply(e) for e in c.a_operand.index)
+
+    def b_gmem(row, col):  # slab[row][col] = B[k0 + row][col_base + col]
+        n = BinaryExpr("+", col_base, col)
+        sig = Sigma({k_axis.name: BinaryExpr("+", Var(k0), row), n_axis.name: _clamp(n, n_ext) if mask_n else n})
+        return tuple(sig.apply(e) for e in c.b_load.index)
+
+    fills = cp_async_fill(
+        slab=a_slab, slab_rows=tile_m, slab_cols=bk_elems, src=a_buf, gmem_index=a_gmem, cta=cta, elem_bytes=elem_bytes, name="a"
+    )
+    fills += cp_async_fill(
+        slab=b_slab, slab_rows=bk_elems, slab_cols=tile_n, src=b_buf, gmem_index=b_gmem, cta=cta, elem_bytes=elem_bytes, name="b"
+    )
+    fills += cp_async_barrier()
+    outer = StridedLoop(
+        axis=Axis(name=k0, extent=K),
+        start=Literal(0, "int"),
+        step=Literal(bk_elems, "int"),
+        body=Body((*fills, drain, Sync())),
+        unroll=False,
+    )
+    slab_decls = [slab_smem(a_slab, tile_m, bk_elems, slab_dtype), slab_smem(b_slab, bk_elems, tile_n, slab_dtype)]
+    return slab_decls, [outer]
+
+
 #: The reusable ``(state_decls, reduce_region)`` pair, keyed by atom kind — the operand fragments +
 #: the K-loop, **sink-agnostic**: both leave the accumulator a sink consumes (mma ``_c{i}_{j}``
 #: register fragments / scalar ``acc__c{i}_{j}`` per cell). :func:`reduce_codegen` binds the node.
@@ -789,14 +929,16 @@ _MMA_REDUCE = (_mma_state, _mma_reduce)
 _SCALAR_REDUCE = (_scalar_state, _scalar_reduce)
 
 
-def reduce_codegen(c: Contraction, stage: Stage | None = None):
+def reduce_codegen(c: Contraction, stage: Stage | None = None, inputs=None):
     """The reusable ``(state_decls, reduce_region)`` — operand fragments + the contraction K-loop
     (``ldmatrix`` + ``mma.sync`` / the synthesized scalar fma), dispatched off the atom and bound to
-    ``c`` + its operand ``stage`` (the mma tier stages an smem slab off it; the scalar tier ignores
-    it). **Sink-agnostic**: it leaves the accumulator the :func:`store_sink` (or a flash sink) then
+    ``c`` + its operand ``stage`` (both tiers stage an smem slab off it: the mma tier via ``ldmatrix``,
+    the scalar tier via plain-``Load`` slab reads — ``inputs`` supplies the operand slab dtype).
+    **Sink-agnostic**: it leaves the accumulator the :func:`store_sink` (or a flash sink) then
     consumes, so the same K-loop emission is reused wherever a contraction is tiled."""
-    state, reduce_region = _MMA_REDUCE if isinstance(c.atom, AtomKind) else _SCALAR_REDUCE
-    return partial(state, c, stage), partial(reduce_region, c, stage)
+    if isinstance(c.atom, AtomKind):
+        return partial(_mma_state, c, stage), partial(_mma_reduce, c, stage)
+    return partial(_scalar_state, c, stage, inputs), partial(_scalar_reduce, c, stage, inputs)
 
 
 def store_sink(c: Contraction):
@@ -831,7 +973,7 @@ def factorize(tile, root, store=None) -> Tile:
         tail = list(op.epilogue)
         if not has_write(tail):
             op = replace(op, epilogue=with_store(tail, root.output.name, tile.place.grid, op))
-        return _factorize_contraction(op, tile.stage, store)
+        return _factorize_contraction(op, tile.stage, store, tile.inputs)
     # Cooperative / ILP reduce tier: a PLANAR / TWISTED reduce, OR a non-output-tiled CONTRACTION
     # whose ReducePlan cooperates — read the role structurally, not the kernel kind. A contraction
     # folds here carrier-generically (a contraction is the degenerate carrier of its additive fold).
@@ -845,14 +987,14 @@ def factorize(tile, root, store=None) -> Tile:
     return Tile(axes=tuple(tile.place.grid), body=Body(tuple(stmts)))
 
 
-def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=None) -> Tile:
+def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=None, inputs=None) -> Tile:
     """Expand a :class:`Contraction` into its tiled ``Tile`` — the one pipeline for both atoms. The
-    node supplies the per-level geometry + its operand ``stage`` (the smem pipeline the mma tier
-    lowers); :func:`reduce_codegen` synthesizes the operand load + K-loop and ``store`` is the
-    **per-cell sink** (default: the matmul :func:`store_sink`; the flash inner QK/PV pass a sink that
-    bridges the accumulator into the softmax twist); the layer owns the offset, the axes, and the
-    splice."""
-    state_decls, reduce_region = reduce_codegen(c, stage)
+    node supplies the per-level geometry + its operand ``stage`` (the smem pipeline both tiers lower);
+    :func:`reduce_codegen` synthesizes the operand load + K-loop (``inputs`` supplies the scalar slab
+    dtype) and ``store`` is the **per-cell sink** (default: the matmul :func:`store_sink`; the flash
+    inner QK/PV pass a sink that bridges the accumulator into the softmax twist); the layer owns the
+    offset, the axes, and the splice."""
+    state_decls, reduce_region = reduce_codegen(c, stage, inputs)
     if store is None:
         store = store_sink(c)
     masks = (c.mask_m, c.mask_n, c.m_ext, c.n_ext)

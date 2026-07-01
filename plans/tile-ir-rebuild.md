@@ -390,9 +390,23 @@ Flips `test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit`,
   it is now unreachable after wiring, delete the unreachable renderers rather than leaving them as museum pieces. Grep
   the kernel-IR for transport nodes with no producer.
 
-### Scalar-tier operand staging — execution-ready design (`test_article_tma_sgemm_reproduction`, `test_sgemm_inner_reduce_is_unrolled`)
+### Scalar-tier operand staging — ✅ LANDED (`test_article_tma_sgemm_reproduction`, `test_sgemm_inner_reduce_is_unrolled`)
 
-The scalar contraction tier is gmem-direct today (`_scalar_state` / `_scalar_reduce` in `_factor.py` ignore `stage`). The
+**Landed** exactly as the design below specifies: `_scalar_stage_plan` + `_scalar_staged_kloop` + `_scalar_drain` in
+`_factor.py` (threaded `factorize → _factorize_contraction → reduce_codegen → _scalar_state`/`_scalar_reduce` off
+`TileOp.stage` + `tile.inputs` for the slab dtype). The STAGE-pinned scalar contraction now stages its fp32 operands
+through an smem slab (TMA `cp.async.bulk.tensor` box copy or cp.async), drained by a `#pragma-unroll`ed inner loop over
+the derived K-chunk (bk=32 for the article tile), numerically exact (max-abs-err 0.0 vs numpy). The nested-accumulator
+crux is solved with a **`Loop.seed` flag** (new field on `ir/stmt/blocks.Loop`): the inner drain is `seed=False` so it
+does not re-declare the accumulators `_scalar_state` pre-seeds outside the outer slab loop. Masked M/N is supported (TMA
+zero-fills the box overhang / cp.async clamps the gmem read; the drain indexes the slab by **local** tile coords so the
+`% extent` wrap can't corrupt it, and the overhanging store is guarded). Gmem-direct is byte-identical (opt-in behind a
+STAGE pin). `test_article_tma_sgemm_reproduction` was rewritten off the demolished `StageBundle` / `StagePolicy` API to
+assert the scheduled scalar `TileOp` carries a TMA `Stage` + the kernel emits the box copy. **Remaining follow-ons:**
+the cp.async gmem→smem ring (`depth ≥ 2` is single-buffer today) and the fp32 `analytic._enumerate` path (now
+producible — the golden's staged fp32 signature can be enumerated; the fp16 golden still needs the warp-move catalog).
+
+The scalar contraction tier was gmem-direct (`_scalar_state` / `_scalar_reduce` in `_factor.py` ignored `stage`). The
 two xfailed SGEMM tests want the scalar tier to stage its fp32 operands through an smem slab (the article hero kernel:
 `TILE=n32x8/f4x26`, `STAGE=d2/tma` → `cp.async.bulk.tensor` box copy + `#pragma unroll` inner reduce). This is a
 **contained** build (scalar atom only; the mma path and the gmem-direct scalar baseline are untouched). Deep mapping

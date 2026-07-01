@@ -69,16 +69,18 @@ XFAIL: dict[str, str] = {
     # accuracy for the rest, which is un-xfailed). The whole-block (TinyLlama / Qwen) and RoPE
     # self-attention cases recovered once the op-tree lift covered the un-fused RoPE-attention
     # fallback (multi-reduce kernels lower as a flat ``Map``), so they are no longer registered.
-    "tests/compiler/e2e/test_knob_pinning.py::test_article_tma_sgemm_reproduction": _R,
     # test_matmul_single_cta_f_replicated / test_gated_mlp_single_cta_f_replicated deleted —
     # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
-    # dynamic, by test_matmul_coverage.
-    "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
+    # dynamic, by test_matmul_coverage. test_sgemm_inner_reduce_is_unrolled recovered with the
+    # scalar-tier operand staging (the STAGE-pinned scalar contraction stages via a smem slab +
+    # #pragma-unrolled inner drain).
     # mma operand staging (cp.async / TMA / gmem→smem ring / smem→register double-buffer) landed —
-    # the six warp-tier STAGE structure / bit-identity tests are recovered. Scalar-tier staging is
-    # NOT restored: ``test_article_tma_sgemm_reproduction`` (fp32 SGEMM via the demolished
-    # ``StageBundle`` API) stays below, and ``test_bank_conflicts.py`` (already xfailed above) needs
-    # the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a separate follow-up).
+    # the six warp-tier STAGE structure / bit-identity tests are recovered. Scalar-tier operand
+    # staging landed too (``_scalar_staged_kloop`` — the STAGE-pinned scalar contraction stages its
+    # operands through an smem slab via tma / cp.async), so ``test_article_tma_sgemm_reproduction``
+    # (rewritten off the demolished ``StageBundle`` API to the Stage-on-TileOp model) is recovered.
+    # ``test_bank_conflicts.py`` (already xfailed above) still needs the demolished
+    # ``find_all_bindings`` staging-diagnostics oracle rebuilt (a separate follow-up).
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once
     # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). Two residuals:
     # test_greedy_run_falls_back_to_option0_when_prior_overflows needs the greedy

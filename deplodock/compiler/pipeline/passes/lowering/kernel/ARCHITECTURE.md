@@ -88,7 +88,15 @@ TMA prefetch over the K-slab loop), `p<reg_depth>` is the smem→register double
 inner atom-K steps). Staging is a **pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic /
 non-divisible K, or a computed-A flash operand) silently falls back to gmem-direct, and a staged kernel is
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
-follow-up. The **scalar** contraction tier is gmem-direct (no operand slab).
+follow-up.
+
+The **scalar** contraction tier stages too, under the same `STAGE` pin (`_scalar_stage_plan` / `_scalar_staged_kloop` /
+`_scalar_drain` in `_factor.py`): the STAGE-pinned scalar contraction fills the A / B operand slabs via the **same**
+`_stage.py` `cp_async_fill` / `tma_fill` (a scalar `CtaTile`, `block_threads` threads) and drains them with a plain-`Load`
+inner loop over the derived K-chunk (`bk_elems` fit-to-smem, not a codec field). The nested outer-slab / inner-drain
+accumulator lifetime is handled by seeding the per-cell accumulators once in `_scalar_state` (outside the outer loop) and
+marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA zero-fills /
+cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged (no pin) is byte-identical gmem-direct.
 
 **Shared-row staging (`_factorize_reduce`) — the reduce tier's `sync` transport.** The fused norm→linear prologue is a
 cooperative reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a

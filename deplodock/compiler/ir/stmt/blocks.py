@@ -71,6 +71,9 @@ class Loop(Stmt):
     unroll: bool = False
     role: AxisRole = AxisRole.FREE
     carrier: Carrier | None = None
+    seed: bool = True  # emit the per-Accum ``<acc> = identity;`` seed before the loop; False when a
+    # nested drain whose accumulators are pre-seeded once outside an enclosing loop (the staged
+    # scalar contraction — re-seeding per outer-slab iteration would zero the running sum).
 
     def __post_init__(self) -> None:
         # Coerce so ``Loop(body=tuple_value)`` keeps working without
@@ -86,7 +89,7 @@ class Loop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier)
+        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier, seed=self.seed)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
@@ -124,7 +127,8 @@ class Loop(Stmt):
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
-                out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
+                if self.seed:
+                    out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)

@@ -257,27 +257,31 @@ def test_scalar_matmul_f16(monkeypatch):
 
 def test_article_tma_sgemm_reproduction(monkeypatch):
     """The matmul-optimization blogs' hero kernel is a SCALAR fp32 SGEMM whose staged
-    operands ride the **TMA** transport (``cp.async.bulk.tensor.2d`` double buffer) —
-    the ``TM=26`` tile (``BM=8 BN=32 FM=26 FN=4 BK=32``) reaching ~106 % of cuBLAS at
-    2048³. ``130_transport`` promotes any staged matmul with a ringable K loop, scalar
-    as well as warp-tier; the scalar tier's plain-``Load`` consumer reads an unswizzled
-    (``SwizzleMode.NONE``) deposit (``_slab._make_bundle``, keyed on ``Block.atom``)
-    where the warp tier's ``ldmatrix`` reads a swizzled one. This asserts both that the
-    staged bundles flip to ``StagePolicy.TMA`` and that the lowered kernel emits the
-    ``cp.async.bulk.tensor`` box copy. Tile-level (inspects the staging policy + source).
-    No CUDA needed."""
+    operands ride the **TMA** transport (``cp.async.bulk.tensor.2d``) — the ``n32x8/f4x26``
+    tile reaching ~106 % of cuBLAS at 2048³. In the rebuilt IR the operand ``STAGE`` rides
+    the scheduled ``TileOp.stage`` (a :class:`Stage`, transport ``tma``), NOT a
+    ``StageBundle`` in the tile body: the scalar tier stages its plain-``Load`` operands
+    through an smem slab filled by a ``cp.async.bulk.tensor`` box copy (``_scalar_staged_kloop``
+    in ``_factor.py``), reading it unswizzled where the warp tier's ``ldmatrix`` reads a swizzled
+    one. This asserts both that the scheduled scalar tile carries a TMA ``Stage`` and that the
+    lowered kernel emits the box copy. Tile-level (inspects the schedule + source). No CUDA needed."""
     from deplodock.compiler.context import Context
     from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.ir.tile.ir import StageBundle, StagePolicy, TileOp
+    from deplodock.compiler.ir.schedule import Stage
+    from deplodock.compiler.ir.tile.ir import Contraction, TileOp
     from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
 
     g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
     for k, v in {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}.items():
         monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
     res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
-    bundles = [s for n in res.nodes.values() if isinstance(n.op, TileOp) for s in n.op.body.iter() if isinstance(s, StageBundle)]
-    assert bundles, "the staged scalar tile must synthesize at least one StageBundle"
-    assert any(b.policy is StagePolicy.TMA for b in bundles), "scalar-tile TMA transport engaged"
+    staged = [
+        n.op.stage
+        for n in res.nodes.values()
+        if isinstance(n.op, TileOp) and isinstance(n.op.op, Contraction) and isinstance(n.op.stage, Stage)
+    ]
+    assert staged, "the scheduled scalar contraction must carry an operand Stage"
+    assert any(s.transport == "tma" for s in staged), "scalar-tile TMA transport engaged"
 
     g2, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
     cuda = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g2, ctx=Context.from_target((12, 0)))
