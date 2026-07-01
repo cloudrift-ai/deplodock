@@ -90,13 +90,16 @@ non-divisible K, or a computed-A flash operand) silently falls back to gmem-dire
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
 follow-up. The **scalar** contraction tier is gmem-direct (no operand slab).
 
-**Shared-row staging (`_factorize_reduce`) — a distinct reduce-tier mechanism.** The fused norm→linear prologue is a
+**Shared-row staging (`_factorize_reduce`) — the reduce tier's `sync` transport.** The fused norm→linear prologue is a
 cooperative reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a
-free-axis `Loop` over an inner reduce). `_factorize_reduce` (in `_factor.py`) stages that one row into a single
-`__shared__` slab (cooperatively filled, `sync` transport) and rewrites both readers to it. The trigger is narrow
-(`_has_contraction_tail`) so a plain softmax sum or a bare reduction is untouched. This is the *reduce* tier's shared-row
-reuse, NOT the warp operand pipeline above — folding the two into one `Stage`-driven mechanism (a `Stage` on the reduce's
-input) is the remaining Phase-2 purge item.
+free-axis `Loop` over an inner reduce). `_factorize_reduce` (in `_factor.py`) detects that one row
+(`_shared_row_buf` / `_has_contraction_tail`, narrow so a plain softmax sum or a bare reduction is untouched), fills it
+cooperatively via `_stage.sync_row_fill` — the **same `_stage.py` fill module** the warp tier's cp.async / TMA fills
+live in, indexed off the same linear-tid / thread-count seam — and rewrites both readers to the slab (`_restage_loads`).
+So every operand-staging *transport* (`sync` 1-D row · cp.async / TMA 2-D slab) now lowers through one module; the
+remaining Phase-2 purge is to drive the reduce tier's staging off a first-class `Stage` on the node (decided in
+`020_schedule`, not detected at materialize time) so the mma and reduce tiers share the same `Stage` → apply path, not
+just the fill module.
 
 ## Kernel-IR peepholes
 

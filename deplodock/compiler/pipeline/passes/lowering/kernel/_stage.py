@@ -1,9 +1,12 @@
-"""Operand-staging assembly for the one contraction emitter (``_factor.factorize``).
+"""Operand-staging assembly for the kernel emitters (``_factor.factorize``).
 
-Builds the cooperative gmem→smem slab fill + the staged-load drain off a
-:class:`~deplodock.compiler.ir.schedule.Stage`, assembling the surviving kernel-IR transport
-leaf nodes (``Smem`` / ``CpAsyncCopy`` / ``CpAsyncCommit`` / ``CpAsyncWait`` / ``Sync`` —
-and the TMA quartet ``TmaDescriptor`` / ``TmaLoad`` / ``Mbarrier*``).
+The single home for every operand-staging *transport*: the warp tier's cooperative gmem→smem
+2-D slab fills (``cp.async`` / TMA, off a :class:`~deplodock.compiler.ir.schedule.Stage`) and
+the reduce tier's ``sync`` 1-D shared-row fill (:func:`sync_row_fill`, the fused norm→linear
+prologue) both live here, indexed off the same linear-tid / thread-count seam. Assembles the
+surviving kernel-IR transport leaf nodes (``Smem`` / ``CpAsyncCopy`` / ``CpAsyncCommit`` /
+``CpAsyncWait`` / ``Sync`` — and the TMA quartet ``TmaDescriptor`` / ``TmaLoad`` /
+``Mbarrier*``).
 
 The fill is written against a small :class:`CtaTile` seam (the CTA tile-base + a linear
 intra-CTA thread id + the thread count), NOT a materializer's internal warp/register
@@ -33,7 +36,7 @@ from deplodock.compiler.ir.kernel.ir import (
     TmaDescriptor,
     TmaLoad,
 )
-from deplodock.compiler.ir.stmt import Body, Cond, Stmt, StridedLoop
+from deplodock.compiler.ir.stmt import Body, Cond, Load, Stmt, StridedLoop, Write
 
 
 def _mul(a: Expr, b: Expr) -> Expr:
@@ -142,6 +145,23 @@ def slab_smem(name: str, rows: int, cols: int, dtype: str, *, align: int = 0) ->
     is ``cols``. ``align`` stamps an explicit byte alignment — TMA destination slabs
     need 128 B (``cp.async.bulk.tensor`` requires an aligned smem base)."""
     return Smem(name=name, extents=(rows, cols), dtype=dtype, align=align)
+
+
+def sync_row_fill(*, slab: str, src: str, extent: int, grid_vars: tuple, linear_tid: Expr, n_threads: int, dtype: str) -> list[Stmt]:
+    """The ``sync``-transport 1-D operand fill: cooperatively copy the CTA-shared row
+    ``src[grid…, 0:extent]`` into a length-``extent`` smem ``slab``, then a CTA barrier so
+    every lane sees the filled row before the reader drains it. The ``n_threads`` cooperating
+    lanes stripe it (``for k = linear_tid; k < extent; k += n_threads``), the same
+    linear-tid / thread-count seam :func:`cp_async_fill` indexes off — so every transport's
+    fill lives here. This is the scalar reduce tier's shared-row prologue (the fused
+    norm→linear input row), the single-buffer ``sync`` counterpart of the async 2-D slab
+    fills above."""
+    fe = Axis(name=f"_{slab}_f", extent=extent)
+    val = f"_{slab}_v"
+    load = Load(name=val, input=src, index=(*grid_vars, Var(fe.name)))
+    write = Write(output=slab, index=(Var(fe.name),), value=val)
+    loop = StridedLoop(axis=fe, start=linear_tid, step=_lit(n_threads), body=Body((load, write)), unroll=False)
+    return [Smem(name=slab, extents=(extent,), dtype=dtype), loop, Sync()]
 
 
 # --------------------------------------------------------------------------- #

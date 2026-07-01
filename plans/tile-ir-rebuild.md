@@ -19,8 +19,12 @@ have landed together** — the `STAGE` codec → `Stage` now lowers on the mma t
 `ldmatrix` drain, the `d<depth>` gmem→smem ring, and the `p<reg_depth>` smem→register double-buffer, all pure
 bit-identical perf transforms over the gmem-direct baseline (the transport primitives in `_stage.py`; the staged K-loop
 + `_mma_stage_plan` in `_factor.py`). The six warp-tier `STAGE` structure / bit-identity e2e tests are recovered.
-**Remaining purge / follow-ups:** (a) subsume the `_shared_row_*` fused-prologue helpers into a `Stage`-driven reduce
-input (the last two-staging-mechanisms divergence); (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
+**Remaining purge / follow-ups:** (a) the `_shared_row_*` fused-prologue fill now lowers through the shared `_stage.py`
+module (`sync_row_fill`, the reduce tier's `sync` transport next to the warp tier's cp.async / TMA fills), so every
+operand-staging *transport* lives in one place; the reduce and warp tiers still detect/apply their staging by different
+paths (the mma tier has **no `sync` transport**, the reduce tier has no 2-D slab), so the remaining unification is to
+drive the reduce-tier staging off a first-class `Stage` stamped in `020_schedule` (not detected at materialize time), a
+scheduler-side build, not a pure purge; (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
 — the fp32 SGEMM via the demolished `StageBundle` API); (c) rebuild the `find_all_bindings` bank-conflict staging oracle
 (`test_bank_conflicts.py`); (d) the mma split-K auto-fork (drop the "pin-only" hedge); (4) warp specialization
 (`WarpSpec`). Branch `refactoring/tile-ir-rebuild`.
@@ -345,12 +349,16 @@ tier.
 
 **Purge — the big "no divergent path" win.**
 
-- **Subsume the fused-prologue shared-row staging into the general mechanism and delete the bespoke helpers.** Today the
-  *only* surviving staging is `_factor.py`'s `_shared_row_buf` / `_restage_loads` / `_shared_row_fill` /
-  `_has_contraction_tail` / `_shared_row` — a special-cased RMSNorm→linear prologue that stages one smem row by hand.
-  Once general `Stage` staging exists, that prologue is just a `Stage` on the reduce's input. Re-express it as such and
-  **delete all five helpers.** Two staging mechanisms for one concept is exactly the divergence this rebuild exists to
-  kill.
+- **Subsume the fused-prologue shared-row staging into the general mechanism.** The RMSNorm→linear prologue is a
+  special-cased reduce-tier staging (`_factor.py`'s `_shared_row_buf` / `_has_contraction_tail` detection +
+  `_restage_loads` rewrite). **Step 1 landed:** its cooperative fill moved out of `_factor.py` into the shared `_stage.py`
+  module as `sync_row_fill` (the reduce tier's `sync` transport, indexed off the same linear-tid / thread-count seam as
+  the warp tier's `cp_async_fill`), so every operand-staging *transport* now lives in one module — byte-identical, e2e
+  green. **Step 2 (remaining):** the mma tier has no `sync` transport and the reduce tier has no 2-D ldmatrix slab, so
+  the tiers still detect/apply staging by different paths. Full unification means driving the reduce-tier staging off a
+  first-class `Stage` stamped in `020_schedule` (not detected at materialize time), so both tiers share the same
+  `Stage` → apply path — a scheduler-side build, not a pure delete. The detection (`_shared_row_buf` /
+  `_has_contraction_tail`) then moves to `020_schedule` and the reduce apply reads `tile.stage`.
 - **Flip `TileOp.stage` from "dropped/reserved" to live** and strike "reserved" / "materialization dropped" from the
   knob table, `_factor.py`, `kernel/ARCHITECTURE.md`, and `xfail_registry._STAGE` (delete `_STAGE` itself as its tests
   XPASS).

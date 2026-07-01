@@ -60,7 +60,6 @@ from deplodock.compiler.ir.kernel.ir import (
     RegEpilogue,
     RegFragment,
     RegStore,
-    Smem,
     Sync,
 )
 from deplodock.compiler.ir.schedule import Stage
@@ -80,6 +79,7 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     cp_async_fill,
     cp_async_wait,
     slab_smem,
+    sync_row_fill,
     tma_descriptor,
     tma_fill,
     tma_mbar_prologue,
@@ -994,17 +994,6 @@ def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_var
     return out
 
 
-def _shared_row_fill(buf: str, smem: str, extent: int, grid_vars: tuple, n_threads: int, start, dtype_c: str) -> list[Stmt]:
-    """Cooperatively copy the CTA-shared ``buf`` row ``[grid…, 0:extent]`` into ``smem`` (the
-    ``n_threads`` lanes stripe it, ``for k = lane; k < extent; k += n_threads``), then a CTA
-    barrier so every lane sees the filled row before the reduce + tail read it."""
-    fe = Axis(name=f"_{smem}_f", extent=extent)
-    load = Load(name=f"_{smem}_v", input=buf, index=(*grid_vars, Var(fe.name)))
-    write = Write(output=smem, index=(Var(fe.name),), value=f"_{smem}_v")
-    loop = StridedLoop(axis=fe, start=start, step=Literal(n_threads, "int"), body=Body((load, write)), unroll=False)
-    return [Smem(name=smem, extents=(extent,), dtype=dtype_c), loop, Sync()]
-
-
 def _factorize_reduce(tile, root) -> Tile:
     """Materialize a cooperative / ILP reduce into its bound ``Tile`` (see the section header)."""
     op = tile.op
@@ -1044,8 +1033,14 @@ def _factorize_reduce(tile, root) -> Tile:
             from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
             smem_name = f"{staged}_smem"
-            fill_stmts = _shared_row_fill(
-                staged, smem_name, axis.extent.as_static(), grid_vars, coop, start, cuda_name(tile.inputs[staged].dtype)
+            fill_stmts = sync_row_fill(
+                slab=smem_name,
+                src=staged,
+                extent=axis.extent.as_static(),
+                grid_vars=grid_vars,
+                linear_tid=start,
+                n_threads=coop,
+                dtype=cuda_name(tile.inputs[staged].dtype),
             )
             n_grid = len(grid)
             rloop = replace(rloop, body=Body(tuple(_restage_loads(list(rloop.body), staged, smem_name, n_grid, grid_vars))))
