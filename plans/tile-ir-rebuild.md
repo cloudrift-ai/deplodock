@@ -252,6 +252,22 @@ never a divergent path.
    feeds the resulting `P` fragment straight into PV as an operand **without a gmem round-trip** (the one genuinely new
    primitive); the twisted `(m_i, l_i)` carrier + `O_i` rescale run over in-register fragments.
 
+**Decision (chosen): option (b)** — unify on the blocked form, scalar = its `block=1` degenerate, prove parity against
+the non-xfailed scalar flash e2e.
+
+**THE CRUX — PV's A operand is register-resident, not a gmem `Load` (confirmed against the generated merge).** The exp
+merge computes `P = exp(s − M)` (`m_i__t5`) and folds `O_i = O_i·α + v·P`. Making PV a real `Contraction` means its **A
+operand is `P`** — the softmax probabilities, which live **in registers** (they are computed from the QK score
+fragment), not in gmem. But the `Contraction` node bakes in **gmem `Load` operands** everywhere: `a_load: Load`;
+`_atomize.bind_contraction` binds the A/B `Load`s indexed over the reduce axis; `_mma_reduce` does `ldmatrix` straight
+from `a_load.input`'s gmem address. So "use `Contraction` for PV" is blocked on **extending the `Contraction` model to a
+computed / register-resident A operand** (a `Body` producing `P`, not a `Load`) — this IS the
+"score-S-fragment-as-operand-without-gmem-round-trip" primitive, and it is what makes tensor-core flash hard under any
+option. It also blocks the naive block=1 scalar splice (there `P` is a scalar SSA temp, still not a `Load`). **Next
+concrete step:** design the `Contraction` extension for a register-resident operand (its `a_load` becomes an
+`operand: Load | Body`, the scalar tier reads the value, the mma tier reads the fragment), land it with unit tests over
+a standalone `P@V` where `P` is computed, THEN rebuild `_flash_op` on it.
+
 Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
 `test_attention_coverage.py::test_cooperative_flash_matches_torch`. Scalar-parity risk is real (step 2 changes the
 scalar tree); the non-xfailed scalar flash cases are the gate — do not proceed to mma until they are green.
