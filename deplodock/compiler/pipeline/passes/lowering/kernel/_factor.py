@@ -97,7 +97,7 @@ def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=Non
     if store is None:
         store = store_sink(c)
     mn = c.mn
-    t = atomize((c.atom.atom_m, c.atom.atom_n))
+    t = atomize(c.atom.shape[:2])
     t = register_tile(t, mn)
     t = unit_tile(t, mn)
     return grid_tile(

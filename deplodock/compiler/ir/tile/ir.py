@@ -291,22 +291,24 @@ class Contraction(Stmt):
     # m/n names live in the operand indices, so the bound axes take a fresh ``_b`` / ``_u`` suffix).
     # ``_factor`` threads these as the ``(m, n)`` pair, mirroring the schedule's tuples. ---------- #
     @property
+    def mn(self) -> tuple[Side, Side]:
+        """The ``(m, n)`` output sides — each output axis paired with its derived per-CTA tile
+        geometry (width / unit / register counts, read off the ``tile``). Built as the pair; :attr:`m`
+        / :attr:`n` index it."""
+        t = self.tile
+        dims = ((t.tile_m, t.units_m, t.reg_m), (t.tile_n, t.units_n, t.reg_n))
+        return tuple(
+            Side(axis=ax, tile=tile, units=units, reg=reg, block=ax.name + "_b", unit=ax.name + "_u")
+            for ax, (tile, units, reg) in zip(self.axes, dims, strict=True)
+        )
+
+    @property
     def m(self) -> Side:
-        return self._side(0)
+        return self.mn[0]
 
     @property
     def n(self) -> Side:
-        return self._side(1)
-
-    @property
-    def mn(self) -> tuple[Side, Side]:
-        """The ``(m, n)`` output sides — the per-axis geometry the factorizer tiles through."""
-        return (self.m, self.n)
-
-    def _side(self, i: int) -> Side:
-        t, ax = self.tile, self.axes[i]
-        tile, units, reg = (t.tile_m, t.units_m, t.reg_m) if i == 0 else (t.tile_n, t.units_n, t.reg_n)
-        return Side(axis=ax, tile=tile, units=units, reg=reg, block=ax.name + "_b", unit=ax.name + "_u")
+        return self.mn[1]
 
     @property
     def block_threads(self) -> int | None:

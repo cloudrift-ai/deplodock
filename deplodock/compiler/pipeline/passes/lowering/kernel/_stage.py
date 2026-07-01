@@ -25,6 +25,7 @@ Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips it
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -82,21 +83,12 @@ def _cp_async_width(slab_cols: int, elem_bytes: int) -> int:
 
 
 def cp_async_fill(
-    *,
-    slab: str,
-    slab_rows: int,
-    slab_cols: int,
-    src: str,
-    gmem_index,
-    cta: CtaTile,
-    elem_bytes: int,
-    name: str,
-    row_offset: Expr | None = None,
+    *, slab: str, shape: tuple[int, int], src: str, gmem_index, cta: CtaTile, elem_bytes: int, name: str, row_offset: Expr | None = None
 ) -> list[Stmt]:
-    """Cooperatively ``cp.async``-copy a ``slab_rows × slab_cols`` row-major smem
+    """Cooperatively ``cp.async``-copy a ``rows × cols`` (= ``shape``) row-major smem
     ``slab`` from gmem ``src``. ``gmem_index(row_expr, col_expr)`` returns the gmem
     index tuple for slab cell ``(row, col)``. The CTA's ``n_threads`` lanes stripe
-    ``slab_rows·slab_cols / V``-element chunks (``V`` = :func:`_cp_async_width`); each
+    ``rows·cols / V``-element chunks (``V`` = :func:`_cp_async_width`); each
     lane runs ``for e = tid; e < n_chunks; e += n_threads``. Emits the fill loop only
     — the caller appends one ``CpAsyncCommit`` + ``CpAsyncWait`` + ``Sync`` after the
     A and B fills together. The loop bound (not a predicate) masks the tail, so every
@@ -104,7 +96,8 @@ def cp_async_fill(
 
     ``row_offset`` (the gmem→smem ring): when staging through a depth>1 slab, it picks
     the ring SLOT — the write row becomes ``row_offset + row`` (each slot is a contiguous
-    ``slab_rows``-row block), so the fill targets one slot while the drain reads another."""
+    ``rows``-row block), so the fill targets one slot while the drain reads another."""
+    slab_rows, slab_cols = shape
     v = _cp_async_width(slab_cols, elem_bytes)
     n_chunks = (slab_rows * slab_cols) // v
     fe = Axis(name=f"_f{name}", extent=n_chunks)
@@ -251,11 +244,9 @@ class CpAsyncTransport:
     def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:
         out: list[Stmt] = []
         for op in self.operands:
-            rows, cols = op.shape
             out += cp_async_fill(
                 slab=op.slab,
-                slab_rows=rows,
-                slab_cols=cols,
+                shape=op.shape,
                 src=op.buf,
                 gmem_index=op.index(k0),
                 cta=self.cta,
@@ -291,7 +282,7 @@ class TmaTransport:
 
     @property
     def _total_bytes(self) -> int:
-        return sum(rows * cols for rows, cols in (op.shape for op in self.operands)) * self.elem_bytes
+        return sum(math.prod(op.shape) for op in self.operands) * self.elem_bytes
 
     def slab_decls(self, ring: int) -> list[Stmt]:
         # TMA destination smem must be 128 B-aligned; one mbarrier per ring slot.
