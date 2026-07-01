@@ -189,3 +189,28 @@ def test_splitk_reduction_over_contraction_is_no_double_reduce() -> None:
     inner_loops = [s for s in lo[0].body if isinstance(s, Loop)]
     assert len(inner_loops) == 1 and inner_loops[0].axis.name == "k"  # distinct from ksplit — no double-reduce
     assert isinstance(inner_loops[0].body[-1], Accum) and inner_loops[0].body[-1].name == "acc"
+
+
+# --- flash: a reduce partial composing a nested PV Contraction (tensor-core-flash seam) --------- #
+
+
+def test_reduce_partial_flattens_a_nested_pv_contraction() -> None:
+    """Flash composes TWO contractions — QK on ``source`` and PV **inside the partial**. The QK loop
+    splices ahead of the partial and the nested PV ``Contraction`` (a ``Stmt``) flattens to its own
+    loop in place — one recursion rule, so the scalar tier expands ``for kv:[QK loop; P; PV loop;
+    fold]``. This is the structural seam warp-flash rides."""
+    qk = _contraction()  # Σ_k A·B -> acc (the score S)
+    pv = replace(_contraction(), axes=(Axis("m", 128), Axis("d", 64)), k_axis=Axis("j", 32), acc="oblk")
+    prob = Assign(name="p", op="exp", args=("acc",))  # softmax weight between the two contractions
+    fold = Accum(name="O_i", value="oblk", op="add")
+    red = Reduction(carrier=fold.as_carrier(), axis=Axis("kv", 128), partial=Body((prob, pv, fold)), role=AxisRole.TWISTED, source=qk)
+
+    (kv_loop,) = lower(red)
+    assert kv_loop.axis.name == "kv" and kv_loop.role is AxisRole.TWISTED
+    body = list(kv_loop.body)
+    assert not any(isinstance(s, Contraction) for s in body), "the nested PV contraction must be flattened, not left raw"
+    (qk_loop,) = [s for s in body if isinstance(s, Loop) and s.axis.name == "k"]
+    (pv_loop,) = [s for s in body if isinstance(s, Loop) and s.axis.name == "j"]
+    # QK (source) first, then the pre-PV probability, then the flattened PV loop, then the carrier fold.
+    assert body.index(qk_loop) < body.index(prob) < body.index(pv_loop) < body.index(fold)
+    assert pv_loop.role is AxisRole.CONTRACTION and isinstance(pv_loop.body[-1], Accum) and pv_loop.body[-1].name == "oblk"

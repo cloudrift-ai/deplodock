@@ -66,6 +66,20 @@ def _overhangs(axis: Axis, tile: int) -> bool:
     return not (axis.extent.is_static and axis.extent.as_static() % tile == 0)
 
 
+def _flatten_nodes(body: Body) -> tuple[Stmt, ...]:
+    """Flatten any nested :class:`Contraction` that sits as a stmt in ``body`` to its own lowered
+    loop nest (``Contraction`` is a ``Stmt``, so it can ride inside a reduce ``partial`` — the flash
+    PV ``Σ_j P·V``); plain stmts pass through. One recursion rule for a reduce whose per-step partial
+    composes a contraction, mirroring the ``Reduction.source`` splice."""
+    out: list[Stmt] = []
+    for s in body:
+        if isinstance(s, Contraction):
+            out.extend(s.lower())
+        else:
+            out.append(s)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Reduction:
     """A scheduled ``PLANAR`` / ``TWISTED`` reduce — the typed successor of the bare annotated reduce
@@ -117,11 +131,16 @@ class Reduction:
     @property
     def loop(self) -> Loop:
         """The synthesized annotated reduce ``Loop`` — reconstructed from the params. With no
-        :attr:`source` it is byte-identical to the loop :meth:`from_loop` captured; a ``source``
-        (the ``Reduction ⊃ Contraction`` composition) splices the source's lowered loop nest ahead
-        of the ``partial`` inside the loop body (so flash's kv loop holds the nested ``Σ Q·K``
-        contraction loop, exactly the loop-in-body form the scalar tier expands)."""
-        body = self.partial if self.source is None else Body((*self.source.lower(), *self.partial))
+        :attr:`source` and a plain ``partial`` it is byte-identical to the loop :meth:`from_loop`
+        captured; a ``source`` (the ``Reduction ⊃ Contraction`` composition) splices the source's
+        lowered loop nest ahead of the ``partial`` inside the loop body (so flash's kv loop holds the
+        nested ``Σ Q·K`` contraction loop, exactly the loop-in-body form the scalar tier expands). A
+        **nested structural node inside the ``partial``** — the flash PV ``Contraction`` (``Σ_j P·V``)
+        that folds the block into the carrier — is flattened to its own loop nest in place, the same
+        recursion the ``source`` splice does: one structural rule for a reduce whose per-step partial
+        composes a contraction."""
+        prefix = self.source.lower() if self.source is not None else ()
+        body = Body((*prefix, *_flatten_nodes(self.partial)))
         return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier)
 
     @property
