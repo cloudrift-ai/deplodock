@@ -18,8 +18,8 @@ FROM vllm/vllm-openai:${VLLM_VERSION}
 # The cupy wheel must match the image's CUDA major (vllm-openai:v0.22.1
 # ships CUDA 13.0 + nvcc; transformers 5.10.2 satisfies the compile pin).
 ARG CUPY_PACKAGE=cupy-cuda13x
-COPY dist/emmy-*.whl /tmp/wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/wheels/emmy-*.whl \
+COPY dist/emmy_llm-*.whl /tmp/wheels/
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/emmy_llm-*.whl \
     && pip install --no-cache-dir "${CUPY_PACKAGE}" catboost pyyaml httpx "huggingface_hub[hf_transfer]" safetensors \
     && rm -rf /tmp/wheels
 
