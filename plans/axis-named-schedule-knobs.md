@@ -41,6 +41,10 @@ The structural-node vocabulary exists and recognize builds it; the **scheduling/
 - ✅ **Migration step 3** — `Kernel` / `TileSchedule` collapsed (seam #2). `TileOp` holds the structural
   root `op` directly + thin flat schedule fields (`place` / `workers` / residual `reduce`/`tier`/`stage`/
   `bind`); `kernel_for` gone. All readers repointed (`ops.reduce_plan(tile)`, `tile.place.grid`, etc.).
+- ✅ **Migration step 4** — axis-named schedule keys. `resolve_axis` / `family_value` / `family_of` /
+  `axis_of` in `knob.py`; `_schedule` stamps `TILE@<k_axis>` / `STAGE@<k_axis>`; the featurizer reads via
+  `family_value` (bare ↔ `@<axis>` byte-identical on one node); display collapses back to bare. `REDUCE`
+  stays bare for step 6.
 
 ## Structural nodes + field homes (the dissolution, seams resolved)
 
@@ -357,14 +361,16 @@ and the knob schema:
    `tile_op.workers`/`tile_op.stage`. Emitted kernels byte-identical (full suite green). Fully dissolving
    the residual fields onto nodes (so only `place`/`workers` survive) is completed with the flash work in
    step 8.
-4. **The resolver + addressing shim, behavior-preserving.** Land `resolve_axis(family, key, eligible_axes)`
-   (bare → unique eligible axis; ambiguous → loud error; zero → drop) and route env pins / `--ab` /
-   `DEPLODOCK_KNOBS` / the featurizer's bare-read through it. One schedule node per kernel (pre-flash) ⇒
-   bare and `@<axis>` resolve identically. Byte-identical featurizer output; **every existing bare pin
-   keeps resolving** (`op_cache_key` shifts per seam #3).
-5. **Per-node featurizer loop.** Convert the singleton `knobs.get("TILE"/"REDUCE"/"STAGE")` reads into the
-   group-by-axis loop; per-node `S_*` stamping. Still one node per kernel, so **pool == today** — parity
-   bar is byte-identical features.
+4. ✅ **The resolver + addressing shim** — landed. `resolve_axis(family, key, eligible)` (bare → unique
+   eligible axis; ambiguous → loud error naming candidates; zero → drop) + `family_of` / `axis_of` /
+   `family_value` in `knob.py`. `_schedule` stamps `TILE@<k_axis>` / `STAGE@<k_axis>`; the featurizer /
+   `tile_signature` read via `family_value` (bare and `@<axis>` featurize / golden-match identically);
+   `tuning_knob_items` collapses `TILE@d`→`TILE` for a single eligible axis. Byte-identical feature vector
+   on one-node kernels; every existing bare pin keeps resolving; `op_cache_key` re-keys (per seam #3).
+   `REDUCE` stays bare (deferred to step 6). `_FAMILY_ORDER` gains `TILE@` / `STAGE@`.
+5. **Per-node featurizer loop.** The `TILE`/`STAGE` singleton reads are now `family_value` (byte-identical
+   pool for one node — done alongside step 4). Remaining: the group-by-axis loop for a true multi-node
+   pool, and per-node `S_*` stamping (addressed). Still one node per kernel, so **pool == today**.
 6. **Reconcile `REDUCE@`.** Unify the native moveset `REDUCE@<axis>` with the schedule reduce partition
    (the sharp edge above). Parity over a split-K matmul fixture.
 7. **Fork `Level`s per node + emit structural leaves.** Restructure `build_fork_tree`'s levels to

@@ -18,7 +18,7 @@ instance — no ``register(...)`` wrapper, no manual bookkeeping.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -95,7 +95,7 @@ def mma_atom(knobs: dict) -> str | None:
     ``atom`` names it. A scalar ``TILE`` (``n../f..`` or empty) names no atom → ``None``."""
     from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
-    spec = knobs.get("TILE")
+    spec = family_value(knobs, "TILE")
     if not is_warp_codec(spec):
         return None
     try:
@@ -325,6 +325,68 @@ WSPEC = Knob(
 )
 
 
+# --- Axis-named schedule keys ----------------------------------------------
+#
+# A per-node schedule codec is keyed ``FAMILY@<axis>`` — ``TILE@<k_axis>`` / ``STAGE@<axis>`` — so a
+# multi-node kernel (flash) can address each schedule-bearing node by the reduce/contraction axis it
+# schedules. The **bare** form (``TILE`` with no suffix) stays first-class: it resolves to the unique
+# eligible axis for that family, so the common single-node kernel — and every existing pin / recipe /
+# golden — keeps working unchanged (the suffix disambiguates only a kernel with two eligible nodes).
+# ``TILE`` / ``STAGE`` gain the suffix (they collide with no native ``@``-family); ``REDUCE`` stays bare
+# until the native-moveset ``REDUCE@<axis>`` reconciliation (a separate step). Readers use
+# :func:`family_value` so a bare and a suffixed key featurize / match identically.
+
+# The per-node schedule codec families that carry an ``@<axis>`` element (``WSPEC`` / ``PLACE`` are
+# root-global, always bare).
+_AXIS_FAMILIES = ("TILE", "REDUCE", "STAGE")
+
+
+def family_of(key: str) -> str:
+    """The knob family — the part before an ``@<axis>`` suffix (``TILE@d`` → ``TILE``); the whole key
+    when unsuffixed."""
+    return key.split("@", 1)[0]
+
+
+def axis_of(key: str) -> str | None:
+    """The ``@<axis>`` element of a knob key (``TILE@d`` → ``d``), or ``None`` when bare."""
+    return key.split("@", 1)[1] if "@" in key else None
+
+
+def family_value(knobs: dict, family: str):
+    """The value of a per-node schedule codec ``family`` in ``knobs``, keyed bare (``TILE``) or
+    axis-suffixed (``TILE@<axis>``). ``None`` when absent. A single-node kernel has exactly one match;
+    a multi-node kernel (flash) has one key per node — this returns the first (a pooled read; a
+    per-node featurizer reads each node's slice via a group-by-axis loop)."""
+    v = knobs.get(family)
+    if v is not None:
+        return v
+    prefix = family + "@"
+    for k, val in knobs.items():
+        if k.startswith(prefix):
+            return val
+    return None
+
+
+def resolve_axis(family: str, key: str, eligible: Sequence[str]) -> str | None:
+    """Canonicalize a schedule-knob ``key`` (bare ``TILE`` or suffixed ``TILE@d``) to its
+    ``FAMILY@<axis>`` form given the kernel's ``eligible`` axes for that ``family``:
+
+    - already suffixed (``TILE@d``) → returned unchanged (idempotent).
+    - bare, exactly one eligible axis → ``TILE@<that axis>`` (the suffix is sugar).
+    - bare, no eligible axis → ``None`` (the family doesn't apply — drop / OFF).
+    - bare, ≥2 eligible axes → ``ValueError`` naming the candidates (a hand-written pin must
+      disambiguate, e.g. ``TILE@d`` vs ``TILE@sk``); enumeration never emits a bare key here, so the
+      ambiguous case only arises from a pin."""
+    if "@" in key:
+        return key
+    if not eligible:
+        return None
+    if len(eligible) == 1:
+        return f"{family}@{eligible[0]}"
+    cands = " or ".join(f"{family}@{a}" for a in eligible)
+    raise ValueError(f"{family} is ambiguous: use {cands}")
+
+
 # --- Registry --------------------------------------------------------------
 
 _REGISTRY: dict[str, Knob] | None = None
@@ -476,9 +538,14 @@ apply_knobs_env()
 # unified-codec exact-name knobs (the output-fragment ``TILE``, the ``REDUCE`` partition, the
 # ``STAGE`` pipeline) follow, unknown knobs last (alpha). Shared by the ``run --bench`` kernel
 # table and the ``deplodock eval`` tables so columns read stably.
-_FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@")
+_FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@", "TILE@", "STAGE@")
 KNOB_ORDER = ("TILE", "REDUCE", "STAGE", "WSPEC")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
+
+# Schedule codec families whose ``@<axis>`` display collapses back to bare when the kernel has a
+# single eligible axis (so one-node tables read as ``TILE=…`` / ``STAGE=…``, exactly as before the
+# axis-naming). ``REDUCE`` is excluded — its ``@`` keys are the native moveset's, not collapsible.
+_COLLAPSE_FAMILIES = ("TILE", "STAGE")
 
 
 def knob_sort_key(name: str) -> tuple[int, str]:
@@ -512,7 +579,15 @@ def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
     build aligned columns. ``STRUCT_PREFIX`` / ``CTX_PREFIX`` features and marker
     booleans are dropped; the rest is sorted by :func:`knob_sort_key`. The unified
     ``TILE`` output-fragment knob is one column for both the scalar and warp tiers
-    (the value self-describes), so there are no tier-foreign OFF knobs to hide."""
+    (the value self-describes), so there are no tier-foreign OFF knobs to hide.
+
+    A per-node schedule codec keyed ``@<axis>`` (``TILE@d`` / ``STAGE@d``) **collapses back to bare**
+    (``TILE`` / ``STAGE``) when the kernel has a single eligible axis for that family (one such key),
+    so a one-node table reads exactly as it did before axis-naming; a multi-node kernel (flash) keeps
+    the ``@<axis>`` suffix to disambiguate."""
+    from collections import Counter  # noqa: PLC0415
+
+    fam_counts = Counter(family_of(k) for k in knobs if "@" in k and family_of(k) in _COLLAPSE_FAMILIES)
     rendered: list[tuple[str, str]] = []
     for k, v in knobs.items():
         if k.startswith(STRUCT_PREFIX) or k.startswith(CTX_PREFIX):
@@ -522,7 +597,9 @@ def tuning_knob_items(knobs: dict) -> list[tuple[str, str]]:
             continue
         if knob is None and isinstance(v, bool):
             continue
-        rendered.append((k, str(v)))
+        fam = family_of(k)
+        disp = fam if ("@" in k and fam in _COLLAPSE_FAMILIES and fam_counts[fam] == 1) else k
+        rendered.append((disp, str(v)))
     return sorted(rendered, key=lambda kv: knob_sort_key(kv[0]))
 
 
@@ -561,7 +638,7 @@ def _stage_features(knobs: dict) -> dict[str, float]:
     smem copy from cp.async from TMA. Read schema-agnostically off the raw codec, exactly as
     ``_reduce_decomp`` reads ``REDUCE`` — so a ``d2/cp`` stage featurizes identically on a
     scalar (``TILE``) and a warp (``WARP``) contraction (the cross-kind feature transfer)."""
-    spec = knobs.get("STAGE")
+    spec = family_value(knobs, "STAGE")
     if not spec:
         return {}
     from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
@@ -624,7 +701,7 @@ def knob_features(knobs: dict) -> dict[str, float]:
     # priors rank on. A scalar ``TILE`` names no atom → only the ``MMA_tier=0`` default below.
     from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
-    tile_spec = knobs.get("TILE")
+    tile_spec = family_value(knobs, "TILE")
     if is_warp_codec(tile_spec):
         try:
             feats.update(_atom_features(TilePlan.parse(tile_spec).atom))
@@ -656,7 +733,7 @@ def _free_slots(knobs: dict) -> tuple[int, int, int, int] | None:
     (per-cell ``TILE``)."""
     from deplodock.compiler.ir.tile.schedule import TilePlan  # noqa: PLC0415
 
-    spec = knobs.get("TILE")
+    spec = family_value(knobs, "TILE")
     try:
         tile = TilePlan.parse(spec)  # one parse for both fragments — the atom discriminates
     except ValueError:
@@ -692,7 +769,7 @@ def _reduce_decomp(knobs: dict) -> _Decomp:
     learned prior is refit on the ``REDUCE`` schema."""
     from deplodock.compiler.ir.tile.schedule import ReducePlan  # noqa: PLC0415
 
-    plan = ReducePlan.parse(knobs.get("REDUCE"))
+    plan = ReducePlan.parse(family_value(knobs, "REDUCE"))
     return _Decomp(fold=plan.reg, cta=plan.cta, coop=plan.coop)
 
 
@@ -713,7 +790,7 @@ def tile_signature(knobs: dict) -> tuple:
 def _stage_sig(knobs: dict) -> tuple | None:
     """The structural staging identity ``(depth, transport, ring)`` for ``tile_signature``, or
     ``None`` when ``STAGE`` is absent / empty (the gmem-direct baseline)."""
-    spec = knobs.get("STAGE")
+    spec = family_value(knobs, "STAGE")
     if not spec:
         return None
     from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
@@ -895,7 +972,7 @@ def _warp_tile_features(knobs: dict) -> dict[str, float]:
     doesn't parse (so a malformed row degrades gracefully)."""
     from deplodock.compiler.ir.tile.schedule import TilePlan, is_warp_codec  # noqa: PLC0415
 
-    spec = knobs.get("TILE")
+    spec = family_value(knobs, "TILE")
     if not is_warp_codec(spec):
         return {}
     try:

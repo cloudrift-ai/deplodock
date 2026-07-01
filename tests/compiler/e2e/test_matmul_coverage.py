@@ -31,7 +31,7 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import mma_atom
+from deplodock.compiler.pipeline.knob import family_value, mma_atom
 
 from ..conftest import dyn_M, requires_cuda, requires_sm90
 
@@ -270,7 +270,8 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert tile_op.knobs.get("STAGE") == "d1/sync", tile_op.knobs.get("STAGE")
+    # ``STAGE`` is keyed ``@<k_axis>`` (axis-named schedule knob); ``family_value`` reads it.
+    assert family_value(tile_op.knobs, "STAGE") == "d1/sync", tile_op.knobs
     stage = tile_op.stage
     assert stage is not None and stage.transport == "sync" and stage.depth == 1, stage
 

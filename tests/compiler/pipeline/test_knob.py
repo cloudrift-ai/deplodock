@@ -10,10 +10,16 @@ from deplodock.compiler.pipeline.knob import (
     KnobType,
     apply_knobs_env,
     apply_off_defaults,
+    axis_of,
+    family_of,
+    family_value,
     format_tuning_knobs,
     is_warp,
     knob_features,
     mma_atom,
+    resolve_axis,
+    tile_signature,
+    tuning_knob_items,
 )
 
 
@@ -438,3 +444,47 @@ def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("DEPLODOCK_KNOBS", "BK=8")
     applied = apply_knobs_env()
     assert applied == {"DEPLODOCK_BK": "8"}
+
+
+# --- Axis-named schedule keys -------------------------------------------------
+
+
+def test_family_and_axis_of():
+    assert family_of("TILE@d") == "TILE" and axis_of("TILE@d") == "d"
+    assert family_of("TILE") == "TILE" and axis_of("TILE") is None
+    # A native ``MOVE@element`` splits on the first ``@`` (the ``.cta`` rides the element).
+    assert family_of("REDUCE@k.cta") == "REDUCE" and axis_of("REDUCE@k.cta") == "k.cta"
+
+
+def test_resolve_axis_bare_suffixed_and_ambiguous():
+    assert resolve_axis("TILE", "TILE", ["d"]) == "TILE@d"  # bare → the unique eligible axis
+    assert resolve_axis("TILE", "TILE@d", ["d"]) == "TILE@d"  # already suffixed: idempotent
+    assert resolve_axis("TILE", "TILE", []) is None  # no eligible axis → drop
+    with pytest.raises(ValueError, match=r"TILE is ambiguous: use TILE@d or TILE@sk"):
+        resolve_axis("TILE", "TILE", ["d", "sk"])  # a bare pin on a flash kernel is ambiguous
+
+
+def test_family_value_reads_bare_or_suffixed():
+    assert family_value({"TILE@d": "x"}, "TILE") == "x"
+    assert family_value({"TILE": "x"}, "TILE") == "x"
+    assert family_value({"REDUCE": "b8"}, "TILE") is None
+
+
+def test_bare_and_axis_named_featurize_identically():
+    """A single-node kernel's bare ``TILE`` / ``STAGE`` and their ``@<axis>`` forms parse, featurize,
+    and match identically — the migration is invisible on one-node kernels (the parity bar)."""
+    bare = {"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "STAGE": "d2/cp", "S_ext_free_prod": 4096.0}
+    axed = {"TILE@d": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "STAGE@d": "d2/cp", "S_ext_free_prod": 4096.0}
+    assert knob_features(bare) == knob_features(axed)
+    assert tile_signature(bare) == tile_signature(axed)
+    assert is_warp(bare) == is_warp(axed) is True
+    assert mma_atom(bare) == mma_atom(axed) == "mma_m16n8k16_f16"
+
+
+def test_display_collapses_single_axis_but_keeps_multi():
+    """One eligible axis → ``TILE@d`` displays as bare ``TILE`` (one-node tables read as before); two
+    (flash) keep the suffix to disambiguate. ``WSPEC`` / native ``REDUCE@`` are never collapsed."""
+    one = dict(tuning_knob_items({"TILE@d": "n4/f2", "STAGE@d": "d2/cp"}))
+    assert set(one) == {"TILE", "STAGE"}
+    flash = dict(tuning_knob_items({"TILE@d": "n4/f2", "TILE@sk": "n2/f4"}))
+    assert set(flash) == {"TILE@d", "TILE@sk"}

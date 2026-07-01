@@ -50,6 +50,13 @@ from deplodock.compiler.pipeline.pipeline import LoweringError
 # resolved into the schedule slices. The decision hierarchy for each is the env pin (via
 # ``Knob.narrow``) > the search/prior fork > the conservative default below.
 
+
+def _at(knob, axis_name: str) -> str:
+    """The axis-named knob key ``FAMILY@<axis>`` (e.g. ``TILE@d``) — the per-node schedule codec keyed
+    by the reduce/contraction axis it schedules, so a multi-node kernel addresses each node."""
+    return f"{knob.name}@{axis_name}"
+
+
 # Conservative cooperative-reduce selection constants (the default when REDUCE is unpinned).
 _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this wide
 _SERIAL_TARGET = 8  # aim for ~this many serial steps per cooperating thread
@@ -279,9 +286,12 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
     # splits the warps into roles over this fixed pipeline (gated on the ``stage``).
     workers, wspec_spec = _wspec_workers(stage)
-    stamped = {**knobs, TILE.name: spec}
+    # The per-node schedule codecs key ``@<k_axis>`` (the contraction axis this node schedules), so a
+    # multi-node kernel can address each node; ``WSPEC`` stays root-global (bare).
+    kaxis = op.k_axis.name
+    stamped = {**knobs, _at(TILE, kaxis): spec}
     if stage_spec:
-        stamped[STAGE.name] = stage_spec
+        stamped[_at(STAGE, kaxis)] = stage_spec
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
     return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, bind=bind, knobs=stamped)
@@ -317,11 +327,14 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
             bind = None
         if bind is not None:
             op = _contraction_node(tile.op, place, plan, bind)
-    stamped = {**knobs, TILE.name: spec}
+    # ``TILE`` / ``STAGE`` key ``@<k_axis>``; the split-K ``REDUCE`` stays bare (the native-moveset
+    # ``REDUCE@<axis>`` reconciliation is a later step).
+    kaxis = reduce_loop(tile.op).axis.name
+    stamped = {**knobs, _at(TILE, kaxis): spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec
     if stage_spec:
-        stamped[STAGE.name] = stage_spec
+        stamped[_at(STAGE, kaxis)] = stage_spec
     return TileOp(op=op, name=name, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage, knobs=stamped)
 
 
