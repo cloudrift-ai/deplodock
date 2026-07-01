@@ -99,9 +99,12 @@ the in-progress rebuild breaks it, and it flips back to a hard requirement when 
   (lift / projection, optional `source`), `Reduction` (a `PLANAR` / `TWISTED` reduce splitting its `Carrier` algebra
   from its `axis` + `partial`, the fold `Loop` synthesized on demand), and `Contraction` (a matmul before atom
   factorization), all in `ir/tile/ir.py` alongside `ir/stmt/algebra` (where the live `Carrier` / `State` / `Twist`
-  algebra lives — those are carrier components, not node kinds). The algebra is read **structurally** off the annotated
-  reduce loop / node, never a stored kind tag; `ops.lower` flattens any tree back to the loop nest. Flash is
-  `Map(source=Reduction(TWISTED, source=Contraction(QK)))`.
+  algebra lives — those are carrier components, not node kinds). A `Contraction`'s A operand is `a_operand: Load | Body`
+  — a gmem load **or** a computed register-resident body (flash PV's `P = exp(S − M)`). The algebra is read
+  **structurally** off the annotated reduce loop / node, never a stored kind tag; `ops.lower` flattens any tree back to
+  the loop nest. Flash is the **two-`Contraction` tree** `Map(source=Reduction(TWISTED, source=Contraction(Q@K),
+  partial=[softmax, Contraction(P@V), O-fold]))` — both Q@K and P@V factorize through the one `_factor` path (block=1
+  scalar today; block>1 + mma is step 3).
 - **One `factorize` emitter (factorize-consolidation Part I)** — `010_materialize` is a thin wrapper;
   `_factor.factorize` is the single node-kind dispatcher (scalar / pointwise + coop-ILP reduce + tiled contraction). The
   old three-tier `010_materialize` (`_reduce` + inline scalar fallback) is gone. `reduce_codegen` (operand fragments +
