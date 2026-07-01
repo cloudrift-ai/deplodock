@@ -86,14 +86,12 @@ XFAIL: dict[str, str] = {
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_still_raises_when_no_in_budget_option": _R,
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_raise_on_unlowered_fires_for_stuck_tileop": _R,
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_run_leaves_no_state_on_pipeline": _R,
-    "tests/compiler/backend/test_emit.py::test_softmax_emits_multiple_k_loops": _R,
     # test_compile_dynamic_emits_runtime_arg / test_run_code_dynamic_seq_len recovered with the
     # dynamic-grid tier (a symbolic free axis lowers to a symbolic launch + runtime ``int`` arg).
+    # test_run_ir_{tile,kernel}_stage / _bench / _seed_reproducible recovered once the tile-IR +
+    # kernel-IR JSON round-trip returned (TileOp / KernelOp reconstruct via graph.py's repr-eval).
+    # The FK half2-window codegen (packed __half2 accumulate) is not yet rebuilt at the scalar tier:
     "tests/compiler/cli/test_run.py::test_compile_fp16_matmul_window_emits_half2": _R,
-    "tests/compiler/cli/test_run.py::test_run_ir_bench": _R,
-    "tests/compiler/cli/test_run.py::test_run_ir_kernel_stage": _R,
-    "tests/compiler/cli/test_run.py::test_run_ir_seed_reproducible": _R,
-    "tests/compiler/cli/test_run.py::test_run_ir_tile_stage": _R,
     "tests/compiler/pipeline/search/test_diagnostics.py::test_golden_prior_eval_joins_fp16_goldens": _R,
     "tests/compiler/pipeline/search/test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": _R,
     "tests/compiler/pipeline/search/test_structural_push.py::test_split_demoted_fork_pushes_structural": _R,

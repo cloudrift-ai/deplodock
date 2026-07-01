@@ -132,8 +132,9 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     from deplodock.compiler.ir.kernel import ir as _kernel
     from deplodock.compiler.ir.loop import ir as _loop
     from deplodock.compiler.ir.tensor import ir as _tensor
+    from deplodock.compiler.ir.tile import ir as _tile
 
-    for module in (_base, _tensor, _frontend, _loop, _kernel, _cuda):
+    for module in (_base, _tensor, _frontend, _loop, _kernel, _cuda, _tile):
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls
@@ -198,10 +199,23 @@ def _deserialize_field(k, v):
     Stmt instances. Nested-op dicts (``{"__op__": ..., "fields": ...}``)
     are reconstructed via ``_lookup_op_class``. The eval scope mirrors
     the IR's ``__all__`` exports — same classes the Stmt reprs reference."""
+    import re as _re
+
     from deplodock.compiler.ir.elementwise import ElementwiseImpl
 
     if k == "op" and isinstance(v, str):
-        return ElementwiseImpl(v)
+        # A bare name (``"add"``) is an ``ElementwiseImpl``; a constructor repr
+        # (``"Map(...)"`` — the ``TileOp.op`` node tree) is eval'd back like a Stmt repr.
+        return _eval_stmt(v) if "(" in v else ElementwiseImpl(v)
+    # ``TileOp``'s schedule descriptors serialize as constructor-repr strings
+    # (``Placement(...)`` / ``TilePlan(...)`` / ``ReducePlan(...)`` / ``Stage(...)`` /
+    # ``WarpSpec(...)``); ``None`` fields round-trip as JSON null. Eval a string only when it
+    # opens with a constructor whose name is a known IR class — so a plain string field
+    # (a name / path / C source) that merely looks like ``Name(...)`` is never eval'd.
+    if isinstance(v, str):
+        _m = _re.match(r"([A-Z]\w*)\(", v)
+        if _m and _m.group(1) in _stmt_eval_scope():
+            return _eval_stmt(v)
     if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
         return tuple(_eval_stmt(e) for e in v)
     if k == "sources" and isinstance(v, list) and v and all(isinstance(e, str) and e.startswith("IndexSource(") for e in v):
@@ -315,6 +329,22 @@ def _stmt_eval_scope() -> dict:
         "dtype": _np.dtype,
         "__builtins__": {},
     }
+    # The tile-IR structural nodes (``Map`` / ``Reduction`` / ``Contraction``) and the
+    # schedule descriptors (``Placement`` / ``TilePlan`` / ``ReducePlan`` / ``Stage`` /
+    # ``WarpSpec`` + their component dataclasses / enums) round-trip through ``TileOp``'s
+    # repr-string fields (``op`` / ``place`` / ``reduce`` / ``tier`` / ``stage`` /
+    # ``workers``), so ``deplodock run --ir <tile.json>`` can eval them back. Auto-populate
+    # every public class from those two modules (``setdefault`` so the explicit stmt/expr
+    # entries above win on any name clash) — a new node/knob field needs no edit here.
+    import deplodock.compiler.ir.kernel.ir as _kernel_mod  # noqa: PLC0415
+    import deplodock.compiler.ir.schedule as _sched_mod  # noqa: PLC0415
+    import deplodock.compiler.ir.tile.ir as _tile_mod  # noqa: PLC0415
+
+    for _mod in (_sched_mod, _tile_mod, _kernel_mod):
+        for _nm in dir(_mod):
+            _obj = getattr(_mod, _nm)
+            if isinstance(_obj, type):
+                _STMT_EVAL_SCOPE.setdefault(_nm, _obj)
     return _STMT_EVAL_SCOPE
 
 
