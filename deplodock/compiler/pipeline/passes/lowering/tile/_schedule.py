@@ -144,28 +144,23 @@ def _reduce_specs(kernel, place) -> list[str]:
 def _with_reduce(op, plan: ReducePlan):
     """Stamp the chosen ``ReducePlan`` onto the op's :class:`Reduction` node (bare, or wrapped under a
     projecting :class:`Map`). The reduce partition lives **on the node**, not the ``TileSchedule`` —
-    read back via ``ops.reduce_plan``."""
+    read back via ``ops.reduce_plan``. ``_option`` only schedules a PLANAR / TWISTED reduce, whose op
+    recognition always emits as a bare ``Reduction`` or a projecting ``Map(source=Reduction)``."""
     if isinstance(op, Reduction):
         return replace(op, reduce=plan)
-    if isinstance(op, Map) and isinstance(op.source, Reduction):
-        return replace(op, source=replace(op.source, reduce=plan))
-    return op  # a reduce kernel's op is always a Reduction / Map(source=Reduction)
+    assert isinstance(op, Map) and isinstance(op.source, Reduction), f"reduce op must nodify to Reduction, got {type(op).__name__}"
+    return replace(op, source=replace(op.source, reduce=plan))
 
 
 def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
     """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec resolved into the
     :class:`Reduction` node's ``ReducePlan`` (the ephemeral knob → materialized plan stamped **on the
-    node**), with the spec stamped on ``knobs`` for the prior. A reduce whose op is still a legacy
-    ``Map`` (the loop in the body — flash, not yet a ``Reduction``) keeps the plan on the ``TileOp``'s
-    residual ``reduce`` field (``ops.reduce_plan`` falls back there). The spec is keyed ``REDUCE@<axis>``
+    node**), with the spec stamped on ``knobs`` for the prior. The spec is keyed ``REDUCE@<axis>``
     (the reduce axis this node partitions), so a multi-node kernel addresses each reduce."""
     plan = ReducePlan.parse(spec)
     op = _with_reduce(tile.op, plan)
-    # ``_with_reduce`` returns the op unchanged when there is no ``Reduction`` node to stamp (a legacy
-    # loop-in-body ``Map``); keep its plan on the root ``reduce`` field so ``reduce_plan`` still finds it.
-    residual = plan if op is tile.op else ReducePlan()
     raxis = reduce_loop(tile.op).axis.name
-    return TileOp(op=op, name=name, place=place, reduce=residual, knobs={**knobs, _at(REDUCE, raxis): spec})
+    return TileOp(op=op, name=name, place=place, knobs={**knobs, _at(REDUCE, raxis): spec})
 
 
 def _tile_specs(kernel) -> list[str]:
@@ -215,7 +210,7 @@ def _stage_spec(kernel) -> str:
     """The pinned ``STAGE`` codec for ``kernel`` — only a ``CONTRACTION`` contraction stages its
     operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
     returns the authoritative ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (gmem-direct,
-    ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a legacy operand
+    ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a bare operand
     binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
     (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
     codecs follow."""
@@ -365,7 +360,7 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     form of the ``TILE`` spec resolved into the warp-atom :class:`TilePlan`, plus an optional operand
     ``STAGE`` resolved into a :class:`Stage`. The tiled :class:`Contraction` leaf is built here (``op``),
     so materialize only ``factorize``\\ s. The packed ``TILE`` codec is the sole on-dict spelling — the
-    learned-prior featurizer parses it directly (no legacy ``WM``/``WN``/``MMA`` explosion)."""
+    learned-prior featurizer parses it directly (one codec, not a per-knob ``WM``/``WN``/``MMA`` explosion)."""
     wt = TilePlan.parse(spec)
     _check_warp_static_k(tile, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None

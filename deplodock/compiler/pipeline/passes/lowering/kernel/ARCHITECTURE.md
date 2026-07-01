@@ -68,14 +68,14 @@ parallel thread-tile are the *same* level, differing only in `lanes`; `block_thr
 carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The store-glue helpers `with_store` /
 `has_write`, shared by the constructor and the thread-binding tiers, live in `_store.py`.)
 
-## Operand staging — reserved
+## Operand staging — materialization dropped, codec stamps
 
 The warp tier's smem **operand-staging** pipeline (the `STAGE` codec's cp.async / TMA slab — formerly `_stage.py` +
-the warp factorizer's `_warp_staged_kloop` / `_warp_tma_staged_kloop`) was **dropped** so both contraction tiers load
-operands gmem-direct (both tiers are symmetric — neither carries a `stage`). The `STAGE` codec +
-`schedule.Stage` field still land (`020_schedule` stamps them — the knob/featurizer path is intact), but they are **not
-materialized**; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The
-mma-staging structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
+the warp factorizer's `_warp_staged_kloop` / `_warp_tma_staged_kloop`) has its **materialization dropped** so both
+contraction tiers load operands gmem-direct (both tiers are symmetric — neither carries a `stage`). The **`STAGE` codec
+stamps** (`020_schedule` stamps the codec + `schedule.Stage` field — the knob/featurizer path is intact), but nothing
+lowers them yet; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The mma-staging
+structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
 
 **Shared-row staging (`_factorize_reduce`) — distinct, still present.** The fused norm→linear prologue is a cooperative
 reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis

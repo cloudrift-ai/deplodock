@@ -31,9 +31,9 @@ the reduce axis ``coop`` ways across threads and ``reg`` ways across per-thread 
 REG-tree fold, the cross-thread combine (``_combine.emit_combine``), and the projection — carrier-
 generic (a contraction is the degenerate carrier of its additive fold).
 
-The smem operand-staging pipeline (cp.async / TMA) was dropped to keep the two contraction tiers
-symmetric (the ``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/schedule``). Leading ``_`` so
-the pass loader skips this module."""
+The smem operand-staging **materialization** is dropped; the ``STAGE`` codec stamps (the codec +
+``schedule.Stage`` still land — see ``ir/schedule`` — but nothing lowers them yet, keeping the two
+contraction tiers gmem-direct symmetric). Leading ``_`` so the pass loader skips this module."""
 
 from __future__ import annotations
 

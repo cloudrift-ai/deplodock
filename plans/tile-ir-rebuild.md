@@ -1,33 +1,77 @@
 # Tile IR rebuild
 
-Status: **the scalar + cooperative + cross-CTA-split tiers have landed, plus the scalar register-tile and the
-dynamic-grid tier.** `010_recognize` is the sole Loop-IR → Tile-IR boundary (it lifts every kernel to a `TileOp`
-carrying one op-tree node — `Map` / `Monoid` / `Semiring` — plus a typed schedule); `020_schedule` maps the free axes
-onto the grid and picks the reduce partition + the free-axis output tile; `030_split` consumes a cross-CTA `GRID` stage
-as a graph rewrite; `lowering/kernel` materializes. Every elementwise, reduction, online-softmax, RMSNorm, matmul,
-scalar-flash, and whole-transformer-block kernel is recovered, plus the **cooperative (BLOCK) reduce** tier (whole-CTA +
-strided rows), the **register-fold ILP (REG)** tier (independent per-thread accumulator chains), the **scalar
-register-tile (`TILE` codec)** tier (each thread owns a `reg_m·reg_n` block of output cells, operands reused across
-them, the small inner reduce unrolled), the **dynamic-grid** tier (a symbolic free / output axis → a symbolic launch
-grid sized from the runtime `Dim` arg; register-tiled symbolic axes mask their tail), and the **cross-CTA (GRID) split**
-tier (`030_split`: the `g<n>[a|k]` codec — `atomicAdd` one-kernel finalize OR a deferred `__partial`-workspace +
-sibling combine kernel; additive `sum` / split-K matmul AND the twisted flash `(m, l, O)` split-KV, carrier-generic via
-`as_state_merge`). All of these work over **static AND symbolic** axes, plus the **warp / tensor-core tier** — the
-`Semiring·Warp` gmem-direct `mma.sync` matmul (the `WARP` codec + the `_warp` materializer): canonical + transposed-B,
-f16/f32 out, fused projection / causal epilogues, static + dynamic-grid (pin-only). **Remaining: operand staging (smem +
-`ldmatrix`, cp.async / TMA), MMA split-K (the `Warp` contraction through `030_split`), symbolic-K masked tiles,
-warp-tier flash (the `Monoid·Warp` fragment), and warp specialization.** Branch `refactoring/tile-ir-rebuild`.
+Status: **the structural-node skeleton, the single-`factorize` emitter, and the mma tier have landed.** The tile IR is
+now a tree of **structural nodes** (`Map` / `Reduction` / `Contraction`, all in `ir/tile/ir.py`) carried on a `TileOp`
+with root-global schedule fields (`place` / `reduce` / `tier` / `stage` / `workers`) plus per-node schedule slices
+(`Contraction.tile`, `Reduction.reduce`). `010_recognize` is the sole Loop-IR → Tile-IR boundary; `020_schedule` maps
+the free axes onto the grid and stamps the partition / tile / (pin-only) warp fragment; `030_split` consumes a cross-CTA
+`GRID` stage as a graph rewrite; `lowering/kernel/010_materialize` calls **one** emitter, `_factor.factorize`, per
+kernel. Recovered: every elementwise / reduction / online-softmax / RMSNorm / scalar + register-tile + **mma** matmul /
+scalar-flash / whole-block kernel, the cooperative (BLOCK) + register-ILP (REG) reduce tiers, the dynamic-grid tier, the
+cross-CTA (GRID) split tier, and the gmem-direct `mma.sync` **warp / tensor-core matmul** (canonical + transposed-B,
+f16/f32 out, fused epilogues, static + dynamic-grid, pin-driven mma split-K via the structural `Reduction ⊃ Contraction`
+fork). All over **static AND symbolic** axes. **Phase 0 (purge the consolidation's residue) has landed** — the
+`Schedule` alias, the `_with_reduce` no-op, and the dead docstring framing are gone; the audit corrected one false
+premise (the `Map.out` / `reduce_loop` reads of the flat-contraction `Map` are load-bearing, not legacy — see Phase 0
+below). **Remaining, in restore order — each phase followed by a purge of the code it obsoletes: (1) finish mma
+(tensor-core flash + symbolic-K masked edges); (2) operand staging (smem + `ldmatrix`); (3) pipelining (cp.async ring /
+register double-buffer / TMA); (4) warp specialization (`WarpSpec`).** Branch `refactoring/tile-ir-rebuild`.
 
-This doc is now thin: the executed phases live in git history and the `ARCHITECTURE.md` files. What remains is the
-**recovery contract** (the governing invariant), the **xfail mechanism** (still driving the rebuild), a one-paragraph
-record of what landed, and — the substance — the **settled schedule design** that the warp-tier recovery builds on.
+## The mandate — purity, not accretion
+
+This rebuild is a demolition, not a migration. Its output is a codebase that reads as if the old tiers never existed —
+**not** one stratified with compatibility shims, "not-yet-migrated" fallbacks, and reserved-for-later fields.
+
+The rules are absolute:
+
+- **Zero back-compat aliases, zero re-exports "during the transition."** A renamed symbol is renamed at every call
+  site in the same change; the old name does not survive one commit past its last use.
+- **Zero legacy fallback branches.** Every `if it's the old form / else the new form` is a lie about the IR's
+  invariants. If recognition guarantees every reduce is a `Reduction` node, then a body-scan fallback that handles a
+  bare annotated `Loop` is dead code *asserting the opposite* — delete it and put an `assert isinstance(...)` in its
+  place. A fallback that "can't happen" either can't (delete it) or can (a recognizer bug the fallback is hiding — fix
+  the recognizer). Never both.
+- **Zero divergent codegen paths.** Everything flows through the one `factorize` emitter over `Reduction` /
+  `Contraction` / `Map` (see the invariant below). Two code paths that produce the same kind of kernel are one bug and
+  one dead path.
+- **The recovery contract is the license to delete without mercy.** `tests/compiler/e2e/` is black-box and pins
+  numerics + generated source. Anything a green e2e suite does not require is, by definition, dead — remove it and let
+  the suite catch you if you were wrong. No feature is kept "just in case."
+- **A phase is not done when the capability works. It is done when the code it replaced no longer exists and every doc
+  describes the world as it is.** The purge sub-step is not optional cleanup deferred to "later"; it ships in the same
+  phase, and the phase's PR is incomplete without it.
+
+Boldness here is not recklessness — it is *decisiveness backed by the contract*. Delete first; the e2e suite is the
+proof.
+
+## Governing invariant — one hierarchical emitter, no divergent codegen paths
+
+Everything lowers through the **same hierarchical structure of `Reduction` / `Contraction` / `Map`**. One entry point —
+`010_materialize.rewrite` calls `_factor.factorize(tile, root)` once per kernel — and one flattener, `ops.lower(op)`,
+which unfolds any node tree (including nesting: `Map(source=Reduction(source=Contraction))`) back to the same loop nest.
+`factorize` reads the node kind + role (`ops.axis_role`) + reduce plan (`ops.reduce_plan`) off `tile.op` and routes to a
+tier that differs **only in the schedule's partition/tiling**, never in the algebra:
+
+- a `Contraction` → `_factorize_contraction` (the four-level `atomize → register_tile → unit_tile → grid_tile`
+  pipeline; both atoms — tensor-core `AtomKind` and scalar `ScalarAtom` — share it, dispatching only at `reduce_codegen`
+  and the `store` sink);
+- a cooperative / ILP `PLANAR` / `TWISTED` reduce (or a non-output-tiled `CONTRACTION`) → `_factorize_reduce`
+  (carrier-generic: a contraction is the degenerate carrier of its additive fold);
+- anything else (pointwise `Map`, trivial-plan reduction) → the inline scalar tier (`lower(op)` + `with_store`).
+
+**The bar for every remaining phase: it lands as new data/config on a node** (a `TilePlan` atom, a `Stage`, a
+`WarpSpec`) **that the one emitter already structurally supports — not a bespoke path.** Tensor-core flash is the inner
+`Contraction` gaining an mma `TilePlan` + a flash `store` sink; operand staging is a `Stage` step spliced into
+`reduce_codegen` symmetrically for both atoms; warp specialization is a `WarpSpec` whose roles each bottom out in a
+`Map` / `Reduction` / `Contraction` sub-schedule. **If a phase needs its own emitter, the node model is wrong — fix
+the model, do not fork the codegen.**
 
 ## The recovery contract
 
-`tests/compiler/e2e/` is the **only** thing the rebuild must satisfy. Every file there is black-box: it builds a
-graph, runs it through `CudaBackend`, and compares the output to a numpy/torch reference (a handful also assert on
-generated CUDA source — part of the contract too). None assert on tile-IR Python objects, so they survive any internal
-redesign. The rebuild is "done" when the whole `e2e/` suite is green with an **empty** xfail registry.
+`tests/compiler/e2e/` is the **only** thing the rebuild must satisfy. Every file there is black-box: it builds a graph,
+runs it through `CudaBackend`, and compares the output to a numpy/torch reference (a handful also assert on generated
+CUDA source — part of the contract too). None assert on tile-IR Python objects, so they survive any internal redesign.
+The rebuild is "done" when the whole `e2e/` suite is green with an **empty** xfail registry.
 
 ## Integration-test xfail mechanism
 
@@ -38,377 +82,266 @@ A single registry drives expected failures during the rebuild — no scattered `
   `pytest_collection_modifyitems` hook in `tests/conftest.py` marks every collected item whose `nodeid` contains a
   registered substring with `xfail(strict=False)`.
 - **Recovery semantics:** `strict=False` means a test that starts passing reports as **XPASS**, not a failure — the
-  signal a capability came back. Delete its entry and it reverts to a required test. **An empty `XFAIL` means the
-  rebuild is fully recovered.** It shrinks as each warp-tier capability lands.
-- **A file whose module-level import of a tile symbol breaks** fails at collection (before any item exists to mark) —
-  guard the import (`try/except ModuleNotFoundError`) and register the nodeids, rather than letting a collection error
-  return.
+  signal a capability came back. Delete its entry the moment it XPASSes; a stale xfail entry is itself dead scaffolding.
+  **An empty `XFAIL` means the rebuild is fully recovered** — at which point the registry, the conftest hook, and the
+  guarded `try/except ModuleNotFoundError` tile imports are all torn out too (see the Phase 4 purge).
+- **A file whose module-level import of a tile symbol breaks** fails at collection — its import was guarded so it
+  still collects. `TILE_ENTANGLED_FILES` is empty now.
 
 **Deleting unit tests while rebuilding:** a tile-IR **unit** test (imports `deplodock.compiler.ir.tile` or
-`…passes.lowering.tile` and asserts on those objects — tile graphs, schedules, fragments, enumeration counts — instead
-of running a graph and checking output) → **delete it**, don't port it; the new internals get new unit tests. An
-**integration/accuracy** test (anything in `tests/compiler/e2e/`) → **never delete or weaken** it; xfail it if the
-in-progress rebuild breaks it, and it flips back to a hard requirement when the capability returns.
+`…passes.lowering.tile` and asserts on those objects) → **delete it**, don't port it; the new internals get new unit
+tests. An **integration/accuracy** test (anything in `tests/compiler/e2e/`) → **never delete or weaken** it; xfail it if
+the in-progress rebuild breaks it, and it flips back to a hard requirement when the capability returns.
 
-## What has landed (scalar + cooperative + register-tile + dynamic-grid)
+## What has landed
 
-Recorded compactly; details in git + `ARCHITECTURE.md`:
+- **The structural-node skeleton** — the `Monoid` / `Semiring` node wrappers were **retired**; the tile IR is now `Map`
+  (lift / projection, optional `source`), `Reduction` (a `PLANAR` / `TWISTED` reduce splitting its `Carrier` algebra
+  from its `axis` + `partial`, the fold `Loop` synthesized on demand), and `Contraction` (a matmul before atom
+  factorization), all in `ir/tile/ir.py` alongside `ir/stmt/algebra` (where the live `Carrier` / `State` / `Twist`
+  algebra lives — those are carrier components, not node kinds). The algebra is read **structurally** off the annotated
+  reduce loop / node, never a stored kind tag; `ops.lower` flattens any tree back to the loop nest. Flash is
+  `Map(source=Reduction(TWISTED, source=Contraction(QK)))`.
+- **One `factorize` emitter (factorize-consolidation Part I)** — `010_materialize` is a thin wrapper;
+  `_factor.factorize` is the single node-kind dispatcher (scalar / pointwise + coop-ILP reduce + tiled contraction). The
+  old three-tier `010_materialize` (`_reduce` + inline scalar fallback) is gone. `reduce_codegen` (operand fragments +
+  the K-loop, sink-agnostic) and the pluggable `store` sink are the shared seams; `emit_combine` /
+  `carrier.as_state_merge` fold any carrier (degenerate `id` or twisted `exp`) identically.
+- **The scalar + cooperative + register-tile + dynamic-grid tiers** — pointwise, per-cell reduce (plain + online
+  softmax via the twist), scalar matmul, scalar flash, the BLOCK coop + REG ILP reduce partitions (combine + REG-tree
+  fold derived from the plan), the scalar register-tile (`TILE` codec), and the symbolic launch grid. Static AND
+  symbolic.
+- **The cross-CTA (GRID) split tier** — `030_split`: `g<n>[a|k]` codec, `atomicAdd` one-kernel OR deferred
+  `__partial`-workspace + combine kernel; additive `sum` / split-K AND twisted flash split-KV, carrier-generic.
+- **The mma / tensor-core matmul tier** — the gmem-direct `mma.sync` `Contraction` (`_mma_state` / `_mma_reduce` /
+  `_mma_store`, the `WARP` codec): canonical + transposed-B, f16/f32 out, fused epilogues, static + dynamic-grid.
+  **mma split-K** via the structural fork (pin-driven; auto-fork enumeration is a Phase-1 follow-up).
 
-- **The skeleton and the scalar tiers** — pointwise (`Map`), the per-cell reduce (`Monoid`, plain reduce + online
-  softmax unified by the **twist**), scalar matmul (`Semiring`), and scalar flash (the nested `Monoid(Semiring)`), all
-  on one generic `Tile` thread-decode + `lower` path.
-- **The high-level op tree** (`ir/stmt/algebra.py` + `ir/tile/ops.py`) — the lift `Map`, the carrier `Monoid` + `Twist`,
-  the `Semiring` contraction. A carrier **dissolves** into its fold `Accum`s; seeding is one path (`op.identity` via
-  `Loop.render`), no explicit `Init`.
-- **The op tree as flowing IR** — `010_recognize` is the sole Loop-IR → Tile-IR boundary; free axes ride the schedule's
-  `Placement`, not the algebra node.
-- **The typed schedule + the cooperative (BLOCK) reduce** — `TileOp` carries a typed `Kernel` (op + `*Schedule`); the
-  reduce axis partitions across the BLOCK level (whole-CTA + strided-cooperative rows), the cross-thread combine is
-  **derived** from the level, static AND symbolic reduce axis. This established the schedule type system below.
-- **The REG (ILP) reduce level** — the `ReducePlan` `reg` width gives each thread `reg` independent register-accumulator
-  chains (breaking the serial fold's loop-carried dependency), folded by a register tree (`carrier.as_state_merge`,
-  carrier-generic) before the cross-thread combine. The materializer replicates the reduce body `reg`×, offset `r·coop`,
-  in one `StridedLoop` of step `coop·reg`; a symbolic / non-divisible tail is **clamp-to-identity** (in-bounds `% extent`
-  read + value masked to the fold identity). Composes with coop or stands alone (`coop = 1`). `reg = 1` default (ILP via
-  the `REDUCE` `r<n>` pin / prior fork, not the cold path).
-- **The scalar register-tile (`TILE` codec)** — the `Scalar`-fragment sibling of `REDUCE` (`TilePlan` on
-  `SemiringSchedule`, decided in `020_schedule`, materialized by `_reg_tile`). The codec `n<N>[xm<M>]` (parallel
-  thread-tile) `/ f<fn>[xf<fm>]` (register sub-tile) gives each thread a `reg_m·reg_n` block of output cells: the
-  reduce-loop body is replicated per cell, **operand loads deduped** (an `A[m,k]` load is shared across the `n` cells,
-  `B[k,n]` across the `m` cells — the arithmetic-intensity reuse), the small inner reduce `#pragma unroll`'d, the
-  parallel widths set `block_threads` (`par·reg == extent` ⇒ one CTA). A non-divisible / symbolic tiled axis masks its
-  tail (clamp-read `% extent` + a guarded store). The featurizer sources its `_free_slots` from the `TILE` codec.
-- **The dynamic-grid tier** — a symbolic FREE / output axis rides a symbolic launch grid: `Tile` sizes the guard +
-  decode from the runtime extents (`_gid < ∏extents`), `lowering/cuda` builds the `gridDim` as `ceil(∏extents /
-  blockDim)` with the symbolic `Dim` resolved at launch (`runtime_args`). Recovered dynamic elementwise / linear /
-  rmsnorm / sdpa and the dynamic Qwen layer + whole-model (+ capture-replay). Composes with the register-tile (a
-  symbolic register-tiled axis masks its tail).
+## The current architecture — where the schedule lives
 
-## The schedule design
+The combine (the ⊕ algebra + reduce/contract structure) lives in the op tree; the schedule lives on the `TileOp` and its
+nodes. **Root-global** `TileOp` fields: `place` (`Placement`), `reduce` (`ReducePlan` for a not-yet-nodified reduce),
+`tier` (`TilePlan` for a non-tiled contraction), `stage` (`Stage` — materialization currently dropped), `workers`
+(`WarpSpec` — not yet built). **Per-node** slices: `Contraction.tile` (a `TilePlan` carrying the leaf `atom` +
+unit/register widths + K-chunk), `Reduction.reduce` (the partition). There is no per-kind schedule *type*: the role is
+read structurally, the materializer reads the schedule straight off the node. `ops.reduce_plan` reads the partition off
+a `Reduction` node **or falls back to `TileOp.reduce`** for the not-yet-nodified coop/ILP-K contraction — a Phase-1
+purge target.
 
-The thesis: **the schedule is separate from the combine, and the schedule is defined by the *operation*, not by the
-execution unit.** The combine (the ⊕) lives in the op tree (`ir/stmt/algebra.py`); the schedule — which axes are
-parallel, how the reduce axis partitions, how a cell is realized — lives on a typed `*Schedule` paired with the op node
-in a `*Kernel`. The pairing makes a kind/schedule mismatch unrepresentable; the variant is keyed by `type(op)`, no
-`classify_algebra` tag.
+### The knob schema — shared orthogonal codes
 
-### The two axes: kind × fragment
+A schedule is **spelled** by orthogonal codes, one per tunable sub-component; a kernel's config is the union that
+applies. One vocabulary, learned-feature generalization across kinds (the featurizer reads one code kind-agnostically);
+**not** cross-kind measured-evidence sharing (`op_cache_key` silos `perf` rows by kind).
 
-A schedule varies along two orthogonal axes:
+| code | sub-component | where | grammar (coarse→fine) | status |
+|---|---|---|---|---|
+| `REDUCE` | `ReducePlan` (reduce-axis partition) | `Reduction`, non-tiled `Contraction` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
+| `TILE` | scalar output tile (`TilePlan` — par + reg) | `Contraction` (scalar atom) | `n<N>[xm<M>]` par · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** |
+| `WARP` | mma fragment (`TilePlan` w/ tensor-core atom) | `Contraction` (mma atom) | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (gmem-direct; pin-only) |
+| `STAGE` | `Stage` (operand pipeline) | `Reduction`, `Contraction` | `d<depth>` ring · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` · empty = gmem-direct | **materialization dropped — Phase 2/3** |
 
-1. **The algebra kind** (the *operation*) — `Map` (pointwise), `Monoid` (reduction / online softmax / flash), or
-   `Semiring` (contraction). This is **primary**: it determines the schedule's *structure* (a `Monoid` schedule has the
-   streaming-reduce axis + the carrier combine + the projection; a `Semiring` schedule has the contraction). Flash is a
-   `Monoid` over a nested partial `Semiring`, so it is a **`Monoid` schedule** — the op tree nests, the schedule is flat,
-   typed by the outermost kind.
-2. **The fragment** (the per-output compute unit) — `Scalar` (one thread per cell, register accumulator) or `Warp`
-   (a tensor-core mma tile: `WM·WN` warps per output tile, an mma C-fragment accumulator). This is **secondary**: it
-   parameterizes the kind's schedule, picking the per-cell *realization* without changing the structure. It mirrors the
-   kernel IR, where `FragmentApply` / `FragmentRowReduce` / `FragmentMask` are already the carrier-generic fragment-tier
-   **siblings** of the scalar `Assign` / `WarpShuffle` / `Select`.
+**Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser): **`,` is reserved** as the
+knob-list separator and MUST NOT appear inside a code value. Within a value: `/` separates fields, `x` pairs dims, `:`
+introduces a name (`a:<atom>`), `;` lists. Sub-field order is fixed **m-then-n**. Interpretation is per-node-kind
+(`REDUCE b32` partitions *the* reduce axis — a `Reduction` reads its reduce axis, a `Contraction` reads K); fragment is
+implicit in which output code is present (`TILE` ⇒ scalar atom, `WARP` ⇒ mma atom, never both).
 
-So scalar-vs-warp is **not** a different schedule class — it is the `fragment` field of the same kind's schedule. The
-combine *mechanism* is derived from `(level, fragment)`: a `Warp` reduce row-reduces through `FragmentRowReduce`, a
-`Scalar` reduce through `WarpShuffle` / `TreeHalve` — derived, never stored.
+## Phase 0 — Purge the consolidation's residue (do first; blocks nothing)
 
-### The matrix
+The landed consolidation left shims and lies behind. Delete them **before** building on top, so the new phases stand on
+clean ground. All e2e-covered; each deletion is proven by the suite staying green.
 
-| `op` kind \ tier              | uniform · `Scalar`         | uniform · `Warp`         | `WarpSpec` |
-|-------------------------------|----------------------------|--------------------------|------------|
-| **`Map`** (pointwise)         | `MapSchedule`              | —                        | —          |
-| **`Monoid`** (reduce / flash) | `MonoidSchedule(Scalar)`   | `MonoidSchedule(Warp)`   | `WarpSpec` |
-| **`Semiring`** (contraction)  | `SemiringSchedule(Scalar)` | `SemiringSchedule(Warp)` | `WarpSpec` |
+- **Kill `Schedule = Placement`** (`ir/tile/ir.py`) — the "kept re-exported during the transition" alias. Rewrite every
+  `Schedule` reference to `Placement`, delete the alias and its two-line apology.
+- **The `Map.out` annotated-`Loop` branch and the `ops.reduce_loop` body-scan are BOTH load-bearing — not legacy.**
+  The plan's premise ("recognition nodifies every reduce/contraction") is **false for contractions**, verified against
+  the e2e suite. Recognition emits every **reduce** as a `Reduction` node (bare) or `Map(source=Reduction)` (projected),
+  but a **contraction** rides a flat `Map(body=(annotated CONTRACTION loop, …))`: a *tiled* / warp / split-K contraction
+  is nodified to a `Contraction` by `_schedule`, but a **scalar per-cell contraction keeps the flat `Map` all the way
+  through materialize** (deleting the `Map.out` `carrier.out` arm broke every scalar-matmul e2e test — `_store`'s
+  store-glue reads `op.out` off that loop's carrier). Likewise `reduce_loop`'s body-scan reads the K loop off the
+  pre-nodification flat `Map` (`_contraction_node` / `_check_warp_static_k` / `axis_role`), and `030_split`'s
+  finalize/partial kernels carry sliced reduce loops. The node can't be built at recognize time (its `tile` is a
+  fork-chosen `TilePlan`; its operand binding needs the mapped `place.grid`). **Both branches stay** and their
+  docstrings now describe the flat-contraction `Map` as a real current form. Fully retiring the body-scan would need a
+  recognizer refactor (nodify the scalar contraction too, with a deferred `tile`) — a real follow-up, not Phase-0
+  residue.
+- **Delete `_schedule._with_reduce`'s "returns the op unchanged for a legacy non-`Reduction` op" no-op path** and the
+  sibling legacy-pin branches (`_schedule.py` ~158/164/218) — same principle: if the stamp target always exists, the
+  no-op arm is dead.
+- **Reconcile the docstrings to reality.** Strike every "not-yet-migrated" / "legacy form" / "residual fallback" /
+  "reserved during the transition" phrase from `ir/tile/ir.py`, `ir/tile/ops.py`, `_atomize.py` (its `Semiring` /
+  `Monoid` op-tree reference), and `_schedule.py`. A docstring that describes a fallback you just deleted is a document
+  inconsistency — the audit is not done until grep for those phrases over `ir/tile/` + `passes/lowering/` is empty.
+- **Resolve the STAGE "built vs dropped" contradiction now.** The knob table says built, `_factor.py`'s docstring says
+  dropped, `kernel/ARCHITECTURE.md` says "reserved", and `xfail_registry._STAGE` says materialization is gone. Pick one
+  truth — *materialization dropped, codec stamps* — and make all four say it verbatim (the table above already does).
 
-The Scalar / Warp columns are the **same class, different `fragment`** — "defined by the operation, not the block."
-`Map` has no fragment axis (pointwise never accumulates, so never tensor-cores). The per-kernel schedule union is each
-row:
+## The remaining phases — build, then purge
 
-```python
-MapKernel.schedule      = MapSchedule
-MonoidKernel.schedule   = MonoidSchedule  | WarpSpec
-SemiringKernel.schedule = SemiringSchedule | WarpSpec
-```
+Ordered as requested. Each phase adds config the `factorize` path already structurally supports (no divergent path),
+**then immediately deletes what it obsoletes.** Named tests flip XPASS → delete the xfail entry.
 
-Five concepts total: three kind-schedules + two fragments + one `WarpSpec`. The Scalar half (`MapSchedule`,
-`MonoidSchedule`, `SemiringSchedule`, the `ReducePlan` partition) is **built**; the `Warp` fragment and `WarpSpec` are
-the **warp-tier recovery** (below).
+### Phase 1 — finish mma (tensor-core flash + symbolic-K masked edges)
 
-### Why not a shared `WarpSchedule`
+**Build.** Two mma capabilities remain, both reusing the existing `Contraction` mma codegen through the node hierarchy:
 
-A tempting alternative — one kind-agnostic `WarpSchedule` reused across `Monoid` and `Semiring` — was **rejected**.
-The two only *look* alike (same field names); their meaning differs: a `Semiring` warp tile's reduce axis and its mma
-tile describe the **same** axis (K) at two granularities, while a flash `Monoid` warp tile's reduce axis (KV) and its
-mma tile describe **different** axes (the tile is a *nested* contraction inside the streaming reduce). Deduping by
-field-shape would force that kind-dependent relationship into an unwritten convention. Keeping the kind primary and the
-warp tile as a `Warp` fragment of `MonoidSchedule` / `SemiringSchedule` makes each relationship intrinsic to its type.
+- **Tensor-core flash** — give the flash tree's **inner** `Contraction` an mma `TilePlan` (an `AtomKind`, not today's
+  scalar `TilePlan()` in `_flash._flash_op`). The `Map(source=Reduction(TWISTED, source=Contraction(QK)))` factorizes
+  the QK / PV contractions through the **same** `_factorize_contraction` a standalone matmul takes, with a flash `store`
+  **sink** (the existing `factorize(store=…)` seam) that bridges the mma C-fragment into the streaming-softmax twist.
+  Genuinely new primitive: the score `S` fragment as the next matmul's operand **without a gmem round-trip**, and the
+  twisted carrier over in-register fragments. Requires wiring the recursive inner geometry (`_atomize.bind_contraction`
+  on the inner loop). Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
+  `test_attention_coverage.py::test_cooperative_flash_matches_torch`.
+- **Symbolic-K masked mma edges** — `_mma_reduce` `raise LoweringError` for transposed-B symbolic K is the last mma
+  accuracy hole. Restore the clamped / zero-filled K slab for that case.
 
-`WarpSpec`, by contrast, **is** genuinely shared (one struct, no per-kind variants) — and for a principled reason: it
-**delegates**. It holds `roles`, each carrying a `(kind, fragment)` sub-schedule, so it has no kind-specific structure
-of its own. Sharing a container that delegates is sound; sharing a `WarpSchedule` whose fields encode kind-dependent
-meaning is not.
+**Purge.**
 
-### The structures
+- **Delete the `raise LoweringError("warp tier: transposed-B symbolic-K mma not supported…")`** the moment the masked
+  path lands — a guard for a case you now handle is a lie.
+- **Rip out the "future work" scaffolding in `_flash.py` and `_atomize.py`** — the scalar-`TilePlan()` note, the E2
+  gating comment ("requires warp-flash to first attach that inner geometry"), and the redundant scalar-flash prose. The
+  scalar `ScalarAtom` config stays (it is a real config of the one path), but every comment framing tensor-core flash as
+  unbuilt goes.
+- **Land the mma split-K auto-fork and delete the "pin-only" hedge.** `_schedule.schedule()` must emit unpinned `g<w>`
+  candidates (`_splitk_specs` + occupancy gate); then strike "split-K stays pin-only" from the docs and flip the
+  structural-fork search tests (`test_structural_push.py`, `test_two_level.py`, `test_resolve.py`,
+  `test_diagnostics.py`). Sequence after the golden sweep re-validates (`tile_signature` parity).
 
-```python
-# Kind-neutral free-axis → grid binding. on_grid() binds every free axis (scalar tier);
-# the warp fragment reads place.grid at CTA-tile granularity instead of per-cell.
-@dataclass(frozen=True)
-class Placement:
-    free: tuple[Axis, ...] = ()
-    grid: tuple[Axis, ...] = ()
+### Phase 2 — operand staging (smem + `ldmatrix`)
 
-# The reduce-axis partition — tuned widths only, coarse→fine. ReduceStage(level, width) per
-# level (GRID / BLOCK / REG / SERIAL); the combine MECHANISM (Fold) is derived from the
-# level (+ fragment), not stored. serial = ceil(extent / parallel), derived. GRID = the
-# cross-CTA split request (see "Kernel splits").
-@dataclass(frozen=True)
-class ReducePlan:
-    stages: tuple[ReduceStage, ...] = ()
-    # .of(cta=, coop=, reg=), .parse/.spell (the REDUCE codec g<n>/b<n>/r<n>), .needs_split, .coop, .cta, .reg
+**Build.** Restore **single-buffer** staging: a `sync`-transport smem slab filled cooperatively (a `__syncthreads` fill,
+no prefetch), operands read `ldmatrix`-from-smem. It splices into `reduce_codegen` as a stage step **symmetric across
+both atoms** (mma: `ldmatrix` from smem; scalar: from the slab), driven off the `Stage` on the node (`STAGE=d1/sync`).
+The stage is a wrapper on the K-loop's operand loads, **not** a second contraction tier. Flips
+`test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit`, `::test_masked_symbolic_m_structure`,
+`test_bank_conflicts.py`.
 
-# The per-output compute-unit realization — the secondary (fragment) axis.
-class Fragment: ...
-@dataclass(frozen=True)
-class Scalar(Fragment): ...                     # one thread / cell, register accumulator
-@dataclass(frozen=True)
-class Warp(Fragment):                           # WM·WN warps / tile, mma C-fragment accumulator
-    tile: WarpTile
+**Purge — the big "no divergent path" win.**
 
-# The mma output tile (the Warp fragment's geometry): atom + warps + register sub-tiles + the
-# K-chunk. tile_m = WM·FM·atom_m, tile_n = WN·FN·atom_n, block_threads = WM·WN·32.
-@dataclass(frozen=True)
-class WarpTile:
-    atom: AtomKind                              # the mma cell (mma_m16n8k16_f16 today)
-    warps: tuple[int, int]                      # (WM, WN)
-    reg: tuple[int, int] = (1, 1)               # (FM, FN) register atom sub-tiles per warp
-    bk: int = 1                                 # K-chunk per inner step, in atom_k units
-    # .parse/.spell (the WARP codec a<atom>/w<m>x<n>/f<m>x<n>/k<n>)
+- **Subsume the fused-prologue shared-row staging into the general mechanism and delete the bespoke helpers.** Today the
+  *only* surviving staging is `_factor.py`'s `_shared_row_buf` / `_restage_loads` / `_shared_row_fill` /
+  `_has_contraction_tail` / `_shared_row` — a special-cased RMSNorm→linear prologue that stages one smem row by hand.
+  Once general `Stage` staging exists, that prologue is just a `Stage` on the reduce's input. Re-express it as such and
+  **delete all five helpers.** Two staging mechanisms for one concept is exactly the divergence this rebuild exists to
+  kill.
+- **Flip `TileOp.stage` from "dropped/reserved" to live** and strike "reserved" / "materialization dropped" from the
+  knob table, `_factor.py`, `kernel/ARCHITECTURE.md`, and `xfail_registry._STAGE` (delete `_STAGE` itself as its tests
+  XPASS).
 
-# Operand transport over the reduce loop (built: the warp tier's smem pipeline + the scalar
-# fused-prologue shared row). stage=None = gmem-direct; Stage(d1/sync) = real single-buffer
-# staging (a plain __syncthreads fill, no prefetch); cp / tma add async / descriptor transport.
-@dataclass(frozen=True)
-class Stage:
-    depth: int = 1
-    transport: str = "sync"                     # sync | cp.async | tma
-    smem: tuple[str, ...] = ()
-    ring: bool = False
+### Phase 3 — pipelining (cp.async ring / register double-buffer / TMA)
 
-@dataclass(frozen=True)
-class MapSchedule:                              # pointwise — no fragment, no reduce
-    place: Placement
+**Build.** Layer the depth/async variants on Phase 2's single-buffer stage, **all as fields on the same `Stage`** — no
+new path:
 
-@dataclass(frozen=True)
-class MonoidSchedule:                           # streaming reduce / online softmax / flash
-    place: Placement
-    fragment: Fragment = Scalar()
-    block: tuple[Axis, ...] = ()                # free axes resident in the CTA (strided-coop rows)
-    reduce: ReducePlan = ReducePlan()
-    stage: Stage | None = None
+- **cp.async ring** (`STAGE.depth>1`, `sm_80`) — prefetch the next K-chunk's fill over the current mma, a `depth`-slot
+  ring.
+- **smem→register double-buffer** (`STAGE.reg_depth` / `/p<n>`) — ping-pong `ldmatrix` over the inner atom-K steps
+  (`STAGE.depth` = gmem→smem ring; `STAGE.reg_depth` = smem→register; `WarpTile.bk` = slab K-granularity, not a depth).
+- **TMA** (`sm_90`, `cp.async.bulk.tensor` + mbarrier) — descriptor-driven bulk transfer; single-buffer then the ring.
 
-@dataclass(frozen=True)
-class SemiringSchedule:                         # contraction
-    place: Placement
-    fragment: Fragment = Scalar()
-    reduce: ReducePlan = ReducePlan()           # the K (contraction) axis partition
-    stage: Stage | None = None
-```
+Flips `test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit`,
+`test_register_double_buffer_matches_single_buffer_bit_for_bit`, `test_bf16_operands_stage_via_cp_async`,
+`test_pinned_transport_and_shape_fire`, `test_knob_pinning.py::test_article_tma_sgemm_reproduction`.
 
-`__post_init__` asserts the fragment's coherence with the dependent fields (e.g. a `Warp` fragment forbids a BLOCK
-`ReducePlan` stage — the warp *is* the cooperation; only GRID split + serial remain) so an illegal combo fails loud
-rather than miscompiling.
+**Purge.**
 
-### Warp specialization (`WarpSpec`) — the third either-arm
+- **Collapse single-buffer into depth=1 of the ring — do not keep two emitters.** If Phase 2 produced a standalone
+  single-buffer code path, `depth=1` must now be the ring with one slot; delete the standalone path. The transport
+  (`sync` / `cp` / `tma`) is a parameter, not a branch of duplicated fill logic.
+- **The kernel-IR transport vocabulary survived the demolition** (`cp.async`, TMA, mbarrier, the ring codec) — if any of
+  it is now unreachable after wiring, delete the unreachable renderers rather than leaving them as museum pieces. Grep
+  the kernel-IR for transport nodes with no producer.
 
-The uniform tiers run **homogeneous** warps (every warp does the same job). `WarpSpec` runs **heterogeneous** warps —
-the CTA's warps partition into producer / mma / reducer roles wired by shared smem rings. It is a generic container:
+### Phase 4 — warp specialization (`WarpSpec`)
+
+**Build.** Heterogeneous warps: the CTA partitions into producer / mma / reducer roles wired by shared smem rings.
+`WarpSpec` **delegates** — each `WarpRole` carries a sub-schedule that bottoms out in a uniform `Map` / `Reduction` /
+`Contraction`, so warp-spec composes the *same three nodes*, never a fourth. The uniform `Stage` splits: the gmem→smem
+*fill* becomes the shared `Channel`; each consumer's *local* register double-buffer stays on `role.stage`. `WarpSpec`
+lives only at the top CTA level (`TileOp.workers`); roles do not nest.
 
 ```python
 @dataclass(frozen=True)
-class Channel:                                  # a shared smem ring — the producer/consumer seam
+class Channel:                       # a shared smem ring — the producer/consumer seam
     name: str
-    depth: int                                  # ring slots (the shared fill↔drain depth)
-    transport: str = "cp.async"                 # how the producer fills it: cp.async | tma
+    depth: int
+    transport: str = "cp.async"      # cp.async | tma
 
 @dataclass(frozen=True)
-class WarpRole:                                 # one warp group's job; its sub-schedule type NAMES the role
-    stage_node: object                          # the op-tree node this role runs
+class WarpRole:                      # one warp group's job; its sub-schedule node NAMES the role
+    stage_node: object               # the Map / Reduction / Contraction this role runs
     warps: int
-    schedule: MapSchedule | MonoidSchedule | SemiringSchedule   # producer = Map; mma = Semiring/Monoid(Warp);
-    reads: tuple[str, ...] = ()                                 #   reducer = Monoid(Scalar, coop ReducePlan)
+    reads: tuple[str, ...] = ()
     writes: tuple[str, ...] = ()
-    stage: Stage | None = None                  # this role's LOCAL pipeline (e.g. consumer smem→reg double-buffer)
+    stage: Stage | None = None       # this role's LOCAL smem→register double-buffer
 
 @dataclass(frozen=True)
 class WarpSpec:
-    place: Placement                            # the CTA-tile grid
+    place: Placement                 # the CTA-tile grid
     channels: tuple[Channel, ...] = ()
-    roles: tuple[WarpRole, ...] = ()            # Σ role.warps = the CTA warp count
+    roles: tuple[WarpRole, ...] = () # Σ role.warps = the CTA warp count
 ```
 
-The single uniform `Stage` **splits** under warp-spec: the gmem→smem *fill* pipeline becomes the shared `Channel`
-(depth + transport, since producer and consumer must agree), while each consumer's *local* register double-buffer stays
-on its own `role.stage`. `WarpSpec` appears only at the top CTA-level schedule; roles bottom out in uniform schedules —
-no nesting.
+`WarpSpec` reuses the role vocabulary (`REDUCE` reducer / `WARP` mma / `STAGE` producer) and adds **role-namespacing**
+(`mma:WARP=…` + the `CHANNEL` ring) — new grammar registered so `knob_features` / `apply_off_defaults` /
+`tuning_knob_items` handle role-prefixed keys. Spelling: `CHANNEL=K:d3/cp;V:d3/cp mma:WARP=…/k2 reducer:REDUCE=b2
+producer:STAGE=d3/cp`.
 
-### Kernel splits — a schedule request, a graph rewrite, a materializer invariant
+**Purge — tear down the rebuild scaffolding itself.**
 
-"Launch a separate kernel" is **not** a schedule field — a schedule describes exactly one launch. The split lives in
-the **graph** (two `TileOp` nodes). What the schedule carries is the *request*: a `ReduceStage(GRID, n)` in the
-`ReducePlan` (so `needs_split`). The lifecycle:
+- **`Channel` must not reimplement `Stage`'s transport.** If `Channel.depth` / `.transport` duplicate the ring logic
+  Phase 3 built on `Stage`, factor the shared ring into one place and have `Channel` hold the *shared* variant only. One
+  transport implementation, period.
+- **Delete `TileOp.workers`'s "not yet built" language** and any `WarpSpec` placeholder / `None`-only handling once it
+  is live.
+- **When `XFAIL` reaches empty, demolish the recovery apparatus.** Delete `tests/xfail_registry.py`, the
+  `pytest_collection_modifyitems` hook in `tests/conftest.py`, `TILE_ENTANGLED_FILES`, and unwrap every
+  `try/except ModuleNotFoundError` guard around a tile import (the imports are unconditional now). **Then delete this
+  plan** — a rebuild plan for a completed rebuild is the last shim.
 
-1. **`020_schedule` — decide:** a `GRID` stage lands in the `ReducePlan` (the partition's coarsest level — uniform
-   across split-K on `Semiring`, split-reduce on `Monoid`, split-KV on flash).
-2. **`030_split` — consume** (last tile pass): realize the `GRID` stage as either **atomics** (the partial kernel
-   atomic-adds into the output — `ReduceStage(GRID).combine() → (ATOMIC,)`, the split axis folds into `place.grid`, **1
-   node**) or **partial + finalize** (the partial kernel writes a `ws[split, *free]` workspace; the finalize kernel is an
-   ordinary `Monoid` reduce over the split axis via `carrier.as_state_merge`, **2 nodes**). The finalize needs no new
-   type — splitting a reduce yields a smaller reduce; the algebra is closed under it. **No `GRID` stage survives** (the
-   partial consumed it into the grid; the finalize is a fresh `ReducePlan()`; the atomic case marks the store, not the
-   partition).
-3. **`010_materialize` — assume** (first kernel pass): `assert not schedule.reduce.needs_split`. The materializer only
-   ever lowers a single-launch kernel — a `ReducePlan` of `{SERIAL, REG, BLOCK}` stages — so it carries no multi-kernel
-   logic. Any cross-CTA combine was already realized upstream.
-
-So the schedule carries the partition (including the split request); the **graph** carries the kernel count.
-
-### The knob schema — shared orthogonal codes, not per-class
-
-A schedule is **spelled** by a small set of **orthogonal codes**, one per tunable sub-component. A kernel's full
-config is the **union** of the codes that apply to it — NOT one monolithic code per `*Schedule` class. The schedules
-recompose the same sub-components (a `ReducePlan` lives on both `Monoid` and `Semiring`; a `WarpTile` on both `Warp`
-fragments; a `Stage` on every reduce loop), so a per-class code would re-encode shared concepts and spell them
-differently. The payoff is precisely two things — and **not** a third that's easy to over-claim:
-
-- **No duplicated concept** — one vocabulary for the reduce partition, the tile, the warp fragment, the transport,
-  wherever each appears. The knob schema mirrors the schedule's *fields* and the prior's *feature families*
-  (`_reduce_decomp` / `_free_slots` / `_warp_tile_features`).
-- **Learned-feature generalization across kinds** — because the featurizer reads ONE code schema-agnostically (today
-  `_reduce_decomp` reads the raw `REDUCE` key), a `b32` reduce featurizes identically on a `Monoid` and a `Semiring`, so
-  the *learned model* transfers what it knows about reduce width across kinds.
-- **NOT cross-kind measured-evidence sharing.** `op_cache_key` digests the op-tree body + kind (`keys.py`), so a
-  `Monoid` and a `Semiring` `perf`/reservoir row never share a key regardless of spelling — the *measured* `evidence_pick`
-  is siloed by kind either way. Shared spelling buys the learned-feature transfer above, not measured-row reuse; don't
-  expect the latter.
-
-| code | sub-component (schedule field) | schedules | grammar (coarse→fine) | status |
-|---|---|---|---|---|
-| `REDUCE` | `ReducePlan` (reduce-axis partition) | `Monoid`, `Semiring` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
-| `TILE` | free-axis output tile (`TilePlan` — par + `Scalar` reg) | `Semiring` (`Map`/`Monoid` reserved) | `n<N>[xm<M>]` parallel · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** (`Semiring·Scalar`) |
-| `WARP` | the `Warp` fragment (`WarpTile`) — replaces `TILE`'s realization | `Monoid`, `Semiring` | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (`Semiring·Warp`, gmem-direct + epilogues; pin-only) |
-| `STAGE` | `Stage` (the two-level operand pipeline) | `Monoid`, `Semiring` | `d<depth>` (gmem→smem ring) · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` (smem→register double-buffer) · empty = gmem-direct | **built** (warp tier: cp.async ring depth>1 + register double-buffer; TMA single-buffer; static/masked-M/symbolic-K; scalar fused-prologue shared row; pin-only) |
-
-**Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser, which splits on `,` and requires
-`=` per entry — `knob.py::parse_knob_spec`): **`,` is reserved** as the knob-list separator and MUST NOT appear inside a
-code value. Within a value: `/` separates fields, `x` pairs dims, `:` introduces a name (`a:<atom>`), `;` lists
-(e.g. a multi-`Channel` `WarpSpec`). Sub-field order is fixed **m-then-n** everywhere (`f<FM>xf<FN>`, `w<WM>xw<WN>`) to
-match the legacy `FM`/`FN`/`WM`/`WN` order — but note `_free_slots` re-canonicalizes the two free slots by parallel
-width (wider = the `n`/coalesced slot), so the codec's `m`/`n` labels are nominal, not the feature's source of truth.
-
-Three rules keep it unambiguous (the same separation the type design already draws):
-
-1. **Vocabulary is shared; interpretation is per-class.** A code names a single-meaning sub-component; the `*Schedule`
-   *type* resolves which axis it targets. `REDUCE b32` = "32-wide BLOCK partition of *the* reduce axis" — `Monoid`
-   reads KV, `Semiring` reads K. This is why a shared knob does NOT reintroduce the ambiguity that a shared
-   `WarpSchedule` *type* would: the K-vs-KV relationship stays in the type, never in the code.
-2. **Fragment is implicit in which output code is present.** `TILE` ⇒ `Scalar` (`n`/`m` are threads); `WARP` ⇒ `Warp`
-   (`n`/`m` are warps; `WARP` carries its own reg `f` + atom + `k`-chunk). Never both — the either-ness mirrors the
-   `fragment` field.
-3. **Grammar (validity) is per-(kind, fragment); vocabulary is not.** `Map` offers only `TILE`; `Monoid·Scalar` offers
-   `REDUCE`+`TILE`+`STAGE`; `Semiring·Warp` offers `WARP`+`REDUCE`+`STAGE`. The enumeration (the `020_schedule` fork)
-   decides which codes/values are valid candidates per cell; the codec vocabulary is the same everywhere.
-
-`WarpSpec` reuses the role vocabulary (`REDUCE` reducer / `WARP` mma / `STAGE` producer) but DOES add one piece of
-grammar: **role-namespacing** (a flat `TileOp.knobs` dict can't hold two roles each with a `STAGE` otherwise). A
-role-prefixed key (`mma:WARP=…`) plus the `CHANNEL` ring is genuine new vocabulary — it must be registered so
-`knob_features` / `apply_off_defaults` / `tuning_knob_items` handle role-prefixed keys, not silently drop them. Worked
-examples (✅ built, 🔲 proposed; `;` lists, never `,` — see the delimiter hierarchy):
+## Sequencing & verification
 
 ```
-✅ Monoid·Scalar  REDUCE=b64/r4          # 64-way coop + 4 ILP register accumulators
-✅ Monoid·Scalar  REDUCE=b16  TILE=n8    # strided-coop rows: 16 lanes, 8 output rows/CTA
-✅ Monoid·Scalar  REDUCE=b32             # flash-decoding (cooperative-KV, scalar flash)
-✅ Monoid·Scalar  REDUCE=g2a             # cross-CTA split-reduce, atomicAdd finalize (one kernel)
-✅ Monoid·Scalar  REDUCE=g2k             # cross-CTA split-reduce / flash split-KV, deferred __partial + combine kernel
-✅ Semiring·Scalar REDUCE=g2a            # split-K matmul, atomicAdd finalize (1-component additive carrier)
-✅ Semiring·Scalar TILE=n128xm64/f4xf4   # register-blocked SGEMM: 4×4 reg cells/thread, operands reused, inner reduce unrolled
-✅ Semiring·Warp  WARP=a:mma_m16n8k16_f16/w2xw2/f4xf8/k2   # gmem-direct mma.sync, 128×128 tile, 128 threads (+ fused epilogue / transposed-B / dynamic-grid)
-✅ Semiring·Warp  WARP=a:mma_m16n8k16_f16/w2xw2/f2xf2/k2  STAGE=d2/tma   # + TMA operand staging (cp.async.bulk.tensor)
-🔲 Semiring·Warp  WARP=a:m16n8k16_f16/w2xw2/f2xf2/k2  REDUCE=g4k  STAGE=d3/cp   # split-K=4 kernel-finalize (staging + split still proposed)
-🔲 Monoid·Warp    WARP=a:m16n8k16_f16/w4xw1/f1xf1/k1  REDUCE=b2  STAGE=d2/tma   # warp-tier flash, coop-KV
-🔲 WarpSpec       CHANNEL=K:d3/cp;V:d3/cp  mma:WARP=…/k2  reducer:REDUCE=b2  producer:STAGE=d3/cp
+Phase 0  purge residue    Schedule alias · Map.out/reduce_loop fallbacks · _with_reduce no-op · STAGE doc contradiction
+   ▼
+Phase 1  finish mma        tensor-core flash (Contraction mma atom + flash store sink) · symbolic-K masked edges
+   │  purge → delete transposed-B-symbolic-K guard · flash "future work" scaffolding · split-K "pin-only" hedge
+   ▼
+Phase 2  staging           single-buffer smem + ldmatrix, symmetric across atoms (Stage on the node)
+   │  purge → SUBSUME + delete the _shared_row_* prologue helpers · flip TileOp.stage live, delete _STAGE
+   ▼
+Phase 3  pipelining        cp.async ring · smem→reg double-buffer · TMA — fields on the same Stage
+   │  purge → collapse single-buffer into depth=1 · delete unreachable transport renderers
+   ▼
+Phase 4  warp spec         WarpSpec roles bottoming out in Map / Reduction / Contraction
+      purge → unify Channel/Stage transport · demolish xfail registry + conftest hook + guarded imports · delete this plan
 ```
 
-### Wiring cost & open gaps (from the design review)
+- **Per phase:** delete the flipped xfail entries; `./venv/bin/pytest tests/compiler/e2e/ -p no:randomly -n auto
+  --dist=loadgroup`; `make lint`. Staging / pipelining tests assert **bit-identity vs gmem-direct** — a stage must not
+  change numerics. Guard the learned-prior featurization with a `tile_signature` invariance check (a phase adds a code
+  but must not re-key existing kernels).
+- **Purge gate (per phase):** grep proves the deletion is total — no surviving reference to the removed symbol, no
+  docstring describing the removed fallback, no dead branch. A phase PR that adds capability without its purge is
+  rejected.
+- **Whole rebuild:** `make test` green with `XFAIL` empty and the registry deleted; no golden regression
+  (`make bench-kernels` spot-check on a reduction + a matmul + a flash kernel).
 
-The cost is **not** "only the source keys move" — featurization is **codec-aware** (as `_reduce_decomp` already parses
-the raw `REDUCE` key). Concretely, before the warp tier can use this schema:
+## Critical files
 
-- **Codec-aware tier discriminator (blocking).** `is_warp` / `mma_atom` / `_free_slots` / `_warp_tile_features` key off
-  scalar names (`WN`/`WM`/`ATOM@`) today; a packed `WARP=…` value has none, so a warp kernel would featurize through the
-  *scalar* path. Either keep `WM`/`WN`/`ATOM@`/`FM`/`FN` as the on-dict representation and treat `WARP`/`TILE` as the
-  pin/display spelling that explodes into those keys at stamp time (featurizers unchanged), **or** make all four entry
-  points parse the codec. Pick one; the former is the smaller change and keeps `tile_signature` golden-matching working.
-- **`REDUCE`'s finalize letter round-trips (landed).** `ReduceStage.finalize` carries `"atomic"` | `"kernel"`;
-  `ReducePlan.parse`/`spell` round-trip the `g<n>[a|k]` letter and `ReducePlan.finalize` reads it (`030_split` picks the
-  atomic vs deferred-kernel arm off it). `_Decomp.finalize` / `D_finalize_kernel` therefore featurize correctly. (The
-  auto-fork still doesn't *propose* `g` — cross-CTA split is pin-/prior-driven, like `r`/ILP.)
-- **OFF-sentinel & validity need a codec-aware home.** `apply_off_defaults` / the tier filters work per *named* knob; a
-  packed code has no per-subfield OFF, so "decided: not a warp kernel" needs an explicit empty-codec OFF (`WARP=""`).
-  And the per-(kind,fragment) validity must live as a **codec-dict validator** (where pins / the featurizer run), not
-  only a schedule `__post_init__` — a pinned illegal union (`TILE`+`WARP`) otherwise constructs and mislowers silently.
-- **Type reconciliation.** The "kind × fragment" section types the fragment as `Fragment = Scalar() | Warp(tile)`, but
-  the *built* `schedule.py` carries `warp_tile: WarpTile | None` (no `Fragment` type yet) and has no `__post_init__`.
-  Land the `Fragment` type (or restate the section against `warp_tile`) so the codec rules ("`TILE`⇒Scalar / `WARP`⇒Warp")
-  have something to assert against.
-- **Interacting depths — resolved.** The operand pipeline has two buffer **depths** plus a **granularity**, kept
-  distinct: `STAGE.depth` = the gmem→smem ring (cp.async prefetch over the K-chunk loop; TMA single-buffer), `STAGE.reg_depth`
-  (`/p<n>`) = the smem→register double-buffer (the ldmatrix ping-pong over the inner atom-K steps), and `WarpTile.bk`
-  = the slab K-granularity (how much K is resident — NOT a depth). The two depths both live on `STAGE` (same kind of
-  quantity, one level apart); `bk` stays on `WarpTile`. `Channel.depth` (WarpSpec) is the shared-ring variant, still
-  reserved.
-- **Unspellable today (note, not block).** `>2` free axes (batched outputs) and the `block` strided-rows field beyond
-  one packed axis have no dedicated code.
-
-`REDUCE`, `TILE`, `WARP`, and `STAGE` are wired (reachable via pin; `REDUCE` `r<n>` ILP, `TILE` reg-tile, `WARP`
-mma.sync, `STAGE` the two-level cp.async pipeline). Each one's auto-fork — the prior-ranked candidate set — is still a
-follow-up, so a cold greedy compile stays scalar per-cell unless pinned. Pipelining gaps remaining: the **TMA ring**
-(depth>1 — TMA is single-buffer today) and general **scalar-tier operand staging** (only the fused-prologue shared row
-exists, so scalar has no `STAGE` slab to pipeline).
-
-## Remaining — the warp / tensor-core tier
-
-The `Warp` fragment + `WarpSpec` are the recovery target. The kernel-IR tensor-core vocabulary **survived the
-demolition** (`RegFragment`, `LdmatrixLoad`, `MmaSyncPtx`, the carrier-generic `FragmentApply` / `FragmentRowReduce` /
-`FragmentMask`, `RegEpilogue` / `RegStore`, the `FragLayout` geometry seam, cp.async / TMA / mbarrier, the
-`dpl_mma_m16n8k16` renderer), as did the matmul knob schema (`WM` / `WN` / `FM` / `FN` / `BK` / `SPLITK` / `ATOM@`) and
-the prior featurization (`is_warp`, `_warp_tile_features`). What is gone is only the **tile-tier decision**
-(`020_schedule` building a `Warp` fragment) and the **kernel-tier materializer** (`010_materialize` lowering a `Warp`
-fragment / `WarpSpec` into those primitives). The phased recovery, feature by feature:
-
-1. **Static fp16 mma matmul** — ✅ **LANDED.** The `Warp` fragment (`WarpTile` on `SemiringSchedule`) + the `WARP`
-   codec (decided pin-only in `020_schedule`, exploded into the on-dict `ATOM@`/`WM`/`WN`/`FM`/`FN`/`BK` featurizer
-   keys) + the `_warp` materializer (`010_materialize`): free axes split four ways (GRID/WARP/REGISTER/ATOM), the
-   atom-lane offset decoded at render, a gmem-direct `LdmatrixLoad(staged=False)` a/b + `MmaSyncPtx` K loop per register
-   cell, `RegStore` out. Canonical + transposed-B, f16/f32 out, static + dynamic-grid (symbolic M). The legacy-API
-   `test_matmul_mma.py` / `test_matmul_mma_transposed_b.py` + the demolished rule tests were dropped; the capability is
-   covered by the `WARP`-codec matrix in `test_matmul_tile_coverage`.
-2. **Fused epilogues** — ✅ **LANDED.** The projection `Map` tail over the `Semiring` folds into the `RegStore`
-   `RegEpilogue` (residual / bias / scale), the out-dtype cast on `RegStore` (`__floats2half2_rn`), a causal `Select` →
-   per-element ternary. Covered by the epilogue matrix in `test_matmul_tile_coverage` (static + dynamic). Still gmem-direct
-   (no staging). **Remaining phases below: operand staging, MMA split-K, symbolic-K edges, warp-tier flash.**
-3. **Operand staging** — make `Stage` real: smem slabs + `ldmatrix`, double-buffered via cp.async (sm_80) / TMA (sm_90).
-   Recovers `test_stage_scalar.py`, `test_matmul_mma_parity.py` (cp.async / tma), the blocked-prologue tests.
-4. **Cross-CTA split** — `030_split` (the `GRID` stage → atomic / partial+finalize above) has **landed for the scalar
-   tier**: additive `sum` split-reduce, split-K scalar matmul, and the twisted flash `(m, l, O)` split-KV
-   (carrier-generic via `as_state_merge`), both atomic and deferred-kernel arms (the `test_cross_cta_finalize` matrix).
-   What remains under the warp tier is **MMA split-K** — `test_mma_atomic_free_splitk.py` and the split-K rule tests —
-   which needs the `Warp` fragment's contraction to feed the same `030_split` rewrite.
-5. **Symbolic M / N / K edges** — masked mma tiles (per-element `RegStore` guards, clamped / zero-filled K slabs).
-   Recovers `test_matmul_mma_masked.py`, the dynamic mma-parity / causal-epilogue / dynamic-shape matmul cases.
-6. **Warp-tier flash** — the `Warp` fragment on a `MonoidSchedule` (flash's inner QK / PV), reusing the fragment
-   machinery; cooperative-KV / split-KV composes the `ReducePlan` with the `Warp` fragment. Recovers
-   `test_flash_tensorcore_generated.py`, the dynamic flash variants.
-
-Then **warp specialization** (`WarpSpec`) and the remaining **operand-pipelining** depth tuning. The rebuild is complete
-when `e2e/` is green and `XFAIL` is empty.
+- `deplodock/compiler/ir/tile/ir.py` — the nodes + `TileOp` fields; Phase 0 alias/fallback purge.
+- `deplodock/compiler/ir/tile/ops.py` — `lower` / `axis_role` / `reduce_loop` / `reduce_plan`; Phase 0 fallback purge.
+- `deplodock/compiler/pipeline/passes/lowering/kernel/_factor.py` — the one emitter; Phase 1 flash sink, Phase 2/3 stage
+  splice, Phase 2 `_shared_row_*` deletion.
+- `deplodock/compiler/pipeline/passes/lowering/kernel/_tiling.py` — the four tiling levels + the `grid_tile` splice.
+- `deplodock/compiler/pipeline/passes/lowering/tile/_flash.py`, `.../_atomize.py` — Phase 1 inner-contraction mma
+  geometry + scaffolding purge.
+- `deplodock/compiler/pipeline/passes/lowering/tile/_schedule.py` — schedule forks; Phase 0 legacy-branch purge, Phase 1
+  split-K auto-fork.
+- `deplodock/compiler/ir/schedule` — `Stage` (Phase 2/3), `WarpSpec` / `Channel` / `WarpRole` (Phase 4).
+- `tests/xfail_registry.py`, `tests/conftest.py` — the recovery ledger + hook; demolished in the Phase 4 purge.
+</content>

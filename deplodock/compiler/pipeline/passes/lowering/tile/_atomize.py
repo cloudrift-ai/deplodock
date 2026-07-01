@@ -6,9 +6,10 @@ axis-in-index), the fold accumulator, and the projection epilogue.
 — the operand ``Load``\\ s indexed over the K axis, the fold ``Accum`` target — and returns them as
 the ``(a_load, b_load, acc, epilogue)`` facts that ``_schedule._contraction_node`` stamps onto the
 :class:`~deplodock.compiler.ir.tile.ir.Contraction` structural node at fork-emit (the node
-is then the single source of truth — it re-derives ``b_trans`` off ``b_load`` itself). Reading off
-the annotated loop (not an op-tree node) is what let the ``Semiring`` / ``Monoid`` op-tree node
-classes retire. The cooperative reduce needs no binding here — its accumulator dtype + shuffle/tree
+is then the single source of truth — it re-derives ``b_trans`` off ``b_load`` itself). Reading the
+binding **structurally** off the annotated loop — not a stored node kind — is what keeps the ⊗/⊕
+algebra a property of the loop, so no per-algebra op-tree node class is needed. The cooperative reduce
+needs no binding here — its accumulator dtype + shuffle/tree
 mechanism are derived at materialize time (``emit_combine`` off the carrier + ``ReduceStage.combine``).
 
 **Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the tiled

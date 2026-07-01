@@ -35,12 +35,12 @@ from __future__ import annotations
 
 _R = "tile IR demolished — rebuild in progress"
 
-#: The warp tier's smem operand-staging pipeline (cp.async / TMA) was dropped to restore symmetry
-#: with the scalar tier (both gmem-direct). A symmetric staging mechanism for both tiers will be
+#: The warp tier's smem operand-staging **materialization is dropped**; the ``STAGE`` codec stamps
+#: (the codec + ``schedule.Stage`` still land — those tests pass — but nothing lowers them yet, keeping
+#: both tiers gmem-direct symmetric). A symmetric staging mechanism for both tiers will be
 #: (re)introduced; until then the tests that assert staged structure / bit-identity-vs-gmem fail.
-#: (The ``STAGE`` codec + ``schedule.Stage`` still stamp — those tests pass; only the materialization
-#: is gone.) Delete these entries when the symmetric staging lands and the tests are restored.
-_STAGE = "mma operand staging dropped — symmetric staging mechanism reserved"
+#: Delete these entries when the symmetric staging lands and the tests are restored.
+_STAGE = "mma operand staging materialization dropped, codec stamps"
 
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).

@@ -22,7 +22,7 @@ from deplodock.compiler.ir.schedule import (
     WarpSpec,
     role_for,
 )
-from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction, Schedule, TileOp
+from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction, TileOp
 
 __all__ = [
     "AtomKind",
@@ -36,7 +36,6 @@ __all__ = [
     "Reduction",
     "RoleAlloc",
     "RoleKind",
-    "Schedule",
     "Stage",
     "TileOp",
     "TilePlan",

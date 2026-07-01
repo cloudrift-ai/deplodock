@@ -169,7 +169,7 @@ def build_flash_frag(
 
     The compute is the op tree itself — a ``Map`` whose body is the ``(m,l,O)`` LSE
     ``TWISTED`` reduce ``Loop`` then the ``O/l`` projection, carried unlowered on the ``TileOp`` with an empty
-    schedule; the free ``(batch…, m, d)`` axes are the ``Schedule``'s ``free`` (no
+    schedule; the free ``(batch…, m, d)`` axes are the ``Placement``'s ``free`` (no
     free-axis loop nest). ``020_schedule`` maps them onto the grid; ``materialize`` lowers
     the node and generates the output-store glue (the ``Write`` at the grid cell) — it
     isn't stored here.
