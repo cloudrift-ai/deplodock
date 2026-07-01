@@ -60,6 +60,9 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
+    # test_flash_off_keeps_decomposition: FLASH-off no longer keeps the score-materializing
+    # multi-kernel 010_sdpa decomposition (SDPA lowers to a single kernel regardless) — the
+    # knob-gated recognition path is a separate rebuild target.
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_off_keeps_decomposition": _R,
     # matmul enabled at the scalar tier — these files partially recovered; residuals still need
     # the mma / staging / split-K / dynamic / attention tiers (scalar fallback gives correct
