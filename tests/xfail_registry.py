@@ -42,7 +42,6 @@ XFAIL: dict[str, str] = {
     "test_bank_conflicts.py": _R,
     "test_attention_coverage.py::test_cooperative_flash_matches_torch": _R,
     "test_fused_edge.py": _R,
-    "test_launch_geometry_rules.py": _R,
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
     # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the
     # warp-tier matrix in test_matmul_coverage (the WARP codec): plain + transposed-B + the

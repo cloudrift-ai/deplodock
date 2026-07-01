@@ -1,9 +1,10 @@
-"""Tests for the ``launch_geometry`` rule (``001_coordination``).
+"""The Loop-IR → Tile-IR boundary fires for every kernel kind.
 
-After the planner-emits-tiles refactor, ``launch_geometry`` only fires
-as a fallback for kernels the planner skips. For pointwise / reduce
-the planner handles everything, so we assert the planner fired —
-transitively proving axes got lifted.
+``lowering/tile/010_recognize`` is the sole recognizer that lifts a
+``LoopOp`` into the tile IR (a ``Map`` / ``Reduction`` / ``Contraction``
+node). These assert it fires on the two simplest kinds — pointwise and
+reduce — transitively proving the axes got lifted and the kernel entered
+the tile dialect (no planner / launch-geometry fallback needed).
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ def _input(g: Graph, name: str, shape: tuple) -> str:
     return g.add_node(op=InputOp(), inputs=[], output=Tensor(name, shape), node_id=name)
 
 
-def test_launch_geometry_fires_on_pointwise(recording_dump):
+def test_recognize_fires_on_pointwise(recording_dump):
     g = Graph()
     _input(g, "x", (4, 8))
     g.add_node(op=ElementwiseOp("relu"), inputs=["x"], output=Tensor("o", (4, 8)), node_id="o")
@@ -26,10 +27,10 @@ def test_launch_geometry_fires_on_pointwise(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "build" in recording_dump.fired_rules("lowering/tile/enumeration")
+    assert "recognize" in recording_dump.fired_rules("lowering/tile")
 
 
-def test_launch_geometry_fires_on_reduction(recording_dump):
+def test_recognize_fires_on_reduction(recording_dump):
     g = Graph()
     _input(g, "x", (4, 8))
     g.add_node(op=ReduceOp(op="sum", axis=-1), inputs=["x"], output=Tensor("o", (4, 1)), node_id="o")
@@ -37,4 +38,4 @@ def test_launch_geometry_fires_on_reduction(recording_dump):
     g.outputs = ["o"]
 
     Pipeline.build(TILE_PASSES).run(g, dump=recording_dump)
-    assert "build" in recording_dump.fired_rules("lowering/tile/enumeration")
+    assert "recognize" in recording_dump.fired_rules("lowering/tile")
