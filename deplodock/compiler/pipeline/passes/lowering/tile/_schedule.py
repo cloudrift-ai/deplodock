@@ -282,7 +282,7 @@ def _contraction_node(node, place, tile_plan: TilePlan) -> Contraction:
     return Contraction(
         axes=(grid[-2], grid[-1]),
         k_axis=reduce_loop(node).axis,
-        a_load=a_load,
+        a_operand=a_load,
         b_load=b_load,
         acc=acc,
         tile=tile_plan,
@@ -342,7 +342,7 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
     inner = replace(
         inner,
         k_axis=kslice,
-        a_load=replace(inner.a_load, index=tuple(sigma.apply(e) for e in inner.a_load.index)),
+        a_operand=replace(inner.a_operand, index=tuple(sigma.apply(e) for e in inner.a_operand.index)),
         b_load=replace(inner.b_load, index=tuple(sigma.apply(e) for e in inner.b_load.index)),
     )
     carrier = Accum(name=inner.acc, value=f"{inner.acc}__v", op=ElementwiseImpl("add"), dtype=F32).as_carrier()

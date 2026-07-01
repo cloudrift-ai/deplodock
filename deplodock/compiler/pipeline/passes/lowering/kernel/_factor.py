@@ -140,7 +140,8 @@ def _mma_reduce(c: Contraction, cells, offset, masks) -> tuple[list[Stmt], list[
     swaps the (k, n) index roles to (n, k))."""
     atom = c.atom
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    a_load, b_load, b_trans = c.a_load, c.b_load, c.b_trans
+    assert not c.a_computed, "mma tier: register-resident A operand (flash PV fragment feed) not yet wired — Phase 1 step 3"
+    a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
     mask_m, mask_n, m_ext, n_ext = masks
     k_static = k_axis.extent.is_static
     k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
@@ -206,14 +207,15 @@ def _synth_reduce(c: Contraction) -> Loop:
     """The scalar contraction reduce loop ``for k: v = a*b; acc += v`` — built by the shared
     ``ops.contraction_loop`` builder (the **same** ``CONTRACTION`` loop generation the flash score
     producer uses, one source of truth, no register-tile special case), then stamping the
-    small-static ``unroll``. The :class:`Contraction` node carries A/B as plain leaf ``Load``\\ s (their
-    indices carry the cell ``m`` / ``n`` + the loop ``k``); the operands keep B-then-A order for the
-    load reuse."""
+    small-static ``unroll``. The :class:`Contraction` node carries B as a plain leaf ``Load`` and A as
+    either a leaf ``Load`` (its index carries the cell ``m`` + the loop ``k``) or a computed
+    register-resident ``Body`` (flash PV's ``P = exp(S − M)``, spliced into the K-loop as extra stmts the
+    register-tile replication handles); the operands keep B-then-A order for the load reuse."""
     k = c.k_axis
     loop = contraction_loop(
         lift=_MUL,
         fold=Accum(name=c.acc, value=f"{c.acc}__v", op=_ADD, axes=(k.name,)),
-        operand_bodies=([c.b_load], [c.a_load]),  # B[k, n], A[m, k]
+        operand_bodies=([c.b_load], c.a_body),  # B[k, n], A[m, k] (or A's computed register-resident body)
         reduce_axis=k,
     )
     return replace(loop, unroll=_unroll_inner(k))

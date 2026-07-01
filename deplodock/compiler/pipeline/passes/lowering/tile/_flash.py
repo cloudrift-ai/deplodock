@@ -269,7 +269,7 @@ def _flash_op(
     score_contraction = Contraction(
         axes=(Axis(name="m", extent=s_q), Axis(name="kv", extent=s_k)),
         k_axis=Axis(name="dd", extent=Dim(head_dim)),
-        a_load=Load(name="q_e", input=q_buf, index=q_idx),
+        a_operand=Load(name="q_e", input=q_buf, index=q_idx),
         b_load=Load(name="k_e", input=k_buf, index=k_idx),
         acc="sacc",
         tile=TilePlan(),

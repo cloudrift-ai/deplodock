@@ -116,7 +116,7 @@ def _contraction(epilogue: Body | None = None) -> Contraction:
     return Contraction(
         axes=(Axis("m", 128), Axis("n", 128)),
         k_axis=Axis("k", 256),
-        a_load=a,
+        a_operand=a,
         b_load=b,
         acc="acc",
         tile=TilePlan.parse("n2/f2"),
@@ -176,7 +176,7 @@ def test_splitk_reduction_over_contraction_is_no_double_reduce() -> None:
     inner = replace(
         c,
         k_axis=kslice,
-        a_load=replace(c.a_load, index=tuple(sigma.apply(e) for e in c.a_load.index)),
+        a_operand=replace(c.a_operand, index=tuple(sigma.apply(e) for e in c.a_operand.index)),
         b_load=replace(c.b_load, index=tuple(sigma.apply(e) for e in c.b_load.index)),
     )
     carrier = Accum(name="acc", value="acc__v", op=ElementwiseImpl("add")).as_carrier()
@@ -214,3 +214,57 @@ def test_reduce_partial_flattens_a_nested_pv_contraction() -> None:
     # QK (source) first, then the pre-PV probability, then the flattened PV loop, then the carrier fold.
     assert body.index(qk_loop) < body.index(prob) < body.index(pv_loop) < body.index(fold)
     assert pv_loop.role is AxisRole.CONTRACTION and isinstance(pv_loop.body[-1], Accum) and pv_loop.body[-1].name == "oblk"
+
+
+# --- computed (register-resident) A operand: the tensor-core-flash PV crux ---------------------- #
+
+
+def _pv_contraction(tile: str = "") -> Contraction:
+    """A PV-style contraction whose **A operand is computed**, not a gmem ``Load``:
+    ``O[m, d] = Σ_j P[m, j]·V[j, d]`` with ``P = exp(S[m, j])`` produced from an in-register score
+    (the flash PV shape — its A is register-resident, so ``a_operand`` is a ``Body``, not a ``Load``)."""
+    a_body = Body((Load(name="s_e", input="S", index=(Var("m"), Var("j"))), Assign(name="p", op="exp", args=("s_e",))))
+    return Contraction(
+        axes=(Axis("m", 8), Axis("d", 8)),
+        k_axis=Axis("j", 8),
+        a_operand=a_body,
+        b_load=Load(name="v_e", input="V", index=(Var("j"), Var("d"))),
+        acc="oblk",
+        tile=TilePlan.parse(tile) if tile else TilePlan(),
+        epilogue=Body((Write(output="out", index=(Var("m"), Var("d")), value="oblk"),)),
+    )
+
+
+def test_contraction_computed_a_operand_exposes_its_body() -> None:
+    c = _pv_contraction()
+    assert c.a_computed and c.a_name == "p"
+    assert isinstance(c.a_body[0], Load) and c.a_body[0].input == "S" and c.a_body[-1].op.name == "exp"
+    # external reads are the A body's LOADED buffers + B — the computed ``p`` is an internal temp, not a read.
+    assert set(c.external_reads()) == {"S", "V"}
+
+
+def test_contraction_computed_a_lowers_into_the_k_loop() -> None:
+    """The computed A body is spliced into the synthesized ``CONTRACTION`` loop AHEAD of the ⊗ multiply:
+    ``for j: s_e = S[m, j]; p = exp(s_e); v_e = V[j, d]; oblk__v = v_e·p; oblk += oblk__v`` — the
+    register-resident P produced per K-step, then multiplied by V and folded. Same builder a gmem-A
+    contraction uses; the operand is just a body, not a leaf load."""
+    loop = _pv_contraction().loop
+    assert loop.role is AxisRole.CONTRACTION and loop.axis.name == "j"
+    body = list(loop.body)
+    exp_i = next(i for i, s in enumerate(body) if isinstance(s, Assign) and s.op.name == "exp")
+    mul_i = next(i for i, s in enumerate(body) if isinstance(s, Assign) and s.op.name == "multiply")
+    acc_i = next(i for i, s in enumerate(body) if isinstance(s, Accum))
+    assert exp_i < mul_i < acc_i  # P computed, then P·V, then the additive fold
+    assert "p" in body[mul_i].args  # the ⊗ multiplies the register-resident P, no gmem A load
+
+
+def test_contraction_computed_a_factorizes_at_the_scalar_tier() -> None:
+    """The scalar tier expands a computed-A contraction with **no gmem A address**: the register-tile
+    replication treats ``P = exp(S)`` as ordinary K-loop body, so the emitted kernel carries the ``exp``
+    inside the reduce loop feeding the accumulator. This is the standalone P@V the tensor-core-flash
+    rebuild rests on (proved at the scalar tier; the mma tier reads the same operand as a fragment)."""
+    from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
+
+    tile = factorize(TileOp(op=_pv_contraction()), root=None)
+    exps = [s for s in tile.body.iter_of_type(Assign) if s.op.name == "exp"]
+    assert exps, "the computed A operand (exp of the score) must survive into the scalar kernel body"

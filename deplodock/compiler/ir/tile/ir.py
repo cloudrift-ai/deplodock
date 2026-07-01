@@ -184,7 +184,7 @@ class Contraction(Stmt):
 
     axes: tuple[Axis, Axis]  # the tiled output (m_axis, n_axis) — params
     k_axis: Axis  # the contraction axis — params
-    a_load: Load  # params
+    a_operand: Load | Body  # A: a gmem ``Load`` OR a computed register-resident ``Body`` (flash PV's ``P = exp(S − M)``) — params
     b_load: Load  # params
     acc: str  # params
     tile: TilePlan  # the schedule: leaf atom + unit/register widths + K-chunk (the only schedule field)
@@ -202,6 +202,24 @@ class Contraction(Stmt):
         return self.acc
 
     @property
+    def a_body(self) -> tuple[Stmt, ...]:
+        """The A operand's producing stmts — a singleton gmem ``Load``, or a computed body's stmts
+        (a **register-resident** A: flash PV's ``P = exp(S − M)``, produced from an in-register score,
+        not a gmem address). The last stmt's def is the operand value ``contraction_loop`` multiplies."""
+        return (self.a_operand,) if isinstance(self.a_operand, Load) else tuple(self.a_operand)
+
+    @property
+    def a_computed(self) -> bool:
+        """True when A is a computed register-resident operand (a ``Body``), not a gmem ``Load`` — the
+        mma tier reads it as a fragment, the scalar tier as the value."""
+        return not isinstance(self.a_operand, Load)
+
+    @property
+    def a_name(self) -> str:
+        """The A operand's bound SSA name (its producing body's last def)."""
+        return self.a_body[-1].defines()[-1]
+
+    @property
     def loop(self) -> Loop:
         """The synthesized ``CONTRACTION`` reduce ``Loop`` — the canonical ``for k: v = a*b; acc += v``
         mul-add form (built by the shared ``ops.contraction_loop``, the same generation
@@ -213,7 +231,7 @@ class Contraction(Stmt):
         return contraction_loop(
             lift=ElementwiseImpl("multiply"),
             fold=Accum(name=self.acc, value=f"{self.acc}__v", op=ElementwiseImpl("add"), axes=(self.k_axis.name,)),
-            operand_bodies=([self.b_load], [self.a_load]),  # B[k, n], A[m, k] — keep B-then-A load reuse
+            operand_bodies=([self.b_load], self.a_body),  # B[k, n], A[m, k] (or A's computed body) — keep B-then-A load reuse
             reduce_axis=self.k_axis,
         )
 
@@ -322,11 +340,13 @@ class Contraction(Stmt):
         return (self.acc,)
 
     def external_reads(self) -> tuple[str, ...]:
-        return (self.a_load.input, self.b_load.input)
+        a_inputs = tuple(s.input for s in self.a_body if isinstance(s, Load))
+        return (*a_inputs, self.b_load.input)
 
     def pretty(self, indent: str = "") -> list[str]:
         t = " trans" if self.b_trans else ""
-        ops = f"{self.a_load.input} @ {self.b_load.input}{t} -> {self.acc} ({self.atom.name})"
+        a_src = self.a_operand.input if isinstance(self.a_operand, Load) else self.a_name
+        ops = f"{a_src} @ {self.b_load.input}{t} -> {self.acc} ({self.atom.name})"
         return [f"{indent}Contraction [{self.m_axis.name}, {self.n_axis.name}] {ops}", *pretty_body(self.epilogue, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -343,10 +363,15 @@ def _(s: Contraction, rename, sigma, axis_fn):
     # Route the operand Loads + accumulator + epilogue through the generic rewrite (SSA / Expr / axis
     # canonicalization); map the skeleton axes; pass the ``tile`` schedule through unchanged.
     # ``b_trans`` is derived from ``b_load`` (a property), so the rewritten load carries it.
+    a_operand = (
+        _rewrite(s.a_operand, rename, sigma, axis_fn)
+        if isinstance(s.a_operand, Load)
+        else Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.a_operand))
+    )
     return Contraction(
         axes=tuple(axis_fn(a) for a in s.axes),
         k_axis=axis_fn(s.k_axis),
-        a_load=_rewrite(s.a_load, rename, sigma, axis_fn),
+        a_operand=a_operand,
         b_load=_rewrite(s.b_load, rename, sigma, axis_fn),
         acc=rename(s.acc),
         tile=s.tile,

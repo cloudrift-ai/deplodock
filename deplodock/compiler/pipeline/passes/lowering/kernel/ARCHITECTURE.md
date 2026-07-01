@@ -27,7 +27,8 @@ are shared across kinds; only the partition changes):
 
 The `Contraction` node is **one flat** Stmt — binding-driven for both atoms, with **no per-atom subclass** — that cleanly
 splits the **algebra params** (what to contract: the m/n output `axes` + the `k_axis`, the leading batch `lead_axes`, the
-structured A/B operand `Load`s read off the atomize binding, the fold accumulator `acc`, and the projection `epilogue`)
+B operand `Load` + the A `a_operand` — a gmem `Load` **or** a computed register-resident `Body` (flash PV's `P = exp(S −
+M)`, produced from an in-register score, not a gmem address) — the fold accumulator `acc`, and the projection `epilogue`)
 from the **schedule** (one `tile: TilePlan` field carrying the leaf `atom` — a tensor-core `AtomKind` / the scalar
 `ScalarAtom`, `ir/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (`tile_m` / `mask_m` /
 `block_threads` / …) is **derived** on the node from `tile` × `axes` (`@property`). Keeping the schedule a single swappable

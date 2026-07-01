@@ -258,15 +258,24 @@ the non-xfailed scalar flash e2e.
 **THE CRUX — PV's A operand is register-resident, not a gmem `Load` (confirmed against the generated merge).** The exp
 merge computes `P = exp(s − M)` (`m_i__t5`) and folds `O_i = O_i·α + v·P`. Making PV a real `Contraction` means its **A
 operand is `P`** — the softmax probabilities, which live **in registers** (they are computed from the QK score
-fragment), not in gmem. But the `Contraction` node bakes in **gmem `Load` operands** everywhere: `a_load: Load`;
-`_atomize.bind_contraction` binds the A/B `Load`s indexed over the reduce axis; `_mma_reduce` does `ldmatrix` straight
-from `a_load.input`'s gmem address. So "use `Contraction` for PV" is blocked on **extending the `Contraction` model to a
-computed / register-resident A operand** (a `Body` producing `P`, not a `Load`) — this IS the
-"score-S-fragment-as-operand-without-gmem-round-trip" primitive, and it is what makes tensor-core flash hard under any
-option. It also blocks the naive block=1 scalar splice (there `P` is a scalar SSA temp, still not a `Load`). **Next
-concrete step:** design the `Contraction` extension for a register-resident operand (its `a_load` becomes an
-`operand: Load | Body`, the scalar tier reads the value, the mma tier reads the fragment), land it with unit tests over
-a standalone `P@V` where `P` is computed, THEN rebuild `_flash_op` on it.
+fragment), not in gmem. The `Contraction` node used to bake in **gmem `Load` operands** everywhere.
+
+**✅ Register-resident A operand landed (this step).** `Contraction.a_load` is now `a_operand: Load | Body` — a gmem
+`Load` **or** a computed `Body` producing `P` (its last def is the operand value). New node accessors: `a_body` (the
+producing stmts — a singleton `(Load,)` for gmem, the body's stmts for computed), `a_computed`, `a_name`. The gmem path
+is **byte-identical** (`a_body` for a `Load` is `(a_load,)`, so `contraction_loop`/`_synth_reduce` splice the same
+single-stmt operand body). The **scalar tier** handles a computed A **for free**: the register-tile replication treats
+`P = exp(S)` as ordinary K-loop body, so `for j: s=S[m,j]; p=exp(s); v=V[j,d]; oblk__v=v·p; oblk += oblk__v` factorizes
+with no gmem A address. The **mma tier** (`_mma_reduce`) asserts `not a_computed` — the fragment-feed is step 3. Proven
+by `test_contraction_computed_a_*` (standalone P@V: `O[m,d] = Σ_j exp(S[m,j])·V[j,d]`) in
+`tests/compiler/ir/tile/test_structural_reduction.py`. `_atomize.bind_contraction` is unchanged — a computed-A
+contraction is **constructed directly** (flash / tests), never recognized (recognition rejects pre-scaled operands), so
+the binding path stays gmem-`Load`-only.
+
+**Next concrete step: rebuild `_flash._flash_op` on the register-resident PV `Contraction`** (option (b), the blocked
+two-`Contraction` tree). The scalar-flash e2e (`test_scalar_flash_matches_torch` / `_kv_tile_` / `_dynamic_`) is the
+numeric gate — it must stay green. The exp carrier's merge must **split around the PV contraction** (max/denom → `M`,
+`α`, `P`; then PV `Oblk = Σ_j P·V`; then the O-fold `O_i = O_i·α + Oblk`), with `block=1` the scalar degenerate.
 
 Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
 `test_attention_coverage.py::test_cooperative_flash_matches_torch`. Scalar-parity risk is real (step 2 changes the
