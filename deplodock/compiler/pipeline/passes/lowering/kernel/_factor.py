@@ -44,8 +44,7 @@ module."""
 
 from __future__ import annotations
 
-from dataclasses import replace
-from functools import partial
+from dataclasses import dataclass, replace
 
 from deplodock.compiler.backend.cuda.dtype import cuda_name
 from deplodock.compiler.dtype import F32
@@ -945,33 +944,67 @@ def _scalar_staged_kloop(c: Contraction, inputs, cells, offset, masks, mode: str
     return slab_decls, [outer]
 
 
-#: The reusable ``(state_decls, reduce_region)`` pair, keyed by atom kind — the operand fragments +
-#: the K-loop, **sink-agnostic**: both leave the accumulator a sink consumes (mma ``_c{i}_{j}``
-#: register fragments / scalar ``acc__c{i}_{j}`` per cell). :func:`reduce_codegen` binds the node.
-_MMA_REDUCE = (_mma_state, _mma_reduce)
-_SCALAR_REDUCE = (_scalar_state, _scalar_reduce)
+@dataclass(frozen=True)
+class _AtomOps:
+    """The per-atom codegen **strategy** — the one seam every tiled contraction dispatches through.
+    Bound to the contraction ``c`` + its operand ``stage`` / ``inputs``, it supplies the three
+    ``grid_tile`` callables — ``state(cells)`` (accumulator decls), ``reduce(cells, offset, masks)``
+    (the K-loop, via the shared :func:`_contract_kloop` skeleton), ``store(i, j, offset, masks)`` (the
+    per-cell sink). The two concrete atoms (:class:`_MmaOps` / :class:`_ScalarOps`) differ only in the
+    leaf codegen they delegate to. This IS the "atom as descriptor" seam: one factory
+    (:func:`_atom_ops`), no scattered ``isinstance``."""
+
+    c: Contraction
+    stage: Stage | None = None
+    inputs: object = None
+
+
+class _MmaOps(_AtomOps):
+    """Tensor-core atom — ``ldmatrix`` fragment reads + ``mma.sync``, a ``RegStore`` sink."""
+
+    def state(self, cells):
+        return _mma_state(self.c, self.stage, cells)
+
+    def reduce(self, cells, offset, masks):
+        return _mma_reduce(self.c, self.stage, cells, offset, masks)
+
+    def store(self, i, j, offset, masks):
+        return _mma_store(self.c, i, j, offset, masks)
+
+
+class _ScalarOps(_AtomOps):
+    """Scalar fma atom — plain ``Load``\\ s + an ``fma`` cell, the replicated-``epilogue`` sink."""
+
+    def state(self, cells):
+        return _scalar_state(self.c, self.stage, self.inputs, cells)
+
+    def reduce(self, cells, offset, masks):
+        return _scalar_reduce(self.c, self.stage, self.inputs, cells, offset, masks)
+
+    def store(self, i, j, offset, masks):
+        return _scalar_store(self.c, i, j, offset, masks)
+
+
+def _atom_ops(c: Contraction, stage: Stage | None = None, inputs=None) -> _AtomOps:
+    """The **one** atom dispatch — select the codegen strategy off the atom kind."""
+    return _MmaOps(c, stage, inputs) if isinstance(c.atom, AtomKind) else _ScalarOps(c, stage, inputs)
 
 
 def reduce_codegen(c: Contraction, stage: Stage | None = None, inputs=None):
-    """The reusable ``(state_decls, reduce_region)`` — operand fragments + the contraction K-loop
-    (``ldmatrix`` + ``mma.sync`` / the synthesized scalar fma), dispatched off the atom and bound to
-    ``c`` + its operand ``stage`` (both tiers stage an smem slab off it: the mma tier via ``ldmatrix``,
-    the scalar tier via plain-``Load`` slab reads — ``inputs`` supplies the operand slab dtype).
-    **Sink-agnostic**: it leaves the accumulator the :func:`store_sink` (or a flash sink) then
-    consumes, so the same K-loop emission is reused wherever a contraction is tiled."""
-    if isinstance(c.atom, AtomKind):
-        return partial(_mma_state, c, stage), partial(_mma_reduce, c, stage)
-    return partial(_scalar_state, c, stage, inputs), partial(_scalar_reduce, c, stage, inputs)
+    """The reusable, **sink-agnostic** ``(state_decls, reduce_region)`` from the atom strategy — the
+    accumulator decls + the contraction K-loop (the shared :func:`_contract_kloop` skeleton with the
+    atom's leaf constructors). ``stage`` / ``inputs`` bind operand staging (both tiers stage an smem
+    slab off it — the mma tier ``ldmatrix``-drains, the scalar tier plain-``Load``-drains)."""
+    ops = _atom_ops(c, stage, inputs)
+    return ops.state, ops.reduce
 
 
 def store_sink(c: Contraction):
-    """The default **matmul sink** — the per-cell ``store(i, j, offset, masks)`` callable that writes
-    each accumulator cell to the output through the projection ``epilogue`` (an mma ``RegStore`` /
-    the replicated scalar epilogue tail), dispatched off the atom. The flash branch swaps a sink that
-    instead feeds the accumulator fragments into the streaming-softmax twist, reusing
-    :func:`reduce_codegen`."""
-    store = _mma_store if isinstance(c.atom, AtomKind) else _scalar_store
-    return partial(store, c)
+    """The default **matmul sink** — the per-cell ``store(i, j, offset, masks)`` from the atom strategy
+    (an mma ``RegStore`` / the replicated scalar ``epilogue`` tail). ``factorize(c, store=…)`` swaps it
+    (a flash sink that bridges the accumulator into the streaming-softmax twist), reusing the shared
+    ``reduce`` emission."""
+    return _atom_ops(c).store
 
 
 def factorize(tile, root, store=None) -> Tile:

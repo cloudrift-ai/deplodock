@@ -185,9 +185,11 @@ top of this*, not before it — flash is the acceptance test that the collapse i
   — `ldmatrix`+`mma.sync` fragments vs `Load`+`fma` cells). This is a **strategy/factory refactor, not a kernel-IR
   redesign** (the earlier "needs a uniform node family" framing was wrong — that is optional Level-2 polish; keeping the
   two leaf node families behind one skeleton already removes the duplication). The scalar tier dropped `_synth_reduce` +
-  `_scalar_cells` (the replicate-then-dedup mechanism) for explicit row/col reads. **Remaining in (2):** fold `state` /
-  `store` behind the same per-atom factory (currently still `reduce_codegen` / `store_sink` `isinstance` dispatch), and
-  optionally the Level-2 uniform-node polish.
+  `_scalar_cells` (the replicate-then-dedup mechanism) for explicit row/col reads.
+- ✅ **Deviation 2 complete — `state` / `reduce` / `store` folded behind one `Atom` strategy** (`_AtomOps` +
+  `_MmaOps` / `_ScalarOps`, selected by the single `_atom_ops` factory). `reduce_codegen` / `store_sink` no longer carry
+  their own `isinstance(c.atom, AtomKind)` branch — there is now exactly ONE atom dispatch point. The atom is a
+  strategy object bound to `(c, stage, inputs)`; the Level-2 uniform-node-family polish stays optional (not needed).
 - **Remaining:** (3) staging-driver unification — `_warp_staged_kloop` / `_warp_tma_staged_kloop` / `_mma_stage_plan` vs
   `_scalar_staged_kloop` / `_scalar_stage_plan`, still dispatched per-atom inside each tier's `reduce`, onto one
   `Stage`-driven fill/drain keyed on slab layout; (4) placement-keyed fold move (lands with the tensor-core flash, which
