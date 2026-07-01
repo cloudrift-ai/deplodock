@@ -143,12 +143,12 @@ def _can_stage_warp_tma(
 
 
 def _staged_inner_atom_loop(
-    *, a_slab, b_slab, m: Side, n: Side, atom, bk_elems, ki, reg_depth: int = 1, a_slab_off=None, b_slab_off=None
+    *, slabs: tuple[str, str], mn: tuple[Side, Side], atom, bk_elems, ki, reg_depth: int = 1, offs=(None, None)
 ) -> list[Stmt]:
-    """The inner atom-K drain shared by the cp.async and TMA staged paths: read the A/B slabs via
+    """The inner atom-K drain shared by the cp.async and TMA staged paths: read the A/B ``slabs`` via
     ``LdmatrixLoad(staged=True)`` + ``MmaSyncPtx``. Slab-local indices — A[tile_m][bk_elems]
-    (ldm=bk_elems), B[bk_elems][tile_n] (ldm=tile_n) — independent of which producer filled the
-    (plain row-major, NONE-swizzle) slab.
+    (ldm=bk_elems), B[bk_elems][tile_n] (ldm=tile_n) — independent of which producer filled the (plain
+    row-major, NONE-swizzle) slab; ``mn`` is the ``(m, n)`` :class:`Side` pair.
 
     ``reg_depth == 1`` (default): one ``StridedLoop`` over the ``bk`` atom-K steps, ldmatrix-then-mma
     inline (the operand fragments ``_a{i}``/``_b{j}`` reused every step). ``reg_depth >= 2`` (the
@@ -157,82 +157,62 @@ def _staged_inner_atom_loop(
     ``reg_depth-1`` steps ahead while the mma consumes the current slot — breaking the per-step WAR
     hazard on the operand fragments. Numerically identical to the inline form.
 
-    ``a_slab_off`` / ``b_slab_off`` (the gmem→smem ring, ``STAGE`` depth>1): the read SLOT row offset
-    into a multi-slot slab — added to the A row / the B (K) row so the drain reads the ring slot the
-    producer already filled, while a later chunk prefetches into another slot."""
-    m_w, n_w, fm, fn, tile_n = m.unit, n.unit, m.reg, n.reg, n.tile
+    ``offs`` (the gmem→smem ring, ``STAGE`` depth>1): the ``(a, b)`` read SLOT row offsets — added to
+    each slab's ROW (A's tile row / B's K row) so the drain reads the ring slot the producer already
+    filled, while a later chunk prefetches into another slot."""
+    (a_slab, b_slab), (m, n) = slabs, mn
     atom_m, atom_n, atom_k = atom.shape
     n_steps = bk_elems // atom_k
+    # Per-operand drain spec: (tag, slab, ldm, tile-is-slab-row, reg count, warp-unit var, atom dim, slot row off).
+    # A stacks the tile axis on the slab row (K the col); B swaps (K the row, tile the col); the slot
+    # offset always lands on the ROW. The two share ONE emission loop.
+    specs = (
+        ("a", a_slab, bk_elems, True, m.reg, m.unit, atom_m, offs[0]),
+        ("b", b_slab, n.tile, False, n.reg, n.unit, atom_n, offs[1]),
+    )
 
-    def a_row(i):  # within-tile A row for register cell i (warp m_w · FM·atom_m + i·atom_m) + ring slot
-        r = BinaryExpr("+", BinaryExpr("*", Var(m_w), Literal(fm * atom_m, "int")), Literal(i * atom_m, "int"))
-        return BinaryExpr("+", a_slab_off, r) if a_slab_off is not None else r
+    def ldms(kexpr, suffix):  # both operands' ldmatrix reads at K position `kexpr`, into fragment slot `suffix`
+        reads: list[Stmt] = []
+        for tag, slab, ldm, is_row, reg, unit, adim, off in specs:
+            for x in range(reg):  # within-tile coord for register cell x: warp·(reg·adim) + x·adim
+                prim = BinaryExpr("+", BinaryExpr("*", Var(unit), Literal(reg * adim, "int")), Literal(x * adim, "int"))
+                row, col = (prim, kexpr) if is_row else (kexpr, prim)
+                if off is not None:
+                    row = BinaryExpr("+", off, row)
+                reads.append(LdmatrixLoad(frag=f"_{tag}{x}{suffix}", src_buffer=slab, src_index=(row, col), role=tag, staged=True, ldm=ldm))
+        return reads
 
-    def b_col(j):  # within-tile B col for register cell j
-        return BinaryExpr("+", BinaryExpr("*", Var(n_w), Literal(fn * atom_n, "int")), Literal(j * atom_n, "int"))
+    def mmas(suffix):  # every (i, j) cell's mma.sync over the `suffix`-slotted operand fragments
+        return [
+            MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}{suffix}", b_frag=f"_b{j}{suffix}", shape=atom.shape, ab_dtype=atom.ab_dtype)
+            for i in range(m.reg)
+            for j in range(n.reg)
+        ]
 
-    def b_krow(kc):  # the B slab (K) row for atom-K col `kc` + ring slot
-        return BinaryExpr("+", b_slab_off, kc) if b_slab_off is not None else kc
-
-    if reg_depth < 2 or n_steps < 2:  # single-buffer: the original inline ldmatrix→mma loop
-        inner: list[Stmt] = []
-        for i in range(fm):  # A: row = a_slab_off + within-tile row (a_row), col = ki (the K position)
-            inner.append(LdmatrixLoad(frag=f"_a{i}", src_buffer=a_slab, src_index=(a_row(i), Var(ki)), role="a", staged=True, ldm=bk_elems))
-        for j in range(fn):  # B: row = b_slab_off + ki (the K position), col = within-tile col (b_col)
-            inner.append(
-                LdmatrixLoad(frag=f"_b{j}", src_buffer=b_slab, src_index=(b_krow(Var(ki)), b_col(j)), role="b", staged=True, ldm=tile_n)
-            )
-        for i in range(fm):
-            for j in range(fn):
-                inner.append(MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}", b_frag=f"_b{j}", shape=atom.shape, ab_dtype=atom.ab_dtype))
+    if reg_depth < 2 or n_steps < 2:  # single-buffer: the inline ldmatrix→mma loop
+        body = ldms(Var(ki), "") + mmas("")
         return [
             StridedLoop(
                 axis=Axis(name=ki, extent=bk_elems),
                 start=Literal(0, "int"),
                 step=Literal(atom_k, "int"),
-                body=Body(tuple(inner)),
+                body=Body(tuple(body)),
                 unroll=True,
             )
         ]
 
-    # reg_depth ≥ 2: the unrolled register double-buffer. ``slot = step % depth`` cycles the
-    # fragment buffers; prefetch runs ``depth-1`` steps ahead of the consuming mma.
+    # reg_depth ≥ 2: the unrolled register double-buffer. ``slot = step % depth`` cycles the fragment
+    # buffers; prefetch runs ``depth-1`` steps ahead of the consuming mma.
     depth = min(reg_depth, n_steps)
     kcol = lambda step: Literal(step * atom_k, "int")  # slab-local K col of atom-K step `step`  # noqa: E731
-
-    def load_step(step: int) -> list[Stmt]:
-        slot = step % depth
-        out: list[Stmt] = []
-        for i in range(fm):
-            out.append(
-                LdmatrixLoad(
-                    frag=f"_a{i}_s{slot}", src_buffer=a_slab, src_index=(a_row(i), kcol(step)), role="a", staged=True, ldm=bk_elems
-                )
-            )
-        for j in range(fn):
-            out.append(
-                LdmatrixLoad(
-                    frag=f"_b{j}_s{slot}", src_buffer=b_slab, src_index=(b_krow(kcol(step)), b_col(j)), role="b", staged=True, ldm=tile_n
-                )
-            )
-        return out
-
-    def mma_step(step: int) -> list[Stmt]:
-        slot = step % depth
-        return [
-            MmaSyncPtx(c_frag=f"_c{i}_{j}", a_frag=f"_a{i}_s{slot}", b_frag=f"_b{j}_s{slot}", shape=atom.shape, ab_dtype=atom.ab_dtype)
-            for i in range(fm)
-            for j in range(fn)
-        ]
-
     stmts: list[Stmt] = []
     for s in range(depth - 1):  # prologue: prime the first depth-1 steps
-        stmts += load_step(s)
+        stmts += ldms(kcol(s), f"_s{s % depth}")
     for step in range(n_steps):
         nxt = step + depth - 1
         if nxt < n_steps:  # prefetch depth-1 ahead, into the slot the mma below frees
-            stmts += load_step(nxt)
-        stmts += mma_step(step)
+            stmts += ldms(kcol(nxt), f"_s{nxt % depth}")
+        stmts += mmas(f"_s{step % depth}")
     return stmts
 
 
@@ -266,49 +246,48 @@ def _slab_index(operand_index, *, tile: Side, tile_base, k_axis, tile_is_row: bo
 
 def _tile_base(mn: tuple[Side, Side]) -> tuple[Expr, Expr]:
     """The CTA tile's ``(row_base, col_base)`` top-left origin — ``(m_b·tile_m, n_b·tile_n)``."""
-    m, n = mn
-    return (BinaryExpr("*", Var(m.block), Literal(m.tile, "int")), BinaryExpr("*", Var(n.block), Literal(n.tile, "int")))
+    return tuple(BinaryExpr("*", Var(s.block), Literal(s.tile, "int")) for s in mn)
 
 
-def _slab_operands(
-    *, a_index_src, b_index_src, bufs: tuple[str, str], mn: tuple[Side, Side], k_axis, bk_elems: int, base: tuple[Expr, Expr]
-):
-    """The staged ``(A, B)`` :class:`Operand` pair — the one operand-geometry factory both tiers build.
-    A is ``(tile_m × bk)`` indexed by the M tile axis (the slab ROW), B is ``(bk × tile_n)`` by the N
-    tile axis (the slab COL); ``base`` is the ``(row_base, col_base)`` CTA tile origin. ``a_index_src`` /
-    ``b_index_src`` are the operands' gmem index expressions (``load.index``)."""
-    m, n = mn
-    a_buf, b_buf = bufs
-    row_base, col_base = base
-    a = Operand(
-        tag="a",
-        buf=a_buf,
-        shape=(m.tile, bk_elems),
-        coords=lambda k0: (row_base, k0),
-        index=_slab_index(a_index_src, tile=m, tile_base=row_base, k_axis=k_axis, tile_is_row=True),
-    )
-    b = Operand(
-        tag="b",
-        buf=b_buf,
-        shape=(bk_elems, n.tile),
-        coords=lambda k0: (k0, col_base),
-        index=_slab_index(b_index_src, tile=n, tile_base=col_base, k_axis=k_axis, tile_is_row=False),
-    )
-    return (a, b)
+def _box_coords(tile_base: Expr, is_row: bool):
+    """The TMA box origin at K-chunk ``k0`` — ``(tile_base, k0)`` when the tile axis is the slab ROW (A),
+    ``(k0, tile_base)`` when it is the COL (B)."""
+    return (lambda k0: (tile_base, k0)) if is_row else (lambda k0: (k0, tile_base))
 
 
-def _mma_staged(*, a_load, b_load, mn: tuple[Side, Side], k_axis, atom, bk, slab_dtype, elem_bytes, reg_depth: int, depth: int, mode: str):
+def _slab_operands(*, index_srcs: tuple, bufs: tuple[str, str], mn: tuple[Side, Side], k_axis, bk_elems: int, base: tuple[Expr, Expr]):
+    """The staged ``(A, B)`` :class:`Operand` pair — the one operand-geometry factory both tiers build,
+    looped over the two operands. A is ``(tile_m × bk)`` indexed by the M tile axis (the slab ROW); B is
+    ``(bk × tile_n)`` by the N tile axis (the slab COL) — ``is_row`` flips the slot shape + the TMA box
+    origin. ``base`` is the ``(row_base, col_base)`` CTA tile origin; ``index_srcs`` are the operands'
+    gmem index expressions (``load.index``)."""
+    ops: list[Operand] = []
+    for i, (tag, is_row) in enumerate((("a", True), ("b", False))):
+        tile, tile_base = mn[i], base[i]
+        shape = (tile.tile, bk_elems) if is_row else (bk_elems, tile.tile)
+        ops.append(
+            Operand(
+                tag=tag,
+                buf=bufs[i],
+                shape=shape,
+                coords=_box_coords(tile_base, is_row),
+                index=_slab_index(index_srcs[i], tile=tile, tile_base=tile_base, k_axis=k_axis, tile_is_row=is_row),
+            )
+        )
+    return tuple(ops)
+
+
+def _mma_staged(*, loads: tuple, mn: tuple[Side, Side], k_axis, atom, bk, slab_dtype, elem_bytes, reg_depth: int, depth: int, mode: str):
     """The warp tier's STAGED K-loop — build the operand :class:`Transport` (a cp.async prefetch ring
-    or the TMA box-copy producer) + the shared ``ldmatrix`` drain leaf, then run the one
-    :func:`staged_kloop`. A pure perf transform, bit-identical to gmem-direct. ``depth == 1`` is the
-    single-buffer degenerate; ``depth >= 2`` (cp.async ``d<depth>``) is the gmem→smem ring; ``reg_depth``
-    composes the inner smem→register double-buffer. ``mask_m``: the cp.async A fill clamps the
-    overhanging gmem row in-bounds; TMA zero-fills the box overhang instead (both leave the discard to
-    the ``RegStore`` ``m_guard``)."""
+    or the TMA box-copy producer) from the ``(a_load, b_load)`` operand pair + the shared ``ldmatrix``
+    drain leaf, then run the one :func:`staged_kloop`. A pure perf transform, bit-identical to
+    gmem-direct. ``depth == 1`` is the single-buffer degenerate; ``depth >= 2`` (cp.async ``d<depth>``)
+    is the gmem→smem ring; ``reg_depth`` composes the inner smem→register double-buffer. ``mask_m``: the
+    cp.async A fill clamps the overhanging gmem row in-bounds; TMA zero-fills the box overhang instead
+    (both leave the discard to the ``RegStore`` ``m_guard``)."""
     m, n = mn
     bk_elems = bk * atom.shape[2]
     K = k_axis.extent.as_static()  # static K (the staging eligibility rule)
-    base = _tile_base(mn)
     # intra-CTA linear thread id from the decoded warp / lane axis vars (never a raw threadIdx.x).
     linear_tid = BinaryExpr(
         "+",
@@ -316,13 +295,12 @@ def _mma_staged(*, a_load, b_load, mn: tuple[Side, Side], k_axis, atom, bk, slab
         Var("_lane"),
     )
     operands = _slab_operands(
-        a_index_src=a_load.index,
-        b_index_src=b_load.index,
-        bufs=(a_load.input, b_load.input),
+        index_srcs=tuple(ld.index for ld in loads),
+        bufs=tuple(ld.input for ld in loads),
         mn=mn,
         k_axis=k_axis,
         bk_elems=bk_elems,
-        base=base,
+        base=_tile_base(mn),
     )
     common = dict(
         operands=operands,
@@ -333,18 +311,14 @@ def _mma_staged(*, a_load, b_load, mn: tuple[Side, Side], k_axis, atom, bk, slab
     transport = TmaTransport(**common) if mode == "tma" else CpAsyncTransport(**common)
 
     def drain(slot):  # the ldmatrix + mma.sync leaf, reading ring `slot`
-        a_op, b_op = operands
         return _staged_inner_atom_loop(
-            a_slab=a_op.slab,
-            b_slab=b_op.slab,
-            m=m,
-            n=n,
+            slabs=tuple(op.slab for op in operands),
+            offs=tuple(op.slot_row(slot) for op in operands),
+            mn=mn,
             atom=atom,
             bk_elems=bk_elems,
             ki="_ki",
             reg_depth=reg_depth,
-            a_slab_off=a_op.slot_row(slot),
-            b_slab_off=b_op.slot_row(slot),
         )
 
     return staged_kloop(transport=transport, drain=drain, depth=depth, bk_elems=bk_elems, n_chunks=K // bk_elems, k_extent=K)
@@ -466,10 +440,12 @@ def _scalar_protected(c: Contraction) -> frozenset[str]:
     """The shared iteration coordinates — the block / unit / loop / extent vars excluded from the
     per-cell SSA rename (everything else is suffixed ``__c{i}_{j}`` so each cell owns its names)."""
     m, n, k_axis = c.m, c.n, c.k_axis
-    prot = {n.block, n.unit, k_axis.name, m.block, m.unit}
+    prot = {k_axis.name}
+    for s in (m, n):
+        prot |= {s.block, s.unit}
     for a in c.lead_axes:
         prot.add(a.name)
-    for a in (n.axis, k_axis, m.axis, *c.lead_axes):
+    for a in (m.axis, n.axis, k_axis, *c.lead_axes):
         prot |= set(_extent_expr(a).free_vars())
     return frozenset(prot)
 
@@ -538,9 +514,7 @@ def _scalar_staged(c: Contraction, inputs, cells, offset, mode: str, bk_elems: i
     slab_dtype, elem_bytes = cuda_name(inputs[bufs[0]].dtype), inputs[bufs[0]].dtype.nbytes
     base = _tile_base(mn)
     linear_tid = BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit))
-    operands = _slab_operands(
-        a_index_src=c.a_operand.index, b_index_src=c.b_load.index, bufs=bufs, mn=mn, k_axis=k_axis, bk_elems=bk_elems, base=base
-    )
+    operands = _slab_operands(index_srcs=(c.a_operand.index, c.b_load.index), bufs=bufs, mn=mn, k_axis=k_axis, bk_elems=bk_elems, base=base)
     common = dict(
         operands=operands, slab_dtype=slab_dtype, elem_bytes=elem_bytes, cta=CtaTile(linear_tid=linear_tid, n_threads=c.block_threads)
     )
@@ -579,16 +553,22 @@ class _MmaOps(_AtomOps):
         c, stage = self.c, self.stage
         atom, m, n = c.atom, c.m, c.n
         _mode, _gmem_depth, reg_depth = _mma_stage_plan(c, stage)
-        a_frags = [f"_a{i}_s{s}" for i in range(m.reg) for s in range(reg_depth)] if reg_depth >= 2 else [f"_a{i}" for i in range(m.reg)]
-        b_frags = [f"_b{j}_s{s}" for j in range(n.reg) for s in range(reg_depth)] if reg_depth >= 2 else [f"_b{j}" for j in range(n.reg)]
-        decls: list[Stmt] = []
-        for name in a_frags:
-            decls.append(RegFragment(name=name, role="a", shape=atom.shape, dtype=atom.operand_dtype("a")))
-        for name in b_frags:
-            decls.append(RegFragment(name=name, role="b", shape=atom.shape, dtype=atom.operand_dtype("b")))
-        for i in range(m.reg):
-            for j in range(n.reg):
-                decls.append(RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c")))
+
+        def frags(tag, reg):  # reg-tile operand fragment names (slotted ``_s{s}`` when double-buffered)
+            return (
+                [f"_{tag}{i}_s{s}" for i in range(reg) for s in range(reg_depth)] if reg_depth >= 2 else [f"_{tag}{i}" for i in range(reg)]
+            )
+
+        decls: list[Stmt] = [
+            RegFragment(name=nm, role=tag, shape=atom.shape, dtype=atom.operand_dtype(tag))
+            for tag, reg in (("a", m.reg), ("b", n.reg))
+            for nm in frags(tag, reg)
+        ]
+        decls += [
+            RegFragment(name=f"_c{i}_{j}", role="c", shape=atom.shape, dtype=atom.operand_dtype("c"))
+            for i in range(m.reg)
+            for j in range(n.reg)
+        ]
         return decls
 
     def reduce(self, cells, offset, mn):
@@ -608,8 +588,7 @@ class _MmaOps(_AtomOps):
         mode, gmem_depth, reg_depth = _mma_stage_plan(c, stage)
         if mode != "gmem":
             return _mma_staged(
-                a_load=a_load,
-                b_load=b_load,
+                loads=(a_load, b_load),
                 mn=mn,
                 k_axis=k_axis,
                 atom=atom,
