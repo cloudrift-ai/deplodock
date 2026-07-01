@@ -401,10 +401,21 @@ and the knob schema:
      tier expands the same loop nest — flash accuracy vs torch unchanged (attention coverage green,
      21 passed / 34 xfail). The `{TILE@d, TILE@sk, REDUCE@sk}` featurize-per-node round-trip landed with
      step 5 (`test_multinode_flash_keys_apart_and_pools_per_node`).
-   - **Remaining:** build split-K (`g<n>` wraps the non-tiled `Contraction` in a `Reduction`, retiring
-     the `_tile_option` split-K `Map`); add the flash QK/PV warp-budget coupling legality `Level`; the
-     addressed per-node `S_*` stamp (only once warp-flash produces two tiled contractions — until then
-     flash keys one node, `kv`); a `test_mma_splitk_finalize` structural assertion.
+   - **Split-K deferred (finding).** The clean `Reduction ⊃ Contraction` nesting works when the two
+     axes **differ** (flash: `kv` reduce outer, `dd` contract inner) — `Reduction.loop` splices the
+     inner loop under the outer. A **plain split-K matmul** has only ONE reduce (the contraction's own
+     `k` fold): `Reduction(axis=k, source=Contraction(k_axis=k))` would lower to `for k: [for k: …]` — a
+     double reduce. The correct structural form is `Reduction(axis=ksplit, source=Contraction(k_axis=
+     kslice))`, but `ksplit`/`kslice` don't exist until `030_split` factors them at rewrite time, so
+     emitting the split axis is a **fork-catalog (step 7)** concern, not a pre-030 build. Split-K stays
+     on its current (working, tested) `_tile_option` residual-`Map` path until step 7 introduces the
+     split axis at build. `030_split` already reads the reduce structurally via `lower(op)`, so it
+     consumes either form. The `tile.reduce` residual fallback in `ops.reduce_plan` therefore survives
+     for the split-K matmul (only flash migrated off it).
+   - **Remaining (gated):** the flash QK/PV warp-budget coupling legality `Level` and the addressed
+     per-node `S_*` stamp both need **warp-flash** (two tiled contractions, `TILE@d` + `TILE@sk`); until
+     that lands, scalar flash keys one node (`kv`), so the featurizer's multi-node path is exercised only
+     by the synthetic round-trip test. These ride the warp-flash follow-up, not this plan.
 9. **Per-node prior (optional, gated).** If we commit to per-node predict, add the per-node feature block +
    compose step; otherwise stop at pool. Decide via an A/B of prior rank on a flash fixture.
 
