@@ -331,6 +331,23 @@ make format    # auto-fix
 4. `make test && make lint` (use `make format` to auto-fix).
 5. Open a PR against `main`.
 
+## Releasing
+
+Publishes to [PyPI as `emmy-llm`](https://pypi.org/project/emmy-llm/) via GitHub Actions
+([publish.yml](.github/workflows/publish.yml)) when a GitHub Release is published — trusted publishing
+(OIDC), no API token. The distribution is `emmy-llm` (the name `emmy` was taken); the import package and CLI
+stay `emmy` (`pip install emmy-llm` → `import emmy`).
+
+```bash
+# 1. Bump `version` in pyproject.toml to a NEW value (PyPI versions and git tags are immutable).
+# 2. Merge to main, then cut a Release whose tag is v<version> — CI hard-checks tag == pyproject version:
+gh release create v0.1.2 --target main --title "emmy-llm 0.1.2" --generate-notes
+```
+
+CI runs `make test` → build → publish. A brand-new distribution name first needs a one-time
+[PyPI trusted publisher](https://docs.pypi.org/trusted-publishers/) registered (owner `cloudrift-ai`, repo
+`emmy`, workflow `publish.yml`, environment `pypi`).
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
