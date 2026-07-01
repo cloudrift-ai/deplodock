@@ -230,10 +230,12 @@ never a divergent path.
 
 **Consolidation steps (architecture first, each kept green by the non-xfailed *scalar* flash e2e):**
 
-1. **Structural seam — let a reduce `partial` carry a nested `Contraction`.** Today `Reduction.source` holds one node;
-   flash needs the QK on `source` **and** the PV inside `partial`. Teach `ops.lower` / `ops.reduce_loop` /
-   `factorize` to recurse into a `Contraction` sitting in a reduce partial (the same recursion `_atomize`'s deferred
-   "warp-flash seam" note anticipates). One structural rule, both tiers.
+1. ✅ **Structural seam — a reduce `partial` can carry a nested `Contraction`.** `Reduction.loop` now flattens a
+   `Contraction` (a `Stmt`) sitting in its `partial` to its own loop nest in place (`_flatten_nodes`), the same
+   recursion the `source` splice does. Backward-compatible (a no-op for a plain partial → every existing reduce lowers
+   byte-identically); pinned by `test_reduce_partial_flattens_a_nested_pv_contraction`. This is the QK-on-`source` +
+   PV-in-`partial` capability the two-`Contraction` tree rests on. (Step 3's mma tier will factorize the nested PV
+   instead of flattening it — `factorize` recursion is a step-3 concern.)
 2. **Rebuild `_flash._flash_op` to the blocked two-`Contraction` tree** with `kv_block = 1` (degenerate `j`) so the
    **scalar** tier lowers to today's per-element nest — accuracy-identical, the guardrail. The carrier stays
    `flash_combine(m_i, l_i, O_i, …)`, but the expect channel's per-element `p·v` is replaced by the PV `Contraction`'s
