@@ -60,7 +60,7 @@ from deplodock.compiler.ir.tile import (
     TileOp,
     TilePlan,
 )
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
+from deplodock.compiler.ir.tile.ops import axis_role, lower, nodify_reduce, reduce_loop, reduce_plan
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]
@@ -98,6 +98,15 @@ def _strip_grid(plan: ReducePlan) -> ReducePlan:
     return ReducePlan(tuple(s for s in plan.stages if s.level is not Level.GRID))
 
 
+def _residual(map_op: Map, plan: ReducePlan) -> Map | Reduction:
+    """The split partial's op with the residual (non-GRID) reduce partition on its
+    :class:`Reduction` **node**: when the ``GRID`` strip leaves a coop / ILP partition, nodify
+    the flat ``Map`` (:func:`nodify_reduce`); otherwise the partial folds its slice serially and
+    stays a flat ``Map`` (``reduce_plan`` reads ``None`` → the degenerate one-thread-per-cell arm)."""
+    stripped = _strip_grid(plan)
+    return nodify_reduce(map_op, stripped) if (stripped.coop > 1 or stripped.reg > 1) else map_op
+
+
 def _carrier_identities(carrier) -> dict[str, float]:
     """The per-state-component neutral element (the finalize seeds the state with it before
     folding the partitions). A degenerate carrier reads it off its dissolved ``Accum``\\ s; a
@@ -109,14 +118,12 @@ def _carrier_identities(carrier) -> dict[str, float]:
     return {s.name: s.op.identity for s in carrier.merge if isinstance(s, Accum)}
 
 
-def _mapped(op, grid, *, name: str = "", reduce: ReducePlan | None = None, tier=None) -> TileOp:
-    """A **mapped** ``TileOp`` wrapping ``op`` over ``grid`` (so ``_schedule`` skips it). ``reduce``
-    sets the residual reduce partition; ``tier`` preserves a contraction's scalar output tier
-    (:class:`TilePlan`)."""
+def _mapped(op, grid, *, name: str = "", tier=None) -> TileOp:
+    """A **mapped** ``TileOp`` wrapping ``op`` over ``grid`` (so ``_schedule`` skips it). ``tier``
+    preserves a contraction's scalar output tier (:class:`TilePlan`); a residual reduce partition
+    rides the op's :class:`Reduction` **node** (:func:`nodify_reduce`), not a ``TileOp`` field."""
     place = Placement(free=tuple(grid), grid=tuple(grid))
     kw: dict = {}
-    if reduce is not None:
-        kw["reduce"] = reduce
     if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
         kw["tier"] = tier
     return TileOp(op=op, name=name, place=place, **kw)
@@ -298,7 +305,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
             # the atomic ``Write`` of the carrier state directly.
             atomic_proj = (Write(output=out.name, index=cell, values=states, atomic=True),)
         atomic_op = Map(body=Body((*before, sliced_loop, *atomic_proj)))
-        return _mapped(atomic_op, (split, *grid), name=tile.name, reduce=_strip_grid(plan), tier=tile_plan)
+        return _mapped(_residual(atomic_op, plan), (split, *grid), name=tile.name, tier=tile_plan)
 
     # The ``__partial`` workspace packs every carrier-state component: ``ws[comp, cta, *free]``
     # (the ``comp`` leading axis dropped for a single-component additive carrier, so the
@@ -314,7 +321,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # --- partial kernel: reduce a CTA's slice, write its carrier state to the workspace -----
     ws_writes = tuple(Write(output=ws_name, index=ws_index(i), value=states[i]) for i in range(n_comp))
     partial_op = Map(body=Body((*before, sliced_loop, *ws_writes)))
-    partial_tile = _mapped(partial_op, (split, *grid), name=f"{tile.name}__partial", reduce=_strip_grid(plan), tier=tile_plan)
+    partial_tile = _mapped(_residual(partial_op, plan), (split, *grid), name=f"{tile.name}__partial", tier=tile_plan)
 
     # --- finalize kernel: seed the carrier state, then fold each partition's state from the
     # workspace over the split axis via the carrier's ``as_state_merge`` (a renderable

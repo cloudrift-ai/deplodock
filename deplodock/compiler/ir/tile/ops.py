@@ -16,7 +16,10 @@ the carriers already dissolved into loose folds at recognition) plus the structu
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from deplodock.compiler.ir.axis import AxisRole
+from deplodock.compiler.ir.schedule import ReducePlan
 from deplodock.compiler.ir.stmt import Assign, Body, Loop, StridedLoop
 from deplodock.compiler.ir.stmt.base import Stmt, pretty_body
 from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction
@@ -40,17 +43,36 @@ def reduce_loop(op):
 
 
 def reduce_plan(tile):
-    """The tile's reduce partition (:class:`~deplodock.compiler.ir.schedule.ReducePlan`) — read
-    off the :class:`~deplodock.compiler.ir.tile.ir.Reduction` node when ``tile.op`` is (or wraps
-    via ``Map.source``) one, else off the ``TileOp``'s residual ``reduce`` field (a non-tiled
-    contraction's split-K / coop-K reduce, not yet a node). Flash is now a ``Map(source=Reduction)`` too,
-    so its partition rides the node; the ``TileOp.reduce`` field serves only the non-tiled contraction's
-    coop-K / split-K partition (still a root field, not yet nodified).
-    The single accessor the materializer / ``030_split`` read so the reduce partition can live on the
-    node instead of a root schedule field."""
+    """The tile's reduce partition (:class:`~deplodock.compiler.ir.schedule.ReducePlan`), read
+    **off the** :class:`~deplodock.compiler.ir.tile.ir.Reduction` **node** — when ``tile.op`` is a
+    ``Reduction`` (bare, or wrapped via ``Map.source``), else ``None`` (a pure pointwise / scalar
+    per-cell ``Map`` has no partition). Every partitioned reduce — a plain / twisted monoid, flash,
+    a coop-K / split-K contraction (:func:`nodify_reduce`) — carries its plan on the node; there is
+    **no** residual ``TileOp.reduce`` field. The single accessor the materializer / ``030_split`` read."""
     op = tile.op
     red = op.source if isinstance(op, Map) and isinstance(op.source, Reduction) else (op if isinstance(op, Reduction) else None)
-    return red.reduce if red is not None else tile.reduce
+    return red.reduce if red is not None else None
+
+
+def nodify_reduce(op: Map, plan: ReducePlan):
+    """Nodify a flat ``Map`` holding an annotated reduce ``Loop`` into a
+    :class:`~deplodock.compiler.ir.tile.ir.Reduction` node carrying the reduce partition ``plan``
+    **on the node** (not a residual ``TileOp.reduce`` field). :meth:`Reduction.from_loop`
+    reconstructs the identical annotated loop, so the lowering is byte-identical; a projection tail
+    (a fused epilogue) rides a wrapping ``Map`` over the node, a bare reduce becomes the root node.
+
+    Used by the scheduler (the coop / ILP-K contraction) and ``030_split`` (the split partial) so
+    EVERY partitioned reduce reads its plan off a node uniformly — the ``lower(op)``-then-refind
+    smell (and the ``TileOp.reduce`` residual) is gone. The reduce ``Loop`` must be a top-level stmt
+    of ``op.body`` with no prologue ahead of it (true for a contraction / bare sum: the reduce is the
+    body's head); a projection tail after it becomes the wrapping ``Map`` body."""
+    rloop = reduce_loop(op)
+    red = replace(Reduction.from_loop(rloop), reduce=plan)
+    body = list(op.body)
+    idx = body.index(rloop)
+    pre, tail = body[:idx], body[idx + 1 :]
+    assert not pre, f"nodify_reduce: unexpected prologue ahead of the reduce loop: {pre}"
+    return Map(body=Body(tuple(tail)), source=red) if tail else red
 
 
 def axis_role(op) -> AxisRole:
@@ -111,4 +133,4 @@ def pretty(op, indent: str = "") -> list[str]:
     return [f"{indent}{op!r}"]
 
 
-__all__ = ["Map", "axis_role", "contraction_loop", "lower", "pretty", "reduce_loop", "reduce_plan"]
+__all__ = ["Map", "axis_role", "contraction_loop", "lower", "nodify_reduce", "pretty", "reduce_loop", "reduce_plan"]

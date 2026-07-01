@@ -79,10 +79,10 @@ def test_pure_pointwise_map_has_no_reduce() -> None:
     assert node.out == "y"
 
 
-def _tile(op, schedule_reduce: ReducePlan | None = None) -> TileOp:
-    """An unmapped :class:`TileOp` — its ``reduce`` field is the residual root partition (the
-    fallback ``reduce_plan`` reads for a not-yet-nodified reduce)."""
-    return TileOp(op=op, reduce=schedule_reduce or ReducePlan())
+def _tile(op) -> TileOp:
+    """An unmapped :class:`TileOp` wrapping ``op`` — the reduce partition rides ``op``'s
+    :class:`Reduction` node (there is no residual ``TileOp.reduce`` field)."""
+    return TileOp(op=op)
 
 
 def test_reduce_plan_reads_the_partition_off_the_reduction_node() -> None:
@@ -92,14 +92,16 @@ def test_reduce_plan_reads_the_partition_off_the_reduction_node() -> None:
     assert reduce_plan(_tile(red)) is plan
     wrapped = Map(body=Body((Assign(name="rms", op="sqrt", args=("acc",)),)), source=red)
     assert reduce_plan(_tile(wrapped)) is plan
-    # The partition rides the node, not the ``TileOp``'s residual ``reduce`` field.
-    assert _tile(red).reduce == ReducePlan()
 
 
-def test_reduce_plan_falls_back_to_the_residual_reduce_for_a_legacy_loop_in_body_map() -> None:
-    residual = ReducePlan.of(coop=64)
-    legacy = Map(body=(_sum_loop(),))  # loop in the body, no Reduction source (flash's form)
-    assert reduce_plan(_tile(legacy, residual)) is residual
+def test_reduce_plan_is_none_for_a_flat_map_without_a_reduction_node() -> None:
+    """A flat ``Map`` (pointwise, or a scalar per-cell contraction holding a loop-in-body with no
+    ``Reduction`` source) has NO partition — ``reduce_plan`` reads ``None``, not a residual field.
+    Every partitioned reduce is nodified (``nodify_reduce``), so the fallback is gone."""
+    legacy = Map(body=(_sum_loop(),))  # loop in the body, no Reduction source
+    assert reduce_plan(_tile(legacy)) is None
+    pointwise = Map(body=(Load(name="x_e", input="x", index=(Var("m"),)),))
+    assert reduce_plan(_tile(pointwise)) is None
 
 
 def test_twisted_role_propagates() -> None:
@@ -147,6 +149,38 @@ def test_contraction_lower_appends_the_fused_epilogue() -> None:
     c = _contraction(epilogue=Body(proj))
     assert lower(c) == [c.loop, *proj]
     assert reduce_loop(c).role is AxisRole.CONTRACTION  # the projection doesn't hide the contraction
+
+
+# --- nodify_reduce: the coop-K / split partial flat-Map → Reduction node lift ------------------ #
+
+
+def test_nodify_reduce_lifts_a_bare_loop_in_body_map_to_a_reduction() -> None:
+    """A flat ``Map`` holding just the annotated reduce loop nodifies to a **bare** ``Reduction`` node
+    carrying the partition — ``lower`` byte-identical, ``reduce_plan`` reading the node."""
+    from deplodock.compiler.ir.tile.ops import nodify_reduce
+
+    loop = _sum_loop()
+    flat = Map(body=(loop,))
+    plan = ReducePlan.of(coop=4)
+    node = nodify_reduce(flat, plan)
+    assert isinstance(node, Reduction) and node.reduce is plan
+    assert lower(node) == lower(flat)  # bit-identical lowering
+    assert reduce_plan(_tile(node)) is plan
+
+
+def test_nodify_reduce_keeps_a_projection_tail_as_a_wrapping_map() -> None:
+    """A fused-epilogue contraction (loop then projection) nodifies to ``Map(body=proj,
+    source=Reduction)`` — the tail rides the wrapping ``Map``, the partition the ``Reduction``."""
+    from deplodock.compiler.ir.tile.ops import nodify_reduce
+
+    loop = _sum_loop(role=AxisRole.CONTRACTION)
+    proj = (Assign(name="y", op="relu", args=("acc",)), Write(output="out", index=(Var("m"),), value="y"))
+    flat = Map(body=(loop, *proj))
+    node = nodify_reduce(flat, ReducePlan.of(reg=2))
+    assert isinstance(node, Map) and isinstance(node.source, Reduction)
+    assert tuple(node.body) == proj
+    assert lower(node) == lower(flat)  # bit-identical
+    assert axis_role(node) is AxisRole.CONTRACTION
 
 
 # --- split-K: Reduction ⊃ Contraction (E1) --------------------------------------------------- #

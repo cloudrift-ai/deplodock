@@ -45,7 +45,7 @@ from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
-from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
+from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 from deplodock.compiler.pipeline.passes.lowering.tile._catalog import scalar_tile_moves
@@ -384,10 +384,11 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
 
 def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
     """One scheduled scalar-tier contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE``
-    spec resolved into the ``TilePlan`` (an optional cooperative / ILP ``REDUCE`` spec into the
-    orthogonal residual ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the
-    specs stamped on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r`` K partition only —
-    the cross-CTA split-K ``g`` rides the separate structural :func:`_splitk_option` fork."""
+    spec resolved into the ``TilePlan`` (an optional cooperative / ILP ``REDUCE`` spec **nodifying** the
+    contraction to a :class:`Reduction` node carrying the K partition, an optional operand ``STAGE`` into
+    the :class:`Stage`), the specs stamped on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r``
+    K partition only — the cross-CTA split-K ``g`` rides the separate structural :func:`_splitk_option`
+    fork."""
     stage = Stage.parse(stage_spec) if stage_spec else None
     plan = TilePlan.parse(spec)
     # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
@@ -402,14 +403,18 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
         )
     # A tiled register-tile leaf (a ``TILE`` pin) becomes a :class:`Contraction` node here, so
     # materialize only ``factorize``\\ s. An unbindable contraction (a non-``Load`` operand) keeps the
-    # ``Map`` form — materialize's per-cell scalar tier lowers it. A coop / ILP ``reduce_spec`` keeps
-    # the ``Map`` too (the K partition rides the residual ``reduce``, folded by ``_factorize_reduce``).
+    # ``Map`` form — materialize's per-cell scalar tier lowers it. A coop / ILP ``reduce_spec``
+    # **nodifies** the flat ``Map`` contraction to a :class:`Reduction` node carrying the K partition
+    # (:func:`nodify_reduce`), so the plan rides the node — not a residual ``TileOp.reduce`` field —
+    # and ``_factorize_reduce`` folds it off the node.
     op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
             op = _contraction_node(tile.op, place, plan)
         except LoweringError:
             pass  # an unbindable contraction (a non-Load operand) keeps the Map form
+    elif reduce_spec:
+        op = nodify_reduce(tile.op, ReducePlan.parse(reduce_spec))
     # ``TILE`` / ``REDUCE`` / ``STAGE`` key ``@<k_axis>`` (the contraction axis this node schedules),
     # unifying the schedule onto the axis-named family.
     kaxis = reduce_loop(tile.op).axis.name
@@ -418,7 +423,7 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
         stamped[_at(REDUCE, kaxis)] = reduce_spec
     if stage_spec:
         stamped[_at(STAGE, kaxis)] = stage_spec
-    return TileOp(op=op, name=name, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage, knobs=stamped)
+    return TileOp(op=op, name=name, place=place, tier=plan, stage=stage, knobs=stamped)
 
 
 def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:

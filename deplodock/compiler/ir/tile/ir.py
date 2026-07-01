@@ -438,22 +438,21 @@ class TileOp(Op):
     - ``place`` — the free-axis → grid binding (:class:`~.schedule.Placement`); root-global.
     - ``workers`` — the warp-specialization split (:class:`~.schedule.WarpSpec`); root-global, ``None`` =
       uniform SIMT.
-    - ``reduce`` — the reduce-axis partition (:class:`~.schedule.ReducePlan`) for a not-yet-nodified
-      reduce (a non-tiled contraction's split-K); a ``Reduction`` node (a plain reduce, softmax, **or
-      flash** — now a ``Map(source=Reduction)``) carries its own partition (read via
-      ``ops.reduce_plan``, which falls back here).
     - ``tier`` — the output fragment (:class:`~.schedule.TilePlan`) for a non-tiled / split-partial
       contraction; a tiled contraction rides its ``tile`` on the ``Contraction`` node. ``None`` = per-cell.
     - ``stage`` — the operand smem pipeline (:class:`~.schedule.Stage`); ``None`` = gmem-direct (pin-only).
 
-    The contraction operand→role binding is not a ``TileOp`` field — a tiled contraction carries its
-    A/B operands / accumulator / epilogue on its ``Contraction`` node (``op``), the single source of
-    truth; ``_schedule._contraction_node`` resolves them via ``_atomize.semiring_binding``."""
+    There is **no** residual reduce-partition field: EVERY partitioned reduce — a plain / twisted
+    monoid, flash, a coop-K / split-K contraction — carries its :class:`~.schedule.ReducePlan` on its
+    ``Reduction`` node (read via ``ops.reduce_plan``); the flat-``Map`` coop-K contraction is nodified
+    by ``ops.nodify_reduce`` at schedule / split time. The contraction operand→role binding is not a
+    ``TileOp`` field either — a tiled contraction carries its A/B operands / accumulator / epilogue on
+    its ``Contraction`` node (``op``), the single source of truth; ``_schedule._contraction_node``
+    resolves them via ``_atomize.semiring_binding``."""
 
     op: object = None
     name: str = ""
     place: Placement = field(default_factory=Placement)
-    reduce: ReducePlan = field(default_factory=ReducePlan)
     tier: TilePlan | None = None
     stage: Stage | None = None
     workers: WarpSpec | None = None
