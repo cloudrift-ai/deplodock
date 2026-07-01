@@ -161,7 +161,8 @@ class Contraction(Stmt):
     (``_schedule._contraction_node`` resolves the operand→role binding via ``_atomize.semiring_binding``
     and stamps the resolved ``tile``), then expanded in ``010_materialize`` (``_factor.factorize``).
     :func:`ops.lower` / ``ops.reduce_loop`` flatten it back to the synthesized mul-add ``CONTRACTION``
-    loop nest (:attr:`loop`), the same generation ``_factor._synth_reduce`` register-tiles. **ONE
+    loop nest (:attr:`loop`), the same ``for k: v = a·b; acc += v`` form ``_factor._scalar_reduce``
+    register-tiles through the shared ``_contract_kloop`` skeleton. **ONE
     flat node** that cleanly splits the **algebra params** (what to contract) from the **schedule**
     (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,
     the leading batch ``lead_axes``, the structured A/B operand ``Load``\\ s, the fold accumulator
@@ -222,9 +223,9 @@ class Contraction(Stmt):
     @property
     def loop(self) -> Loop:
         """The synthesized ``CONTRACTION`` reduce ``Loop`` — the canonical ``for k: v = a*b; acc += v``
-        mul-add form (built by the shared ``ops.contraction_loop``, the same generation
-        ``_factor._synth_reduce`` register-tiles). Lets :func:`ops.lower` / ``ops.reduce_loop`` flatten
-        the node back to the loop nest; the node never stores the loop."""
+        mul-add form (built by the shared ``ops.contraction_loop``, the same fold ``_factor``'s scalar
+        contraction tier register-tiles). Lets :func:`ops.lower` / ``ops.reduce_loop`` flatten the node
+        back to the loop nest; the node never stores the loop."""
         from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
         from deplodock.compiler.ir.tile.ops import contraction_loop  # noqa: PLC0415 — avoid an import cycle
 

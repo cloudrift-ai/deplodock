@@ -172,14 +172,26 @@ drivers onto the one `Stage` → (4) make the fold move placement-keyed → (1) 
 tier into the skeleton, at which point `factorize` is a single pipeline call. The reopened tensor-core flash lands *on
 top of this*, not before it — flash is the acceptance test that the collapse is real.
 
-**Progress.** ✅ **Deviation 1, first cut — `factorize`'s three routes collapsed to two** (byte-identical, full compiler
-e2e green). The inline scalar tier is gone as a separate branch: `factorize` is now `if Contraction →
-_factorize_contraction; else → _factorize_reduce`, and `_factorize_reduce` owns both the cooperative/ILP partition and
-the degenerate one-thread-per-cell fold (a pointwise `Map` or trivial `ReducePlan`). Remaining: (2) the atom-triple
-unification — the big one, a uniform-node-family redesign so `_mma_*` / `_scalar_*` collapse to one descriptor-driven
-`read → ⊗ → fold → store` (the mma path emits `Ldmatrix`/`MmaSyncPtx` fragment nodes, the scalar path `Load`/`Assign`
-element nodes, so this needs the kernel-IR to carry the atom granularity + `FragLayout` as data); (3) staging-driver
-unification; (4) placement-keyed fold move (lands with the tensor-core flash, which needs the returning fragment shuffle).
+**Progress.**
+
+- ✅ **Deviation 1, first cut — `factorize`'s three routes collapsed to two** (byte-identical, full compiler e2e green).
+  The inline scalar tier is gone as a separate branch: `factorize` is `if Contraction → _factorize_contraction; else →
+  _factorize_reduce`, and `_factorize_reduce` owns both the cooperative/ILP partition and the degenerate
+  one-thread-per-cell fold (a pointwise `Map` or trivial `ReducePlan`).
+- ✅ **Deviation 2, first cut — one contract-loop skeleton + per-atom leaf factories** (compiler e2e green; mma
+  byte-identical, scalar accuracy-identical with restructured source). The gmem-direct K-loop is now the shared
+  `_contract_kloop` (read each register row's A + col's B once, contract all `(row, col)` pairs, wrap in the reduce
+  loop); the mma and scalar tiers supply only the four leaf constructors (`read_row` / `read_col` / `contract` / `wrap`
+  — `ldmatrix`+`mma.sync` fragments vs `Load`+`fma` cells). This is a **strategy/factory refactor, not a kernel-IR
+  redesign** (the earlier "needs a uniform node family" framing was wrong — that is optional Level-2 polish; keeping the
+  two leaf node families behind one skeleton already removes the duplication). The scalar tier dropped `_synth_reduce` +
+  `_scalar_cells` (the replicate-then-dedup mechanism) for explicit row/col reads. **Remaining in (2):** fold `state` /
+  `store` behind the same per-atom factory (currently still `reduce_codegen` / `store_sink` `isinstance` dispatch), and
+  optionally the Level-2 uniform-node polish.
+- **Remaining:** (3) staging-driver unification — `_warp_staged_kloop` / `_warp_tma_staged_kloop` / `_mma_stage_plan` vs
+  `_scalar_staged_kloop` / `_scalar_stage_plan`, still dispatched per-atom inside each tier's `reduce`, onto one
+  `Stage`-driven fill/drain keyed on slab layout; (4) placement-keyed fold move (lands with the tensor-core flash, which
+  needs the returning fragment shuffle).
 
 ## The recovery contract
 
