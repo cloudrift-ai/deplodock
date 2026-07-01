@@ -190,10 +190,18 @@ top of this*, not before it — flash is the acceptance test that the collapse i
   `_MmaOps` / `_ScalarOps`, selected by the single `_atom_ops` factory). `reduce_codegen` / `store_sink` no longer carry
   their own `isinstance(c.atom, AtomKind)` branch — there is now exactly ONE atom dispatch point. The atom is a
   strategy object bound to `(c, stage, inputs)`; the Level-2 uniform-node-family polish stays optional (not needed).
-- **Remaining:** (3) staging-driver unification — `_warp_staged_kloop` / `_warp_tma_staged_kloop` / `_mma_stage_plan` vs
-  `_scalar_staged_kloop` / `_scalar_stage_plan`, still dispatched per-atom inside each tier's `reduce`, onto one
-  `Stage`-driven fill/drain keyed on slab layout; (4) placement-keyed fold move (lands with the tensor-core flash, which
-  needs the returning fragment shuffle).
+- ✅ **Deviation 3, first cut — one single-buffer staged-K-loop skeleton** (`_staged_slab_kloop`; full compiler suite
+  bit-identical). The TMA and cp.async single-buffer drivers — near-identical across tiers, differing only in
+  `linear_tid`, the drain leaf, and the cp gmem-clamp closures — now share one skeleton (fill → barrier/mbar → drain →
+  `Sync` over the K-slab loop); `_warp_tma_staged_kloop`, `_scalar_staged_kloop`, and `_warp_staged_kloop`'s `ring == 1`
+  branch all call it, supplying the `cta` / drain / gmem closures. The fill already lived in `_stage.py`; the drain is
+  the atom leaf (`_staged_inner_atom_loop` ldmatrix vs `_scalar_drain` plain-`Load`). **Remaining in (3):** the mma
+  `cp.async` depth≥2 **ring** + register double-buffer stay an mma-only extension in `_warp_staged_kloop` (scalar has no
+  ring), and the two `*_stage_plan`s stay separate (they compute genuinely different sizing — mma ring/reg depth vs
+  scalar slab `bk_elems`); full convergence needs the scheduler-side first-class `Stage` (stamped in `020_schedule`), a
+  build, not a pure delete.
+- **Remaining:** (4) placement-keyed fold move (lands with the tensor-core flash, which needs the returning fragment
+  shuffle).
 
 ## The recovery contract
 
