@@ -565,6 +565,41 @@ class SearchDB:
                 gpu=gpu,
             )
 
+    def merge_nodes(self, src_path: Path | str) -> int:
+        """Keep-min merge the ``node`` table from the autotune DB at ``src_path`` into
+        this DB, and return the number of source node rows processed.
+
+        Source rows are read read-only (:meth:`open_readonly`) and re-upserted through
+        :meth:`record_nodes`, so they inherit its exact keep-the-minimum semantics: a
+        source row wins only when strictly faster for the same ``node_key``. Because
+        ``node_key`` folds the ``gpu`` identity, that collision never happens *across
+        cards* — so merging another GPU's node store into this one accumulates a
+        cross-hardware dataset and leaves every other card's rows untouched. The use
+        case is bringing per-card node data measured on a rented GPU back to a single
+        canonical DB (``scripts/merge_node_db.py``).
+
+        Caveat: :meth:`iter_nodes` doesn't carry ``n_updates``, so each merged row
+        re-enters as one ``record_nodes`` bump rather than carrying the source's visit
+        count — acceptable, since ``n_updates`` is bookkeeping only."""
+        src = SearchDB.open_readonly(src_path)
+        try:
+            rows = list(src.iter_nodes())
+        finally:
+            src.close()
+        # One transaction around the whole batch. ``record_nodes`` runs row-at-a-time on
+        # this autocommit connection (``isolation_level=None``), which for a cross-card
+        # merge of 10k+ rows would mean one fsync per row; an explicit BEGIN/COMMIT
+        # collapses it to a single commit (keep-min within the batch still sees prior
+        # inserts on the same connection).
+        self._conn.execute("BEGIN")
+        try:
+            self.record_nodes(rows)
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
+        return len(rows)
+
     # ------------------------------------------------------------------
     # Perf — read
     # ------------------------------------------------------------------

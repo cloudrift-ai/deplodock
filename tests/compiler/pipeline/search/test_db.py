@@ -388,6 +388,53 @@ def test_iter_nodes_pre_gpu_column_readonly_degrades(tmp_path) -> None:
     ro.close()
 
 
+def test_merge_nodes_keeps_min_and_coexists_across_cards(tmp_path) -> None:
+    """``merge_nodes`` upserts another DB's ``node`` rows keyed on ``node_key`` with
+    keep-min semantics, in both directions: a shared key takes the faster source row but
+    a *slower* source row never clobbers a faster dest row. Rows under distinct
+    ``node_key``s — which different cards always produce, since ``_node_key`` folds the
+    ``gpu`` (proven in ``test_online_prior.test_node_key_folds_gpu``) — merge in
+    alongside untouched. The cross-hardware accumulation behind ``scripts/merge_node_db.py``."""
+    dst = SearchDB(tmp_path / "dst.db")
+    dst.record_nodes(
+        [
+            _node_row("shared", 5.0, gpu="NVIDIA H100 80GB"),  # same key as src, slower here
+            _node_row("faster_here", 1.0, gpu="NVIDIA H100 80GB"),  # same key as src, FASTER here
+            _node_row("dst_only", 7.0, gpu="NVIDIA H100 80GB"),  # untouched by the merge
+        ]
+    )
+    src = SearchDB(tmp_path / "src.db")
+    src.record_nodes(
+        [
+            _node_row("shared", 2.0, gpu="NVIDIA H100 80GB"),  # improves the shared node
+            _node_row("faster_here", 9.0, gpu="NVIDIA H100 80GB"),  # slower — must NOT overwrite dest
+            _node_row("h200_only", 3.0, gpu="NVIDIA H200 141GB"),  # a different card's row
+        ]
+    )
+    src.close()  # flush the on-disk file before the read-only open inside merge
+
+    merged = dst.merge_nodes(tmp_path / "src.db")
+    assert merged == 3  # source rows processed
+    by_key = {n.node_key: n for n in dst.iter_nodes()}
+    assert set(by_key) == {"shared", "faster_here", "dst_only", "h200_only"}  # both cards coexist
+    assert by_key["shared"].value_us == 2.0  # keep-min took the faster source row
+    assert by_key["faster_here"].value_us == 1.0  # slower source row did NOT overwrite the faster dest
+    assert by_key["dst_only"].value_us == 7.0  # other rows untouched
+    assert by_key["h200_only"].gpu == "NVIDIA H200 141GB"  # cross-card row carried its gpu
+
+
+def test_merge_nodes_into_pre_node_dest_autocreates(tmp_path) -> None:
+    """Merging into a freshly-opened DB (no node rows yet) just inserts the source
+    rows — the dest's ``node`` table is created by ``SearchDB.__init__``."""
+    src = SearchDB(tmp_path / "src.db")
+    src.record_nodes([_node_row("n1", 4.0, gpu="NVIDIA H200 141GB")])
+    src.close()
+    dst = SearchDB(tmp_path / "dst.db")
+    assert dst.merge_nodes(tmp_path / "src.db") == 1
+    (n,) = list(dst.iter_nodes())
+    assert (n.node_key, n.value_us, n.gpu) == ("n1", 4.0, "NVIDIA H200 141GB")
+
+
 # ---------------------------------------------------------------------------
 # op inventory
 # ---------------------------------------------------------------------------

@@ -389,7 +389,12 @@ The autotune state is split across two cooperating modules:
   never collides: `context_key` (cc + opt only) can't separate same-die SKUs (H100
   vs H200 share cc + SM count), so without `gpu` their rows would merge and keep-min
   would silently drop one card's data (the `H_total_mem` VRAM feature is what then
-  lets the prior model the difference).
+  lets the prior model the difference). `SearchDB.merge_nodes(src_db)` is the
+  cross-hardware accumulation entry point: it reads another autotune DB's `node`
+  rows read-only and re-upserts them through `record_nodes`, so a card's node data
+  measured on a rented GPU folds into one canonical DB with the same keep-min and
+  no cross-card collision (driven by `scripts/merge_node_db.py` / the
+  `collect-node-data` skill).
   `node` is content-keyed like `perf` (parent-tree-independent) and survives a
   `_SCHEMA_VERSION` bump; only the topology-keyed `lowering` table is dropped on
   mismatch. Selection statistic is the median.

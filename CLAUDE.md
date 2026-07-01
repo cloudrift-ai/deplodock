@@ -283,6 +283,23 @@ fails fast with a specific message.
 - Generative decode-step profiler (W / G / overhead breakdown): `python scripts/profile_gen_decode.py --bucket 16` — builds `EmmyGenRunner` and decomposes one T=1 decode step into wall vs pure GPU kernel time (CUDA-graph-captured) vs host+dispatch overhead; the "Profiling the tuned step" reproducer (shows the gap is overhead-bound post-tune)
 - Per-kernel chart: `python scripts/bench_model_kernels.py --model Qwen/Qwen3-Embedding-0.6B --layer 0` — compiles with a dump, benches each prov-named kernel from its `.torch.json` reproducer (eager / `torch.compile` overlaid where the kernel is torch-runnable — including linear/attention, whose transposed weights are matched via `load_ops`-replayed constants), and renders a per-kernel latency bar chart via `emmy.visualize`. `--tune` autotunes each kernel first.
 - New-model discovery: `python scripts/new_models.py [--since YYYY-MM-DD] [--text-only] [--include-supported] [--arena] [--json]` — lists open-weight models OpenRouter hosts (catalog entries with a `hugging_face_id`), verifies each on HuggingFace, and ranks the unsupported, recently-released ones by HF `trendingScore`/downloads/likes. Keyless + read-only (OpenRouter `/api/v1/models` + HF `/api/models/{id}`); excludes families already in `recipes/` (base-model match) and models older than `--since` (default ~90 days) by default. `--arena` adds LMArena Elo/rank from the `lmarena-ai/leaderboard-dataset` HF dataset (`text`/`latest`/`overall`, ~360 models, keyless) by fuzzy name-match, and lists the open arena models it couldn't link (fuzzy misses / outside the window). Triage feed for the `benchmark-new-model` flow.
+- Cross-hardware node-store merge: `python scripts/merge_node_db.py {--src DB | --remote user@host [--ssh-key PATH]
+  [--port N] [--remote-db PATH]} [--db DEST]` — merge the `node` table from another autotune DB (a local snapshot, or a
+  WAL-safe `VACUUM INTO` snapshot fetched from a remote host over SSH) into the local canonical DB via the tested
+  `SearchDB.merge_nodes` (keep-min per `node_key`; the GPU-folded key means other cards' rows are never clobbered).
+  Prints a per-card row-count receipt. The copy-back step of the `collect-node-data` skill (rent a GPU → `tune --dataset
+  golden` there → merge its node rows home).
+- Remote node-tune driver: `python scripts/remote_node_tune.py --remote user@host [--ssh-key PATH] [--port N] [--repo
+  DIR] [--poll S] [--timeout S] [--no-merge]` — the setup+tune+**merge** core of the `collect-node-data` skill, extracted
+  so the agent makes one **backgrounded** call instead of ~20 ssh polls: ensures the python3.12 venv/dev pkgs + `nvcc`,
+  rsyncs the working tree to `~/.local/share/emmy/node-tune/` (the repo's `REMOTE_DEPLOY_DIR` layout), runs `make
+  setup` (output to `setup.log` there), launches `emmy tune --dataset
+  golden` detached, polls the remote log **internally** until done, then (unless `--no-merge`) reuses
+  `merge_node_db.fetch_and_merge` to fetch + keep-min merge the node rows into the local DB and print the per-card
+  receipt — ending `status: COMPLETE (tune + merge done)`. One compact summary; a log tail only on failure. Robustness
+  baked in: argv-list ssh (zsh-safe), `[e]mmy tune` bracket-pgrep, one ssh per poll, non-tty-safe detached launch
+  (`-n` + `< /dev/null`, so `nohup … &` doesn't hang the launch ssh). Run via Bash `run_in_background: true` (the tune is
+  ~30–60 min).
 
 ## Key Make Targets
 
