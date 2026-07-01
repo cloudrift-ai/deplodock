@@ -674,8 +674,8 @@ class Placement:
 # --------------------------------------------------------------------------- #
 # The operand-transport + warp-split descriptors. ``Stage`` (cp.async / TMA) is built and
 # materialized; ``WarpSpec`` (the WSPEC worker split) is pin-only this cut — its codec + schedule
-# field land, but its producer/consumer codegen is reserved (``# TODO(warp-spec)`` in
-# lowering/kernel/010_materialize).
+# field land, but the materializer does not yet consume ``TileOp.workers`` (no producer/consumer
+# warp codegen), so a pinned WSPEC is inert. Phase 4 wires it.
 # --------------------------------------------------------------------------- #
 
 
@@ -795,8 +795,9 @@ class WarpSpec:
     ``WarpSpec`` means specialization is on. Spelled by the ``WSPEC`` codec ``<token><np>[:<param>,
     ...]`` per role (``p2`` / ``p2:q8`` / ``p2:q8/s1``), decided in ``020_schedule``.
 
-    **Reserved this cut**: the schedule field + the codec land (pin-only), but ``010_materialize``
-    does not yet emit producer/consumer warps (``# TODO(warp-spec)``)."""
+    **Reserved this cut**: the schedule field + the codec land (pin-only), but the materializer does
+    not yet consume ``TileOp.workers`` (no producer/consumer warp codegen), so a pinned WSPEC is
+    inert. Phase 4 wires it."""
 
     roles: tuple[RoleAlloc, ...] = ()
 

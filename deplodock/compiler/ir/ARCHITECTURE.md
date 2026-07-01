@@ -417,14 +417,15 @@ so the round-trip stays byte-identical.
 `workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
 split over the fixed pipeline rather than replacing it. Pin-only this cut — `020_schedule` stamps `workers` from a
 `DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the
-producer/consumer codegen in `lowering/kernel` is a documented `TODO(warp-spec)`.
+materializer does not yet consume `TileOp.workers`, so a pinned WSPEC is inert (no producer/consumer codegen) until
+Phase 4.
 
 `tile/ops.py` `lower(op)` returns the `Map`'s body verbatim — the loop nest with its annotated reduce `Loop`s, the
 carriers already dissolved into loose folds + the streaming `merge` at recognition; `pretty(op)` renders it for
 dumps. The tensor-core,
 cooperative-combine, and staging (cp.async / TMA) tiers are materialized downstream in `lowering/kernel` against the
-op tree + schedule; warp specialization has its schedule codec (`WSPEC` → `workers`) but its producer/consumer codegen
-is still a `TODO(warp-spec)`. The older tile-level `GridTile` / `ThreadTile` / `Stage` structures were removed in the
+op tree + schedule; warp specialization has its schedule codec (`WSPEC` → `workers`) but the materializer does not yet
+consume `workers`, so it is inert until Phase 4. The older tile-level `GridTile` / `ThreadTile` / `Stage` structures were removed in the
 tile-IR rebuild and are being rebuilt there as the schedules return (see `pipeline/passes/ARCHITECTURE.md`).
 
 ## `kernel/`
