@@ -218,9 +218,7 @@ def _emit(op, ctx: Ctx) -> Frag:
         return Frag(body=[*prefix, *_emit_body(op.body, ctx)], out=_map_wire(op), carrier=src.carrier if src is not None else None)
     if isinstance(op, Reduction):
         prefix = list(_emit(op.source, ctx).body) if op.source is not None else []
-        loop = Loop(
-            axis=op.axis, body=Body((*prefix, *_emit_body(op.partial, ctx))), unroll=op.unroll, role=op.role, carrier=op.carrier
-        )
+        loop = Loop(axis=op.axis, body=Body((*prefix, *_emit_body(op.partial, ctx))), unroll=op.unroll, role=op.role, carrier=op.carrier)
         return Frag(body=[loop], out=Handle(op.out), carrier=op.carrier)
     if isinstance(op, Contraction):
         # Scalar / block=1: the synthesized ``CONTRACTION`` loop nest + fused epilogue — byte-identical
