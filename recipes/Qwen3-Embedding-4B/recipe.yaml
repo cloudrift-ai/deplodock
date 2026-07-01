@@ -42,11 +42,11 @@ matrices:
     zip:
       engine.llm.vllm.image:
         - "vllm/vllm-openai:v0.22.1"
-        # pinned to the existing published image (registers DeplodockEmbedModel); bump to vllm-emmy + EmmyEmbedModel once rebuilt+pushed
-        - "cloudriftai/vllm-deplodock:0.22.1-8c7b0e9b"
+        # emmy compiled-kernel serving image (registers EmmyEmbedModel)
+        - "cloudriftai/vllm-emmy:0.22.1-90c70d5e"
       engine.llm.vllm.extra_args:
         - "--runner pooling"
-        - "--runner pooling --enforce-eager --hf-overrides '{\"architectures\":[\"DeplodockEmbedModel\"]}'"
+        - "--runner pooling --enforce-eager --hf-overrides '{\"architectures\":[\"EmmyEmbedModel\"]}'"
 
 aggregate:
   run: |
