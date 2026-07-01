@@ -236,10 +236,17 @@ never a divergent path.
    byte-identically); pinned by `test_reduce_partial_flattens_a_nested_pv_contraction`. This is the QK-on-`source` +
    PV-in-`partial` capability the two-`Contraction` tree rests on. (Step 3's mma tier will factorize the nested PV
    instead of flattening it — `factorize` recursion is a step-3 concern.)
-2. **Rebuild `_flash._flash_op` to the blocked two-`Contraction` tree** with `kv_block = 1` (degenerate `j`) so the
-   **scalar** tier lowers to today's per-element nest — accuracy-identical, the guardrail. The carrier stays
-   `flash_combine(m_i, l_i, O_i, …)`, but the expect channel's per-element `p·v` is replaced by the PV `Contraction`'s
-   output `Oblk` (block=1 ⇒ `Oblk = p·v`, so byte-identical). Verify the scalar flash e2e stays green **before** any mma.
+2. **Rebuild `_flash._flash_op` to the blocked two-`Contraction` tree** — the crux, still open. **Deep finding
+   (this session):** the exp carrier's generated `merge` (`exp_merge` in `ir/stmt/carrier.py`) fuses
+   `O_i = O_i·α + p·v` **atomically**, but a PV `Contraction` needs `P = exp(S − M)` computed *before* it and feeds its
+   output `Oblk` *back into* the O-fold — an online-softmax ordering coupling (`P` depends on the new max `M`, which the
+   carrier's max channel produces). So the merge must **split around the PV contraction**: {max/denom → `M`, `α`, `P`;
+   fold `l_i`} · [PV: `Oblk = Σ_j P·V`] · {fold `O_i = O_i·α + Oblk`}. For `kv_block = 1` the carrier's expect channel
+   already *is* the PV (`p·v`), so a degenerate PV node there is where byte-identity gets delicate. **Design options for
+   the next effort:** (a) teach the carrier generator to emit the merge in two halves (pre-/post-⊗) with `P`/`α` exposed
+   as first-class named intermediates the PV `Contraction` and the O-fold consume; or (b) adopt the blocked form as the
+   single structure and accept the scalar tier as its `block=1` degenerate, proving parity against the non-xfailed
+   scalar flash e2e. Do NOT proceed to mma until the scalar flash e2e is green.
 3. **Layer mma** — QK and PV get mma `TilePlan`s (`kv_block` = the mma tile); `_factorize_contraction` tiles both; a
    flash `store` **sink** (the existing `factorize(store=…)` seam) bridges the QK C-fragment into the softmax twist and
    feeds the resulting `P` fragment straight into PV as an operand **without a gmem round-trip** (the one genuinely new
