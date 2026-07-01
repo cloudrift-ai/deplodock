@@ -1021,13 +1021,12 @@ def test_bf16_operands_stage_via_cp_async(monkeypatch):
 
 
 # --- atomic-free split-K on the warp tier -----------------------------------
-# Dropping the ``is_warp`` early-out lets an MMA split-K route its C-fragment store into a
-# ``workspace[K_s, M, N]`` and reuse the additive ``Accum``-sum reduce kernel instead of a codegen
-# ``atomicAdd``. The finalize is the native ``REDUCE`` codec ``c``-letter (``c2k`` deferred / ``c2a``
-# atomic), pinned through the native move-knob set (``ATOM`` / ``SPLIT`` / ``REDUCE``).
-_WARP_NATIVE = {"DEPLODOCK_ATOM": "mma_m16n8k16_f16", "DEPLODOCK_SPLIT": "2x2"}
-
-
+# MMA split-K rides the structural ``Reduction(axis=ksplit, source=Contraction(k_axis=kslice))`` fork
+# (``_schedule._splitk_option``): the inner ``Contraction`` factorizes to mma exactly like a non-split
+# matmul, and ``030_split`` retargets each partition's C-fragment into a ``ws[ksplit, M, N]`` workspace
+# summed by a sibling additive finalize kernel (deferred ``g2k``) — NO codegen ``atomicAdd``. The atomic
+# finalize (``g2a``) can't accumulate an mma C-fragment (``RegStore`` has no atomicAdd), so it is
+# refused; scalar-tier atomic split-K is covered by ``test_reduce_coverage``'s cross-CTA matrix.
 def _splitk_mma_graph(m: int, k: int, n: int) -> Graph:
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (m, k), dtype=F16), node_id="a")
@@ -1041,26 +1040,29 @@ def _splitk_mma_graph(m: int, k: int, n: int) -> Graph:
 @requires_cuda
 @pytest.mark.parametrize("finalize", ["deferred", "atomic"])
 def test_mma_splitk_finalize(monkeypatch, finalize):
-    """fp16 MMA split-K is accurate vs numpy under both finalize folds: the deferred combine
-    kernel (``s2/c2k``) emits NO ``atomicAdd`` (the atomic-free path), and the in-place atomic
-    finalize (``s2/c2a``) stays selectable and accurate."""
+    """fp16 MMA split-K through the structural fork (warp ``TILE`` atom + ``REDUCE=g2k``/``g2a``).
+    Deferred (``g2k``) sums each partition's C-fragment through a workspace + additive finalize kernel
+    on the tensor-core tier — mma present, NO ``atomicAdd`` — and is accurate. Atomic (``g2a``) is
+    refused: an mma C-fragment can't ``atomicAdd`` (``RegStore`` has none), so the deferred kernel is
+    the mma split-K path."""
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
-    for key, val in _WARP_NATIVE.items():
-        monkeypatch.setenv(key, val)
-    monkeypatch.setenv("DEPLODOCK_REDUCE", "s2/c2k" if finalize == "deferred" else "s2/c2a")
+    monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "g2k" if finalize == "deferred" else "g2a")
     m, k, n = 128, 512, 128
-    rng = np.random.default_rng(4 if finalize == "deferred" else 5)
+    be = CudaBackend()
+    if finalize == "atomic":
+        with pytest.raises(NotImplementedError, match="atomicAdd"):
+            be.compile(_splitk_mma_graph(m, k, n))
+        return
+    rng = np.random.default_rng(4)
     a = (rng.standard_normal((m, k)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((k, n)) * 0.1).astype(np.float16)
-    be = CudaBackend()
     compiled = be.compile(_splitk_mma_graph(m, k, n))
     src = "\n".join(node.op.kernel_source for node in compiled.nodes.values() if getattr(node.op, "kernel_source", None))
-    if finalize == "deferred":
-        # The deferred path retargets the C-fragment store into a workspace and reuses the additive
-        # reduce kernel on the tensor-core tier — no codegen ``atomicAdd``.
-        assert "mma.sync.aligned.m16n8k16" in src, "must be on the tensor-core tier"
-        assert "atomicAdd" not in src, "atomic-free split-K must not emit atomicAdd"
+    assert "mma.sync.aligned.m16n8k16" in src, "must be on the tensor-core tier"
+    assert "atomicAdd" not in src, "atomic-free split-K must not emit atomicAdd"
+    assert "__partial" in src, "the deferred finalize writes partials to a workspace"
     out = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"]).reshape(m, n)
     ref = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(out.astype(np.float32), ref, rtol=2e-2, atol=2e-2)

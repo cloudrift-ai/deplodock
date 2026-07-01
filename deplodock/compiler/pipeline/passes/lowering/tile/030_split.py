@@ -28,6 +28,13 @@ kernels (``assert not needs_split``).
 This cut handles **additive** carriers — a degenerate ``PLANAR`` reduce (``sum``) and a
 ``CONTRACTION`` contraction (split-K matmul), one carrier-state component each. A twisted
 multi-component carrier (flash split-KV) is the remaining step.
+
+**Two shapes of contraction split-K.** A structural ``Reduction(axis=ksplit,
+source=Contraction(k_axis=kslice))`` (built by ``_schedule._splitk_option``) has its K axis already
+factored + operands offset, so :func:`_split_contraction` makes the partial the **bare Contraction**
+— it factorizes to **mma** (or scalar) through ``_factor.factorize``, ``ksplit`` prefixed as a lead
+grid axis, no ``_slice_loop``. The residual path below (a plain-sum ``sum`` split, or a coop/ILP
+contraction still on a ``Map``) keeps the loop-slicing rewrite.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from dataclasses import replace
 from deplodock.compiler.dim import Dim
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.graph import Graph, Node, Tensor
+from deplodock.compiler.ir.atom import AtomKind
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
@@ -44,9 +52,11 @@ from deplodock.compiler.ir.schedule import Level
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from deplodock.compiler.ir.tile import (
+    Contraction,
     Map,
     Placement,
     ReducePlan,
+    Reduction,
     TileOp,
     TilePlan,
 )
@@ -143,6 +153,79 @@ def _projection_distributes(body, states: tuple[str, ...]) -> bool:
     return False  # no Write reached
 
 
+def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Contraction, carrier, plan: ReducePlan, split: Axis):
+    """Realize a **structural** split-K ``Reduction(axis=ksplit, source=Contraction)`` — the K axis is
+    already factored (``split`` == ``ksplit``, extent == ``cta``) and the operands offset, so the
+    partial is the **bare Contraction** with ``ksplit`` prefixed as a lead grid axis (each CTA a fixed
+    partition) and its projection retargeted to the workspace / an atomic output. Because the partial
+    is a ``Contraction``, materialize expands it through ``_factor.factorize`` — **mma** for a warp
+    atom, scalar otherwise. No ``_slice_loop`` (unlike the residual plain-sum path).
+
+    Finalize matches the additive-carrier finalize: ``atomic`` (``g<w>a``) atomicAdds the partition's
+    ``acc`` into the zero-init'd output (**scalar only** — an mma C-fragment can't ``atomicAdd``);
+    ``kernel`` (``g<w>k``) writes each partition's ``acc`` to a ``ws[ksplit, *cell]`` workspace and a
+    sibling finalize kernel sums it + runs the projection epilogue."""
+    out = root.output
+    grid = tile.place.grid
+    cell = tuple(Var(a.name) for a in grid)
+    states = carrier.state.names
+    if len(states) != 1:
+        raise NotImplementedError("split-K contraction carrier must be additive (1-component)")
+    acc = states[0]
+    lead = (split, *contraction.lead_axes)
+    epilogue = list(contraction.epilogue)  # the fused projection (empty for a bare matmul)
+
+    if plan.finalize == "atomic":
+        if isinstance(contraction.atom, AtomKind):
+            raise NotImplementedError(
+                "atomic finalize can't accumulate an mma C-fragment (RegStore has no atomicAdd); "
+                "pin the deferred-kernel finalize (REDUCE=g<w>k)"
+            )
+        if epilogue:
+            # Apply the projection per-partition before the atomicAdd — legal only if it distributes.
+            if not _projection_distributes(epilogue, states):
+                raise NotImplementedError(
+                    "atomic finalize can't carry a non-distributive projection on a split-K matmul; "
+                    "pin the deferred-kernel finalize (REDUCE=g<w>k)"
+                )
+            atomic_epi = tuple(replace(s, atomic=True) if isinstance(s, Write) else s for s in epilogue)
+        else:
+            atomic_epi = (Write(output=out.name, index=cell, value=acc, atomic=True),)
+        part = replace(contraction, lead_axes=lead, epilogue=Body(atomic_epi))
+        return _mapped(part, (split, *grid), name=tile.name)
+
+    # --- deferred kernel finalize: partial writes raw ``acc`` to ``ws[ksplit, *cell]`` -----------
+    ws_name = f"{out.name}__partial"
+    ws_shape = (Dim(plan.cta), *out.shape)
+    ws_write = Write(output=ws_name, index=(Var(split.name), *cell), value=acc)
+    part = replace(contraction, lead_axes=lead, epilogue=Body((ws_write,)))
+    partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial")
+
+    # --- finalize kernel: seed ``acc``, fold ``ws`` over ``ksplit`` (``as_state_merge``), then the
+    # original projection epilogue (or a bare store) — the same additive finalize the residual path uses.
+    other = (f"{acc}__p",)
+    combine = carrier.as_state_merge(other)
+    ids = _carrier_identities(carrier)
+    seeds = (Init(name=acc, identity=ids[acc], dtype=F32),)
+    loads = (Load(name=other[0], input=ws_name, index=(Var(split.name), *cell)),)
+    fin_loop = Loop(axis=split, body=Body((*loads, combine)))
+    fin_proj = list(epilogue)
+    if not any(isinstance(s, Write) for s in fin_proj):
+        out_val = fin_proj[-1].defines()[-1] if fin_proj else acc
+        fin_proj.append(Write(output=out.name, index=cell, value=out_val))
+    fin_op = Map(body=Body((*seeds, fin_loop, *fin_proj)))
+    fin_tile = _mapped(fin_op, grid, name=tile.name)
+
+    frag = Graph()
+    for inp in root.inputs:
+        n = match.graph.nodes[inp]
+        frag.add_node(op=InputOp(), inputs=[], output=n.output, node_id=inp)
+    frag.add_node(op=partial_tile, inputs=list(root.inputs), output=Tensor(ws_name, ws_shape, out.dtype), node_id=ws_name)
+    frag.add_node(op=fin_tile, inputs=[ws_name], output=Tensor(out.name, out.shape, out.dtype), node_id=out.name)
+    frag.outputs = [out.name]
+    return frag
+
+
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     tile: TileOp = root.op
     # The reduce partition lives on the Reduction node (off the schedule) — ``reduce_plan`` reads
@@ -157,6 +240,11 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     carrier = rloop.carrier
     cta = plan.cta
     rax = rloop.axis
+    # Structural split-K: ``op`` is ``Reduction(axis=ksplit, source=Contraction(k_axis=kslice))`` —
+    # the axis is already factored + operands offset (``_schedule._splitk_option``), so the partial
+    # is the **bare Contraction** (→ ``factorize`` → mma / scalar), no ``_slice_loop``.
+    if isinstance(op, Reduction) and isinstance(op.source, Contraction):
+        return _split_contraction(match, root, tile, op.source, carrier, plan, rax)
     if not rax.extent.is_static:
         raise NotImplementedError("cross-CTA split of a symbolic reduce axis is not built yet")
     extent = rax.extent.as_static()

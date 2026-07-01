@@ -138,7 +138,11 @@ split-K, and pointwise all emit identical structure/numerics. No capability adde
 
 ## Part II — Extend on the unified base
 
-### E1 — mma split-K  →  detailed in `plans/splitk-structural-fork.md`
+### E1 — mma split-K  →  detailed in `plans/splitk-structural-fork.md`  — ✅ core landed (pin-driven)
+
+mma split-K now works via the structural `Reduction(source=Contraction)` fork — the nested contraction factorizes to
+mma through the same `factorize` path as any matmul. Pin-driven; auto-fork enumeration deferred. See that plan's status
+header for what landed and the deviations (coop/ILP-K kept on the residual; mma+atomic refused; F.6 deferred).
 
 Represent split-K structurally as `Reduction(axis=ksplit, source=Contraction(k_axis=kslice))`, introduced by a new
 **split-K schedule fork** (`g<w>[a|k]` codec), lowered so the partial is a bare `Contraction` (→ factorize/**mma**),

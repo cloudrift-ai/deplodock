@@ -36,9 +36,14 @@ from dataclasses import replace
 from math import prod
 from types import SimpleNamespace
 
-from deplodock.compiler.dim import DEFAULT_SEQ_HINT
-from deplodock.compiler.ir.axis import AxisRole
+from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
+from deplodock.compiler.dtype import F32
+from deplodock.compiler.ir.axis import Axis, AxisRole
+from deplodock.compiler.ir.elementwise import ElementwiseImpl
+from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
+from deplodock.compiler.ir.sigma import Sigma
+from deplodock.compiler.ir.stmt import Accum
 from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
@@ -105,9 +110,9 @@ def _coop_carrier(kernel):
     is a grid axis) and **full-row** outputs (softmax / RMSNorm — the post-reduce sweep is
     distributed across the coop lanes by the materializer) are handled. The reduce axis may be
     **symbolic** (dynamic ``seq_len``): each lane strides it to the runtime extent (the ``< seq_len``
-    bound is the masked tail). A ``CONTRACTION`` (handled by ``_semiring_reduce_spec``) or a
-    flat-``Map`` fallback (multi / nested-non-flash reduce — no annotated reduce loop) is not
-    eligible here and keeps the serial fold."""
+    bound is the masked tail). A ``CONTRACTION`` (its output tile is ``_tile_option`` / ``_warp_option``;
+    a cross-CTA split-K is the ``_splitk_option`` fork) or a flat-``Map`` fallback (multi /
+    nested-non-flash reduce — no annotated reduce loop) is not eligible here and keeps the serial fold."""
     rl = reduce_loop(kernel.op)
     if rl is None or rl.role not in (AxisRole.PLANAR, AxisRole.TWISTED):
         return None
@@ -177,21 +182,33 @@ def _tile_specs(kernel) -> list[str]:
     return list(TILE.narrow(scalar_tile_moves()))
 
 
-def _semiring_reduce_spec() -> str:
-    """The ``REDUCE`` spec a **scalar** (non-output-tiled) ``CONTRACTION`` contraction honors — the
-    full K-axis codec: a cross-CTA split (``g``, consumed by ``030_split``) AND the cooperative
-    (``b``) / ILP (``r``) partitions (consumed by ``_factor._factorize_reduce``, since a
-    contraction is the degenerate carrier of its additive fold). Only the scalar tier reaches here
-    (``_tile_option``); the warp tier ignores ``REDUCE`` (composing the mma tile with a K
-    partition is the remaining step). Returns the pinned spec when it parses to a non-trivial
-    partition (split / coop / reg), else ``""`` (serial). A pin in another tier's codec doesn't
-    parse as ``g``/``b``/``r`` — not ours, so ignore it rather than fail."""
+def _splitk_pin() -> str:
+    """The pinned ``g<w>[a|k]`` split-K spec (or ``""``) — the cross-CTA K partition a
+    ``CONTRACTION`` honors through the structural ``Reduction ⊃ Contraction`` fork
+    (:func:`_splitk_option`), consumed by ``030_split``. Reads the ``REDUCE`` pin and returns it
+    only when it parses to a **GRID split** (``needs_split``); a non-split ``b`` / ``r`` pin or
+    another codec is not a split-K request — ignore it rather than fail."""
     pinned = REDUCE.narrow([""])[0]
     try:
         plan = ReducePlan.parse(pinned)
     except ValueError:
         return ""
-    return pinned if (plan.needs_split or plan.coop > 1 or plan.reg > 1) else ""
+    return pinned if plan.needs_split else ""
+
+
+def _coop_reduce_spec() -> str:
+    """The pinned cooperative (``b``) / ILP (``r``) K partition a **non-output-tiled** ``CONTRACTION``
+    honors — folded through ``_factor._factorize_reduce`` (a contraction is the degenerate carrier of
+    its additive fold), riding the residual ``reduce`` field on the still-``Map`` scalar tier. Returns
+    the ``REDUCE`` pin iff it parses to a coop / reg partition WITHOUT a GRID split (the split-K ``g``
+    takes the structural :func:`_splitk_option` fork instead); ``""`` otherwise (a foreign codec is
+    not ours — ignore it rather than fail)."""
+    pinned = REDUCE.narrow([""])[0]
+    try:
+        plan = ReducePlan.parse(pinned)
+    except ValueError:
+        return ""
+    return pinned if (not plan.needs_split and (plan.coop > 1 or plan.reg > 1)) else ""
 
 
 def _stage_spec(kernel) -> str:
@@ -279,6 +296,70 @@ def _contraction_node(node, place, tile_plan: TilePlan) -> Contraction:
     )
 
 
+def _factor_k(k_axis: Axis, w: int) -> tuple[Axis, Axis, Sigma]:
+    """Factor a **static** contraction axis ``k`` into ``ksplit × kslice`` for split-K.
+
+    ``ksplit`` (extent ``w``, name ``<k>_ks``) is the outer *partition index* — becomes the
+    :class:`Reduction`'s reduce axis, parallelized across CTAs and summed in the finalize; ``kslice``
+    (extent ``K/w``, the **original** name) is the per-partition chunk — stays the inner
+    :class:`Contraction`'s ``k_axis``. The returned ``sigma`` maps the original ``k`` var to
+    ``ksplit·(K/w) + kslice`` so the operand loads reconstruct the absolute index. Distinct names
+    (``k`` vs ``<k>_ks``) are what avoid a double-reduce ``for k:[for k:]`` — every original ``k`` is
+    visited once (``kslice`` folded into a partial, ``ksplit`` summed across partials)."""
+    big_k = k_axis.extent.as_static()
+    b = big_k // w
+    ksplit = Axis(name=f"{k_axis.name}_ks", extent=Dim(w))
+    kslice = replace(k_axis, extent=Dim(b))
+    sigma = Sigma({k_axis.name: BinaryExpr("+", BinaryExpr("*", Var(ksplit.name), Literal(b, "int")), Var(k_axis.name))})
+    return ksplit, kslice, sigma
+
+
+def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
+    """One scheduled **split-K** contraction ``TileOp``: the structural ``Reduction(axis=ksplit,
+    source=Contraction(k_axis=kslice))``. The inner :class:`Contraction` is the **same** node a
+    non-split matmul builds (:func:`_contraction_node`, so it factorizes through ``_factor`` to mma or
+    scalar per the ``tile_spec`` atom) but over ``kslice`` with operands reindexed to
+    ``ksplit·(K/w) + kslice``; the outer additive :class:`Reduction` carries the ``g<w>[a|k]`` GRID
+    partition (:class:`ReducePlan`) that ``030_split`` consumes into the cross-CTA partial + finalize.
+
+    The additive carrier is built exactly as ``contraction_loop`` / a plain-sum reduce does — an
+    ``Accum(op="add").as_carrier()`` (identity ``0.0``, 1 component) — so ``030_split``'s finalize
+    (which reads the carrier's identity + ``as_state_merge``) needs no change. The output tile
+    (``tier``) rides the inner ``Contraction``; the ``Reduction`` holds only the K partition.
+
+    Knob keying: ``TILE`` / ``REDUCE`` are stamped on the **original** k-axis name (not
+    ``ksplit`` / ``kslice``), keeping the kernel single-eligible-axis so golden bare-collapse + the
+    prior featurizer stay invariant vs the residual/golden spelling."""
+    wt = TilePlan.parse(tile_spec)
+    inner = _contraction_node(tile.op, place, wt)
+    w = ReducePlan.parse(split_spec).cta
+    # A warp (mma) slice must keep the inner K-step dividing K/w — the warp K-loop has no static-K
+    # tail masking (same guard as ``_check_warp_static_k``, but on the post-split slice).
+    if wt.is_warp:
+        step = wt.atom.atom_k * wt.bk
+        ks = inner.k_axis.extent.as_static() // w
+        if ks % step:
+            raise ValueError(
+                f"split-K slice K={ks} (K/{w}) is not a multiple of the mma K-step {step} "
+                f"(atom_k={wt.atom.atom_k}·bk={wt.bk}); pick a split width whose slice is divisible."
+            )
+    ksplit, kslice, sigma = _factor_k(inner.k_axis, w)
+    inner = replace(
+        inner,
+        k_axis=kslice,
+        a_load=replace(inner.a_load, index=tuple(sigma.apply(e) for e in inner.a_load.index)),
+        b_load=replace(inner.b_load, index=tuple(sigma.apply(e) for e in inner.b_load.index)),
+    )
+    carrier = Accum(name=inner.acc, value=f"{inner.acc}__v", op=ElementwiseImpl("add"), dtype=F32).as_carrier()
+    op = Reduction(carrier=carrier, axis=ksplit, role=AxisRole.CONTRACTION, source=inner, reduce=ReducePlan.parse(split_spec))
+    kaxis = reduce_loop(tile.op).axis.name  # the ORIGINAL k-axis name — single-eligible-axis keying
+    stage = Stage.parse(stage_spec) if stage_spec else None
+    stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec}
+    if stage_spec:
+        stamped[_at(STAGE, kaxis)] = stage_spec
+    return TileOp(op=op, name=name, place=place, tier=inner.tile, stage=stage, knobs=stamped)
+
+
 def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
     form of the ``TILE`` spec resolved into the warp-atom :class:`TilePlan`, plus an optional operand
@@ -307,10 +388,11 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
 
 
 def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
-    """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
-    resolved into the ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the orthogonal
-    ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the specs stamped on
-    ``knobs`` for the prior."""
+    """One scheduled scalar-tier contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE``
+    spec resolved into the ``TilePlan`` (an optional cooperative / ILP ``REDUCE`` spec into the
+    orthogonal residual ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the
+    specs stamped on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r`` K partition only —
+    the cross-CTA split-K ``g`` rides the separate structural :func:`_splitk_option` fork."""
     stage = Stage.parse(stage_spec) if stage_spec else None
     plan = TilePlan.parse(spec)
     # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
@@ -325,17 +407,16 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
         )
     # A tiled register-tile leaf (a ``TILE`` pin) becomes a :class:`Contraction` node here, so
     # materialize only ``factorize``\\ s. An unbindable contraction (a non-``Load`` operand) keeps the
-    # ``Map`` form — materialize's per-cell scalar tier lowers it. The split-K (``reduce_spec``) combo
-    # stays on the ``Map`` too (composing the output tile with a K split is a later step), so
-    # ``030_split`` / ``_factor._factorize_reduce`` see the loop form they expect.
+    # ``Map`` form — materialize's per-cell scalar tier lowers it. A coop / ILP ``reduce_spec`` keeps
+    # the ``Map`` too (the K partition rides the residual ``reduce``, folded by ``_factorize_reduce``).
     op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
             op = _contraction_node(tile.op, place, plan)
         except LoweringError:
             pass  # an unbindable contraction (a non-Load operand) keeps the Map form
-    # ``TILE`` / ``STAGE`` / the split-K ``REDUCE`` all key ``@<k_axis>`` (the contraction axis this
-    # node schedules), unifying the schedule reduce partition onto the axis-named reduce family.
+    # ``TILE`` / ``REDUCE`` / ``STAGE`` key ``@<k_axis>`` (the contraction axis this node schedules),
+    # unifying the schedule onto the axis-named family.
     kaxis = reduce_loop(tile.op).axis.name
     stamped = {**knobs, _at(TILE, kaxis): spec}
     if reduce_spec:
@@ -369,7 +450,15 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
     if role is AxisRole.CONTRACTION:
         stage_spec = _stage_spec(tile)
-        reduce_spec = _semiring_reduce_spec()
+        # A pinned cross-CTA split-K (``g<w>[a|k]``) routes EVERY tile candidate (scalar or mma)
+        # through the structural ``Reduction ⊃ Contraction`` fork — one split-K path, consumed by
+        # ``030_split`` (the partial is a bare ``Contraction`` that factorizes to mma / scalar).
+        split_spec = _splitk_pin()
+        if split_spec:
+            return [_splitk_option(tile, place, spec, split_spec, name, knobs, stage_spec) for spec in _tile_specs(tile)]
+        # A non-split cooperative / ILP (``b`` / ``r``) K partition rides the residual ``reduce`` on the
+        # scalar tier (``_factorize_reduce``); orthogonal to the output tile.
+        reduce_spec = _coop_reduce_spec()
         return [
             _warp_option(tile, place, spec, name, knobs, stage_spec)
             if is_warp_codec(spec)

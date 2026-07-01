@@ -147,3 +147,45 @@ def test_contraction_lower_appends_the_fused_epilogue() -> None:
     c = _contraction(epilogue=Body(proj))
     assert lower(c) == [c.loop, *proj]
     assert reduce_loop(c).role is AxisRole.CONTRACTION  # the projection doesn't hide the contraction
+
+
+# --- split-K: Reduction ⊃ Contraction (E1) --------------------------------------------------- #
+
+
+def test_factor_k_splits_the_axis_with_distinct_names() -> None:
+    """``_factor_k`` factors a static ``k`` into ``ksplit × kslice`` — distinct names, the σ
+    reconstructing the absolute index ``ksplit·(K/w) + kslice``."""
+    from deplodock.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
+
+    ksplit, kslice, sigma = _factor_k(Axis("k", 512), 2)
+    assert (ksplit.name, ksplit.extent.as_static()) == ("k_ks", 2)
+    assert (kslice.name, kslice.extent.as_static()) == ("k", 256)  # original name, K/w extent
+    assert sigma.apply(Var("k")).pretty() == "((k_ks * 256) + k)"
+
+
+def test_splitk_reduction_over_contraction_is_no_double_reduce() -> None:
+    """Split-K is ``Reduction(axis=ksplit, source=Contraction(k_axis=kslice))``: the outer additive
+    reduce sums partials across CTAs, the inner contraction folds its slice. ``lower`` is a SINGLE
+    ``for ksplit:[for kslice: mul-add]`` with DISTINCT axis names (not ``for k:[for k:]``), and it
+    still classifies as a ``CONTRACTION`` carrying the GRID (cta) partition."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl
+    from deplodock.compiler.pipeline.passes.lowering.tile._schedule import _factor_k
+
+    c = _contraction()  # k_axis = k(256)
+    ksplit, kslice, sigma = _factor_k(c.k_axis, 2)
+    inner = replace(
+        c,
+        k_axis=kslice,
+        a_load=replace(c.a_load, index=tuple(sigma.apply(e) for e in c.a_load.index)),
+        b_load=replace(c.b_load, index=tuple(sigma.apply(e) for e in c.b_load.index)),
+    )
+    carrier = Accum(name="acc", value="acc__v", op=ElementwiseImpl("add")).as_carrier()
+    red = Reduction(carrier=carrier, axis=ksplit, role=AxisRole.CONTRACTION, source=inner, reduce=ReducePlan.of(cta=2, finalize="atomic"))
+
+    assert axis_role(red) is AxisRole.CONTRACTION
+    assert reduce_plan(_tile(red)).cta == 2
+    lo = lower(red)
+    assert len(lo) == 1 and isinstance(lo[0], Loop) and lo[0].axis.name == "k_ks"
+    inner_loops = [s for s in lo[0].body if isinstance(s, Loop)]
+    assert len(inner_loops) == 1 and inner_loops[0].axis.name == "k"  # distinct from ksplit — no double-reduce
+    assert isinstance(inner_loops[0].body[-1], Accum) and inner_loops[0].body[-1].name == "acc"

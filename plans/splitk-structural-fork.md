@@ -1,5 +1,28 @@
 # Split-K matmul: structural `Reduction ⊃ Contraction` via a schedule fork
 
+## Status — ✅ core landed (pin-driven); auto-fork (F.6) deferred
+
+mma split-K works for the first time via the structural fork. Done: axis factoring (`_schedule._factor_k`),
+`_schedule._splitk_option` building `Reduction(role=CONTRACTION, axis=ksplit, source=Contraction(k_axis=kslice))`,
+the `schedule()` CONTRACTION arm routing a pinned `g<w>[a|k]` through it (`_splitk_pin`), and
+`030_split._split_contraction` making the partial a **bare Contraction** (→ `factorize` → mma / scalar, no
+`_slice_loop`) with the deferred-kernel + atomic finalizes. `test_mma_splitk_finalize` drives the fork (deferred =
+mma, no `atomicAdd`, accurate; the `[deferred]` xfail removed); structural build/lower + `_factor_k` unit tests added.
+
+Deviations from the plan below:
+
+- **`_semiring_reduce_spec` NOT deleted (D.1) — split its two jobs.** Coop/ILP-K on a non-output-tiled contraction
+  (`REDUCE=b<n>`/`r<n>`) is a *live, tested* feature (`test_matmul_reduce_partition`), so it stays on the residual
+  `reduce` path via the renamed `_coop_reduce_spec` (b/r only). Only the split-K `g<w>` was retired from the residual
+  and routed through the structural `_splitk_option`. Consequently the `ops.reduce_plan` residual fallback (D.3) is
+  **kept** (coop/ILP-K needs it).
+- **mma + atomic (`g<w>a`) is refused**, not supported: an mma C-fragment can't `atomicAdd` (`RegStore` has no atomic).
+  Deferred (`g<w>k`) is the mma split-K path; scalar-tier atomic split-K is unaffected (covered by
+  `test_reduce_coverage`'s cross-CTA matrix).
+- **F.6 (auto-fork enumeration) deferred.** Split-K stays **pin-only** — `schedule()` does not yet emit unpinned
+  `g<w>` candidates (`_splitk_specs` + the occupancy gate + golden-sweep re-validation). The structural base is in
+  place; enabling auto-fork is a follow-up gated on the golden sweep.
+
 ## Context
 
 Split-K partitions a matmul's contraction axis `k` across CTAs: each block contracts a slice of `k`, then the

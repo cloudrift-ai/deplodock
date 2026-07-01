@@ -82,11 +82,6 @@ XFAIL: dict[str, str] = {
     # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
     # dynamic, by test_matmul_coverage.
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
-    # test_static_dynamic_mma_parity[dynamic-*] recovered — the dynamic-grid tier makes the
-    # dynamic matmul accurate (the static/dynamic accuracy parity the test asserts). The
-    # atomic-free split-K (deferred ``c2k`` finalize) on the warp tier still needs its workspace
-    # retarget rebuilt; the atomic arm (``c2a``) of the merged test passes.
-    "tests/compiler/e2e/test_matmul_coverage.py::test_mma_splitk_finalize[deferred]": _R,
     # --- mma operand staging dropped (see _STAGE) — these assert staged structure / bit-identity ---
     "tests/compiler/e2e/test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit": _STAGE,
     "tests/compiler/e2e/test_matmul_coverage.py::test_register_double_buffer_matches_single_buffer_bit_for_bit": _STAGE,
