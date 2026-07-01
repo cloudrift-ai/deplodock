@@ -76,15 +76,14 @@ XFAIL: dict[str, str] = {
     # NOT restored: ``test_article_tma_sgemm_reproduction`` (fp32 SGEMM via the demolished
     # ``StageBundle`` API) stays below, and ``test_bank_conflicts.py`` (already xfailed above) needs
     # the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a separate follow-up).
-    # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
-    # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
-    # TileGraph lowering).
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_compute_phase_info_raises_on_collapsed_index": _R,
+    # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once
+    # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). Two residuals:
+    # test_greedy_run_falls_back_to_option0_when_prior_overflows needs the greedy
+    # option-0 fallback (a prior-overflow conservative pick, not yet rebuilt), and
+    # test_compute_phase_info_raises_on_collapsed_index imports the demolished
+    # kernel/_stage_expand module (compute_phase_info — a separate rebuild target).
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_falls_back_to_option0_when_prior_overflows": _R,
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_raises_lowering_error": _R,
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_still_raises_when_no_in_budget_option": _R,
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_raise_on_unlowered_fires_for_stuck_tileop": _R,
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_run_leaves_no_state_on_pipeline": _R,
+    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_compute_phase_info_raises_on_collapsed_index": _R,
     # test_compile_dynamic_emits_runtime_arg / test_run_code_dynamic_seq_len recovered with the
     # dynamic-grid tier (a symbolic free axis lowers to a symbolic launch + runtime ``int`` arg).
     # test_run_ir_{tile,kernel}_stage / _bench / _seed_reproducible recovered once the tile-IR +

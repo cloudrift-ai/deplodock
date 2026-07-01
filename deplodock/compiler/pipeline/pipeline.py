@@ -1023,15 +1023,18 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
     rejection (see :func:`Candidate.try_rewrite`) left its node un-lowered.
 
     ``rejections`` is ``[(node_id, pass_label, reason), ...]``. A node is
-    "stuck" iff it still holds a pre-final dialect op (``LoopOp``) at the
-    terminal — if a later rule lowered it anyway the op is a ``CudaOp`` and
-    we stay silent (the rejection was a harmless intermediate filter). Only
+    "stuck" iff it still holds a pre-final dialect op (``LoopOp`` or ``TileOp``)
+    at the terminal — if a later rule lowered it anyway the op is a ``KernelOp`` /
+    ``CudaOp`` and we stay silent (the rejection was a harmless intermediate
+    filter). The over-budget-tile drop leaves a ``TileOp`` (its only
+    tile→kernel lowering was filtered); a pre-tile drop leaves a ``LoopOp``. Only
     nodes with a recorded rejection are checked, so partial pipelines that
-    legitimately terminate at the loop stage (no lowering pass to drop
+    legitimately terminate at the loop / tile stage (no lowering pass to drop
     anything) never trip this."""
     if not rejections:
         return
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     # Last recorded reason / pass wins (the final pass that tried to lower it).
     reason_by_node: dict[str, str] = {}
@@ -1040,7 +1043,7 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
         reason_by_node[nid] = reason
         pass_by_node[nid] = pass_label
 
-    stuck = [nid for nid in reason_by_node if (node := graph.nodes.get(nid)) is not None and isinstance(node.op, LoopOp)]
+    stuck = [nid for nid in reason_by_node if (node := graph.nodes.get(nid)) is not None and isinstance(node.op, (LoopOp, TileOp))]
     if not stuck:
         return
     lines = [f"  - {nid!r}: {pass_by_node[nid]} rejected its only lowering — {reason_by_node[nid]}" for nid in stuck]
