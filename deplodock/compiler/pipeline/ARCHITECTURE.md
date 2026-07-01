@@ -109,7 +109,7 @@ pass's declared knobs the variant left unspecified at the **pass boundary** (`Cu
 fill to the just-finished pass avoids prematurely stamping a later pass's knob (which would trip that pass's idempotency
 guard). The point: the learned prior NaN-fills absent feature columns, so with explicit OFF values NaN means *only*
 "not-yet-decided" (a partial fork prefix during descent), distinct from "decided: unused" (an OFF value on a complete
-leaf). A knob with no `off` (the `_UNSET` default — universal knobs like `BN` / `BM`, always set by their pass) is never
+leaf). A knob with no `off` (the `_UNSET` default — a knob its owning pass always stamps itself) is never
 auto-filled. Tier discrimination is value-based throughout (`knob.is_warp` / `knob.mma_atom`). Verified by
 `tests/compiler/passes/test_knob_stamp_invariant.py`.
 

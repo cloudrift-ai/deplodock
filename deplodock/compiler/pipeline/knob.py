@@ -79,8 +79,8 @@ def masked_axis_features(*, m: bool = False, n: bool = False, k: bool = False) -
 
 class _Unset:
     """Sentinel for ``Knob.off`` meaning "no OFF value declared" — the knob is
-    expected to always be stamped by its owning pass (universal knobs like
-    ``BN`` / ``BM``), so :func:`apply_off_defaults` never auto-fills it."""
+    expected to always be stamped by its owning pass, so
+    :func:`apply_off_defaults` never auto-fills it."""
 
     def __repr__(self) -> str:
         return "<unset>"
@@ -152,8 +152,7 @@ class Knob:
     # realized variant carries an *explicit* decision rather than an absent key —
     # letting the learned prior tell "decided: unused" (an OFF value) from
     # "not-yet-decided" (still absent → NaN-filled). ``_UNSET`` (the default)
-    # means the knob is always stamped by its pass and is never auto-filled
-    # (universal knobs like ``BN`` / ``BM``).
+    # means the knob is always stamped by its pass and is never auto-filled.
     off: Any = _UNSET
 
     @property
@@ -178,11 +177,10 @@ class Knob:
         """Read this knob's ``DEPLODOCK_<NAME>`` env pin as an int (empty /
         unset / unparseable → ``default``).
 
-        The heuristic-default path in ``compiler/tuning.py`` uses this to read
-        the matmul tile knobs (``BN`` / ``BM`` / ``FM`` / ``FN`` / ``BK`` /
-        ``SPLITK``) through their canonical descriptors rather than re-spelling
-        the names as bare strings — a rename of the constant now fails loudly
-        instead of silently reading a dead env var. ``INT`` knobs only."""
+        Reads a knob's env override through its canonical descriptor rather
+        than re-spelling the name as a bare string, so a rename of the constant
+        fails loudly instead of silently reading a dead env var. ``INT`` knobs
+        only."""
         if self.type is not KnobType.INT:
             raise ValueError(f"Knob.read_int only valid for INT knobs ({self.name!r} is {self.type})")
         return config.int_env(self.env, default)
@@ -237,7 +235,7 @@ class Knob:
         Folds env-driven pinning into the same iteration that produces
         hint-driven candidates, so callers don't enumerate-then-filter:
 
-            bn_choices = BN.narrow(_TUNE_AXIS_CHOICES)  # 1-tuple if pinned
+            reduce_choices = REDUCE.narrow(cands)  # 1-tuple if pinned
 
         Returns ``tuple(candidates)`` unchanged when the env var is
         absent; otherwise a 1-tuple ``(pinned,)`` — *authoritative*,
