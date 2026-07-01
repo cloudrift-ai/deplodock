@@ -9,10 +9,14 @@ halves:
 - **Construction** — the ``flash_combine`` carrier, the ``flash_shape_eligible`` /
   ``gqa_group`` predicates, and the fragment builder ``build_flash_frag``. It doesn't
   hand-assemble a kernel body — it builds the high-level **structural-node tree**
-  (``ir/tile/ir``): flash is ``Map(body=[O/l projection], source=Reduction(role=TWISTED,
-  axis=kv, source=Contraction(Σ Q·K)))`` — the ``(m,l,O)`` LSE streaming reduce over kv whose
-  per-step partial folds a nested ``Σ_dd Q·K`` :class:`Contraction` node (the ``Reduction ⊃
-  Contraction`` composition), projected ``O/l`` after the loop. ``build_flash_frag`` returns that
+  (``ir/tile/ir``): flash is the **two-``Contraction`` tree** ``Map(body=[O/l projection],
+  source=Reduction(role=TWISTED, axis=kv, source=Contraction(Σ_dd Q·K)))`` — the ``(m,l,O)`` LSE
+  streaming reduce over kv whose ``source`` is the ``Σ_dd Q·K`` score :class:`Contraction` and whose
+  per-step ``partial`` splices the **P@V** ``Σ_j P·V`` :class:`Contraction` (its A operand the
+  register-resident softmax weight ``P``; ``_split_pv`` redirects the carrier's expectation-fold value
+  through it), projected ``O/l`` after the loop. Both Q@K and P@V factorize through the one
+  ``_factor`` contraction path; block=1 is the scalar streaming degenerate (``j`` a singleton reduce),
+  block>1 + mma-tiling is the tensor-core tier (future work). ``build_flash_frag`` returns that
   ``Map`` UNLOWERED, on a ``TileOp`` with an UNMAPPED ``Placement`` — the free ``(batch…, m, d)``
   axes are the schedule's (like every recognizer), and ``_schedule`` maps them onto the grid;
   ``materialize`` lowers the nodes (``Reduction.loop`` splices the contraction's ``Σ Q·K`` loop
@@ -38,11 +42,14 @@ redundant, scalar form; the tensor-core P@V tier is future work::
 
     for *batch, m (query rows), d (value dim):       # free / grid
       Init (m_i = -inf, l_i = 0, O_i = 0)            # running (max, denom, out)
-      for kv in 0..S_k:                              # streaming reduce
+      for kv in 0..S_k:                              # streaming reduce (TWISTED)
         Init sacc = 0
-        for dd in 0..head_dim: sacc += Q[…,m,dd]·K[…,kv,dd]   # score reduce
+        for dd in 0..head_dim: sacc += Q[…,m,dd]·K[…,kv,dd]   # Q@K score Contraction
         s = sacc · scale
-        Carrier((m_i,l_i,O_i), (s, V[…,kv,d]))      # the LSE rescale (flash_combine)
+        M = max(m_i, s); alpha = exp(m_i − M); P = exp(s − M)  # softmax stats (flash_combine merge)
+        l_i = l_i·alpha + P
+        for j in 0..1:  O_i__pv += P · V[…,kv,d]     # P@V Contraction (block=1: singleton j)
+        O_i = O_i·alpha + O_i__pv                    # the LSE rescale + PV fold
       out[…,m,d] = O_i / l_i
 
 Scope: static OR dynamic (symbolic ``seq_len`` on Q/K/V dim -2 — one cached kernel
@@ -59,6 +66,7 @@ offer + ``AnalyticPrior`` cold-start are a follow-up.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from deplodock.compiler.dim import Dim
@@ -183,7 +191,7 @@ def build_flash_frag(
     mask_buf, mask_shape = mask if mask is not None else (None, None)
 
     flash_op = _flash_op(
-        q_id, k_id, v_id, batch, s_q_dim, s_k_dim, head_dim, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
+        q_id, k_id, v_id, batch, s_q_dim, s_k_dim, head_dim, d_v, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     grid = (
         *(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch)),
@@ -222,6 +230,44 @@ def _batch_vars(n: int) -> tuple[Var, ...]:
     return tuple(Var(f"b{i}") for i in range(n))
 
 
+def _split_pv(merge: list, o: str, v: str, v_buf: str, v_idx: tuple, m_axis: Axis, d_axis: Axis) -> list:
+    """Split the exp carrier's streaming ``merge`` around a real **PV** :class:`Contraction`.
+
+    The generated merge folds the expectation channel ``O = O·α + v·P`` **atomically** (``P = exp(s − M)``
+    the softmax weight). This rewrites it so the ``v·P`` product becomes the output of a
+    ``Oblk = Σ_j P·V`` contraction whose **A operand is the register-resident ``P``** (rebind of the exp
+    weight the carrier already computed) and whose B is the value ``Load`` — then the O-fold consumes
+    ``Oblk`` (``O = O·α + Oblk``). ``O`` stays a carrier channel (so its seed + cross-tier machinery are
+    untouched); only the value it folds is redirected through the contraction.
+
+    This is the two-``Contraction`` flash tree at ``block = 1``: the ``j`` reduce is a singleton (the
+    scalar streaming degenerate). Step 3 blocks the ``kv`` axis (``j`` = the block) and mma-tiles this
+    same node. ``O`` and ``V`` are per-``(m, d)``; ``P`` per-``(m, j)`` — different axes from the
+    streaming ``kv``, so the PV contraction never duplicates the streaming reduce."""
+    o_accum = next(s for s in merge if isinstance(s, Accum) and s.name == o)
+    defs = {s.name: s for s in merge if isinstance(s, Assign)}
+    prod = defs[o_accum.value]  # the fused ``v·P`` (multiply(v, P))
+    p_name = next(a for a in prod.args if a != v)  # the softmax weight P (register-resident)
+    pv = Contraction(
+        axes=(m_axis, d_axis),
+        k_axis=Axis(name="pj", extent=Dim(1)),  # block=1: a singleton intra-block reduce
+        a_operand=Body((Assign(name=f"{o}__p", op="copy", args=(p_name,)),)),  # A = P, register-resident
+        b_load=Load(name=v, input=v_buf, index=v_idx),  # B = V (the value tile)
+        acc=f"{o}__pv",
+        tile=TilePlan(),
+    )
+    out: list = []
+    for s in merge:
+        if s is prod:
+            continue  # the inline v·P is dropped — the PV contraction computes it
+        if s is o_accum:
+            out.append(pv)  # Oblk = Σ_j P·V, flattened in place by Reduction.loop
+            out.append(replace(o_accum, value=f"{o}__pv"))  # O = O·α + Oblk (base O·α unchanged)
+            continue
+        out.append(s)
+    return out
+
+
 def _flash_op(
     q_buf: str,
     k_buf: str,
@@ -230,6 +276,7 @@ def _flash_op(
     s_q: Dim,
     s_k: Dim,
     head_dim: int,
+    d_v: int,
     *,
     causal: bool = False,
     group: int = 1,
@@ -300,11 +347,14 @@ def _flash_op(
     else:
         score_name = "s"
     # The (m,l,O) streaming fold over kv, as a ``TWISTED`` :class:`Reduction` node: its per-step
-    # ``partial`` is the scale / mask binding ``score_name``, the value ``Load``, then the carrier's
-    # dissolved streaming ``merge`` (``flash_combine`` supplies state + twist); the nested ``Σ Q·K``
-    # contraction rides on ``source`` (``Reduction.loop`` splices its loop ahead of the partial).
+    # ``partial`` is the scale / mask binding ``score_name``, then the carrier's dissolved streaming
+    # ``merge`` with the **PV split out as a real contraction**. ``flash_combine`` supplies the state +
+    # twist; the nested ``Σ Q·K`` contraction rides on ``source`` (``Reduction.loop`` splices its loop
+    # ahead of the partial). Both P@V and Q@K are now :class:`Contraction` nodes — the two-contraction tree.
     carrier = flash_combine("m_i", "l_i", "O_i", score_name, "v_e")
-    partial = [*score_post, Load(name="v_e", input=v_buf, index=v_idx), *carrier.dissolve()]
+    m_axis = Axis(name="m", extent=s_q)
+    d_axis = Axis(name="d", extent=Dim(d_v))
+    partial = [*score_post, *_split_pv(carrier.dissolve(), "O_i", "v_e", v_buf, v_idx, m_axis, d_axis)]
     reduction = Reduction(
         carrier=carrier,
         axis=Axis(name="kv", extent=s_k),

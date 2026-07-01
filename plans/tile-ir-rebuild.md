@@ -236,17 +236,19 @@ never a divergent path.
    byte-identically); pinned by `test_reduce_partial_flattens_a_nested_pv_contraction`. This is the QK-on-`source` +
    PV-in-`partial` capability the two-`Contraction` tree rests on. (Step 3's mma tier will factorize the nested PV
    instead of flattening it — `factorize` recursion is a step-3 concern.)
-2. **Rebuild `_flash._flash_op` to the blocked two-`Contraction` tree** — the crux, still open. **Deep finding
-   (this session):** the exp carrier's generated `merge` (`exp_merge` in `ir/stmt/carrier.py`) fuses
-   `O_i = O_i·α + p·v` **atomically**, but a PV `Contraction` needs `P = exp(S − M)` computed *before* it and feeds its
-   output `Oblk` *back into* the O-fold — an online-softmax ordering coupling (`P` depends on the new max `M`, which the
-   carrier's max channel produces). So the merge must **split around the PV contraction**: {max/denom → `M`, `α`, `P`;
-   fold `l_i`} · [PV: `Oblk = Σ_j P·V`] · {fold `O_i = O_i·α + Oblk`}. For `kv_block = 1` the carrier's expect channel
-   already *is* the PV (`p·v`), so a degenerate PV node there is where byte-identity gets delicate. **Design options for
-   the next effort:** (a) teach the carrier generator to emit the merge in two halves (pre-/post-⊗) with `P`/`α` exposed
-   as first-class named intermediates the PV `Contraction` and the O-fold consume; or (b) adopt the blocked form as the
-   single structure and accept the scalar tier as its `block=1` degenerate, proving parity against the non-xfailed
-   scalar flash e2e. Do NOT proceed to mma until the scalar flash e2e is green.
+2. ✅ **Rebuilt `_flash._flash_op` to the blocked two-`Contraction` tree (block=1).** `_split_pv`
+   (`_flash.py`) rewrites the exp carrier's dissolved `merge` so the expectation fold `O_i = O_i·α + v·P` is redirected
+   through a real **PV `Contraction`** `O_i__pv = Σ_j P·V` whose **A operand is the register-resident `P`** (a `copy`
+   rebind of the exp weight the carrier already computes — extracted structurally off the `O_i` Accum's `multiply(v, P)`
+   value) and whose B is the value `Load`. `O_i` **stays a carrier channel** (so its seed + cross-tier machinery are
+   untouched — the online-softmax ordering coupling is resolved by splicing the PV *inside* the generated merge, right
+   before the O-fold, where `M`/`α`/`P` are already computed), only the value it folds is redirected. Both Q@K (on
+   `source`) and P@V (in `partial`) are now `Contraction` nodes; `Reduction.loop` flattens both. At `block = 1` the `j`
+   reduce is a singleton — the scalar streaming degenerate, **numerically identical** to the old inline `v·P` (proven:
+   `test_scalar_flash_matches_torch` / `_dynamic_` / `_kv_tile_` / `_flash_chain_causal_and_gqa_` all green). Structure
+   pinned by `test_flash_op_is_a_two_contraction_tree`. Chose **option (b)** but realized it *without* carrier-generator
+   surgery: keeping `O_i` a carrier channel (not removing it) is what preserves the seed/cross-tier machinery while still
+   de-fusing the ⊗ into a contraction.
 3. **Layer mma** — QK and PV get mma `TilePlan`s (`kv_block` = the mma tile); `_factorize_contraction` tiles both; a
    flash `store` **sink** (the existing `factorize(store=…)` seam) bridges the QK C-fragment into the softmax twist and
    feeds the resulting `P` fragment straight into PV as an operand **without a gmem round-trip** (the one genuinely new
@@ -272,10 +274,13 @@ by `test_contraction_computed_a_*` (standalone P@V: `O[m,d] = Σ_j exp(S[m,j])·
 contraction is **constructed directly** (flash / tests), never recognized (recognition rejects pre-scaled operands), so
 the binding path stays gmem-`Load`-only.
 
-**Next concrete step: rebuild `_flash._flash_op` on the register-resident PV `Contraction`** (option (b), the blocked
-two-`Contraction` tree). The scalar-flash e2e (`test_scalar_flash_matches_torch` / `_kv_tile_` / `_dynamic_`) is the
-numeric gate — it must stay green. The exp carrier's merge must **split around the PV contraction** (max/denom → `M`,
-`α`, `P`; then PV `Oblk = Σ_j P·V`; then the O-fold `O_i = O_i·α + Oblk`), with `block=1` the scalar degenerate.
+✅ **`_flash._flash_op` rebuilt on the register-resident PV `Contraction`** (block=1; see consolidation step 2 above).
+**Next concrete step (step 3): mma-tile the two contractions.** Block the `kv` axis so `j` = the mma tile width (not a
+singleton); the QK `Contraction` gets an mma `TilePlan` producing a score fragment; the softmax twist runs over the
+in-register score; the PV `Contraction`'s A operand is the resulting `P` **fragment** (the register-resident-A mma path
+`_mma_reduce` currently asserts against — this is the genuinely new `ldmatrix`-from-fragment primitive) fed straight into
+`mma.sync` without a gmem round-trip. Gate: `test_generated_tensorcore_flash_*` / `test_warp_chain_*` flip XPASS while
+the scalar-flash e2e stays green.
 
 Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
 `test_attention_coverage.py::test_cooperative_flash_matches_torch`. Scalar-parity risk is real (step 2 changes the
