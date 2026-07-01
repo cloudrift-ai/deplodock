@@ -15,7 +15,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: make setup
+        run: make setup-ci
 
       - name: Ruff check
         run: ./venv/bin/ruff check
@@ -23,8 +23,20 @@ jobs:
       - name: Ruff format check
         run: ./venv/bin/ruff format --check
 
+      # Cache the HuggingFace hub downloads (TinyLlama-1.1B-Chat-v1.0 +
+      # Qwen/Qwen3-Embedding-0.6B). The anonymous HF CDN rate-limits the
+      # shared runner egress IPs — 429s on config.json have killed multiple
+      # runs — and with a populated cache ``from_pretrained`` falls back to
+      # the cached files when the hub is unreachable. Bump the key suffix
+      # when tests start needing new models.
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-v1
+
       - name: Run tests
-        run: ./venv/bin/pytest tests/ -v
+        run: make test
 
   build:
     needs: test
