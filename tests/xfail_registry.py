@@ -46,11 +46,9 @@ _STAGE = "mma operand staging materialization dropped, codec stamps"
 # capability (delete an entry when its test flips to XPASS).
 XFAIL: dict[str, str] = {
     # --- whole files: every collected test currently fails ---
-    "test_attention_split_gpu.py": _R,
     "test_bank_conflicts.py": _R,
     "test_attention_coverage.py::test_cooperative_flash_matches_torch": _R,
     "test_fused_edge.py": _R,
-    "test_gen_runner_gpu.py": _R,
     "test_launch_geometry_rules.py": _R,
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
     # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the
@@ -61,7 +59,6 @@ XFAIL: dict[str, str] = {
     # test_matmul_coverage.py (masked symbolic warp tier): the masked symbolic-M/N matmul
     # **accuracy** recovered with the dynamic-grid tier; the batched-M+K structure render
     # (test_batched_symbolic_mk_reaches_warp) reaches the warp tier again, so its entry is gone.
-    "test_runner_batched_gpu.py": _R,
     "test_vllm_plugin_gen_gpu.py": _R,
     "test_vllm_plugin_gpu.py": _R,
     # --- individual cases: the file still has passing tests ---
@@ -116,8 +113,6 @@ XFAIL: dict[str, str] = {
     "tests/compiler/pipeline/search/test_two_level.py::test_split_kernels_attribute_to_pre_decision_op": _R,
     "tests/compiler/pipeline/test_resolve.py::test_structural_replay_consulted": _R,
     "tests/compiler/pipeline/test_resolve.py::test_trace_records_partition_fork": _R,
-    "tests/serving/test_generate_gpu.py::test_generate_loop_runs_end_to_end": _R,
-    "tests/serving/test_generate_gpu.py::test_generate_oracle_matches_eager_fp16": _R,
 }
 
 # Files that error at COLLECTION on a tile import (xfail can't catch those). Empty now:
