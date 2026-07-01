@@ -40,7 +40,7 @@ def reduce_loop(op):
 
 
 def reduce_plan(tile):
-    """The tile's reduce partition (:class:`~deplodock.compiler.ir.tile.schedule.ReducePlan`) — read
+    """The tile's reduce partition (:class:`~deplodock.compiler.ir.schedule.ReducePlan`) — read
     off the :class:`~deplodock.compiler.ir.tile.structural.Reduction` node when ``tile.op`` is (or wraps
     via ``Map.source``) one, else off the ``TileOp``'s residual ``reduce`` field (a non-tiled
     contraction's split-K / coop-K reduce, not yet a node). Flash is now a ``Map(source=Reduction)`` too,

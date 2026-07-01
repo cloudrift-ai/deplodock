@@ -1,45 +1,363 @@
-"""Tile schedule type system — how a kernel's axes bind to the hardware.
+"""Tile schedule type system — how a kernel's axes bind to the hardware — plus the codec engine that
+ser/des the schedule knobs and the warp-spec role registry they build on.
 
-Split out of :mod:`.ir`. The whole layer's thesis is that the **schedule is separate
-from the combine**: the combine (the ⊕) lives in the op tree
-(:mod:`deplodock.compiler.ir.stmt.algebra` + :mod:`.structural`), and the schedule — which axes
-are parallel, how the reduce axis partitions across hardware levels — is the **codec value
-types** defined here (:class:`ReducePlan` / :class:`TilePlan` / :class:`Stage` / :class:`WarpSpec` +
-:class:`Placement`). They ride on the structural nodes (a :class:`~.structural.Contraction`'s
-``tile``, a :class:`~.structural.Reduction`'s ``reduce``) and on the thin root
-:class:`~.ir.TileOp` fields (``place`` / ``workers`` + the residual reduce/tier/stage) — there is no
-longer a ``Kernel`` / ``TileSchedule`` wrapper (both collapsed into ``TileOp``).
+This root ``ir`` module is the merge of the former ``ir/tile/{codec,role,schedule}.py``. The schedule
+value types are used by both the tile IR and the kernel materializer, so they live at the ir root
+beside :mod:`~deplodock.compiler.ir.atom`, not under ``ir/tile``.
 
-A reduction's only freedom is **how the reduce axis is partitioned across hardware
-levels** (:class:`ReducePlan`); the combine *mechanism* at each level is **derived** from
-the level (:meth:`ReduceStage.combine`), and the combine *algebra* rides the carrier (the
-``Twist``). So the same op + the same materializer extend across kernel kinds — only the
-carrier and the partition change.
+**The schedule is separate from the combine.** The combine (the ⊕) lives in the op tree
+(:mod:`deplodock.compiler.ir.stmt.algebra` + :mod:`~deplodock.compiler.ir.tile.structural`); the
+schedule — which axes are parallel, how the reduce axis partitions across hardware levels — is the
+**codec value types** here (:class:`ReducePlan` / :class:`TilePlan` / :class:`Stage` /
+:class:`WarpSpec` + :class:`Placement`). They ride on the structural nodes (a ``Contraction``'s
+``tile``, a ``Reduction``'s ``reduce``) and on the thin root :class:`~deplodock.compiler.ir.tile.ir.TileOp`
+fields (``place`` / ``workers`` + the residual reduce/tier/stage).
 
-The schedule is **flat and kind-free**. The old per-kind ``MapSchedule`` / ``MonoidSchedule`` /
-``SemiringSchedule`` zoo (paired in ``MapKernel`` / ``MonoidKernel`` / ``SemiringKernel``) is gone, as
-are the ``Monoid`` / ``Semiring`` op-tree node kinds: a kernel's structure is read from its annotated
-reduce loop's :class:`~deplodock.compiler.ir.axis.AxisRole` (``ops.axis_role``), not a Python type, so a
-pointwise kernel, a ``PLANAR`` / ``TWISTED`` reduce, and a ``CONTRACTION`` contraction all schedule
-through the same codec value types and use the subset their axes admit. Warp specialization is
-**orthogonal**, not a second schedule kind: it rides an optional ``workers: WarpSpec | None`` root
-field (``None`` = uniform SIMT) — a role→warp-count split *over* the fixed pipeline.
+A reduction's only freedom is **how the reduce axis is partitioned across hardware levels**
+(:class:`ReducePlan`); the combine *mechanism* at each level is **derived** from the level
+(:meth:`ReduceStage.combine`), and the combine *algebra* rides the carrier (the ``Twist``). So the
+same op + the same materializer extend across kernel kinds — only the carrier and the partition
+change.
 
-Every codec here — ``ReducePlan`` / ``TilePlan`` / ``Stage`` / ``WarpSpec`` —
-routes its ``parse`` / ``spell`` through the shared schema engine (:mod:`.codec`), declaring a
-``Schema`` of typed ``Field``\\s and keeping only its own semantics. ``WarpSpec`` materialization
-(the producer/consumer warp emission) is reserved this cut (``# TODO(warp-spec)``).
+The schedule is **flat and kind-free**: a kernel's structure is read from its annotated reduce loop's
+:class:`~deplodock.compiler.ir.axis.AxisRole` (``ops.axis_role``), not a Python type, so a pointwise
+cell, a ``PLANAR`` / ``TWISTED`` reduce, and a ``CONTRACTION`` contraction all schedule through the
+same value types and use the subset their axes admit. Warp specialization is **orthogonal** — an
+optional ``workers: WarpSpec | None`` root field (``None`` = uniform SIMT), a role→warp-count split
+*over* the fixed pipeline.
+
+**The codec engine** (:func:`decode` / :func:`encode` / :class:`Schema` / :class:`Field`) is the
+single ser/de source of truth: every schedule codec is one ``/``-separated string of ``TOKEN`` nodes
+(grammar at :func:`desugar` / :func:`decode`), and each value type declares a :class:`Schema` of typed
+:class:`Field`\\s and routes its ``parse`` / ``spell`` through here, keeping only its own semantics
+(``combine`` / ``tile_m`` / ``block_threads`` / ``is_async`` / validation). The tunable knob
+*declarations* that spell these codecs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) live one layer
+up in :mod:`deplodock.compiler.pipeline.forks` — they are ``Knob`` instances, a pipeline concern.
+
+**Warp-spec roles** (:class:`RoleKind` / :data:`ROLE_REGISTRY`) are the worker bands a CTA's warps
+split into; the ``WSPEC`` schema is built from the registry so a new role needs no codec edit. The
+COMPUTE / mma-consumer role is implicit (sized by ``TilePlan.units``), never registered.
 """
 
 from __future__ import annotations
 
 import enum
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import field as dc_field
+from typing import Any
 
-from deplodock.compiler.ir.atom import SCALAR_ATOM, Atom, AtomKind
+from deplodock.compiler.ir.atom import SCALAR_ATOM, Atom, AtomKind, atom_for
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.tile.codec import Emit, Field, FieldKind, Schema, decode, encode, field_default
-from deplodock.compiler.ir.tile.role import ROLE_REGISTRY, RoleKind
+
+# ===========================================================================================
+# Codec engine — the single ser/de source of truth for the schedule knob codecs below.
+# ===========================================================================================
+
+_TOKEN_RE = re.compile(r"^([A-Za-z]+)(.*)$")
+
+
+def _codec_width(num: str, *, tok: str, codec: str) -> int:
+    """Parse a codec field's positive-integer width, rejecting empty / non-numeric / ``< 1``
+    values with a clear message. A ``1`` width is the legal identity (the level is off); only
+    ``0`` / negatives / non-digits are rejected. The ``codec`` name rides the message so a bad
+    pin names the knob it came from (``bad REDUCE token ...`` / ``bad WARP token ...``)."""
+    if not num.isdigit() or int(num) < 1:
+        raise ValueError(f"bad {codec} token {tok!r}: expected a positive integer width, got {num!r}")
+    return int(num)
+
+
+class FieldKind(enum.Enum):
+    """The five leaf shapes a codec field can take."""
+
+    TUPLE = "tuple"  # int(xint)* — arity-1 scalar or arity-n pair (n/f/w/b/r/k/d/p)
+    NAME = "name"  # a registry name resolved to an object (the warp atom, a:<atom>)
+    CHOICE = "choice"  # a bare token that IS the value (the STAGE transport sync|cp|tma)
+    FLAG = "flag"  # a valueless bare token → bool (STAGE ring)
+    GROUP = "group"  # a value plus named sub-fields (the WSPEC roles, p<np>[:<param>,...])
+
+
+class Emit(enum.Enum):
+    """When :func:`encode` renders a field (the byte-identity lever — mirrors the old ``spell``)."""
+
+    ALWAYS = "always"  # render unconditionally (STAGE d/transport, warp a/w/f)
+    NONDEFAULT = "nondefault"  # render iff the value differs from the field default (g/b/r/k/n/f/p)
+    TRUE = "true"  # render iff truthy (the ring flag)
+
+
+@dataclass(frozen=True)
+class Field:
+    """One node slot in a codec :class:`Schema`."""
+
+    token: str
+    kind: FieldKind
+    arity: int = 1  # TUPLE: number of int elements (1 = scalar int value, ≥2 = tuple value)
+    emit: Emit = Emit.NONDEFAULT
+    suppress_trailing: bool = True  # TUPLE arity≥2: drop trailing ``x<m>`` when it equals 1
+    required: bool = False  # decode raises if the node is absent (the warp atom)
+    suffix: tuple[tuple[str, str], ...] = ()  # TUPLE arity-1 enum letter: ((codec, canonical), ...)
+    suffix_default: str = ""  # the canonical suffix when the letter is omitted
+    choices: tuple[tuple[str, str], ...] = ()  # CHOICE: ((codec-token, canonical), ...)
+    default: Any = None  # CHOICE: the canonical default; others derive via :func:`_default`
+    params: tuple[Field, ...] = ()  # GROUP sub-fields
+
+    @property
+    def is_bare(self) -> bool:
+        """True for the no-leading-letter-token kinds matched whole (CHOICE / FLAG)."""
+        return self.kind in (FieldKind.CHOICE, FieldKind.FLAG)
+
+
+@dataclass(frozen=True)
+class Schema:
+    """A codec's field list + its name (rides parse errors) + the ``expect`` hint."""
+
+    name: str
+    fields: tuple[Field, ...]
+    expect: str = ""
+
+    def by_token(self) -> dict[str, Field]:
+        return {f.token: f for f in self.fields}
+
+
+def _default(field: Field) -> Any:
+    """The value of an absent field (decode fills these so the IR glue reads every token)."""
+    if field.kind is FieldKind.TUPLE:
+        if field.suffix:
+            return (1, field.suffix_default)
+        return 1 if field.arity == 1 else tuple([1] * field.arity)
+    if field.kind is FieldKind.FLAG:
+        return False
+    if field.kind is FieldKind.CHOICE:
+        return field.default
+    if field.kind is FieldKind.NAME:
+        return None
+    return None  # GROUP absent → None
+
+
+def desugar(node: str) -> str:
+    """Rewrite a glued node into canonical ``TOKEN:value[,params]`` form.
+
+    ``w2x2`` → ``w:2x2``; ``g2a`` → ``g:2a``; ``p2:q8`` → ``p:2,q8``. A node with no glued value
+    (``cp`` / ``ring`` / ``a:mma...`` — already colon-form) is returned unchanged."""
+    m = _TOKEN_RE.match(node)
+    if not m:
+        return node
+    token, rest = m.group(1), m.group(2)
+    if rest and rest[0].isdigit():
+        value, _, tail = rest.partition(":")
+        return f"{token}:{value}" + (f",{tail}" if tail else "")
+    return node
+
+
+def _split_top(s: str) -> list[str]:
+    return [t.strip() for t in s.split("/") if t.strip()]
+
+
+def _decode_tuple(field: Field, body: str, *, tok: str, codec: str) -> Any:
+    """Decode an ``int(xint)*`` value (peeling a suffix letter first when the field has one)."""
+    if field.suffix:
+        suf = dict(field.suffix)
+        tag = field.suffix_default
+        if body and body[-1] in suf:
+            tag = suf[body[-1]]
+            body = body[:-1]
+        return (_codec_width(body, tok=tok, codec=codec), tag)
+    parts = body.split("x") if body else [""]
+    if len(parts) > field.arity:
+        raise ValueError(f"bad {codec} token {tok!r}: expected ≤{field.arity} dims, got {len(parts)}")
+    nums = [_codec_width(p, tok=tok, codec=codec) for p in parts]
+    nums += [1] * (field.arity - len(nums))
+    return nums[0] if field.arity == 1 else tuple(nums)
+
+
+def _decode_value(field: Field, body: str, *, tok: str, schema: Schema) -> Any:
+    if field.kind is FieldKind.TUPLE:
+        return _decode_tuple(field, body, tok=tok, codec=schema.name)
+    if field.kind is FieldKind.NAME:
+        return atom_for(body)  # raises ValueError on an unknown name
+    if field.kind is FieldKind.GROUP:
+        return _decode_group(field, body, tok=tok, schema=schema)
+    raise ValueError(f"bad {schema.name} token {tok!r} ({schema.expect})")
+
+
+def _decode_group(field: Field, body: str, *, tok: str, schema: Schema) -> dict[str, Any]:
+    """Decode a GROUP body ``2,q8`` into ``{"": <own value>, <sub-token>: <sub value>, ...}``,
+    binding the single bare-tuple positional to the field's own value and named params by token."""
+    sub_by_token = {p.token: p for p in field.params}
+    out: dict[str, Any] = {"": 1 if field.arity == 1 else tuple([1] * field.arity)}
+    out.update({p.token: _default(p) for p in field.params})
+    for raw in body.split(",") if body else []:
+        part = raw.strip()
+        if not part:
+            continue
+        if part[0].isdigit():  # the positional own-value tuple
+            out[""] = _decode_tuple(field, part, tok=tok, codec=schema.name)
+            continue
+        sub = desugar(part)
+        sub_tok, _, sub_body = sub.partition(":")
+        pf = sub_by_token.get(sub_tok)
+        if pf is None:
+            raise ValueError(f"bad {schema.name} role param {part!r} on {tok!r} ({schema.expect})")
+        out[sub_tok] = _decode_value(pf, sub_body, tok=part, schema=schema)
+    return out
+
+
+def _match_bare(schema: Schema, node: str) -> Field | None:
+    """Match a whole bare node against a FLAG token or a CHOICE codec-token."""
+    for f in schema.fields:
+        if f.kind is FieldKind.FLAG and node == f.token:
+            return f
+        if f.kind is FieldKind.CHOICE and node in dict(f.choices):
+            return f
+    return None
+
+
+def decode(schema: Schema, spec: str | None) -> dict[str, Any]:
+    """Decode a codec string into ``{token: value}`` (defaults filled for absent fields).
+
+    Raises ``ValueError`` — and only ``ValueError`` — on any malformed input (the featurizer
+    degrades on ``ValueError``); the message names ``schema.name`` so a bad pin names its knob."""
+    result: dict[str, Any] = {f.token: _default(f) for f in schema.fields}
+    present: set[str] = set()
+    by_token = schema.by_token()
+    for node in _split_top((spec or "").strip()):
+        bare = _match_bare(schema, node)
+        if bare is not None:
+            result[bare.token] = True if bare.kind is FieldKind.FLAG else dict(bare.choices)[node]
+            present.add(bare.token)
+            continue
+        token, _, body = desugar(node).partition(":")
+        field = by_token.get(token)
+        if field is None or field.is_bare:
+            raise ValueError(f"bad {schema.name} token {node!r} ({schema.expect})")
+        result[field.token] = _decode_value(field, body, tok=node, schema=schema)
+        present.add(field.token)
+    for f in schema.fields:
+        if f.required and f.token not in present:
+            raise ValueError(f"{schema.name} codec {spec!r} names no {f.token} ({schema.expect})")
+    return result
+
+
+def _is_default(field: Field, value: Any) -> bool:
+    if field.kind is FieldKind.TUPLE:
+        if field.suffix:
+            return value[0] == 1  # the width drives presence; the suffix rides an emitted token
+        return value == 1 if field.arity == 1 else all(v == 1 for v in value)
+    if field.kind is FieldKind.CHOICE:
+        return value == field.default
+    return not value
+
+
+def _render_tuple(field: Field, value: Any) -> str:
+    if field.suffix:
+        width, tag = value
+        canonical_to_codec = {canonical: codec for codec, canonical in field.suffix}
+        return f"{width}{canonical_to_codec[tag]}"
+    if field.arity == 1:
+        return str(value)
+    nums = list(value)
+    if field.suppress_trailing:
+        while len(nums) > 1 and nums[-1] == 1:
+            nums.pop()
+    return "x".join(str(n) for n in nums)
+
+
+def _encode_field(field: Field, value: Any) -> str | None:
+    if field.emit is Emit.TRUE:
+        return field.token if value else None
+    if field.emit is Emit.NONDEFAULT and _is_default(field, value):
+        return None
+    if field.kind is FieldKind.FLAG:
+        return field.token if value else None
+    if field.kind is FieldKind.CHOICE:
+        return dict((t, c) for c, t in field.choices)[value]
+    if field.kind is FieldKind.NAME:
+        return f"{field.token}:{value.name}"
+    if field.kind is FieldKind.GROUP:
+        return _encode_group(field, value)
+    return f"{field.token}{_render_tuple(field, value)}"
+
+
+def _encode_group(field: Field, value: dict[str, Any]) -> str:
+    """Render ``p<own>`` (glued, no params) or ``p<own>:<param>,...`` — the positional value is
+    glued to the token; emitted named params follow after a ``:`` (matching the ``WSPEC`` spelling)."""
+    own = _render_tuple(field, value.get("", 1 if field.arity == 1 else tuple([1] * field.arity)))
+    params = [frag for p in field.params if (frag := _encode_field(p, value.get(p.token, _default(p)))) is not None]
+    return f"{field.token}{own}" + (":" + ",".join(params) if params else "")
+
+
+def encode(schema: Schema, values: dict[str, Any]) -> str:
+    """Encode a ``{token: value}`` map into the canonical codec string (fields in schema order)."""
+    toks: list[str] = []
+    for field in schema.fields:
+        frag = _encode_field(field, values.get(field.token, _default(field)))
+        if frag is not None:
+            toks.append(frag)
+    return "/".join(toks)
+
+
+def field_default(field: Field) -> Any:
+    """The value of an absent ``field`` — the public handle on the engine's default (used to drop
+    default-valued params when building a structured codec object, so they don't spell back)."""
+    return _default(field)
+
+
+# ===========================================================================================
+# Warp-specialization roles — the worker bands the WSPEC codec / WarpSpec build on.
+# ===========================================================================================
+
+
+def _always(_sched: object) -> bool:
+    return True
+
+
+def _has_stage(sched: object) -> bool:
+    """The producer band is only meaningful when the pipeline actually stages operands."""
+    return getattr(sched, "stage", None) is not None
+
+
+@dataclass(frozen=True)
+class RoleKind:
+    """One warp-specialized worker role.
+
+    ``token`` is the ``WSPEC`` codec letter (``p`` producer, ``s`` sfu, ...); ``params`` is the
+    per-role param schema (extra :class:`~deplodock.compiler.ir.schedule.Field`\\s after the
+    warp-count value — e.g. the producer's in-flight op window ``q``); ``legal`` decides whether
+    the role is meaningful for a given uniform schedule (the producer needs a ``stage`` to drive).
+    Frozen + hashable so it rides on a frozen ``WarpSpec``."""
+
+    token: str
+    help: str = ""
+    params: tuple[Field, ...] = ()
+    legal: Callable[[object], bool] = dc_field(default=_always)
+
+
+#: The registered warp-spec roles, keyed by the ``WSPEC`` codec token. COMPUTE (the mma consumer)
+#: is implicit — sized by ``TilePlan.units``, never registered. PRODUCER drives the ``Stage`` load
+#: half; SFU is a stub example of the role-extension path (a transcendental epilogue band).
+ROLE_REGISTRY: dict[str, RoleKind] = {
+    "p": RoleKind(
+        "p",
+        help="producer warps — drive the Stage gmem→smem load half",
+        params=(Field("q", FieldKind.TUPLE),),  # in-flight op window (producer-local; not STAGE.depth)
+        legal=_has_stage,
+    ),
+    "s": RoleKind("s", help="sfu / transcendental combine warps — reserved example role"),
+}
+
+
+def role_for(token: str) -> RoleKind:
+    """The registered :class:`RoleKind` for ``token`` (a ``WSPEC`` codec role token)."""
+    try:
+        return ROLE_REGISTRY[token]
+    except KeyError:
+        raise ValueError(f"unknown warp-spec role {token!r} (have {sorted(ROLE_REGISTRY)})") from None
+
+
+# ===========================================================================================
+# Schedule value types — the codec value objects that ride the structural nodes + TileOp.
+# ===========================================================================================
 
 
 class Level(enum.Enum):
@@ -103,7 +421,7 @@ class ReduceStage:
         return (Fold.SMEM,)
 
 
-#: The ``REDUCE`` codec schema (decoded / encoded by :mod:`codec`): ``g<n>[a|k]`` (GRID cross-CTA
+#: The ``REDUCE`` codec schema (decoded / encoded by :func:`decode`): ``g<n>[a|k]`` (GRID cross-CTA
 #: split + finalize letter), ``b<n>`` (BLOCK cooperative threads), ``r<n>`` (REG ILP fold).
 _REDUCE_SCHEMA = Schema(
     "REDUCE",
@@ -147,7 +465,7 @@ class ReducePlan:
         coarse→fine — ``g<n>[a|k]`` (GRID cross-CTA split + finalize letter), ``b<n>``
         (BLOCK cooperative threads), ``r<n>`` (REG ILP fold). Empty / ``None`` = the scalar
         serial fold. (The ``serial`` remainder is never spelled — it's derived as
-        ``ceil(extent / parallel)``.) Ser/de routes through :mod:`codec` (``_REDUCE_SCHEMA``)."""
+        ``ceil(extent / parallel)``.) Ser/de routes through :func:`decode` (``_REDUCE_SCHEMA``)."""
         v = decode(_REDUCE_SCHEMA, spec)
         width, finalize = v["g"]
         return cls.of(cta=width, coop=v["b"], reg=v["r"], finalize=finalize)
@@ -271,7 +589,7 @@ class TilePlan:
         """Decode the unified ``TILE`` knob into a tile: the warp form (``a:<atom>/w../f../k..``) →
         an mma tile, or the scalar form (``n../f..``, no atom token) → a scalar register sub-tile
         (``atom`` defaults to the scalar atom). Empty / ``None`` = the per-cell tier. Ser/de routes
-        through :mod:`codec`."""
+        through :func:`decode`."""
         if is_warp_codec(spec):
             v = decode(_WARP_SCHEMA, spec)
             return cls(atom=v["a"], units=v["w"], regs=v["f"], bk=v["k"])
@@ -426,7 +744,7 @@ class Stage:
         depth). Empty / ``None`` = the depth-1 ``sync`` default (the caller maps an empty
         ``STAGE`` to ``stage=None``, the gmem-direct baseline — ``parse`` is only reached on a
         non-empty spec). ``smem`` is filled in later by the scheduler. Ser/de routes through
-        :mod:`codec`; ``cls(...)`` then runs :meth:`__post_init__` (the depth / ring semantics)."""
+        :func:`decode`; ``cls(...)`` then runs :meth:`__post_init__` (the depth / ring semantics)."""
         v = decode(_STAGE_SCHEMA, spec)
         return cls(depth=v["d"], transport=v["transport"], ring=v["ring"], reg_depth=v["p"])
 
@@ -485,7 +803,7 @@ class WarpSpec:
     @classmethod
     def parse(cls, spec: str | None) -> WarpSpec:
         """Decode the ``WSPEC`` codec into a role allocation (``""`` / ``None`` = no roles). Ser/de
-        routes through :mod:`codec` (``_WSPEC_SCHEMA``)."""
+        routes through :func:`decode` (``_WSPEC_SCHEMA``)."""
         v = decode(_WSPEC_SCHEMA, spec)
         allocs: list[RoleAlloc] = []
         for token, role in ROLE_REGISTRY.items():
@@ -517,13 +835,28 @@ class WarpSpec:
 
 
 __all__ = [
+    "AtomKind",
+    "Emit",
+    "Field",
+    "FieldKind",
     "Fold",
     "Level",
     "Placement",
+    "ROLE_REGISTRY",
     "ReducePlan",
     "ReduceStage",
     "RoleAlloc",
+    "RoleKind",
+    "Schema",
     "Stage",
     "TilePlan",
     "WarpSpec",
+    "_codec_width",
+    "atom_for",
+    "decode",
+    "desugar",
+    "encode",
+    "field_default",
+    "is_warp_codec",
+    "role_for",
 ]

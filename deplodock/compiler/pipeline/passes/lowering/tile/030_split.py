@@ -40,6 +40,7 @@ from deplodock.compiler.graph import Graph, Node, Tensor
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.schedule import Level
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from deplodock.compiler.ir.tile import (
@@ -50,7 +51,6 @@ from deplodock.compiler.ir.tile import (
     TilePlan,
 )
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
-from deplodock.compiler.ir.tile.schedule import Level
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", TileOp)]

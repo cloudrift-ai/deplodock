@@ -16,10 +16,10 @@ from dataclasses import replace
 
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Var
+from deplodock.compiler.ir.schedule import TilePlan
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Write
 from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
-from deplodock.compiler.ir.tile.schedule import TilePlan
 
 
 def _sum_loop(role: AxisRole = AxisRole.PLANAR) -> Loop:

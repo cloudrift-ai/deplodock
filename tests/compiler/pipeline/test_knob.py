@@ -369,7 +369,7 @@ def test_knob_features_stage_codec():
 def test_stage_codec_reg_depth_roundtrip():
     """``Stage.parse``/``spell`` round-trip the ``p<reg_depth>`` token; ``p1`` (the default) is
     omitted so an unstaged-register config spells byte-identical to before the field existed."""
-    from deplodock.compiler.ir.tile.schedule import Stage  # noqa: PLC0415
+    from deplodock.compiler.ir.schedule import Stage  # noqa: PLC0415
 
     assert Stage.parse("d3/cp/ring/p2") == Stage(depth=3, transport="cp.async", ring=True, reg_depth=2)
     assert Stage.parse("d2/cp/p4").reg_depth == 4

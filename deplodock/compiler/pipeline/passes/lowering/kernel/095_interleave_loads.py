@@ -35,17 +35,9 @@ from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.stmt.leaves import Assign, Load
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.forks import INTERLEAVE_LOADS
 
 PATTERN = [Pattern("root", KernelOp)]
-
-INTERLEAVE_LOADS = Knob(
-    "INTERLEAVE_LOADS",
-    KnobType.BOOL,
-    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
-    help="Sink each Load to just before its first SSA-consumer in flat compute blocks.",
-    off=False,
-)
 
 
 def rewrite(root: Node) -> KernelOp | None:

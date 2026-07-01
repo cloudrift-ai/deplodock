@@ -16,7 +16,7 @@ from deplodock.compiler.dim import Dim
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import MatmulOp
-from deplodock.compiler.ir.tile.schedule import TilePlan
+from deplodock.compiler.ir.schedule import TilePlan
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
 from deplodock.compiler.pipeline.knob import axis_of, family_of, family_value

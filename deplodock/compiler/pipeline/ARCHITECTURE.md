@@ -10,7 +10,12 @@ The engine core is `pipeline.py` (`Pattern` / `Match` / `Rule` / `Pass` / `Pipel
 the per-run state and engine loop) and `fork.py` (the `Fork` interface with `OptionFork` / `ThunkFork`, and the reusable
 `Level` + `build_fork_tree` lazy knob-cartesian tree builder). `knob.py` owns the `Knob` descriptor system and the
 `DEPLODOCK_<KNOB>` env namespace (it borrows `config.knob_var` / `config.knob_raw`; `format_tuning_knobs` renders the
-real tuning knobs for `tune` output). `dump.py` and `rule_diff.py` are the dump / `-vv` presentation layers.
+real tuning knobs for `tune` output) — but **not** the concrete knob declarations. **INVARIANT: every `Knob` instance is
+declared in `forks.py` and nowhere else** — the single home for the whole tunable surface (the schedule codec knobs
+`REDUCE` / `TILE` / `STAGE` / `WSPEC` and the kernel-lowering policy knobs `VECTORIZE_LOADS` / `INTERLEAVE_LOADS`). A rule
+that decides a knob imports it from `forks.py` rather than declaring its own; `knob.registry()` still discovers them by
+walking loaded modules (`forks.py` loads at pipeline startup via those rules). `dump.py` and `rule_diff.py` are the dump /
+`-vv` presentation layers.
 
 The autotune state lives under `search/`. The persistent store is `SearchDB` (`db.py`, SQLite). The in-memory MCTS lives
 with its only reader, `TuningSearch`, in `policy/mcts.py` (greedy compiles use `policy/greedy.greedy_decide` instead, no

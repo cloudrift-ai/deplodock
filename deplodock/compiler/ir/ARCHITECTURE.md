@@ -384,7 +384,7 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 ## `tile/`
 
-Tile IR (`tile/ir.py`, `tile/structural.py`, `tile/schedule.py`, `tile/ops.py`) carries the scheduling decisions on the
+Tile IR (`tile/ir.py`, `tile/structural.py`, `tile/ops.py`) carries the scheduling decisions on the
 op tree + thin root fields rather than re-deriving them from the body. A `TileOp` holds the structural-IR root `op`
 directly — a `Map` / `Reduction` / `Contraction` (`tile/structural.py`, over the `ir/stmt/algebra.py` annotated loop
 nest) — plus thin schedule fields: the root-global free→grid `Placement` (`place`) and warp split (`workers`), and the
@@ -392,7 +392,12 @@ residual `ReducePlan` / `tier` / `stage` / `bind` for the not-yet-nodified forms
 nodes: a `Contraction`'s `tile`, a `Reduction`'s `reduce`). The `Kernel` / `TileSchedule` wrapper is gone. A kernel's
 structure is read off its annotated reduce loop's `AxisRole` (`ops.axis_role`), not a Python type.
 
-`ReducePlan` (`tile/schedule.py`) is a list of `ReduceStage`s, one per hardware `Level` the reduce axis is
+The schedule type system lives at the ir root in `schedule.py` (used by both the tile IR and the kernel
+materializer, so it sits beside `atom.py`, not under `tile/`) — the merge of the former
+`tile/{schedule,codec,role}.py`: the schedule value types, the codec ser/de engine, and the warp-spec role
+registry in one module.
+
+`ReducePlan` (`schedule.py`) is a list of `ReduceStage`s, one per hardware `Level` the reduce axis is
 partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooperative threads within a CTA), `REG`
 (ILP register-fold), `SERIAL` (the per-thread remainder). The per-level combine `Fold` (`SHFL` lane butterfly /
 `SMEM` block tree / `ATOMIC` cross-CTA finalize) is **derived** from the level (`ReduceStage.combine`), not stored
@@ -400,7 +405,7 @@ or tuned. The single `REDUCE` codec knob decides the plan in `020_schedule`; the
 tree.
 
 All four schedule codecs — `REDUCE`, `TILE` (scalar or warp `TilePlan`), `STAGE`, and `WSPEC` — share one
-schema-driven ser/de engine (`tile/codec.py`): a `Schema` of typed `Field`s plus generic `desugar` / `decode` /
+schema-driven ser/de engine (the codec half of `schedule.py`): a `Schema` of typed `Field`s plus generic `desugar` / `decode` /
 `encode`. Each codec class keeps its `parse` / `spell` API and its semantics, delegating only the string ↔ struct
 conversion to the engine, so the featurizer and `020_schedule` call sites — and the on-disk golden wire format — are
 unchanged. The grammar collapses int and pair widths into one tuple kind and supports per-field params (the recursive
@@ -408,7 +413,7 @@ unchanged. The grammar collapses int and pair widths into one tuple kind and sup
 so the round-trip stays byte-identical.
 
 `WSPEC` (warp specialization) is the worker-mapping pin — a role→warp-count allocation (`WarpSpec`; role descriptors in
-`tile/role.py`, the COMPUTE consumer implicit and sized by `TilePlan.units`) carried on an **orthogonal**
+`schedule.py`, the COMPUTE consumer implicit and sized by `TilePlan.units`) carried on an **orthogonal**
 `workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
 split over the fixed pipeline rather than replacing it. Pin-only this cut — `020_schedule` stamps `workers` from a
 `DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the

@@ -21,7 +21,7 @@ codegen halves into ``grid_tile``:
   :func:`reduce_codegen`.
 
 The smem operand-staging pipeline (cp.async / TMA) was dropped to keep the two tiers symmetric (the
-``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/tile/schedule``). Leading ``_`` so the pass
+``STAGE`` codec + ``schedule.Stage`` still land; see ``ir/schedule``). Leading ``_`` so the pass
 loader skips this module."""
 
 from __future__ import annotations

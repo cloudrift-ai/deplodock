@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.expr import Expr, Literal
+from deplodock.compiler.ir.schedule import ReducePlan, TilePlan
 from deplodock.compiler.ir.stmt import INDENT, Accum, Body, Carrier, Load, Loop, RenderCtx, Stmt, pretty_body
-from deplodock.compiler.ir.tile.schedule import ReducePlan, TilePlan
 
 if TYPE_CHECKING:
     from deplodock.compiler.ir.atom import Atom
@@ -47,7 +47,7 @@ class Reduction:
     ``sum`` / ``max`` / ``mean``, twisted ``exp`` for online-softmax / flash) from its **structure**
     (the reduce ``axis`` + the per-element ``partial`` it folds). The fold ``Loop`` is **synthesized on
     demand** (:attr:`loop`), never stored — so the same node tiles under any
-    :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition rides the node's
+    :class:`~deplodock.compiler.ir.schedule.ReducePlan` (the reduce partition rides the node's
     ``reduce`` field, read via ``ops.reduce_plan``).
 
     It holds **no projection**: a bare reduce (``sum`` / ``max``) is the kernel root (its grid ``Write``
@@ -120,7 +120,7 @@ class Contraction(Stmt):
     (how to tile it): the params are the tiled output ``axes`` ``(m, n)``, the contraction ``k_axis``,
     the leading batch ``lead_axes``, the structured A/B operand ``Load``\\ s, the fold accumulator
     ``acc``, and the projection ``epilogue`` (which carries the output ``Write``); the schedule is the
-    one ``tile`` field — a resolved :class:`~deplodock.compiler.ir.tile.schedule.TilePlan` carrying the
+    one ``tile`` field — a resolved :class:`~deplodock.compiler.ir.schedule.TilePlan` carrying the
     leaf ``atom`` (tensor-core :class:`AtomKind` or the ``1×1`` :class:`ScalarAtom`), the per-CTA
     **UNIT** grid + per-unit **REGISTER** sub-tile, and the K-chunk. Keeping the schedule a single
     swappable field is what lets the same operand/acc params be tiled by a different ``TilePlan`` (the

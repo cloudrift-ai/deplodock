@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from deplodock.compiler.ir.base import Op
-from deplodock.compiler.ir.tile.schedule import Placement, ReducePlan, Stage, TilePlan, WarpSpec
+from deplodock.compiler.ir.schedule import Placement, ReducePlan, Stage, TilePlan, WarpSpec
 
 #: Back-compat alias: the old two-field ``Schedule`` (``free`` / ``grid``) is now
 #: :class:`~.schedule.Placement`. Kept re-exported during the transition.

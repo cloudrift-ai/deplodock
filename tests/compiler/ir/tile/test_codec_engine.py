@@ -1,6 +1,6 @@
 """The generic codec engine — desugar, decode/encode round-trips, order-free binding.
 
-These exercise :mod:`deplodock.compiler.ir.tile.codec` directly on synthetic schemas (the real
+These exercise :mod:`deplodock.compiler.ir.schedule` directly on synthetic schemas (the real
 ``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC`` schemas are covered through their IR codec classes).
 The contract: every malformed input raises ``ValueError`` (never another type), the wire format is
 byte-identical across ``decode``→``encode``, and adding a param is append-compatible
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from deplodock.compiler.ir.tile.codec import (
+from deplodock.compiler.ir.schedule import (
     Emit,
     Field,
     FieldKind,

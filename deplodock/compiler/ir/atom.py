@@ -13,7 +13,7 @@ The **unit** is the atom's parallel thread footprint (:attr:`lanes`): a warp (32
 thread (1) for scalar. So the warp tile and the scalar parallel thread-tile are the *same* tiling
 level — a 2-D grid of units — differing only in ``lanes``. ``block_threads = units · lanes``.
 
-``AtomKind`` rides on the ``atom`` field of :class:`~deplodock.compiler.ir.tile.schedule.TilePlan`;
+``AtomKind`` rides on the ``atom`` field of :class:`~deplodock.compiler.ir.schedule.TilePlan`;
 the kernel-IR ``MmaSyncPtx`` / ``RegFragment`` / ``RegStore`` render off its ``shape`` +
 ``operand_dtype`` per role; the ``TILE`` codec names an mma atom by its registry key
 (:data:`ATOM_REGISTRY`). The cooperative-reduce combine (``WarpShuffle`` / ``TreeHalve``) needs no

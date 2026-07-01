@@ -58,7 +58,7 @@ def test_golden_configs_set_is_well_formed():
         if isinstance(c, MatmulGoldenConfig):
             assert c.M > 0 and c.N > 0 and c.K > 0, c.name
         elif isinstance(c, ReduceGoldenConfig):
-            from deplodock.compiler.ir.tile.schedule import ReducePlan
+            from deplodock.compiler.ir.schedule import ReducePlan
 
             assert c.M > 0 and c.K > 0, c.name
             coop = ReducePlan.parse(c.knobs.get("REDUCE")).coop
@@ -96,7 +96,7 @@ def test_goldens_speak_native_codecs_and_featurize():
     codecs (no legacy GEMM-letter vocabulary survives), and every **matmul** golden featurizes to a
     non-empty tile geometry family — the scalar path that silently produced empty ``D_*`` features
     while the goldens still spelled ``BM``/``BN`` (the bug the migration fixed)."""
-    from deplodock.compiler.ir.tile.schedule import ReducePlan, Stage, TilePlan
+    from deplodock.compiler.ir.schedule import ReducePlan, Stage, TilePlan
     from deplodock.compiler.pipeline import knob
 
     legacy = {"BN", "BM", "FM", "FN", "BK", "BR", "FK", "SPLITK", "WN", "WM", "MMA", "RING", "TMA"}

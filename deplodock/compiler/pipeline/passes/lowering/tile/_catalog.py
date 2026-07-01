@@ -24,7 +24,7 @@ hierarchical ``build_fork_tree`` levels the multi-node flash warp QK+PV case wan
 
 from __future__ import annotations
 
-from deplodock.compiler.ir.tile.schedule import TilePlan
+from deplodock.compiler.ir.schedule import TilePlan
 
 # The scalar block-thread budget (CUDA's 1024-thread/CTA hardware limit); a scalar tile launches
 # ``par_n·par_m`` threads (one per parallel output cell). Mirrors ``_schedule._MAX_BLOCK_THREADS``.

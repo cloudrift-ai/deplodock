@@ -11,8 +11,7 @@ import types
 
 import pytest
 
-from deplodock.compiler.ir.tile.role import ROLE_REGISTRY, role_for
-from deplodock.compiler.ir.tile.schedule import WarpSpec
+from deplodock.compiler.ir.schedule import ROLE_REGISTRY, WarpSpec, role_for
 
 
 @pytest.mark.parametrize("spec", ["", "p2", "p2:q8", "p2:q8/s1", "s1"])

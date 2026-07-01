@@ -38,16 +38,16 @@ from types import SimpleNamespace
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.ir.axis import AxisRole
+from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
-from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
-from deplodock.compiler.pipeline.knob import REDUCE, STAGE, TILE, WSPEC
+from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 from deplodock.compiler.pipeline.passes.lowering.tile._catalog import scalar_tile_moves
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
 # The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) are declared in
-# ``knob.py`` (the single home for the whole tunable surface) and imported here, where they are
+# ``pipeline/forks.py`` (split out of ``knob.py``) and imported here, where they are
 # resolved into the schedule slices. The decision hierarchy for each is the env pin (via
 # ``Knob.narrow``) > the search/prior fork > the conservative default below.
 

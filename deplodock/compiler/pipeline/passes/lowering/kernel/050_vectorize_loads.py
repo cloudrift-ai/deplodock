@@ -49,19 +49,11 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.knob import Knob, KnobType
+from deplodock.compiler.pipeline.forks import VECTORIZE_LOADS
 
 PATTERN = [Pattern("root", KernelOp)]
 
 _TARGET = CudaRenderTarget()
-
-VECTORIZE_LOADS = Knob(
-    "VECTORIZE_LOADS",
-    KnobType.BOOL,
-    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
-    help="Fold runs of consecutive scalar Loads into one wide vector Load (float4 / __half2).",
-    off=False,
-)
 
 
 def rewrite(root: Node) -> KernelOp | None:
