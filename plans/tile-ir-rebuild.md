@@ -390,6 +390,55 @@ Flips `test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit`,
   it is now unreachable after wiring, delete the unreachable renderers rather than leaving them as museum pieces. Grep
   the kernel-IR for transport nodes with no producer.
 
+### Scalar-tier operand staging — execution-ready design (`test_article_tma_sgemm_reproduction`, `test_sgemm_inner_reduce_is_unrolled`)
+
+The scalar contraction tier is gmem-direct today (`_scalar_state` / `_scalar_reduce` in `_factor.py` ignore `stage`). The
+two xfailed SGEMM tests want the scalar tier to stage its fp32 operands through an smem slab (the article hero kernel:
+`TILE=n32x8/f4x26`, `STAGE=d2/tma` → `cp.async.bulk.tensor` box copy + `#pragma unroll` inner reduce). This is a
+**contained** build (scalar atom only; the mma path and the gmem-direct scalar baseline are untouched). Deep mapping
+settled every constraint:
+
+- **Gate for safety — gmem-direct stays byte-identical.** `_scalar_reduce` branches to the staged loop **only** when
+  `stage is not None` AND `_scalar_stage_plan` returns eligible. `stage is None` (every current scalar matmul — no
+  `STAGE` pin) takes the existing `_synth_reduce` path unchanged. So the whole build is opt-in behind a `STAGE` pin, and
+  the green scalar-matmul e2e suite is the byte-identity guard.
+- **Derive the scalar K-chunk — no codec change.** `TilePlan.bk` is mma-only (`1` for scalar) and the scalar `TILE`
+  codec (`n<N>x<M>/f<fn>x<fm>`) has no `k<bk>` token; the tests pin no bk. So `_scalar_stage_plan` **derives** the slab
+  K-chunk (`bk_elems`) to fit smem given `tile_m` / `tile_n` / dtype (a fit-to-48KiB pick, K divisible), avoiding any
+  schema / featurizer / `tile_signature` / golden-signature change. Ineligible (symbolic / indivisible K, computed-A) →
+  `"gmem"`, unchanged.
+- **Reuse the fill; write only the scalar drain.** The fill is tier-agnostic: build a `CtaTile(row_base=m_b·tile_m,
+  col_base=n_b·tile_n, linear_tid=<scalar unit-thread id from m_uvar/n_uvar>, n_threads=block_threads)` and call the
+  **existing** `_stage.cp_async_fill` / `tma_fill` for the A `[tile_m × bk_elems]` and B `[bk_elems × tile_n]` slabs —
+  the same primitives the warp tier uses. Only the **drain** is new: an inner K-loop over `bk_elems` whose cell FMAs read
+  `a_slab[m − row_base, k − k0]` / `b_slab[k − k0, n − col_base]` instead of gmem (rewrite the `_synth_reduce` operand
+  `Load`s' buffer+index; the `_scalar_cells` σ-replication + `_dedup_loads` are reused verbatim). Mark the inner loop
+  `unroll` via the existing `_unroll_inner` (satisfies `test_sgemm_inner_reduce_is_unrolled`).
+- **Structure** mirrors `_warp_staged_kloop`: outer K-slab `StridedLoop` (step `bk_elems`) { cooperative fill → barrier →
+  inner drain loop → trailing `Sync` }; `depth ≥ 2` reuses the same ring prologue. TMA uses `tma_fill` + `tma_mbar_prologue`.
+- **Test rewrite.** `test_article_tma_sgemm_reproduction` asserts on the **demolished** `StageBundle` / `StagePolicy`
+  tile-body objects — rewrite it to the new model: drop the body-object assertions, keep the source assertion
+  (`cp.async.bulk.tensor` emitted for the staged scalar tile). `test_sgemm_inner_reduce_is_unrolled` needs no rewrite
+  (pure source check) — it passes once staging engages + the inner loop is unrolled.
+- **The one hard sub-problem — accumulator lifetime across the nested loop.** Gmem-direct scalar seeds each cell's
+  accumulator (`acc__c{i}_{j}`) *inside* the single `for k` loop (the dissolved fold `Accum` + `Loop.render` seed
+  `acc = 0` at loop entry, fold inside). The staged form is **nested** — outer slab loop `for k0` { fill; inner
+  `for ki` { fold } } — so the accumulators must be seeded **once, outside the outer loop** and folded across every slab
+  without re-seeding. So `_scalar_state` (today `[]`) must, for the staged path, emit the per-cell accumulator
+  `Init(acc=0)` seed decls, and the inner drain loop's `Accum` must fold into the pre-seeded acc (no re-seed). This is the
+  scalar analogue of `_mma_state` declaring the `_c` fragments outside the mma K-loop. **Solution (traced):**
+  `contraction_loop` seeds the acc via the Loop's *carrier* prelude (no explicit `Init`), so the staged form makes
+  `_scalar_state` emit a per-cell `Init(name=f"{c.acc}__c{i}_{j}", identity=0)` for every cell (matching `_scalar_cells`'
+  `copy_cell` suffix `__c{i}_{j}` exactly), and the inner drain is a **carrier-less** `Loop` (built like `_synth_reduce`
+  but `role`/`carrier` unset and operand bodies reading the slabs) whose `Accum` folds into the pre-seeded acc — no
+  re-seed. The slab operand loads index `a_slab[m_axis − row_base, ki]` / `b_slab[ki, n_axis − col_base]`; the existing
+  `_scalar_cells` σ (which maps `m_axis` → `offset.base("m", i)`) rewrites them to `a_slab[local_row, ki]` automatically,
+  so the drain reuses `_scalar_cells` + `_dedup_loads` verbatim. Add a `test_staged_scalar_matches_gmem_direct`
+  bit-identity unit test alongside the article tests.
+- **Verify:** scalar-matmul e2e stays byte-identical (gmem-direct untouched); the two tests flip; `make bench-kernels`
+  spot-check on the article SGEMM shape. Then unblocks the fp32 `analytic._enumerate` path (the golden's `STAGE` signature
+  becomes producible) — a follow-on, since the fp16 golden still needs the warp-move catalog.
+
 ### Phase 4 — warp specialization (`WarpSpec`)
 
 **Build.** Heterogeneous warps: the CTA partitions into producer / mma / reducer roles wired by shared smem rings.
