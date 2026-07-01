@@ -7,8 +7,8 @@ This is the Loop-IR → Tile-IR boundary: after this pass nothing downstream tra
 compute into a :class:`~deplodock.compiler.ir.tile.structural.Map` whose body is the **annotated
 loop nest** (the reduce ``Loop`` stamped with its
 :class:`~deplodock.compiler.ir.axis.AxisRole` + :class:`~deplodock.compiler.ir.stmt.algebra.Carrier`)
-on a ``Kernel`` with an UNMAPPED placement; the final step hands that kernel to **scheduling**
-(:func:`~deplodock.compiler.pipeline.passes.lowering.tile._schedule.schedule`, the
+on an UNMAPPED :class:`~deplodock.compiler.ir.tile.ir.TileOp`; the final step hands that tile op to
+**scheduling** (:func:`~deplodock.compiler.pipeline.passes.lowering.tile._schedule.schedule`, the
 ``_schedule`` helper) which maps the free axes onto the grid and offers the per-axis
 scheduling forks (``REDUCE`` partition / ``TILE`` output tile), dispatched on the axes'
 ``AxisRole``. Materialization back to loop IR happens in ``lowering/kernel``.
@@ -54,7 +54,7 @@ from deplodock.compiler.ir.expr import Var
 from deplodock.compiler.ir.loop import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from deplodock.compiler.ir.stmt.base import Stmt
-from deplodock.compiler.ir.tile import Map, Placement, Reduction, TileOp, kernel_for
+from deplodock.compiler.ir.tile import Map, Placement, Reduction, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
@@ -239,9 +239,9 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
     # kernel-less ``TileOp`` (already scheduled, or ``030_split``'s output) is left for materialize.
     if isinstance(root.op, TileOp):
         tile: TileOp = root.op
-        if tile.kernel is None or tile.kernel.schedule.place.is_mapped:
+        if tile.op is None or tile.place.is_mapped:
             raise RuleSkipped("TileOp already scheduled / nothing to map")
-        return schedule(tile.kernel, tile.name, tile.knobs)
+        return schedule(tile, tile.name, tile.knobs)
     # (1) Flash attention — a graph rewrite that fuses a softmax-then-P@V kernel with its
     # scaled-QK producer. Tried first on every node; flash precedes online-softmax precedes
     # normalize, each consuming the Accums the next would match.
@@ -264,8 +264,8 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
     # output-sweep axis is likewise supported (the reduce loop strides to the runtime extent,
     # the ``< seq_len`` cap masking the tail). Register-tiled symbolic axes mask their tail
     # cell (clamp-read + guarded write) in ``lowering/kernel``.
-    # Wrap the lifted node + its unmapped placement in a ``Kernel``, then schedule it inline
+    # Wrap the lifted node + its unmapped placement in an UNMAPPED ``TileOp``, then schedule it inline
     # (the merged second half, ``_schedule.schedule``): map the free axes onto the grid and offer
     # the per-axis scheduling forks (``REDUCE`` partition / ``TILE`` output tile), dispatched on
     # the axes' ``AxisRole``. Returns the scheduled ``TileOp`` (or a fork list of candidates).
-    return schedule(kernel_for(node, Placement(free=free)), loop.name, {})
+    return schedule(TileOp(op=node, place=Placement(free=free)), loop.name, {})

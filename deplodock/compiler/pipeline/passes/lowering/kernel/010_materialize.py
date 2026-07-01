@@ -187,11 +187,10 @@ def _shared_row_fill(buf: str, smem: str, extent: int, grid_vars: tuple, n_threa
 
 def _reduce(tile: TileOp, root: Node) -> KernelOp:
     """Materialize a cooperative / ILP reduce (see module docstring)."""
-    kernel = tile.kernel
-    op = kernel.op
-    plan = reduce_plan(kernel)
+    op = tile.op
+    plan = reduce_plan(tile)
     coop, reg = plan.coop, plan.reg
-    grid = kernel.schedule.place.grid
+    grid = tile.place.grid
     stmts = lower(op)
 
     # The cooperative / cross-thread combine reads its :class:`Carrier` off the annotated reduce
@@ -287,11 +286,11 @@ def _reduce(tile: TileOp, root: Node) -> KernelOp:
 
 def rewrite(match: Match, root: Node) -> KernelOp | None:
     tile: TileOp = root.op
-    kernel = tile.kernel
+    has_op = tile.op is not None
     # By the kernel pass, ``030_split`` has consumed every cross-CTA ``GRID`` stage (the
     # partial's plan is stripped, the finalize is a fresh ``ReducePlan``). A surviving split
     # request is a bug — the materializer only lowers single-launch kernels.
-    rplan = reduce_plan(kernel) if kernel is not None else None
+    rplan = reduce_plan(tile) if has_op else None
     assert rplan is None or not rplan.needs_split, "materialize: a GRID split stage survived 030_split"
     # Output-tiled ``CONTRACTION`` (warp / register tile): the high-level :class:`Contraction` node
     # was built recognize-side (``_schedule._contraction_node``, seam #1), so materialize only
@@ -303,11 +302,11 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
         contraction = tile.op
         tail = list(contraction.epilogue)
         if not has_write(tail):
-            tail = _with_store(tail, root.output.name, kernel.schedule.place.grid, contraction)
+            tail = _with_store(tail, root.output.name, tile.place.grid, contraction)
             contraction = replace(contraction, epilogue=tail)
         return KernelOp(body=Body((factorize(contraction),)), name=tile.name)
-    tier = getattr(kernel.schedule, "tier", None) if kernel is not None else None
-    role = axis_role(kernel.op) if kernel is not None else None
+    tier = tile.tier if has_op else None
+    role = axis_role(tile.op) if has_op else None
     # Cooperative / ILP reduce tier (``_reduce``): a PLANAR / TWISTED monoid reduce, OR a
     # **non-output-tiled** ``CONTRACTION`` whose ``ReducePlan`` cooperates — the carrier-generic
     # K partition (split-K / coop-K matmul). A contraction's reduce composes here because a
@@ -315,7 +314,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # same machinery folds its K axis. Composing the output tile WITH a reduce partition is the
     # remaining step. Read the role structurally, not the kernel kind.
     coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
-    plan = reduce_plan(kernel) if (coop_eligible and kernel is not None) else None
+    plan = reduce_plan(tile) if (coop_eligible and has_op) else None
     # Reduce tier: the plan cooperates (BLOCK) and/or register-folds (REG).
     if plan is not None and (plan.coop > 1 or plan.reg > 1):
         return _reduce(tile, root)
@@ -323,6 +322,6 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # Scalar tier: one thread per output cell. ``lower`` emits the per-cell body (any serial
     # reduce ``Loop`` sits inside it); add the output-store glue if the body has none.
     op = tile.op
-    stmts = _with_store(lower(op), root.output.name, tile.schedule.place.grid, op)
-    bound = Tile(axes=tuple(tile.schedule.place.grid), body=Body(tuple(stmts)))
+    stmts = _with_store(lower(op), root.output.name, tile.place.grid, op)
+    bound = Tile(axes=tuple(tile.place.grid), body=Body(tuple(stmts)))
     return KernelOp(body=Body((bound,)), name=tile.name)

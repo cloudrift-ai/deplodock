@@ -1,10 +1,10 @@
 """Schedule a lifted kernel onto the thread grid (+ pick the reduce partition / output tile).
 
 The scheduling **half** of the merged ``010_recognize`` tile-lowering pass — recognition
-builds the :class:`~deplodock.compiler.ir.tile.schedule.Kernel` (op-tree node + a kind-free
-:class:`~...schedule.TileSchedule` with an UNMAPPED :class:`~...schedule.Placement`) and calls
-:func:`schedule` here in the same rewrite (no separate ``020`` pass). Scheduling binds the
-placement's ``free`` axes onto the grid (``Placement.on_grid``) and offers the per-axis
+builds an UNMAPPED :class:`~deplodock.compiler.ir.tile.ir.TileOp` (the structural-IR root ``op`` +
+a ``place`` carrying just the free axes) and calls :func:`schedule` here in the same rewrite (no
+separate ``020`` pass). Scheduling binds the placement's ``free`` axes onto the grid
+(``Placement.on_grid``) and offers the per-axis
 scheduling forks — the reduce-axis **partition** (:class:`~...schedule.ReducePlan`, the
 ``REDUCE`` codec) for a reduce axis and the output **tile** (:class:`~...schedule.TilePlan`,
 the ``TILE`` codec) for a contraction — read off the axes' :class:`~...axis.AxisRole`, never a
@@ -34,10 +34,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from math import prod
+from types import SimpleNamespace
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT
 from deplodock.compiler.ir.axis import AxisRole
-from deplodock.compiler.ir.tile import Contraction, Kernel, Map, ReducePlan, Reduction, TileOp, TilePlan
+from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, reduce_loop
 from deplodock.compiler.ir.tile.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.pipeline.knob import REDUCE, STAGE, TILE, WSPEC
@@ -138,18 +139,18 @@ def _with_reduce(op, plan: ReducePlan):
     return op  # a reduce kernel's op is always a Reduction / Map(source=Reduction)
 
 
-def _option(kernel, place, spec: str, name: str, knobs: dict) -> TileOp:
+def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
     """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec resolved into the
     :class:`Reduction` node's ``ReducePlan`` (the ephemeral knob → materialized plan stamped **on the
     node**), with the spec stamped on ``knobs`` for the prior. A reduce whose op is still a legacy
-    ``Map`` (the loop in the body — flash, not yet a ``Reduction``) keeps the plan on the schedule
-    (``ops.reduce_plan`` falls back there)."""
+    ``Map`` (the loop in the body — flash, not yet a ``Reduction``) keeps the plan on the ``TileOp``'s
+    residual ``reduce`` field (``ops.reduce_plan`` falls back there)."""
     plan = ReducePlan.parse(spec)
-    op = _with_reduce(kernel.op, plan)
+    op = _with_reduce(tile.op, plan)
     # ``_with_reduce`` returns the op unchanged when there is no ``Reduction`` node to stamp (a legacy
-    # loop-in-body ``Map``); keep its plan on the schedule so ``reduce_plan`` still finds it.
-    sched = replace(kernel.schedule, place=place, reduce=plan if op is kernel.op else ReducePlan())
-    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs={**knobs, REDUCE.name: spec})
+    # loop-in-body ``Map``); keep its plan on the root ``reduce`` field so ``reduce_plan`` still finds it.
+    residual = plan if op is tile.op else ReducePlan()
+    return TileOp(op=op, name=name, place=place, reduce=residual, knobs={**knobs, REDUCE.name: spec})
 
 
 def _tile_specs(kernel) -> list[str]:
@@ -199,13 +200,12 @@ def _stage_spec(kernel) -> str:
     return pinned
 
 
-def _wspec_workers(sched) -> tuple[WarpSpec | None, str]:
-    """The pinned ``WSPEC`` worker split for ``sched`` (which already carries its ``stage``), or
-    ``(None, "")`` — uniform SIMT. Pin-only this cut: returns the authoritative ``DEPLODOCK_WSPEC``
-    pin (``Knob.narrow``) when it parses AND every role is legal for the schedule (a producer needs
-    a ``stage`` to drive); a pin that doesn't parse, names no role, or whose roles are illegal
-    degrades to uniform — the same pin-validity rule the other codecs follow. The second element is
-    the spec to restamp on ``knobs`` (``""`` when uniform)."""
+def _wspec_workers(stage) -> tuple[WarpSpec | None, str]:
+    """The pinned ``WSPEC`` worker split for a pipeline with the given ``stage``, or ``(None, "")`` —
+    uniform SIMT. Pin-only this cut: returns the authoritative ``DEPLODOCK_WSPEC`` pin (``Knob.narrow``)
+    when it parses AND every role is legal (a producer needs a ``stage`` to drive); a pin that doesn't
+    parse, names no role, or whose roles are illegal degrades to uniform — the same pin-validity rule the
+    other codecs follow. The second element is the spec to restamp on ``knobs`` (``""`` when uniform)."""
     pinned = WSPEC.narrow([""])[0]
     if not pinned:
         return None, ""
@@ -213,7 +213,8 @@ def _wspec_workers(sched) -> tuple[WarpSpec | None, str]:
         ws = WarpSpec.parse(pinned)
     except ValueError:
         return None, ""
-    if not ws.roles or not ws.is_legal(sched):
+    # ``is_legal`` reads only ``.stage`` off its arg (the producer-needs-a-stage rule) — pass a probe.
+    if not ws.roles or not ws.is_legal(SimpleNamespace(stage=stage)):
         return None, ""
     return ws, pinned
 
@@ -243,7 +244,7 @@ def _check_warp_static_k(kernel, wt) -> None:
 def _contraction_node(node, place, tile_plan: TilePlan, bind) -> Contraction:
     """The high-level :class:`Contraction` structural node for a tiled ``CONTRACTION`` leaf, built
     here at fork-emit (seam #1 — the node must exist recognize-side so its ``tile`` / ``bind`` ride
-    the node, not the ``TileSchedule``; the build moved off ``010_materialize``'s retired
+    the node, not a root schedule field; the build moved off ``010_materialize``'s retired
     ``_build_contraction``). Reads the operand→role ``bind`` (:func:`semiring_binding`) + the
     resolved ``tile_plan`` from the schedule fork, and the (m, n) output / K axes off the
     still-``Map`` ``node``. The projection ``epilogue`` is the binding's body verbatim — the
@@ -262,39 +263,35 @@ def _contraction_node(node, place, tile_plan: TilePlan, bind) -> Contraction:
     )
 
 
-def _warp_option(kernel, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
+def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled warp-tier contraction ``TileOp``: ``place`` mapped onto the grid + the warp
     form of the ``TILE`` spec resolved into the warp-atom :class:`TilePlan`, plus an optional operand
-    ``STAGE`` resolved into the schedule's :class:`Stage`. The tiled :class:`Contraction` leaf is
-    built here (``op``), so materialize only ``factorize``\\ s. The packed ``TILE`` codec is the sole
-    on-dict spelling — the learned-prior featurizer parses it directly (no legacy ``WM``/``WN``/``MMA``
-    explosion)."""
+    ``STAGE`` resolved into a :class:`Stage`. The tiled :class:`Contraction` leaf is built here (``op``),
+    so materialize only ``factorize``\\ s. The packed ``TILE`` codec is the sole on-dict spelling — the
+    learned-prior featurizer parses it directly (no legacy ``WM``/``WN``/``MMA`` explosion)."""
     wt = TilePlan.parse(spec)
-    _check_warp_static_k(kernel, wt)
+    _check_warp_static_k(tile, wt)
     stage = Stage.parse(stage_spec) if stage_spec else None
     # Resolve the operand→role atom binding here too — an unbindable atom (a non-Load operand:
     # a computed-cone / demoted matmul) is rejected at fork construction, like the static-K check.
-    bind = semiring_binding(kernel.op, place.grid)
-    op = _contraction_node(kernel.op, place, wt, bind)
-    sched = replace(kernel.schedule, place=place, tier=wt, stage=stage, bind=bind)
+    bind = semiring_binding(tile.op, place.grid)
+    op = _contraction_node(tile.op, place, wt, bind)
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
-    # splits the warps into roles over this fixed pipeline (gated on the stage now set on ``sched``).
-    workers, wspec_spec = _wspec_workers(sched)
-    if workers is not None:
-        sched = replace(sched, workers=workers)
+    # splits the warps into roles over this fixed pipeline (gated on the ``stage``).
+    workers, wspec_spec = _wspec_workers(stage)
     stamped = {**knobs, TILE.name: spec}
     if stage_spec:
         stamped[STAGE.name] = stage_spec
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
-    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs=stamped)
+    return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, bind=bind, knobs=stamped)
 
 
-def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
+def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
     """One scheduled contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE`` spec
-    resolved into the schedule's ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the
-    orthogonal ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the specs
-    stamped on ``knobs`` for the prior."""
+    resolved into the ``TilePlan`` (and an optional split-K ``REDUCE`` spec into the orthogonal
+    ``ReducePlan``, an optional operand ``STAGE`` into the :class:`Stage`), the specs stamped on
+    ``knobs`` for the prior."""
     stage = Stage.parse(stage_spec) if stage_spec else None
     plan = TilePlan.parse(spec)
     # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
@@ -312,37 +309,36 @@ def _tile_option(kernel, place, spec: str, name: str, knobs: dict, reduce_spec: 
     # ``Map`` form — materialize's per-cell scalar tier lowers it. The split-K (``reduce_spec``) combo
     # stays on the ``Map`` too (composing the output tile with a K split is a later step), so
     # ``030_split`` / ``_reduce`` see the loop form they expect.
-    op = kernel.op
+    op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
-            bind = semiring_binding(kernel.op, place.grid)
+            bind = semiring_binding(tile.op, place.grid)
         except LoweringError:
             bind = None
         if bind is not None:
-            op = _contraction_node(kernel.op, place, plan, bind)
-    sched = replace(kernel.schedule, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage)
+            op = _contraction_node(tile.op, place, plan, bind)
     stamped = {**knobs, TILE.name: spec}
     if reduce_spec:
         stamped[REDUCE.name] = reduce_spec
     if stage_spec:
         stamped[STAGE.name] = stage_spec
-    return TileOp(kernel=replace(kernel, op=op, schedule=sched), name=name, knobs=stamped)
+    return TileOp(op=op, name=name, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage, knobs=stamped)
 
 
-def schedule(kernel: Kernel, name: str, knobs: dict) -> list[TileOp] | TileOp:
-    """Map a freshly-recognized (UNMAPPED) ``kernel`` onto the grid and offer its scheduling
-    forks — the scheduling half of ``010_recognize``, called inline once recognition has built
-    the kernel. Returns a single scheduled ``TileOp`` (no fork) or a list of candidate
-    ``TileOp``\\ s (the search / prior ranks them). ``knobs`` is the recognized kernel's knob
-    base (empty for a fresh kernel)."""
-    place = kernel.schedule.place.on_grid()
+def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
+    """Map a freshly-recognized (UNMAPPED) ``tile`` onto the grid and offer its scheduling forks —
+    the scheduling half of ``010_recognize``, called inline once recognition has built the tile op.
+    ``tile`` is an unmapped :class:`TileOp` (its ``op`` set, ``place`` carrying just the free axes).
+    Returns a single scheduled ``TileOp`` (no fork) or a list of candidate ``TileOp``\\ s (the search /
+    prior ranks them). ``knobs`` is the recognized kernel's knob base (empty for a fresh kernel)."""
+    place = tile.place.on_grid()
     # Dispatch on the axes' role, not a kernel kind: a pointwise (FREE) kernel has no reduce
     # decision — just map the grid (the off-default stamps ``REDUCE=""``). A reduction offers its
     # ``REDUCE`` candidate(s); a contraction offers its output ``TILE``. One candidate applies
     # directly; multiple fork for the search / prior to rank.
-    role = axis_role(kernel.op)
+    role = axis_role(tile.op)
     if role is AxisRole.FREE:
-        return TileOp(kernel=replace(kernel, schedule=replace(kernel.schedule, place=place)), name=name)
+        return TileOp(op=tile.op, name=name, place=place)
     # A contraction picks its free-axis output tile (``TILE``); a reduction picks its reduce
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
     # A contraction ALSO honors a cross-CTA split-K (``g``) / cooperative (``b``/``r``) ``REDUCE``
@@ -352,13 +348,13 @@ def schedule(kernel: Kernel, name: str, knobs: dict) -> list[TileOp] | TileOp:
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
     if role is AxisRole.CONTRACTION:
-        stage_spec = _stage_spec(kernel)
+        stage_spec = _stage_spec(tile)
         reduce_spec = _semiring_reduce_spec()
         return [
-            _warp_option(kernel, place, spec, name, knobs, stage_spec)
+            _warp_option(tile, place, spec, name, knobs, stage_spec)
             if is_warp_codec(spec)
-            else _tile_option(kernel, place, spec, name, knobs, reduce_spec, stage_spec)
-            for spec in _tile_specs(kernel)
+            else _tile_option(tile, place, spec, name, knobs, reduce_spec, stage_spec)
+            for spec in _tile_specs(tile)
         ]
-    specs = _reduce_specs(kernel, place)
-    return [_option(kernel, place, spec, name, knobs) for spec in specs]
+    specs = _reduce_specs(tile, place)
+    return [_option(tile, place, spec, name, knobs) for spec in specs]

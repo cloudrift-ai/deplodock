@@ -66,7 +66,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.loop.ir import LoopOp
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Carrier, Load, Loop, Select, SelectBranch, Write
-from deplodock.compiler.ir.tile import Placement, TileOp, kernel_for
+from deplodock.compiler.ir.tile import Placement, TileOp
 from deplodock.compiler.ir.tile.ops import Map, contraction_loop
 from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp_family_twist, expect
 
@@ -190,7 +190,7 @@ def build_flash_frag(
     # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid. Flash's outermost
     # reduce is the ``TWISTED`` kv loop (a nested ``CONTRACTION`` score loop inside it); its
     # cooperative-KV / warp tier is future work, so it keeps the scalar (serial) reduce partition.
-    tile = TileOp(kernel=kernel_for(flash_op, Placement(free=grid)))
+    tile = TileOp(op=flash_op, place=Placement(free=grid))
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):

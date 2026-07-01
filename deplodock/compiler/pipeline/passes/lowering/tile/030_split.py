@@ -48,7 +48,6 @@ from deplodock.compiler.ir.tile import (
     ReducePlan,
     TileOp,
     TilePlan,
-    kernel_for,
 )
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_loop, reduce_plan
 from deplodock.compiler.ir.tile.schedule import Level
@@ -100,17 +99,17 @@ def _carrier_identities(carrier) -> dict[str, float]:
     return {s.name: s.op.identity for s in carrier.merge if isinstance(s, Accum)}
 
 
-def _mapped(op, grid, *, reduce: ReducePlan | None = None, tier=None):
-    """A ``Kernel`` wrapping ``op`` with a **mapped** placement over ``grid`` (so ``_schedule``
-    skips it). ``reduce`` sets the reduce partition; ``tier`` preserves a contraction's scalar
-    output tier (:class:`TilePlan`)."""
-    k = kernel_for(op, Placement(free=tuple(grid), grid=tuple(grid)))
-    sched = k.schedule
-    if reduce is not None and hasattr(sched, "reduce"):
-        sched = replace(sched, reduce=reduce)
+def _mapped(op, grid, *, name: str = "", reduce: ReducePlan | None = None, tier=None) -> TileOp:
+    """A **mapped** ``TileOp`` wrapping ``op`` over ``grid`` (so ``_schedule`` skips it). ``reduce``
+    sets the residual reduce partition; ``tier`` preserves a contraction's scalar output tier
+    (:class:`TilePlan`)."""
+    place = Placement(free=tuple(grid), grid=tuple(grid))
+    kw: dict = {}
+    if reduce is not None:
+        kw["reduce"] = reduce
     if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
-        sched = replace(sched, tier=tier)
-    return replace(k, schedule=sched)
+        kw["tier"] = tier
+    return TileOp(op=op, name=name, place=place, **kw)
 
 
 def _projection_distributes(body, states: tuple[str, ...]) -> bool:
@@ -146,10 +145,10 @@ def _projection_distributes(body, states: tuple[str, ...]) -> bool:
 
 def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     tile: TileOp = root.op
-    sched = tile.kernel.schedule if tile.kernel is not None else None
     # The reduce partition lives on the Reduction node (off the schedule) — ``reduce_plan`` reads
-    # it there, falling back to the schedule for a non-tiled contraction's split-K (still a Map).
-    plan = reduce_plan(tile.kernel) if tile.kernel is not None else None
+    # it there, falling back to the ``TileOp``'s residual ``reduce`` field for a non-tiled
+    # contraction's split-K (still a Map).
+    plan = reduce_plan(tile) if tile.op is not None else None
     if plan is None or not plan.needs_split:
         raise RuleSkipped("no cross-CTA split stage — nothing to split")
 
@@ -168,7 +167,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     n_comp = len(states)
 
     out = root.output
-    grid = sched.place.grid
+    grid = tile.place.grid
     # The lowered loop nest (``Map`` / ``Reduction`` alike) — find the carrier-bearing reduce loop
     # in it by position (``reduce_loop`` returns a fresh synthesized loop for a ``Reduction``, so key
     # off the lowered list, not object identity).
@@ -182,8 +181,8 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     before = tuple(stmts[:idx])
     after = list(stmts[idx + 1 :])
     # Only the scalar output tier survives a split (a warp/None tier doesn't ride the partial
-    # kernels — they materialize scalar); ``getattr`` covers a non-contraction split (no ``tier``).
-    tier = getattr(sched, "tier", None)
+    # kernels — they materialize scalar). ``tile.tier`` is ``None`` for a non-contraction split.
+    tier = tile.tier
     tile_plan = tier if isinstance(tier, TilePlan) and not tier.is_warp else None
 
     # --- atomic finalize: ONE kernel — each CTA atomicAdds its slice's state into the output
@@ -211,8 +210,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
             # the atomic ``Write`` of the carrier state directly.
             atomic_proj = (Write(output=out.name, index=cell, values=states, atomic=True),)
         atomic_op = Map(body=Body((*before, sliced_loop, *atomic_proj)))
-        atomic_kernel = _mapped(atomic_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
-        return TileOp(kernel=atomic_kernel, name=tile.name)
+        return _mapped(atomic_op, (split, *grid), name=tile.name, reduce=_strip_grid(plan), tier=tile_plan)
 
     # The ``__partial`` workspace packs every carrier-state component: ``ws[comp, cta, *free]``
     # (the ``comp`` leading axis dropped for a single-component additive carrier, so the
@@ -228,8 +226,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
     # --- partial kernel: reduce a CTA's slice, write its carrier state to the workspace -----
     ws_writes = tuple(Write(output=ws_name, index=ws_index(i), value=states[i]) for i in range(n_comp))
     partial_op = Map(body=Body((*before, sliced_loop, *ws_writes)))
-    partial_kernel = _mapped(partial_op, (split, *grid), reduce=_strip_grid(plan), tier=tile_plan)
-    partial_tile = TileOp(kernel=partial_kernel, name=f"{tile.name}__partial")
+    partial_tile = _mapped(partial_op, (split, *grid), name=f"{tile.name}__partial", reduce=_strip_grid(plan), tier=tile_plan)
 
     # --- finalize kernel: seed the carrier state, then fold each partition's state from the
     # workspace over the split axis via the carrier's ``as_state_merge`` (a renderable
@@ -246,8 +243,7 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
         out_val = fin_proj[-1].defines()[-1] if fin_proj else states[0]
         fin_proj.append(Write(output=out.name, index=cell, value=out_val))
     fin_op = Map(body=Body((*seeds, fin_loop, *fin_proj)))
-    fin_kernel = _mapped(fin_op, grid)
-    fin_tile = TileOp(kernel=fin_kernel, name=tile.name)
+    fin_tile = _mapped(fin_op, grid, name=tile.name)
 
     # --- splice the two-kernel fragment in place of the single split TileOp ----------------
     frag = Graph()

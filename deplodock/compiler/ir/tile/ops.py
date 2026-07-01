@@ -39,15 +39,16 @@ def reduce_loop(op):
     return None
 
 
-def reduce_plan(kernel):
-    """The kernel's reduce partition (:class:`~deplodock.compiler.ir.tile.schedule.ReducePlan`) — read
-    off the :class:`~deplodock.compiler.ir.tile.structural.Reduction` node when the op is (or wraps via
-    ``Map.source``) one, else off the ``schedule`` (a non-tiled contraction's split-K / coop-K reduce,
-    which is still a flat ``Map`` until it becomes a node). The single accessor the materializer /
-    ``030_split`` read so the reduce partition can live on the node instead of the ``TileSchedule``."""
-    op = kernel.op
+def reduce_plan(tile):
+    """The tile's reduce partition (:class:`~deplodock.compiler.ir.tile.schedule.ReducePlan`) — read
+    off the :class:`~deplodock.compiler.ir.tile.structural.Reduction` node when ``tile.op`` is (or wraps
+    via ``Map.source``) one, else off the ``TileOp``'s residual ``reduce`` field (a non-tiled
+    contraction's split-K / coop-K reduce, or flash's legacy loop-in-body ``Map``, neither yet a node).
+    The single accessor the materializer / ``030_split`` read so the reduce partition can live on the
+    node instead of a root schedule field."""
+    op = tile.op
     red = op.source if isinstance(op, Map) and isinstance(op.source, Reduction) else (op if isinstance(op, Reduction) else None)
-    return red.reduce if red is not None else kernel.schedule.reduce
+    return red.reduce if red is not None else tile.reduce
 
 
 def axis_role(op) -> AxisRole:

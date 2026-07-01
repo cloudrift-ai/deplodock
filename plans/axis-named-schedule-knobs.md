@@ -37,7 +37,10 @@ The structural-node vocabulary exists and recognize builds it; the **scheduling/
 - ✅ **Migration step 2** — `Contraction` built recognize-side (`_schedule._contraction_node`, seam #1);
   `_build_contraction` retired; `Contraction` is now a structural source node `ops.lower`/`reduce_loop`/
   `axis_role` dispatch on (it synthesizes the mul-add `CONTRACTION` loop). A tiled contraction's
-  `kernel.op` is the `Contraction` node; materialize only synthesizes the bare grid-`Write` + `factorize`s.
+  `tile.op` is the `Contraction` node; materialize only synthesizes the bare grid-`Write` + `factorize`s.
+- ✅ **Migration step 3** — `Kernel` / `TileSchedule` collapsed (seam #2). `TileOp` holds the structural
+  root `op` directly + thin flat schedule fields (`place` / `workers` / residual `reduce`/`tier`/`stage`/
+  `bind`); `kernel_for` gone. All readers repointed (`ops.reduce_plan(tile)`, `tile.place.grid`, etc.).
 
 ## Structural nodes + field homes (the dissolution, seams resolved)
 
@@ -346,9 +349,14 @@ and the knob schema:
    `axis_role` dispatch on it, synthesizing the mul-add `CONTRACTION` loop on demand). Materialize only
    synthesizes the bare grid-`Write` + `factorize`s. Emitted kernels byte-identical; `op_cache_key` re-keys
    onto the `Contraction` structural identity (expected).
-3. **Collapse `Kernel`/`TileSchedule`** (seam #2) — NEXT. `TileOp` holds the structural root + thin
-   `place`/`workers`; `tier`/`bind`/`stage` ride the nodes. Repoint the `test_matmul_coverage`
-   accessors. Emitted kernels byte-identical.
+3. ✅ **Collapse `Kernel`/`TileSchedule`** (seam #2) — landed. Both wrappers removed; `TileOp` now holds
+   the structural root `op` directly plus thin schedule fields (`place` / `workers` + the residual
+   `reduce`/`tier`/`stage`/`bind` for the not-yet-nodified forms — flash's legacy `Map`, a non-tiled
+   split-K, the pin-only STAGE/WSPEC). `ops.reduce_plan` / materialize / `030_split` / `_schedule` read
+   the flat fields; `_mapped` returns a mapped `TileOp`. `test_matmul_coverage` accessors repointed to
+   `tile_op.workers`/`tile_op.stage`. Emitted kernels byte-identical (full suite green). Fully dissolving
+   the residual fields onto nodes (so only `place`/`workers` survive) is completed with the flash work in
+   step 8.
 4. **The resolver + addressing shim, behavior-preserving.** Land `resolve_axis(family, key, eligible_axes)`
    (bare → unique eligible axis; ambiguous → loud error; zero → drop) and route env pins / `--ab` /
    `DEPLODOCK_KNOBS` / the featurizer's bare-read through it. One schedule node per kernel (pre-flash) ⇒

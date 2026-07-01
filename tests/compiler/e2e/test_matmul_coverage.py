@@ -271,7 +271,7 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((8, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     assert tile_op.knobs.get("STAGE") == "d1/sync", tile_op.knobs.get("STAGE")
-    stage = tile_op.kernel.schedule.stage
+    stage = tile_op.stage
     assert stage is not None and stage.transport == "sync" and stage.depth == 1, stage
 
 
@@ -287,7 +287,7 @@ def test_warp_matmul_stamps_wspec_workers(monkeypatch) -> None:
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     assert tile_op.knobs.get("WSPEC") == "p2:q8", tile_op.knobs.get("WSPEC")
-    workers = tile_op.kernel.schedule.workers
+    workers = tile_op.workers
     assert workers is not None and [a.role.token for a in workers.roles] == ["p"], workers
     assert workers.roles[0].warps == 2 and workers.roles[0].params == (("q", 8),)
 
@@ -311,7 +311,7 @@ def test_wspec_degrades_to_uniform(monkeypatch, tile: str, stage: str | None) ->
     monkeypatch.setenv("DEPLODOCK_WSPEC", "p2")
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert tile_op.kernel.schedule.workers is None
+    assert tile_op.workers is None
     assert tile_op.knobs.get("WSPEC", "") == ""  # off-default only, no explicit pin stamped
 
 

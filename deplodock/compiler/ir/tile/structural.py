@@ -47,8 +47,8 @@ class Reduction:
     ``sum`` / ``max`` / ``mean``, twisted ``exp`` for online-softmax / flash) from its **structure**
     (the reduce ``axis`` + the per-element ``partial`` it folds). The fold ``Loop`` is **synthesized on
     demand** (:attr:`loop`), never stored — so the same node tiles under any
-    :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition stays on the
-    schedule this cut; it moves onto the node when ``TileSchedule`` dissolves).
+    :class:`~deplodock.compiler.ir.tile.schedule.ReducePlan` (the reduce partition rides the node's
+    ``reduce`` field, read via ``ops.reduce_plan``).
 
     It holds **no projection**: a bare reduce (``sum`` / ``max``) is the kernel root (its grid ``Write``
     is glue); a reduce with a post-fold sweep (softmax / RMSNorm) is the ``source`` of a wrapping
@@ -58,9 +58,9 @@ class Reduction:
     ``_reduce`` expander stay byte-identical to the bare-loop form.
 
     The **scheduling param** is the ``reduce`` partition (:class:`ReducePlan` — GRID split / BLOCK coop
-    / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here**, off the
-    ``TileSchedule`` — read via ``ops.reduce_plan``). ``lower`` ignores it (it's metadata the
-    materializer / ``030_split`` read), so adding it leaves ``op_cache_key`` byte-identical."""
+    / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here** on the node
+    — read via ``ops.reduce_plan``). ``lower`` ignores it (it's metadata the materializer / ``030_split``
+    read), so it leaves ``op_cache_key`` byte-identical."""
 
     carrier: Carrier  # the loop-carried ⊕ algebra (degenerate id / twisted exp)
     axis: Axis  # the reduce axis

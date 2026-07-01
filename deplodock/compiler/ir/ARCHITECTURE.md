@@ -12,7 +12,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
 | `frontend/ir`     | after tracing                   | `LinearOp`, `MatmulOp`, `SdpaOp`, `MeanOp`, `UnsqueezeOp`, `TransposeOp`, `ReshapeOp`, `SliceOp`, `CatOp` |
 | `tensor/ir`       | after decomposition             | `ElementwiseOp`, `ReduceOp`, `ScanOp`, `GatherOp`, `ScatterOp`, `IndexMapOp`                          |
 | `loop/ir`         | after fusion                    | `LoopOp` + body types (`Load`, `Assign`, `Accum`, `Write`, `Select`, `Loop`, `Axis`)                  |
-| `tile/ir`         | after `lowering/tile`           | `TileOp` carrying a typed `Kernel` (`tile/schedule`: the op-tree `Map` paired with one kind-free `TileSchedule`); the schedule holds the free→grid `Placement` + the reduce `ReducePlan` |
+| `tile/ir`         | after `lowering/tile`           | `TileOp` holding the structural-IR root `op` (`tile/structural`: `Map` / `Reduction` / `Contraction`) + thin schedule fields (free→grid `Placement`, `workers`, residual `ReducePlan`/`tier`/`stage`) |
 | `kernel/ir`       | after `lowering/kernel`         | `KernelOp` + hardware stmts (`Tile`, `Smem`, `Sync`, `TreeHalve`)                                     |
 | `cuda/ir`         | after `lowering/cuda`           | `CudaOp` (rendered `__global__` source)                                                               |
 
@@ -28,10 +28,11 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `Accum.op` (`ElementwiseOp` only — `ReduceOp` is not a valid body
   op; reductions are `Accum` statements inside a reduce `Loop`).
 - **Loop → tile** (after `lowering/tile`): `LoopOp` nodes replaced by
-  `TileOp` carrying a typed `Kernel` (`tile/schedule` — the op-tree
-  `Map` paired with one kind-free `TileSchedule`; a kernel's structure
+  `TileOp` holding the structural-IR root `op` directly (`tile/structural` —
+  a `Map` / `Reduction` / `Contraction`) plus thin schedule fields
+  (`place` / `workers` + residual reduce/tier/stage); a kernel's structure
   is read off its annotated reduce loop's `AxisRole`, not a Python
-  type). `010_recognize` lifts the `Map` (a thin `Body` wrapper over
+  type. `010_recognize` lifts the `Map` (a thin `Body` wrapper over
   the annotated loop nest, each reduce `Loop` carrying its `AxisRole` +
   `Carrier`) with an UNMAPPED `Placement`; `020_schedule` maps the free
   axes onto the grid and decides the reduce `ReducePlan` via the single
@@ -383,11 +384,13 @@ LoopOp bodies without spelling out every `Loop(Axis(…))` nest.
 
 ## `tile/`
 
-Tile IR (`tile/ir.py`, `tile/schedule.py`, `tile/ops.py`) carries the scheduling decisions on a typed `Kernel`
-rather than re-deriving them from the body. A `TileOp` holds exactly one `Kernel` — the op-tree `Map`
-(from `ir/stmt/algebra.py`, a thin `Body` wrapper over the annotated loop nest) paired with one kind-free
-`TileSchedule` (`tile/schedule.py`); a kernel's structure is read off its annotated reduce loop's `AxisRole`
-(`ops.axis_role`), not a Python type. The schedule holds the free→grid `Placement` and, for a reduction, the `ReducePlan`.
+Tile IR (`tile/ir.py`, `tile/structural.py`, `tile/schedule.py`, `tile/ops.py`) carries the scheduling decisions on the
+op tree + thin root fields rather than re-deriving them from the body. A `TileOp` holds the structural-IR root `op`
+directly — a `Map` / `Reduction` / `Contraction` (`tile/structural.py`, over the `ir/stmt/algebra.py` annotated loop
+nest) — plus thin schedule fields: the root-global free→grid `Placement` (`place`) and warp split (`workers`), and the
+residual `ReducePlan` / `tier` / `stage` / `bind` for the not-yet-nodified forms (per-node slices ride the structural
+nodes: a `Contraction`'s `tile`, a `Reduction`'s `reduce`). The `Kernel` / `TileSchedule` wrapper is gone. A kernel's
+structure is read off its annotated reduce loop's `AxisRole` (`ops.axis_role`), not a Python type.
 
 `ReducePlan` (`tile/schedule.py`) is a list of `ReduceStage`s, one per hardware `Level` the reduce axis is
 partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooperative threads within a CTA), `REG`
