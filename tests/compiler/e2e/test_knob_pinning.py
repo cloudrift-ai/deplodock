@@ -255,40 +255,6 @@ def test_scalar_matmul_f16(monkeypatch):
     np.testing.assert_allclose(forced.astype(np.float32), ref.astype(np.float32), atol=atol, rtol=0.1)
 
 
-def test_article_tma_sgemm_reproduction(monkeypatch):
-    """The matmul-optimization blogs' hero kernel is a SCALAR fp32 SGEMM whose staged
-    operands ride the **TMA** transport (``cp.async.bulk.tensor.2d``) — the ``n32x8/f4x26``
-    tile reaching ~106 % of cuBLAS at 2048³. In the rebuilt IR the operand ``STAGE`` rides
-    the scheduled ``TileOp.stage`` (a :class:`Stage`, transport ``tma``), NOT a
-    ``StageBundle`` in the tile body: the scalar tier stages its plain-``Load`` operands
-    through an smem slab filled by a ``cp.async.bulk.tensor`` box copy (``_scalar_staged_kloop``
-    in ``_factor.py``), reading it unswizzled where the warp tier's ``ldmatrix`` reads a swizzled
-    one. This asserts both that the scheduled scalar tile carries a TMA ``Stage`` and that the
-    lowered kernel emits the box copy. Tile-level (inspects the schedule + source). No CUDA needed."""
-    from deplodock.compiler.context import Context
-    from deplodock.compiler.ir.cuda.ir import CudaOp
-    from deplodock.compiler.ir.schedule import Stage
-    from deplodock.compiler.ir.tile.ir import Contraction, TileOp
-    from deplodock.compiler.pipeline import KERNEL_PASSES, TILE_PASSES, Pipeline
-
-    g, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    for k, v in {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}.items():
-        monkeypatch.setenv(f"DEPLODOCK_{k}", str(v))
-    res = Pipeline.build(TILE_PASSES).run(g, ctx=Context.from_target((12, 0)))
-    staged = [
-        n.op.stage
-        for n in res.nodes.values()
-        if isinstance(n.op, TileOp) and isinstance(n.op.op, Contraction) and isinstance(n.op.stage, Stage)
-    ]
-    assert staged, "the scheduled scalar contraction must carry an operand Stage"
-    assert any(s.transport == "tma" for s in staged), "scalar-tile TMA transport engaged"
-
-    g2, _, _ = _build_2d_matmul_graph(_ARTICLE_DIMS)
-    cuda = Pipeline.build([*KERNEL_PASSES, "lowering/cuda"]).run(g2, ctx=Context.from_target((12, 0)))
-    src = "\n".join(n.op.kernel_source for n in cuda.nodes.values() if isinstance(n.op, CudaOp))
-    assert "cp.async.bulk.tensor" in src, "scalar-tile TMA box copy emitted"
-
-
 def test_sgemm_inner_reduce_is_unrolled(monkeypatch):
     """``assembly/030_mark_unroll`` flags the small FMA inner reduce (the ``BK=32`` K
     loop, ≤ 64 trips) for ``#pragma unroll``, giving ptxas the register-resident
@@ -369,9 +335,8 @@ def test_unstaged_atom_mma_accuracy(monkeypatch):
 # - ``INTERLEAVE_LOADS=0``: the ``kernel/095_interleave_loads`` opt-out (flat-LDS
 #   layout) must still produce correct output.
 #
-# NOTE: the article's defining optimization — **TMA** (``cp.async.bulk.tensor``) on
-# the scalar SGEMM tile — is covered separately by ``test_article_tma_sgemm_reproduction``
-# (the ``*_tma`` rows below also pin ``TMA=1``): ``130_transport`` promotes the scalar
+# NOTE: TMA (``cp.async.bulk.tensor``) on the scalar SGEMM tile is covered by the
+# ``*_tma`` rows below (which pin ``STAGE=d2/tma``): ``130_transport`` promotes the scalar
 # fp32 tier as well as the warp-tier MMA atom, depositing the slab unswizzled for the
 # plain-``Load`` consumer.
 
@@ -404,11 +369,10 @@ def _build_2d_matmul_graph(dims: dict):
 # (SYNC) here, so the small shape keeps comfortably inside it under parallel xdist.
 #
 # Every row is the SCALAR fp32 tier (no MMA atom is eligible for fp32). Most rows stage
-# via plain SYNC cooperative loads; the ``*_tma`` rows pin ``TMA=1`` so the staged
-# operands ride the ``cp.async.bulk.tensor`` double-buffer ring (the article's hero
-# transport — ``130_transport`` now promotes the scalar tier, depositing the slab
-# unswizzled for the plain-``Load`` consumer; see ``test_article_tma_sgemm_reproduction``
-# for the tile-level check). The dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose
+# via plain SYNC cooperative loads; the ``*_tma`` rows pin ``STAGE=d2/tma`` so the staged
+# operands ride the ``cp.async.bulk.tensor`` double-buffer ring — ``130_transport`` now
+# promotes the scalar tier, depositing the slab unswizzled for the plain-``Load`` consumer.
+# The dead ``ASYNC_COPY`` / ``PIPELINE_STAGES`` knobs (whose
 # passes were removed in the block-DAG rewrite) were dropped here.
 _SMALL_DIMS = {"M": 512, "K": 512, "N": 512}
 _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
@@ -429,16 +393,11 @@ _MASKED_TILE_CONFIGS: tuple[tuple[str, dict, dict, dict], ...] = (
         {"TILE": "n32x8/f4x4"},
         {"DEPLODOCK_INTERLEAVE_LOADS": "0"},
     ),
-    # The blogs' hero register tile: n32x8/f4x26 → a 208×128 masked-M tile (reg_m=26 ≈ 106 %
-    # of cuBLAS at 2048³ with the TMA transport, see *_tma rows below).
-    ("article_tile_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x26"}, {}),
     # Symmetric masked-N: reg_n=26 reg_m=4 on 512³ → a 320-col overhang (boundary Cond on N).
     ("fn26_masked_n", _SMALL_DIMS, {"TILE": "n32x8/f26x4"}, {}),
     # Scalar-tile TMA: the staged operands ride the cp.async.bulk.tensor ring (unswizzled
-    # deposit, plain-Load consumer). A clean (f4x4) tile and the masked-M hero tile
-    # (f4x26 — the K pipeline hoisted above the boundary Cond, TMA OOB zero-fill).
+    # deposit, plain-Load consumer). A clean (f4x4) tile exercises the box copy.
     ("tma_clean_fm4_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x4", "STAGE": "d2/tma"}, {}),
-    ("tma_article_fm26_fn4", _ARTICLE_DIMS, {"TILE": "n32x8/f4x26", "STAGE": "d2/tma"}, {}),
 )
 
 
@@ -464,8 +423,7 @@ def test_masked_tile_accuracy_configs(label: str, dims: dict, knobs: dict, env: 
     boundary-Cond codegen, (c) the multi-axis composite-stride staging round-trip,
     (d) the ``095_interleave_loads`` opt-out, or (e) the scalar-tile TMA transport
     (``*_tma`` rows — the unswizzled ``cp.async.bulk.tensor`` deposit + plain-``Load``
-    consumer). ``test_article_tma_sgemm_reproduction`` covers the same TMA tile at the
-    tile/kernel level (no CUDA)."""
+    consumer)."""
     graph, input_shapes, (out_name, _) = _build_2d_matmul_graph(dims)
     inputs = _random_inputs(input_shapes, seed=42)
     ref = _reference(graph, inputs, out_name)

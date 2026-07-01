@@ -60,6 +60,14 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
+    # Tensor-core flash — the warp-chain codegen was a DEVIATION (a bespoke
+    # `_flash_warp.factorize_flash` emitter + the `DEPLODOCK_CHAIN` knob, bypassing the one `_factor`
+    # contraction path) and was DELETED to restore the mandate. Flash now lowers only on the scalar
+    # tier, so these cases (asserting the `dpl_mma…` / `flash_pv_smem` warp chain) fail again.
+    # Recovering this tier means the Q@K / P@V `Contraction`s carrying an mma `TilePlan` and routing
+    # through `_factorize_contraction` — NOT a fourth emitter. Two substrings cover all 26 cases:
+    "test_generated_tensorcore_flash": _R,
+    "test_warp_chain_": _R,
     # test_flash_off_keeps_decomposition: FLASH-off no longer keeps the score-materializing
     # multi-kernel 010_sdpa decomposition (SDPA lowers to a single kernel regardless) — the
     # knob-gated recognition path is a separate rebuild target.
@@ -77,10 +85,9 @@ XFAIL: dict[str, str] = {
     # mma operand staging (cp.async / TMA / gmem→smem ring / smem→register double-buffer) landed —
     # the six warp-tier STAGE structure / bit-identity tests are recovered. Scalar-tier operand
     # staging landed too (``_scalar_staged_kloop`` — the STAGE-pinned scalar contraction stages its
-    # operands through an smem slab via tma / cp.async), so ``test_article_tma_sgemm_reproduction``
-    # (rewritten off the demolished ``StageBundle`` API to the Stage-on-TileOp model) is recovered.
-    # ``test_bank_conflicts.py`` (already xfailed above) still needs the demolished
-    # ``find_all_bindings`` staging-diagnostics oracle rebuilt (a separate follow-up).
+    # operands through an smem slab via tma / cp.async). ``test_bank_conflicts.py`` (already xfailed
+    # above) still needs the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a
+    # separate follow-up).
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once
     # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). Two residuals:
     # test_greedy_run_falls_back_to_option0_when_prior_overflows needs the greedy

@@ -57,15 +57,6 @@ from deplodock.compiler.pipeline.pipeline import LoweringError
 # ``Knob.narrow``) > the search/prior fork > the conservative default below.
 
 
-def _is_mma_flash(op) -> bool:
-    """True iff ``op`` is the mma-flash tree — a ``TWISTED`` :class:`Reduction` (bare or under a
-    projecting :class:`Map`) whose ``source`` :class:`Contraction` carries a tensor-core
-    :class:`TilePlan` (the ``DEPLODOCK_CHAIN`` build). It is fully scheduled recognize-side, so
-    :func:`schedule` passes it through untouched to the flash-warp emitter."""
-    red = op.source if isinstance(op, Map) else op
-    return isinstance(red, Reduction) and isinstance(red.source, Contraction) and red.source.tile.is_warp
-
-
 def _at(knob, axis_name: str) -> str:
     """The axis-named knob key ``FAMILY@<axis>`` (e.g. ``TILE@d``) — the per-node schedule codec keyed
     by the reduce/contraction axis it schedules, so a multi-node kernel addresses each node."""
@@ -437,12 +428,6 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
     Returns a single scheduled ``TileOp`` (no fork) or a list of candidate ``TileOp``\\ s (the search /
     prior ranks them). ``knobs`` is the recognized kernel's knob base (empty for a fresh kernel)."""
     place = tile.place.on_grid()
-    # The mma-flash tree (the ``DEPLODOCK_CHAIN`` warp chain) is already fully scheduled
-    # recognize-side — both contractions carry their warp ``TilePlan`` and the query-tile grid
-    # rides ``place`` — so it bypasses the generic reduce/contraction fork and lowers straight
-    # through the flash-warp emitter (``_factor`` dispatches on ``is_mma_flash``).
-    if _is_mma_flash(tile.op):
-        return TileOp(op=tile.op, name=name, place=place, knobs=knobs)
     # Dispatch on the axes' role, not a kernel kind: a pointwise (FREE) kernel has no reduce
     # decision — just map the grid (the off-default stamps ``REDUCE=""``). A reduction offers its
     # ``REDUCE`` candidate(s); a contraction offers its output ``TILE``. One candidate applies

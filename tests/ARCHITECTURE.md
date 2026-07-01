@@ -101,7 +101,7 @@ tests/
 │   │   ├── test_ops_vs_torch.py                # backend × op vs torch eager (parity layer)
 │   │   ├── test_matmul_coverage.py             # SEMIRING: scalar TILE + warp MMA + masked-symbolic
 │   │   ├── test_reduce_coverage.py             # MONOID: cooperative combine + online-softmax fusion
-│   │   ├── test_attention_coverage.py          # flash (scalar / warp-chain TC / coop-KV) + model chains
+│   │   ├── test_attention_coverage.py          # flash (scalar; TC warp-chain xfailed) + model chains
 │   │   ├── test_block.py                       # TinyLlama / Qwen block vs eager
 │   │   └── test_pipeline.py                    # LOOP_PASSES → CudaBackend on toys
 │   └── diagnostics/

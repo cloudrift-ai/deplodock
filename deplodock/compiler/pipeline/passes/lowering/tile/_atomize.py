@@ -18,14 +18,14 @@ contraction leaf is built (``_warp_option`` / the tiled ``_tile_option``) — so
 fork construction, alongside ``_check_warp_static_k``, instead of failing several passes later.
 Leading ``_`` so the pass loader skips this module.
 
-**Flash contractions are stamped, not recursively atomized.** Flash is a ``TWISTED`` kv
+**Flash contractions are not recursively atomized.** Flash is a ``TWISTED`` kv
 ``Reduction`` over a ``Q@K`` :class:`~deplodock.compiler.ir.tile.ir.Contraction` ``source`` +
-a ``P@V`` one in the ``partial``. The tensor-core warp chain (``DEPLODOCK_CHAIN``) attaches the mma
-``TilePlan`` to both directly at construction (``_flash._chain_stamp``) and the fragment-resident
-FA-2 emitter (``lowering/kernel/_flash_warp``) reads the operands / geometry straight off those
-nodes — it does **not** re-derive the binding via a recursive :func:`bind_contraction` tree-walk.
-``bind_contraction`` stays loop-addressable (it binds the root contraction structurally), but the
-recursive-atomize path is unused: the flash tree already carries its per-node geometry."""
+a ``P@V`` one in the ``partial``, lowered on the scalar tier (block=1) — each contraction carries a
+scalar ``TilePlan()`` and factorizes through the one ``_factor`` contraction path. A tensor-core
+flash tier would attach an mma ``TilePlan`` to those same nodes and route through that same path (no
+bespoke emitter); ``bind_contraction`` stays loop-addressable (it binds the root contraction
+structurally), and the recursive-atomize path is unused — the flash tree carries its per-node
+geometry."""
 
 from __future__ import annotations
 

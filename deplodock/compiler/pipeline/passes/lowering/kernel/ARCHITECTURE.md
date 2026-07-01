@@ -41,15 +41,14 @@ dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `
 ### The one factorizer — dispatch, atoms, and the reduce tier (`_factor.py` / `_tiling.py`)
 
 `_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind +
-role + reduce plan off `tile.op` and routes to `_factorize_contraction` (a tiled `Contraction`), `_factorize_reduce`
-(a cooperative / ILP `PLANAR` / `TWISTED` reduce), or the inline **scalar tier** (`lower(op)` + `with_store`, one
-thread per output cell). All three tiers, plus the shared-row staging helpers, live in `_factor.py`. The one exception
-is the **tensor-core flash** (the mma-flash tree — a `TWISTED` `Reduction` whose `source`/`partial` `Contraction`s carry
-a warp `TilePlan`, built by `DEPLODOCK_CHAIN`): `factorize` dispatches it to `_flash_warp.factorize_flash`, the
-fragment-resident FA-2 warp chain (score C-fragments → in-register online softmax → the C→A `flash_pv_smem` handoff →
-the PV mma → `O/l`). It is a distinct single-warp *orchestration* (the streaming softmax + the register-resident A
-handoff — the one genuinely-new primitive) but reuses the **shared** mma / fragment / store kernel-IR nodes, so there is
-no divergent tensor-core codegen, only a distinct schedule of the same primitives.
+role + reduce plan off `tile.op` and routes to exactly one of three tiers — `_factorize_contraction` (a tiled
+`Contraction`), `_factorize_reduce` (a cooperative / ILP `PLANAR` / `TWISTED` reduce), or the inline **scalar tier**
+(`lower(op)` + `with_store`, one thread per output cell). All three tiers, plus the shared-row staging helpers, live in
+`_factor.py`. **There is no fourth, kind-specific path — no flash / attention special case.** Flash is the
+two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through those
+same three routes (scalar block=1 today). A tensor-core flash tier is a matter of the contractions carrying an mma
+`TilePlan` (a schedule field on the node) and routing through `_factorize_contraction` like any other mma matmul —
+**never** a bespoke emitter, which would be a divergent codegen path the mandate forbids.
 
 **The contraction factorization — two atoms.** `_factorize_contraction` is the atom-generic path — there is no per-atom
 variant, and **no per-atom geometry object**. It expands any `Contraction` by tiling a **leaf atom** four ways through

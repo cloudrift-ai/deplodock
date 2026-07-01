@@ -22,13 +22,10 @@ halves:
   contraction's ``Σ Q·K`` loop ahead of the partial, the scalar tier expanding the same loop nest) +
   generates the output-store glue (the ``Write`` at the grid cell — not stored).
 
-  **Tensor-core warp chain (``DEPLODOCK_CHAIN``).** When CHAIN is pinned and the shape / dtype
-  tensorize (16-bit operands, ``head_dim % 16``, ``d_v % 8``), :func:`_chain_stamp` stamps the mma
-  atom on **both** contractions and the grid tiles the query rows 16-per-warp (``d`` folds into the
-  PV output tile, not the grid). That mma-flash tree lowers through the dedicated
-  ``lowering/kernel/_flash_warp`` emitter — the fragment-resident FA-2 chain (score C-fragments →
-  in-register online softmax → the C→A ``flash_pv_smem`` handoff → the PV mma → ``O/l``), reusing the
-  shared mma / fragment / store kernel-IR nodes. Static AND symbolic seq, causal, GQA, f16 / bf16.
+  A tensor-core flash tier is **not** a bespoke emitter: the mandate is that giving the Q@K / P@V
+  contractions an mma ``TilePlan`` (a schedule field on the node) must route through the same
+  ``_factor`` contraction path as any other mma matmul. Until that lands the whole way through the one
+  emitter, flash lowers **only** on the scalar tier below — there is no divergent flash codegen path.
 
 ``is_flash_score_producer`` lets ``010_recognize`` defer the general lift of a scaled-QK
 score producer until its softmax-then-P@V consumer has fused (the fusion reads the
@@ -44,7 +41,7 @@ was removed rather than kept half-converted to the op tree.
 The fragment fuses scaled-dot-product attention into ONE kernel that tiles the KV
 (reduce) axis and never materializes the ``[S_q, S_k]`` score matrix. The scalar tier
 runs one independent streaming softmax per output element ``(…, m, d)`` — a correct, if
-redundant, form (the tensor-core warp chain above tiles the score / PV instead)::
+redundant, form::
 
     for *batch, m (query rows), d (value dim):       # free / grid
       Init (m_i = -inf, l_i = 0, O_i = 0)            # running (max, denom, out)
@@ -65,8 +62,7 @@ score per element, ``kv ≤ m`` else −inf — tile-skip is a tensor-core-tier
 follow-up), an optional broadcast additive mask (the HF ``(1,1,S,S)`` float bias),
 and GQA (``q_heads == group · kv_heads``; the K/V head axis read at ``head //
 group`` directly, no materialized broadcast). Read from the ``DEPLODOCK_FLASH=1`` env
-pin (``DEPLODOCK_CHAIN=1`` selects the tensor-core warp chain); the two-level
-``OptionFork`` offer + ``AnalyticPrior`` cold-start are a follow-up.
+pin; the two-level ``OptionFork`` offer + ``AnalyticPrior`` cold-start are a follow-up.
 """
 
 from __future__ import annotations
@@ -75,11 +71,8 @@ import math
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from deplodock import config
 from deplodock.compiler.dim import Dim
-from deplodock.compiler.dtype import BF16, F16
 from deplodock.compiler.graph import Graph, Tensor
-from deplodock.compiler.ir.atom import atom_for
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.base import ConstantOp, InputOp
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
@@ -203,16 +196,7 @@ def build_flash_frag(
         q_id, k_id, v_id, batch, s_q_dim, s_k_dim, head_dim, d_v, causal=causal, group=group, mask_buf=mask_buf, mask_shape=mask_shape
     )
     batch_axes = tuple(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch))
-    # The tensor-core warp chain (``DEPLODOCK_CHAIN``): stamp the mma atom on both contractions and
-    # tile the query rows 16-per-warp — ``d`` folds into the PV output tile, not the grid. The
-    # streaming-softmax + C→A handoff lower through ``_flash_warp`` (the mma-flash emitter). Without
-    # CHAIN (or when the shape / dtype can't tensorize) flash keeps the scalar ``(m, d)`` grid.
-    atom = _chain_atom(out.dtype)
-    if atom is not None and _chain_eligible(head_dim, d_v, s_q_dim, s_k_dim):
-        flash_op = _chain_stamp(flash_op, atom)
-        grid = (*batch_axes, Axis(name="qb", extent=s_q_dim.ceil_div(16)))
-    else:
-        grid = (*batch_axes, Axis(name="m", extent=s_q_dim), Axis(name="d", extent=Dim(d_v)))
+    grid = (*batch_axes, Axis(name="m", extent=s_q_dim), Axis(name="d", extent=Dim(d_v)))
     # The free axes are the schedule's, carried on the ``TileOp`` with an UNMAPPED grid —
     # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid.
     tile = TileOp(op=flash_op, place=Placement(free=grid))
@@ -243,40 +227,6 @@ def _batch_vars(n: int) -> tuple[Var, ...]:
     return tuple(Var(f"b{i}") for i in range(n))
 
 
-def _chain_atom(dtype):
-    """The mma :class:`AtomKind` for the warp-chain when ``DEPLODOCK_CHAIN`` is on and the operands
-    are 16-bit (f16 / bf16 — the tensor-core multiplicand dtypes); ``None`` otherwise (keep the
-    scalar streaming flash)."""
-    if config.knob_raw("CHAIN") not in ("1", "true", "True"):
-        return None
-    if dtype == F16:
-        return atom_for("mma_m16n8k16_f16")
-    if dtype == BF16:
-        return atom_for("mma_m16n8k16_bf16")
-    return None  # f32 operands don't tensorize on this atom
-
-
-def _chain_eligible(head_dim: int, d_v: int, s_q: Dim, s_k: Dim) -> bool:
-    """True iff the warp chain can serve this SDPA — the head dim a multiple of the mma K
-    (``atom_k = 16``), the value dim a multiple of the mma N (``atom_n = 8``), and any *static* seq
-    a multiple of the 16-row / 16-key tile (a symbolic seq reaches the masked tail: the query
-    ``m_guard`` + the key ``k_zero`` / boundary ``FragmentMask``)."""
-    if head_dim % 16 or d_v % 8:
-        return False
-    return all(not (d.is_static and d.as_static() % 16) for d in (s_q, s_k))
-
-
-def _chain_stamp(flash_op: Map, atom) -> Map:
-    """Stamp the mma ``TilePlan`` (the warp atom) onto both flash contractions — the ``Q@K`` on the
-    reduce ``source`` and the ``P@V`` in the ``partial`` — turning the scalar two-``Contraction``
-    tree into the mma-flash tree the warp emitter lowers. Only the schedule field changes; the
-    algebra (operands / carrier / axes) is untouched."""
-    red = flash_op.source
-    qk = replace(red.source, tile=TilePlan(atom=atom))
-    partial = tuple(replace(s, tile=TilePlan(atom=atom)) if isinstance(s, Contraction) else s for s in red.partial)
-    return replace(flash_op, source=replace(red, source=qk, partial=Body(tuple(partial))))
-
-
 def _split_pv(merge: list, o: str, v: str, v_buf: str, v_idx: tuple, m_axis: Axis, d_axis: Axis) -> list:
     """Split the exp carrier's streaming ``merge`` around a real **PV** :class:`Contraction`.
 
@@ -288,11 +238,10 @@ def _split_pv(merge: list, o: str, v: str, v_buf: str, v_idx: tuple, m_axis: Axi
     untouched); only the value it folds is redirected through the contraction.
 
     This is the scalar two-``Contraction`` flash tree at ``block = 1``: the ``j`` reduce is a singleton
-    (the scalar streaming degenerate). The tensor-core warp chain (``DEPLODOCK_CHAIN``) tiles the same
-    ``P@V`` node with an mma ``TilePlan`` and streams the KV in 16-key blocks — the score / P /
-    output all fragment-resident (``lowering/kernel/_flash_warp``), the register-resident ``P`` the C→A
-    handoff. ``O`` and ``V`` are per-``(m, d)``; ``P`` per-``(m, j)`` — different axes from the
-    streaming ``kv``, so the PV contraction never duplicates the streaming reduce."""
+    (the scalar streaming degenerate). A tensor-core tier would tile the same ``P@V`` node with an mma
+    ``TilePlan`` — routed through the one ``_factor`` contraction path, not a bespoke emitter. ``O``
+    and ``V`` are per-``(m, d)``; ``P`` per-``(m, j)`` — different axes from the streaming ``kv``, so
+    the PV contraction never duplicates the streaming reduce."""
     o_accum = next(s for s in merge if isinstance(s, Accum) and s.name == o)
     defs = {s.name: s for s in merge if isinstance(s, Assign)}
     prod = defs[o_accum.value]  # the fused ``v·P`` (multiply(v, P))
@@ -338,11 +287,8 @@ def _flash_op(
     ``Σ_dd Q·K`` :class:`Contraction` node (then scaled, optionally masked, the value read + the
     carrier's dissolved merge), projected ``O/l`` after the loop. The ``Reduction ⊃ Contraction``
     composition: :meth:`Reduction.loop` splices the contraction's synthesized ``Σ Q·K`` loop ahead of
-    the partial, so the scalar tier expands the same loop-in-body nest as before. The tensor-core warp
-    chain (``DEPLODOCK_CHAIN``) instead stamps the mma atom on both contractions (``_chain_stamp``) and
-    the fragment-resident FA-2 emitter ``lowering/kernel/_flash_warp`` streams them (the score / P /
-    output register-resident). The free ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops
-    here (the warp chain tiles ``m`` 16-per-warp, ``d`` into the PV output); the output store is glue
+    the partial, so the scalar tier expands the same loop-in-body nest as before. The free
+    ``(batch…, m, d)`` axes are the ``TileOp``'s grid, not loops here; the output store is glue
     generated at materialize.
 
     GQA: the K/V head axis (last batch dim) is read at ``head // group``, the same
@@ -360,10 +306,9 @@ def _flash_op(
     v_idx = (*kv_bvars, Var("kv"), Var("d"))
 
     # s = Σ_dd Q·K — the inner contraction as a high-level :class:`Contraction` structural node, the
-    # ``source`` of the streaming kv :class:`Reduction`. Per-cell scalar (``TilePlan()``) by default —
-    # the redundant one-dot-per-output-element score; the ``DEPLODOCK_CHAIN`` build (``_chain_stamp``)
-    # swaps in the mma atom, and the ``_flash_warp`` emitter tiles the score ``[m, kv]`` at the warp
-    # tier. Its output axes are the score matrix ``[m, kv]``. The scale / mask reads ``sacc``.
+    # ``source`` of the streaming kv :class:`Reduction`. Per-cell scalar (``TilePlan()``): the
+    # redundant one-dot-per-output-element score. Its output axes are the score matrix ``[m, kv]``.
+    # The scale / mask reads ``sacc``.
     score_contraction = Contraction(
         axes=(Axis(name="m", extent=s_q), Axis(name="kv", extent=s_k)),
         k_axis=Axis(name="dd", extent=Dim(head_dim)),

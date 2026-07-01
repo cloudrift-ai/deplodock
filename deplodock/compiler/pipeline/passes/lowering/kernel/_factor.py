@@ -68,7 +68,6 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Lo
 from deplodock.compiler.ir.tile.ir import Contraction
 from deplodock.compiler.ir.tile.ops import axis_role, contraction_loop, lower, reduce_plan
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
-from deplodock.compiler.pipeline.passes.lowering.kernel._flash_warp import factorize_flash, is_mma_flash
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
@@ -557,7 +556,7 @@ def _mma_reduce(c: Contraction, stage: Stage | None, cells, offset, masks) -> tu
     transposed-B both have gmem-direct K zero-fill helpers)."""
     atom = c.atom
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
-    assert not c.a_computed, "mma tier: register-resident A operand (flash PV fragment feed) not yet wired — Phase 1 step 3"
+    assert not c.a_computed, "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
     a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
     mode, gmem_depth, reg_depth = _mma_stage_plan(c, stage)
     if mode != "gmem":
@@ -965,10 +964,13 @@ def factorize(tile, root, store=None) -> Tile:
     - anything else (a pointwise ``Map``, or a reduction with a trivial :class:`ReducePlan`) → the
       **scalar tier**: one thread per output cell. ``lower(op)`` emits the per-cell body (a serial
       reduce ``Loop`` sits inside it), the output-store glue is appended if the body has none, and the
-      body is wrapped in a single :class:`Tile` bound to ``place.grid``."""
+      body is wrapped in a single :class:`Tile` bound to ``place.grid``.
+
+    There is **no** flash / attention special case: flash is the two-``Contraction`` ``TWISTED``
+    reduce tree, so its Q@K / P@V contractions and its streaming reduce factorize through the same
+    three routes below (scalar block=1 today). A fourth, bespoke emitter would be a divergent codegen
+    path — forbidden by the mandate."""
     op = tile.op
-    if op is not None and is_mma_flash(op):
-        return factorize_flash(tile, root)
     if isinstance(op, Contraction):
         tail = list(op.epilogue)
         if not has_write(tail):
