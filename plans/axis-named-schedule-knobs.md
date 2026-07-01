@@ -368,11 +368,20 @@ and the knob schema:
    `tuning_knob_items` collapses `TILE@d`→`TILE` for a single eligible axis. Byte-identical feature vector
    on one-node kernels; every existing bare pin keeps resolving; `op_cache_key` re-keys (per seam #3).
    `REDUCE` stays bare (deferred to step 6). `_FAMILY_ORDER` gains `TILE@` / `STAGE@`.
-5. **Per-node featurizer loop.** The `TILE`/`STAGE` singleton reads are now `family_value` (byte-identical
-   pool for one node — done alongside step 4). Remaining: the group-by-axis loop for a true multi-node
-   pool, and per-node `S_*` stamping (addressed). Still one node per kernel, so **pool == today**.
-6. **Reconcile `REDUCE@`.** Unify the native moveset `REDUCE@<axis>` with the schedule reduce partition
-   (the sharp edge above). Parity over a split-K matmul fixture.
+5. **Per-node featurizer loop** — the `TILE`/`STAGE`/`REDUCE` singleton reads are `family_value`
+   (byte-identical pool for one node). The group-by-axis loop + per-node `S_*` (addressed) is genuinely
+   invisible until a kernel has two nodes (its own note: "**pool == today**"), and per-node `S_*` renaming
+   would break the byte-identical feature-vector bar with no multi-node consumer to exercise it — so this
+   is **folded into step 8**, built together with the flash two-node kernel that first needs it.
+6. ✅ **Reconcile `REDUCE@`** — landed. The schedule reduce partition is now stored `REDUCE@<axis>`
+   (`_schedule._option` keys it by the reduce axis, split-K by the `k_axis`), joining `TILE`/`STAGE` on the
+   axis-named keying; `_COLLAPSE_FAMILIES` gains `REDUCE` so a one-node table bares out to `REDUCE=…` and
+   matches the bare golden YAML. The "sharp edge" dissolved: there is **no** real native `REDUCE@<axis>`
+   family stamped anywhere (grep-confirmed — the reference in `analytic.py`/`_FAMILY_ORDER` is vestigial
+   naming; the split count is the codec-derived `D_splitk`), so the reduce partition IS the one reduce
+   family — nothing to collide with. `family_value` reads it, `tile_signature` matches the bare goldens,
+   feature vector byte-identical on one-node kernels; `op_cache_key` re-keys (seam #3). Full e2e suite
+   green (reduce/matmul/knob-pinning/search/eval).
 7. **Fork `Level`s per node + emit structural leaves.** Restructure `build_fork_tree`'s levels to
    root-global-then-per-node; the recognize emit produces the move catalog → structural leaves.
    Structural-coverage test: the leaf set over a matmul fixture equals the hand-computed legal product.
@@ -404,8 +413,8 @@ and the knob schema:
 - **Pool vs per-node predict** — pool keeps the prior unchanged and is enough to *unblock* the schema; per-node
   predict is the transfer payoff but adds a compose step. Lean: ship pool with the schema (steps 4–8), gate
   per-node predict (step 9) behind the A/B.
-- **`REDUCE@` unification** — are the native moveset `REDUCE@<axis>` and the schedule `REDUCE` codec one
-  decision (collapse) or two (distinct tokens)? Resolve before step 6. Lean: one decision, collapse.
+- ✅ **`REDUCE@` unification** — resolved (step 6): one decision. There is no real native `REDUCE@<axis>`
+  family stamped in code, so the schedule reduce partition simply keys `REDUCE@<axis>` like `TILE`/`STAGE`.
 - **`TILE` key = `k_axis`?** — keying the output tile by the contraction's single `k_axis` identifies the node
   cleanly; the alternative (key by the output m/n pair) is more literal but multi-axis. Lean: `k_axis`.
 - **Coupling shape** — joint `Level` vs master→slave tile derivation for the flash QK/PV warp budget. Lean:

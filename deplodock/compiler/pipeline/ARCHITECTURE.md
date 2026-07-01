@@ -437,15 +437,16 @@ epilogue (`l2`'s `sqrt`, a fused bias/activation) is refused (`NotImplementedErr
 after the combine). The check is `030_split._projection_distributes`.
 
 **Axis-named schedule keys.** A per-node schedule codec is stored keyed `FAMILY@<axis>` — `TILE@<k_axis>` /
-`STAGE@<axis>`, the reduce/contraction axis the node schedules — so a multi-node kernel (flash: `TILE@d` QK + `TILE@sk`
-PV) can address each schedule-bearing node; `WSPEC` / `PLACE` stay root-global (bare). The **bare** form is first-class:
-`resolve_axis(family, key, eligible)` maps a bare `TILE` to the unique eligible axis (a hand pin on a two-node kernel
-raises naming the candidates; a family with no eligible axis drops). Readers go through `family_value(knobs, family)` so
-a bare and a suffixed key parse / featurize / golden-match identically — the schema is **invisible on one-node kernels**
-(the display collapses `TILE@d` back to bare `TILE` for `TILE`/`STAGE` when there is a single eligible axis, so those
-tables read as before). `REDUCE` is still stored bare pending its reconciliation with the native moveset's
-`REDUCE@<axis>` family (they must unify onto one axis-keyed reduce decision, not two colliding). The op cache key re-keys
-onto the axis-named identity (expected — the transfer handle for the prior, not a regression).
+`STAGE@<axis>` / `REDUCE@<axis>`, the reduce/contraction axis the node schedules — so a multi-node kernel (flash: `TILE@d`
+QK + `TILE@sk` PV) can address each schedule-bearing node; `WSPEC` / `PLACE` stay root-global (bare). The **bare** form is
+first-class: `resolve_axis(family, key, eligible)` maps a bare `TILE` to the unique eligible axis (a hand pin on a
+two-node kernel raises naming the candidates; a family with no eligible axis drops). Readers go through
+`family_value(knobs, family)` so a bare and a suffixed key parse / featurize / golden-match identically — the schema is
+**invisible on one-node kernels** (the display collapses `TILE@d` / `REDUCE@d` back to bare when there is a single
+eligible axis for the family, so those tables read as before and match the bare golden YAML). The schedule reduce
+partition IS the axis-named reduce family — there is no separate native `REDUCE@` decision to collide with (the
+reduce/split-K partition is the one reduce family), so `REDUCE` joins `TILE`/`STAGE` on the `@<axis>` keying. The op
+cache key re-keys onto the axis-named identity (expected — the transfer handle for the prior, not a regression).
 
 `BINMASK` parsing accepts a binary string (`"101"` = bits 0 and 2), the keywords `"all"` / `"none"`, or a decimal /
 `0x`-hex int clamped to the candidate width. `format_tuning_knobs` drops `BOOL` knobs from the rendered `knobs=` line —

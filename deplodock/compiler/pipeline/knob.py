@@ -327,14 +327,15 @@ WSPEC = Knob(
 
 # --- Axis-named schedule keys ----------------------------------------------
 #
-# A per-node schedule codec is keyed ``FAMILY@<axis>`` — ``TILE@<k_axis>`` / ``STAGE@<axis>`` — so a
-# multi-node kernel (flash) can address each schedule-bearing node by the reduce/contraction axis it
-# schedules. The **bare** form (``TILE`` with no suffix) stays first-class: it resolves to the unique
-# eligible axis for that family, so the common single-node kernel — and every existing pin / recipe /
-# golden — keeps working unchanged (the suffix disambiguates only a kernel with two eligible nodes).
-# ``TILE`` / ``STAGE`` gain the suffix (they collide with no native ``@``-family); ``REDUCE`` stays bare
-# until the native-moveset ``REDUCE@<axis>`` reconciliation (a separate step). Readers use
-# :func:`family_value` so a bare and a suffixed key featurize / match identically.
+# A per-node schedule codec is keyed ``FAMILY@<axis>`` — ``TILE@<k_axis>`` / ``STAGE@<axis>`` /
+# ``REDUCE@<axis>`` — so a multi-node kernel (flash) can address each schedule-bearing node by the
+# reduce/contraction axis it schedules. The **bare** form (``TILE`` with no suffix) stays first-class:
+# it resolves to the unique eligible axis for that family, so the common single-node kernel — and every
+# existing pin / recipe / golden — keeps working unchanged (the suffix disambiguates only a kernel with
+# two eligible nodes). ``TILE`` / ``STAGE`` / ``REDUCE`` all carry the suffix: the schedule reduce
+# partition IS the axis-named reduce decision (there is no separate native ``REDUCE@`` family — the
+# reduce/split-K partition is the one reduce family). ``WSPEC`` / ``PLACE`` stay root-global (always
+# bare). Readers use :func:`family_value` so a bare and a suffixed key featurize / match identically.
 
 # The per-node schedule codec families that carry an ``@<axis>`` element (``WSPEC`` / ``PLACE`` are
 # root-global, always bare).
@@ -543,9 +544,10 @@ KNOB_ORDER = ("TILE", "REDUCE", "STAGE", "WSPEC")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 
 # Schedule codec families whose ``@<axis>`` display collapses back to bare when the kernel has a
-# single eligible axis (so one-node tables read as ``TILE=…`` / ``STAGE=…``, exactly as before the
-# axis-naming). ``REDUCE`` is excluded — its ``@`` keys are the native moveset's, not collapsible.
-_COLLAPSE_FAMILIES = ("TILE", "STAGE")
+# single eligible axis (so one-node tables read as ``TILE=…`` / ``REDUCE=…`` / ``STAGE=…``, exactly as
+# before the axis-naming, matching the bare golden YAML). All three per-node schedule codecs collapse —
+# the schedule reduce partition is the one reduce family, so ``REDUCE@<axis>`` bares out like the rest.
+_COLLAPSE_FAMILIES = ("TILE", "REDUCE", "STAGE")
 
 
 def knob_sort_key(name: str) -> tuple[int, str]:

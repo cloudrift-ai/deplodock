@@ -151,13 +151,15 @@ def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
     :class:`Reduction` node's ``ReducePlan`` (the ephemeral knob → materialized plan stamped **on the
     node**), with the spec stamped on ``knobs`` for the prior. A reduce whose op is still a legacy
     ``Map`` (the loop in the body — flash, not yet a ``Reduction``) keeps the plan on the ``TileOp``'s
-    residual ``reduce`` field (``ops.reduce_plan`` falls back there)."""
+    residual ``reduce`` field (``ops.reduce_plan`` falls back there). The spec is keyed ``REDUCE@<axis>``
+    (the reduce axis this node partitions), so a multi-node kernel addresses each reduce."""
     plan = ReducePlan.parse(spec)
     op = _with_reduce(tile.op, plan)
     # ``_with_reduce`` returns the op unchanged when there is no ``Reduction`` node to stamp (a legacy
     # loop-in-body ``Map``); keep its plan on the root ``reduce`` field so ``reduce_plan`` still finds it.
     residual = plan if op is tile.op else ReducePlan()
-    return TileOp(op=op, name=name, place=place, reduce=residual, knobs={**knobs, REDUCE.name: spec})
+    raxis = reduce_loop(tile.op).axis.name
+    return TileOp(op=op, name=name, place=place, reduce=residual, knobs={**knobs, _at(REDUCE, raxis): spec})
 
 
 def _tile_specs(kernel) -> list[str]:
@@ -327,12 +329,12 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
             bind = None
         if bind is not None:
             op = _contraction_node(tile.op, place, plan, bind)
-    # ``TILE`` / ``STAGE`` key ``@<k_axis>``; the split-K ``REDUCE`` stays bare (the native-moveset
-    # ``REDUCE@<axis>`` reconciliation is a later step).
+    # ``TILE`` / ``STAGE`` / the split-K ``REDUCE`` all key ``@<k_axis>`` (the contraction axis this
+    # node schedules), unifying the schedule reduce partition onto the axis-named reduce family.
     kaxis = reduce_loop(tile.op).axis.name
     stamped = {**knobs, _at(TILE, kaxis): spec}
     if reduce_spec:
-        stamped[REDUCE.name] = reduce_spec
+        stamped[_at(REDUCE, kaxis)] = reduce_spec
     if stage_spec:
         stamped[_at(STAGE, kaxis)] = stage_spec
     return TileOp(op=op, name=name, place=place, tier=plan, reduce=ReducePlan.parse(reduce_spec), stage=stage, knobs=stamped)

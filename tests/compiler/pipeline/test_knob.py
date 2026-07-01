@@ -482,9 +482,12 @@ def test_bare_and_axis_named_featurize_identically():
 
 
 def test_display_collapses_single_axis_but_keeps_multi():
-    """One eligible axis → ``TILE@d`` displays as bare ``TILE`` (one-node tables read as before); two
-    (flash) keep the suffix to disambiguate. ``WSPEC`` / native ``REDUCE@`` are never collapsed."""
-    one = dict(tuning_knob_items({"TILE@d": "n4/f2", "STAGE@d": "d2/cp"}))
-    assert set(one) == {"TILE", "STAGE"}
-    flash = dict(tuning_knob_items({"TILE@d": "n4/f2", "TILE@sk": "n2/f4"}))
-    assert set(flash) == {"TILE@d", "TILE@sk"}
+    """One eligible axis → ``TILE@d`` / ``REDUCE@d`` display as bare ``TILE`` / ``REDUCE`` (one-node
+    tables read as before, matching the bare golden YAML); two (flash) keep the suffix to disambiguate.
+    ``WSPEC`` (root-global) is never collapsed."""
+    one = dict(tuning_knob_items({"TILE@d": "n4/f2", "REDUCE@d": "b8", "STAGE@d": "d2/cp"}))
+    assert set(one) == {"TILE", "REDUCE", "STAGE"}
+    # Collapse is per-family: the two-axis ``TILE`` keeps its suffixes to disambiguate, while the
+    # single-axis ``REDUCE`` (only ``sk`` carries a reduce partition) still bares out.
+    flash = dict(tuning_knob_items({"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "REDUCE@sk": "b8"}))
+    assert set(flash) == {"TILE@d", "TILE@sk", "REDUCE"}
