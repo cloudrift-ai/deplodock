@@ -93,7 +93,15 @@ XFAIL: dict[str, str] = {
     # kernel-IR JSON round-trip returned (TileOp / KernelOp reconstruct via graph.py's repr-eval).
     # The FK half2-window codegen (packed __half2 accumulate) is not yet rebuilt at the scalar tier:
     "tests/compiler/cli/test_run.py::test_compile_fp16_matmul_window_emits_half2": _R,
+    # test_golden_prior_eval_joins_fp16_goldens: analytic._enumerate (the planner-matmul
+    # enumeration the golden/prior eval reconstructs a shape from) is a demolished stub
+    # (raises NotImplementedError) — rebuilding it against the new _schedule enumeration is
+    # a separate target tied to the golden/prior system.
     "tests/compiler/pipeline/search/test_diagnostics.py::test_golden_prior_eval_joins_fp16_goldens": _R,
+    # The split-K structural-fork search tests below assert on demolished pass names
+    # (010_split_demoted / 150_cross_cta_finalize / 060_reduce_tile) AND need the mma
+    # split-K auto-fork emission — both a rewrite to the new 020_schedule / 030_split fork
+    # sites and the unpinned g<w> candidate enumeration (Phase-1 follow-up):
     "tests/compiler/pipeline/search/test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": _R,
     "tests/compiler/pipeline/search/test_structural_push.py::test_split_demoted_fork_pushes_structural": _R,
     "tests/compiler/pipeline/search/test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": _R,
