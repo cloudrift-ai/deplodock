@@ -534,6 +534,50 @@ def _mma_matmul_graph(mode: str, M: int, N: int, K: int, out: str, trans: bool):
     return g
 
 
+def _mma_symbolic_k_graph(M: int, N: int, *, trans: bool):
+    """``C[i,j] = Σ_k A[i,k]·B[…]`` with the contraction (K) axis SYMBOLIC (``seq_len``) — ``trans``
+    makes B ``[j,k]`` (transposed-B, K contiguous), so the warp mma zero-fills the masked-K tail
+    through the (n,k)-swapped trans helper. M / N are static tile divisors (no M/N mask)."""
+    from deplodock.compiler.ir.elementwise import ElementwiseImpl  # noqa: PLC0415
+    from deplodock.compiler.ir.expr import Var  # noqa: PLC0415
+    from deplodock.compiler.ir.loop import Axis, Load, Loop, LoopOp, Write  # noqa: PLC0415
+    from deplodock.compiler.ir.stmt import Accum, Assign  # noqa: PLC0415
+
+    Kg = Dim("seq_len")
+    i, j, k = Axis("i", M), Axis("j", N), Axis("k", Kg)
+    b_index = (Var("j"), Var("k")) if trans else (Var("k"), Var("j"))
+    op = LoopOp(
+        body=(
+            Loop(
+                axis=i,
+                body=(
+                    Loop(
+                        axis=j,
+                        body=(
+                            Loop(
+                                axis=k,
+                                body=(
+                                    Load(name="a_v", input="a", index=(Var("i"), Var("k"))),
+                                    Load(name="b_v", input="b", index=b_index),
+                                    Assign(name="p", op=ElementwiseImpl("multiply"), args=("a_v", "b_v")),
+                                    Accum(name="acc", value="p"),
+                                ),
+                            ),
+                            Write(output="c", index=(Var("i"), Var("j")), value="acc"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (M, Kg), dtype=F16), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (N, Kg) if trans else (Kg, N), dtype=F16), node_id="b")
+    g.add_node(op, ["a", "b"], Tensor("c", (M, N), dtype=F16), node_id="c")
+    g.inputs, g.outputs = ["a", "b"], ["c"]
+    return g
+
+
 def _compile_run_mma(graph, feed: dict) -> tuple[np.ndarray, str]:
     """Compile the (already WARP-pinned) graph and run it on the seeded f16 operands in ``feed``;
     return ``(output, kernel_source)``."""
@@ -1243,6 +1287,18 @@ def test_batched_symbolic_mk_reaches_warp(monkeypatch):
     assert "int seq_len" in src, "runtime extent must be a kernel arg"
 
 
+def test_transposed_b_symbolic_k_zero_fills(monkeypatch):
+    """A warp-tier A @ Bᵀ with symbolic K (transposed-B, K contiguous) emits the (n,k)-swapped
+    K-zero-fill helper — K is summed by the mma, so the straddling final K tile must read +0.0
+    past ``seq_len``, not a duplicate. (Accuracy at straddling sizes: ``symbolic_k_trans`` below.)"""
+    monkeypatch.setenv("DEPLODOCK_TILE", _MASK_WARP)
+    lowered = Pipeline.build(CUDA_PASSES).run(_mma_symbolic_k_graph(64, 32, trans=True), ctx=Context(compute_capability=(12, 0)))
+    kop = lowered.nodes["c"].op
+    src = kop.kernel_source
+    assert "mma.sync.aligned.m16n8k16" in src, "transposed-B symbolic-K must reach the warp tier"
+    assert "dpl_mma_load_b_gmem_trans_kzero" in src, "transposed-B symbolic-K must zero-fill via the (n,k)-swapped trans helper"
+
+
 # (label, env, seqs, make). ``make(seq)`` builds (graph, feed, want) for one off-hint runtime
 # size; the driver compiles once per case and runs at each straddling size. ``env`` is the full
 # ``DEPLODOCK_*`` pin set (some cases route to the scalar tier with no WARP pin).
@@ -1292,6 +1348,14 @@ def _make_symbolic_k(seq):
     return g, {"a": a, "b": b}, a.astype(np.float32) @ b.astype(np.float32)
 
 
+def _make_transposed_symbolic_k(seq):
+    g = _mma_symbolic_k_graph(64, 32, trans=True)
+    rng = np.random.default_rng(0)
+    a = (rng.standard_normal((64, seq)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((32, seq)) * 0.1).astype(np.float16)
+    return g, {"a": a, "b": b}, a.astype(np.float32) @ b.astype(np.float32).T
+
+
 def _make_demoted_n(seq):
     g = _demoted_symbolic_n_graph()
     rng = np.random.default_rng(0)
@@ -1331,6 +1395,9 @@ _MASKED_CASES = {
     "symbolic_mn_cp": (_CP_KNOBS, (), [31, 512, 700], _make_symbolic_mn),
     "residual_cp": (_CP_KNOBS, (), [100], _make_symbolic_m_residual),
     "symbolic_k_cp": (_CP_KNOBS, (), [16, 31, 130, 512, 700], _make_symbolic_k),
+    # Transposed-B (A @ Bᵀ, K contiguous) symbolic-K: the mma zero-fills the masked-K tail through
+    # the (n,k)-swapped trans helper. Gmem-direct (no STAGE), M/N are tile divisors so only K masks.
+    "symbolic_k_trans": ({"TILE": _MASK_WARP}, (), [16, 31, 130, 512, 700], _make_transposed_symbolic_k),
     # Routed through the SCALAR tier (no WARP pin): the batched-warp masked-M+K fragment codegen
     # at runtime is a separate gap, so accuracy rides the scalar tier (the structure render
     # reaches the warp tier — see ``test_batched_symbolic_mk_reaches_warp``).

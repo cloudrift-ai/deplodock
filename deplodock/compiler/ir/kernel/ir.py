@@ -1131,19 +1131,24 @@ class LdmatrixLoad(Stmt):
             # the helper). No swizzle: that's a TMA-smem-layout concern only.
             if self.k_zero is not None:
                 # Masked-K (symbolic reduce): zero-fill (not clamp) the K halves
-                # past the runtime extent so the mma reduction stays correct.
-                # ``k_left`` = in-range K elements from the tile base; may co-occur
-                # with an M/N clamp. (b_trans masked-K never reaches here — a
-                # transposed-B's K is its contiguous dim and stays gmem-direct
-                # without zero-fill via the clamp path; canonical B only.)
+                # past the runtime extent so the mma reduction stays correct — K is
+                # summed, so a duplicate corrupts it. ``k_left`` = in-range K elements
+                # from the tile base; may co-occur with an M/N clamp. Transposed-B (K
+                # contiguous) has its own (n, k)-swapped zero-fill helper.
                 kbase, kbound = self.k_zero[0].render(ctx), self.k_zero[1].render(ctx)
                 k_left = f"({kbound}) - ({kbase})"
                 if self.gmem_guard is not None:
                     base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
                     mn_left = f"({bound}) - ({base})"
-                    helper = "dpl_mma_load_a_gmem_mclamp_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp_kzero"
+                    if self.role == "a":
+                        helper = "dpl_mma_load_a_gmem_mclamp_kzero"
+                    else:
+                        helper = "dpl_mma_load_b_gmem_trans_nclamp_kzero" if self.b_trans else "dpl_mma_load_b_gmem_nclamp_kzero"
                     return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {mn_left}, {k_left});"]
-                helper = "dpl_mma_load_a_gmem_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_kzero"
+                if self.role == "a":
+                    helper = "dpl_mma_load_a_gmem_kzero"
+                else:
+                    helper = "dpl_mma_load_b_gmem_trans_kzero" if self.b_trans else "dpl_mma_load_b_gmem_kzero"
                 return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {k_left});"]
             if self.gmem_guard is not None:
                 # Masked axis: clamp the lane coordinate to the in-range

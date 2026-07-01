@@ -319,6 +319,40 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp_kzero(unsigned
     }
 }
 
+// Transposed-B (Q@K^T, ``g[n][k]`` with K contiguous) masked-K: zero-fill the K
+// halves past the runtime extent. K is summed by the mma, so a past-extent element
+// must read as +0.0 (never a duplicate). Mirrors ``dpl_mma_load_b_gmem_kzero`` with
+// the (k, n) index roles swapped to (n, k) — cf. ``dpl_mma_load_b_gmem_trans``.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;                                 // N: groupID (0..7)
+        int k = (tig << 1) + (i ? 8 : 0);            // K: 2*threadID_in_group, +8 for the k16 half
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[n * ldm + k];       // .f16x2: contiguous (k, k+1) in row n
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
+// Transposed-B: masked-N (clamp the ``n`` row) AND masked-K (zero-fill the contiguous k).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_nclamp_kzero(unsigned* r, const T* g, int ldm, int cols_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[n * ldm + k];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"

@@ -195,13 +195,16 @@ Ordered as requested. Each phase adds config the `factorize` path already struct
   twisted carrier over in-register fragments. Requires wiring the recursive inner geometry (`_atomize.bind_contraction`
   on the inner loop). Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
   `test_attention_coverage.py::test_cooperative_flash_matches_torch`.
-- **Symbolic-K masked mma edges** — `_mma_reduce` `raise LoweringError` for transposed-B symbolic K is the last mma
-  accuracy hole. Restore the clamped / zero-filled K slab for that case.
+- **Symbolic-K masked mma edges** ✅ **landed.** The transposed-B symbolic-K guard is gone; two gmem-direct
+  zero-fill helpers (`dpl_mma_load_b_gmem_trans_kzero` / `…_trans_nclamp_kzero`, the (n,k)-swapped mirror of the
+  canonical-B ones) zero the masked-K tail, and the `LdmatrixLoad` renderer dispatches them off `b_trans`. Proven by
+  `test_transposed_b_symbolic_k_zero_fills` (structure) + `test_masked_symbolic_accuracy[symbolic_k_trans-*]`
+  (accuracy at straddling K = 16/31/130/512/700).
 
 **Purge.**
 
-- **Delete the `raise LoweringError("warp tier: transposed-B symbolic-K mma not supported…")`** the moment the masked
-  path lands — a guard for a case you now handle is a lie.
+- ✅ **Deleted the `raise LoweringError("warp tier: transposed-B symbolic-K mma not supported…")`** — landed with the
+  masked path above.
 - **Rip out the "future work" scaffolding in `_flash.py` and `_atomize.py`** — the scalar-`TilePlan()` note, the E2
   gating comment ("requires warp-flash to first attach that inner geometry"), and the redundant scalar-flash prose. The
   scalar `ScalarAtom` config stays (it is a real config of the one path), but every comment framing tensor-core flash as

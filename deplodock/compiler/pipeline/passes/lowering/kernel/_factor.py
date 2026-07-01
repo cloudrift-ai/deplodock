@@ -65,7 +65,6 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
-from deplodock.compiler.pipeline.pipeline import LoweringError
 
 #: The contraction semiring — multiply ⊗ then accumulate ⊕ (add). The same multiply-add ``mma.sync``
 #: realizes; in the scalar tier it is a plain scalar fma loop.
@@ -137,14 +136,13 @@ def _mma_reduce(c: Contraction, cells, offset, masks) -> tuple[list[Stmt], list[
     """The mma K-loop: ``ldmatrix`` each operand fragment **gmem-direct**, then ``mma.sync`` every
     cell. A symbolic / non-divisible K zero-fills the masked-K tail via the ``k_zero`` helper variants
     — a duplicate read would corrupt the reduction (unlike a masked M/N row, whose store is just
-    guarded). Transposed-B has no gmem-direct K zero-fill helper, so it bails."""
+    guarded). Both canonical and transposed-B have gmem-direct K zero-fill helpers (the trans variant
+    swaps the (k, n) index roles to (n, k))."""
     atom = c.atom
     m_axis, n_axis, k_axis = c.m_axis, c.n_axis, c.k_axis
     a_load, b_load, b_trans = c.a_load, c.b_load, c.b_trans
     mask_m, mask_n, m_ext, n_ext = masks
     k_static = k_axis.extent.is_static
-    if not k_static and b_trans:
-        raise LoweringError("warp tier: transposed-B symbolic-K mma not supported (no gmem-direct K zero-fill)")
     k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
     chain: list[Stmt] = []
     for i in range(c.reg_m):
