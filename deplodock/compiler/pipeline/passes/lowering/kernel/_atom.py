@@ -50,6 +50,28 @@ _MUL = ElementwiseImpl("multiply")
 _ADD = ElementwiseImpl("add")
 
 
+# The per-axis masked-overhang helpers — one :class:`Side` in, so the codegen never re-derives a
+# ``mask_m`` / ``m_ext`` scalar pair: ``_guard`` predicates a store, ``_wrap`` clamp-reads an operand.
+def _guard(side: Side, coord: Expr):
+    """The overhang guard for cell ``coord`` on ``side`` — ``(coord, extent)`` when the axis is masked
+    (its store is predicated on it), else ``None``."""
+    return (coord, side.ext) if side.mask else None
+
+
+def _wrap(side: Side, coord: Expr) -> Expr:
+    """Wrap ``coord`` in-bounds (``coord % extent``) on a masked ``side`` so an overhanging cell
+    clamp-reads, else ``coord`` unchanged."""
+    return BinaryExpr("%", coord, side.ext) if side.mask else coord
+
+
+def _cells(mn: tuple, offset, i: int, j: int):
+    """Yield ``(side, cell-base coord)`` for each present output axis of register cell ``(i, j)`` —
+    ``(m, offset.m.base(i))`` then ``(n, offset.n.base(j))`` (``m`` skipped for a 1-D output)."""
+    for side, off, r in ((mn[0], offset.m, i), (mn[1], offset.n, j)):
+        if side is not None:
+            yield side, off.base(r)
+
+
 # ---- warp/mma tier ----------------------------------------------------------------------------- #
 def _warp_roles(index, m_name: str, n_name: str) -> tuple[str, ...]:
     """Per-dim epilogue-load role: ``"m"`` / ``"n"`` for a dim varying with the output row /
@@ -407,27 +429,15 @@ def _guard_writes(stmts: list[Stmt], cond) -> list[Stmt]:
 
 
 def _scalar_sigma(mn, offset, i: int, j: int) -> Sigma:
-    """σ mapping the output axes to register cell ``(i, j)``'s real coordinate (the offset's
+    """σ mapping each present output axis to register cell ``(i, j)``'s real coordinate (the offset's
     block·tile + unit·reg + r), a **masked** axis wrapped in-bounds (``% extent``)."""
-    m, n = mn
-    smap: dict = {}
-    if m is not None:
-        bm = offset.m.base(i)
-        smap[m.name] = BinaryExpr("%", bm, m.ext) if m.mask else bm
-    bn = offset.n.base(j)
-    smap[n.name] = BinaryExpr("%", bn, n.ext) if n.mask else bn
-    return Sigma(smap)
+    return Sigma({side.name: _wrap(side, cell) for side, cell in _cells(mn, offset, i, j)})
 
 
 def _scalar_bound(mn, offset, i: int, j: int):
-    """The in-bounds predicate for cell ``(i, j)`` — ``base < extent`` for each masked axis (anded),
+    """The in-bounds predicate for cell ``(i, j)`` — ``base < extent`` anded over the masked axes,
     or ``None`` when nothing overhangs."""
-    m, n = mn
-    conds = []
-    if m is not None and m.mask:
-        conds.append(BinaryExpr("<", offset.m.base(i), m.ext))
-    if n.mask:
-        conds.append(BinaryExpr("<", offset.n.base(j), n.ext))
+    conds = [BinaryExpr("<", cell, side.ext) for side, cell in _cells(mn, offset, i, j) if side.mask]
     if not conds:
         return None
     cond = conds[0]
@@ -580,7 +590,7 @@ class _MmaOps(_AtomOps):
         transposed-B both have gmem-direct K zero-fill helpers)."""
         c, stage = self.c, self.stage
         atom, (m, n) = c.atom, mn
-        m_axis, n_axis, k_axis = m.axis, n.axis, c.k_axis
+        k_axis = c.k_axis
         assert not c.a_computed, (
             "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
         )
@@ -599,20 +609,21 @@ class _MmaOps(_AtomOps):
                 depth=gmem_depth,
                 mode=mode,
             )
-        mask_m, mask_n, m_ext, n_ext = m.mask, n.mask, m.ext, n.ext
         k_static = k_axis.extent.is_static
         k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
 
         def read_row(i):
-            idx = tuple(Sigma({m_axis.name: offset.m.base(i)}).apply(e) for e in a_load.index)
-            guard = (offset.m.base(i), m_ext) if mask_m else None
+            cell = offset.m.base(i)
+            idx = tuple(Sigma({m.axis.name: cell}).apply(e) for e in a_load.index)
             return [
-                LdmatrixLoad(frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=guard, k_zero=k_zero)
+                LdmatrixLoad(
+                    frag=f"_a{i}", src_buffer=a_load.input, src_index=idx, role="a", staged=False, gmem_guard=_guard(m, cell), k_zero=k_zero
+                )
             ]
 
         def read_col(j):
-            idx = tuple(Sigma({n_axis.name: offset.n.base(j)}).apply(e) for e in b_load.index)
-            guard = (offset.n.base(j), n_ext) if mask_n else None
+            cell = offset.n.base(j)
+            idx = tuple(Sigma({n.axis.name: cell}).apply(e) for e in b_load.index)
             return [
                 LdmatrixLoad(
                     frag=f"_b{j}",
@@ -621,7 +632,7 @@ class _MmaOps(_AtomOps):
                     role="b",
                     staged=False,
                     b_trans=b_trans,
-                    gmem_guard=guard,
+                    gmem_guard=_guard(n, cell),
                     k_zero=k_zero,
                 )
             ]
@@ -642,20 +653,19 @@ class _MmaOps(_AtomOps):
         c = self.c
         atom = c.atom
         m, n = mn
-        m_axis, n_axis = m.axis, n.axis
-        mask_m, mask_n, m_ext, n_ext = m.mask, n.mask, m.ext, n.ext
+        mcell, ncell = offset.m.base(i), offset.n.base(j)
         tail = list(c.epilogue)
         write = next(s for s in tail if isinstance(s, Write))
-        sigma = Sigma({m_axis.name: offset.m.base(i), n_axis.name: offset.n.base(j)})
+        sigma = Sigma({m.axis.name: mcell, n.axis.name: ncell})
         return [
             RegStore(
                 dst_buffer=write.output,
                 dst_index=tuple(sigma.apply(e) for e in write.index),
                 frag=f"_c{i}_{j}",
                 shape=atom.shape,
-                epilogue=_warp_epilogue(tail, c.acc, m_axis.name, n_axis.name, sigma),
-                m_guard=(offset.m.base(i), m_ext) if mask_m else None,
-                n_guard=(offset.n.base(j), n_ext) if mask_n else None,
+                epilogue=_warp_epilogue(tail, c.acc, m.axis.name, n.axis.name, sigma),
+                m_guard=_guard(m, mcell),
+                n_guard=_guard(n, ncell),
             )
         ]
 
@@ -690,21 +700,16 @@ class _ScalarOps(_AtomOps):
             return _scalar_staged(c, inputs, cells, offset, mode, bk_elems)
         k_axis = c.k_axis
         m, n = mn
-        mask_m, mask_n, m_ext, n_ext = m.mask, n.mask, m.ext, n.ext
         prot = _scalar_protected(c)
-        m_name = m.name if m is not None else None
-        n_name = n.name
         b_name, a_name = c.b_load.names[0], c.a_name
 
         def read_row(i):
-            if m_name is None:
+            if m is None:
                 return copy_cell(c.a_body, Sigma({}), f"__ar{i}", prot)
-            bm = offset.m.base(i)
-            return copy_cell(c.a_body, Sigma({m_name: BinaryExpr("%", bm, m_ext) if mask_m else bm}), f"__ar{i}", prot)
+            return copy_cell(c.a_body, Sigma({m.name: _wrap(m, offset.m.base(i))}), f"__ar{i}", prot)
 
         def read_col(j):
-            bn = offset.n.base(j)
-            return copy_cell([c.b_load], Sigma({n_name: BinaryExpr("%", bn, n_ext) if mask_n else bn}), f"__bc{j}", prot)
+            return copy_cell([c.b_load], Sigma({n.name: _wrap(n, offset.n.base(j))}), f"__bc{j}", prot)
 
         def contract(i, j):
             v = f"{c.acc}__v__c{i}_{j}"
