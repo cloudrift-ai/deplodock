@@ -57,8 +57,9 @@ class AxisOffset:
 
 class Offset(NamedTuple):
     """The per-cell offset the codegen callables receive — the ``(m, n)`` :class:`AxisOffset` pair.
-    Unpacks like the ``(m, n)`` :class:`Side` pair it parallels (``m_off, n_off = offset``), and its
-    fields align: ``offset.m.base(i)`` is the row-cell offset, ``offset.n.base(j)`` the col-cell."""
+    Unpacks / zips like the ``(m, n)`` :class:`Side` pair it parallels (``m_off, n_off = offset``;
+    ``zip(offset, mn)``), and its fields align: ``offset.m.base(i)`` is the row-cell offset,
+    ``offset.n.base(j)`` the col-cell."""
 
     m: AxisOffset
     n: AxisOffset
@@ -67,49 +68,44 @@ class Offset(NamedTuple):
 @dataclass(frozen=True)
 class Tiling:
     """The accumulating tiling state threaded through ``atomize → register_tile → unit_tile →
-    grid_tile`` — the per-axis :class:`AxisOffset` pair + the bound ``Tile`` axes (unit → grid) +
-    ``block_threads``. ``grid_tile`` (the finalizer) splices the codegen callables' state +
-    reduce-region + stores into the ``Tile``."""
+    grid_tile`` — the per-axis :class:`Offset` pair + the bound ``Tile`` axes (unit → grid) +
+    ``block_threads``. Each level ``zip``\\ s the offset pair with the ``(m, n)`` :class:`Side` pair,
+    so the two axes never split into ``*_m`` / ``*_n`` locals. ``grid_tile`` (the finalizer) splices
+    the codegen callables' state + reduce-region + stores into the ``Tile``."""
 
-    m: AxisOffset
-    n: AxisOffset
+    offset: Offset
     axes: tuple[Axis, ...] = ()
     block_threads: int | None = None
 
 
-def atomize(atom_m: int, atom_n: int) -> Tiling:
-    """The leaf: a single atom of ``atom_m × atom_n`` (1×1 for a scalar cell). Seeds the
-    per-axis offset with the atom step; the atom-lane offset stays OUT of σ (added at render)."""
-    return Tiling(m=AxisOffset(atom_dim=atom_m), n=AxisOffset(atom_dim=atom_n))
+def atomize(atoms: tuple[int, int]) -> Tiling:
+    """The leaf: a single ``(atom_m, atom_n)`` atom (1×1 for a scalar cell). Seeds the per-axis
+    offset with the atom step; the atom-lane offset stays OUT of σ (added at render)."""
+    return Tiling(offset=Offset(*(AxisOffset(atom_dim=a) for a in atoms)))
 
 
-def register_tile(t: Tiling, m: Side, n: Side) -> Tiling:
+def register_tile(t: Tiling, mn: tuple[Side, Side]) -> Tiling:
     """The REGISTER level: ``m.reg × n.reg`` atoms per thread/warp. Records the cell counts; the
     per-cell ``r·atom_dim`` term is applied at :meth:`AxisOffset.base`."""
-    return replace(t, m=replace(t.m, reg=m.reg), n=replace(t.n, reg=n.reg))
+    return replace(t, offset=Offset(*(replace(o, reg=s.reg) for o, s in zip(t.offset, mn, strict=True))))
 
 
-def unit_tile(t: Tiling, m: Side, n: Side) -> Tiling:
+def unit_tile(t: Tiling, mn: tuple[Side, Side]) -> Tiling:
     """The UNIT level: ``m.units × n.units`` parallel units per CTA, where a *unit* is the atom's
     thread footprint — a warp (32 lanes) for an mma atom, a single thread for a scalar atom. (So the
     tensor-core warp tile and the scalar parallel thread-tile are the same level, differing only in
     the atom's ``lanes``; the counts are the warp counts ``WM``/``WN`` for mma, the thread counts
     ``par_m``/``par_n`` for scalar.) Adds the unit term ``unit·(reg·atom)`` to each axis offset and
-    the ``m.unit`` / ``n.unit`` unit axes."""
-    axes = (*t.axes, Axis(name=m.unit, extent=m.units), Axis(name=n.unit, extent=n.units))
-    return replace(
-        t,
-        m=replace(t.m, unit_var=m.unit, unit_count=m.units),
-        n=replace(t.n, unit_var=n.unit, unit_count=n.units),
-        axes=axes,
-    )
+    the per-axis unit axes."""
+    offset = Offset(*(replace(o, unit_var=s.unit, unit_count=s.units) for o, s in zip(t.offset, mn, strict=True)))
+    axes = (*t.axes, *(Axis(name=s.unit, extent=s.units) for s in mn))
+    return replace(t, offset=offset, axes=axes)
 
 
 def grid_tile(
     t: Tiling,
     *,
-    m: Side | None,
-    n: Side,
+    mn: tuple[Side | None, Side],
     lead_axes: tuple[Axis, ...] = (),
     block_threads: int | None,
     lanes: int = 1,
@@ -123,23 +119,17 @@ def grid_tile(
     state + reduce-region + per-cell stores into the ``Tile``. This is the outermost stage — it
     emits. The three callables (atom-specific, from ``_atom.reduce_codegen`` + the ``store`` sink) are the
     only per-atom variation; the splice is shared. The reduce-region / store callables take the
-    per-cell :class:`Offset` (``m``/``n`` :class:`AxisOffset`) + the ``(m, n)`` :class:`Side` pair
-    (each axis' mask / extent ride the ``Side``).
+    per-cell :class:`Offset` + the ``mn`` :class:`Side` pair (each axis' mask / extent ride the ``Side``).
 
-    ``m is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.
+    ``mn[0] is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.
     ``lead_axes`` are extra outer grid axes (a batched contraction's leading dims) carried through
     untiled. ``lanes == 1`` (scalar) emits no ``_lane`` axis."""
-    m_off, n_off = t.m, replace(t.n, block_var=n.block)
-    grid_axes: tuple[Axis, ...] = lead_axes
-    if m is not None:
-        m_off = replace(t.m, block_var=m.block)
-        grid_axes = (*grid_axes, _shrink_axis(Axis(name=m.block, extent=m.axis.extent, source_axis=m.axis), m.tile))
-    grid_axes = (*grid_axes, _shrink_axis(Axis(name=n.block, extent=n.axis.extent, source_axis=n.axis), n.tile))
+    offset = Offset(*(replace(o, block_var=s.block) if s is not None else o for o, s in zip(t.offset, mn, strict=True)))
+    block_axes = tuple(_shrink_axis(Axis(name=s.block, extent=s.axis.extent, source_axis=s.axis), s.tile) for s in mn if s is not None)
     lane_axes = (Axis(name="_lane", extent=lanes),) if lanes > 1 else ()
-    axes = (*grid_axes, *t.axes, *lane_axes)
+    axes = (*lead_axes, *block_axes, *t.axes, *lane_axes)
 
-    offset, mn = Offset(m=m_off, n=n_off), (m, n)
-    cells = [(i, j) for i in range(t.m.reg) for j in range(t.n.reg)]
+    cells = [(i, j) for i in range(offset.m.reg) for j in range(offset.n.reg)]
     state = state_decls(cells)
     top_decls, kstmts = reduce_region(cells, offset, mn)
     stores = [s for (i, j) in cells for s in store(i, j, offset, mn)]

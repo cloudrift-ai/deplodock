@@ -96,14 +96,13 @@ def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=Non
     state_decls, reduce_region = reduce_codegen(c, stage, inputs)
     if store is None:
         store = store_sink(c)
-    m, n = c.mn
-    t = atomize(c.atom.atom_m, c.atom.atom_n)
-    t = register_tile(t, m, n)
-    t = unit_tile(t, m, n)
+    mn = c.mn
+    t = atomize((c.atom.atom_m, c.atom.atom_n))
+    t = register_tile(t, mn)
+    t = unit_tile(t, mn)
     return grid_tile(
         t,
-        m=m,
-        n=n,
+        mn=mn,
         lead_axes=c.lead_axes,
         block_threads=c.block_threads,
         lanes=c.atom.lanes,
