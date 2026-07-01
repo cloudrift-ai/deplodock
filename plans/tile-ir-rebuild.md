@@ -8,14 +8,15 @@ the free axes onto the grid and stamps the partition / tile / (pin-only) warp fr
 `GRID` stage as a graph rewrite; `lowering/kernel/010_materialize` calls **one** emitter, `_factor.factorize`, per
 kernel. Recovered: every elementwise / reduction / online-softmax / RMSNorm / scalar + register-tile + **mma** matmul /
 scalar-flash / whole-block kernel, the cooperative (BLOCK) + register-ILP (REG) reduce tiers, the dynamic-grid tier, the
-cross-CTA (GRID) split tier, and the gmem-direct `mma.sync` **warp / tensor-core matmul** (canonical + transposed-B,
+cross-CTA (GRID) split tier, the gmem-direct `mma.sync` **warp / tensor-core matmul** (canonical + transposed-B,
 f16/f32 out, fused epilogues, static + dynamic-grid, pin-driven mma split-K via the structural `Reduction ⊃ Contraction`
-fork). All over **static AND symbolic** axes. **Phase 0 (purge the consolidation's residue) has landed** — the
+fork), and the **tensor-core flash** (the `DEPLODOCK_CHAIN` fragment-resident FA-2 warp chain — static AND symbolic seq,
+causal, GQA, f16/bf16). All over **static AND symbolic** axes. **Phase 0 (purge the consolidation's residue) has landed** — the
 `Schedule` alias, the `_with_reduce` no-op, and the dead docstring framing are gone; the audit corrected one false
 premise (the `Map.out` / `reduce_loop` reads of the flat-contraction `Map` are load-bearing, not legacy — see Phase 0
-below). **Remaining, in restore order — each phase followed by a purge of the code it obsoletes: (1) finish mma
-(tensor-core flash + symbolic-K masked edges); (2) operand staging (smem + `ldmatrix`); (3) pipelining (cp.async ring /
-register double-buffer / TMA); (4) warp specialization (`WarpSpec`).** Branch `refactoring/tile-ir-rebuild`.
+below). **Phase 1 has landed** (mma tensor-core flash + symbolic-K masked edges). **Remaining, in restore order — each
+phase followed by a purge of the code it obsoletes: (2) operand staging (smem + `ldmatrix`); (3) pipelining (cp.async
+ring / register double-buffer / TMA); (4) warp specialization (`WarpSpec`).** Branch `refactoring/tile-ir-rebuild`.
 
 ## The mandate — purity, not accretion
 
@@ -252,10 +253,20 @@ never a divergent path.
    pinned by `test_flash_op_is_a_two_contraction_tree`. Chose **option (b)** but realized it *without* carrier-generator
    surgery: keeping `O_i` a carrier channel (not removing it) is what preserves the seed/cross-tier machinery while still
    de-fusing the ⊗ into a contraction.
-3. **Layer mma** — QK and PV get mma `TilePlan`s (`kv_block` = the mma tile); `_factorize_contraction` tiles both; a
-   flash `store` **sink** (the existing `factorize(store=…)` seam) bridges the QK C-fragment into the softmax twist and
-   feeds the resulting `P` fragment straight into PV as an operand **without a gmem round-trip** (the one genuinely new
-   primitive); the twisted `(m_i, l_i)` carrier + `O_i` rescale run over in-register fragments.
+3. ✅ **Layered mma — the tensor-core warp chain landed (`DEPLODOCK_CHAIN`).** `_flash._chain_stamp` stamps the mma atom
+   on both contractions and tiles the query rows 16-per-warp (`d` folds into the PV output tile, not the grid);
+   `_schedule` passes the mma-flash tree through untouched (already scheduled recognize-side); `factorize` dispatches it
+   to the new `lowering/kernel/_flash_warp.factorize_flash`. Realized as a **dedicated single-warp emitter** (not the
+   `factorize(store=…)` sink — the fixed 16×16 warp-chain orchestration is genuinely distinct), but reusing the
+   **shared** mma / fragment / store kernel-IR nodes (`LdmatrixLoad` / `MmaSyncPtx` / `RegFragment` / `FragmentApply` /
+   `FragmentRowReduce` / `FragmentMask` / `RegStore`) — no divergent tensor-core codegen. It streams the KV in 16-key
+   blocks keeping the score / P / output **fragment-resident**: QK gmem-direct mma (transposed-B) → in-register online
+   softmax (scale · causal/boundary `FragmentMask` · `FragmentRowReduce` rowmax/rowsum · `FragmentApply` exp/α/rescale,
+   the `(m_i, l_i)` stats 2-rows/lane) → the **C→A `flash_pv_smem` handoff** (P C-fragments → smem → `dpl_ldmatrix_x4` →
+   the PV A operand, the one genuinely-new primitive, no gmem round-trip) → PV gmem-direct mma (canonical-B) → `O/l`
+   `RegStore`. Static AND symbolic seq (query `m_guard` + key N-clamp + boundary `FragmentMask`), causal, GQA (falls out
+   of the K/V load index), f16/bf16. Flipped **all 26** `test_generated_tensorcore_flash_*` + `test_warp_chain_*` cases
+   XPASS; the scalar flash e2e stays green.
 
 **Decision (chosen): option (b)** — unify on the blocked form, scalar = its `block=1` degenerate, prove parity against
 the non-xfailed scalar flash e2e.
@@ -277,17 +288,15 @@ by `test_contraction_computed_a_*` (standalone P@V: `O[m,d] = Σ_j exp(S[m,j])·
 contraction is **constructed directly** (flash / tests), never recognized (recognition rejects pre-scaled operands), so
 the binding path stays gmem-`Load`-only.
 
-✅ **`_flash._flash_op` rebuilt on the register-resident PV `Contraction`** (block=1; see consolidation step 2 above).
-**Next concrete step (step 3): mma-tile the two contractions.** Block the `kv` axis so `j` = the mma tile width (not a
-singleton); the QK `Contraction` gets an mma `TilePlan` producing a score fragment; the softmax twist runs over the
-in-register score; the PV `Contraction`'s A operand is the resulting `P` **fragment** (the register-resident-A mma path
-`_mma_reduce` currently asserts against — this is the genuinely new `ldmatrix`-from-fragment primitive) fed straight into
-`mma.sync` without a gmem round-trip. Gate: `test_generated_tensorcore_flash_*` / `test_warp_chain_*` flip XPASS while
-the scalar-flash e2e stays green.
+✅ **`_flash._flash_op` rebuilt on the register-resident PV `Contraction`**, then the tensor-core warp chain landed on
+top (consolidation step 3 above). The warp chain does **not** take the register-resident-A mma path through
+`_mma_reduce` (which still asserts `not a_computed`) — the `_flash_warp` emitter realizes the C→A handoff itself
+(`RegStore` P → `flash_pv_smem` → staged `LdmatrixLoad` A), so the `Contraction`'s computed-A `Body` is only the scalar
+tier's concern.
 
-Flips `test_generated_tensorcore_flash_*`, `test_warp_chain_*`, `test_attention_split_gpu.py`,
-`test_attention_coverage.py::test_cooperative_flash_matches_torch`. Scalar-parity risk is real (step 2 changes the
-scalar tree); the non-xfailed scalar flash cases are the gate — do not proceed to mma until they are green.
+Still xfailed (separate scalar-tier capabilities, **not** the tensor-core chain): `test_attention_split_gpu.py`
+(cross-CTA flash split), `test_attention_coverage.py::test_cooperative_flash_matches_torch` (the `BR` cooperative-KV
+scalar flash), `test_flash_chain_matches_torch[*]` (the `O[d]` register-vector scalar chain).
 
 - **Symbolic-K masked mma edges** ✅ **landed.** The transposed-B symbolic-K guard is gone; two gmem-direct
   zero-fill helpers (`dpl_mma_load_b_gmem_trans_kzero` / `…_trans_nclamp_kzero`, the (n,k)-swapped mirror of the
@@ -299,10 +308,11 @@ scalar tree); the non-xfailed scalar flash cases are the gate — do not proceed
 
 - ✅ **Deleted the `raise LoweringError("warp tier: transposed-B symbolic-K mma not supported…")`** — landed with the
   masked path above.
-- **Rip out the "future work" scaffolding in `_flash.py` and `_atomize.py`** — the scalar-`TilePlan()` note, the E2
-  gating comment ("requires warp-flash to first attach that inner geometry"), and the redundant scalar-flash prose. The
-  scalar `ScalarAtom` config stays (it is a real config of the one path), but every comment framing tensor-core flash as
-  unbuilt goes.
+- ✅ **Ripped out the "future work" scaffolding in `_flash.py` and `_atomize.py`** — the "tensor-core P@V tier is future
+  work" prose, the "block>1 + mma-tiling is future work" note, and the `_atomize` "requires warp-flash to first attach
+  that inner geometry" comment now describe the landed warp chain (`_chain_stamp` → `_flash_warp`). The scalar
+  `ScalarAtom` / `TilePlan()` config stays (a real config of the scalar tier); the `_atomize` recursion seam is
+  documented as unused (the flash tree carries its per-node geometry, so no recursive `bind_contraction` tree-walk).
 - **Land the mma split-K auto-fork and delete the "pin-only" hedge.** `_schedule.schedule()` must emit unpinned `g<w>`
   candidates (`_splitk_specs` + occupancy gate); then strike "split-K stays pin-only" from the docs and flip the
   structural-fork search tests (`test_structural_push.py`, `test_two_level.py`, `test_resolve.py`,

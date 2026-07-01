@@ -18,13 +18,14 @@ contraction leaf is built (``_warp_option`` / the tiled ``_tile_option``) — so
 fork construction, alongside ``_check_warp_static_k``, instead of failing several passes later.
 Leading ``_`` so the pass loader skips this module.
 
-**Recursion seam (deferred — warp-flash).** Flash is a ``TWISTED`` kv ``Loop`` (online-softmax)
-over a nested ``CONTRACTION`` score ``Loop``, so a recursive atomize would bind the inner QK^T /
-PV with the same :func:`bind_contraction` the root uses — that function is loop-addressable for
-exactly this reuse. The inner score ``Loop`` IS now a structural ``CONTRACTION`` (built by
-``ops.contraction_loop``, the same builder a standalone matmul uses), but it is **not wired yet**:
-it carries no per-loop ``TilePlan`` / inner geometry, so a tree-walk would bind nothing. Wiring it
-requires warp-flash to first attach that inner geometry; until then it is intentionally absent."""
+**Flash contractions are stamped, not recursively atomized.** Flash is a ``TWISTED`` kv
+``Reduction`` over a ``Q@K`` :class:`~deplodock.compiler.ir.tile.ir.Contraction` ``source`` +
+a ``P@V`` one in the ``partial``. The tensor-core warp chain (``DEPLODOCK_CHAIN``) attaches the mma
+``TilePlan`` to both directly at construction (``_flash._chain_stamp``) and the fragment-resident
+FA-2 emitter (``lowering/kernel/_flash_warp``) reads the operands / geometry straight off those
+nodes — it does **not** re-derive the binding via a recursive :func:`bind_contraction` tree-walk.
+``bind_contraction`` stays loop-addressable (it binds the root contraction structurally), but the
+recursive-atomize path is unused: the flash tree already carries its per-node geometry."""
 
 from __future__ import annotations
 

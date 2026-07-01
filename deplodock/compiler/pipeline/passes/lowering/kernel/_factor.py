@@ -61,6 +61,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Lo
 from deplodock.compiler.ir.tile.ir import Contraction
 from deplodock.compiler.ir.tile.ops import axis_role, contraction_loop, lower, reduce_plan
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.passes.lowering.kernel._flash_warp import factorize_flash, is_mma_flash
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
@@ -379,6 +380,8 @@ def factorize(tile, root, store=None) -> Tile:
       reduce ``Loop`` sits inside it), the output-store glue is appended if the body has none, and the
       body is wrapped in a single :class:`Tile` bound to ``place.grid``."""
     op = tile.op
+    if op is not None and is_mma_flash(op):
+        return factorize_flash(tile, root)
     if isinstance(op, Contraction):
         tail = list(op.epilogue)
         if not has_write(tail):
