@@ -10,20 +10,24 @@ surviving kernel-IR transport leaf nodes (``Smem`` / ``CpAsyncCopy`` / ``CpAsync
 
 The fill is written against a small :class:`CtaTile` seam (the CTA tile-base + a linear
 intra-CTA thread id + the thread count), NOT a materializer's internal warp/register
-geometry — so one fill helper drives any tier that stages. The staged K-loops that call these
-primitives live in ``_factor.py`` (``_warp_staged_kloop`` / ``_warp_tma_staged_kloop``); the
-(plain row-major, NONE-swizzle) slab feeds the same staged ``LdmatrixLoad`` drain regardless of
-which producer (cp.async / TMA) filled it.
+geometry — so one fill helper drives any tier that stages. The staged K-loop itself is ONE
+skeleton, :func:`staged_kloop` (``fill → commit → wait → drain → Sync``, ``depth`` the sole
+buffering knob), driven by a :class:`Transport` strategy (:class:`CpAsyncTransport` /
+:class:`TmaTransport`) — the two producers put behind one ``fill``/``commit``/``wait`` seam. The
+(plain row-major, NONE-swizzle) slab feeds the same staged ``LdmatrixLoad`` / scalar ``Load`` drain
+regardless of which producer (cp.async / TMA) filled it; ``_factor.py`` builds the transport + the
+per-tier drain leaf and calls :func:`staged_kloop`.
 
 Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips it.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from deplodock.compiler.ir.axis import Axis
-from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, TernaryExpr, Var
 from deplodock.compiler.ir.kernel.ir import (
     CpAsyncCommit,
     CpAsyncCopy,
@@ -119,14 +123,6 @@ def cp_async_fill(
     return [loop]
 
 
-def cp_async_barrier(group: int = 0) -> list[Stmt]:
-    """The handshake after the cooperative cp.async fills: commit the group, wait until
-    at most ``group`` groups remain in flight, then a CTA barrier so every lane sees the
-    drained slab. ``group=0`` (single-buffer) drains everything; a depth-``D`` ring keeps
-    ``D-1`` prefetch groups outstanding (``group=D-1``)."""
-    return [CpAsyncCommit(), CpAsyncWait(group=group), Sync()]
-
-
 def cp_async_commit() -> list[Stmt]:
     """Close the current cp.async batch into a commit-group (the depth-``D`` ring commits one
     group per filled slot, so ``CpAsyncWait(group=D-1)`` can drain exactly the slot it needs)."""
@@ -165,10 +161,9 @@ def sync_row_fill(*, slab: str, src: str, extent: int, grid_vars: tuple, linear_
 
 
 # --------------------------------------------------------------------------- #
-# TMA (``cp.async.bulk.tensor``) fill — single-thread descriptor box copy +
-# mbarrier handshake. Shares the slab + staged-``LdmatrixLoad`` drain with the
-# cp.async path; only the producer differs (one thread issues the TMA, every
-# thread waits on the mbarrier parity).
+# TMA (``cp.async.bulk.tensor``) descriptor — the host-built ``CUtensorMap`` the
+# box copies index off (the copy + mbarrier handshake live in :class:`TmaTransport`
+# below). Shares the slab + staged-``LdmatrixLoad`` drain with the cp.async path.
 # --------------------------------------------------------------------------- #
 
 # TMA destination smem must be aligned (``cp.async.bulk.tensor`` faults otherwise);
@@ -185,22 +180,213 @@ def tma_descriptor(name: str, src: str, box: tuple[int, int], dtype: str) -> Tma
     return TmaDescriptor(name=name, src_buf=src, src_shape=(), box_extents=box, swizzle="NONE", dtype=dtype)
 
 
-def tma_mbar_prologue(mbar: str, tid0: Expr, count: int = 1) -> list[Stmt]:
-    """One single-slot mbarrier, initialized by the issuer thread, then a CTA barrier so
-    every consumer sees the init before the first wait. ``count`` = number of producer
-    ``arrive``\\ s per phase (one — the issuer's single ``arrive.expect_tx`` covers both
-    operand box copies via the summed transaction-byte count)."""
-    init = Cond(cond=tid0, body=(MbarrierInit(mbar=mbar, count=count, slot=_lit(0)),))
-    return [Smem(name=mbar, extents=(1,), dtype="unsigned long long"), init, Sync()]
+# --------------------------------------------------------------------------- #
+# The Transport strategy — the one interface the staged K-loop drives, and the
+# two producers behind it (cp.async / TMA). A :class:`Transport` owns the operand
+# slab layout + the fill/commit/wait handshake; :func:`staged_kloop` owns the
+# depth-parametrized control flow. The two are structurally different primitives
+# (cp.async is fill → commit → wait-group; TMA is an arrive/expect-tx + box copy
+# gated by an mbarrier phase) put behind ONE seam so ``depth`` becomes the sole
+# buffering knob: ``depth == 1`` is the degenerate single-buffer loop, ``depth >= 2``
+# a gmem→smem prefetch ring.
+# --------------------------------------------------------------------------- #
+
+# The A slab is ``ring·tile_m`` rows (slot s at row ``s·tile_m``); the B slab is
+# ``ring·bk_elems`` rows (slot s at row ``s·bk_elems``). Both are plain row-major /
+# NONE-swizzle, feeding the same staged ``LdmatrixLoad`` (mma) / scalar ``Load`` drain.
+_A_SLAB, _B_SLAB = "_a_smem", "_b_smem"
 
 
-def tma_fill(*, loads: list[tuple[str, str, tuple]], mbar: str, tid0: Expr, phase: Expr, total_bytes: int) -> list[Stmt]:
-    """One pipeline stage of the TMA fill: the issuer thread declares the expected
-    transaction bytes and issues every operand's box ``TmaLoad`` onto ``mbar``; every
-    thread then waits on the barrier parity for ``phase``. ``loads`` is a list of
-    ``(desc_name, slab, coords)`` (coords C-order, the box origin in the source). The
-    barrier (not a predicate) gates the readers — every CTA thread reaches the wait."""
-    body: list[Stmt] = [MbarrierArriveExpectTx(mbar=mbar, bytes_=total_bytes, slot=_lit(0))]
-    for desc_name, slab, coords in loads:
-        body.append(TmaLoad(smem=slab, smem_index=(_lit(0), _lit(0)), desc=desc_name, coords=tuple(coords), mbar=mbar, mbar_slot=_lit(0)))
-    return [Cond(cond=tid0, body=tuple(body)), MbarrierWait(mbar=mbar, phase=phase, slot=_lit(0))]
+def _slot_row(slot: Expr, rows_per_slot: int) -> Expr | None:
+    """The row offset of ring ``slot`` — ``slot·rows_per_slot``, or ``None`` for a literal
+    slot 0 (the single-buffer / ring-slot-0 case). ``None`` keeps the emitted index free of a
+    dead ``+ 0·rows`` term, so single-buffer staging stays bit-identical to its gmem baseline."""
+    if isinstance(slot, Literal) and slot.value == 0:
+        return None
+    return _mul(slot, _lit(rows_per_slot))
+
+
+@dataclass(frozen=True)
+class CpAsyncTransport:
+    """The cp.async producer: cooperative gmem→smem fills committed into groups, drained by
+    ``CpAsyncWait(group=in_flight)``. ``a_index`` / ``b_index`` map a K-chunk offset ``k0`` to the
+    per-cell ``(row, col) → gmem-index`` closure (each tier bakes in its own masked-axis clamp)."""
+
+    a_buf: str
+    b_buf: str
+    a_index: Callable[[Expr], Callable]
+    b_index: Callable[[Expr], Callable]
+    tile_m: int
+    tile_n: int
+    bk_elems: int
+    slab_dtype: str
+    elem_bytes: int
+    cta: CtaTile
+
+    def a_row(self, slot: Expr) -> Expr | None:
+        return _slot_row(slot, self.tile_m)
+
+    def b_row(self, slot: Expr) -> Expr | None:
+        return _slot_row(slot, self.bk_elems)
+
+    def slab_decls(self, ring: int) -> list[Stmt]:
+        return [
+            slab_smem(_A_SLAB, ring * self.tile_m, self.bk_elems, self.slab_dtype),
+            slab_smem(_B_SLAB, ring * self.bk_elems, self.tile_n, self.slab_dtype),
+        ]
+
+    def prologue(self, ring: int) -> list[Stmt]:
+        return []
+
+    def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:
+        out = cp_async_fill(
+            slab=_A_SLAB,
+            slab_rows=self.tile_m,
+            slab_cols=self.bk_elems,
+            src=self.a_buf,
+            gmem_index=self.a_index(k0),
+            cta=self.cta,
+            elem_bytes=self.elem_bytes,
+            name="a",
+            row_offset=self.a_row(slot),
+        )
+        out += cp_async_fill(
+            slab=_B_SLAB,
+            slab_rows=self.bk_elems,
+            slab_cols=self.tile_n,
+            src=self.b_buf,
+            gmem_index=self.b_index(k0),
+            cta=self.cta,
+            elem_bytes=self.elem_bytes,
+            name="b",
+            row_offset=self.b_row(slot),
+        )
+        return out
+
+    def commit(self) -> list[Stmt]:
+        return cp_async_commit()
+
+    def wait(self, *, in_flight: int, slot: Expr, phase: Expr) -> list[Stmt]:
+        return cp_async_wait(in_flight)  # keep ``in_flight`` prefetch groups outstanding + a CTA barrier
+
+
+@dataclass(frozen=True)
+class TmaTransport:
+    """The TMA (``cp.async.bulk.tensor``) producer: one thread issues an ``arrive.expect_tx`` + the
+    A/B box copies onto a **per-slot mbarrier array**; every thread waits on the slot's parity. The
+    multi-slot mbarrier is what makes ``depth`` a free knob for TMA — ``wait(slot, phase)`` gates the
+    ring slot the same way ``CpAsyncWait(in_flight)`` gates a commit group."""
+
+    a_buf: str
+    b_buf: str
+    tile_m: int
+    tile_n: int
+    bk_elems: int
+    slab_dtype: str
+    elem_bytes: int
+    cta: CtaTile
+    desc_a: str = "_desc_a"
+    desc_b: str = "_desc_b"
+    mbar: str = "_mbar"
+
+    def a_row(self, slot: Expr) -> Expr | None:
+        return _slot_row(slot, self.tile_m)
+
+    def b_row(self, slot: Expr) -> Expr | None:
+        return _slot_row(slot, self.bk_elems)
+
+    @property
+    def _tid0(self) -> Expr:
+        return BinaryExpr("==", self.cta.linear_tid, _lit(0))
+
+    @property
+    def _total_bytes(self) -> int:
+        return (self.tile_m * self.bk_elems + self.bk_elems * self.tile_n) * self.elem_bytes
+
+    def slab_decls(self, ring: int) -> list[Stmt]:
+        # TMA destination smem must be 128 B-aligned; one mbarrier per ring slot.
+        return [
+            tma_descriptor(self.desc_a, self.a_buf, (self.tile_m, self.bk_elems), self.slab_dtype),
+            tma_descriptor(self.desc_b, self.b_buf, (self.bk_elems, self.tile_n), self.slab_dtype),
+            slab_smem(_A_SLAB, ring * self.tile_m, self.bk_elems, self.slab_dtype, align=TMA_SLAB_ALIGN),
+            slab_smem(_B_SLAB, ring * self.bk_elems, self.tile_n, self.slab_dtype, align=TMA_SLAB_ALIGN),
+            Smem(name=self.mbar, extents=(ring,), dtype="unsigned long long"),
+        ]
+
+    def prologue(self, ring: int) -> list[Stmt]:
+        # Init every ring slot's mbarrier (one producer ``arrive`` per phase), then a CTA barrier so
+        # every consumer sees the init before its first wait.
+        inits = tuple(MbarrierInit(mbar=self.mbar, count=1, slot=_lit(s)) for s in range(ring))
+        return [Cond(cond=self._tid0, body=inits), Sync()]
+
+    def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:
+        row_a, row_b = self.a_row(slot) or _lit(0), self.b_row(slot) or _lit(0)
+        body: list[Stmt] = [
+            MbarrierArriveExpectTx(mbar=self.mbar, bytes_=self._total_bytes, slot=slot),
+            TmaLoad(
+                smem=_A_SLAB, smem_index=(row_a, _lit(0)), desc=self.desc_a, coords=(self.cta.row_base, k0), mbar=self.mbar, mbar_slot=slot
+            ),
+            TmaLoad(
+                smem=_B_SLAB, smem_index=(row_b, _lit(0)), desc=self.desc_b, coords=(k0, self.cta.col_base), mbar=self.mbar, mbar_slot=slot
+            ),
+        ]
+        return [Cond(cond=self._tid0, body=tuple(body))]
+
+    def commit(self) -> list[Stmt]:
+        return []  # TMA has no commit-group; the arrive.expect_tx above already armed the barrier
+
+    def wait(self, *, in_flight: int, slot: Expr, phase: Expr) -> list[Stmt]:
+        return [MbarrierWait(mbar=self.mbar, phase=phase, slot=slot)]
+
+
+def staged_kloop(
+    *, transport, drain: Callable[[Expr], list[Stmt]], depth: int, bk_elems: int, n_chunks: int, k_extent: int
+) -> tuple[list[Stmt], list[Stmt]]:
+    """The **one** staged K-loop skeleton — ``fill → commit → wait → drain → Sync`` over the K-chunks,
+    with ``depth`` the sole buffering knob and ``transport`` the sole producer seam. Returns
+    ``(slab_decls, [prologue…, outer_loop])``.
+
+    ``ring = min(depth, n_chunks)`` slots (``<2`` chunks ⇒ nothing to prefetch, ``ring == 1``):
+
+    - ``ring == 1`` (single buffer): fill chunk ``i`` into slot 0, wait everything, ``drain`` slot 0.
+    - ``ring >= 2`` (gmem→smem prefetch ring): a prologue primes chunks ``0..ring-2`` into slots
+      ``0..ring-2``; each loop step prefetches chunk ``i+ring-1`` (clamped to the last chunk so the
+      commit/wait stays uniform across all CTA threads — the barrier-under-mask invariant) into slot
+      ``(i+ring-1) % ring``, then waits ``ring-1`` chunks in flight and ``drain``\\ s slot ``i % ring``.
+
+    ``transport`` supplies fill/commit/wait + the slab layout; ``drain(slot)`` is the atom leaf reading
+    ring ``slot`` (``ldmatrix`` fragments / scalar slab ``Load``\\ s). For TMA the wait phase toggles per
+    slot generation (``chunk // ring``); cp.async ignores it (it gates on the commit group instead)."""
+    ring = min(depth, n_chunks) if n_chunks >= 2 else 1
+    k0, K = "_ks", k_extent
+    decls = transport.slab_decls(ring)
+    pre = transport.prologue(ring)
+    for s in range(ring - 1):  # prime chunks 0..ring-2 into slots 0..ring-2 (phase 0)
+        pre += transport.fill(k0=_lit(s * bk_elems), slot=_lit(s))
+        pre += transport.commit()
+
+    i_expr = BinaryExpr("/", Var(k0), _lit(bk_elems))  # chunk index of the current step
+    body: list[Stmt] = []
+    if ring == 1:
+        phase = BinaryExpr("%", i_expr, _lit(2))
+        body += transport.fill(k0=Var(k0), slot=_lit(0))
+        body += transport.commit()
+        body += transport.wait(in_flight=0, slot=_lit(0), phase=phase)
+        body += drain(_lit(0))
+        body.append(Sync())
+    else:
+        pref_chunk = BinaryExpr("+", i_expr, _lit(ring - 1))  # logical index of the prefetched chunk
+        pref_slot = BinaryExpr("%", pref_chunk, _lit(ring))
+        read_slot = BinaryExpr("%", i_expr, _lit(ring))
+        read_phase = BinaryExpr("%", BinaryExpr("/", i_expr, _lit(ring)), _lit(2))
+        last_k0 = (n_chunks - 1) * bk_elems
+        k0_next = BinaryExpr("+", Var(k0), _lit((ring - 1) * bk_elems))
+        k0_pref = TernaryExpr(cond=BinaryExpr("<", k0_next, _lit(K)), if_true=k0_next, if_false=_lit(last_k0))
+        body += transport.fill(k0=k0_pref, slot=pref_slot)
+        body += transport.commit()
+        body += transport.wait(in_flight=ring - 1, slot=read_slot, phase=read_phase)
+        body += drain(read_slot)
+        body.append(Sync())  # done reading this slot before a later chunk prefetches into it
+
+    outer = StridedLoop(axis=Axis(name=k0, extent=K), start=_lit(0), step=_lit(bk_elems), body=Body(tuple(body)), unroll=False)
+    return decls, [*pre, outer]

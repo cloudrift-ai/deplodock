@@ -1032,6 +1032,43 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
 
 @requires_sm90
 @requires_cuda
+@pytest.mark.parametrize("depth", [2, 3])
+@pytest.mark.parametrize("M", [128, 256])
+def test_tma_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
+    """The TMA gmem→smem ring (``STAGE=d<depth>/tma``, depth≥2) is the same one :func:`staged_kloop`
+    the cp.async ring runs — ``depth`` becomes the sole buffering knob across transports. TMA rides a
+    **per-slot mbarrier array** (``_mbar[depth]``, each slot's parity toggled per generation
+    ``chunk // ring``) instead of a cp.async commit group. A PURE perf transform: bit-identical to the
+    gmem-direct baseline, allocating ``depth`` ring slots."""
+    if not _supports_tma():
+        pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
+    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    rng = np.random.default_rng(2)
+    a = (rng.standard_normal((M, _PK)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((_PK, _PN)) * 0.1).astype(np.float16)
+
+    def _go(stage: str | None) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
+        if stage:
+            monkeypatch.setenv("DEPLODOCK_STAGE", stage)
+        else:
+            monkeypatch.delenv("DEPLODOCK_STAGE", raising=False)
+        be = CudaBackend()
+        compiled = be.compile(_parity_mma_graph("static", M=M))
+        src = compiled.nodes["o"].op.kernel_source
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, src
+
+    ring, ring_src = _go(f"d{depth}/tma")
+    gmem, _ = _go(None)
+    np.testing.assert_array_equal(ring, gmem)  # bit-identical: the mbarrier-phased prefetch perturbs nothing
+    assert f"_mbar[{depth}]" in ring_src, f"a depth-{depth} TMA ring must declare a {depth}-slot mbarrier array"
+    assert ring_src.count("mbarrier_init(&_mbar[") == depth, f"each of the {depth} ring slots' mbarriers must be initialized"
+
+
+@requires_sm90
+@requires_cuda
 def test_bf16_operands_stage_via_cp_async(monkeypatch):
     """The bf16 MMA atom (``mma_m16n8k16_bf16``) stages through cp.async and stays accurate vs
     torch — the cp.async byte-width fill must handle the 2-byte bf16 operand. (No native numpy

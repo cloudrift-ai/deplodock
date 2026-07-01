@@ -82,22 +82,25 @@ carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The
 ## Operand staging — the warp-tier smem pipeline (`STAGE` codec → `Stage`)
 
 The warp (mma) tier stages its reused gmem operands through an smem slab, driven off the node's `STAGE` codec →
-`schedule.Stage`. The transport primitives (the cooperative gmem→smem fill loops + the cp.async commit/wait and TMA
-mbarrier handshakes) live in **`_stage.py`**; the K-loop that schedules them onto the `Contraction` geometry lives in
-`_factor.py` (`_warp_staged_kloop` / `_warp_tma_staged_kloop`, plus the shared inner `ldmatrix` drain
-`_staged_inner_atom_loop`). `_mma_stage_plan` decodes the `Stage` once (TMA > cp.async > gmem-direct, with the
-eligibility rules `_can_stage_warp[_tma]`) and both `_MmaOps.state` (which slots the operand fragments) and
-`_MmaOps.reduce` (which emits the loop) read it. The `Stage` spells two buffering levels: `d<depth>` is the gmem→smem
-ring (cp.async / TMA prefetch over the K-slab loop), `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix`
-ping-pong over the inner atom-K steps). Staging is a **pure perf transform** — an ineligible kernel (transposed-B,
-masked N, symbolic / non-divisible K, or a computed-A flash operand) silently falls back to gmem-direct, and a staged
-kernel is
+`schedule.Stage`. Every staged path runs **one** K-loop skeleton, `staged_kloop` in **`_stage.py`**
+(`fill → commit → wait → drain → Sync`, `depth` the sole buffering knob — `depth == 1` is the single-buffer degenerate,
+`depth >= 2` a gmem→smem prefetch ring), behind a `Transport` strategy: `CpAsyncTransport` (fill → commit → wait-group)
+and `TmaTransport` (an `arrive.expect_tx` + box copy gated by a **per-slot mbarrier array**, so `depth` is a free knob
+for TMA too). The two producers — structurally different primitives — sit behind one `fill`/`commit`/`wait` seam; the
+tier in `_factor.py` (`_mma_staged` / `_scalar_staged`) only builds the transport + the drain leaf (the shared inner
+`ldmatrix` drain `_staged_inner_atom_loop`, or the scalar `_scalar_drain`). `_mma_stage_plan` decodes the `Stage` once
+(TMA > cp.async > gmem-direct, with the eligibility rules `_can_stage_warp[_tma]`) and both `_MmaOps.state` (which slots
+the operand fragments) and `_MmaOps.reduce` (which emits the loop) read it. The `Stage` spells two buffering levels:
+`d<depth>` is the gmem→smem ring (cp.async commit group / TMA mbarrier-phased prefetch over the K-slab loop),
+`p<reg_depth>` is the smem→register double-buffer (the `ldmatrix` ping-pong over the inner atom-K steps). Staging is a
+**pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic / non-divisible K, or a computed-A
+flash operand) silently falls back to gmem-direct, and a staged kernel is
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
 follow-up.
 
-The **scalar** contraction tier stages too, under the same `STAGE` pin (`_scalar_stage_plan` / `_scalar_staged_kloop` /
-`_scalar_drain` in `_factor.py`): the STAGE-pinned scalar contraction fills the A / B operand slabs via the **same**
-`_stage.py` `cp_async_fill` / `tma_fill` (a scalar `CtaTile`, `block_threads` threads) and drains them with a plain-`Load`
+The **scalar** contraction tier stages too, under the same `STAGE` pin (`_scalar_stage_plan` / `_scalar_staged` /
+`_scalar_drain` in `_factor.py`): the STAGE-pinned scalar contraction builds the **same** `Transport` (a scalar
+`CtaTile`, `block_threads` threads) over the one `staged_kloop` (single-buffer) and drains it with a plain-`Load`
 inner loop over the derived K-chunk (`bk_elems` fit-to-smem, not a codec field). The nested outer-slab / inner-drain
 accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer loop)
 and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA
