@@ -44,9 +44,10 @@ from deplodock.compiler.ir.kernel.ir import (
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Load, Loop, Select, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import Contraction
-from deplodock.compiler.ir.tile.ops import contraction_loop
+from deplodock.compiler.ir.tile.ops import contraction_loop, lower
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
+from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
 from deplodock.compiler.pipeline.pipeline import LoweringError
 
@@ -346,7 +347,29 @@ def store_sink(c: Contraction):
     return partial(store, c)
 
 
-def factorize(c: Contraction, store=None) -> Tile:
+def factorize(tile, root, store=None) -> Tile:
+    """The single node-kind dispatcher — expand a ``TileOp``'s ``op`` into its bound ``Tile``.
+
+    Reads the structural node off ``tile.op`` and picks the emitter:
+
+    - a :class:`Contraction` (warp / register tile) → :func:`_factorize_contraction`, the atom-generic
+      four-level pipeline. The bare grid-``Write`` is synthesized here (it needs ``root.output``, so it
+      can't ride the node) into the projection ``epilogue`` before the tiling.
+    - anything else (a pointwise ``Map``, or a reduction with a trivial :class:`ReducePlan`) → the
+      **scalar tier**: one thread per output cell. ``lower(op)`` emits the per-cell body (a serial
+      reduce ``Loop`` sits inside it), the output-store glue is appended if the body has none, and the
+      body is wrapped in a single :class:`Tile` bound to ``place.grid``."""
+    op = tile.op
+    if isinstance(op, Contraction):
+        tail = list(op.epilogue)
+        if not has_write(tail):
+            op = replace(op, epilogue=with_store(tail, root.output.name, tile.place.grid, op))
+        return _factorize_contraction(op, store)
+    stmts = with_store(lower(op), root.output.name, tile.place.grid, op)
+    return Tile(axes=tuple(tile.place.grid), body=Body(tuple(stmts)))
+
+
+def _factorize_contraction(c: Contraction, store=None) -> Tile:
     """Expand a :class:`Contraction` into its tiled ``Tile`` — the one pipeline for both atoms. The
     node supplies the per-level geometry; :func:`reduce_codegen` synthesizes the operand load + K-loop
     and ``store`` is the **per-cell sink** (default: the matmul :func:`store_sink`; the flash inner

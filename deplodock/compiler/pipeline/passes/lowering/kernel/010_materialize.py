@@ -62,7 +62,6 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_com
 from deplodock.compiler.pipeline.passes.lowering.kernel._factor import factorize
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import with_store as _with_store
 
 PATTERN = [Pattern("root", TileOp)]
@@ -299,12 +298,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     # ``MmaSyncPtx`` / ``RegStore`` fragment soup, the scalar arm into the per-thread register cell
     # tile, both via the shared ``_tiling`` layer.
     if isinstance(tile.op, Contraction):
-        contraction = tile.op
-        tail = list(contraction.epilogue)
-        if not has_write(tail):
-            tail = _with_store(tail, root.output.name, tile.place.grid, contraction)
-            contraction = replace(contraction, epilogue=tail)
-        return KernelOp(body=Body((factorize(contraction),)), name=tile.name)
+        return KernelOp(body=Body((factorize(tile, root),)), name=tile.name)
     tier = tile.tier if has_op else None
     role = axis_role(tile.op) if has_op else None
     # Cooperative / ILP reduce tier (``_reduce``): a PLANAR / TWISTED monoid reduce, OR a
@@ -319,9 +313,7 @@ def rewrite(match: Match, root: Node) -> KernelOp | None:
     if plan is not None and (plan.coop > 1 or plan.reg > 1):
         return _reduce(tile, root)
 
-    # Scalar tier: one thread per output cell. ``lower`` emits the per-cell body (any serial
-    # reduce ``Loop`` sits inside it); add the output-store glue if the body has none.
-    op = tile.op
-    stmts = _with_store(lower(op), root.output.name, tile.place.grid, op)
-    bound = Tile(axes=tuple(tile.place.grid), body=Body(tuple(stmts)))
-    return KernelOp(body=Body((bound,)), name=tile.name)
+    # Scalar tier: one thread per output cell — delegated to the node-kind dispatcher
+    # (``factorize`` emits the degenerate one-cell ``Tile`` for a pointwise ``Map`` / trivial-plan
+    # reduction).
+    return KernelOp(body=Body((factorize(tile, root),)), name=tile.name)
