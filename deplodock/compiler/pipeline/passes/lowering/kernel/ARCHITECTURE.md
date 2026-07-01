@@ -30,8 +30,9 @@ splits the **algebra params** (what to contract: the m/n output `axes` + the `k_
 B operand `Load` + the A `a_operand` — a gmem `Load` **or** a computed register-resident `Body` (flash PV's `P = exp(S −
 M)`, produced from an in-register score, not a gmem address) — the fold accumulator `acc`, and the projection `epilogue`)
 from the **schedule** (one `tile: TilePlan` field carrying the leaf `atom` — a tensor-core `AtomKind` / the scalar
-`ScalarAtom`, `ir/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (`tile_m` / `mask_m` /
-`block_threads` / …) is **derived** on the node from `tile` × `axes` (`@property`). Keeping the schedule a single swappable
+`ScalarAtom`, `ir/atom.py` — plus the unit/register widths + K-chunk). The per-CTA geometry (the `(m, n)` `Side` pair —
+tile width / mask / block+unit var names — plus `block_threads`) is **derived** on the node from `tile` × `axes`
+(`@property`). Keeping the schedule a single swappable
 field is what lets the same operand/`acc` params be tiled by a *different* `TilePlan` — the seam the flash inner QK/PV
 reuse needs.
 
@@ -56,8 +57,10 @@ those same two routes (scalar block=1 today). A tensor-core flash tier is a matt
 variant, and **no per-atom geometry object**. It expands any `Contraction` by tiling a **leaf atom** four ways through
 the layer in `_tiling.py`:
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The tiling
-geometry (`tile_m` / `mask_m` / `m_b` / `m_uvar` / `block_threads` / `lanes` / …) is **derived on the `Contraction` node
-itself** (`@property`, from the `tile` schedule × the output axes); `factorize` reads it straight off `c` and hands
+geometry (the `(m, n)` `Side` pair — `tile` / `mask` / `block` / `unit` per axis — plus `block_threads` / `lanes`) is
+**derived on the `Contraction` node itself** (`@property`, from the `tile` schedule × the output axes); the two sides
+thread through the tiling levels + the codegen callables as one `(m, n)` pair. `factorize` reads it straight off `c`
+and hands
 `grid_tile` the codegen in two halves: `_factor.reduce_codegen` — the reusable, **sink-agnostic** `(state_decls,
 reduce_region)` (operand fragments + the K-loop, dispatched off the atom) — and a per-cell **sink** `store`. The
 default is the matmul `_factor.store_sink`; `factorize(c, store=…)` swaps it. Per-atom diff:

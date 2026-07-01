@@ -156,6 +156,37 @@ class Reduction:
 
 
 @dataclass(frozen=True)
+class Side:
+    """One tiled output axis of a contraction — the outer ``m`` or inner ``n`` — paired with its
+    derived per-CTA tile geometry. The two ride as a ``(m, n)`` pair (:attr:`Contraction.mn`)
+    mirroring the schedule's ``(m, n)`` tuples (``TilePlan.units`` / ``regs``), so the factorizer
+    threads one object per axis instead of a dozen loose ``*_m`` / ``*_n`` args. The tile width,
+    unit / register counts, and bound block/unit var names are stamped by :meth:`Contraction._side`;
+    the ``mask`` / ``ext`` are derived from the axis + width."""
+
+    axis: Axis  # the output axis (a param)
+    tile: int  # the per-CTA width = units · reg · atom_dim
+    units: int  # parallel units on this axis (warps for mma / threads for scalar)
+    reg: int  # register sub-cells per unit on this axis
+    block: str  # the bound grid-block var (the axis name + ``_b``)
+    unit: str  # the bound unit var (the axis name + ``_u``)
+
+    @property
+    def name(self) -> str:
+        return self.axis.name
+
+    @property
+    def mask(self) -> bool:
+        """True iff a ``tile``-wide CTA block overhangs the axis (its tail must be masked)."""
+        return _overhangs(self.axis, self.tile)
+
+    @property
+    def ext(self) -> Expr:
+        """The axis extent as an ``Expr`` — a static literal or the symbolic ``Dim`` expr."""
+        return _ext_expr(self.axis)
+
+
+@dataclass(frozen=True)
 class Contraction(Stmt):
     """A contraction **before** atom factorization — built **recognize-side** at fork-emit
     (``_schedule._contraction_node`` resolves the operand→role binding via ``_atomize.semiring_binding``
@@ -178,8 +209,8 @@ class Contraction(Stmt):
     ``for k: acc += a*b`` register-tiled loop — then run the ``epilogue`` (``acc`` is the SSA name the
     synthesized reduce produces and the epilogue consumes). The operand buffers ride
     :meth:`external_reads`; the epilogue is the only nested ``Body``. ``_factor.factorize`` reads the
-    **derived** geometry below (``tile_m`` / ``mask_m`` / ``m_b`` / ``m_uvar`` / ``block_threads`` /
-    ``b_trans`` / …) straight off the node; it's ``@property``, so it stays out of the fields
+    **derived** geometry below (the ``(m, n)`` :class:`Side` pair — ``tile`` / ``mask`` / ``block`` /
+    ``unit`` per axis — plus ``block_threads`` / ``b_trans``) straight off the node; it's ``@property``, so it stays out of the fields
     ``structural_key`` digests (the node IS keyed as an intermediate ``KernelOp``). The atom selects
     the codegen — there is no separate ``Leaf`` / per-atom subclass."""
 
@@ -251,53 +282,31 @@ class Contraction(Stmt):
     def n_axis(self) -> Axis:
         return self.axes[1]
 
-    # ---- schedule: the leaf atom + unit/register widths, read off the ``tile`` (m-then-n,
-    # normalized by ``TilePlan``'s accessors) ---------- #
     @property
     def atom(self) -> Atom:
         return self.tile.atom
 
+    # ---- the (m, n) output sides: each axis paired with its derived per-CTA tile geometry (width /
+    # unit / register counts, read off the ``tile``) + the bound block/unit var names (the original
+    # m/n names live in the operand indices, so the bound axes take a fresh ``_b`` / ``_u`` suffix).
+    # ``_factor`` threads these as the ``(m, n)`` pair, mirroring the schedule's tuples. ---------- #
     @property
-    def units_m(self) -> int:
-        return self.tile.units_m
+    def m(self) -> Side:
+        return self._side(0)
 
     @property
-    def units_n(self) -> int:
-        return self.tile.units_n
+    def n(self) -> Side:
+        return self._side(1)
 
     @property
-    def reg_m(self) -> int:
-        return self.tile.reg_m
+    def mn(self) -> tuple[Side, Side]:
+        """The ``(m, n)`` output sides — the per-axis geometry the factorizer tiles through."""
+        return (self.m, self.n)
 
-    @property
-    def reg_n(self) -> int:
-        return self.tile.reg_n
-
-    # ---- derived geometry (read by ``_factor.factorize``) — the per-CTA tile dims come straight off
-    # the ``tile``; the masks / extents combine the ``tile`` widths with the output axes (params) ---- #
-    @property
-    def tile_m(self) -> int:
-        return self.tile.tile_m
-
-    @property
-    def tile_n(self) -> int:
-        return self.tile.tile_n
-
-    @property
-    def mask_m(self) -> bool:
-        return _overhangs(self.m_axis, self.tile_m)
-
-    @property
-    def mask_n(self) -> bool:
-        return _overhangs(self.n_axis, self.tile_n)
-
-    @property
-    def m_ext(self) -> Expr:
-        return _ext_expr(self.m_axis)
-
-    @property
-    def n_ext(self) -> Expr:
-        return _ext_expr(self.n_axis)
+    def _side(self, i: int) -> Side:
+        t, ax = self.tile, self.axes[i]
+        tile, units, reg = (t.tile_m, t.units_m, t.reg_m) if i == 0 else (t.tile_n, t.units_n, t.reg_n)
+        return Side(axis=ax, tile=tile, units=units, reg=reg, block=ax.name + "_b", unit=ax.name + "_u")
 
     @property
     def block_threads(self) -> int | None:
@@ -309,24 +318,6 @@ class Contraction(Stmt):
         """B stored N×K (the K axis last in its index) vs the canonical B[k, n] — read off the
         binding load, the same test ``_atomize`` made when it bound the operand."""
         return self.k_axis.name in self.b_load.index[-1].free_vars()
-
-    # The bound GRID-block / UNIT axis names — the original m/n names live in the operand indices,
-    # so the bound axes take a fresh ``_b`` (block) / ``_u`` (unit) suffix.
-    @property
-    def m_b(self) -> str:
-        return self.m_axis.name + "_b"
-
-    @property
-    def n_b(self) -> str:
-        return self.n_axis.name + "_b"
-
-    @property
-    def m_uvar(self) -> str:
-        return self.m_axis.name + "_u"
-
-    @property
-    def n_uvar(self) -> str:
-        return self.n_axis.name + "_u"
 
     # ---- the kernel-stmt protocol (the epilogue is the only nested Body; the operand buffers are
     # external reads; the synthesized reduce produces ``acc``) ---------- #
