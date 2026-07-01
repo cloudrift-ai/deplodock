@@ -10,7 +10,7 @@ here — :func:`_factorize_contraction` (a tiled :class:`~...ir.Contraction`), :
 :func:`_factorize_contraction` reads the tiling **geometry straight off the** ``Contraction`` **node**
 (``tile_m`` / ``mask_m`` / ``m_b`` / ``block_threads`` / …, derived there from the ``tile`` schedule +
 the output axes), expands both atoms through the *same* four-level tiling pipeline (``atomize →
-register_tile → unit_tile → grid_tile``, in ``_tiling.py``), and splices in two codegen halves from
+register_tile → unit_tile → grid_tile``, in this module), and splices in two codegen halves from
 the per-atom strategies in **``_atom.py``**: :func:`~...kernel._atom.reduce_codegen` — the reusable,
 **sink-agnostic** ``(state_decls, reduce_region)`` (accumulator/operand decls + the contraction
 K-loop) — and a per-cell **sink** ``store(i, j, offset, mn)`` (default
@@ -34,26 +34,123 @@ module."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis, AxisRole
-from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
+from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.schedule import Stage
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop
-from deplodock.compiler.ir.tile.ir import Contraction
+from deplodock.compiler.ir.tile.ir import Contraction, Side
 from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_plan
 from deplodock.compiler.pipeline.passes.lowering.kernel._atom import reduce_codegen, store_sink
-from deplodock.compiler.pipeline.passes.lowering.kernel._combine import emit_combine
+from deplodock.compiler.pipeline.passes.lowering.kernel._combine import combine_tail
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
-    sync_row_fill,
-)
+from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
+from deplodock.compiler.pipeline.passes.lowering.kernel._stage import sync_row_fill
 from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
-from deplodock.compiler.pipeline.passes.lowering.kernel._tiling import atomize, grid_tile, register_tile, unit_tile
+
+
+# ---- generic tiling layer: atomize → register_tile → unit_tile → grid_tile ---------------------- #
+# A contraction is lowered by tiling a leaf atom four ways: GRID block / UNIT / REGISTER / ATOM. The
+# UNIT is the atom's parallel thread footprint (a warp for mma, a thread for scalar). Each level zips
+# the per-axis :class:`AxisOffset` pair (``Tiling.offset``) with the ``(m, n)`` :class:`Side` pair, so
+# the two axes never split into ``*_m`` / ``*_n`` locals; :func:`grid_tile` (the finalizer) splices the
+# atom's ``state`` / ``reduce_region`` / ``store`` callables (from :func:`reduce_codegen` / the sink) in.
+@dataclass(frozen=True)
+class AxisOffset:
+    """One output axis's per-register-cell coordinate, accumulated across the tiling levels (atom →
+    register → unit → grid). :meth:`base` reproduces ``block·(units·reg·atom) + unit·(reg·atom) +
+    r·atom`` once the UNIT level is present (the mma warp tile AND the scalar thread tile both go
+    through :func:`unit_tile`), else the bare ``Var(block)·reg + r``."""
+
+    atom_dim: int  # the atom step along this axis
+    reg: int = 1  # register sub-cells per unit
+    block_var: str | None = None  # the grid-block axis var (set at grid_tile)
+    unit_var: str | None = None  # the UNIT-level var — a warp for mma, a thread for scalar
+    unit_count: int = 1
+
+    def base(self, r: int) -> Expr:
+        """The offset of register cell index ``r`` along this axis."""
+        reg_term = Literal(r * self.atom_dim, "int")
+        if self.unit_var is not None:  # block·(units·reg·atom) + unit·(reg·atom) + r·atom
+            tile = self.unit_count * self.reg * self.atom_dim
+            e = BinaryExpr("*", Var(self.block_var), Literal(tile, "int"))
+            e = BinaryExpr("+", e, BinaryExpr("*", Var(self.unit_var), Literal(self.reg * self.atom_dim, "int")))
+            return BinaryExpr("+", e, reg_term)
+        return BinaryExpr("+", BinaryExpr("*", Var(self.block_var), Literal(self.reg, "int")), reg_term)  # no unit level
+
+
+@dataclass(frozen=True)
+class Tiling:
+    """The accumulating tiling state threaded through ``atomize → register_tile → unit_tile →
+    grid_tile`` — the per-axis ``(m, n)`` :class:`AxisOffset` tuple ``offset`` + the bound ``Tile``
+    axes (unit → grid) + ``block_threads``. Each level ``zip``\\ s ``offset`` with the ``(m, n)``
+    :class:`Side` pair, so the two axes never split into ``*_m`` / ``*_n`` locals."""
+
+    offset: tuple[AxisOffset, AxisOffset]
+    axes: tuple[Axis, ...] = ()
+    block_threads: int | None = None
+
+
+def atomize(atoms: tuple[int, int]) -> Tiling:
+    """The leaf: a single ``(atom_m, atom_n)`` atom (1×1 for a scalar cell). Seeds the per-axis
+    offset with the atom step; the atom-lane offset stays OUT of σ (added at render)."""
+    return Tiling(offset=tuple(AxisOffset(atom_dim=a) for a in atoms))
+
+
+def register_tile(t: Tiling, mn: tuple[Side, Side]) -> Tiling:
+    """The REGISTER level: ``m.reg × n.reg`` atoms per thread/warp. Records the cell counts; the
+    per-cell ``r·atom_dim`` term is applied at :meth:`AxisOffset.base`."""
+    return replace(t, offset=tuple(replace(o, reg=s.reg) for o, s in zip(t.offset, mn, strict=True)))
+
+
+def unit_tile(t: Tiling, mn: tuple[Side, Side]) -> Tiling:
+    """The UNIT level: ``m.units × n.units`` parallel units per CTA, where a *unit* is the atom's
+    thread footprint — a warp (32 lanes) for an mma atom, a single thread for a scalar atom (so the
+    tensor-core warp tile and the scalar parallel thread-tile are the same level, differing only in
+    the atom's ``lanes``). Adds the unit term ``unit·(reg·atom)`` to each axis offset + the per-axis
+    unit axes."""
+    offset = tuple(replace(o, unit_var=s.unit, unit_count=s.units) for o, s in zip(t.offset, mn, strict=True))
+    axes = (*t.axes, *(Axis(name=s.unit, extent=s.units) for s in mn))
+    return replace(t, offset=offset, axes=axes)
+
+
+def grid_tile(
+    t: Tiling,
+    *,
+    mn: tuple[Side | None, Side],
+    lead_axes: tuple[Axis, ...] = (),
+    block_threads: int | None,
+    lanes: int = 1,
+    state_decls: Callable[[list[tuple[int, int]]], list[Stmt]],
+    reduce_region: Callable[..., tuple[list[Stmt], list[Stmt]]],
+    store: Callable[..., list[Stmt]],
+) -> Tile:
+    """The GRID level + finalize: bind the block axes (the shrunk grid), set the per-axis grid term
+    ``block·tile``, append any leading (batch) grid axes verbatim and — when the atom is warp-cooperative
+    (``lanes > 1``) — the atom ``_lane`` axis, then splice the codegen callables' state + reduce-region +
+    per-cell stores into the ``Tile``. The three callables (atom-specific, from :func:`reduce_codegen` +
+    the ``store`` sink) are the only per-atom variation; the splice is shared. They take the per-cell
+    ``offset`` (the ``(m, n)`` :class:`AxisOffset` tuple) + the ``mn`` :class:`Side` pair.
+
+    ``mn[0] is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.
+    ``lead_axes`` are extra outer grid axes carried through untiled; ``lanes == 1`` (scalar) emits no
+    ``_lane`` axis."""
+    offset = tuple(replace(o, block_var=s.block) if s is not None else o for o, s in zip(t.offset, mn, strict=True))
+    block_axes = tuple(_shrink_axis(Axis(name=s.block, extent=s.axis.extent, source_axis=s.axis), s.tile) for s in mn if s is not None)
+    lane_axes = (Axis(name="_lane", extent=lanes),) if lanes > 1 else ()
+    axes = (*lead_axes, *block_axes, *t.axes, *lane_axes)
+
+    cells = [(i, j) for i in range(offset[0].reg) for j in range(offset[1].reg)]
+    state = state_decls(cells)
+    top_decls, kstmts = reduce_region(cells, offset, mn)
+    stores = [s for (i, j) in cells for s in store(i, j, offset, mn)]
+    return Tile(axes=axes, body=Body((*state, *top_decls, *kstmts, *stores)), block_threads=block_threads)
 
 
 def factorize(tile, root, store=None) -> Tile:
@@ -312,20 +409,11 @@ def _factorize_reduce(tile, root) -> Tile:
         copies.extend(_replicate(rloop.body, r, coop, axis, masked, protected))
     strided = StridedLoop(axis=axis, start=start, step=Literal(stride, "int"), body=Body(tuple(copies)), unroll=rloop.unroll)
 
-    # REG tree: fold each register copy into the survivor (copy 0's names), carrier-generic —
-    # ``as_state_merge`` is the one-shot ``StateMerge`` whose ``render`` reassigns the survivor
-    # state in place from the copy's renamed state (the same state-merge the cross-partition
-    # combine uses; emitted as a stmt so ``render_merge_program`` handles the reassignment, not
-    # a shadowing ``float`` redeclare).
-    reg_fold: list[Stmt] = []
-    for r in range(1, reg):
-        other = tuple(f"{n}__r{r}" for n in carrier.state.names)
-        # ``as_state_merge`` regenerates the finalize with its temps keyed on ``other[0]`` (or has
-        # none, for a degenerate fold), so each fold's internal temps are already unique — no
-        # per-fold uniquify needed.
-        reg_fold.append(carrier.as_state_merge(other))
-
-    combine = emit_combine(carrier, t=lane.name, n_threads=coop) if lane is not None else []
+    # The carrier-driven partial merge: the REG-tree fold of the ``reg`` ILP copies into the survivor
+    # (copy 0's names) + (when threads cooperate) the cross-thread combine, reassigning the carried
+    # state in place. The one shared tail a cooperative reduce and a future cooperative-K contraction
+    # both emit (``_combine.combine_tail``).
+    merge = combine_tail(carrier, reg=reg, coop=coop, lane=lane)
 
     # Post-reduce projection. A full-row output (softmax / RMSNorm) distributes its sweep
     # across the coop lanes; a scalar output is written once, guarded to lane 0. With no
@@ -344,6 +432,6 @@ def _factorize_reduce(tile, root) -> Tile:
         stored = with_store(tail, root.output.name, grid, op)
         body_tail = [Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(stored))]
 
-    body = [*fill_stmts, *pre, strided, *reg_fold, *combine, *body_tail]
+    body = [*fill_stmts, *pre, strided, *merge, *body_tail]
     axes = (*grid, lane) if lane is not None else tuple(grid)
     return Tile(axes=axes, body=Body(tuple(body)), block_threads=coop if lane is not None else None)

@@ -39,7 +39,7 @@ reuse needs.
 A symbolic / non-divisible tail is **clamp-to-identity** (the masked overhang folds a no-op or guards its store); the
 dynamic-grid tier ceil-divides the launch and threads the runtime extent as an `int seq_len` arg.
 
-### The one factorizer — dispatch + reduce tier (`_factor.py`), atom strategies (`_atom.py`), tiling (`_tiling.py`)
+### The one factorizer — dispatch + reduce tier (`_factor.py`), atom strategies + tiling (`_atom.py` / `_factor.py`)
 
 `_factor.factorize(tile, root)` is the **single emitter** every `TileOp` root lowers through. It reads the node kind off
 `tile.op` and routes to one of **two** paths, split only on whether the OUTPUT is tiled: `_factorize_contraction` (a
@@ -55,7 +55,7 @@ those same two routes (scalar block=1 today). A tensor-core flash tier is a matt
 
 **The contraction factorization — two atoms.** `_factorize_contraction` is the atom-generic path — there is no per-atom
 variant, and **no per-atom geometry object**. It expands any `Contraction` by tiling a **leaf atom** four ways through
-the layer in `_tiling.py`:
+the tiling layer (now inlined in `_factor.py`):
 `grid_tile(unit_tile(register_tile(atomize(...))))` — **GRID** block / **UNIT** / **REGISTER** / **ATOM**. The tiling
 geometry (the `(m, n)` `Side` pair — `tile` / `mask` / `block` / `unit` per axis — plus `block_threads` / `lanes`) is
 **derived on the `Contraction` node itself** (`@property`, from the `tile` schedule × the output axes); the two sides

@@ -66,8 +66,8 @@ def _wrap(side: Side, coord: Expr) -> Expr:
 
 def _cells(mn: tuple, offset, i: int, j: int):
     """Yield ``(side, cell-base coord)`` for each present output axis of register cell ``(i, j)`` —
-    ``(m, offset.m.base(i))`` then ``(n, offset.n.base(j))`` (``m`` skipped for a 1-D output)."""
-    for side, off, r in ((mn[0], offset.m, i), (mn[1], offset.n, j)):
+    ``(m, offset[0].base(i))`` then ``(n, offset[1].base(j))`` (``m`` skipped for a 1-D output)."""
+    for side, off, r in ((mn[0], offset[0], i), (mn[1], offset[1], j)):
         if side is not None:
             yield side, off.base(r)
 
@@ -487,7 +487,7 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
     """The inner slab-drain reduce loop ``for ki: b = b_slab[ki, n_local]; a = a_slab[m_local, ki];
     v = a·b; acc += v`` — the scalar counterpart of the mma ``ldmatrix`` drain. Built per-cell directly
     (NOT via the masked gmem-direct σ, whose ``% extent`` wrap would corrupt the slab index for an
-    overhanging cell): the slab is indexed by the **local** tile coordinate ``offset.{m,n}.base(...) −
+    overhanging cell): the slab is indexed by the **local** tile coordinate ``offset[{0,1}].base(...) −
     base`` (``m_uvar·reg_m + i`` ∈ [0, tile_m), always in-slab), so an overhanging cell reads a
     clamped / zero-filled slab row and its store is discarded by the guard. ``_dedup_loads`` still
     shares A across the n-cells and B across the m-cells exactly as gmem-direct does. **Carrier-less**
@@ -499,8 +499,8 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
     for i, j in cells:
         sfx = f"__c{i}_{j}"
         bn, an, vn, cn = f"{b_name}{sfx}", f"{a_name}{sfx}", f"{c.acc}__v{sfx}", f"{c.acc}{sfx}"
-        m_local = BinaryExpr("-", offset.m.base(i), row_base)
-        n_local = BinaryExpr("-", offset.n.base(j), col_base)
+        m_local = BinaryExpr("-", offset[0].base(i), row_base)
+        n_local = BinaryExpr("-", offset[1].base(j), col_base)
         body.append(Load(names=(bn,), input=b_slab, index=(Var(ki), n_local)))
         body.append(Load(names=(an,), input=a_slab, index=(m_local, Var(ki))))
         body.append(Assign(name=vn, op=_MUL, args=(bn, an)))
@@ -613,7 +613,7 @@ class _MmaOps(_AtomOps):
         k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
 
         def read_row(i):
-            cell = offset.m.base(i)
+            cell = offset[0].base(i)
             idx = tuple(Sigma({m.axis.name: cell}).apply(e) for e in a_load.index)
             return [
                 LdmatrixLoad(
@@ -622,7 +622,7 @@ class _MmaOps(_AtomOps):
             ]
 
         def read_col(j):
-            cell = offset.n.base(j)
+            cell = offset[1].base(j)
             idx = tuple(Sigma({n.axis.name: cell}).apply(e) for e in b_load.index)
             return [
                 LdmatrixLoad(
@@ -653,7 +653,7 @@ class _MmaOps(_AtomOps):
         c = self.c
         atom = c.atom
         m, n = mn
-        mcell, ncell = offset.m.base(i), offset.n.base(j)
+        mcell, ncell = offset[0].base(i), offset[1].base(j)
         tail = list(c.epilogue)
         write = next(s for s in tail if isinstance(s, Write))
         sigma = Sigma({m.axis.name: mcell, n.axis.name: ncell})
@@ -706,10 +706,10 @@ class _ScalarOps(_AtomOps):
         def read_row(i):
             if m is None:
                 return copy_cell(c.a_body, Sigma({}), f"__ar{i}", prot)
-            return copy_cell(c.a_body, Sigma({m.name: _wrap(m, offset.m.base(i))}), f"__ar{i}", prot)
+            return copy_cell(c.a_body, Sigma({m.name: _wrap(m, offset[0].base(i))}), f"__ar{i}", prot)
 
         def read_col(j):
-            return copy_cell([c.b_load], Sigma({n.name: _wrap(n, offset.n.base(j))}), f"__bc{j}", prot)
+            return copy_cell([c.b_load], Sigma({n.name: _wrap(n, offset[1].base(j))}), f"__bc{j}", prot)
 
         def contract(i, j):
             v = f"{c.acc}__v__c{i}_{j}"

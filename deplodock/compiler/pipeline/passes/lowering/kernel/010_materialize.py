@@ -9,7 +9,7 @@ reads the node kind + role + reduce plan off ``tile.op`` and picks the tier:
   built recognize-side (``_schedule._contraction_node``, seam #1); ``factorize`` synthesizes its bare
   grid-``Write`` (needs ``root.output``, so it can't ride the node) and expands it (mma → the
   ``RegFragment`` / ``LdmatrixLoad`` / ``MmaSyncPtx`` / ``RegStore`` fragment soup; scalar → the
-  per-thread register cell tile) through the shared four-level ``_tiling`` layer.
+  per-thread register cell tile) through the shared four-level tiling layer (in ``_factor``).
 - **Reduce tier** — a ``PLANAR`` / ``TWISTED`` reduce (or a non-output-tiled ``CONTRACTION``) whose
   ``ReducePlan`` carries a BLOCK ``coop`` and/or a REG ``reg`` stage: the reduce axis is partitioned
   ``coop`` ways across the CTA's threads (cooperation) and ``reg`` ways across per-thread register

@@ -84,3 +84,19 @@ def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmen
         else:  # Fold.ATOMIC / Fold.REG — cross-CTA / register tiers, not emitted by the intra-CTA walk.
             raise NotImplementedError(f"intra-CTA combine cannot emit {fold} (cta/reg tiers are future work)")
     return out
+
+
+def combine_tail(carrier, *, reg: int, coop: int, lane) -> list[Stmt]:
+    """The carrier-driven **partial merge** that follows a partitioned reduce loop — the one place the
+    two partial-fold geometries are assembled: the REG-tree fold of the ``reg`` ILP register copies
+    into copy 0 (``as_state_merge``), then — when threads cooperate (``lane`` is a lane :class:`Axis`,
+    not ``None``) — the cross-thread :func:`emit_combine`. Both reassign the carried state **in place**
+    (the survivor SSA names hold the full reduction), so the post-reduce projection reads them directly.
+
+    Carrier-generic: a monoid reduce and a contraction's degenerate additive carrier fold identically,
+    so a cooperative reduce and a (future) cooperative-K contraction share this tail. ``as_state_merge``
+    keys its finalize temps on the copy name, so each fold's internals are already unique."""
+    merge: list[Stmt] = [carrier.as_state_merge(tuple(f"{n}__r{r}" for n in carrier.state.names)) for r in range(1, reg)]
+    if lane is not None:
+        merge += emit_combine(carrier, t=lane.name, n_threads=coop)
+    return merge
