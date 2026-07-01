@@ -75,21 +75,28 @@ parallel thread-tile are the *same* level, differing only in `lanes`; `block_thr
 carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The store-glue helpers `with_store` /
 `has_write`, shared by the constructor and the thread-binding tiers, live in `_store.py`.)
 
-## Operand staging — materialization dropped, codec stamps
+## Operand staging — the warp-tier smem pipeline (`STAGE` codec → `Stage`)
 
-The warp tier's smem **operand-staging** pipeline (the `STAGE` codec's cp.async / TMA slab — formerly `_stage.py` +
-the warp factorizer's `_warp_staged_kloop` / `_warp_tma_staged_kloop`) has its **materialization dropped** so both
-contraction tiers load operands gmem-direct (both tiers are symmetric — neither carries a `stage`). The **`STAGE` codec
-stamps** (`020_schedule` stamps the codec + `schedule.Stage` field — the knob/featurizer path is intact), but nothing
-lowers them yet; a **symmetric** operand-staging mechanism for *both* tiers is the planned follow-up. The mma-staging
-structure tests are xfailed in `tests/xfail_registry.py` (the `_STAGE` reason) until it lands.
+The warp (mma) tier stages its reused gmem operands through an smem slab, driven off the node's `STAGE` codec →
+`schedule.Stage`. The transport primitives (the cooperative gmem→smem fill loops + the cp.async commit/wait and TMA
+mbarrier handshakes) live in **`_stage.py`**; the K-loop that schedules them onto the `Contraction` geometry lives in
+`_factor.py` (`_warp_staged_kloop` / `_warp_tma_staged_kloop`, plus the shared inner `ldmatrix` drain
+`_staged_inner_atom_loop`). `_mma_stage_plan` decodes the `Stage` once (TMA > cp.async > gmem-direct, with the
+eligibility rules `_can_stage_warp[_tma]`) and both `_mma_state` (which slots the operand fragments) and `_mma_reduce`
+(which emits the loop) read it. The `Stage` spells two buffering levels: `d<depth>` is the gmem→smem ring (cp.async /
+TMA prefetch over the K-slab loop), `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix` ping-pong over the
+inner atom-K steps). Staging is a **pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic /
+non-divisible K, or a computed-A flash operand) silently falls back to gmem-direct, and a staged kernel is
+**bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
+follow-up. The **scalar** contraction tier is gmem-direct (no operand slab).
 
-**Shared-row staging (`_factorize_reduce`) — distinct, still present.** The fused norm→linear prologue is a cooperative
-reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a free-axis
-`Loop` over an inner reduce). `_factorize_reduce` (in `_factor.py`) stages that one row into a single `__shared__` slab
-(cooperatively filled) and rewrites both readers to it. The trigger is narrow (`_has_contraction_tail`) so a plain
-softmax sum or a bare
-reduction is untouched. This is the *reduce* tier's shared-row reuse, not the (dropped) warp operand pipeline.
+**Shared-row staging (`_factorize_reduce`) — a distinct reduce-tier mechanism.** The fused norm→linear prologue is a
+cooperative reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a
+free-axis `Loop` over an inner reduce). `_factorize_reduce` (in `_factor.py`) stages that one row into a single
+`__shared__` slab (cooperatively filled, `sync` transport) and rewrites both readers to it. The trigger is narrow
+(`_has_contraction_tail`) so a plain softmax sum or a bare reduction is untouched. This is the *reduce* tier's shared-row
+reuse, NOT the warp operand pipeline above — folding the two into one `Stage`-driven mechanism (a `Stage` on the reduce's
+input) is the remaining Phase-2 purge item.
 
 ## Kernel-IR peepholes
 

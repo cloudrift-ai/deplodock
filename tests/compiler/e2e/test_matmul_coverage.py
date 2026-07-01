@@ -1268,7 +1268,8 @@ def test_masked_symbolic_m_structure(transport, monkeypatch):
         # Per-element row guards from the RegStore (both fragment row blocks).
         assert "+ _g < (seq_len)" in src and "+ _g + 8 < (seq_len)" in src, "fragment store must row-guard against seq_len"
     else:
-        stage = kop.knobs.get("STAGE", "")
+        # STAGE is stamped per-node (axis-keyed ``STAGE@<k_axis>``), not bare — find this node's.
+        stage = next((v for k, v in kop.knobs.items() if k.split("@")[0] == "STAGE"), "")
         assert stage.endswith("/tma"), f"symbolic-M with static innermost dim must stage via TMA: {stage!r}"
         assert "cp.async.bulk.tensor" in src, "A operand must stage via TMA"
         assert "CUtensorMap" in src, "kernel must take the TMA descriptor param"

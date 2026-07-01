@@ -35,13 +35,6 @@ from __future__ import annotations
 
 _R = "tile IR demolished — rebuild in progress"
 
-#: The warp tier's smem operand-staging **materialization is dropped**; the ``STAGE`` codec stamps
-#: (the codec + ``schedule.Stage`` still land — those tests pass — but nothing lowers them yet, keeping
-#: both tiers gmem-direct symmetric). A symmetric staging mechanism for both tiers will be
-#: (re)introduced; until then the tests that assert staged structure / bit-identity-vs-gmem fail.
-#: Delete these entries when the symmetric staging lands and the tests are restored.
-_STAGE = "mma operand staging materialization dropped, codec stamps"
-
 # nodeid-substring -> reason. Populated by the demolition; emptied as the rebuild restores each
 # capability (delete an entry when its test flips to XPASS).
 XFAIL: dict[str, str] = {
@@ -79,13 +72,11 @@ XFAIL: dict[str, str] = {
     # the register-tile (``TILE`` codec) capability they exercised is now covered, static AND
     # dynamic, by test_matmul_coverage.
     "tests/compiler/e2e/test_knob_pinning.py::test_sgemm_inner_reduce_is_unrolled": _R,
-    # --- mma operand staging dropped (see _STAGE) — these assert staged structure / bit-identity ---
-    "tests/compiler/e2e/test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit": _STAGE,
-    "tests/compiler/e2e/test_matmul_coverage.py::test_register_double_buffer_matches_single_buffer_bit_for_bit": _STAGE,
-    "tests/compiler/e2e/test_matmul_coverage.py::test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit": _STAGE,
-    "tests/compiler/e2e/test_matmul_coverage.py::test_bf16_operands_stage_via_cp_async": _STAGE,
-    "tests/compiler/e2e/test_matmul_coverage.py::test_pinned_transport_and_shape_fire": _STAGE,
-    "tests/compiler/e2e/test_matmul_coverage.py::test_masked_symbolic_m_structure": _STAGE,
+    # mma operand staging (cp.async / TMA / gmem→smem ring / smem→register double-buffer) landed —
+    # the six warp-tier STAGE structure / bit-identity tests are recovered. Scalar-tier staging is
+    # NOT restored: ``test_article_tma_sgemm_reproduction`` (fp32 SGEMM via the demolished
+    # ``StageBundle`` API) stays below, and ``test_bank_conflicts.py`` (already xfailed above) needs
+    # the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a separate follow-up).
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once TileOp
     # exists again; these still need un-rebuilt tile internals (Source / StageBundle / real
     # TileGraph lowering).

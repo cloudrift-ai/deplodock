@@ -14,9 +14,16 @@ fork), and the **tensor-core flash** (the `DEPLODOCK_CHAIN` fragment-resident FA
 causal, GQA, f16/bf16). All over **static AND symbolic** axes. **Phase 0 (purge the consolidation's residue) has landed** — the
 `Schedule` alias, the `_with_reduce` no-op, and the dead docstring framing are gone; the audit corrected one false
 premise (the `Map.out` / `reduce_loop` reads of the flat-contraction `Map` are load-bearing, not legacy — see Phase 0
-below). **Phase 1 has landed** (mma tensor-core flash + symbolic-K masked edges). **Remaining, in restore order — each
-phase followed by a purge of the code it obsoletes: (2) operand staging (smem + `ldmatrix`); (3) pipelining (cp.async
-ring / register double-buffer / TMA); (4) warp specialization (`WarpSpec`).** Branch `refactoring/tile-ir-rebuild`.
+below). **Phase 1 has landed** (mma tensor-core flash + symbolic-K masked edges). **Phase 2 + 3 (warp-tier operand staging)
+have landed together** — the `STAGE` codec → `Stage` now lowers on the mma tier: cp.async / TMA smem-slab fill +
+`ldmatrix` drain, the `d<depth>` gmem→smem ring, and the `p<reg_depth>` smem→register double-buffer, all pure
+bit-identical perf transforms over the gmem-direct baseline (the transport primitives in `_stage.py`; the staged K-loop
++ `_mma_stage_plan` in `_factor.py`). The six warp-tier `STAGE` structure / bit-identity e2e tests are recovered.
+**Remaining purge / follow-ups:** (a) subsume the `_shared_row_*` fused-prologue helpers into a `Stage`-driven reduce
+input (the last two-staging-mechanisms divergence); (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
+— the fp32 SGEMM via the demolished `StageBundle` API); (c) rebuild the `find_all_bindings` bank-conflict staging oracle
+(`test_bank_conflicts.py`); (d) the mma split-K auto-fork (drop the "pin-only" hedge); (4) warp specialization
+(`WarpSpec`). Branch `refactoring/tile-ir-rebuild`.
 
 ## The mandate — purity, not accretion
 
@@ -143,7 +150,7 @@ applies. One vocabulary, learned-feature generalization across kinds (the featur
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Reduction`, non-tiled `Contraction` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
 | `TILE` | scalar output tile (`TilePlan` — par + reg) | `Contraction` (scalar atom) | `n<N>[xm<M>]` par · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** |
 | `WARP` | mma fragment (`TilePlan` w/ tensor-core atom) | `Contraction` (mma atom) | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (gmem-direct; pin-only) |
-| `STAGE` | `Stage` (operand pipeline) | `Reduction`, `Contraction` | `d<depth>` ring · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` · empty = gmem-direct | **materialization dropped — Phase 2/3** |
+| `STAGE` | `Stage` (operand pipeline) | `Reduction`, `Contraction` | `d<depth>` ring · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` · empty = gmem-direct | **built** (warp tier; pin-only) |
 
 **Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser): **`,` is reserved** as the
 knob-list separator and MUST NOT appear inside a code value. Within a value: `/` separates fields, `x` pairs dims, `:`
@@ -318,14 +325,23 @@ scalar flash), `test_flash_chain_matches_torch[*]` (the `O[d]` register-vector s
   structural-fork search tests (`test_structural_push.py`, `test_two_level.py`, `test_resolve.py`,
   `test_diagnostics.py`). Sequence after the golden sweep re-validates (`tile_signature` parity).
 
-### Phase 2 — operand staging (smem + `ldmatrix`)
+### Phase 2 + 3 — operand staging (smem + `ldmatrix`) — ✅ LANDED (warp tier, together)
 
-**Build.** Restore **single-buffer** staging: a `sync`-transport smem slab filled cooperatively (a `__syncthreads` fill,
-no prefetch), operands read `ldmatrix`-from-smem. It splices into `reduce_codegen` as a stage step **symmetric across
-both atoms** (mma: `ldmatrix` from smem; scalar: from the slab), driven off the `Stage` on the node (`STAGE=d1/sync`).
-The stage is a wrapper on the K-loop's operand loads, **not** a second contraction tier. Flips
-`test_matmul_coverage.py::test_staged_matches_gmem_direct_bit_for_bit`, `::test_masked_symbolic_m_structure`,
-`test_bank_conflicts.py`.
+The plan sequenced Phase 2 (single-buffer `sync`) before Phase 3 (cp.async / TMA / ring / double-buffer), but every
+recovery test pins a `cp` / `tma` transport, so the two phases landed together on the mma tier. `_stage.py` holds the
+transport primitives (`cp_async_fill` / `cp_async_barrier` / `slab_smem` / `tma_*`); `_factor.py` holds
+`_mma_stage_plan` (the TMA > cp.async > gmem-direct decision + `_can_stage_warp[_tma]` eligibility), the staged K-loop
+(`_warp_staged_kloop` gmem→smem ring / `_warp_tma_staged_kloop`), and the shared inner drain
+(`_staged_inner_atom_loop`, `reg_depth` register double-buffer). Threaded `factorize → _factorize_contraction →
+reduce_codegen → _mma_state`/`_mma_reduce` off `TileOp.stage`. **Flipped:** `test_staged_matches_gmem_direct_bit_for_bit`,
+`test_register_double_buffer_matches_single_buffer_bit_for_bit`, `test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit`,
+`test_bf16_operands_stage_via_cp_async`, `test_pinned_transport_and_shape_fire`, `test_masked_symbolic_m_structure`.
+
+**Original Phase-2 plan (for reference).** Restore **single-buffer** staging: a `sync`-transport smem slab filled
+cooperatively (a `__syncthreads` fill, no prefetch), operands read `ldmatrix`-from-smem. It splices into `reduce_codegen`
+as a stage step **symmetric across both atoms** (mma: `ldmatrix` from smem; scalar: from the slab), driven off the
+`Stage` on the node (`STAGE=d1/sync`). The stage is a wrapper on the K-loop's operand loads, **not** a second contraction
+tier.
 
 **Purge — the big "no divergent path" win.**
 
@@ -339,10 +355,13 @@ The stage is a wrapper on the K-loop's operand loads, **not** a second contracti
   knob table, `_factor.py`, `kernel/ARCHITECTURE.md`, and `xfail_registry._STAGE` (delete `_STAGE` itself as its tests
   XPASS).
 
-### Phase 3 — pipelining (cp.async ring / register double-buffer / TMA)
+### Phase 3 — pipelining (cp.async ring / register double-buffer / TMA) — ✅ LANDED (with Phase 2)
 
-**Build.** Layer the depth/async variants on Phase 2's single-buffer stage, **all as fields on the same `Stage`** — no
-new path:
+Landed together with Phase 2 (see above) — the ring / double-buffer / TMA are all fields on the one `Stage`, decoded by
+`_mma_stage_plan`. The remaining transport-renderer dead-code sweep (below) still applies.
+
+**Build (reference).** Layer the depth/async variants on Phase 2's single-buffer stage, **all as fields on the same
+`Stage`** — no new path:
 
 - **cp.async ring** (`STAGE.depth>1`, `sm_80`) — prefetch the next K-chunk's fill over the current mma, a `depth`-slot
   ring.
