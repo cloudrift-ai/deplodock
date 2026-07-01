@@ -38,14 +38,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from deplodock.compiler.dtype import F32
-from deplodock.compiler.ir.axis import Axis, AxisRole
+from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
 from deplodock.compiler.ir.schedule import Stage
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop
-from deplodock.compiler.ir.tile.ir import Contraction, Side
-from deplodock.compiler.ir.tile.ops import axis_role, lower, reduce_plan
+from deplodock.compiler.ir.tile.ir import Contraction, Map, Side
+from deplodock.compiler.ir.tile.ops import lower, reduce_plan
 from deplodock.compiler.pipeline.passes.lowering.kernel._atom import reduce_codegen, store_sink
 from deplodock.compiler.pipeline.passes.lowering.kernel._combine import combine_tail
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
@@ -337,26 +337,24 @@ def _factorize_reduce(tile, root) -> Tile:
     ways across register accumulators, as the section header describes."""
     op = tile.op
     grid = tile.place.grid
-    # Eligible to partition only when the reduce axis has a cooperating plan: a PLANAR / TWISTED reduce,
-    # or a non-output-tiled CONTRACTION — read structurally, not by kernel kind.
-    role = axis_role(op) if op is not None else AxisRole.FREE
-    tier = tile.tier
-    coop_eligible = role in (AxisRole.PLANAR, AxisRole.TWISTED) or (role is AxisRole.CONTRACTION and (tier is None or not tier.is_tiled))
-    plan = reduce_plan(tile) if coop_eligible else None
+    # The reduce partition rides the :class:`Reduction` node (``reduce_plan``); ``None`` for a pure
+    # pointwise / scalar per-cell ``Map`` (no partition). Every partitioned reduce — monoid, flash,
+    # coop-K / split contraction — is a ``Reduction`` node after ``ops.nodify_reduce``.
+    plan = reduce_plan(tile) if op is not None else None
     if plan is None or (plan.coop <= 1 and plan.reg <= 1):
         # One thread per output cell — the degenerate fold, no cross-thread / ILP partition.
         stmts = with_store(lower(op), root.output.name, grid, op)
         return Tile(axes=tuple(grid), body=Body(tuple(stmts)))
     coop, reg = plan.coop, plan.reg
-    stmts = lower(op)
 
-    # The cooperative / cross-thread combine reads its :class:`Carrier` off the annotated reduce
-    # loop (``loop.carrier``, stamped by ``lower``), NOT an op-tree node — a contraction's K loop
-    # and a monoid's reduce loop both carry their carrier here. (A contraction is a monoid with a
-    # ⊗ lift, so the same carrier-generic machinery — ``state`` / ``as_state_merge`` /
-    # ``combine_states`` — folds it; the ⊗ lift already sits in the loop body.)
-    ridx = next(i for i, s in enumerate(stmts) if isinstance(s, Loop) and s.carrier is not None)
-    rloop = stmts[ridx]
+    # Read the reduce straight off the :class:`Reduction` **node** (bare, or wrapped under a
+    # projecting ``Map``) — no ``lower(op)``-then-refind. The node's synthesized ``loop`` carries the
+    # :class:`Carrier` (a contraction's K loop and a monoid's reduce loop both carry it here — the ⊗
+    # lift already sits in the loop body, so the carrier-generic ``state`` / ``as_state_merge`` /
+    # ``combine_states`` machinery folds either). A ``Reduction`` has no prologue ahead of its loop
+    # (``pre`` empty); a wrapping ``Map``'s body IS the post-reduce projection tail.
+    red = op.source if isinstance(op, Map) else op
+    rloop = red.loop
     carrier = rloop.carrier
     axis = rloop.axis
     stride = coop * reg
@@ -371,8 +369,8 @@ def _factorize_reduce(tile, root) -> Tile:
     # cooperative reduce AND re-read per output column of a contraction tail, stage it into smem
     # once (cooperatively) and rewrite both readers to the slab — one ``__shared__`` row shared
     # by the prologue + the matmul body. Only the cooperative tier (coop > 1) stages.
-    pre = list(stmts[:ridx])
-    tail_src = list(stmts[ridx + 1 :])
+    pre: list[Stmt] = []
+    tail_src = list(op.body) if isinstance(op, Map) else []
     fill_stmts: list[Stmt] = []
     if lane is not None:
         grid_vars = tuple(Var(a.name) for a in grid)
