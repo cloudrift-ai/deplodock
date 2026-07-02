@@ -39,8 +39,14 @@ COMPUTE-FILLS the A slab (`_stage.SyncTransport` / `_atom._sync_operands`), the 
 drain unchanged — `test_fused_edge.py` warp cells green for pure-MAP cones (broadcast recognition + the reduce-bearing
 MONOID cone remain, see the registry); (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
 — the fp32 SGEMM via the demolished `StageBundle` API); (c) rebuild the `find_all_bindings` bank-conflict staging oracle
-(`test_bank_conflicts.py`); (d) the mma split-K auto-fork (drop the "pin-only" hedge); (4) warp specialization
-(`WarpSpec`). Branch `refactoring/tile-ir-rebuild`.
+(`test_bank_conflicts.py`); (d) ✅ the mma split-K auto-fork LANDED with the knob-search restoration (branch
+`refactoring/knob-search-restore`): the schedule fork enumerates divisor- and occupancy-guarded `g<w>` rows (warp:
+deferred-only) alongside the warp TILE / STAGE move grids — one lazy tile → stage → reduce fork tree per contraction;
+(4) warp specialization (`WarpSpec`). Knob-search follow-ups recorded from that branch: the flash-form fork
+(warp/chain/coop/serial as prior-ranked siblings — blocked on the AnalyticPrior cold-start refit, whose offline fitter
+(`scripts/golden_knob_heuristics.py`) still imports the demolished `enumeration/_iterdag` for non-matmul kernels), and
+the scalar-tier cp/tma ring (item (b) above) which the recorded scalar goldens' `d2+/tma/ring` configs need to be
+reachable at all. Branch `refactoring/tile-ir-rebuild`.
 
 ## The mandate — purity, not accretion
 
@@ -314,8 +320,8 @@ applies. One vocabulary, learned-feature generalization across kinds (the featur
 |---|---|---|---|---|
 | `REDUCE` | `ReducePlan` (reduce-axis partition) | `Reduction`, non-tiled `Contraction` | `g<n>[a\|k]` / `b<n>` / `r<n>` · empty = serial | **built** |
 | `TILE` | scalar output tile (`TilePlan` — par + reg) | `Contraction` (scalar atom) | `n<N>[xm<M>]` par · `f<fn>[xf<fm>]` reg · empty = per-cell | **built** |
-| `WARP` | mma fragment (`TilePlan` w/ tensor-core atom) | `Contraction` (mma atom) | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built** (gmem-direct; pin-only) |
-| `STAGE` | `Stage` (operand pipeline) | `Reduction`, `Contraction` | `d<depth>` ring · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` · empty = gmem-direct | **built** (warp tier; pin-only) |
+| `WARP` | mma fragment (`TilePlan` w/ tensor-core atom) | `Contraction` (mma atom) | `a:<atom>` · `w<WM>xw<WN>` · `f<FM>xf<FN>` · `k<bk>` | **built + enumerated** |
+| `STAGE` | `Stage` (operand pipeline) | `Reduction`, `Contraction` | `d<depth>` ring · `sync\|cp\|tma` · `[ring]` · `[p<reg_depth>]` · empty = gmem-direct | **built + enumerated** (resolver-gated) |
 
 **Delimiter hierarchy** (so codes survive the `DEPLODOCK_KNOBS` / `run --ab` parser): **`,` is reserved** as the
 knob-list separator and MUST NOT appear inside a code value. Within a value: `/` separates fields, `x` pairs dims, `:`
