@@ -225,6 +225,64 @@ class Operand:
 
 
 @dataclass(frozen=True)
+class SyncOperand:
+    """One ``sync``-transport slab operand — filled by plain per-thread COMPUTE / COPY, not an
+    async copy. ``value(k0, row, col)`` returns the stmts producing the cell's value at slab
+    coords ``(row, col)`` of the K-chunk at ``k0`` + the SSA name holding it: a gmem ``Load`` for
+    a copy fill, the fused producer CONE for a compute fill (the fused-edge A operand — the
+    computed tile materializes straight into the slab the ``ldmatrix`` drain reads)."""
+
+    tag: str  # "a" / "b" — the smem-slab suffix
+    shape: tuple[int, int]  # (rows, cols) of the (single-buffer) slab
+    value: Callable[[Expr, Expr, Expr], tuple[list[Stmt], str]]  # (k0, row, col) -> (stmts, name)
+
+    @property
+    def slab(self) -> str:
+        return f"_{self.tag}_smem"
+
+    def slot_row(self, slot: Expr) -> Expr | None:  # noqa: ARG002 — single-buffer: no ring slot
+        return None
+
+
+@dataclass(frozen=True)
+class SyncTransport:
+    """The ``sync`` producer — plain compute/copy fills (each CTA thread produces slab cells,
+    striped by the linear tid) closed by ONE CTA barrier; no async handshake, single-buffer
+    (``depth == 1``). This is the mma tier's ``sync`` transport: the fused-edge compute-fill (a
+    producer cone materializing the A tile) and the plain smem copy are the same fill with a
+    different ``value`` producer, behind the same ``fill``/``commit``/``wait`` seam as cp.async /
+    TMA."""
+
+    operands: tuple[SyncOperand, ...]
+    slab_dtype: str
+    cta: CtaTile
+
+    def slab_decls(self, ring: int) -> list[Stmt]:  # noqa: ARG002 — always single-buffer
+        return [slab_smem(op.slab, op.shape[0], op.shape[1], self.slab_dtype) for op in self.operands]
+
+    def prologue(self, ring: int) -> list[Stmt]:  # noqa: ARG002
+        return []
+
+    def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:  # noqa: ARG002 — no ring slot
+        out: list[Stmt] = []
+        for op in self.operands:
+            rows, cols = op.shape
+            fe = Axis(name=f"_f{op.tag}", extent=rows * cols)
+            row = BinaryExpr("/", Var(fe.name), _lit(cols))
+            col = BinaryExpr("%", Var(fe.name), _lit(cols))
+            stmts, val = op.value(k0, row, col)
+            body = (*stmts, Write(output=op.slab, index=(row, col), value=val))
+            out.append(StridedLoop(axis=fe, start=self.cta.linear_tid, step=_lit(self.cta.n_threads), body=Body(body), unroll=False))
+        return out
+
+    def commit(self) -> list[Stmt]:
+        return []
+
+    def wait(self, *, in_flight: int, slot: Expr, phase: Expr) -> list[Stmt]:  # noqa: ARG002
+        return [Sync()]
+
+
+@dataclass(frozen=True)
 class CpAsyncTransport:
     """The cp.async producer: cooperative gmem→smem fills committed into groups, drained by
     ``CpAsyncWait(group=in_flight)``. ``operands`` is the ``(A, B)`` :class:`Operand` pair; each

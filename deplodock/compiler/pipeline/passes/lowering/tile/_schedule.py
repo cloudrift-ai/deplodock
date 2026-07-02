@@ -44,7 +44,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt
+from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt
 from deplodock.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
@@ -657,8 +657,115 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
         warp = _twisted_warp_option(tile, name, knobs)
         if warp is not None:
             return warp
+        # A PLANAR ⊗-fold over a computed MAP cone — the fused producer → matmul edge — honors a
+        # warp ``TILE`` pin (pin-driven, like the matmul warp tier): the demoted contraction
+        # nodifies with its computed A and the sync compute-fill stage.
+        demoted = _demoted_warp_option(tile, place, name, knobs)
+        if demoted is not None:
+            return demoted
     specs = _reduce_specs(tile, place)
     return [_option(tile, place, spec, name, knobs) for spec in specs]
+
+
+def _map_cone(body: list, root: str) -> list | None:
+    """The backward cone of SSA ``root`` within ``body`` — the fused producer's compute, in body
+    order. ``None`` unless every cone stmt is a scalar ``Load`` or a pointwise ``Assign`` (a pure
+    MAP cone — a reduce-bearing cone, e.g. an rmsnorm scale, is not compute-fillable per cell)."""
+    defs: dict[str, Stmt] = {}
+    for st in body:
+        for d in st.defines():
+            defs[d] = st
+    need, cone, seen = [root], [], set()
+    while need:
+        nm = need.pop()
+        st = defs.get(nm)
+        if st is None or id(st) in seen:
+            continue
+        seen.add(id(st))
+        if isinstance(st, Load):
+            cone.append(st)
+            continue
+        if isinstance(st, Assign):
+            cone.append(st)
+            need.extend(st.args)
+            continue
+        return None  # an Accum / Loop / Select in the cone — not a pure MAP producer
+    order = {id(st): i for i, st in enumerate(body)}
+    return sorted(cone, key=lambda st: order[id(st)])
+
+
+def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp | None:
+    """The warp (mma) candidate for a **demoted-cone contraction** — a ``PLANAR`` ⊗-fold whose
+    lift multiplies a gmem ``Load`` B with a computed pure-MAP cone A (the fused producer → matmul
+    edge: ``f(x, …) @ w``), or ``None`` (stay scalar). PIN-DRIVEN like the matmul warp tier: fires
+    only under a warp ``TILE`` pin. Nodifies the fold to a computed-A :class:`Contraction` (the
+    same ``a_operand = Body`` the flash P@V rides) and stamps the ``sync`` compute-fill
+    :class:`Stage` — the producer cone materializes the A tile straight into the smem slab the
+    ``ldmatrix`` drain reads (the fused edge IS the mma tier's ``sync`` transport). First cut:
+    exact-cover geometry only (static M/N/K divisible by the tile / K-chunk — no masked overhang),
+    and the cone may read the ``(m, k)`` axes only."""
+    spec = TILE.narrow([""])[0]
+    if not is_warp_codec(spec):
+        return None
+    op = tile.op
+    red = op.source if isinstance(op, Map) and isinstance(op.source, Reduction) else (op if isinstance(op, Reduction) else None)
+    if red is None or red.role is not AxisRole.PLANAR or red.source is not None or red.carrier.twist.family != "id":
+        return None
+    body = list(red.partial)
+    accums = [st for st in body if isinstance(st, Accum)]
+    if len(accums) != 1 or accums[0].op.name != "add":
+        return None
+    acc = accums[0]
+    defs = {st.name: st for st in body if isinstance(st, Assign)}
+    lift = defs.get(acc.value)
+    if lift is None or lift.op.name != "multiply" or len(lift.args) != 2:
+        return None
+    grid = list(place.grid)
+    if len(grid) < 2:
+        return None
+    m_ax, n_ax, k_ax = grid[-2], grid[-1], red.axis
+    loads = {st.names[0]: st for st in body if isinstance(st, Load)}
+
+    def _load_vars(nm: str) -> set | None:
+        ld = loads.get(nm)
+        return {v for e in ld.index for v in e.free_vars()} if ld is not None else None
+
+    b_name = next((a for a in lift.args if (vs := _load_vars(a)) and n_ax.name in vs and k_ax.name in vs), None)
+    if b_name is None:
+        return None
+    a_name = next(a for a in lift.args if a != b_name)
+    cone = _map_cone(body, a_name)
+    if cone is None or not cone:
+        return None
+    for st in cone:
+        if isinstance(st, Load) and n_ax.name in {v for e in st.index for v in e.free_vars()}:
+            return None  # the cone must be (m, k)-indexed — an n-dependent producer isn't the A tile
+    wt = TilePlan.parse(spec)
+    atom = wt.atom
+    atom_m, atom_n, atom_k = atom.shape
+    q_tensor = tile.inputs.get(next(st.input for st in cone if isinstance(st, Load))) if tile.inputs else None
+    if getattr(getattr(q_tensor, "dtype", None), "name", None) != atom.ab_dtype:
+        return None
+    exts = (m_ax.extent, n_ax.extent, k_ax.extent)
+    if not all(e.is_static for e in exts):
+        return None
+    M, N, K = (e.as_static() for e in exts)
+    bk_elems = wt.bk * atom_k
+    if K % bk_elems or M % (wt.units_m * wt.reg_m * atom_m) or N % (wt.units_n * wt.reg_n * atom_n):
+        return None
+    epilogue = Body(tuple(op.body)) if isinstance(op, Map) else Body(())
+    node = Contraction(
+        axes=(m_ax, n_ax),
+        k_axis=k_ax,
+        a_operand=Body(tuple(cone)),
+        b_load=loads[b_name],
+        acc=acc.name,
+        tile=wt,
+        lead_axes=tuple(grid[:-2]),
+        epilogue=epilogue,
+    )
+    stage = Stage(transport="sync", smem=(node.a_name,), bk_elems=bk_elems)
+    return TileOp(op=node, name=name, place=place, tier=wt, stage=stage, knobs={**knobs, _at(TILE, k_ax.name): spec})
 
 
 def _twisted_warp_option(tile: TileOp, name: str, knobs: dict) -> TileOp | None:

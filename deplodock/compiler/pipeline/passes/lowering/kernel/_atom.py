@@ -43,6 +43,8 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     CpAsyncTransport,
     CtaTile,
     Operand,
+    SyncOperand,
+    SyncTransport,
     TmaTransport,
     staged_kloop,
 )
@@ -296,6 +298,30 @@ def _cta(mn: tuple[Side, Side], lanes: int, n_threads: int) -> CtaTile:
     return CtaTile(linear_tid=tid, n_threads=n_threads)
 
 
+def _sync_operands(c: Contraction, bk_elems: int, mn: tuple[Side, Side]) -> tuple[SyncOperand, SyncOperand]:
+    """The ``sync``-transport (fused-edge) operand pair: A **compute-filled** from the node's
+    producer cone (``a_operand`` is a ``Body`` — each thread evaluates the cone at the slab cell's
+    absolute ``(m, k)`` coords and writes the result), B copy-filled from its gmem ``Load``. The
+    schedule's eligibility guarantees exact-cover geometry (no masked overhang), so the σ needs no
+    clamps."""
+    m_name, n_name, k_name = c.m_axis.name, c.n_axis.name, c.k_axis.name
+    row_base, col_base = _tile_base(mn)
+
+    def a_value(k0, row, col):
+        sigma = Sigma({m_name: BinaryExpr("+", row_base, row), k_name: BinaryExpr("+", k0, col)})
+        return [s.rewrite(lambda nm: nm, sigma) for s in c.a_body], c.a_name
+
+    def b_value(k0, row, col):
+        sigma = Sigma({k_name: BinaryExpr("+", k0, row), n_name: BinaryExpr("+", col_base, col)})
+        name = f"{c.b_load.names[0]}__f"
+        return [Load(name=name, input=c.b_load.input, index=tuple(sigma.apply(e) for e in c.b_load.index))], name
+
+    return (
+        SyncOperand(tag="a", shape=(mn[0].tile, bk_elems), value=a_value),
+        SyncOperand(tag="b", shape=(bk_elems, mn[1].tile), value=b_value),
+    )
+
+
 def _staged(ops: _AtomOps, cells, offset, mn: tuple[Side, Side]):
     """The **one** STAGED K-loop driver, atom-agnostic — build the ``(A, B)`` operand pair, the
     :class:`Transport` (a cp.async prefetch ring or the TMA box-copy producer) and run the one
@@ -311,22 +337,29 @@ def _staged(ops: _AtomOps, cells, offset, mn: tuple[Side, Side]):
     c, stage = ops.c, ops.stage
     k_axis = c.k_axis
     K = k_axis.extent.as_static()  # static K (the resolution eligibility rule)
-    operands = _slab_operands(
-        index_srcs=(c.a_operand.index, c.b_load.index),
-        bufs=(c.a_operand.input, c.b_load.input),
-        mn=mn,
-        k_axis=k_axis,
-        bk_elems=stage.bk_elems,
-        base=_tile_base(mn),
-    )
     elem = ops.slab_elem()
-    common = dict(
-        operands=operands,
-        slab_dtype=cuda_name(elem),
-        elem_bytes=elem.nbytes,
-        cta=_cta(mn, c.atom.lanes, c.block_threads),
-    )
-    transport = TmaTransport(**common) if stage.transport == "tma" else CpAsyncTransport(**common)
+    cta = _cta(mn, c.atom.lanes, c.block_threads)
+    if stage.transport == "sync":
+        # The fused-edge compute-fill: the A tile is COMPUTED into its slab (the producer cone),
+        # B plain-copied — the mma tier's ``sync`` transport; single-buffer, one CTA barrier.
+        operands = _sync_operands(c, stage.bk_elems, mn)
+        transport = SyncTransport(operands=operands, slab_dtype=cuda_name(elem), cta=cta)
+    else:
+        operands = _slab_operands(
+            index_srcs=(c.a_operand.index, c.b_load.index),
+            bufs=(c.a_operand.input, c.b_load.input),
+            mn=mn,
+            k_axis=k_axis,
+            bk_elems=stage.bk_elems,
+            base=_tile_base(mn),
+        )
+        common = dict(
+            operands=operands,
+            slab_dtype=cuda_name(elem),
+            elem_bytes=elem.nbytes,
+            cta=cta,
+        )
+        transport = TmaTransport(**common) if stage.transport == "tma" else CpAsyncTransport(**common)
 
     def drain(slot):  # the atom's slab-reading leaf, over ring `slot`
         return ops.staged_drain(operands, slot, cells, offset, mn)

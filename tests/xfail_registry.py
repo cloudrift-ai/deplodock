@@ -41,13 +41,14 @@ XFAIL: dict[str, str] = {
     # --- whole files: every collected test currently fails ---
     "test_bank_conflicts.py": _R,
     "test_attention_coverage.py::test_cooperative_flash_matches_torch": _R,
-    # test_fused_edge.py was rewritten black-box off the demolished enumeration/assembly API;
-    # its scalar cells are green (the fused MAP/MONOID producer → matmul, one kernel + accuracy).
-    # The WARP cells remain: a computed-A (demoted-cone) matmul is per-cell scalar today —
-    # recognition leaves the cone a flat reduce, so a TILE warp pin cannot engage. Restoring it
-    # means binding the cone as ``Contraction.a_operand = Body`` + a sync compute-fill transport
-    # staging the computed tile for the ldmatrix drain (the mma tier's missing ``sync`` transport).
-    "test_fused_edge.py::test_fused_map_matmul[warp": _R,
+    # test_fused_edge.py was rewritten black-box off the demolished enumeration/assembly API. The
+    # scalar cells AND the pure-MAP warp cells (relu / sigmoid / multiply) are green — the demoted
+    # cone nodifies to a computed-A Contraction under a warp TILE pin and the producer compute-fills
+    # the A slab (the mma tier's sync transport). Two residuals: the BROADCAST producer recognizes
+    # as a flat un-annotated Map (no Reduction node for the option to nodify — a recognition gap),
+    # and the MONOID (rmsnorm) producer's cone carries a reduce (not compute-fillable per cell —
+    # needs the cooperative-prologue warp fusion).
+    "test_fused_edge.py::test_fused_map_matmul[warp-broadcast": _R,
     "test_fused_edge.py::test_fused_rmsnorm_linear[warp": _R,
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
     # legacy-API (DEPLODOCK_MMA / WM / WN / BK pin) per-capability tests are superseded by the

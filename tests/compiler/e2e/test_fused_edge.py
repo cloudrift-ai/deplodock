@@ -6,11 +6,11 @@ producer × tier matrix (``f(x, …) @ w`` — the demoted-cone shapes a real mo
 linear); the MONOID producer (RMSNorm → Linear) is the one special case (its staged-shared-row
 structural pin lives with ``test_fused_prologue_compiles_in_budget``).
 
-The **warp tier for a computed-A (demoted-cone) matmul is not rebuilt** — recognition leaves the
-demoted cone a flat reduce (no ``CONTRACTION`` annotation), so a ``TILE`` warp pin cannot engage;
-restoring it means binding the cone as ``Contraction.a_operand = Body`` + a sync compute-fill
-transport staging the computed tile for the ``ldmatrix`` drain. Those cells are xfailed via the
-registry and flip XPASS when the capability lands.
+The **warp tier** engages under a warp ``TILE`` pin: the demoted cone nodifies to a computed-A
+``Contraction`` (``_schedule._demoted_warp_option``) and the producer COMPUTE-FILLS the A slab the
+``ldmatrix`` drain reads (the mma tier's ``sync`` transport). Two cells stay xfailed via the
+registry: the broadcast producer recognizes as a flat un-annotated ``Map`` (a recognition gap), and
+the MONOID (rmsnorm) cone carries a reduce — not compute-fillable per cell.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from tests.compiler.conftest import requires_cuda
 F16 = _dt.get("f16")
 _M, _K, _N = 32, 64, 32  # M != K so the row / col broadcasts are unambiguous
 
-_WARP_TILE = "a:mma_m16n8k16_f16/w2x2/f2x2/k2"
+_WARP_TILE = "a:mma_m16n8k16_f16/w1x1/f2x2/k2"  # tile 32x16, bk 32 — exact cover of the 32x64x32 shape
 
 
 def _sigmoid(x):
@@ -85,8 +85,8 @@ def test_fused_map_matmul(tier, producer, monkeypatch):
     """``f(x, …) @ w`` computes in **one** kernel matching numpy — the MAP producer fused into the
     matmul, no gmem round-trip for the ``xn`` intermediate. Covers unary (relu / sigmoid),
     multi-input (multiply), and broadcast-operand (``x·rs[m]·cs[k]``) producers on the scalar tier;
-    the ``warp`` cells additionally demand the ``mma.sync`` tier (xfailed until the computed-A warp
-    contraction is rebuilt — the pin cannot engage on the flat demoted cone today)."""
+    the ``warp`` cells additionally demand the ``mma.sync`` tier (the compute-filled A slab;
+    the broadcast cell is xfailed — its producer recognizes as a flat un-annotated ``Map``)."""
     if tier == "warp":
         monkeypatch.setenv("DEPLODOCK_TILE", _WARP_TILE)
     g, extra = _producer_graph(producer)

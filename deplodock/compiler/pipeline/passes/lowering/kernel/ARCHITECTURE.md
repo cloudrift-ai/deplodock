@@ -134,6 +134,14 @@ flash operand) silently falls back to gmem-direct, and a staged kernel is
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
 follow-up.
 
+**The fused edge — the mma tier's `sync` transport.** A demoted-cone matmul (`f(x, …) @ w`) takes the warp tier
+under a warp `TILE` pin: `_schedule._demoted_warp_option` nodifies the PLANAR ⊗-fold to a computed-A `Contraction`
+(the same `a_operand = Body` flash P@V rides) and stamps a `sync` `Stage`; `_staged` then builds a `SyncTransport`
+whose A fill is the producer CONE evaluated per slab cell (compute-fill) and whose B fill is a plain copy — the same
+`fill`/`commit`/`wait` seam, single-buffer, one CTA barrier, feeding the unchanged `ldmatrix` drain. Pin-driven,
+exact-cover geometry (static M/N/K divisible; masks are a follow-on); a reduce-bearing cone (rmsnorm) is not
+compute-fillable per cell and stays scalar.
+
 The **scalar** contraction tier stages too, under the same `STAGE` pin, through the **same** `_staged` driver — the
 scheduler's `_resolve_scalar_stage` sizes the slab (single-buffer; the derived fit-to-smem K-chunk `bk_elems`, not a
 codec field) and its `staged_drain` is the plain-`Load` inner loop (`_scalar_drain`). The nested outer-slab / inner-drain

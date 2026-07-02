@@ -33,7 +33,11 @@ through the shared `_stage.py` module (`sync_row_fill`), and the reduce-tier sta
 and stamps a `sync` `Stage` whose `smem` names the row buffer — a derived schedule field, never a knob, so the prior
 featurization is untouched); `_bind_reduce` only applies it off `ctx.stage`, the same `Stage` → apply shape the
 contraction tiers follow. Bit-identical; the materialize-time detection helpers are deleted from `_factor.py`;
-(b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
+(a2) ✅ the mma tier's missing `sync` transport landed as the FUSED EDGE: a demoted-cone matmul under a warp
+`TILE` pin nodifies to a computed-A `Contraction` (`_schedule._demoted_warp_option`) and its producer cone
+COMPUTE-FILLS the A slab (`_stage.SyncTransport` / `_atom._sync_operands`), the B slab plain-copied, the `ldmatrix`
+drain unchanged — `test_fused_edge.py` warp cells green for pure-MAP cones (broadcast recognition + the reduce-bearing
+MONOID cone remain, see the registry); (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
 — the fp32 SGEMM via the demolished `StageBundle` API); (c) rebuild the `find_all_bindings` bank-conflict staging oracle
 (`test_bank_conflicts.py`); (d) the mma split-K auto-fork (drop the "pin-only" hedge); (4) warp specialization
 (`WarpSpec`). Branch `refactoring/tile-ir-rebuild`.
