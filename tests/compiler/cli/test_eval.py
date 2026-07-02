@@ -448,16 +448,16 @@ def test_knob_columns_names_in_header_values_in_cells():
 
     cols, cells = knob_columns(
         [
-            {"BN": ("16", False), "BK": ("32", False)},
-            {"BN": ("32", False), "MMA": ("x", False)},
+            {"TILE": ("n16", False), "REDUCE": ("b32", False)},
+            {"TILE": ("n32", False), "STAGE": ("d2/cp", False)},
         ]
     )
-    assert [c.name for c in cols] == ["BN", "BK", "MMA"]  # canonical order BN, BK, MMA
+    assert [c.name for c in cols] == ["TILE", "REDUCE", "STAGE"]  # canonical KNOB_ORDER
     lines = render_table(cols, cells)
-    assert lines[0].split() == ["BN", "BK", "MMA"]  # header row carries the names
-    assert lines[1].split() == ["16", "32"]  # values only, no "BN=" prefix; trailing MMA blank stripped
-    assert "BN=" not in lines[1]
-    assert lines[2].split() == ["32", "x"]  # BK column blank between BN and MMA
+    assert lines[0].split() == ["TILE", "REDUCE", "STAGE"]  # header row carries the names
+    assert lines[1].split() == ["n16", "b32"]  # values only, no "TILE=" prefix; trailing STAGE blank stripped
+    assert "TILE=" not in lines[1]
+    assert lines[2].split() == ["n32", "d2/cp"]  # REDUCE column blank between TILE and STAGE
 
 
 def test_render_table_ansi_aware_width():

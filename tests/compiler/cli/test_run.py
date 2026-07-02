@@ -57,14 +57,14 @@ def test_pinned_knobs_sets_and_restores_env(monkeypatch):
 
     from emmy.commands.run import _pinned_knobs
 
-    monkeypatch.delenv("EMMY_BM", raising=False)
-    monkeypatch.setenv("EMMY_BN", "preexisting")
-    with _pinned_knobs({"BM": 8, "BN": 32, "WARP_SPECIALIZE": False}):
-        assert os.environ["EMMY_BM"] == "8"
-        assert os.environ["EMMY_BN"] == "32"
+    monkeypatch.delenv("EMMY_TILE", raising=False)
+    monkeypatch.setenv("EMMY_STAGE", "preexisting")
+    with _pinned_knobs({"TILE": "n32x8/f2x4", "STAGE": "d2/cp", "WARP_SPECIALIZE": False}):
+        assert os.environ["EMMY_TILE"] == "n32x8/f2x4"
+        assert os.environ["EMMY_STAGE"] == "d2/cp"
         assert os.environ["EMMY_WARP_SPECIALIZE"] == "False"
-    assert "EMMY_BM" not in os.environ  # was unset → removed
-    assert os.environ["EMMY_BN"] == "preexisting"  # restored
+    assert "EMMY_TILE" not in os.environ  # was unset → removed
+    assert os.environ["EMMY_STAGE"] == "preexisting"  # restored
     assert "EMMY_WARP_SPECIALIZE" not in os.environ
 
 
@@ -214,14 +214,14 @@ def test_ab_samples_parse_label_and_shape():
     cue to nest by kernel ``S_*`` signature instead of a golden matmul shape)."""
     from emmy.commands.run import _ab_samples
 
-    (s,) = _ab_samples(["bm=8, BN=16"])
-    assert s.knobs == {"BM": "8", "BN": "16"}  # names uppercased, whitespace tolerated
-    assert s.name == "ab bm=8, BN=16"
+    (s,) = _ab_samples(["tile=n16x8, STAGE=d2/cp"])
+    assert s.knobs == {"TILE": "n16x8", "STAGE": "d2/cp"}  # names uppercased, whitespace tolerated
+    assert s.name == "ab tile=n16x8, STAGE=d2/cp"
     assert s.shape is None
     assert s.dynamic is None
     # A --dynamic run stamps its specs on the pseudo-sample so the A/B re-trace
     # builds the same symbolic graph as the greedy run.
-    (d,) = _ab_samples(["BM=8"], dynamic=["seq_len@x0:0"])
+    (d,) = _ab_samples(["TILE=n16x8"], dynamic=["seq_len@x0:0"])
     assert d.dynamic == ("seq_len@x0:0",)
 
 
@@ -247,8 +247,8 @@ def test_bench_golden_variants_retraces_with_dynamic_spec(monkeypatch):
         return SimpleNamespace()
 
     backend = SimpleNamespace(compile=lambda g: g, benchmark_async=fake_benchmark_async)
-    dyn = SimpleNamespace(name="g.dynM", knobs={"BM": 8}, shape=None, dynamic=("seq_len@x0:0",))
-    static = SimpleNamespace(name="g", knobs={"BM": 8}, shape=None, dynamic=None)
+    dyn = SimpleNamespace(name="g.dynM", knobs={"TILE": "n16x8/f2x2"}, shape=None, dynamic=("seq_len@x0:0",))
+    static = SimpleNamespace(name="g", knobs={"TILE": "n16x8/f2x2"}, shape=None, dynamic=None)
     benches = asyncio.run(
         _bench_golden_variants(backend, "torch.matmul(torch.randn(8,8), torch.randn(8,8))", [dyn, static], warmup=1, iters=1)
     )
@@ -374,33 +374,6 @@ def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
         monkeypatch.setenv("EMMY_BR", str(br))
     rc, _, stderr = run_cli("run", "--code", "torch.nn.RMSNorm(2048)(torch.randn(4,32,2048))")
     assert rc == 0, f"stderr: {stderr}"
-
-
-def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
-    """Structural guard: a pinned FK window must actually rewrite the K loop into
-    the half2 pack + ``__half2`` accumulate + widen-flush (catches a silent
-    015_pack_fk_window regression that would fall back to fp32 accumulate). No
-    CUDA device needed — just inspects the generated source.
-
-    Pins a FULL clean (no-overhang) knob set + ``--target sm_90`` so the variant
-    is fully determined: enumeration / lowering gate on ``compute_capability``,
-    so without the target override a GPU-less CI runner resolves a different
-    capability, picks a masked non-window variant, and the FK-only pin falls back
-    to FK=1 (no window). The full pin + fixed target make the single FK=bk window
-    variant the only candidate on any runner."""
-    monkeypatch.setenv("EMMY_KNOBS", "MMA=0,BN=16,BM=16,FM=1,FN=1,BK=4,SPLITK=1,FK=4")
-    rc, stdout, stderr = run_cli(
-        "compile",
-        "--code",
-        "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)",
-        "--ir",
-        "cuda",
-        "--target",
-        "sm_90",
-    )
-    assert rc == 0, f"stderr: {stderr}"
-    assert "__halves2half2" in stdout, "no __half2 pack — FK window did not fire"
-    assert "__low2half" in stdout and "__high2half" in stdout, "no widen+flush of the half2 window"
 
 
 @requires_cuda
@@ -547,7 +520,7 @@ def test_run_ir_loop_stage(run_cli, project_root, tmp_path):
     assert rc == 0, f"stderr: {stderr}"
     log = stdout + stderr
     assert "Loaded loop IR" in log
-    assert "lowering/tile/enumeration" in log
+    assert "lowering/tile" in log
 
 
 @requires_cuda

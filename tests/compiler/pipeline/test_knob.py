@@ -10,12 +10,14 @@ from emmy.compiler.pipeline.knob import (
     KnobType,
     apply_knobs_env,
     apply_off_defaults,
+    axis_of,
+    family_of,
+    family_value,
     format_tuning_knobs,
-    is_warp,
-    knob_features,
-    mma_atom,
-    mma_decode,
+    resolve_axis,
+    tuning_knob_items,
 )
+from emmy.compiler.pipeline.search.features import is_warp, knob_features, mma_atom, tile_signature
 
 
 def test_int_parse():
@@ -38,6 +40,15 @@ def test_bool_parse():
         assert k.parse(falsy) is False
 
 
+def test_bool_parse_rejects_unknown():
+    # An unrecognized value used to coerce silently to False (a typo'd ``ture`` disabled the
+    # knob with no diagnostic); it now fails loudly.
+    k = Knob("FLAG", KnobType.BOOL)
+    for bad in ("banana", "ture", "2", "yep"):
+        with pytest.raises(ValueError, match="bad BOOL"):
+            k.parse(bad)
+
+
 def test_bool_pretty():
     k = Knob("FLAG", KnobType.BOOL)
     assert k.pretty(True) == "True"
@@ -45,7 +56,7 @@ def test_bool_pretty():
 
 
 def test_binmask_parse_binary_string():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     # char i = bit i (left-to-right reads as buffer rank 0..n-1)
     assert k.parse("101", width=3) == 0b101
     assert k.parse("000", width=3) == 0
@@ -53,33 +64,33 @@ def test_binmask_parse_binary_string():
 
 
 def test_binmask_parse_keywords():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.parse("all", width=3) == 0b111
     assert k.parse("all", width=5) == 0b11111
     assert k.parse("none", width=3) == 0
 
 
 def test_binmask_parse_int_clamps_to_width():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.parse("0xFFFF", width=3) == 0b111
     assert k.parse("5", width=3) == 0b101
 
 
 def test_binmask_pretty():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     assert k.pretty(0b101, width=3) == "101"
     assert k.pretty(0, width=3) == "000"
     assert k.pretty(0b111, width=3) == "111"
 
 
 def test_binmask_roundtrip():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     for mask in range(16):
         assert k.parse(k.pretty(mask, width=4), width=4) == mask
 
 
 def test_binmask_requires_width():
-    k = Knob("STAGE", KnobType.BINMASK)
+    k = Knob("MASK", KnobType.BINMASK)
     with pytest.raises(ValueError, match="width"):
         k.parse("101")
     with pytest.raises(ValueError, match="width"):
@@ -88,7 +99,7 @@ def test_binmask_requires_width():
 
 def test_env_property():
     assert Knob("BN", KnobType.INT).env == "EMMY_BN"
-    assert Knob("STAGE", KnobType.BINMASK).env == "EMMY_STAGE"
+    assert Knob("MASK", KnobType.BINMASK).env == "EMMY_MASK"
 
 
 # ---------------------------------------------------------------------------
@@ -133,31 +144,10 @@ def test_narrow_bool(monkeypatch):
 
 
 def test_narrow_binmask_rejected(monkeypatch):
-    k = Knob("STAGE", KnobType.BINMASK)
-    monkeypatch.setenv("EMMY_STAGE", "111")
+    k = Knob("MASK", KnobType.BINMASK)
+    monkeypatch.setenv("EMMY_MASK", "111")
     with pytest.raises(ValueError, match="BINMASK"):
         k.narrow((0b000, 0b111))
-
-
-def test_raw_alias_fallback(monkeypatch):
-    """``Knob.raw`` reads the primary ``EMMY_<NAME>`` first, then each
-    alias in declaration order (e.g. ``MMA`` accepting ``ATOM_KIND``)."""
-    k = Knob("NEWNAME", KnobType.STR, aliases=("OLDNAME",))
-    monkeypatch.delenv("EMMY_NEWNAME", raising=False)
-    monkeypatch.delenv("EMMY_OLDNAME", raising=False)
-    assert k.raw() is None
-    monkeypatch.setenv("EMMY_OLDNAME", "via-alias")
-    assert k.raw() == "via-alias"
-    monkeypatch.setenv("EMMY_NEWNAME", "primary")
-    assert k.raw() == "primary"
-
-
-def test_narrow_reads_alias(monkeypatch):
-    """``Knob.narrow`` honors an alias-spelled env pin."""
-    k = Knob("NEWNAME", KnobType.INT, aliases=("OLDNAME",))
-    monkeypatch.delenv("EMMY_NEWNAME", raising=False)
-    monkeypatch.setenv("EMMY_OLDNAME", "8")
-    assert k.narrow((1, 2)) == (8,)
 
 
 # ---------------------------------------------------------------------------
@@ -180,51 +170,39 @@ def test_apply_off_defaults_fills_only_unspecified_off_knobs():
     assert knobs2 == {"WM": 2, "BK": 64}
 
 
-def test_mma_decode_value_semantics():
-    """``mma_decode`` maps unset/empty/truthy → auto, falsy → scalar-only, an
-    atom name → pinned warp."""
-    assert mma_decode(None) == (True, None)
-    assert mma_decode("") == (True, None)
-    assert mma_decode("1") == (True, None)
-    assert mma_decode("0") == (False, None)
-    assert mma_decode("false") == (False, None)
-    assert mma_decode("mma_m16n8k16_f16") == (True, "mma_m16n8k16_f16")
-
-
 def test_is_warp_and_mma_atom_tier_discriminator():
-    """The ``"0"`` OFF sentinel (and absent / falsy / auto) read as scalar; only a
-    concrete atom name is the warp tier. Guards the truthy-string footgun: the
-    old ``knobs.get("MMA")`` check misread ``"0"`` as warp."""
+    """The unified ``TILE`` knob self-discriminates: a value carrying an ``a:<atom>`` token is the
+    warp fragment (and names the atom); a scalar ``n../f..`` codec / empty / absent is the scalar
+    tier (no atom)."""
     assert not is_warp({}) and mma_atom({}) is None
-    assert not is_warp({"MMA": "0"}) and mma_atom({"MMA": "0"}) is None
-    assert not is_warp({"MMA": "1"})  # pre-enumeration auto control, not an atom
-    assert is_warp({"MMA": "mma_m16n8k16_f16"})
-    assert mma_atom({"MMA": "mma_m16n8k16_f16"}) == "mma_m16n8k16_f16"
+    assert not is_warp({"TILE": ""}) and mma_atom({"TILE": ""}) is None
+    assert not is_warp({"TILE": "n32x8/f2x4"})  # scalar fragment names no atom
+    assert is_warp({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2"})
+    assert mma_atom({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2"}) == "mma_m16n8k16_f16"
 
 
 def test_scalar_tile_features_from_thread_tile():
-    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from
-    its thread tile (``BN·BM`` threads, ``BM·FM × BN·FN`` output)."""
-    sf = knob_features({"BN": 32, "BM": 8, "FM": 4, "FN": 2, "MMA": "0", "WM": 0, "WN": 0})
+    """``knob_features`` emits the ``D_*`` occupancy family for a scalar row from its
+    ``TILE`` codec free split (``par_n·par_m`` threads, ``par_m·reg_m × par_n·reg_n``
+    output) — ``n32x8`` parallel thread-tile, ``f2x4`` register sub-tile."""
+    sf = knob_features({"TILE": "n32x8/f2x4"})
     assert any(k.startswith("D_") for k in sf)
     assert sf["D_threads"] == 32 * 8
     assert sf["D_tile_m"] == 8 * 4 and sf["D_tile_n"] == 32 * 2
 
 
 def test_warp_tile_features_from_warp_tile():
-    """``_warp_tile_features`` builds the ``D_*`` family from the warp tile
-    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the warp
-    ``BM=BN=0`` OFF sentinels never feed a scalar tile. Atom dims (16×8 for
-    ``m16n8k16``) come from the MMA featurizer in the real pipeline; here passed
-    directly to avoid needing the registry loaded."""
-    from emmy.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
+    """``_warp_tile_features`` builds the ``D_*`` family from the warp form of the ``TILE`` codec
+    (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the atom cell dims (16×8 for
+    ``m16n8k16``) are read off the parsed atom. A scalar ``TILE`` value → empty."""
+    from emmy.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
 
-    wf = _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2, "SPLITK": 1, "S_ext_free_prod": 2048 * 2048}, 16.0, 8.0)
+    wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "S_ext_free_prod": 2048 * 2048})
     assert wf["D_threads"] == 128.0  # WM·WN·32
     assert wf["D_tile_m"] == 2 * 2 * 16  # WM·FM·atom_m
     assert wf["D_tile_n"] == 2 * 2 * 8  # WN·FN·atom_n
     assert "D_log2_ctas" in wf and "D_log2_waves" in wf  # occupancy present (free_prod given)
-    assert _warp_tile_features({"WM": 2, "WN": 2, "FM": 2, "FN": 2}, None, None) == {}  # missing atom dims → empty
+    assert _warp_tile_features({"TILE": "n32x8/f2x4"}) == {}  # scalar fragment → empty
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +283,7 @@ def test_parse_knob_spec_grammar():
     whitespace tolerated, empties skipped, values kept as raw strings."""
     from emmy.compiler.pipeline.knob import parse_knob_spec
 
-    assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=110 ") == {"BK": "2", "BM": "16", "STAGE": "110"}
+    assert parse_knob_spec(" bk = 2 ,, BM=16, STAGE=d2/cp ") == {"BK": "2", "BM": "16", "STAGE": "d2/cp"}
     assert parse_knob_spec("") == {}
     with pytest.raises(ValueError, match="missing '='"):
         parse_knob_spec("BK2")
@@ -336,24 +314,54 @@ def test_knob_features_typed_knobs(monkeypatch):
         {
             "BN": Knob("BN", KnobType.INT),
             "FLAG": Knob("FLAG", KnobType.BOOL),
-            "STAGE": Knob("STAGE", KnobType.BINMASK),
+            "MASK": Knob("MASK", KnobType.BINMASK),
         },
     )
-    feats = knob_features({"BN": 64, "FLAG": True, "STAGE": "101"})
+    feats = knob_features({"BN": 64, "FLAG": True, "MASK": "101"})
     assert feats["BN"] == 64.0
     assert feats["FLAG"] == 1.0
-    assert feats["STAGE_popcount"] == 2.0
-    assert feats["STAGE_width"] == 3.0
-    assert feats["STAGE_frac"] == 2 / 3
+    assert feats["MASK_popcount"] == 2.0
+    assert feats["MASK_width"] == 3.0
+    assert feats["MASK_frac"] == 2 / 3
+
+
+def test_knob_features_stage_codec():
+    """The ``STAGE`` codec (``d<depth>/sync|cp|tma[/ring]``) featurizes to the ``D_stage_*``
+    family; an absent / gmem-direct stage contributes nothing."""
+    feats = knob_features({"STAGE": "d3/tma/ring"})
+    assert feats["D_stage_depth"] == 3.0
+    assert feats["D_stage_async"] == 1.0
+    assert feats["D_stage_tma"] == 1.0
+    assert feats["D_stage_ring"] == 1.0
+    assert feats["D_stage_reg_depth"] == 1.0  # no /p<n> ⇒ register pipeline OFF
+    sync = knob_features({"STAGE": "d2/cp"})
+    assert sync["D_stage_depth"] == 2.0 and sync["D_stage_async"] == 1.0 and sync["D_stage_tma"] == 0.0
+    # The smem→register double-buffer (``p<n>``) featurizes orthogonally to the gmem→smem ring.
+    pp = knob_features({"STAGE": "d3/cp/ring/p2"})
+    assert pp["D_stage_depth"] == 3.0 and pp["D_stage_reg_depth"] == 2.0 and pp["D_stage_ring"] == 1.0
+    assert not any(k.startswith("D_stage_") for k in knob_features({"STAGE": ""}))
+
+
+def test_stage_codec_reg_depth_roundtrip():
+    """``Stage.parse``/``spell`` round-trip the ``p<reg_depth>`` token; ``p1`` (the default) is
+    omitted so an unstaged-register config spells byte-identical to before the field existed."""
+    from emmy.compiler.ir.schedule import Stage  # noqa: PLC0415
+
+    assert Stage.parse("d3/cp/ring/p2") == Stage(depth=3, transport="cp.async", ring=True, reg_depth=2)
+    assert Stage.parse("d2/cp/p4").reg_depth == 4
+    assert Stage.parse("d2/cp").reg_depth == 1  # absent ⇒ OFF
+    assert Stage(depth=2, transport="cp.async", reg_depth=2).spell() == "d2/cp/p2"
+    assert Stage(depth=2, transport="cp.async", reg_depth=1).spell() == "d2/cp"  # p1 omitted
+    # reg_depth is perf-only — NOT part of the structural signature (golden-match stability).
+    from emmy.compiler.pipeline.search.features import _stage_sig  # noqa: PLC0415
+
+    assert _stage_sig({"STAGE": "d2/cp/p2"}) == _stage_sig({"STAGE": "d2/cp"})
 
 
 def test_knob_features_mma_expansion():
-    # MMA expansion now dispatches through the MMA Knob's ``features`` callable,
-    # so the declaring module must be loaded + present in the registry.
-    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _knobs  # noqa: F401, PLC0415
-
-    knob_mod.reset_registry()
-    feats = knob_features({"MMA": "mma_m16n8k16_f16"})
+    # The warp fragment names its atom on the ``TILE`` codec (``a:<atom>``); ``knob_features``
+    # expands its physical cell / dtype properties into the ``MMA_*`` family.
+    feats = knob_features({"TILE": "a:mma_m16n8k16_f16/w1x1/f1x1"})
     assert feats["MMA_tier"] == 1.0
     assert (feats["MMA_atom_m"], feats["MMA_atom_n"], feats["MMA_atom_k"]) == (16.0, 8.0, 16.0)
     assert feats["MMA_a_bits"] == 16.0  # f16 operand
@@ -400,12 +408,10 @@ def test_format_tuning_knobs_skips_struct():
 
 
 def test_format_tuning_knobs_canonical_order():
-    """Knobs render in canonical tile-geometry order (``KNOB_ORDER``), not
-    alphabetical — shared with the ``emmy eval`` golden tables. (Uses a
-    tier-consistent warp dict so the tier-foreign display filter doesn't drop
-    anything — a warp variant carries WM/WN/MMA, not BM/BN.)"""
-    out = format_tuning_knobs({"SPLITK": 1, "WN": 4, "WM": 2, "BK": 64, "MMA": "x", "FM": 4})
-    assert out == "BK=64, FM=4, WM=2, WN=4, SPLITK=1, MMA=x"
+    """The codec knobs render in canonical order (``KNOB_ORDER`` = ``TILE``, ``REDUCE``,
+    ``STAGE``), not alphabetical — shared with the ``emmy eval`` golden tables."""
+    out = format_tuning_knobs({"STAGE": "d2/cp", "REDUCE": "b32", "TILE": "a:mma_m16n8k16_f16/w2x2"})
+    assert out == "TILE=a:mma_m16n8k16_f16/w2x2, REDUCE=b32, STAGE=d2/cp"
 
 
 def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
@@ -414,3 +420,92 @@ def test_apply_knobs_env_no_raw_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("EMMY_KNOBS", "BK=8")
     applied = apply_knobs_env()
     assert applied == {"EMMY_BK": "8"}
+
+
+# --- Axis-named schedule keys -------------------------------------------------
+
+
+def test_family_and_axis_of():
+    assert family_of("TILE@d") == "TILE" and axis_of("TILE@d") == "d"
+    assert family_of("TILE") == "TILE" and axis_of("TILE") is None
+    # A native ``MOVE@element`` splits on the first ``@`` (the ``.cta`` rides the element).
+    assert family_of("REDUCE@k.cta") == "REDUCE" and axis_of("REDUCE@k.cta") == "k.cta"
+
+
+def test_resolve_axis_bare_suffixed_and_ambiguous():
+    assert resolve_axis("TILE", "TILE", ["d"]) == "TILE@d"  # bare → the unique eligible axis
+    assert resolve_axis("TILE", "TILE@d", ["d"]) == "TILE@d"  # already suffixed: idempotent
+    assert resolve_axis("TILE", "TILE", []) is None  # no eligible axis → drop
+    with pytest.raises(ValueError, match=r"TILE is ambiguous: use TILE@d or TILE@sk"):
+        resolve_axis("TILE", "TILE", ["d", "sk"])  # a bare pin on a flash kernel is ambiguous
+
+
+def test_family_value_reads_bare_or_suffixed():
+    assert family_value({"TILE@d": "x"}, "TILE") == "x"
+    assert family_value({"TILE": "x"}, "TILE") == "x"
+    assert family_value({"REDUCE": "b8"}, "TILE") is None
+
+
+def test_bare_and_axis_named_featurize_identically():
+    """A single-node kernel's bare ``TILE`` / ``STAGE`` and their ``@<axis>`` forms parse, featurize,
+    and match identically — the migration is invisible on one-node kernels (the parity bar)."""
+    bare = {"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "STAGE": "d2/cp", "S_ext_free_prod": 4096.0}
+    axed = {"TILE@d": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "STAGE@d": "d2/cp", "S_ext_free_prod": 4096.0}
+    assert knob_features(bare) == knob_features(axed)
+    assert tile_signature(bare) == tile_signature(axed)
+    assert is_warp(bare) == is_warp(axed) is True
+    assert mma_atom(bare) == mma_atom(axed) == "mma_m16n8k16_f16"
+
+
+def test_display_collapses_single_axis_but_keeps_multi():
+    """One eligible axis → ``TILE@d`` / ``REDUCE@d`` display as bare ``TILE`` / ``REDUCE`` (one-node
+    tables read as before, matching the bare golden YAML); two (flash) keep the suffix to disambiguate.
+    ``WSPEC`` (root-global) is never collapsed."""
+    one = dict(tuning_knob_items({"TILE@d": "n4/f2", "REDUCE@d": "b8", "STAGE@d": "d2/cp"}))
+    assert set(one) == {"TILE", "REDUCE", "STAGE"}
+    # Collapse is per-family: the two-axis ``TILE`` keeps its suffixes to disambiguate, while the
+    # single-axis ``REDUCE`` (only ``sk`` carries a reduce partition) still bares out.
+    flash = dict(tuning_knob_items({"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "REDUCE@sk": "b8"}))
+    assert set(flash) == {"TILE@d", "TILE@sk", "REDUCE"}
+
+
+# --- Per-node featurizer (multi-node pool) -----------------------------------
+
+
+def test_multinode_flash_keys_apart_and_pools_per_node():
+    """A flash kernel addresses two contractions by their k-axis (QK@d, PV@sk) + the online reduce
+    (REDUCE@sk); the two ``TILE`` keys are distinct flat entries (no collision), and the schedule
+    geometry featurizes **per node** and sum-pools — ``D_threads`` = QK threads + PV threads, and
+    ``MMA_tier`` = 2.0 over the two warp nodes. This is the case the flat one-key schema can't express."""
+    from emmy.compiler.pipeline.search.features import _node_axes, _node_slice, _schedule_node_features
+
+    qk_tile = "a:mma_m16n8k16_f16/w4x1/f2x2/k2"  # WM·WN·32 = 128 threads
+    pv_tile = "a:mma_m16n8k16_f16/w2x2/f4x1/k2"  # WM·WN·32 = 128 threads
+    knobs = {
+        "TILE@d": qk_tile,
+        "STAGE@d": "d2/cp",
+        "REDUCE@sk": "b8",
+        "TILE@sk": pv_tile,
+        "STAGE@sk": "d2/cp",
+        "S_ext_free_prod": 4096.0,
+    }
+    assert knobs["TILE@d"] != knobs["TILE@sk"]  # the two tiles key apart in the flat dict
+    assert _node_axes(knobs) == ["d", "sk"]
+    qk = _schedule_node_features(_node_slice(knobs, "d"))
+    pv = _schedule_node_features(_node_slice(knobs, "sk"))
+    feats = knob_features(knobs)
+    assert feats["D_threads"] == qk["D_threads"] + pv["D_threads"] == 256.0
+    assert feats["MMA_tier"] == 2.0  # both nodes are warp-tier → pooled tier count
+
+
+def test_node_slice_addresses_per_node_struct():
+    """Each node reads its OWN reduce extent: an addressed ``S_ext_reduce_prod@<axis>`` overrides the
+    shared bare value in that node's slice (so QK@d and PV@sk featurize with different K depths), while
+    a one-node kernel with a bare ``S_ext_reduce_prod`` featurizes byte-identically (bare fallback)."""
+    from emmy.compiler.pipeline.search.features import _node_slice
+
+    knobs = {"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "S_ext_reduce_prod": 8.0, "S_ext_reduce_prod@sk": 512.0}
+    assert _node_slice(knobs, "d")["S_ext_reduce_prod"] == 8.0  # no @d override → bare fallback
+    assert _node_slice(knobs, "sk")["S_ext_reduce_prod"] == 512.0  # addressed override wins
+    # One-node bare stamp: the slice for the sole node is the whole dict (byte-identical featurizer).
+    assert _node_slice({"TILE": "n4/f2", "S_ext_reduce_prod": 8.0}, None) == {"TILE": "n4/f2", "S_ext_reduce_prod": 8.0}

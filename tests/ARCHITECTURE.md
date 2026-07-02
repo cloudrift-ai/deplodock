@@ -65,7 +65,7 @@ tests/
 │   │   ├── test_real_trace.py                  # TinyLlama fixture sanity (op-type counts)
 │   │   ├── test_body_deps.py / test_op_shape_invariants.py / …
 │   │   ├── stmt/   — SSA-body unit tests (hoist / merge / rename / structural_key)
-│   │   ├── tile/   — TileOp / StageBundle unit tests
+│   │   ├── tile/   — TileOp / schedule-codec (TILE / WARP / STAGE / REDUCE) unit tests
 │   │   └── loop/   — splicer / runner-cache unit tests
 │   ├── passes/                         # single-pass + pass-suite tests
 │   │   ├── conftest.py                         # RecordingDump fixture
@@ -77,7 +77,6 @@ tests/
 │   │   ├── test_launch_geometry_rules.py / test_masked_tile.py
 │   │   ├── test_stage_inputs_classify.py
 │   │   ├── test_lowering_accuracy.py           # 040 / 060 / 070 + TMA end-to-end
-│   │   ├── test_lowering_blocked_gemm.py       # FN > 1 matmul accuracy (per-cell + replicator)
 │   │   ├── test_knob_pinning.py                # EMMY_KNOBS regression configs
 │   │   ├── test_tile_naming.py                 # provenance-driven kernel naming
 │   │   └── test_pipeline_semantics.py          # full pass chain vs numpy
@@ -98,11 +97,13 @@ tests/
 │   ├── cli/                            # subprocess CLI tests via run_cli fixture
 │   │   ├── test_compile.py / test_knobs.py / test_run.py
 │   ├── e2e/                            # end-to-end accuracy / pipeline / blocks
-│   │   ├── test_accuracy.py                    # backend × dtype × pattern matrix
+│   │   ├── test_accuracy.py                    # backend × dtype × pattern parity matrix
+│   │   ├── test_ops_vs_torch.py                # backend × op vs torch eager (parity layer)
+│   │   ├── test_matmul_coverage.py             # SEMIRING: scalar TILE + warp MMA + masked-symbolic
+│   │   ├── test_reduce_coverage.py             # MONOID: cooperative combine + online-softmax fusion
+│   │   ├── test_attention_coverage.py          # flash (scalar; TC warp-chain xfailed) + model chains
 │   │   ├── test_block.py                       # TinyLlama / Qwen block vs eager
-│   │   ├── test_pipeline.py                    # LOOP_PASSES → CudaBackend on toys
-│   │   ├── test_attention_chains.py            # Q,K,V + SDPA bisection harness
-│   │   └── test_ops_vs_torch.py                # backend × op vs torch eager
+│   │   └── test_pipeline.py                    # LOOP_PASSES → CudaBackend on toys
 │   └── diagnostics/
 │       └── test_bank_conflicts.py
 ├── scripts/
@@ -195,12 +196,12 @@ LPT-bucketed across the remaining workers using the cached duration table.
 mma.sync warp tier (swizzled `ldmatrix` + `mma.sync`, TMA transport) auto-enumerates and is validated on **sm_90+**;
 on sm_80-89 it is pin-only and currently non-functional for two independent reasons — the `sm_NNa` arch-accelerated
 target the TMA path emits is rejected by nvcc (`Unsupported gpu architecture 'sm_89a'`), and `ldmatrix` itself faults
-at runtime on at least Ada (sm_89). Tests that **force** the warp tier via `EMMY_MMA` / `TMA` pins carry
-`requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
-context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The pure mma suites
-(`test_matmul_mma.py`, `test_matmul_mma_tma.py`, `test_matmul_mma_staged_pipelined.py`,
-`test_matmul_mma_causal_epilogue.py`, `test_matmul_mma_transposed_b.py`) gate at module scope; mixed files that also
-hold GPU-less structure / compile-only tests (`test_matmul_mma_masked.py`, `test_matmul_mma_parity.py`,
-`test_matmul_mma_residual.py`, `test_warp_specialize_deadlock.py`) gate only the warp-tier
-tests, and `test_knob_pinning.py` skips its `TMA=1` rows in-body. `_supports_mma_sync()` (≥ sm_80, the
-instruction-availability check) and `_supports_tma()` (≥ sm_90) still gate on top.
+at runtime on at least Ada (sm_89). Tests that **force** the warp tier via a warp `TILE` codec (`a:<atom>/…`) + `STAGE`
+carry `requires_sm90` so they skip below sm_90 instead of faulting (a single warp-tier fault corrupts the shared `cuda`
+context and cascades `cudaErrorIllegalAddress` into every later test on the worker, CUDA or not). The warp-tier matmul
+coverage all lives in `test_matmul_coverage.py` — the scalar vs warp `TILE` accuracy/structure matrix, the
+masked-symbolic sweep (symbolic M/N/K at off-hint sizes), the static-vs-dynamic parity across the `STAGE=d2/cp` and
+`d2/tma` transports, and the operand-pipelining transforms — the gmem→smem ring (`d<depth>/cp`) and the smem→register
+double-buffer (`/p<n>`), each asserted **bit-identical** to the single-buffer / gmem-direct baseline (a pure perf
+transform) — gating its GPU cases on `requires_sm90` / `_supports_tma()` (≥ sm_90); its GPU-less render / structure cases
+run anywhere. The TMA accuracy path additionally exercises the host descriptor encoder (`backend/cuda/_tma.py`).

@@ -1,5 +1,4 @@
-"""``EmmyGenModel`` — the vLLM out-of-tree **generative** model class (Phase 3 of
-``plans/generative-inference-support.md``).
+"""``EmmyGenModel`` — the vLLM out-of-tree **generative** model class (Phase 3).
 
 Serve a decoder-only chat model (Qwen3 / Llama) through emmy-compiled per-layer
 kernels with vLLM owning the API / sampler / scheduler / paged KV-cache:
@@ -122,8 +121,8 @@ class EmmyGenModel(nn.Module):
         # clamp guards vLLM's _dummy_run garbage-id profiling batches (out-of-vocab → IndexError).
         ids = input_ids.clamp(0, self.config.vocab_size - 1)
         t = int(ids.shape[0])
-        # Decode hot path (T <= bucket): device-resident, no host numpy round-trip (Phase A,
-        # plans/generative-device-resident-decode.md). Prefill / larger T keeps the host path.
+        # Decode hot path (T <= bucket): device-resident, no host numpy round-trip (Phase A).
+        # Prefill / larger T keeps the host path.
         if self.runner.has_device_decode and 0 < t <= self.runner.decode_bucket:
             return self._forward_device(ids, positions)
         ids_np = ids.cpu().numpy()

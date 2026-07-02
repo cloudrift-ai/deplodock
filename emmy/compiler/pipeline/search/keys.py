@@ -27,34 +27,31 @@ from emmy.compiler.structural import digest
 
 Dialect = Literal["loop", "tile", "kernel", "cuda"]
 
-# The native ``PLACE@cone`` placement records the demoted-cone keep-vs-cut **structural**
-# (kernel-set-changing) decision — ``inline`` keep / ``cut`` materialize-to-gmem
-# (``enumeration/_families``). Its canonical ``cone`` element is distinct from any
-# operand-staging ``PLACE@<buffer>`` or score ``PLACE@<edge>``, so a hop that introduces it
-# is unambiguously the structural fork (the `cut` value also self-describes the
-# materialization vs an operand `gmem`-direct read). A source-chain hop that introduces it
-# is a decomposition hop whose cost is a Σ owned by the two-level tuner, NOT a ``lowering``
-# row. The literal is kept here (search/ shouldn't import a lowering pass) — it mirrors
-# ``_families.cone_key()``.
-_CONE_PLACE = "PLACE@cone"
+# The ``PLACE@<element>`` placement family records a **structural** (kernel-set-changing)
+# decision — ``fuse`` (registers) / ``cut`` (materialize the edge to gmem) per edge class
+# (``cone`` producer-cone inlining, ``fold`` flash vs multi-kernel attention; ``tuple`` is
+# dominance policy and never stamped). A source-chain hop that introduces a ``PLACE@`` key is
+# a decomposition hop whose cost is a Σ owned by the two-level tuner, NOT a ``lowering`` row.
+# Matched by family prefix (search/ shouldn't import the lowering pass that stamps them).
+_PLACE_PREFIX = "PLACE@"
 
 
 def structural_decision_delta(knobs: dict) -> dict:
-    """The structural-decision knobs ``knobs`` carries — today the single ``PLACE@cone``
-    placement (keep ``inline`` / cut ``cut``); ``{}`` when the op carries no cone decision.
-    Read by the candidate replay (``search/candidate``) and the decomposition-row featurizer
+    """The structural-decision knobs ``knobs`` carries — the ``PLACE@<element>`` placements
+    (resolved ``fuse`` / ``cut``); ``{}`` when the op carries none. Read by the candidate
+    replay (``search/candidate``) and the decomposition-row featurizer
     (``two_level._decomposition_rows``) to attribute each side's Σ cost."""
-    return {_CONE_PLACE: knobs[_CONE_PLACE]} if _CONE_PLACE in knobs else {}
+    return {k: v for k, v in knobs.items() if k.startswith(_PLACE_PREFIX)}
 
 
 def introduces_structural_decision(parent_op: object, child_op: object) -> bool:
-    """True when ``child_op`` carries the ``PLACE@cone`` structural decision the
-    ``parent_op`` lacks — the keep-vs-cut fork hop. Covers both the cut (loop→loop fragment
-    splice) and the keep (loop→tile ``seed_fused`` jump), so the recorder skips the decision
-    hop regardless of dialect crossing."""
+    """True when ``child_op`` carries a ``PLACE@<element>`` structural decision the
+    ``parent_op`` lacks — the fuse-vs-cut fork hop. Covers both the cut (fragment splice)
+    and the fuse (the fused-kernel jump), so the recorder skips the decision hop regardless
+    of dialect crossing."""
     p = getattr(parent_op, "knobs", None) or {}
     c = getattr(child_op, "knobs", None) or {}
-    return _CONE_PLACE in c and _CONE_PLACE not in p
+    return any(k.startswith(_PLACE_PREFIX) and k not in p for k in c)
 
 
 def op_cache_key(op: object) -> str | None:
@@ -62,7 +59,7 @@ def op_cache_key(op: object) -> str | None:
     from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
     from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
     from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-    from emmy.compiler.ir.tile.ir import TileGraphOp, TileOp  # noqa: PLC0415
+    from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     if isinstance(op, CudaOp):
         # Name-invariant: the kernel function name is rendered into the source
@@ -73,19 +70,21 @@ def op_cache_key(op: object) -> str | None:
         src = op.kernel_source.replace(op.kernel_name, "_K_") if op.kernel_name else op.kernel_source
         return digest("CudaOp", src, op.arg_order, op.grid, op.block, op.smem_bytes)
     if isinstance(op, (LoopOp, TileOp, KernelOp)):
-        # Knobs are part of the key: same-body / different-knobs variants
-        # (e.g. ``020_stage_inputs`` emits a no-op TileOp with a
-        # ``STAGE="0..0"`` knob to mark "considered, declined" decisions)
-        # must not collide with their parent in the search tree, or
+        # Knobs are part of the key: same-body / different-knobs variants must
+        # not collide with their parent in the search tree, or
         # ``SearchTree.expand`` self-parents the node and
         # ``_propagate_expected`` walks the parent chain forever.
         knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
-        return digest(type(op).__name__, op.body.structural_key(), knob_key)
-    if isinstance(op, TileGraphOp):
-        # The enumeration-pass output (a chosen Schedule's TileGraph, pre-assembly):
-        # key on the TileGraph's canonical algorithm + Schedule identity + knobs.
-        knob_key = tuple(sorted(op.knobs.items())) if op.knobs else ()
-        return digest("TileGraphOp", op.structural_key(), knob_key)
+        # ``TileOp`` has no stored body — its compute is the ``op`` tree; lower it on
+        # demand for the structural key (the body proper is generated at materialize).
+        if isinstance(op, TileOp):
+            from emmy.compiler.ir.stmt.body import Body  # noqa: PLC0415
+            from emmy.compiler.ir.tile.ops import lower  # noqa: PLC0415
+
+            body = Body(lower(op.op)) if op.op is not None else Body(())
+        else:
+            body = op.body
+        return digest(type(op).__name__, body.structural_key(), knob_key)
     return None
 
 
@@ -104,10 +103,6 @@ def dialect_of(op: object) -> Dialect | None:
         return "tile"
     if isinstance(op, LoopOp):
         return "loop"
-    from emmy.compiler.ir.tile.ir import TileGraphOp  # noqa: PLC0415
-
-    if isinstance(op, TileGraphOp):
-        return "tile"  # the enumeration output, still the tile dialect (pre-assembly)
     return None
 
 

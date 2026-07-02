@@ -1709,8 +1709,7 @@ async def _bench_interleaved(module, args, kwargs, backend, compiled_graph, warm
     # Whole-program (e2e) time when available — windows around replays of one
     # all-launches CUDA graph, the same semantics the captured torch closures
     # above get. The fallback sums per-launch solo windows, which is not an
-    # end-to-end number (no cross-kernel cache effects) — see finding 6 of
-    # plans/qwen3-embedding-layer0-tune-findings.md.
+    # end-to-end number (no cross-kernel cache effects).
     dep_ms = bench.e2e_min_ms if bench.e2e_min_ms is not None else (bench.min_ms if bench.min_ms is not None else bench.time_ms)
     results["Emmy"] = dep_ms * 1000
     return results, bench

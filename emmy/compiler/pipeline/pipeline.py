@@ -906,8 +906,7 @@ class Run:
 
 
 def _is_structural_option(option: object) -> bool:
-    """Classify one raw rewrite option by its effect (see
-    ``plans/structural-forks-in-two-level.md`` step 1): a ``Graph`` splice
+    """Classify one raw rewrite option by its effect: a ``Graph`` splice
     changes which ops exist — **structural**; an ``Op`` rebind is in-place —
     **op-variant**. The Op/Graph return type IS the classification; rules wrap
     a Graph option in a leaf :class:`OptionFork` (e.g. ``tile/010_split_demoted``),
@@ -935,8 +934,8 @@ def _option_decision(option: object, root_knobs: dict) -> dict | None:
     change** vs the offer (a ``Graph`` option reads the union over its nodes'
     op knobs — fragment kernels restamp their own ``S_*``, which describe the
     child bodies, not the decision). A *changed value* on an existing key counts
-    (e.g. the cross-CTA finalize fork mutates the ``REDUCE@<axis>`` codec's ``c``
-    field from a bare ``c<cta>`` to ``c<cta>a`` / ``c<cta>k`` — same key, new
+    (e.g. the cross-CTA finalize fork mutates the ``REDUCE`` codec's ``g``
+    field from a bare ``g<cta>`` to ``g<cta>a`` / ``g<cta>k`` — same key, new
     value), not only a brand-new key. ``None`` when the option stamps nothing new."""
     if isinstance(option, Graph):
         knobs: dict = {}
@@ -1004,9 +1003,11 @@ def _replay_structural_decision(graph: Graph, root_op, options: list) -> object 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
     """``{node_id: tile_identity}`` for every node a ``validate(ctx)`` rejection
-    left un-lowered (still a ``LoopOp`` / ``TileOp`` at the terminal). The
-    ``tile_identity`` is the offending tile's planner knobs — what ``Pipeline.run``
-    blocklists so the greedy retry falls back to the next prior-ranked sibling."""
+    left un-lowered (still a pre-final ``LoopOp`` / ``TileOp`` at the terminal — the
+    over-budget tile→kernel drop leaves a knob-stamped ``TileOp``, a pre-tile drop a
+    ``LoopOp``, mirroring :func:`_raise_on_unlowered`'s stuck set). The
+    ``tile_identity`` is the offending op's knobs — what ``Pipeline.run`` blocklists
+    so the greedy retry falls back to the next prior-ranked sibling."""
     if not rejections:
         return {}
     from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
@@ -1017,7 +1018,9 @@ def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> di
     for nid, _pass_label, _reason in rejections:
         node = graph.nodes.get(nid)
         if node is not None and isinstance(node.op, (LoopOp, TileOp)):
-            out[nid] = tile_identity(node.op.knobs)
+            # Key through ``tile_identity`` — the SAME canonicalization ``greedy._tile_blocked``
+            # applies to a leaf's fork knobs, so the blocklist actually matches on retry.
+            out[nid] = tile_identity(getattr(node.op, "knobs", None) or {})
     return out
 
 
@@ -1026,12 +1029,14 @@ def _raise_on_unlowered(graph: Graph, rejections: list[tuple[str, str, str]], ct
     rejection (see :func:`Candidate.try_rewrite`) left its node un-lowered.
 
     ``rejections`` is ``[(node_id, pass_label, reason), ...]``. A node is
-    "stuck" iff it still holds a pre-final dialect op (``LoopOp`` /
-    ``TileOp``) at the terminal — if a later rule lowered it anyway the
-    op is a ``CudaOp`` and we stay silent (the rejection was a harmless
-    intermediate filter). Only nodes with a recorded rejection are
-    checked, so partial pipelines that legitimately terminate at the loop
-    / tile stage (no lowering pass to drop anything) never trip this."""
+    "stuck" iff it still holds a pre-final dialect op (``LoopOp`` or ``TileOp``)
+    at the terminal — if a later rule lowered it anyway the op is a ``KernelOp`` /
+    ``CudaOp`` and we stay silent (the rejection was a harmless intermediate
+    filter). The over-budget-tile drop leaves a ``TileOp`` (its only
+    tile→kernel lowering was filtered); a pre-tile drop leaves a ``LoopOp``. Only
+    nodes with a recorded rejection are checked, so partial pipelines that
+    legitimately terminate at the loop / tile stage (no lowering pass to drop
+    anything) never trip this."""
     if not rejections:
         return
     from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
@@ -1173,7 +1178,6 @@ class _TerminalBench:
         from emmy.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
         from emmy.compiler.ir.kernel.ir import KernelOp  # noqa: PLC0415
         from emmy.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
-        from emmy.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
         from emmy.compiler.pipeline.search.keys import op_cache_key  # noqa: PLC0415
 
         key = op_cache_key(op)
@@ -1191,8 +1195,6 @@ class _TerminalBench:
             )
         elif isinstance(op, KernelOp):
             self.db.record_kernel_op(key, self._body_json(op, "kernel"), op.pretty_body())
-        elif isinstance(op, TileOp):
-            self.db.record_tile_op(key, self._body_json(op, "tile"), op.pretty_body())
         elif isinstance(op, LoopOp):
             self.db.record_loop_op(key, self._body_json(op, "loop"), op.pretty_body())
 

@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 
 from emmy.compiler.graph import Graph
-from emmy.compiler.ir.base import ConstantOp
 from emmy.compiler.loader.binder import apply_load_ops
 
 logger = logging.getLogger(__name__)
@@ -101,16 +100,14 @@ def load_constants_from_safetensors(graph: Graph, model_id_or_path: str) -> dict
 
     needed: dict[str, list[str]] = {}  # shard path → list of keys
     resolved: dict[str, str] = {}  # node_id → safetensors key
-    for nid, node in graph.nodes.items():
-        if not isinstance(node.op, ConstantOp) or node.op.value is not None or node.op.source_path is None:
-            continue
-        for cand in _candidate_keys(node.op.source_path):
+    for nid, op in graph.loadable_constants():
+        for cand in _candidate_keys(op.source_path):
             if cand in index:
                 resolved[nid] = cand
                 needed.setdefault(str(index[cand]), []).append(cand)
                 break
         else:
-            logger.warning("safetensors loader: no key matched for %s (source_path=%r)", nid, node.op.source_path)
+            logger.warning("safetensors loader: no key matched for %s (source_path=%r)", nid, op.source_path)
 
     sources: dict[str, np.ndarray] = {}
     for shard_path, keys in needed.items():
@@ -119,11 +116,9 @@ def load_constants_from_safetensors(graph: Graph, model_id_or_path: str) -> dict
                 sources[k] = f.get_tensor(k)
 
     out: dict[str, np.ndarray] = {}
-    for nid, node in graph.nodes.items():
-        if not isinstance(node.op, ConstantOp) or node.op.value is not None:
-            continue
+    for nid, op in graph.loadable_constants():
         key = resolved.get(nid)
         if key is None:
             continue
-        out[nid] = apply_load_ops(sources[key], node.op.load_ops)
+        out[nid] = apply_load_ops(sources[key], op.load_ops)
     return out

@@ -1,4 +1,4 @@
-"""Fork classification by effect (``plans/structural-forks-in-two-level.md`` step 1).
+"""Fork classification by effect.
 
 The engine classifies every multi-option fork at the spawn site in ``Run.drive``
 — where the raw option list is concrete — and threads the result through
@@ -23,10 +23,20 @@ from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from emmy.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
-from emmy.compiler.pipeline.fork import OptionFork, ThunkFork
+from emmy.compiler.pipeline.fork import Fork, OptionFork
 from emmy.compiler.pipeline.pipeline import _is_structural_option
 from emmy.compiler.pipeline.search.db import SearchDB
 from tests.compiler.conftest import drain_tune
+
+
+class _BranchFork(Fork):
+    """Minimal non-leaf ``Fork`` — untypable without ``expand()``, so never structural."""
+
+    knobs: dict = {}
+
+    def expand(self):
+        return []
+
 
 _S, _H, _I = 32, 1024, 3072
 
@@ -95,31 +105,4 @@ def test_is_structural_option_predicate() -> None:
     assert _is_structural_option(OptionFork(option=Graph()))
     assert not _is_structural_option(InputOp())
     assert not _is_structural_option(OptionFork(option=InputOp()))
-    assert not _is_structural_option(ThunkFork(knobs={}, expand_fn=lambda _k: []))
-
-
-def test_split_demoted_fork_pushes_structural(monkeypatch) -> None:
-    """005's keep-vs-split offer reads structural=True; every other fork on the
-    same drive (partition leaves, stage rebinds) reads False."""
-    for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
-        monkeypatch.setenv(f"EMMY_{k}", v)
-    target_mod.set_target((12, 0))
-    search = _drive_one_terminal(_norm_linear_graph(), (12, 0))
-    structural_rules = {rule for rule, structural in search.pushes if structural}
-    assert structural_rules == {"010_split_demoted"}, f"only 005's offer is structural, got {structural_rules}"
-    # The fully-pinned partition enumeration collapses to a single inline
-    # option (no fork pushed) — partition-leaf classification is covered by
-    # the 017 test below, whose tree stays multi-leaf.
-
-
-def test_atomic_free_splitk_fork_pushes_structural(monkeypatch) -> None:
-    """055's atomic-vs-workspace fork (a sub-partition ``Graph`` splice) reads
-    structural=True; the op-variant tiling forks (reduce / thread / register decomp)
-    on the same SPLITK=2 drive read False."""
-    monkeypatch.setenv("EMMY_SPLITK", "2")
-    target_mod.set_target((8, 0))
-    search = _drive_one_terminal(_f32_matmul_graph(), (8, 0))
-    structural_rules = {rule for rule, structural in search.pushes if structural}
-    assert structural_rules == {"150_cross_cta_finalize"}, f"only 055's offer is structural, got {structural_rules}"
-    tiling = [(rule, st) for rule, st in search.pushes if rule in {"060_reduce_tile", "090_thread_tile", "100_register_tile"}]
-    assert tiling and not any(st for _, st in tiling), "the body-move tiling forks are op-variant"
+    assert not _is_structural_option(_BranchFork())

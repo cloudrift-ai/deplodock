@@ -1,25 +1,24 @@
 """Drop redundant ``Sync`` stmts left by the materializer's templates.
 
-``100_materialize_tile`` emits a defensive ``Sync()`` at several template
-boundaries (stage prologue, combine, TMA wait). Many collapse: two
-consecutive ``Sync``s are one, and a leading ``Sync`` before any smem
-access fences nothing. This Kernel-IR peephole runs after materialize
-and before the CUDA lowering.
+A materializer that stages smem emits a defensive ``Sync()`` at several
+template boundaries (stage prologue, combine, TMA wait). Many collapse: two
+consecutive ``Sync``s are one, and a leading ``Sync`` before any smem access
+fences nothing. This Kernel-IR peephole runs after materialize and before the
+CUDA lowering.
 
-Scope matches the materializer's original in-line cleanup exactly: the
-immediate body of the (cooperative) ``ThreadTile`` — inside an optional
-``GridTile`` wrapper. No descent into nested ``Loop`` / ``Cond`` bodies,
-where the syncs are load-bearing.
+Scope: the immediate body of each :class:`Tile` (the thread-schedule
+wrapper). No descent into nested ``Loop`` / ``Cond`` bodies, where the syncs
+are load-bearing.
 """
 
 from __future__ import annotations
 
-from emmy.compiler.graph import Graph, Node
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.kernel import KernelOp, Tile
 from emmy.compiler.ir.kernel.ir import (
     CpAsyncCommit,
     CpAsyncCopy,
     CpAsyncWait,
-    KernelOp,
     MbarrierArriveExpectTx,
     MbarrierInit,
     MbarrierWait,
@@ -30,7 +29,6 @@ from emmy.compiler.ir.kernel.ir import (
     WarpShuffle,
 )
 from emmy.compiler.ir.stmt import Body, Stmt
-from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
 from emmy.compiler.pipeline import Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
@@ -80,29 +78,22 @@ def _drop_redundant_syncs(body: tuple[Stmt, ...]) -> list[Stmt]:
     return out
 
 
-def rewrite(root: Node) -> Graph | None:
+def rewrite(root: Node) -> KernelOp | None:
     op: KernelOp = root.op
     changed = False
 
-    def clean_parallel_tile(tt: ThreadTile | WarpTile) -> ThreadTile | WarpTile:
+    def clean_tile(t: Tile) -> Tile:
         nonlocal changed
-        deduped = _drop_redundant_syncs(tuple(tt.body))
-        if list(deduped) != list(tt.body):
+        deduped = _drop_redundant_syncs(tuple(t.body))
+        if list(deduped) != list(t.body):
             changed = True
-        if isinstance(tt, WarpTile):
-            return WarpTile(axes=tt.axes, body=Body(deduped))
-        return ThreadTile(axes=tt.axes, body=Body(deduped))
+            # ``with_bodies`` preserves ``block_threads`` — a bare ``Tile(axes, body)``
+            # would drop it, reverting a cooperative / staged tile's ``blockDim``.
+            return t.with_bodies((Body(deduped),))
+        return t
 
-    new_body: list[Stmt] = []
-    for s in op.body:
-        if isinstance(s, GridTile):
-            new_children = [clean_parallel_tile(c) if isinstance(c, (ThreadTile, WarpTile)) else c for c in s.body]
-            new_body.append(GridTile(axes=s.axes, body=Body(new_children), swizzle_group_m=s.swizzle_group_m))
-        elif isinstance(s, (ThreadTile, WarpTile)):
-            new_body.append(clean_parallel_tile(s))
-        else:
-            new_body.append(s)
+    new_body: list[Stmt] = [clean_tile(s) if isinstance(s, Tile) else s for s in op.body]
 
     if not changed:
         raise RuleSkipped("no redundant syncs at the tile body level")
-    return KernelOp(body=new_body, name=op.name)
+    return KernelOp(body=Body(new_body), name=op.name, knobs=dict(op.knobs))

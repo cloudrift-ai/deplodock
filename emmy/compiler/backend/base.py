@@ -163,17 +163,7 @@ class Backend(ABC):
         # ``CudaBackend.run``): each atomic symbolic input dim records its
         # runtime size; downstream node shapes — possibly composite Dim
         # exprs — resolve via ``expr.eval(sym_env)``.
-        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
-
-        sym_env: dict[str, int] = {}
-        for nid in input_set:
-            node = compiled.nodes.get(nid)
-            if node is None or nid not in input_data:
-                continue
-            arr_shape = np.asarray(input_data[nid]).shape
-            for i, d in enumerate(node.output.shape):
-                if not d.is_static and isinstance(d.expr, Var) and i < len(arr_shape):
-                    sym_env.setdefault(d.expr.name, int(arr_shape[i]))
+        sym_env = compiled.symbolic_env(input_data)
 
         def _shape_of(node) -> tuple[int, ...]:  # noqa: ANN001
             return tuple(d.as_static() if d.is_static else int(d.expr.eval(sym_env)) for d in node.output.shape)

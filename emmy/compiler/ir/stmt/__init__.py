@@ -26,10 +26,8 @@ Defined here rather than under any one IR package because all three IRs
 Each IR layer adds its own scheduling-specific Stmts on top:
 
 - Loop IR: nothing extra — its bodies are exactly Loop / leaves.
-- Tile IR: ``StageBundle``, plus the shared ``Loop`` / ``StridedLoop``
-  constructs from this module and the typed tile flavors (``GridTile``,
-  ``ThreadTile``, ``RegisterTile``, ``SerialTile``, ``StridedTile``) from
-  :mod:`emmy.compiler.ir.tile.ir`.
+- Tile IR: the typed tile flavors and staging constructs — DEMOLISHED,
+  pending rebuild.
 - Kernel IR: ``Smem``, ``Sync``, ``TreeHalve``, plus the shared
   constructs.
 
@@ -39,9 +37,9 @@ they enforce Loop-IR's invariants (SSA scoping rules, axis uniqueness)
 and produce Loop-IR's canonical form.
 """
 
+from emmy.compiler.ir.stmt.algebra import Carrier, State, StateMerge, Twist
 from emmy.compiler.ir.stmt.base import (
     INDENT,
-    ReduceCarrier,
     RenderCtx,
     Stmt,
     op_to_expr,
@@ -51,7 +49,7 @@ from emmy.compiler.ir.stmt.base import (
     select_to_ternary,
 )
 from emmy.compiler.ir.stmt.base import (
-    _axis_identity as _axis_identity,  # re-export for ir.tile.ir / ir.kernel.ir
+    _axis_identity as _axis_identity,  # re-export for downstream IR layers
 )
 from emmy.compiler.ir.stmt.base import (
     _pad as _pad,  # re-export for ir.kernel.ir
@@ -64,7 +62,6 @@ from emmy.compiler.ir.stmt.leaves import (
     Init,
     Load,
     Mma,
-    Monoid,
     Pack,
     Select,
     SelectBranch,
@@ -90,19 +87,21 @@ __all__ = [
     "Accum",
     "Assign",
     "Body",
-    "Monoid",
+    "Carrier",
+    "StateMerge",
     "Cond",
     "Init",
     "Load",
     "Loop",
     "Mma",
     "Pack",
-    "ReduceCarrier",
     "RenderCtx",
     "Select",
     "SelectBranch",
+    "State",
     "Stmt",
     "StridedLoop",
+    "Twist",
     "Unpack",
     "Write",
     "canonicalize_buffer_names",

@@ -201,8 +201,8 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 
 **Status:** correctness complete for decoder-only **Llama / Qwen3** (full-causal, fp16, TP=1). Perf is **not yet
 hardened** — host-sync interleave at the per-layer seam, and `serve` compiles 2× n_layers programs (startup- and
-memory-heavy → small models for now). Design + phase status:
-[`plans/generative-inference-support.md`](plans/generative-inference-support.md).
+memory-heavy → small models for now). See [`emmy/serving/ARCHITECTURE.md`](emmy/serving/ARCHITECTURE.md) for
+the design.
 
 ## Recipe
 
@@ -313,8 +313,7 @@ make format    # auto-fix
 - [docker/](docker/) — Custom image builds ([vllm-emmy](docker/vllm-emmy/) — vLLM + the emmy plugin)
 - [experiments/](experiments/) — Experiment parameter sweeps (self-contained recipe + results)
 - [kernels/](kernels/) — Standalone CUDA kernel sources
-- [docs/](docs/) — Technical notes and engine-specific guides
-  - [sglang-awq-moe.md](docs/sglang-awq-moe.md) — SGLang quantization for AWQ MoE models
+- [docs/](docs/) — Docusaurus user-docs site (getting started, benchmarking, custom configurations, deployment)
 - [tests/](tests/) — pytest tests (see [ARCHITECTURE.md](tests/ARCHITECTURE.md))
   - [compiler/passes/](tests/compiler/passes/) — compiler pass tests (see [ARCHITECTURE.md](tests/compiler/passes/ARCHITECTURE.md))
 - [scripts/](scripts/) — Analysis and visualization scripts

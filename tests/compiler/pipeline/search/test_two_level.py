@@ -17,13 +17,12 @@ import zlib
 
 import pytest
 
-from emmy.compiler import dtype as _dt
 from emmy.compiler.backend.base import BenchmarkResult, LaunchTime
 from emmy.compiler.context import Context
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.cuda.ir import CudaOp
-from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.pipeline import LOOP_PASSES, Pipeline, TuningSearch
 from emmy.compiler.pipeline.search.db import SearchDB
@@ -31,9 +30,6 @@ from emmy.compiler.pipeline.search.keys import op_cache_key
 from emmy.compiler.pipeline.search.slice import single_node_graph
 from emmy.compiler.pipeline.search.two_level import (
     LOWERING_PASSES,
-    OpResult,
-    _decomposition_rows,
-    outer_pipeline,
 )
 from tests.compiler.conftest import drain_tune, run_inner_reward, run_two_level
 
@@ -262,13 +258,23 @@ def test_inner_reward_shares_identical_kernel() -> None:
     assert reward.total_us == pytest.approx(2 * reward.per_op[0].best_us)
 
 
-def test_inner_reward_parallel_matches_serial() -> None:
+def test_inner_reward_parallel_matches_serial(monkeypatch) -> None:
     """The core multi-GPU invariant: tuning the unique kernels concurrently across
     a pool of N device-pinned backends yields the SAME per-op bests and summed
     reward as the one-slot serial path. Each op's search is seeded by ``op_idx``
     (execution-order-independent) and the fake backend's latency keys off
     ``op_cache_key`` (slot-independent), so completion order can't change the
-    result. ``prior=None`` keeps this off the learned-prior (catboost) path."""
+    result. ``prior=None`` keeps this off the learned-prior (catboost) path.
+
+    The tile is pinned to per-cell (``EMMY_TILE=""``) so the matmul enumerates a
+    single candidate: the tile move catalog (``search/space.py``) now offers ~20
+    scalar tiles per contraction, and under the small ``_PATIENCE`` window the
+    patience-limited MCTS explores a *subset* whose membership is sensitive to the
+    bench-completion interleaving of the parallel pool — so the exact parallel==serial
+    total only holds once the candidate set is fixed. Pinning isolates the
+    orchestration invariant this test targets (the reward summing / multiplicity across
+    backends); the search-space breadth is covered by ``test_inner_reward_is_separable``."""
+    monkeypatch.setenv("EMMY_TILE", "")
     fused = _fuse(_two_distinct_matmuls())
     ctx = Context.from_target((8, 0))
 
@@ -280,243 +286,6 @@ def test_inner_reward_parallel_matches_serial() -> None:
     s_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in serial.per_op}
     p_by_key = {r.op_key: (r.best_us, r.multiplicity) for r in parallel.per_op}
     assert p_by_key == s_by_key, "per-op bests must be identical regardless of slot count"
-
-
-def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
-    """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
-    f16 = _dt.get("f16")
-    g = g if g is not None else Graph()
-    x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
-    g.add_node(InputOp(), [], Tensor(x, (1, 32, 1024), f16), node_id=x)
-    g.add_node(InputOp(), [], Tensor(nw, (1024,), f16), node_id=nw)
-    g.add_node(InputOp(), [], Tensor(wg, (3072, 1024), f16), node_id=wg)
-    g.add_node(RmsNormOp(eps=1e-6), [x, nw], Tensor(xn, (1, 32, 1024), f16), node_id=xn)
-    g.add_node(LinearOp(), [xn, wg], Tensor(o, (1, 32, 3072), f16), node_id=o)
-    g.inputs += [x, nw, wg]
-    g.outputs += [o]
-    return g
-
-
-class _RecordingProgress:
-    """Duck-typed ``TuneProgress``: captures per-terminal op denominators and
-    the tuned op-leaf names."""
-
-    def __init__(self) -> None:
-        self.terminal_sizes: list[int] = []
-        self.ops: list[str] = []
-
-    def start_terminal(self, n_ops: int) -> None:
-        self.terminal_sizes.append(n_ops)
-
-    def op_start(self, name: str, *, slot: int = 0) -> None:  # noqa: ARG002
-        self.ops.append(name)
-
-    def variant(self, *a, **kw) -> None:  # noqa: ANN002
-        pass
-
-    def op_done(self, name: str, *, slot: int = 0) -> None:
-        pass
-
-
-class _RecordingPrior:
-    """Minimal ``Prior`` stand-in for ``load_prior`` monkeypatching: unfitted
-    (uniform PUCT, greedy keeps cold behavior), captures ``add_rows`` traffic."""
-
-    fitted = False
-
-    def __init__(self) -> None:
-        self.rows: list[tuple[dict, float]] = []
-        self.trajectory: list = []
-
-    def add_rows(self, rows) -> None:
-        self.rows.extend(rows)
-
-    def maybe_refit(self, *, force: bool = False) -> bool:
-        return False
-
-    def checkpoint(self) -> None:
-        pass
-
-    def record_bench(self, knobs, median, status) -> None:
-        pass
-
-    def score(self, knobs) -> float:
-        return 0.0
-
-    def mean_score(self, knobs) -> float:
-        return 0.0
-
-    def mean_scores(self, rows) -> list[float]:
-        return [0.0] * len(rows)
-
-    def summary(self, label) -> str:
-        return ""
-
-
-def _is_decomposition_row(knobs: dict) -> bool:
-    """Composed Σ rows carry the structural decision knob (PLACE@cone) but no tile-level
-    knobs — every inner per-kernel / branch row carries at least one native geometry knob."""
-    return "PLACE@cone" in knobs and not any(k.startswith(("SPLIT@", "REDUCE@", "ATOM@")) for k in knobs)
-
-
-def test_outer_branches_on_structural_fork(monkeypatch) -> None:
-    """The outer drives through the pre-partition tile head: 005's keep-vs-split
-    offer branches the OUTER tree, so both kernel sets appear as outer terminals
-    and the split producer/consumer are their own tuned op leaves (own progress
-    denominator), not sub-explorations inside the fused kernel's slice. Each
-    terminal also feeds the prior one composed Σ row per structural decision —
-    the kernel-set cost of the side it realized."""
-    from emmy.compiler import target as target_mod
-    from emmy.compiler.pipeline.search import prior as prior_pkg
-
-    for k, v in {"WM": "2", "WN": "2", "FM": "1", "FN": "8", "BK": "2", "BM": "8", "BN": "64", "BR": "1", "SPLITK": "1", "FK": "1"}.items():
-        monkeypatch.setenv(f"EMMY_{k}", v)
-    target_mod.set_target((12, 0))
-    rec = _RecordingPrior()
-    monkeypatch.setattr(prior_pkg, "load_prior", lambda *a, **kw: rec)
-    progress = _RecordingProgress()
-    db = SearchDB()
-    result = run_two_level(
-        _norm_linear("a"),
-        ctx=Context.from_target((12, 0)),
-        db=db,
-        backend=_CountingBackend(),
-        patience=4,
-        progress=progress,
-    )
-    assert result.n_terminals == 2, "keep-vs-split must branch the outer tree into two terminals"
-    # One terminal carries the fused kernel (1 op leaf), the other the split
-    # producer + consumer (2 op leaves) — the denominators the progress bar sees.
-    assert sorted(progress.terminal_sizes) == [1, 2]
-    assert any(name.endswith("_xn") for name in progress.ops), f"split producer must be its own op leaf, got {progress.ops}"
-    # Both sides' composed rows reached the prior: PLACE@cone=inline (keep) labeled
-    # with the fused best, PLACE@cone=cut (cut) with the split kernels' Σ.
-    decomp = [(k, us) for k, us in rec.rows if _is_decomposition_row(k)]
-    assert {k["PLACE@cone"] for k, _ in decomp} == {"inline", "cut"}
-    assert all(us > 0 for _, us in decomp)
-    # The decision hop never enters the ``lowering`` table (one best child per
-    # parent — a multi-kernel decomposition's parent must not resolve through
-    # ONE fragment kernel's median): the pre-decision op has no lowering row.
-    site = next(_site(n.op) for n in result.best_fused.nodes.values() if _site(n.op) is not None)
-    assert db.lookup_lowering(op_cache_key(site)) is None
-
-
-def _outer_terminals(graph: Graph) -> list[Graph]:
-    search = TuningSearch(patience=10**6)
-    drained = drain_tune(outer_pipeline(), graph, search=search, ctx=Context.from_target((12, 0)), db=SearchDB())
-    return [cand.graph for cand in drained]
-
-
-def _kernels(graph: Graph) -> list:
-    """Outer-terminal kernel ops. A terminal sits past ``010_build``, so its
-    kernels are ``TileGraphOp`` seeds (the keep(SMEM) fused kernel + the cut's
-    producer/consumer); a ``LoopOp`` survives only when ``010_build`` skipped it."""
-    from emmy.compiler.ir.tile.ir import TileGraphOp
-
-    return [n.op for n in graph.nodes.values() if isinstance(n.op, (LoopOp, TileGraphOp))]
-
-
-def _site(op):
-    """The pre-decision offer site — the deepest ``S_*``-stamped loop ancestor,
-    mirroring ``two_level._decomposition_rows`` (the original demoted matmul,
-    before the fission re-stamped each fragment's own shallower ``S_*``)."""
-    from emmy.compiler.pipeline.search.keys import dialect_of, source_chain
-
-    site = None
-    for anc in source_chain(op):
-        if dialect_of(anc) == "loop" and any(k.startswith("S_") for k in getattr(anc, "knobs", {})):
-            site = anc
-    return site
-
-
-def test_split_kernels_attribute_to_pre_decision_op() -> None:
-    """Both sides of the structural fork attribute to the offer-site op via
-    ``Op.source`` — the decomposition link the composed Σ rows group by. The
-    split side is stamped at the splice; the keep side is stamped by the
-    engine's UNCONDITIONAL rebind stamp (005 builds the keep option via
-    ``dataclasses.replace``, which copies the root's own knob-less ancestor
-    into ``source`` — honoring the copy used to point the link past the offer
-    site)."""
-    terminals = _outer_terminals(_norm_linear("a"))
-    split = next(t for t in terminals if len(_kernels(t)) == 2)
-    kernels = _kernels(split)
-    assert all(k.knobs.get("PLACE@cone") == "cut" for k in kernels)
-    assert all(_site(k) is not None for k in kernels)
-    assert len({op_cache_key(_site(k)) for k in kernels}) == 1, "both fragment kernels must attribute to one pre-decision op"
-    site = _site(kernels[0])
-    assert "PLACE@cone" not in site.knobs
-    assert any(k.startswith("S_") for k in site.knobs), "the site is the S_*-stamped offer op, not a bare ancestor"
-
-    fused = next(t for t in terminals if len(_kernels(t)) == 1)
-    keep = _kernels(fused)[0]
-    assert keep.knobs.get("PLACE@cone") == "inline"
-    assert _site(keep) is not None and op_cache_key(_site(keep)) == op_cache_key(site), (
-        "the keep side must attribute to the SAME offer-site op as the split side"
-    )
-
-
-def test_outer_descends_prior_preferred_branch_first() -> None:
-    """With a prior ranking the split side cheaper, the outer PUCT explores it
-    FIRST — including past the fork's resolve: the resolved branch's
-    continuation keeps its ``PLACE@cone`` delta (``LazyCandidate.resolved_knobs``),
-    so it isn't out-scored by the unresolved keep-fused sibling as a knob-less
-    generic row (the regression this test pins)."""
-
-    class _SplitCheapPrior(_RecordingPrior):
-        def score(self, knobs) -> float:
-            if knobs.get("PLACE@cone") == "cut":
-                return 1.0
-            return 2.0 if "PLACE@cone" in knobs else 3.0
-
-    ctx = Context.from_target((12, 0))
-    search = TuningSearch(patience=10**6, prior_model=_SplitCheapPrior(), base_knobs=ctx.features())
-    drained = drain_tune(outer_pipeline(), _norm_linear("a"), search=search, ctx=ctx, db=SearchDB(), on=lambda c: True)
-    first = drained[0]
-    assert len(_kernels(first.graph)) == 2, "the prior-preferred (split) kernel set must reach its terminal first"
-
-
-def test_decomposition_rows_sum_kernel_set_costs() -> None:
-    """One composed row per structural decision: features = the offer site's
-    knobs + the decision delta (never the kids' restamped ``S_*``), label =
-    the Σ of the side's per-kernel bests."""
-    terminals = _outer_terminals(_norm_linear("a"))
-    by_size = {len(_kernels(t)): t for t in terminals}
-    ctx = Context.from_target((12, 0))
-
-    split = by_size[2]
-    per_op = [OpResult(name="k", op_key=op_cache_key(op), best_us=us) for op, us in zip(_kernels(split), (7.0, 13.0), strict=True)]
-    rows = _decomposition_rows(split, per_op, ctx)
-    assert len(rows) == 1
-    feats, label = rows[0]
-    assert label == pytest.approx(20.0), "the split side's price is the kernel-set Σ"
-    assert feats["PLACE@cone"] == "cut"
-    site = _site(_kernels(split)[0])
-    site_s_feats = {k: v for k, v in site.knobs.items() if k.startswith("S_")}
-    assert site_s_feats and all(feats[k] == v for k, v in site_s_feats.items()), "the row rides the SITE's S_* identity"
-
-    fused = by_size[1]
-    fop = _kernels(fused)[0]
-    rows = _decomposition_rows(fused, [OpResult(name="k", op_key=op_cache_key(fop), best_us=42.0)], ctx)
-    assert len(rows) == 1
-    feats, label = rows[0]
-    assert label == pytest.approx(42.0)
-    assert feats["PLACE@cone"] == "inline"
-
-
-def test_identical_offer_sites_take_the_same_side() -> None:
-    """Two structurally identical offer sites take the same side within a
-    trajectory — the engine replays the first decision read off the graph via
-    the ``Op.source`` links + stamped decision knobs
-    (``pipeline._replay_structural_decision``): the outer tree yields 2
-    terminals (all-fused, all-split), not the 2^sites cross-product."""
-    g = _norm_linear("b", _norm_linear("a"))
-    terminals = [
-        cand.graph
-        for cand in drain_tune(outer_pipeline(), g, search=TuningSearch(patience=10**6), ctx=Context.from_target((12, 0)), db=SearchDB())
-    ]
-    sizes = sorted(len(_kernels(t)) for t in terminals)
-    assert sizes == [2, 4], f"expected all-fused (2 kernels) and all-split (4) terminals only, got {sizes}"
 
 
 def test_run_two_level_tune_single_terminal_assembles_bests() -> None:

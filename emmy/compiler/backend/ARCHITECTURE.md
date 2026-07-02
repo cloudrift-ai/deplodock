@@ -51,10 +51,11 @@ compute node. `InputOp` and `ConstantOp` boundaries are seeded from
 when the target shape is statically known.
 
 Every op implements `forward(*inputs: np.ndarray) → np.ndarray`,
-including `LoopOp`: its `forward` delegates to
-`ir/loop/interpret.execute_loop_op`, the body-level numpy interpreter.
-That's why the same default `run` works for pre-fusion graphs (LoopOp
-absent) and post-fusion graphs (LoopOp is just another `Op` subclass).
+including `LoopOp`: its `forward` delegates to `ir/loop/runner.py`
+(`execute_loop_op_cpp`), which renders the body to C++ and JIT-compiles
+it in-process via cppyy / Cling. That's why the same default `run` works
+for pre-fusion graphs (LoopOp absent) and post-fusion graphs (LoopOp is
+just another `Op` subclass).
 `NumpyBackend` and `LoopBackend` inherit it verbatim; `CudaBackend`
 overrides with cupy dispatch.
 

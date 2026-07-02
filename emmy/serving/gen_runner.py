@@ -1,5 +1,4 @@
-"""``EmmyGenRunner`` — per-layer attention-split runner (Phase 2 of
-``plans/generative-inference-support.md``).
+"""``EmmyGenRunner`` — per-layer attention-split runner (Phase 2).
 
 Sibling to ``EmmyForwardRunner`` (the embedding runner). Carves SDPA out of every
 decoder layer (``build_attention_split_wrapper``), compiles **two programs per layer**
@@ -262,7 +261,7 @@ class EmmyGenRunner:
             out = self._norm(torch.from_numpy(np.ascontiguousarray(hidden)))
         return out.numpy()
 
-    # --- Device-resident decode path (Phase A of plans/generative-device-resident-decode.md) ---
+    # --- Device-resident decode path (Phase A) ---
     # Used by the vLLM plugin for the decode hot path (T <= decode_bucket); the numpy methods
     # above stay for prefill / the standalone ``emmy generate`` oracle.
 

@@ -235,8 +235,7 @@ def build_layer_wrapper(block, rotary_emb, hidden_size: int, dtype, *, layer_typ
 
 
 def build_attention_split_wrapper(block):
-    """Carve SDPA out of one HF decoder layer (Phase 1 of
-    ``plans/generative-inference-support.md``). Returns ``(pre, post)`` ``nn.Module``s over
+    """Carve SDPA out of one HF decoder layer (Phase 1). Returns ``(pre, post)`` ``nn.Module``s over
     the flattened **``[num_tokens, H]``** per-token layout:
 
     - ``pre(hidden[T, H]) -> (q, k, v)`` runs ``input_layernorm`` → separate

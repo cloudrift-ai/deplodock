@@ -9,7 +9,7 @@ silently.
 
 from __future__ import annotations
 
-from emmy.compiler.pipeline import knob
+from emmy.compiler.pipeline.search import features
 from emmy.compiler.pipeline.search.data import Dataset, Sample, ShapeKey
 from emmy.compiler.pipeline.search.db import PerfSample, PerfStats, SearchDB
 
@@ -100,7 +100,7 @@ def test_db_row_round_trip_is_lossless() -> None:
     raw = {"BN": 32, "BM": 8, "SPLITK": 1, "S_ext_free_prod": 4194304.0, "S_n_mma": 1.0, "H_cc": 120.0, "H_opt": 3.0}
     s = Sample.from_perf_sample(PerfSample(pretty=_pretty("k_matmul"), knobs=raw, latency_us=42.0))
     assert s.all_knobs() == raw
-    assert s.features() == knob.knob_features(raw)
+    assert s.features() == features.knob_features(raw)
     assert s.name == "k_matmul"
     assert s.knobs == {"BN": 32, "BM": 8, "SPLITK": 1}  # tunable only
 
@@ -125,7 +125,7 @@ def test_prior_row_round_trip_is_lossless() -> None:
     raw = {"BM": 16, "S_kind": 1.0, "H_cc": 90.0}
     s = Sample.from_prior_row(raw, 3.5)
     assert s.all_knobs() == raw
-    assert s.features() == knob.knob_features(raw)
+    assert s.features() == features.knob_features(raw)
     assert s.source == "prior"
 
 
@@ -150,7 +150,7 @@ def test_golden_compile_s_feats_matches_inline(monkeypatch) -> None:
     # gpu_name pins the device-physical H_* features to the golden's own card's
     # memorized specs (so a 4090 golden gets 128 SMs, not the live device's count) —
     # Sample.from_golden does the same, so the two must still agree.
-    inline = knob.knob_features({**Context.from_target(g.compute_cap, gpu_name=g.gpu_name).features(), **s_feats, **g.knobs})
+    inline = features.knob_features({**Context.from_target(g.compute_cap, gpu_name=g.gpu_name).features(), **s_feats, **g.knobs})
 
     assert Sample.from_golden(g, compile_s_feats=True).features() == inline
 

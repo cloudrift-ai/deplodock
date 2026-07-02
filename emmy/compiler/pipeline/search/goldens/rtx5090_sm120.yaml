@@ -6,7 +6,7 @@ configs:
     M: 512
     N: 512
     K: 512
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, BK: 64, SPLITK: 1, BR: 1, FK: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', STAGE: 'd3/tma/ring'}
     emmy_us: 9.0
     cublas_us: 14.5
   - kernel: matmul
@@ -14,7 +14,7 @@ configs:
     M: 1024
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x14', STAGE: 'd2/tma/ring'}
     emmy_us: 45.8
     cublas_us: 53.3
   - kernel: matmul
@@ -22,7 +22,7 @@ configs:
     M: 1024
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x16/f4x8', STAGE: 'd4/tma/ring'}
     emmy_us: 44.1
     cublas_us: 53.3
   - kernel: matmul
@@ -30,7 +30,7 @@ configs:
     M: 2048
     N: 2048
     K: 2048
-    knobs: {BN: 32, BM: 8, FM: 26, FN: 4, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, WARPSPEC: false, TMA: 1}
+    knobs: {TILE: 'n32x8/f4x26', STAGE: 'd2/tma/ring', WARPSPEC: false}
     emmy_us: 294.8
     cublas_us: 296.1
   - kernel: matmul
@@ -38,7 +38,7 @@ configs:
     M: 4096
     N: 4096
     K: 4096
-    knobs: {BN: 32, BM: 16, FM: 10, FN: 4, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, WARPSPEC: false, TMA: 1}
+    knobs: {TILE: 'n32x16/f4x10', STAGE: 'd2/tma/ring', WARPSPEC: false}
     emmy_us: 2348.7
     cublas_us: 2144.7
   - kernel: matmul
@@ -47,7 +47,7 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {WN: 4, WM: 4, FM: 1, FN: 1, BK: 4, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w4x4/f1x1/k4', STAGE: 'd2/tma/ring'}
     emmy_us: 4.1
     cublas_us: 6.2
   - kernel: matmul
@@ -56,7 +56,7 @@ configs:
     N: 1024
     K: 1024
     dtype: fp16
-    knobs: {WN: 4, WM: 1, FM: 4, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f4x2/k2', WARPSPEC: true}
     emmy_us: 18.5
     cublas_us: 17.0
   - kernel: matmul
@@ -65,7 +65,7 @@ configs:
     N: 1024
     K: 1024
     dtype: fp16
-    knobs: {WN: 4, WM: 4, FM: 2, FN: 2, BK: 8, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w4x4/f2x2/k8', WARPSPEC: true}
     emmy_us: 17.3
     cublas_us: 17.0
   - kernel: matmul
@@ -74,7 +74,7 @@ configs:
     N: 2048
     K: 2048
     dtype: fp16
-    knobs: {WN: 4, WM: 1, FM: 4, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f4x2/k2', WARPSPEC: true}
     emmy_us: 106.7
     cublas_us: 113.0
   - kernel: matmul
@@ -83,7 +83,7 @@ configs:
     N: 2048
     K: 2048
     dtype: fp16
-    knobs: {WN: 8, WM: 1, FM: 2, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x8/f2x2/k2', STAGE: 'd2/tma/ring', WARPSPEC: true}
     emmy_us: 108.3
     cublas_us: 97.2
   - kernel: matmul
@@ -92,7 +92,7 @@ configs:
     N: 4096
     K: 4096
     dtype: fp16
-    knobs: {WN: 4, WM: 1, FM: 4, FN: 2, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f4x2/k2', WARPSPEC: true}
     emmy_us: 746.3
     cublas_us: 765.0
   - kernel: matmul
@@ -101,7 +101,7 @@ configs:
     N: 4096
     K: 4096
     dtype: fp16
-    knobs: {WN: 4, WM: 2, FM: 2, FN: 4, BK: 2, SPLITK: 1, MMA: 'mma_m16n8k16_f16', STAGE: '11', RING: 2, WARPSPEC: true, TMA: 1}
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x4/f2x4/k2', STAGE: 'd2/tma/ring', WARPSPEC: true}
     emmy_us: 727.7
     cublas_us: 728.0
   - kernel: matmul
@@ -109,7 +109,7 @@ configs:
     M: 32
     N: 2048
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 7.5
     cublas_us: 12.4
   - kernel: matmul
@@ -117,7 +117,7 @@ configs:
     M: 32
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 2, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 4.9
     cublas_us: 8.3
   - kernel: matmul
@@ -125,7 +125,7 @@ configs:
     M: 32
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 8, FM: 2, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 8.0
     cublas_us: 10.3
   - kernel: matmul
@@ -133,7 +133,7 @@ configs:
     M: 32
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x4', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     emmy_us: 9.6
     cublas_us: 14.6
   - kernel: matmul
@@ -141,7 +141,7 @@ configs:
     M: 32
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x4', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     emmy_us: 10.9
     cublas_us: 14.6
   - kernel: matmul
@@ -149,7 +149,7 @@ configs:
     M: 32
     N: 1024
     K: 3072
-    knobs: {BN: 16, BM: 8, FM: 2, FN: 2, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     emmy_us: 16.4
     cublas_us: 14.5
   - kernel: matmul
@@ -157,7 +157,7 @@ configs:
     M: 32
     N: 1024
     K: 3072
-    knobs: {BN: 16, BM: 8, FM: 2, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x2', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     emmy_us: 16.4
     cublas_us: 14.5
   - kernel: matmul
@@ -165,7 +165,7 @@ configs:
     M: 128
     N: 2048
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', STAGE: 'd3/tma/ring'}
     emmy_us: 18.4
     cublas_us: 20.9
   - kernel: matmul
@@ -173,7 +173,7 @@ configs:
     M: 128
     N: 2048
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x4', STAGE: 'd3/tma/ring'}
     emmy_us: 16.3
     cublas_us: 20.9
   - kernel: matmul
@@ -181,7 +181,7 @@ configs:
     M: 128
     N: 1024
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x4', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     emmy_us: 9.8
     cublas_us: 14.5
   - kernel: matmul
@@ -189,7 +189,7 @@ configs:
     M: 128
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', STAGE: 'd2/tma/ring'}
     emmy_us: 11.4
     cublas_us: 14.5
   - kernel: matmul
@@ -197,7 +197,7 @@ configs:
     M: 128
     N: 1024
     K: 2048
-    knobs: {BN: 32, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x4', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     emmy_us: 17.7
     cublas_us: 19.7
   - kernel: matmul
@@ -205,7 +205,7 @@ configs:
     M: 128
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x16/f2x4', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     emmy_us: 17.4
     cublas_us: 19.7
   - kernel: matmul
@@ -213,7 +213,7 @@ configs:
     M: 128
     N: 3072
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 6, FN: 4, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f4x6', STAGE: 'd2/tma/ring'}
     emmy_us: 23.8
     cublas_us: 39.2
   - kernel: matmul
@@ -221,7 +221,7 @@ configs:
     M: 128
     N: 1024
     K: 3072
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     emmy_us: 24.9
     cublas_us: 97.3
   - kernel: matmul
@@ -229,7 +229,7 @@ configs:
     M: 128
     N: 1024
     K: 3072
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x16/f2x4', REDUCE: 'g2a', STAGE: 'd4/tma/ring'}
     emmy_us: 25.1
     cublas_us: 97.3
   - kernel: matmul
@@ -237,7 +237,7 @@ configs:
     M: 128
     N: 1024
     K: 3072
-    knobs: {BN: 16, BM: 8, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x4', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 28.2
     cublas_us: 97.3
   - kernel: matmul
@@ -245,7 +245,7 @@ configs:
     M: 512
     N: 2048
     K: 1024
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 4, TMA: 1}
+    knobs: {TILE: 'n16x16/f4x8', STAGE: 'd4/tma/ring'}
     emmy_us: 44.2
     cublas_us: 53.5
   - kernel: matmul
@@ -253,7 +253,7 @@ configs:
     M: 512
     N: 1024
     K: 1024
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x14', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 24.6
     cublas_us: 39.6
   - kernel: matmul
@@ -261,7 +261,7 @@ configs:
     M: 512
     N: 1024
     K: 2048
-    knobs: {BN: 16, BM: 8, FM: 14, FN: 2, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f2x14', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 50.5
     cublas_us: 58.6
   - kernel: matmul
@@ -269,7 +269,7 @@ configs:
     M: 512
     N: 3072
     K: 1024
-    knobs: {BN: 32, BM: 8, FM: 10, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f4x10', STAGE: 'd3/tma/ring'}
     emmy_us: 52.4
     cublas_us: 82.2
   - kernel: matmul
@@ -277,7 +277,7 @@ configs:
     M: 512
     N: 1024
     K: 3072
-    knobs: {BN: 32, BM: 8, FM: 14, FN: 2, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n32x8/f2x14', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 75.7
     cublas_us: 79.6
   # --- dynamic (symbolic-M) goldens: masked-tile kernels, M is the Dim hint (== DEFAULT_SEQ_HINT),
@@ -289,7 +289,7 @@ configs:
     N: 512
     K: 512
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 4, FN: 2, FK: 1, BK: 64, SPLITK: 1, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n16x16/f2x4', STAGE: 'd3/tma/ring'}
     emmy_us: 11.0
     cublas_us: 14.0
   - kernel: matmul
@@ -298,7 +298,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n32x16/f4x4', STAGE: 'd2/tma/ring'}
     emmy_us: 52.5
     cublas_us: 47.0
   - kernel: matmul
@@ -307,7 +307,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 16, FM: 4, FN: 4, FK: 1, BK: 32, SPLITK: 1, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x16/f4x4', STAGE: 'd3/tma/ring'}
     emmy_us: 50.4
     cublas_us: 47.0
   - kernel: matmul
@@ -316,7 +316,7 @@ configs:
     N: 2048
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 32, BM: 8, FM: 14, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 3, TMA: 1}
+    knobs: {TILE: 'n32x8/f4x14', REDUCE: 'g2a', STAGE: 'd3/tma/ring'}
     emmy_us: 54.4
     cublas_us: 47.0
   - kernel: matmul
@@ -325,7 +325,7 @@ configs:
     N: 1024
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f4x8', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 30.7
     cublas_us: 39.0
   - kernel: matmul
@@ -334,7 +334,7 @@ configs:
     N: 1024
     K: 2048
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x16/f4x8', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 52.7
     cublas_us: 57.0
   - kernel: matmul
@@ -343,7 +343,7 @@ configs:
     N: 3072
     K: 1024
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 8, FM: 8, FN: 4, FK: 1, BK: 32, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x8/f4x8', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 72.8
     cublas_us: 79.0
   - kernel: matmul
@@ -352,41 +352,41 @@ configs:
     N: 1024
     K: 3072
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {BN: 16, BM: 16, FM: 8, FN: 4, FK: 1, BK: 64, SPLITK: 2, BR: 1, STAGE: '11', RING: 2, TMA: 1}
+    knobs: {TILE: 'n16x16/f4x8', REDUCE: 'g2a', STAGE: 'd2/tma/ring'}
     emmy_us: 74.8
     cublas_us: 76.0
   - kernel: reduce
     name: reduce.2048x2048
     M: 2048
     K: 2048
-    knobs: {BN: 1, BM: 1, BR: 16, BK: 64, FM: 1, FN: 1, FK: 1, SPLITK: 1}
+    knobs: {REDUCE: 'b16'}
     emmy_us: 4.12
     cublas_us: 6.13
   - kernel: reduce
     name: reduce.1024x512
     M: 1024
     K: 512
-    knobs: {BN: 1, BM: 1, BR: 32, BK: 16, FM: 1, FN: 2, FK: 1, SPLITK: 1}
+    knobs: {TILE: 'f2', REDUCE: 'b32'}
     emmy_us: 2.05
     cublas_us: 2.05
   - kernel: reduce
     name: reduce.2048x128
     M: 2048
     K: 128
-    knobs: {BN: 1, BM: 1, BR: 8, BK: 16, FM: 1, FN: 2, FK: 1, SPLITK: 1}
+    knobs: {TILE: 'f2', REDUCE: 'b8'}
     emmy_us: 2.05
     cublas_us: 2.05
   - kernel: pointwise
     name: pointwise.2048x2048
     M: 2048
     N: 2048
-    knobs: {BN: 128, BM: 8, BR: 1, BK: 1, FM: 8, FN: 1, FK: 1, SPLITK: 1}
+    knobs: {TILE: 'n128x8/f1x8'}
     emmy_us: 8.0
     cublas_us: 8.0
   - kernel: pointwise
     name: pointwise.512x4096
     M: 512
     N: 4096
-    knobs: {BN: 128, BM: 8, BR: 1, BK: 1, FM: 16, FN: 1, FK: 1, SPLITK: 1}
+    knobs: {TILE: 'n128x8/f1x16'}
     emmy_us: 6.15
     cublas_us: 6.15

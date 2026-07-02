@@ -17,6 +17,7 @@ from functools import singledispatch
 from emmy.compiler.ir.axis import Axis, extend_simplify_ctx
 from emmy.compiler.ir.expr import Expr, SimplifyCtx, Var
 from emmy.compiler.ir.sigma import Sigma
+from emmy.compiler.ir.stmt.algebra import State, StateMerge
 from emmy.compiler.ir.stmt.base import Stmt, _axis_identity
 from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
 from emmy.compiler.ir.stmt.leaves import (
@@ -25,7 +26,6 @@ from emmy.compiler.ir.stmt.leaves import (
     Init,
     Load,
     Mma,
-    Monoid,
     Pack,
     Select,
     SelectBranch,
@@ -129,6 +129,7 @@ def _(s: Accum, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         op=s.op,
         dtype=s.dtype,
         axes=new_axes,
+        base=rename(s.base) if s.base is not None else None,
     )
 
 
@@ -153,40 +154,26 @@ def _(s: Mma, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 
 @rewrite.register
-def _(s: Monoid, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    new_axes = tuple(n for old in s.axes for n in _rewrite_axis_name(old, sigma))
-    # The merge / combine_states programs reference state / partial / state_b
-    # (all in the rename map) PLUS carrier-internal temps that are NOT surfaced via
-    # ``defines()`` — so a register-tile replicator that renames the state per cell
-    # leaves the temps shared, colliding across replicas. Uniquify the temps with a
-    # suffix derived from the renamed first state name whenever the state actually
-    # moves (identity rename / pure σ-split leaves them untouched, preserving the
-    # streaming-form SSA).
-    new_state0 = rename(s.state[0]) if s.state else None
-    carried = set(s.state) | set(s.state_b)
-    temps = {a.name for a in (*s.merge, *s.combine_states)} - carried
-    overlay: dict[str, str] = {}
-    if new_state0 is not None and new_state0 != s.state[0]:
-        overlay = {t: f"{t}__{new_state0}" for t in temps}
+def _(s: StateMerge, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # The renderable cross-partition combine: rename the state / state_b (in the rename map)
+    # PLUS the carrier-internal temps NOT surfaced via ``defines()`` — so a register-tile
+    # replicator that renames the state per cell leaves the temps shared, colliding across
+    # replicas. Uniquify the temps with a suffix derived from the renamed first state name
+    # whenever the state actually moves (identity rename / pure σ-split leaves them untouched).
+    names = s.state.names
+    new_state0 = rename(names[0]) if names else None
+    carried = set(names) | set(s.state_b)
+    temps = {a.name for a in s.merge} - carried
+    overlay = {t: f"{t}__{new_state0}" for t in temps} if new_state0 is not None and new_state0 != names[0] else {}
 
     def rn(name: str) -> str:
-        # Prefer the caller's rename; the overlay is a fallback only for the
-        # internal temps a SELECTIVE replicator rename leaves untouched (a uniform
-        # ``f"{n}__r"`` rename already suffixes them — don't double-rename).
         r = rename(name)
-        if r != name:
-            return r
-        return overlay.get(name, name)
+        return r if r != name else overlay.get(name, name)
 
-    return Monoid(
-        state=tuple(rn(n) for n in s.state),
-        partial=tuple(rn(n) for n in s.partial),
+    return StateMerge(
+        state=State(names=tuple(rn(n) for n in names)),
         merge=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.merge),
-        identity=s.identity,  # constant Exprs — no SSA names to rename
-        commutative=s.commutative,
-        axes=new_axes,
         state_b=tuple(rn(n) for n in s.state_b),
-        combine_states=tuple(rewrite(m, rn, sigma, axis_fn) for m in s.combine_states),
     )
 
 
@@ -209,7 +196,9 @@ def _rewrite_axis_name(name: str, sigma: Sigma) -> tuple[str, ...]:
 
 @rewrite.register
 def _(s: Init, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
-    return Init(name=rename(s.name), op=s.op, dtype=s.dtype)
+    # ``identity`` is a constant scalar — only the name moves. Renamed in lockstep with
+    # the carrier's ``Accum`` / ``Carrier.state`` (registered above) so the seed stays paired.
+    return Init(name=rename(s.name), identity=s.identity, dtype=s.dtype)
 
 
 @rewrite.register
@@ -219,6 +208,7 @@ def _(s: Write, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         index=tuple(_rename_ssa_vars_in_expr(sigma.apply(e), rename) for e in s.index),
         values=tuple(rename(n) for n in s.values),
         value_dtype=s.value_dtype,
+        atomic=s.atomic,
     )
 
 
@@ -232,10 +222,15 @@ def _(s: Select, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @rewrite.register
 def _(s: Loop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
+    # Preserve the reduce annotation (``role`` / ``carrier``): a σ-offset / axis-rename of an
+    # annotated reduce loop (030_split's slice) leaves the carried-state algebra unchanged — only
+    # the loop's operand load indices move — so the carrier rides through verbatim.
     return Loop(
         axis=axis_fn(s.axis),
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
@@ -248,6 +243,8 @@ def _(s: StridedLoop, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
         step=step,
         body=tuple(rewrite(c, rename, sigma, axis_fn) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
@@ -267,7 +264,7 @@ def _(s: Cond, rename: Rename, sigma: Sigma, axis_fn: AxisFn) -> Stmt:
 
 @singledispatch
 def simplify(stmt: Stmt, ctx: SimplifyCtx) -> Stmt:
-    # Default: no Expr fields to simplify (Assign / Accum / Init / Monoid).
+    # Default: no Expr fields to simplify (Assign / Accum / Init / StateMerge).
     return stmt
 
 
@@ -283,6 +280,7 @@ def _(s: Write, ctx: SimplifyCtx) -> Stmt:
         index=tuple(e.simplify(ctx) for e in s.index),
         values=s.values,
         value_dtype=s.value_dtype,
+        atomic=s.atomic,
     )
 
 
@@ -294,7 +292,7 @@ def _(s: Select, ctx: SimplifyCtx) -> Stmt:
 @simplify.register
 def _(s: Loop, ctx: SimplifyCtx) -> Stmt:
     inner = extend_simplify_ctx(ctx, s.axis)
-    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll)
+    return Loop(axis=s.axis, body=tuple(simplify(c, inner) for c in s.body), unroll=s.unroll, role=s.role, carrier=s.carrier)
 
 
 @simplify.register
@@ -307,6 +305,8 @@ def _(s: StridedLoop, ctx: SimplifyCtx) -> Stmt:
         step=step,
         body=tuple(simplify(c, inner) for c in s.body),
         unroll=s.unroll,
+        role=s.role,
+        carrier=s.carrier,
     )
 
 
@@ -319,7 +319,5 @@ def _(s: Cond, ctx: SimplifyCtx) -> Stmt:
     )
 
 
-# Tile-IR Stmt registrations (Stage / AsyncWait / Monoid) live in
-# ``emmy.compiler.ir.tile.passes`` — that module is imported from the
-# bottom of ``tile/ir.py`` so loading any Tile-IR symbol auto-registers the
-# handlers without a circular import.
+# Tile-IR Stmt registrations were DEMOLISHED along with the tile IR; pending
+# rebuild.

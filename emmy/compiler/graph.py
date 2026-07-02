@@ -20,11 +20,11 @@ its only users.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from emmy.compiler.ir.base import InputOp, Op
+from emmy.compiler.ir.base import ConstantOp, InputOp, Op
 from emmy.compiler.tensor import Tensor
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ def _lookup_op_class(name: str) -> type[Op] | None:
     from emmy.compiler.ir.tensor import ir as _tensor
     from emmy.compiler.ir.tile import ir as _tile
 
-    for module in (_base, _tensor, _frontend, _loop, _tile, _kernel, _cuda):
+    for module in (_base, _tensor, _frontend, _loop, _kernel, _cuda, _tile):
         cls = getattr(module, name, None)
         if isinstance(cls, type) and issubclass(cls, Op):
             return cls
@@ -199,10 +199,23 @@ def _deserialize_field(k, v):
     Stmt instances. Nested-op dicts (``{"__op__": ..., "fields": ...}``)
     are reconstructed via ``_lookup_op_class``. The eval scope mirrors
     the IR's ``__all__`` exports — same classes the Stmt reprs reference."""
+    import re as _re
+
     from emmy.compiler.ir.elementwise import ElementwiseImpl
 
     if k == "op" and isinstance(v, str):
-        return ElementwiseImpl(v)
+        # A bare name (``"add"``) is an ``ElementwiseImpl``; a constructor repr
+        # (``"Map(...)"`` — the ``TileOp.op`` node tree) is eval'd back like a Stmt repr.
+        return _eval_stmt(v) if "(" in v else ElementwiseImpl(v)
+    # ``TileOp``'s schedule descriptors serialize as constructor-repr strings
+    # (``Placement(...)`` / ``TilePlan(...)`` / ``ReducePlan(...)`` / ``Stage(...)`` /
+    # ``WarpSpec(...)``); ``None`` fields round-trip as JSON null. Eval a string only when it
+    # opens with a constructor whose name is a known IR class — so a plain string field
+    # (a name / path / C source) that merely looks like ``Name(...)`` is never eval'd.
+    if isinstance(v, str):
+        _m = _re.match(r"([A-Z]\w*)\(", v)
+        if _m and _m.group(1) in _stmt_eval_scope():
+            return _eval_stmt(v)
     if k == "body" and isinstance(v, list) and v and all(isinstance(e, str) for e in v):
         return tuple(_eval_stmt(e) for e in v)
     if k == "sources" and isinstance(v, list) and v and all(isinstance(e, str) and e.startswith("IndexSource(") for e in v):
@@ -243,7 +256,7 @@ def _stmt_eval_scope() -> dict:
 
     from emmy.compiler.dim import Dim
     from emmy.compiler.dtype import DataType
-    from emmy.compiler.ir.axis import Axis
+    from emmy.compiler.ir.axis import Axis, AxisRole
     from emmy.compiler.ir.elementwise import ElementwiseImpl
     from emmy.compiler.ir.expr import (
         BinaryExpr,
@@ -258,6 +271,7 @@ def _stmt_eval_scope() -> dict:
     from emmy.compiler.ir.stmt import (
         Accum,
         Assign,
+        Carrier,
         Cond,
         Init,
         Load,
@@ -265,24 +279,15 @@ def _stmt_eval_scope() -> dict:
         Pack,
         Select,
         SelectBranch,
+        State,
+        StateMerge,
         StridedLoop,
+        Twist,
         Unpack,
         Write,
     )
+    from emmy.compiler.ir.stmt.carrier import Channel
     from emmy.compiler.ir.tensor.ir import IndexSource
-    from emmy.compiler.ir.tile.ir import (
-        AffineAddressing,
-        AsyncWait,
-        GridTile,
-        RegisterTile,
-        SerialTile,
-        StageBundle,
-        StagePolicy,
-        StridedTile,
-        SwizzleMode,
-        TemplateAddressing,
-        ThreadTile,
-    )
 
     _STMT_EVAL_SCOPE = {
         "Dim": Dim,
@@ -306,17 +311,12 @@ def _stmt_eval_scope() -> dict:
         "Loop": Loop,
         "StridedLoop": StridedLoop,
         "Cond": Cond,
-        "GridTile": GridTile,
-        "ThreadTile": ThreadTile,
-        "RegisterTile": RegisterTile,
-        "SerialTile": SerialTile,
-        "StridedTile": StridedTile,
-        "StageBundle": StageBundle,
-        "StagePolicy": StagePolicy,
-        "SwizzleMode": SwizzleMode,
-        "AffineAddressing": AffineAddressing,
-        "TemplateAddressing": TemplateAddressing,
-        "AsyncWait": AsyncWait,
+        "AxisRole": AxisRole,
+        "Carrier": Carrier,
+        "State": State,
+        "Twist": Twist,
+        "StateMerge": StateMerge,
+        "Channel": Channel,
         "Smem": Smem,
         "Sync": Sync,
         "TreeHalve": TreeHalve,
@@ -329,6 +329,22 @@ def _stmt_eval_scope() -> dict:
         "dtype": _np.dtype,
         "__builtins__": {},
     }
+    # The tile-IR structural nodes (``Map`` / ``Reduction`` / ``Contraction``) and the
+    # schedule descriptors (``Placement`` / ``TilePlan`` / ``ReducePlan`` / ``Stage`` /
+    # ``WarpSpec`` + their component dataclasses / enums) round-trip through ``TileOp``'s
+    # repr-string fields (``op`` / ``place`` / ``reduce`` / ``tier`` / ``stage`` /
+    # ``workers``), so ``emmy run --ir <tile.json>`` can eval them back. Auto-populate
+    # every public class from those two modules (``setdefault`` so the explicit stmt/expr
+    # entries above win on any name clash) — a new node/knob field needs no edit here.
+    import emmy.compiler.ir.kernel.ir as _kernel_mod  # noqa: PLC0415
+    import emmy.compiler.ir.schedule as _sched_mod  # noqa: PLC0415
+    import emmy.compiler.ir.tile.ir as _tile_mod  # noqa: PLC0415
+
+    for _mod in (_sched_mod, _tile_mod, _kernel_mod):
+        for _nm in dir(_mod):
+            _obj = getattr(_mod, _nm)
+            if isinstance(_obj, type):
+                _STMT_EVAL_SCOPE.setdefault(_nm, _obj)
     return _STMT_EVAL_SCOPE
 
 
@@ -633,6 +649,107 @@ class Graph:
     def consumers(self, node_id: str) -> list[str]:
         """List form of :meth:`users`, preserved for existing callers."""
         return list(self._users.get(node_id, ()))
+
+    # ------------------------------------------------------------------
+    # Boundary / symbolic-dim queries
+    # ------------------------------------------------------------------
+
+    def constant_ops(self) -> Iterator[tuple[str, ConstantOp]]:
+        """Yield ``(node_id, op)`` for every ``ConstantOp`` node, in insertion order."""
+        for nid, node in self.nodes.items():
+            if isinstance(node.op, ConstantOp):
+                yield nid, node.op
+
+    def loadable_constants(self) -> Iterator[tuple[str, ConstantOp]]:
+        """Yield ``(node_id, op)`` for the constants an executor must *load* — non-static
+        (``value is None``) constants that name an external ``source_path``. Scalar,
+        ``context_value``, and synthetic (source-less) constants are skipped: the backend
+        materializes those itself. The single entry point shared by the safetensors and
+        live-module loaders."""
+        for nid, op in self.constant_ops():
+            if op.value is None and op.source_path is not None:
+                yield nid, op
+
+    def node_role(self, node_id: str) -> str:
+        """Classify a node for buffer planning: ``'input'`` / ``'constant'`` /
+        ``'output'`` / ``'scratch'``. Inputs take precedence over outputs (a passthrough
+        node that is both binds as an input)."""
+        if node_id in self.inputs:
+            return "input"
+        node = self.nodes.get(node_id)
+        if node is not None and isinstance(node.op, ConstantOp):
+            return "constant"
+        if node_id in self.outputs:
+            return "output"
+        return "scratch"
+
+    def symbolic_env(self, input_data: dict[str, Any] | None) -> dict[str, int]:
+        """Resolve each atomic symbolic input dim to its runtime size from the supplied
+        input arrays. A symbolic name is recovered from an atomic ``Var`` axis
+        (``shape[d] == Var(name)``); first-seen position wins. Inputs absent from
+        ``input_data`` — or with fewer runtime dims than declared — are skipped.
+        Downstream (possibly composite) shapes then resolve via ``dim.expr.eval(env)``."""
+        import numpy as np  # noqa: PLC0415
+
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+
+        input_data = input_data or {}
+        env: dict[str, int] = {}
+        for nid in self.inputs:
+            node = self.nodes.get(nid)
+            if node is None or nid not in input_data:
+                continue
+            arr_shape = np.asarray(input_data[nid]).shape
+            for i, d in enumerate(node.output.shape):
+                if isinstance(d.expr, Var) and i < len(arr_shape):
+                    env.setdefault(d.expr.name, int(arr_shape[i]))
+        return env
+
+    def symbolic_bindings(self) -> dict[str, tuple[str, int]]:
+        """Map every symbolic dim name to its source ``(input_buf, dim_index)`` — the launch
+        resolver reads the runtime value from ``input_arrays[buf].shape[dim_index]``.
+        First-seen position wins on conflicts so each name resolves deterministically.
+
+        A symbolic name is recovered from an **atomic** ``Var`` axis (``shape[d] ==
+        Var(name)``). A **composite** symbolic input dim — e.g. a sliced masked-K producer
+        slab's padded extent ``((seq_len + 63) // 64) * 64`` reaching a standalone-benched
+        consumer as a synthetic input — can't be inverted to its free var directly, so it
+        does NOT bind; it is fine as long as every free var it carries is bound from an
+        atomic axis somewhere (the slab's own ``seq_q`` axis, the sibling P operand, …).
+        Only a name that appears *exclusively* in composite dims is unrecoverable — that
+        raises."""
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+
+        bindings: dict[str, tuple[str, int]] = {}
+        composite_names: set[str] = set()
+        for nid in self.inputs:
+            for d, dim in enumerate(self.nodes[nid].output.shape):
+                if dim.is_static:
+                    continue
+                if isinstance(dim.expr, Var):
+                    bindings.setdefault(dim.expr.name, (nid, d))
+                else:
+                    composite_names |= dim.expr.free_vars()
+        unrecoverable = composite_names - bindings.keys()
+        if unrecoverable:
+            raise ValueError(
+                f"symbolic name(s) {sorted(unrecoverable)} appear only in composite input dims; "
+                "no atomic Var-backed axis to recover them from at launch"
+            )
+        return bindings
+
+    def symbolic_hints(self) -> dict[str, int]:
+        """Map every symbolic input-dim name to its ``Dim`` hint (default expected size),
+        read straight off the input ``Dim``. Used as the fallback bench size when no
+        ``input_data`` is supplied (the autotuner case)."""
+        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
+
+        hints: dict[str, int] = {}
+        for nid in self.inputs:
+            for dim in self.nodes[nid].output.shape:
+                if isinstance(dim.expr, Var) and dim.hint is not None:
+                    hints.setdefault(dim.expr.name, dim.hint)
+        return hints
 
     def structural_key(self) -> str:
         """Implements :class:`emmy.compiler.structural.Structural`.

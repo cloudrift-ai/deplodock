@@ -25,14 +25,10 @@ that slice computed-operand cones. Region transforms (``replace_at``,
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import TYPE_CHECKING
 
 from emmy.compiler.ir.stmt.base import Stmt
-
-if TYPE_CHECKING:
-    from emmy.compiler.ir.stmt.leaves import Write
 
 
 @dataclass(frozen=True)
@@ -626,97 +622,6 @@ class Body(tuple[Stmt, ...]):
         # other flags do not share this cache.
         return _shared_structural_key(self)
 
-    @cached_property
-    def coordination(self) -> Coordination:
-        """Per-Write atomic / broadcast-guard classifications and
-        per-Accum cooperative-axis sets, derived from one walk of this
-        body. Materializer + Kernel-IR render consume this to pick
-        ``atomicAdd`` vs plain store, ``Cond(t == 0)`` guard wrapping,
-        and warp-shuffle / smem tree-halve emission points. Cached on
-        the instance.
-
-        Derivation (one body.iter() pass):
-
-        - block axes = union of every ``GridTile.axes``
-        - thread axes = union of every ``ThreadTile.axes``
-        - staging buffers = ``Smem.name`` + ``StageBundle.sources.name``
-        - per-Accum cooperative axes = ``Accum.axes ∩ thread axes``
-        - per-Write atomic axes = ``block axes − Write.index free vars``
-          (skipped for staging-buffer Writes)
-        - per-Write broadcast axes = ``cooperative thread axes −
-          Write.index free vars`` (skipped for staging-buffer Writes)
-
-        A ``TileOp`` body has at most one outer ``GridTile`` and one
-        outer ``ThreadTile`` (enforced by ``TileOp.__post_init__``),
-        and axis names are unique within the body after
-        ``normalize_body``, so the axis sets are global — no per-stmt
-        scope walk needed. Staging-buffer Writes (smem stores from the
-        cooperative-load nest / warp-shuffle emission) are excluded
-        because those are per-thread slab slots, not racing global
-        stores."""
-        # Lazy imports avoid the ir/stmt → ir/tile cycle (ir/tile/ir.py
-        # imports Body from this module). Smem / StageBundle staging buffers
-        # are picked up generically via ``Stmt.local_decls`` so no kernel-IR
-        # import is needed.
-        from emmy.compiler.ir.stmt.leaves import Accum, Monoid, Write  # noqa: PLC0415
-        from emmy.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
-
-        block_axes: set[str] = set()
-        thread_axes: set[str] = set()
-        staging_buffers: set[str] = set()
-        accums: list[Accum] = []
-        combines: list[Monoid] = []
-        writes: list[Write] = []
-
-        for s in self.iter():
-            staging_buffers.update(s.local_decls())
-            if isinstance(s, GridTile):
-                block_axes.update(ax.name for ax in s.axes)
-            elif isinstance(s, ThreadTile):
-                thread_axes.update(ax.name for ax in s.axes)
-            elif isinstance(s, Accum):
-                accums.append(s)
-            elif isinstance(s, Monoid):
-                combines.append(s)
-            elif isinstance(s, Write):
-                writes.append(s)
-
-        block_axes_fz = frozenset(block_axes)
-        thread_axes_fz = frozenset(thread_axes)
-        staging_buffers_fz = frozenset(staging_buffers)
-
-        # Per-carrier cooperative axes = the carrier's reduce axes that are ALSO
-        # CTA thread axes (cooperative-K). Keyed by carried name: an Accum's single
-        # accumulator, OR each of each of a Monoid carrier's state components (the
-        # materializer keys the cross-thread combine off the first state name).
-        accum_cooperative = {acc.name: frozenset(acc.axes) & thread_axes_fz for acc in accums}
-        for c in combines:
-            coop = frozenset(c.axes) & thread_axes_fz
-            for st in c.state:
-                accum_cooperative[st] = coop
-        cooperative_thread_axes = frozenset().union(*accum_cooperative.values()) if accum_cooperative else frozenset()
-
-        atomic_by_id: dict[int, frozenset[str]] = {}
-        broadcast_by_id: dict[int, frozenset[str]] = {}
-        for w in writes:
-            if w.output in staging_buffers_fz:
-                atomic_by_id[id(w)] = frozenset()
-                broadcast_by_id[id(w)] = frozenset()
-                continue
-            idx_vars: set[str] = set()
-            for e in w.index:
-                idx_vars |= e.free_vars()
-            atomic_by_id[id(w)] = block_axes_fz - idx_vars
-            broadcast_by_id[id(w)] = cooperative_thread_axes - idx_vars
-
-        return Coordination(
-            cooperative_thread_axes=cooperative_thread_axes,
-            accum_cooperative_axes=accum_cooperative,
-            writes=tuple(writes),
-            _write_atomic_axes=atomic_by_id,
-            _write_broadcast_axes=broadcast_by_id,
-        )
-
 
 @lru_cache(maxsize=4096)
 def _shared_structural_key(body: Body) -> str:
@@ -744,31 +649,3 @@ def _shared_structural_key(body: Body) -> str:
 
     normalized = normalize_body(body, hoist=False, canonical_buffers=True, cluster_ops=True)
     return "\n".join(pretty_body(normalized))
-
-
-@dataclass(frozen=True)
-class Coordination:
-    """Result of :attr:`Body.coordination`. Per-Write atomic / broadcast
-    classifications and per-Accum cooperative-axis sets.
-
-    ``Write`` lookups use ``id(...)`` internally because ``Write.index``
-    may hold ``BinaryExpr`` nodes that aren't hashable — use the
-    :meth:`atomic_axes` / :meth:`broadcast_axes` accessors. ``writes``
-    is the analyzed Writes in body-walk order so callers can iterate
-    deterministically.
-    """
-
-    cooperative_thread_axes: frozenset[str] = frozenset()
-    accum_cooperative_axes: dict[str, frozenset[str]] = field(default_factory=dict)
-    writes: tuple[Write, ...] = field(default_factory=tuple)
-    _write_atomic_axes: dict[int, frozenset[str]] = field(default_factory=dict)
-    _write_broadcast_axes: dict[int, frozenset[str]] = field(default_factory=dict)
-
-    def atomic_axes(self, w: Write) -> frozenset[str]:
-        """Block axes NOT in ``w.index`` — non-empty ⇒ ``atomicAdd``."""
-        return self._write_atomic_axes.get(id(w), frozenset())
-
-    def broadcast_axes(self, w: Write) -> frozenset[str]:
-        """Cooperative thread axes NOT in ``w.index`` — non-empty ⇒
-        ``Cond(axis == 0)`` guard around the Write."""
-        return self._write_broadcast_axes.get(id(w), frozenset())

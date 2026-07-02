@@ -134,8 +134,8 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             continue
         index.setdefault(ShapeKey.from_s_features(d), {k: v for k, v in d.items() if k.startswith("S_")})
 
-    thread = ("BN", "BM", "FM", "FN", "BK", "SPLITK", "BR")
-    warp = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
+    from emmy.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
     rows, skipped = [], []
     lines = ["[prior] golden selection — golden's rank under the prior over the full gated enumeration:"]
     for g in GOLDEN_CONFIGS:
@@ -150,7 +150,7 @@ def golden_prior_eval(prior, kernel_filter: str | None = None) -> str:
             skipped.append((g.name, "no tuned rows for this shape in the prior dataset"))
             continue
         base = {**Context.from_target(g.compute_cap).features(), **s_feats}
-        gold = {k: v for k, v in g.knobs.items() if k in (thread if g.dtype == "fp32" else warp)}
+        gold = dict(tuning_knob_items(g.knobs))  # native codec knobs (TILE/REDUCE/STAGE), tier-agnostic
         # ``evaluate_golden`` ranks by descending score; the prior predicts latency
         # (lower = better), so negate to rank the predicted-fastest config first.
         _, rank, pool = analytic.evaluate_golden(

@@ -45,7 +45,6 @@ from emmy.compiler.ir.stmt import (  # noqa: F401  (re-exported via __init__)
     Init,
     Load,
     Loop,
-    Monoid,
     Select,
     SelectBranch,
     Stmt,
@@ -387,6 +386,14 @@ def _validate(loop: LoopOp) -> None:
         disambiguate (the axis is only referenced as Var(name), and SSA
         scoping handles variable shadowing).
         """
+        # Loop-carried accumulators are live across the WHOLE body, not just from
+        # their fold stmt onward: a twisted carrier's ψ rescale reads the carried value
+        # (``lm = l·alpha``) before the ``base``-``Accum`` that folds it (``l = lm + p``).
+        # Seed those carried names up front so the pre-fold read validates. (A plain
+        # self-fold ``acc += x`` reads ``acc`` implicitly, so this is a no-op there.)
+        for stmt in stmts:
+            if isinstance(stmt, Accum):
+                defined.add(stmt.name)
         exported_accs: set[str] = set()
         for stmt in stmts:
             if isinstance(stmt, Assign):
@@ -424,21 +431,10 @@ def _validate(loop: LoopOp) -> None:
                 defined.add(stmt.name)
             elif isinstance(stmt, Init):
                 # Explicit accumulator seed at this scope — a binding site for the
-                # carried name (a Monoid's carried state is declared here, before
+                # carried name (a Carrier's carried state is declared here, before
                 # the streaming Loop, so a post-loop sweep can read it).
                 defined.add(stmt.name)
                 exported_accs.add(stmt.name)
-            elif isinstance(stmt, Monoid):
-                # Monoid carrier: its ``partial`` (this iteration's contribution)
-                # must be in scope; its ``state`` is loop-carried (seeded by an
-                # enclosing Init, like Accum's implicit declare) and exports to the
-                # enclosing scope.
-                for pdep in stmt.partial:
-                    if pdep not in defined:
-                        raise ValueError(f"Monoid: partial dep {pdep!r} not defined")
-                for nm in stmt.state:
-                    defined.add(nm)
-                    exported_accs.add(nm)
             elif isinstance(stmt, Write):
                 if stmt.value not in defined:
                     raise ValueError(f"Write: value {stmt.value!r} not defined")

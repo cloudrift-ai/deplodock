@@ -1,21 +1,19 @@
 """Widen runs of consecutive scalar ``Load`` Stmts into one vector ``Load``.
 
-Until this pass, the body of every Kernel-IR Tile carries scalar
-``Load`` Stmts (``extra_names=()``). Some sequences of those Loads have
-a "vector" shape: N consecutive Loads from the same source buffer whose
-last-dim indices differ by 0, 1, ..., N-1. The CUDA backend can emit
-those as a single ``float<N>`` / ``__half2`` reinterpret-cast read
-followed by N ``.x/.y/.z/.w`` unpacks. Folding the run into one
-``Load(name=n0, extra_names=(n1..n_{N-1}), input, index)`` makes the
-optimization visible in the IR (``--ir kernel`` shows one Load with
+Until this pass, the body of every materialized kernel carries scalar
+``Load`` Stmts. Some sequences of those Loads have a "vector" shape: N
+consecutive Loads from the same source buffer whose last-dim indices differ
+by 0, 1, ..., N-1. The CUDA backend can emit those as a single
+``float<N>`` / ``__half2`` reinterpret-cast read followed by N ``.x/.y/.z/.w``
+unpacks. Folding the run into one ``Load(names=(n0, n1, ...), input, index)``
+makes the optimization visible in the IR (``--ir kernel`` shows one Load with
 multiple LHS names) while keeping the renderer simple — ``Load.render``
-branches on ``extra_names`` to emit either the scalar or the vector
-form.
+branches on the vector form.
 
 ## What the pass does
 
-For each ``Body`` (Tile body and every nested Loop / StridedLoop / Cond /
-Tile body, post-order):
+For each ``Body`` (every nested Tile / Loop / StridedLoop / Cond body,
+post-order):
 
 1. Walk the stmts. At each position, try widths 8 then 4 then 2.
 2. If ``[body[i], ..., body[i+n-1]]`` are all scalar ``Load``s from the
@@ -26,55 +24,19 @@ Tile body, post-order):
    the run with one widened ``Load``.
 3. Otherwise advance one stmt.
 
-## Why this runs at the TileOp level
+## Why this needs the source-buffer dtype
 
-The decision needs the source-buffer dtype, which Body alone doesn't
-carry, so ``normalize_body`` (which runs on every Body construction)
-can't make the call without external context. This pass matches
-``TileOp`` and runs before ``100_materialize_tile`` lowers to Kernel-IR,
-reading the dtype off the staged ``Source`` / ``TileOp.inputs``.
+The decision needs the source-buffer dtype, read off the stamped
+``Load.dtype`` (``030_stamp_types``). Runs after ``040_demote_to_write_dtype``
+so the demote pass sees the original scalar Loads.
 
-## Composition with the demote pass
+## Observed impact
 
-Runs after ``040_demote_to_write_dtype`` so the demote pass sees the
-original scalar Loads (the demote analysis is on Assigns, not Loads,
-so order is mostly independent; this is the conservative ordering).
-
-## Observed impact (RTX 5090, nvcc/ptxas 13.0)
-
-Like ``095_interleave_loads``, this is an IR-legibility pass, not a perf
-lever — and ``cuobjdump`` says exactly why. The vectorized and scalar source
-forms compile to **identical SASS** at every deployable opt level: the
-scalar-source kernel shows the same two ``LDS.128`` as the ``float4`` source.
-ptxas does its own load coalescing once it knows the static smem layout and
-16-byte alignment, so a manual ``float4`` only re-states an alignment it can
-already prove. Measured latency is therefore **0 %** across the whole
-tile-intensity spectrum (load-bound ``FM=1, FN=4`` through compute-bound
-``FM=FN=8``).
-
-What flag makes the pass change the SASS? Only ``-Xptxas -O0`` — the one level
-that disables the coalescer. There the scalar source stays scalar (0
-``LDS.128``) while the ``float4`` source keeps its 2; from ``-O1`` up both
-coalesce to the same SASS:
-
-    -Xptxas -O   scalar-source LDS.128   float4-source LDS.128
-    -O0          0                       2
-    -O1/-O2/-O3  2                       2
-
-``-O0`` is never deployable, and even there the load width is not this matmul's
-bottleneck, so the latency is unchanged regardless. Manual coalescing is still
-a real win on hand-written kernels where ptxas *cannot* prove alignment, where
-the access chain has gaps, or where pointers may alias without
-``const __restrict__`` — none of which a statically-shaped tile hits.
-(Mechanism: ptxas auto-vectorizes scalar ``ld.shared`` runs once alignment is
-known — https://github.com/JuliaGPU/CUDA.jl/issues/68 ; the cast is purely an
-alignment promise — https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/ .)
-
-The pass folds the runs anyway so ``--ir kernel`` / ``--ir cuda`` show one
-wide ``Load`` matching the hand-written SGEMM shape. ``VECTORIZE_LOADS`` is
-*not* a search dimension — only ``True`` is enumerated, so the autotuner never
-forks on it. ``EMMY_VECTORIZE_LOADS=0`` is a manual override for the
-scalar-load form.
+This is an IR-legibility pass, not a perf lever: ptxas coalesces scalar
+``ld.shared`` runs once alignment is known, so the vectorized and scalar
+source forms compile to identical SASS at every deployable opt level.
+``VECTORIZE_LOADS`` is therefore *not* a search dimension — only ``True`` is
+enumerated. ``EMMY_VECTORIZE_LOADS=0`` is a manual override.
 """
 
 from __future__ import annotations
@@ -82,47 +44,38 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
-from emmy.compiler.graph import Graph, Node
+from emmy.compiler.graph import Node
 from emmy.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_form
+from emmy.compiler.ir.kernel import KernelOp
 from emmy.compiler.ir.stmt import Body, Load, Stmt
-from emmy.compiler.ir.tile.ir import Source, StageBundle, TileOp
-from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
-from emmy.compiler.pipeline.knob import Knob, KnobType
+from emmy.compiler.pipeline import Pattern, RuleSkipped
+from emmy.compiler.pipeline.search.space import VECTORIZE_LOADS
 
-PATTERN = [Pattern("root", TileOp)]
+PATTERN = [Pattern("root", KernelOp)]
 
 _TARGET = CudaRenderTarget()
 
-VECTORIZE_LOADS = Knob(
-    "VECTORIZE_LOADS",
-    KnobType.BOOL,
-    hints=(True,),  # on by default; not a search dimension — manual override only via the env var
-    help="Fold runs of consecutive scalar Loads into one wide vector Load (float4 / __half2).",
-    off=False,
-)
 
-
-def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
-    top: TileOp = root.op
-    # Idempotence: the policy is recorded as the VECTORIZE_LOADS knob (every path
-    # stamps it now), so a re-scan of the rebound op skips here.
+def rewrite(root: Node) -> KernelOp | None:
+    top: KernelOp = root.op
+    # Idempotence: the policy is recorded as the VECTORIZE_LOADS knob, so a
+    # re-scan of the rebound op skips here.
     if VECTORIZE_LOADS.name in top.knobs:
         raise RuleSkipped("VECTORIZE_LOADS already decided (idempotence via knob)")
     # Only ``True`` is enumerated, so the autotuner never forks on this knob;
-    # ``EMMY_VECTORIZE_LOADS=0`` still pins ``False`` (``narrow`` honours an env
-    # pin authoritatively, even when it is not in the candidate set).
+    # ``EMMY_VECTORIZE_LOADS=0`` still pins ``False``.
     if not VECTORIZE_LOADS.narrow((True,))[0]:
-        return TileOp(body=top.body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: False})
+        return KernelOp(body=top.body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: False})
     # Stamp the policy (True) even when no run is foldable — the realized config
     # records that vectorization was enabled, keeping a uniform knob set.
     new_body = _vectorize_body(top, top.body)
-    return TileOp(body=new_body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: True})
+    return KernelOp(body=new_body, name=top.name, knobs={**top.knobs, VECTORIZE_LOADS.name: True})
 
 
-def _vectorize_body(top: TileOp, body: Body) -> Body:
+def _vectorize_body(top: KernelOp, body: Body) -> Body:
     """Post-order body transform: recurse into nested bodies first, then
     scan this scope for consecutive-Load runs. Threads ``top`` through so
-    constant-input filtering can resolve against the surrounding TileOp."""
+    constant-input filtering can resolve against the surrounding op."""
     descended: list[Stmt] = []
     for s in body:
         nested = s.nested()
@@ -148,7 +101,7 @@ def _vectorize_body(top: TileOp, body: Body) -> Body:
     return Body(tuple(out))
 
 
-def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Load | None:
+def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: KernelOp) -> Load | None:
     """If ``stmts[start:start+n]`` matches the consecutive-Load pattern
     and the target supports ``vector_type(elem_dtype, n)`` for the
     source buffer's dtype, return the widened :class:`Load`. Otherwise
@@ -197,8 +150,7 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
             return None
 
     # Last-dim indices: same free-var coefficients, anchor differs by
-    # exactly k for the k-th load. Same affine-form check that
-    # ``_vec_load_run`` used in the previous rendering-side fast path.
+    # exactly k for the k-th load.
     inner_0 = loads[0].index[-1]
     free = inner_0.free_vars()
     for s in loads[1:]:
@@ -223,15 +175,9 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
     # The reinterpret-cast destination must be aligned to ``n * elem_bytes``.
     # Prove statically from the affine form: every free-var coefficient on
     # the last dim must be a multiple of n, and the literal anchor must also
-    # be a multiple of n.
-    #
-    # Earlier this check was skipped for n=2 fp16 with the comment "__half2
-    # is 4-byte aligned in cuda_fp16.h" — the TYPE is, but reinterpreting a
-    # fp16 pointer at an odd-element offset still misses the alignment.
-    # Per-cell matmul shapes with FN > 1 expose this: an N-stride of 3
-    # (lm_head-style vocab=3 test case) gives a3 a stride of 3 elements =
-    # 6 bytes — not a multiple of 4 — and the half2 read faults with
-    # CUDA_ERROR_MISALIGNED_ADDRESS.
+    # be a multiple of n. n=2 fp16 is NOT a freebie despite __half2's 4-byte
+    # type alignment — an odd-element offset still misses the alignment and
+    # faults with CUDA_ERROR_MISALIGNED_ADDRESS.
     if n >= 2:
         if not all(c % n == 0 for c in coeffs_0.values()):
             return None
@@ -239,53 +185,9 @@ def _try_vec_load(stmts: Iterable[Stmt], start: int, n: int, top: TileOp) -> Loa
         if not isinstance(anchor_simplified, Literal) or anchor_simplified.value % n != 0:
             return None
 
-        # Multi-dim staged smem case: the last logical dim may be a constant
-        # offset (cell index 0/1/...) while the BASE address ``Σ outer_dim ×
-        # outer_stride`` carries the per-cell stride packed into preceding
-        # dims (e.g. blocked-N smem with layout ``[K, N_t, N_r]`` and FN=3
-        # has stride ``a3 * 3`` from the N_t dim; packing two cells across
-        # the inner N_r yields byte offsets ``base + 0`` and ``base + 4``,
-        # but ``base = a3 * 12`` lands at 12 bytes for a3=1 — not 8-byte
-        # aligned for float2). The last-dim coeff check passes vacuously
-        # (no free vars there), so the broader check has to walk back into
-        # the preceding logical dims via the Source's cache_axes. If any
-        # preceding dim's cache-axis extent is not a multiple of n at the
-        # innermost slot (= the byte stride from the cell-offset Load
-        # group's base to its neighbour group isn't n-aligned), refuse to
-        # vectorize.
-        #
-        # Use ``alloc_extents`` (padded), not raw ``cache_axes`` extents:
-        # ``070_pad_smem`` may add a +1 bank-conflict-breaking pad on the
-        # inner axis (e.g. FN=4 cell + pad=1 → padded inner extent 5).
-        # The stride from the N-thread dim then becomes 5 floats = 20
-        # bytes per thread, so a float4 reinterpret_cast at ``base = a3 *
-        # 5`` is misaligned for ``a3 % 4 != 0`` — causes
-        # CUDA_ERROR_MISALIGNED_ADDRESS (silent on cp.async + pipelined
-        # because that path's interleave hides the run from this pass;
-        # surfaces as a hang on the BUFFERED / unpipelined paths that
-        # do see a contiguous Load run here).
-        source = _find_source(top.body, input_name)
-        if source is not None and len(source.cache_axes) >= 2:
-            inner_extent = source.alloc_extents[-1]
-            if inner_extent % n != 0:
-                return None
-
     return Load(
         names=tuple(s.name for s in loads),
         input=input_name,
         index=loads[0].index,
         dtype=loads[0].dtype,
     )
-
-
-def _find_source(body: Body, name: str) -> Source | None:
-    """Walk ``body`` for a ``Source`` whose ``name`` matches — used by
-    multi-dim staged-smem alignment checks. Returns the first match
-    (sources are unique by name within a TileOp by construction) or
-    ``None`` if the buffer isn't a Stage-backed smem (e.g. a gmem input)."""
-    for stmt in body.iter():
-        if isinstance(stmt, StageBundle):
-            for src in stmt.sources:
-                if src.name == name:
-                    return src
-    return None

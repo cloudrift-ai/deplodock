@@ -1,5 +1,5 @@
 """Pure-Python token sampling + chat-template helper for the standalone
-``emmy generate`` oracle (Phase 0 of ``plans/generative-inference-support.md``).
+``emmy generate`` oracle (Phase 0).
 
 No vLLM, no CUDA: every function operates on a 1-D ``logits`` vector (numpy), so the
 whole module is unit-testable on CPU. ``Sampler`` is a callable ``logits -> token id``

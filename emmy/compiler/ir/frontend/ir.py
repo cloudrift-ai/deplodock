@@ -24,18 +24,6 @@ import numpy as np
 from emmy.compiler.dim import Dim
 from emmy.compiler.ir.base import Op, _keepdim_axis
 
-
-def _numel(shape) -> Dim:
-    """Product of a shape's extents as a single ``Dim``. Accumulator starts
-    at ``Dim(1)`` so bare-int shape elements (from tests / loader scratch
-    shapes) are promoted to ``Dim`` on the first multiply; pure-Dim inputs
-    fold exactly via ``Expr.simplify``."""
-    out = Dim(1)
-    for d in shape:
-        out = out * d
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Layout-only ops (decomposed to IndexMapOp)
 # ---------------------------------------------------------------------------
@@ -79,6 +67,17 @@ class ReshapeOp(Op):
 
     shape: tuple[int | str, ...]
 
+    @staticmethod
+    def _numel(shape) -> Dim:
+        """Product of a shape's extents as a single ``Dim``. Accumulator starts
+        at ``Dim(1)`` so bare-int shape elements (from tests / loader scratch
+        shapes) are promoted to ``Dim`` on the first multiply; pure-Dim inputs
+        fold exactly via ``Expr.simplify``."""
+        out = Dim(1)
+        for d in shape:
+            out = out * d
+        return out
+
     def infer_output_shape(self, input_shapes: list[tuple]) -> tuple:
         if -1 not in self.shape:
             return tuple(self.shape)
@@ -88,7 +87,8 @@ class ReshapeOp(Op):
         # static/symbolic produces a ``BinaryExpr`` Dim that resolves at launch.
         # ``_numel`` bootstraps the accumulator with ``Dim(1)``, so a raw-int
         # input shape still yields a ``Dim`` result.
-        inferred = _numel(input_shapes[0]) // _numel(known) if known else _numel(input_shapes[0])
+        numel = self._numel
+        inferred = numel(input_shapes[0]) // numel(known) if known else numel(input_shapes[0])
         return tuple(inferred if d == -1 else d for d in self.shape)
 
     def forward(self, *inputs):

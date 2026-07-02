@@ -14,23 +14,17 @@ from emmy.compiler.dtype import F32, DataType
 from emmy.compiler.ir.elementwise import ElementwiseImpl, reduce_spelling
 from emmy.compiler.ir.expr import BinaryExpr, Expr, Literal, Var, _float_lit
 from emmy.compiler.ir.stmt.base import (
-    ReduceCarrier,
     RenderCtx,
     Stmt,
     _pad,
     dtype_promote,
     op_to_expr,
     render_index,
-    render_merge_program,
     select_to_ternary,
 )
 
-if TYPE_CHECKING:
-    # ``Mma.atom`` holds an ``Atom`` (defined in the tile-IR layer, which builds
-    # on this stmt layer). The annotation is lazy (``from __future__ import
-    # annotations``) and ``Mma`` never calls the class at runtime — it just
-    # holds an instance — so this stays a type-only import, no stmt↔tile cycle.
-    from emmy.compiler.ir.tile.ir import Atom
+if TYPE_CHECKING:  # annotation only — algebra imports leaves (Accum.as_carrier does the runtime import)
+    from emmy.compiler.ir.stmt.algebra import Carrier
 
 
 def _resolve_value(name: str, ctx: RenderCtx) -> str:
@@ -65,36 +59,6 @@ def _args_at_dtype(target, args: tuple[str, ...], arg_dtypes: list[str], dst_dt:
             out.append(FuncCallExpr(converted[:paren], [Var(a)]))
         else:
             out.append(Var(a))
-    return out
-
-
-def _promote_args_to_f32(target, args: tuple[str, ...], arg_dtypes: list[str]) -> list[Expr]:
-    """Wrap each non-f32 SSA name with ``target.convert(name, dt, "f32")``
-    so the resulting Expr tree composes in fp32. Used by ``Assign.render``
-    for the f32 result path and the f16-fallback path.
-
-    Returns an ``Expr`` list, with conversions threaded through a
-    ``FuncCallExpr``-style ``Cast``: we synthesize a no-op
-    :class:`Var` for f32 args and an inline-rendered cast for others."""
-    from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
-
-    out: list[Expr] = []
-    for a, dt in zip(args, arg_dtypes, strict=True):
-        if dt == "f32":
-            out.append(Var(a))
-        else:
-            # ``target.convert`` returns a fully-rendered string; wrap as
-            # a synthetic FuncCallExpr so it slots into ``op_to_expr``'s
-            # Expr-tree output without round-tripping through Var lookups.
-            converted = target.convert(a, dt, "f32")
-            # Strip the synthesized prefix to reuse FuncCallExpr's
-            # "name(args)" rendering. ``target.convert("x", "f16", "f32")``
-            # returns ``"__half2float(x)"`` — we split on the open paren.
-            paren = converted.index("(") if "(" in converted else -1
-            if paren > 0 and converted.endswith(")"):
-                out.append(FuncCallExpr(converted[:paren], (Var(a),)))
-            else:
-                out.append(Var(a))
     return out
 
 
@@ -448,7 +412,7 @@ class Assign(Stmt):
 
         # f32 / no-native path: promote args to f32, render in f32, then
         # convert the result back to ``result_dt`` when narrower.
-        promoted = _promote_args_to_f32(ctx.target, self.args, arg_dtypes)
+        promoted = _args_at_dtype(ctx.target, self.args, arg_dtypes, "f32")
         expr = op_to_expr(op_name, promoted)
         body_str = expr.render(ctx)
         if result_dt != "f32":
@@ -458,7 +422,7 @@ class Assign(Stmt):
 
 
 @dataclass(frozen=True)
-class Accum(ReduceCarrier):
+class Accum(Stmt):
     """Reduce accumulator — declares-and-folds in one statement.
 
     Semantics: ``name = op(name, value)`` inside the enclosing reduce
@@ -495,6 +459,14 @@ class Accum(ReduceCarrier):
     # f32 rendering.
     dtype: DataType | None = None
     axes: tuple[str, ...] = ()
+    # Optional rescaled base — the value the fold reads as its left operand instead
+    # of ``name`` (``name = op(base, value)``). ``None`` = the ordinary self-fold
+    # ``name = op(name, value)``. A twisted carrier's streaming merge lowers each
+    # state component to a ``base``-``Accum``: the ψ rescale is a preceding ``Assign``
+    # binding ``base`` (e.g. ``lm = l·alpha``), so the fold itself stays an ``Accum``
+    # whose seed is still ``op.identity``. The seed (and ``Loop.render``'s per-Accum
+    # init) is unchanged — ``base`` only redirects the in-loop left operand.
+    base: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.op, str):
@@ -507,6 +479,10 @@ class Accum(ReduceCarrier):
         return Literal(identity if identity is not None else 0.0)
 
     def deps(self) -> tuple[str, ...]:
+        # ``base`` (when it redirects the left operand) is a same-scope read; the
+        # carried ``name`` read is implicit (loop-carried), like the default fold.
+        if self.base is not None and self.base != self.name:
+            return (self.value, self.base)
         return (self.value,)
 
     def defines(self) -> tuple[str, ...]:
@@ -522,23 +498,24 @@ class Accum(ReduceCarrier):
         """The scalar op-fold of two partials: ``name = op(name, name__o)`` — the
         same combine the cooperative / split-K realizations apply, reified as a
         one-``Assign`` program so the decomposition move reads it uniformly with
-        ``Monoid.combine_states``."""
+        ``Carrier.combine_states``."""
         return (Assign(name=self.name, op=self.op, args=(self.name, f"{self.name}__o"), dtype=self.dtype),)
 
-    def as_monoid(self) -> Monoid:
-        """This additive/associative ``Accum`` AS the degenerate 1-component ``Monoid`` it already is —
-        state ``(name,)``, partial ``(value,)``, ``merge`` = ``name = op(name, value)``, identity the
-        op's. The carrier-algebra fact that a SEMIRING / scalar reduce is the trivial monoid: it lets an
-        ``Accum`` lower through the **same** ``Combiner`` / cross-partition path as a general ``Monoid``,
-        with no additive special-case. The auto-derived ``combine_states`` (``name = op(name, name__o)``)
-        equals :meth:`combine_partials`, so the ``⊙`` realization is identical."""
-        return Monoid(
-            state=(self.name,),
-            partial=(self.value,),
-            merge=(Assign(name=self.name, op=self.op, args=(self.name, self.value), dtype=self.dtype),),
-            identity=(self.init,),
-            commutative=self.op.commutative,
-            axes=self.axes,
+    def as_carrier(self) -> Carrier:
+        """This additive/associative ``Accum`` AS the degenerate 1-component :class:`Carrier` it already is —
+        state ``(name,)``, ``merge`` = ``name = op(name, value)``, identity the op's. The carrier-algebra
+        fact that a contraction / scalar reduce is the trivial (``id``-twist) carrier: it lets the reduce
+        ``Loop`` fold through the **same** cooperative / cross-partition path as a twisted carrier, with no
+        additive special-case. The auto-derived ``combine_states`` (``name = op(name, name__o)``) equals
+        :meth:`combine_partials`, so the ``⊙`` realization is identical."""
+        from emmy.compiler.ir.stmt.algebra import Carrier, State, Twist  # local: algebra imports leaves
+        from emmy.compiler.ir.stmt.carrier import Channel
+
+        # The folded ``value`` is a sibling whose name lives in the degenerate ``merge``
+        # (``name = op(name, value)``), built as the ``id``-family spec.
+        return Carrier(
+            state=State(names=(self.name,)),
+            twist=Twist(family="id", channels=(Channel(fold=self.op, term=self.value, dtype=self.dtype),)),
         )
 
     # Algebraic traits forward to the scalar combine op — a ``max`` Accum and a
@@ -557,27 +534,33 @@ class Accum(ReduceCarrier):
 
     def pretty(self, indent: str = "") -> list[str]:
         prefix = f"{self.dtype.name} " if self.dtype is not None else ""
-        return [f"{indent}{prefix}{self.name} <- {self.op.name}({self.name}, {self.value})"]
+        base = self.base if self.base is not None else self.name
+        return [f"{indent}{prefix}{self.name} <- {self.op.name}({base}, {self.value})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)
-        # Accumulator dtype — explicit on Accum once the Init-placement pass
+        # Accumulator dtype — explicit on Accum once the dtype policy
         # has frozen it; otherwise default to fp32 (legacy behavior).
         acc_dt = (self.dtype or F32).name
         ctx.ssa_dtypes[self.name] = acc_dt
         value_dt = ctx.ssa_dtypes.get(self.value, "f32")
         rhs = ctx.target.convert(self.value, value_dt, acc_dt)
+        # Left operand of the fold: ``base`` (a rescaled state, already at acc_dt)
+        # when set, else the carried ``name`` itself.
+        base = self.base if self.base is not None else self.name
         # Spelling (``+=`` / ``*=`` / ``fmax`` / ``fmin``) from the shared reduce
         # registry; defaults to additive for non-reduce ops.
         spelling = reduce_spelling(self.op)
         if spelling.intrinsic is not None:
             fn = ctx.target.intrinsic(spelling.intrinsic, acc_dt)
-            return [f"{pad}{self.name} = {fn}({self.name}, {rhs});"]
-        return [f"{pad}{self.name} {spelling.compound} {rhs};"]
+            return [f"{pad}{self.name} = {fn}({base}, {rhs});"]
+        if base == self.name:
+            return [f"{pad}{self.name} {spelling.compound} {rhs};"]
+        return [f"{pad}{self.name} = {base} {spelling.infix} {rhs};"]
 
 
 @dataclass(frozen=True)
-class Mma(ReduceCarrier):
+class Mma(Stmt):
     """Tensor-core multiply-accumulate over one atom cell — ``c += a @ b``.
 
     The fused replacement for the scalar ``Assign(multiply) + Accum`` matmul
@@ -594,9 +577,10 @@ class Mma(ReduceCarrier):
       fragment at lowering); read-and-written, like ``Accum.name``.
     - ``a`` / ``b`` — the SSA names of the two operand ``Load``s (A = M×K,
       B = K×N); the lowering matches each Load by these names.
-    - ``atom`` — the :class:`~emmy.compiler.ir.tile.ir.Atom` spec itself
-      (cell shape + per-operand dtypes + group size); a hashable frozen record,
-      so it rides on this frozen ``Mma`` Stmt.
+    - ``atom`` — the ``Atom`` spec itself (cell shape + per-operand dtypes +
+      group size); a hashable frozen record, so it rides on this frozen ``Mma``
+      Stmt. NOTE: the tile-IR ``Atom`` type was demolished — the annotation is a
+      bare ``object`` placeholder pending the tile-IR rebuild.
     - ``axes`` — the reduction axes (mirrors ``Accum.axes``; carries the
       cooperative-K info the escape analysis reads). Threaded through
       ``rewrite`` like ``Accum.axes``.
@@ -610,7 +594,7 @@ class Mma(ReduceCarrier):
     c: str
     a: str
     b: str
-    atom: Atom
+    atom: object
     axes: tuple[str, ...] = ()
     b_trans: bool = False
     # Explicit masked-tile guards for a HAND-BUILT cell (the symbolic warp-chain flash),
@@ -673,200 +657,29 @@ class Mma(ReduceCarrier):
         )
 
 
-def _rename_assign_args(a: Assign, sub: dict[str, str]) -> Assign:
-    """Return ``a`` with each read in ``args`` remapped through ``sub`` (the
-    target ``name`` is left alone — only the reads move). Used to retarget a
-    ``merge`` / ``combine_states`` step's right operand (partial → second
-    state, or one state-name set → another)."""
-    return Assign(name=a.name, op=a.op, args=tuple(sub.get(x, x) for x in a.args), dtype=a.dtype)
-
-
-@dataclass(frozen=True)
-class Monoid(ReduceCarrier):
-    """A loop-carried **monoid** combine — a general associative reduce over
-    internal state, the tuple-valued sibling of ``Accum`` (scalar fold) and
-    ``Mma`` (tensor-core fragment fold).
-
-    A monoid is *(identity element, associative binary operation, carried state)*;
-    ``Monoid`` makes all three explicit so the streaming-reduce machinery isn't
-    tied to any one recurrence:
-
-    - ``state`` — the carried SSA names (the internal state); read-and-written
-      across the reduce axis (the carried read is implicit, like ``Accum.name`` /
-      ``Mma.c``), and the defs visible after the loop.
-    - ``partial`` — this iteration's contribution SSA names (the right operand the
-      step folds into the state).
-    - ``merge`` — the associative operation, **as data**: a short program of
-      ``Assign`` steps that reads the OLD state + the partial and reassigns the new
-      state. An ``Assign`` whose target is a ``state`` name is a state update
-      (rendered ``name = …;`` — the carried name is already declared by an
-      enclosing ``Init``); every other ``Assign`` is a local fp32 temp (declared
-      ``float t = …;``). Statement ORDER is load-bearing — a state update must come
-      after every read of that state's old value.
-    - ``identity`` — the monoid's neutral element, one ``Expr`` per state
-      component. The enclosing ``Init`` seeds it at the carrier's scope (split-KV /
-      cooperative-combine reductions read it to seed their partial accumulators).
-    - ``combine_states`` — the **state-merges-state** form of the monoid op: a
-      program (like ``merge``) that reads the OLD state + a SECOND full state
-      (named by ``state_b``) and reassigns the merged state. ``merge`` folds a
-      *partial* into the state (the streaming reduce); ``combine_states`` merges
-      two *fully-reduced* partition states — the form the cross-partition combine
-      needs (cooperative-tree / split-KV / split-K cross-CTA reduce), where each
-      partition holds a complete state, not a raw partial. For an **additive**
-      carrier whose partial lifts to a state (``len(partial) == len(state)``) the
-      two coincide, so ``combine_states`` is auto-derived from ``merge`` by
-      substituting the partial reads with ``state_b``; an asymmetric monoid
-      (flash's LSE) must author both. ``state_b`` defaults to ``"<s>__o"`` per
-      state component when not given.
-    - ``commutative`` — whether the operation also commutes (split-KV legality);
-      ``associative`` / ``has_identity`` are ``True`` by construction (it *is* a
-      monoid). ``axes`` are the reduction axes, threaded through ``rewrite``.
-
-    The whole operation lives **inside this carrier**, not as loose body
-    statements, so the gates that reject online algorithms (``accums_independent``,
-    ``classify_fragment_epilogue``) never see the cross-state coupling, and the
-    partition planner places one carrier.
-
-    Example — flash attention's **online softmax** (the log-sum-exp monoid): state
-    ``(m, l, O)`` = running row-max / denominator / output, partial ``(s, v)`` =
-    this key's score + value, identity ``(−inf, 0, 0)``, and the merge::
-
-        m_new = max(m, s);   alpha = exp(m − m_new);   p = exp(s − m_new)
-        l = l·alpha + p;     O = O·alpha + p·v;         m = m_new   (last)
-
-    associative + commutative — which is what makes split-KV (flash-decoding) and
-    cooperative-combine legal. The flash instance is built by
-    ``loop/recognize/_flash.flash_combine``.
-    """
-
-    state: tuple[str, ...]
-    partial: tuple[str, ...]
-    merge: tuple[Assign, ...] = ()
-    identity: tuple[Expr, ...] = ()
-    commutative: bool = True
-    axes: tuple[str, ...] = ()
-    state_b: tuple[str, ...] = ()
-    combine_states: tuple[Assign, ...] = ()
-
-    def __post_init__(self) -> None:
-        # Default the second-operand state names ("<s>__o") so a carrier built
-        # with only ``state`` / ``partial`` / ``merge`` still has a complete
-        # cross-partition surface. ``object.__setattr__`` — the dataclass is frozen.
-        if not self.state_b:
-            object.__setattr__(self, "state_b", tuple(f"{s}__o" for s in self.state))
-        # Auto-derive ``combine_states`` from ``merge`` for an additive carrier
-        # (the partial lifts to a state, one component each): substitute the
-        # partial reads with the second-operand state names. An asymmetric monoid
-        # (different partial / state arity, e.g. flash LSE) must author it.
-        if not self.combine_states and len(self.partial) == len(self.state):
-            sub = dict(zip(self.partial, self.state_b, strict=True))
-            object.__setattr__(
-                self,
-                "combine_states",
-                tuple(_rename_assign_args(a, sub) for a in self.merge),
-            )
-
-    def as_state_merge(self, other: tuple[str, ...]) -> Monoid:
-        """Return a one-shot ``Monoid`` that merges this carrier's ``state`` with
-        a second fully-reduced state named ``other`` (the cross-partition
-        combine's right operand). The returned carrier's ``merge`` IS
-        ``combine_states`` with ``state_b`` renamed to ``other`` and its
-        ``partial`` set to ``other`` — so the cooperative-tree / cross-CTA reduce
-        renders the state-merge through the same machinery as a streaming step.
-        """
-        sub = dict(zip(self.state_b, other, strict=True))
-        merged = tuple(_rename_assign_args(a, sub) for a in self.combine_states)
-        return Monoid(
-            state=self.state,
-            partial=other,
-            merge=merged,
-            identity=self.identity,
-            commutative=self.commutative,
-            axes=self.axes,
-            state_b=other,
-            combine_states=merged,
-        )
-
-    def deps(self) -> tuple[str, ...]:
-        # Mirror ``Accum`` / ``Mma``: the carried-state read is implicit
-        # (loop-carried), so only this iteration's partial contribution is listed —
-        # keeps sibling-def analyses from treating the state as a same-scope read.
-        return self.partial
-
-    def defines(self) -> tuple[str, ...]:
-        return self.state
-
-    def carried_names(self) -> tuple[str, ...]:
-        return self.state
-
-    def combine_operands(self) -> tuple[str, ...]:
-        return self.state_b
-
-    def combine_partials(self) -> tuple[Assign, ...]:
-        """The state-merges-state monoid op (``combine_states``) — already the
-        realization-agnostic cross-partition combine the cooperative-tree /
-        split-KV / split-K reductions fold through."""
-        return self.combine_states
-
-    # ``project`` is the shared ``ReduceCarrier`` default (keyed off ``carried_names()`` ==
-    # ``state``) — the one magic method every carrier inherits; no Monoid-specific override.
-
-    # A monoid is associative with identity by construction; commutativity is the
-    # extra property (the ``commutative`` field) split-KV / split reordering needs.
-    @property
-    def associative(self) -> bool:
-        return True
-
-    @property
-    def has_identity(self) -> bool:
-        return True
-
-    def pretty(self, indent: str = "") -> list[str]:
-        state = ", ".join(self.state)
-        partial = ", ".join(self.partial)
-        return [f"{indent}({state}) <- combine({partial})"]
-
-    def render(self, ctx: RenderCtx) -> list[str]:
-        """Emit the merge program in fp32: each ``Assign`` targeting a ``state``
-        name is a reassignment of the carried value (already declared by an
-        enclosing ``Init``); every other ``Assign`` declares a local temp. The
-        builder orders the program so each old-state read precedes that state's
-        update (e.g. flash reads the old ``m`` for ``alpha`` before ``m = m_new``).
-        """
-        return render_merge_program(self.merge, self.state, ctx)
-
-
 @dataclass(frozen=True)
 class Init(Stmt):
-    """Explicit accumulator initialization at this scope.
+    """Explicit accumulator / carried-state seed at this scope:
+    ``<dtype> <name> = <identity>;`` — a scope-local declaration.
 
-    By default, the renderer emits ``float <name> = <identity>;`` above
-    a ``Loop`` whose immediate body contains a matching ``Accum``. That
-    semantics is wrong when the same ``Accum`` is reduced across multiple
-    nested ``Loop``s (e.g. matmul chunked-K: ``Loop(k_o) > Loop(k_i) >
-    Accum(acc)`` should not reset ``acc`` per ``k_o`` iteration).
-
-    Placing an ``Init(name, op)`` Stmt at the desired enclosing scope
-    declares the accumulator there. The renderer emits the init at this
-    point, and suppresses the default Loop-immediate init for any
-    ``Accum`` whose name has a matching ``Init`` in an enclosing scope.
-
-    The ``op`` is redundant with the matching ``Accum.op`` (the
-    accumulator carries its own combine), but is kept here so the
-    renderer can pick the identity without scanning ahead.
+    Currently UNPRODUCED — a carrier's seed now rides on its fold and is derived by
+    ``Loop.render`` (an ``Accum`` from ``op.identity``, a ``Carrier`` from
+    ``State.identity``), so no pass emits an explicit ``Init``. Kept as a primitive
+    (with its render / rewrite / validation handlers) for an explicit cross-scope seed
+    the cooperative / split-K reduce tier may want — e.g. a chunked-K accumulator that
+    must seed above the outer loop and NOT reset per chunk. ``identity`` is the neutral
+    element (one scalar — 0 / 1 / -inf), held directly.
     """
 
     name: str
-    op: ElementwiseImpl
-    # Accumulator dtype — required. Placing an ``Init`` is the freeze
+    identity: float
+    # Accumulator / state dtype — required. Placing an ``Init`` is the freeze
     # point; the pass that emits it must commit to a concrete dtype. The
     # same pass stamps the matching ``Accum``'s ``dtype`` to this value
     # so the IR stays self-consistent.
     dtype: DataType = field(kw_only=True)
 
     def __post_init__(self) -> None:
-        if isinstance(self.op, str):
-            object.__setattr__(self, "op", ElementwiseImpl(self.op))
         if isinstance(self.dtype, str):
             from emmy.compiler.dtype import get as _get  # noqa: PLC0415
 
@@ -879,15 +692,11 @@ class Init(Stmt):
         return (self.name,)
 
     def pretty(self, indent: str = "") -> list[str]:
-        return [f"{indent}Init({self.dtype.name} {self.name}, op={self.op.name})"]
+        return [f"{indent}Init({self.dtype.name} {self.name} = {self.identity})"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
-        identity = self.op.identity
-        if identity is None:
-            raise ValueError(f"Init {self.name!r} op {self.op.name!r} has no identity")
-        ctx.explicit_inits.add(self.name)
         ctx.ssa_dtypes[self.name] = self.dtype.name
-        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(identity, self.dtype)};"]
+        return [f"{_pad(ctx.indent)}{ctx.type_name(self.dtype)} {self.name} = {ctx.identity_literal(self.identity, self.dtype)};"]
 
 
 # Map ``ElementwiseImpl`` op names to compound-assignment operator symbols
@@ -916,12 +725,6 @@ class Write(Stmt):
     node's id, or — for multi-output kernels — one of its output buffer
     names). ``index`` uses axis Vars to compute the per-dim offset.
 
-    Whether the store lowers to ``atomicAdd`` or a plain store is
-    decided at codegen time by ``escape_analysis.atomic_axes`` (any
-    enclosing block axis missing from ``index`` ⇒ atomic). The vectorize
-    pass also consults the helper to refuse atomic-add Writes (each lane
-    would need its own atomicAdd).
-
     ``value_dtype`` is optional; when set, names the SSA-value dtype being
     stored. Stamped by ``030_stamp_types``; downstream passes read it
     instead of querying ``ctx.ssa_dtypes`` at render time.
@@ -931,6 +734,11 @@ class Write(Stmt):
     index: tuple[Expr, ...]
     values: tuple[str, ...]
     value_dtype: DataType | None
+    # An ``atomicAdd`` reduce-write (cross-CTA split-reduce, ``030_split``'s atomic finalize):
+    # every contributing CTA adds its partial into the SAME output cell, so the store is an
+    # atomic accumulate (the output is zero-init'd per launch — ``CudaOp.zero_outputs``).
+    # Scalar only; never vectorized (each lane needs its own ``atomicAdd``).
+    atomic: bool
 
     def __init__(
         self,
@@ -940,6 +748,7 @@ class Write(Stmt):
         *,
         values: tuple[str, ...] | None = None,
         value_dtype: DataType | None = None,
+        atomic: bool = False,
     ) -> None:
         if values is None:
             if value is None:
@@ -953,10 +762,13 @@ class Write(Stmt):
             raise TypeError("Write requires `index=`")
         if not values:
             raise ValueError("Write.values must be non-empty")
+        if atomic and len(values) != 1:
+            raise ValueError("an atomic Write is scalar (one value per atomicAdd)")
         object.__setattr__(self, "output", output)
         object.__setattr__(self, "index", tuple(index))
         object.__setattr__(self, "values", tuple(values))
         object.__setattr__(self, "value_dtype", value_dtype)
+        object.__setattr__(self, "atomic", atomic)
 
     @property
     def value(self) -> str:
@@ -993,6 +805,8 @@ class Write(Stmt):
         idx = ", ".join(e.pretty() for e in self.index)
         if self.is_vector:
             return [f"{indent}{self.output}[{idx}] = ({', '.join(self.values)})"]
+        if self.atomic:
+            return [f"{indent}{self.output}[{idx}] += {self.values[0]}  (atomic)"]
         return [f"{indent}{self.output}[{idx}] = {self.values[0]}"]
 
     def render(self, ctx: RenderCtx) -> list[str]:
@@ -1005,29 +819,14 @@ class Write(Stmt):
             # Scalar path. Convert at the store boundary only when the
             # value's SSA dtype disagrees with the destination buffer's
             # dtype — native chains write through with no conversion.
-            # Applies to both plain stores and atomic reduce-writes
-            # (split-K matmul fans an f32 accumulator into an f16 output;
-            # without conversion the ``atomicAdd(__half*, float)`` call
-            # is silently broken).
             flat = render_index(self.output, self.index, ctx)
             value_dt = stamped_value_dt or ctx.ssa_dtypes.get(self.value, "f32")
             rhs = ctx.target.convert(_resolve_value(self.value, ctx), value_dt, out_dt)
-            # Atomic-Write trigger: helper-derived signal from
-            # ``ctx.atomic_writes``, populated by ``render_kernelop``.
-            # Standalone-render unit tests that build a bare RenderCtx
-            # see an empty dict and get a plain store.
-            is_atomic = bool(ctx.atomic_writes.get(id(self)))
-            store = f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});" if is_atomic else f"{pad}{self.output}[{flat}] = {rhs};"
-            # Broadcast guard: when the helper says this Write is missing
-            # one or more cooperative thread axes from its index, wrap the
-            # store in ``if (axis == 0)`` so only one thread of the
-            # cooperative group performs it. The guard condition is the
-            # conjunction of all missing axes.
-            broadcast = ctx.broadcast_writes.get(id(self), frozenset())
-            if broadcast:
-                cond = " && ".join(f"{ax} == 0" for ax in sorted(broadcast))
-                return [f"{pad}if ({cond}) {{", store, f"{pad}}}"]
-            return [store]
+            if self.atomic:
+                # Cross-CTA additive finalize: every contributing CTA accumulates into the
+                # same cell (the output is zero-init'd per launch — ``CudaOp.zero_outputs``).
+                return [f"{pad}atomicAdd(&{self.output}[{flat}], {rhs});"]
+            return [f"{pad}{self.output}[{flat}] = {rhs};"]
         # Vectorized path. Per-value dtype conversion: every SSA arg
         # must be at ``out_dt`` before packing.
         n = self.width

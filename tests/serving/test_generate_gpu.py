@@ -1,4 +1,4 @@
-"""GPU spike for the Phase-0 generation oracle (``plans/generative-inference-support.md``).
+"""GPU spike for the Phase-0 generation oracle.
 
 ``perf``-marked (deselected by default): needs CUDA + cupy. Builds a TINY random-weight
 Llama CausalLM (no network), compiles the whole-model fp16 dynamic path through

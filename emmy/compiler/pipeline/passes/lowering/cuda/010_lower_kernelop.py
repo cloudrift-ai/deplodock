@@ -1,206 +1,112 @@
 """Lower each ``KernelOp`` node to a ``CudaOp``.
 
-Renders the ``KernelOp`` body to a ``__global__`` CUDA source string
-and mutates the node's op payload in place. Grid / block geometry is
-derived from the ``Tile`` in the body; ``smem_bytes`` is summed
-over ``Smem`` decls. ``arg_order`` is ``kernel_op.inputs +
-kernel_op.outputs`` keys — matches the kernel signature emitted by
-``render_kernelop``.
+Renders the ``KernelOp`` body to a ``__global__`` source string and derives the
+launch geometry. The body is a single :class:`Tile` (the thread-grid decode), so the grid
+is sized from the tile's element count over the block (``_BLOCK_SIZE`` scalar tier, the
+cooperative ``block_threads`` otherwise). A **symbolic reduce / output-sweep axis** (a
+dynamic ``seq_len`` inside the body's loops) becomes a runtime ``int`` arg: the kernel
+signature gains one ``int <name>`` per symbolic ``Dim`` and the launch resolves it from the
+input array shapes (``sym_values`` → ``runtime_args``). The free (grid) axes are static
+here (``010_recognize`` defers a symbolic free axis), so the grid stays a static int.
 """
 
-from __future__ import annotations
+from dataclasses import replace
 
-from emmy.compiler.graph import Graph, Node
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.cuda import CudaOp, TmaDescMeta
-from emmy.compiler.ir.cuda.ir import GridDimSpec
-from emmy.compiler.ir.kernel import KernelOp
+from emmy.compiler.ir.kernel import KernelOp, Tile
 from emmy.compiler.ir.kernel.ir import TmaDescriptor
-from emmy.compiler.ir.kernel.render import render_kernelop
-from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile
-from emmy.compiler.pipeline import Match, Pattern
-from emmy.compiler.tensor import Tensor
+from emmy.compiler.ir.kernel.render import _BLOCK_SIZE, render_kernelop
+from emmy.compiler.ir.stmt import Write
+from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 
 PATTERN = [Pattern("root", KernelOp)]
 
-_BLOCK = 256
+
+def _atomic_outputs(kernel: KernelOp) -> tuple[str, ...]:
+    """Output buffers an atomic reduce-write (``030_split``'s atomic finalize) accumulates
+    into — they must be zero-init'd before each launch (``CudaOp.zero_outputs``), since every
+    contributing CTA ``atomicAdd``\\ s into the same cell. Dict-keyed for stable order."""
+    seen: dict[str, None] = {}
+    for s in kernel.body.iter():
+        if isinstance(s, Write) and s.atomic:
+            seen.setdefault(s.output, None)
+    return tuple(seen)
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:  # noqa: ARG001 — match required by rule dispatch signature
-    # Per-buffer Tensor descriptors (shape + dtype) come straight off
-    # ``root.op.inputs`` / ``root.op.outputs`` — the matcher snapped them
-    # to the surrounding graph's Tensors via ``populate_io``, including
-    # the ``constant`` / ``value`` flags for ConstantOp predecessors.
-    tensors: dict[str, Tensor] = {**root.op.inputs, **root.op.outputs}
+def _tma_descriptors(kernel: KernelOp) -> tuple[TmaDescMeta, ...]:
+    """Each distinct ``TmaDescriptor`` in the body → a ``TmaDescMeta`` the backend
+    encodes at launch (``cuTensorMapEncodeTiled`` off the bound array's device
+    pointer + the box). First-seen order; deduped by descriptor name so the param
+    list matches the renderer's signature (``const CUtensorMap* <name>``)."""
+    seen: dict[str, TmaDescMeta] = {}
+    for s in kernel.body.iter_of_type(TmaDescriptor):
+        seen.setdefault(s.name, TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle))
+    return tuple(seen.values())
 
-    # Scalar ConstantOp inputs get embedded as float literals in the kernel
-    # body — no kernel parameter, no buffer load.
-    literal_constants: dict[str, float] = {n: float(t.value) for n, t in root.op.inputs.items() if t.constant and t.value is not None}
 
-    runtime_inputs = tuple(b for b in root.op.inputs if b not in literal_constants)
+def _symbolic_runtime_args(kernel: KernelOp) -> tuple[str, ...]:
+    """Every symbolic ``Dim`` name referenced by an axis anywhere in the body, in first-seen
+    order (a dynamic reduce / output-sweep ``seq_len`` — the kernel takes one ``int`` arg per
+    name, the launch resolves it from the input shapes). Dict-keyed for stable ordering."""
+    seen: dict[str, None] = {}
+    for s in kernel.body.iter():
+        axes = s.axes if isinstance(s, Tile) else ((s.axis,) if hasattr(s, "axis") else ())
+        for ax in axes:
+            if isinstance(ax, Axis) and not ax.extent.is_static:
+                for nm in ax.extent.expr.free_vars():
+                    seen.setdefault(nm, None)
+    return tuple(seen)
 
-    grid, block, runtime_args = _launch_geometry(root.op)
-    # TMA descriptors are kernel parameters that come *after* the buffer
-    # args (matching the signature emitted by ``render_kernelop``).
-    # Collect dedup'd metadata so the backend can encode + bind them.
-    desc_stmts = root.op.body.iter_of_type(TmaDescriptor)
-    seen: set[str] = set()
-    descriptors: list[TmaDescMeta] = []
-    desc_names: list[str] = []
-    for s in desc_stmts:
-        if s.name in seen:
-            continue
-        seen.add(s.name)
-        descriptors.append(
-            TmaDescMeta(name=s.name, src_buf=s.src_buf, box_extents=s.box_extents, swizzle=s.swizzle),
-        )
-        desc_names.append(s.name)
-    # Outputs receiving atomic-reduction writes (cross-CTA split-K) must be
-    # zero-initialized before each launch so per-CTA partials accumulate
-    # cleanly. Anything else can keep its prior contents. Helper-driven:
-    # a Write is atomic iff some enclosing block axis is missing from its
-    # index (see ``body.coordination``).
-    escape = root.op.body.coordination
-    atomic_outputs: list[str] = []
-    seen_atomic: set[str] = set()
-    output_set = set(root.op.outputs)
-    for s in escape.writes:
-        if escape.atomic_axes(s) and s.output in output_set and s.output not in seen_atomic:
-            seen_atomic.add(s.output)
-            atomic_outputs.append(s.output)
+
+def rewrite(match: Match, root: Node) -> CudaOp | None:
+    kernel: KernelOp = root.op
+    tiles = [s for s in kernel.body if isinstance(s, Tile)]
+    if len(tiles) != 1:
+        raise RuleSkipped("only single-Tile KernelOps lower so far")
+    (tile,) = tiles
+
+    # The kernel function name doubles as the CudaOp's launch name — keep them
+    # identical. Loop naming always stamps a label, but fall back to the node id.
+    name = kernel.name or f"k_{root.id}"
+    if name != kernel.name:
+        kernel = replace(kernel, name=name)
+
+    # Buffer shapes / dtypes for the renderer come from the op's I/O Tensors
+    # (snapped to the graph by the matcher's populate_io). A symbolic reduce axis adds an
+    # ``int <name>`` runtime arg to the signature, threaded through to the CudaOp.
+    runtime_args = _symbolic_runtime_args(kernel)
+    tensors = {**kernel.inputs, **kernel.outputs}
+    source = render_kernelop(kernel, tensors=tensors, runtime_args=runtime_args)
+
+    # A cooperative tile fixes the per-CTA thread count (``coop · ∏block-cells``): one CTA
+    # per output-cell group, ``blockDim = block_threads``, ``gridDim = N / block_threads``
+    # (the linear ``_gid`` decode groups ``block_threads`` consecutive cells per CTA). The
+    # scalar tier is one thread per cell over the fixed ``_BLOCK_SIZE`` block.
+    blockdim = tile.block_threads if tile.block_threads is not None else _BLOCK_SIZE
+    if tile.is_static_grid:
+        n = tile.n_elements
+        grid = (((n + blockdim - 1) // blockdim,), (1,), (1,))
+    else:
+        # Symbolic grid (a dynamic free axis): ``ceil(∏extents / blockDim)`` CTAs, the symbolic
+        # factor resolved from ``sym_values`` at launch (the ``Expr`` grid factor).
+        grid = ((tile.n_dim.ceil_div(blockdim).expr,), (1,), (1,))
+    block = ((blockdim,), (1,), (1,))
+    # Signature / arg order: buffers, then the TMA descriptor params (bound to the
+    # launch-encoded ``CUtensorMap`` device arrays), then the symbolic ``int`` args
+    # (tail-appended in ``_launch``) — matching ``render_kernelop``'s param layout.
+    tma_descs = _tma_descriptors(kernel)
+    arg_order = (*kernel.inputs, *kernel.outputs, *(d.name for d in tma_descs))
     return CudaOp(
-        kernel_source=render_kernelop(root.op, tensors=tensors, literal_constants=literal_constants, runtime_args=runtime_args),
-        kernel_name=root.op.name,
-        arg_order=(*runtime_inputs, *root.op.outputs, *desc_names),
+        kernel_source=source,
+        kernel_name=name,
+        arg_order=arg_order,
         grid=grid,
         block=block,
-        smem_bytes=root.op.smem_bytes(),
-        tma_descriptors=tuple(descriptors),
-        zero_outputs=tuple(atomic_outputs),
+        smem_bytes=kernel.smem_bytes(),
+        comment=name,
         runtime_args=runtime_args,
+        zero_outputs=_atomic_outputs(kernel),
+        tma_descriptors=tma_descs,
     )
-
-
-def _launch_geometry(
-    kernel_op: KernelOp,
-) -> tuple[tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[GridDimSpec, GridDimSpec, GridDimSpec], tuple[str, ...]]:
-    """Pick (grid_spec, block_spec, runtime_args) from the outermost tile.
-
-    Symbolic ``Axis.extent`` values flow through as ``str`` entries in the
-    grid / block factor tuples; static extents collapse to a single int
-    factor (or the empty product ``(1,)``). ``runtime_args`` lists every
-    symbolic axis name referenced anywhere in the body (grid / thread
-    tiles AND inner serial loops over symbolic reduce axes), in
-    first-seen order — these become ``int`` kernel parameters and
-    arg-pack entries.
-
-    - ``GridTile`` (cooperative): one CTA per block-axis tuple; per-CTA
-      threads = product of inner ``ThreadTile``'s axes.
-    - Standalone ``ThreadTile`` (pointwise): flatten all axes into a
-      linear ``tid = blockIdx.x * blockDim.x + threadIdx.x`` and launch
-      ``ceil(n / _BLOCK)`` CTAs of ``_BLOCK`` threads (only legal when
-      that prod is fully static — block count must be known at launch
-      time and we don't have a ceil-div spec yet).
-    """
-    seen = _collect_symbolic_axis_names(kernel_op)
-
-    def _axes_spec(axes) -> GridDimSpec:
-        from emmy.compiler.ir.expr import Var  # noqa: PLC0415
-
-        factors: list = []
-        for a in axes:
-            if a.extent.is_static:
-                v = a.extent.as_static()
-                if v != 1:
-                    factors.append(v)
-            elif isinstance(a.extent.expr, Var):
-                name = a.extent.as_atom_name()
-                seen.setdefault(name, None)
-                factors.append(name)
-            else:
-                # Composite symbolic extent (ceil-div block axis for a
-                # hint-driven masked tile): carry the Expr; the launch resolver
-                # evals it. Its free names become ``int`` runtime args.
-                expr = a.extent.expr
-                for name in expr.free_vars():
-                    seen.setdefault(name, None)
-                factors.append(expr)
-        return tuple(factors) if factors else (1,)
-
-    for s in kernel_op.body:
-        if isinstance(s, GridTile):
-            grid_spec = _axes_spec(s.axes)
-            block_spec: GridDimSpec = (1,)
-            for child in s.body:
-                if isinstance(child, ThreadTile):
-                    block_spec = _axes_spec(child.axes)
-                    break
-                if isinstance(child, WarpTile):
-                    # Warp-cooperative kernel: each warp coord owns 32
-                    # threads (one warp). The block dimension is the
-                    # row-major-flattened warp-axis product × 32.
-                    warp_spec = _axes_spec(child.axes)
-                    block_spec = (*warp_spec, 32)
-                    break
-            return (grid_spec, (1,), (1,)), (block_spec, (1,), (1,)), tuple(seen)
-        if isinstance(s, ThreadTile):
-            from math import prod  # noqa: PLC0415
-
-            if all(a.extent.is_static for a in s.axes):
-                n_threads = max(prod(a.extent.as_static() for a in s.axes), 1)
-                grid = (((n_threads + _BLOCK - 1) // _BLOCK,), (1,), (1,))
-                return grid, ((_BLOCK,), (1,), (1,)), tuple(seen)
-            # Symbolic flattened pointwise: grid = ceil_div(prod(extents), _BLOCK).
-            # ``Dim`` arithmetic folds the static factors and carries the
-            # symbolic ones; the launch resolver evals the Expr per launch.
-            from emmy.compiler.dim import Dim  # noqa: PLC0415
-
-            nthreads = Dim(1)
-            for a in s.axes:
-                nthreads = nthreads * a.extent
-                if not a.extent.is_static:
-                    for name in a.extent.expr.free_vars():
-                        seen.setdefault(name, None)
-            grid_expr = ((nthreads + (_BLOCK - 1)) // _BLOCK).expr
-            return ((grid_expr,), (1,), (1,)), ((_BLOCK,), (1,), (1,)), tuple(seen)
-    return ((1,), (1,), (1,)), ((1,), (1,), (1,)), tuple(seen)
-
-
-def _collect_symbolic_axis_names(kernel_op: KernelOp) -> dict[str, None]:
-    """Walk the entire body and collect every symbolic axis name (via
-    ``Axis.extent.as_atom_name()``) referenced by any tile or loop. Dict
-    (not set) so insertion order matches first-seen order — kernel param
-    signature is stable across runs of the same kernel."""
-    from emmy.compiler.ir.axis import Axis  # noqa: PLC0415
-    from emmy.compiler.ir.stmt.base import Stmt  # noqa: PLC0415
-
-    seen: dict[str, None] = {}
-
-    def visit(stmt: Stmt) -> None:
-        for ax in _stmt_axes(stmt):
-            if isinstance(ax, Axis) and not ax.extent.is_static:
-                # Composite extents (ceil-div block axes) contribute every free
-                # name (``free_vars``), not just an atomic one — each becomes a
-                # runtime arg.
-                for name in ax.extent.expr.free_vars():
-                    seen.setdefault(name, None)
-        for body in stmt.nested():
-            for child in body:
-                visit(child)
-
-    for stmt in kernel_op.body:
-        visit(stmt)
-    return seen
-
-
-def _stmt_axes(stmt) -> tuple:
-    """Surface every ``Axis`` directly carried by ``stmt`` (``ParallelTile``
-    axes tuple or ``Loop`` / ``SerialTile`` / ``StridedTile`` single
-    axis). Excludes axes inside nested bodies — those get visited
-    recursively by the caller."""
-    axes = getattr(stmt, "axes", None)
-    if axes is not None:
-        return tuple(axes)
-    axis = getattr(stmt, "axis", None)
-    if axis is not None:
-        return (axis,)
-    return ()

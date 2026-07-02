@@ -319,6 +319,40 @@ static __device__ __forceinline__ void dpl_mma_load_b_gmem_nclamp_kzero(unsigned
     }
 }
 
+// Transposed-B (Q@K^T, ``g[n][k]`` with K contiguous) masked-K: zero-fill the K
+// halves past the runtime extent. K is summed by the mma, so a past-extent element
+// must read as +0.0 (never a duplicate). Mirrors ``dpl_mma_load_b_gmem_kzero`` with
+// the (k, n) index roles swapped to (n, k) — cf. ``dpl_mma_load_b_gmem_trans``.
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_kzero(unsigned* r, const T* g, int ldm, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;                                 // N: groupID (0..7)
+        int k = (tig << 1) + (i ? 8 : 0);            // K: 2*threadID_in_group, +8 for the k16 half
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[n * ldm + k];       // .f16x2: contiguous (k, k+1) in row n
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
+// Transposed-B: masked-N (clamp the ``n`` row) AND masked-K (zero-fill the contiguous k).
+template <typename T>
+static __device__ __forceinline__ void dpl_mma_load_b_gmem_trans_nclamp_kzero(unsigned* r, const T* g, int ldm, int cols_left, int k_left) {
+    int lane = threadIdx.x & 31, grp = lane >> 2, tig = lane & 3;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int n = grp;
+        if (n >= cols_left) n = cols_left - 1;       // N: clamp to the runtime extent
+        int k = (tig << 1) + (i ? 8 : 0);
+        unsigned packed = 0;
+        if (k < k_left) ((T*)&packed)[0] = g[n * ldm + k];
+        if (k + 1 < k_left) ((T*)&packed)[1] = g[n * ldm + k + 1];
+        r[i] = packed;
+    }
+}
+
 static __device__ __forceinline__ void dpl_mma_m16n8k16_f16(float* d, const unsigned* a, const unsigned* b, const float* c) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\\n"
@@ -411,11 +445,6 @@ def render_kernelop(
         for n, s in shapes.items():
             tmap.setdefault(n, Tensor(n, tuple(s)))
     smem_offsets, smem_total = _compute_dynamic_smem_offsets(kernel_op)
-    # Body.coordination populates atomic_writes / broadcast_writes so
-    # ``Write.render`` can decide ``atomicAdd`` and broadcast-guard
-    # emission from structural body analysis (block axes / cooperative
-    # thread axes vs. Write.index).
-    escape = kernel_op.body.coordination
     ctx = RenderCtx(
         target=CudaRenderTarget(),
         shapes={n: tuple(t.shape) for n, t in tmap.items()},
@@ -425,8 +454,6 @@ def render_kernelop(
         literal_constants=literals,
         smem_dynamic_offsets=smem_offsets,
         buffer_dtypes={n: t.dtype.name for n, t in tmap.items()},
-        atomic_writes=dict(escape._write_atomic_axes),
-        broadcast_writes=dict(escape._write_broadcast_axes),
     )
 
     def _dtype_for(name: str) -> object:
@@ -453,6 +480,12 @@ def render_kernelop(
     launch_bounds = f"\n__launch_bounds__({bounds})"
 
     body_text = "\n".join(render_body(kernel_op.body, ctx))
+    # The cross-thread combine (``WarpShuffle`` / ``TreeHalve``) references the hardware
+    # warp ``lane`` / ``warp`` ids; declare them at function entry when the body needs them.
+    from emmy.compiler.ir.stmt.blocks import _body_uses_lane_warp  # noqa: PLC0415
+
+    if _body_uses_lane_warp(kernel_op.body):
+        body_text = "    int lane = threadIdx.x & 31;\n    int warp = threadIdx.x >> 5;\n" + body_text
     if smem_offsets:
         # All Smem decls were rewritten to pointer aliases into a single
         # dynamic pool; declare the pool at function entry. The pool base must
@@ -503,32 +536,14 @@ def _compute_dynamic_smem_offsets(kernel_op: KernelOp) -> tuple[dict[str, int], 
 
 
 def _launch_bounds_for(kernel_op: KernelOp) -> int:
-    """Derive ``__launch_bounds__`` from the outermost tile flavor.
+    """Derive ``__launch_bounds__`` from the (single) ``Tile``'s per-CTA thread count — a
+    cooperative tile's ``block_threads`` (``coop · ∏block-cells``), else the scalar tier's
+    ``_BLOCK_SIZE``. Matches the ``blockDim`` the cuda lowering picks."""
+    from emmy.compiler.ir.kernel.ir import Tile  # noqa: PLC0415
 
-    - ``GridTile`` (cooperative): launch bounds = product of inner
-      ``ThreadTile`` axis extents (per-CTA thread count), or — for a
-      ``WarpTile`` inner — ``prod(warp_extents) * 32`` (32 lanes per warp).
-    - Standalone ``ThreadTile`` (pointwise): use the default ``_BLOCK_SIZE``
-      since launch is flattened across blockIdx + threadIdx.
-    """
-    from emmy.compiler.ir.tile.ir import GridTile, ThreadTile, WarpTile  # noqa: PLC0415
-
-    for s in kernel_op.body:
-        if isinstance(s, GridTile):
-            for child in s.body:
-                if isinstance(child, ThreadTile):
-                    bsize = 1
-                    for ax in child.axes:
-                        bsize *= ax.extent.as_static()
-                    return max(bsize, 1)
-                if isinstance(child, WarpTile):
-                    bsize = 32
-                    for ax in child.axes:
-                        bsize *= ax.extent.as_static()
-                    return max(bsize, 32)
-            return _BLOCK_SIZE
-        if isinstance(s, ThreadTile):
-            return _BLOCK_SIZE
+    for s in kernel_op.body.iter_of_type(Tile):
+        if s.block_threads is not None:
+            return s.block_threads
     return _BLOCK_SIZE
 
 

@@ -528,9 +528,10 @@ def hoist_loop_invariants(stmts: Body) -> Body:
     stmts = Body.coerce(stmts)
 
     def _hoistable(s: Stmt, axis: str) -> bool:
-        # Accum / Init are scope-bound to their enclosing Loop's reduction — they can't
-        # move alone, but the whole enclosing block can. Side-effecting stmts (Write, or
-        # any block containing a Write) pin their iteration count and stay put.
+        # Accum / Init are scope-bound to their enclosing Loop's reduction (an Init seeds an
+        # Accum or a Carrier's state per output cell) — they can't move alone, but the
+        # whole enclosing block can. Side-effecting stmts (Write, or any block containing a
+        # Write) pin their iteration count and stay put.
         if isinstance(s, (Accum, Init)) or s.has_side_effects():
             return False
         return not stmts.depends_on(s, axis)
@@ -780,13 +781,6 @@ def rename_ssa_sequential(stmts: Body) -> Body:
       order.
 
     Idempotent: bodies already in canonical form round-trip unchanged."""
-    from emmy.compiler.ir.tile.ir import (  # noqa: PLC0415 — break stmt↔tile cycle
-        ParallelTile,
-        SerialTileBase,
-        StageBundle,
-        WarpSpecialize,
-    )
-
     stmts = Body.coerce(stmts)
     ssa_rename: dict[str, str] = {}
     axis_rename: dict[str, str] = {}
@@ -843,32 +837,7 @@ def rename_ssa_sequential(stmts: Body) -> Body:
             # ``Pack.name`` defines a fresh f16x2 SSA value consumed by the
             # next Accum. Same reasoning as Assign — give it a ``v`` slot.
             _rename(stmt.name, "v")
-        elif isinstance(stmt, ParallelTile):
-            # GridTile / ThreadTile / RegisterTile — record every axis in
-            # the tuple before any nested Stage's cache axes so the
-            # parallel coords keep their pre-order rename slots.
-            for ax in stmt.axes:
-                _record_axis(ax.name)
-        elif isinstance(stmt, WarpSpecialize):
-            # The consumer thread/warp coords live only as free Vars in the
-            # consumer body plus this off-body field — the ThreadTile is
-            # re-synthesised later by the materializer, so no ParallelTile binds
-            # them here. Record them (pre-order, before the nested StageBundle
-            # cache axes) so each gets its own canonical slot. Without this, an
-            # *unstaged* coord (e.g. the N-thread index of a matmul whose B
-            # operand isn't TMA-staged, hence absent from every cache axis) is
-            # never recorded, keeps an uncontrolled name, and can collide with a
-            # renamed cache axis — emitting two identically-named thread loops
-            # (a duplicate ``int aN`` declaration that fails to compile).
-            for ax in stmt.consumer_thread_axes:
-                _record_axis(ax.name)
-        elif isinstance(stmt, StageBundle):
-            for src in stmt.sources:
-                for ax in src.cache_axes:
-                    _record_axis(ax.name)
         elif isinstance(stmt, (Loop, StridedLoop)):
-            _record_axis(stmt.axis.name)
-        elif isinstance(stmt, SerialTileBase):
             _record_axis(stmt.axis.name)
 
     if all(o == n for o, n in ssa_rename.items()) and all(o == n for o, n in axis_rename.items()):
@@ -967,7 +936,7 @@ def canonicalize_op_clusters(stmts: Body) -> Body:
     ``dataclasses.fields`` to locate any field currently holding an
     ``ElementwiseImpl`` (covers ``Init.op`` / ``Assign.op`` /
     ``Accum.op`` without coupling this module to those IR dialects). A
-    monoid carrier (``Monoid``) and the kernel-IR cross-thread combine
+    carrier (``Carrier``) and the kernel-IR cross-thread combine
     stmts (``WarpShuffle`` / ``TreeHalve``) carry their op inside an
     ``Assign`` program (``merge`` / ``combine_states``), already
     canonicalized at the carrier before lowering. The replacement is

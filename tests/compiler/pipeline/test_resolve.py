@@ -1,6 +1,6 @@
 """``Run.resolve`` — the deterministic-resolution entry point (one live graph,
 a ``decide`` callback per fork, a ``Decision`` trace as the only process-state
-output; see ``plans/resolve-trace-driver.md`` M1).
+output).
 
 Pins the M1 contract: in-place apply (the terminal IS the seeded graph object,
 no per-fork copies), an option-0 ``decide`` reproducing the no-prior greedy
@@ -13,16 +13,15 @@ from __future__ import annotations
 
 import pytest
 
-from emmy.compiler import dtype as _dt
 from emmy.compiler import target as target_mod
 from emmy.compiler.context import Context
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
-from emmy.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
+from emmy.compiler.ir.frontend.ir import MatmulOp
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.pipeline import TILE_PASSES, Pipeline
 from emmy.compiler.pipeline.fork import Fork
-from emmy.compiler.pipeline.pipeline import Run, _is_structural_option
+from emmy.compiler.pipeline.pipeline import Run
 
 
 @pytest.fixture(autouse=True)
@@ -41,22 +40,6 @@ def _f32_matmul_graph(M: int = 128, K: int = 128, N: int = 128) -> Graph:
     g.add_node(MatmulOp(), ["a", "b"], Tensor("o", (M, N)), node_id="o")
     g.inputs = ["a", "b"]
     g.outputs = ["o"]
-    return g
-
-
-def _norm_linear(prefix: str, g: Graph | None = None) -> Graph:
-    """RMSNorm → Linear (f16): fusion yields the prologue-demoted matmul whose
-    keep-vs-split offer (``tile/010_split_demoted``) is a structural fork."""
-    f16 = _dt.get("f16")
-    g = g if g is not None else Graph()
-    x, nw, wg, xn, o = (f"{prefix}{n}" for n in ("x", "nw", "wg", "xn", "o"))
-    g.add_node(InputOp(), [], Tensor(x, (1, 32, 1024), f16), node_id=x)
-    g.add_node(InputOp(), [], Tensor(nw, (1024,), f16), node_id=nw)
-    g.add_node(InputOp(), [], Tensor(wg, (3072, 1024), f16), node_id=wg)
-    g.add_node(RmsNormOp(eps=1e-6), [x, nw], Tensor(xn, (1, 32, 1024), f16), node_id=xn)
-    g.add_node(LinearOp(), [xn, wg], Tensor(o, (1, 32, 3072), f16), node_id=o)
-    g.inputs += [x, nw, wg]
-    g.outputs += [o]
     return g
 
 
@@ -112,34 +95,24 @@ def test_option0_decide_matches_no_prior_greedy() -> None:
 
 
 def test_trace_records_partition_fork() -> None:
-    """The inner partition forks trace under their per-family rule names with the
-    kernel's node id and the decide's score annotation (None for the unranked
-    option-0 decide); ``chosen_kind`` is ``"op"`` for tile rebinds. The block-DAG
-    Tile IR splits the old monolithic ``010_enumerate`` into the per-family
-    chain (``060_reduce_tile`` → ``090_thread_tile`` → ``100_register_tile`` →
-    ``120_stage``), so one kernel records that chain rather than one fork, and
-    the cumulative knob row carries the complete tile (``{BM, BN}``) by the
-    thread-tile fork."""
+    """The contraction's schedule fork traces as ONE decision under the recognizer rule (the
+    hierarchical tile → stage → reduce fork tree is one fork point, not a per-family chain), with
+    the kernel's node id, ``chosen_kind == "op"`` (a ``TileOp`` rebind), the decide's score
+    annotation (``None`` for the unranked option-0 decide), and the chosen leaf's COMPLETE knob
+    row (the axis-named ``TILE@<k>`` key; option-0 = the conservative per-cell leaf)."""
+    from emmy.compiler.pipeline.knob import family_of, family_value
+
     g = _f32_matmul_graph()
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     terminal, trace = run.resolve(g, _option0)
-    part = [d for d in trace if d.rule_name in {"060_reduce_tile", "090_thread_tile", "100_register_tile"}]
-    assert [d.rule_name for d in part] == ["060_reduce_tile", "090_thread_tile", "100_register_tile"], (
-        f"the inner tile-fork chain for one kernel, got {[d.rule_name for d in trace]}"
-    )
-    for d in part:
-        assert d.node_id in terminal.nodes
-        assert d.chosen_kind == "op"
-        assert d.score is None
-        assert d.n_options >= 1, "each family fork emits its lazy fork tree as the raw option"
-    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _families as fam
-
-    thread = next(d for d in part if d.rule_name == "090_thread_tile")
-    # The matmul free axes are a0 (M, outer) and a1 (N, inner); the thread fork stamps the
-    # par-only ``SPLIT@<axis>`` for both (the register fork completes par×reg).
-    assert {fam.split_key("a1"), fam.split_key("a0")} <= set(thread.knob_delta), (
-        f"the thread-tile decision carries the free-axis SPLIT row, got {thread.knob_delta}"
-    )
+    part = [d for d in trace if any(family_of(k) == "TILE" for k in d.knob_delta)]
+    assert len(part) == 1, f"one hierarchical schedule fork per contraction, got {[d.rule_name for d in part]}"
+    d = part[0]
+    assert d.node_id in terminal.nodes
+    assert d.chosen_kind == "op"
+    assert d.score is None
+    assert d.n_options >= 1, "the fork offers its lazy fork tree as the raw option"
+    assert family_value(d.knob_delta, "TILE") == "", "option-0 is the conservative per-cell leaf"
 
 
 def test_decide_score_lands_on_trace() -> None:
@@ -153,35 +126,3 @@ def test_decide_score_lands_on_trace() -> None:
     run = Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((8, 0)))
     _, trace = run.resolve(_f32_matmul_graph(), scored)
     assert trace and all(d.score == 42.0 for d in trace)
-
-
-# ---------------------------------------------------------------------------
-# Structural forks: decide sees them, replay is consulted
-# ---------------------------------------------------------------------------
-
-
-def test_structural_replay_consulted() -> None:
-    """Two structurally identical offer sites decide ONCE: the second 005 offer
-    replays the first decision read off the graph (``Op.source`` + stamped
-    decision knobs), so the decide callback sees one structural fork and the
-    terminal carries both splits. Replays are not decisions — no trace entry."""
-    from emmy.compiler.pipeline.search.two_level import outer_pipeline
-
-    g = _norm_linear("b", _norm_linear("a"))
-    seen: list[str] = []
-
-    def split_first(fp):
-        seen.append(fp.match.rule.name)
-        structural = [o for o in fp.options if _is_structural_option(o)]
-        if structural:
-            assert fp.structural
-            return structural[0]
-        return _option0(fp)
-
-    terminal, trace = Run(pipeline=outer_pipeline(), ctx=Context.from_target((12, 0))).resolve(g, split_first)
-    assert seen.count("010_split_demoted") == 1, f"the second offer site must replay, decide saw {seen}"
-    assert sum(1 for d in trace if d.rule_name == "010_split_demoted") == 1
-    assert sum(1 for n in terminal.nodes.values() if isinstance(n.op, LoopOp)) == 4, "both sites must take the split side"
-    split = next(d for d in trace if d.rule_name == "010_split_demoted")
-    assert split.chosen_kind == "graph"
-    assert split.knob_delta.get("PLACE@cone") == "cut"  # the structural materialize decision (legacy CUT="1")

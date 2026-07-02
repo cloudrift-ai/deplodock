@@ -61,9 +61,8 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   batches (index 0 always opens a span; overlong spans are chopped).
 - `sampling.py` — **no vLLM, no CUDA**. Pure-numpy token sampling (`Sampler`: greedy / temperature / top-k / top-p) +
   `apply_chat_template` (delegates to the HF tokenizer). Used by the standalone **generation oracle**
-  (`commands/generate.py`, Phase 0 of `plans/generative-inference-support.md`) — `emmy generate`'s host loop
-  re-runs the whole fp16 prefix each step on the CUDA backend and samples with this. The generative *vLLM plugin*
-  (`EmmyGenModel`) is later-phase work tracked in that plan.
+  (`commands/generate.py`) — `emmy generate`'s host loop re-runs the whole fp16 prefix each step on the CUDA
+  backend and samples with this. The generative *vLLM plugin* (`EmmyGenModel`) builds on this oracle.
 - `gen_runner.py` — `EmmyGenRunner` (Phase 2; sibling to `EmmyForwardRunner`). Carves SDPA out of every
   decoder layer (`build_attention_split_wrapper`), compiles **two dynamic-`num_tokens` programs per layer** (`pre` +
   `post`) over the flattened `[num_tokens, H]` layout, and exposes `embed` / `forward_layer_pre(L,…)→(q,k,v)`
@@ -72,12 +71,11 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   prefill / `num_tokens > bucket` use the host numpy `rebind` path; the **decode hot path** (`num_tokens ≤ bucket`)
   is **device-resident** (Phase A — `run_device` / `embed_device` / `forward_layer_*_device` / `final_norm_device`:
   captured-replay over the static program with torch↔cupy DLPack zero-copy, no host hop; reuses the embedding
-  runner's pattern). This removed the ~40% host/dispatch overhead and ~2×'d served decode (see
-  `plans/generative-device-resident-decode.md`). **Decode bucket:** it
+  runner's pattern). This removed the ~40% host/dispatch overhead and ~2×'d served decode. **Decode bucket:** it
   also compiles a **static M=`decode_bucket` (default 16)** `pre`/`post` twin per layer and uses it when
   `num_tokens ≤ bucket` (pad → run → slice the real rows) — the symbolic hint-512 M-tile is ~66× too slow at decode
   M=1; falls back to symbolic above the bucket or if a static compile fails. So
-  up to 4 capacity programs/layer — the memory budget the plan flags (Top risk #9).
+  up to 4 capacity programs/layer — a real memory-budget risk.
 - `vllm_model_gen.py` — `EmmyGenModel` (Phase 3; the generative vLLM model class). **NOT** `IsAttentionFree`: it
   builds real vLLM `Attention` layers (one per decoder layer, unique `prefix` → vLLM allocates a KV-cache spec and runs
   paged attention) + a shared `get_rope` module (a bare `Attention` does no RoPE) + `ParallelLMHead` + `LogitsProcessor`.
@@ -88,7 +86,7 @@ checkpoint, tokenizer, and sentence-transformers pooling config still come from 
   hop); prefill keeps the numpy path. Select via `--runner generate` +
   `--hf-overrides '{"architectures":["EmmyGenModel"]}'` + `--dtype float16` (the `serve --generate` branch forces
   this for seam coherence). Registered in `__init__.py`. Whole-step CUDA-graph capture (drop `--enforce-eager`) is
-  Phase B (`plans/generative-device-resident-decode.md`).
+  future work.
 
 ## Static mode (`EMMY_SERVING_STATIC=1`) — static extents for both batch and seq
 
@@ -102,7 +100,7 @@ flag, not a separate emmy knob (the toggle is boolean; the size comes from what 
 **Measured (RTX 5090, Qwen3-Embedding-0.6B, uniform 512 tokens, concurrency 32):** this is currently a throughput
 **regression**, not a win — the static `(32, 512)` forward takes ~1.1 s (26.6 req/s) vs the batch-1 path's 64 req/s and
 stock vLLM's ~232 req/s. Making the extents static is *not* the lever: the batched program does B× the existing,
-non-flash, O(B·H·S²)-materialized attention (Finding 2 in `plans/qwen3-embedding-0.6b-layer0-static-vs-dynamic-tune-findings.md`),
+non-flash, O(B·H·S²)-materialized attention,
 and the static-shape kernels are cold greedy picks (untuned, unlike the batch-1 symbolic kernels which carried prior
 tuning). The throughput win needs efficient attention (flash/varlen, follow-up #1) and/or an autotune of the static
 batched shape — batching alone, over today's kernels, loses. Why static, not symbolic: the dynamic-seq
@@ -144,8 +142,8 @@ Recorded follow-ups, in impact order:
    array on the GPU (`runner._mask`) and copied into the prefix device-to-device. Still open: an in-kernel `j <= i`
    predicate would drop the mask input + its per-request D2D copy entirely.
 4. **Single capacity-baked graph** — would collapse the per-S cache to one graph, but needs every symbolic-M kernel to
-   be correct at an oversized (capacity) grid; today several aren't (swizzle decode + staged loads read OOB). Tracked
-   in `plans/serving-dynamic-shape-cuda-graphs.md`.
+   be correct at an oversized (capacity) grid; today several aren't (swizzle decode + staged loads read OOB). Future
+   work.
 
 ## Serving constraints
 

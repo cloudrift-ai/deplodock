@@ -17,10 +17,41 @@ carry bare ``Axis`` tuples and encode the binding in the flavor's type.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 
 from emmy.compiler.dim import Dim, to_dim
-from emmy.compiler.ir.expr import Interval, Literal, SimplifyCtx
+from emmy.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx
+
+
+class AxisRole(enum.Enum):
+    """The scheduling **role** of one iteration axis — read structurally off the loop body,
+    not a stored algebra kind (the removed ``classify_algebra`` tagged the whole *kernel*; this
+    tags each *axis*, and stays re-derivable from the body).
+
+    Detection (``lowering/tile``) stamps each loop with its role so scheduling dispatches on the
+    axis's job, never on a node *type*:
+
+    - ``FREE`` — a parallel / output-grid axis (no fold; one independent cell per value).
+    - ``PLANAR`` — a plain reduce axis (``sum`` / ``max`` / ``mean`` — the degenerate ``id``
+      twist). Several stacked ``PLANAR`` axes form a reduction *plane*.
+    - ``CONTRACTION`` — a reduce axis whose body distributes a ``⊗`` lift over ≥ 2 operands (the
+      matmul K axis).
+    - ``TWISTED`` — a ψ-conjugated reduce carrying an ``exp``-family :class:`Twist` (online
+      softmax / flash).
+
+    Every role but ``FREE`` is a reduce axis (the carrier rides the loop)."""
+
+    FREE = "free"
+    PLANAR = "planar"
+    CONTRACTION = "contraction"
+    TWISTED = "twisted"
+
+    @property
+    def is_reduce(self) -> bool:
+        """True for every fold role (everything but :attr:`FREE`)."""
+        return self is not AxisRole.FREE
+
 
 # Sentinel upper bound for a symbolic loop axis ``[0, hi]``. Only its ``lo = 0``
 # matters (gives the non-negativity the ``(i*c + …)//c → i`` div fold needs);
@@ -91,6 +122,11 @@ class Axis:
             Axis(f"{self.name}_i", factor, source_axis=src),
         )
 
+    def extent_expr(self) -> Expr:
+        """This axis's extent as an ``Expr`` — a literal int (static) or the symbolic ``Dim``
+        expr (dynamic ``seq_len``)."""
+        return Literal(self.extent.as_static(), "int") if self.extent.is_static else self.extent.expr
+
 
 def extend_simplify_ctx(ctx: SimplifyCtx, axis: Axis) -> SimplifyCtx:
     """Push an iteration axis ``[0, extent)`` into a ``SimplifyCtx`` so index
@@ -111,4 +147,4 @@ def extend_simplify_ctx(ctx: SimplifyCtx, axis: Axis) -> SimplifyCtx:
     return ctx.extend(axis.name, Interval(0, _SYMBOLIC_AXIS_HI), bound=ext.expr)
 
 
-__all__ = ["Axis", "extend_simplify_ctx"]
+__all__ = ["Axis", "AxisRole", "extend_simplify_ctx"]

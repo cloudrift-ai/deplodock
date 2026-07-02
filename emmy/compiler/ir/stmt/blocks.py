@@ -3,8 +3,8 @@
 Each carries a child body (or two, for ``Cond``) and overrides
 ``Stmt.nested`` so :func:`iter_body` can recurse uniformly. Tile-axis
 decode helpers (``_render_grid_axis_decode``, ``_render_thread_axis_decode``,
-``_body_uses_lane_warp``) live alongside and are consumed by the typed
-tile flavors in :mod:`emmy.compiler.ir.tile.ir`.
+``_body_uses_lane_warp``) live alongside and were consumed by the typed
+tile flavors of the (now demolished) tile IR.
 """
 
 from __future__ import annotations
@@ -12,11 +12,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from emmy.compiler.dtype import F32 as _F32
-from emmy.compiler.ir.axis import Axis
+from emmy.compiler.ir.axis import Axis, AxisRole
 from emmy.compiler.ir.expr import Expr, Var
-from emmy.compiler.ir.stmt.base import INDENT, ReduceCarrier, RenderCtx, Stmt, _pad, pretty_body, render_body
+from emmy.compiler.ir.stmt.algebra import Carrier
+from emmy.compiler.ir.stmt.base import INDENT, RenderCtx, Stmt, _pad, pretty_body, render_body
 from emmy.compiler.ir.stmt.body import Body
-from emmy.compiler.ir.stmt.leaves import Accum
+from emmy.compiler.ir.stmt.leaves import Accum, Mma
+
+# The loop-carried reduce accumulators — a Loop is a *reduce* loop iff its immediate
+# body holds one of these (the predicate `is_reduce` keys off, see below).
+_CARRIERS = (Accum, Mma)
 
 
 def _source_suffix(axis: Axis) -> str:
@@ -52,11 +57,23 @@ class Loop(Stmt):
     ``unroll=True`` annotates the loop for ``#pragma unroll`` at render
     time. Set by scheduling passes (``mark_unroll``); has no
     effect on the IR's iteration semantics.
+
+    ``role`` is the axis's scheduling :class:`~emmy.compiler.ir.axis.AxisRole`
+    (``FREE`` / ``PLANAR`` / ``CONTRACTION`` / ``TWISTED``), stamped by tile-lowering
+    detection; ``carrier`` is the :class:`~emmy.compiler.ir.stmt.algebra.Carrier`
+    algebra payload (state + twist) a reduce loop folds through (``None`` on a ``FREE`` loop
+    or a not-yet-annotated reduce). Both default to the unannotated ``FREE`` / ``None`` so
+    every existing construction site keeps working.
     """
 
     axis: Axis
     body: Body
     unroll: bool = False
+    role: AxisRole = AxisRole.FREE
+    carrier: Carrier | None = None
+    seed: bool = True  # emit the per-Accum ``<acc> = identity;`` seed before the loop; False when a
+    # nested drain whose accumulators are pre-seeded once outside an enclosing loop (the staged
+    # scalar contraction — re-seeding per outer-slab iteration would zero the running sum).
 
     def __post_init__(self) -> None:
         # Coerce so ``Loop(body=tuple_value)`` keeps working without
@@ -72,28 +89,18 @@ class Loop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return Loop(axis=self.axis, body=body, unroll=self.unroll)
+        return Loop(axis=self.axis, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier, seed=self.seed)
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
 
     @property
     def is_reduce(self) -> bool:
-        """A loop is a reduce-loop iff its immediate body contains a
-        ``ReduceCarrier`` (``Accum``, or its tensor-core form ``Mma``)."""
-        return any(isinstance(s, ReduceCarrier) for s in self.body)
-
-    @property
-    def algebra_kind(self):
-        """The loop's algebraic kind (``AlgebraKind``), derived bottom-up from
-        its carrier — ``MAP`` (non-reduce) / ``MONOID`` / ``SEMIRING``. A tuple
-        `Monoid` carrier (flash) is a monoid (transport of structure), so it
-        reads as ``MONOID``. A computed read (never stored, never in
-        ``op_cache_key``), so it can never contradict the body's algebra. See
-        ``ir/algebra.py``."""
-        from emmy.compiler.ir.algebra import classify_algebra  # noqa: PLC0415 — break blocks↔algebra cycle
-
-        return classify_algebra(self)
+        """A loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
+        ``FREE``) OR — for a not-yet-annotated loop — its immediate body contains a carrier
+        (``Accum`` or its tensor-core form ``Mma``). The structural fallback keeps recognition
+        working before detection stamps the role."""
+        return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         head = f"{indent}for {self.axis.name} in 0..{self.axis.extent}{_source_suffix(self.axis)}"
@@ -103,22 +110,25 @@ class Loop(Stmt):
 
         pad = _pad(ctx.indent)
         out: list[str] = []
-        # Per-Loop ``<dtype> <acc> = identity;`` for each distinct Accum in
-        # the immediate body — suppressed when an enclosing Init already
-        # declared it. dtype comes from the Accum's optional ``dtype`` field
-        # (defaults to fp32) so fp32-over-fp16 accumulators declare as
-        # ``float acc = 0.0f;`` while a fp16-typed Accum declares as
-        # ``__half acc = __float2half(0.0f);``.
+        # Per-Loop ``<dtype> <acc> = identity;`` for each distinct ``Accum`` fold in the
+        # immediate body — the seed rides on the fold, derived here from ``op.identity`` at
+        # the fold's ``dtype`` (so fp32-over-fp16 declares ``float acc = 0.0f;``, a fp16
+        # ``max`` declares ``__half acc = __float2half(0.0f);``), no explicit ``Init``. This
+        # is the SINGLE seed-placement path: a reduce ``Loop`` carries its ``Carrier`` but its
+        # body already holds the loose fold ``Accum``\\ s (dissolved at recognition), so there
+        # is never a carrier stmt to special-case here. A nested fold re-declares per enclosing
+        # iteration (scope-local shadowing), so a same-named outer carrier is harmless. This
+        # is the *serial* schedule's placement; a cooperative / cross-CTA realization reads
+        # the same fold ``Accum``\\ s' ``op.identity`` to seed its partials.
         seen: set[str] = set()
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
                 seen.add(s.name)
-                if s.name in ctx.explicit_inits:
-                    continue
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
-                out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
+                if self.seed:
+                    out.append(f"{pad}{ctx.type_name(s.dtype)} {s.name} = {ctx.identity_literal(identity, s.dtype)};")
                 ctx.ssa_dtypes[s.name] = (s.dtype or _F32).name
         var = self.axis.name
         extent = _extent_c(self.axis, ctx)
@@ -275,13 +285,15 @@ class StridedLoop(Stmt):
     loop construct itself rather than via affine indexing in the body.
 
     Reduction detection mirrors ``Loop``: a ``StridedLoop`` is a
-    reduce-loop iff its body contains an ``Accum``."""
+    reduce-loop iff its annotated :attr:`role` folds or its body contains an ``Accum``."""
 
     axis: Axis
     start: Expr
     step: Expr
     body: Body
     unroll: bool = False
+    role: AxisRole = AxisRole.FREE
+    carrier: Carrier | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, Body):
@@ -295,7 +307,9 @@ class StridedLoop(Stmt):
 
     def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
         (body,) = bodies
-        return StridedLoop(axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll)
+        return StridedLoop(
+            axis=self.axis, start=self.start, step=self.step, body=body, unroll=self.unroll, role=self.role, carrier=self.carrier
+        )
 
     def binds_axes(self) -> frozenset[str]:
         return frozenset({self.axis.name})
@@ -305,9 +319,9 @@ class StridedLoop(Stmt):
 
     @property
     def is_reduce(self) -> bool:
-        """A strided loop is a reduce-loop iff its immediate body contains a
-        ``ReduceCarrier`` (``Accum``, or its tensor-core form ``Mma``)."""
-        return any(isinstance(s, ReduceCarrier) for s in self.body)
+        """A strided loop is a reduce-loop iff its annotated :attr:`role` folds (anything but
+        ``FREE``) OR its immediate body contains a carrier (``Accum`` / ``Mma``)."""
+        return self.role.is_reduce or any(isinstance(s, _CARRIERS) for s in self.body)
 
     def pretty(self, indent: str = "") -> list[str]:
         start = self.start.pretty()
@@ -325,8 +339,6 @@ class StridedLoop(Stmt):
         for s in self.body:
             if isinstance(s, Accum) and s.name not in seen:
                 seen.add(s.name)
-                if s.name in ctx.explicit_inits:
-                    continue
                 identity = s.op.identity
                 if identity is None:
                     raise ValueError(f"Accum {s.name!r} op {s.op.name!r} has no identity")
@@ -335,9 +347,13 @@ class StridedLoop(Stmt):
         var = self.axis.name
         start_str = self.start.render(ctx)
         step_str = self.step.render(ctx) if isinstance(self.step, Expr) else str(self.step)
+        # ``_extent_c`` renders a symbolic bound (a cooperative reduce over a dynamic
+        # ``seq_len`` strides each lane to the runtime extent — the ``< seq_len`` bound is the
+        # masked tail, idle lanes folding the carrier identity) as the C name, a static one as
+        # its literal int.
         if self.unroll:
             out.append(f"{pad}#pragma unroll")
-        out.append(f"{pad}for (int {var} = {start_str}; {var} < {self.axis.extent.as_static()}; {var} += {step_str}) {{")
+        out.append(f"{pad}for (int {var} = {start_str}; {var} < {_extent_c(self.axis, ctx)}; {var} += {step_str}) {{")
         inner = ctx.child()
         out.extend(render_body(self.body, inner))
         out.append(f"{pad}}}")

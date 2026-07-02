@@ -84,24 +84,29 @@ class _Buffer:
 
 
 def _buffers(graph: Graph) -> list[_Buffer]:
-    input_set = set(graph.inputs)
-    output_set = set(graph.outputs)
-    bufs: list[_Buffer] = []
-    for nid, node in graph.nodes.items():
-        if nid in input_set:
-            role = "input"
-        elif isinstance(node.op, ConstantOp):
-            role = "constant"
-        elif nid in output_set:
-            role = "output"
-        else:
-            role = "scratch"
-        bufs.append(_Buffer(name=nid, shape=tuple(node.output.shape), dtype=node.output.dtype, role=role))
-    return bufs
+    return [
+        _Buffer(name=nid, shape=tuple(node.output.shape), dtype=node.output.dtype, role=graph.node_role(nid))
+        for nid, node in graph.nodes.items()
+    ]
 
 
 def _constant_values(graph: Graph) -> dict[str, float]:
-    return {nid: node.op.value for nid, node in graph.nodes.items() if isinstance(node.op, ConstantOp) and node.op.value is not None}
+    return {nid: op.value for nid, op in graph.constant_ops() if op.value is not None}
+
+
+def _runtime_constants(graph: Graph):
+    """``{nid: Expr}`` for each ``ConstantOp`` bound to a runtime ``context_value`` (a value
+    set by the symbolic context — e.g. a dynamic mean's divisor = the runtime reduce-axis
+    size). Resolved to a concrete float per run from ``sym_values``."""
+    return {nid: op.context_value for nid, op in graph.constant_ops() if op.context_value is not None}
+
+
+def _resolved_constants(compiled: _Compiled, sym_values: dict[str, int]) -> dict[str, float]:
+    """The constant-value map for this run: the static constants plus each runtime
+    ``context_value`` constant evaluated at ``sym_values`` (``float(seq_len)``)."""
+    if not compiled.runtime_constants:
+        return compiled.constants
+    return {**compiled.constants, **{nid: float(expr.eval(sym_values)) for nid, expr in compiled.runtime_constants.items()}}
 
 
 def _launches(graph: Graph) -> list[Node]:
@@ -156,13 +161,17 @@ class _Compiled:
     # benches a symbolic graph at the hint size).
     symbolic_hints: dict[str, int] = field(default_factory=dict)
     # Symbolic axis name → its capacity CAP. A capacity-capped kernel (the
-    # smem-staged fused symbolic-K SDPA P@V — ``plans/fused-symbolic-pv-smem-staged.md``)
+    # smem-staged fused symbolic-K SDPA P@V)
     # bakes its smem slab at the ``Dim`` hint and is only correct for runtime
     # extents ≤ that cap, so the launch resolver hard-errors when the supplied
     # input shape exceeds it (rather than reading/writing past the baked slab).
     # Empty for every kernel set that tiles the symbolic extent with a ceil-div
     # grid (those handle any runtime size); populated only by the capped cut.
     symbolic_caps: dict[str, int] = field(default_factory=dict)
+    # ConstantOp nid → ``Expr`` (over symbolic-dim names) whose runtime value fills the
+    # constant (a dynamic mean's divisor = the runtime reduce-axis size). Resolved per run
+    # via :func:`_resolved_constants`.
+    runtime_constants: dict = field(default_factory=dict)
 
 
 def _compile(graph: Graph) -> _Compiled:
@@ -170,8 +179,9 @@ def _compile(graph: Graph) -> _Compiled:
     buf_by_name = {b.name: b for b in bufs}
     constants = _constant_values(graph)
     launches_nodes = _launches(graph)
-    symbolic_bindings = _symbolic_bindings(graph)
-    symbolic_hints = _symbolic_hints(graph)
+    symbolic_bindings = graph.symbolic_bindings()
+    symbolic_hints = graph.symbolic_hints()
+    runtime_constants = _runtime_constants(graph)
 
     # ``nvcc.load_function`` returns a cupy ``Function`` (or a ``RawKernel`` on
     # NVRTC fallback) — both launch-callable and smem-attr settable.
@@ -212,58 +222,8 @@ def _compile(graph: Graph) -> _Compiled:
         launches=launches,
         symbolic_bindings=symbolic_bindings,
         symbolic_hints=symbolic_hints,
+        runtime_constants=runtime_constants,
     )
-
-
-def _symbolic_bindings(graph: Graph) -> dict[str, tuple[str, int]]:
-    """Walk graph inputs to map every symbolic dim name to its source
-    ``(input_buf, dim_index)`` — the launch resolver reads the runtime
-    value from ``input_arrays[buf].shape[dim_index]``. First-seen position
-    wins on conflicts so each name resolves deterministically.
-
-    A symbolic name is recovered from an **atomic** ``Var`` axis (``shape[d] ==
-    Var(name)``). A **composite** symbolic input dim — e.g. a sliced masked-K
-    producer slab's padded extent ``((seq_len + 63) // 64) * 64`` reaching a
-    standalone-benched consumer as a synthetic input — can't be inverted to its
-    free var directly, so it does NOT bind; it is fine as long as every free var
-    it carries is bound from an atomic axis somewhere (the slab's own ``seq_q``
-    axis, the sibling P operand, …). Only a name that appears *exclusively* in
-    composite dims is unrecoverable — that raises."""
-    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
-
-    bindings: dict[str, tuple[str, int]] = {}
-    composite_names: set[str] = set()
-    for nid in graph.inputs:
-        for d, dim in enumerate(graph.nodes[nid].output.shape):
-            if dim.is_static:
-                continue
-            if isinstance(dim.expr, Var):
-                bindings.setdefault(dim.expr.name, (nid, d))
-            else:
-                composite_names |= dim.expr.free_vars()
-    unrecoverable = composite_names - bindings.keys()
-    if unrecoverable:
-        raise ValueError(
-            f"symbolic name(s) {sorted(unrecoverable)} appear only in composite input dims; "
-            "no atomic Var-backed axis to recover them from at launch"
-        )
-    return bindings
-
-
-def _symbolic_hints(graph: Graph) -> dict[str, int]:
-    """Map every symbolic input-dim name to its ``Dim`` hint (default expected
-    size). Read straight off the input ``Dim`` — convenient here since this
-    walks the same input shapes as ``_symbolic_bindings``. Used by
-    ``_resolve_symbolic`` as the fallback bench size when no ``input_data`` is
-    supplied (the autotuner case)."""
-    from emmy.compiler.ir.expr import Var  # noqa: PLC0415
-
-    hints: dict[str, int] = {}
-    for nid in graph.inputs:
-        for dim in graph.nodes[nid].output.shape:
-            if isinstance(dim.expr, Var) and dim.hint is not None:
-                hints.setdefault(dim.expr.name, dim.hint)
-    return hints
 
 
 def _nvrtc_options(*, uses_tma: bool) -> tuple[str, ...]:
@@ -295,7 +255,13 @@ def _materialize(buf: _Buffer, shape: tuple[int, ...], src: np.ndarray | None, c
     if src is not None:
         return cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
     if buf.role == "constant" and buf.name in constants:
-        return cp.full(shape, float(constants[buf.name]), dtype=cp_dtype)
+        v = float(constants[buf.name])
+        if getattr(buf.dtype, "name", buf.dtype) == "bf16":
+            # bf16 buffers ride as uint16 BITS (``BF16.np``) — casting the float would zero it;
+            # encode the value to bf16 bits (round-to-nearest-even on the dropped mantissa half).
+            bits = int(np.float32(v).view(np.uint32))
+            return cp.full(shape, np.uint16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16), dtype=cp_dtype)
+        return cp.full(shape, v, dtype=cp_dtype)
     if buf.role == "input":
         # Pseudo-random fill for un-supplied inputs (matches old generated program).
         n = 1
@@ -377,6 +343,7 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
     input/constant/output buffers stay standalone (persistent across the call)."""
     input_data = input_data or {}
     sym_values = _resolve_symbolic(compiled, input_data)
+    constants = _resolved_constants(compiled, sym_values)
     arrays: dict[str, cp.ndarray] = {}
     # Saturating casts here are intended, not bugs: e.g. an SDPA mask-fill
     # constant (``-1e9``) is meant to become ``-inf`` in fp16 (masked → 0 after
@@ -386,7 +353,7 @@ def _allocate(compiled: _Compiled, input_data: dict[str, np.ndarray] | None) -> 
             if buf.role == "scratch":
                 continue  # placed into the slab below
             shape = buf.resolve_shape(sym_values) or (1,)
-            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), compiled.constants)
+            arrays[buf.name] = _materialize(buf, shape, input_data.get(buf.name), constants)
     # ``scratch`` buffers become views into one zero-init slab. The build-time
     # zero preserves the contract scratch had under ``cp.zeros``; per-launch
     # ``zero_outputs`` re-zeros atomic-reduction outputs, and every other kernel
@@ -769,6 +736,12 @@ class CompiledProgram:
             for buf in self.compiled.bufs:
                 if reuse and buf.role == "scratch":
                     continue  # slab-managed; re-planned below when dims change
+                # A runtime ``context_value`` constant (a dynamic mean's divisor) keeps a
+                # static (1,) shape but its VALUE tracks the runtime context — refill in place
+                # whenever sym_values change (the shape-change check below would skip it).
+                if buf.name in self.compiled.runtime_constants:
+                    self.arrays[buf.name].fill(float(self.compiled.runtime_constants[buf.name].eval(new_sym)))
+                    continue
                 src = input_data.get(buf.name)
                 if src is None and not buf.is_symbolic:
                     continue

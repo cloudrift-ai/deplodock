@@ -56,9 +56,6 @@ class RenderCtx:
 
     ``shapes`` maps every buffer to its declared shape so multi-dim
     ``Load`` / ``Write`` indices can be flattened row-major.
-    ``explicit_inits`` carries the set of accumulator names whose init
-    has been emitted by an enclosing ``Init`` Stmt — Loop's default
-    per-Loop init is suppressed for those names.
     """
 
     target: RenderTarget = field(default_factory=_default_render_target)
@@ -66,7 +63,6 @@ class RenderCtx:
     indent: int = 1
     intrinsics: dict[str, str] = field(default_factory=dict)
     builtins: dict[str, str] = field(default_factory=dict)
-    explicit_inits: set[str] = field(default_factory=set)
     literal_constants: dict[str, float] = field(default_factory=dict)
     # SSA names whose defining Load came from a ``literal_constants``
     # input — populated by ``render_body`` after scanning the body, and
@@ -96,40 +92,14 @@ class RenderCtx:
     # so they compose with non-default-dtype operands. Set transiently
     # by ``Assign.render`` around the native expression render.
     literal_default_dtype: str | None = None
-    # True inside a ``GridTile``'s render scope. Set by ``GridTile.render``
-    # when descending into its body so a nested ``ThreadTile.render`` picks
-    # the cooperative-decode form (threadIdx → axes) rather than the
-    # standalone pointwise form (linear tid + bounds guard).
-    inside_grid_tile: bool = False
-    # Per-Write coordination metadata derived from the escape-analysis
-    # helper. Populated once at ``render_kernelop`` entry; consumed by
-    # ``Write.render`` to decide atomicAdd vs plain store and whether to
-    # wrap the store in a single-thread broadcast guard. Keyed by
-    # ``id(write)`` because ``Write.index`` may hold ``BinaryExpr`` nodes
-    # that aren't hashable. Empty when no helper analysis was run (legacy
-    # callers / unit-test fixtures that build a RenderCtx directly).
-    atomic_writes: dict[int, frozenset[str]] = field(default_factory=dict)
-    broadcast_writes: dict[int, frozenset[str]] = field(default_factory=dict)
 
     def child(self) -> RenderCtx:
-        """Return a new ctx one indent level deeper, sharing all tables."""
-        return RenderCtx(
-            target=self.target,
-            shapes=self.shapes,
-            indent=self.indent + 1,
-            intrinsics=self.intrinsics,
-            builtins=self.builtins,
-            explicit_inits=self.explicit_inits,
-            literal_constants=self.literal_constants,
-            literal_ssa=self.literal_ssa,
-            smem_dynamic_offsets=self.smem_dynamic_offsets,
-            buffer_dtypes=self.buffer_dtypes,
-            ssa_dtypes=self.ssa_dtypes,
-            literal_default_dtype=self.literal_default_dtype,
-            inside_grid_tile=self.inside_grid_tile,
-            atomic_writes=self.atomic_writes,
-            broadcast_writes=self.broadcast_writes,
-        )
+        """Return a new ctx one indent level deeper, sharing all tables.
+
+        ``replace`` shallow-copies every field, so the mutable tables (``shapes``,
+        ``ssa_dtypes``, …) stay shared by reference with the parent — only ``indent``
+        is bumped."""
+        return replace(self, indent=self.indent + 1)
 
     # ---- Convenience wrappers over ``self.target``. These exist so the
     # render methods read ``ctx.type_name(dt)`` instead of pulling the
@@ -245,7 +215,7 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     (``<ty> t = …;``). Statement order is load-bearing — a state update must follow
     every read of that state's old value (the carrier builder guarantees it).
 
-    Shared by ``Monoid.render`` (the streaming step, fp32) and the kernel-IR
+    Shared by ``StateMerge.render`` (the streaming step, fp32) and the kernel-IR
     cross-thread combine primitives ``WarpShuffle`` / ``TreeHalve`` (the
     state-merges-state step, at the carrier's dtype — fp32 for monoids, the
     accumulator dtype for a degenerate scalar reduce), so all spell the carrier's
@@ -257,6 +227,15 @@ def render_merge_program(program, state_names, ctx: RenderCtx, pad: str | None =
     sset = set(state_names)
     out: list[str] = []
     for a in program:
+        # A twisted streaming merge interleaves ``Assign`` temps/rescales with ``Accum``
+        # state folds (the ``base``-``Accum`` form). An ``Accum`` renders its own
+        # reassignment (``name = op(base, value)``) — the carried state is already declared
+        # (an enclosing ``Init`` or ``Loop.render`` seed), so it never declares. Duck-typed
+        # (``base.py`` can't import ``Accum`` — leaves.py imports base): an ``Assign`` has
+        # ``args``, an ``Accum`` does not.
+        if not hasattr(a, "args"):
+            out += a.render(ctx)
+            continue
         # The merge runs at ``dt`` — cast any arg with a different dtype (e.g. a raw
         # ``__half`` value loaded into the partial, as in fp16 flash's ``p · v``) so
         # the operator isn't ambiguous. The cast is a no-op for matching args.
@@ -424,9 +403,7 @@ class Stmt:
         Per-stmt logic lives in :mod:`.passes` (singledispatch over Stmt
         type + introspection walker for the Stage hierarchy). This method
         is a thin shim so existing call sites (``s.rewrite(...)``) keep
-        working. Tile-IR Stmt registrations are loaded by importing
-        ``emmy.compiler.ir.tile.ir`` (which any caller passing a
-        Tile-IR Stmt has done already).
+        working.
         """
         from emmy.compiler.ir.stmt.passes import rewrite  # noqa: PLC0415
 
@@ -526,96 +503,6 @@ class Stmt:
         for index flattening. Subclasses override.
         """
         raise NotImplementedError(f"{type(self).__name__}.render not implemented")
-
-
-class ReduceCarrier(Stmt):
-    """A loop-carried reduce accumulator — the shared structural role behind
-    ``Accum`` (scalar monoid fold), ``Mma`` (tensor-core ``c += a @ b``), and
-    the general monoid ``Monoid`` (e.g. flash attention's online softmax).
-
-    A ``Loop`` / ``StridedLoop`` / serial tile is a *reduce* loop iff its
-    immediate body holds a ``ReduceCarrier`` — that is the one predicate the
-    trait-agnostic machinery (``is_reduce``, axis threading, topo-sort)
-    keys off, so a new carrier kind is recognized everywhere by subclassing
-    this rather than being threaded through an ``isinstance(s, (Accum, Mma))``
-    ladder at every site.
-
-    Rules that *do* care about the combine's algebra don't switch on the
-    carrier type either — they read the algebraic traits (``associative`` /
-    ``commutative`` / ``has_identity``) the carrier exposes directly to decide
-    whether a reduction may be split / reordered (split-K, cooperative
-    tree-combine). The traits live on the carrier itself: ``Accum`` forwards to
-    its scalar ``op``; ``Mma`` reports the additive-fold constants; ``Monoid``
-    reports `associative` / `has_identity` `True` (it is a monoid) with a
-    per-instance `commutative` flag. No separate combine object is reified —
-    three booleans don't earn one, and an ``Mma`` has no scalar op to point at
-    (its accumulation merely *is* additive).
-
-    Two methods name the carrier's reduce surface, distinct from the generic
-    SSA def-use surface (:meth:`deps` / :meth:`defines`):
-
-    - :meth:`carried_names` — the accumulator name(s) read-and-written across
-      the reduce axis (the carried read is *implicit*, so it is absent from
-      :meth:`deps`).
-    - :meth:`partial_deps` — the SSA names read to form this iteration's
-      contribution, excluding the carried accumulator. Defaults to
-      :meth:`deps`, which ``Accum`` / ``Mma`` already define to exclude it.
-    """
-
-    @property
-    def associative(self) -> bool:
-        raise NotImplementedError(f"{type(self).__name__}.associative")
-
-    @property
-    def commutative(self) -> bool:
-        raise NotImplementedError(f"{type(self).__name__}.commutative")
-
-    @property
-    def has_identity(self) -> bool:
-        raise NotImplementedError(f"{type(self).__name__}.has_identity")
-
-    def carried_names(self) -> tuple[str, ...]:
-        raise NotImplementedError(f"{type(self).__name__}.carried_names")
-
-    def partial_deps(self) -> tuple[str, ...]:
-        return self.deps()
-
-    def combine_partials(self) -> tuple:
-        """The operator that folds two FULLY-reduced partial states — the ONE
-        recombine a decomposition move (split-K / split-KV / cooperative-tree)
-        reads, independent of how it is realized (atomic / warp-shuffle / smem
-        tree / mma). Returned **as data**: a tuple of :class:`Assign` steps that
-        read the carried state plus a second state operand named by
-        :meth:`combine_operands` and reassign the merged state.
-
-        ``Monoid`` returns its authored ``combine_states``; the additive carriers
-        (``Accum`` scalar fold, ``Mma`` fragment add) return a one-``Assign``
-        op-fold. This is the carrier-side half of
-        ``plans/algebra-licensed-decomposition-moves.md`` (phase 1)."""
-        raise NotImplementedError(f"{type(self).__name__}.combine_partials")
-
-    def combine_operands(self) -> tuple[str, ...]:
-        """The SSA names of the SECOND state operand :meth:`combine_partials`
-        folds in (the first is the carried state itself). ``Monoid``'s is its
-        ``state_b`` (``"<s>__o"`` by default); the additive carriers name theirs
-        ``"<carried>__o"`` to match."""
-        raise NotImplementedError(f"{type(self).__name__}.combine_operands")
-
-    def project(self, program, *, distributed_inputs, dist) -> None:
-        """Project this carrier's ``program`` (a ``merge`` forward-step / ``combine_states``
-        body) onto a :class:`~emmy.compiler.ir.stmt.carrier_algebra.Distribution` backend
-        — the **magic method** that takes the carrier algebra to a target distribution by the
-        distribution law. Taints the distributed values (seeded by ``distributed_inputs``), then
-        dispatches each ``Assign`` to the backend's fold (a reduce over the distributed axis →
-        its cross-partition combine) / pointwise (elementwise → its per-element map) / scalar /
-        carried-state reassign — carrier-generic, no shape knowledge, no carrier-type switch.
-        The fragment realizer is one such backend (``ir/twist.MmaTwist``); ``dist`` is the
-        stateful backend, mutated in place. Default keyed off :meth:`carried_names` — the one
-        ``project`` every carrier (``Accum`` / ``Mma`` / ``Monoid``) shares. See
-        ``ir/stmt/carrier_algebra``."""
-        from emmy.compiler.ir.stmt.carrier_algebra import interpret  # noqa: PLC0415
-
-        interpret(program, distributed_inputs=distributed_inputs, state_names=self.carried_names(), dist=dist)
 
 
 def pretty_body(body: Body, indent: str = "") -> list[str]:

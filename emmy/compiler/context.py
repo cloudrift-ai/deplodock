@@ -36,7 +36,7 @@ _TENSOR_CORE_GEN = gpu.TENSOR_CORE_GEN
 # device the golden configs were measured on, so offline golden ranking matches).
 # The live count (``target.live_device_features`` → ``gpu.probe_live_features``)
 # overrides this in ``from_target`` / ``probe``. Consumed by the occupancy-aware
-# analytic prior (the ``D_*`` CTA / waves features in ``knob.knob_features``) to
+# analytic prior (the ``D_*`` CTA / waves features in ``features.knob_features``) to
 # size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
 DEFAULT_SM_COUNT = gpu.DEFAULT_GPU.sm_count
 
@@ -133,7 +133,7 @@ class Context:
     # stale -O1 number. Populated from the env by :meth:`probe` /
     # :meth:`from_target`.
     compile_flags: str = ""
-    # Whether the strict knob-pin validator (``lowering/tile/enumeration/_validate``)
+    # Whether the strict knob-pin validator (``lowering/tile/_validate``)
     # is active. ``True`` on the deterministic greedy compile (``compile`` / ``run``),
     # where a force-pinned env knob foreign to the kernel's resolved tier is a user
     # error that should fail loudly instead of silently mis-compiling. ``False`` under

@@ -133,7 +133,7 @@ class CompilerDump:
             self._dump_per_kernel(prefix, graph)
 
     def _dump_per_kernel(self, prefix: str, graph: Graph) -> None:
-        """Split each compute-kernel node (LoopOp / TileOp / KernelOp /
+        """Split each compute-kernel node (LoopOp / KernelOp /
         CudaOp) into its own minimal sub-graph and write to
         ``<prefix>.kernels/<kname>.json``. Each sub-graph contains the
         kernel node plus its transitive ``InputOp`` / ``ConstantOp``
@@ -152,10 +152,9 @@ class CompilerDump:
         from emmy.compiler.ir.cuda.ir import CudaOp
         from emmy.compiler.ir.kernel.ir import KernelOp
         from emmy.compiler.ir.loop import LoopOp
-        from emmy.compiler.ir.tile.ir import TileOp
         from emmy.compiler.pipeline.search.slice import single_node_graph
 
-        compute_types = (LoopOp, TileOp, KernelOp, CudaOp)
+        compute_types = (LoopOp, KernelOp, CudaOp)
         compute_nodes = [(nid, n) for nid, n in graph.nodes.items() if isinstance(n.op, compute_types)]
         if not compute_nodes:
             return

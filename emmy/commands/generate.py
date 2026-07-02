@@ -1,5 +1,4 @@
-"""``emmy generate`` — standalone naive generation oracle (Phase 0 of
-``plans/generative-inference-support.md``).
+"""``emmy generate`` — standalone naive generation oracle (Phase 0).
 
 Re-runs the whole growing prefix each step (O(S^2)) on the emmy CUDA backend with
 **no vLLM** — emmy controls the loop, so this is the token-for-token correctness

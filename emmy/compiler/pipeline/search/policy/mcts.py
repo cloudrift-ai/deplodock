@@ -371,8 +371,8 @@ class TuningSearch(Search):
         rows would collide and keep-min would silently drop one card's data. ``S_*`` /
         ``H_*`` features are excluded from the set — already folded via ``op_sig`` /
         ``context_key`` (and ``gpu``) — so the key is the within-op node identity.
-        ``str()``-ified values mirror :meth:`_o3_sig` so list-valued knobs
-        (``OVERHANG``) stay stable, and the sorted tuple keeps :func:`digest`
+        ``str()``-ified values mirror :meth:`_o3_sig` so non-string knob values
+        stay stable, and the sorted tuple keeps :func:`digest`
         (order-sensitive) deterministic."""
         tun = tuple(sorted((k, str(v)) for k, v in feats.items() if not k.startswith(("S_", "H_"))))
         return digest(context_key, gpu, op_sig, tun)

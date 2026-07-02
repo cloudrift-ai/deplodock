@@ -47,7 +47,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from emmy import config
-from emmy.compiler.pipeline.passes.lowering.tile.enumeration._knobs import BM, BN, FM, FN
 
 if TYPE_CHECKING:
     from emmy.compiler.ir.stmt.body import Body
@@ -215,29 +214,7 @@ def _external_input_count(stmts) -> int:
     Pure ``matmul`` = 2 (a, b). ``matmul_add`` = 3 (a, b, residual).
     ``silu_mul_matmul`` = 3 (g, u, w). The default-large class is
     gated on ``count == 2``."""
-    from emmy.compiler.ir.stmt import Load
-    from emmy.compiler.ir.stmt.body import Body
-    from emmy.compiler.ir.tile.ir import Stage, StageBundle
-
-    body = Body.coerce(stmts)
-    # Collect smem decl names so we skip Loads that read from staged smem
-    # (not external gmem). Both Stage members (yielded inside a bundle's
-    # synthetic body) and the StageBundle itself expose ``local_decls()``.
-    stage_smem_names: set[str] = set()
-    for s in body.iter():
-        if isinstance(s, (Stage, StageBundle)):
-            stage_smem_names.update(s.local_decls())
-    bufs: set[str] = set()
-    for s in body.iter():
-        if isinstance(s, (Stage, StageBundle)):
-            # ``external_reads()`` returns gmem buffer names; Stage members
-            # with ``compute != None`` (hoisted-invariant cooperative
-            # compute) override to ``()`` because they read sibling smem.
-            for buf_name in s.external_reads():
-                bufs.add(buf_name)
-        elif isinstance(s, Load) and s.input not in stage_smem_names:
-            bufs.add(s.input)
-    return len(bufs)
+    raise NotImplementedError("tile lowering demolished — pending rebuild")
 
 
 # --- Extent recovery ----------------------------------------------------
@@ -332,12 +309,7 @@ def thread_tile_shape(output_extents: tuple[int, ...], body_info: BodyInfo) -> t
     """Per-axis THREAD-tile widths the launch-geometry step should emit,
     innermost-first. ``(BN, BM)`` for matmul, ``(BN,)`` for non-matmul
     kernels (single THREAD axis; same env namespace as the matmul case)."""
-    if body_info.has_matmul:
-        (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-        bn = BN.read_int(def_bn)
-        bm = BM.read_int(def_bm)
-        return (bn, bm)
-    return (BN.read_int(_NON_MATMUL_BN_DEFAULT),)
+    raise NotImplementedError("tile lowering demolished — pending rebuild")
 
 
 def register_tile_shape(
@@ -353,28 +325,7 @@ def register_tile_shape(
     return the class-tuned ``(FM, FN)``. For off-default extents
     derive a heuristic F from the actual thread extents that targets
     ~256 post-split threads."""
-    if not body_info.has_matmul:
-        return (1, 1)
-    (def_bn, def_bm), (def_fm, def_fn) = _default_tile(output_extents, body_info)
-    f_m = FM.read_int(def_fm)
-    f_n = FN.read_int(def_fn)
-    bn = BN.read_int(def_bn)
-    bm = BM.read_int(def_bm)
-    if not thread_extents:
-        return (f_m, f_n)
-    te_set = {int(e) for e in thread_extents}
-    if te_set & {bn, bm}:
-        return (f_m, f_n)
-    sorted_te = sorted(int(e) for e in thread_extents)
-    m_ext = sorted_te[0]
-    n_ext = sorted_te[-1]
-    cur_threads = m_ext * n_ext
-    if cur_threads <= 32:
-        return (1, 1)
-    for f in (8, 4, 2):
-        if m_ext % f == 0 and n_ext % f == 0 and (m_ext // f) * (n_ext // f) >= 32:
-            return (f, f)
-    return (1, 1)
+    raise NotImplementedError("tile lowering demolished — pending rebuild")
 
 
 def forced_bk(
@@ -409,17 +360,7 @@ def _bk_fits_smem(output_extents: tuple[int, ...], body_info: BodyInfo, bk: int,
     minus pad headroom. Returns the largest BK ≥ 1 that fits.
 
     Stage footprint = ``n_inputs · max(BN, BM) · BK · 4 · 2``."""
-    budget = static_smem_cap - _PAD_HEADROOM_BYTES
-    if len(output_extents) < 2:
-        return bk
-    (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-    bn_actual = min(output_extents[0], BN.read_int(def_bn))
-    bm_actual = min(output_extents[1], BM.read_int(def_bm))
-    n_inputs = max(body_info.external_input_count, 2)
-    stage_footprint = n_inputs * max(bn_actual, bm_actual) * _DTYPE_BYTES * 2
-    while bk > 1 and stage_footprint * bk > budget:
-        bk //= 2
-    return bk
+    raise NotImplementedError("tile lowering demolished — pending rebuild")
 
 
 def auto_splitk(
@@ -434,32 +375,7 @@ def auto_splitk(
     ``waves_target * num_sms`` total CTAs, divide by the current
     M-N grid count, clamp to the largest divisor of ``k_o_extent``
     that is ≤ the target. Returns 1 when no useful split exists."""
-    forced = config.int_env(config.knob_var("SPLITK"), 0)  # legacy EMMY_SPLITK pin (heuristic-defaults UI)
-    if forced > 0:
-        return forced
-    if not body_info.has_matmul:
-        return 1
-    (def_bn, def_bm), _ = _default_tile(output_extents, body_info)
-    bn = BN.read_int(def_bn)
-    bm = BM.read_int(def_bm)
-    targets = (bn, bm)
-    # Pre-blockify thread extents — same shape as ``tile.axes`` extents
-    # in the legacy synthetic-Tile call. Sort descending; innermost-2
-    # axes become the matmul tile dims and map to (BN, BM).
-    extents = sorted((int(e) for e in thread_extents), reverse=True)
-    grid = 1
-    for i, ext in enumerate(extents):
-        if i < len(targets):
-            tgt = targets[i]
-            grid *= max(1, ext // tgt) if ext >= tgt else 1
-        else:
-            grid *= ext
-    target_total = _splitk_target_waves(output_extents, body_info) * _SPLITK_NUM_SMS
-    if grid >= target_total:
-        return 1
-    desired = max(1, target_total // grid)
-    splitk = max((d for d in range(1, min(desired, k_o_extent) + 1) if k_o_extent % d == 0), default=1)
-    return splitk
+    raise NotImplementedError("tile lowering demolished — pending rebuild")
 
 
 def _splitk_target_waves(output_extents: tuple[int, ...], body_info: BodyInfo) -> int:
@@ -478,4 +394,4 @@ def _splitk_target_waves(output_extents: tuple[int, ...], body_info: BodyInfo) -
 def cooperative_block_size() -> int:
     """Threads/CTA for synthetic-thread axes in non-matmul paths.
     Shares the matmul ``EMMY_BN`` env namespace."""
-    return BN.read_int(_NON_MATMUL_BN_DEFAULT)
+    raise NotImplementedError("tile lowering demolished — pending rebuild")

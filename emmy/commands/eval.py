@@ -95,7 +95,7 @@ def register_eval_command(subparsers) -> None:
     pp.add_argument(
         "--features",
         action="store_true",
-        help="Also print the exact feature vector the prior (CatBoost) regresses on per golden config (knob.knob_features).",
+        help="Also print the exact feature vector the prior (CatBoost) regresses on per golden config (features.knob_features).",
     )
     pp.set_defaults(func=handle_eval_prior)
 
@@ -345,7 +345,7 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
 
 def _emit_registry() -> None:
     """List every registered :class:`~emmy.compiler.pipeline.knob.Knob` — the
-    canonical tuning schema (name, type, candidate hints, aliases, help) collected
+    canonical tuning schema (name, type, candidate hints, help) collected
     by ``knob.registry`` from all loaded passes, regardless of any DB."""
     from emmy.compiler.pipeline import CUDA_PASSES, Pipeline, knob  # noqa: PLC0415
 
@@ -371,15 +371,10 @@ def _emit_registry() -> None:
         if len(hints) > hw:
             hints = hints[: hw - 1] + "…"
         help_txt = " ".join((k.help or "").split())  # collapse whitespace/newlines
-        if k.aliases:
-            help_txt += f" [aliases: {', '.join(k.aliases)}]"
         lines = textwrap.wrap(help_txt, width=help_w) or [""]
         logger.info(f"{name:<{kw}}  {k.type.value:<{tw}}  {hints:<{hw}}  {lines[0]}")
         for cont in lines[1:]:
             logger.info(indent + cont)
-
-
-_WARP_KNOBS = ("WN", "WM", "FM", "FN", "BK", "SPLITK", "MMA")
 
 
 def _ratio_color(matched: int, total: int) -> str:
@@ -422,7 +417,7 @@ def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str)
 
 def _emit_golden_features(kernel_filter: str | None) -> None:
     """Print, per golden config, the exact feature vector the learned
-    :class:`CatBoostPrior` regresses on — ``knob.knob_features(merged)`` where
+    :class:`CatBoostPrior` regresses on — ``features.knob_features(merged)`` where
     ``merged`` is the ``H_*`` host/regime features + the ``S_*`` structural/shape
     features (obtained by compiling the shape to the loop dialect, where
     ``992_stamp_structural_features`` runs) + the golden tuning knobs. This is
@@ -440,7 +435,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
         configs = [g for g in configs if kernel_filter in g.name]
 
     logger.info("")
-    logger.info("Learned-prior feature vector (knob.knob_features) — the CatBoost regressor's input per golden config:")
+    logger.info("Learned-prior feature vector (features.knob_features) — the CatBoost regressor's input per golden config:")
     quiet = [_logging.getLogger(n) for n in ("emmy.compiler", "emmy.commands.trace")]
     prev = [lg.level for lg in quiet]
     for lg in quiet:
@@ -490,13 +485,14 @@ def _emit_analytic_eval(kernel_filter: str | None) -> None:
     from statistics import median  # noqa: PLC0415
 
     from emmy.compiler.context import Context  # noqa: PLC0415
-    from emmy.compiler.pipeline.search.analytic import THREAD_KNOBS, evaluate_golden  # noqa: PLC0415
+    from emmy.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+    from emmy.compiler.pipeline.search.analytic import evaluate_golden  # noqa: PLC0415
 
     configs = _golden_configs(kernel_filter)
     ranks: list[int] = []
     entries: list[tuple] = []  # ("row", lead_cells, gold, got) | ("err", name, message)
     for g in configs:
-        gold = {k: v for k, v in g.knobs.items() if k in (THREAD_KNOBS if g.dtype == "fp32" else _WARP_KNOBS)}
+        gold = dict(tuning_knob_items(g.knobs))  # the native codec knobs (TILE/REDUCE/STAGE), tier-agnostic
         try:
             dyn = bool(getattr(g, "dynamic", None))
             got, rank, pool = evaluate_golden(g.M, g.N, g.K, g.dtype, gold, Context.from_target(g.compute_cap), dynamic=dyn)

@@ -82,7 +82,7 @@ class ElementwiseImpl:
     # for the per-op ``selecting`` trait (was a ``_SELECTING_OPS`` frozenset in
     # ``020_place_inits``).
     _SELECTING: frozenset[str] = frozenset({"maximum", "amax", "minimum", "max", "min"})
-    # Semiring pairing — a reduce combine ``⊕`` mapped to the products ``⊗``
+    # semiring pairing — a reduce combine ``⊕`` mapped to the products ``⊗``
     # that distribute over it (``a·(b⊕c) == a·b ⊕ a·c``), so a contraction
     # ``Σ_k a⊗b`` is a matmul over ``⊕``. Only ``(+, ×)`` is exercised today;
     # the table is *data* so tropical ``(min, +)`` etc. is a one-line add when a

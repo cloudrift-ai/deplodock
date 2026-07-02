@@ -40,8 +40,10 @@ from emmy.compiler.ir.expr import (
     Var,
 )
 from emmy.compiler.ir.stmt import (
+    INDENT,
     Accum,
     Assign,
+    Body,
     Cond,
     Load,
     Loop,
@@ -52,10 +54,11 @@ from emmy.compiler.ir.stmt import (
     StridedLoop,
     Write,
     _pad,
+    pretty_body,
+    render_body,
 )
 from emmy.compiler.ir.stmt.base import render_merge_program
 from emmy.compiler.ir.stmt.ir import BodyOp
-from emmy.compiler.ir.tile.ir import GridTile, RegisterTile, SerialTile, StridedTile, ThreadTile
 
 # ---------------------------------------------------------------------------
 # Hardware primitives
@@ -150,6 +153,145 @@ class Sync(Stmt):
         if self.count is None:
             raise ValueError(f"Sync(barrier_id={self.barrier_id}) requires count")
         return [f'{pad}asm volatile("bar.sync {self.barrier_id}, {self.count};\\n" ::: "memory");']
+
+
+@dataclass(frozen=True)
+class Tile(Stmt):
+    """Tile coordinate binding — one GPU thread per output element.
+
+    The kernel-IR realization of a :class:`~emmy.compiler.ir.tile.TileOp`'s
+    thread schedule (geometry only — the combine, if any, lives in the wrapped
+    ``body``): it maps the kernel's iteration space (the product of its ``axes``
+    extents — the tile's ``grid_axes``) onto a 1-D linear thread grid. Each
+    thread derives a global linear id
+    ``_gid = blockIdx.x * blockDim.x + threadIdx.x``, guards ``_gid < N``
+    (``N`` = ∏ extents), decodes its per-axis indices from ``_gid``, and
+    runs the ``body`` once. Index motion (broadcast, transpose, gather) is
+    already encoded in the body's ``Load`` index Exprs, so the decode only
+    has to bind the axis induction variables.
+
+    Renders to::
+
+        int _gid = blockIdx.x * blockDim.x + threadIdx.x;
+        if (_gid < N) {
+            int a0 = _gid / s0;          // outermost (s0 = ∏ inner extents)
+            int a1 = _gid / s1 % e1;
+            ...
+            <body>
+        }
+
+    The cuda lowering reads ``N`` to size the launch grid
+    (``ceil(N / blockDim)`` CTAs of ``blockDim`` threads). Static extents only
+    for now — a symbolic axis raises (the runtime-arg / masked-tile forms land
+    as the skeleton grows).
+
+    ``block_threads`` is the per-CTA thread count for a **cooperative** tile —
+    the materializer sets it to ``coop · ∏block-cells`` so the cuda lowering
+    derives ``blockDim = block_threads`` and ``gridDim = N / block_threads``
+    (the linear ``_gid`` decode then groups ``block_threads`` consecutive cells
+    per CTA, the innermost being the cooperative lanes). ``None`` is the scalar
+    tier (one thread per cell, ``blockDim = _BLOCK_SIZE``).
+    """
+
+    axes: tuple[Axis, ...]
+    body: Body
+    block_threads: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.body, Body):
+            object.__setattr__(self, "body", Body(self.body))
+
+    def nested(self) -> tuple[Body, ...]:
+        return (self.body,)
+
+    def with_bodies(self, bodies: tuple[Body, ...]) -> Stmt:
+        (body,) = bodies
+        return Tile(axes=self.axes, body=body, block_threads=self.block_threads)
+
+    def binds_axes(self) -> frozenset[str]:
+        return frozenset(a.name for a in self.axes)
+
+    @property
+    def extents(self) -> tuple[int, ...]:
+        """Static extent of each axis (raises on a symbolic extent)."""
+        out: list[int] = []
+        for a in self.axes:
+            if not a.extent.is_static:
+                raise NotImplementedError(f"Tile: symbolic axis {a.name!r} not supported yet")
+            out.append(a.extent.as_static())
+        return tuple(out)
+
+    @property
+    def n_elements(self) -> int:
+        """Total iteration-space size — one thread per element. Static axes only (raises on a
+        symbolic axis; the dynamic-grid path uses :attr:`n_dim` instead)."""
+        from math import prod  # noqa: PLC0415
+
+        return prod(self.extents) if self.axes else 1
+
+    @property
+    def is_static_grid(self) -> bool:
+        """True iff every grid axis has a static extent (the static launch path)."""
+        return all(a.extent.is_static for a in self.axes)
+
+    @property
+    def n_dim(self):
+        """Total iteration-space size as a :class:`Dim` — the ∏ of the axis extents, holding a
+        symbolic factor (a dynamic ``seq_len``) when any axis is symbolic. The cuda lowering
+        sizes the launch from this (``ceil(n_dim / blockDim)`` CTAs, ``seq_len`` resolved at
+        launch); the renderer guards ``_gid < n_dim`` so the partial last block is masked."""
+        from emmy.compiler.dim import Dim  # noqa: PLC0415
+
+        n = Dim(1)
+        for a in self.axes:
+            n = n * a.extent
+        return n
+
+    def pretty(self, indent: str = "") -> list[str]:
+        names = ", ".join(a.name for a in self.axes)
+        return [f"{indent}Tile[{names}] (N={self.n_elements})", *pretty_body(self.body, indent + INDENT)]
+
+    def render(self, ctx: RenderCtx) -> list[str]:
+        pad = _pad(ctx.indent)
+        # Symbolic grid (a dynamic free axis): size the guard + decode from the runtime extents
+        # via the symbolic-aware helpers (the ``Dim`` name renders to its ``int`` arg). Kept off
+        # the static path so static codegen stays byte-identical.
+        if not self.is_static_grid:
+            from emmy.compiler.ir.stmt.blocks import _render_grid_axis_decode, _stride_c  # noqa: PLC0415
+
+            inner = ctx.child()
+            n = _stride_c(list(self.axes), inner)
+            out = [
+                f"{pad}int _gid = blockIdx.x * blockDim.x + threadIdx.x;",
+                f"{pad}if (_gid < {n}) {{",
+            ]
+            out.extend(_render_grid_axis_decode(self.axes, "_gid", inner))
+            out.extend(render_body(self.body, inner))
+            out.append(f"{pad}}}")
+            return out
+        extents = self.extents
+        # Inner-stride of each axis = product of the extents to its right.
+        strides: list[int] = [1] * len(extents)
+        acc = 1
+        for i in range(len(extents) - 1, -1, -1):
+            strides[i] = acc
+            acc *= extents[i]
+        n = self.n_elements
+        out = [
+            f"{pad}int _gid = blockIdx.x * blockDim.x + threadIdx.x;",
+            f"{pad}if (_gid < {n}) {{",
+        ]
+        inner = ctx.child()
+        ipad = _pad(inner.indent)
+        for i, a in enumerate(self.axes):
+            s, e = strides[i], extents[i]
+            term = "_gid" if s == 1 else f"_gid / {s}"
+            # The outermost axis needs no modulo (``_gid / s0 < e0`` since _gid < N).
+            expr = term if i == 0 else f"({term}) % {e}"
+            out.append(f"{ipad}int {a.name} = {expr};")
+        out.extend(render_body(self.body, inner))
+        out.append(f"{pad}}}")
+        return out
 
 
 @dataclass(frozen=True)
@@ -385,8 +527,8 @@ class SetMaxNReg(Stmt):
     warps claim them, decoupling occupancy from the consumer's pressure.
 
     Requires sm_90+. On older targets NVCC rejects the instruction at
-    compile time — the materializer only emits this Stmt on the WS=1 path
-    where the kernel is already TMA-gated to sm_90+ anyway."""
+    compile time — only a warp-specialized materialization emits this Stmt,
+    and that path is already TMA-gated to sm_90+ anyway."""
 
     count: int
     direction: str  # "inc" or "dec"
@@ -691,12 +833,23 @@ class FragmentApply(Stmt):
         shown = ", ".join(_show(a, k) for a, k in zip(self.args, self.kinds, strict=True))
         return [f"{indent}FragmentApply({self.out} {'*=' if self.in_place else '<-'} {self.op.name}({shown}))"]
 
-    def _arg(self, name: object, kind: str, i: int) -> Var:
+    def _arg(self, name: object, kind: str, i: int, ctx: RenderCtx) -> Expr:
         if kind == FRAG:
             return Var(f"{name}[{i}]")
         if kind == ROW:
             return Var(name[self.layout.elem_row[i]])  # the per-row scalar for element i's row
-        return Var(str(name))  # UNIFORM — verbatim
+        # UNIFORM — the fragment algebra is f32; a narrower scalar (e.g. an ``__half`` constant
+        # load) converts through the target intrinsic, like the scalar ``Assign``'s promote rule.
+        nm = str(name)
+        dt = ctx.ssa_dtypes.get(nm) if ctx.ssa_dtypes else None
+        if dt and dt != "f32":
+            from emmy.compiler.ir.expr import FuncCallExpr  # noqa: PLC0415
+
+            converted = ctx.target.convert(nm, dt, "f32")
+            paren = converted.index("(") if "(" in converted else -1
+            if paren > 0 and converted.endswith(")"):
+                return FuncCallExpr(converted[:paren], [Var(nm)])
+        return Var(nm)
 
     def render(self, ctx: RenderCtx) -> list[str]:
         from emmy.compiler.ir.stmt.base import op_to_expr  # noqa: PLC0415
@@ -704,7 +857,7 @@ class FragmentApply(Stmt):
         pad = _pad(ctx.indent)
         lines = [] if self.in_place else [f"{pad}float {self.out}[{self.layout.n_elems}];"]
         for i in range(self.layout.n_elems):
-            argvars = [self._arg(a, k, i) for a, k in zip(self.args, self.kinds, strict=True)]
+            argvars = [self._arg(a, k, i, ctx) for a, k in zip(self.args, self.kinds, strict=True)]
             lines.append(f"{pad}{self.out}[{i}] = {op_to_expr(self.op.name, argvars).render(ctx)};")
         return lines
 
@@ -712,8 +865,8 @@ class FragmentApply(Stmt):
 @dataclass(frozen=True)
 class FragmentRowReduce(Stmt):
     """Per-row reduction over an ``mma.sync`` C-fragment's N (column) lanes — the
-    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated in
-    ``tests/compiler/e2e/test_flash_tensorcore_reference.py``).
+    flash fragment-softmax ``rowmax`` / ``rowsum`` (validated by the FA-2 reference
+    kernel in ``tests/compiler/e2e/test_attention_coverage.py``).
 
     Each lane of an ``m16n8`` C-fragment owns 4 f32 elements: rows ``g`` / ``g+8``
     (``g = lane/4``), cols ``(lane%4)*2 + {0,1}``. A ``BN``-wide score tile is
@@ -989,19 +1142,24 @@ class LdmatrixLoad(Stmt):
             # the helper). No swizzle: that's a TMA-smem-layout concern only.
             if self.k_zero is not None:
                 # Masked-K (symbolic reduce): zero-fill (not clamp) the K halves
-                # past the runtime extent so the mma reduction stays correct.
-                # ``k_left`` = in-range K elements from the tile base; may co-occur
-                # with an M/N clamp. (b_trans masked-K never reaches here — a
-                # transposed-B's K is its contiguous dim and stays gmem-direct
-                # without zero-fill via the clamp path; canonical B only.)
+                # past the runtime extent so the mma reduction stays correct — K is
+                # summed, so a duplicate corrupts it. ``k_left`` = in-range K elements
+                # from the tile base; may co-occur with an M/N clamp. Transposed-B (K
+                # contiguous) has its own (n, k)-swapped zero-fill helper.
                 kbase, kbound = self.k_zero[0].render(ctx), self.k_zero[1].render(ctx)
                 k_left = f"({kbound}) - ({kbase})"
                 if self.gmem_guard is not None:
                     base, bound = self.gmem_guard[0].render(ctx), self.gmem_guard[1].render(ctx)
                     mn_left = f"({bound}) - ({base})"
-                    helper = "dpl_mma_load_a_gmem_mclamp_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_nclamp_kzero"
+                    if self.role == "a":
+                        helper = "dpl_mma_load_a_gmem_mclamp_kzero"
+                    else:
+                        helper = "dpl_mma_load_b_gmem_trans_nclamp_kzero" if self.b_trans else "dpl_mma_load_b_gmem_nclamp_kzero"
                     return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {mn_left}, {k_left});"]
-                helper = "dpl_mma_load_a_gmem_kzero" if self.role == "a" else "dpl_mma_load_b_gmem_kzero"
+                if self.role == "a":
+                    helper = "dpl_mma_load_a_gmem_kzero"
+                else:
+                    helper = "dpl_mma_load_b_gmem_trans_kzero" if self.b_trans else "dpl_mma_load_b_gmem_kzero"
                 return [f"{_pad(ctx.indent)}{helper}({self.frag}, &{self.src_buffer}[{flat}], {ldm}, {k_left});"]
             if self.gmem_guard is not None:
                 # Masked axis: clamp the lane coordinate to the in-range
@@ -1534,26 +1692,11 @@ class KernelOp(BodyOp):
           variants with tens of thousands of light CTAs slot into the
           GPU command processor so slowly that the per-launch
           ``_KERNEL_TIMEOUT_MS`` watchdog stops being a useful escape
-          hatch; better to drop them at the rule level before benching)."""
-        from math import prod  # noqa: PLC0415
+          hatch; better to drop them at the rule level before benching).
 
-        from emmy.compiler.ir.tile.ir import GridTile, ThreadTile  # noqa: PLC0415
-
-        for s in self.body:
-            if isinstance(s, GridTile):
-                ctas = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-                if ctas > _MAX_CTAS:
-                    return False
-                # ThreadTile lives inside the GridTile's body.
-                for child in s.body:
-                    if isinstance(child, ThreadTile):
-                        threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in child.axes)
-                        if threads > ctx.max_threads_per_cta:
-                            return False
-            elif isinstance(s, ThreadTile):
-                threads = prod((ax.extent.as_static() if ax.extent.is_static else 1) for ax in s.axes)
-                if threads > ctx.max_threads_per_cta:
-                    return False
+        NOTE: the per-CTA thread / grid-CTA checks walked the now-demolished
+        tile-flavor wrappers (``GridTile`` / ``ThreadTile``); they are pending
+        rebuild. Only the smem-footprint check survives."""
         if self.smem_bytes() > ctx.max_dynamic_smem:
             return False
         return True
@@ -1583,13 +1726,8 @@ __all__ = [
     "Accum",
     "Cond",
     "Loop",
-    # Kernel-IR statements — typed tile flavor hierarchy (kernel-IR
-    # materialization preserves the wrappers Tile IR emits)
-    "GridTile",
-    "ThreadTile",
-    "RegisterTile",
-    "SerialTile",
-    "StridedTile",
+    # Kernel-IR statements
+    "Tile",
     "Smem",
     "Sync",
     "TreeHalve",
@@ -1629,6 +1767,16 @@ __all__ = [
 
 
 from emmy.compiler.ir.stmt.passes import rewrite as _rewrite  # noqa: E402
+
+
+@_rewrite.register
+def _(s: Tile, rename, sigma, axis_fn):
+    # ``axes`` map through ``axis_fn``; the body's stmts route through the
+    # generic per-stmt rewrite so SSA names / Exprs canonicalize inside.
+    return Tile(
+        axes=tuple(axis_fn(a) for a in s.axes),
+        body=Body(tuple(_rewrite(c, rename, sigma, axis_fn) for c in s.body)),
+    )
 
 
 @_rewrite.register

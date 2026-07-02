@@ -23,7 +23,7 @@ half`` sequences and demotes the float-compute middle to half.
 
 ## Algorithm
 
-Backward dataflow over the TileOp body:
+Backward dataflow over the KernelOp body:
 
 1. Build a def map ``name → defining_stmt`` from a deep ``Body.iter()``.
 2. Seed a worklist with the ``value`` of every ``Write`` whose output
@@ -40,8 +40,8 @@ Backward dataflow over the TileOp body:
 
 ## Why this is safe
 
-- ``Accum`` is not crossed — its dtype is the freeze point chosen by
-  ``020_place_inits``; changing it would change reduction semantics.
+- ``Accum`` is not crossed — its dtype is the freeze point chosen by the
+  reduction's seed; changing it would change reduction semantics.
 - ``Load`` is not crossed either — the source buffer's dtype is the
   ground truth; Load.render already declares the local in that dtype.
 - Ops without a native fp16 form aren't demoted; they stay in fp32
@@ -65,26 +65,25 @@ from __future__ import annotations
 from dataclasses import replace
 
 from emmy.compiler.backend.cuda.render_target import CudaRenderTarget
-from emmy.compiler.dtype import F16, F32
-from emmy.compiler.graph import Graph, Node
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Stmt, Write
-from emmy.compiler.ir.tile.ir import TileOp
-from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.dtype import F16
+from emmy.compiler.graph import Node
+from emmy.compiler.ir.kernel import KernelOp
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Stmt, Write
+from emmy.compiler.pipeline import Pattern, RuleSkipped
 
-PATTERN = [Pattern("root", TileOp)]
+PATTERN = [Pattern("root", KernelOp)]
 
 # Single shared target instance — the pass only consults its
 # ``has_native_op`` predicate, which is stateless.
 _TARGET = CudaRenderTarget()
 
 
-def rewrite(match: Match, root: Node) -> Graph | None:
-    top: TileOp = root.op
+def rewrite(root: Node) -> KernelOp | None:
+    top: KernelOp = root.op
     body = top.body
 
-    # Output buffer dtypes — read off ``TileOp.outputs`` (same shape as
-    # the legacy ``KernelOp.outputs``: matcher-populated graph Tensors).
-    # Fall back to ``root.output`` for the op's own node-output.
+    # Output buffer dtypes — read off ``KernelOp.outputs`` (matcher-populated
+    # graph Tensors). Fall back to ``root.output`` for the op's node-output.
     out_dtypes: dict[str, str] = {n: t.dtype.name for n, t in top.outputs.items()}
     out_dtypes.setdefault(root.id, root.output.dtype.name)
 
@@ -125,8 +124,8 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     queue: list[str] = []
     for s in body.iter():
         if isinstance(s, Write) and out_dtypes.get(s.output, "f32") == "f16":
-            # ``s.value`` asserts scalar; pre-materialize Writes are
-            # always scalar (vectorize_stores runs later).
+            # ``s.value`` asserts scalar; pre-vectorize Writes are always
+            # scalar (vectorize_stores runs after demote).
             if s.value not in feeds_f16_write:
                 feeds_f16_write.add(s.value)
                 queue.append(s.value)
@@ -182,7 +181,7 @@ def rewrite(match: Match, root: Node) -> Graph | None:
     if new_body == body:
         raise RuleSkipped("no change after demotion (already stamped)")
 
-    return TileOp(body=new_body, name=top.name)
+    return KernelOp(body=new_body, name=top.name, knobs=dict(top.knobs))
 
 
 def _build_uses(body: Body) -> dict[str, list[Stmt]]:
@@ -229,16 +228,16 @@ def _seed_fp16_carriers(body: Body) -> set[str]:
     fp16 from the moment they're defined:
 
     - ``Load`` whose stamped ``dtype.name == "f16"`` (either reading
-      from an fp16 graph buffer or from an fp16-stamped Stage source).
-      ``030_stamp_types`` populates ``Load.dtype`` from either side
-      before this pass runs.
+      from an fp16 graph buffer or from an fp16-stamped smem source).
+      ``030_stamp_types`` populates ``Load.dtype`` before this pass runs.
     - ``Accum`` / ``Init`` with ``dtype == F16``.
 
-    Pre-materialize there are no ``WarpShuffle`` / ``TreeHalve`` /
-    ``Smem`` Stmts to consider — those land at materialize time.
-    Pre-materialize Loads are always scalar (vectorize_loads runs
-    later), so ``s.names`` has length 1.
+    Pre-vectorize Loads are always scalar (vectorize_loads runs after
+    demote), so ``s.names`` has length 1.
     """
+    from emmy.compiler.dtype import F32  # noqa: PLC0415
+    from emmy.compiler.ir.stmt import Init  # noqa: PLC0415
+
     carriers: set[str] = set()
     for s in body.iter():
         if isinstance(s, Load):

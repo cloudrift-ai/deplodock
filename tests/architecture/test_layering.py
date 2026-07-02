@@ -10,7 +10,6 @@ this file rather than scattering one-off greps elsewhere.
 
 from __future__ import annotations
 
-import dataclasses
 import pathlib
 import re
 
@@ -78,7 +77,7 @@ def test_lowering_tile_does_not_import_kernel_passes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 firewall (plans/tileop-schedule-boundary-fixes.md) — keep the
+# Fix 1 firewall — keep the
 # assemble→TileOp boundary clean: every benched scheduling choice lives in the
 # enumeration ``Schedule`` (above assemble); every kernel pass is *mechanical*
 # (it lowers the stamped ``TileOp``, it never re-derives a scheduling decision).
@@ -166,30 +165,3 @@ def test_lowering_kernel_calls_no_schedule_classifier() -> None:
         "lowering/kernel/*.py must not call a schedule classifier / offer fn — "
         "read the stamped TileOp attribute instead of re-deriving the decision.\n" + "\n".join(offenders)
     )
-
-
-def test_materialized_tile_flavors_stamp_schedule_facts() -> None:
-    """assemble stamps every schedule fact its kernel passes consume.
-
-    Fix 1's positive contract: the facts ``lowering/kernel/`` reads are explicit
-    dataclass fields on the materialized tile flavors, not something a pass
-    recovers by pattern-matching tree adjacency. ``StageBundle`` carries its
-    transport ``policy`` + ring (``buffer_count`` / ``phase`` / ``pipeline_depth``);
-    ``SerialTile`` its structural ``kind`` (``serial_outer`` / ``stage_inner``);
-    ``WarpSpecialize`` its producer/consumer partition (``ring_depth`` /
-    ``n_producer_threads`` / ``consumer_thread_axes``); ``AtomTile`` its ``atom``.
-    Drop one of these to an implicit tree shape and a kernel pass would have to
-    classify the body to recover it — the brittleness this firewall forbids.
-    """
-    from emmy.compiler.ir.tile.ir import AtomTile, SerialTile, StageBundle, WarpSpecialize
-
-    required: dict[type, set[str]] = {
-        StageBundle: {"policy", "buffer_count", "phase", "pipeline_depth"},
-        SerialTile: {"kind"},
-        WarpSpecialize: {"ring_depth", "n_producer_threads", "consumer_thread_axes"},
-        AtomTile: {"atom"},
-    }
-    for flavor, fields in required.items():
-        present = {f.name for f in dataclasses.fields(flavor)}
-        missing = fields - present
-        assert not missing, f"{flavor.__name__} no longer stamps schedule fact(s) {sorted(missing)} as explicit fields"

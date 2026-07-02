@@ -101,7 +101,11 @@ def test_buffer_roles():
 
 
 def test_softmax_emits_multiple_k_loops():
-    """Softmax pattern emits separate K-loops for max, sub+exp+sum, div."""
+    """Softmax emits separate K-loops: the online reduce (running ``fmaxf`` max + the
+    rescaled running denominator, the twisted state-merge) then the per-element div —
+    two loops, not a single collapsed pass. (The online formulation folds max + sum in
+    one loop via the ``exp(x−m)`` twist, so the sum accumulates as a state-merge, not a
+    literal ``+=``.)"""
     compiled = CudaBackend().compile(_softmax_graph())
     sources = [n.op.kernel_source for n in _cuda_nodes(compiled)]
     # Find the softmax-bearing kernel (contains fmaxf for max reduction).
@@ -109,7 +113,7 @@ def test_softmax_emits_multiple_k_loops():
     assert softmax_src is not None, f"no kernel with fmaxf found; sources={sources}"
     loop_count = softmax_src.count("for (int")
     assert loop_count >= 2, f"expected >= 2 K-loops, got {loop_count}\n{softmax_src}"
-    assert "+=" in softmax_src
+    assert "expf" in softmax_src  # the softmax numerator / online-reduce normalizer
 
 
 def test_softmax_emits_per_element_store():
