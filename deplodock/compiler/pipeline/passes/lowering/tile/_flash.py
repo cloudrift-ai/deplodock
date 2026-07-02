@@ -205,7 +205,10 @@ def build_flash_frag(
     grid = (*batch_axes, Axis(name="m", extent=s_q_dim), Axis(name="d", extent=Dim(d_v)))
     # The free axes are the schedule's, carried on the ``TileOp`` with an UNMAPPED grid —
     # like every other recognizer; ``_schedule`` (inside ``010_recognize``) maps ``free`` onto the grid.
-    tile = TileOp(op=flash_op, place=Placement(free=grid))
+    # ``PLACE@fold=fuse`` is the RESOLVED downstream-fold placement this fragment realizes (the fused
+    # flash kernel vs the cut's separate score + softmax-P@V kernels) — root-global, ridden through
+    # scheduling on ``knobs`` so the DB row / featurizer sees the structural decision.
+    tile = TileOp(op=flash_op, place=Placement(free=grid), knobs={"PLACE@fold": "fuse"})
 
     frag = Graph()
     for nid, shp in ((q_id, q_shape), (k_id, k_shape), (v_id, v_shape)):
@@ -506,6 +509,15 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
     if v_buf is None:
         return None
     return x_buf, v_buf, mask_kind, mask_buf
+
+
+def is_fold_offer_site(graph: Graph, root: Node) -> bool:
+    """True iff ``root`` is a softmax-then-P@V consumer — the kernel where the ``PLACE@fold``
+    decision (fuse into flash vs keep the score producer separate) is offered. Purely structural
+    (:func:`_recognize` on ``root``'s own body), independent of whether the producer is still a
+    ``LoopOp`` or the fused form is certifiable — an offer site that did NOT fuse (pin-forced or
+    degraded) stamps the resolved ``cut``."""
+    return _recognize(graph, root) is not None
 
 
 def _fuse_degraded(root: Node, reason: str) -> None:

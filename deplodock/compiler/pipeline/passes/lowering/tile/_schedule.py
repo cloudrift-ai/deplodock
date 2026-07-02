@@ -32,6 +32,7 @@ and flash cooperative-KV remain future steps.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from math import prod
 from types import SimpleNamespace
@@ -50,6 +51,8 @@ from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 from deplodock.compiler.pipeline.pipeline import LoweringError
 from deplodock.compiler.pipeline.search.space import MAX_BLOCK_THREADS, REDUCE, STAGE, TILE, WSPEC, scalar_tile_moves
+
+logger = logging.getLogger(__name__)
 
 # The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) and the enumeration
 # value grids are declared in ``search/space.py`` (the one search-space file) and imported here,
@@ -288,9 +291,9 @@ def _stage_spec(kernel) -> str:
     ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a bare operand
     binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
     (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
-    codecs follow. The returned spec is only the *spelling* (stamped on ``knobs``); each option
-    builder RESOLVES it against its built node (:func:`_resolve_warp_stage` /
-    :func:`_resolve_scalar_stage`) into the ``Stage`` it stamps."""
+    codecs follow. The returned spec is only the requested *spelling*; each option builder RESOLVES
+    it against its built node (:func:`_resolve_warp_stage` / :func:`_resolve_scalar_stage`) into the
+    ``Stage`` it stamps, and ``knobs`` records that resolved spelling (or nothing, when declined)."""
     if axis_role(kernel.op) is not AxisRole.CONTRACTION:
         return ""
     pinned = STAGE.narrow([""])[0]
@@ -308,8 +311,9 @@ def _stage_spec(kernel) -> str:
 # transport eligibility, the slab K-chunk (``bk_elems``), and the depth clamps — and the RESOLVED
 # :class:`Stage` (or ``None``, gmem-direct) is stamped on the ``TileOp``. The materializer
 # (``_atom._staged``) applies it verbatim, deciding nothing — the same stamp-then-apply shape as the
-# reduce tier's shared-row stage (:func:`_row_stage`). The raw pin string still rides ``knobs`` for
-# the prior, so featurization is untouched by resolution.
+# reduce tier's shared-row stage (:func:`_row_stage`). ``knobs`` carries the RESOLVED spelling
+# (``Stage.spell()``), and nothing when resolution declines — the DB row / feature vector describes
+# the pipeline the kernel actually has, never the pin as requested.
 
 
 def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom_k: int, mask_m: bool, mask_n: bool, b_trans: bool) -> bool:
@@ -396,10 +400,12 @@ def _resolve_scalar_stage(c: Contraction, stage: Stage, inputs) -> Stage | None:
 
 def _wspec_workers(stage) -> tuple[WarpSpec | None, str]:
     """The pinned ``WSPEC`` worker split for a pipeline with the given ``stage``, or ``(None, "")`` —
-    uniform SIMT. Pin-only this cut: returns the authoritative ``DEPLODOCK_WSPEC`` pin (``Knob.narrow``)
-    when it parses AND every role is legal (a producer needs a ``stage`` to drive); a pin that doesn't
-    parse, names no role, or whose roles are illegal degrades to uniform — the same pin-validity rule the
-    other codecs follow. The second element is the spec to restamp on ``knobs`` (``""`` when uniform)."""
+    uniform SIMT. A pin that doesn't parse, names no role, or whose roles are illegal (a producer needs
+    a ``stage`` to drive) degrades to uniform silently — the same pin-validity rule the other codecs
+    follow. A pin that IS legal is **refused loudly while the materialization is inert**: the emitter
+    does not split warps into roles yet, so accepting it would stamp (and record in the perf DB) a warp
+    split that never existed. When wspec codegen lands, this refusal is what flips back to
+    ``return ws, pinned``."""
     pinned = WSPEC.narrow([""])[0]
     if not pinned:
         return None, ""
@@ -410,7 +416,8 @@ def _wspec_workers(stage) -> tuple[WarpSpec | None, str]:
     # ``is_legal`` reads only ``.stage`` off its arg (the producer-needs-a-stage rule) — pass a probe.
     if not ws.roles or not ws.is_legal(SimpleNamespace(stage=stage)):
         return None, ""
-    return ws, pinned
+    logger.warning("WSPEC pin %r ignored: warp specialization is not materialized yet — the kernel runs uniform SIMT", pinned)
+    return None, ""
 
 
 def _check_warp_static_k(kernel, wt) -> None:
@@ -477,7 +484,7 @@ def _factor_k(k_axis: Axis, w: int) -> tuple[Axis, Axis, Sigma]:
     return ksplit, kslice, sigma
 
 
-def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
+def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knobs: dict) -> TileOp:
     """One scheduled **split-K** contraction ``TileOp``: the structural ``Reduction(axis=ksplit,
     source=Contraction(k_axis=kslice))``. The inner :class:`Contraction` is the **same** node a
     non-split matmul builds (:func:`_contraction_node`, so it factorizes through ``_factor`` to mma or
@@ -516,18 +523,11 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
     carrier = Accum(name=inner.acc, value=f"{inner.acc}__v", op=ElementwiseImpl("add"), dtype=F32).as_carrier()
     op = Reduction(carrier=carrier, axis=ksplit, role=AxisRole.CONTRACTION, source=inner, reduce=ReducePlan.parse(split_spec))
     kaxis = reduce_loop(tile.op).axis.name  # the ORIGINAL k-axis name — single-eligible-axis keying
-    # Resolve the STAGE pin against the SLICED inner contraction (K/w — the K the partial kernel
-    # sees). NOTE: ``030_split`` does not thread ``stage`` onto its partial ``TileOp``s today, so a
-    # split-K partial always materializes gmem-direct; the resolved stamp here is what a future
-    # threading consumes.
-    stage = None
-    if stage_spec:
-        parsed = Stage.parse(stage_spec)
-        stage = _resolve_warp_stage(inner, parsed) if wt.is_warp else _resolve_scalar_stage(inner, parsed, tile.inputs)
+    # No STAGE on a split-K kernel: ``030_split`` drops ``stage`` from its partial ``TileOp``s (the
+    # partials are gmem-direct), so resolving/stamping a pin here would record a pipeline no kernel
+    # has. Threading the stage through the split is a follow-up; the stamp returns with it.
     stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec}
-    if stage_spec:
-        stamped[_at(STAGE, kaxis)] = stage_spec
-    return TileOp(op=op, name=name, place=place, tier=inner.tile, stage=stage, knobs=stamped)
+    return TileOp(op=op, name=name, place=place, tier=inner.tile, knobs=stamped)
 
 
 def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
@@ -551,8 +551,11 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     # multi-node kernel can address each node; ``WSPEC`` stays root-global (bare).
     kaxis = op.k_axis.name
     stamped = {**knobs, _at(TILE, kaxis): spec}
-    if stage_spec:
-        stamped[_at(STAGE, kaxis)] = stage_spec
+    # Honest stamping: the RESOLVED spelling (depth clamps, dropped ring) — the DB row / feature
+    # vector must describe the pipeline the kernel actually has. A declined resolution (gmem-direct)
+    # stamps nothing, so the row is indistinguishable from an unpinned gmem-direct kernel.
+    if stage is not None:
+        stamped[_at(STAGE, kaxis)] = stage.spell()
     if wspec_spec:
         stamped[WSPEC.name] = wspec_spec
     return TileOp(op=op, name=name, place=place, tier=wt, stage=stage, workers=workers, knobs=stamped)
@@ -561,10 +564,10 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
 def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: str = "", stage_spec: str = "") -> TileOp:
     """One scheduled scalar-tier contraction ``TileOp``: ``place`` mapped onto the grid + the ``TILE``
     spec resolved into the ``TilePlan`` (an optional cooperative / ILP ``REDUCE`` spec **nodifying** the
-    contraction to a :class:`Reduction` node carrying the K partition, an optional operand ``STAGE`` into
-    the :class:`Stage`), the specs stamped on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r``
-    K partition only — the cross-CTA split-K ``g`` rides the separate structural :func:`_splitk_option`
-    fork."""
+    contraction to a :class:`Reduction` node carrying the K partition — the per-cell tier only, a tiled
+    candidate drops it; an optional operand ``STAGE`` into the :class:`Stage`), the applied specs stamped
+    on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r`` K partition only — the cross-CTA
+    split-K ``g`` rides the separate structural :func:`_splitk_option` fork."""
     plan = TilePlan.parse(spec)
     # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
     # each owning a ``reg_n · reg_m`` register sub-tile). Reject a parallel tile over the
@@ -584,7 +587,12 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # and ``_factor._tile_reduce_axis`` folds it off the node.
     op = tile.op
     stage = None
-    if plan.is_tiled and not reduce_spec:
+    if plan.is_tiled:
+        # The coop / ILP ``REDUCE`` partition rides the NON-output-tiled tier only
+        # (``_coop_reduce_spec``'s contract — ``_tile_reduce_axis`` folds one cell per thread): a
+        # tiled candidate contracts K serially per register cell, so the partition is DROPPED here
+        # rather than stamped onto a kernel that doesn't fold it (an honest row, not a claimed one).
+        reduce_spec = ""
         try:
             op = _contraction_node(tile.op, place, plan)
         except LoweringError:
@@ -597,13 +605,14 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     elif reduce_spec:
         op = nodify_reduce(tile.op, ReducePlan.parse(reduce_spec))
     # ``TILE`` / ``REDUCE`` / ``STAGE`` key ``@<k_axis>`` (the contraction axis this node schedules),
-    # unifying the schedule onto the axis-named family.
+    # unifying the schedule onto the axis-named family. STAGE stamps the RESOLVED spelling, and only
+    # when resolution took (see ``_warp_option`` — the same honest-stamping rule).
     kaxis = reduce_loop(tile.op).axis.name
     stamped = {**knobs, _at(TILE, kaxis): spec}
     if reduce_spec:
         stamped[_at(REDUCE, kaxis)] = reduce_spec
-    if stage_spec:
-        stamped[_at(STAGE, kaxis)] = stage_spec
+    if stage is not None:
+        stamped[_at(STAGE, kaxis)] = stage.spell()
     return TileOp(op=op, name=name, place=place, tier=plan, stage=stage, knobs=stamped)
 
 
@@ -636,7 +645,7 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
         # ``030_split`` (the partial is a bare ``Contraction`` that factorizes to mma / scalar).
         split_spec = _splitk_pin()
         if split_spec:
-            return [_splitk_option(tile, place, spec, split_spec, name, knobs, stage_spec) for spec in _tile_specs(tile)]
+            return [_splitk_option(tile, place, spec, split_spec, name, knobs) for spec in _tile_specs(tile)]
         # A non-split cooperative / ILP (``b`` / ``r``) K partition rides the residual ``reduce`` on the
         # scalar tier (``_factor._tile_reduce_axis``); orthogonal to the output tile.
         reduce_spec = _coop_reduce_spec()
@@ -804,7 +813,12 @@ def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp 
         epilogue=epilogue,
     )
     stage = Stage(transport="sync", smem=(node.a_name,), bk_elems=bk_elems)
-    return TileOp(op=node, name=name, place=place, tier=wt, stage=stage, knobs={**knobs, _at(TILE, k_ax.name): spec})
+    # ``PLACE@cone=fuse`` is the RESOLVED producer-cone placement this option realizes — the cone
+    # compute-fills the A slab instead of round-tripping a gmem intermediate. The one live producer
+    # of the cone element (the cut side — materialize the producer as its own kernel — has no
+    # emitter in the rebuilt tree, so only ``fuse`` is ever stamped today).
+    stamped = {**knobs, _at(TILE, k_ax.name): spec, "PLACE@cone": "fuse"}
+    return TileOp(op=node, name=name, place=place, tier=wt, stage=stage, knobs=stamped)
 
 
 def _twisted_warp_option(tile: TileOp, name: str, knobs: dict) -> TileOp | None:

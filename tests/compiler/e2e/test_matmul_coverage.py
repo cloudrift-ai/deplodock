@@ -269,8 +269,10 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     """The ``TILE_PASSES`` chain RESOLVES the ``STAGE`` codec against the scheduled contraction and
     stamps the resolved ``Stage`` (eligibility + sizing run once, scheduler-side): a ``tma`` pin on a
     register-tiled scalar matmul resolves to a single-buffer stage with the fit-to-smem ``bk_elems``
-    derived; a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The raw
-    codec rides ``knobs`` either way (the prior's spelling is resolution-independent)."""
+    derived; a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The
+    stamped ``knobs`` codec is the RESOLVED spelling (honest variant identity): the clamped ``d1/tma``
+    for the ``d2/tma`` pin, and NOTHING when resolution declines — the row must describe the pipeline
+    the kernel actually has."""
     from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
 
     monkeypatch.setenv("DEPLODOCK_TILE", "n16x16/f2x2")
@@ -278,7 +280,7 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     # ``STAGE`` is keyed ``@<k_axis>`` (axis-named schedule knob); ``family_value`` reads it.
-    assert family_value(tile_op.knobs, "STAGE") == "d2/tma", tile_op.knobs
+    assert family_value(tile_op.knobs, "STAGE") == "d1/tma", tile_op.knobs  # resolved: d2 clamps to d1
     stage = tile_op.stage
     assert stage is not None and stage.transport == "tma", stage
     assert stage.depth == 1, stage  # the scalar tier is single-buffer — the pinned d2 is clamped
@@ -287,25 +289,27 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")  # sync is not a contraction transport
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert family_value(tile_op.knobs, "STAGE") == "d1/sync", tile_op.knobs
+    assert not family_value(tile_op.knobs, "STAGE"), tile_op.knobs  # declined pin stamps nothing
     assert tile_op.stage is None, tile_op.stage  # resolved: ineligible pin ⇒ gmem-direct
 
 
-def test_warp_matmul_stamps_wspec_workers(monkeypatch) -> None:
-    """A ``WSPEC`` pin on a staged warp matmul stamps the orthogonal ``workers`` split (the
-    producer/compute warp roles) onto the ``SemiringSchedule`` — pin-only this cut (the
-    producer/consumer materialization is a documented TODO). The codec rides on ``knobs`` too."""
+def test_warp_matmul_refuses_wspec_while_inert(monkeypatch, caplog) -> None:
+    """A structurally LEGAL ``WSPEC`` pin is refused (warn + no stamp, uniform SIMT) while the
+    producer/consumer materialization is not built — an accepted pin would record a warp split in
+    the perf DB that no kernel ever ran. Flips back to stamping when wspec codegen lands."""
+    import logging as _logging  # noqa: PLC0415
+
     from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
 
     monkeypatch.setenv("DEPLODOCK_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # warp (mma) tier
     monkeypatch.setenv("DEPLODOCK_STAGE", "d2/cp")
     monkeypatch.setenv("DEPLODOCK_WSPEC", "p2:q8")
-    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
+    with caplog.at_level(_logging.WARNING):
+        out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
-    assert tile_op.knobs.get("WSPEC") == "p2:q8", tile_op.knobs.get("WSPEC")
-    workers = tile_op.workers
-    assert workers is not None and [a.role.token for a in workers.roles] == ["p"], workers
-    assert workers.roles[0].warps == 2 and workers.roles[0].params == (("q", 8),)
+    assert tile_op.knobs.get("WSPEC", "") == "", tile_op.knobs.get("WSPEC")  # not stamped
+    assert tile_op.workers is None, tile_op.workers  # uniform SIMT
+    assert any("not materialized" in r.message for r in caplog.records), caplog.records
 
 
 @pytest.mark.parametrize(

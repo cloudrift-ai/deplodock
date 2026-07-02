@@ -56,7 +56,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Wr
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import Map, Placement, Reduction, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
-from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
+from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, is_fold_offer_site, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
 from deplodock.compiler.pipeline.search.space import place_decision
@@ -259,6 +259,11 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
         # has had its chance to consume it (a later scan re-visits this node, by then removed).
         if is_flash_score_producer(graph, root):
             raise RuleSkipped("flash score producer — defer to its consumer's fusion")
+    # A fold offer site (a softmax-then-P@V consumer) that did NOT fuse — the pin forced the cut,
+    # or the fuse degraded (uncertifiable) — stamps the RESOLVED ``cut`` so its DB row is
+    # distinguishable from a never-offered kernel (the fuse side stamps ``fuse`` on the fused
+    # fragment in ``build_flash_frag``).
+    knob_base: dict = {"PLACE@fold": "cut"} if is_fold_offer_site(graph, root) else {}
     loop: LoopOp = root.op
     # (3) Online softmax — the sibling-fold tupling (``PLACE@tuple``): fuse the adjacent
     # (rowmax, Σexp) reduce pair into one streaming pass; ``cut`` keeps the two-pass stats.
@@ -277,4 +282,4 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
     # ``inputs`` is seeded from the matched ``LoopOp`` (the matcher populated its real Tensors) so
     # the scheduler can read operand shapes (the shared-row stage detection); the matcher refreshes
     # it from the graph again when a later pass matches the scheduled op.
-    return schedule(TileOp(op=node, place=Placement(free=free), inputs=dict(loop.inputs)), loop.name, {})
+    return schedule(TileOp(op=node, place=Placement(free=free), inputs=dict(loop.inputs)), loop.name, knob_base)
