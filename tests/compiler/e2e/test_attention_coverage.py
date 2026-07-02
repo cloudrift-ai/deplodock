@@ -10,7 +10,7 @@ softmax reduce. This file pins every tier of it:
   the one ``_factor`` contraction path.
 - **tensor-core flash** — **xfailed; capability removed.** The bespoke ``_flash_warp`` warp-chain
   emitter was a mandate violation (a fourth ``factorize`` path + a shape gate) and was deleted; the
-  rebuild must go through ``_factorize_contraction`` (an mma ``TilePlan`` on the Q@K / P@V
+  rebuild must go through the one ``_factor._bind`` contraction arm (an mma ``TilePlan`` on the Q@K / P@V
   contractions), not a private emitter. The ``test_generated_tensorcore_flash_*`` / ``test_warp_chain_*``
   cases assert the deleted warp chain and are xfailed (see ``tests/xfail_registry.py``).
 - **cooperative-KV flash** (``BR``) — the KV axis split across threads, partial ``(m, l, O)`` states
@@ -301,7 +301,7 @@ def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
 # bespoke ``_flash_warp`` emitter — a fourth ``factorize`` path + a shape gate — and DELETED to
 # restore the mandate; flash now lowers only on the scalar tier, so these assertions (``dpl_mma…`` /
 # ``flash_pv_smem``) fail and are xfailed (see ``tests/xfail_registry.py``). The rebuild must give the
-# Q@K / P@V ``Contraction``s an mma ``TilePlan`` routed through ``_factorize_contraction`` — NOT a
+# Q@K / P@V ``Contraction``s an mma ``TilePlan`` routed through the one ``_factor._bind`` contraction arm — NOT a
 # private emitter — at which point these flip XPASS and their registry entries are deleted.
 
 

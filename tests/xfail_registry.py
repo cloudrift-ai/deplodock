@@ -65,7 +65,7 @@ XFAIL: dict[str, str] = {
     # contraction path) and was DELETED to restore the mandate. Flash now lowers only on the scalar
     # tier, so these cases (asserting the `dpl_mma…` / `flash_pv_smem` warp chain) fail again.
     # Recovering this tier means the Q@K / P@V `Contraction`s carrying an mma `TilePlan` and routing
-    # through `_factorize_contraction` — NOT a fourth emitter. Two substrings cover all 26 cases:
+    # through the one `_factor._bind` contraction arm — NOT a fourth emitter. Two substrings cover all 26 cases:
     "test_generated_tensorcore_flash": _R,
     "test_warp_chain_": _R,
     # test_flash_off_keeps_decomposition: FLASH-off no longer keeps the score-materializing

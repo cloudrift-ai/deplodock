@@ -11,7 +11,7 @@ scalar-flash / whole-block kernel, the cooperative (BLOCK) + register-ILP (REG) 
 cross-CTA (GRID) split tier, and the gmem-direct `mma.sync` **warp / tensor-core matmul** (canonical + transposed-B,
 f16/f32 out, fused epilogues, static + dynamic-grid, pin-driven mma split-K via the structural `Reduction ⊃ Contraction`
 fork). All over **static AND symbolic** axes. **Flash lowers only on the scalar tier** — the two-`Contraction` `TWISTED`
-reduce tree at block=1, routed through the common `_factorize_contraction` / `_factorize_reduce` / scalar path.
+reduce tree at block=1, routed through the common single-binder (`_factor._bind`) path.
 **The tensor-core flash `DEPLODOCK_CHAIN` warp chain was REVERTED** — it had been built as a bespoke
 `_flash_warp.factorize_flash` emitter (with `_schedule` / `_factor` `is_mma_flash` bypasses and a shape-gated
 `_chain_stamp`), a divergent codegen path the mandate forbids; it is deleted and its e2e cases re-xfailed until the tier
@@ -21,7 +21,7 @@ is rebuilt **through the one contraction emitter** (see Phase 1).
 `Schedule` alias, the `_with_reduce` no-op, and the dead docstring framing are gone; the audit corrected one false
 premise (the `Map.out` / `reduce_loop` reads of the flat-contraction `Map` are load-bearing, not legacy — see Phase 0
 below). **Phase 1 is PARTIAL** — the symbolic-K masked mma edges landed, but the tensor-core flash was reverted (see
-above) and is re-opened as a build-through-`_factorize_contraction` task. **Phase 2 + 3 (warp-tier operand staging)
+above) and is re-opened as a build-through-the-one-`_bind`-contraction-arm task. **Phase 2 + 3 (warp-tier operand staging)
 have landed together** — the `STAGE` codec → `Stage` now lowers on the mma tier: cp.async / TMA smem-slab fill +
 `ldmatrix` drain, the `d<depth>` gmem→smem ring, and the `p<reg_depth>` smem→register double-buffer, all pure
 bit-identical perf transforms over the gmem-direct baseline (the transport primitives in `_stage.py`; the staged K-loop
@@ -54,9 +54,9 @@ The rules are absolute:
 - **Zero divergent codegen paths.** Everything flows through the one `factorize` emitter over `Reduction` /
   `Contraction` / `Map` (see the invariant below). Two code paths that produce the same kind of kernel are one bug and
   one dead path.
-- **`_factor.factorize` has exactly THREE routes — no fourth.** Every `TileOp` lowers through
-  `_factorize_contraction`, `_factorize_reduce`, or the inline scalar tier — dispatched on the structural role, never on
-  a kernel *identity*. There is no `if is_flash(op)` / `if is_attention(op)` / `if is_<anything-named>(op)` arm. A kernel
+- **`_factor.factorize` has exactly ONE binder — no second.** Every `TileOp` lowers through the single `_bind`
+  pipeline (its arms — output-tiled contraction / tiled reduce axis / degenerate fold — are selected by which axes the
+  node's SCHEDULE tiles, sealed by the one `grid_tile` finalizer), never a kernel *identity*. There is no `if is_flash(op)` / `if is_attention(op)` / `if is_<anything-named>(op)` arm. A kernel
   that "needs its own emitter" is proof the node model is wrong (fix the model), not a license to add a dispatch. The
   moment a phase adds a `factorize_<kind>` function or an `is_<kind>` dispatch predicate, it has already failed the
   mandate — the reviewer rejects it on sight. **Cautionary example (do not repeat):** tensor-core flash was landed as a
@@ -81,12 +81,14 @@ which unfolds any node tree (including nesting: `Map(source=Reduction(source=Con
 `factorize` reads the node kind + role (`ops.axis_role`) + reduce plan (`ops.reduce_plan`) off `tile.op` and routes to a
 tier that differs **only in the schedule's partition/tiling**, never in the algebra:
 
-- a `Contraction` → `_factorize_contraction` (the four-level `atomize → register_tile → unit_tile → grid_tile`
+- a `Contraction` tiles its OUTPUT `(m, n)` axes (the four-level `atomize → register_tile → unit_tile → grid_tile`
   pipeline; both atoms — tensor-core `AtomKind` and scalar `ScalarAtom` — share it, dispatching only at `reduce_codegen`
   and the `store` sink);
-- a cooperative / ILP `PLANAR` / `TWISTED` reduce (or a non-output-tiled `CONTRACTION`) → `_factorize_reduce`
-  (carrier-generic: a contraction is the degenerate carrier of its additive fold);
-- anything else (pointwise `Map`, trivial-plan reduction) → the inline scalar tier (`lower(op)` + `with_store`).
+- a cooperative / ILP `PLANAR` / `TWISTED` reduce (or a non-output-tiled `CONTRACTION`) tiles its REDUCE axis instead
+  (`_tile_reduce_axis` — carrier-generic: a contraction is the degenerate carrier of its additive fold);
+- anything else (pointwise `Map`, trivial-plan reduction) tiles nothing — the degenerate one-thread-per-cell fold.
+
+All three are arms of the ONE `_bind` binder, sealed by the one `grid_tile` finalizer.
 
 **The bar for every remaining phase: it lands as new data/config on a node** (a `TilePlan` atom, a `Stage`, a
 `WarpSpec`) **that the one emitter already structurally supports — not a bespoke path.** Tensor-core flash is the inner
@@ -176,9 +178,19 @@ top of this*, not before it — flash is the acceptance test that the collapse i
 **Progress.**
 
 - ✅ **Deviation 1, first cut — `factorize`'s three routes collapsed to two** (byte-identical, full compiler e2e green).
-  The inline scalar tier is gone as a separate branch: `factorize` is `if Contraction → _factorize_contraction; else →
-  _factorize_reduce`, and `_factorize_reduce` owns both the cooperative/ILP partition and the degenerate
-  one-thread-per-cell fold (a pointwise `Map` or trivial `ReducePlan`).
+  The inline scalar tier is gone as a separate branch; the reduce binder owns both the cooperative/ILP partition and
+  the degenerate one-thread-per-cell fold (a pointwise `Map` or trivial `ReducePlan`).
+- ✅ **Deviation 1 complete — ONE root binder, one finalizer** (bit-identical across 22 dump configs — coop / ILP /
+  masked coop+ILP / serial / full-row coop softmax / coop-K contraction / per-cell + tiled + staged matmuls /
+  pointwise — full suite green). `_bind_contraction` / `_factorize_contraction` / `_bind_reduce` are deleted:
+  `_factorize` peels the projecting `Map`s and binds the leaf via the single `_bind` pipeline, whose arms — tile the
+  OUTPUT `(m, n)` axes (a `Contraction`), tile the REDUCE axis (`_tile_reduce_axis`: `coop` lanes at the unit level +
+  `reg` ILP chains at the register level, returning `(state, fold, close, lane)`), or tile nothing (the degenerate
+  fold, the 1×1 `atomize`) — are selected by WHICH AXES the node's schedule tiles, and ALL seal through the one
+  `grid_tile` finalizer (`mn == (None, None)` = the untiled one-cell-per-thread output, the grid riding `lead_axes`,
+  a tiled reduce axis contributing its lane through `t.axes`). The reduce partitioner's offset algebra (the cyclic
+  `r·coop` copy offsets + the strided residual loop) intentionally stays its own arithmetic — it is the genuinely
+  different distribution (cyclic vs blocked), not a divergent path.
 - ✅ **Deviation 2, first cut — one contract-loop skeleton + per-atom leaf factories** (compiler e2e green; mma
   byte-identical, scalar accuracy-identical with restructured source). The gmem-direct K-loop is now the shared
   `_contract_kloop` (read each register row's A + col's B once, contract all `(row, col)` pairs, wrap in the reduce
@@ -260,7 +272,7 @@ the in-progress rebuild breaks it, and it flips back to a hard requirement when 
   the loop nest. Flash is the **two-`Contraction` tree** `Map(source=Reduction(TWISTED, source=Contraction(Q@K),
   partial=[softmax, Contraction(P@V), O-fold]))` — both Q@K and P@V factorize through the one `_factor` path (block=1
   scalar today; the mma tier is a re-opened Phase-1 task, to land as an mma `TilePlan` on those contractions routed
-  through `_factorize_contraction` — never a bespoke emitter, see the reverted step 3).
+  through the one `_bind` contraction arm — never a bespoke emitter, see the reverted step 3).
 - **One `factorize` emitter (factorize-consolidation Part I)** — `010_materialize` is a thin wrapper;
   `_factor.factorize` is the single node-kind dispatcher (scalar / pointwise + coop-ILP reduce + tiled contraction). The
   old three-tier `010_materialize` (`_reduce` + inline scalar fallback) is gone. `reduce_codegen` (operand fragments +
@@ -384,7 +396,7 @@ duplicates the streaming reduce. The `expect(v)` channel's `lift` (already carri
 its docstring, "a future fragment realizer can lower ⊗ to a contraction (mma)") is **realized as the PV `Contraction`**:
 its per-element `p·v` term becomes the PV output `Oblk`, so the carrier keeps its `(m_i, l_i)` stats **and** the O-fold
 `O_i = O_i·α + Oblk` (α still generated internally), but the ⊗ is now a tiled contraction node instead of a scalar FMA.
-Both contractions factorize through the **same** `_factorize_contraction`; the tier is chosen by each node's `TilePlan`,
+Both contractions factorize through the **same** `_bind` contraction arm; the tier is chosen by each node's `TilePlan`,
 never a divergent path.
 
 **Consolidation steps (architecture first, each kept green by the non-xfailed *scalar* flash e2e):**
@@ -422,7 +434,7 @@ never a divergent path.
    **The correct rebuild (not yet done).** The two-`Contraction` flash tree is already the right *structure*. A
    tensor-core tier is: the Q@K and P@V `Contraction`s carry an mma `TilePlan` (a schedule field, stamped by
    `020_schedule` — no recognizer-side stamp, no shape gate outside the normal atom-eligibility the mma matmul tier
-   already applies), and BOTH factorize through **`_factorize_contraction`** exactly like a standalone mma matmul. The
+   already applies), and BOTH factorize through **the one `_bind` contraction arm** exactly like a standalone mma matmul. The
    only genuinely-new capability is the register-resident A operand (PV's `P` fragment): teach `_mma_reduce` to consume a
    computed-A `Body` (drop its `assert not a_computed`) so the C→A handoff is a *step inside the shared contraction
    pipeline*, not a private emitter. If that cannot be expressed as data on the node + the shared pipeline, the node
@@ -470,7 +482,7 @@ test_cooperative_flash_matches_torch` (the `BR` cooperative-KV scalar flash), `t
   masked path above.
 - ✅ **`_flash.py` / `_atomize.py` docstrings describe the scalar-only reality** — with the warp chain reverted, the
   prose no longer references `_chain_stamp` / `_flash_warp` / `DEPLODOCK_CHAIN`; it states plainly that flash lowers on
-  the scalar tier and a tensor-core tier is a matter of an mma `TilePlan` routed through `_factorize_contraction`, not a
+  the scalar tier and a tensor-core tier is a matter of an mma `TilePlan` routed through the one `_bind` contraction arm, not a
   bespoke emitter. The scalar `ScalarAtom` / `TilePlan()` config stays (a real config of the scalar tier); the
   `_atomize` recursion seam is documented as unused (the flash tree carries its per-node geometry, so no recursive
   `bind_contraction` tree-walk).

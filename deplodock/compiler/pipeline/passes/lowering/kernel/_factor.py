@@ -1,29 +1,31 @@
-"""The factorizer — the recursive ``TileOp``-root emitter, the contraction-tiling glue, and the
-cooperative / ILP reduce binder. The per-atom codegen **strategies** it drives live in ``_atom.py``.
+"""The factorizer — the recursive ``TileOp``-root emitter and the ONE root binder every kernel
+seals through. The per-atom codegen **strategies** it drives live in ``_atom.py``.
 
 :func:`factorize` is the entry ``010_materialize`` calls once per kernel: it builds the ambient
 :class:`Ctx` and dispatches ``tile.op`` through the recursion :func:`_factorize`, which walks the
 ``Map`` / ``Reduction`` / ``Contraction`` node tree. A :class:`~...ir.Map` with a ``source``
-**recurses** (its projection walked into the ``tail``); a leaf binds to the grid via one of the two
-ROOT binders — :func:`_bind_contraction` → :func:`_factorize_contraction` (a tiled
-:class:`~...ir.Contraction`, register / warp OUTPUT tile) or :func:`_bind_reduce` (a ``PLANAR`` /
-``TWISTED`` reduce — cooperative / ILP, or the degenerate one-thread-per-cell fold). The per-cell body
-under either binder is built by the shared recursion :func:`_emit` (which walks ``source`` AND
-``partial``, reaching flash's Q@K / P@V as nodes).
+**recurses** (its projection walked into the ``tail``); the leaf binds to the grid via the single
+:func:`_bind` pipeline, whose form is read off the node's SCHEDULE — which axes are tiled — never a
+kernel kind: a tiled :class:`~...ir.Contraction` tiles its OUTPUT ``(m, n)`` axes (register / warp
+cells), a cooperating :class:`~...ir.Reduction` tiles its REDUCE axis (:func:`_tile_reduce_axis` —
+``coop`` lanes + ``reg`` ILP chains), and everything else tiles nothing (the degenerate
+one-thread-per-cell fold). All three seal through the one :func:`grid_tile` finalizer; the per-cell
+body is built by the shared recursion :func:`_emit` (which walks ``source`` AND ``partial``,
+reaching flash's Q@K / P@V as nodes).
 
-:func:`_factorize_contraction` reads the tiling **geometry straight off the** ``Contraction`` **node**
-(``tile_m`` / ``mask_m`` / ``m_b`` / ``block_threads`` / …, derived there from the ``tile`` schedule +
-the output axes), expands both atoms through the *same* four-level tiling pipeline (``atomize →
+The output tiling reads its **geometry straight off the** ``Contraction`` **node** (``tile_m`` /
+``mask_m`` / ``m_b`` / ``block_threads`` / …, derived there from the ``tile`` schedule + the output
+axes), expands both atoms through the *same* four-level tiling pipeline (``atomize →
 register_tile → unit_tile → grid_tile``, in this module), and splices in two codegen halves from
 the per-atom strategies in **``_atom.py``**: :func:`~...kernel._atom.reduce_codegen` — the reusable,
 **sink-agnostic** ``(state_decls, reduce_region)`` (accumulator/operand decls + the contraction
 K-loop) — and a per-cell **sink** ``store(i, j, offset, mn)`` (default
-:func:`~...kernel._atom.store_sink`, the matmul sink; ``_factorize_contraction(c, store=…)`` swaps it —
+:func:`~...kernel._atom.store_sink`, the matmul sink; ``factorize(tile, root, store=…)`` swaps it —
 the flash inner QK/PV pass a sink that bridges the accumulator into the streaming-softmax twist,
 reusing the same ``reduce_codegen``).
 
-The cooperative / ILP reduce tier (:func:`_bind_reduce` + the shared-row staging helpers) folds
-the reduce axis ``coop`` ways across threads and ``reg`` ways across per-thread accumulators, then the
+The reduce-axis tiling (:func:`_tile_reduce_axis` + the shared-row staging apply) folds the reduce
+axis ``coop`` ways across threads and ``reg`` ways across per-thread accumulators, then the
 REG-tree fold, the cross-thread combine (:func:`emit_combine`), and the projection — carrier-
 generic (a contraction is the degenerate carrier of its additive fold).
 
@@ -34,7 +36,7 @@ It is driven off the node's ``STAGE`` codec →
 :class:`~...schedule.Stage` (``d<depth>`` gmem→smem ring · ``sync``/``cp``/``tma`` transport ·
 ``p<n>`` smem→register double-buffer). The **scalar** contraction tier stays gmem-direct. The fused
 norm→linear **shared-row** prologue is Stage-driven too: ``020_schedule`` detects the reused input row
-and stamps a ``sync`` :class:`~...schedule.Stage` whose ``smem`` names it; :func:`_bind_reduce` only
+and stamps a ``sync`` :class:`~...schedule.Stage` whose ``smem`` names it; :func:`_tile_reduce_axis` only
 applies it (the 1-D ``sync_row_fill`` + the load rewrite). Leading ``_`` so the pass loader skips this
 module."""
 
@@ -125,7 +127,7 @@ def unit_tile(t: Tiling, mn: tuple[Side, Side]) -> Tiling:
 def grid_tile(
     t: Tiling,
     *,
-    mn: tuple[Side | None, Side],
+    mn: tuple[Side | None, Side | None],
     lead_axes: tuple[Axis, ...] = (),
     block_threads: int | None,
     lanes: int = 1,
@@ -133,16 +135,19 @@ def grid_tile(
     reduce_region: Callable[..., tuple[list[Stmt], list[Stmt]]],
     store: Callable[..., list[Stmt]],
 ) -> Tile:
-    """The GRID level + finalize: bind the block axes (the shrunk grid), set the per-axis grid term
-    ``block·tile``, append any leading (batch) grid axes verbatim and — when the atom is warp-cooperative
-    (``lanes > 1``) — the atom ``_lane`` axis, then splice the codegen callables' state + reduce-region +
-    per-cell stores into the ``Tile``. The three callables (atom-specific, from :func:`reduce_codegen` +
-    the ``store`` sink) are the only per-atom variation; the splice is shared. They take the per-cell
-    ``offset`` (the ``(m, n)`` :class:`AxisOffset` tuple) + the ``mn`` :class:`Side` pair.
+    """The GRID level + finalize — the ONE seal every kernel binds through: bind the block axes (the
+    shrunk grid), set the per-axis grid term ``block·tile``, append any leading (untiled) grid axes
+    verbatim and — when the atom is warp-cooperative (``lanes > 1``) — the atom ``_lane`` axis, then
+    splice the codegen callables' state + reduce-region + per-cell stores into the ``Tile``. The
+    three callables (atom-specific for a contraction, from :func:`reduce_codegen` + the ``store``
+    sink; the reduce tier's fill / partitioned fold / projection close) are the only variation; the
+    splice is shared. They take the per-cell ``offset`` (the ``(m, n)`` :class:`AxisOffset` tuple) +
+    the ``mn`` :class:`Side` pair.
 
     ``mn[0] is None`` is a 1-D output grid (only ``n`` tiled) — no ``m`` block axis is bound.
-    ``lead_axes`` are extra outer grid axes carried through untiled; ``lanes == 1`` (scalar) emits no
-    ``_lane`` axis."""
+    ``mn == (None, None)`` is the fully-untiled output (the reduce tier / degenerate fold): one cell
+    per thread, no block axis at all — the whole grid rides ``lead_axes``, and a tiled REDUCE axis
+    contributes its lane through ``t.axes``. ``lanes == 1`` (scalar) emits no ``_lane`` axis."""
     offset = tuple(replace(o, block_var=s.block) if s is not None else o for o, s in zip(t.offset, mn, strict=True))
     block_axes = tuple(shrink_axis(Axis(name=s.block, extent=s.axis.extent, source_axis=s.axis), s.tile) for s in mn if s is not None)
     lane_axes = (Axis(name="_lane", extent=lanes),) if lanes > 1 else ()
@@ -160,13 +165,12 @@ def grid_tile(
 # divergent codegen path). :func:`_emit` walks a ``Map`` / ``Reduction`` / ``Contraction`` tree —
 # through ``source`` AND ``partial`` — threading a :class:`Ctx` down (the ambient cell environment)
 # and returning a :class:`Frag` up (the per-cell loop-IR body + the produced :class:`Handle` wire +
-# the reduce ``carrier`` when the node folds one). The two ROOT binders consume the recursion:
-# :func:`_factorize_contraction` (the ``grid_tile`` output-tiling pipeline) for an output-tiled
-# ``Contraction`` root, and :func:`_bind_reduce` (the reduce partitioner) for a cooperative /
-# scalar reduce — the latter builds its per-cell reduce loop via :func:`_emit`, so a nested
-# ``Contraction`` (flash's Q@K / P@V) is reached AS A NODE. Scalar-nested today (block=1); the
-# per-node warp tile that routes a nested contraction through the mma path is the tensor-core seam
-# marked in :func:`_emit` (a ``Contraction`` case).
+# the reduce ``carrier`` when the node folds one). The ONE root binder (:func:`_bind`) consumes the
+# recursion: the output-tiled ``Contraction`` arm splices the atom's codegen through ``grid_tile``,
+# and the reduce partitioner (:func:`_tile_reduce_axis`) builds its per-cell reduce loop via
+# :func:`_emit`, so a nested ``Contraction`` (flash's Q@K / P@V) is reached AS A NODE. Scalar-nested
+# today (block=1); the per-node warp tile that routes a nested contraction through the mma path is
+# the tensor-core seam marked in :func:`_emit` (a ``Contraction`` case).
 
 
 @dataclass(frozen=True)
@@ -284,31 +288,18 @@ def factorize(tile, root, store=None) -> Tile:
 
 
 def _factorize(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
-    """The recursive root-binder dispatch — bind ``op`` to the grid, projecting ``tail`` (an enclosing
-    ``Map``'s post-source sweep) after it. Three cases, mirroring the node kinds:
-
-    - a :class:`Map` with a ``source`` **recurses**: its ``body`` (the projection / epilogue) is walked
-      (:func:`_emit_body`, reaching any nested node) and prepended to ``tail``, then ``source`` is bound.
-    - a :class:`Contraction` (warp / register OUTPUT tile) → :func:`_factorize_contraction`, the
-      atom-generic four-level ``grid_tile`` pipeline. Its projection ``epilogue`` (+ any ``tail``) rides
-      the node; the bare grid-``Write`` is synthesized here (it needs ``ctx.output``, so it can't ride
-      the node).
-    - everything else (a :class:`Reduction`, or a pure pointwise ``Map``) → :func:`_bind_reduce`, the
-      reduce partitioner: one thread per output cell, partitioning the reduce axis when the
-      :class:`ReducePlan` cooperates (BLOCK ``coop`` / REG ``reg``).
-
-    The two binders are the two OUTPUT-binding strategies (register-tile the output vs. one-cell-
-    per-thread + partition the reduce) — a kernel makes that choice once at its root; the body inside
-    is built by the recursion (:func:`_emit`). There is **no** flash / attention special case: flash is
-    the two-``Contraction`` ``TWISTED`` reduce tree, so its Q@K / P@V contractions and its streaming
-    reduce factorize through this one dispatch (scalar block=1 today; a nested warp-tiled contraction
-    routes through the ``_emit`` ``Contraction`` seam). A bespoke emitter would be a divergent codegen
-    path the mandate forbids."""
+    """The recursive root walk — peel the projecting ``Map``\\ s, then bind the leaf to the grid via
+    the ONE binder. A :class:`Map` with a ``source`` **recurses**: its ``body`` (the projection /
+    epilogue) is walked (:func:`_emit_body`, reaching any nested node) and prepended to ``tail``;
+    everything else is a leaf, bound by :func:`_bind` — the single pipeline, whose form is read off
+    the node's SCHEDULE (which axes are tiled), never a kernel kind. There is **no** flash /
+    attention special case: flash is the two-``Contraction`` ``TWISTED`` reduce tree, so its Q@K /
+    P@V contractions and its streaming reduce factorize through this one walk (scalar block=1
+    today; a nested warp-tiled contraction routes through the ``_emit`` ``Contraction`` seam). A
+    bespoke emitter would be a divergent codegen path the mandate forbids."""
     if isinstance(op, Map) and op.source is not None:
         return _factorize(op.source, ctx, tail=(*_emit_body(op.body, ctx), *tail), out_val=out_val, store=store)
-    if isinstance(op, Contraction):
-        return _bind_contraction(op, ctx, tail, store)
-    return _bind_reduce(op, ctx, tail, out_val)
+    return _bind(op, ctx, tail, out_val, store)
 
 
 def has_write(stmts: list[Stmt]) -> bool:
@@ -334,43 +325,64 @@ def with_store(stmts: list[Stmt], output: str, grid, value: str) -> list[Stmt]:
     return [*stmts, Write(output=output, index=index, value=value)]
 
 
-def _bind_contraction(c: Contraction, ctx: Ctx, tail: tuple, store=None) -> Tile:
-    """The output-tiling binder case — append the enclosing ``Map``'s ``tail`` (empty for a bare
-    matmul) to the contraction's projection ``epilogue``, synthesize the grid-``Write`` glue when the
-    epilogue carries none (it needs ``ctx.output``), and expand through :func:`_factorize_contraction`."""
-    epi = [*c.epilogue, *tail]
-    if not has_write(epi):
-        epi = with_store(epi, ctx.output, ctx.grid, c.out)
-    return _factorize_contraction(replace(c, epilogue=Body(tuple(epi))), ctx.stage, store, ctx.inputs)
+def _bind(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
+    """The ONE root binder — every kernel binds through the same pipeline: read WHICH AXES the
+    schedule tiles off the node, build the fold region, and seal through the one :func:`grid_tile`
+    finalizer. The cases are points of one ``(output-tiling) × (reduce-folding)`` space, selected by
+    the schedule — never separate emitters:
 
+    - a :class:`Contraction` tiles its OUTPUT ``(m, n)`` axes — register / warp cells through
+      ``atomize → register_tile → unit_tile``, the reduce (K) serial per cell from the atom's
+      :func:`reduce_codegen`, ``store`` the per-cell sink (default :func:`store_sink`; the flash
+      inner QK/PV pass a sink that bridges the accumulator into the softmax twist). Its projection
+      ``epilogue`` (+ any ``tail``) rides the node; the bare grid-``Write`` glue is synthesized here
+      (it needs ``ctx.output``, so it can't ride the node).
+    - a :class:`Reduction` whose :class:`ReducePlan` cooperates tiles its REDUCE axis instead
+      (:func:`_tile_reduce_axis` — ``coop`` lanes at the unit level, ``reg`` ILP chains at the
+      register level, the carrier merge closing the fold). The output stays one cell per thread:
+      the 1×1 ``atomize`` with the whole grid riding ``lead_axes`` untiled.
+    - anything else (a pure pointwise ``Map``, a trivial plan) tiles NOTHING — the degenerate
+      one-thread-per-cell fold: the per-cell body (:func:`_emit`; a serial reduce ``Loop`` sits
+      inside it) + ``tail`` + the ``out_val`` store glue is the whole fold region."""
+    grid = tuple(ctx.grid)
+    if isinstance(op, Contraction):
+        epi = [*op.epilogue, *tail]
+        if not has_write(epi):
+            epi = with_store(epi, ctx.output, grid, op.out)
+        c = replace(op, epilogue=Body(tuple(epi)))
+        state_decls, reduce_region = reduce_codegen(c, ctx.stage, ctx.inputs)
+        sink = store if store is not None else store_sink(c)
+        t = unit_tile(register_tile(atomize(c.atom.shape[:2]), c.mn), c.mn)
+        mn, lead, bt, lanes = c.mn, c.lead_axes, c.block_threads, c.atom.lanes
+    else:
+        # The reduce partition rides the :class:`Reduction` node; ``None`` for a pure pointwise /
+        # scalar per-cell ``Map`` (no partition). Every partitioned reduce — monoid, flash, coop-K /
+        # split contraction — is a ``Reduction`` node after ``ops.nodify_reduce`` (a projecting
+        # ``Map`` was already peeled off by :func:`_factorize`).
+        plan = op.reduce if isinstance(op, Reduction) else None
+        t, mn, lead, lanes = atomize((1, 1)), (None, None), grid, 1
+        if plan is None or (plan.coop <= 1 and plan.reg <= 1):
+            state, fold, close, bt = [], with_store([*_emit(op, ctx).body, *tail], ctx.output, grid, out_val), [], None
+        else:
+            state, fold, close, lane = _tile_reduce_axis(op, plan, ctx, tail, out_val)
+            t = replace(t, axes=(lane,)) if lane is not None else t
+            bt = plan.coop if lane is not None else None
 
-def _factorize_contraction(c: Contraction, stage: Stage | None = None, store=None, inputs=None) -> Tile:
-    """Expand a :class:`Contraction` into its tiled ``Tile`` — the one pipeline for both atoms. The
-    node supplies the per-level geometry + its operand ``stage`` (the smem pipeline both tiers lower);
-    :func:`reduce_codegen` synthesizes the operand load + K-loop (``inputs`` supplies the scalar slab
-    dtype) and ``store`` is the **per-cell sink** (default: the matmul :func:`store_sink`; the flash
-    inner QK/PV pass a sink that bridges the accumulator into the softmax twist); the layer owns the
-    offset, the axes, and the splice."""
-    state_decls, reduce_region = reduce_codegen(c, stage, inputs)
-    if store is None:
-        store = store_sink(c)
-    mn = c.mn
-    t = atomize(c.atom.shape[:2])
-    t = register_tile(t, mn)
-    t = unit_tile(t, mn)
+        def state_decls(_cells):
+            return state
+
+        def reduce_region(_cells, _offset, _mn):
+            return [], fold
+
+        def sink(_i, _j, _offset, _mn):
+            return close
+
     return grid_tile(
-        t,
-        mn=mn,
-        lead_axes=c.lead_axes,
-        block_threads=c.block_threads,
-        lanes=c.atom.lanes,
-        state_decls=state_decls,
-        reduce_region=reduce_region,
-        store=store,
+        t, mn=mn, lead_axes=lead, block_threads=bt, lanes=lanes, state_decls=state_decls, reduce_region=reduce_region, store=sink
     )
 
 
-# ---- cooperative / ILP reduce tier ------------------------------------------------------------- #
+# ---- the tiled REDUCE axis (cooperative / ILP) -------------------------------------------------- #
 # A PLANAR / TWISTED monoid reduce (sum / max / mean / RMSNorm / softmax / the coop-KV TWISTED flash
 # reduce) partitions the reduce axis ``coop`` ways across the CTA's threads (cooperation) and ``reg``
 # ways across per-thread register accumulators (ILP). The serial reduce ``Loop`` becomes a
@@ -509,26 +521,17 @@ def combine_tail(carrier, *, reg: int, coop: int, lane) -> list[Stmt]:
     return merge
 
 
-def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
-    """The reduce-partitioner binder case — bind ``op`` (a :class:`Reduction`, or a pointwise / scalar
-    per-cell ``Map``) one output cell per thread, projecting the enclosing ``Map``'s ``tail`` after the
-    reduce. It drives the recursion (:func:`_emit`) for the per-cell body.
-
-    **Degenerate arm (no partition).** A pointwise ``Map``, or a reduce whose :class:`ReducePlan` is
-    trivial (``coop == reg == 1``), is one thread per output cell: :func:`_emit` emits the per-cell
-    body (a serial reduce ``Loop`` sits inside it), ``tail`` is appended, and the ``out_val`` store glue
-    closes it. **Partitioned arm.** Otherwise partition the reduce axis ``coop`` ways across threads
-    and/or ``reg`` ways across register accumulators, as the section header describes."""
+def _tile_reduce_axis(op: Reduction, plan, ctx: Ctx, tail: tuple, out_val: str) -> tuple[list[Stmt], list[Stmt], list[Stmt], Axis | None]:
+    """Tile the REDUCE axis per the node's cooperating :class:`ReducePlan` — the reduce counterpart
+    of the output ``unit_tile`` / ``register_tile`` levels: ``coop`` lanes across threads (the
+    ``_co`` lane axis, the axis's UNIT level) and ``reg`` ILP chains across per-thread accumulators
+    (its REGISTER level — cyclic, copy ``r`` offset by ``r·coop``, the loop striding ``coop·reg``).
+    It drives the recursion (:func:`_emit`) for the per-cell reduce loop and returns the pieces the
+    one pipeline (:func:`_bind` → :func:`grid_tile`) seals: ``(state, fold, close, lane)`` — the
+    shared-row fill decls, the strided fold loop + the carrier merge (the REG tree + the
+    cross-thread combine), the distributed projection close, and the lane :class:`Axis` (``None``
+    for standalone ILP — one thread per cell, lane fixed at 0)."""
     grid = ctx.grid
-    # The reduce partition rides the :class:`Reduction` node; ``None`` for a pure pointwise / scalar
-    # per-cell ``Map`` (no partition). Every partitioned reduce — monoid, flash, coop-K / split
-    # contraction — is a ``Reduction`` node after ``ops.nodify_reduce`` (a projecting ``Map`` was
-    # already peeled off by :func:`_factorize`, so a partition here always means ``op`` is a ``Reduction``).
-    plan = op.reduce if isinstance(op, Reduction) else None
-    if plan is None or (plan.coop <= 1 and plan.reg <= 1):
-        # One thread per output cell — the degenerate fold, no cross-thread / ILP partition.
-        stmts = with_store([*_emit(op, ctx).body, *tail], ctx.output, grid, out_val)
-        return Tile(axes=tuple(grid), body=Body(tuple(stmts)))
     coop, reg = plan.coop, plan.reg
 
     # Build the per-cell reduce loop via the recursion (:func:`_emit`) off the :class:`Reduction`
@@ -612,6 +615,4 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
         stored = with_store(tail, ctx.output, grid, out_val)
         body_tail = [Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(stored))]
 
-    body = [*fill_stmts, strided, *merge, *body_tail]
-    axes = (*grid, lane) if lane is not None else tuple(grid)
-    return Tile(axes=axes, body=Body(tuple(body)), block_threads=coop if lane is not None else None)
+    return fill_stmts, [strided, *merge], body_tail, lane

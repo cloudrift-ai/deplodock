@@ -1,6 +1,6 @@
 r"""The per-atom codegen strategies — the one seam every tiled contraction dispatches through.
 
-``_factorize_contraction`` (in ``_factor.py``) reads the tiling geometry off the :class:`Contraction`
+``_factor._bind`` (the output-tiled contraction arm) reads the tiling geometry off the :class:`Contraction`
 node and asks this module for the two codegen halves: :func:`reduce_codegen` (the sink-agnostic
 ``(state_decls, reduce_region)`` — the accumulator/operand decls + the shared :func:`_contract_kloop`
 K-loop) and :func:`store_sink` (the per-cell matmul sink). Both resolve through :func:`_atom_ops` to
@@ -69,7 +69,7 @@ def copy_cell(body, sigma, suffix: str, protected) -> list:
     per-copy SSA name (the shared grid / reduce / lane coordinates in ``protected`` pass through
     unrenamed). This is the **one** replication mechanic shared by the register tile (this module,
     one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``_factor``
-    ``_bind_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
+    ``_tile_reduce_axis``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
     ``sigma`` (the coordinate offset) and ``suffix`` (the SSA tag)."""
     rename = lambda n: n if n in protected else f"{n}{suffix}"  # noqa: E731
     return [s.rewrite(rename, sigma) for s in body]

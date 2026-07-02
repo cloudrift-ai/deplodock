@@ -61,7 +61,7 @@ bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul) is reject
   + `ReduceStage.combine`), never stored. Its one schedule-time staging decision follows the same
   resolve-once-structurally rule: `_schedule._row_stage` detects the fused norm→linear shared row when the cooperative
   partition is chosen and stamps a `sync` `Stage` naming it (`smem`) on the `TileOp` — a derived schedule field, not a
-  knob — so `_factor._bind_reduce` only applies it, never re-detects.
+  knob — so `_factor._tile_reduce_axis` only applies it, never re-detects.
 
 The atom spec is subtyped by kind (`ir/atom.py`: `AtomKind` is the fixed mma cell selected by name; `ScalarAtom`
 is the plain scalar fma cell). The contraction binder (`bind_contraction`) is loop-addressable so warp-flash can later

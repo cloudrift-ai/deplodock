@@ -101,7 +101,7 @@ class Reduction:
     :class:`Map` whose body IS that projection. It is NOT a ``Stmt``
     — like ``Map`` it is an op-tree node a :class:`TileOp` holds;
     :func:`ops.lower` flattens it to the synthesized loop (``[loop]``), so ``op_cache_key`` and the
-    ``_factor._bind_reduce`` expander stay byte-identical to the bare-loop form.
+    ``_factor._tile_reduce_axis`` expander stay byte-identical to the bare-loop form.
 
     The **scheduling param** is the ``reduce`` partition (:class:`ReducePlan` — GRID split / BLOCK coop
     / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here** on the node
