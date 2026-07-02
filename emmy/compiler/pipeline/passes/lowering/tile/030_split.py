@@ -48,9 +48,9 @@ from emmy.compiler.ir.atom import AtomKind
 from emmy.compiler.ir.axis import Axis, AxisRole
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.schedule import Level
+from emmy.compiler.ir.schedule import Fold, Level
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
+from emmy.compiler.ir.stmt import Accum, Body, Init, Load, Loop, Write
 from emmy.compiler.ir.tile import (
     Contraction,
     Map,
@@ -62,6 +62,7 @@ from emmy.compiler.ir.tile import (
 )
 from emmy.compiler.ir.tile.ops import axis_role, lower, nodify_reduce, reduce_loop, reduce_plan
 from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile._carrier import projection_distributes as _projection_distributes
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -118,46 +119,17 @@ def _carrier_identities(carrier) -> dict[str, float]:
     return {s.name: s.op.identity for s in carrier.merge if isinstance(s, Accum)}
 
 
-def _mapped(op, grid, *, name: str = "", tier=None) -> TileOp:
+def _mapped(op, grid, *, name: str = "", tier=None, stage=None) -> TileOp:
     """A **mapped** ``TileOp`` wrapping ``op`` over ``grid`` (so ``_schedule`` skips it). ``tier``
-    preserves a contraction's scalar output tier (:class:`TilePlan`); a residual reduce partition
-    rides the op's :class:`Reduction` **node** (:func:`nodify_reduce`), not a ``TileOp`` field."""
+    preserves a contraction's scalar output tier (:class:`TilePlan`); ``stage`` threads the
+    scheduler-resolved operand :class:`Stage` onto a split partial (resolved against the sliced
+    inner node by ``_splitk_option``); a residual reduce partition rides the op's
+    :class:`Reduction` **node** (:func:`nodify_reduce`), not a ``TileOp`` field."""
     place = Placement(free=tuple(grid), grid=tuple(grid))
     kw: dict = {}
     if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
         kw["tier"] = tier
-    return TileOp(op=op, name=name, place=place, **kw)
-
-
-def _projection_distributes(body, states: tuple[str, ...]) -> bool:
-    """True if the kernel's projection epilogue is a **linear-homogeneous** map of the carrier
-    state(s) — i.e. it distributes over the atomic-add combine, so applying it to each CTA's
-    partition before the ``atomicAdd`` equals applying it once after the cross-CTA sum
-    (``Σ c·xₛ = c·(Σ xₛ)``). A bare state write (``proj = id``) trivially distributes; a constant
-    *scale* — ``mean``'s ``×1/N`` — does; an additive offset (a fused bias), a nonlinear unary
-    (``relu`` / ``reciprocal`` of the *state*), or a product of two state-derived values do NOT.
-
-    Conservative forward dataflow: ``linear`` is the set of SSA names that are a
-    linear-homogeneous function of the state. A value is grown into it only by ``multiply`` with
-    a state-independent operand (an arg not itself in ``linear``); any other op that consumes a
-    ``linear`` value — or any projection stmt we can't reason about — refuses. The final ``Write``
-    must store only ``linear`` values."""
-    linear = set(states)
-    for s in body:
-        if isinstance(s, Write):
-            return all(v in linear for v in s.values)
-        if isinstance(s, Load):
-            continue  # reads memory (the count / a per-output operand) — state-independent
-        if not isinstance(s, Assign):
-            return False  # an unfamiliar projection stmt — can't prove distributivity
-        hot = [a for a in s.args if a in linear]
-        if not hot:
-            continue  # state-independent — a constant w.r.t. the split
-        if s.op.name == "multiply" and len(hot) == 1:
-            linear.add(s.name)  # state · constant — still linear-homogeneous
-            continue
-        return False  # add / divide / nonlinear of a state value breaks distributivity
-    return False  # no Write reached
+    return TileOp(op=op, name=name, place=place, stage=stage, **kw)
 
 
 def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Contraction, carrier, plan: ReducePlan, split: Axis):
@@ -182,7 +154,11 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
     lead = (split, *contraction.lead_axes)
     epilogue = list(contraction.epilogue)  # the fused projection (empty for a bare matmul)
 
-    if plan.finalize == "atomic":
+    # The cross-CTA MOVE derives from the one placement-keyed selector (ReduceStage.combine over
+    # the GRID stage) — this rewrite only realizes it; the carrier / projection legality raises
+    # below stay here (they need the graph context the selector doesn't hold).
+    (cross_move,) = next(st for st in plan.stages if st.level is Level.GRID).combine(warp_size=32)
+    if cross_move is Fold.ATOMIC:
         if isinstance(contraction.atom, AtomKind):
             raise NotImplementedError(
                 "atomic finalize can't accumulate an mma C-fragment (RegStore has no atomicAdd); "
@@ -199,7 +175,7 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
         else:
             atomic_epi = (Write(output=out.name, index=cell, value=acc, atomic=True),)
         part = replace(contraction, lead_axes=lead, epilogue=Body(atomic_epi))
-        return _mapped(part, (split, *grid), name=tile.name)
+        return _mapped(part, (split, *grid), name=tile.name, stage=tile.stage)
 
     # --- deferred kernel finalize: partial writes raw ``acc`` to ``ws[ksplit, *cell]`` -----------
     # The workspace shape MUST match the rank of the index the writes/loads use — ``(ksplit,
@@ -211,7 +187,7 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
     ws_shape = (Dim(plan.cta), *(a.extent for a in grid))
     ws_write = Write(output=ws_name, index=(Var(split.name), *cell), value=acc)
     part = replace(contraction, lead_axes=lead, epilogue=Body((ws_write,)))
-    partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial")
+    partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial", stage=tile.stage)
 
     # --- finalize kernel: seed ``acc``, fold ``ws`` over ``ksplit`` (``as_state_merge``), then the
     # original projection epilogue (or a bare store) — the same additive finalize the residual path uses.
@@ -287,8 +263,10 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
 
     # --- atomic finalize: ONE kernel — each CTA atomicAdds its slice's state into the output
     # (zero-init'd per launch). Additive (single-component) carriers only; the GRID stage is
-    # consumed into the grid (the split becomes a grid axis), no second node.
-    if plan.finalize == "atomic":
+    # consumed into the grid (the split becomes a grid axis), no second node. The move itself
+    # derives from the one placement-keyed selector (ReduceStage.combine).
+    (cross_move,) = next(st for st in plan.stages if st.level is Level.GRID).combine(warp_size=32)
+    if cross_move is Fold.ATOMIC:
         if n_comp != 1:
             raise NotImplementedError("atomic finalize needs an additive (1-component) carrier; the twisted carrier is kernel-only")
         # The kernel's projection epilogue (``mean``'s ``×1/N``, a fused bias/activation, …) rides

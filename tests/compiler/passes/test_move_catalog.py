@@ -65,8 +65,10 @@ def test_schedule_leaf_set_equals_catalog():
     - distinct ``TILE`` values = exactly ``scalar_tile_moves()`` (f32 → no warp moves);
     - the per-cell tile rides serial + the coop/ILP moves (non-output-tiled tier only), no split-K
       (one thread per cell already saturates the 64×64 grid — the occupancy gate);
-    - every tiled tile rides serial × {gmem-direct + the resolved d1 stages} + the divisor-guarded
-      split-K widths on the gmem-direct row only (split partials are gmem-direct).
+    - every tiled tile rides the RESOLVED stage spellings (gmem-direct + the resolver-deduped
+      cp.async / TMA ring depths) × (serial + the divisor-guarded split-K widths) — staging
+      composes with split-K (``_splitk_option`` re-resolves against the sliced inner node and
+      ``030_split`` threads the stage onto the partial).
     """
     from emmy.compiler.pipeline.search.space import coop_reduce_moves, splitk_moves
 
@@ -84,24 +86,29 @@ def test_schedule_leaf_set_equals_catalog():
     assert rows, "no TILE fork was emitted for the matmul"
     tiles = {str(family_value(r, "TILE")) for r in rows}
     assert tiles == set(scalar_tile_moves())
-    # The hand-computed legal product: per-cell = serial + the 5 coop/ILP moves (6 rows); each of
-    # the 20 tiled tiles = gmem-direct × (serial + 6 split moves) + 2 resolved d1 stages × serial.
-    n_percell = 1 + len(coop_reduce_moves())
-    n_tiled = (1 + len(splitk_moves(warp=False))) + 2
-    assert len(rows) == n_percell + 20 * n_tiled, f"got {len(rows)} rows"
     by_tile: dict[str, list[dict]] = {}
     for r in rows:
         by_tile.setdefault(str(family_value(r, "TILE")), []).append(r)
     percell = by_tile[""]
     assert {str(family_value(r, "REDUCE")) for r in percell} == {"", *coop_reduce_moves()}
     assert all(family_value(r, "STAGE") == "" for r in percell), "per-cell has no operand slab to stage (decided-empty)"
-    tiled = by_tile["n16x8/f2x4"]
-    assert {str(family_value(r, "STAGE")) for r in tiled} == {"", "d1/cp", "d1/tma"}, "resolved d1 stages only"
-    splits = {str(family_value(r, "REDUCE")) for r in tiled if family_value(r, "REDUCE")}
-    assert splits == set(splitk_moves(warp=False))
-    assert all(family_value(r, "STAGE") == "" for r in tiled if family_value(r, "REDUCE")), (
-        "split rows are gmem-direct (030_split drops the stage)"
-    )
+    # Every tiled tile is the full (resolved stages) × (serial + split widths) product, the split
+    # rows carrying the SAME stage spellings as the unsplit rows (staging composes with split-K).
+    n_reduces = 1 + len(splitk_moves(warp=False))
+    for tile_spec, tiled in by_tile.items():
+        if not tile_spec:
+            continue
+        stages = {str(family_value(r, "STAGE")) for r in tiled if not family_value(r, "REDUCE")}
+        assert {"", "d1/cp"} <= stages, f"{tile_spec}: missing the base resolved stages: {stages}"
+        # This matmul is BATCHED (a leading literal batch dim in A's gmem index): TMA's 2-D
+        # descriptor box cannot encode the extra dim, so every tma move resolver-declines —
+        # cp.async (whose fill closure carries the dim verbatim) is the only transport offered.
+        assert not any("tma" in s for s in stages), f"{tile_spec}: batched operands must decline TMA: {stages}"
+        splits = {str(family_value(r, "REDUCE")) for r in tiled if family_value(r, "REDUCE")}
+        assert splits == set(splitk_moves(warp=False)), f"{tile_spec}: {splits}"
+        split_stages = {str(family_value(r, "STAGE")) for r in tiled if family_value(r, "REDUCE")}
+        assert split_stages == stages, f"{tile_spec}: split rows must carry the same stage spellings"
+        assert len(tiled) == len(stages) * n_reduces, f"{tile_spec}: {len(tiled)} rows"
 
 
 def test_schedule_leaves_key_tile_by_contraction_axis():

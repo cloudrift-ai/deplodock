@@ -466,7 +466,7 @@ without a re-tune).
 
 Pass files are numerically prefixed so `sorted()` pickup is deterministic. Pick a fresh prefix when adding a rule; the
 loader ignores the prefix itself — it's only for ordering readability. Per-pass authoring invariants are in
-[`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md); the tile passes (`split` → `enumeration` → `assembly`) and the
+[`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md); the tile passes (`010_recognize` → `030_split`) and the
 algebraic moveset are also documented there.
 
 | Pass                      | What rules do                                                                                |

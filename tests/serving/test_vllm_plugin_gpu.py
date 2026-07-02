@@ -37,7 +37,9 @@ def test_vllm_plugin_embed_matches_hf_eager(monkeypatch):
         runner="pooling",
         enforce_eager=True,
         max_model_len=4096,
-        gpu_memory_utilization=0.8,
+        # 0.5 leaves headroom for a desktop session sharing the GPU (vLLM demands util·total
+        # FREE at startup); a 0.6B embed model + kv cache fits in a fraction of it.
+        gpu_memory_utilization=0.5,
         hf_overrides={"architectures": ["EmmyEmbedModel"]},
     )
     outs = llm.embed(texts)

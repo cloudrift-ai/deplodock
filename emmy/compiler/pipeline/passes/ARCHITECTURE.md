@@ -47,13 +47,15 @@ and feeds it into the `Contraction` structural node (`_schedule._contraction_nod
 bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul) is rejected at fork construction, alongside
 `_check_warp_static_k`, instead of failing several passes later:
 
-- a warp / register-tiled `CONTRACTION` contraction → the `(a_load, b_load, acc, epilogue)` operand→role facts
-  (`_atomize.semiring_binding`): the A/B operands bound to roles by which output grid axis each operand's OWN leaf `Load`
+- a `CONTRACTION` contraction → the `(a_load, b_load, acc, epilogue)` operand→role facts
+  (`_atomize.bind_contraction`): the A/B operands bound to roles by which output grid axis each operand's OWN leaf `Load`
   index carries (structural — read off the annotated loop, not a flattened-loop scan), plus the fold accumulator and the
-  projection epilogue. Those facts are stamped straight onto the `Contraction` node at fork-emit (the node is the single
-  source of truth — it re-derives `b_trans` off `b_load`); `_factor.factorize` reads them off the node instead of
-  `lower()`-ing the contraction and pattern-matching the result. A `STAGE` pin follows the same rule: the option
-  builders resolve it against the built node ONCE (`_resolve_warp_stage` / `_resolve_scalar_stage` — transport
+  projection epilogue. The binding now happens ONCE at **recognize time** (`010_recognize._nodify_contraction` — every
+  recognized contraction, per-cell scalar included, is a `Contraction` node with a deferred `TilePlan()`; an unbindable
+  one — a 1-D matvec-shaped output — demotes to `PLANAR` and folds as an ordinary `Reduction`); the schedule fork only
+  swaps the node's `tile` field (`_schedule._contraction_node`), and `_factor.factorize` reads the facts off the node
+  instead of `lower()`-ing the contraction and pattern-matching the result. A `STAGE` pin follows the same rule: the
+  option builders resolve it against the built node ONCE (`_resolve_warp_stage` / `_resolve_scalar_stage` — transport
   eligibility, the slab K-chunk `bk_elems`, the depth clamps) and stamp the resolved `Stage` (or `None`, gmem-direct)
   on the `TileOp`, so the materializer's one staged driver applies it verbatim, deciding nothing.
 - a cooperative / ILP reduce (`PLANAR` / `TWISTED`, or a non-output-tiled `CONTRACTION`) needs **no** binding here — its

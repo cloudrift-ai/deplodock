@@ -221,7 +221,10 @@ def golden_deploy_perf(prior, kernel_filter: str | None = None) -> dict[str, flo
         if not leaves:
             continue
         best_i, _ = prior.pick([s.all_knobs() for s in leaves])
-        out[g.name] = leaves[best_i].latency_us / g.emmy_us
+        ratio = leaves[best_i].latency_us / g.emmy_us
+        # A shape may record several parity entries under one name — compare against the BEST
+        # (fastest) recorded golden, not whichever entry iterates last (max ratio = min emmy_us).
+        out[g.name] = max(out.get(g.name, ratio), ratio)
     return out
 
 

@@ -269,11 +269,11 @@ def _scalar_stage_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
 def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     """The ``TILE_PASSES`` chain RESOLVES the ``STAGE`` codec against the scheduled contraction and
     stamps the resolved ``Stage`` (eligibility + sizing run once, scheduler-side): a ``tma`` pin on a
-    register-tiled scalar matmul resolves to a single-buffer stage with the fit-to-smem ``bk_elems``
-    derived; a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The
-    stamped ``knobs`` codec is the RESOLVED spelling (honest variant identity): the clamped ``d1/tma``
-    for the ``d2/tma`` pin, and the explicit OFF ``""`` when resolution declines — the row must
-    describe the pipeline the kernel actually has."""
+    register-tiled scalar matmul resolves with the depth-aware fit-to-smem ``bk_elems`` derived (the
+    scalar gmem→smem ring — ``depth`` is honored, the K-chunk sized so ``depth`` slots fit 48 KiB);
+    a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The stamped
+    ``knobs`` codec is the RESOLVED spelling (honest variant identity), and the explicit OFF ``""``
+    when resolution declines — the row must describe the pipeline the kernel actually has."""
     from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
 
     monkeypatch.setenv("EMMY_TILE", "n16x16/f2x2")
@@ -282,17 +282,50 @@ def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     # ``STAGE`` is keyed ``@<k_axis>`` (axis-named schedule knob); ``family_value`` reads it.
-    assert family_value(tile_op.knobs, "STAGE") == "d1/tma", tile_op.knobs  # resolved: d2 clamps to d1
+    assert family_value(tile_op.knobs, "STAGE") == "d2/tma", tile_op.knobs  # resolved at the pinned depth
     stage = tile_op.stage
     assert stage is not None and stage.transport == "tma", stage
-    assert stage.depth == 1, stage  # the scalar tier is single-buffer — the pinned d2 is clamped
-    assert stage.bk_elems == 64, stage  # derived fit-to-smem K-chunk (K=64 divides; slab fits 48 KiB)
+    assert stage.depth == 2, stage  # the scalar ring honors the pinned depth (slots fit 48 KiB)
+    assert stage.bk_elems == 64, stage  # derived depth-aware fit-to-smem K-chunk (K=64 divides)
 
     monkeypatch.setenv("EMMY_STAGE", "d1/sync")  # sync is not a contraction transport
     out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     assert family_value(tile_op.knobs, "STAGE") == "", tile_op.knobs  # declined pin stamps the OFF value
     assert tile_op.stage is None, tile_op.stage  # resolved: ineligible pin ⇒ gmem-direct
+
+
+@requires_cuda
+@pytest.mark.parametrize("stage", ["d2/cp/ring", "d3/cp/ring"])
+def test_scalar_ring_matches_gmem_direct_bit_for_bit(monkeypatch, stage):
+    """The SCALAR gmem→smem prefetch ring (``STAGE=d<depth>/cp``, depth ≥ 2) runs the same
+    ``staged_kloop`` phases as the warp ring — the atom contributes only the slab drain — and is a
+    PURE perf transform: bit-identical to the gmem-direct scalar register tile, and the kernel
+    actually rings (cp.async + a multi-slot slab)."""
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    M, N, K = 64, 64, 512
+    rng = np.random.default_rng(1)
+    a = rng.standard_normal((M, K), dtype=np.float32)
+    b = rng.standard_normal((K, N), dtype=np.float32)
+
+    def _go(st: str | None) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("EMMY_TILE", "n16x16/f2x2")
+        monkeypatch.setenv("EMMY_REDUCE", "")
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", st if st else "")
+        be = CudaBackend()
+        compiled = be.compile(_scalar_stage_graph(M, N, K))
+        src = compiled.nodes["o"].op.kernel_source
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, src
+
+    staged, staged_src = _go(stage)
+    gmem, gmem_src = _go(None)
+    assert "cp.async" in staged_src and "__shared__" in staged_src, "the scalar ring must stage via cp.async"
+    assert "cp.async" not in gmem_src, "the gmem-direct baseline must not stage"
+    np.testing.assert_array_equal(staged, gmem)  # bit-identical: staging perturbs nothing
+    np.testing.assert_allclose(staged.reshape(M, N), a @ b, atol=1e-3, rtol=1e-3)
 
 
 def test_warp_matmul_refuses_wspec_while_inert(monkeypatch, caplog) -> None:
@@ -304,6 +337,7 @@ def test_warp_matmul_refuses_wspec_while_inert(monkeypatch, caplog) -> None:
     from emmy.compiler.ir.tile import TileOp  # noqa: PLC0415
 
     monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")  # warp (mma) tier
+    monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is the WSPEC refusal, not the split fork
     monkeypatch.setenv("EMMY_STAGE", "d2/cp")
     monkeypatch.setenv("EMMY_WSPEC", "p2:q8")
     with caplog.at_level(_logging.WARNING):
@@ -914,10 +948,8 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -952,6 +984,7 @@ def test_register_double_buffer_matches_single_buffer_bit_for_bit(monkeypatch, t
 
     def _go(stage: str) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
+        monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the subject is the p2 double-buffer, not the split fork
         monkeypatch.setenv("EMMY_STAGE", stage)
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
@@ -984,10 +1017,8 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1021,10 +1052,8 @@ def test_tma_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1118,6 +1147,45 @@ def test_mma_splitk_finalize(monkeypatch, finalize):
     out = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"]).reshape(m, n)
     ref = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(out.astype(np.float32), ref, rtol=2e-2, atol=2e-2)
+
+
+@requires_sm90
+@requires_cuda
+@pytest.mark.parametrize("transport", ["cp", "tma"])
+def test_staged_splitk_matches_gmem_direct_bit_for_bit(monkeypatch, transport):
+    """Operand staging composes with split-K: the ``STAGE`` resolved against the SLICED inner node
+    threads onto the split partial (``030_split``), whose K-loop stages its slice through the smem
+    pipeline. A pure perf transform — the staged split is **bit-identical** to the gmem-direct
+    split (same partials, same finalize), and the partial kernel actually stages."""
+    if transport == "tma" and not _supports_tma():
+        pytest.skip("TMA needs sm_90+ (Hopper / Blackwell)")
+    from emmy.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
+
+    m, k, n = 128, 512, 128
+    rng = np.random.default_rng(4)
+    a = (rng.standard_normal((m, k)) * 0.1).astype(np.float16)
+    b = (rng.standard_normal((k, n)) * 0.1).astype(np.float16)
+
+    def _go(stage: str | None) -> tuple[np.ndarray, str]:
+        monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")
+        monkeypatch.setenv("EMMY_REDUCE", "g2k")
+        # The baseline pins STAGE="" (gmem-direct) explicitly — unpinned, the analytic prior may
+        # legitimately pick a staged row (D_stage_* terms), which is not the baseline this test wants.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
+        be = CudaBackend()
+        compiled = be.compile(_splitk_mma_graph(m, k, n))
+        partial_src = compiled.nodes["o__partial"].op.kernel_source  # the deferred-finalize partial kernel
+        got = np.asarray(be.run(compiled, input_data={"a": a, "b": b})[0].outputs["o"])
+        return got, partial_src
+
+    marker = "cp.async" if transport == "cp" else "cp.async.bulk.tensor"
+    staged, staged_src = _go(f"d2/{transport}")
+    gmem, gmem_src = _go(None)
+    assert marker in staged_src and "__shared__" in staged_src, f"the split partial must stage via {transport}"
+    assert "cp.async" not in gmem_src, "the gmem-direct split partial must not stage"
+    np.testing.assert_array_equal(staged, gmem)  # bit-identical: staging perturbs nothing
+    ref = a.astype(np.float32) @ b.astype(np.float32)
+    np.testing.assert_allclose(staged.astype(np.float32).reshape(m, n), ref, rtol=2e-2, atol=2e-2)
 
 
 # =========================================================================== #

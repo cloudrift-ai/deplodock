@@ -21,8 +21,9 @@ regime**: fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise
      ``eval analytic`` and the greedy deploy rank over (fp32 → thread tier, fp16/bf16
      → the warp tier alone; the block-DAG rework moved the scalar↔warp choice to a
      structural fork, so a warp golden ranks within the warp tier, not against
-     scalar rows). Reduce / pointwise trace the snippet to an ``IterDag`` and compose
-     the cooperative-reduce / MAP ``_moves`` offers.
+     scalar rows). Reduce / pointwise trace the snippet and capture the restored
+     schedule fork's rows through the same live-fork capture
+     (``analytic.enumerate_graph``).
   2. Featurize every candidate via ``features.knob_features`` (the ``D_*`` engineered
      features plus ``MMA_tier``, the warp/scalar tier discriminator — the ``S_*`` /
      ``H_*`` shape/regime features are constant within a shape, so they drop out of
@@ -48,7 +49,7 @@ import numpy as np
 
 from emmy.compiler.context import Context
 from emmy.compiler.pipeline.search import features
-from emmy.compiler.pipeline.search.analytic import _enumerate
+from emmy.compiler.pipeline.search.analytic import _enumerate, enumerate_graph
 from emmy.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
     MatmulGoldenConfig,
@@ -72,68 +73,18 @@ def _base(ctx: Context, M: int, N: int, K: int, *, dynamic: bool = False) -> dic
     return base
 
 
-def _dag_from_snippet(snippet: str, ctx: Context):
-    """Trace a golden's torch snippet and lower it through ``LOOP_PASSES`` (option-0
-    greedy resolve, no GPU) to the first ``LoopOp``'s ``IterDag`` — the shape the
-    reduce / pointwise enumeration offers are composed over. Mirrors
-    ``analytic._matmul_dag`` but regime-agnostic: ``torch.sum`` / ``torch.relu`` have
-    no dedicated frontend op, so the dag comes from the real trace, not a hand-built
-    graph. Returns ``None`` if nothing lowers."""
-    from emmy.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
-
+def _snippet_rows(snippet: str, ctx: Context) -> list[dict]:
+    """A non-matmul golden's candidate rows — trace the golden's torch snippet
+    (``torch.sum`` / ``torch.relu`` have no dedicated frontend op, so the graph comes from the real
+    trace) and capture the RESTORED schedule fork's leaf rows via the same live-fork capture the
+    matmul path uses (``analytic.enumerate_graph``). A reduce offers its ``REDUCE@<axis>``
+    partitions; a pointwise kernel forks nothing today, so its pool is empty and the golden is
+    reported un-enumerable (an honest read of the live space, not a reconstruction of the
+    demolished one)."""
     from emmy.commands.trace import graph_from_code  # noqa: PLC0415
-    from emmy.compiler.ir.loop import LoopOp  # noqa: PLC0415
-    from emmy.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
-    from emmy.compiler.pipeline.fork import Fork  # noqa: PLC0415
-    from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
-
-    def _option0(fp):
-        o = fp.options[0]
-        while isinstance(o, Fork) and not o.is_leaf:
-            o = o.expand()[0]
-        return o
 
     graph = graph_from_code(snippet)[0]
-    terminal, _ = Run(pipeline=Pipeline.build(LOOP_PASSES), ctx=ctx).resolve(graph, _option0)
-    loops = [n.op for n in terminal.nodes.values() if isinstance(n.op, LoopOp)]
-    return iter_dag(loops[0]) if loops else None
-
-
-def _reduce_rows(dag) -> list[dict]:
-    """Cooperative-reduce candidate knob rows: the cartesian of the carrier's
-    cooperative ``(bk, fk, br)`` K-partitions (``coop_reduce_offers``) × the free-row
-    register tile (``reduce_reg_offers``), over the free-axis THREAD tile
-    (``coop_free_threads``). The native rows speak the axis-named schedule codecs (``TILE@<axis>`` +
-    ``REDUCE@<axis>``); a 1-D reduce (no outer M axis) leaves the M slot degenerate,
-    which the schema-agnostic ``tile_signature`` matches against the golden's
-    ``BM``/``FM`` = 1."""
-    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
-
-    budget = _moves.Budget()
-    thread = _moves.coop_free_threads(dag)  # free-axis THREAD tile (par)
-    rows = []
-    for bk, fk, br in _moves.coop_reduce_offers(dag):
-        red = _moves.coop_reduce_knobs(dag, (bk, fk, br))  # native REDUCE@<primary>
-        for reg in _moves.reduce_reg_offers(dag, budget, fk):
-            rows.append({**_moves.free_split_knobs(dag, thread, reg), **red})  # par + swept reg
-    return rows
-
-
-def _pointwise_rows(dag) -> list[dict]:
-    """Pointwise (MAP, no reduce) candidate knob rows: the cartesian of the free
-    thread tile (``thread_offers``) × the register tile (``map_reg_offers``). The native
-    rows carry only the free-axis tile (no ``REDUCE@`` — a MAP nest has no contraction);
-    ``tile_signature``'s degenerate reduce decomposition matches the golden's
-    ``BK=FK=SPLITK=BR=1``."""
-    from emmy.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415
-
-    budget = _moves.Budget()
-    rows = []
-    for thread in _moves.thread_offers(dag, budget):
-        thr = _moves.thread_knobs(dag, thread)  # par-only SPLIT
-        for reg in _moves.map_reg_offers(dag, budget):
-            rows.append({**thr, **_moves.reg_knobs(dag, thr, reg)})  # complete SPLIT (par×reg)
-    return rows
+    return enumerate_graph(graph, ctx)
 
 
 def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
@@ -148,8 +99,9 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
     structural fork, so a real fp16 matmul ranks within the warp tier alone, no
     scalar rows in the pool). A dynamic (``.dynM``) golden enumerates its hint-sized
     static twin's pool and featurizes with the symbolic-axis stamp (its own weight
-    set). Reduce / pointwise goldens trace their snippet to an ``IterDag`` and
-    compose the cooperative-reduce / MAP ``_moves`` offers.
+    set). Reduce / pointwise goldens trace their snippet and capture the restored
+    schedule fork's rows (``_snippet_rows``); a regime the live tree doesn't fork
+    (pointwise) reports un-enumerable rather than reconstructing the demolished space.
 
     Each golden is reconstructed under its OWN card's context
     (``Context.from_target(cap, gpu_name=…)``, mirroring ``Sample.from_golden``):
@@ -166,12 +118,10 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
             # The reduce's free axis (the ``M`` rows) maps to the planner's N axis
             # (the tuned ``FN`` register tile sweeps it): trace E_M=1, E_N=M, E_K=K.
             base = _base(ctx, 1, g.M, g.K)
-            dag = _dag_from_snippet(g.snippet(), ctx)
-            rows, tier = (_reduce_rows(dag) if dag is not None else []), "reduce"
+            rows, tier = _snippet_rows(g.snippet(), ctx), "reduce"
         elif isinstance(g, PointwiseGoldenConfig):
             base = _base(ctx, g.M, g.N, 1)
-            dag = _dag_from_snippet(g.snippet(), ctx)
-            rows, tier = (_pointwise_rows(dag) if dag is not None else []), "pointwise"
+            rows, tier = _snippet_rows(g.snippet(), ctx), "pointwise"
         elif isinstance(g, MatmulGoldenConfig):
             dyn = bool(g.dynamic)
             base = _base(ctx, g.M, g.N, g.K, dynamic=dyn)
@@ -205,8 +155,12 @@ def _matrix(feats: list[dict[str, float]], names: list[str]) -> np.ndarray:
 
 
 def rank_of_golden(scores: np.ndarray, gidx: int) -> int:
-    """0-based rank of the golden by descending score (ties count as 'above')."""
-    return int((scores > scores[gidx]).sum())
+    """0-based rank of the golden by descending score. Ties count AGAINST the golden
+    (``>=``): greedy deploy breaks score ties by enumeration order, and option-0 is the
+    per-cell / gmem-direct row — a tie IS a miss at deploy time. (The old ``>`` tie-optimism
+    let a fit with zero ``D_stage_*`` weights report top-1 golden ranks while the deploy pick
+    landed on the per-cell row — the 2026-07-02 sweep's 5-15x regressions.)"""
+    return int((scores >= scores[gidx]).sum()) - 1
 
 
 def topk_table(ranks: list[int], ks=(1, 5, 10, 25, 50, 100)) -> str:

@@ -54,6 +54,7 @@ from emmy.compiler.ir.kernel.ir import (
     Smem,
     Sync,
 )
+from emmy.compiler.ir.schedule import Fold, Level, ReduceStage
 from emmy.compiler.ir.sigma import Sigma
 from emmy.compiler.ir.stmt import Assign, Body, Init, Load, Select, Stmt, StridedLoop
 from emmy.compiler.ir.tile.ir import Contraction, Map, Reduction
@@ -296,6 +297,12 @@ def realize_warp_twist(op, ctx, tail: tuple) -> tuple[list[Stmt], list[Stmt], li
             stream.append(FragmentMask(frag=f, mask_when=BinaryExpr(">=", Var(FRAG_COL), seq), col_base=col_bases[t]))
 
     # ---- the merge, regenerated from the channel spec at fragment residence ------------------- #
+    # The per-block fold move derives from the ONE placement-keyed selector: the streamed block
+    # lives within one warp, so ReduceStage.combine(BLOCK, 32) yields the SHFL move — realized
+    # here at FRAGMENT residence as the FragmentRowReduce __shfl butterfly (the same move
+    # _factor.emit_combine realizes as a WarpShuffle over scalar registers).
+    (row_move,) = ReduceStage(Level.BLOCK, 32).combine(warp_size=32)
+    assert row_move is Fold.SHFL, row_move
     # pivot: the per-block fold (rowmax) then the running update mn = fold(m, rowmax(S)) + rescale α.
     stream.append(FragmentRowReduce(top="_rmx0", bot="_rmx1", frags=sfrags, op=channels[0].fold, group=4))
     stream += _stats("_mn", channels[0].fold, (pivot_name, "_rmx"))

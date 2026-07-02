@@ -242,15 +242,14 @@ def warp_tile_moves(atom_names: tuple[str, ...]) -> list[str]:
 
 def stage_moves(*, warp: bool) -> list[str]:
     """The operand-staging ``STAGE`` codec candidates — gmem-direct ``""`` first (the conservative
-    option-0), then the transport / depth / double-buffer variants. The scalar tier resolves
-    single-buffer today (``_resolve_scalar_stage`` clamps ``depth`` to 1), so only ``d1`` spellings
-    are offered there; the warp tier offers the cp.async ring depths, TMA, and the ``p2``
-    smem→register double-buffer. Emission is resolver-gated in ``_schedule`` — a candidate is
-    offered only when it RESOLVES against the built node, and the row carries the resolved
-    spelling."""
-    if warp:
-        return ["", "d1/cp", "d2/cp/ring", "d3/cp/ring", "d4/cp/ring", "d2/cp/ring/p2", "d1/tma", "d2/tma/ring"]
-    return ["", "d1/cp", "d1/tma"]
+    option-0), then the transport / depth / double-buffer variants. Both tiers offer the gmem→smem
+    prefetch ring depths (the scalar ring lands on the same ``staged_kloop`` phases; its slab
+    K-chunk is depth-aware, derived in ``_resolve_scalar_stage``); the ``p2`` smem→register
+    double-buffer is an ``ldmatrix`` transform, warp-only. Emission is resolver-gated in
+    ``_schedule`` — a candidate is offered only when it RESOLVES against the built node, and the
+    row carries the resolved spelling."""
+    ring = ["", "d1/cp", "d2/cp/ring", "d3/cp/ring", "d4/cp/ring", "d1/tma", "d2/tma/ring", "d3/tma/ring", "d4/tma/ring"]
+    return [*ring, "d2/cp/ring/p2"] if warp else ring
 
 
 # Cross-CTA split-K widths (the ``REDUCE`` codec's ``g<w>`` field). Divisor / occupancy legality is
