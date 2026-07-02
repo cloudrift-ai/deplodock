@@ -48,7 +48,7 @@ from emmy.compiler.ir.atom import AtomKind
 from emmy.compiler.ir.axis import Axis, AxisRole
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.schedule import Level
+from emmy.compiler.ir.schedule import Fold, Level
 from emmy.compiler.ir.sigma import Sigma
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from emmy.compiler.ir.tile import (
@@ -184,7 +184,11 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
     lead = (split, *contraction.lead_axes)
     epilogue = list(contraction.epilogue)  # the fused projection (empty for a bare matmul)
 
-    if plan.finalize == "atomic":
+    # The cross-CTA MOVE derives from the one placement-keyed selector (ReduceStage.combine over
+    # the GRID stage) — this rewrite only realizes it; the carrier / projection legality raises
+    # below stay here (they need the graph context the selector doesn't hold).
+    (cross_move,) = next(st for st in plan.stages if st.level is Level.GRID).combine(warp_size=32)
+    if cross_move is Fold.ATOMIC:
         if isinstance(contraction.atom, AtomKind):
             raise NotImplementedError(
                 "atomic finalize can't accumulate an mma C-fragment (RegStore has no atomicAdd); "
@@ -289,8 +293,10 @@ def rewrite(match: Match, root: Node) -> TileOp | Graph | None:
 
     # --- atomic finalize: ONE kernel — each CTA atomicAdds its slice's state into the output
     # (zero-init'd per launch). Additive (single-component) carriers only; the GRID stage is
-    # consumed into the grid (the split becomes a grid axis), no second node.
-    if plan.finalize == "atomic":
+    # consumed into the grid (the split becomes a grid axis), no second node. The move itself
+    # derives from the one placement-keyed selector (ReduceStage.combine).
+    (cross_move,) = next(st for st in plan.stages if st.level is Level.GRID).combine(warp_size=32)
+    if cross_move is Fold.ATOMIC:
         if n_comp != 1:
             raise NotImplementedError("atomic finalize needs an additive (1-component) carrier; the twisted carrier is kernel-only")
         # The kernel's projection epilogue (``mean``'s ``×1/N``, a fused bias/activation, …) rides

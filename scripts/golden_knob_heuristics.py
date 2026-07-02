@@ -155,8 +155,12 @@ def _matrix(feats: list[dict[str, float]], names: list[str]) -> np.ndarray:
 
 
 def rank_of_golden(scores: np.ndarray, gidx: int) -> int:
-    """0-based rank of the golden by descending score (ties count as 'above')."""
-    return int((scores > scores[gidx]).sum())
+    """0-based rank of the golden by descending score. Ties count AGAINST the golden
+    (``>=``): greedy deploy breaks score ties by enumeration order, and option-0 is the
+    per-cell / gmem-direct row — a tie IS a miss at deploy time. (The old ``>`` tie-optimism
+    let a fit with zero ``D_stage_*`` weights report top-1 golden ranks while the deploy pick
+    landed on the per-cell row — the 2026-07-02 sweep's 5-15x regressions.)"""
+    return int((scores >= scores[gidx]).sum()) - 1
 
 
 def topk_table(ranks: list[int], ks=(1, 5, 10, 25, 50, 100)) -> str:

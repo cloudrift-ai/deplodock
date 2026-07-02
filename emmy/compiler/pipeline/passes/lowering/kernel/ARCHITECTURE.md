@@ -170,7 +170,11 @@ A `TWISTED` streaming reduce whose contractions carry mma `TilePlan`s (stamped b
 structural warp-tile read (`_twist.warp_source`) and `realize_warp_twist` produces the `(state, fold, close)` triple
 the one pipeline seals, the kernel warp-collective through the same `lanes` parameter `grid_tile` already takes. This
 is the placement-keyed fold's **fragment row**: where the scalar tier folds in-thread, the fragment tier's per-block
-fold is a `FragmentRowReduce` `__shfl` butterfly over the C-fragment lanes. Everything realizes from structure — the
+fold is a `FragmentRowReduce` `__shfl` butterfly over the C-fragment lanes. The fold MOVE itself is never re-decided
+per site: `ReduceStage.combine` (`ir/schedule.py`) is the ONE placement-keyed selector — within-warp → `SHFL`,
+within-block → `SHFL`+`SMEM` tree, cross-CTA → `ATOMIC`/`KERNEL` — and every emitter consumes its output
+(`emit_combine` at scalar residence, this realizer at fragment residence, `030_split` as the graph rewrite); only the
+residence-specific realization differs. Everything realizes from structure — the
 head contraction's `ldmatrix`/`mma.sync` off its node geometry (`_frag_contraction`); the score prologue stmt-by-stmt
 (`Assign` → `FragmentApply`, a coordinate `Select` → `FragmentMask` with the keep-predicate negated, loop-invariant
 constant `Load`s hoisted); the streaming merge REGENERATED from the carrier's channel spec (pivot → rowmax + running

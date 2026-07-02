@@ -249,7 +249,10 @@ class Tile(Stmt):
 
     def pretty(self, indent: str = "") -> list[str]:
         names = ", ".join(a.name for a in self.axes)
-        return [f"{indent}Tile[{names}] (N={self.n_elements})", *pretty_body(self.body, indent + INDENT)]
+        # A symbolic grid (dynamic seq_len) prints its Dim product — ``n_elements`` would raise,
+        # and ``pretty`` feeds ``structural_key`` / the op-inventory persist, so it must stay total.
+        n = self.n_elements if self.is_static_grid else self.n_dim
+        return [f"{indent}Tile[{names}] (N={n})", *pretty_body(self.body, indent + INDENT)]
 
     def render(self, ctx: RenderCtx) -> list[str]:
         pad = _pad(ctx.indent)

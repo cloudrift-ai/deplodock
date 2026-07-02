@@ -370,13 +370,19 @@ class Level(enum.Enum):
 
 
 class Fold(enum.Enum):
-    """The per-level combine *mechanism* — derived from the :class:`Level`, not tuned."""
+    """The per-level combine *mechanism* — the placement-keyed fold MOVE, derived from the
+    :class:`Level` (where the reduced axis sits), never tuned and never re-decided at a consumer.
+    :meth:`ReduceStage.combine` is the ONE selector; every fold emitter consumes its output —
+    ``_factor.emit_combine`` (SHFL butterfly / SMEM tree at scalar residence), ``_twist``'s
+    streaming merge (the same SHFL move realized as a ``FragmentRowReduce`` at fragment
+    residence), and ``030_split`` (the cross-CTA ATOMIC / KERNEL finalize as a graph rewrite)."""
 
     SERIAL = "serial"  # no cross-unit combine (the serial / reg remainder)
     REG = "reg"  # register tree (ILP) — TODO(reg)
-    SHFL = "shfl"  # lane-level ``__shfl_xor_sync`` butterfly
-    SMEM = "smem"  # cross-warp / block-wide smem tree-halve
-    ATOMIC = "atomic"  # cross-CTA ``atomicAdd`` finalize — TODO(cta), 030_split only
+    SHFL = "shfl"  # lane-level ``__shfl_xor_sync`` butterfly (within-warp)
+    SMEM = "smem"  # cross-warp / block-wide smem tree-halve (within-block)
+    ATOMIC = "atomic"  # cross-CTA ``atomicAdd`` finalize (030_split's one-kernel arm)
+    KERNEL = "kernel"  # cross-CTA workspace + deferred sibling combine kernel (030_split)
 
 
 @dataclass(frozen=True)
@@ -397,10 +403,13 @@ class ReduceStage:
     finalize: str = "kernel"  # GRID only: "atomic" | "kernel" (the g<n> finalize letter)
 
     def combine(self, *, warp_size: int, segmented: bool = False) -> tuple[Fold, ...]:
-        """The derived per-level combine fold(s), fine→coarse within this stage.
+        """The derived per-level combine fold(s), fine→coarse within this stage — the ONE
+        placement-keyed move selector every fold emitter consumes (see :class:`Fold`).
 
         - ``SERIAL`` / ``REG`` → ``()`` (no cross-unit combine; REG-fold is TODO(reg)).
-        - ``GRID`` → ``(ATOMIC,)`` (the split-K finalize — emitted by ``030_split``).
+        - ``GRID`` → ``(ATOMIC,)`` or ``(KERNEL,)`` per the ``finalize`` letter (the split-K
+          cross-CTA move — consumed by ``030_split``; the carrier / projection legality raises
+          stay with the graph rewrite, which alone holds the context).
         - ``BLOCK`` → the intra-CTA hierarchy: a lone ``SHFL`` when ``segmented`` (the
           per-row segmented butterfly for strided-cooperative rows) or ``width ≤ warp``
           (one warp); ``(SHFL, SMEM)`` when ``width`` is a clean warp multiple (lanes then
@@ -409,7 +418,7 @@ class ReduceStage:
         if self.level in (Level.SERIAL, Level.REG):
             return ()
         if self.level is Level.GRID:
-            return (Fold.ATOMIC,)
+            return (Fold.ATOMIC,) if self.finalize == "atomic" else (Fold.KERNEL,)
         # BLOCK.
         w = self.width
         if w & (w - 1):
