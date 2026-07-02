@@ -260,10 +260,17 @@ def _tile_base(mn: tuple[Side, Side]) -> tuple[Expr, Expr]:
     return tuple(BinaryExpr("*", Var(s.block), Literal(s.tile, "int")) for s in mn)
 
 
-def _box_coords(tile_base: Expr, is_row: bool):
-    """The TMA box origin at K-chunk ``k0`` — ``(tile_base, k0)`` when the tile axis is the slab ROW (A),
-    ``(k0, tile_base)`` when it is the COL (B)."""
-    return (lambda k0: (tile_base, k0)) if is_row else (lambda k0: (k0, tile_base))
+def _box_origin(operand_index, *, tile: Side, tile_base: Expr, k_axis):
+    """The TMA box origin at K-chunk ``k0`` — the operand's OWN gmem index evaluated (σ) at the
+    tile base and ``k0``, so an offset operand (a split-K partial's ``ksplit·(K/w) + k``) lands
+    the box at its absolute coordinates. For a canonical operand this is exactly ``(tile_base,
+    k0)`` (A, tile axis the slab row) / ``(k0, tile_base)`` (B)."""
+
+    def at(k0):
+        sig = Sigma({tile.axis.name: tile_base, k_axis.name: k0})
+        return tuple(sig.apply(e) for e in operand_index)
+
+    return at
 
 
 def _slab_operands(*, index_srcs: tuple, bufs: tuple[str, str], mn: tuple[Side, Side], k_axis, bk_elems: int, base: tuple[Expr, Expr]):
@@ -281,7 +288,7 @@ def _slab_operands(*, index_srcs: tuple, bufs: tuple[str, str], mn: tuple[Side, 
                 tag=tag,
                 buf=bufs[i],
                 shape=shape,
-                coords=_box_coords(tile_base, is_row),
+                coords=_box_origin(index_srcs[i], tile=tile, tile_base=tile_base, k_axis=k_axis),
                 index=_slab_index(index_srcs[i], tile=tile, tile_base=tile_base, k_axis=k_axis, tile_is_row=is_row),
             )
         )
@@ -526,7 +533,9 @@ def _scalar_protected(c: Contraction) -> frozenset[str]:
     return frozenset(prot)
 
 
-def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str, bk_elems: int, base: tuple[Expr, Expr]) -> Loop:
+def _scalar_drain(
+    c: Contraction, cells, offset, slabs: tuple[str, str], ki: str, bk_elems: int, base: tuple[Expr, Expr], offs=(None, None)
+) -> Loop:
     """The inner slab-drain reduce loop ``for ki: b = b_slab[ki, n_local]; a = a_slab[m_local, ki];
     v = a·b; acc += v`` — the scalar counterpart of the mma ``ldmatrix`` drain. Built per-cell directly
     (NOT via the masked gmem-direct σ, whose ``% extent`` wrap would corrupt the slab index for an
@@ -535,8 +544,11 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
     clamped / zero-filled slab row and its store is discarded by the guard. ``_dedup_loads`` still
     shares A across the n-cells and B across the m-cells exactly as gmem-direct does. **Carrier-less**
     (no ``Loop.carrier``): the accumulators are pre-seeded once by :meth:`_ScalarOps.state` outside the
-    outer slab loop, so the drain folds into them without re-seeding."""
+    outer slab loop, so the drain folds into them without re-seeding. ``offs`` (the gmem→smem ring,
+    depth > 1) is the ``(a, b)`` read SLOT row offset pair, added to each slab's ROW — the same slot
+    seam the mma drain rides."""
     (a_slab, b_slab), (row_base, col_base) = slabs, base
+    off_a, off_b = offs
     b_name, a_name = c.b_load.names[0], c.a_name
     body: list[Stmt] = []
     for i, j in cells:
@@ -544,8 +556,10 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
         bn, an, vn, cn = f"{b_name}{sfx}", f"{a_name}{sfx}", f"{c.acc}__v{sfx}", f"{c.acc}{sfx}"
         m_local = BinaryExpr("-", offset[0].base(i), row_base)
         n_local = BinaryExpr("-", offset[1].base(j), col_base)
-        body.append(Load(names=(bn,), input=b_slab, index=(Var(ki), n_local)))
-        body.append(Load(names=(an,), input=a_slab, index=(m_local, Var(ki))))
+        k_row = Var(ki) if off_b is None else BinaryExpr("+", off_b, Var(ki))
+        m_row = m_local if off_a is None else BinaryExpr("+", off_a, m_local)
+        body.append(Load(names=(bn,), input=b_slab, index=(k_row, n_local)))
+        body.append(Load(names=(an,), input=a_slab, index=(m_row, Var(ki))))
         body.append(Assign(name=vn, op=_MUL, args=(bn, an)))
         body.append(Accum(name=cn, value=vn, op=_ADD, axes=(ki,)))
     body = _dedup_loads(body)
@@ -707,11 +721,13 @@ class _ScalarOps(_AtomOps):
         """The slab element dtype — the gmem operand's own dtype (fp32 SGEMM stages fp32)."""
         return self.inputs[self.c.a_operand.input].dtype
 
-    def staged_drain(self, operands, slot, cells, offset, mn):  # noqa: ARG002 — slot: single-buffer (no ring)
+    def staged_drain(self, operands, slot, cells, offset, mn):
         """The scalar slab drain — the plain-``Load`` fma leaf (:func:`_scalar_drain`), reading by
-        LOCAL tile coords; ``slot`` is unused (the scalar tier is single-buffer, ``depth == 1``)."""
+        LOCAL tile coords over ring ``slot`` (the ``depth >= 2`` gmem→smem ring offsets each slab's
+        row by the slot, exactly as the mma drain does)."""
         a_op, b_op = operands
-        return [_scalar_drain(self.c, cells, offset, (a_op.slab, b_op.slab), "_ki", self.stage.bk_elems, _tile_base(mn))]
+        offs = tuple(op.slot_row(slot) for op in operands)
+        return [_scalar_drain(self.c, cells, offset, (a_op.slab, b_op.slab), "_ki", self.stage.bk_elems, _tile_base(mn), offs)]
 
     def state(self, cells):
         """The scalar accumulator seeds. Gmem-direct (unstaged): none — the accumulators are seeded

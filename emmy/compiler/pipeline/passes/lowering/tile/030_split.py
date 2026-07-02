@@ -118,15 +118,17 @@ def _carrier_identities(carrier) -> dict[str, float]:
     return {s.name: s.op.identity for s in carrier.merge if isinstance(s, Accum)}
 
 
-def _mapped(op, grid, *, name: str = "", tier=None) -> TileOp:
+def _mapped(op, grid, *, name: str = "", tier=None, stage=None) -> TileOp:
     """A **mapped** ``TileOp`` wrapping ``op`` over ``grid`` (so ``_schedule`` skips it). ``tier``
-    preserves a contraction's scalar output tier (:class:`TilePlan`); a residual reduce partition
-    rides the op's :class:`Reduction` **node** (:func:`nodify_reduce`), not a ``TileOp`` field."""
+    preserves a contraction's scalar output tier (:class:`TilePlan`); ``stage`` threads the
+    scheduler-resolved operand :class:`Stage` onto a split partial (resolved against the sliced
+    inner node by ``_splitk_option``); a residual reduce partition rides the op's
+    :class:`Reduction` **node** (:func:`nodify_reduce`), not a ``TileOp`` field."""
     place = Placement(free=tuple(grid), grid=tuple(grid))
     kw: dict = {}
     if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
         kw["tier"] = tier
-    return TileOp(op=op, name=name, place=place, **kw)
+    return TileOp(op=op, name=name, place=place, stage=stage, **kw)
 
 
 def _projection_distributes(body, states: tuple[str, ...]) -> bool:
@@ -199,7 +201,7 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
         else:
             atomic_epi = (Write(output=out.name, index=cell, value=acc, atomic=True),)
         part = replace(contraction, lead_axes=lead, epilogue=Body(atomic_epi))
-        return _mapped(part, (split, *grid), name=tile.name)
+        return _mapped(part, (split, *grid), name=tile.name, stage=tile.stage)
 
     # --- deferred kernel finalize: partial writes raw ``acc`` to ``ws[ksplit, *cell]`` -----------
     # The workspace shape MUST match the rank of the index the writes/loads use — ``(ksplit,
@@ -211,7 +213,7 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
     ws_shape = (Dim(plan.cta), *(a.extent for a in grid))
     ws_write = Write(output=ws_name, index=(Var(split.name), *cell), value=acc)
     part = replace(contraction, lead_axes=lead, epilogue=Body((ws_write,)))
-    partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial")
+    partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial", stage=tile.stage)
 
     # --- finalize kernel: seed ``acc``, fold ``ws`` over ``ksplit`` (``as_state_merge``), then the
     # original projection epilogue (or a bare store) — the same additive finalize the residual path uses.

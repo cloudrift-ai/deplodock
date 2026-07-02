@@ -37,32 +37,42 @@ def _matmul_graph(M: int, N: int, K: int, dtype: str):
     return g
 
 
-def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:
-    """Reconstruct the planner's matmul enumeration for a shape — the SAME candidate rows the
-    scheduler's fork tree offers a live compile, captured by resolving the shape through
-    ``TILE_PASSES`` with a decide that flattens the contraction fork's leaves (each leaf's knob row
-    keyed ``FAMILY@<k_axis>``, exactly what ``tile_signature`` joins a golden against). The second
-    element is kept for the historic ``(rows, knob_names)`` shape — no caller reads it."""
+def enumerate_graph(graph, ctx: Context, *, family: str = "") -> list[dict]:
+    """The planner's candidate enumeration for any ``graph`` — the SAME rows the scheduler's fork
+    tree offers a live compile, captured by resolving the graph through ``TILE_PASSES`` with a
+    decide that flattens each fork's leaves (each leaf's knob row keyed ``FAMILY@<axis>``, exactly
+    what ``tile_signature`` joins a golden against). ``family`` keeps only rows carrying that knob
+    family (``"TILE"`` for a contraction pool); ``""`` keeps every row with an axis-named schedule
+    knob (a reduce's ``REDUCE@<axis>`` fork). The one live-fork capture the matmul
+    :func:`_enumerate` and the offline fitter (``scripts/golden_knob_heuristics.py``) share."""
     from emmy.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
     from emmy.compiler.pipeline.fork import Fork, flatten_leaves  # noqa: PLC0415
     from emmy.compiler.pipeline.knob import family_of  # noqa: PLC0415
     from emmy.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     rows: list[dict] = []
+    wanted = (family,) if family else ("TILE", "REDUCE", "STAGE")
 
     def decide(fp):
         leaves = flatten_leaves(fp.options)
         for leaf in leaves:
             row = dict(getattr(leaf, "knobs", None) or {})
-            if any(family_of(k) == "TILE" for k in row):
+            if any(family_of(k) in wanted and "@" in k for k in row):
                 rows.append(row)
         option = fp.options[0]
         while isinstance(option, Fork) and not option.is_leaf:
             option = option.expand()[0]
         return option
 
-    Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_matmul_graph(M, N, K, dtype), decide)
-    return rows, ()
+    Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(graph, decide)
+    return rows
+
+
+def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:
+    """Reconstruct the planner's matmul enumeration for a shape (:func:`enumerate_graph` over the
+    bare matmul graph, TILE-family rows). The second element is kept for the historic
+    ``(rows, knob_names)`` shape — no caller reads it."""
+    return enumerate_graph(_matmul_graph(M, N, K, dtype), ctx, family="TILE"), ()
 
 
 def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = False) -> Callable[[dict], float]:

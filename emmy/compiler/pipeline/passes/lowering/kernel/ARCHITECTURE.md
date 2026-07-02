@@ -147,13 +147,21 @@ stripe the tile's rows, each folds its row's statistic into a stat smem row, one
 reads the bridged values back from the stat rows. The prologue is a one-shot `SyncTransport.prologue`, ahead of the
 staged K-loop.
 
-The **scalar** contraction tier stages too, under the same `STAGE` pin, through the **same** `_staged` driver — the
-scheduler's `_resolve_scalar_stage` sizes the slab (single-buffer; the derived fit-to-smem K-chunk `bk_elems`, not a
-codec field) and its `staged_drain` is the plain-`Load` inner loop (`_scalar_drain`). The nested outer-slab / inner-drain
-accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer loop)
-and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA
-zero-fills /
-cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged (no pin) is byte-identical gmem-direct.
+The **scalar** contraction tier stages too, under the same `STAGE` codec, through the **same** `_staged` driver — the
+scheduler's `_resolve_scalar_stage` sizes the slab (the depth-aware fit-to-smem K-chunk `bk_elems`, not a codec field;
+the depth steps down when no chunk fits) and its `staged_drain` is the plain-`Load` inner loop (`_scalar_drain`,
+reading the ring slot via the same slot-row seam as the mma drain). `depth >= 2` is the scalar gmem→smem prefetch
+ring — the identical `staged_kloop` cp.async / TMA-mbarrier phases the warp tier runs; only `p<n>` (the
+smem→register double-buffer) stays warp-only (an `ldmatrix` transform). The nested outer-slab / inner-drain
+accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer
+loop) and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA
+zero-fills / cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged is byte-identical
+gmem-direct.
+
+**Split-K composes with staging.** `_splitk_option` resolves a `STAGE` spec against the SLICED inner `Contraction`
+(the `kslice` extent + the `ksplit`-offset operand indices) and `030_split` threads the resolved `Stage` onto its
+partial `TileOp`s, so the partial kernel's K-loop stages its slice through the same pipeline (the TMA box origin is
+the operand's own index evaluated at the tile base — an offset operand lands the box at absolute coordinates).
 
 ## The fragment realizer (`_twist.py`) — a TWISTED carrier at warp-fragment residence
 

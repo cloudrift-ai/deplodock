@@ -371,9 +371,9 @@ def _tile_rows(kernel, place) -> tuple[list[dict], str]:
             _check_warp_static_k(kernel, plan)  # a PIN with an indivisible K-step raises (the pin contract)
         for stage in _stage_candidates(kernel, probe, plan):
             for red in _reduce_candidates(kernel, place, plan):
-                needs_split = bool(red) and ReducePlan.parse(red).needs_split
-                if needs_split and stage:
-                    continue  # split partials are gmem-direct (030_split drops the stage) — no staged split rows
+                # A staged split row is legal: ``_splitk_option`` re-resolves the stage against the
+                # SLICED inner node (the warp slice divisibility already held in
+                # ``_reduce_candidates``) and ``030_split`` threads it onto the partial kernel.
                 # Every family key is explicit — ``""`` is a DECIDED empty (per-cell / serial /
                 # gmem-direct), distinguishable from an absent (never-offered) family. The
                 # evidence pick's prefix-consistency depends on it: an absent key reads as
@@ -493,7 +493,12 @@ def _resolve_warp_stage(c: Contraction, stage: Stage) -> Stage | None:
     a_nbytes = atom.operand_dtype("a").nbytes
     bk = c.tile.bk
     m, n = c.m, c.n
-    tma_ok = _can_stage_warp_tma(stage, c.k_axis, n.axis, n.tile, bk, atom.atom_k, a_nbytes, n.mask, c.b_trans)
+    # The TMA descriptor's box is 2-D over the operand's own array — a batched (or
+    # leading-literal-indexed) operand has more gmem dims than the box and cannot encode. cp.async
+    # has no descriptor (its fill closure carries the extra index dims verbatim), so it stays
+    # eligible for those.
+    tma_rank_ok = isinstance(c.a_operand, Load) and len(c.a_operand.index) == 2 and len(c.b_load.index) == 2
+    tma_ok = tma_rank_ok and _can_stage_warp_tma(stage, c.k_axis, n.axis, n.tile, bk, atom.atom_k, a_nbytes, n.mask, c.b_trans)
     cp_ok = (not tma_ok) and _can_stage_warp(stage, c.k_axis, m.tile, n.tile, bk, atom.atom_k, m.mask, n.mask, c.b_trans)
     if not (tma_ok or cp_ok):
         return None
@@ -509,21 +514,38 @@ def _resolve_scalar_stage(c: Contraction, stage: Stage, inputs) -> Stage | None:
     is ``tma`` / ``cp.async`` and K is static (a computed-A contraction never reaches here — it keeps
     the ``Map`` form). A masked (overhanging) M / N is fine — the drain reads the slab by LOCAL tile
     coords and the overhanging store is guarded, so TMA zero-fills the box overhang and cp.async
-    clamps the gmem read. The slab K-chunk ``bk_elems`` is **derived** to fit a single
-    ``tile_m×bk + bk×tile_n`` operand slab in 48 KiB (largest power-of-two dividing K; ``inputs``
-    supplies the element dtype) — not spelled by a codec, so no schema change. The resolved stage is
-    single-buffer (``depth == 1``; the scalar gmem→smem ring is a follow-on)."""
+    clamps the gmem read. The slab K-chunk ``bk_elems`` is **derived** to fit ``depth``
+    ``tile_m×bk + bk×tile_n`` operand slots in 48 KiB (largest power-of-two dividing K; ``inputs``
+    supplies the element dtype) — not spelled by a codec, so no schema change. ``depth >= 2`` is the
+    scalar gmem→smem prefetch ring — the same ``staged_kloop`` phases the warp tier runs, the atom
+    contributing only the slab drain; when no K-chunk fits at the requested depth, the depth steps
+    down (a smaller ring beats gmem-direct), single-buffer last. ``reg_depth`` stays 1 (the
+    smem→register double-buffer is an ``ldmatrix`` transform, no scalar counterpart)."""
     if not c.k_axis.extent.is_static or stage.transport not in ("tma", "cp.async"):
         return None
     if not inputs or c.a_operand.input not in inputs:
         return None
+    # TMA's 2-D descriptor box cannot encode a batched / leading-literal-indexed operand (extra
+    # gmem dims); cp.async's fill closure carries them verbatim, so only TMA is gated on rank.
+    if stage.transport == "tma" and (len(c.a_operand.index) != 2 or len(c.b_load.index) != 2):
+        return None
+    # Staging needs the CTA to BE one (tile_m × tile_n) output tile (the cooperative fill / drain
+    # contract). A register-only tile (units 1×1, ``block_threads`` None) launches the scalar
+    # default block over unrelated cells — no CTA-shared slab to fill; stay gmem-direct.
+    if c.block_threads is None:
+        return None
     K = c.k_axis.extent.as_static()
     elem_bytes = inputs[c.a_operand.input].dtype.nbytes
-    cap = (48 * 1024) // (max(1, c.m.tile + c.n.tile) * elem_bytes)
-    bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
+    depth, bk_elems = max(1, stage.depth), 0
+    while depth >= 1:
+        cap = (48 * 1024) // (depth * max(1, c.m.tile + c.n.tile) * elem_bytes)
+        bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
+        if bk_elems >= 4:
+            break
+        depth -= 1
     if bk_elems < 4:
         return None
-    return replace(stage, depth=1, ring=False, reg_depth=1, bk_elems=bk_elems)
+    return replace(stage, depth=depth, ring=stage.ring and depth >= 2, reg_depth=1, bk_elems=bk_elems)
 
 
 def _wspec_workers(stage) -> tuple[WarpSpec | None, str]:
@@ -612,7 +634,7 @@ def _factor_k(k_axis: Axis, w: int) -> tuple[Axis, Axis, Sigma]:
     return ksplit, kslice, sigma
 
 
-def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knobs: dict) -> TileOp:
+def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
     """One scheduled **split-K** contraction ``TileOp``: the structural ``Reduction(axis=ksplit,
     source=Contraction(k_axis=kslice))``. The inner :class:`Contraction` is the **same** node a
     non-split matmul builds (:func:`_contraction_node`, so it factorizes through ``_factor`` to mma or
@@ -625,7 +647,12 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
     (which reads the carrier's identity + ``as_state_merge``) needs no change. The output tile
     (``tier``) rides the inner ``Contraction``; the ``Reduction`` holds only the K partition.
 
-    Knob keying: ``TILE`` / ``REDUCE`` are stamped on the **original** k-axis name (not
+    An operand ``stage_spec`` is RESOLVED against the **sliced** inner node (its ``kslice`` extent +
+    offset operand indices), so eligibility is judged on the pipeline the partial kernel actually
+    runs; ``030_split`` threads the resolved ``Stage`` onto its partial ``TileOp``. The honest-
+    stamping rule applies (the resolved spelling, or the decided-empty ``""`` on decline).
+
+    Knob keying: ``TILE`` / ``REDUCE`` / ``STAGE`` are stamped on the **original** k-axis name (not
     ``ksplit`` / ``kslice``), keeping the kernel single-eligible-axis so golden bare-collapse + the
     prior featurizer stay invariant vs the residual/golden spelling."""
     wt = TilePlan.parse(tile_spec)
@@ -648,14 +675,16 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
         a_operand=replace(inner.a_operand, index=tuple(sigma.apply(e) for e in inner.a_operand.index)),
         b_load=replace(inner.b_load, index=tuple(sigma.apply(e) for e in inner.b_load.index)),
     )
+    stage = None
+    if stage_spec:
+        st = Stage.parse(stage_spec)
+        stage = _resolve_warp_stage(inner, st) if wt.is_warp else _resolve_scalar_stage(inner, st, tile.inputs)
     carrier = Accum(name=inner.acc, value=f"{inner.acc}__v", op=ElementwiseImpl("add"), dtype=F32).as_carrier()
     op = Reduction(carrier=carrier, axis=ksplit, role=AxisRole.CONTRACTION, source=inner, reduce=ReducePlan.parse(split_spec))
     kaxis = reduce_loop(tile.op).axis.name  # the ORIGINAL k-axis name — single-eligible-axis keying
-    # No STAGE on a split-K kernel: ``030_split`` drops ``stage`` from its partial ``TileOp``s (the
-    # partials are gmem-direct), so resolving/stamping a pin here would record a pipeline no kernel
-    # has. Threading the stage through the split is a follow-up; the stamp returns with it.
-    stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec, _at(STAGE, kaxis): ""}
-    return TileOp(op=op, name=name, place=place, tier=inner.tile, knobs=stamped)
+    stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec}
+    stamped[_at(STAGE, kaxis)] = stage.spell() if stage is not None else ""
+    return TileOp(op=op, name=name, place=place, tier=inner.tile, stage=stage, knobs=stamped)
 
 
 def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str = "") -> TileOp:
@@ -779,7 +808,7 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> Fork | list[TileOp] | Tile
             stage_spec = row.get(_at(STAGE, kaxis), "")
             red = row.get(_at(REDUCE, kaxis), "")
             if red and ReducePlan.parse(red).needs_split:
-                return _splitk_option(tile, place, spec, red, name, knobs)
+                return _splitk_option(tile, place, spec, red, name, knobs, stage_spec)
             if is_warp_codec(spec):
                 return _warp_option(tile, place, spec, name, knobs, stage_spec)
             return _tile_option(tile, place, spec, name, knobs, red, stage_spec)
