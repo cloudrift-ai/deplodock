@@ -10,6 +10,14 @@ configs:
     emmy_us: 9.0
     cublas_us: 14.5
   - kernel: matmul
+    name: square.512
+    M: 512
+    N: 512
+    K: 512
+    knobs: {TILE: 'n32x8/f2x4', STAGE: 'd2/tma/ring'}
+    emmy_us: 9.4
+    cublas_us: 14.5
+  - kernel: matmul
     name: square.1024
     M: 1024
     N: 1024
@@ -47,8 +55,8 @@ configs:
     N: 512
     K: 512
     dtype: fp16
-    knobs: {TILE: 'a:mma_m16n8k16_f16/w4x4/f1x1/k4', STAGE: 'd2/tma/ring'}
-    emmy_us: 4.1
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x2/f2x2', STAGE: 'd4/tma/ring'}
+    emmy_us: 5.4
     cublas_us: 6.2
   - kernel: matmul
     name: square.1024.fp16
@@ -65,8 +73,8 @@ configs:
     N: 1024
     K: 1024
     dtype: fp16
-    knobs: {TILE: 'a:mma_m16n8k16_f16/w4x4/f2x2/k8', WARPSPEC: true}
-    emmy_us: 17.3
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x2/f2x4', STAGE: 'd4/tma/ring'}
+    emmy_us: 21.9
     cublas_us: 17.0
   - kernel: matmul
     name: square.2048.fp16
@@ -92,17 +100,8 @@ configs:
     N: 4096
     K: 4096
     dtype: fp16
-    knobs: {TILE: 'a:mma_m16n8k16_f16/w1x4/f4x2/k2', WARPSPEC: true}
-    emmy_us: 746.3
-    cublas_us: 765.0
-  - kernel: matmul
-    name: square.4096.fp16
-    M: 4096
-    N: 4096
-    K: 4096
-    dtype: fp16
-    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x4/f2x4/k2', STAGE: 'd2/tma/ring', WARPSPEC: true}
-    emmy_us: 727.7
+    knobs: {TILE: 'a:mma_m16n8k16_f16/w2x2/f4x8', STAGE: 'd4/tma/ring'}
+    emmy_us: 744.7
     cublas_us: 728.0
   - kernel: matmul
     name: qwen3_06b.q_proj.s32
@@ -289,8 +288,8 @@ configs:
     N: 512
     K: 512
     dynamic: {seq_len: {input: x0, axis: 0}}
-    knobs: {TILE: 'n16x16/f2x4', STAGE: 'd3/tma/ring'}
-    emmy_us: 11.0
+    knobs: {TILE: 'n16x8/f4x4', STAGE: 'd2/tma/ring'}
+    emmy_us: 8.2
     cublas_us: 14.0
   - kernel: matmul
     name: qwen3_06b.q_proj.s512.dynM
