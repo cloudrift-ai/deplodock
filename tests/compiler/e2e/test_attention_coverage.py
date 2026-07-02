@@ -1,4 +1,4 @@
-"""Attention coverage — flash (the twisted ``(m, l, O)`` MONOID on the streaming schedule), one file.
+r"""Attention coverage — flash (the twisted ``(m, l, O)`` MONOID on the streaming schedule), one file.
 
 Attention is the hybrid algebra: a SEMIRING contraction (QK^T, P@V) wrapped in a MONOID streaming
 softmax reduce. This file pins every tier of it:
@@ -8,11 +8,10 @@ softmax reduce. This file pins every tier of it:
   static AND dynamic (symbolic ``seq_len``); KV tiling; the default-path guards. This is the ONLY
   flash tier that lowers today — the two-``Contraction`` ``TWISTED`` reduce tree at block=1, through
   the one ``_factor`` contraction path.
-- **tensor-core flash** — **xfailed; capability removed.** The bespoke ``_flash_warp`` warp-chain
-  emitter was a mandate violation (a fourth ``factorize`` path + a shape gate) and was deleted; the
-  rebuild must go through the one ``_factor._bind`` contraction arm (an mma ``TilePlan`` on the Q@K / P@V
-  contractions), not a private emitter. The ``test_generated_tensorcore_flash_*`` / ``test_warp_chain_*``
-  cases assert the deleted warp chain and are xfailed (see ``tests/xfail_registry.py``).
+- **tensor-core flash** — RECOVERED through the one emitter: ``_schedule._twisted_warp_option`` stamps
+  the mma ``TilePlan``\ s on the Q@K / P@V ``Contraction``\ s and the tree realizes at fragment
+  residence (``_twist``) — no private emitter. The ``test_generated_tensorcore_flash_*`` /
+  ``test_warp_chain_*`` cases assert that warp chain.
 - **cooperative-KV flash** (``BR``) — the KV axis split across threads, partial ``(m, l, O)`` states
   merged via the monoid combine. Xfailed pending the rebuild.
 - **validated FA-2 reference** — a hand-written fused tensor-core flash kernel, the executable spec a
@@ -267,12 +266,11 @@ def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
 # Tensor-core flash — XFAILED (capability removed as a deviation).
 # =========================================================================== #
 # These cases expect a fp16/bf16 SDPA to lower to a single ``mma.sync`` kernel (the warp chain:
-# σ-tiled + atomized contractions, fragment online-softmax, C->A smem handoff). That was built as a
-# bespoke ``_flash_warp`` emitter — a fourth ``factorize`` path + a shape gate — and DELETED to
-# restore the mandate; flash now lowers only on the scalar tier, so these assertions (``dpl_mma…`` /
-# ``flash_pv_smem``) fail and are xfailed (see ``tests/xfail_registry.py``). The rebuild must give the
-# Q@K / P@V ``Contraction``s an mma ``TilePlan`` routed through the one ``_factor._bind`` contraction arm — NOT a
-# private emitter — at which point these flip XPASS and their registry entries are deleted.
+# tiled + atomized contractions, fragment online-softmax, C->A smem handoff) — realized through the
+# ONE pipeline: ``_schedule._twisted_warp_option`` stamps the mma ``TilePlan``\ s on the Q@K / P@V
+# ``Contraction``\ s and ``_bind``'s reduce arm realizes the TWISTED carrier at fragment residence
+# (``_twist``). No private emitter exists; a bespoke path would be the mandate violation the
+# demolition removed.
 
 
 def _compile_tc(q, k, v, module=None):

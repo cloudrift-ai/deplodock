@@ -312,10 +312,8 @@ def test_scalar_ring_matches_gmem_direct_bit_for_bit(monkeypatch, stage):
     def _go(st: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", "n16x16/f2x2")
         monkeypatch.setenv("EMMY_REDUCE", "")
-        if st:
-            monkeypatch.setenv("EMMY_STAGE", st)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", st if st else "")
         be = CudaBackend()
         compiled = be.compile(_scalar_stage_graph(M, N, K))
         src = compiled.nodes["o"].op.kernel_source
@@ -950,10 +948,8 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1021,10 +1017,8 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source
@@ -1058,10 +1052,8 @@ def test_tma_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", _WARP_CODEC)
         monkeypatch.setenv("EMMY_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # Pin STAGE="" for the baseline — unpinned, the analytic prior may legitimately stage.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_parity_mma_graph("static", M=M))
         src = compiled.nodes["o"].op.kernel_source

@@ -573,6 +573,11 @@ def _resolve_scalar_stage(c: Contraction, stage: Stage, inputs) -> Stage | None:
         return None
     K = c.k_axis.extent.as_static()
     elem_bytes = inputs[c.a_operand.input].dtype.nbytes
+    # TMA hardware: every box dim must be 1..256 — the slot shapes are A (tile_m, bk) / B (bk,
+    # tile_n), and bk never exceeds 128, so the gate is on the tile widths (an oversized scalar
+    # register tile like tile_n=832 must decline TMA; cp.async has no box).
+    if stage.transport == "tma" and max(c.m.tile, c.n.tile) > 256:
+        return None
     depth, bk_elems = max(1, stage.depth), 0
     while depth >= 1:
         cap = (48 * 1024) // (depth * max(1, c.m.tile + c.n.tile) * elem_bytes)

@@ -29,14 +29,8 @@ from emmy.compiler.context import Context
 from emmy.compiler.graph import Graph, Tensor
 from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.kernel.ir import KernelOp, Smem
+from emmy.compiler.ir.tile.ir import TileOp
 from emmy.compiler.pipeline import LoweringError
-
-# tile IR demolished — pending rebuild; guarded so the
-# module collects and its tests register as xfail rather than a collection error.
-try:
-    from emmy.compiler.ir.tile.ir import TileOp
-except ModuleNotFoundError:
-    TileOp = None
 from emmy.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule, _raise_on_unlowered
 from tests.compiler.conftest import drain_tune
 
