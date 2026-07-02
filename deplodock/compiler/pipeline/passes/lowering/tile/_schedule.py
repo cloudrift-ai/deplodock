@@ -48,9 +48,21 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt
 from deplodock.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
+from deplodock.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
 from deplodock.compiler.pipeline.pipeline import LoweringError
-from deplodock.compiler.pipeline.search.space import MAX_BLOCK_THREADS, REDUCE, STAGE, TILE, WSPEC, scalar_tile_moves
+from deplodock.compiler.pipeline.search.space import (
+    MAX_BLOCK_THREADS,
+    REDUCE,
+    STAGE,
+    TILE,
+    WSPEC,
+    coop_reduce_moves,
+    scalar_tile_moves,
+    splitk_moves,
+    stage_moves,
+    warp_tile_moves,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -241,18 +253,134 @@ def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
     return TileOp(op=op, name=name, place=place, stage=stage, knobs={**knobs, _at(REDUCE, raxis): spec})
 
 
-def _tile_specs(kernel) -> list[str]:
-    """Candidate ``TILE`` codec strings for ``kernel`` — only a ``CONTRACTION`` contraction tiles
-    its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
-    pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); unpinned, the default is the
-    **permitted-move catalog** (:func:`search.space.scalar_tile_moves` — per-cell option-0 then the
-    legality-guarded scalar register-tile grid), so an unpinned ``compile`` / ``tune`` explores the
-    tile space ranked by the prior. Warp (tensor-core) tiles stay pin-driven (a pinned ``a:<atom>``
-    codec routes to ``_warp_option``); folding the warp / reduce / stage moves into the catalog is the
-    next slice."""
-    if axis_role(kernel.op) is not AxisRole.CONTRACTION:
+# The mma atoms eligible per operand dtype — the warp tier's dtype gate (16-bit operands only).
+_ATOMS_BY_DTYPE = {"f16": ("mma_m16n8k16_f16",), "bf16": ("mma_m16n8k16_bf16",)}
+
+# Emit unpinned split-K candidates only when the output grid alone leaves the GPU under-occupied —
+# split-K beyond the ~2-wave occupancy need is pure combine/workspace waste (the prior's
+# ``D_splitk_excess`` prices the remainder; this gate keeps the obviously-pointless rows out).
+_SPLITK_MAX_CTAS = 512
+
+
+def _warp_atoms(kernel, probe) -> tuple[str, ...]:
+    """The dtype-eligible tensor-core atom names for this contraction, ``()`` when the warp tier
+    doesn't apply (unbindable / computed-A node, or a non-16-bit operand dtype)."""
+    if probe is None or probe.a_computed or not kernel.inputs:
+        return ()
+    t = kernel.inputs.get(probe.a_operand.input)
+    return _ATOMS_BY_DTYPE.get(getattr(getattr(t, "dtype", None), "name", None), ())
+
+
+def _warp_move_ok(kernel, spec: str) -> bool:
+    """The enumeration-side (filtering) form of :func:`_check_warp_static_k` — an unpinned warp
+    move whose K-step doesn't divide the static contraction K is silently dropped (a PIN with the
+    same defect still raises, in :func:`_tile_rows`)."""
+    try:
+        _check_warp_static_k(kernel, TilePlan.parse(spec))
+    except ValueError:
+        return False
+    return True
+
+
+def _tile_area(plan: TilePlan) -> int:
+    """The output cells one CTA covers under ``plan`` — the occupancy denominator."""
+    am, an = (plan.atom.atom_m, plan.atom.atom_n) if plan.is_warp else (1, 1)
+    return max(plan.units_m * plan.reg_m * am * plan.units_n * plan.reg_n * an, 1)
+
+
+def _stage_candidates(kernel, probe, plan: TilePlan) -> list[str]:
+    """The RESOLVED operand-stage spellings for one tile candidate — gmem-direct ``""`` first, then
+    every grid move that resolves against the node with this ``plan`` (:func:`_resolve_warp_stage` /
+    :func:`_resolve_scalar_stage`); the row carries the resolved spelling so the leaf identity, the
+    stamped knobs, and the kernel agree. A pinned ``STAGE`` is authoritative: the resolved pin
+    alone, or gmem-direct when it declines (the standard pin-validity degrade)."""
+    if probe is None or not plan.is_tiled:
+        return [""]  # per-cell / unbindable — no operand slab to stage
+    node = replace(probe, tile=plan)
+
+    def resolve(spec: str) -> str | None:
+        st = Stage.parse(spec)
+        r = _resolve_warp_stage(node, st) if plan.is_warp else _resolve_scalar_stage(node, st, kernel.inputs)
+        return r.spell() if r is not None else None
+
+    if STAGE.raw() is not None:
+        pinned = _stage_spec(kernel)
+        r = resolve(pinned) if pinned else None
+        return [r] if r else [""]
+    out = [""]
+    for move in stage_moves(warp=plan.is_warp):
+        r = resolve(move) if move else None
+        if r and r not in out:
+            out.append(r)
+    return out
+
+
+def _reduce_candidates(kernel, place, plan: TilePlan) -> list[str]:
+    """The ``REDUCE`` codec candidates for one tile candidate — serial ``""`` first (option-0),
+    then the legal coop / ILP moves (per-cell tier only — the non-output-tiled contract) and the
+    divisor- and occupancy-guarded split-K moves (deferred-only on the warp tier). A pinned
+    ``REDUCE`` is authoritative and keeps the pin contract: a ``g`` split rides every tile (an
+    invalid warp slice raises in :func:`_splitk_option`, as a pin should), a ``b``/``r`` partition
+    applies to the per-cell tier only (a tiled candidate has no row under it)."""
+    ext = reduce_loop(kernel.op).axis.extent
+    if REDUCE.raw() is not None:
+        split = _splitk_pin()
+        if split:
+            return [split]
+        coop = _coop_reduce_spec()
+        if coop:
+            return [coop] if not plan.is_tiled else []
         return [""]
-    return list(TILE.narrow(scalar_tile_moves()))
+    out = [""]
+    k = ext.as_static() if ext.is_static else None
+    if k is not None and not plan.is_tiled:
+        for move in coop_reduce_moves():
+            p = ReducePlan.parse(move)
+            if p.coop <= k and p.reg <= k:
+                out.append(move)
+    free = prod(_hint_extent(a) for a in place.free) if place.free else 1
+    if k is not None and free // _tile_area(plan) <= _SPLITK_MAX_CTAS:
+        step = plan.atom.atom_k * plan.bk if plan.is_warp else 1
+        for move in splitk_moves(warp=plan.is_warp):
+            w = ReducePlan.parse(move).cta
+            if k % w == 0 and (k // w) % step == 0:
+                out.append(move)
+    return out
+
+
+def _tile_rows(kernel, place) -> tuple[list[dict], str]:
+    """The contraction's enumerated knob rows (the tile × stage × reduce legal product, each row
+    keyed ``FAMILY@<k_axis>``) and the k-axis name. Env pins narrow each family (``Knob.narrow``);
+    the unpinned families come from the ``search/space.py`` move catalog, legality-guarded here
+    (the per-node half of the space)."""
+    kaxis = reduce_loop(kernel.op).axis.name
+    try:
+        probe = _contraction_node(kernel.op, place, TilePlan())
+    except LoweringError:
+        probe = None
+    tiles = scalar_tile_moves() if probe is not None else [""]
+    if probe is not None:
+        atoms = _warp_atoms(kernel, probe)
+        if atoms:
+            tiles += [s for s in warp_tile_moves(atoms) if _warp_move_ok(kernel, s)]
+    tiles = list(TILE.narrow(tiles))
+    rows: list[dict] = []
+    for spec in tiles:
+        plan = TilePlan.parse(spec)
+        if plan.is_warp and TILE.raw() is not None:
+            _check_warp_static_k(kernel, plan)  # a PIN with an indivisible K-step raises (the pin contract)
+        for stage in _stage_candidates(kernel, probe, plan):
+            for red in _reduce_candidates(kernel, place, plan):
+                needs_split = bool(red) and ReducePlan.parse(red).needs_split
+                if needs_split and stage:
+                    continue  # split partials are gmem-direct (030_split drops the stage) — no staged split rows
+                row = {_at(TILE, kaxis): spec}
+                if stage:
+                    row[_at(STAGE, kaxis)] = stage
+                if red:
+                    row[_at(REDUCE, kaxis)] = red
+                rows.append(row)
+    return rows, kaxis
 
 
 def _splitk_pin() -> str:
@@ -286,9 +414,9 @@ def _coop_reduce_spec() -> str:
 
 def _stage_spec(kernel) -> str:
     """The pinned ``STAGE`` codec for ``kernel`` — only a ``CONTRACTION`` contraction stages its
-    operands today (everything else is ``""``, the pin doesn't apply). Pin-only this cut:
-    returns the authoritative ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (gmem-direct,
-    ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a bare operand
+    operands today (everything else is ``""``, the pin doesn't apply). Returns the authoritative
+    ``DEPLODOCK_STAGE`` pin (``Knob.narrow``) or ``""`` (unpinned — the enumeration's resolver-gated
+    grid takes over, see :func:`_stage_candidates`). A pin that doesn't parse as the ``STAGE`` codec (e.g. a bare operand
     binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
     (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
     codecs follow. The returned spec is only the requested *spelling*; each option builder RESOLVES
@@ -616,7 +744,7 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     return TileOp(op=op, name=name, place=place, tier=plan, stage=stage, knobs=stamped)
 
 
-def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
+def schedule(tile: TileOp, name: str, knobs: dict) -> Fork | list[TileOp] | TileOp:
     """Map a freshly-recognized (UNMAPPED) ``tile`` onto the grid and offer its scheduling forks —
     the scheduling half of ``010_recognize``, called inline once recognition has built the tile op.
     ``tile`` is an unmapped :class:`TileOp` (its ``op`` set, ``place`` carrying just the free axes).
@@ -639,22 +767,33 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
     if role is AxisRole.CONTRACTION:
-        stage_spec = _stage_spec(tile)
-        # A pinned cross-CTA split-K (``g<w>[a|k]``) routes EVERY tile candidate (scalar or mma)
-        # through the structural ``Reduction ⊃ Contraction`` fork — one split-K path, consumed by
-        # ``030_split`` (the partial is a bare ``Contraction`` that factorizes to mma / scalar).
-        split_spec = _splitk_pin()
-        if split_spec:
-            return [_splitk_option(tile, place, spec, split_spec, name, knobs) for spec in _tile_specs(tile)]
-        # A non-split cooperative / ILP (``b`` / ``r``) K partition rides the residual ``reduce`` on the
-        # scalar tier (``_factor._tile_reduce_axis``); orthogonal to the output tile.
-        reduce_spec = _coop_reduce_spec()
-        return [
-            _warp_option(tile, place, spec, name, knobs, stage_spec)
-            if is_warp_codec(spec)
-            else _tile_option(tile, place, spec, name, knobs, reduce_spec, stage_spec)
-            for spec in _tile_specs(tile)
-        ]
+        # The RESTORED enumeration: the tile × stage × reduce legal product (rows keyed
+        # ``FAMILY@<k_axis>``), offered as a lazy hierarchical fork tree — greedy descent flattens
+        # the rows for one prior-scoring pass; MCTS pays one level per pop. Env pins narrow each
+        # family (a fully-pinned space collapses to the single materialized option, no fork). A
+        # split ``g`` row routes through the structural ``Reduction ⊃ Contraction`` fork
+        # (:func:`_splitk_option`, consumed by ``030_split``); a warp row through
+        # :func:`_warp_option`; the rest through :func:`_tile_option`.
+        rows, kaxis = _tile_rows(tile, place)
+
+        def _materialize(row: dict) -> TileOp:
+            spec = row.get(_at(TILE, kaxis), "")
+            stage_spec = row.get(_at(STAGE, kaxis), "")
+            red = row.get(_at(REDUCE, kaxis), "")
+            if red and ReducePlan.parse(red).needs_split:
+                return _splitk_option(tile, place, spec, red, name, knobs)
+            if is_warp_codec(spec):
+                return _warp_option(tile, place, spec, name, knobs, stage_spec)
+            return _tile_option(tile, place, spec, name, knobs, red, stage_spec)
+
+        if len(rows) == 1:
+            return _materialize(rows[0])
+
+        def _level(key: str) -> Level:
+            return Level((key,), key=lambda r: (r.get(key, ""),))
+
+        levels = [_level(_at(k, kaxis)) for k in (TILE, STAGE, REDUCE)]
+        return build_fork_tree(params=rows, levels=levels, materialize=_materialize)
     # A TWISTED streaming reduce whose per-step partial is a contraction pair takes the WARP
     # (fragment-resident) tier when the mma atom is eligible — the conservative deterministic pick,
     # like the coop constants above (the tensor-core stream strictly dominates the redundant

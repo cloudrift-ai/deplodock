@@ -202,8 +202,13 @@ def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Cont
         return _mapped(part, (split, *grid), name=tile.name)
 
     # --- deferred kernel finalize: partial writes raw ``acc`` to ``ws[ksplit, *cell]`` -----------
+    # The workspace shape MUST match the rank of the index the writes/loads use — ``(ksplit,
+    # *grid vars)`` — or ``render_index``'s rank-mismatch fallback silently flattens without
+    # strides (colliding partials; the misaligned-vector-store crash). ``cell`` is the GRID vars
+    # (the structural partial has no original Write to copy), so size the workspace by the grid
+    # extents, not ``out.shape`` (whose extent-1 batch dims the grid never carries).
     ws_name = f"{out.name}__partial"
-    ws_shape = (Dim(plan.cta), *out.shape)
+    ws_shape = (Dim(plan.cta), *(a.extent for a in grid))
     ws_write = Write(output=ws_name, index=(Var(split.name), *cell), value=acc)
     part = replace(contraction, lead_axes=lead, epilogue=Body((ws_write,)))
     partial_tile = _mapped(part, (split, *grid), name=f"{tile.name}__partial")

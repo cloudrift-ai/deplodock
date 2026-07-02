@@ -97,12 +97,10 @@ XFAIL: dict[str, str] = {
     # above) still needs the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a
     # separate follow-up).
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once
-    # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). One residual:
-    # test_greedy_run_falls_back_to_option0_when_prior_overflows needs the greedy
-    # option-0 fallback (a prior-overflow conservative pick, not yet rebuilt).
+    # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp); the greedy option-0
+    # fallback recovered once _unlowered_tiles blocklisted a stuck TileOp too.
     # test_compute_phase_info_raises_on_collapsed_index deleted — a unit test of the demolished
     # kernel/_stage_expand module against old-IR Source objects.
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_falls_back_to_option0_when_prior_overflows": _R,
     # test_compile_dynamic_emits_runtime_arg / test_run_code_dynamic_seq_len recovered with the
     # dynamic-grid tier (a symbolic free axis lowers to a symbolic launch + runtime ``int`` arg).
     # test_run_ir_{tile,kernel}_stage / _bench / _seed_reproducible recovered once the tile-IR +
@@ -111,24 +109,18 @@ XFAIL: dict[str, str] = {
     # 015_pack_fk_window pass through the dead legacy FK/BN/BM knob set; the packed-__half2
     # scalar-tier accumulate is a perf codegen follow-on (no TILE-codec spelling yet), tracked
     # in tile-ir-rebuild.md.
-    # test_golden_prior_eval_joins_fp16_goldens: analytic._enumerate (the planner-matmul
-    # enumeration the golden/prior eval reconstructs a shape from) is a demolished stub
-    # (raises NotImplementedError) — rebuilding it against the new _schedule enumeration is
-    # a separate target tied to the golden/prior system.
-    "tests/compiler/pipeline/search/test_diagnostics.py::test_golden_prior_eval_joins_fp16_goldens": _R,
-    # The split-K structural-fork search tests below assert on demolished pass names
-    # (010_split_demoted / 150_cross_cta_finalize / 060_reduce_tile) AND need the mma
-    # split-K auto-fork emission — both a rewrite to the new 020_schedule / 030_split fork
-    # sites and the unpinned g<w> candidate enumeration (Phase-1 follow-up):
-    "tests/compiler/pipeline/search/test_structural_push.py::test_atomic_free_splitk_fork_pushes_structural": _R,
-    "tests/compiler/pipeline/search/test_structural_push.py::test_split_demoted_fork_pushes_structural": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_decomposition_rows_sum_kernel_set_costs": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_identical_offer_sites_take_the_same_side": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_outer_branches_on_structural_fork": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_outer_descends_prior_preferred_branch_first": _R,
-    "tests/compiler/pipeline/search/test_two_level.py::test_split_kernels_attribute_to_pre_decision_op": _R,
-    "tests/compiler/pipeline/test_resolve.py::test_structural_replay_consulted": _R,
-    "tests/compiler/pipeline/test_resolve.py::test_trace_records_partition_fork": _R,
+    # test_golden_prior_eval_joins_fp16_goldens recovered — analytic._enumerate is rebuilt on
+    # the restored _schedule enumeration (it resolves the shape through TILE_PASSES and captures
+    # the contraction fork's leaf rows).
+    # The split-K structural-fork search tests (test_structural_push's two drive tests +
+    # test_two_level's five outer-branching tests + test_resolve's structural replay) pinned the
+    # demolished 010_split_demoted / 150_cross_cta_finalize structural fork emitters — DELETED:
+    # the rebuilt tree has no multi-option Graph-splicing fork (PLACE@cone is pin-only; split-K is
+    # an op-variant row of the restored schedule enumeration, consumed deterministically by
+    # 030_split). The engine-side machinery (structural classification, replay, decomposition
+    # rows) stays, tested at the unit level; its tests return with a structural fork producer
+    # (the PLACE auto knobification follow-up). test_resolve's partition-fork trace test was
+    # rewritten against the ONE hierarchical schedule fork.
 }
 
 # Files that error at COLLECTION on a tile import (xfail can't catch those). Empty now:

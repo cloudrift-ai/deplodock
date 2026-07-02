@@ -131,8 +131,8 @@ verbatim. The `Stage` spells two buffering levels:
 `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix` ping-pong over the inner atom-K steps). Staging is a
 **pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic / non-divisible K, or a computed-A
 flash operand) silently falls back to gmem-direct, and a staged kernel is
-**bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
-follow-up.
+**bit-identical** to its gmem-direct baseline. Unpinned, the schedule fork enumerates the resolver-gated stage grid
+(`search/space.stage_moves`) alongside the tile / reduce moves; a `DEPLODOCK_STAGE` pin stays authoritative.
 
 **The fused edge — the mma tier's `sync` transport.** A demoted-cone matmul (`f(x, …) @ w`) takes the warp tier
 under a warp `TILE` pin: `_schedule._demoted_warp_option` nodifies the PLANAR ⊗-fold to a computed-A `Contraction`

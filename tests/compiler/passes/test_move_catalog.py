@@ -59,21 +59,49 @@ def _matmul_graph() -> Graph:
 
 
 def test_schedule_leaf_set_equals_catalog():
-    """The tile scheduler's emitted leaf set over a static matmul equals the catalog product, keyed
-    ``TILE@<k_axis>`` — the enumeration IS the legal move product."""
-    captured: list[str] = []
+    """The tile scheduler's emitted leaf set over a static f32 matmul equals the catalog's legal
+    product (keyed ``FAMILY@<k_axis>``) — the enumeration IS the tile × stage × reduce move product:
+
+    - distinct ``TILE`` values = exactly ``scalar_tile_moves()`` (f32 → no warp moves);
+    - the per-cell tile rides serial + the coop/ILP moves (non-output-tiled tier only), no split-K
+      (one thread per cell already saturates the 64×64 grid — the occupancy gate);
+    - every tiled tile rides serial × {gmem-direct + the resolved d1 stages} + the divisor-guarded
+      split-K widths on the gmem-direct row only (split partials are gmem-direct).
+    """
+    from deplodock.compiler.pipeline.search.space import coop_reduce_moves, splitk_moves
+
+    rows: list[dict] = []
 
     def decide(fp):
         leaves = flatten_leaves(fp.options)
-        rows = [dict(leaf.knobs) if hasattr(leaf, "knobs") else {} for leaf in leaves]
-        # The contraction tile fork is the one whose leaves carry a ``TILE@<k>`` key.
-        if any("TILE" in family_of(k) for row in rows for k in row):
-            captured.extend(str(family_value(row, "TILE")) for row in rows)
+        for leaf in leaves:
+            row = dict(getattr(leaf, "knobs", {}) or {})
+            if any("TILE" in family_of(k) for k in row):
+                rows.append(row)
         return leaves[0]
 
     Run(pipeline=Pipeline.build(TILE_PASSES), ctx=Context.from_target((12, 0))).resolve(_matmul_graph(), decide)
-    assert captured, "no TILE fork was emitted for the matmul"
-    assert sorted(captured) == sorted(scalar_tile_moves())
+    assert rows, "no TILE fork was emitted for the matmul"
+    tiles = {str(family_value(r, "TILE")) for r in rows}
+    assert tiles == set(scalar_tile_moves())
+    # The hand-computed legal product: per-cell = serial + the 5 coop/ILP moves (6 rows); each of
+    # the 20 tiled tiles = gmem-direct × (serial + 6 split moves) + 2 resolved d1 stages × serial.
+    n_percell = 1 + len(coop_reduce_moves())
+    n_tiled = (1 + len(splitk_moves(warp=False))) + 2
+    assert len(rows) == n_percell + 20 * n_tiled, f"got {len(rows)} rows"
+    by_tile: dict[str, list[dict]] = {}
+    for r in rows:
+        by_tile.setdefault(str(family_value(r, "TILE")), []).append(r)
+    percell = by_tile[""]
+    assert {str(family_value(r, "REDUCE")) for r in percell} == {"None", *coop_reduce_moves()}
+    assert all(family_value(r, "STAGE") is None for r in percell), "per-cell has no operand slab to stage"
+    tiled = by_tile["n16x8/f2x4"]
+    assert {str(family_value(r, "STAGE")) for r in tiled} == {"None", "d1/cp", "d1/tma"}, "resolved d1 stages only"
+    splits = {str(family_value(r, "REDUCE")) for r in tiled if family_value(r, "REDUCE")}
+    assert splits == set(splitk_moves(warp=False))
+    assert all(family_value(r, "STAGE") is None for r in tiled if family_value(r, "REDUCE")), (
+        "split rows are gmem-direct (030_split drops the stage)"
+    )
 
 
 def test_schedule_leaves_key_tile_by_contraction_axis():

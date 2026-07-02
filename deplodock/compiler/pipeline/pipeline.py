@@ -1003,17 +1003,20 @@ def _replay_structural_decision(graph: Graph, root_op, options: list) -> object 
 
 def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> dict[str, frozenset]:
     """``{node_id: tile_identity}`` for every node a ``validate(ctx)`` rejection
-    left un-lowered (still a ``LoopOp`` at the terminal). The ``tile_identity`` is
-    the offending op's knobs — what ``Pipeline.run`` blocklists so the greedy retry
-    falls back to the next prior-ranked sibling."""
+    left un-lowered (still a pre-final ``LoopOp`` / ``TileOp`` at the terminal — the
+    over-budget tile→kernel drop leaves a knob-stamped ``TileOp``, a pre-tile drop a
+    ``LoopOp``, mirroring :func:`_raise_on_unlowered`'s stuck set). The
+    ``tile_identity`` is the offending op's knobs — what ``Pipeline.run`` blocklists
+    so the greedy retry falls back to the next prior-ranked sibling."""
     if not rejections:
         return {}
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
+    from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
 
     out: dict[str, frozenset] = {}
     for nid, _pass_label, _reason in rejections:
         node = graph.nodes.get(nid)
-        if node is not None and isinstance(node.op, LoopOp):
+        if node is not None and isinstance(node.op, (LoopOp, TileOp)):
             out[nid] = frozenset((getattr(node.op, "knobs", None) or {}).items())
     return out
 

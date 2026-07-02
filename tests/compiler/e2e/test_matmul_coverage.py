@@ -229,6 +229,7 @@ def test_matmul_reg_tile_epilogue(epilogue, mode, monkeypatch):
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
 
     monkeypatch.setenv("DEPLODOCK_TILE", _EPILOGUE_TILE)
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
     m = _DYN_M if mode == "dynamic" else _M
     rng = np.random.default_rng(0)
     feed = {"a": rng.standard_normal((1, m, _K), dtype=np.float32), "b": rng.standard_normal((_K, _N), dtype=np.float32)}
@@ -792,6 +793,7 @@ def test_matmul_mma_epilogue_coverage(epilogue, mode, monkeypatch):
     epilogue into the ONE mma.sync kernel (the per-element ``RegStore`` chain), over static and
     symbolic M."""
     monkeypatch.setenv("DEPLODOCK_TILE", _WARP_PIN)
+    monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the subject is the fused epilogue, not the restored split-K fork
     M = N = K = 128
     run_m = M if mode == "static" else M + 2
     rng = np.random.default_rng(1)
@@ -910,6 +912,7 @@ def test_staged_matches_gmem_direct_bit_for_bit(monkeypatch, M):
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
             monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         else:
@@ -979,6 +982,7 @@ def test_cp_async_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, 
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
             monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         else:
@@ -1015,6 +1019,7 @@ def test_tma_deep_ring_matches_gmem_direct_bit_for_bit(monkeypatch, depth, M):
 
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("DEPLODOCK_TILE", _WARP_CODEC)
+        monkeypatch.setenv("DEPLODOCK_REDUCE", "")  # serial K: the baseline must not reroute through the restored split-K fork
         if stage:
             monkeypatch.setenv("DEPLODOCK_STAGE", stage)
         else:

@@ -211,3 +211,65 @@ def scalar_tile_moves() -> list[str]:
         for reg in _SCALAR_REG:
             moves.append(TilePlan(units=par, regs=reg).spell())
     return moves
+
+
+# The warp (tensor-core) tile candidate grid: ``(WM, WN)`` warp counts × ``(FM, FN)`` per-warp
+# register fragments × ``bk`` K-chunks, spelled ``a:<atom>/w..x../f..x../k..``. Bounded to shapes the
+# golden sweeps have deployed (≤ 4 warps, ``FM·FN ≤ 32`` C-fragment cells, shallow pipelined bk).
+# Per-node legality — the atom's operand dtype and the ``_check_warp_static_k`` K-divisibility —
+# is the scheduler's (``_schedule``), not the grid's.
+_WARP_UNITS: tuple[tuple[int, int], ...] = ((1, 1), (2, 1), (1, 2), (2, 2), (4, 1), (1, 4))  # (WM, WN)
+_WARP_REGS: tuple[tuple[int, int], ...] = ((1, 1), (2, 2), (1, 4), (4, 1), (2, 4), (4, 2), (4, 4), (4, 8))  # (FM, FN)
+_WARP_BK: tuple[int, ...] = (1, 2, 4)
+
+
+def warp_tile_moves(atom_names: tuple[str, ...]) -> list[str]:
+    """The warp-contraction output-tile ``TILE`` codec candidates over the (already
+    dtype-eligible) ``atom_names``: the :data:`_WARP_UNITS` × :data:`_WARP_REGS` × :data:`_WARP_BK`
+    grid per atom. No conservative option-0 of its own — these EXTEND :func:`scalar_tile_moves`
+    (whose per-cell ``""`` leads the combined list)."""
+    from deplodock.compiler.ir.atom import ATOM_REGISTRY  # noqa: PLC0415
+
+    moves = []
+    for name in atom_names:
+        atom = ATOM_REGISTRY[name]
+        for units in _WARP_UNITS:
+            for regs in _WARP_REGS:
+                for bk in _WARP_BK:
+                    moves.append(TilePlan(atom=atom, units=units, regs=regs, bk=bk).spell())
+    return moves
+
+
+def stage_moves(*, warp: bool) -> list[str]:
+    """The operand-staging ``STAGE`` codec candidates — gmem-direct ``""`` first (the conservative
+    option-0), then the transport / depth / double-buffer variants. The scalar tier resolves
+    single-buffer today (``_resolve_scalar_stage`` clamps ``depth`` to 1), so only ``d1`` spellings
+    are offered there; the warp tier offers the cp.async ring depths, TMA, and the ``p2``
+    smem→register double-buffer. Emission is resolver-gated in ``_schedule`` — a candidate is
+    offered only when it RESOLVES against the built node, and the row carries the resolved
+    spelling."""
+    if warp:
+        return ["", "d1/cp", "d2/cp/ring", "d3/cp/ring", "d4/cp/ring", "d2/cp/ring/p2", "d1/tma", "d2/tma/ring"]
+    return ["", "d1/cp", "d1/tma"]
+
+
+# Cross-CTA split-K widths (the ``REDUCE`` codec's ``g<w>`` field). Divisor / occupancy legality is
+# the scheduler's.
+SPLITK_WIDTHS: tuple[int, ...] = (2, 4, 8)
+
+
+def splitk_moves(*, warp: bool) -> list[str]:
+    """The cross-CTA split-K ``REDUCE`` codec candidates: deferred-kernel finalize (``g<w>k``) for
+    both tiers, in-place atomic (``g<w>a``) for the scalar tier only (an mma C-fragment cannot
+    ``atomicAdd`` — ``RegStore`` has no atomic form). These EXTEND the serial ``""`` option-0."""
+    moves = [f"g{w}k" for w in SPLITK_WIDTHS]
+    if not warp:
+        moves += [f"g{w}a" for w in SPLITK_WIDTHS]
+    return moves
+
+
+def coop_reduce_moves() -> list[str]:
+    """The cooperative / ILP K-partition ``REDUCE`` codec candidates for a NON-output-tiled
+    contraction (``_coop_reduce_spec``'s contract — the per-cell tier folds K across ``b`` coop
+    threads / ``r`` ILP register chains). These EXTEND the serial ``""`` option-0."""
+    return ["b4", "b8", "r2", "r4", "r2/b4"]

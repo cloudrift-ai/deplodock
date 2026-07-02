@@ -417,10 +417,10 @@ so the round-trip stays byte-identical.
 `WSPEC` (warp specialization) is the worker-mapping pin — a role→warp-count allocation (`WarpSpec`; role descriptors in
 `schedule.py`, the COMPUTE consumer implicit and sized by `TilePlan.units`) carried on an **orthogonal**
 `workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
-split over the fixed pipeline rather than replacing it. Pin-only this cut — the `_schedule` helper (inside `010_recognize`) stamps `workers` from a
-`DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the
-materializer does not yet consume `TileOp.workers`, so a pinned WSPEC is inert (no producer/consumer codegen) until
-Phase 4.
+split over the fixed pipeline rather than replacing it. While the materializer does not consume `TileOp.workers` (no producer/consumer codegen yet), a structurally
+legal `DEPLODOCK_WSPEC` pin is REFUSED (warning + no stamp, uniform SIMT) — accepting it would record warp splits
+in the perf DB that no kernel ever ran; an illegal / unparseable pin degrades to uniform silently. Stamping
+returns when wspec codegen lands.
 
 `tile/ops.py` `lower(op)` returns the `Map`'s body verbatim — the loop nest with its annotated reduce `Loop`s, the
 carriers already dissolved into loose folds + the streaming `merge` at recognition; `pretty(op)` renders it for

@@ -440,7 +440,7 @@ class TileOp(Op):
       uniform SIMT.
     - ``tier`` — the output fragment (:class:`~.schedule.TilePlan`) for a non-tiled / split-partial
       contraction; a tiled contraction rides its ``tile`` on the ``Contraction`` node. ``None`` = per-cell.
-    - ``stage`` — the operand smem pipeline (:class:`~.schedule.Stage`); ``None`` = gmem-direct (pin-only).
+    - ``stage`` — the operand smem pipeline (:class:`~.schedule.Stage`); ``None`` = gmem-direct.
 
     There is **no** residual reduce-partition field: EVERY partitioned reduce — a plain / twisted
     monoid, flash, a coop-K / split-K contraction — carries its :class:`~.schedule.ReducePlan` on its

@@ -56,6 +56,7 @@ from deplodock.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Wr
 from deplodock.compiler.ir.stmt.base import Stmt
 from deplodock.compiler.ir.tile import Map, Placement, Reduction, TileOp
 from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
+from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, is_fold_offer_site, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
@@ -232,7 +233,7 @@ def _order_free_by_output(node: Map | Reduction, free: list) -> tuple:
     return tuple(sorted(free, key=lambda ax: pos[ax.name]))
 
 
-def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
+def rewrite(match: Match, root: Node) -> Fork | list[TileOp] | TileOp | Graph | None:
     # (0) Schedule an UNMAPPED ``TileOp`` — a kernel that recognition emitted as a *graph
     # rewrite* (flash's fused fragment, ``try_flash``) rather than scheduling inline, because a
     # graph fragment can't embed a scheduling fork. The fused ``TileOp`` re-enters this same pass

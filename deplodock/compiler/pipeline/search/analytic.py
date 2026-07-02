@@ -17,24 +17,52 @@ from collections.abc import Callable
 from deplodock.compiler.context import Context
 from deplodock.compiler.pipeline.search.features import tile_signature
 
-
-def _matmul_thread_gate(r: dict, dag, reduce_key: str) -> bool:
-    """The heuristic-plausible band for thread-tier matmul tiles — pruned the
-    enumeration so the cold ``AnalyticPrior`` couldn't argmin onto an *unbenched*
-    degenerate tile."""
-    raise NotImplementedError("tile lowering demolished — pending rebuild")
+# Golden dtype spelling → the graph Tensor dtype name.
+_DTYPES = {"fp32": "f32", "fp16": "f16", "bf16": "bf16"}
 
 
-def _matmul_dag(M: int, N: int, K: int, dtype: str, ctx: Context):
-    """Build a single ``(M, K) @ (K, N)`` matmul ``LoopOp`` and return its
-    ``IterDag`` — the shape the per-family enumeration offers were composed over."""
-    raise NotImplementedError("tile lowering demolished — pending rebuild")
+def _matmul_graph(M: int, N: int, K: int, dtype: str):
+    """A bare ``(M, K) @ (K, N)`` matmul frontend graph — the shape a matmul golden records."""
+    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
+    from deplodock.compiler.graph import Graph, Tensor  # noqa: PLC0415
+    from deplodock.compiler.ir.base import InputOp  # noqa: PLC0415
+    from deplodock.compiler.ir.frontend.ir import MatmulOp  # noqa: PLC0415
+
+    dt = _dt.get(_DTYPES.get(dtype, dtype))
+    g = Graph()
+    g.add_node(InputOp(), [], Tensor("a", (M, K), dt), node_id="a")
+    g.add_node(InputOp(), [], Tensor("b", (K, N), dt), node_id="b")
+    g.add_node(MatmulOp(), ["a", "b"], Tensor("o", (M, N), dt), node_id="o")
+    g.inputs, g.outputs = ["a", "b"], ["o"]
+    return g
 
 
 def _enumerate(M: int, N: int, K: int, dtype: str, ctx: Context) -> tuple[list[dict], tuple[str, ...]]:
-    """Reconstruct the planner's matmul enumeration for a shape + the knob tuple to
-    match a golden on."""
-    raise NotImplementedError("tile lowering demolished — pending rebuild")
+    """Reconstruct the planner's matmul enumeration for a shape — the SAME candidate rows the
+    scheduler's fork tree offers a live compile, captured by resolving the shape through
+    ``TILE_PASSES`` with a decide that flattens the contraction fork's leaves (each leaf's knob row
+    keyed ``FAMILY@<k_axis>``, exactly what ``tile_signature`` joins a golden against). The second
+    element is kept for the historic ``(rows, knob_names)`` shape — no caller reads it."""
+    from deplodock.compiler.pipeline import TILE_PASSES, Pipeline  # noqa: PLC0415
+    from deplodock.compiler.pipeline.fork import Fork, flatten_leaves  # noqa: PLC0415
+    from deplodock.compiler.pipeline.knob import family_of  # noqa: PLC0415
+    from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
+
+    rows: list[dict] = []
+
+    def decide(fp):
+        leaves = flatten_leaves(fp.options)
+        for leaf in leaves:
+            row = dict(getattr(leaf, "knobs", None) or {})
+            if any(family_of(k) == "TILE" for k in row):
+                rows.append(row)
+        option = fp.options[0]
+        while isinstance(option, Fork) and not option.is_leaf:
+            option = option.expand()[0]
+        return option
+
+    Run(pipeline=Pipeline.build(TILE_PASSES), ctx=ctx).resolve(_matmul_graph(M, N, K, dtype), decide)
+    return rows, ()
 
 
 def _analytic_scorer(M: int, N: int, K: int, ctx: Context, *, dynamic: bool = False) -> Callable[[dict], float]:
