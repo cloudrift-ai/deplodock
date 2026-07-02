@@ -57,7 +57,6 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import sync_row_fill
-from deplodock.compiler.pipeline.passes.lowering.kernel._store import has_write, with_store
 
 
 # ---- generic tiling layer: atomize → register_tile → unit_tile → grid_tile ---------------------- #
@@ -312,6 +311,29 @@ def _factorize(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
     if isinstance(op, Contraction):
         return _bind_contraction(op, ctx, tail, store)
     return _bind_reduce(op, ctx, tail, out_val)
+
+
+def has_write(stmts: list[Stmt]) -> bool:
+    """Any ``Write`` reachable in ``stmts`` (deep — a projection's output sweep nests its
+    ``Write`` inside a per-cell ``Loop``)."""
+    for s in stmts:
+        if isinstance(s, Write):
+            return True
+        if any(has_write(list(b)) for b in s.nested()):
+            return True
+    return False
+
+
+def with_store(stmts: list[Stmt], output: str, grid, value: str) -> list[Stmt]:
+    """Append the output-store glue when the body has none — a bare reduction / contraction produces
+    its finalized value as the SSA name ``value`` (the carrier state / accumulator, or a projection's
+    last def) that must be written to the output buffer at the grid cell. A body that already carries
+    a ``Write`` needs no glue (``value`` is left unread). The caller resolves ``value`` off the node
+    (``Contraction.out`` / the recursion's produced ``Handle``) so this helper stays node-agnostic."""
+    if has_write(stmts):
+        return stmts
+    index = tuple(Var(ax.name) for ax in grid)
+    return [*stmts, Write(output=output, index=index, value=value)]
 
 
 def _bind_contraction(c: Contraction, ctx: Ctx, tail: tuple, store=None) -> Tile:

@@ -106,7 +106,7 @@ dispatch + `reduce_codegen` / `store_sink` the seam `_factor` calls: the new-ato
 The **unit** is the atom's parallel thread footprint (`atom.lanes`) — so the tensor-core warp tile and the scalar
 parallel thread-tile are the *same* level, differing only in `lanes`; `block_threads = units · lanes`. `grid_tile` also
 carries any leading (batch) grid axes and supports a 1-D (m-absent) output. (The store-glue helpers `with_store` /
-`has_write`, shared by the constructor and the thread-binding tiers, live in `_store.py`.)
+`has_write`, shared by the constructor and the thread-binding tiers, live in `_factor.py`.)
 
 ## Operand staging — the warp-tier smem pipeline (`STAGE` codec → `Stage`)
 
