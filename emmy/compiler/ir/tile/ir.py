@@ -340,8 +340,16 @@ class Contraction(Stmt):
         return (self.acc,)
 
     def external_reads(self) -> tuple[str, ...]:
-        a_inputs = tuple(s.input for s in self.a_body if isinstance(s, Load))
-        return (*a_inputs, self.b_load.input)
+        def loads(stmts):
+            for s in stmts:
+                if isinstance(s, Load):
+                    yield s.input
+                for b in s.nested():
+                    yield from loads(b)
+
+        # Deep over the A body — a computed cone may nest its loads (the fused norm→linear cone's
+        # per-row statistic reduce ``Loop``).
+        return (*dict.fromkeys(loads(self.a_body)), self.b_load.input)
 
     def pretty(self, indent: str = "") -> list[str]:
         t = " trans" if self.b_trans else ""

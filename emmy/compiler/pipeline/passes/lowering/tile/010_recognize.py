@@ -74,22 +74,26 @@ PATTERN = [Pattern("root", (LoopOp, TileOp))]
 def _peel(body: Body) -> tuple[list, list[Stmt]]:
     """Split a body into ``(free_axes, per_cell_stmts)``.
 
-    A leading run of non-``Loop`` stmts (loop-invariant loads hoisted above the nest) is
-    pulled into the per-cell body; then the outer chain of single-child **free** loops
-    becomes the parallel axes. The chain stops at the first reduce loop or branch —
-    everything from there down is the per-cell body (the fold and its epilogue / output
-    sweep), run serially by one thread per cell."""
-    stmts = list(body)
-    i = 0
-    while i < len(stmts) and not isinstance(stmts[i], Loop):
-        i += 1
-    prefix, rest = stmts[:i], stmts[i:]
-    axes = []
-    cur = rest
-    while len(cur) == 1 and isinstance(cur[0], Loop) and not cur[0].is_reduce:
-        axes.append(cur[0].axis)
-        cur = list(cur[0].body)
-    return axes, prefix + list(cur)
+    The outer chain of **free** loops becomes the parallel axes. At every level of the
+    chain a leading run of pure stmts (``Load`` / ``Assign`` / ``Init`` — loop-invariant
+    loads hoisted above or between the free loops, e.g. a broadcast row scale ``rs[m]``
+    read once per ``m``) is sunk into the per-cell body, re-evaluated per cell. The chain
+    stops at the first reduce loop, branch, or non-pure stmt — everything from there down
+    is the per-cell body (the fold and its epilogue / output sweep), run serially by one
+    thread per cell."""
+    axes: list = []
+    prefix: list[Stmt] = []
+    cur = list(body)
+    while True:
+        i = 0
+        while i < len(cur) and isinstance(cur[i], (Load, Assign, Init)):
+            i += 1
+        head, rest = cur[:i], cur[i:]
+        if len(rest) != 1 or not isinstance(rest[0], Loop) or rest[0].is_reduce:
+            return axes, prefix + cur
+        prefix += head
+        axes.append(rest[0].axis)
+        cur = list(rest[0].body)
 
 
 def _reduce_in(stmts) -> bool:

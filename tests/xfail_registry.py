@@ -46,15 +46,13 @@ XFAIL: dict[str, str] = {
     # test_cooperative_flash_matches_torch RECOVERED — the carrier-generic coop tier handles the
     # twisted flash carrier; the test's dead legacy ``EMMY_BR`` pin was modernized to the
     # live ``REDUCE=b<n>`` codec (shuffle combine at b32, the hierarchical smem tree at b64).
-    # test_fused_edge.py was rewritten black-box off the demolished enumeration/assembly API. The
-    # scalar cells AND the pure-MAP warp cells (relu / sigmoid / multiply) are green — the demoted
-    # cone nodifies to a computed-A Contraction under a warp TILE pin and the producer compute-fills
-    # the A slab (the mma tier's sync transport). Two residuals: the BROADCAST producer recognizes
-    # as a flat un-annotated Map (no Reduction node for the option to nodify — a recognition gap),
-    # and the MONOID (rmsnorm) producer's cone carries a reduce (not compute-fillable per cell —
-    # needs the cooperative-prologue warp fusion).
-    "test_fused_edge.py::test_fused_map_matmul[warp-broadcast": _R,
-    "test_fused_edge.py::test_fused_rmsnorm_linear[warp": _R,
+    # test_fused_edge.py RECOVERED in full. The scalar cells AND every warp cell are green — the
+    # demoted MAP cone nodifies to a computed-A Contraction under a warp TILE pin and the producer
+    # compute-fills the A slab (the mma tier's sync transport). The broadcast cell recovered once
+    # _peel sank the hoisted between-loop row-scale load into the per-cell body; the MONOID
+    # (rmsnorm) cell recovered with the cooperative-prologue warp fusion (_prologue_warp_option —
+    # the A cone carries the per-row statistic reduce, run once per tile row by the sync
+    # transport's stat fill).
     # test_matmul_mma.py / _transposed_b.py / _residual.py / _causal_epilogue.py deleted — those
     # legacy-API (EMMY_MMA / WM / WN / BK pin) per-capability tests are superseded by the
     # warp-tier matrix in test_matmul_coverage (the WARP codec): plain + transposed-B + the

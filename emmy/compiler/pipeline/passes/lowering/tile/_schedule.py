@@ -45,7 +45,7 @@ from emmy.compiler.ir.elementwise import ElementwiseImpl
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt
+from emmy.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt, Write
 from emmy.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduction, TileOp, TilePlan
 from emmy.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from emmy.compiler.pipeline.fork import Fork, Level, build_fork_tree
@@ -815,6 +815,12 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> Fork | list[TileOp] | Tile
         demoted = _demoted_warp_option(tile, place, name, knobs)
         if demoted is not None:
             return demoted
+        # A MONOID (reduce-bearing) producer cone — the fused norm→linear edge — honors the same
+        # warp pin: the tail contraction nodifies with a computed A whose cone CARRIES the per-row
+        # statistic prologue (run once cooperatively by the sync transport's stat fill).
+        prologue = _prologue_warp_option(tile, name, knobs)
+        if prologue is not None:
+            return prologue
     specs = _reduce_specs(tile, place)
     return [_option(tile, place, spec, name, knobs) for spec in specs]
 
@@ -960,6 +966,123 @@ def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp 
     # compute-fills the A slab instead of round-tripping a gmem intermediate. The one live producer
     # of the cone element (the cut side — materialize the producer as its own kernel — has no
     # emitter in the rebuilt tree, so only ``fuse`` is ever stamped today).
+    stamped = {**knobs, _at(TILE, k_ax.name): spec, "PLACE@cone": "fuse"}
+    return TileOp(op=node, name=name, place=place, tier=wt, stage=stage, knobs=stamped)
+
+
+def _idx_vars_deep(stmts) -> set:
+    """Every free Var name across the index exprs reachable in ``stmts`` (deep)."""
+    out: set = set()
+    for s in stmts:
+        idx = getattr(s, "index", None)
+        if idx:
+            out |= {v for e in idx for v in e.free_vars()}
+        for b in s.nested():
+            out |= _idx_vars_deep(list(b))
+    return out
+
+
+def _prologue_warp_option(tile: TileOp, name: str, knobs: dict) -> TileOp | None:
+    """The warp (mma) candidate for a **reduce-bearing (MONOID) producer cone** — the fused
+    norm→linear edge (``rmsnorm(x)·nw @ w``): a projecting ``Map`` whose ``source`` is a per-row
+    ``PLANAR`` statistic reduce and whose body is that statistic's scalar epilogue followed by a
+    fresh free (column) ``Loop`` over an ⊗-fold contraction whose A cone reads the statistic.
+    PIN-DRIVEN like the matmul warp tier. Nodifies the tail fold to a computed-A
+    :class:`Contraction` whose A cone **carries the statistic prologue** (the annotated stat
+    reduce ``Loop`` + its scalar epilogue ahead of the per-cell map stmts — the k-invariant
+    prefix) and stamps the ``sync`` compute-fill :class:`Stage`; the materializer runs that
+    prefix ONCE per tile row into a stat smem row (``_stage.sync_stat_fill``, the shared-row
+    seam) and the per-cell remainder per A-slab cell. The column axis joins the grid. First cut:
+    exact-cover geometry only (static M/N/K divisible), like the demoted-cone option."""
+    spec = TILE.narrow([""])[0]
+    if not is_warp_codec(spec):
+        return None
+    op = tile.op
+    if not isinstance(op, Map) or not isinstance(op.source, Reduction):
+        return None
+    red = op.source
+    if red.role is not AxisRole.PLANAR or red.source is not None or red.carrier.twist.family != "id":
+        return None
+    body = list(op.body)
+    if not body or not isinstance(body[-1], Loop) or body[-1].is_reduce:
+        return None
+    stat_epi, nloop = body[:-1], body[-1]
+    if not all(isinstance(s, (Load, Assign)) for s in stat_epi):
+        return None
+    n_ax = nloop.axis
+    inner = list(nloop.body)
+    if len(inner) != 2 or not isinstance(inner[0], Loop) or not inner[0].is_reduce or not isinstance(inner[1], Write):
+        return None
+    kloop, write = inner
+    k_ax = kloop.axis
+    grid = list(tile.place.free)
+    if not grid:
+        return None
+    m_ax = grid[-1]
+    kbody = list(kloop.body)
+    accums = [st for st in kbody if isinstance(st, Accum)]
+    if len(accums) != 1 or accums[0].op.name != "add":
+        return None
+    acc = accums[0]
+    if write.values != (acc.name,) or not write.is_scalar:
+        return None
+    defs = {st.name: st for st in kbody if isinstance(st, Assign)}
+    lift = defs.get(acc.value)
+    if lift is None or lift.op.name != "multiply" or len(lift.args) != 2:
+        return None
+    loads = {st.names[0]: st for st in kbody if isinstance(st, Load)}
+
+    def _load_vars(nm: str) -> set | None:
+        ld = loads.get(nm)
+        return {v for e in ld.index for v in e.free_vars()} if ld is not None else None
+
+    b_name = next((a for a in lift.args if (vs := _load_vars(a)) and n_ax.name in vs and k_ax.name in vs), None)
+    if b_name is None:
+        return None
+    a_name = next(a for a in lift.args if a != b_name)
+    cone = _map_cone(kbody, a_name)
+    if cone is None or not cone:
+        return None
+    for st in cone:
+        if isinstance(st, Load) and n_ax.name in {v for e in st.index for v in e.free_vars()}:
+            return None  # the cone must be (m, k)-indexed — an n-dependent producer isn't the A tile
+    # Every free SSA name the cone reads must be a statistic (the source reduce's carried state or
+    # its scalar epilogue) — anything else is a shape this option doesn't understand.
+    stat_defs = {red.out} | {nm for s in stat_epi for nm in s.defines()}
+    cone_defs = {nm for st in cone for nm in st.defines()}
+    free_refs = {a for st in cone if isinstance(st, Assign) for a in st.args if a not in cone_defs}
+    if not free_refs or not free_refs <= stat_defs:
+        return None  # a stat-free cone is the demoted option's shape, not ours
+    # The statistic prologue must be row-local: its gmem reads may index (m, its own reduce axis)
+    # but never the column / contraction axes.
+    if _idx_vars_deep([*red.partial, *stat_epi]) & {n_ax.name, k_ax.name}:
+        return None
+    wt = TilePlan.parse(spec)
+    atom = wt.atom
+    atom_m, atom_n, atom_k = atom.shape
+    first_load = next((st for st in cone if isinstance(st, Load)), None)
+    t = tile.inputs.get(first_load.input) if (first_load is not None and tile.inputs) else None
+    if getattr(getattr(t, "dtype", None), "name", None) != atom.ab_dtype:
+        return None
+    exts = (m_ax.extent, n_ax.extent, k_ax.extent)
+    if not all(e.is_static for e in exts):
+        return None
+    M, N, K = (e.as_static() for e in exts)
+    bk_elems = wt.bk * atom_k
+    if K % bk_elems or M % (wt.units_m * wt.reg_m * atom_m) or N % (wt.units_n * wt.reg_n * atom_n):
+        return None
+    place = Placement(free=(*tile.place.free, n_ax)).on_grid()
+    node = Contraction(
+        axes=(m_ax, n_ax),
+        k_axis=k_ax,
+        a_operand=Body((red.loop, *stat_epi, *cone)),
+        b_load=loads[b_name],
+        acc=acc.name,
+        tile=wt,
+        lead_axes=tuple(grid[:-1]),
+        epilogue=Body((write,)),
+    )
+    stage = Stage(transport="sync", smem=(node.a_name,), bk_elems=bk_elems)
     stamped = {**knobs, _at(TILE, k_ax.name): spec, "PLACE@cone": "fuse"}
     return TileOp(op=node, name=name, place=place, tier=wt, stage=stage, knobs=stamped)
 

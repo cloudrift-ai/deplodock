@@ -47,6 +47,7 @@ from emmy.compiler.pipeline.passes.lowering.kernel._stage import (
     SyncTransport,
     TmaTransport,
     staged_kloop,
+    sync_stat_fill,
 )
 
 #: The contraction semiring — multiply ⊗ then accumulate ⊕ (add). The same multiply-add ``mma.sync``
@@ -298,28 +299,92 @@ def _cta(mn: tuple[Side, Side], lanes: int, n_threads: int) -> CtaTile:
     return CtaTile(linear_tid=tid, n_threads=n_threads)
 
 
-def _sync_operands(c: Contraction, bk_elems: int, mn: tuple[Side, Side]) -> tuple[SyncOperand, SyncOperand]:
-    """The ``sync``-transport (fused-edge) operand pair: A **compute-filled** from the node's
-    producer cone (``a_operand`` is a ``Body`` — each thread evaluates the cone at the slab cell's
-    absolute ``(m, k)`` coords and writes the result), B copy-filled from its gmem ``Load``. The
-    schedule's eligibility guarantees exact-cover geometry (no masked overhang), so the σ needs no
-    clamps."""
+def _deep_defines(s: Stmt) -> set[str]:
+    """Every SSA name defined in ``s`` (deep — a stat reduce ``Loop``'s ``Accum`` counts)."""
+    out = set(s.defines())
+    for b in s.nested():
+        for child in b:
+            out |= _deep_defines(child)
+    return out
+
+
+def _deep_reads(stmts: list[Stmt]) -> set[str]:
+    """Every SSA name read anywhere in ``stmts`` (deep)."""
+    out: set[str] = set()
+    for s in stmts:
+        out |= set(s.deps())
+        for b in s.nested():
+            out |= _deep_reads(list(b))
+    return out
+
+
+def _refs_axis(s: Stmt, name: str) -> bool:
+    """``s`` references axis ``name`` in any index expr (deep)."""
+    idx = getattr(s, "index", None)
+    if idx and any(name in e.free_vars() for e in idx):
+        return True
+    return any(_refs_axis(child, name) for b in s.nested() for child in b)
+
+
+def _split_stat_prologue(a_body: tuple[Stmt, ...], k_name: str) -> tuple[tuple[Stmt, ...], tuple[Stmt, ...], tuple[str, ...]]:
+    """Split a computed-A body at the contraction-axis seam: the maximal leading run of stmts that
+    never index the K axis is the **per-row statistic prologue** (the fused norm→linear cone's stat
+    reduce ``Loop`` + scalar epilogue — or a broadcast row scale), the remainder the **per-cell**
+    cone. Returns ``(prologue, cell, stats)`` — ``stats`` are the prologue defs the cell reads, the
+    values bridged through the stat smem rows (a prologue whose defs go unread is dropped)."""
+    body = list(a_body)
+    pro: list[Stmt] = []
+    while body and not _refs_axis(body[0], k_name):
+        pro.append(body.pop(0))
+    if not pro:
+        return (), tuple(body), ()
+    stats = tuple(sorted({nm for s in pro for nm in _deep_defines(s)} & _deep_reads(body)))
+    return (tuple(pro), tuple(body), stats) if stats else ((), tuple(body), ())
+
+
+def _stat_slab(name: str) -> str:
+    """The smem row buffer bridging per-row statistic ``name`` from the sync prologue to the fill."""
+    return f"_a_stat_{name}"
+
+
+def _sync_operands(
+    c: Contraction, bk_elems: int, mn: tuple[Side, Side], cta: CtaTile
+) -> tuple[tuple[SyncOperand, SyncOperand], list[Stmt]]:
+    """The ``sync``-transport (fused-edge) operand pair + the one-shot prologue stmts: A
+    **compute-filled** from the node's producer cone (``a_operand`` is a ``Body`` — each thread
+    evaluates the cone at the slab cell's absolute ``(m, k)`` coords and writes the result), B
+    copy-filled from its gmem ``Load``. A cone with a k-invariant prefix (the fused norm→linear
+    per-row statistic — its reduce ``Loop`` + scalar epilogue) is split at the K seam
+    (:func:`_split_stat_prologue`): the prefix runs ONCE per tile row (:func:`sync_stat_fill`,
+    returned as the transport prologue) and the per-cell fill reads the bridged values back from
+    the stat smem rows. The schedule's eligibility guarantees exact-cover geometry (no masked
+    overhang), so the σ needs no clamps."""
     m_name, n_name, k_name = c.m_axis.name, c.n_axis.name, c.k_axis.name
     row_base, col_base = _tile_base(mn)
+    pro, cell, stats = _split_stat_prologue(c.a_body, k_name)
 
     def a_value(k0, row, col):
         sigma = Sigma({m_name: BinaryExpr("+", row_base, row), k_name: BinaryExpr("+", k0, col)})
-        return [s.rewrite(lambda nm: nm, sigma) for s in c.a_body], c.a_name
+        stmts: list[Stmt] = [Load(names=(nm,), input=_stat_slab(nm), index=(row,)) for nm in stats]
+        stmts += [s.rewrite(lambda nm: nm, sigma) for s in cell]
+        return stmts, c.a_name
 
     def b_value(k0, row, col):
         sigma = Sigma({k_name: BinaryExpr("+", k0, row), n_name: BinaryExpr("+", col_base, col)})
         name = f"{c.b_load.names[0]}__f"
         return [Load(name=name, input=c.b_load.input, index=tuple(sigma.apply(e) for e in c.b_load.index))], name
 
-    return (
+    prologue: list[Stmt] = []
+    if stats:
+        row_axis = Axis(name="_sr", extent=mn[0].tile)
+        sigma = Sigma({m_name: BinaryExpr("+", row_base, Var(row_axis.name))})
+        row_body = [s.rewrite(lambda nm: nm, sigma) for s in pro]
+        prologue = sync_stat_fill(stats=stats, slab_of=_stat_slab, row_axis=row_axis, row_body=row_body, cta=cta)
+    operands = (
         SyncOperand(tag="a", shape=(mn[0].tile, bk_elems), value=a_value),
         SyncOperand(tag="b", shape=(bk_elems, mn[1].tile), value=b_value),
     )
+    return operands, prologue
 
 
 def _staged(ops: _AtomOps, cells, offset, mn: tuple[Side, Side]):
@@ -341,9 +406,11 @@ def _staged(ops: _AtomOps, cells, offset, mn: tuple[Side, Side]):
     cta = _cta(mn, c.atom.lanes, c.block_threads)
     if stage.transport == "sync":
         # The fused-edge compute-fill: the A tile is COMPUTED into its slab (the producer cone),
-        # B plain-copied — the mma tier's ``sync`` transport; single-buffer, one CTA barrier.
-        operands = _sync_operands(c, stage.bk_elems, mn)
-        transport = SyncTransport(operands=operands, slab_dtype=cuda_name(elem), cta=cta)
+        # B plain-copied — the mma tier's ``sync`` transport; single-buffer, one CTA barrier. A
+        # k-invariant cone prefix (the fused norm→linear per-row statistic) rides the transport
+        # prologue, run once ahead of the K-loop.
+        operands, stat_pro = _sync_operands(c, stage.bk_elems, mn, cta)
+        transport = SyncTransport(operands=operands, slab_dtype=cuda_name(elem), cta=cta, prologue_stmts=tuple(stat_pro))
     else:
         operands = _slab_operands(
             index_srcs=(c.a_operand.index, c.b_load.index),

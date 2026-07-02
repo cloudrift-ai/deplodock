@@ -128,17 +128,19 @@ def _sink_loads(body: Body) -> Body:
             out.append(s)
             emitted.add(i)
 
-    # Walk non-Load stmts in original order. Before each, emit any
-    # pending Loads whose first consumer is this position.
+    # Walk positions in original order. Before each, emit any pending Loads
+    # whose first consumer is this position — including when the consumer is
+    # itself a Load (a gather's index producer must land before the gather,
+    # which is emitted at ITS consumer's position, always later).
     for j, sj in enumerate(stmts):
-        if isinstance(sj, Load):
-            continue
         for i, si in enumerate(stmts):
             if i in emitted or not isinstance(si, Load):
                 continue
             if first_consumer.get(i) == j:
                 out.append(si)
                 emitted.add(i)
+        if isinstance(sj, Load):
+            continue  # placed via the pending mechanism (or the no-consumer top block)
         out.append(sj)
 
     # Safety: emit any unclaimed Loads at the end (shouldn't fire, but

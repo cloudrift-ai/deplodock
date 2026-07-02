@@ -154,6 +154,22 @@ def sync_row_fill(*, slab: str, src: str, extent: int, grid_vars: tuple, linear_
     return [Smem(name=slab, extents=(extent,), dtype=dtype), loop, Sync()]
 
 
+def sync_stat_fill(
+    *, stats: tuple[str, ...], slab_of, row_axis: Axis, row_body: list[Stmt], cta: CtaTile, dtype: str = "float"
+) -> list[Stmt]:
+    """The ``sync``-transport per-row STATISTIC prologue — the fused norm→linear warp edge's
+    cooperative prologue, run ONCE before the staged K-loop: the CTA's threads stripe the tile's
+    rows (``for r = tid; r < rows; r += n_threads``); each runs ``row_body`` (the computed-A cone's
+    k-invariant prefix — the stat reduce ``Loop`` + its scalar epilogue, already σ-rebased to the
+    tile row ``row_axis``) and writes each bridged ``stats`` value into its length-``rows`` smem
+    row (``slab_of(name)``); one CTA barrier publishes them to the A compute-fill. The same
+    linear-tid / thread-count striping seam as every other fill here."""
+    body = (*row_body, *(Write(output=slab_of(nm), index=(Var(row_axis.name),), value=nm) for nm in stats))
+    loop = StridedLoop(axis=row_axis, start=cta.linear_tid, step=_lit(cta.n_threads), body=Body(body), unroll=False)
+    decls: list[Stmt] = [Smem(name=slab_of(nm), extents=(row_axis.extent.as_static(),), dtype=dtype) for nm in stats]
+    return [*decls, loop, Sync()]
+
+
 # --------------------------------------------------------------------------- #
 # TMA (``cp.async.bulk.tensor``) descriptor — the host-built ``CUtensorMap`` the
 # box copies index off (the copy + mbarrier handshake live in :class:`TmaTransport`
@@ -256,12 +272,15 @@ class SyncTransport:
     operands: tuple[SyncOperand, ...]
     slab_dtype: str
     cta: CtaTile
+    # The optional one-shot per-row statistic prologue (:func:`sync_stat_fill` — the fused
+    # norm→linear cone's cooperative reduce), emitted once ahead of the K-loop.
+    prologue_stmts: tuple[Stmt, ...] = ()
 
     def slab_decls(self, ring: int) -> list[Stmt]:  # noqa: ARG002 — always single-buffer
         return [slab_smem(op.slab, op.shape[0], op.shape[1], self.slab_dtype) for op in self.operands]
 
     def prologue(self, ring: int) -> list[Stmt]:  # noqa: ARG002
-        return []
+        return list(self.prologue_stmts)
 
     def fill(self, *, k0: Expr, slot: Expr) -> list[Stmt]:  # noqa: ARG002 — no ring slot
         out: list[Stmt] = []
