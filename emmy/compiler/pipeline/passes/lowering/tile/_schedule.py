@@ -101,14 +101,17 @@ def _prevpow2(n: int) -> int:
     return p
 
 
-def _pick_coop(extent: int, free: int) -> int:
+def _pick_coop(extent: int, free: int, *, has_tail: bool = False) -> int:
     """The conservative whole-CTA cooperative-thread count for a reduce of static
     ``extent`` over ``free`` output cells, or ``1`` (stay scalar/serial). Cooperate only on
     a wide reduce (``extent ≥ _COOP_MIN_EXTENT``) feeding a small grid (``free ≤
     _FREE_CAP`` — otherwise the scalar tier already saturates the GPU); the count targets
     ``_SERIAL_TARGET`` serial steps, capped at ``_MAX_COOP``, rounded to a power of two (the
-    butterfly / tree reorder)."""
-    if extent < _COOP_MIN_EXTENT or free > _FREE_CAP:
+    butterfly / tree reorder). ``has_tail`` lifts the free-grid cap: a fused contraction
+    tail multiplies each cell's work by its column extent, so "the scalar tier saturates"
+    does not hold — the fused final-norm → lm_head (151k columns) runs MINUTES one-thread-
+    per-row, while the cooperative row distributes the tail across the lanes."""
+    if extent < _COOP_MIN_EXTENT or (free > _FREE_CAP and not has_tail):
         return 1
     coop = min(_prevpow2(extent // _SERIAL_TARGET), _MAX_COOP)
     return coop if coop >= 2 else 1
@@ -149,9 +152,12 @@ def _reduce_specs(kernel, place) -> list[str]:
     # kernel deploys at the hint and strides to the runtime extent); a pin overrides it.
     extent = _hint_extent(carrier.axis)
     # A symbolic free axis (dynamic-grid tier) is sized by its ``Dim`` hint for the occupancy
-    # heuristic — the kernel still deploys over the runtime grid.
+    # heuristic — the kernel still deploys over the runtime grid. A fused contraction tail
+    # (the norm→linear shape — ``_has_contraction_tail``) lifts the free-grid cap: per-cell
+    # work scales with the tail's columns, so a big grid does NOT mean the serial tier saturates.
     free = prod(_hint_extent(a) for a in place.free) if place.free else 1
-    coop = _pick_coop(extent, free)
+    tail = list(kernel.op.body) if isinstance(kernel.op, Map) else []
+    coop = _pick_coop(extent, free, has_tail=_has_contraction_tail(tail))
     cands = [f"b{coop}", ""] if coop > 1 else [""]  # conservative coop first (cold greedy → option-0)
     return list(REDUCE.narrow(cands))
 
