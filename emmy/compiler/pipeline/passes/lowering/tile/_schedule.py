@@ -50,6 +50,7 @@ from emmy.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduc
 from emmy.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from emmy.compiler.pipeline.fork import Fork, Level, build_fork_tree
 from emmy.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
+from emmy.compiler.pipeline.passes.lowering.tile._carrier import projection_distributes
 from emmy.compiler.pipeline.pipeline import LoweringError
 from emmy.compiler.pipeline.search.space import (
     MAX_BLOCK_THREADS,
@@ -332,13 +333,17 @@ def _stage_candidates(kernel, probe, plan: TilePlan) -> list[str]:
     return out
 
 
-def _reduce_candidates(kernel, place, plan: TilePlan) -> list[str]:
+def _reduce_candidates(kernel, place, plan: TilePlan, probe: Contraction | None = None) -> list[str]:
     """The ``REDUCE`` codec candidates for one tile candidate — serial ``""`` first (option-0),
     then the legal coop / ILP moves (per-cell tier only — the non-output-tiled contract) and the
-    divisor- and occupancy-guarded split-K moves (deferred-only on the warp tier). A pinned
-    ``REDUCE`` is authoritative and keeps the pin contract: a ``g`` split rides every tile (an
-    invalid warp slice raises in :func:`_splitk_option`, as a pin should), a ``b``/``r`` partition
-    applies to the per-cell tier only (a tiled candidate has no row under it)."""
+    divisor- and occupancy-guarded split-K moves (deferred-only on the warp tier). An **atomic**
+    split (``g<w>a``) is offered only when the kernel's projection epilogue distributes over the
+    add (``projection_distributes`` off the ``probe`` node) — a non-distributive fused projection
+    would raise at ``030_split`` and waste a search slot; the deferred ``g<w>k`` finalize stays
+    legal for any epilogue. A pinned ``REDUCE`` is authoritative and keeps the pin contract: a
+    ``g`` split rides every tile (an invalid warp slice / atomic-on-non-distributive raises in
+    :func:`_splitk_option` / ``030_split``, as a pin should), a ``b``/``r`` partition applies to
+    the per-cell tier only (a tiled candidate has no row under it)."""
     ext = reduce_loop(kernel.op).axis.extent
     if REDUCE.raw() is not None:
         split = _splitk_pin()
@@ -358,9 +363,12 @@ def _reduce_candidates(kernel, place, plan: TilePlan) -> list[str]:
     free = prod(_hint_extent(a) for a in place.free) if place.free else 1
     if k is not None and free // _tile_area(plan) <= _SPLITK_MAX_CTAS:
         step = plan.atom.atom_k * plan.bk if plan.is_warp else 1
+        atomic_ok = probe is not None and (len(probe.epilogue) == 0 or projection_distributes(probe.epilogue, (probe.acc,)))
         for move in splitk_moves(warp=plan.is_warp):
-            w = ReducePlan.parse(move).cta
-            if k % w == 0 and (k // w) % step == 0:
+            sp = ReducePlan.parse(move)
+            if sp.finalize == "atomic" and not atomic_ok:
+                continue  # non-distributive fused projection — 030_split would raise; don't offer
+            if k % sp.cta == 0 and (k // sp.cta) % step == 0:
                 out.append(move)
     return out
 
@@ -393,7 +401,7 @@ def _tile_rows(kernel, place) -> tuple[list[dict], str]:
                     "drop the a:<atom> token to use the scalar tier."
                 )
         for stage in _stage_candidates(kernel, probe, plan):
-            for red in _reduce_candidates(kernel, place, plan):
+            for red in _reduce_candidates(kernel, place, plan, probe):
                 # A staged split row is legal: ``_splitk_option`` re-resolves the stage against the
                 # SLICED inner node (the warp slice divisibility already held in
                 # ``_reduce_candidates``) and ``030_split`` threads it onto the partial kernel.

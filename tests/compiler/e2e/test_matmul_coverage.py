@@ -1177,10 +1177,9 @@ def test_staged_splitk_matches_gmem_direct_bit_for_bit(monkeypatch, transport):
     def _go(stage: str | None) -> tuple[np.ndarray, str]:
         monkeypatch.setenv("EMMY_TILE", "a:mma_m16n8k16_f16/w2x2/f2x2/k2")
         monkeypatch.setenv("EMMY_REDUCE", "g2k")
-        if stage:
-            monkeypatch.setenv("EMMY_STAGE", stage)
-        else:
-            monkeypatch.delenv("EMMY_STAGE", raising=False)
+        # The baseline pins STAGE="" (gmem-direct) explicitly — unpinned, the analytic prior may
+        # legitimately pick a staged row (D_stage_* terms), which is not the baseline this test wants.
+        monkeypatch.setenv("EMMY_STAGE", stage if stage else "")
         be = CudaBackend()
         compiled = be.compile(_splitk_mma_graph(m, k, n))
         partial_src = compiled.nodes["o__partial"].op.kernel_source  # the deferred-finalize partial kernel

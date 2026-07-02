@@ -50,7 +50,7 @@ from emmy.compiler.ir.base import InputOp
 from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
 from emmy.compiler.ir.schedule import Fold, Level
 from emmy.compiler.ir.sigma import Sigma
-from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
+from emmy.compiler.ir.stmt import Accum, Body, Init, Load, Loop, Write
 from emmy.compiler.ir.tile import (
     Contraction,
     Map,
@@ -62,6 +62,7 @@ from emmy.compiler.ir.tile import (
 )
 from emmy.compiler.ir.tile.ops import axis_role, lower, nodify_reduce, reduce_loop, reduce_plan
 from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
+from emmy.compiler.pipeline.passes.lowering.tile._carrier import projection_distributes as _projection_distributes
 
 PATTERN = [Pattern("root", TileOp)]
 
@@ -129,37 +130,6 @@ def _mapped(op, grid, *, name: str = "", tier=None, stage=None) -> TileOp:
     if axis_role(op) is AxisRole.CONTRACTION and tier is not None:
         kw["tier"] = tier
     return TileOp(op=op, name=name, place=place, stage=stage, **kw)
-
-
-def _projection_distributes(body, states: tuple[str, ...]) -> bool:
-    """True if the kernel's projection epilogue is a **linear-homogeneous** map of the carrier
-    state(s) — i.e. it distributes over the atomic-add combine, so applying it to each CTA's
-    partition before the ``atomicAdd`` equals applying it once after the cross-CTA sum
-    (``Σ c·xₛ = c·(Σ xₛ)``). A bare state write (``proj = id``) trivially distributes; a constant
-    *scale* — ``mean``'s ``×1/N`` — does; an additive offset (a fused bias), a nonlinear unary
-    (``relu`` / ``reciprocal`` of the *state*), or a product of two state-derived values do NOT.
-
-    Conservative forward dataflow: ``linear`` is the set of SSA names that are a
-    linear-homogeneous function of the state. A value is grown into it only by ``multiply`` with
-    a state-independent operand (an arg not itself in ``linear``); any other op that consumes a
-    ``linear`` value — or any projection stmt we can't reason about — refuses. The final ``Write``
-    must store only ``linear`` values."""
-    linear = set(states)
-    for s in body:
-        if isinstance(s, Write):
-            return all(v in linear for v in s.values)
-        if isinstance(s, Load):
-            continue  # reads memory (the count / a per-output operand) — state-independent
-        if not isinstance(s, Assign):
-            return False  # an unfamiliar projection stmt — can't prove distributivity
-        hot = [a for a in s.args if a in linear]
-        if not hot:
-            continue  # state-independent — a constant w.r.t. the split
-        if s.op.name == "multiply" and len(hot) == 1:
-            linear.add(s.name)  # state · constant — still linear-homogeneous
-            continue
-        return False  # add / divide / nonlinear of a state value breaks distributivity
-    return False  # no Write reached
 
 
 def _split_contraction(match: Match, root: Node, tile: TileOp, contraction: Contraction, carrier, plan: ReducePlan, split: Axis):
