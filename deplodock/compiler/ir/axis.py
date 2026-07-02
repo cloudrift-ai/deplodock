@@ -21,7 +21,7 @@ import enum
 from dataclasses import dataclass, field
 
 from deplodock.compiler.dim import Dim, to_dim
-from deplodock.compiler.ir.expr import Interval, Literal, SimplifyCtx
+from deplodock.compiler.ir.expr import Expr, Interval, Literal, SimplifyCtx
 
 
 class AxisRole(enum.Enum):
@@ -121,6 +121,11 @@ class Axis:
             Axis(f"{self.name}_o", ext // factor, source_axis=src),
             Axis(f"{self.name}_i", factor, source_axis=src),
         )
+
+    def extent_expr(self) -> Expr:
+        """This axis's extent as an ``Expr`` — a literal int (static) or the symbolic ``Dim``
+        expr (dynamic ``seq_len``)."""
+        return Literal(self.extent.as_static(), "int") if self.extent.is_static else self.extent.expr
 
 
 def extend_simplify_ctx(ctx: SimplifyCtx, axis: Axis) -> SimplifyCtx:

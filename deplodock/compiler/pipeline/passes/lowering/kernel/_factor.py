@@ -24,7 +24,7 @@ reusing the same ``reduce_codegen``).
 
 The cooperative / ILP reduce tier (:func:`_bind_reduce` + the shared-row staging helpers) folds
 the reduce axis ``coop`` ways across threads and ``reg`` ways across per-thread accumulators, then the
-REG-tree fold, the cross-thread combine (``_combine.emit_combine``), and the projection — carrier-
+REG-tree fold, the cross-thread combine (:func:`emit_combine`), and the projection — carrier-
 generic (a contraction is the degenerate carrier of its additive fold).
 
 The smem operand-staging pipeline lives in ``_stage.py`` (the :class:`~...kernel._stage.Transport`
@@ -47,15 +47,13 @@ from deplodock.compiler.dtype import F32
 from deplodock.compiler.ir.axis import Axis
 from deplodock.compiler.ir.expr import BinaryExpr, Expr, Literal, Var
 from deplodock.compiler.ir.kernel import Tile
+from deplodock.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
 from deplodock.compiler.ir.schedule import Stage
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Body, Cond, Init, Load, Loop, Select, SelectBranch, Stmt, StridedLoop, Write
+from deplodock.compiler.ir.tile import Fold, Level, ReduceStage
 from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction, Side
-from deplodock.compiler.pipeline.passes.lowering.kernel._atom import reduce_codegen, store_sink
-from deplodock.compiler.pipeline.passes.lowering.kernel._combine import combine_tail
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import shrink_axis as _shrink_axis
+from deplodock.compiler.pipeline.passes.lowering.kernel._atom import copy_cell, reduce_codegen, shrink_axis, store_sink
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import sync_row_fill
 
 
@@ -146,7 +144,7 @@ def grid_tile(
     ``lead_axes`` are extra outer grid axes carried through untiled; ``lanes == 1`` (scalar) emits no
     ``_lane`` axis."""
     offset = tuple(replace(o, block_var=s.block) if s is not None else o for o, s in zip(t.offset, mn, strict=True))
-    block_axes = tuple(_shrink_axis(Axis(name=s.block, extent=s.axis.extent, source_axis=s.axis), s.tile) for s in mn if s is not None)
+    block_axes = tuple(shrink_axis(Axis(name=s.block, extent=s.axis.extent, source_axis=s.axis), s.tile) for s in mn if s is not None)
     lane_axes = (Axis(name="_lane", extent=lanes),) if lanes > 1 else ()
     axes = (*lead_axes, *block_axes, *t.axes, *lane_axes)
 
@@ -416,10 +414,10 @@ def _replicate(body: Body, r: int, coop: int, axis: Axis, masked: bool, protecte
         return list(body)
     offset = r * coop
     shifted = BinaryExpr("+", Var(axis.name), Literal(offset, "int"))
-    index_expr = BinaryExpr("%", shifted, _extent_expr(axis)) if masked else shifted
+    index_expr = BinaryExpr("%", shifted, axis.extent_expr()) if masked else shifted
     sigma = Sigma({axis.name: index_expr})
     out = copy_cell(body, sigma, f"__r{r}", protected)
-    return _mask_streamed(out, axis.name, offset, _extent_expr(axis)) if masked else out
+    return _mask_streamed(out, axis.name, offset, axis.extent_expr()) if masked else out
 
 
 def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_vars: tuple) -> list[Stmt]:
@@ -436,6 +434,79 @@ def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_var
             s = s.with_bodies(tuple(Body(tuple(_restage_loads(list(b), buf, smem, n_grid, grid_vars))) for b in bodies))
         out.append(s)
     return out
+
+
+def emit_combine(carrier, t: str, n_threads: int, *, warp_size: int = 32, segmented: bool = False) -> list[Stmt]:
+    """Build the cross-thread combine of a cooperative reduce ``carrier`` (a :class:`Carrier`)
+    over ``n_threads`` cooperating threads, reassigning the carried state in place.
+
+    The mechanism per level is derived by :meth:`ReduceStage.combine`:
+
+    - a ``SHFL`` fold → one ``WarpShuffle`` register butterfly. The XOR butterfly never
+      crosses an aligned ``width``-lane group, so a lone ``SHFL`` is also the SEGMENTED
+      per-row combine for strided-cooperative rows (caller passes ``segmented=True``).
+    - a ``SMEM`` fold **after** a ``SHFL`` → the hierarchical cross-warp slab: lane-0 of each
+      warp stages its broadcast state to a ``smem[n_warps]`` slab per component; one ``Sync``
+      + ``TreeHalve(tid_var="warp")`` collapses across warps and broadcasts.
+    - a standalone ``SMEM`` → the block slab: every thread stages its partial, one ``Sync``,
+      a single ``TreeHalve`` reduces + broadcasts in place.
+
+    The carrier's combine surface (``state.names`` / ``twist.state_b`` /
+    ``twist.combine_states``) drives the nodes; the combine renders at the accumulator dtype
+    (fp32 for a reduction, with the carrier's own dtype honored when set)."""
+    state = carrier.state.names
+    state_b = carrier.state_b
+    prog = carrier.combine_states
+    dtype = next((a.dtype for a in prog if a.dtype is not None), None) or F32
+    folds = ReduceStage(Level.BLOCK, n_threads).combine(warp_size=warp_size, segmented=segmented)
+
+    from deplodock.compiler.backend.cuda.dtype import cuda_name as _cuda_name  # noqa: PLC0415
+
+    smem_c = _cuda_name(dtype)
+    bufs = tuple(f"{st}_smem" for st in state)
+    out: list[Stmt] = []
+    for i, fold in enumerate(folds):
+        if fold is Fold.SHFL:
+            # The lane-level butterfly: warp-wide when followed by a cross-warp SMEM stage
+            # (hierarchical), else the full ``n_threads`` (one warp / segment).
+            width = warp_size if (len(folds) == 2 and folds[1] is Fold.SMEM) else n_threads
+            out.append(WarpShuffle(state=state, state_b=state_b, combine_states=prog, length=width, dtype=dtype))
+        elif fold is Fold.SMEM:
+            hierarchical = i > 0 and folds[i - 1] is Fold.SHFL
+            width = n_threads // warp_size if hierarchical else n_threads
+            tid_var = "warp" if hierarchical else t
+            out += [Smem(name=b, extents=(width,), dtype=smem_c) for b in bufs]
+            if hierarchical:
+                # Lane-0 of each warp stages that warp's broadcast state, indexed by ``warp``.
+                out.append(
+                    Cond(
+                        cond=BinaryExpr("==", Var("lane"), Literal(0, "int")),
+                        body=tuple(Write(output=b, index=(Var("warp"),), value=st) for b, st in zip(bufs, state, strict=True)),
+                    )
+                )
+            else:
+                out += [Write(output=b, index=(Var(tid_var),), value=st) for b, st in zip(bufs, state, strict=True)]
+            out.append(Sync())
+            out.append(TreeHalve(bufs=bufs, state=state, state_b=state_b, combine_states=prog, length=width, tid_var=tid_var, dtype=dtype))
+        else:  # Fold.ATOMIC / Fold.REG — cross-CTA / register tiers, not emitted by the intra-CTA walk.
+            raise NotImplementedError(f"intra-CTA combine cannot emit {fold} (cta/reg tiers are future work)")
+    return out
+
+
+def combine_tail(carrier, *, reg: int, coop: int, lane) -> list[Stmt]:
+    """The carrier-driven **partial merge** that follows a partitioned reduce loop — the one place the
+    two partial-fold geometries are assembled: the REG-tree fold of the ``reg`` ILP register copies
+    into copy 0 (``as_state_merge``), then — when threads cooperate (``lane`` is a lane :class:`Axis`,
+    not ``None``) — the cross-thread :func:`emit_combine`. Both reassign the carried state **in place**
+    (the survivor SSA names hold the full reduction), so the post-reduce projection reads them directly.
+
+    Carrier-generic: a monoid reduce and a contraction's degenerate additive carrier fold identically,
+    so a cooperative reduce and a (future) cooperative-K contraction share this tail. ``as_state_merge``
+    keys its finalize temps on the copy name, so each fold's internals are already unique."""
+    merge: list[Stmt] = [carrier.as_state_merge(tuple(f"{n}__r{r}" for n in carrier.state.names)) for r in range(1, reg)]
+    if lane is not None:
+        merge += emit_combine(carrier, t=lane.name, n_threads=coop)
+    return merge
 
 
 def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
@@ -511,7 +582,7 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
     # extent's runtime arg(s) (e.g. ``seq_len``) are common to every register copy — exclude
     # them from the per-copy SSA rename.
     protected = frozenset(
-        {axis.name, *(ax.name for ax in grid), *_extent_expr(axis).free_vars()} | ({lane.name} if lane is not None else set())
+        {axis.name, *(ax.name for ax in grid), *axis.extent_expr().free_vars()} | ({lane.name} if lane is not None else set())
     )
     copies: list[Stmt] = []
     for r in range(reg):
@@ -521,7 +592,7 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
     # The carrier-driven partial merge: the REG-tree fold of the ``reg`` ILP copies into the survivor
     # (copy 0's names) + (when threads cooperate) the cross-thread combine, reassigning the carried
     # state in place. The one shared tail a cooperative reduce and a future cooperative-K contraction
-    # both emit (``_combine.combine_tail``).
+    # both emit (``combine_tail``).
     merge = combine_tail(carrier, reg=reg, coop=coop, lane=lane)
 
     # Post-reduce projection. A full-row output (softmax / RMSNorm) distributes its sweep

@@ -48,7 +48,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   `KernelOp` whose body is a `Tile` (the thread-grid decode) over the
   lowered op tree. A cooperative `ReducePlan` lowers the reduce as a
   `StridedLoop` (lane-strided fold) + the derived carrier-generic
-  cross-thread combine (`_combine.emit_combine` → `WarpShuffle` /
+  cross-thread combine (`_factor.emit_combine` → `WarpShuffle` /
   `Smem`+`Sync`+`TreeHalve`, multi-component for a twisted carrier) +
   the projection (a full-row output sweep distributed across the coop
   lanes, a scalar output guarded to lane 0); the `Tile` gains the coop

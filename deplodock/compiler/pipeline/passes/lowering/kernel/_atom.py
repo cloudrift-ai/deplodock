@@ -39,8 +39,6 @@ from deplodock.compiler.ir.schedule import Stage
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Cond, Init, Load, Loop, Select, Stmt, StridedLoop, Write
 from deplodock.compiler.ir.tile.ir import Contraction, Side
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import copy_cell
-from deplodock.compiler.pipeline.passes.lowering.kernel._geom import extent_expr as _extent_expr
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
     CpAsyncTransport,
     CtaTile,
@@ -53,6 +51,28 @@ from deplodock.compiler.pipeline.passes.lowering.kernel._stage import (
 #: realizes; in the scalar tier it is a plain scalar fma loop.
 _MUL = ElementwiseImpl("multiply")
 _ADD = ElementwiseImpl("add")
+
+
+# Shared axis-geometry helpers, used across this module (the atom-generic mma/scalar codegen) AND
+# ``_factor.py`` (the tiling layer + the cooperative / ILP reduce tier).
+def shrink_axis(axis: Axis, reg: int) -> Axis:
+    """The grid (cell) axis for a register-tiled free axis: ``ceil(E / reg)`` cells, each a
+    per-thread ``reg``-wide register sub-tile. ``Dim.ceil_div`` keeps a symbolic extent
+    symbolic (``(seq_len+reg-1)//reg``) so the launch grid sizes from the runtime extent."""
+    if reg <= 1:
+        return axis
+    return Axis(name=axis.name, extent=axis.extent.ceil_div(reg), source_axis=axis.source_axis or axis)
+
+
+def copy_cell(body, sigma, suffix: str, protected) -> list:
+    """One copy of a tiled reduce ``body``: σ-substitute its indices (``sigma``) and suffix every
+    per-copy SSA name (the shared grid / reduce / lane coordinates in ``protected`` pass through
+    unrenamed). This is the **one** replication mechanic shared by the register tile (this module,
+    one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``_factor``
+    ``_bind_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
+    ``sigma`` (the coordinate offset) and ``suffix`` (the SSA tag)."""
+    rename = lambda n: n if n in protected else f"{n}{suffix}"  # noqa: E731
+    return [s.rewrite(rename, sigma) for s in body]
 
 
 # The per-axis masked-overhang helpers — one :class:`Side` in, so the codegen never re-derives a
@@ -402,7 +422,7 @@ def _scalar_protected(c: Contraction) -> frozenset[str]:
     for a in c.lead_axes:
         prot.add(a.name)
     for a in (m.axis, n.axis, k_axis, *c.lead_axes):
-        prot |= set(_extent_expr(a).free_vars())
+        prot |= set(a.extent_expr().free_vars())
     return frozenset(prot)
 
 
@@ -520,7 +540,7 @@ class _MmaOps(_AtomOps):
         )
         a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
         k_static = k_axis.extent.is_static
-        k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
+        k_zero = None if k_static else (Var(k_axis.name), k_axis.extent_expr())
 
         def read_row(i):
             cell = offset[0].base(i)

@@ -22,9 +22,9 @@ partition changes):
   so the node's `tile` / `bind` exist before scheduling — seam #1.)
 - **Reduce tier** (`_bind_reduce`, a `PLANAR` / `TWISTED` reduce — or a non-output-tiled `CONTRACTION` — whose
   `ReducePlan` cooperates / register-folds) — the reduce axis is partitioned `coop` ways across the CTA's threads and
-  `reg` ways across per-thread accumulators (ILP), then a REG-tree fold, the cross-thread combine (`_combine`), and the
-  projection. It reads the reduce straight off the `Reduction` node (no `lower`-then-refind) and builds its per-cell body
-  via the recursion (`_emit`, below).
+  `reg` ways across per-thread accumulators (ILP), then a REG-tree fold, the cross-thread combine
+  (`emit_combine`), and the projection. It reads the reduce straight off the `Reduction` node (no `lower`-then-refind)
+  and builds its per-cell body via the recursion (`_emit`, below).
 - **Scalar tier** — one thread per output cell (`_emit(op)` + an output-store glue).
 
 ### The recursive node walk (`_emit`) — one hierarchical emitter
