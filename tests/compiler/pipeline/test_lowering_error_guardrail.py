@@ -292,31 +292,6 @@ def test_greedy_run_propagates_lowering_exception():
         pipeline.run(_graph_with_tile(), ctx=_small_smem_ctx())
 
 
-def test_compute_phase_info_raises_on_collapsed_index():
-    # A hoisted-compute Write whose index has a non-cache-axis entry (a
-    # ``Literal`` left by a sibling-cell fusion) is un-lowerable by the
-    # single-Write materializer — ``compute_phase_info`` flags it as a
-    # ``LoweringError`` (caught + pruned under tune by the containment above)
-    # instead of an opaque ``AttributeError`` mid-tune.
-    from deplodock.compiler.pipeline.passes.lowering.kernel._stage_expand import compute_phase_info
-
-    from deplodock.compiler.ir.axis import Axis
-    from deplodock.compiler.ir.expr import Literal, Var
-    from deplodock.compiler.ir.stmt import Write
-    from deplodock.compiler.ir.tile.ir import Source
-
-    sources = (Source(name="slab", buf="x", cache_axes=(Axis("a2", 4), Axis("a4", 8)), origin=(Literal(0, "int"), Literal(0, "int"))),)
-    # Clean all-Var index → recovers the two cache axes.
-    good = [Write(output="slab", index=(Var("a2"), Var("a4")), value="v")]
-    name, axes, _ = compute_phase_info(good, sources)
-    assert name == "slab"
-    assert tuple(a.name for a in axes) == ("a2", "a4")
-    # Collapsed index (a sibling-cell-fused constant) → LoweringError.
-    bad = [Write(output="slab", index=(Var("a2"), Literal(1, "int")), value="v")]
-    with pytest.raises(LoweringError, match="sibling-cell-fused"):
-        compute_phase_info(bad, sources)
-
-
 def test_tuning_contains_raising_lowering_pass(caplog):
     # Under tune, ``Run.drive`` catches the lowering exception, drops the
     # candidate's subtree, logs a warning, and finishes without raising —

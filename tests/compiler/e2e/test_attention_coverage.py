@@ -260,17 +260,6 @@ def test_flash_default_is_scalar_stream(monkeypatch):
 
 
 @requires_cuda
-def test_flash_off_keeps_decomposition(monkeypatch):
-    """FLASH off — the score-materializing 010_sdpa decomposition (multiple kernels: QK^T, softmax,
-    P@V), proving the knob gates the Loop-IR recognition and the default is unchanged."""
-    monkeypatch.delenv("DEPLODOCK_FLASH", raising=False)
-    torch.manual_seed(0)
-    q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
-    _backend, _compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))
-    assert len(kernels) > 1, "FLASH off should keep the score-materializing multi-kernel path"
-
-
-@requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
 def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
     """The FA-2 shared-score scalar chain — the P@V output ``d`` rides a register vector ``O[BM, D]``,
@@ -571,7 +560,7 @@ def test_cooperative_flash_matches_torch(monkeypatch, br, B, H, S, D):
     (``__shfl_xor_sync`` for BR≤32, a per-component smem tree for BR>32) and matches torch SDPA —
     the KV parallelization is accuracy-preserving (the LSE monoid is associative + commutative)."""
     monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    monkeypatch.setenv("DEPLODOCK_BR", br)
+    monkeypatch.setenv("DEPLODOCK_REDUCE", f"b{br}")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
     backend, compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))

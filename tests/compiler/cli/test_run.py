@@ -376,33 +376,6 @@ def test_run_code_rmsnorm_fk_accuracy(run_cli, monkeypatch, fk, br):
     assert rc == 0, f"stderr: {stderr}"
 
 
-def test_compile_fp16_matmul_window_emits_half2(run_cli, monkeypatch):
-    """Structural guard: a pinned FK window must actually rewrite the K loop into
-    the half2 pack + ``__half2`` accumulate + widen-flush (catches a silent
-    015_pack_fk_window regression that would fall back to fp32 accumulate). No
-    CUDA device needed — just inspects the generated source.
-
-    Pins a FULL clean (no-overhang) knob set + ``--target sm_90`` so the variant
-    is fully determined: enumeration / lowering gate on ``compute_capability``,
-    so without the target override a GPU-less CI runner resolves a different
-    capability, picks a masked non-window variant, and the FK-only pin falls back
-    to FK=1 (no window). The full pin + fixed target make the single FK=bk window
-    variant the only candidate on any runner."""
-    monkeypatch.setenv("DEPLODOCK_KNOBS", "MMA=0,BN=16,BM=16,FM=1,FN=1,BK=4,SPLITK=1,FK=4")
-    rc, stdout, stderr = run_cli(
-        "compile",
-        "--code",
-        "torch.randn(256,256,dtype=torch.float16) @ torch.randn(256,256,dtype=torch.float16)",
-        "--ir",
-        "cuda",
-        "--target",
-        "sm_90",
-    )
-    assert rc == 0, f"stderr: {stderr}"
-    assert "__halves2half2" in stdout, "no __half2 pack — FK window did not fire"
-    assert "__low2half" in stdout and "__high2half" in stdout, "no widen+flush of the half2 window"
-
-
 @requires_cuda
 @pytest.mark.parametrize("fk", [2, 4, 8])
 def test_run_code_fp16_matmul_window_accuracy(run_cli, monkeypatch, fk):

@@ -39,8 +39,13 @@ _R = "tile IR demolished — rebuild in progress"
 # capability (delete an entry when its test flips to XPASS).
 XFAIL: dict[str, str] = {
     # --- whole files: every collected test currently fails ---
-    "test_bank_conflicts.py": _R,
-    "test_attention_coverage.py::test_cooperative_flash_matches_torch": _R,
+    # test_bank_conflicts.py deleted — a unit cross-validation of the demolished
+    # ``diagnostics.bank_conflicts`` oracle (``find_all_bindings`` is a NotImplementedError stub;
+    # the oracle rebuild stays a tile-ir-rebuild follow-up, with the visualizer scripts as its
+    # consumers).
+    # test_cooperative_flash_matches_torch RECOVERED — the carrier-generic coop tier handles the
+    # twisted flash carrier; the test's dead legacy ``DEPLODOCK_BR`` pin was modernized to the
+    # live ``REDUCE=b<n>`` codec (shuffle combine at b32, the hierarchical smem tree at b64).
     # test_fused_edge.py was rewritten black-box off the demolished enumeration/assembly API. The
     # scalar cells AND the pure-MAP warp cells (relu / sigmoid / multiply) are green — the demoted
     # cone nodifies to a computed-A Contraction under a warp TILE pin and the producer compute-fills
@@ -73,10 +78,9 @@ XFAIL: dict[str, str] = {
     # `_bind`'s reduce arm realizes the TWISTED carrier at fragment residence (`_twist`), and the
     # C→A handoff rides the shared kernel-IR nodes — all 26 `test_generated_tensorcore_flash_*` /
     # `test_warp_chain_*` cases are green again (their entries deleted).
-    # test_flash_off_keeps_decomposition: FLASH-off no longer keeps the score-materializing
-    # multi-kernel 010_sdpa decomposition (SDPA lowers to a single kernel regardless) — the
-    # knob-gated recognition path is a separate rebuild target.
-    "tests/compiler/e2e/test_attention_coverage.py::test_flash_off_keeps_decomposition": _R,
+    # test_flash_off_keeps_decomposition deleted — it pinned the OLD pipeline's score-
+    # materializing multi-kernel decomposition; the rebuilt pipeline fuses SDPA to one correct
+    # kernel with FLASH off too (accuracy covered by test_ops_vs_torch::test_sdpa).
     # matmul enabled at the scalar tier — these files partially recovered; residuals still need
     # the mma / staging / split-K / dynamic / attention tiers (scalar fallback gives correct
     # accuracy for the rest, which is un-xfailed). The whole-block (TinyLlama / Qwen) and RoPE
@@ -94,19 +98,20 @@ XFAIL: dict[str, str] = {
     # above) still needs the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a
     # separate follow-up).
     # test_lowering_error_guardrail.py: the guardrail-engine tests recovered once
-    # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). Two residuals:
+    # _raise_on_unlowered detected a stuck TileOp (not only a LoopOp). One residual:
     # test_greedy_run_falls_back_to_option0_when_prior_overflows needs the greedy
-    # option-0 fallback (a prior-overflow conservative pick, not yet rebuilt), and
-    # test_compute_phase_info_raises_on_collapsed_index imports the demolished
-    # kernel/_stage_expand module (compute_phase_info — a separate rebuild target).
+    # option-0 fallback (a prior-overflow conservative pick, not yet rebuilt).
+    # test_compute_phase_info_raises_on_collapsed_index deleted — a unit test of the demolished
+    # kernel/_stage_expand module against old-IR Source objects.
     "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_greedy_run_falls_back_to_option0_when_prior_overflows": _R,
-    "tests/compiler/pipeline/test_lowering_error_guardrail.py::test_compute_phase_info_raises_on_collapsed_index": _R,
     # test_compile_dynamic_emits_runtime_arg / test_run_code_dynamic_seq_len recovered with the
     # dynamic-grid tier (a symbolic free axis lowers to a symbolic launch + runtime ``int`` arg).
     # test_run_ir_{tile,kernel}_stage / _bench / _seed_reproducible recovered once the tile-IR +
     # kernel-IR JSON round-trip returned (TileOp / KernelOp reconstruct via graph.py's repr-eval).
-    # The FK half2-window codegen (packed __half2 accumulate) is not yet rebuilt at the scalar tier:
-    "tests/compiler/cli/test_run.py::test_compile_fp16_matmul_window_emits_half2": _R,
+    # test_compile_fp16_matmul_window_emits_half2 deleted — it pinned the demolished
+    # 015_pack_fk_window pass through the dead legacy FK/BN/BM knob set; the packed-__half2
+    # scalar-tier accumulate is a perf codegen follow-on (no TILE-codec spelling yet), tracked
+    # in tile-ir-rebuild.md.
     # test_golden_prior_eval_joins_fp16_goldens: analytic._enumerate (the planner-matmul
     # enumeration the golden/prior eval reconstructs a shape from) is a demolished stub
     # (raises NotImplementedError) — rebuilding it against the new _schedule enumeration is
