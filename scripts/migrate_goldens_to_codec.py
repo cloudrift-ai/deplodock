@@ -26,7 +26,7 @@ Usage::
     python scripts/migrate_goldens_to_codec.py --check      # report drift, write nothing (exit 1 if any)
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import argparse
 import re

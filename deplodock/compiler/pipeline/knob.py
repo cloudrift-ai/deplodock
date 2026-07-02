@@ -80,15 +80,12 @@ class Knob:
     the env override ``DEPLODOCK_<NAME>``. ``hints`` is the autotune
     candidate list (a guideline, not a constraint — rules apply their
     own structural validity gates). ``help`` is a short docstring shown
-    by future tooling (``deplodock knobs``). ``aliases`` are alternate
-    names whose ``DEPLODOCK_<ALIAS>`` env vars also pin this knob (read
-    via :meth:`raw`; the primary name wins when both are set)"""
+    by ``deplodock eval knobs``."""
 
     name: str
     type: KnobType
     hints: tuple = ()
     help: str = ""
-    aliases: tuple[str, ...] = ()
     # Optional custom featurizer for the learned-prior feature vector: maps this
     # knob's value to a ``dict[str, float]`` of sub-features. Declared at the
     # knob (e.g. ``MMA`` expands an atom kind into physical cell/dtype props) so
@@ -109,18 +106,8 @@ class Knob:
         return config.knob_var(self.name)
 
     def raw(self) -> str | None:
-        """Live env pin: the primary ``DEPLODOCK_<NAME>`` first, then each
-        alias in declaration order; ``None`` when nothing is set. Every
-        env read of an alias-bearing knob must route through here so the
-        alias spelling behaves identically to the primary."""
-        value = config.knob_raw(self.name)
-        if value is not None:
-            return value
-        for alias in self.aliases:
-            value = config.knob_raw(alias)
-            if value is not None:
-                return value
-        return None
+        """Live env pin (``DEPLODOCK_<NAME>``); ``None`` when unset."""
+        return config.knob_raw(self.name)
 
     def read_int(self, default: int) -> int:
         """Read this knob's ``DEPLODOCK_<NAME>`` env pin as an int (empty /
@@ -433,13 +420,12 @@ apply_knobs_env()
 
 # --- Rendering -------------------------------------------------------------
 
-# Canonical display order for tuning knobs. The native ``MOVE@element`` families lead —
-# ``SPLIT@`` (free-axis tiles), then ``REDUCE@`` (contraction tower), then ``ATOM@``
-# (atomize), then ``PLACE@`` (placement) — each family's keys sorted by element; the
-# unified-codec exact-name knobs (the output-fragment ``TILE``, the ``REDUCE`` partition, the
-# ``STAGE`` pipeline) follow, unknown knobs last (alpha). Shared by the ``run --bench`` kernel
-# table and the ``deplodock eval`` tables so columns read stably.
-_FAMILY_ORDER = ("SPLIT@", "REDUCE@", "ATOM@", "PLACE@", "TILE@", "STAGE@")
+# Canonical display order for tuning knobs. The ``FAMILY@element`` keys lead — the structural
+# ``PLACE@`` placement, then the axis-named schedule codecs (``TILE@`` / ``REDUCE@`` / ``STAGE@``)
+# — each family's keys sorted by element; the bare exact-name knobs follow in ``KNOB_ORDER``,
+# unknown knobs last (alpha). Shared by the ``run --bench`` kernel table and the ``deplodock
+# eval`` tables so columns read stably.
+_FAMILY_ORDER = ("PLACE@", "TILE@", "REDUCE@", "STAGE@")
 KNOB_ORDER = ("TILE", "REDUCE", "STAGE", "WSPEC")
 _KNOB_RANK = {k: i for i, k in enumerate(KNOB_ORDER)}
 

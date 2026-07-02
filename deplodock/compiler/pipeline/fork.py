@@ -4,9 +4,8 @@ pipeline rules that enumerate a knob cartesian.
 
 :class:`Fork` is the interface — ``knobs``, ``is_leaf``, ``expand()``.
 Implementations hold their producer's state as data:
-:class:`OptionFork` (a concrete ``Op``/``Graph`` leaf), :class:`ThunkFork`
-(generic flat forks), and the tree node classes :class:`_Branch` /
-:class:`_Leaf` built by :func:`build_fork_tree`.
+:class:`OptionFork` (a concrete ``Op``/``Graph`` leaf) and the tree node
+classes :class:`_Branch` / :class:`_Leaf` built by :func:`build_fork_tree`.
 
 The tree builder converts a flat list of variant knob rows (plain dicts)
 into the ROOT :class:`_Branch` of a lazy tree: each ``Level`` groups
@@ -21,11 +20,6 @@ resolves a leaf.
 Everything is lazy: no Fork below the root exists until the search expands
 it. Siblings are emitted in grouping order — RANKING IS SEARCH POLICY: the
 policies rank the frontier with the learned prior (Forks carry no score).
-
-Use the builder when a rule produces ≥2 hierarchical levels of knob
-bundling. For flat 2-element forks with no hierarchy a bare
-``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer —
-don't reach for the builder.
 
 The engine in ``pipeline.py`` consumes ``fork.knobs`` flat (it doesn't walk
 ancestors): branch Forks pin their level's slice of the row, leaves carry
@@ -91,21 +85,6 @@ class OptionFork(Fork):
 
     def expand(self) -> list[Op | Graph | Fork]:
         return [self.option]
-
-
-@dataclass(frozen=True)
-class ThunkFork(Fork):
-    """Generic implementation for flat one-off forks: ``expand_fn(knobs)``
-    as a plain function of the fork's ``knobs`` so siblings share ONE function
-    instead of per-instance capture lambdas (the knob delta is the only thing
-    that varies)."""
-
-    knobs: dict
-    expand_fn: Callable[[dict], list[Op | Graph | Fork]]
-    is_leaf: bool = False
-
-    def expand(self) -> list[Op | Graph | Fork]:
-        return self.expand_fn(self.knobs)
 
 
 def flatten_leaves(options: Sequence[Op | Graph | Fork]) -> list[Op | Graph | Fork]:

@@ -527,8 +527,8 @@ class SetMaxNReg(Stmt):
     warps claim them, decoupling occupancy from the consumer's pressure.
 
     Requires sm_90+. On older targets NVCC rejects the instruction at
-    compile time — the materializer only emits this Stmt on the WS=1 path
-    where the kernel is already TMA-gated to sm_90+ anyway."""
+    compile time — only a warp-specialized materialization emits this Stmt,
+    and that path is already TMA-gated to sm_90+ anyway."""
 
     count: int
     direction: str  # "inc" or "dec"

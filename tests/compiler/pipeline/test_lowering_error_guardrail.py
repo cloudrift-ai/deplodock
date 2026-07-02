@@ -179,7 +179,7 @@ def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
     prior can rank them top and the blocklist retry engages per tile identity
     (``BN``). Pass 0 ``RuleSkipped``-guards on the BN marker so it never
     re-fires on its own (already-tiled) output."""
-    from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
+    from deplodock.compiler.pipeline.fork import OptionFork
     from deplodock.compiler.pipeline.pipeline import RuleSkipped
 
     def _tile_leaf(bn: int) -> TileOp:
@@ -190,7 +190,7 @@ def _two_pass_tile_pipeline(n_over_budget: int) -> Pipeline:
             raise RuleSkipped("already tiled")
         leaves = [OptionFork(option=_tile_leaf(8), knobs={"BN": 8})]
         leaves += [OptionFork(option=_tile_leaf(16 + 8 * i), knobs={"BN": 16 + 8 * i}) for i in range(n_over_budget)]
-        return ThunkFork(knobs={}, expand_fn=lambda _k: leaves)
+        return leaves
 
     def materialize(root):
         bn = root.op.knobs.get("BN", 0)

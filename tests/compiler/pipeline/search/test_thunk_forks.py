@@ -13,14 +13,29 @@ the expected knob delta.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp, Op
-from deplodock.compiler.pipeline.fork import ThunkFork
+from deplodock.compiler.pipeline.fork import Fork
 from deplodock.compiler.pipeline.pipeline import Pass, Pattern, Pipeline, Rule
 from tests.compiler.conftest import drain_tune
+
+
+@dataclass(frozen=True)
+class ThunkFork(Fork):
+    """Minimal branch-``Fork`` test stand-in (the production ``ThunkFork`` was removed with its
+    last rule): ``expand_fn(knobs)`` produces the next level, so these engine tests can build
+    arbitrary lazy fork shapes without the tree builder."""
+
+    knobs: dict = field(default_factory=dict)
+    expand_fn: Callable = lambda knobs: []
+    is_leaf: bool = False
+
+    def expand(self):
+        return self.expand_fn(self.knobs)
 
 
 # A tiny stub Op for testing. Carries an arbitrary ``knobs`` dict that the

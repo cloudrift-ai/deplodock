@@ -150,27 +150,6 @@ def test_narrow_binmask_rejected(monkeypatch):
         k.narrow((0b000, 0b111))
 
 
-def test_raw_alias_fallback(monkeypatch):
-    """``Knob.raw`` reads the primary ``DEPLODOCK_<NAME>`` first, then each
-    alias in declaration order (e.g. ``MMA`` accepting ``ATOM_KIND``)."""
-    k = Knob("NEWNAME", KnobType.STR, aliases=("OLDNAME",))
-    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
-    monkeypatch.delenv("DEPLODOCK_OLDNAME", raising=False)
-    assert k.raw() is None
-    monkeypatch.setenv("DEPLODOCK_OLDNAME", "via-alias")
-    assert k.raw() == "via-alias"
-    monkeypatch.setenv("DEPLODOCK_NEWNAME", "primary")
-    assert k.raw() == "primary"
-
-
-def test_narrow_reads_alias(monkeypatch):
-    """``Knob.narrow`` honors an alias-spelled env pin."""
-    k = Knob("NEWNAME", KnobType.INT, aliases=("OLDNAME",))
-    monkeypatch.delenv("DEPLODOCK_NEWNAME", raising=False)
-    monkeypatch.setenv("DEPLODOCK_OLDNAME", "8")
-    assert k.narrow((1, 2)) == (8,)
-
-
 # ---------------------------------------------------------------------------
 # OFF defaults + tier (is_warp / mma_atom)
 # ---------------------------------------------------------------------------

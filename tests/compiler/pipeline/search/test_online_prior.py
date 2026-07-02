@@ -156,21 +156,23 @@ def test_prior_file_checkpoint_round_trips(tmp_path):
 
 
 def test_load_tolerates_stale_checkpoint(tmp_path):
-    """A pre-CatBoost checkpoint (sklearn estimator-state ``model`` dict +
-    legacy ``archived_rows`` key) migrates instead of crashing: the unusable
-    model is dropped, the rows are salvaged, and the next refit rebuilds it."""
+    """A checkpoint with an incompatible ``model`` blob (e.g. a pre-CatBoost sklearn
+    estimator-state dict) migrates instead of crashing: the unusable model is dropped,
+    the ``dataset`` rows are salvaged, and the next refit rebuilds it. (The pre-rebuild
+    ``archived_rows`` dataset key is retired — a checkpoint that old is discarded whole,
+    its rows being suspect under the restored knob schema.)"""
     from deplodock import storage
 
     path = tmp_path / "prior.json"
     stale = {
         "cols": ["BM"],
         "model": {"class": "BayesianRidge", "state": {}},  # sklearn estimator state, not a cbm blob
-        "archived_rows": [[{"BM": bm}, math.log(bm)] for bm in (2, 4, 8, 16)],
+        "dataset": [[{"BM": bm}, math.log(bm)] for bm in (2, 4, 8, 16)],
     }
     storage.write_json(path, stale)
     p = CatBoostPrior.load(path=path)
     assert not p.fitted  # stale model discarded
-    assert len(p._dataset) == 4  # legacy rows salvaged
+    assert len(p._dataset) == 4  # rows salvaged
     p.add_rows(_bm_rows())
     p.fit()
     assert p.fitted  # rebuilt fine from salvaged + new rows

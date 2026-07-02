@@ -23,10 +23,20 @@ from deplodock.compiler.graph import Graph, Tensor
 from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline, TuningSearch
-from deplodock.compiler.pipeline.fork import OptionFork, ThunkFork
+from deplodock.compiler.pipeline.fork import Fork, OptionFork
 from deplodock.compiler.pipeline.pipeline import _is_structural_option
 from deplodock.compiler.pipeline.search.db import SearchDB
 from tests.compiler.conftest import drain_tune
+
+
+class _BranchFork(Fork):
+    """Minimal non-leaf ``Fork`` — untypable without ``expand()``, so never structural."""
+
+    knobs: dict = {}
+
+    def expand(self):
+        return []
+
 
 _S, _H, _I = 32, 1024, 3072
 
@@ -95,4 +105,4 @@ def test_is_structural_option_predicate() -> None:
     assert _is_structural_option(OptionFork(option=Graph()))
     assert not _is_structural_option(InputOp())
     assert not _is_structural_option(OptionFork(option=InputOp()))
-    assert not _is_structural_option(ThunkFork(knobs={}, expand_fn=lambda _k: []))
+    assert not _is_structural_option(_BranchFork())

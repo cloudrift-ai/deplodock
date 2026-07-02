@@ -345,7 +345,7 @@ def _emit_variant_table(name: str, samples: list, prior, *, n_fail: int, o3: dic
 
 def _emit_registry() -> None:
     """List every registered :class:`~deplodock.compiler.pipeline.knob.Knob` — the
-    canonical tuning schema (name, type, candidate hints, aliases, help) collected
+    canonical tuning schema (name, type, candidate hints, help) collected
     by ``knob.registry`` from all loaded passes, regardless of any DB."""
     from deplodock.compiler.pipeline import CUDA_PASSES, Pipeline, knob  # noqa: PLC0415
 
@@ -371,8 +371,6 @@ def _emit_registry() -> None:
         if len(hints) > hw:
             hints = hints[: hw - 1] + "…"
         help_txt = " ".join((k.help or "").split())  # collapse whitespace/newlines
-        if k.aliases:
-            help_txt += f" [aliases: {', '.join(k.aliases)}]"
         lines = textwrap.wrap(help_txt, width=help_w) or [""]
         logger.info(f"{name:<{kw}}  {k.type.value:<{tw}}  {hints:<{hw}}  {lines[0]}")
         for cont in lines[1:]:

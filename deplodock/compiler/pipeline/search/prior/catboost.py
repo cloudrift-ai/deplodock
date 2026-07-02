@@ -138,9 +138,7 @@ class CatBoostPrior(Prior):
         the model), so e.g. a pre-CatBoost prior file migrates instead of crashing."""
         p = cls()
         p._cols = obj.get("cols")
-        # ``dataset`` is the current key; ``archived_rows`` the legacy one — keep
-        # either so an old checkpoint's accumulated rows survive the migration.
-        raw = obj.get("dataset") or obj.get("archived_rows") or []
+        raw = obj.get("dataset") or []
         p._dataset = [(dict(k), float(v)) for k, v in raw]
         p._seen = int(obj.get("seen", len(p._dataset)))
         p._since_fit = int(obj.get("since_fit", 0))

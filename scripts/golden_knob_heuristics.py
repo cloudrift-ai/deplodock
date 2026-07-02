@@ -103,7 +103,7 @@ def _reduce_rows(dag) -> list[dict]:
     """Cooperative-reduce candidate knob rows: the cartesian of the carrier's
     cooperative ``(bk, fk, br)`` K-partitions (``coop_reduce_offers``) × the free-row
     register tile (``reduce_reg_offers``), over the free-axis THREAD tile
-    (``coop_free_threads``). The native rows speak ``MOVE@element`` (``SPLIT@<axis>`` +
+    (``coop_free_threads``). The native rows speak the axis-named schedule codecs (``TILE@<axis>`` +
     ``REDUCE@<axis>``); a 1-D reduce (no outer M axis) leaves the M slot degenerate,
     which the schema-agnostic ``tile_signature`` matches against the golden's
     ``BM``/``FM`` = 1."""
@@ -122,7 +122,7 @@ def _reduce_rows(dag) -> list[dict]:
 def _pointwise_rows(dag) -> list[dict]:
     """Pointwise (MAP, no reduce) candidate knob rows: the cartesian of the free
     thread tile (``thread_offers``) × the register tile (``map_reg_offers``). The native
-    rows carry only ``SPLIT@<axis>`` (no ``REDUCE@`` — a MAP nest has no contraction);
+    rows carry only the free-axis tile (no ``REDUCE@`` — a MAP nest has no contraction);
     ``tile_signature``'s degenerate reduce decomposition matches the golden's
     ``BK=FK=SPLITK=BR=1``."""
     from deplodock.compiler.pipeline.passes.lowering.tile.enumeration import _moves  # noqa: PLC0415

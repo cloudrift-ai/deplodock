@@ -109,8 +109,8 @@ def evaluate_golden(
     if scorer is None:
         scorer = _analytic_scorer(M, N, K, ctx, dynamic=dynamic)
     # Match the recorded golden against the native candidate rows by schema-agnostic
-    # structural signature (free slots + reduce decomp + atom + stage) — robust to either
-    # spelling, so it still joins a legacy-recorded DB row against the native enumeration.
+    # structural signature (free slots + reduce decomp + atom + stage) — robust to bare vs
+    # axis-named key spelling.
     want = tile_signature(golden_knobs) if golden_knobs else None
     gidx = next((i for i, r in enumerate(rows) if tile_signature(r) == want), None) if want else None
     scores = [scorer(r) for r in rows]

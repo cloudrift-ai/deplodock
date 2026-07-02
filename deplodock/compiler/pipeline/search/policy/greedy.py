@@ -51,31 +51,25 @@ def _tile_pipeline():
     return Pipeline.build(["lowering/tile"])
 
 
-# Tile-identity knobs a blocklist entry keys on — the planner/enumeration choices
-# that fully determine a tile (so two leaves are "the same tile" iff these match).
-# Excludes the post-lowering staging knobs (RING / STAGE), which are stamped after
-# the greedy fork pick and differ between the leaf and the rejected node. Every
-# tile-geometry family is now native (``SPLIT@``/``REDUCE@``/``ATOM@`` per-element keys),
-# matched by key prefix since the element names are per-kernel; no legacy exact-name
-# knob remains.
-_TILE_IDENTITY: tuple[str, ...] = ()
-_TILE_IDENTITY_PREFIXES = ("REDUCE@", "SPLIT@", "ATOM@")
-
 # The rule whose fork prices a kernel: the prior's predicted µs for the chosen
-# complete tile row at the partition fork is the per-kernel cost the structural
-# pricing sums (defined here, not in ``two_level``, because that module imports
+# complete schedule row at the contraction fork (the one hierarchical tile → stage → reduce
+# fork ``_schedule`` offers from inside ``010_recognize``) is the per-kernel cost the
+# structural pricing sums (defined here, not in ``two_level``, because that module imports
 # this package at module scope — the reverse would cycle).
-PARTITION_RULE = "100_register_tile"
+PARTITION_RULE = "010_recognize"
 
 
 def tile_identity(knobs: dict) -> frozenset:
-    """The blocklist key for a tile — its planner-chosen knobs as a hashable set.
+    """The blocklist key for a tile — its canonical tuning-knob view
+    (:func:`~deplodock.compiler.pipeline.knob.tuning_knob_items`: the ``S_*`` / ``H_*``
+    features and marker booleans dropped, values stringified) as a hashable set.
     Computed identically for a greedy leaf's fork knobs and for a rejected node's
-    realized knobs, so :func:`greedy_decide` can skip a leaf that already failed
-    ``validate(ctx)`` downstream (the smem / thread-budget gate)."""
-    exact = [(k, str(knobs[k])) for k in _TILE_IDENTITY if k in knobs]
-    native = [(k, str(v)) for k, v in knobs.items() if k.startswith(_TILE_IDENTITY_PREFIXES)]
-    return frozenset(exact + native)
+    realized knobs — the honest-stamping rule makes the two agree — so
+    :func:`greedy_decide` can skip a leaf that already failed ``validate(ctx)``
+    downstream (the smem / thread-budget gate)."""
+    from deplodock.compiler.pipeline.knob import tuning_knob_items  # noqa: PLC0415
+
+    return frozenset(tuning_knob_items(knobs))
 
 
 def _tile_blocked(fork_knobs: dict, blocked: set[frozenset]) -> bool:

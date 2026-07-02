@@ -1012,12 +1012,15 @@ def _unlowered_tiles(graph: Graph, rejections: list[tuple[str, str, str]]) -> di
         return {}
     from deplodock.compiler.ir.loop.ir import LoopOp  # noqa: PLC0415
     from deplodock.compiler.ir.tile.ir import TileOp  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.policy.greedy import tile_identity  # noqa: PLC0415
 
     out: dict[str, frozenset] = {}
     for nid, _pass_label, _reason in rejections:
         node = graph.nodes.get(nid)
         if node is not None and isinstance(node.op, (LoopOp, TileOp)):
-            out[nid] = frozenset((getattr(node.op, "knobs", None) or {}).items())
+            # Key through ``tile_identity`` — the SAME canonicalization ``greedy._tile_blocked``
+            # applies to a leaf's fork knobs, so the blocklist actually matches on retry.
+            out[nid] = tile_identity(getattr(node.op, "knobs", None) or {})
     return out
 
 

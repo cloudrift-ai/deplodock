@@ -133,7 +133,6 @@ def test_scalar_flash_matches_torch(monkeypatch, variant):
     to ONE streaming online-softmax kernel and matches torch SDPA across the variant's static
     configs. The non-causal kernel carries the streaming softmax markers (``fmaxf`` + ``expf``);
     causal/mask/GQA recognize their per-element guard structurally from the fused body."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(0)
     for cfg in _FLASH_VARIANTS[variant][2]:
         module, args, feed, ref = _flash_feed(variant, *cfg)
@@ -152,7 +151,6 @@ def test_scalar_flash_dynamic_matches_torch(monkeypatch, variant):
     """Symbolic ``seq_len`` (Q/K/V dim -2): ONE cached kernel carrying ``int seq_len`` serves every
     runtime size — flash's single dynamic axis lands on the masked-row M, the symbolic reduce, and
     (for GQA) the causal guard at once. Accurate vs torch at seq ∈ {8, 16, 37}."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(0)
     seq = torch.export.Dim("seq_len", min=4, max=4096)
     module_cls, kwargs, _ = _FLASH_VARIANTS[variant]
@@ -199,7 +197,6 @@ def test_scalar_flash_kv_tile_matches_torch(monkeypatch, bk):
     """KV tiling: a ``DEPLODOCK_BK`` pin re-brackets the streaming reduce ``S_k → S_k/BK · BK``
     (serial within the tile). The fused flash kernel must still fuse to one kernel and match torch.
     ``S=32`` / ``D=16`` are divisible by both 2 and 4, so the pin is honored."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     monkeypatch.setenv("DEPLODOCK_BK", str(bk))
     torch.manual_seed(0)
     q, k, v = (torch.randn(2, 3, 32, 16) for _ in range(3))
@@ -219,7 +216,6 @@ def test_scalar_flash_kv_tile_matches_torch(monkeypatch, bk):
 def test_flash_causal_and_gqa_match_torch(monkeypatch):
     """Scalar flash keeps the causal / GQA masks in the ``d``-invariant score prefix, so masked +
     grouped-head flash also matches torch (one streaming online-softmax kernel)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(0)
 
     q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
@@ -252,7 +248,6 @@ def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
     the QK^T score computed once per KV step and shared across ``d`` (one kernel, scalar FMA P@V).
     **Xfailed:** this scalar-chain restructuring is not yet rebuilt (no ``O_i_0`` register vector is
     emitted today), so the ``O_i_0`` assertion below fails."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
     backend, compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))
@@ -287,7 +282,6 @@ def _compile_tc(q, k, v, module=None):
 @requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 2, 32, 16), (2, 3, 64, 32), (1, 4, 128, 64), (1, 1, 16, 16)])
 def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(S + D)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.float16) for _ in range(3))
     backend, compiled, graph, kernels = _compile_tc(q, k, v)
@@ -312,7 +306,6 @@ def test_generated_tensorcore_flash_matches_torch(monkeypatch, B, H, S, D):
 def test_generated_tensorcore_flash_bf16_matches_torch(monkeypatch, B, H, S, D):
     """bf16 in, f32 accumulate. Same fused warp-chain as fp16 (the 16-bit operand dtype only swaps
     the mma atom / PTX dtype field); validated vs torch SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(S + D + 1)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
     backend, compiled, graph, kernels = _compile_tc(q, k, v)
@@ -339,7 +332,6 @@ def test_generated_tensorcore_flash_causal_bf16_matches_torch(monkeypatch, B, H,
     """The cross-product: bf16 operands AND the fragment causal mask, together. The softmax realizer
     is dtype-agnostic (f32 algebra) and causal is a score-partial mask, so the two compose with no
     special-casing — validated vs torch's bf16 is_causal SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(S + D + 2)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.bfloat16) for _ in range(3))
     backend, compiled, graph, kernels = _compile_tc(q, k, v, module=_Causal())
@@ -371,7 +363,6 @@ def test_generated_tensorcore_flash_causal_matches_torch(monkeypatch, B, H, S, D
     """Causal masking at the fragment tier. The fused warp-chain inserts a per-element
     ``FragmentMask`` (causal) on the score fragment (strict upper triangle → ``-1e30`` before the
     rowmax), matching torch's ``is_causal=True`` SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(S + D)
     q, k, v = (torch.randn(B, H, S, D, dtype=torch.float16) for _ in range(3))
     backend, compiled, graph, kernels = _compile_tc(q, k, v, module=_Causal())
@@ -402,7 +393,6 @@ def test_warp_chain_dynamic_matches_torch(monkeypatch, seq):
     serves every runtime size: the partial final KV / query tile (seq=37 straddles both) is masked
     at the score fragment, its K/V gmem loads clamped, its output store guarded. Matches torch SDPA
     at seq ∈ {8, 16, 37, 64}."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     B, H, D = 1, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     seed = tuple(torch.randn(B, H, 16, D, dtype=torch.float16) for _ in range(3))
@@ -433,7 +423,6 @@ def test_warp_chain_causal_dynamic_matches_torch(monkeypatch, seq):
     """Symbolic ``seq_len`` warp-chain flash with **causal** masking (equal-head). The causal
     score-fragment mask (``kv_col > q_row`` → ``-1e30``) composes with the symbolic boundary mask
     (both write soft −inf before the rowmax). Matches torch ``is_causal=True`` SDPA."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     B, H, D = 1, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     seed = tuple(torch.randn(B, H, 16, D, dtype=torch.float16) for _ in range(3))
@@ -467,7 +456,6 @@ def test_warp_chain_causal_dynamic_matches_torch(monkeypatch, seq):
 def test_warp_chain_gqa_static_matches_torch(monkeypatch, Hq, Hkv, S, D):
     """STATIC ``S`` warp-chain flash with GQA (``head // group`` K/V indexing). ``_Gqa`` traces as
     GQA+causal; the fused warp-chain reads K/V at the kv-head with no materialized broadcast."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     torch.manual_seed(S + D)
     q = torch.randn(1, Hq, S, D, dtype=torch.float16)
     k, v = (torch.randn(1, Hkv, S, D, dtype=torch.float16) for _ in range(2))
@@ -498,7 +486,6 @@ def test_warp_chain_gqa_dynamic_matches_torch(monkeypatch, seq):
     """Symbolic ``seq_len`` warp-chain flash with **GQA** (``Hq=4 / Hkv=2``, group 2). ``_Gqa`` traces
     as GQA+causal, so this also exercises the causal mask composed with the symbolic boundary mask.
     ONE cached kernel carrying ``int seq_len``; matches torch GQA+causal SDPA at seq ∈ {8,16,37,64}."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     B, Hq, Hkv, D = 1, 4, 2, 32
     sd = torch.export.Dim("seq_len", min=4, max=4096)
     seed = (
@@ -545,7 +532,6 @@ def test_cooperative_flash_matches_torch(monkeypatch, br, B, H, S, D):
     """A cooperative-KV flash (BR>1) fuses to one kernel carrying the monoid cross-thread combine
     (``__shfl_xor_sync`` for BR≤32, a per-component smem tree for BR>32) and matches torch SDPA —
     the KV parallelization is accuracy-preserving (the LSE monoid is associative + commutative)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
     monkeypatch.setenv("DEPLODOCK_REDUCE", f"b{br}")
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, S, D) for _ in range(3))
