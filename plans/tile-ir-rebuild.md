@@ -203,10 +203,21 @@ top of this*, not before it — flash is the acceptance test that the collapse i
   each atom's `stage_plan` sizing returns) picks gmem-direct (`_contract_kloop`) or staged (`_atom._staged` — the one
   atom-agnostic driver that builds the operand pair, the `CtaTile` via the shared lanes-keyed `_cta`, and the
   transport). `_mma_staged` / `_scalar_staged` / the free `*_stage_plan`s are deleted; the atoms supply only descriptor
-  reads (`stage_plan` / `gmem_leaves` / `staged_drain` / `slab_elem`). **Still per-atom inside `stage_plan`:** the
-  sizing sources genuinely differ (mma: codec-spelled `TilePlan.bk` + ring/reg depths; scalar: derived fit-to-smem
-  `bk_elems`, single-buffer — the scalar ring stays a follow-on); converging those needs the scheduler-side
-  fully-resolved `Stage` (stamped in `020_schedule`), a build, not a pure delete.
+  reads (`gmem_leaves` / `staged_drain` / `slab_elem`).
+- ✅ **The scheduler-side fully-resolved `Stage` — the staging decision leaves the emitter entirely** (bit-identical
+  across staged, gmem-direct, AND ineligible-pin configs; compiler e2e green). A `STAGE` pin on a contraction is
+  resolved at option-build time (`_schedule._resolve_warp_stage` / `_resolve_scalar_stage`, next to
+  `_contraction_node` — the same resolve-once-structurally rule as the operand binding and the shared-row
+  `_row_stage`): transport eligibility (`_can_stage_warp[_tma]`, moved from `_atom.py`), the slab K-chunk stored on
+  the new derived `Stage.bk_elems` field (mma: `TilePlan.bk·atom_k`; scalar: the fit-to-smem derivation off the
+  step-1-seeded `tile.inputs`), and the depth clamps (48 KiB budget / `reg_depth ≤ bk`; scalar pinned single-buffer) —
+  stamped as the resolved `Stage`, or `None` (gmem-direct). The emitter's `stage_plan` methods and `_StagePlan` are
+  deleted: `_AtomOps.reduce` just branches on `stage is not None` and applies the fields verbatim. The raw codec
+  string still rides `knobs`, so `tile_signature` / featurization are untouched. WSPEC now gates on the RESOLVED
+  stage (an ineligible pin leaves no pipeline for a producer role). Split-K: the pin resolves against the SLICED
+  inner contraction; `030_split` still drops `stage` from its partial `TileOp`s (partials were and remain
+  gmem-direct — threading it is a follow-on). The remaining genuinely-per-atom staging surface is the *apply* leaf
+  (`staged_drain`) — the atom's read primitive, descriptor data by design.
 - **Remaining:** (4) placement-keyed fold move (lands with the tensor-core flash, which needs the returning fragment
   shuffle).
 

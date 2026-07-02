@@ -289,7 +289,9 @@ def _stage_spec(kernel) -> str:
     ``stage=None``). A pin that doesn't parse as the ``STAGE`` codec (e.g. a bare operand
     binmask ``"11"``) is **structurally invalid** for this tier, so it degrades to ``""``
     (gmem-direct) rather than failing the lowering — the same pin-validity rule the other
-    codecs follow."""
+    codecs follow. The returned spec is only the *spelling* (stamped on ``knobs``); each option
+    builder RESOLVES it against its built node (:func:`_resolve_warp_stage` /
+    :func:`_resolve_scalar_stage`) into the ``Stage`` it stamps."""
     if axis_role(kernel.op) is not AxisRole.CONTRACTION:
         return ""
     pinned = STAGE.narrow([""])[0]
@@ -300,6 +302,97 @@ def _stage_spec(kernel) -> str:
     except ValueError:
         return ""
     return pinned
+
+
+# ---- contraction operand-stage RESOLUTION (eligibility + sizing, once, scheduler-side) ---------- #
+# A ``STAGE`` pin on a contraction is resolved HERE against the built :class:`Contraction` node —
+# transport eligibility, the slab K-chunk (``bk_elems``), and the depth clamps — and the RESOLVED
+# :class:`Stage` (or ``None``, gmem-direct) is stamped on the ``TileOp``. The materializer
+# (``_atom._staged``) applies it verbatim, deciding nothing — the same stamp-then-apply shape as the
+# reduce tier's shared-row stage (:func:`_row_stage`). The raw pin string still rides ``knobs`` for
+# the prior, so featurization is untouched by resolution.
+
+
+def _can_stage_warp(stage, k_axis: Axis, tile_m: int, tile_n: int, bk: int, atom_k: int, mask_m: bool, mask_n: bool, b_trans: bool) -> bool:
+    """cp.async staging eligibility: a ``cp.async`` stage over a contraction with a STATIC,
+    tile-divisible K axis and a canonical (non-transposed) B operand. A masked / symbolic **M**
+    (output rows) is fine — the A-slab fill clamp-reads the overhanging rows in-bounds and the
+    ``RegStore`` guards their store. A masked **N** (the B-slab inner dim) and a symbolic /
+    non-divisible **K** stay gmem-direct (K zero-fill is a follow-up). Staging only ever *adds* a
+    faster lowering, so an ineligible kernel silently falls back to gmem-direct."""
+    if stage is None or stage.transport != "cp.async" or b_trans or mask_n:
+        return False
+    if not k_axis.extent.is_static:
+        return False
+    bk_elems = bk * atom_k
+    if k_axis.extent.as_static() % bk_elems != 0:
+        return False
+    # cp.async needs a ≥4-byte contiguous chunk; the 16-bit mma operands give 2 B/elem, so the
+    # inner slab dim must be even (A's BK, B's tile_n). Odd ⇒ fall back.
+    return (bk_elems % 2 == 0) and (tile_n % 2 == 0)
+
+
+def _can_stage_warp_tma(
+    stage, k_axis: Axis, n_axis: Axis, tile_n: int, bk: int, atom_k: int, elem_bytes: int, mask_n: bool, b_trans: bool
+) -> bool:
+    """TMA (``cp.async.bulk.tensor``) staging eligibility: a ``tma`` stage over a contraction with a
+    STATIC, tile-divisible K and a canonical B. A masked / symbolic **M** is fine — the descriptor's
+    globalDim is the runtime M and TMA zero-fills the box overhang past it (no fill clamp needed). A
+    masked **N** and a symbolic / non-divisible **K** stay gmem-direct. The box's inner dim (A's BK,
+    B's tile_n) and the source's inner global stride (A's K, B's N) must be 16 B-aligned (the
+    NONE-swizzle TMA box-copy rule)."""
+    if stage is None or stage.transport != "tma" or b_trans or mask_n:
+        return False
+    if not (k_axis.extent.is_static and n_axis.extent.is_static):
+        return False
+    bk_elems = bk * atom_k
+    k, n = k_axis.extent.as_static(), n_axis.extent.as_static()
+    if k % bk_elems != 0:
+        return False
+    return all((x * elem_bytes) % 16 == 0 for x in (bk_elems, tile_n, k, n))
+
+
+def _resolve_warp_stage(c: Contraction, stage: Stage) -> Stage | None:
+    """Resolve a pinned operand ``Stage`` against the warp (mma) contraction ``c`` — TMA > cp.async >
+    gmem-direct (``None``). The resolved stage carries ``bk_elems`` (the codec-spelled ``TilePlan.bk``
+    in elements), ``depth`` clamped so the ring's slots fit the 48 KiB smem budget (dropping ``ring``
+    when the clamp leaves nothing to cycle), and ``reg_depth`` clamped to ``bk`` (nothing to ping-pong
+    past the resident chunk)."""
+    atom = c.atom
+    a_nbytes = atom.operand_dtype("a").nbytes
+    bk = c.tile.bk
+    m, n = c.m, c.n
+    tma_ok = _can_stage_warp_tma(stage, c.k_axis, n.axis, n.tile, bk, atom.atom_k, a_nbytes, n.mask, c.b_trans)
+    cp_ok = (not tma_ok) and _can_stage_warp(stage, c.k_axis, m.tile, n.tile, bk, atom.atom_k, m.mask, n.mask, c.b_trans)
+    if not (tma_ok or cp_ok):
+        return None
+    bk_elems = bk * atom.atom_k
+    slot_bytes = (m.tile + n.tile) * bk_elems * a_nbytes
+    depth = min(stage.depth, max(1, (48 * 1024) // slot_bytes))
+    return replace(stage, depth=depth, ring=stage.ring and depth >= 2, reg_depth=min(stage.reg_depth, bk), bk_elems=bk_elems)
+
+
+def _resolve_scalar_stage(c: Contraction, stage: Stage, inputs) -> Stage | None:
+    """Resolve a pinned operand ``Stage`` against the scalar register-tile contraction ``c``, or
+    ``None`` (gmem-direct). Staging is **opt-in behind a ``STAGE`` pin**: eligible when the transport
+    is ``tma`` / ``cp.async`` and K is static (a computed-A contraction never reaches here — it keeps
+    the ``Map`` form). A masked (overhanging) M / N is fine — the drain reads the slab by LOCAL tile
+    coords and the overhanging store is guarded, so TMA zero-fills the box overhang and cp.async
+    clamps the gmem read. The slab K-chunk ``bk_elems`` is **derived** to fit a single
+    ``tile_m×bk + bk×tile_n`` operand slab in 48 KiB (largest power-of-two dividing K; ``inputs``
+    supplies the element dtype) — not spelled by a codec, so no schema change. The resolved stage is
+    single-buffer (``depth == 1``; the scalar gmem→smem ring is a follow-on)."""
+    if not c.k_axis.extent.is_static or stage.transport not in ("tma", "cp.async"):
+        return None
+    if not inputs or c.a_operand.input not in inputs:
+        return None
+    K = c.k_axis.extent.as_static()
+    elem_bytes = inputs[c.a_operand.input].dtype.nbytes
+    cap = (48 * 1024) // (max(1, c.m.tile + c.n.tile) * elem_bytes)
+    bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
+    if bk_elems < 4:
+        return None
+    return replace(stage, depth=1, ring=False, reg_depth=1, bk_elems=bk_elems)
 
 
 def _wspec_workers(stage) -> tuple[WarpSpec | None, str]:
@@ -424,7 +517,14 @@ def _splitk_option(tile, place, tile_spec: str, split_spec: str, name: str, knob
     carrier = Accum(name=inner.acc, value=f"{inner.acc}__v", op=ElementwiseImpl("add"), dtype=F32).as_carrier()
     op = Reduction(carrier=carrier, axis=ksplit, role=AxisRole.CONTRACTION, source=inner, reduce=ReducePlan.parse(split_spec))
     kaxis = reduce_loop(tile.op).axis.name  # the ORIGINAL k-axis name — single-eligible-axis keying
-    stage = Stage.parse(stage_spec) if stage_spec else None
+    # Resolve the STAGE pin against the SLICED inner contraction (K/w — the K the partial kernel
+    # sees). NOTE: ``030_split`` does not thread ``stage`` onto its partial ``TileOp``s today, so a
+    # split-K partial always materializes gmem-direct; the resolved stamp here is what a future
+    # threading consumes.
+    stage = None
+    if stage_spec:
+        parsed = Stage.parse(stage_spec)
+        stage = _resolve_warp_stage(inner, parsed) if wt.is_warp else _resolve_scalar_stage(inner, parsed, tile.inputs)
     stamped = {**knobs, _at(TILE, kaxis): tile_spec, _at(REDUCE, kaxis): split_spec}
     if stage_spec:
         stamped[_at(STAGE, kaxis)] = stage_spec
@@ -439,13 +539,14 @@ def _warp_option(tile, place, spec: str, name: str, knobs: dict, stage_spec: str
     learned-prior featurizer parses it directly (one codec, not a per-knob ``WM``/``WN``/``MMA`` explosion)."""
     wt = TilePlan.parse(spec)
     _check_warp_static_k(tile, wt)
-    stage = Stage.parse(stage_spec) if stage_spec else None
     # Build the tiled Contraction node here — it resolves the operand→role facts internally, so an
     # unbindable atom (a non-Load operand: a computed-cone / demoted matmul) raises and is rejected
     # at fork construction, like the static-K check.
     op = _contraction_node(tile.op, place, wt)
+    stage = _resolve_warp_stage(op, Stage.parse(stage_spec)) if stage_spec else None
     # Warp specialization rides ORTHOGONAL to the tile/stage just resolved: an optional WSPEC pin
-    # splits the warps into roles over this fixed pipeline (gated on the ``stage``).
+    # splits the warps into roles over this fixed pipeline (gated on the RESOLVED ``stage`` — an
+    # ineligible pin leaves no pipeline for a producer to drive, so WSPEC degrades to uniform).
     workers, wspec_spec = _wspec_workers(stage)
     # The per-node schedule codecs key ``@<k_axis>`` (the contraction axis this node schedules), so a
     # multi-node kernel can address each node; ``WSPEC`` stays root-global (bare).
@@ -465,7 +566,6 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     the :class:`Stage`), the specs stamped on ``knobs`` for the prior. ``reduce_spec`` is the ``b`` / ``r``
     K partition only — the cross-CTA split-K ``g`` rides the separate structural :func:`_splitk_option`
     fork."""
-    stage = Stage.parse(stage_spec) if stage_spec else None
     plan = TilePlan.parse(spec)
     # The scalar tile's CTA launches ``par_n · par_m`` threads (one per parallel output cell,
     # each owning a ``reg_n · reg_m`` register sub-tile). Reject a parallel tile over the
@@ -484,11 +584,17 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # (:func:`nodify_reduce`), so the plan rides the node — not a residual ``TileOp.reduce`` field —
     # and ``_bind_reduce`` folds it off the node.
     op = tile.op
+    stage = None
     if plan.is_tiled and not reduce_spec:
         try:
             op = _contraction_node(tile.op, place, plan)
         except LoweringError:
             pass  # an unbindable contraction (a non-Load operand) keeps the Map form
+        else:
+            # Only a built Contraction node can engage operand staging — resolve the pin against it
+            # (per-cell / coop-K / unbindable forms stamp None: nothing downstream would read a stage).
+            if stage_spec:
+                stage = _resolve_scalar_stage(op, Stage.parse(stage_spec), tile.inputs)
     elif reduce_spec:
         op = nodify_reduce(tile.op, ReducePlan.parse(reduce_spec))
     # ``TILE`` / ``REDUCE`` / ``STAGE`` key ``@<k_axis>`` (the contraction axis this node schedules),

@@ -707,10 +707,16 @@ class Stage:
     A constructed ``Stage`` means staging is **on** (the reused gmem operands ride a shared-
     memory slab); ``schedule.stage is None`` is the register / gmem-direct baseline (no
     slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring][/p<reg_depth>]``
-    (decided in ``020_schedule``). ``smem`` (the staged-operand buffer names) is never spelled
-    by the codec: a contraction operand pipeline leaves it empty (both operands stage), while
-    the reduce tier's shared-row stage carries the ONE detected row buffer here — **derived
-    by the scheduler** (``_schedule._row_stage``), applied by ``_factor._bind_reduce``.
+    (decided in ``020_schedule``). A stage stamped on a ``TileOp`` is **RESOLVED**, not the raw
+    pin: the scheduler runs eligibility + sizing against the node ONCE
+    (``_schedule._resolve_warp_stage`` / ``_resolve_scalar_stage`` for a contraction's operand
+    pipeline, ``_row_stage`` for the reduce tier's shared row) and stamps the result — or ``None``
+    when the pin can't engage (gmem-direct) — so the materializer applies it verbatim, deciding
+    nothing. Two fields are derived at resolution and never spelled by the codec: ``smem`` (empty
+    for a contraction pipeline — both operands stage; the ONE detected row buffer for the
+    shared-row stage) and ``bk_elems`` (the contraction slab's K-chunk in elements — the
+    codec-spelled ``TilePlan.bk · atom_k`` on the warp tier, the fit-to-smem derivation on the
+    scalar tier; 0 for the 1-D shared row).
 
     The pipeline has two buffering levels down the memory hierarchy, each with its own depth:
     ``depth`` is the **gmem→smem** ring (the cp.async / TMA prefetch over the serial reduce
@@ -723,9 +729,10 @@ class Stage:
 
     depth: int = 1  # gmem→smem ring depth over the reduce loop (1 = single buffer, no prefetch)
     transport: str = "sync"  # sync | cp.async | tma (the gmem→smem producer)
-    smem: tuple[str, ...] = ()  # operands staged through smem (derived; not in the codec)
+    smem: tuple[str, ...] = ()  # operands staged through smem (derived at resolution; not in the codec)
     ring: bool = False  # ring buffer vs static double-buffer
     reg_depth: int = 1  # smem→register double-buffer depth (1 = no inner ldmatrix prefetch)
+    bk_elems: int = 0  # contraction slab K-chunk, elements (derived at resolution; not in the codec)
 
     def __post_init__(self) -> None:
         if self.transport not in _TRANSPORT_SPELL:

@@ -262,18 +262,29 @@ def _scalar_stage_graph(M: int = 64, N: int = 64, K: int = 64) -> Graph:
 
 
 def test_scalar_matmul_stages_through_pipeline(monkeypatch) -> None:
-    """The ``TILE_PASSES`` chain stamps the ``STAGE`` codec onto the scalar matmul's typed
-    ``Stage`` schedule struct (the orthogonal codec on the ``SemiringKernel`` arm). ``d1/sync`` is
-    the single-buffer plain-``__syncthreads`` staging point."""
+    """The ``TILE_PASSES`` chain RESOLVES the ``STAGE`` codec against the scheduled contraction and
+    stamps the resolved ``Stage`` (eligibility + sizing run once, scheduler-side): a ``tma`` pin on a
+    register-tiled scalar matmul resolves to a single-buffer stage with the fit-to-smem ``bk_elems``
+    derived; a ``sync`` pin — no contraction transport — resolves to ``None`` (gmem-direct). The raw
+    codec rides ``knobs`` either way (the prior's spelling is resolution-independent)."""
     from deplodock.compiler.ir.tile import TileOp  # noqa: PLC0415
 
-    monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")
-    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((8, 0)))
+    monkeypatch.setenv("DEPLODOCK_TILE", "n16x16/f2x2")
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d2/tma")
+    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
     tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
     # ``STAGE`` is keyed ``@<k_axis>`` (axis-named schedule knob); ``family_value`` reads it.
-    assert family_value(tile_op.knobs, "STAGE") == "d1/sync", tile_op.knobs
+    assert family_value(tile_op.knobs, "STAGE") == "d2/tma", tile_op.knobs
     stage = tile_op.stage
-    assert stage is not None and stage.transport == "sync" and stage.depth == 1, stage
+    assert stage is not None and stage.transport == "tma", stage
+    assert stage.depth == 1, stage  # the scalar tier is single-buffer — the pinned d2 is clamped
+    assert stage.bk_elems == 64, stage  # derived fit-to-smem K-chunk (K=64 divides; slab fits 48 KiB)
+
+    monkeypatch.setenv("DEPLODOCK_STAGE", "d1/sync")  # sync is not a contraction transport
+    out = Pipeline.build(TILE_PASSES).run(_scalar_stage_graph(), ctx=Context.from_target((9, 0)))
+    tile_op = next(n.op for n in out.nodes.values() if isinstance(n.op, TileOp))
+    assert family_value(tile_op.knobs, "STAGE") == "d1/sync", tile_op.knobs
+    assert tile_op.stage is None, tile_op.stage  # resolved: ineligible pin ⇒ gmem-direct
 
 
 def test_warp_matmul_stamps_wspec_workers(monkeypatch) -> None:

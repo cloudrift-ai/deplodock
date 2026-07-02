@@ -52,7 +52,10 @@ bound (e.g. a non-`Load` operand — a computed-cone / demoted matmul) is reject
   index carries (structural — read off the annotated loop, not a flattened-loop scan), plus the fold accumulator and the
   projection epilogue. Those facts are stamped straight onto the `Contraction` node at fork-emit (the node is the single
   source of truth — it re-derives `b_trans` off `b_load`); `_factor.factorize` reads them off the node instead of
-  `lower()`-ing the contraction and pattern-matching the result.
+  `lower()`-ing the contraction and pattern-matching the result. A `STAGE` pin follows the same rule: the option
+  builders resolve it against the built node ONCE (`_resolve_warp_stage` / `_resolve_scalar_stage` — transport
+  eligibility, the slab K-chunk `bk_elems`, the depth clamps) and stamp the resolved `Stage` (or `None`, gmem-direct)
+  on the `TileOp`, so the materializer's one staged driver applies it verbatim, deciding nothing.
 - a cooperative / ILP reduce (`PLANAR` / `TWISTED`, or a non-output-tiled `CONTRACTION`) needs **no** binding here — its
   accumulator dtype + the shuffle/tree fold mechanism are **derived** at materialize time (`emit_combine` off the carrier
   + `ReduceStage.combine`), never stored. Its one schedule-time staging decision follows the same
