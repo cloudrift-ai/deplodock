@@ -536,7 +536,7 @@ class _MmaOps(_AtomOps):
         atom, (m, n) = c.atom, mn
         k_axis = c.k_axis
         assert not c.a_computed, (
-            "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
+            "mma matmul arm: a register-resident (computed) A operand lowers through the fragment realizer (_twist), not here"
         )
         a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
         k_static = k_axis.extent.is_static

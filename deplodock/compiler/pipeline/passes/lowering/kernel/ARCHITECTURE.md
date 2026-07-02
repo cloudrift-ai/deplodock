@@ -142,6 +142,23 @@ and marking the inner drain `Loop(seed=False)` so it folds without re-declaring.
 zero-fills /
 cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged (no pin) is byte-identical gmem-direct.
 
+## The fragment realizer (`_twist.py`) — a TWISTED carrier at warp-fragment residence
+
+A `TWISTED` streaming reduce whose contractions carry mma `TilePlan`s (stamped by
+`_schedule._twisted_warp_option` — tensor-core flash) realizes at FRAGMENT residence: `_bind`'s reduce arm keys on the
+structural warp-tile read (`_twist.warp_source`) and `realize_warp_twist` produces the `(state, fold, close)` triple
+the one pipeline seals, the kernel warp-collective through the same `lanes` parameter `grid_tile` already takes. This
+is the placement-keyed fold's **fragment row**: where the scalar tier folds in-thread, the fragment tier's per-block
+fold is a `FragmentRowReduce` `__shfl` butterfly over the C-fragment lanes. Everything realizes from structure — the
+head contraction's `ldmatrix`/`mma.sync` off its node geometry (`_frag_contraction`); the score prologue stmt-by-stmt
+(`Assign` → `FragmentApply`, a coordinate `Select` → `FragmentMask` with the keep-predicate negated, loop-invariant
+constant `Load`s hoisted); the streaming merge REGENERATED from the carrier's channel spec (pivot → rowmax + running
+stats + α-rescale; denom → rowsum; the expect channel's ⊗ `lift` IS the P@V node, its register-resident A operand fed
+through the `flash_pv_smem` C→A smem handoff); the projection tail as an in-place `FragmentApply` + the `RegStore`
+close. Symbolic seq masks at the fragment (`FragmentMask(col ≥ seq)`) with the gmem reads clamped; causal composes as
+another mask. No kernel-identity dispatch anywhere — an unrealizable tree is rejected at schedule time (the additive
+`(m, kv)` score bias, a non-exp family), never here.
+
 **Shared-row staging (`_tile_reduce_axis`) — the reduce tier's `sync` transport.** The fused norm→linear prologue is a
 cooperative reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a
 free-axis `Loop` over an inner reduce). Like the contraction tiers, it is **`Stage`-driven**: the scheduler

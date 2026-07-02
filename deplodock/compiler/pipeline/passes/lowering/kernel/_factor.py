@@ -57,6 +57,7 @@ from deplodock.compiler.ir.tile import Fold, Level, ReduceStage
 from deplodock.compiler.ir.tile.ir import Contraction, Map, Reduction, Side
 from deplodock.compiler.pipeline.passes.lowering.kernel._atom import copy_cell, reduce_codegen, shrink_axis, store_sink
 from deplodock.compiler.pipeline.passes.lowering.kernel._stage import sync_row_fill
+from deplodock.compiler.pipeline.passes.lowering.kernel._twist import realize_warp_twist, warp_source
 
 
 # ---- generic tiling layer: atomize → register_tile → unit_tile → grid_tile ---------------------- #
@@ -168,9 +169,9 @@ def grid_tile(
 # the reduce ``carrier`` when the node folds one). The ONE root binder (:func:`_bind`) consumes the
 # recursion: the output-tiled ``Contraction`` arm splices the atom's codegen through ``grid_tile``,
 # and the reduce partitioner (:func:`_tile_reduce_axis`) builds its per-cell reduce loop via
-# :func:`_emit`, so a nested ``Contraction`` (flash's Q@K / P@V) is reached AS A NODE. Scalar-nested
-# today (block=1); the per-node warp tile that routes a nested contraction through the mma path is
-# the tensor-core seam marked in :func:`_emit` (a ``Contraction`` case).
+# :func:`_emit`, so a nested ``Contraction`` (flash's Q@K / P@V) is reached AS A NODE — scalar-nested
+# at block=1, while a WARP-TILED tree realizes at fragment residence through ``_twist`` (the
+# ``warp_source`` read in :func:`_bind`), the per-node warp tiles stamped by the scheduler.
 
 
 @dataclass(frozen=True)
@@ -216,8 +217,8 @@ def _emit(op, ctx: Ctx) -> Frag:
     """Recurse over a structural node, returning its :class:`Frag` (per-cell body + wire + carrier).
     The single node-kind dispatch every kernel's compute flows through — walking ``source`` AND
     ``partial`` so flash's Q@K / P@V contractions are reached as nodes. Scalar-nested: a node's body
-    is its lowered loop-IR (byte-identical to ``ops.lower``); the tensor-core tier adds the per-node
-    warp-tile branch in the ``Contraction`` case."""
+    is its lowered loop-IR (byte-identical to ``ops.lower``); a WARP-TILED tree does not reach this
+    walk — ``_bind`` realizes it at fragment residence through ``_twist`` instead."""
     if isinstance(op, Map):
         src = _emit(op.source, ctx) if op.source is not None else None
         prefix = list(src.body) if src is not None else []
@@ -228,8 +229,8 @@ def _emit(op, ctx: Ctx) -> Frag:
         return Frag(body=[loop], out=Handle(op.out), carrier=op.carrier)
     if isinstance(op, Contraction):
         # Scalar / block=1: the synthesized ``CONTRACTION`` loop nest + fused epilogue — byte-identical
-        # to ``op.lower()``. Tensor-core seam: an output-warp-tiled ``Contraction`` (an mma ``TilePlan``)
-        # emits through the register-tile pipeline + the fragment recast here instead.
+        # to ``op.lower()``. A warp-tiled nested contraction never reaches here — the warp-tiled tree
+        # realizes wholesale at fragment residence (``_twist``, keyed in ``_bind``).
         return Frag(body=list(op.lower()), out=Handle(op.acc))
     raise TypeError(f"_emit: expected a Map / Reduction / Contraction node, got {type(op).__name__}")
 
@@ -361,7 +362,16 @@ def _bind(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
         # ``Map`` was already peeled off by :func:`_factorize`).
         plan = op.reduce if isinstance(op, Reduction) else None
         t, mn, lead, lanes = atomize((1, 1)), (None, None), grid, 1
-        if plan is None or (plan.coop <= 1 and plan.reg <= 1):
+        wsrc = warp_source(op)
+        if wsrc is not None:
+            # A warp-tiled TWISTED tree (the schedule stamped mma TilePlans on its contractions):
+            # the per-step values live in mma C-fragments, so the whole reduce realizes at fragment
+            # residence (``_twist``) and the kernel is warp-collective — the same ``lanes`` seam the
+            # output-tiled contraction arm uses.
+            state, fold, close = realize_warp_twist(op, ctx, tail)
+            lanes = wsrc.tile.atom.lanes
+            bt = lanes
+        elif plan is None or (plan.coop <= 1 and plan.reg <= 1):
             state, fold, close, bt = [], with_store([*_emit(op, ctx).body, *tail], ctx.output, grid, out_val), [], None
         else:
             state, fold, close, lane = _tile_reduce_axis(op, plan, ctx, tail, out_val)

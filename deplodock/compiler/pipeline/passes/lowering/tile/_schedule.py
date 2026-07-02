@@ -38,13 +38,14 @@ from types import SimpleNamespace
 
 from deplodock.compiler.dim import DEFAULT_SEQ_HINT, Dim
 from deplodock.compiler.dtype import F32
+from deplodock.compiler.ir.atom import ATOM_REGISTRY
 from deplodock.compiler.ir.axis import Axis, AxisRole
 from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt
-from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
+from deplodock.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
@@ -647,5 +648,74 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
             else _tile_option(tile, place, spec, name, knobs, reduce_spec, stage_spec)
             for spec in _tile_specs(tile)
         ]
+    # A TWISTED streaming reduce whose per-step partial is a contraction pair takes the WARP
+    # (fragment-resident) tier when the mma atom is eligible — the conservative deterministic pick,
+    # like the coop constants above (the tensor-core stream strictly dominates the redundant
+    # per-cell scalar recompute). An explicit ``REDUCE`` pin is the scalar escape: it asks for a
+    # reduce partition, which only the scalar tiers honor.
+    if not REDUCE.narrow([""])[0]:
+        warp = _twisted_warp_option(tile, name, knobs)
+        if warp is not None:
+            return warp
     specs = _reduce_specs(tile, place)
     return [_option(tile, place, spec, name, knobs) for spec in specs]
+
+
+def _twisted_warp_option(tile: TileOp, name: str, knobs: dict) -> TileOp | None:
+    """The fragment-resident (tensor-core) candidate for a ``TWISTED`` streaming reduce, or ``None``
+    (not eligible — the scalar options stand alone). Eligible when the tree is the streaming
+    contraction pair — a head :class:`Contraction` with gmem ``Load`` operands producing the score
+    and an expect :class:`Contraction` consuming a computed (register-resident) weight, under an
+    exp-family carrier — and the mma atom's own demands hold (a 16-bit operand dtype; the head's
+    contraction axis and the expect's output axis divisible by the atom; a static stream / query
+    extent divisible by the block, since a static ragged tail has no fragment mask — the symbolic
+    path masks at the fragment and guards the gmem reads). The same-per-node stamping rule as
+    ``_warp_option``: the two contractions get their mma :class:`TilePlan`\\ s (one warp, the score
+    block ``2·atom_n`` keys wide, the value dim folded into the expect tile), and the placement maps
+    one warp per ``atom_m`` query rows — the value axis leaves the grid. An additive ``(m, kv)``
+    score bias is not realizable at the fragment tier → ``None``."""
+    op = tile.op
+    red = op.source if isinstance(op, Map) and isinstance(op.source, Reduction) else (op if isinstance(op, Reduction) else None)
+    if red is None or red.role is not AxisRole.TWISTED or red.carrier.twist.family != "exp" or len(red.partial) == 0:
+        return None
+    head = red.partial[0]
+    if not isinstance(head, Contraction) or not isinstance(head.a_operand, Load):
+        return None
+    tail_contractions = [s for s in list(red.partial)[1:] if isinstance(s, Contraction)]
+    if len(tail_contractions) != 1 or not tail_contractions[0].a_computed:
+        return None
+    pv = tail_contractions[0]
+    channels = red.carrier.twist.channels
+    if len(channels) != 3 or channels[1].lift is not None or channels[2].lift is None:
+        return None
+    q_tensor = tile.inputs.get(head.a_operand.input) if tile.inputs else None
+    atom_name = {"f16": "mma_m16n8k16_f16", "bf16": "mma_m16n8k16_bf16"}.get(getattr(getattr(q_tensor, "dtype", None), "name", None))
+    if atom_name is None:
+        return None
+    atom = ATOM_REGISTRY[atom_name]
+    atom_m, atom_n, atom_k = atom.shape
+    head_dim, d_v = head.k_axis.extent, pv.n_axis.extent
+    if not (head_dim.is_static and head_dim.as_static() % atom_k == 0 and d_v.is_static and d_v.as_static() % atom_n == 0):
+        return None
+    bn = 2 * atom_n  # the streaming block: one double-atom key step
+    kv_ext, m_ext = red.axis.extent, head.m_axis.extent
+    if (kv_ext.is_static and kv_ext.as_static() % bn != 0) or (m_ext.is_static and m_ext.as_static() % atom_m != 0):
+        return None
+    m_name, kv_name = head.m_axis.name, red.axis.name
+    for s in list(red.partial)[1:]:
+        if isinstance(s, Load) and s.index and {m_name, kv_name} <= {v for e in s.index for v in e.free_vars()}:
+            return None  # an additive (m, kv) score bias — fragment-unrealizable, stay scalar
+    qk_plan = TilePlan(atom=atom, units=(1, 1), regs=(1, bn // atom_n), bk=head_dim.as_static() // atom_k)
+    pv_plan = TilePlan(atom=atom, units=(1, 1), regs=(1, d_v.as_static() // atom_n), bk=1)
+    partial = tuple(replace(s, tile=qk_plan) if s is head else (replace(s, tile=pv_plan) if s is pv else s) for s in red.partial)
+    red2 = replace(red, partial=type(red.partial)(partial))
+    op2 = replace(op, source=red2) if isinstance(op, Map) else red2
+    # One warp per atom_m query rows: the query axis shrinks to its block count; the value (expect
+    # output) axis folds into the fragment tile and leaves the grid.
+    grid = tuple(
+        Axis(name=ax.name, extent=ax.extent.ceil_div(atom_m), source_axis=ax.source_axis or ax) if ax.name == m_name else ax
+        for ax in tile.place.free
+        if ax.name != pv.n_axis.name
+    )
+    place = Placement(free=tile.place.free, grid=grid)
+    return TileOp(op=op2, name=name, place=place, knobs={**knobs, _at(TILE, head.k_axis.name): qk_plan.spell()})

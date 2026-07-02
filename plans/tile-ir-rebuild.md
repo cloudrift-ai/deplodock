@@ -10,9 +10,10 @@ kernel. Recovered: every elementwise / reduction / online-softmax / RMSNorm / sc
 scalar-flash / whole-block kernel, the cooperative (BLOCK) + register-ILP (REG) reduce tiers, the dynamic-grid tier, the
 cross-CTA (GRID) split tier, and the gmem-direct `mma.sync` **warp / tensor-core matmul** (canonical + transposed-B,
 f16/f32 out, fused epilogues, static + dynamic-grid, pin-driven mma split-K via the structural `Reduction ⊃ Contraction`
-fork). All over **static AND symbolic** axes. **Flash lowers only on the scalar tier** — the two-`Contraction` `TWISTED`
-reduce tree at block=1, routed through the common single-binder (`_factor._bind`) path.
-**The tensor-core flash `DEPLODOCK_CHAIN` warp chain was REVERTED** — it had been built as a bespoke
+fork). All over **static AND symbolic** axes. **Flash lowers on the tensor-core tier** for 16-bit atom-eligible shapes (the schedule-stamped warp
+`TilePlan`s + the `_twist` fragment realizer through the one `_factor._bind` binder — see the Phase-1 landed note) and
+on the scalar tier otherwise — the same two-`Contraction` `TWISTED` reduce tree either way.
+**The earlier `DEPLODOCK_CHAIN` warp chain was REVERTED** — it had been built as a bespoke
 `_flash_warp.factorize_flash` emitter (with `_schedule` / `_factor` `is_mma_flash` bypasses and a shape-gated
 `_chain_stamp`), a divergent codegen path the mandate forbids; it is deleted and its e2e cases re-xfailed until the tier
 is rebuilt **through the one contraction emitter** (see Phase 1).
@@ -460,15 +461,36 @@ by `test_contraction_computed_a_*` (standalone P@V: `O[m,d] = Σ_j exp(S[m,j])·
 contraction is **constructed directly** (flash / tests), never recognized (recognition rejects pre-scaled operands), so
 the binding path stays gmem-`Load`-only.
 
-✅ **`_flash._flash_op` is the register-resident PV `Contraction` tree** (block=1 scalar). The mma tier (`_mma_reduce`)
-still asserts `not a_computed` — teaching it to consume the computed-A `Body` (the C→A fragment handoff **inside** the
-shared contraction pipeline) is exactly the re-opened step-3 work. Until then a computed-A `Contraction` is a
-scalar-tier-only concern.
+✅ **`_flash._flash_op` is the register-resident PV `Contraction` tree** (block=1 scalar).
+
+✅ **Step 3 LANDED — tensor-core flash through the one emitter** (all 26 `test_generated_tensorcore_flash_*` /
+`test_warp_chain_*` cases green: fp16/bf16 × plain/causal × static/dynamic-seq × GQA; every non-flash dump config
+byte-identical). The sanctioned shape, no fourth path:
+
+- **Schedule-side stamp** — `_schedule._twisted_warp_option`: a `TWISTED` exp-family streaming reduce whose partial is
+  the contraction pair (a gmem-`Load` head + a computed-A expect) takes the warp tier when the mma atom is eligible
+  (16-bit operand dtype; head-dim % atom_k; d_v % atom_n; static extents block-divisible — the symbolic path masks at
+  the fragment instead). Both contractions get mma `TilePlan`s (per-node `tile`), the placement maps one warp per 16
+  query rows (the value axis leaves the grid — it folds into the expect tile). The deterministic conservative pick,
+  like `_pick_coop`; a `REDUCE` pin is the explicit scalar escape. No recognizer stamp, no `is_mma_flash` dispatch.
+- **Fragment realization in the one binder** — `_bind`'s reduce arm keys on the structural warp-tile read
+  (`_twist.warp_source`) and realizes the whole tree at FRAGMENT residence (`_twist.realize_warp_twist`): the head
+  contraction emits `ldmatrix`/`mma.sync` off its node geometry; the score prologue realizes stmt-by-stmt (`Assign` →
+  `FragmentApply`, coordinate `Select` → `FragmentMask` with the keep-predicate negated, loop-invariant constant
+  `Load`s hoisted); the streaming merge is REGENERATED from the carrier's channel spec (pivot → `FragmentRowReduce`
+  rowmax + running stats + α-rescale; denom → rowsum; the expect channel's ⊗ lift IS the P@V node, its
+  register-resident A fed through the `flash_pv_smem` C→A smem handoff — the `Channel.lift` docstring's anticipated
+  fragment realizer); the projection tail realizes as `FragmentApply(divide, ROW)` + `RegStore`. The kernel becomes
+  warp-collective through the same `lanes` parameter `grid_tile` already takes. **This is deviation 4's fragment row
+  landed with its first consumer** — the within-warp `__shfl` fold move, keyed on residence.
+- **Kernel-IR restore** — the fragment family (`FragmentApply` / `FragmentRowReduce` / `FragmentMask`, `FragLayout` /
+  `M16N8`) restored from the reverted commit; `FragmentApply` UNIFORM args now convert non-f32 scalars through the
+  target intrinsic (the scalar `Assign` promote rule). Fixed en route: bf16 scalar constants materialized as ZERO bits
+  (`cp.full` on the uint16-bits dtype) — `_materialize` now encodes bf16 constants with RNE.
 
 Still xfailed: `test_attention_split_gpu.py` (cross-CTA flash split), `test_attention_coverage.py::
-test_cooperative_flash_matches_torch` (the `BR` cooperative-KV scalar flash), `test_flash_chain_matches_torch[*]` (the
-`O[d]` register-vector scalar chain), and — after the step-3 revert — every `test_generated_tensorcore_flash_*` /
-`test_warp_chain_*` tensor-core case.
+test_cooperative_flash_matches_torch` (the `BR` cooperative-KV scalar flash), and `test_flash_chain_matches_torch[*]`
+(the `O[d]` register-vector scalar chain). The tensor-core cases are all recovered.
 
 - **Symbolic-K masked mma edges** ✅ **landed.** The transposed-B symbolic-K guard is gone; two gmem-direct
   zero-fill helpers (`dpl_mma_load_b_gmem_trans_kzero` / `…_trans_nclamp_kzero`, the (n,k)-swapped mirror of the

@@ -239,8 +239,9 @@ def _split_pv(merge: list, o: str, v: str, v_buf: str, v_idx: tuple, m_axis: Axi
     untouched); only the value it folds is redirected through the contraction.
 
     This is the scalar two-``Contraction`` flash tree at ``block = 1``: the ``j`` reduce is a singleton
-    (the scalar streaming degenerate). A tensor-core tier would tile the same ``P@V`` node with an mma
-    ``TilePlan`` — routed through the one ``_factor`` contraction path, not a bespoke emitter. ``O``
+    (the scalar streaming degenerate). The tensor-core tier tiles the same ``P@V`` node with an mma
+    ``TilePlan`` (``_schedule._twisted_warp_option``), realized at fragment residence by ``_factor``'s
+    one binder (``_twist``) — never a bespoke emitter. ``O``
     and ``V`` are per-``(m, d)``; ``P`` per-``(m, j)`` — different axes from the streaming ``kv``, so
     the PV contraction never duplicates the streaming reduce."""
     o_accum = next(s for s in merge if isinstance(s, Accum) and s.name == o)

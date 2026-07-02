@@ -60,14 +60,11 @@ XFAIL: dict[str, str] = {
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
     "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
-    # Tensor-core flash — the warp-chain codegen was a DEVIATION (a bespoke
-    # `_flash_warp.factorize_flash` emitter + the `DEPLODOCK_CHAIN` knob, bypassing the one `_factor`
-    # contraction path) and was DELETED to restore the mandate. Flash now lowers only on the scalar
-    # tier, so these cases (asserting the `dpl_mma…` / `flash_pv_smem` warp chain) fail again.
-    # Recovering this tier means the Q@K / P@V `Contraction`s carrying an mma `TilePlan` and routing
-    # through the one `_factor._bind` contraction arm — NOT a fourth emitter. Two substrings cover all 26 cases:
-    "test_generated_tensorcore_flash": _R,
-    "test_warp_chain_": _R,
+    # Tensor-core flash RECOVERED through the one emitter: `_schedule._twisted_warp_option` stamps
+    # the mma TilePlans on the Q@K / P@V Contractions (a schedule decision, no recognizer stamp),
+    # `_bind`'s reduce arm realizes the TWISTED carrier at fragment residence (`_twist`), and the
+    # C→A handoff rides the shared kernel-IR nodes — all 26 `test_generated_tensorcore_flash_*` /
+    # `test_warp_chain_*` cases are green again (their entries deleted).
     # test_flash_off_keeps_decomposition: FLASH-off no longer keeps the score-materializing
     # multi-kernel 010_sdpa decomposition (SDPA lowers to a single kernel regardless) — the
     # knob-gated recognition path is a separate rebuild target.

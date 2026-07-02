@@ -255,7 +255,13 @@ def _materialize(buf: _Buffer, shape: tuple[int, ...], src: np.ndarray | None, c
     if src is not None:
         return cp.asarray(np.ascontiguousarray(src, dtype=np_dtype).reshape(shape))
     if buf.role == "constant" and buf.name in constants:
-        return cp.full(shape, float(constants[buf.name]), dtype=cp_dtype)
+        v = float(constants[buf.name])
+        if getattr(buf.dtype, "name", buf.dtype) == "bf16":
+            # bf16 buffers ride as uint16 BITS (``BF16.np``) — casting the float would zero it;
+            # encode the value to bf16 bits (round-to-nearest-even on the dropped mantissa half).
+            bits = int(np.float32(v).view(np.uint32))
+            return cp.full(shape, np.uint16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16), dtype=cp_dtype)
+        return cp.full(shape, v, dtype=cp_dtype)
     if buf.role == "input":
         # Pseudo-random fill for un-supplied inputs (matches old generated program).
         n = 1
