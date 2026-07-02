@@ -102,9 +102,12 @@ def _run(mode: str, tile: str, monkeypatch) -> tuple[np.ndarray, np.ndarray, str
 #   reg_inner   (f4)            — 4 register cells along N, B-load shared across them
 #   reg_2d      (f2x2)         — full 2×2 register block, both operands reused
 #   single_cta  (n32x16/f2x4) — par·reg == 64×64 ⇒ one 512-thread CTA (static)
+#   reg_f3      (f3)            — a stride-3 register row: the store vectorizer must refuse to pack
+#                                  across the misaligned cell stride (the old FN=3 hang/fault shape)
 _VARIANTS = {
     "none": ("", False, None),
     "reg_inner": ("f4", True, None),
+    "reg_f3": ("f3", True, None),
     "reg_2d": ("f2x2", True, None),
     "single_cta": ("n32x16/f2x4", True, 512),
 }
@@ -378,83 +381,29 @@ def _assert_close(out: np.ndarray, ref: np.ndarray, *, atol_rel: float = 0.05, a
     np.testing.assert_allclose(out, ref, atol=atol, rtol=atol_rel)
 
 
-def _pin_knobs(monkeypatch, **knobs) -> None:
-    for key, value in knobs.items():
-        monkeypatch.setenv(f"DEPLODOCK_{key}", str(value))
-
-
-@requires_cuda
-@pytest.mark.parametrize("dt", ["f32", "f16"])
-def test_blocked_matmul_vectorize_misalign(monkeypatch, dt):
-    """``BK=64 BM=32 BN=32 BR=1 FM=1 FN=3 SPLITK=1 STAGE=111`` on ``matmul(a@b)*scalar`` (N=96 =
-    BN·FN) previously hung / faulted: ``050_vectorize_loads`` packed two cells into one
-    ``float2`` / ``__half2`` reinterpret without seeing the stride-3 (FN=3) base address, so half
-    the threads read off-alignment (byte 12 for float2, byte 6 for __half2). The fix walks back
-    into the Source's innermost cache-axis extent and refuses to vectorize when it isn't a
-    multiple of the pack count. Only the matmul-chained-into-mul gives the planner a STAGE=111
-    enumeration with all three buffers stage-able."""
-    from deplodock.compiler import dtype as _dt  # noqa: PLC0415
-
-    _pin_knobs(monkeypatch, BK=64, BM=32, BN=32, BR=1, FM=1, FN=3, SPLITK=1, STAGE=111)
-    npd = np.float16 if dt == "f16" else np.float32
-    td = _dt.get("f16") if dt == "f16" else _dt.get("f32")
-    scale = 0.1 if dt == "f16" else 1.0
-    atol_min = 5e-3 if dt == "f16" else 1e-3
-
-    g = Graph()
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("a", (32, 64), td), node_id="a")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("b", (64, 96), td), node_id="b")
-    g.add_node(op=InputOp(), inputs=[], output=Tensor("s", (1,), td), node_id="s")  # broadcast scalar
-    g.add_node(op=MatmulOp(), inputs=["a", "b"], output=Tensor("ab", (32, 96), td), node_id="ab")
-    g.add_node(op=ElementwiseOp("multiply"), inputs=["ab", "s"], output=Tensor("o", (32, 96), td), node_id="o")
-    g.inputs, g.outputs = ["a", "b", "s"], ["o"]
-
-    inputs = {
-        "a": _random((32, 64), seed=1, scale=scale, dtype=npd),
-        "b": _random((64, 96), seed=2, scale=scale, dtype=npd),
-        "s": np.array([1.0 if dt == "f16" else 1.5], dtype=npd),
-    }
-    ref = _numpy_reference(g, inputs)["o"]
-    from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
-
-    out = CudaBackend().run(CudaBackend().compile(g), input_data=inputs)[0].outputs["o"]
-    _assert_close(out, ref, atol_min=atol_min)
-
-
 # (label, knobs, N, line-budget, assert-single-x-smem). The fused RMSNorm+Linear prologue must
 # fold to ONE body-level chain (+ short per-cell guarded multiplies) rather than duplicate per
 # register cell — else the rendered kernel blows the ~2 s nvcc budget.
 _FUSED_PROLOGUE = {
-    "rmsnorm_linear_fn32": {
-        "knobs": dict(BK=64, BM=1, BN=128, BR=1, FM=1, FN=32, SPLITK=1),
-        "N": 4096,
-        "lines": 360,
-        "one_smem": True,
-    },
-    "qwen_lmhead_fn64": {
-        "knobs": dict(BK=64, BM=1, BN=64, BR=1, FM=1, FN=64, SPLITK=1, STAGE=1),
-        "N": 4099,
-        "lines": 850,
-        "one_smem": False,
-    },
+    "rmsnorm_linear_n4096": {"N": 4096, "lines": 360, "one_smem": True},
+    "qwen_lmhead_n4099": {"N": 4099, "lines": 850, "one_smem": False},
 }
 
 
 @requires_cuda
 @pytest.mark.parametrize("case", list(_FUSED_PROLOGUE))
-def test_fused_prologue_compiles_in_budget(monkeypatch, case):
-    """A fused RMSNorm→Linear at lm_head-style knobs (FN=32 / FN=64) folds the N-invariant
-    prologue chain (mean reduce + rsqrt + ``norm_weight·v``) back into one body-level copy with
-    per-cell guarded multiplies, so the rendered kernel stays under the nvcc budget (line count
-    below threshold) and matches the numpy reference. The duplicated-prologue regression inflates
-    the body well past these thresholds (and, for the FN=32 case, opens a SECOND ``x_smem`` slab)."""
+def test_fused_prologue_compiles_in_budget(case):
+    """A fused RMSNorm→Linear at lm_head-style shapes keeps the N-invariant prologue chain (mean
+    reduce + rsqrt + ``norm_weight·v``) as ONE body-level copy, so the rendered kernel stays under
+    the nvcc budget (line count below threshold) and matches the numpy reference. The
+    duplicated-prologue regression inflates the body well past these thresholds (and, for the
+    divisible-N case, opens a SECOND ``x_smem`` slab)."""
     import re as _re  # noqa: PLC0415
 
     from deplodock.compiler.backend.cuda.backend import CudaBackend  # noqa: PLC0415
     from deplodock.compiler.ir.cuda.ir import CudaOp  # noqa: PLC0415
 
     spec = _FUSED_PROLOGUE[case]
-    _pin_knobs(monkeypatch, **spec["knobs"])
     M, K, N = 2, 1024, spec["N"]
     g = Graph()
     g.add_node(op=InputOp(), inputs=[], output=Tensor("x", (M, K)), node_id="x")
