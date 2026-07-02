@@ -54,12 +54,14 @@ from emmy.compiler.ir.expr import Var
 from emmy.compiler.ir.loop import LoopOp
 from emmy.compiler.ir.stmt import Accum, Assign, Body, Init, Load, Loop, Write
 from emmy.compiler.ir.stmt.base import Stmt
-from emmy.compiler.ir.tile import Map, Placement, Reduction, TileOp
+from emmy.compiler.ir.tile import Contraction, Map, Placement, Reduction, TileOp, TilePlan
 from emmy.compiler.pipeline import Match, Pattern, RuleSkipped
 from emmy.compiler.pipeline.fork import Fork
+from emmy.compiler.pipeline.passes.lowering.tile._atomize import bind_contraction
 from emmy.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, is_fold_offer_site, try_flash
 from emmy.compiler.pipeline.passes.lowering.tile._schedule import schedule
 from emmy.compiler.pipeline.passes.lowering.tile._softmax import _fuse
+from emmy.compiler.pipeline.pipeline import LoweringError
 from emmy.compiler.pipeline.search.space import place_decision
 
 PATTERN = [Pattern("root", (LoopOp, TileOp))]
@@ -200,8 +202,9 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map | Reduction:
     # ``bare`` ⇒ materialize writes ``carrier.out`` at the grid cell (empty projection).
     projection = () if bare else (*pre_epilogue, *after)
     # A PLANAR / TWISTED reduce lifts to a typed ``Reduction`` node (its ⊕ carrier + structure split
-    # out, the fold loop synthesized on demand); a ``CONTRACTION`` keeps the flat ``Map`` form (it
-    # becomes a ``Contraction`` node in a later step). ``lower`` flattens either back identically.
+    # out, the fold loop synthesized on demand); a ``CONTRACTION`` is nodified to a
+    # :class:`Contraction` right after the free axes are ordered (:func:`_nodify_contraction`).
+    # ``lower`` flattens either back identically.
     if annotated.role in (AxisRole.PLANAR, AxisRole.TWISTED):
         reduction = Reduction.from_loop(annotated)
         # A bare reduce is the kernel root (its grid ``Write`` is glue); a projected reduce
@@ -210,13 +213,53 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map | Reduction:
     return Map(body=(annotated, *projection))
 
 
-def _lift(stmts: list[Stmt], output: str) -> tuple[Map | Reduction, tuple]:
+def _nodify_contraction(node, free: tuple):
+    """Nodify a freshly-lifted flat ``CONTRACTION`` ``Map`` into the :class:`Contraction`
+    structural node with a **deferred** per-cell ``TilePlan()`` (the schedule fork re-tiles it),
+    resolving the operand→role binding ONCE, recognize-side (:func:`bind_contraction` over the
+    ordered ``free`` axes' trailing ``(m, n)``). An unbindable contraction — a 1-D output (a
+    matvec-shaped cell) or no (m, n)-bearing K-loads — **demotes to PLANAR**: its carrier is
+    already the additive fold, so it becomes an ordinary :class:`Reduction` (gaining the
+    cooperative / ILP partitions a per-cell serial fold never offered). After this step no flat
+    ``Map`` carries an annotated ``CONTRACTION`` loop — the scheduler and materializer read
+    contraction structure only off the node."""
+    if not isinstance(node, Map) or node.source is not None or len(node.body) == 0:
+        return node
+    rloop = node.body[0]
+    if not isinstance(rloop, Loop) or rloop.role is not AxisRole.CONTRACTION:
+        return node
+    projection = Body(tuple(node.body[1:]))
+    if len(free) >= 2:
+        try:
+            a_load, b_load, acc, epi = bind_contraction(rloop, free[-2].name, free[-1].name, projection)
+        except LoweringError:
+            pass
+        else:
+            return Contraction(
+                axes=(free[-2], free[-1]),
+                k_axis=rloop.axis,
+                a_operand=a_load,
+                b_load=b_load,
+                acc=acc,
+                tile=TilePlan(),
+                lead_axes=tuple(free[:-2]),
+                epilogue=epi,
+            )
+    demoted = Loop(axis=rloop.axis, body=rloop.body, unroll=rloop.unroll, role=AxisRole.PLANAR, carrier=rloop.carrier)
+    red = Reduction.from_loop(demoted)
+    return Map(body=projection, source=red) if len(projection) else red
+
+
+def _lift(stmts: list[Stmt], output: str) -> tuple[Map | Reduction | Contraction, tuple]:
     """Peel the free axes and lift the per-cell compute, returning ``(root node, free
     axes)``. The free axes are the schedule's (carried on the ``TileOp``, not the node);
-    ``_schedule`` (inside ``010_recognize``) maps them onto the grid."""
+    ``_schedule`` (inside ``010_recognize``) maps them onto the grid. A ``CONTRACTION`` cell
+    nodifies to a :class:`Contraction` once the free axes are output-ordered (the binding needs
+    the final ``(m, n)``)."""
     free, cell = _peel(Body(tuple(stmts)))
     node = _lift_cell(cell, free, output)
-    return node, _order_free_by_output(node, free)
+    free = _order_free_by_output(node, free)
+    return _nodify_contraction(node, free), free
 
 
 def _order_free_by_output(node: Map | Reduction, free: list) -> tuple:

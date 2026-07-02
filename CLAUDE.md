@@ -15,16 +15,18 @@ The `README.md` is intentionally short — example-driven, no narrative. For det
 - **Pipeline / autotune** (pass framework, knob/fork system, learned-prior search, two-level tune) →
   [`emmy/compiler/pipeline/ARCHITECTURE.md`](emmy/compiler/pipeline/ARCHITECTURE.md)
 - **Tile lowering** (LoopOp → TileOp; **purely algebraic moveset — no shape specializations**. The stored tile IR is
-  growing into a tree of **structural nodes** (all in `ir/tile/ir.py`): a `PLANAR`/`TWISTED` reduce lifts to a
-  typed `Reduction` (its `Carrier` + reduce `axis` + `partial` split out, the fold `Loop` synthesized on demand, holding
-  no projection); a contraction is a `Contraction`; the lift / projection wrapper is a `Map` (`body` + an optional
-  `source: Reduction | Contraction | None` — `project ∘ reduce`). A bare reduce is the root `Reduction`; softmax/RMSNorm
-  is a `Map(body=sweep, source=Reduction)`; a pure pointwise cell is a `Map(source=None)`; a not-yet-migrated
-  contraction still rides an annotated `Loop` inside a `Map.body`. Dispatch reads the role/carrier off the node
-  (`ops.axis_role`/`reduce_loop` recurse through `Map.source`), and `ops.lower` flattens any node back to the same loop
-  nest — there is no stored `Monoid`/`Semiring` node kind (those wrappers were retired). Flash attention is the
-  `TWISTED` reduce on the streaming schedule, a twisted monoid is a monoid, selected structurally not as a distinct
-  kind) → [`emmy/compiler/pipeline/passes/ARCHITECTURE.md`](emmy/compiler/pipeline/passes/ARCHITECTURE.md)
+  a tree of **structural nodes** (all in `ir/tile/ir.py`): a `PLANAR`/`TWISTED` reduce lifts to a typed `Reduction`
+  (its `Carrier` + reduce `axis` + `partial` split out, the fold `Loop` synthesized on demand, holding no
+  projection); EVERY recognized contraction — per-cell scalar included — is a `Contraction` node (nodified at
+  recognize time with a deferred `TilePlan()`; an unbindable one demotes to `PLANAR`); the lift / projection wrapper
+  is a `Map` (`body` + an optional `source: Reduction | Contraction | None` — `project ∘ reduce`). A bare reduce is
+  the root `Reduction`; softmax/RMSNorm is a `Map(body=sweep, source=Reduction)`; a pure pointwise cell is a
+  `Map(source=None)`; the only annotated `Loop`s still riding a flat `Map.body` are `030_split`'s sliced partials.
+  Dispatch reads the role/carrier off the node (`ops.axis_role`/`reduce_loop` recurse through `Map.source`), and
+  `ops.lower` flattens any node back to the same loop nest — there is no stored `Monoid`/`Semiring` node kind (those
+  wrappers were retired). Flash attention is the `TWISTED` reduce on the streaming schedule, a twisted monoid is a
+  monoid, selected structurally not as a distinct kind) →
+  [`emmy/compiler/pipeline/passes/ARCHITECTURE.md`](emmy/compiler/pipeline/passes/ARCHITECTURE.md)
 
 When the user asks about a CLI flag, recipe field, or matrix combinator, read the relevant ARCHITECTURE.md before
 answering — they hold the detail that is no longer in this file or the README.

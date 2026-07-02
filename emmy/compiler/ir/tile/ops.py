@@ -54,18 +54,25 @@ def reduce_plan(tile):
     return red.reduce if red is not None else None
 
 
-def nodify_reduce(op: Map, plan: ReducePlan):
-    """Nodify a flat ``Map`` holding an annotated reduce ``Loop`` into a
-    :class:`~emmy.compiler.ir.tile.ir.Reduction` node carrying the reduce partition ``plan``
-    **on the node** (not a residual ``TileOp.reduce`` field). :meth:`Reduction.from_loop`
-    reconstructs the identical annotated loop, so the lowering is byte-identical; a projection tail
-    (a fused epilogue) rides a wrapping ``Map`` over the node, a bare reduce becomes the root node.
+def nodify_reduce(op, plan: ReducePlan):
+    """Nodify a kernel op into a :class:`~emmy.compiler.ir.tile.ir.Reduction` node carrying the
+    reduce partition ``plan`` **on the node** (not a residual ``TileOp.reduce`` field). A
+    :class:`Contraction` node (the recognize-side per-cell contraction) folds through its
+    synthesized loop — the coop / ILP K partition treats it as the degenerate carrier of its
+    additive fold, the epilogue riding the wrapping ``Map``. A flat ``Map`` holding an annotated
+    reduce ``Loop`` (a split partial) nodifies via :meth:`Reduction.from_loop`, which reconstructs
+    the identical annotated loop, so the lowering is byte-identical; a projection tail (a fused
+    epilogue) rides a wrapping ``Map`` over the node, a bare reduce becomes the root node.
 
     Used by the scheduler (the coop / ILP-K contraction) and ``030_split`` (the split partial) so
     EVERY partitioned reduce reads its plan off a node uniformly — the ``lower(op)``-then-refind
-    smell (and the ``TileOp.reduce`` residual) is gone. The reduce ``Loop`` must be a top-level stmt
-    of ``op.body`` with no prologue ahead of it (true for a contraction / bare sum: the reduce is the
-    body's head); a projection tail after it becomes the wrapping ``Map`` body."""
+    smell (and the ``TileOp.reduce`` residual) is gone. For the ``Map`` form the reduce ``Loop``
+    must be a top-level stmt of ``op.body`` with no prologue ahead of it (true for a split partial /
+    bare sum: the reduce is the body's head); a projection tail after it becomes the wrapping
+    ``Map`` body."""
+    if isinstance(op, Contraction):
+        red = replace(Reduction.from_loop(op.loop), reduce=plan)
+        return Map(body=op.epilogue, source=red) if len(op.epilogue) else red
     rloop = reduce_loop(op)
     red = replace(Reduction.from_loop(rloop), reduce=plan)
     body = list(op.body)

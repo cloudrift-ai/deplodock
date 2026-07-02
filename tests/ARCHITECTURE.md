@@ -167,6 +167,12 @@ CLI tests use the **`run_cli` fixture** (a subprocess wrapper) and **`make_bench
 
 ## Conventions
 
+- **Prefer combinatorial coverage matrices over per-capability test files.** The compiler e2e suite covers each
+  regime with one parameterized matrix (`test_matmul_coverage.py`'s tile × stage × reduce × static/dynamic grid,
+  `test_reduce_coverage.py`, `test_attention_coverage.py`, `test_fused_edge.py`'s producer × tier product) rather
+  than a file per capability. When a legacy one-off test's behavior is subsumed by such a matrix (or by the matmul
+  coverage matrix specifically), DELETE the one-off — do not maintain both. A new capability extends the nearest
+  matrix with a parameter/case before it earns its own file.
 - **Async tests** — tests for async functions are plain `async def` (no decorator needed; `asyncio_mode = "auto"` handles it). Mock async callables with `AsyncMock`.
 - **No mocking** — dry-run mode is the primary strategy for testing command orchestration without side effects.
 - **Real recipes** — CLI dry-run tests use recipes from the `recipes/` directory to catch config drift.

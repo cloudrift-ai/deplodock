@@ -262,10 +262,27 @@ _ATOMS_BY_DTYPE = {"f16": ("mma_m16n8k16_f16",), "bf16": ("mma_m16n8k16_bf16",)}
 _SPLITK_MAX_CTAS = 512
 
 
+def _fragment_epilogue_ok(epilogue: Body) -> bool:
+    """The mma store folds the projection into a :class:`RegEpilogue` whose leaf ``Load``\\ s are
+    evaluated independently per fragment element — a load whose INDEX reads a name defined by an
+    earlier epilogue stmt (an embedding-gather chain, ``emb[(int)ids[m], n]``) cannot be threaded
+    through that form. Gate in the negative: walk the epilogue and refuse on the first
+    data-dependent index; everything else folds."""
+    defs: set[str] = set()
+    for s in epilogue:
+        if isinstance(s, Load) and {v for e in s.index for v in e.free_vars()} & defs:
+            return False
+        defs.update(s.defines())
+    return True
+
+
 def _warp_atoms(kernel, probe) -> tuple[str, ...]:
     """The dtype-eligible tensor-core atom names for this contraction, ``()`` when the warp tier
-    doesn't apply (unbindable / computed-A node, or a non-16-bit operand dtype)."""
+    doesn't apply (unbindable / computed-A node, a non-16-bit operand dtype, or a fragment-
+    unrealizable gather epilogue)."""
     if probe is None or probe.a_computed or not kernel.inputs:
+        return ()
+    if not _fragment_epilogue_ok(probe.epilogue):
         return ()
     t = kernel.inputs.get(probe.a_operand.input)
     return _ATOMS_BY_DTYPE.get(getattr(getattr(t, "dtype", None), "name", None), ())
@@ -369,6 +386,12 @@ def _tile_rows(kernel, place) -> tuple[list[dict], str]:
         plan = TilePlan.parse(spec)
         if plan.is_warp and TILE.raw() is not None:
             _check_warp_static_k(kernel, plan)  # a PIN with an indivisible K-step raises (the pin contract)
+            if probe is not None and not _fragment_epilogue_ok(probe.epilogue):
+                raise ValueError(
+                    "warp TILE pin: the projection epilogue gathers through another epilogue "
+                    "load (a data-dependent index) — the fragment epilogue cannot thread it; "
+                    "drop the a:<atom> token to use the scalar tier."
+                )
         for stage in _stage_candidates(kernel, probe, plan):
             for red in _reduce_candidates(kernel, place, plan):
                 # A staged split row is legal: ``_splitk_option`` re-resolves the stage against the
@@ -593,15 +616,18 @@ def _check_warp_static_k(kernel, wt) -> None:
 
 
 def _contraction_node(node, place, tile_plan: TilePlan) -> Contraction:
-    """The high-level :class:`Contraction` structural node for a tiled ``CONTRACTION`` leaf, built
-    here at fork-emit (seam #1 — the node must exist recognize-side so its ``tile`` rides the node,
-    not a root schedule field; the build moved off ``010_materialize``'s retired
-    ``_build_contraction``). Resolves the ``(a_load, b_load, acc, epilogue)`` operand→role facts
-    structurally (:func:`semiring_binding`) — raising ``LoweringError`` on an unbindable atom — plus
-    the resolved ``tile_plan`` from the schedule fork, and the (m, n) output / K axes off the
-    still-``Map`` ``node``. The projection ``epilogue`` is the binding's body verbatim — the
-    synthesized grid-``Write`` for a bare contraction stays a materialize concern (it needs
-    ``root.output``), appended there when the epilogue carries no ``Write``."""
+    """The high-level :class:`Contraction` structural node for a tiled ``CONTRACTION`` leaf. A
+    kernel recognition already nodified (the per-cell scalar contraction — ``_nodify_contraction``
+    in ``010_recognize``) only swaps the ``tile`` schedule field; a still-``Map`` form (a fused /
+    flash-side contraction) is bound here at fork-emit (seam #1): the ``(a_load, b_load, acc,
+    epilogue)`` operand→role facts resolve structurally (:func:`semiring_binding`) — raising
+    ``LoweringError`` on an unbindable atom — plus the resolved ``tile_plan`` from the schedule
+    fork, and the (m, n) output / K axes off the ``Map``. The projection ``epilogue`` is the
+    binding's body verbatim — the synthesized grid-``Write`` for a bare contraction stays a
+    materialize concern (it needs ``root.output``), appended there when the epilogue carries no
+    ``Write``."""
+    if isinstance(node, Contraction):
+        return replace(node, tile=tile_plan)
     grid = list(place.grid)
     a_load, b_load, acc, epilogue = semiring_binding(node, place.grid)
     return Contraction(
@@ -980,6 +1006,8 @@ def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp 
     if K % bk_elems or M % (wt.units_m * wt.reg_m * atom_m) or N % (wt.units_n * wt.reg_n * atom_n):
         return None
     epilogue = Body(tuple(op.body)) if isinstance(op, Map) else Body(())
+    if not _fragment_epilogue_ok(epilogue):
+        return None  # a gather epilogue is fragment-unrealizable — stay scalar
     node = Contraction(
         axes=(m_ax, n_ax),
         k_axis=k_ax,

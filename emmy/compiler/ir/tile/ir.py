@@ -398,12 +398,11 @@ class Map:
     it projects over (a :class:`Reduction` / :class:`Contraction` — ``project ∘ reduce``) or ``None``
     for a pure pointwise map. A pure pointwise cell is a ``Map`` of plain stmts (``source=None``);
     softmax / RMSNorm is a ``Map`` whose ``body`` is the post-fold sweep over a ``Reduction`` source.
-    A **contraction** rides its annotated ``CONTRACTION`` ``Loop`` in ``body`` (recognition emits the
-    flat ``Map``): a *tiled* / warp / split-K contraction is nodified to a :class:`Contraction` by
-    ``_schedule`` before materialize, but a *scalar per-cell* contraction keeps the flat ``Map`` all the
-    way down — both lower identically via :func:`ops.lower`. ``out`` is the bound output name (the
-    body's last def, the reduce loop's ``carrier.out`` for that per-cell contraction, or the source's
-    carried state for an empty-body wrap). It HAS a Body, not IS one."""
+    Every recognized contraction — per-cell scalar included — is a :class:`Contraction` node
+    (``_nodify_contraction`` in ``010_recognize``); the only annotated reduce ``Loop``\\ s still riding
+    a flat ``Map`` body are ``030_split``'s sliced partials. ``out`` is the bound output name (the
+    body's last def, or the source's carried state for an empty-body wrap). It HAS a Body, not IS
+    one."""
 
     body: Body = field(default_factory=Body)
     source: Reduction | Contraction | None = None  # the project∘reduce source, or None (pure pointwise)
@@ -414,19 +413,11 @@ class Map:
 
     @property
     def out(self) -> str:
-        """The bound output name. With no projection body it is the ``source``'s carried state; when
-        the body's last stmt is an annotated reduce ``Loop`` — a **scalar per-cell contraction** that
-        rides the flat ``Map`` through materialize (only tiled / warp / split-K contractions nodify to
-        a :class:`Contraction`), its grid-cell ``Write`` synthesized as store glue — the carried
-        state's primary component (``loop.carrier.out``); otherwise the last defining stmt's name (a
-        pointwise lift / a post-reduce projection)."""
+        """The bound output name. With no projection body it is the ``source``'s carried state;
+        otherwise the last defining stmt's name (a pointwise lift / a post-reduce projection)."""
         if len(self.body) == 0 and self.source is not None:
             return self.source.out
-        last = self.body[-1]
-        carrier = getattr(last, "carrier", None)
-        if carrier is not None:
-            return carrier.out
-        return last.defines()[-1]
+        return self.body[-1].defines()[-1]
 
 
 @dataclass
