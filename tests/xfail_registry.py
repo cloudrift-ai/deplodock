@@ -84,7 +84,7 @@ XFAIL: dict[str, str] = {
     # #pragma-unrolled inner drain).
     # mma operand staging (cp.async / TMA / gmem→smem ring / smem→register double-buffer) landed —
     # the six warp-tier STAGE structure / bit-identity tests are recovered. Scalar-tier operand
-    # staging landed too (``_scalar_staged_kloop`` — the STAGE-pinned scalar contraction stages its
+    # staging landed too (the STAGE-pinned scalar contraction stages its
     # operands through an smem slab via tma / cp.async). ``test_bank_conflicts.py`` (already xfailed
     # above) still needs the demolished ``find_all_bindings`` staging-diagnostics oracle rebuilt (a
     # separate follow-up).

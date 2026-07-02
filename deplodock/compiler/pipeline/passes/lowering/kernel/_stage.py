@@ -17,8 +17,9 @@ skeleton, :func:`staged_kloop` (``fill → commit → wait → drain → Sync``,
 buffering knob), driven by a :class:`Transport` strategy (:class:`CpAsyncTransport` /
 :class:`TmaTransport`) — the two producers put behind one ``fill``/``commit``/``wait`` seam. The
 (plain row-major, NONE-swizzle) slab feeds the same staged ``LdmatrixLoad`` / scalar ``Load`` drain
-regardless of which producer (cp.async / TMA) filled it; ``_factor.py`` builds the transport + the
-per-tier drain leaf and calls :func:`staged_kloop`.
+regardless of which producer (cp.async / TMA) filled it; ``_atom._staged`` — the one atom-agnostic
+driver — builds the transport, asks the atom strategy for the drain leaf, and calls
+:func:`staged_kloop`.
 
 Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips it.
 """

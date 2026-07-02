@@ -86,18 +86,22 @@ geometry (the `(m, n)` `Side` pair — `tile` / `mask` / `block` / `unit` per ax
 thread through the tiling levels + the codegen callables as one `(m, n)` pair. `factorize` reads it straight off `c`
 and hands
 `grid_tile` the codegen in two halves: `_atom.reduce_codegen` — the reusable, **sink-agnostic** `(state_decls,
-reduce_region)` (operand fragments + the K-loop, dispatched off the atom) — and a per-cell **sink** `store`. The
-default is the matmul `_atom.store_sink`; `factorize(c, store=…)` swaps it. Per-atom diff:
+reduce_region)` (operand fragments + the K-loop) — and a per-cell **sink** `store`. The
+default is the matmul `_atom.store_sink`; `factorize(c, store=…)` swaps it. The K-loop itself is **one driver** on the
+strategy base (`_AtomOps.reduce`): the resolved `_StagePlan` picks its form — gmem-direct through the shared
+`_contract_kloop` `read → ⊗ → fold` spine, or staged through the shared `_staged` fill→drain skeleton — and the atom
+contributes only leaves, never a loop. Per-atom diff:
 
-- **mma** (`_MmaOps.state` / `.reduce` / `.store`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; the
-  codegen emits `RegFragment` / `LdmatrixLoad` / `MmaSyncPtx` / `RegStore`, owns the K-loop (operands **gmem-direct**),
-  and decodes the atom-lane offset at render.
-- **scalar** (`_ScalarOps.state` / `.reduce` / `.store`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a
-  **single thread** (so there is no `_lane` axis); the codegen **synthesizes** the reduce `Loop` from the operands and
-  replicates it + a projection `tail` per register cell with its operand loads deduped (the arithmetic-intensity reuse).
+- **mma** (`_MmaOps`) — atom `(16, 8, 16)`, `lanes == 32`. The UNIT is a **warp**; its leaves emit `RegFragment` /
+  `LdmatrixLoad` / `MmaSyncPtx` / `RegStore` and decode the atom-lane offset at render.
+- **scalar** (`_ScalarOps`) — atom `(1, 1, 1)`, `lanes == 1`. The UNIT is a **single thread** (so there is no `_lane`
+  axis); its leaves are plain `Load`s + an fma cell, the projection `tail` replicated per register cell with its
+  operand loads deduped (the arithmetic-intensity reuse).
 
-Both triples are methods on the `_MmaOps` / `_ScalarOps` strategy classes in **`_atom.py`** (with `_atom_ops` the
-dispatch + `reduce_codegen` / `store_sink` the seam `_factor` calls), the new-atom seam.
+Each atom is a strategy class in **`_atom.py`** supplying `state` / `store` plus the descriptor reads the shared
+`reduce` consumes — `stage_plan` (staging eligibility + sizing), `gmem_leaves` (the four gmem-direct leaf
+constructors), `staged_drain` (the slab-reading leaf), `slab_elem` (the slab element dtype) — with `_atom_ops` the
+dispatch + `reduce_codegen` / `store_sink` the seam `_factor` calls: the new-atom seam.
 
 The **unit** is the atom's parallel thread footprint (`atom.lanes`) — so the tensor-core warp tile and the scalar
 parallel thread-tile are the *same* level, differing only in `lanes`; `block_threads = units · lanes`. `grid_tile` also
@@ -111,11 +115,13 @@ The warp (mma) tier stages its reused gmem operands through an smem slab, driven
 (`fill → commit → wait → drain → Sync`, `depth` the sole buffering knob — `depth == 1` is the single-buffer degenerate,
 `depth >= 2` a gmem→smem prefetch ring), behind a `Transport` strategy: `CpAsyncTransport` (fill → commit → wait-group)
 and `TmaTransport` (an `arrive.expect_tx` + box copy gated by a **per-slot mbarrier array**, so `depth` is a free knob
-for TMA too). The two producers — structurally different primitives — sit behind one `fill`/`commit`/`wait` seam; the
-tier in `_atom.py` (`_mma_staged` / `_scalar_staged`) only builds the transport + the drain leaf (the shared inner
-`ldmatrix` drain `_staged_inner_atom_loop`, or the scalar `_scalar_drain`). `_mma_stage_plan` decodes the `Stage` once
-(TMA > cp.async > gmem-direct, with the eligibility rules `_can_stage_warp[_tma]`) and both `_MmaOps.state` (which slots
-the operand fragments) and `_MmaOps.reduce` (which emits the loop) read it. The `Stage` spells two buffering levels:
+for TMA too). The two producers — structurally different primitives — sit behind one `fill`/`commit`/`wait` seam, and
+**one atom-agnostic driver** (`_atom._staged`) builds the operand pair + the transport for either atom; the atom
+supplies only the slab drain leaf via `_AtomOps.staged_drain` (the shared inner `ldmatrix` drain
+`_staged_inner_atom_loop`, or the scalar `_scalar_drain`). Each atom's `stage_plan` resolves the `Stage` once into the
+uniform `_StagePlan` (mode TMA > cp.async > gmem-direct — the mma eligibility rules are `_can_stage_warp[_tma]` — plus
+the slab K-chunk and depths), read by both `state` (which slots the operand fragments) and the shared `reduce` (which
+emits the loop). The `Stage` spells two buffering levels:
 `d<depth>` is the gmem→smem ring (cp.async commit group / TMA mbarrier-phased prefetch over the K-slab loop),
 `p<reg_depth>` is the smem→register double-buffer (the `ldmatrix` ping-pong over the inner atom-K steps). Staging is a
 **pure perf transform** — an ineligible kernel (transposed-B, masked N, symbolic / non-divisible K, or a computed-A
@@ -123,10 +129,9 @@ flash operand) silently falls back to gmem-direct, and a staged kernel is
 **bit-identical** to its gmem-direct baseline. It is **pin-only** today (`DEPLODOCK_STAGE`); auto-fork enumeration is a
 follow-up.
 
-The **scalar** contraction tier stages too, under the same `STAGE` pin (`_scalar_stage_plan` / `_scalar_staged` /
-`_scalar_drain` in `_atom.py`): the STAGE-pinned scalar contraction builds the **same** `Transport` (a scalar
-`CtaTile`, `block_threads` threads) over the one `staged_kloop` (single-buffer) and drains it with a plain-`Load`
-inner loop over the derived K-chunk (`bk_elems` fit-to-smem, not a codec field). The nested outer-slab / inner-drain
+The **scalar** contraction tier stages too, under the same `STAGE` pin, through the **same** `_staged` driver — its
+`stage_plan` sizes the slab (single-buffer; the derived fit-to-smem K-chunk `bk_elems`, not a codec field) and its
+`staged_drain` is the plain-`Load` inner loop (`_scalar_drain`). The nested outer-slab / inner-drain
 accumulator lifetime is handled by seeding the per-cell accumulators once in `_ScalarOps.state` (outside the outer loop)
 and marking the inner drain `Loop(seed=False)` so it folds without re-declaring. Masked M / N is supported (TMA
 zero-fills /

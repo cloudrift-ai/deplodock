@@ -6,9 +6,13 @@ node and asks this module for the two codegen halves: :func:`reduce_codegen` (th
 K-loop) and :func:`store_sink` (the per-cell matmul sink). Both resolve through :func:`_atom_ops` to
 one of the two concrete strategies — :class:`_MmaOps` (tensor-core ``ldmatrix`` + ``mma.sync``, a
 ``RegStore`` sink) or :class:`_ScalarOps` (plain ``Load``\ s + an ``fma`` cell, the replicated-
-``epilogue`` sink) — which share the ``_contract_kloop`` skeleton and the operand-staging helpers
-(:func:`_mma_staged` / :func:`_scalar_staged` over the one ``_stage.staged_kloop``). This IS the
-"atom as descriptor" seam: one factory, no scattered ``isinstance``.
+``epilogue`` sink). The K-loop itself is ONE driver on the base strategy (:meth:`_AtomOps.reduce`):
+the resolved :class:`_StagePlan` picks its form — gmem-direct through the shared
+:func:`_contract_kloop` spine, or staged through the shared :func:`_staged` fill→drain skeleton
+(over the one ``_stage.staged_kloop``) — and the atom supplies only descriptor reads: the plan
+sizing (:meth:`stage_plan`), the four gmem leaf constructors (:meth:`gmem_leaves`), the slab drain
+leaf (:meth:`staged_drain`), and the slab element dtype. This IS the "atom as descriptor" seam:
+one factory, one loop over atoms, no scattered ``isinstance``.
 
 Leading ``_`` so the pass loader (globs ``*.py``, skips ``_``-prefixed) skips it."""
 
@@ -299,75 +303,66 @@ def _slab_operands(*, index_srcs: tuple, bufs: tuple[str, str], mn: tuple[Side, 
     return tuple(ops)
 
 
-def _mma_staged(*, loads: tuple, mn: tuple[Side, Side], k_axis, atom, bk, slab_dtype, elem_bytes, reg_depth: int, depth: int, mode: str):
-    """The warp tier's STAGED K-loop — build the operand :class:`Transport` (a cp.async prefetch ring
-    or the TMA box-copy producer) from the ``(a_load, b_load)`` operand pair + the shared ``ldmatrix``
-    drain leaf, then run the one :func:`staged_kloop`. A pure perf transform, bit-identical to
-    gmem-direct. ``depth == 1`` is the single-buffer degenerate; ``depth >= 2`` (cp.async ``d<depth>``)
-    is the gmem→smem ring; ``reg_depth`` composes the inner smem→register double-buffer. ``mask_m``: the
-    cp.async A fill clamps the overhanging gmem row in-bounds; TMA zero-fills the box overhang instead
-    (both leave the discard to the ``RegStore`` ``m_guard``)."""
+@dataclass(frozen=True)
+class _StagePlan:
+    """The resolved operand-staging decision for one contraction — atom-agnostic, computed once by
+    the atom's :meth:`_AtomOps.stage_plan` sizing and consumed by the ONE staged driver
+    (:func:`_staged`) + the atom's ``state``. ``mode`` is ``"tma"`` / ``"cp"`` / ``"gmem"``
+    (TMA > cp.async > gmem-direct — ``gmem`` means no slab, the remaining fields moot);
+    ``bk_elems`` the slab K-chunk in elements; ``depth`` the gmem→smem ring (TMA's ring rides the
+    per-slot mbarrier, cp.async's the commit group); ``reg_depth`` the smem→register double-buffer
+    (mma-only, 1 elsewhere)."""
+
+    mode: str
+    bk_elems: int = 0
+    depth: int = 1
+    reg_depth: int = 1
+
+
+def _cta(mn: tuple[Side, Side], lanes: int, n_threads: int) -> CtaTile:
+    """The staging :class:`CtaTile` for either atom — the intra-CTA linear thread id from the
+    decoded unit axis vars (never a raw threadIdx.x): unit-major ``m_unit·units_n + n_unit``,
+    ``·lanes + _lane`` when the unit is a warp (``lanes > 1``; a scalar unit IS one thread)."""
     m, n = mn
-    bk_elems = bk * atom.shape[2]
+    tid = BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit))
+    if lanes > 1:
+        tid = BinaryExpr("+", BinaryExpr("*", tid, Literal(lanes, "int")), Var("_lane"))
+    return CtaTile(linear_tid=tid, n_threads=n_threads)
+
+
+def _staged(ops: _AtomOps, cells, offset, mn: tuple[Side, Side], plan: _StagePlan):
+    """The **one** STAGED K-loop driver, atom-agnostic — build the ``(A, B)`` operand pair, the
+    :class:`Transport` (a cp.async prefetch ring or the TMA box-copy producer) and run the one
+    :func:`staged_kloop`; the atom supplies only the slab drain leaf (:meth:`_AtomOps.staged_drain`
+    — ``ldmatrix`` + ``mma.sync`` vs plain-``Load`` fma) and the slab element dtype. A pure perf
+    transform, numerically identical to gmem-direct (mma: bit-identical). ``plan.depth == 1`` is the
+    single-buffer degenerate; ``depth >= 2`` the gmem→smem ring; ``reg_depth`` composes the mma
+    inner smem→register double-buffer. A masked M / N overhang is fill-side clamped (cp.async) or
+    box zero-filled (TMA); the discard stays with the store guard."""
+    c = ops.c
+    k_axis = c.k_axis
     K = k_axis.extent.as_static()  # static K (the staging eligibility rule)
-    # intra-CTA linear thread id from the decoded warp / lane axis vars (never a raw threadIdx.x).
-    linear_tid = BinaryExpr(
-        "+",
-        BinaryExpr("*", BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit)), Literal(32, "int")),
-        Var("_lane"),
-    )
     operands = _slab_operands(
-        index_srcs=tuple(ld.index for ld in loads),
-        bufs=tuple(ld.input for ld in loads),
+        index_srcs=(c.a_operand.index, c.b_load.index),
+        bufs=(c.a_operand.input, c.b_load.input),
         mn=mn,
         k_axis=k_axis,
-        bk_elems=bk_elems,
+        bk_elems=plan.bk_elems,
         base=_tile_base(mn),
     )
+    elem = ops.slab_elem()
     common = dict(
         operands=operands,
-        slab_dtype=slab_dtype,
-        elem_bytes=elem_bytes,
-        cta=CtaTile(linear_tid=linear_tid, n_threads=m.units * n.units * 32),
+        slab_dtype=cuda_name(elem),
+        elem_bytes=elem.nbytes,
+        cta=_cta(mn, c.atom.lanes, c.block_threads),
     )
-    transport = TmaTransport(**common) if mode == "tma" else CpAsyncTransport(**common)
+    transport = TmaTransport(**common) if plan.mode == "tma" else CpAsyncTransport(**common)
 
-    def drain(slot):  # the ldmatrix + mma.sync leaf, reading ring `slot`
-        return _staged_inner_atom_loop(
-            slabs=tuple(op.slab for op in operands),
-            offs=tuple(op.slot_row(slot) for op in operands),
-            mn=mn,
-            atom=atom,
-            bk_elems=bk_elems,
-            ki="_ki",
-            reg_depth=reg_depth,
-        )
+    def drain(slot):  # the atom's slab-reading leaf, over ring `slot`
+        return ops.staged_drain(operands, slot, cells, offset, mn, plan)
 
-    return staged_kloop(transport=transport, drain=drain, depth=depth, bk_elems=bk_elems, n_chunks=K // bk_elems, k_extent=K)
-
-
-def _mma_stage_plan(c: Contraction, stage: Stage | None) -> tuple[str, int, int]:
-    """The operand-staging decision for the mma contraction ``c`` under ``stage`` — read once and
-    shared by :meth:`_MmaOps.state` (which slots the fragments) and :meth:`_MmaOps.reduce` (which emits the
-    K-loop). Returns ``(mode, gmem_depth, reg_depth)`` where ``mode`` is ``"tma"`` / ``"cp"`` /
-    ``"gmem"`` (TMA > cp.async > gmem-direct). ``gmem`` forces both depths to 1 (no slab). Both
-    transports share the ``gmem_depth`` gmem→smem ring — the collapse's one buffering knob (TMA's ring
-    rides the per-slot mbarrier, cp.async's the commit group), capped so the ``depth``-slot slab fits in
-    a 48 KiB smem budget."""
-    if stage is None or c.a_computed:
-        return "gmem", 1, 1
-    atom = c.atom
-    a_nbytes = atom.operand_dtype("a").nbytes
-    bk = c.tile.bk
-    m, n = c.m, c.n
-    tma_ok = _can_stage_warp_tma(stage, c.k_axis, n.axis, n.tile, bk, atom.atom_k, a_nbytes, n.mask, c.b_trans)
-    cp_ok = (not tma_ok) and _can_stage_warp(stage, c.k_axis, m.tile, n.tile, bk, atom.atom_k, m.mask, n.mask, c.b_trans)
-    if not (tma_ok or cp_ok):
-        return "gmem", 1, 1
-    reg_depth = min(stage.reg_depth, bk)
-    slot_bytes = (m.tile * bk * atom.atom_k + bk * atom.atom_k * n.tile) * a_nbytes
-    gmem_depth = min(stage.depth, max(1, (48 * 1024) // slot_bytes))
-    return ("tma" if tma_ok else "cp"), gmem_depth, reg_depth
+    return staged_kloop(transport=transport, drain=drain, depth=plan.depth, bk_elems=plan.bk_elems, n_chunks=K // plan.bk_elems, k_extent=K)
 
 
 def _contract_kloop(c, cells, *, read_row, read_col, contract, wrap):
@@ -460,29 +455,6 @@ def _scalar_protected(c: Contraction) -> frozenset[str]:
     return frozenset(prot)
 
 
-def _scalar_stage_plan(c: Contraction, stage: Stage | None, inputs) -> tuple[str, int]:
-    """The scalar-tier operand-staging decision — ``(mode, bk_elems)``, ``mode`` one of ``"tma"`` /
-    ``"cp"`` / ``"gmem"`` (gmem = no slab). Staging is **opt-in behind a ``STAGE`` pin**: a scalar
-    contraction with no ``stage`` (every default scalar matmul) is ``"gmem"``, byte-identical. Eligible
-    when ``stage`` is set with a ``tma`` / ``cp.async`` transport, K is static, and the operands are
-    plain gmem ``Load``\\ s (not a computed-A flash body). A masked (overhanging) M / N is fine — the
-    drain reads the slab by LOCAL tile coords and the overhanging store is guarded, so TMA zero-fills
-    the box overhang and cp.async clamps the gmem read. The slab K-chunk ``bk_elems`` is **derived** to
-    fit a single ``tile_m×bk + bk×tile_n`` operand slab in 48 KiB (largest power-of-two dividing K) —
-    not spelled by a codec, so no schema change."""
-    if stage is None or c.a_computed or not c.k_axis.extent.is_static:
-        return "gmem", 0
-    if inputs is None or c.a_operand.input not in inputs or stage.transport not in ("tma", "cp.async"):
-        return "gmem", 0
-    K = c.k_axis.extent.as_static()
-    elem_bytes = inputs[c.a_operand.input].dtype.nbytes
-    cap = (48 * 1024) // (max(1, c.m.tile + c.n.tile) * elem_bytes)
-    bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
-    if bk_elems < 4:
-        return "gmem", 0
-    return ("tma" if stage.transport == "tma" else "cp"), bk_elems
-
-
 def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str, bk_elems: int, base: tuple[Expr, Expr]) -> Loop:
     """The inner slab-drain reduce loop ``for ki: b = b_slab[ki, n_local]; a = a_slab[m_local, ki];
     v = a·b; acc += v`` — the scalar counterpart of the mma ``ldmatrix`` drain. Built per-cell directly
@@ -511,58 +483,83 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
     return Loop(axis=Axis(name=ki, extent=bk_elems), body=Body(tuple(body)), unroll=bk_elems <= 64, seed=False)
 
 
-def _scalar_staged(c: Contraction, inputs, cells, offset, mode: str, bk_elems: int) -> tuple[list[Stmt], list[Stmt]]:
-    """The scalar tier's STAGED K-loop — a scalar operand :class:`Transport` (cp.async gmem-index clamps
-    / TMA box-copy zero-fill) + the plain-``Load`` :func:`_scalar_drain`, over the one
-    :func:`staged_kloop` (single-buffer, ``depth == 1``). The scalar :class:`CtaTile` (``block_threads``
-    threads, the ``m.unit·n.units + n.unit`` linear id) is the only per-tier seam; a pure perf transform,
-    numerically identical to gmem-direct."""
-    mn, k_axis = c.mn, c.k_axis
-    m, n = mn
-    K = k_axis.extent.as_static()
-    bufs = (c.a_operand.input, c.b_load.input)
-    slab_dtype, elem_bytes = cuda_name(inputs[bufs[0]].dtype), inputs[bufs[0]].dtype.nbytes
-    base = _tile_base(mn)
-    linear_tid = BinaryExpr("+", BinaryExpr("*", Var(m.unit), Literal(n.units, "int")), Var(n.unit))
-    operands = _slab_operands(index_srcs=(c.a_operand.index, c.b_load.index), bufs=bufs, mn=mn, k_axis=k_axis, bk_elems=bk_elems, base=base)
-    common = dict(
-        operands=operands, slab_dtype=slab_dtype, elem_bytes=elem_bytes, cta=CtaTile(linear_tid=linear_tid, n_threads=c.block_threads)
-    )
-    transport = TmaTransport(**common) if mode == "tma" else CpAsyncTransport(**common)
-
-    def drain(_slot):  # single-buffer: the scalar slab drain reads by local tile coords (no ring slot)
-        a_op, b_op = operands
-        return [_scalar_drain(c, cells, offset, (a_op.slab, b_op.slab), "_ki", bk_elems, base)]
-
-    return staged_kloop(transport=transport, drain=drain, depth=1, bk_elems=bk_elems, n_chunks=K // bk_elems, k_extent=K)
-
-
 @dataclass(frozen=True)
 class _AtomOps:
     """The per-atom codegen **strategy** — the one seam every tiled contraction dispatches through.
     Bound to the contraction ``c`` + its operand ``stage`` / ``inputs``, it supplies the three
-    ``grid_tile`` callables — ``state(cells)`` (accumulator decls), ``reduce(cells, offset, mn)``
-    (the K-loop, via the shared :func:`_contract_kloop` skeleton), ``store(i, j, offset, mn)`` (the
-    per-cell sink; ``mn`` is the contraction's ``(m, n)`` :class:`Side` pair). The two concrete atoms
-    (:class:`_MmaOps` / :class:`_ScalarOps`) differ only in the
-    leaf codegen they delegate to. This IS the "atom as descriptor" seam: one factory
-    (:func:`_atom_ops`), no scattered ``isinstance``."""
+    ``grid_tile`` callables — ``state(cells)`` (accumulator decls), :meth:`reduce` (the K-loop —
+    **shared on this base**, one loop over atoms), ``store(i, j, offset, mn)`` (the per-cell sink;
+    ``mn`` is the contraction's ``(m, n)`` :class:`Side` pair). The two concrete atoms
+    (:class:`_MmaOps` / :class:`_ScalarOps`) supply only descriptor reads: :meth:`stage_plan` (the
+    staging eligibility + sizing), :meth:`gmem_leaves` (the four gmem-direct leaf constructors),
+    :meth:`staged_drain` (the slab-reading leaf) and :meth:`slab_elem` (the slab element dtype).
+    This IS the "atom as descriptor" seam: one factory (:func:`_atom_ops`), no scattered
+    ``isinstance``."""
 
     c: Contraction
     stage: Stage | None = None
     inputs: object = None
 
+    def reduce(self, cells, offset, mn):
+        """The contraction K-loop — the ONE driver both atoms flow through. The resolved
+        :class:`_StagePlan` picks its form: staged (an smem operand slab over the one
+        :func:`_staged` fill→drain skeleton) or gmem-direct (the shared :func:`_contract_kloop`
+        ``read → ⊗ → fold`` spine). Either way the atom contributes only leaves, never a loop."""
+        plan = self.stage_plan()
+        if plan.mode != "gmem":
+            return _staged(self, cells, offset, mn, plan)
+        return _contract_kloop(self.c, cells, **self.gmem_leaves(offset, mn))
+
 
 class _MmaOps(_AtomOps):
     """Tensor-core atom — ``ldmatrix`` fragment reads + ``mma.sync``, a ``RegStore`` sink."""
+
+    def stage_plan(self) -> _StagePlan:
+        """The mma staging sizing (TMA > cp.async > gmem-direct). The slab K-chunk is the codec-spelled
+        ``TilePlan.bk`` in atom-K units (``bk · atom_k`` elements); ``depth`` is the gmem→smem ring,
+        capped so the ``depth``-slot slab fits the 48 KiB smem budget; ``reg_depth`` the smem→register
+        double-buffer, capped at ``bk`` (nothing to ping-pong past the resident chunk)."""
+        c, stage = self.c, self.stage
+        if stage is None or c.a_computed:
+            return _StagePlan("gmem")
+        atom = c.atom
+        a_nbytes = atom.operand_dtype("a").nbytes
+        bk = c.tile.bk
+        m, n = c.m, c.n
+        tma_ok = _can_stage_warp_tma(stage, c.k_axis, n.axis, n.tile, bk, atom.atom_k, a_nbytes, n.mask, c.b_trans)
+        cp_ok = (not tma_ok) and _can_stage_warp(stage, c.k_axis, m.tile, n.tile, bk, atom.atom_k, m.mask, n.mask, c.b_trans)
+        if not (tma_ok or cp_ok):
+            return _StagePlan("gmem")
+        bk_elems = bk * atom.atom_k
+        slot_bytes = (m.tile + n.tile) * bk_elems * a_nbytes
+        depth = min(stage.depth, max(1, (48 * 1024) // slot_bytes))
+        return _StagePlan("tma" if tma_ok else "cp", bk_elems=bk_elems, depth=depth, reg_depth=min(stage.reg_depth, bk))
+
+    def slab_elem(self):
+        """The slab element dtype — the mma A/B operand dtype (f16/bf16 fragments)."""
+        return self.c.atom.operand_dtype("a")
+
+    def staged_drain(self, operands, slot, cells, offset, mn, plan: _StagePlan):
+        """The mma slab drain — the ``ldmatrix`` + ``mma.sync`` leaf reading ring ``slot``
+        (:func:`_staged_inner_atom_loop`; the cells ride ``mn``'s reg counts, so ``cells`` /
+        ``offset`` are unused here)."""
+        return _staged_inner_atom_loop(
+            slabs=tuple(op.slab for op in operands),
+            offs=tuple(op.slot_row(slot) for op in operands),
+            mn=mn,
+            atom=self.c.atom,
+            bk_elems=plan.bk_elems,
+            ki="_ki",
+            reg_depth=plan.reg_depth,
+        )
 
     def state(self, cells):
         """The mma operand/accumulator register fragments — one ``_a``/``_b`` per register row/col and
         one ``_c`` accumulator per cell (held across the K-loop). A staged ``reg_depth >= 2`` slots the
         operand fragments (``_a{i}_s{slot}``) for the smem→register double-buffer's ping-pong."""
-        c, stage = self.c, self.stage
+        c = self.c
         atom, m, n = c.atom, c.m, c.n
-        _mode, _gmem_depth, reg_depth = _mma_stage_plan(c, stage)
+        reg_depth = self.stage_plan().reg_depth
 
         def frags(tag, reg):  # reg-tile operand fragment names (slotted ``_s{s}`` when double-buffered)
             return (
@@ -581,34 +578,18 @@ class _MmaOps(_AtomOps):
         ]
         return decls
 
-    def reduce(self, cells, offset, mn):
-        """The mma K-loop, dispatched on the staging decision (TMA > cp.async > gmem-direct). Staged:
-        cooperatively fill an smem slab then ``ldmatrix``-drain it (:func:`_mma_staged`, the one
-        :func:`staged_kloop`) — a pure perf transform, bit-identical to gmem-direct. Gmem-direct:
-        ``ldmatrix`` each operand fragment straight from gmem, then ``mma.sync`` every cell (a symbolic /
-        non-divisible K zero-fills the masked-K tail via the ``k_zero`` helper variants — canonical and
-        transposed-B both have gmem-direct K zero-fill helpers)."""
-        c, stage = self.c, self.stage
+    def gmem_leaves(self, offset, mn):
+        """The gmem-direct mma leaf constructors: ``ldmatrix`` each operand fragment straight from
+        gmem, ``mma.sync`` every cell, the K-loop a ``StridedLoop`` of step ``atom_k`` (a symbolic /
+        non-divisible K zero-fills the masked-K tail via the ``k_zero`` helper variants — canonical
+        and transposed-B both have gmem-direct K zero-fill helpers)."""
+        c = self.c
         atom, (m, n) = c.atom, mn
         k_axis = c.k_axis
         assert not c.a_computed, (
             "mma tier: register-resident A operand (a computed flash-PV fragment feed) is a scalar-tier-only capability"
         )
         a_load, b_load, b_trans = c.a_operand, c.b_load, c.b_trans
-        mode, gmem_depth, reg_depth = _mma_stage_plan(c, stage)
-        if mode != "gmem":
-            return _mma_staged(
-                loads=(a_load, b_load),
-                mn=mn,
-                k_axis=k_axis,
-                atom=atom,
-                bk=c.tile.bk,
-                slab_dtype=cuda_name(atom.operand_dtype("a")),
-                elem_bytes=atom.operand_dtype("a").nbytes,
-                reg_depth=reg_depth,
-                depth=gmem_depth,
-                mode=mode,
-            )
         k_static = k_axis.extent.is_static
         k_zero = None if k_static else (Var(k_axis.name), _extent_expr(k_axis))
 
@@ -645,7 +626,7 @@ class _MmaOps(_AtomOps):
                 StridedLoop(axis=k_axis, start=Literal(0, "int"), step=Literal(atom.atom_k, "int"), body=Body(tuple(body)), unroll=k_static)
             ]
 
-        return _contract_kloop(c, cells, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
+        return dict(read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
 
     def store(self, i, j, offset, mn):
         """Store cell ``(i, j)``'s ``_c`` fragment to the output, folding the projection ``tail`` into a
@@ -673,6 +654,39 @@ class _MmaOps(_AtomOps):
 class _ScalarOps(_AtomOps):
     """Scalar fma atom — plain ``Load``\\ s + an ``fma`` cell, the replicated-``epilogue`` sink."""
 
+    def stage_plan(self) -> _StagePlan:
+        """The scalar staging sizing. **Opt-in behind a ``STAGE`` pin**: a scalar contraction with no
+        ``stage`` (every default scalar matmul) is ``"gmem"``, byte-identical. Eligible when ``stage``
+        is set with a ``tma`` / ``cp.async`` transport, K is static, and the operands are plain gmem
+        ``Load``\\ s (not a computed-A flash body). A masked (overhanging) M / N is fine — the drain
+        reads the slab by LOCAL tile coords and the overhanging store is guarded, so TMA zero-fills
+        the box overhang and cp.async clamps the gmem read. The slab K-chunk ``bk_elems`` is
+        **derived** to fit a single ``tile_m×bk + bk×tile_n`` operand slab in 48 KiB (largest
+        power-of-two dividing K) — not spelled by a codec, so no schema change. Single-buffer
+        (``depth == 1``; the scalar gmem→smem ring is a follow-on)."""
+        c, stage, inputs = self.c, self.stage, self.inputs
+        if stage is None or c.a_computed or not c.k_axis.extent.is_static:
+            return _StagePlan("gmem")
+        if inputs is None or c.a_operand.input not in inputs or stage.transport not in ("tma", "cp.async"):
+            return _StagePlan("gmem")
+        K = c.k_axis.extent.as_static()
+        elem_bytes = inputs[c.a_operand.input].dtype.nbytes
+        cap = (48 * 1024) // (max(1, c.m.tile + c.n.tile) * elem_bytes)
+        bk_elems = next((v for v in (128, 64, 32, 16, 8, 4) if v <= cap and K % v == 0), 0)
+        if bk_elems < 4:
+            return _StagePlan("gmem")
+        return _StagePlan("tma" if stage.transport == "tma" else "cp", bk_elems=bk_elems)
+
+    def slab_elem(self):
+        """The slab element dtype — the gmem operand's own dtype (fp32 SGEMM stages fp32)."""
+        return self.inputs[self.c.a_operand.input].dtype
+
+    def staged_drain(self, operands, slot, cells, offset, mn, plan: _StagePlan):  # noqa: ARG002 — slot: single-buffer (no ring)
+        """The scalar slab drain — the plain-``Load`` fma leaf (:func:`_scalar_drain`), reading by
+        LOCAL tile coords; ``slot`` is unused (the scalar tier is single-buffer, ``depth == 1``)."""
+        a_op, b_op = operands
+        return [_scalar_drain(self.c, cells, offset, (a_op.slab, b_op.slab), "_ki", plan.bk_elems, _tile_base(mn))]
+
     def state(self, cells):
         """The scalar accumulator seeds. Gmem-direct (unstaged): none — the accumulators are seeded
         inside the reduce ``Loop`` (the dissolved fold ``Accum``\\ s + ``Loop.render``). **Staged**: a
@@ -680,24 +694,18 @@ class _ScalarOps(_AtomOps):
         carrier-less :func:`_scalar_drain` folds across every slab without re-seeding (the nested-loop
         accumulator-lifetime split — the scalar analogue of :meth:`_MmaOps.state` declaring the ``_c``
         fragments outside the mma K-loop)."""
-        c, stage, inputs = self.c, self.stage, self.inputs
-        mode, _bk = _scalar_stage_plan(c, stage, inputs)
-        if mode == "gmem":
+        c = self.c
+        if self.stage_plan().mode == "gmem":
             return []
         return [Init(name=f"{c.acc}__c{i}_{j}", identity=_ADD.identity, dtype=F32) for i, j in cells]
 
-    def reduce(self, cells, offset, mn):
-        """The scalar contraction K-loop, through the shared :func:`_contract_kloop` skeleton with scalar
-        leaf constructors: each register ROW reads its A operand once (a gmem ``Load`` — or the computed
-        register-resident body, e.g. flash PV's ``P``), each COL its B ``Load`` once, and each ``(i, j)``
-        cell folds ``acc__c{i}_{j} += b·a`` in a unit ``Loop`` (``Loop.render`` seeds the accumulators; the
-        store reads them). A masked axis wraps its read in-bounds (``% extent``) and the overhanging store
-        is guarded (:meth:`_ScalarOps.store`). Under a ``STAGE`` pin the eligible contraction routes to
-        :func:`_scalar_staged` (smem operand slab, the one :func:`staged_kloop`); unstaged is this path."""
-        c, stage, inputs = self.c, self.stage, self.inputs
-        mode, bk_elems = _scalar_stage_plan(c, stage, inputs)
-        if mode != "gmem":
-            return _scalar_staged(c, inputs, cells, offset, mode, bk_elems)
+    def gmem_leaves(self, offset, mn):
+        """The gmem-direct scalar leaf constructors: each register ROW reads its A operand once (a
+        gmem ``Load`` — or the computed register-resident body, e.g. flash PV's ``P``), each COL its
+        B ``Load`` once, each ``(i, j)`` cell folds ``acc__c{i}_{j} += b·a``, and the K-loop is a unit
+        ``Loop`` (``Loop.render`` seeds the accumulators; the store reads them). A masked axis wraps
+        its read in-bounds (``% extent``) and the overhanging store is guarded (:meth:`store`)."""
+        c = self.c
         k_axis = c.k_axis
         m, n = mn
         prot = _scalar_protected(c)
@@ -721,7 +729,7 @@ class _ScalarOps(_AtomOps):
         def wrap(body):
             return [Loop(axis=k_axis, body=Body(tuple(body)), unroll=_unroll_inner(k_axis))]
 
-        return _contract_kloop(c, cells, read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
+        return dict(read_row=read_row, read_col=read_col, contract=contract, wrap=wrap)
 
     def store(self, i, j, offset, mn):
         """Replicate the projection ``tail`` for cell ``(i, j)`` — σ-offset, suffix the SSA names, guard
@@ -740,9 +748,10 @@ def _atom_ops(c: Contraction, stage: Stage | None = None, inputs=None) -> _AtomO
 
 def reduce_codegen(c: Contraction, stage: Stage | None = None, inputs=None):
     """The reusable, **sink-agnostic** ``(state_decls, reduce_region)`` from the atom strategy — the
-    accumulator decls + the contraction K-loop (the shared :func:`_contract_kloop` skeleton with the
-    atom's leaf constructors). ``stage`` / ``inputs`` bind operand staging (both tiers stage an smem
-    slab off it — the mma tier ``ldmatrix``-drains, the scalar tier plain-``Load``-drains)."""
+    accumulator decls + the contraction K-loop (the ONE :meth:`_AtomOps.reduce` driver: the shared
+    :func:`_contract_kloop` spine gmem-direct, the shared :func:`_staged` fill→drain skeleton staged).
+    ``stage`` / ``inputs`` bind operand staging (both atoms stage the same smem slab off it, differing
+    only in the drain leaf — ``ldmatrix`` vs plain ``Load``)."""
     ops = _atom_ops(c, stage, inputs)
     return ops.state, ops.reduce
 

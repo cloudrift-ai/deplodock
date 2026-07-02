@@ -28,8 +28,9 @@ REG-tree fold, the cross-thread combine (``_combine.emit_combine``), and the pro
 generic (a contraction is the degenerate carrier of its additive fold).
 
 The smem operand-staging pipeline lives in ``_stage.py`` (the :class:`~...kernel._stage.Transport`
-strategy + the one :func:`~...kernel._stage.staged_kloop`); the per-tier builders (``_atom._mma_staged``
-/ ``_atom._scalar_staged``) build the transport + drain leaf. It is driven off the node's ``STAGE`` codec →
+strategy + the one :func:`~...kernel._stage.staged_kloop`); the ONE atom-agnostic driver
+(``_atom._staged``) builds the transport, the atom strategy supplying only the slab drain leaf.
+It is driven off the node's ``STAGE`` codec →
 :class:`~...schedule.Stage` (``d<depth>`` gmem→smem ring · ``sync``/``cp``/``tma`` transport ·
 ``p<n>`` smem→register double-buffer). The **scalar** contraction tier stays gmem-direct. The fused
 norm→linear **shared-row** prologue is Stage-driven too: ``020_schedule`` detects the reused input row

@@ -196,11 +196,17 @@ top of this*, not before it — flash is the acceptance test that the collapse i
   `linear_tid`, the drain leaf, and the cp gmem-clamp closures — now share one skeleton (fill → barrier/mbar → drain →
   `Sync` over the K-slab loop); `_warp_tma_staged_kloop`, `_scalar_staged_kloop`, and `_warp_staged_kloop`'s `ring == 1`
   branch all call it, supplying the `cta` / drain / gmem closures. The fill already lived in `_stage.py`; the drain is
-  the atom leaf (`_staged_inner_atom_loop` ldmatrix vs `_scalar_drain` plain-`Load`). **Remaining in (3):** the mma
-  `cp.async` depth≥2 **ring** + register double-buffer stay an mma-only extension in `_warp_staged_kloop` (scalar has no
-  ring), and the two `*_stage_plan`s stay separate (they compute genuinely different sizing — mma ring/reg depth vs
-  scalar slab `bk_elems`); full convergence needs the scheduler-side first-class `Stage` (stamped in `020_schedule`), a
-  build, not a pure delete.
+  the atom leaf (`_staged_inner_atom_loop` ldmatrix vs `_scalar_drain` plain-`Load`).
+- ✅ **Deviation 3 complete — ONE contraction K-loop driver, ONE staged driver** (bit-identical modulo the pre-existing
+  nondeterministic vectorize-store gensym; compiler e2e green). `_AtomOps.reduce` on the strategy BASE is now the one
+  K-loop entry for both atoms: the resolved `_StagePlan` (a uniform mode / `bk_elems` / `depth` / `reg_depth` struct
+  each atom's `stage_plan` sizing returns) picks gmem-direct (`_contract_kloop`) or staged (`_atom._staged` — the one
+  atom-agnostic driver that builds the operand pair, the `CtaTile` via the shared lanes-keyed `_cta`, and the
+  transport). `_mma_staged` / `_scalar_staged` / the free `*_stage_plan`s are deleted; the atoms supply only descriptor
+  reads (`stage_plan` / `gmem_leaves` / `staged_drain` / `slab_elem`). **Still per-atom inside `stage_plan`:** the
+  sizing sources genuinely differ (mma: codec-spelled `TilePlan.bk` + ring/reg depths; scalar: derived fit-to-smem
+  `bk_elems`, single-buffer — the scalar ring stays a follow-on); converging those needs the scheduler-side
+  fully-resolved `Stage` (stamped in `020_schedule`), a build, not a pure delete.
 - **Remaining:** (4) placement-keyed fold move (lands with the tensor-core flash, which needs the returning fragment
   shuffle).
 
