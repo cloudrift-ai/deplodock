@@ -40,7 +40,7 @@ How to comply:
 ## Resolve the hardware-atom binding once, structurally, at the tile level
 
 The same invariant applies *across* the tile→kernel boundary: the kernel materializer must not re-recognize structure
-the tile IR already holds. The **atomize** step (`lowering/tile/_atomize.py`, called from `020_schedule` when it builds
+the tile IR already holds. The **atomize** step (`lowering/tile/_atomize.py`, called from the `_schedule` helper inside `010_recognize` when it builds
 the warp / register-tiled option — *not* a standalone pass) resolves the algebra→hardware-atom binding once at fork-emit
 and feeds it into the `Contraction` structural node (`_schedule._contraction_node`), so materialize reads the operands /
 `acc` / epilogue off the node and only `factorize`s. Resolving it at option-build time means an atom that **cannot** be

@@ -62,12 +62,15 @@ masked-row M and the symbolic reduce), causal or non-causal (causal masks the
 score per element, ``kv ≤ m`` else −inf — tile-skip is a tensor-core-tier
 follow-up), an optional broadcast additive mask (the HF ``(1,1,S,S)`` float bias),
 and GQA (``q_heads == group · kv_heads``; the K/V head axis read at ``head //
-group`` directly, no materialized broadcast). Read from the ``DEPLODOCK_FLASH=1`` env
-pin; the two-level ``OptionFork`` offer + ``AnalyticPrior`` cold-start are a follow-up.
+group`` directly, no materialized broadcast). Fusion is the ``PLACE@fold`` placement
+(default ``fuse``; ``cut`` is the multi-kernel attention escape — gated in
+``010_recognize``, before :func:`try_flash` is even tried); the two-level ``OptionFork``
+offer + ``AnalyticPrior`` cold-start are a follow-up.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -86,6 +89,8 @@ from deplodock.compiler.pipeline.passes.lowering.tile._carrier import denom, exp
 if TYPE_CHECKING:
     from deplodock.compiler.graph import Node
     from deplodock.compiler.ir.stmt.base import Stmt
+
+logger = logging.getLogger(__name__)
 
 
 def flash_combine(m: str, ll: str, o: str, s: str, v: str) -> Carrier:
@@ -181,7 +186,7 @@ def build_flash_frag(
     The compute is the op tree itself — a ``Map`` whose body is the ``(m,l,O)`` LSE
     ``TWISTED`` reduce ``Loop`` then the ``O/l`` projection, carried unlowered on the ``TileOp`` with an empty
     schedule; the free ``(batch…, m, d)`` axes are the ``Placement``'s ``free`` (no
-    free-axis loop nest). ``020_schedule`` maps them onto the grid; ``materialize`` lowers
+    free-axis loop nest). ``_schedule`` (inside ``010_recognize``) maps them onto the grid; ``materialize`` lowers
     the node and generates the output-store glue (the ``Write`` at the grid cell) — it
     isn't stored here.
 
@@ -199,7 +204,7 @@ def build_flash_frag(
     batch_axes = tuple(Axis(name=f"b{i}", extent=Dim(b)) for i, b in enumerate(batch))
     grid = (*batch_axes, Axis(name="m", extent=s_q_dim), Axis(name="d", extent=Dim(d_v)))
     # The free axes are the schedule's, carried on the ``TileOp`` with an UNMAPPED grid —
-    # like every other recognizer; ``020_schedule`` maps ``free`` onto the grid.
+    # like every other recognizer; ``_schedule`` (inside ``010_recognize``) maps ``free`` onto the grid.
     tile = TileOp(op=flash_op, place=Placement(free=grid))
 
     frag = Graph()
@@ -503,6 +508,17 @@ def _recognize(graph: Graph, node: Node) -> tuple[str, str, str, str | None] | N
     return x_buf, v_buf, mask_kind, mask_buf
 
 
+def _fuse_degraded(root: Node, reason: str) -> None:
+    """A softmax-then-P@V kernel was recognized but cannot be certified for the fused flash
+    form — the fuse degrades to cut (the un-fused tiers). Loud only under an explicit
+    ``PLACE@fold=fuse`` pin (the standard pin-validity rule); silent for the ``auto``
+    default, where most kernels legitimately decline."""
+    from deplodock.compiler.pipeline.search.space import PLACE  # noqa: PLC0415
+
+    if PLACE.narrow_at("fold") == "fuse":
+        logger.warning("PLACE@fold=fuse: flash fuse of %r not certifiable (%s); degrading to cut", root.name, reason)
+
+
 def try_flash(graph: Graph, root: Node) -> Graph | None:
     """Recognize SDPA on ``root`` and return the fused flash ``Graph`` fragment (a
     ``TileOp`` holding the flash ``Map`` (a ``TWISTED`` kv loop) + its scale / -inf constants), or ``None``
@@ -520,6 +536,7 @@ def try_flash(graph: Graph, root: Node) -> Graph | None:
     # flash isn't recognized, and the softmax-then-P@V falls back to its un-fused tiers.
     qk = _extract_qk(graph.nodes[x_buf])
     if qk is None:
+        _fuse_degraded(root, "score producer's Q/K are not plain loads (e.g. RoPE'd QK)")
         return None
     q_id, k_id, _head_dim = qk
     if q_id not in graph.nodes or k_id not in graph.nodes:
@@ -529,9 +546,11 @@ def try_flash(graph: Graph, root: Node) -> Graph | None:
     v_shape = graph.nodes[v_id].output.shape
     group = gqa_group(q_shape, k_shape)
     if group is None:
+        _fuse_degraded(root, "head axis not statically GQA-divisible")
         return None
     mask_shape = graph.nodes[mask_buf].output.shape if mask_buf is not None else None
     if not flash_shape_eligible(q_shape, k_shape, v_shape, group=group, mask_shape=mask_shape):
+        _fuse_degraded(root, "shape not flash-eligible")
         return None
     mask = (mask_buf, mask_shape) if mask_kind == "additive" else None
     return build_flash_frag(

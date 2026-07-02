@@ -49,7 +49,7 @@ from deplodock.compiler.ir.expr import BinaryExpr, Literal, SimplifyCtx, affine_
 from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Load, Stmt
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.forks import VECTORIZE_LOADS
+from deplodock.compiler.pipeline.search.space import VECTORIZE_LOADS
 
 PATTERN = [Pattern("root", KernelOp)]
 

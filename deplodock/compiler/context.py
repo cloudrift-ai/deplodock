@@ -36,7 +36,7 @@ _TENSOR_CORE_GEN = gpu.TENSOR_CORE_GEN
 # device the golden configs were measured on, so offline golden ranking matches).
 # The live count (``target.live_device_features`` → ``gpu.probe_live_features``)
 # overrides this in ``from_target`` / ``probe``. Consumed by the occupancy-aware
-# analytic prior (the ``D_*`` CTA / waves features in ``knob.knob_features``) to
+# analytic prior (the ``D_*`` CTA / waves features in ``features.knob_features``) to
 # size tiles to the device — keep CTA count near ~1-2 waves over the SMs.
 DEFAULT_SM_COUNT = gpu.DEFAULT_GPU.sm_count
 

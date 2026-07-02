@@ -2,7 +2,7 @@
 
 The one ``_bind`` pipeline calls :func:`realize_warp_twist` when the reduce arm's tree carries a
 warp tile (:func:`warp_source` — the stream's head :class:`Contraction` stamped with an mma
-:class:`TilePlan` by ``020_schedule``): the streaming reduce keeps its per-step values in mma
+:class:`TilePlan` by ``_schedule`` (inside ``010_recognize``)): the streaming reduce keeps its per-step values in mma
 C-fragments instead of scalars, so every piece of the scalar lowering is *realized* at the new
 residence — the fragment row of the placement-keyed fold (a within-warp ``FragmentRowReduce``
 ``__shfl`` move where the scalar tier folds in-thread):

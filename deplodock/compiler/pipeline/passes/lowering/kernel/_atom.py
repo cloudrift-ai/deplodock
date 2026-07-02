@@ -8,7 +8,7 @@ one of the two concrete strategies — :class:`_MmaOps` (tensor-core ``ldmatrix`
 ``RegStore`` sink) or :class:`_ScalarOps` (plain ``Load``\ s + an ``fma`` cell, the replicated-
 ``epilogue`` sink). The K-loop itself is ONE driver on the base strategy (:meth:`_AtomOps.reduce`),
 deciding nothing: the **scheduler-resolved** ``stage`` (eligibility + sizing ran once in
-``020_schedule`` — ``_resolve_warp_stage`` / ``_resolve_scalar_stage``; ``None`` = gmem-direct)
+``_schedule`` (inside ``010_recognize``) — ``_resolve_warp_stage`` / ``_resolve_scalar_stage``; ``None`` = gmem-direct)
 picks its form — gmem-direct through the shared :func:`_contract_kloop` spine, or staged through
 the shared :func:`_staged` fill→drain skeleton (over the one ``_stage.staged_kloop``) — and the
 atom supplies only descriptor reads: the four gmem leaf constructors (:meth:`gmem_leaves`), the
@@ -491,7 +491,7 @@ def _scalar_drain(c: Contraction, cells, offset, slabs: tuple[str, str], ki: str
 class _AtomOps:
     """The per-atom codegen **strategy** — the one seam every tiled contraction dispatches through.
     Bound to the contraction ``c`` + its **scheduler-resolved** operand ``stage`` (``None`` =
-    gmem-direct; eligibility + sizing already ran in ``020_schedule``) and ``inputs``, it supplies
+    gmem-direct; eligibility + sizing already ran in ``_schedule`` (inside ``010_recognize``)) and ``inputs``, it supplies
     the three ``grid_tile`` callables — ``state(cells)`` (accumulator decls), :meth:`reduce` (the
     K-loop — **shared on this base**, one loop over atoms), ``store(i, j, offset, mn)`` (the
     per-cell sink; ``mn`` is the contraction's ``(m, n)`` :class:`Side` pair). The two concrete

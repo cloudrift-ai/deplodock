@@ -3,7 +3,7 @@ and ranks it with a ``Prior``.
 
 Ranking itself now lives in :mod:`deplodock.compiler.pipeline.search.prior`: the
 hand-coded :class:`AnalyticPrior` (the cold-start linear model over
-``knob.knob_features``) and the learned ``CatBoostPrior`` are the ONE ranking
+``features.knob_features``) and the learned ``CatBoostPrior`` are the ONE ranking
 path. This module is just the offline *evaluation* glue — given a recorded golden
 it enumerates the shape's candidate rows and reports the golden's rank under a
 scorer (the ``AnalyticPrior`` by default; ``eval prior`` passes the learned one).
@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline import knob
+from deplodock.compiler.pipeline.search.features import tile_signature
 
 
 def _matmul_thread_gate(r: dict, dag, reduce_key: str) -> bool:
@@ -83,8 +83,8 @@ def evaluate_golden(
     # Match the recorded golden against the native candidate rows by schema-agnostic
     # structural signature (free slots + reduce decomp + atom + stage) — robust to either
     # spelling, so it still joins a legacy-recorded DB row against the native enumeration.
-    want = knob.tile_signature(golden_knobs) if golden_knobs else None
-    gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None) if want else None
+    want = tile_signature(golden_knobs) if golden_knobs else None
+    gidx = next((i for i, r in enumerate(rows) if tile_signature(r) == want), None) if want else None
     scores = [scorer(r) for r in rows]
     best = max(range(len(rows)), key=scores.__getitem__)
     rank = sum(1 for s in scores if s > scores[gidx]) if gidx is not None else None

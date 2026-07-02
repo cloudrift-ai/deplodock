@@ -14,13 +14,10 @@ from deplodock.compiler.pipeline.knob import (
     family_of,
     family_value,
     format_tuning_knobs,
-    is_warp,
-    knob_features,
-    mma_atom,
     resolve_axis,
-    tile_signature,
     tuning_knob_items,
 )
+from deplodock.compiler.pipeline.search.features import is_warp, knob_features, mma_atom, tile_signature
 
 
 def test_int_parse():
@@ -219,7 +216,7 @@ def test_warp_tile_features_from_warp_tile():
     """``_warp_tile_features`` builds the ``D_*`` family from the warp form of the ``TILE`` codec
     (``WM·WN·32`` threads, ``WM·FM·atom_m × WN·FN·atom_n`` output) — the atom cell dims (16×8 for
     ``m16n8k16``) are read off the parsed atom. A scalar ``TILE`` value → empty."""
-    from deplodock.compiler.pipeline.knob import _warp_tile_features  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.features import _warp_tile_features  # noqa: PLC0415
 
     wf = _warp_tile_features({"TILE": "a:mma_m16n8k16_f16/w2x2/f2x2/k2", "S_ext_free_prod": 2048 * 2048})
     assert wf["D_threads"] == 128.0  # WM·WN·32
@@ -377,7 +374,7 @@ def test_stage_codec_reg_depth_roundtrip():
     assert Stage(depth=2, transport="cp.async", reg_depth=2).spell() == "d2/cp/p2"
     assert Stage(depth=2, transport="cp.async", reg_depth=1).spell() == "d2/cp"  # p1 omitted
     # reg_depth is perf-only — NOT part of the structural signature (golden-match stability).
-    from deplodock.compiler.pipeline.knob import _stage_sig  # noqa: PLC0415
+    from deplodock.compiler.pipeline.search.features import _stage_sig  # noqa: PLC0415
 
     assert _stage_sig({"STAGE": "d2/cp/p2"}) == _stage_sig({"STAGE": "d2/cp"})
 
@@ -501,7 +498,7 @@ def test_multinode_flash_keys_apart_and_pools_per_node():
     (REDUCE@sk); the two ``TILE`` keys are distinct flat entries (no collision), and the schedule
     geometry featurizes **per node** and sum-pools — ``D_threads`` = QK threads + PV threads, and
     ``MMA_tier`` = 2.0 over the two warp nodes. This is the case the flat one-key schema can't express."""
-    from deplodock.compiler.pipeline.knob import _node_axes, _node_slice, _schedule_node_features
+    from deplodock.compiler.pipeline.search.features import _node_axes, _node_slice, _schedule_node_features
 
     qk_tile = "a:mma_m16n8k16_f16/w4x1/f2x2/k2"  # WM·WN·32 = 128 threads
     pv_tile = "a:mma_m16n8k16_f16/w2x2/f4x1/k2"  # WM·WN·32 = 128 threads
@@ -526,7 +523,7 @@ def test_node_slice_addresses_per_node_struct():
     """Each node reads its OWN reduce extent: an addressed ``S_ext_reduce_prod@<axis>`` overrides the
     shared bare value in that node's slice (so QK@d and PV@sk featurize with different K depths), while
     a one-node kernel with a bare ``S_ext_reduce_prod`` featurizes byte-identically (bare fallback)."""
-    from deplodock.compiler.pipeline.knob import _node_slice
+    from deplodock.compiler.pipeline.search.features import _node_slice
 
     knobs = {"TILE@d": "n4/f2", "TILE@sk": "n2/f4", "S_ext_reduce_prod": 8.0, "S_ext_reduce_prod@sk": 512.0}
     assert _node_slice(knobs, "d")["S_ext_reduce_prod"] == 8.0  # no @d override → bare fallback

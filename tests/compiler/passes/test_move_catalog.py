@@ -1,4 +1,4 @@
-"""Structural-coverage test for the permitted-move catalog (``lowering/tile/_catalog``).
+"""Structural-coverage test for the permitted-move catalog (``search/space.py``).
 
 The scheduling emit (``010_recognize`` → ``_schedule``) enumerates the catalog into the tile fork; this
 file pins the catalog's **legal product** two ways:
@@ -20,8 +20,9 @@ from deplodock.compiler.ir.schedule import TilePlan
 from deplodock.compiler.pipeline import TILE_PASSES, Pipeline
 from deplodock.compiler.pipeline.fork import flatten_leaves
 from deplodock.compiler.pipeline.knob import axis_of, family_of, family_value
-from deplodock.compiler.pipeline.passes.lowering.tile._catalog import _MAX_BLOCK_THREADS, scalar_tile_moves
 from deplodock.compiler.pipeline.pipeline import Run
+from deplodock.compiler.pipeline.search.space import MAX_BLOCK_THREADS as _MAX_BLOCK_THREADS
+from deplodock.compiler.pipeline.search.space import scalar_tile_moves
 
 # The hand-computed legal product as explicit literals — per-cell option-0, then the (par × reg) grid
 # spelled through the codec (the default ``f1x1`` register sub-tile suppresses, so ``reg=(1,1)`` is the

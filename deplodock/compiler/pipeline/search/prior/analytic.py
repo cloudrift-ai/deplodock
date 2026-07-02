@@ -1,11 +1,11 @@
 """Analytic prior — a stateless, hand-weighted :class:`Prior` over
-``knob.knob_features``.
+``features.knob_features``.
 
 This is the *untrained* prior: the cold-start ranking the search uses before any
 tuning data exists. It replaces the old hand-coded matmul heuristic
 (``score_matmul_thread`` + the ``_priority_matmul_*`` enumeration sort) — same
 features, now expressed as a fixed linear model over the one shared feature dict
-``knob.knob_features`` produces, so there is a SINGLE ranking path: a config is
+``features.knob_features`` produces, so there is a SINGLE ranking path: a config is
 scored by a ``Prior`` (this one cold, ``CatBoostPrior`` once trained), composed
 behind :class:`~deplodock.compiler.pipeline.search.prior.fallback.FallbackPrior`.
 
@@ -28,10 +28,10 @@ from __future__ import annotations
 
 import math
 
-from deplodock.compiler.pipeline import knob
+from deplodock.compiler.pipeline.search.features import knob_features
 from deplodock.compiler.pipeline.search.prior.base import Prior
 
-# Linear weights over ``knob.knob_features`` (``D_*`` geometry keys + ``MMA_tier``),
+# Linear weights over ``features.knob_features`` (``D_*`` geometry keys + ``MMA_tier``),
 # fit offline by ``scripts/golden_knob_heuristics.py`` jointly over ALL kernel
 # regimes — fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise
 # goldens — tier-balanced (each regime weighted equally so the sparse
@@ -199,7 +199,7 @@ class AnalyticPrior(Prior):
         weights have no opinion on (no ``D_*`` features — e.g. a non-tiled kernel)
         scores the neutral ``1.0``, so ties fall to enumeration order. Symbolic-axis
         (masked-tile) kernels rank under the dynamic weight set."""
-        feats = knob.knob_features(knobs)
+        feats = knob_features(knobs)
         w_set = self._w_dyn if feats.get("S_ext_n_symbolic_axis", 0.0) > 0 else self._w
         quality = sum(w * feats.get(k, 0.0) for k, w in w_set.items())
         # Deferred-kernel split-K finalize gate (local term — see __init__). The

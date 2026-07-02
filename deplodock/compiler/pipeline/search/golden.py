@@ -35,7 +35,7 @@ GEMM. On sm_120 the warp-tier prior + greedy now land on a square
 TMA, consumer warps run the mma chain), measured at / above cuBLAS across the
 squares (2048²: 106.7 µs / 1.06×; 4096²: 746 µs / 1.03×; 1024²: 0.94×). See the
 warp-tier ranking in ``search/prior/AnalyticPrior`` (the ``D_*`` geometry features
-over ``knob.knob_features``) and the WS=1-first emission order in
+over ``features.knob_features``) and the WS=1-first emission order in
 ``085_warp_specialize``.
 """
 

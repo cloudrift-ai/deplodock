@@ -47,15 +47,14 @@ from deplodock.compiler.ir.sigma import Sigma
 from deplodock.compiler.ir.stmt import Accum, Assign, Body, Load, Loop, Stmt
 from deplodock.compiler.ir.tile import Contraction, Map, Placement, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
-from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
 from deplodock.compiler.pipeline.passes.lowering.tile._atomize import semiring_binding
-from deplodock.compiler.pipeline.passes.lowering.tile._catalog import scalar_tile_moves
 from deplodock.compiler.pipeline.pipeline import LoweringError
+from deplodock.compiler.pipeline.search.space import MAX_BLOCK_THREADS, REDUCE, STAGE, TILE, WSPEC, scalar_tile_moves
 
-# The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) are declared in
-# ``pipeline/forks.py`` (split out of ``knob.py``) and imported here, where they are
-# resolved into the schedule slices. The decision hierarchy for each is the env pin (via
-# ``Knob.narrow``) > the search/prior fork > the conservative default below.
+# The schedule codec knobs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) and the enumeration
+# value grids are declared in ``search/space.py`` (the one search-space file) and imported here,
+# where they are resolved into the schedule slices. The decision hierarchy for each is the env
+# pin (via ``Knob.narrow``) > the search/prior fork > the conservative default below.
 
 
 def _at(knob, axis_name: str) -> str:
@@ -69,7 +68,6 @@ _COOP_MIN_EXTENT = 128  # only cooperate when the reduce axis is at least this w
 _SERIAL_TARGET = 8  # aim for ~this many serial steps per cooperating thread
 _MAX_COOP = 256  # cap on cooperative threads per CTA (power of two)
 _FREE_CAP = 256  # only cooperate when the output grid is at most this many cells (under-occupied)
-_MAX_BLOCK_THREADS = 1024  # CUDA hardware limit on threads per CTA (guards an oversized TILE parallel tile)
 
 
 def _hint_extent(ax) -> int:
@@ -244,7 +242,7 @@ def _tile_specs(kernel) -> list[str]:
     """Candidate ``TILE`` codec strings for ``kernel`` — only a ``CONTRACTION`` contraction tiles
     its output; everything else is the per-cell tier (``[""]``, the pin doesn't apply). The env
     pin ``DEPLODOCK_TILE`` is authoritative (``Knob.narrow``); unpinned, the default is the
-    **permitted-move catalog** (:func:`_catalog.scalar_tile_moves` — per-cell option-0 then the
+    **permitted-move catalog** (:func:`search.space.scalar_tile_moves` — per-cell option-0 then the
     legality-guarded scalar register-tile grid), so an unpinned ``compile`` / ``tune`` explores the
     tile space ranked by the prior. Warp (tensor-core) tiles stay pin-driven (a pinned ``a:<atom>``
     codec routes to ``_warp_option``); folding the warp / reduce / stage moves into the catalog is the
@@ -573,10 +571,10 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # 1024-thread/CTA hardware limit — otherwise the launch fails late with an opaque
     # ``CUDA_ERROR_INVALID_VALUE`` instead of a clear compile-time error.
     block = plan.block_threads
-    if block > _MAX_BLOCK_THREADS:
+    if block > MAX_BLOCK_THREADS:
         raise ValueError(
             f"TILE parallel block {plan.units_n}×{plan.units_m}={block} threads exceeds the "
-            f"{_MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
+            f"{MAX_BLOCK_THREADS}-thread/CTA limit; shrink n/m or move work to the f register sub-tile."
         )
     # A tiled register-tile leaf (a ``TILE`` pin) becomes a :class:`Contraction` node here, so
     # materialize only ``factorize``\\ s. An unbindable contraction (a non-``Load`` operand) keeps the

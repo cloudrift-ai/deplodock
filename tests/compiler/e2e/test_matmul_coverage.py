@@ -31,7 +31,8 @@ from deplodock.compiler.ir.base import InputOp
 from deplodock.compiler.ir.frontend.ir import LinearOp, MatmulOp, RmsNormOp
 from deplodock.compiler.ir.tensor.ir import ElementwiseOp
 from deplodock.compiler.pipeline import CUDA_PASSES, TILE_PASSES, Pipeline
-from deplodock.compiler.pipeline.knob import family_value, mma_atom
+from deplodock.compiler.pipeline.knob import family_value
+from deplodock.compiler.pipeline.search.features import mma_atom
 
 from ..conftest import dyn_M, requires_cuda, requires_sm90
 

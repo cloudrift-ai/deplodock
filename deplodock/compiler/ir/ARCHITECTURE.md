@@ -34,7 +34,7 @@ top-level layer/pass picture see `compiler/ARCHITECTURE.md`.
   is read off its annotated reduce loop's `AxisRole`, not a Python
   type. `010_recognize` lifts the `Map` (a thin `Body` wrapper over
   the annotated loop nest, each reduce `Loop` carrying its `AxisRole` +
-  `Carrier`) with an UNMAPPED `Placement`; `020_schedule` maps the free
+  `Carrier`) with an UNMAPPED `Placement`; the `_schedule` helper (inside `010_recognize`) maps the free
   axes onto the grid and decides the reduce `ReducePlan` via the single
   `REDUCE` codec knob (`g<n>` cta / `b<n>` coop / `r<n>` reg; the
   decision hierarchy = env pin > search/prior fork > conservative
@@ -199,7 +199,7 @@ A reduce is a contraction not by "two loads" but by the genuine algebra — the 
 operands) and contracts ≥ 2 distinct operand buffers (`x·x` is a squared reduce, not a
 contraction). Recognition stamps the `CONTRACTION` role on that form (keeping the matmul's
 `Accum` a loose `Accum` rather than degenerate-folding it like a plain reduce);
-`020_schedule` gates flash structurally (a reduce loop nested inside a reduce loop); the mma
+the `_schedule` helper (inside `010_recognize`) gates flash structurally (a reduce loop nested inside a reduce loop); the mma
 atom tier reads the operands off the annotated loop to pick the tensor-core cell.
 
 `Carrier` (`ir/stmt/algebra.py`) is the carrier **algebra** of a reduce — its carried
@@ -403,13 +403,13 @@ registry in one module.
 partitioned across, coarse→fine: `GRID` (split-K across CTAs), `BLOCK` (cooperative threads within a CTA), `REG`
 (ILP register-fold), `SERIAL` (the per-thread remainder). The per-level combine `Fold` (`SHFL` lane butterfly /
 `SMEM` block tree / `ATOMIC` cross-CTA finalize) is **derived** from the level (`ReduceStage.combine`), not stored
-or tuned. The single `REDUCE` codec knob decides the plan in `020_schedule`; the combine itself stays in the op
+or tuned. The single `REDUCE` codec knob decides the plan in the `_schedule` helper (inside `010_recognize`); the combine itself stays in the op
 tree.
 
 All four schedule codecs — `REDUCE`, `TILE` (scalar or warp `TilePlan`), `STAGE`, and `WSPEC` — share one
 schema-driven ser/de engine (the codec half of `schedule.py`): a `Schema` of typed `Field`s plus generic `desugar` / `decode` /
 `encode`. Each codec class keeps its `parse` / `spell` API and its semantics, delegating only the string ↔ struct
-conversion to the engine, so the featurizer and `020_schedule` call sites — and the on-disk golden wire format — are
+conversion to the engine, so the featurizer and the `_schedule` helper (inside `010_recognize`) call sites — and the on-disk golden wire format — are
 unchanged. The grammar collapses int and pair widths into one tuple kind and supports per-field params (the recursive
 `WSPEC` role case); the one non-uniform value codec is the `REDUCE` `g<n>[a|k]` finalize letter, kept inside the value
 so the round-trip stays byte-identical.
@@ -417,7 +417,7 @@ so the round-trip stays byte-identical.
 `WSPEC` (warp specialization) is the worker-mapping pin — a role→warp-count allocation (`WarpSpec`; role descriptors in
 `schedule.py`, the COMPUTE consumer implicit and sized by `TilePlan.units`) carried on an **orthogonal**
 `workers: WarpSpec | None` field of the uniform schedule (`None` = uniform SIMT), **not** a union arm: it adds a warp
-split over the fixed pipeline rather than replacing it. Pin-only this cut — `020_schedule` stamps `workers` from a
+split over the fixed pipeline rather than replacing it. Pin-only this cut — the `_schedule` helper (inside `010_recognize`) stamps `workers` from a
 `DEPLODOCK_WSPEC` pin (gated on a warp `TILE` + a `STAGE`, since the producer needs a load half to drive); the
 materializer does not yet consume `TileOp.workers`, so a pinned WSPEC is inert (no producer/consumer codegen) until
 Phase 4.

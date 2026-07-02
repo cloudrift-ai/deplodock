@@ -95,7 +95,7 @@ def register_eval_command(subparsers) -> None:
     pp.add_argument(
         "--features",
         action="store_true",
-        help="Also print the exact feature vector the prior (CatBoost) regresses on per golden config (knob.knob_features).",
+        help="Also print the exact feature vector the prior (CatBoost) regresses on per golden config (features.knob_features).",
     )
     pp.set_defaults(func=handle_eval_prior)
 
@@ -419,7 +419,7 @@ def _emit_golden_table(lead_cols: list[Col], entries: list[tuple], caption: str)
 
 def _emit_golden_features(kernel_filter: str | None) -> None:
     """Print, per golden config, the exact feature vector the learned
-    :class:`CatBoostPrior` regresses on — ``knob.knob_features(merged)`` where
+    :class:`CatBoostPrior` regresses on — ``features.knob_features(merged)`` where
     ``merged`` is the ``H_*`` host/regime features + the ``S_*`` structural/shape
     features (obtained by compiling the shape to the loop dialect, where
     ``992_stamp_structural_features`` runs) + the golden tuning knobs. This is
@@ -437,7 +437,7 @@ def _emit_golden_features(kernel_filter: str | None) -> None:
         configs = [g for g in configs if kernel_filter in g.name]
 
     logger.info("")
-    logger.info("Learned-prior feature vector (knob.knob_features) — the CatBoost regressor's input per golden config:")
+    logger.info("Learned-prior feature vector (features.knob_features) — the CatBoost regressor's input per golden config:")
     quiet = [_logging.getLogger(n) for n in ("deplodock.compiler", "deplodock.commands.trace")]
     prev = [lg.level for lg in quiet]
     for lg in quiet:

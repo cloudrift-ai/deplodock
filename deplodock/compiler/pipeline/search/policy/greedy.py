@@ -14,7 +14,7 @@ Exploration stays in :class:`~.mcts.TuningSearch` (``Pipeline.tune``).
 **Flatten, don't descend.** The lazy fork tree (``lowering/tile`` planner) is an
 MCTS data structure — it stages knob choices across levels (``BR`` → ``BM/BN`` →
 ``FM/FN``) so MCTS pays one node per pop. Greedy must NOT walk it level-by-level:
-a branch carries only a *partial* tile, and ``knob.knob_features`` can't compute
+a branch carries only a *partial* tile, and ``features.knob_features`` can't compute
 the tile's area / occupancy until ``FM/FN`` are pinned — so the prior is blind at
 the ``BM/BN`` choice and defaults to ``BN=16`` for every shape. Instead greedy
 **flattens** each fork point to its complete leaves

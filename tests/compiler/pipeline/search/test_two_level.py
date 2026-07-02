@@ -271,7 +271,7 @@ def test_inner_reward_parallel_matches_serial(monkeypatch) -> None:
     result. ``prior=None`` keeps this off the learned-prior (catboost) path.
 
     The tile is pinned to per-cell (``DEPLODOCK_TILE=""``) so the matmul enumerates a
-    single candidate: the tile move catalog (``lowering/tile/_catalog``) now offers ~20
+    single candidate: the tile move catalog (``search/space.py``) now offers ~20
     scalar tiles per contraction, and under the small ``_PATIENCE`` window the
     patience-limited MCTS explores a *subset* whose membership is sensitive to the
     bench-completion interleaving of the parallel pool — so the exact parallel==serial

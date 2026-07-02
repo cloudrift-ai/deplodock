@@ -35,7 +35,7 @@ strategy + the one :func:`~...kernel._stage.staged_kloop`); the ONE atom-agnosti
 It is driven off the node's ``STAGE`` codec →
 :class:`~...schedule.Stage` (``d<depth>`` gmem→smem ring · ``sync``/``cp``/``tma`` transport ·
 ``p<n>`` smem→register double-buffer). The **scalar** contraction tier stays gmem-direct. The fused
-norm→linear **shared-row** prologue is Stage-driven too: ``020_schedule`` detects the reused input row
+norm→linear **shared-row** prologue is Stage-driven too: ``_schedule`` (inside ``010_recognize``) detects the reused input row
 and stamps a ``sync`` :class:`~...schedule.Stage` whose ``smem`` names it; :func:`_tile_reduce_axis` only
 applies it (the 1-D ``sync_row_fill`` + the load rewrite). Leading ``_`` so the pass loader skips this
 module."""

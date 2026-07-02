@@ -7,12 +7,12 @@ The two-level autotuner explores the post-fusion kernel's knob space with an inn
 MCTS that stops on **patience** (N consecutive measured terminals with no new
 best). Cold (no learned data) that search is ranked by the :class:`AnalyticPrior` —
 a fixed linear model over the engineered ``D_*`` geometry / occupancy features
-:func:`knob.knob_features` produces. If the golden config sits at rank 800 of 2400,
+:func:`features.knob_features` produces. If the golden config sits at rank 800 of 2400,
 patience never reaches it. This script fits the linear weights so the golden lands
 near the top.
 
 It treats the problem as offline learning-to-rank, over the SINGLE featurization
-(``knob.knob_features`` — no parallel feature set), covering **every kernel
+(``features.knob_features`` — no parallel feature set), covering **every kernel
 regime**: fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise.
 
   1. For every golden (matmul thread / warp / dyn, reduce, pointwise), reconstruct
@@ -23,7 +23,7 @@ regime**: fp32-scalar + fp16/bf16-warp matmul, cooperative reduce, and pointwise
      structural fork, so a warp golden ranks within the warp tier, not against
      scalar rows). Reduce / pointwise trace the snippet to an ``IterDag`` and compose
      the cooperative-reduce / MAP ``_moves`` offers.
-  2. Featurize every candidate via ``knob.knob_features`` (the ``D_*`` engineered
+  2. Featurize every candidate via ``features.knob_features`` (the ``D_*`` engineered
      features plus ``MMA_tier``, the warp/scalar tier discriminator — the ``S_*`` /
      ``H_*`` shape/regime features are constant within a shape, so they drop out of
      a within-shape ranking).
@@ -47,7 +47,7 @@ import math
 import numpy as np
 
 from deplodock.compiler.context import Context
-from deplodock.compiler.pipeline import knob
+from deplodock.compiler.pipeline.search import features
 from deplodock.compiler.pipeline.search.analytic import _enumerate
 from deplodock.compiler.pipeline.search.golden import (
     GOLDEN_CONFIGS,
@@ -79,11 +79,12 @@ def _dag_from_snippet(snippet: str, ctx: Context):
     ``analytic._matmul_dag`` but regime-agnostic: ``torch.sum`` / ``torch.relu`` have
     no dedicated frontend op, so the dag comes from the real trace, not a hand-built
     graph. Returns ``None`` if nothing lowers."""
+    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
+
     from deplodock.commands.trace import graph_from_code  # noqa: PLC0415
     from deplodock.compiler.ir.loop import LoopOp  # noqa: PLC0415
     from deplodock.compiler.pipeline import LOOP_PASSES, Pipeline  # noqa: PLC0415
     from deplodock.compiler.pipeline.fork import Fork  # noqa: PLC0415
-    from deplodock.compiler.pipeline.passes.lowering.tile.enumeration._iterdag import iter_dag  # noqa: PLC0415
     from deplodock.compiler.pipeline.pipeline import Run  # noqa: PLC0415
 
     def _option0(fp):
@@ -185,8 +186,8 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
         # schema-agnostic structural signature (free-axis slots + reduce decomp +
         # atom) — the candidates speak native ``MOVE@element``, the golden YAML legacy
         # GEMM-letters, so a per-key tuple compare never lines up.
-        want = knob.tile_signature(g.knobs)
-        gidx = next((i for i, r in enumerate(rows) if knob.tile_signature(r) == want), None)
+        want = features.tile_signature(g.knobs)
+        gidx = next((i for i, r in enumerate(rows) if features.tile_signature(r) == want), None)
         if gidx is None:
             print(f"  !! {g.name}: golden not in {len(rows)} candidates — skipping")
             continue
@@ -194,7 +195,7 @@ def build_cases() -> list[tuple[str, str, int, list[dict[str, float]]]]:
         # discriminator, where the featurization still emits it) — the ``S_*`` /
         # ``H_*`` shape/regime features are constant within a shape, so they drop out
         # of a within-shape ranking.
-        feats = [{k: v for k, v in knob.knob_features({**base, **r}).items() if k.startswith("D_") or k == "MMA_tier"} for r in rows]
+        feats = [{k: v for k, v in features.knob_features({**base, **r}).items() if k.startswith("D_") or k == "MMA_tier"} for r in rows]
         cases.append((g.name, tier, gidx, feats))
     return cases
 

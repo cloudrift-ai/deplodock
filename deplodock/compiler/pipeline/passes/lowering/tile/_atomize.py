@@ -12,7 +12,7 @@ algebra a property of the loop, so no per-algebra op-tree node class is needed. 
 needs no binding here — its accumulator dtype + shuffle/tree
 mechanism are derived at materialize time (``emit_combine`` off the carrier + ``ReduceStage.combine``).
 
-**Called from ``020_schedule``, not a standalone pass.** The binding is resolved when the tiled
+**Called from ``_schedule`` (inside ``010_recognize``), not a standalone pass.** The binding is resolved when the tiled
 contraction leaf is built (``_warp_option`` / the tiled ``_tile_option``) — so an atom that
 **cannot** be bound (e.g. a non-``Load`` operand: a computed-cone / demoted matmul) is rejected at
 fork construction, alongside ``_check_warp_static_k``, instead of failing several passes later.

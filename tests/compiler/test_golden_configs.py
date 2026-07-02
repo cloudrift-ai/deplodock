@@ -97,7 +97,7 @@ def test_goldens_speak_native_codecs_and_featurize():
     non-empty tile geometry family — the scalar path that silently produced empty ``D_*`` features
     while the goldens still spelled ``BM``/``BN`` (the bug the migration fixed)."""
     from deplodock.compiler.ir.schedule import ReducePlan, Stage, TilePlan
-    from deplodock.compiler.pipeline import knob
+    from deplodock.compiler.pipeline.search import features
 
     legacy = {"BN", "BM", "FM", "FN", "BK", "BR", "FK", "SPLITK", "WN", "WM", "MMA", "RING", "TMA"}
     for g in GOLDEN_CONFIGS:
@@ -109,7 +109,7 @@ def test_goldens_speak_native_codecs_and_featurize():
         if g.knobs.get("STAGE"):
             Stage.parse(g.knobs["STAGE"])
         if isinstance(g, MatmulGoldenConfig):
-            feats = knob.knob_features(g.knobs)
+            feats = features.knob_features(g.knobs)
             assert feats.get("D_threads", 0) > 0 and "D_tile_m" in feats, f"{g.name} featurized to empty tile geometry"
 
 

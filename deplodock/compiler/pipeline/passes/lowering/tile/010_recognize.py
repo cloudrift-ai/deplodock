@@ -59,6 +59,7 @@ from deplodock.compiler.pipeline import Match, Pattern, RuleSkipped
 from deplodock.compiler.pipeline.passes.lowering.tile._flash import is_flash_score_producer, try_flash
 from deplodock.compiler.pipeline.passes.lowering.tile._schedule import schedule
 from deplodock.compiler.pipeline.passes.lowering.tile._softmax import _fuse
+from deplodock.compiler.pipeline.search.space import place_decision
 
 PATTERN = [Pattern("root", (LoopOp, TileOp))]
 
@@ -207,7 +208,7 @@ def _lift_cell(cell: list[Stmt], free: list, output: str) -> Map | Reduction:
 def _lift(stmts: list[Stmt], output: str) -> tuple[Map | Reduction, tuple]:
     """Peel the free axes and lift the per-cell compute, returning ``(root node, free
     axes)``. The free axes are the schedule's (carried on the ``TileOp``, not the node);
-    ``020_schedule`` maps them onto the grid."""
+    ``_schedule`` (inside ``010_recognize``) maps them onto the grid."""
     free, cell = _peel(Body(tuple(stmts)))
     node = _lift_cell(cell, free, output)
     return node, _order_free_by_output(node, free)
@@ -244,19 +245,24 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
         return schedule(tile, tile.name, tile.knobs)
     # (1) Flash attention — a graph rewrite that fuses a softmax-then-P@V kernel with its
     # scaled-QK producer. Tried first on every node; flash precedes online-softmax precedes
-    # normalize, each consuming the Accums the next would match.
+    # normalize, each consuming the Accums the next would match. The downstream-fold
+    # absorption is the ``PLACE@fold`` placement: ``cut`` keeps the score producer and the
+    # softmax-then-P@V as separate kernels (the multi-kernel attention escape).
     graph = match.graph
-    flash = try_flash(graph, root)
-    if flash is not None:
-        return flash
-    # (2) Defer a flash score producer: the general lift below would turn this scaled-QK
-    # matmul into a ``TileOp`` before its softmax-then-P@V consumer fuses, and that fusion
-    # reads the producer's Q/K as plain ``Load``s. Leave it a ``LoopOp`` until the consumer
-    # has had its chance to consume it (a later scan re-visits this node, by then removed).
-    if is_flash_score_producer(graph, root):
-        raise RuleSkipped("flash score producer — defer to its consumer's fusion")
+    if place_decision("fold") == "fuse":
+        flash = try_flash(graph, root)
+        if flash is not None:
+            return flash
+        # (2) Defer a flash score producer: the general lift below would turn this scaled-QK
+        # matmul into a ``TileOp`` before its softmax-then-P@V consumer fuses, and that fusion
+        # reads the producer's Q/K as plain ``Load``s. Leave it a ``LoopOp`` until the consumer
+        # has had its chance to consume it (a later scan re-visits this node, by then removed).
+        if is_flash_score_producer(graph, root):
+            raise RuleSkipped("flash score producer — defer to its consumer's fusion")
     loop: LoopOp = root.op
-    fused, _ = _fuse(loop.body)
+    # (3) Online softmax — the sibling-fold tupling (``PLACE@tuple``): fuse the adjacent
+    # (rowmax, Σexp) reduce pair into one streaming pass; ``cut`` keeps the two-pass stats.
+    fused, _ = _fuse(loop.body) if place_decision("tuple") == "fuse" else (loop.body, False)
     node, free = _lift(list(fused), root.output.name)
     # A symbolic FREE (parallel) axis rides a **symbolic grid**: the ``Tile`` decode sizes the
     # launch from the runtime extent (``_gid < ∏extents``, the ``Dim`` name threaded as an

@@ -11,11 +11,13 @@ the per-run state and engine loop) and `fork.py` (the `Fork` interface with `Opt
 `Level` + `build_fork_tree` lazy knob-cartesian tree builder). `knob.py` owns the `Knob` descriptor system and the
 `DEPLODOCK_<KNOB>` env namespace (it borrows `config.knob_var` / `config.knob_raw`; `format_tuning_knobs` renders the
 real tuning knobs for `tune` output) — but **not** the concrete knob declarations. **INVARIANT: every `Knob` instance is
-declared in `forks.py` and nowhere else** — the single home for the whole tunable surface (the schedule codec knobs
-`REDUCE` / `TILE` / `STAGE` / `WSPEC` and the kernel-lowering policy knobs `VECTORIZE_LOADS` / `INTERLEAVE_LOADS`). A rule
-that decides a knob imports it from `forks.py` rather than declaring its own; `knob.registry()` still discovers them by
-walking loaded modules (`forks.py` loads at pipeline startup via those rules). `dump.py` and `rule_diff.py` are the dump /
-`-vv` presentation layers.
+declared in `search/space.py` and nowhere else** — the single home for the whole search space: the knob declarations (the
+schedule codecs `REDUCE` / `TILE` / `STAGE` / `WSPEC`, the pin-only structural `PLACE`, and the kernel-lowering policy
+knobs `VECTORIZE_LOADS` / `INTERLEAVE_LOADS`) **and** the enumeration value grids (`scalar_tile_moves` & co). A rule that
+decides a knob imports it from `search/space.py` rather than declaring its own; `knob.registry()` still discovers them by
+walking loaded modules (`space.py` loads at pipeline startup via those rules). The featurizers (`knob_features`,
+`tile_signature`, the `D_*` / `MMA_*` encodings) live beside it in `search/features.py`, so the whole space — dimensions ×
+values × encoding — is analyzable in one package. `dump.py` and `rule_diff.py` are the dump / `-vv` presentation layers.
 
 The autotune state lives under `search/`. The persistent store is `SearchDB` (`db.py`, SQLite). The in-memory MCTS lives
 with its only reader, `TuningSearch`, in `policy/mcts.py` (greedy compiles use `policy/greedy.greedy_decide` instead, no
@@ -81,7 +83,7 @@ no longer matches. Most rules satisfy this implicitly via op-type changes (`Loop
 Ranking is always the policy's job over a single `Prior` — Forks carry NO score, and nothing materializes or scores a
 `TileOp` just to rank it (the per-variant `lazy_score` / `score_tile_geometry` formulas, the `Fork.score` /
 `Search.score_of` plumbing, the DB-best `_best_fork` replay, and the `_priority_*` enumeration sort are all gone). The
-`Prior` featurizes the row knobs directly (`knob.knob_features`). There is ONE ranking path: the hand-coded
+`Prior` featurizes the row knobs directly (`features.knob_features`). There is ONE ranking path: the hand-coded
 `AnalyticPrior` cold (a real heuristic *score* over the engineered `D_*` geometry / occupancy features, not emission
 order; a separate `_W_A_DYN` weight set ranks symbolic-axis masked-tile kernels, selected on the stamped
 `S_ext_n_symbolic_axis`) and the learned `CatBoostPrior` once trained, composed behind `FallbackPrior`. `TuningSearch`
@@ -127,8 +129,8 @@ and bumps `Run._dropped_candidates` — without this, one search-only un-lowerab
 
 `lowering/tile/` lowers each fused `LoopOp` to a kernel-ready `TileOp` over the block-DAG Tile IR (`ir/tile/ir.py`):
 `010_recognize` (lift `LoopOp` → `TileOp`, recognize flash / softmax carriers, annotate each reduce `Loop` with its
-`AxisRole` + `Carrier`) → `020_schedule`
-(map free axes to the grid, pick the reduce partition + output `TILE` fragment, and **atomize** — resolve the
+`AxisRole` + `Carrier`, then schedule inline via the `_schedule` helper — no separate `020` pass:
+map free axes to the grid, pick the reduce partition + output `TILE` fragment, and **atomize** — resolve the
 algebra→hardware-atom binding structurally onto the schedule as each warp / cooperative option is built, so an unbindable
 atom is rejected at fork construction; `_atomize.py`, see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md)) → `030_split`
 (cross-CTA split-K as a graph rewrite). It **never dispatches on a named shape** — every decision is gated on the reduce axes' carrier algebra read
@@ -197,7 +199,7 @@ don't invent a third:
 - **Variant identity = `(context, knobs)`** — anything *predictive or replayable*. The `S_*` structural features
   (`loop/stamp` stamps a stmt/op histogram + loop extents + operand dtypes) make the merged knob dict a COMPLETE
   identity, so a prior is a pure function of it. The learned prior is exactly `score(features(ctx, knobs))`: the
-  structural facts are already in the knob dict, so `knob.knob_features` turns it straight into the model feature vector
+  structural facts are already in the knob dict, so `features.knob_features` turns it straight into the model feature vector
   (the `S_*` knobs pass through; tuning knobs encode by type, `MMA` expands to atom props).
 - **Measurement identity = `(ctx.structural_key, op_cache_key)`** — ground truth about *materialized leaves*: `perf`
   rows (the per-variant replay cache), op inventory (`loop_op` / `tile_op` / `kernel_op` / `cuda_op`), and two-level
@@ -357,7 +359,7 @@ supersedes a wall-semantics one for the same key (never the reverse), so old row
 **Greedy uses the prior too — and flattens.** `greedy_decide` (the `Run.resolve` decide for `compile` / `run`) lazy-loads
 the global `Prior` via `load_prior`. The lazy fork tree is an MCTS structure — it stages knob choices across levels
 (`BR` → `BM/BN` → `FM/FN`) so MCTS pays one node per pop. Greedy must NOT walk it level-by-level: a branch carries only a
-*partial* tile, and `knob.knob_features` can't compute its area / occupancy until `FM/FN` are pinned, so the prior would
+*partial* tile, and `features.knob_features` can't compute its area / occupancy until `FM/FN` are pinned, so the prior would
 be blind at the `BM/BN` choice. Instead greedy **flattens** each fork point to its complete leaves
 (`fork.flatten_leaves` expands branches depth-first; only knob dicts, materialization stays deferred to the chosen leaf)
 and picks the lowest `Prior.mean_scores` over the full `{H_*, S_*, complete-knob-row}` vector in one batched `predict`,
@@ -386,15 +388,12 @@ provenance reproducer, vs eager / `torch.compile` / Deplodock.
 ## Tunable knobs
 
 A **`Knob`** (`knob.py`) is the canonical schema for one tuning dimension: name, type (`INT` / `BOOL` / `BINMASK` /
-`STR`), candidate `hints` (advisory — the rule still validates structural fit), and a help string. Rules declare them as
-module-level constants and stamp values into `TileOp.knobs` dicts; the autotuner reads those back as the per-hop knob
-delta in the `lowering` table. The schedule codec knobs (`TILE` / `REDUCE` / `STAGE` / `WSPEC`) are declared **in
-`knob.py` itself** — the single home for the whole tunable surface — and imported by the rule
-(`lowering/tile/_schedule`) that resolves them; the native-moveset knobs are declared in their owning rule modules. The
-registry (`knob.registry()`)
-auto-collects every `Knob` instance in every loaded module (rule modules and `knob.py` alike) — no manual registration.
-`knob.py` also owns the `DEPLODOCK_<KNOB>` env namespace (decode per `Knob` type; `config.py` remains the sole owner of
-`os.environ`).
+`STR`), candidate `hints` (advisory — the rule still validates structural fit), and a help string. Rules stamp values
+into `TileOp.knobs` dicts; the autotuner reads those back as the per-hop knob delta in the `lowering` table. Every knob
+is declared **in `search/space.py`** — the single home for the whole tunable surface — and imported by the rule
+(`lowering/tile/_schedule`, the scheduling helper inside `010_recognize`) that resolves it. The registry
+(`knob.registry()`) auto-collects every `Knob` instance in every loaded module — no manual registration. `knob.py` also
+owns the `DEPLODOCK_<KNOB>` env namespace (decode per `Knob` type; `config.py` remains the sole owner of `os.environ`).
 
 **Pinning knobs from the environment.** Two equivalent forms:
 
@@ -417,17 +416,17 @@ silently-dropped level); a warp `TILE` pin needs its **static** contraction K to
 zero-filled tier); a scalar `TILE` parallel block (`par_n·par_m`) is capped at the 1024-thread/CTA hardware limit; and a
 `BOOL` knob rejects an unrecognized value instead of coercing a typo (`ture`) to `False`.
 
-**Registered knobs** (the schedule codecs `TILE`/`REDUCE`/`STAGE`/`WSPEC` are declared in `knob.py`; the rest across
-`passes/lowering/tile/*.py`; see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md) for the per-rule mechanics):
+**Registered knobs** (all declared in `search/space.py`; see [`passes/ARCHITECTURE.md`](passes/ARCHITECTURE.md) for the
+per-rule mechanics — the "owning rule" for the schedule codecs is the `_schedule` helper inside
+`lowering/tile/010_recognize`, there is no separate `020_schedule` pass):
 
 | Knob     | Type    | Owning rule                       | What it controls                                                        |
 |----------|---------|-----------------------------------|-------------------------------------------------------------------------|
-| `TILE`   | STR (codec) | `lowering/tile/020_schedule` | **Unified output-fragment** codec — a contraction's output tile is *either* the **scalar** register sub-tile `n<N>[x<M>]/f<fn>[x<fm>]` (parallel thread-tile `n`/`m`, register sub-tile `f`) *or* the **warp** tensor-core mma tile `a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>` (atom + warps + register sub-tile + K-chunk), never both. The value self-discriminates: an `a:<atom>` token selects the warp form (a tensor-core-atom `TilePlan`; `schedule.is_warp_codec`), otherwise the scalar `TilePlan`. Empty = per-cell. |
-| `REDUCE` | STR (codec) | `lowering/tile/020_schedule` | Reduce-axis partition codec `g<n>[a\|k]/b<n>/r<n>` — `g` cross-CTA split-K (+ finalize letter), `b` cooperative-thread fold, `r` ILP register fold. Empty = serial (the per-thread remainder is derived, never spelled). |
-| `STAGE`  | STR (codec) | `lowering/tile/020_schedule` → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring][/p<reg_depth>]` on the typed `Stage` schedule struct (composes with both fragments of the `TILE` knob): `d<depth>` the gmem→smem ring depth, `sync`/`cp.async`/TMA transport (`tma` folds in what the old `TMA` bool selected), `p<reg_depth>` the smem→register double-buffer. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
-| `CUT`    | BINMASK | `split/010_split_demoted`         | Cut a demoted matmul's computed multiply-operand cone(s) into producer kernel(s) + the clean gemm — the structural fork above. Width-1 today; `"0"` = considered-and-declined, `"1"` = cut. Deliberately declares no `off=` (to preserve the absent-vs-declined distinction). |
-| `FLASH`  | BOOL    | `loop/recognize/010_recognize_flash` | Fuse SDPA into one streaming online-softmax kernel (the `TWISTED` carrier) instead of the score-materializing `010_sdpa` decomposition. Recovers causal / additive mask + GQA + RoPE-fused producers structurally from the fused body. Static or symbolic-`seq_len`. Off by default (env pin `DEPLODOCK_FLASH=1` today). |
-| `ONLINE_SOFTMAX` | BOOL | `loop/recognize/020_recognize_online_softmax` | Fuse a standalone two-pass softmax (row-max + `Σ exp(x−max)`) into one streaming `(m, d)` `TWISTED` pass. Off by default. |
+| `TILE`   | STR (codec) | `lowering/tile/010_recognize` (`_schedule`) | **Unified output-fragment** codec — a contraction's output tile is *either* the **scalar** register sub-tile `n<N>[x<M>]/f<fn>[x<fm>]` (parallel thread-tile `n`/`m`, register sub-tile `f`) *or* the **warp** tensor-core mma tile `a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>` (atom + warps + register sub-tile + K-chunk), never both. The value self-discriminates: an `a:<atom>` token selects the warp form (a tensor-core-atom `TilePlan`; `schedule.is_warp_codec`), otherwise the scalar `TilePlan`. Empty = per-cell. |
+| `REDUCE` | STR (codec) | `lowering/tile/010_recognize` (`_schedule`) | Reduce-axis partition codec `g<n>[a\|k]/b<n>/r<n>` — `g` cross-CTA split-K (+ finalize letter), `b` cooperative-thread fold, `r` ILP register fold. Empty = serial (the per-thread remainder is derived, never spelled). |
+| `STAGE`  | STR (codec) | `lowering/tile/010_recognize` (`_schedule`) → `lowering/kernel/010_materialize` | Operand-staging codec `d<depth>/sync\|cp\|tma[/ring][/p<reg_depth>]` on the typed `Stage` schedule struct (composes with both fragments of the `TILE` knob): `d<depth>` the gmem→smem ring depth, `sync`/`cp.async`/TMA transport, `p<reg_depth>` the smem→register double-buffer. `stage=None` (unset / unparseable) = gmem-direct. See `lowering/kernel/ARCHITECTURE.md`. |
+| `WSPEC`  | STR (codec) | `lowering/tile/010_recognize` (`_schedule`) | Warp-specialization codec — role→warp split over the fixed pipeline. Pin-only; materialization reserved. Empty = uniform SIMT. |
+| `PLACE`  | STR (pin-only) | `lowering/tile/010_recognize` | Structural placement of an intermediate edge — `auto` \| `fuse` \| `cut`, per edge-class element: `PLACE@cone` (producer-cone inlining), `PLACE@fold` (flash vs separate softmax + P@V kernels), `PLACE@tuple` (online softmax vs two-pass stats). Precedence `PLACE@<element>` > bare `PLACE` > built-in `auto` (today: fuse everywhere). `auto` is pin vocabulary only — the stamped value is the *resolved* `fuse`/`cut`, stamped for `fold`/`cone` only (`tuple` is dominance — never stamped, never enumerated). A forced `fuse` on an uncertifiable kernel (RoPE'd QK) degrades to `cut` with a log line. Since `@` is not a valid shell var character, per-element pins ride `DEPLODOCK_KNOBS` (e.g. `DEPLODOCK_KNOBS="PLACE@fold=cut"`); bare `DEPLODOCK_PLACE` pins every eligible edge. Never enumerated — the `auto` seam is the future search hook for `fold`/`cone`. |
 | `S_*`    | FLOAT   | `loop/stamp/020_stamp_structural_features` | The LoopOp's structural features (stmt/op histogram + loop extents + operand dtypes). Not tunable — identity facts that make a knob dict a complete variant identity (the learned prior's feature vector). Skipped by `format_tuning_knobs`. |
 
 The `REDUCE` codec's cross-CTA split is its `g<n>` field (GRID stage), and the **finalize** is that field's trailing
@@ -475,7 +474,7 @@ algebraic moveset are also documented there.
 | `loop/fusion/`            | `split_shared_indexmap` (first) fuses a fan-out pure-indexmap `LoopOp` into all its consumers in one rewrite; `merge_loop_ops` then splices adjacent single-consumer `LoopOp` pairs; `dedup_loads` drops identical `(input, index)` Loads. Folding scalar-constant broadcasts into consumers cuts Qwen3-Embedding-0.6B from 394 → 337 kernels. |
 | `loop/recognize/`         | Pattern recognizers run AFTER the `loop/fusion` fixpoint settles (not interleaved). `recognize_flash` folds a softmax-then-P@V SDPA into one streaming flash `LoopOp` (the `FLASH` knob); `020_recognize_online_softmax` is the standalone-softmax sibling. |
 | `loop/stamp/`             | `stamp_loop_names` (`provenance.name_for`, e.g. `k_rms_norm_3f2a1b`) + `stamp_structural_features` (the `S_*` dict). Runs last in the loop dialect — after fusion and recognition — so every kernel is named / stamped against its final body. |
-| `lowering/tile/`          | `LoopOp → TileOp` over the block-DAG Tile IR: `010_recognize` → `020_schedule` (maps the grid, picks the reduce/output fragment, and **atomizes** — resolves the algebra→atom binding onto the schedule via `_atomize.py` when each option is built, rejecting an unbindable atom at fork construction) → `030_split`. Dispatch is on the carrier algebra (`MAP` / `SEMIRING` / `MONOID`), never a named shape. |
+| `lowering/tile/`          | `LoopOp → TileOp` over the block-DAG Tile IR: `010_recognize` (recognition + inline scheduling via the `_schedule` helper — maps the grid, picks the reduce/output fragment, and **atomizes** — resolves the algebra→atom binding onto the schedule via `_atomize.py` when each option is built, rejecting an unbindable atom at fork construction) → `030_split`. Dispatch is on the carrier algebra (`MAP` / `SEMIRING` / `MONOID`), never a named shape. |
 | `lowering/kernel/`        | `010_materialize` is a `TileOp → KernelOp` tier dispatcher (scalar / `_reduce`). A tiled `CONTRACTION` arrives as a high-level `Contraction` node already **built recognize-side** (`lowering/tile/_schedule._contraction_node` at fork-emit — one flat node splitting the algebra params (axes / operands / acc / epilogue) from the schedule (a `tile: TilePlan`); seam #1), so materialize only synthesizes its bare grid-`Write` and **expands** it through the one atom-generic `_factor.factorize` over the shared tiling layer (in `_factor.py`) (the geometry is derived on the `Contraction` node; `_atom.reduce_codegen` emits the shared K-loop and a swappable `store` sink, dispatched off the atom). Then the Kernel-IR peepholes: `030_stamp_types` (+ `040_demote_to_write_dtype`) resolve dtypes, `050_vectorize_loads` / `080_vectorize_stores` / `095_interleave_loads` pack/reorder memory ops, `110_drop_redundant_syncs`. See [`passes/lowering/kernel/ARCHITECTURE.md`](passes/lowering/kernel/ARCHITECTURE.md). |
 | `lowering/cuda/`          | `lower_kernelop` renders the `KernelOp` body to a `__global__` source string (`ir/kernel/render.py::render_kernelop`) and mutates the node's op to `CudaOp` in place. |
 

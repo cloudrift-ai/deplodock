@@ -35,7 +35,7 @@ from deplodock.compiler.ir.kernel import KernelOp
 from deplodock.compiler.ir.stmt import Body, Stmt
 from deplodock.compiler.ir.stmt.leaves import Assign, Load
 from deplodock.compiler.pipeline import Pattern, RuleSkipped
-from deplodock.compiler.pipeline.forks import INTERLEAVE_LOADS
+from deplodock.compiler.pipeline.search.space import INTERLEAVE_LOADS
 
 PATTERN = [Pattern("root", KernelOp)]
 

@@ -13,7 +13,7 @@ body and emits an ``S_``-prefixed (``STRUCT_PREFIX``, declared in
 ``pipeline/knob.py``) flat ``dict[str, float]``: a stmt-type / op-multiset
 histogram (the extent-free "skeleton") plus the loop-axis extents (``S_ext_*`` —
 the M/N/K shapes). Stamped into the knobs and carried forward by the engine's
-knob-merge, they ARE the kernel's structural identity: ``knob.knob_features``
+knob-merge, they ARE the kernel's structural identity: ``features.knob_features``
 turns the whole knob dict (the row knobs plus these ``S_*`` features) into the
 learned-prior feature vector, so structurally identical kernels (the same layer
 repeated through a model) featurize alike and share the prior's rows. The

@@ -104,7 +104,7 @@ class Reduction:
     ``_factor._tile_reduce_axis`` expander stay byte-identical to the bare-loop form.
 
     The **scheduling param** is the ``reduce`` partition (:class:`ReducePlan` — GRID split / BLOCK coop
-    / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here** on the node
+    / REG ILP), stamped onto the node by ``_schedule`` (inside ``010_recognize``) (its decided value lives **here** on the node
     — read via ``ops.reduce_plan``). ``lower`` ignores it (it's metadata the materializer / ``030_split``
     read), so it leaves ``op_cache_key`` byte-identical."""
 
@@ -113,7 +113,7 @@ class Reduction:
     partial: Body = field(default_factory=Body)  # the per-cell fold body (the reduce Loop's body)
     role: AxisRole = AxisRole.PLANAR  # PLANAR (plain) or TWISTED (online-softmax / flash)
     unroll: bool = False
-    reduce: ReducePlan = field(default_factory=ReducePlan)  # the reduce partition (schedule slice), stamped by 020_schedule
+    reduce: ReducePlan = field(default_factory=ReducePlan)  # the reduce partition (schedule slice), stamped by the _schedule helper
     # An OPTIONAL nested structural node whose lowered loop nest is spliced AHEAD of the ``partial`` —
     # the split-K ``Reduction ⊃ Contraction`` composition, where ``axis`` (``ksplit``) differs from the
     # inner contraction's ``k_axis`` (``kslice``), so no double-reduce: ``Reduction(source=Contraction,

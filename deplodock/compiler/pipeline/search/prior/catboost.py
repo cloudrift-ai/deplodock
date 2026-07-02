@@ -5,7 +5,7 @@ setting, refit in batches from a bounded dataset and checkpointed to JSON.
 linear / rf / hgb / xgb / lgbm / catboost over a multi-op tuning dataset, and
 CatBoost performed the best.
 
-Regresses ``y = log(median latency µs)`` on :func:`knob.knob_features` — the
+Regresses ``y = log(median latency µs)`` on :func:`features.knob_features` — the
 ``S_*`` structural + ``H_*`` hardware/nvcc-regime features let one model tell
 kernels and regimes apart from the feature vector (log space keeps the RMSE fit
 from being dominated by the slow configs, where we least care). :meth:`score` /
@@ -28,7 +28,7 @@ import tempfile
 
 import numpy as np
 
-from deplodock.compiler.pipeline import knob
+from deplodock.compiler.pipeline.search.features import knob_features
 from deplodock.compiler.pipeline.search.prior.base import Prior
 
 
@@ -69,7 +69,7 @@ class CatBoostPrior(Prior):
         from catboost import CatBoostRegressor  # noqa: PLC0415
 
         rows = [(k, lab) for k, lab in self._dataset if lab > 0]
-        feats = [knob.knob_features(k) for k, _ in rows]
+        feats = [knob_features(k) for k, _ in rows]
         cols = sorted({c for f in feats for c in f})
         if not cols:
             return
@@ -97,7 +97,7 @@ class CatBoostPrior(Prior):
         ``0.0`` until the first fit. Lower is better."""
         if self._model is None:
             return 0.0
-        f = knob.knob_features(knobs)
+        f = knob_features(knobs)
         x = np.array([[f.get(c, np.nan) for c in self._cols]], dtype=float)  # absent → NaN, matching fit (see fit docstring)
         return float(np.exp(self._model.predict(x)[0]))
 
@@ -110,7 +110,7 @@ class CatBoostPrior(Prior):
             return [0.0] * len(knobs_list)
         if not knobs_list:
             return []
-        feats = [knob.knob_features(k) for k in knobs_list]
+        feats = [knob_features(k) for k in knobs_list]
         x = np.array([[f.get(c, np.nan) for c in self._cols] for f in feats], dtype=float)
         return [float(v) for v in np.exp(self._model.predict(x))]
 

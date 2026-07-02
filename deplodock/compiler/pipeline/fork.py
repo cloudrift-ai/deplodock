@@ -23,11 +23,9 @@ it. Siblings are emitted in grouping order — RANKING IS SEARCH POLICY: the
 policies rank the frontier with the learned prior (Forks carry no score).
 
 Use the builder when a rule produces ≥2 hierarchical levels of knob
-bundling (today:
-``passes/lowering/tile/010_partition_loops``). For flat 2-element forks
-with no hierarchy (e.g. ``passes/lowering/tile/085_warp_specialize``) a
-bare ``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer
-— don't reach for the builder.
+bundling. For flat 2-element forks with no hierarchy a bare
+``[ThunkFork(...), ThunkFork(...)]`` list comp is shorter and clearer —
+don't reach for the builder.
 
 The engine in ``pipeline.py`` consumes ``fork.knobs`` flat (it doesn't walk
 ancestors): branch Forks pin their level's slice of the row, leaves carry
@@ -97,8 +95,7 @@ class OptionFork(Fork):
 
 @dataclass(frozen=True)
 class ThunkFork(Fork):
-    """Generic implementation for flat one-off forks (e.g.
-    ``tile/085_warp_specialize``'s two-element WS fork): ``expand_fn(knobs)``
+    """Generic implementation for flat one-off forks: ``expand_fn(knobs)``
     as a plain function of the fork's ``knobs`` so siblings share ONE function
     instead of per-instance capture lambdas (the knob delta is the only thing
     that varies)."""

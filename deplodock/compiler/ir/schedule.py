@@ -32,7 +32,7 @@ single ser/de source of truth: every schedule codec is one ``/``-separated strin
 :class:`Field`\\s and routes its ``parse`` / ``spell`` through here, keeping only its own semantics
 (``combine`` / ``tile_m`` / ``block_threads`` / ``is_async`` / validation). The tunable knob
 *declarations* that spell these codecs (``REDUCE`` / ``TILE`` / ``STAGE`` / ``WSPEC``) live one layer
-up in :mod:`deplodock.compiler.pipeline.forks` — they are ``Knob`` instances, a pipeline concern.
+up in :mod:`deplodock.compiler.pipeline.search.space` — they are ``Knob`` instances, a search concern.
 
 **Warp-spec roles** (:class:`RoleKind` / :data:`ROLE_REGISTRY`) are the worker bands a CTA's warps
 split into; the ``WSPEC`` schema is built from the registry so a new role needs no codec edit. The
@@ -461,7 +461,7 @@ class ReducePlan:
     @classmethod
     def parse(cls, spec: str | None) -> ReducePlan:
         """Decode the ``REDUCE`` knob codec (the schedule's single reduce-partition knob,
-        decided in ``020_schedule``) into a plan: ``/``-separated level-named tokens,
+        decided in ``_schedule`` (inside ``010_recognize``)) into a plan: ``/``-separated level-named tokens,
         coarse→fine — ``g<n>[a|k]`` (GRID cross-CTA split + finalize letter), ``b<n>``
         (BLOCK cooperative threads), ``r<n>`` (REG ILP fold). Empty / ``None`` = the scalar
         serial fold. (The ``serial`` remainder is never spelled — it's derived as
@@ -577,7 +577,7 @@ class TilePlan:
     :attr:`reg_m` / :attr:`reg_n` accessors normalize that order. Spelled by the unified ``TILE``
     knob — the warp form ``a:<atom>/w<WM>x<WN>/f<FM>x<FN>/k<bk>`` or the scalar ``n<N>x<M>/f<fn>x<fm>``
     (no atom token); :func:`is_warp_codec` discriminates string-side, :attr:`is_warp` on the object.
-    Decided in ``020_schedule``."""
+    Decided in ``_schedule`` (inside ``010_recognize``)."""
 
     atom: Atom = SCALAR_ATOM
     units: tuple[int, int] = (1, 1)  # warp (WM, WN) m-then-n / scalar (par_n, par_m) n-then-m
@@ -655,7 +655,7 @@ class TilePlan:
 class Placement:
     """Kind-neutral free-axis → grid binding (the parallel output axes and their grid
     mapping). ``010_recognize`` builds an UNMAPPED placement (just ``free``);
-    ``020_schedule`` maps every free axis onto ``grid`` (the per-cell tier)."""
+    ``_schedule`` (inside ``010_recognize``) maps every free axis onto ``grid`` (the per-cell tier)."""
 
     free: tuple[Axis, ...] = ()
     grid: tuple[Axis, ...] = ()
@@ -701,13 +701,13 @@ _STAGE_SCHEMA = Schema(
 class Stage:
     """One operand-transport pipeline over the serial reduce loop — one ``Stage`` per reduce
     loop (a reduce ``Loop`` ⇒ one reduce axis ⇒ one pipeline). The schedule's
-    operand-staging knob, decided in ``020_schedule`` and materialized in
+    operand-staging knob, decided in ``_schedule`` (inside ``010_recognize``) and materialized in
     ``010_materialize``.
 
     A constructed ``Stage`` means staging is **on** (the reused gmem operands ride a shared-
     memory slab); ``schedule.stage is None`` is the register / gmem-direct baseline (no
     slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring][/p<reg_depth>]``
-    (decided in ``020_schedule``). A stage stamped on a ``TileOp`` is **RESOLVED**, not the raw
+    (decided in ``_schedule`` (inside ``010_recognize``)). A stage stamped on a ``TileOp`` is **RESOLVED**, not the raw
     pin: the scheduler runs eligibility + sizing against the node ONCE
     (``_schedule._resolve_warp_stage`` / ``_resolve_scalar_stage`` for a contraction's operand
     pipeline, ``_row_stage`` for the reduce tier's shared row) and stamps the result — or ``None``
@@ -801,7 +801,7 @@ class WarpSpec:
     launches ``TilePlan.block_threads + 32·aux_warps`` threads. ``workers is None`` on the schedule
     is uniform SIMT (every warp does every role's work, software-pipelined in-warp); a constructed
     ``WarpSpec`` means specialization is on. Spelled by the ``WSPEC`` codec ``<token><np>[:<param>,
-    ...]`` per role (``p2`` / ``p2:q8`` / ``p2:q8/s1``), decided in ``020_schedule``.
+    ...]`` per role (``p2`` / ``p2:q8`` / ``p2:q8/s1``), decided in ``_schedule`` (inside ``010_recognize``).
 
     **Reserved this cut**: the schedule field + the codec land (pin-only), but the materializer does
     not yet consume ``TileOp.workers`` (no producer/consumer warp codegen), so a pinned WSPEC is
