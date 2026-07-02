@@ -246,20 +246,6 @@ def test_flash_causal_and_gqa_match_torch(monkeypatch):
 
 
 @requires_cuda
-def test_flash_default_is_scalar_stream(monkeypatch):
-    """``FLASH`` on: the deployed flash is the scalar streaming nest — NEITHER a shared-score register
-    vector (``O_i_0``) NOR the warp-chain C→A smem slab (``flash_pv_smem``) appears. Those forms don't
-    exist today (the scalar chain is unbuilt; the tensor-core warp chain was removed as a deviation)."""
-    monkeypatch.setenv("DEPLODOCK_FLASH", "1")
-    torch.manual_seed(0)
-    q, k, v = (torch.randn(1, 2, 16, 8) for _ in range(3))
-    _backend, compiled, _graph, kernels = _trace(_Sdpa(), (q, k, v))
-    src = "\n".join(compiled.nodes[nid].op.kernel_source for nid in kernels)
-    assert "O_i_0" not in src, "default flash must stay the scalar streaming nest (no chain O[d] vector)"
-    assert "flash_pv_smem" not in src, "default flash must not be the warp-chain (no C->A smem slab)"
-
-
-@requires_cuda
 @pytest.mark.parametrize(("B", "H", "S", "D"), [(1, 1, 8, 8), (1, 2, 16, 8), (2, 3, 32, 16)])
 def test_flash_chain_matches_torch(monkeypatch, B, H, S, D):
     """The FA-2 shared-score scalar chain — the P@V output ``d`` rides a register vector ``O[BM, D]``,

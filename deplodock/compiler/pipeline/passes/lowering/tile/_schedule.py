@@ -657,6 +657,12 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
         warp = _twisted_warp_option(tile, name, knobs)
         if warp is not None:
             return warp
+        # The warp tier didn't take a TWISTED contraction pair — the scalar register-vector CHAIN
+        # (the FA-2 shared-score form) is the next conservative pick when the column axis fits the
+        # register budget.
+        chain = _twisted_chain_option(tile, place, name, knobs)
+        if chain is not None:
+            return chain
         # A PLANAR ⊗-fold over a computed MAP cone — the fused producer → matmul edge — honors a
         # warp ``TILE`` pin (pin-driven, like the matmul warp tier): the demoted contraction
         # nodifies with its computed A and the sync compute-fill stage.
@@ -692,6 +698,41 @@ def _map_cone(body: list, root: str) -> list | None:
         return None  # an Accum / Loop / Select in the cone — not a pure MAP producer
     order = {id(st): i for i, st in enumerate(body)}
     return sorted(cone, key=lambda st: order[id(st)])
+
+
+_CHAIN_MAX_D = 64  # register-vector budget: the chain holds the whole output row per thread
+
+
+def _twisted_chain_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp | None:
+    """The scalar register-vector (CHAIN) schedule for a ``TWISTED`` streaming contraction pair —
+    the FA-2 shared-score form: the expect contraction's output column axis leaves the grid and
+    rides a per-thread register vector (a scalar ``TilePlan`` register tile on the node), so the
+    score computes ONCE per streamed key and is shared across the columns (vs the per-cell tier's
+    redundant recompute per column). The conservative deterministic pick when the warp tier did not
+    take the tree and the column axis is small + static (``≤ _CHAIN_MAX_D``, the register budget) —
+    stamped on the schedule fields only, never a knob."""
+    op = tile.op
+    red = op.source if isinstance(op, Map) and isinstance(op.source, Reduction) else (op if isinstance(op, Reduction) else None)
+    if red is None or red.role is not AxisRole.TWISTED or red.carrier.twist.family != "exp" or len(red.partial) == 0:
+        return None
+    if not isinstance(red.partial[0], Contraction):
+        return None
+    tail_contractions = [st for st in list(red.partial)[1:] if isinstance(st, Contraction)]
+    if len(tail_contractions) != 1 or not tail_contractions[0].a_computed:
+        return None
+    pv = tail_contractions[0]
+    d_ax = pv.n_axis
+    grid = list(place.grid)
+    if not d_ax.extent.is_static or not grid or grid[-1].name != d_ax.name:
+        return None
+    d = d_ax.extent.as_static()
+    if d > _CHAIN_MAX_D:
+        return None
+    pv2 = replace(pv, tile=TilePlan(regs=(d, 1)))  # scalar reg order (reg_n, reg_m): the column vector
+    partial = tuple(pv2 if st is pv else st for st in red.partial)
+    red2 = replace(red, partial=type(red.partial)(partial))
+    op2 = replace(op, source=red2) if isinstance(op, Map) else red2
+    return TileOp(op=op2, name=name, place=Placement(free=tile.place.free, grid=tuple(grid[:-1])), knobs=knobs)
 
 
 def _demoted_warp_option(tile: TileOp, place, name: str, knobs: dict) -> TileOp | None:

@@ -363,6 +363,7 @@ def _bind(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
         plan = op.reduce if isinstance(op, Reduction) else None
         t, mn, lead, lanes = atomize((1, 1)), (None, None), grid, 1
         wsrc = warp_source(op)
+        csrc = chain_source(op) if wsrc is None else None
         if wsrc is not None:
             # A warp-tiled TWISTED tree (the schedule stamped mma TilePlans on its contractions):
             # the per-step values live in mma C-fragments, so the whole reduce realizes at fragment
@@ -371,6 +372,11 @@ def _bind(op, ctx: Ctx, tail: tuple, out_val: str, store=None) -> Tile:
             state, fold, close = realize_warp_twist(op, ctx, tail)
             lanes = wsrc.tile.atom.lanes
             bt = lanes
+        elif csrc is not None:
+            # The chain schedule — the expect column axis rides a per-thread register vector (the
+            # FA-2 shared-score form); one thread per (grid) cell, the column index a literal.
+            state, fold, close = _realize_chain(op, ctx, tail, csrc)
+            bt = None
         elif plan is None or (plan.coop <= 1 and plan.reg <= 1):
             state, fold, close, bt = [], with_store([*_emit(op, ctx).body, *tail], ctx.output, grid, out_val), [], None
         else:
@@ -529,6 +535,118 @@ def combine_tail(carrier, *, reg: int, coop: int, lane) -> list[Stmt]:
     if lane is not None:
         merge += emit_combine(carrier, t=lane.name, n_threads=coop)
     return merge
+
+
+def chain_source(op) -> Contraction | None:
+    """The expect :class:`Contraction` of a TWISTED tree carrying a SCALAR register tile over its
+    output column axis (the chain schedule — the column axis rides a per-thread register vector),
+    or ``None``. The structural schedule read the one binder keys the chain realization on."""
+    red = op.source if isinstance(op, Map) else op
+    if not isinstance(red, Reduction):
+        return None
+    pv = next((s for s in list(red.partial)[1:] if isinstance(s, Contraction)), None)
+    if pv is not None and not pv.tile.is_warp and pv.tile.regs != (1, 1):
+        return pv
+    return None
+
+
+def _flat_stmts(stmts):
+    for s in stmts:
+        yield s
+        for b in s.nested():
+            yield from _flat_stmts(list(b))
+
+
+def _stmt_axis_hit(s: Stmt, axis: str) -> bool:
+    idx = getattr(s, "index", None)
+    if idx and any(axis in e.free_vars() for e in idx):
+        return True
+    return isinstance(s, Select) and any(axis in br.select.free_vars() for br in s.branches)
+
+
+def _stmt_reads(s: Stmt) -> set[str]:
+    if isinstance(s, Accum):
+        return {s.name, s.value}
+    if isinstance(s, Select):
+        return {br.value for br in s.branches}
+    deps = getattr(s, "deps", None)
+    return set(deps()) if callable(deps) else set(getattr(s, "args", ()) or ())
+
+
+def _taint(stmts: list[Stmt], axis: str) -> frozenset[str]:
+    """The SSA names transitively dependent on the free ``axis`` — the register-vector slice of the
+    per-cell body (everything else is shared across the vector's columns)."""
+    tainted: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for s in _flat_stmts(stmts):
+            d = set(s.defines())
+            if d and not (d <= tainted) and (_stmt_axis_hit(s, axis) or (_stmt_reads(s) & tainted)):
+                tainted |= d
+                changed = True
+    return frozenset(tainted)
+
+
+def _vector_carrier(carrier, tainted: frozenset[str], count: int):
+    """The carrier with each column-dependent state component fanned out per register column —
+    one expectation channel per column, so the loop render seeds every replica (the chain IS the
+    same LSE carrier with ``count`` expect channels)."""
+    if carrier is None or not (set(carrier.state.names) & tainted):
+        return carrier
+    names: list[str] = []
+    channels: list = []
+    for nm, ch in zip(carrier.state.names, carrier.twist.channels, strict=True):
+        if nm in tainted:
+            names += [f"{nm}_{j}" for j in range(count)]
+            channels += [ch] * count
+        else:
+            names.append(nm)
+            channels.append(ch)
+    return replace(carrier, state=replace(carrier.state, names=tuple(names)), twist=replace(carrier.twist, channels=tuple(channels)))
+
+
+def _vectorize_axis(stmts: list[Stmt], axis: str, count: int, tainted: frozenset[str], protected: frozenset[str]) -> list[Stmt]:
+    """Replicate every column-dependent stmt per register column (σ ``axis → j``, names suffixed
+    ``_{j}``), keeping shared stmts single — the FA-2 shared-score restructuring: the score /
+    softmax stats compute once per streamed key, the per-column slice fans out. Recurses into loop
+    bodies (a loop stays single; a column-touched carrier fans out per :func:`_vector_carrier`)."""
+    out: list[Stmt] = []
+    for s in stmts:
+        bodies = s.nested()
+        if bodies:
+            s = s.with_bodies(tuple(Body(tuple(_vectorize_axis(list(b), axis, count, tainted, protected))) for b in bodies))
+            if getattr(s, "carrier", None) is not None:
+                s = replace(s, carrier=_vector_carrier(s.carrier, tainted, count))
+            out.append(s)
+            continue
+        if (set(s.defines()) & tainted) or _stmt_axis_hit(s, axis) or (_stmt_reads(s) & tainted):
+            for j in range(count):
+                out += copy_cell([s], Sigma({axis: Literal(j, "int")}), f"_{j}", protected)
+        else:
+            out.append(s)
+    return out
+
+
+def _realize_chain(op, ctx: Ctx, tail: tuple, pv: Contraction) -> tuple[list[Stmt], list[Stmt], list[Stmt]]:
+    """Realize a chain-scheduled TWISTED tree — the ``(state, fold, close)`` triple: the per-cell
+    body with the expect column axis register-vectorized (the score shared), and the projection +
+    store replicated per column (the column index a literal — the axis left the grid)."""
+    axis = pv.n_axis.name
+    count = pv.tile.regs[0]  # scalar reg order (reg_n, reg_m) — the column (n) register vector
+    (rloop,) = _emit(op, ctx).body
+    all_stmts = [*rloop.body, *tail]
+    tainted = _taint(all_stmts, axis)
+    protected = frozenset({nm for s in _flat_stmts(all_stmts) for nm in (*s.defines(), *_stmt_reads(s))} - tainted)
+    body = _vectorize_axis(list(rloop.body), axis, count, tainted, protected)
+    fold = [replace(rloop, body=Body(tuple(body)), carrier=_vector_carrier(rloop.carrier, tainted, count))]
+    close = _vectorize_axis(list(tail), axis, count, tainted, protected)
+    grid_vars = tuple(Var(a.name) for a in ctx.grid)
+    out_val = tail[-1].defines()[-1] if tail else pv.acc
+    for j in range(count):
+        val = f"{out_val}_{j}" if out_val in tainted else out_val
+        close.append(Write(output=ctx.output, index=(*grid_vars, Literal(j, "int")), value=val))
+    return [], fold, close
 
 
 def _tile_reduce_axis(op: Reduction, plan, ctx: Ctx, tail: tuple, out_val: str) -> tuple[list[Stmt], list[Stmt], list[Stmt], Axis | None]:

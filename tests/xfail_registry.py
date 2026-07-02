@@ -68,11 +68,10 @@ XFAIL: dict[str, str] = {
     "test_vllm_plugin_gpu.py": _R,
     # --- individual cases: the file still has passing tests ---
     # scalar flash landed; the dynamic single-flash variants (sdpa / gqa / additive-mask)
-    # recovered with the dynamic-grid tier. The residual flash-chain cases (a chained flash
-    # whose producer still needs a tier) and the obsolete flash-knob-off test remain.
-    "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-1-8-8]": _R,
-    "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[1-2-16-8]": _R,
-    "tests/compiler/e2e/test_attention_coverage.py::test_flash_chain_matches_torch[2-3-32-16]": _R,
+    # recovered with the dynamic-grid tier. The flash CHAIN (the FA-2 shared-score register-vector
+    # form) RECOVERED as the deterministic scalar default (`_schedule._twisted_chain_option` +
+    # `_factor._realize_chain`); the `test_flash_default_is_scalar_stream` gap snapshot (asserting
+    # the chain's ABSENCE) is deleted with it.
     # Tensor-core flash RECOVERED through the one emitter: `_schedule._twisted_warp_option` stamps
     # the mma TilePlans on the Q@K / P@V Contractions (a schedule decision, no recognizer stamp),
     # `_bind`'s reduce arm realizes the TWISTED carrier at fragment residence (`_twist`), and the
