@@ -70,7 +70,7 @@ per-cell reduce loop via `_emit` off the `Reduction` node, partitions the reduce
 (BLOCK `coop` / REG `reg`), and otherwise folds serially one thread per output cell (the degenerate `_emit(op)` +
 `with_store`) — there is **no** separate "scalar tier" branch. The projection sink and the store value (`out_val`, the
 root node's produced `Handle`) are threaded down the recursion, so `with_store` is node-agnostic. The recursion, both
-binders, and the shared-row staging helpers live in `_factor.py`. **There is no kind-specific path — no
+binders, and the shared-row staging apply live in `_factor.py`. **There is no kind-specific path — no
 flash / attention special case.** Flash is the two-`Contraction` `TWISTED` reduce tree, so its Q@K / P@V contractions and
 its streaming reduce factorize through this one recursion (scalar block=1 today). A tensor-core flash tier is a matter of
 the contractions carrying an mma `TilePlan` (a schedule field on the node) and routing through the `_emit` `Contraction`
@@ -134,14 +134,14 @@ cp.async clamps; the drain indexes the slab by LOCAL tile coords). Unstaged (no 
 
 **Shared-row staging (`_bind_reduce`) — the reduce tier's `sync` transport.** The fused norm→linear prologue is a
 cooperative reduce: an input row folded by the cooperative reduce AND re-read per output column of a contraction tail (a
-free-axis `Loop` over an inner reduce). `_bind_reduce` (in `_factor.py`) detects that one row
-(`_shared_row_buf` / `_has_contraction_tail`, narrow so a plain softmax sum or a bare reduction is untouched), fills it
-cooperatively via `_stage.sync_row_fill` — the **same `_stage.py` fill module** the warp tier's cp.async / TMA fills
-live in, indexed off the same linear-tid / thread-count seam — and rewrites both readers to the slab (`_restage_loads`).
-So every operand-staging *transport* (`sync` 1-D row · cp.async / TMA 2-D slab) now lowers through one module; the
-remaining Phase-2 purge is to drive the reduce tier's staging off a first-class `Stage` on the node (decided in
-`020_schedule`, not detected at materialize time) so the mma and reduce tiers share the same `Stage` → apply path, not
-just the fill module.
+free-axis `Loop` over an inner reduce). Like the contraction tiers, it is **`Stage`-driven**: the scheduler
+(`_schedule._row_stage`, narrow so a plain softmax sum or a bare reduction is untouched) detects that one row and stamps
+a depth-1 `sync` `Stage` whose `smem` names it — a derived schedule field, never a knob. `_bind_reduce` only *applies*
+it: the row is filled cooperatively via `_stage.sync_row_fill` — the **same `_stage.py` fill module** the warp tier's
+cp.async / TMA fills live in, indexed off the same linear-tid / thread-count seam — and both readers are rewritten to
+the slab (`_restage_loads`). So every staging decision rides a `Stage` on the schedule and every transport (`sync` 1-D
+row · cp.async / TMA 2-D slab) lowers through one module. A contraction operand `Stage` never sets `smem`, which is how
+the two apply paths stay distinct on a coop-K contraction.
 
 ## Kernel-IR peepholes
 

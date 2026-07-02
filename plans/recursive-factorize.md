@@ -258,7 +258,10 @@ The direction is sound and matches the mandate (one hierarchical emitter), but t
 - **P3 (R3-A):** re-home flash PV onto a node edge (or add a `partial`-walk) so `factorize` reaches it structurally.
 - **P4 (R3-B / R4 / R5):** nodify the coop-K flat-`Map` contraction (kill the `TileOp.reduce` residual) so the partition
   reads off a node uniformly.
-- **P5 (R3-C):** a cross-node shared-staging channel in `Ctx`/`Emit` for the fused norm→linear smem row.
+- **P5 (R3-C):** ✅ **LANDED** — the shared-staging channel is `Ctx.stage`: the scheduler (`_schedule._row_stage`)
+  detects the fused norm→linear row and stamps a `sync` `Stage` whose `smem` names it; `_bind_reduce` reads `ctx.stage`
+  and applies the cross-node rewrite at the ROOT (the one place that legitimately sees both the reduce body and the
+  projection tail), so no independent `Frag` ever reaches into another's emitted body.
 
 ## The op-tree changes — the INITIAL steps (behavior-preserving nodification)
 

@@ -26,12 +26,13 @@ have landed together** — the `STAGE` codec → `Stage` now lowers on the mma t
 `ldmatrix` drain, the `d<depth>` gmem→smem ring, and the `p<reg_depth>` smem→register double-buffer, all pure
 bit-identical perf transforms over the gmem-direct baseline (the transport primitives in `_stage.py`; the staged K-loop
 + `_mma_stage_plan` in `_factor.py`). The six warp-tier `STAGE` structure / bit-identity e2e tests are recovered.
-**Remaining purge / follow-ups:** (a) the `_shared_row_*` fused-prologue fill now lowers through the shared `_stage.py`
-module (`sync_row_fill`, the reduce tier's `sync` transport next to the warp tier's cp.async / TMA fills), so every
-operand-staging *transport* lives in one place; the reduce and warp tiers still detect/apply their staging by different
-paths (the mma tier has **no `sync` transport**, the reduce tier has no 2-D slab), so the remaining unification is to
-drive the reduce-tier staging off a first-class `Stage` stamped in `020_schedule` (not detected at materialize time), a
-scheduler-side build, not a pure purge; (b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
+**Remaining purge / follow-ups:** (a) ✅ **LANDED (both halves)** — the `_shared_row_*` fused-prologue fill lowers
+through the shared `_stage.py` module (`sync_row_fill`), and the reduce-tier staging is now driven off a first-class
+`Stage` stamped scheduler-side (`_schedule._row_stage` detects the shared row when the cooperative partition is chosen
+and stamps a `sync` `Stage` whose `smem` names the row buffer — a derived schedule field, never a knob, so the prior
+featurization is untouched); `_bind_reduce` only applies it off `ctx.stage`, the same `Stage` → apply shape the
+contraction tiers follow. Bit-identical; the materialize-time detection helpers are deleted from `_factor.py`;
+(b) scalar-tier operand staging (`test_article_tma_sgemm_reproduction`
 — the fp32 SGEMM via the demolished `StageBundle` API); (c) rebuild the `find_all_bindings` bank-conflict staging oracle
 (`test_bank_conflicts.py`); (d) the mma split-K auto-fork (drop the "pin-only" hedge); (4) warp specialization
 (`WarpSpec`). Branch `refactoring/tile-ir-rebuild`.
@@ -481,16 +482,15 @@ tier.
 
 **Purge — the big "no divergent path" win.**
 
-- **Subsume the fused-prologue shared-row staging into the general mechanism.** The RMSNorm→linear prologue is a
-  special-cased reduce-tier staging (`_factor.py`'s `_shared_row_buf` / `_has_contraction_tail` detection +
-  `_restage_loads` rewrite). **Step 1 landed:** its cooperative fill moved out of `_factor.py` into the shared `_stage.py`
-  module as `sync_row_fill` (the reduce tier's `sync` transport, indexed off the same linear-tid / thread-count seam as
-  the warp tier's `cp_async_fill`), so every operand-staging *transport* now lives in one module — byte-identical, e2e
-  green. **Step 2 (remaining):** the mma tier has no `sync` transport and the reduce tier has no 2-D ldmatrix slab, so
-  the tiers still detect/apply staging by different paths. Full unification means driving the reduce-tier staging off a
-  first-class `Stage` stamped in `020_schedule` (not detected at materialize time), so both tiers share the same
-  `Stage` → apply path — a scheduler-side build, not a pure delete. The detection (`_shared_row_buf` /
-  `_has_contraction_tail`) then moves to `020_schedule` and the reduce apply reads `tile.stage`.
+- **Subsume the fused-prologue shared-row staging into the general mechanism — ✅ LANDED (both steps).** The
+  RMSNorm→linear prologue was a special-cased reduce-tier staging (`_factor.py`'s `_shared_row_buf` /
+  `_has_contraction_tail` detection + `_restage_loads` rewrite). **Step 1:** its cooperative fill moved into the shared
+  `_stage.py` module as `sync_row_fill` (the reduce tier's `sync` transport, the same linear-tid / thread-count seam as
+  the warp tier's `cp_async_fill`). **Step 2:** the detection moved to the scheduler — `_schedule._row_stage` runs when
+  a cooperative partition is chosen and stamps a depth-1 `sync` `Stage` whose `smem` names the row (the unmapped
+  `TileOp` is seeded with the recognized `LoopOp`'s `inputs` so the scheduler can read operand shapes); `_bind_reduce`
+  reads `ctx.stage` and only applies (fill + `_restage_loads`). Both tiers now share the same `Stage` → apply path;
+  stamped on the schedule field only (never a knob), so `tile_signature` / featurization are untouched. Byte-identical.
 - **Flip `TileOp.stage` from "dropped/reserved" to live** and strike "reserved" / "materialization dropped" from the
   knob table, `_factor.py`, `kernel/ARCHITECTURE.md`, and `xfail_registry._STAGE` (delete `_STAGE` itself as its tests
   XPASS).

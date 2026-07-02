@@ -31,9 +31,10 @@ The smem operand-staging pipeline lives in ``_stage.py`` (the :class:`~...kernel
 strategy + the one :func:`~...kernel._stage.staged_kloop`); the per-tier builders (``_atom._mma_staged``
 / ``_atom._scalar_staged``) build the transport + drain leaf. It is driven off the node's ``STAGE`` codec →
 :class:`~...schedule.Stage` (``d<depth>`` gmem→smem ring · ``sync``/``cp``/``tma`` transport ·
-``p<n>`` smem→register double-buffer). The **scalar** contraction tier stays gmem-direct; the fused
-norm→linear **shared-row** prologue (:func:`_bind_reduce`) is a *distinct* reduce-tier smem row,
-not this operand slab (a full unification is a follow-up). Leading ``_`` so the pass loader skips this
+``p<n>`` smem→register double-buffer). The **scalar** contraction tier stays gmem-direct. The fused
+norm→linear **shared-row** prologue is Stage-driven too: ``020_schedule`` detects the reused input row
+and stamps a ``sync`` :class:`~...schedule.Stage` whose ``smem`` names it; :func:`_bind_reduce` only
+applies it (the 1-D ``sync_row_fill`` + the load rewrite). Leading ``_`` so the pass loader skips this
 module."""
 
 from __future__ import annotations
@@ -398,57 +399,6 @@ def _replicate(body: Body, r: int, coop: int, axis: Axis, masked: bool, protecte
     return _mask_streamed(out, axis.name, offset, _extent_expr(axis)) if masked else out
 
 
-def _scalar_loads(stmts: list[Stmt]) -> list[Load]:
-    """Every scalar ``Load`` reachable in ``stmts`` (deep)."""
-    out: list[Load] = []
-    for s in stmts:
-        if isinstance(s, Load) and s.is_scalar:
-            out.append(s)
-        for b in s.nested():
-            out.extend(_scalar_loads(list(b)))
-    return out
-
-
-def _has_accum(stmts: list[Stmt]) -> bool:
-    return any(isinstance(s, Accum) or any(_has_accum(list(b)) for b in s.nested()) for s in stmts)
-
-
-def _has_contraction_tail(stmts: list[Stmt]) -> bool:
-    """The post-reduce tail contracts over a NEW free axis — a ``Loop`` (the free output
-    axis) whose body holds an inner reduce ``Loop`` (an ``Accum``). This is the fused
-    norm→linear shape (``for n: for k: acc += …``), and it distinguishes it from a plain
-    softmax tail (a single ``for k`` sum over the SAME reduce axis, no nested contraction).
-    Only the former benefits from staging the shared input row — and only it is rewritten."""
-    for s in stmts:
-        if isinstance(s, Loop) and any(isinstance(c, Loop) and _has_accum(list(c.body)) for c in s.body):
-            return True
-        if any(_has_contraction_tail(list(b)) for b in s.nested()):
-            return True
-    return False
-
-
-def _shared_row_buf(carrier_body, tail: list[Stmt], grid_vars: tuple, raxis: Axis, inputs: dict) -> str | None:
-    """The input buffer reused as a CTA-shared ROW across the reduce + a contraction tail — an
-    input read in the carrier reduce at ``(grid…, raxis)`` AND in the tail at ``(grid…, k)``,
-    whose trailing dim is the (static) reduce extent. That row (e.g. RMSNorm's ``x[m, :]``,
-    folded by the mean reduce then re-read per output column of the fused linear) is the one
-    operand worth staging into smem. ``None`` ⇒ no eligible operand (stay gmem-direct)."""
-    if not raxis.extent.is_static or not _has_contraction_tail(tail):
-        return None
-    n = len(grid_vars)
-    carrier_bufs = {
-        s.input
-        for s in _scalar_loads(list(carrier_body))
-        if len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars and s.index[-1] == Var(raxis.name)
-    }
-    for s in _scalar_loads(tail):
-        if s.input in carrier_bufs and len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars:
-            t = inputs.get(s.input)
-            if t is not None and t.shape[-1].is_static and t.shape[-1].as_static() == raxis.extent.as_static():
-                return s.input
-    return None
-
-
 def _restage_loads(stmts: list[Stmt], buf: str, smem: str, n_grid: int, grid_vars: tuple) -> list[Stmt]:
     """Rewrite every ``(grid…, k)`` scalar ``Load`` of ``buf`` to read ``smem[k]`` (the staged
     row), recursing into nested bodies. Other loads (and ``buf`` loads with a different index
@@ -492,7 +442,7 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
     # ``loop`` carries the :class:`Carrier` (a contraction's K loop and a monoid's reduce loop both
     # carry it here — the ⊗ lift already sits in the loop body, so the carrier-generic ``state`` /
     # ``as_state_merge`` / ``combine_states`` machinery folds either). A ``Reduction`` has no prologue
-    # ahead of its loop (``pre`` empty); the enclosing ``Map``'s projection is ``tail`` (already walked).
+    # ahead of its loop; the enclosing ``Map``'s projection is ``tail`` (already walked).
     (rloop,) = _emit(op, ctx).body
     carrier = rloop.carrier
     axis = rloop.axis
@@ -504,33 +454,32 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
     lane = Axis(name=f"{axis.name}_co", extent=coop) if coop > 1 else None
     start = Var(lane.name) if lane is not None else Literal(0, "int")
 
-    # Shared-row staging (the fused norm→linear prologue): when an input row is folded by the
-    # cooperative reduce AND re-read per output column of a contraction tail, stage it into smem
-    # once (cooperatively) and rewrite both readers to the slab — one ``__shared__`` row shared
-    # by the prologue + the matmul body. Only the cooperative tier (coop > 1) stages.
-    pre: list[Stmt] = []
+    # Shared-row staging (the fused norm→linear prologue): an input row folded by the cooperative
+    # reduce AND re-read per output column of a contraction tail rides a first-class ``sync``
+    # :class:`Stage` whose ``smem`` names the row — DETECTED scheduler-side (``_schedule._row_stage``)
+    # and only APPLIED here: fill the row into smem once (cooperatively) and rewrite both readers to
+    # the slab. Only the cooperative tier (coop > 1) is ever stamped; a contraction operand ``Stage``
+    # (the coop-K matmul's pinned pipeline) never sets ``smem``, so it passes through untouched.
     tail_src = list(tail)
     fill_stmts: list[Stmt] = []
-    if lane is not None:
-        grid_vars = tuple(Var(a.name) for a in grid)
-        staged = _shared_row_buf(rloop.body, tail_src, grid_vars, axis, ctx.inputs)
-        if staged is not None:
-            from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
+    if lane is not None and ctx.stage is not None and ctx.stage.smem:
+        from deplodock.compiler.backend.cuda.dtype import cuda_name  # noqa: PLC0415
 
-            smem_name = f"{staged}_smem"
-            fill_stmts = sync_row_fill(
-                slab=smem_name,
-                src=staged,
-                extent=axis.extent.as_static(),
-                grid_vars=grid_vars,
-                linear_tid=start,
-                n_threads=coop,
-                dtype=cuda_name(ctx.inputs[staged].dtype),
-            )
-            n_grid = len(grid)
-            rloop = replace(rloop, body=Body(tuple(_restage_loads(list(rloop.body), staged, smem_name, n_grid, grid_vars))))
-            pre = _restage_loads(pre, staged, smem_name, n_grid, grid_vars)
-            tail_src = _restage_loads(tail_src, staged, smem_name, n_grid, grid_vars)
+        (staged,) = ctx.stage.smem
+        grid_vars = tuple(Var(a.name) for a in grid)
+        smem_name = f"{staged}_smem"
+        fill_stmts = sync_row_fill(
+            slab=smem_name,
+            src=staged,
+            extent=axis.extent.as_static(),
+            grid_vars=grid_vars,
+            linear_tid=start,
+            n_threads=coop,
+            dtype=cuda_name(ctx.inputs[staged].dtype),
+        )
+        n_grid = len(grid)
+        rloop = replace(rloop, body=Body(tuple(_restage_loads(list(rloop.body), staged, smem_name, n_grid, grid_vars))))
+        tail_src = _restage_loads(tail_src, staged, smem_name, n_grid, grid_vars)
 
     # The reduce loop: ``reg`` interleaved accumulator chains (ILP), striding the axis by
     # ``coop·reg`` from the lane's start. The dissolved fold ``Accum``\\ s seed each copy's
@@ -569,6 +518,6 @@ def _bind_reduce(op, ctx: Ctx, tail: tuple, out_val: str) -> Tile:
         stored = with_store(tail, ctx.output, grid, out_val)
         body_tail = [Cond(cond=BinaryExpr("==", Var(lane.name), Literal(0, "int")), body=tuple(stored))]
 
-    body = [*fill_stmts, *pre, strided, *merge, *body_tail]
+    body = [*fill_stmts, strided, *merge, *body_tail]
     axes = (*grid, lane) if lane is not None else tuple(grid)
     return Tile(axes=axes, body=Body(tuple(body)), block_threads=coop if lane is not None else None)

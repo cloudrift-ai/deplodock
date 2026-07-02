@@ -707,9 +707,10 @@ class Stage:
     A constructed ``Stage`` means staging is **on** (the reused gmem operands ride a shared-
     memory slab); ``schedule.stage is None`` is the register / gmem-direct baseline (no
     slab). Spelled by the ``STAGE`` codec ``d<depth>/sync|cp|tma[/ring][/p<reg_depth>]``
-    (decided in ``020_schedule``). ``smem`` (the staged-operand buffer names) is **derived
-    during lowering** — the materializer stages the reused gmem reads — not spelled by the
-    codec; an empty ``smem`` means "stage every reused operand".
+    (decided in ``020_schedule``). ``smem`` (the staged-operand buffer names) is never spelled
+    by the codec: a contraction operand pipeline leaves it empty (both operands stage), while
+    the reduce tier's shared-row stage carries the ONE detected row buffer here — **derived
+    by the scheduler** (``_schedule._row_stage``), applied by ``_factor._bind_reduce``.
 
     The pipeline has two buffering levels down the memory hierarchy, each with its own depth:
     ``depth`` is the **gmem→smem** ring (the cp.async / TMA prefetch over the serial reduce

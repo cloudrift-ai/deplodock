@@ -268,4 +268,7 @@ def rewrite(match: Match, root: Node) -> list[TileOp] | TileOp | Graph | None:
     # (the merged second half, ``_schedule.schedule``): map the free axes onto the grid and offer
     # the per-axis scheduling forks (``REDUCE`` partition / ``TILE`` output tile), dispatched on
     # the axes' ``AxisRole``. Returns the scheduled ``TileOp`` (or a fork list of candidates).
-    return schedule(TileOp(op=node, place=Placement(free=free)), loop.name, {})
+    # ``inputs`` is seeded from the matched ``LoopOp`` (the matcher populated its real Tensors) so
+    # the scheduler can read operand shapes (the shared-row stage detection); the matcher refreshes
+    # it from the graph again when a later pass matches the scheduled op.
+    return schedule(TileOp(op=node, place=Placement(free=free), inputs=dict(loop.inputs)), loop.name, {})

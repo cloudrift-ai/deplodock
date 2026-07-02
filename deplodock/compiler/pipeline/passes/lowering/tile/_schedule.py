@@ -43,7 +43,7 @@ from deplodock.compiler.ir.elementwise import ElementwiseImpl
 from deplodock.compiler.ir.expr import BinaryExpr, Literal, Var
 from deplodock.compiler.ir.schedule import Stage, WarpSpec, is_warp_codec
 from deplodock.compiler.ir.sigma import Sigma
-from deplodock.compiler.ir.stmt import Accum
+from deplodock.compiler.ir.stmt import Accum, Load, Loop, Stmt
 from deplodock.compiler.ir.tile import Contraction, Map, ReducePlan, Reduction, TileOp, TilePlan
 from deplodock.compiler.ir.tile.ops import axis_role, nodify_reduce, reduce_loop
 from deplodock.compiler.pipeline.forks import REDUCE, STAGE, TILE, WSPEC
@@ -152,15 +152,91 @@ def _with_reduce(op, plan: ReducePlan):
     return replace(op, source=replace(op.source, reduce=plan))
 
 
+# ---- shared-row operand staging (the fused norm→linear prologue) -------------------------------- #
+# The reduce tier's one staging move: when an input row is folded by the cooperative reduce AND
+# re-read per output column of a contraction tail (the fused RMSNorm→linear shape), stage it into
+# smem once and share it across both readers. The DETECTION lives here — stamped as a first-class
+# ``sync`` :class:`Stage` whose ``smem`` names the row buffer — and ``_factor._bind_reduce`` only
+# APPLIES it (fill + load-rewrite), the same Stage → apply path the contraction tiers follow. Not a
+# knob: it fires whenever the cooperative partition is chosen and the shape qualifies (a pure perf
+# transform), so nothing is spelled on ``knobs`` and the prior featurization is untouched.
+
+
+def _scalar_loads(stmts: list[Stmt]) -> list[Load]:
+    """Every scalar ``Load`` reachable in ``stmts`` (deep)."""
+    out: list[Load] = []
+    for s in stmts:
+        if isinstance(s, Load) and s.is_scalar:
+            out.append(s)
+        for b in s.nested():
+            out.extend(_scalar_loads(list(b)))
+    return out
+
+
+def _has_accum(stmts: list[Stmt]) -> bool:
+    return any(isinstance(s, Accum) or any(_has_accum(list(b)) for b in s.nested()) for s in stmts)
+
+
+def _has_contraction_tail(stmts: list[Stmt]) -> bool:
+    """The post-reduce tail contracts over a NEW free axis — a ``Loop`` (the free output
+    axis) whose body holds an inner reduce ``Loop`` (an ``Accum``). This is the fused
+    norm→linear shape (``for n: for k: acc += …``), and it distinguishes it from a plain
+    softmax tail (a single ``for k`` sum over the SAME reduce axis, no nested contraction).
+    Only the former benefits from staging the shared input row — and only it is staged."""
+    for s in stmts:
+        if isinstance(s, Loop) and any(isinstance(c, Loop) and _has_accum(list(c.body)) for c in s.body):
+            return True
+        if any(_has_contraction_tail(list(b)) for b in s.nested()):
+            return True
+    return False
+
+
+def _shared_row_buf(carrier_body, tail: list[Stmt], grid_vars: tuple, raxis: Axis, inputs: dict) -> str | None:
+    """The input buffer reused as a CTA-shared ROW across the reduce + a contraction tail — an
+    input read in the carrier reduce at ``(grid…, raxis)`` AND in the tail at ``(grid…, k)``,
+    whose trailing dim is the (static) reduce extent. That row (e.g. RMSNorm's ``x[m, :]``,
+    folded by the mean reduce then re-read per output column of the fused linear) is the one
+    operand worth staging into smem. ``None`` ⇒ no eligible operand (stay gmem-direct)."""
+    if not raxis.extent.is_static or not _has_contraction_tail(tail):
+        return None
+    n = len(grid_vars)
+    carrier_bufs = {
+        s.input
+        for s in _scalar_loads(list(carrier_body))
+        if len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars and s.index[-1] == Var(raxis.name)
+    }
+    for s in _scalar_loads(tail):
+        if s.input in carrier_bufs and len(s.index) == n + 1 and tuple(s.index[:n]) == grid_vars:
+            t = inputs.get(s.input)
+            if t is not None and t.shape and t.shape[-1].is_static and t.shape[-1].as_static() == raxis.extent.as_static():
+                return s.input
+    return None
+
+
+def _row_stage(tile, place) -> Stage | None:
+    """The shared-row :class:`Stage` for a **cooperative** reduce ``tile``, or ``None`` (no eligible
+    row — gmem-direct). Reads the reduce loop / projection tail off the node tree (the same stmts the
+    materializer emits) and the operand shapes off ``tile.inputs`` (seeded from the recognized
+    ``LoopOp``); the stamped stage is the depth-1 ``sync`` transport with ``smem`` naming the row."""
+    rloop = reduce_loop(tile.op)
+    tail = list(tile.op.body) if isinstance(tile.op, Map) else []
+    grid_vars = tuple(Var(a.name) for a in place.grid)
+    buf = _shared_row_buf(rloop.body, tail, grid_vars, rloop.axis, tile.inputs)
+    return Stage(transport="sync", smem=(buf,)) if buf is not None else None
+
+
 def _option(tile, place, spec: str, name: str, knobs: dict) -> TileOp:
     """One scheduled ``TileOp``: ``place`` mapped onto the grid + the ``REDUCE`` spec resolved into the
     :class:`Reduction` node's ``ReducePlan`` (the ephemeral knob → materialized plan stamped **on the
     node**), with the spec stamped on ``knobs`` for the prior. The spec is keyed ``REDUCE@<axis>``
-    (the reduce axis this node partitions), so a multi-node kernel addresses each reduce."""
+    (the reduce axis this node partitions), so a multi-node kernel addresses each reduce. A
+    cooperative partition also derives the shared-row operand :class:`Stage` (:func:`_row_stage`,
+    stamped on the schedule field only — a derived perf transform, never a knob)."""
     plan = ReducePlan.parse(spec)
     op = _with_reduce(tile.op, plan)
     raxis = reduce_loop(tile.op).axis.name
-    return TileOp(op=op, name=name, place=place, knobs={**knobs, _at(REDUCE, raxis): spec})
+    stage = _row_stage(tile, place) if plan.coop > 1 else None
+    return TileOp(op=op, name=name, place=place, stage=stage, knobs={**knobs, _at(REDUCE, raxis): spec})
 
 
 def _tile_specs(kernel) -> list[str]:
