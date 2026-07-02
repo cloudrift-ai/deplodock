@@ -193,7 +193,7 @@ def _splitk_pin() -> str:
 
 def _coop_reduce_spec() -> str:
     """The pinned cooperative (``b``) / ILP (``r``) K partition a **non-output-tiled** ``CONTRACTION``
-    honors — folded through ``_factor._factorize_reduce`` (a contraction is the degenerate carrier of
+    honors — folded through ``_factor._bind_reduce`` (a contraction is the degenerate carrier of
     its additive fold), riding the residual ``reduce`` field on the still-``Map`` scalar tier. Returns
     the ``REDUCE`` pin iff it parses to a coop / reg partition WITHOUT a GRID split (the split-K ``g``
     takes the structural :func:`_splitk_option` fork instead); ``""`` otherwise (a foreign codec is
@@ -406,7 +406,7 @@ def _tile_option(tile, place, spec: str, name: str, knobs: dict, reduce_spec: st
     # ``Map`` form — materialize's per-cell scalar tier lowers it. A coop / ILP ``reduce_spec``
     # **nodifies** the flat ``Map`` contraction to a :class:`Reduction` node carrying the K partition
     # (:func:`nodify_reduce`), so the plan rides the node — not a residual ``TileOp.reduce`` field —
-    # and ``_factorize_reduce`` folds it off the node.
+    # and ``_bind_reduce`` folds it off the node.
     op = tile.op
     if plan.is_tiled and not reduce_spec:
         try:
@@ -444,7 +444,7 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
     # partition (``REDUCE``). Each offers its candidate(s): one applies directly, multiple fork.
     # A contraction ALSO honors a cross-CTA split-K (``g``) / cooperative (``b``/``r``) ``REDUCE``
     # pin — orthogonal to the output tile (``reduce`` = the K partition; ``g`` is consumed by
-    # ``030_split``, ``b``/``r`` by ``_factor._factorize_reduce`` on the non-tiled scalar tier).
+    # ``030_split``, ``b``/``r`` by ``_factor._bind_reduce`` on the non-tiled scalar tier).
     # ``TILE`` is the unified output-fragment knob: a candidate whose codec names an atom
     # (``a:<atom>`` — :func:`is_warp_codec`) builds the tensor-core warp option, otherwise the
     # scalar register-tile option (the either-ness — a kernel is one fragment or the other).
@@ -457,7 +457,7 @@ def schedule(tile: TileOp, name: str, knobs: dict) -> list[TileOp] | TileOp:
         if split_spec:
             return [_splitk_option(tile, place, spec, split_spec, name, knobs, stage_spec) for spec in _tile_specs(tile)]
         # A non-split cooperative / ILP (``b`` / ``r``) K partition rides the residual ``reduce`` on the
-        # scalar tier (``_factorize_reduce``); orthogonal to the output tile.
+        # scalar tier (``_bind_reduce``); orthogonal to the output tile.
         reduce_spec = _coop_reduce_spec()
         return [
             _warp_option(tile, place, spec, name, knobs, stage_spec)

@@ -31,7 +31,7 @@ def copy_cell(body, sigma, suffix: str, protected) -> list:
     per-copy SSA name (the shared grid / reduce / lane coordinates in ``protected`` pass through
     unrenamed). This is the **one** replication mechanic shared by the register tile (``_factor``,
     one copy per output cell ``(i, j)`` → ``__c{i}_{j}``) and the ILP register fold (``_factor``
-    ``_factorize_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
+    ``_bind_reduce``, one copy per accumulator chain ``r`` → ``__r{r}``); the caller supplies the per-copy
     ``sigma`` (the coordinate offset) and ``suffix`` (the SSA tag)."""
     rename = lambda n: n if n in protected else f"{n}{suffix}"  # noqa: E731
     return [s.rewrite(rename, sigma) for s in body]

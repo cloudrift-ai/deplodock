@@ -14,9 +14,9 @@ plus a thin set of **root-global schedule fields** — the free-axis → grid
 :class:`~.schedule.Placement` (``place``) and the warp split (``workers``). The
 per-node schedule slices ride the structural nodes themselves (a
 :class:`Contraction`'s ``tile``, a :class:`Reduction`'s
-``reduce``); the residual root fields (``reduce`` / ``tier`` / ``stage``)
-hold the schedule for the not-yet-nodified forms (a non-tiled
-contraction's split-K, the pin-only ``STAGE`` / ``WSPEC``; flash is now a
+``reduce`` — EVERY reduce partition rides its node, none on the ``TileOp``); the residual root fields
+(``tier`` / ``stage``) hold the schedule for the not-yet-nodified forms (a non-tiled
+contraction's output tile, the pin-only ``STAGE`` / ``WSPEC``; flash is now a
 ``Map(source=Reduction(partial=[Contraction(QK), …, Contraction(PV)]))`` node tree, so its
 partition rides the node). There is no per-kind kernel/schedule type: the algebra is read
 structurally off the axes' :class:`~deplodock.compiler.ir.axis.AxisRole`
@@ -101,7 +101,7 @@ class Reduction:
     :class:`Map` whose body IS that projection. It is NOT a ``Stmt``
     — like ``Map`` it is an op-tree node a :class:`TileOp` holds;
     :func:`ops.lower` flattens it to the synthesized loop (``[loop]``), so ``op_cache_key`` and the
-    ``_factor._factorize_reduce`` expander stay byte-identical to the bare-loop form.
+    ``_factor._bind_reduce`` expander stay byte-identical to the bare-loop form.
 
     The **scheduling param** is the ``reduce`` partition (:class:`ReducePlan` — GRID split / BLOCK coop
     / REG ILP), stamped onto the node by ``020_schedule`` (its decided value lives **here** on the node

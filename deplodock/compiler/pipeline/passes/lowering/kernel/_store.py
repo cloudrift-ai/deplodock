@@ -24,15 +24,16 @@ def has_write(stmts: list[Stmt]) -> bool:
     return False
 
 
-def with_store(stmts: list[Stmt], output: str, grid, op) -> list[Stmt]:
-    """Append the output-store glue when the body has none — a bare reduction (``op`` a ``Map``
-    whose trailing stmt is the annotated reduce ``Loop``) produces its finalized value as an SSA
-    name (``op.out`` = the carrier state) that must be written to the output buffer at the grid
-    cell. A body that already carries a ``Write`` needs no glue (and ``op.out`` is left unread)."""
+def with_store(stmts: list[Stmt], output: str, grid, value: str) -> list[Stmt]:
+    """Append the output-store glue when the body has none — a bare reduction / contraction produces
+    its finalized value as the SSA name ``value`` (the carrier state / accumulator, or a projection's
+    last def) that must be written to the output buffer at the grid cell. A body that already carries
+    a ``Write`` needs no glue (``value`` is left unread). The caller resolves ``value`` off the node
+    (``Contraction.out`` / the recursion's produced ``Handle``) so this helper stays node-agnostic."""
     if has_write(stmts):
         return stmts
     index = tuple(Var(ax.name) for ax in grid)
-    return [*stmts, Write(output=output, index=index, value=op.out)]
+    return [*stmts, Write(output=output, index=index, value=value)]
 
 
 __all__ = ["has_write", "with_store"]
